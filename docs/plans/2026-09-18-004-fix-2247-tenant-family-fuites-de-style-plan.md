@@ -7,6 +7,12 @@
 **Défaut de flotte visé :** tenant cloud grand-public, `MIKA_AGENT_TIER=family`,
 modèle `z-ai/glm-5.2`
 
+> **Note de re-grooming (2026-09-20).** Ce plan a été écrit le 18/09 et relu
+> contre le code de HEAD le 20/09. Cinq corrections ont été portées, dont une
+> qui change la conception : § 4a change le **site de vérité** de l'axe langue.
+> Les quatre autres sont des dérives de référence et sont listées en § 8, avec
+> ce qu'elles enseignent sur la façon d'ancrer un plan.
+
 ---
 
 ## 1. Symptôme mesuré
@@ -22,18 +28,18 @@ dont la persona prescrit « français natif », registre `tu`, zéro jargon :
 
 ---
 
-## 2. Ce que la lecture du code déplace — trois rectifications
+## 2. Ce que la lecture du code déplace — cinq rectifications
 
 Le commentaire opérateur du 08/09 pose : *« Les trois fuites sont pilotées par le
 modèle z-ai/glm-5.2, pas un bug de code : em-dashes (glm-5.2 en produit, rien
 dans le persona ne l'interdit) ; flip FR↔EN (langue non épinglée par tenant) »*.
-Trois mesures corrigent ce diagnostic, et chacune change le remède.
+Cinq mesures corrigent ce diagnostic, et chacune change le remède.
 
 ### R1 — Une des trois occurrences em-dash est **copiée mot pour mot du constant**, pas produite par le modèle
 
-`FAMILY_SOUL` (`crates/mika-common/src/home.rs:726-778`) porte **neuf** lignes
-avec U+2014. L'une d'elles est la ligne 769, dans la section
-`## First-turn opening (référence — persona verbatim approuvé)` :
+`FAMILY_SOUL` (`crates/mika-common/src/home.rs`, constante `pub const
+FAMILY_SOUL`) porte **neuf** lignes avec U+2014. L'une d'elles est dans la
+section `## First-turn opening (référence — persona verbatim approuvé)` :
 
 ```
 > Pas besoin de rien connaître — tu me parles comme à quelqu'un, en français,
@@ -60,25 +66,26 @@ délibérément (§ 7).
 
 ### R2 — La langue **est déjà épinglée dans le prompt**, et ça n'a pas tenu
 
-`FAMILY_SOUL:734` : « Tu réponds en **français** natif et chaleureux. »
-`FAMILY_SOUL:742` : « Parle en français naturel, chaleureux, direct ».
+`FAMILY_SOUL` écrit « Tu réponds en **français** natif et chaleureux. » dans
+`## Personnalité`, puis « Parle en français naturel, chaleureux, direct » dans
+`## Style de communication`.
 
 La prescription existe, en gras, deux fois, et la dérive a eu lieu quand même.
-Donc « épingler la langue par tenant » — s'il s'agit d'une ligne de prompte de
+Donc « épingler la langue par tenant » — s'il s'agit d'une ligne de prompt de
 plus — ajouterait une troisième formulation de ce qui a déjà échoué deux fois.
 C'est exactement la classe que
 `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` borne
 (mika#2120 : neuf récurrences sous enforcement par prompt contre zéro quand le
 fait est posé par le code).
 
-Ce qui manque n'est pas la consigne, ce sont **deux** choses qui n'existent nulle
-part : un axe **déclaré** (la langue du tenant n'est un champ d'aucune
-configuration — recherche exhaustive `lang|locale|language` sur `config.rs` et
-`prompt.rs` : zéro), et une **moitié structurelle** qui refuse un tour dérivé.
+Ce qui manque n'est pas la consigne, ce sont **deux** choses : un axe **déclaré**
+(la langue du tenant n'est un champ d'aucune configuration — recherche
+exhaustive `lang|locale|language` sur `config.rs`, `config_keys.rs` et
+`prompt.rs` : zéro) et une **moitié structurelle** qui refuse un tour dérivé.
 
 ### R3 — Le prompt ne pose **aucune** heure locale : il pose UTC et laisse convertir
 
-`prompt::write_time_section` (`prompt.rs:1162-1169`) rend exactement :
+`prompt::write_time_section` rend exactement :
 
 ```
 ## Current Time
@@ -93,18 +100,17 @@ fait posé. C'est la forme exacte du trou que mika#2290 a dû nommer sur
 l'hébergement : *« il n'y avait rien à conditionner : il y avait un fait à poser
 et une fabrication à empêcher »*.
 
-Et le chemin compact (`build_compact_system_prompt`, ≤ 5 Ko, `ProviderKind::MikaModel`)
-ne rend **aucune** section temporelle du tout. Ce n'est pas un oubli : deux
-assertions le tiennent (`prompt.rs:4422` refuse littéralement `## Current Time`,
-et le `section_count <= 4` juste au-dessus énumère en commentaire les quatre
-sections admises). § 5a en tire la conséquence, qui n'est pas celle qu'on croit.
+Et le chemin compact (`build_compact_system_prompt`, ≤ 5 Ko,
+`ProviderKind::MikaModel`) ne rend **aucune** section temporelle du tout. Ce
+n'est pas un oubli : deux assertions le tiennent, et depuis le 18/09 elles sont
+**plus** explicites qu'alors (§ 5a et § 8-B).
 
 ### R3b — Il y a **trois** assembleurs, pas deux, et le troisième est le plus suspect
 
-`build_system_prompt` (1219), `build_compact_system_prompt` (1624) et
-`build_silent_prompt` (1738). Le troisième appelle `write_time_section` (1764)
-et `write_runtime_section` (1752) — donc les moitiés intention des axes 2 et 3
-l'atteignent **sans threading nouveau**, les deux fonctions étant partagées.
+`build_system_prompt`, `build_compact_system_prompt` et `build_silent_prompt`.
+Le troisième appelle `write_time_section` et `write_runtime_section` — donc les
+moitiés intention des axes 2 et 3 l'atteignent **sans threading nouveau**, les
+deux fonctions étant partagées.
 
 Il mérite d'être nommé plutôt que couvert par accident : les tours silencieux
 (heartbeat, reflection, reminder) sont précisément ceux qui **ouvrent** un
@@ -130,6 +136,65 @@ nouvelle suite de calibration = deux tickets de suivi (§ 7).
 décision modèle** : les moitiés structurelles ci-dessous tiennent sous n'importe
 quel modèle, alors qu'un échange de modèle ne ferme aucun des trois axes de façon
 vérifiable et rouvre les trois le jour du modèle suivant.
+
+### R5 — L'axe langue n'a pas besoin d'un nouveau mécanisme de configuration : il en existe un, et c'est le bon (correction du 20/09)
+
+La version du 18/09 de ce plan proposait `MIKA_TENANT_LANGUAGE` (variable
+d'environnement, lue une fois par process, non hot-swappable) plus une clé
+`[locale].language` dans `identity.toml`, sur le modèle de `MIKA_DEPLOYMENT`
+(mika#2290). **Quatre mesures réfutent ce choix**, et la quatrième est
+éliminatoire.
+
+1. **Le site existe déjà, et il porte déjà le voisin exact.** `customer_config`
+   porte `timezone`, résolu dans `agent_loop::load_agent_context` par un
+   `db.get_customer_config("timezone")` et posé sur `AgentContext` à côté de
+   `soul_content`, `identity` et `core_memory`. L'axe 3 de ce plan lit **cette
+   valeur-là**. Ajouter la langue à la même table, au même site de chargement,
+   sur la même struct, est une ligne — contre un mécanisme complet (parse
+   trois états, cache sur `AgentState`, section `identity.toml`, filetage
+   depuis l'environnement du process).
+
+2. **`SETTABLE_CONFIG_KEYS` *est* la surface d'outil.** `SetConfigTool::definition`
+   construit son `enum` et sa description depuis cette constante, et
+   `validate_config_value` valide par clé. Ajouter la langue là la rend
+   réglable **par l'outil `set_config` déjà exposé au modèle** et par le
+   `/config set` opérateur, sans écrire une ligne de prompt ni un outil.
+
+3. **mika#2358 a déjà tranché ce choix de site, par écrit et pour une clé de
+   même nature.** Son doc-comment (`config_keys.rs`) nomme la propriété
+   mesurée : `customer_config` est *le seul site que rien ne réécrit au
+   démarrage* — une annulation de row est levée par
+   `revert_config_cancel_recurring_task` (mika#2271), et une édition
+   d'`identity.toml` est exposée à la réconciliation des sections code-owned
+   (mika#2330). Choisir `identity.toml` ici rejouerait un arbitrage déjà perdu.
+
+4. **Éliminatoire : rien n'émet `MIKA_TENANT_LANGUAGE`, donc l'axe 2 serait
+   entièrement inerte au déploiement.** La garde de § 4c ne s'arme **que** sur
+   une langue déclarée ; sans déclaration, `Unknown`, rien n'est gardé. Poser
+   la variable est un geste `mika-cloud`, hors de ce workspace — donc le tenant
+   d'Al, **la seule population mesurée**, ne serait pas servi par cette
+   livraison. C'est précisément la dépendance que mika#2290 a acceptée pour son
+   signal `cloud`, mais mika#2290 pouvait se le permettre : sa garde 5d lit le
+   texte sortant et ferme son p1 **sans** la variable. Ici la garde dépend de
+   la valeur. La forme est la même, la conséquence est inverse.
+
+   Avec `customer_config`, la langue se pose sur un tenant vivant **par une
+   phrase dans la conversation** ou une commande opérateur, sans redéploiement
+   de quoi que ce soit.
+
+**Et le hot-swap n'est pas un bonus, c'est l'exigence.** « Parle-moi en
+anglais » est une demande conversationnelle ordinaire. Un axe non
+hot-swappable rendrait cette demande inexécutable — et mika#2358 a mesuré ce
+que coûte une demande de réglage inexécutable : Mika promet une correction
+qu'elle n'a aucun moyen d'appliquer, et la garde 5e a dû être écrite pour ça.
+
+**Le risque du site, nommé plutôt que découvert.** Une garde armée par une
+valeur que le modèle peut lui-même écrire n'est pas une garde contre un modèle
+malveillant. Elle n'a jamais prétendu l'être : elle protège contre la **dérive**
+— le tour qui bascule en EN alors que `fr` est posé. Changer délibérément la clé
+est un **acte**, tracé par la ligne `audit_events` que `set_config` écrit déjà ;
+basculer de langue en cours de fil est une dérive, et c'est elle qu'on refuse.
+Même arbitrage que `timezone`, déjà réglable par le modèle depuis toujours.
 
 ---
 
@@ -157,16 +222,24 @@ précisément ce que le chemin compact rend comme `## Personality`
 (`soul_content.lines().next()`), donc cette édition ferme aussi l'em-dash du
 prompt compact sans y toucher.
 
+**Précaution d'édition, vérifiée le 20/09 :** la dernière ligne de `FAMILY_SOUL`
+est `<!-- MIKA_FAMILY_SOUL_MARKER -->`, le sentinelle de provisionnement lu par
+`soul_has_family_marker` — l'un des deux axes de détection du garde de tier
+(mika#1962). Une réécriture qui le déplacerait ou l'altérerait casserait ce
+garde pour toute la population famille. Il ne porte aucun des trois caractères
+visés, donc il ne doit tout simplement pas être touché ; un test l'épingle.
+
 ### 3b. Moitié structurelle — un normaliseur, pas une garde
 
 **Substitution déterministe, et le choix du mécanisme est l'arbitrage central de
-cet axe.** Une garde EndTurn (la forme des positions 5c/5d) dispose d'un budget
-d'un seul re-prompt ; face à un modèle qui produit des em-dashes par style, elle
-firerait à chaque tour, dépenserait son budget, et **laisserait tout de même
-passer** — la forme littérale de ce que mika#2368 a dû rattraper par un filet
-moteur. Un em-dash n'est pas une affirmation fausse qu'il faut faire *réécrire* :
-c'est un défaut de **rendu**, dont la réparation correcte est mécanique et
-préserve le sens. Une substitution ne peut pas échouer et ne coûte aucun appel.
+cet axe.** Une garde EndTurn (la forme de la famille 5c/5d/5e) dispose d'un
+budget d'un seul re-prompt ; face à un modèle qui produit des em-dashes par
+style, elle firerait à chaque tour, dépenserait son budget, et **laisserait tout
+de même passer** — la forme littérale de ce que mika#2368 a dû rattraper par un
+filet moteur. Un em-dash n'est pas une affirmation fausse qu'il faut faire
+*réécrire* : c'est un défaut de **rendu**, dont la réparation correcte est
+mécanique et préserve le sens. Une substitution ne peut pas échouer et ne coûte
+aucun appel.
 
 Règles, dans l'ordre, sur `—` (U+2014) et `–` (U+2013) :
 
@@ -190,11 +263,14 @@ puisse le lire un jour sans en écrire une seconde copie.
 s'applique **immédiatement après `strip_internal_tags`**, aux trois sites qui
 produisent le texte utilisateur :
 
-| Site | Fichier | Couvre |
+| Site | Fonction | Couvre |
 |---|---|---|
-| extraction EndTurn | `agent_loop/mod.rs:1514` | persistance **et** livraison, mode conversation / silent / team |
-| tour de continuation | `agent_loop/mod.rs:627` | le résumé forcé au dépassement de pas |
-| outil `send_message` | `tools/send_message.rs:48` (`cleaned`) | les envois explicites |
+| extraction EndTurn | `agent_loop/mod.rs`, l'appel `strip_internal_tags(&response.text())` dont le résultat est `let mut text` | persistance **et** livraison, mode conversation / silent / team |
+| tour de continuation | `agent_loop/mod.rs`, l'appel `strip_internal_tags(&resp.text())` dans `attempt_continuation_turn` | le résumé forcé au dépassement de pas |
+| outil `send_message` | `tools/send_message.rs`, la liaison `let cleaned = …strip_internal_tags(text)` | les envois explicites |
+
+*(Les trois sites sont désignés par leur expression, pas par un numéro de ligne :
+voir § 8-A pour pourquoi.)*
 
 Trois raisons pour cet ancrage précis :
 
@@ -205,20 +281,22 @@ Trois raisons pour cet ancrage précis :
   texte que la boucle a **déjà persisté** ; y normaliser ferait diverger la base
   et le message reçu — et le résumé de compaction ré-enseignerait l'em-dash au
   tour suivant.
-- **Après `strip_internal_tags`, avant les gardes.** `text` est `mut` à 1514 et
-  la garde d'ancrage mika#2037 le réécrit ; normaliser d'abord donne un seul
-  texte à tout l'aval (gardes, persistance, livraison). Sur `send_message`,
+- **Après `strip_internal_tags`, avant les gardes.** `text` est `mut` au premier
+  site et la garde d'ancrage mika#2037 le réécrit ; normaliser d'abord donne un
+  seul texte à tout l'aval (gardes, persistance, livraison). Sur `send_message`,
   normaliser avant que `cleaned` ne soit capturé est **obligatoire** : le
   `DeliveryVerdict` de mika#2136 porte `cleaned` et son prédicat compare des
-  textes par égalité — deux normalisations incohérentes rendraient une réparation
-  méconnaissable et feraient partir une ligne « non reçu » à un utilisateur qui a
-  reçu (le piège que le doc-comment de mika#2136 nomme mot pour mot).
+  textes par égalité — deux normalisations incohérentes rendraient une
+  réparation méconnaissable et feraient partir une ligne « non reçu » à un
+  utilisateur qui a reçu (le piège que le doc-comment de mika#2136 nomme mot
+  pour mot).
 
-**Portée : `PersonaProfile::Family` seule.** `ToolContext` porte déjà `tier`
-(`tools/mod.rs:114`) et `AgentTier::persona_profile()` est public — la garde 5d
-lit `tool_ctx.deployment` par le même chemin. **Aucun threading nouveau.**
-Le croisement est un `match` sur `PersonaProfile` sans `_ =>` (modèle mika#2290),
-pour que l'arrivée d'une persona force une décision au lieu d'en hériter.
+**Portée : `PersonaProfile::Family` seule.** `ToolContext` porte déjà `tier`, et
+`AgentTier::persona_profile()` est public — la garde 5d lit `tool_ctx.deployment`
+par le même chemin, et `write_runtime_section` reçoit déjà un `persona:
+PersonaProfile`. **Aucun threading nouveau.** Le croisement est un `match` sur
+`PersonaProfile` sans `_ =>` (modèle mika#2290), pour que l'arrivée d'une persona
+force une décision au lieu d'en hériter.
 
 **Coût nommé :** le normaliseur ne distingue pas un bloc de code d'une prose. Le
 tier famille n'en émet pas (sa persona interdit tout jargon) — donc on l'accepte
@@ -229,19 +307,32 @@ vide.
 
 ## 4. Axe 2 — Langue tenue (AC2)
 
-### 4a. L'axe déclaré, absent aujourd'hui
+### 4a. L'axe déclaré : une clé `customer_config`, pas une variable de process
 
-`MIKA_TENANT_LANGUAGE`, plus la clé per-agent `[locale].language` dans
-`identity.toml`. Trois états, **même forme que `MIKA_DEPLOYMENT`** (mika#2290) :
-lu une fois par process à `server::init_agent`, mis en cache sur `AgentState`,
-fileté vers `PromptContext` et `ToolContext`, **non hot-swappable**, à poser dans
-l'EnvironmentFile / ConfigMap **avant** le premier démarrage.
+**Clé `language` dans `SETTABLE_CONFIG_KEYS`**, à côté de `timezone`, validée
+par `validate_config_value` comme les autres. Trois états :
 
 | Valeur | État | Effet |
 |---|---|---|
 | `fr` | `TenantLanguage::French` | fait posé + garde armée |
 | `en` | `TenantLanguage::English` | idem |
-| absente, vide, non reconnue | `Unknown` (+ `warn!` nommant la valeur entre guillemets si non vide) | **rien n'est posé, rien n'est gardé** |
+| absente, vide | `Unknown` | **rien n'est posé, rien n'est gardé** |
+| non reconnue | refusée **à la porte** par `validate_config_value` ; si présente en base malgré tout (écriture hors outil) → `Unknown` + `warn!` nommant la valeur entre guillemets | idem |
+
+Le refus à la porte est ce que `validate_config_value` fait déjà pour
+`chat_id` et `timezone` : un `set_config` avec une valeur hors domaine rend une
+erreur au modèle, qui peut se corriger dans le tour. Le palier « illisible →
+`Unknown` + WARN » subsiste pour l'écriture directe en base, comme mika#2358 le
+fait pour ses deux clés.
+
+**Trajectoire de lecture, calquée sur `timezone` :**
+`db.get_customer_config("language")` dans `agent_loop::load_agent_context` →
+champ sur `AgentContext` → `PromptContext` / `SilentPromptContext` → et un
+paramètre de `run_loop` pour la garde, sur le modèle de `loaded_skill_names`
+(mika#2355). C'est un filetage de champ, pas un nouveau mécanisme — et c'est le
+**même** filetage quel que soit le site de vérité choisi, ce qui est précisément
+pourquoi le choix du site se décide sur les quatre mesures de R5 et non sur le
+coût du filetage.
 
 **Pourquoi l'absence ne vaut pas « la langue de la persona ».** `FAMILY_SOUL`
 prescrit le français en dur, et mika#2023 a nommé par écrit le prix de ce
@@ -252,24 +343,33 @@ que Prime a tranché le 2026-09-09 (« un choix produit déguisé en défaut
 technique »), arbitrage que mika#2290 a déjà reporté une fois.
 
 Ensemble supporté : **exactement `{fr, en}`**. C'est la borne du détecteur
-(§ 4c), et une valeur hors de cet ensemble tombe en `Unknown` plutôt que d'armer
-une garde qui ne sait pas mesurer. Toute autre langue : § 7.
+(§ 4c), et une valeur hors de cet ensemble est refusée plutôt que d'armer une
+garde qui ne sait pas mesurer. Toute autre langue : § 7.
+
+**Portée effective, dite plutôt que découverte.** `customer_config` est une
+table de la base de l'agent, donc la clé est **par agent**. Les agents
+d'ingénierie (mika-dev, mika-qa, mika-arch) ne la porteront pas : `Unknown`,
+rien n'est gardé, comportement d'aujourd'hui mot pour mot. C'est le résultat
+voulu, pas une lacune — l'acceptance vise le tenant grand-public.
 
 ### 4b. Moitié intention — le fait, pas la consigne
 
 Une ligne dans `## Runtime` (le bloc déjà déclaré *ground truth*, déjà en amont
-de Time / Channel / core-memory) : la langue du tenant, et la règle qu'un fil s'y
-tient quelle que soit la langue d'un message entrant. En `Unknown` : **aucune
-ligne**, donc le comportement d'aujourd'hui, mot pour mot.
+de Time / Channel / core-memory, et qui reçoit déjà `persona`) : la langue du
+tenant, et la règle qu'un fil s'y tient quelle que soit la langue d'un message
+entrant. En `Unknown` : **aucune ligne**, donc le comportement d'aujourd'hui.
 
 R2 dit pourquoi cette moitié ne suffit pas et ne prétend pas suffire.
 
-### 4c. Moitié structurelle — garde EndTurn `response_language_drift`, position 5e
+### 4c. Moitié structurelle — garde EndTurn `response_language_drift`
 
-Position 5e, juste après 5d, dont elle reprend la forme, le budget
-`intent_guard_retries` (un re-prompt) et la télémétrie `guard.*` de la famille
-#953. Non sautée par `skip_remaining_guards` (#1178), pour la raison littérale de
-5c/5d : une revue de PR postée n'autorise pas à répondre dans la mauvaise langue.
+Elle reprend la forme, le budget `intent_guard_retries` (un re-prompt) et la
+télémétrie `guard.*` de la famille #953, et se place **après la dernière garde
+de cette famille** — aujourd'hui `unactioned_frequency_promise` (mika#2358),
+étiquetée 5e. L'ordinal exact est à relire à l'implémentation plutôt qu'à
+recopier d'ici : ces positions bougent (§ 8-C). Non sautée par
+`skip_remaining_guards` (#1178), pour la raison littérale de 5c/5d/5e : une revue
+de PR postée n'autorise pas à répondre dans la mauvaise langue.
 
 Détecteur : discriminant par **mots-fonction** sur deux listes fermées FR/EN
 (`le la les de des un une et est dans que pour` / `the a an of and is in that
@@ -285,10 +385,10 @@ grand-public le prix est une réponse retardée pour rien.
 **Ce que cette garde ne fait pas, écrit ici plutôt que découvert :** un budget
 d'un re-prompt ne *garantit* pas AC2. Il le **borne** et rend le résidu
 comptable — `guard.response_language_drift_uncorrected` (WARN, régime attendu
-zéro), exactement le geste que 5d fait pour sa propre population résiduelle.
-Le mot « tenue » de l'acceptance est donc livré comme *bornée et mesurée*, pas
-comme *impossible*. Si la mesure post-déploiement montre un résidu non
-négligeable, le remède est un filet moteur (forme mika#2368), pas un second
+zéro), exactement le geste que 5d et 5e font pour leur propre population
+résiduelle. Le mot « tenue » de l'acceptance est donc livré comme *bornée et
+mesurée*, pas comme *impossible*. Si la mesure post-déploiement montre un résidu
+non négligeable, le remède est un filet moteur (forme mika#2368), pas un second
 re-prompt — **et c'est un ticket, pas un réglage.**
 
 ---
@@ -300,19 +400,21 @@ re-prompt — **et c'est un ticket, pas un réglage.**
 `write_time_section` gagne, quand le fuseau est **résolu** :
 
 ```
-Local time (Asia/Singapore): 2026-09-06 20:14 — Sunday evening
+Local time (Asia/Singapore): 2026-09-06 20:14 / Sunday evening
 ```
 
-(sans em-dash dans la chaîne réelle, voir AC1 : ` / `.)
+(séparateur ASCII, voir AC1 — la chaîne réelle ne porte pas d'em-dash.)
 
-`chrono-tz` est déjà dépendance de `mika-agent` (`Cargo.toml:49`) et le fuseau est
-déjà résolu (`db.get_customer_config("timezone")`, `agent_loop/mod.rs:434`).
-**Aucune dépendance, aucune requête nouvelle.**
+`chrono-tz` est déjà dépendance de `mika-agent` et le fuseau est déjà résolu
+(`db.get_customer_config("timezone")` dans `load_agent_context`). **Aucune
+dépendance, aucune requête nouvelle.** `db.rs` porte déjà trois usages du motif
+`timezone.parse::<Tz>().unwrap_or(chrono_tz::UTC)` — la conversion est une
+convention maison existante, pas une invention de ce plan.
 
 Parse en **deux temps**, parce que les deux formes circulent : `chrono_tz::Tz`
-(`Asia/Singapore`), puis `FixedOffset` (`+08:00` — la forme des tests
-`prompt.rs:2759` et `2894`, que `config_keys.rs:27` refuse aujourd'hui à
-l'écriture mais que des lignes anciennes peuvent porter).
+(`Asia/Singapore`), puis `FixedOffset` (`+08:00` — la forme de fixtures de test
+de `prompt.rs`, que `validate_config_value` refuse aujourd'hui à l'écriture mais
+que des lignes anciennes peuvent porter).
 
 Découpage du moment de la journée — un paramètre, donc nommé plutôt que dilué :
 `morning 05–11`, `afternoon 12–17`, `evening 18–22`, `night 23–04`.
@@ -324,36 +426,39 @@ modèle a répondu sur son prior parce qu'aucune section ne disait l'heure — l
 leçon mika#2290 à la lettre.
 
 **Chemin compact : on ne rend rien, et on suit mika#2290 au lieu d'en diverger.**
-C'est une rectification d'une version antérieure de ce plan, qui proposait d'y
-rendre la ligne en « assumant la divergence ». Trois faits la refusent, et le
-troisième est le seul qui compte.
+Trois faits le refusent, et le troisième est le seul qui compte.
 
-1. Le compact **refuse explicitement** `## Current Time` (`prompt.rs:4422`), et
-   le `section_count <= 4` au-dessus énumère les quatre sections admises. Rendre
-   la ligne demande donc de modifier **deux décisions épinglées** — le prix
-   qu'un plan doit annoncer, pas découvrir à l'implémentation.
+1. Le test de forme du compact **refuse explicitement** `## Current Time`, et
+   l'assertion de compte de sections juste au-dessus énumère en commentaire les
+   sections admises. Rendre la ligne demande donc de modifier **deux décisions
+   épinglées** — le prix qu'un plan doit annoncer, pas découvrir à
+   l'implémentation. Depuis le 18/09 ce commentaire porte en plus une phrase
+   explicite : *« Raising it again means naming the section, its ticket, and
+   what it guarantees »* (§ 8-B). L'argument est donc plus fort qu'alors, pas
+   plus faible.
 2. Le carve-out mika#2290 est écrit sur le site lui-même, avec son raisonnement :
    *« it withholds the intent half from this path, never the protection: the 5d
    guard reads outgoing text, not the prompt »*.
-3. **Ce raisonnement s'applique ici mot pour mot.** La garde 5f (§ 5b) lit le
+3. **Ce raisonnement s'applique ici mot pour mot.** La garde de § 5b lit le
    texte sortant, pas le prompt — donc elle protège le chemin compact que la
    ligne y soit rendue ou non. La divergence coûtait deux décisions épinglées
    pour un bénéfice que la moitié structurelle fournit déjà.
 
 Le coût est nommé et il est réel : sur MikaModel le modèle n'a pas le fait posé,
-donc la garde 5f y travaille seule, sans la moitié intention. C'est exactement
-le régime que mika#2290 a accepté pour l'hébergement, et il se joint au même
-suivi (mika#1925). Épinglé par `mika2247_compact_prompt_omits_the_local_time_line`,
-rédigé sur le modèle du test frère — **comme décision, pas comme oubli**, pour
-que le prochain lecteur trouve l'argument au lieu de le refaire.
+donc la garde de § 5b y travaille seule, sans la moitié intention. C'est
+exactement le régime que mika#2290 a accepté pour l'hébergement, et il se joint
+au même suivi (mika#1925). Épinglé par
+`mika2247_compact_prompt_omits_the_local_time_line`, rédigé sur le modèle du
+test frère — **comme décision, pas comme oubli**, pour que le prochain lecteur
+trouve l'argument au lieu de le refaire.
 
 ### 5b. Moitié structurelle — garde `time_of_day_greeting_mismatch`
 
-Même forme, même budget, position 5f. Ensemble **fermé et étroit** de formules
-explicitement horodatées, bilingue (« belle journée », « bonne journée »,
-« bonjour », « bonsoir », « bonne nuit », « good morning », « good evening »,
-« good night »), et elle ne fire que si (a) une heure locale est **connue** et
-(b) la formule nomme un autre moment que celui calculé.
+Même forme, même budget, placée juste après celle de § 4c. Ensemble **fermé et
+étroit** de formules explicitement horodatées, bilingue (« belle journée »,
+« bonne journée », « bonjour », « bonsoir », « bonne nuit », « good morning »,
+« good evening », « good night »), et elle ne fire que si (a) une heure locale
+est **connue** et (b) la formule nomme un autre moment que celui calculé.
 
 Elle est présente parce qu'AC3 est un critère d'acceptance et qu'une livraison
 prompt-seule ne satisfait pas la règle de la maison. Elle est **étroite** parce
@@ -371,11 +476,13 @@ contredire.
 | Axe | Test | Ce qu'il refuse |
 |---|---|---|
 | 1 | `home::tests::mika2247_family_soul_carries_no_em_dash` | la **re-prescription** dans le constant |
+| 1 | `home::tests::mika2247_family_soul_marker_is_intact` | une réécriture qui déplace le sentinelle de tier (mika#1962) |
 | 1 | `text::tests::mika2247_normalizer_is_idempotent_and_utf8_safe` | une boucle ou une panique sur multi-octets |
 | 1 | `text::tests::mika2247_the_three_measured_occurrences` | les trois chaînes du ticket, vérifiées en sortie |
 | 1 | `prompt/agent_loop` : contrôle négatif **opérateur** | que le normaliseur morde hors tier famille |
 | 1 | garde structurelle : scan de source, `strip_internal_tags` suivi du normaliseur aux trois sites | un quatrième site muet — halte, pas d'allowlist |
-| 2 | `config::tests::mika2247_language_three_states` | qu'une absence arme quoi que ce soit |
+| 2 | `config_keys::tests::mika2247_language_three_states` | qu'une absence arme quoi que ce soit |
+| 2 | `config_keys::tests::mika2247_unknown_value_is_refused_at_the_door` | une valeur hors `{fr, en}` acceptée par `set_config` |
 | 2 | `guards::tests::mika2247_short_text_is_undetermined` | le faux positif sur « OK » / « Bonjour 🌸 » |
 | 2 | `tests/eval/doctrine_regressions/` : le fil mesuré (EN puis FR), **plus** un contrôle négatif par état | une garde qui fire en `Unknown` |
 | 3 | `prompt::tests::mika2247_local_time_is_computed_not_inferred` | le retour à UTC seul |
@@ -399,8 +506,13 @@ un prédicat n'en lisant qu'une.
   seule population que la garde ne ferme pas ; sans cet événement elle serait
   indistinguable d'un tour sain.
 - `guard.time_of_day_greeting_mismatch` (+ `_uncorrected`) — même lecture.
-- `tenant_language_unrecognized_value` (WARN) — **zéro attendu** ; nomme la valeur
-  entre guillemets, pour qu'un espace parasite se voie.
+- `tenant_language_unrecognized_value` (WARN) — **zéro attendu** ; ne peut venir
+  que d'une écriture hors outil, `validate_config_value` refusant à la porte.
+  Nomme la valeur entre guillemets, pour qu'un espace parasite se voie.
+
+En base : `SELECT * FROM audit_events WHERE tool_name = 'set_config';` répond à
+« quand la langue de ce tenant a-t-elle été posée, et par quelle session ? » —
+`set_config` écrit déjà cette ligne, rien n'est ajouté.
 
 Le normaliseur typographique **n'émet rien**, délibérément : il tourne sur tous
 les tours famille, une ligne par tour serait du churn que la doctrine mika#2131
@@ -412,13 +524,15 @@ borne, et son effet est vérifiable par test plutôt que par grep.
    zéro U+2014 en sortie. *Halte* : un em-dash qui réapparaît alors que les tests
    sont verts signifie un **quatrième** chemin de sortie — l'établir, ne pas
    élargir le normaliseur au gateway par réflexe.
-2. **AC2.** Rejouer le fil bilingue. *Halte* : si la bascule persiste avec
+2. **AC2.** Poser `language = fr` sur le tenant mesuré **par la conversation**
+   (c'est le chemin qu'on teste), vérifier la ligne `## Runtime`, puis rejouer
+   le fil bilingue. *Halte* : si la bascule persiste avec
    `guard.response_language_drift` **vide**, le tour passe par un assembleur que
    la garde ne traverse pas ; établir lequel d'abord.
 3. **AC3.** Une salutation le soir, fuseau déclaré, puis la même **sans** fuseau.
    Le second cas doit produire une salutation non horodatée, pas un pari.
 4. **Contrôle négatif opérateur.** Sur la station de Vincent (tier `default`,
-   aucune variable de langue) : em-dashes préservés, aucune garde armée. *Halte* :
+   aucune clé `language`) : em-dashes préservés, aucune garde armée. *Halte* :
    toute garde qui fire côté opérateur est une fuite de portée — désarmer et
    réparer le croisement persona, pas le seuil.
 
@@ -435,49 +549,87 @@ borne, et son effet est vérifiable par test plutôt que par grep.
   sans laquelle mika#1190 interdit l'échange. R4 dit pourquoi le présent travail
   ne l'attend pas.
 - **Toute langue hors `{fr, en}`.** Le détecteur ne sait pas les mesurer ; elles
-  tombent en `Unknown`, donc au comportement d'aujourd'hui. Suivi.
+  sont refusées à l'écriture, donc le tenant reste au comportement d'aujourd'hui.
+  Suivi.
 - **Le prompt compact et mika#1925.** Le carve-out ne bouge pas : § 5a explique
   pourquoi l'axe 3 le **suit** au lieu d'y déroger, et la moitié intention y
-  reste retenue — protection assurée par la garde 5f, qui lit le texte sortant.
-  Même suivi que mika#2290.
+  reste retenue — protection assurée par la garde de § 5b, qui lit le texte
+  sortant. Même suivi que mika#2290.
 - **mika#2245** (défaut-racine de contexte) et le ticket frère « boilerplate ».
   Le ticket le pose lui-même dans sa section *Portée* — trois clusters distincts.
 - **Un filet moteur pour la langue** (forme mika#2368). Conditionné à la mesure
   du résidu `_uncorrected` : instruire avant de mesurer serait construire sur une
   hypothèse.
+- **Le `curator_review` et le heartbeat comme producteurs de salutations.**
+  mika#2358 vient de borner les réveils proactifs et de taire le curateur sur
+  persona famille. R3b nomme le tour silencieux comme le chemin le plus
+  plausible du symptôme n° 3 et le couvre par `write_time_section` partagée ;
+  changer la **cadence** de ces tours est le périmètre de mika#2358, pas celui-ci.
+
+---
+
+## 8. Dérives relevées au re-grooming du 20/09, et ce qu'elles enseignent
+
+Quatre écarts entre le plan du 18/09 et le code de HEAD, en deux jours. Ils sont
+listés parce que trois d'entre eux sont des **défauts d'ancrage** qui se
+reproduiraient sans la correction de forme correspondante.
+
+**A. Les numéros de ligne ont tous bougé.** `prompt.rs` a pris ~240 lignes,
+`home.rs` ~57, `agent_loop/mod.rs` ~70. Les dix références `fichier:ligne` du
+plan étaient fausses. **Correction de forme :** ce plan désigne désormais les
+sites par nom de fonction, de constante ou d'expression. Un numéro de ligne dans
+un plan de grooming a une demi-vie de quelques jours dans ce dépôt ; un nom de
+fonction survit aux refactors qui comptent.
+
+**B. Le carve-out compact s'est resserré.** L'assertion de compte de sections est
+passée de 4 à 5 (mika#1925 y a ajouté `## Stopped Topics`), et le commentaire
+porte maintenant une exigence explicite pour toute augmentation. Le plan citait
+« 4 » comme un argument ; le chiffre était faux et **l'argument est renforcé**,
+pas affaibli. Corrigé en § 5a.
+
+**C. La position de garde 5e est occupée.** mika#2358
+(`unactioned_frequency_promise`) l'a prise. Le plan réservait 5e et 5f. Corrigé
+en § 4c, et la leçon est écrite sur place : un ordinal de garde est un numéro de
+file, pas une identité — le nommer dans un plan invite à le recopier périmé.
+
+**D. Le site de configuration proposé était le mauvais** — c'est la correction de
+conception, développée en R5 et § 4a, et la seule qui change ce que le plan
+demande d'écrire.
 
 ---
 
 ## Definition of Done
 
 - [ ] `FAMILY_SOUL` ne porte plus aucun U+2014 / U+2013 / U+2026, **aucun mot
-      changé**, et un test de constant le refuse en retour.
+      changé**, sentinelle `MIKA_FAMILY_SOUL_MARKER` intacte, et deux tests de
+      constant le refusent en retour.
 - [ ] `mika_common::text` expose le normaliseur typographique, idempotent et
       UTF-8 safe, appliqué aux **trois** sites de § 3b, scopé
       `PersonaProfile::Family` par un `match` sans `_ =>`.
 - [ ] Une garde structurelle refuse un quatrième site de sortie non normalisé.
-- [ ] `MIKA_TENANT_LANGUAGE` + `[locale].language` résolus en trois états, lus
-      une fois par process, mis en cache, filetés vers `PromptContext` et
-      `ToolContext` par le chemin de `deployment`.
+- [ ] `language` est dans `SETTABLE_CONFIG_KEYS`, validée par
+      `validate_config_value` (`{fr, en}` seuls acceptés), résolue en trois
+      états, lue dans `load_agent_context` à côté de `timezone`, filetée vers
+      `PromptContext` / `SilentPromptContext` et vers `run_loop`.
 - [ ] `## Runtime` porte la langue déclarée ; **rien** en `Unknown`.
-- [ ] Garde 5e `response_language_drift` : un re-prompt, fail-open sur
-      indécidable, résidu nommé par `_uncorrected`.
+- [ ] Garde `response_language_drift` : un re-prompt, fail-open sur indécidable,
+      résidu nommé par `_uncorrected`, non sautée par `skip_remaining_guards`.
 - [ ] `write_time_section` pose l'heure locale et le moment de la journée
       calculés, parse `Tz` **et** `FixedOffset`, et **dit** l'absence de fuseau.
 - [ ] Les **trois** assembleurs sont traités nommément (R3b) : full et silencieux
       portent la ligne par `write_time_section` partagée ; le compact ne la porte
       pas, et un test l'épingle **comme décision** avec l'argument de § 5a.
-- [ ] Garde 5f `time_of_day_greeting_mismatch`, ensemble fermé bilingue,
-      fail-open sans heure connue.
+- [ ] Garde `time_of_day_greeting_mismatch`, ensemble fermé bilingue, fail-open
+      sans heure connue.
 - [ ] Contrôle négatif opérateur vert : aucun des trois axes ne mord hors famille.
 - [ ] Un contrôle négatif **par terme** fail-safe, pas un global.
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt` verts ;
       `scripts/check-byte-slices.sh` vert.
-- [ ] Root `CLAUDE.md` documente `MIKA_TENANT_LANGUAGE` (trois états, lecture
-      unique, non hot-swappable) et les quatre signaux de grep.
-- [ ] `crates/mika-agent/CLAUDE.md` documente les gardes 5e/5f dans la table
-      fabrication/registre, et `crates/mika-common/CLAUDE.md` le normaliseur dans
-      § *Text*.
+- [ ] Root `CLAUDE.md` documente la clé `language` (trois états, réglable par
+      `set_config` et `/config set`, hot-swappable) et les quatre signaux de grep.
+- [ ] `crates/mika-agent/CLAUDE.md` documente les deux nouvelles gardes dans la
+      table fabrication/registre, et `crates/mika-common/CLAUDE.md` le
+      normaliseur dans § *Text*.
 
 ## Acceptance criteria
 
@@ -494,17 +646,19 @@ Reprises verbatim du corps du ticket, avec la borne de livraison de chacune.
   Livrée comme **bornée et mesurée**, pas comme garantie, et § 4c dit pourquoi :
   la langue d'un texte ne se corrige pas mécaniquement, donc le mécanisme est un
   re-prompt à budget un, dont le résidu est compté par
-  `guard.response_language_drift_uncorrected`. Le « selon la config » est
-  l'axe déclaré `{fr, en}` ; le « selon l'utilisateur » reste le comportement
+  `guard.response_language_drift_uncorrected`. Le « selon la config » est la clé
+  `customer_config` `{fr, en}` — **posable sur un tenant vivant sans
+  redéploiement**, ce qui est ce qui rend AC2 livrable ici plutôt que suspendue à
+  un ticket `mika-cloud` (R5). Le « selon l'utilisateur » reste le comportement
   d'aujourd'hui en `Unknown`, à dessein (§ 4a).
 
 - **AC3 — Salutations cohérentes avec l'heure locale du tenant.** L'heure locale
   et le moment de la journée cessent d'être une inférence : ils sont calculés et
   posés (§ 5a), sur les deux assembleurs qui servent un tour famille — y compris
   le silencieux, qui est celui où la salutation proactive naît (R3b). Une
-  incohérence résiduelle est rattrapée une fois par la garde 5f. Deux bornes
-  dites plutôt que découvertes : fuseau non déclaré, la cohérence n'est pas
-  asserted — l'ignorance est dite et la salutation horodatée interdite, ce qui est
-  **vrai** plutôt que deviné ; et sur le chemin compact (MikaModel) la garde 5f
-  travaille seule, sans moitié intention, régime hérité de mika#2290 et joint à
-  son suivi.
+  incohérence résiduelle est rattrapée une fois par la garde de § 5b. Deux
+  bornes dites plutôt que découvertes : fuseau non déclaré, la cohérence n'est
+  pas asserted — l'ignorance est dite et la salutation horodatée interdite, ce
+  qui est **vrai** plutôt que deviné ; et sur le chemin compact (MikaModel) la
+  garde travaille seule, sans moitié intention, régime hérité de mika#2290 et
+  joint à son suivi.
