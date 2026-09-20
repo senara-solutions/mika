@@ -401,6 +401,19 @@ resserrement ne puisse pas non plus être défait par un changement de `Display`
 - Mettre à jour les deux sites d'appel : `spawn.rs:420`
   (`classify_cycle_error(&e)`) et `spawn.rs:696`
   (`classify_milestone_probe_error(&e)` — `e` est déjà en main).
+- **`raw` reste, et ce n'est pas un détail de forme.** À `spawn.rs:695`, la
+  chaîne `raw = format!("{e}")` sert **deux** consommateurs : la classification
+  (696) et `stderr_head` (699). Seul le **premier** se restreint au `stderr`
+  typé ; `stderr_head` garde la chaîne **complète**, ligne de commande comprise.
+  Un implémenteur qui suit U2 à la lettre voit `raw` devenir inutilisé à la 696
+  et peut soit le supprimer — le `stderr_head` ne compile plus — soit, plus
+  insidieux, le rebrancher sur `.stderr` seul « par cohérence ». Ce second
+  geste **compile, passe tous les tests, et ampute le journal** : l'événement
+  `manager_gh_auth_check_failed` perdrait le `gh api /repos/o/r/milestones/N`
+  qui dit *quel* appel a échoué, sur la surface même que mika#2013 existe pour
+  rendre digne de confiance. Le resserrement porte sur **ce qui est classé**,
+  jamais sur ce qui est journalisé — la ligne de commande est du bruit pour le
+  classificateur et du signal pour l'opérateur.
 - Mettre à jour les docstrings des deux classificateurs : dire ce qui est classé
   (le `stderr`, pas la ligne de commande) et pourquoi les motifs non-numériques
   ne bougent pas (D7).
@@ -446,6 +459,7 @@ Voir Verification Contract. Tous les tests vivent dans `mod tests` de
 | `mika1975_untyped_string_still_narrows_the_numeric_patterns` | la même chose en chaîne plate `"gh api /repos/o/r/milestones/401 failed: HTTP 500: Internal Server Error"` ⇒ `Other` | **contrôle négatif du resserrement de motif** |
 | `mika1975_the_classification_of_every_measured_auth_shape_is_unchanged` | corpus figé (D7) ⇒ classes identiques | **l'invariant qui protège l'alarme** |
 | `mika1975_the_gh_command_error_display_is_byte_identical` | `format!("{err}")` == format hérité | protège `stderr_head` et les journaux |
+| `mika1975_the_probe_log_still_names_the_failing_call` | `verify_gh_auth` sur un runner rendant `GhCommandError { args: "api /repos/o/r/milestones/12", stderr: "HTTP 401" }` ⇒ `auth_class == Unauthorized` **et** `stderr_head.contains("/repos/o/r/milestones/12")` | **contrôle négatif de l'amputation** : la seule assertion qui rougit si quelqu'un rebranche `stderr_head` sur `.stderr` « par cohérence ». Les deux moitiés dans le même test, parce que l'une sans l'autre est satisfaite par la régression |
 | `mika1975_the_gh_runner_error_stays_typed` | scan de source sur `reader.rs`, allowlist vide | D8 |
 
 **Les deux contrôles négatifs sont tous les deux requis, et la raison est à
@@ -551,6 +565,8 @@ continu. Vérifier qu'un redémarrage a bien eu lieu avant de conclure.
       complète en fail-open.
 - [ ] Les motifs numériques passent par `has_http_status` ; **aucun motif
       non-numérique n'est retiré**.
+- [ ] `stderr_head` (`spawn.rs:699`) porte toujours la chaîne **complète**, ligne
+      de commande comprise ; seule la classification lit le `stderr` typé.
 - [ ] Les deux contrôles négatifs (typé, non typé) existent et ont été vérifiés
       rouges en neutralisant chacun sa moitié.
 - [ ] Le corpus figé de D7 asserte l'invariance de classification de toutes les
