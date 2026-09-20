@@ -272,18 +272,18 @@ pub struct AskArgs {
     #[arg(short = 'c', long = "continue", conflicts_with_all = ["run_id", "last_run"])]
     pub continue_session: bool,
 
-    /// Force named skill(s) to be active for this invocation (repeatable).
+    /// INERT since mika#1727 — accepted, validated, and without effect on the turn.
+    /// It configures this process's local skill registry, which is no longer the
+    /// execution surface: the turn runs at mika-spirit. Passing it warns on stderr.
+    /// To restrict a turn's skills on the server, use --only-skill.
     /// Mutually exclusive with --disable-skill per skill name.
-    /// Example: --enable-skill self-dev --enable-skill qa-review
-    /// Not supported in team mode (use DB overrides instead).
     #[arg(long, conflicts_with = "team")]
     pub enable_skill: Vec<String>,
 
-    /// Transiently disable named skill(s) for this invocation (repeatable).
-    /// Evicts the skill from the registry — prevents both always_on and keyword activation.
+    /// INERT since mika#1727 — accepted, validated, and without effect on the turn.
+    /// Same reason as --enable-skill above, and the same warning on stderr.
+    /// To restrict a turn's skills on the server, use --only-skill.
     /// Mutually exclusive with --enable-skill per skill name.
-    /// Example: --disable-skill self-dev
-    /// Not supported in team mode (use DB overrides instead).
     #[arg(long, conflicts_with = "team")]
     pub disable_skill: Vec<String>,
 

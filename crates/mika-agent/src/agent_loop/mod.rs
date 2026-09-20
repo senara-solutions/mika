@@ -352,7 +352,28 @@ pub fn format_callback_framing(
 pub struct AgentOutput {
     pub text: Option<String>,
     pub thinking: Option<String>,
+    /// Usage of the turn's **last** LLM call, overwritten at every step.
+    ///
+    /// Kept as it is: callers read it and mika#1883 did not change its meaning.
+    /// What that ticket added is [`Self::run_usage`] beside it — reusing this
+    /// field for the total would have put two measurements under one name, and
+    /// the difference between them is exactly what the ticket is about.
     pub usage: Option<LlmUsage>,
+    /// Sum of **every** LLM call this turn made, continuation included
+    /// (mika#1883).
+    ///
+    /// **Why a second field rather than a better [`Self::usage`].** The loop
+    /// overwrites `usage` at each step, so on a turn that spends its twenty
+    /// tool steps it reports the twenty-first call out of twenty-one. Shipping
+    /// that under the label "per-run usage" would have been a plausible number
+    /// presented with authority — mika#2304's defect one field over — so the
+    /// aggregate lives beside it and the two names stay honest.
+    ///
+    /// `None` when the turn produced no call whose usage could be read. Never
+    /// `Some(0)`: a rendered zero is indistinguishable from a real turn and
+    /// would assert a measurement nobody made. Bounds and RAW-ness are the wire
+    /// key's — see `mika_a2a::params::RUN_USAGE_KEY`.
+    pub run_usage: Option<LlmUsage>,
     /// The turn ended because it ran out of its envelope, not because it
     /// concluded (mika#2276 M2).
     ///
@@ -873,6 +894,9 @@ enum LoopResult {
         text: Option<String>,
         thinking: Option<String>,
         usage: Option<LlmUsage>,
+        /// Sum of every call of the turn (mika#1883). Travels beside `usage`,
+        /// which stays the last call's — see [`AgentOutput::run_usage`].
+        run_usage: Option<LlmUsage>,
         /// Accumulated tool call summaries from all loop steps.
         tool_call_summaries: Vec<ToolCallSummary>,
         /// Original system prompt length before step-awareness nudge was appended.
@@ -883,6 +907,9 @@ enum LoopResult {
     MaxStepsExceeded {
         thinking: Option<String>,
         usage: Option<LlmUsage>,
+        /// Sum of every call of the turn (mika#1883). The continuation call the
+        /// caller is about to make is **added** to it, not substituted for it.
+        run_usage: Option<LlmUsage>,
         tool_call_summaries: Vec<ToolCallSummary>,
         system_prompt_original_len: usize,
     },
@@ -894,6 +921,11 @@ enum LoopResult {
         steps_completed: usize,
         partial_summaries: Vec<ToolCallSummary>,
         last_usage: Option<LlmUsage>,
+        /// Sum of every call the turn made before its envelope ran out
+        /// (mika#1883). A cut-off turn *did* spend tokens, and it is precisely
+        /// the population an operator investigates, so the aggregate travels
+        /// here too rather than being dropped with the rest of the arm.
+        run_usage: Option<LlmUsage>,
         thinking: Option<String>,
         system_prompt_original_len: usize,
     },
@@ -1079,6 +1111,13 @@ async fn run_loop(
     let mut tool_use_occurred = false;
     let mut follow_up_attempted = false;
     let mut last_usage = None;
+    // mika#1883 — the turn's total, beside `last_usage` and never replacing it.
+    // `last_usage` answers "what did the last call cost"; this answers "what did
+    // the turn cost", and the two differ by a factor of the step count on any
+    // turn that used tools. Folded through `LlmUsage::accumulate` at both of its
+    // sites (here and the max-steps bridge), which the source scan
+    // `mika1883_run_usage_accumulates_only_via_the_one_helper` enforces.
+    let mut run_usage: Option<LlmUsage> = None;
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
     // Track which tools have been called across all steps for required_tools enforcement.
@@ -1190,6 +1229,7 @@ async fn run_loop(
                 steps_completed: step,
                 partial_summaries: all_tool_summaries,
                 last_usage,
+                run_usage,
                 thinking: thinking_text,
                 system_prompt_original_len: system_prompt_len,
             });
@@ -1466,6 +1506,13 @@ async fn run_loop(
 
         if mode.is_conversation() {
             last_usage = Some(response.usage.clone());
+            // mika#1883 — same guard, same position, one line apart: an
+            // aggregate summed under a different condition than the last-call
+            // field would be a third measurement nobody asked for. A call that
+            // errored never reaches here (`llm_result?` is above), so a failed
+            // attempt contributes nothing, which is correct and is not a
+            // special case.
+            run_usage = LlmUsage::accumulate(run_usage, Some(&response.usage));
         }
 
         if mode.is_conversation() && step == 0 {
@@ -3425,6 +3472,7 @@ async fn run_loop(
                         text: Some(text),
                         thinking: thinking_text,
                         usage: last_usage,
+                        run_usage,
                         tool_call_summaries: all_tool_summaries,
                         system_prompt_original_len: system_prompt_len,
                     });
@@ -3620,6 +3668,11 @@ async fn run_loop(
                         text: None,
                         thinking: None,
                         usage: None,
+                        // Silent-mode-only exit (`!follow_up_on_empty`), so the
+                        // accumulator's conversation guard has left this `None`
+                        // anyway. Passing the variable rather than a literal
+                        // keeps it following that guard if it ever widens.
+                        run_usage,
                         tool_call_summaries: all_tool_summaries,
                         system_prompt_original_len: system_prompt_len,
                     });
@@ -3662,6 +3715,7 @@ async fn run_loop(
                     text: None,
                     thinking: thinking_text,
                     usage: last_usage,
+                    run_usage,
                     tool_call_summaries: all_tool_summaries,
                     system_prompt_original_len: system_prompt_len,
                 });
@@ -3803,6 +3857,7 @@ async fn run_loop(
                         text: None,
                         thinking: thinking_text,
                         usage: last_usage,
+                        run_usage,
                         tool_call_summaries: all_tool_summaries,
                         system_prompt_original_len: system_prompt_len,
                     });
@@ -3818,6 +3873,7 @@ async fn run_loop(
     Ok(LoopResult::MaxStepsExceeded {
         thinking: thinking_text,
         usage: last_usage,
+        run_usage,
         tool_call_summaries: all_tool_summaries,
         system_prompt_original_len: system_prompt_len,
     })
@@ -4784,6 +4840,9 @@ async fn run_agent_inner(
             0,
             None,
             effective_model_attestation,
+            // mika#1883: zero steps ran, so no call produced a usage to read.
+            // This is the field's one legitimate absence, not an omission.
+            None,
         )
         .await;
     }
@@ -4864,12 +4923,14 @@ async fn run_agent_inner(
             text,
             thinking,
             usage,
+            run_usage,
             tool_call_summaries: _,
             system_prompt_original_len: _,
         } => Ok(AgentOutput {
             text,
             thinking,
             usage,
+            run_usage,
             deadline_exceeded: None,
             undelivered_sends: undelivered,
             effective_model: effective_model_attestation,
@@ -4877,6 +4938,7 @@ async fn run_agent_inner(
         LoopResult::MaxStepsExceeded {
             thinking,
             usage,
+            run_usage,
             tool_call_summaries,
             system_prompt_original_len,
         } => {
@@ -4904,6 +4966,9 @@ async fn run_agent_inner(
                     crate::planning::policy::MAX_TOOL_STEPS,
                     undelivered,
                     effective_model_attestation,
+                    // mika#1883: the full step budget was spent, so the turn has
+                    // a real total even though no continuation call was made.
+                    run_usage,
                 )
                 .await;
             }
@@ -4934,10 +4999,20 @@ async fn run_agent_inner(
                 scope_task_id,
             )
             .await?;
+            // mika#1883 — `.or(…)` below and `accumulate(…)` here say two
+            // different things, deliberately: `usage` is the LAST call and the
+            // continuation *is* the last one, while `run_usage` is the turn's
+            // total and the continuation is one more call in it. A future
+            // reader who "harmonises" one into the other breaks whichever one
+            // they moved — the continuation emits its own `turn_usage` line
+            // (`save_continuation_llm_call`), so a substitution here would make
+            // the field disagree with the log stream it is supposed to sum.
+            let run_usage = LlmUsage::accumulate(run_usage, cont.usage.as_ref());
             Ok(AgentOutput {
                 text: Some(cont.text),
                 thinking,
                 usage: cont.usage.or(usage),
+                run_usage,
                 // Max-steps continuation, not a deadline overrun: the turn
                 // produced a summary. mika#2276's net must not fire here.
                 deadline_exceeded: None,
@@ -4949,7 +5024,9 @@ async fn run_agent_inner(
             })
         }
         LoopResult::DeadlineExceeded {
-            steps_completed, ..
+            steps_completed,
+            run_usage,
+            ..
         } => {
             persist_deadline_fallback(
                 db,
@@ -4960,6 +5037,7 @@ async fn run_agent_inner(
                 steps_completed,
                 undelivered,
                 effective_model_attestation,
+                run_usage,
             )
             .await
         }
@@ -5000,6 +5078,13 @@ async fn persist_deadline_fallback(
     // after the effective provider is resolved, so all three deadline call sites
     // have a value to hand in.
     effective_model: Option<String>,
+    // mika#1883 — carried in for the same reason as the two above. A turn cut
+    // off by its envelope spent every token it spent before the cut, and
+    // reporting nothing there would put a real measurement in the "not
+    // attested" population, which is reserved for turns that produced no call
+    // to read. `None` on the prelude gate, where no step ran and there is
+    // genuinely nothing to report.
+    run_usage: Option<LlmUsage>,
 ) -> Result<AgentOutput> {
     let fallback = "I'm sorry, that took too long. Let me try a simpler approach next time.";
     db.save_message_with_task_context(
@@ -5016,6 +5101,7 @@ async fn persist_deadline_fallback(
         text: Some(fallback.to_string()),
         thinking: None,
         usage: None,
+        run_usage,
         // mika#2276 M2: the one place that says "cut off, not concluded".
         deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
         undelivered_sends,
@@ -14936,6 +15022,107 @@ mod tests {
             return Vec::new();
         }
         scope_match_sites(&mika_common::source_guard::mask_test_regions(src))
+    }
+
+    /// Tokens that make a line an *addition* rather than a read.
+    ///
+    /// `+=` and the three checked forms are unambiguous; bare `+` is matched
+    /// with its surrounding spaces so `run_usage` inside a `format!("{a}+{b}")`
+    /// or a doc link is not swept in.
+    const MIKA1883_ADDITION_TOKENS: &[&str] =
+        &[" + ", "+=", "saturating_add", "checked_add", "wrapping_add"];
+
+    /// The four `LlmUsage` fields an open-coded fold would touch.
+    const MIKA1883_USAGE_FIELDS: &[&str] = &[
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ];
+
+    /// Lines under `agent_loop/` that add usage without going through the
+    /// helper, as `(1-based line, trimmed text)`.
+    fn mika1883_open_coded_fold_sites(src: &str) -> Vec<(usize, String)> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let mentions_usage = line.contains("run_usage")
+                    || MIKA1883_USAGE_FIELDS.iter().any(|f| line.contains(f));
+                let adds = MIKA1883_ADDITION_TOKENS.iter().any(|t| line.contains(t));
+                let via_helper = line.contains("LlmUsage::accumulate");
+                mentions_usage && adds && !via_helper
+            })
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .collect()
+    }
+
+    /// **AC9** — the turn total is folded at one place, and only there.
+    ///
+    /// The writer counterpart of
+    /// `mika1883_both_client_surfaces_read_the_one_reader`, and the only one of
+    /// the two that can see a **second fold**. `LlmUsage::accumulate` has its own
+    /// unit test, which attests that `None + Some(n) = Some(n)` is right — it
+    /// attests nothing about whether the two addition sites *use* it. A second
+    /// site that re-wrote the `Option` merge by hand would serve a wrong total
+    /// with every existing test green, which is the silent class this repo closes
+    /// with a scan wherever it has met it (`mika2131_*`, `mika2220_*`).
+    ///
+    /// Shipped with **no allowlist**. That is not optimism: `run_usage` is born
+    /// in this change and its two addition sites are created by it, so the first
+    /// entry anyone would want to add here is exactly the divergence the scan
+    /// exists to refuse. Resolution when it fires: **remove the second site**,
+    /// never allowlist it — the rule `ACTOR_READING_PREDICATES_ALLOWED`
+    /// (mika#2323) states for its own list shipped empty.
+    #[test]
+    fn mika1883_run_usage_accumulates_only_via_the_one_helper() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let agent_loop_root = src_root.join("agent_loop");
+        let mut offenders: Vec<String> = Vec::new();
+
+        scanner.for_each_under(&agent_loop_root, |path, production| {
+            if crate::source_scan::is_test_source_path(path) {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+            for (line, text) in mika1883_open_coded_fold_sites(production) {
+                offenders.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "mika#1883 — a second site folds usage by hand instead of calling \
+             `LlmUsage::accumulate`. Remove it; do not allowlist it — two folds \
+             that can disagree produce a wrong total with every test green:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Good-faith control for the scan above: it really does catch the shape it
+    /// claims to, rather than being a predicate that matches nothing.
+    #[test]
+    fn mika1883_the_fold_scan_catches_an_open_coded_site() {
+        let offending = "fn f() {\n    run_usage.input_tokens += response.usage.input_tokens;\n}\n";
+        assert_eq!(
+            mika1883_open_coded_fold_sites(offending).len(),
+            1,
+            "the scan must catch a hand-written fold"
+        );
+
+        let legal = "fn f() {\n    run_usage = LlmUsage::accumulate(run_usage, Some(&u));\n}\n";
+        assert!(
+            mika1883_open_coded_fold_sites(legal).is_empty(),
+            "a call to the helper is the legal shape and must not be flagged"
+        );
+
+        let a_mere_read = "fn f() {\n    let n = response.usage.input_tokens;\n}\n";
+        assert!(
+            mika1883_open_coded_fold_sites(a_mere_read).is_empty(),
+            "reading a usage field is not folding it — flagging reads would make \
+             the guard fire on `build_turn_usage_fields` and get disarmed"
+        );
     }
 
     /// **T5** — the scope has one decisional reader, and it is

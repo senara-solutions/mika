@@ -21,8 +21,9 @@ use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 pub use mika_a2a::{
-    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY,
-    SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, attested_model, attested_session_isolation,
+    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY, RUN_USAGE_KEY,
+    RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, attested_model,
+    attested_run_usage, attested_session_isolation,
 };
 use uuid::Uuid;
 
@@ -655,6 +656,12 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
     // reported as isolated, which is the false green that makes a contaminated
     // bench look valid.
     let isolated = attested_session_isolation(task);
+    // mika#1883: the per-turn token total, read through the same `mika-a2a`
+    // function `commands::ask` calls. Two surfaces answering the same question
+    // with two readers is the divergence `attested_model`'s doc comment was
+    // written to prevent, and a second decoding site is refused by the source
+    // scan `mika1883_both_client_surfaces_read_the_one_reader`.
+    let tokens = attested_run_usage(task);
     Ok(match format {
         OutputFormat::Text => {
             if verbose {
@@ -671,6 +678,23 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
                     None => {
                         out.push('\n');
                         out.push_str(NO_ISOLATION_ATTESTATION_LINE);
+                    }
+                }
+                // Unlike `model:` and `isolated:` one field up, absence prints
+                // **nothing** rather than a "(not attested)" line. Those two
+                // answer a flag the caller passed, so silence would leave the
+                // operator unable to tell "not attested" from "the trailer
+                // changed shape"; this one is a measurement nobody requested,
+                // and a line announcing the absence of a number nobody asked
+                // for is noise on every turn a server predating the key serves.
+                if let Some(u) = tokens {
+                    out.push_str(&format!("\ntokens.input: {}", u.input));
+                    out.push_str(&format!("\ntokens.output: {}", u.output));
+                    if let Some(v) = u.cache_read {
+                        out.push_str(&format!("\ntokens.cache_read: {v}"));
+                    }
+                    if let Some(v) = u.cache_write {
+                        out.push_str(&format!("\ntokens.cache_write: {v}"));
                     }
                 }
                 out
@@ -694,6 +718,19 @@ fn render(task: &Task, format: OutputFormat, verbose: bool) -> Result<String> {
                 }
                 if let Some(v) = isolated {
                     metadata["isolated"] = serde_json::Value::Bool(v);
+                }
+                // mika#1883: absent key, never a null and never a zeroed
+                // object — the same encoding of "this server did not say" the
+                // two fields above use.
+                if let Some(u) = tokens {
+                    let mut t = serde_json::json!({ "input": u.input, "output": u.output });
+                    if let Some(v) = u.cache_read {
+                        t["cache_read"] = serde_json::Value::from(v);
+                    }
+                    if let Some(v) = u.cache_write {
+                        t["cache_write"] = serde_json::Value::from(v);
+                    }
+                    metadata["tokens"] = t;
                 }
                 response["metadata"] = metadata;
             }
@@ -1724,5 +1761,171 @@ mod tests {
             text.contains(NO_ISOLATION_ATTESTATION_LINE),
             "a model attestation says nothing about isolation: {text}"
         );
+    }
+
+    // --- mika#1883: the per-turn token total ----------------------------------
+
+    fn task_attesting_run_usage(usage: Option<serde_json::Value>) -> Task {
+        let mut task = task_with_text("ok");
+        if let Some(u) = usage {
+            task.metadata = Some(std::collections::HashMap::from([(
+                RUN_USAGE_KEY.to_string(),
+                u,
+            )]));
+        }
+        task
+    }
+
+    /// **AC1 / AC3, positive** — an attested total is reported on both formats,
+    /// and the cache fields ride along when the provider reported them.
+    #[test]
+    fn mika1883_verbose_reports_the_attested_run_usage_on_both_formats() {
+        let task = task_attesting_run_usage(Some(serde_json::json!({
+            "input": 41_000, "output": 900, "cache_read": 38_000, "cache_write": 12,
+        })));
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        for expected in [
+            "tokens.input: 41000",
+            "tokens.output: 900",
+            "tokens.cache_read: 38000",
+            "tokens.cache_write: 12",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in {text}");
+        }
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["metadata"]["tokens"]["input"], 41_000);
+        assert_eq!(v["metadata"]["tokens"]["output"], 900);
+        assert_eq!(v["metadata"]["tokens"]["cache_read"], 38_000);
+        assert_eq!(v["metadata"]["tokens"]["cache_write"], 12);
+    }
+
+    /// **AC2, and it is the assertion that carries the ticket's rule** — with no
+    /// attestation, **no `tokens.` string appears anywhere** and the JSON key is
+    /// absent.
+    ///
+    /// Asserted on the whole rendered output rather than on the field, so a
+    /// second display path cannot leak a zero either. And deliberately **no**
+    /// "(not attested)" line, unlike `model:` and `isolated:` one test up: those
+    /// answer a flag the caller passed, where silence is ambiguous; this is a
+    /// measurement nobody requested, where a line announcing an absent number is
+    /// noise on every turn a pre-mika#1883 server serves.
+    #[test]
+    fn mika1883_without_an_attestation_no_token_count_is_shown_anywhere() {
+        let task = task_attesting_run_usage(None);
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(
+            !text.contains("tokens."),
+            "an unattested render must show no token line at all — a zero is \
+             indistinguishable from a real turn: {text}"
+        );
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["metadata"].get("tokens").is_none(),
+            "absent, never null and never zeroed: {v}"
+        );
+    }
+
+    /// **AC2, the partial shape** — a provider that reported no cache still
+    /// attests its two totals, and the two absent fields stay absent rather than
+    /// rendering as zeros.
+    #[test]
+    fn mika1883_absent_cache_fields_render_as_absent_not_zero() {
+        let task = task_attesting_run_usage(Some(serde_json::json!({
+            "input": 10, "output": 2,
+        })));
+
+        let text = render(&task, OutputFormat::Text, true).unwrap();
+        assert!(text.contains("tokens.input: 10"));
+        assert!(text.contains("tokens.output: 2"));
+        assert!(
+            !text.contains("tokens.cache_read") && !text.contains("tokens.cache_write"),
+            "a cache field the provider never reported must not be printed as 0: {text}"
+        );
+
+        let json = render(&task, OutputFormat::Json, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["metadata"]["tokens"].get("cache_read").is_none());
+        assert!(v["metadata"]["tokens"].get("cache_write").is_none());
+    }
+
+    /// **AC4** — without `--verbose` both formats are byte-identical to what
+    /// they were before this field existed.
+    #[test]
+    fn mika1883_a_non_verbose_render_is_byte_identical() {
+        let task = task_attesting_run_usage(Some(serde_json::json!({
+            "input": 41_000, "output": 900,
+        })));
+        assert_eq!(render(&task, OutputFormat::Text, false).unwrap(), "ok");
+        let json = render(&task, OutputFormat::Json, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("metadata").is_none(), "unexpected metadata in {v}");
+        assert_eq!(v["content"], "ok");
+    }
+
+    /// **AC3** — both client surfaces decode the key through the one
+    /// `mika-a2a` reader, and neither re-implements it.
+    ///
+    /// A second decoder would make no rendering *wrong* the day it is written;
+    /// it would let `mika ask --verbose` and `mika ask --remote --verbose`
+    /// answer the same question differently — the class `attested_model`'s doc
+    /// comment was written to prevent, and the one
+    /// `mika2220_no_local_reparse_of_the_llm_bodies_env_var` had to engrave once
+    /// on the CLI/daemon split.
+    ///
+    /// Two halves: the wire spelling appears nowhere in this crate (a literal is
+    /// how a second decoder starts), and both surfaces call the reader by name.
+    #[test]
+    fn mika1883_both_client_surfaces_read_the_one_reader() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+
+        // The needle is the spelling **inside a string literal**, not the name:
+        // the same discrimination mika#2220's guard makes, so a doc comment that
+        // names the key in prose stays legal while a second decoder — which must
+        // write the key as a literal to index the metadata map — does not. It is
+        // assembled at runtime for that guard's other reason: a literal here
+        // would match this file and fail forever.
+        let wire_spelling = format!("\"mika.{}\"", "run_usage");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut surfaces_reading: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+            for (i, line) in production.lines().enumerate() {
+                if line.contains(&wire_spelling) {
+                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+            if production.contains("attested_run_usage(") {
+                surfaces_reading.push(rel.to_string());
+            }
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "mika#1883 — the wire spelling is written here instead of being read \
+             through `mika_a2a::params::attested_run_usage`. Two decoders is how \
+             the two `mika ask` doors come to disagree:\n{}",
+            offenders.join("\n")
+        );
+
+        // `commands/ask.rs` carries its directory on purpose: `remote_ask.rs`
+        // also ends in `ask.rs`, so the bare suffix would let one surface
+        // satisfy the assertion for both — the exact shape of a check that
+        // passes while half the property is false.
+        for surface in ["remote_ask.rs", "commands/ask.rs"] {
+            assert!(
+                surfaces_reading.iter().any(|s| s.ends_with(surface)),
+                "{surface} must read the attestation through the shared reader; \
+                 found only: {surfaces_reading:?}"
+            );
+        }
     }
 }
