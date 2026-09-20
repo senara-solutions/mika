@@ -1,3 +1,8 @@
+---
+title: MCP
+description: Model Context Protocol — portée, isolation par tenant, et le cas 1Password
+---
+
 # MCP (Model Context Protocol) — portée, isolation, et le cas 1Password
 
 Mika est **client** MCP. Elle se connecte à des serveurs externes au démarrage
