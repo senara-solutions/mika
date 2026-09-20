@@ -166,8 +166,7 @@ pub enum RunStatus {
 /// person, carrying a remediation ("Try rephrasing the goal…"), where this one
 /// is a short diagnostic that lands in a database column. Two registers for one
 /// fact, separated on purpose; same trade-off as mika#2290 and mika#2292.
-pub const NO_DELEGATION_REASON: &str =
-    "orchestrator returned a conversational reply for an actionable goal and \
+pub const NO_DELEGATION_REASON: &str = "orchestrator returned a conversational reply for an actionable goal and \
      delegated to zero members (after one reinforced retry)";
 
 /// Terminal disposition of a run, as a single compile-checked decision.
