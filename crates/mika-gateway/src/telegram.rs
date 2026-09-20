@@ -42,6 +42,23 @@ pub struct TelegramMessage {
     pub document: Option<TelegramDocument>,
     #[serde(default)]
     pub reply_to_message: Option<ReplyToMessage>,
+    /// Sender, carried only for its `language_code` (mika#2025). Telegram has
+    /// always sent this object; the gateway used to drop it at deserialization,
+    /// which is why no language signal existed anywhere in the process.
+    #[serde(default)]
+    pub from: Option<TelegramUser>,
+}
+
+/// Message sender. Deserialized for `language_code` alone (mika#2025) — every
+/// other field of Telegram's `User` object is deliberately absent, so nothing
+/// here can become a second route to user identity.
+#[derive(Debug, Clone, Deserialize, PartialEq, utoipa::ToSchema)]
+pub struct TelegramUser {
+    /// IETF language tag of the sender's **Telegram interface** (`fr`, `fr-FR`,
+    /// `en-US`, …), as declared by the client. Absent on channel posts and on
+    /// clients that send none.
+    #[serde(default)]
+    pub language_code: Option<String>,
 }
 
 /// Replied-to message context for reply routing.
@@ -83,6 +100,88 @@ pub struct TelegramDocument {
     pub file_size: Option<u64>,
 }
 
+// -- User-facing locale (mika#2025) --
+
+/// The language the gateway answers a Telegram user in.
+///
+/// **Closed on purpose.** `crate::copy::render` matches on `(UserMessage,
+/// Locale)` with no wildcard arm, so adding a member here makes every missing
+/// translation a compile error rather than a silent fallback to English — the
+/// `hosting_ground_truth_line` pattern of mika#2290. A third language is a
+/// deliberate act, never an accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locale {
+    Fr,
+    En,
+}
+
+impl Locale {
+    /// Stable log/wire token. Used by `gateway_locale_resolved`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Locale::Fr => "fr",
+            Locale::En => "en",
+        }
+    }
+}
+
+/// Which gate answered the question "what language?".
+///
+/// Read on `gateway_locale_resolved`. `default` is the floor, not a gate: it
+/// covers an absent `from`, an absent or empty `language_code`, an unrecognized
+/// tag, **and an explicit `en`** — English is what the cascade falls back to, so
+/// nothing ever selects it. A francophone still reading English while this field
+/// says `default` is the population the deferred `customers.locale` column would
+/// cover (mika#2025 D1); that is a result, not a fault, and the remedy is never
+/// to widen the normalization below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocaleSource {
+    /// `message.from.language_code` was present and selected a locale.
+    TelegramLanguageCode,
+    /// No gate selected; the floor applies.
+    Default,
+}
+
+impl LocaleSource {
+    /// Stable log/wire token. Used by `gateway_locale_resolved`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocaleSource::TelegramLanguageCode => "telegram_language_code",
+            LocaleSource::Default => "default",
+        }
+    }
+}
+
+/// Resolve the language to answer this update in, and say which gate decided.
+///
+/// One cascade, one named gate per rung — so the deferred `customers.locale`
+/// (mika#2025 D1) inserts itself as one more gate in front of this one without
+/// anything else moving. Total by construction: no input can produce a panic or
+/// an absent locale, because `Locale` is closed and every unrecognized value
+/// lands on `(En, Default)`, which is today's behaviour.
+///
+/// Normalization is the prefix before the first `-`, compared ASCII-case-
+/// insensitively: `fr`, `fr-FR` and `FR-ca` all resolve to French.
+pub fn resolve_locale(update: &TelegramUpdate) -> (Locale, LocaleSource) {
+    let tag = update
+        .message
+        .as_ref()
+        .and_then(|m| m.from.as_ref())
+        .and_then(|u| u.language_code.as_deref());
+
+    match tag {
+        Some(tag) => {
+            let primary = tag.split('-').next().unwrap_or("");
+            if primary.eq_ignore_ascii_case("fr") {
+                (Locale::Fr, LocaleSource::TelegramLanguageCode)
+            } else {
+                (Locale::En, LocaleSource::Default)
+            }
+        }
+        None => (Locale::En, LocaleSource::Default),
+    }
+}
+
 // -- Parsed message result --
 
 #[derive(Debug, PartialEq)]
@@ -120,10 +219,19 @@ pub enum ParsedMessage {
     },
     /// `/unlink` — request self-unlink of the paired Telegram binding (mika#1749).
     /// Also produced when the user typed `/unlink <anything>` with a suffix we
-    /// don't recognize; the handler shows the warning and prompts the user to
-    /// send `/unlink confirm`.
+    /// don't recognize.
+    ///
+    /// `unrecognized_suffix` carries what followed `/unlink`, whitespace-
+    /// canonicalized, when it was not a recognized confirmation (mika#2025 D4).
+    /// The parser always knew it had just discarded a suffix — it evaluated
+    /// `canonical != "/unlink confirm"` — and threw that away, so a *tried*
+    /// confirmation (`/unlink oui`, `/unlink yes`) was indistinguishable from a
+    /// bare reminder. Serving the copy in French makes `/unlink confirmer` more
+    /// likely, not less, which is why this discriminant ships with the
+    /// localization rather than after it.
     Unlink {
         chat_id: i64,
+        unrecognized_suffix: Option<String>,
     },
     /// `/unlink confirm` — commit the self-unlink (mika#1749). Atomic UPDATE
     /// releases `telegram_chat_id`.
@@ -138,6 +246,14 @@ pub enum ParsedMessage {
 
 /// Image MIME types supported for forwarding to the agent.
 const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Suffixes of `/unlink` that commit the release (mika#1749, mika#2025 R5).
+///
+/// `confirmer` is the French spelling, accepted because localizing the copy
+/// makes a francophone typing it *more* likely, not less. It is an input
+/// tolerance: no copy in either language prescribes it, so there is still one
+/// command to document and one to support.
+const UNLINK_CONFIRM_FORMS: &[&str] = &["confirm", "confirmer"];
 
 /// Parse `[agent_name]` prefix from message text.
 /// Returns the agent name if the text starts with `[name] ` where name matches
@@ -187,16 +303,29 @@ pub fn parse_update(update: &TelegramUpdate) -> ParsedMessage {
             };
         }
         // /unlink family (mika#1749). Canonicalize whitespace so `/unlink   confirm`
-        // parses the same as `/unlink confirm`. Only exact `/unlink` and
-        // `/unlink confirm` match; a stray suffix (typo) falls back to the warning
-        // path. `/unlinkxxx` (no space after `/unlink`) does NOT match — it's not
-        // our command and gets forwarded to the agent as free text.
+        // parses the same as `/unlink confirm`. `/unlinkxxx` (no space after
+        // `/unlink`) does NOT match — it's not our command and gets forwarded to
+        // the agent as free text.
+        //
+        // mika#2025: a suffix that is not a recognized confirmation is carried
+        // on `Unlink` instead of being discarded, so the handler can answer "I
+        // did not recognize that" rather than repeating the bare reminder. The
+        // recognized forms are the command itself and its French spelling — a
+        // tolerance on input, never a second interface: the copy keeps
+        // prescribing `/unlink confirm` in both languages.
         if text == "/unlink" || text.starts_with("/unlink ") {
             let canonical: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if canonical == "/unlink confirm" {
+            let suffix = canonical.strip_prefix("/unlink").unwrap_or("").trim();
+            if UNLINK_CONFIRM_FORMS
+                .iter()
+                .any(|f| suffix.eq_ignore_ascii_case(f))
+            {
                 return ParsedMessage::UnlinkConfirm { chat_id };
             }
-            return ParsedMessage::Unlink { chat_id };
+            return ParsedMessage::Unlink {
+                chat_id,
+                unrecognized_suffix: (!suffix.is_empty()).then(|| suffix.to_string()),
+            };
         }
         return ParsedMessage::Text {
             chat_id,
@@ -1181,6 +1310,10 @@ mod tests {
     use super::*;
 
     /// Helper to build a text-only TelegramMessage.
+    ///
+    /// `from` is `None` — the shape of a client that declares no language, which
+    /// is also the shape every one of these parsing tests had before mika#2025.
+    /// Use [`text_msg_from`] when the language is what is under test.
     fn text_msg(chat_id: i64, text: Option<&str>) -> TelegramMessage {
         TelegramMessage {
             chat: TelegramChat { id: chat_id },
@@ -1189,6 +1322,21 @@ mod tests {
             caption: None,
             document: None,
             reply_to_message: None,
+            from: None,
+        }
+    }
+
+    /// Same, with a declared `language_code` (mika#2025).
+    fn text_msg_from(
+        chat_id: i64,
+        text: Option<&str>,
+        language_code: Option<&str>,
+    ) -> TelegramMessage {
+        TelegramMessage {
+            from: Some(TelegramUser {
+                language_code: language_code.map(|s| s.to_string()),
+            }),
+            ..text_msg(chat_id, text)
         }
     }
 
@@ -1201,6 +1349,7 @@ mod tests {
             caption: caption.map(|s| s.to_string()),
             document: None,
             reply_to_message: None,
+            from: None,
         }
     }
 
@@ -1224,6 +1373,7 @@ mod tests {
                 file_size: None,
             }),
             reply_to_message: None,
+            from: None,
         }
     }
 
@@ -1334,13 +1484,22 @@ mod tests {
     // /unlink command family (mika#1749)
 
     /// Exact `/unlink` produces `Unlink` — the warning-then-confirm entry point.
+    ///
+    /// mika#2025 V7 (negative half): a bare `/unlink` carries **no** suffix, so
+    /// the handler serves the reminder rather than the refusal.
     #[test]
     fn test_parse_unlink_bare() {
         let update = TelegramUpdate {
             update_id: 200,
             message: Some(text_msg(42, Some("/unlink"))),
         };
-        assert_eq!(parse_update(&update), ParsedMessage::Unlink { chat_id: 42 });
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unlink {
+                chat_id: 42,
+                unrecognized_suffix: None,
+            }
+        );
     }
 
     /// `/unlink confirm` produces `UnlinkConfirm` — the atomic release.
@@ -1370,15 +1529,190 @@ mod tests {
         );
     }
 
-    /// Unknown suffix (typo, e.g. `/unlink now`) falls back to `Unlink` — the
-    /// handler shows the warning path. Better than silently no-oping.
+    /// mika#2025 V7 — an unrecognized suffix still produces `Unlink`, but it now
+    /// **carries** what was refused.
+    ///
+    /// Before mika#2025 the parser computed this and discarded it, so a *tried*
+    /// confirmation was served the same reminder as a bare `/unlink` and the
+    /// user could not tell their attempt had been refused.
     #[test]
-    fn test_parse_unlink_unknown_suffix_falls_to_warning() {
+    fn test_parse_unlink_unknown_suffix_is_carried() {
         let update = TelegramUpdate {
             update_id: 203,
             message: Some(text_msg(42, Some("/unlink now"))),
         };
-        assert_eq!(parse_update(&update), ParsedMessage::Unlink { chat_id: 42 });
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unlink {
+                chat_id: 42,
+                unrecognized_suffix: Some("now".to_string()),
+            }
+        );
+    }
+
+    /// The carried suffix is whitespace-canonicalized like the command itself —
+    /// it is quoted back to the user, so it must not echo their stray spacing.
+    #[test]
+    fn mika2025_v7_the_carried_suffix_is_canonicalized() {
+        let update = TelegramUpdate {
+            update_id: 205,
+            message: Some(text_msg(42, Some("/unlink   yes   please"))),
+        };
+        assert_eq!(
+            parse_update(&update),
+            ParsedMessage::Unlink {
+                chat_id: 42,
+                unrecognized_suffix: Some("yes please".to_string()),
+            }
+        );
+    }
+
+    /// mika#2025 V6 / R5 — `confirmer` commits the release.
+    ///
+    /// An input tolerance, never a second interface: the copy keeps prescribing
+    /// `/unlink confirm` in both languages. Serving the warning in French makes
+    /// this spelling *more* likely, which is why the alias ships with the
+    /// localization rather than after it.
+    #[test]
+    fn mika2025_v6_french_confirmation_is_accepted() {
+        for text in [
+            "/unlink confirmer",
+            "/unlink   confirmer",
+            "/unlink CONFIRMER",
+        ] {
+            let update = TelegramUpdate {
+                update_id: 206,
+                message: Some(text_msg(42, Some(text))),
+            };
+            assert_eq!(
+                parse_update(&update),
+                ParsedMessage::UnlinkConfirm { chat_id: 42 },
+                "{text:?} must commit the release"
+            );
+        }
+    }
+
+    /// mika#2025 — the alias widens the confirmation, it does not open it.
+    ///
+    /// `oui`, `yes` and `ok` are exactly the forms D4 argues the message half is
+    /// for: they are refused, and refused *legibly*.
+    #[test]
+    fn mika2025_the_alias_does_not_swallow_every_affirmative() {
+        for text in [
+            "/unlink oui",
+            "/unlink yes",
+            "/unlink ok",
+            "/unlink confirme",
+        ] {
+            let parsed = parse_update(&TelegramUpdate {
+                update_id: 207,
+                message: Some(text_msg(42, Some(text))),
+            });
+            assert!(
+                matches!(
+                    parsed,
+                    ParsedMessage::Unlink {
+                        unrecognized_suffix: Some(_),
+                        ..
+                    }
+                ),
+                "{text:?} must be refused with its suffix carried, got {parsed:?}"
+            );
+        }
+    }
+
+    // -- locale resolution (mika#2025) --
+
+    /// mika#2025 V1 — a declared French tag resolves to French, through the
+    /// `language_code` gate.
+    ///
+    /// Normalization is the prefix before the first `-`, case-insensitive: the
+    /// region subtag is not a second language.
+    #[test]
+    fn mika2025_v1_french_tags_resolve_to_french() {
+        for tag in ["fr", "fr-FR", "FR-ca", "Fr"] {
+            let update = TelegramUpdate {
+                update_id: 300,
+                message: Some(text_msg_from(42, Some("/unlink"), Some(tag))),
+            };
+            assert_eq!(
+                resolve_locale(&update),
+                (Locale::Fr, LocaleSource::TelegramLanguageCode),
+                "{tag:?} must resolve to French"
+            );
+        }
+    }
+
+    /// mika#2025 V2 — everything else lands on the floor, which is today's
+    /// behaviour.
+    ///
+    /// Note `en` is here too: English is the floor, never a gate of its own, so
+    /// its source is `Default`. An operator reading `default` on
+    /// `gateway_locale_resolved` is reading "nothing selected", not "Telegram
+    /// sent nothing" — the two are indistinguishable at this rung and the
+    /// remedy for a francophone still served English is the deferred
+    /// `customers.locale` (D1), never a wider normalization here.
+    #[test]
+    fn mika2025_v2_everything_else_falls_back_to_english() {
+        for tag in [
+            Some("en"),
+            Some("en-US"),
+            Some("de"),
+            Some(""),
+            Some("-"),
+            None,
+        ] {
+            let update = TelegramUpdate {
+                update_id: 301,
+                message: Some(text_msg_from(42, Some("/unlink"), tag)),
+            };
+            assert_eq!(
+                resolve_locale(&update),
+                (Locale::En, LocaleSource::Default),
+                "{tag:?} must fall back to English"
+            );
+        }
+    }
+
+    /// mika#2025 V2 — an absent `from`, and an absent message, resolve too.
+    ///
+    /// The pre-pairing paths are exactly where the defect was measured, and a
+    /// channel post carries no sender at all; neither may produce an absent
+    /// locale, because there is no such state.
+    #[test]
+    fn mika2025_v2_absent_sender_and_absent_message_resolve_to_the_floor() {
+        let no_from = TelegramUpdate {
+            update_id: 302,
+            message: Some(text_msg(42, Some("/start"))),
+        };
+        assert_eq!(
+            resolve_locale(&no_from),
+            (Locale::En, LocaleSource::Default)
+        );
+
+        let no_message = TelegramUpdate {
+            update_id: 303,
+            message: None,
+        };
+        assert_eq!(
+            resolve_locale(&no_message),
+            (Locale::En, LocaleSource::Default)
+        );
+    }
+
+    /// The sender is deserialized additively: a payload without `from` still
+    /// parses, which is what makes this a zero-migration change.
+    #[test]
+    fn mika2025_u1_the_sender_is_optional_on_the_wire() {
+        let without: TelegramMessage =
+            serde_json::from_str(r#"{"chat":{"id":42},"text":"hi"}"#).expect("must parse");
+        assert!(without.from.is_none());
+
+        let with: TelegramMessage = serde_json::from_str(
+            r#"{"chat":{"id":42},"text":"hi","from":{"id":7,"is_bot":false,"first_name":"V","language_code":"fr-FR"}}"#,
+        )
+        .expect("unknown sender fields must be ignored, not refused");
+        assert_eq!(with.from.unwrap().language_code.as_deref(), Some("fr-FR"));
     }
 
     /// `/unlinkxxx` (no space between command and suffix) is NOT our command —

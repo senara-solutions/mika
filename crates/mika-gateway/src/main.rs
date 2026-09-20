@@ -2,6 +2,12 @@ mod a2a_auth;
 mod a2a_routes;
 pub(crate) mod audit_events;
 pub(crate) mod circuit_breaker;
+/// Single producer of the gateway's user-facing copy (mika#2025).
+///
+/// Declared here rather than in `lib.rs`: that file admits a module only when it
+/// has a documented consumer outside the binary (mika#1796), and this one has
+/// none — its guards are in-crate.
+pub(crate) mod copy;
 pub(crate) mod dlq;
 pub(crate) mod egress_fetch;
 pub(crate) mod egress_search;
