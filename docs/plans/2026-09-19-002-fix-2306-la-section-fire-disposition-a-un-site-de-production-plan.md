@@ -257,9 +257,32 @@ dépense plus sur un plan dont on sait déjà qu'il sera refusé.
 
 La garde U2 est une **conjonction de deux `grep`**, jamais un jugement :
 
-- l'architecte a réclamé la section ⇔ ses findings contiennent la chaîne
-  `Fire-Disposition` (c'est le vocabulaire imposé par son propre gate) ;
+- l'architecte a réclamé la section ⇔ **le findings-file de première passe**
+  contient la chaîne `Fire-Disposition` (c'est le vocabulaire imposé par son
+  propre gate) ;
 - la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
+
+**Le premier terme nomme sa source, et ce n'est pas un détail de rédaction.**
+La source est `$1` de `_launch_revise_pilot`, capturée dans `findings_file` à
+l'entrée de la fonction — c'est-à-dire `$WORKTREE_DIR/.iterate/findings-1.md`,
+écrit par `_iterate_groom_loop` depuis la sortie de `_arch_ask_with_retry` du
+**premier** passage (ligne 5829 au 2026-09-20, passé en argument ligne 5835).
+Le findings-file ciblé que la garde écrit elle-même (`findings-1-fd.md`) est
+**interdit comme source du prédicat**, et l'interdiction est portante plutôt que
+cosmétique : ce fichier contient nécessairement la chaîne `Fire-Disposition`
+puisque c'est son objet, donc un prédicat qui le relirait deviendrait
+**auto-entretenu** — son premier terme serait vrai par construction, la garde
+relancerait même quand l'architecte n'a rien demandé, et T5 passerait en vert sur
+une garde qui ne regarde plus la sortie architecte. Le compteur `_FD_REVISE_RETRIED`
+(U3) casserait la boucle infinie ; il ne rendrait pas le défaut visible.
+
+Corollaire d'implémentation, énoncé ici parce qu'il découle du prédicat et non
+d'un goût : **la relance ne se fait pas en ré-appelant `_launch_revise_pilot`.**
+Une récursion ferait de `findings-1-fd.md` le `$1` du second tour, ce qui est
+exactement la confusion de source interdite ci-dessus. La garde relance
+directement l'invocation du pilote (même forme que le lancement nominal, avec
+`@findings-1-fd.md` comme argument), à l'intérieur de la même invocation de
+`_launch_revise_pilot`. T11 est le contrôle qui verrouille la source.
 
 Si l'un des deux termes est faux, **rien ne se passe** : comportement d'avant le
 correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a fait
@@ -299,16 +322,18 @@ adresse.
 | `_PR_BODY_CONTAINMENT_RULE=` (définition) | 2003 | Voisin de la constante U1 |
 | `PROMPT=$(printf … "$_PR_BODY_CONTAINMENT_RULE")` | 2587 | Site d'injection U1 |
 | `_launch_revise_pilot()` | 5317–5377 | Fonction hôte de U2 |
+| `local findings_file="$1"` (entrée de la fonction) | 5331 | **Source unique du premier terme du prédicat** (D4) |
+| `findings_file="$findings_dir/findings-1.md"` (dans `_iterate_groom_loop`) | 5829 | Producteur de cette source ; passé en argument ligne 5835 |
 | `if [ "$pre_hash" != "$post_hash" ]` | 5370 | Branche de greffe U2 |
 | `_arch_ask()` / premier appel `_arch_ask_with_retry` | 4768 / 5732 | Hors `_launch_revise_pilot` — fonde T9 |
 
 | # | Fichier | Changement |
 |---|---|---|
 | **U1** | `skills/bundled/_shared/dispatch-lib.sh` | Constante `_FIRE_DISPOSITION_RULE`, posée à côté de `_PR_BODY_CONTAINMENT_RULE`. Elle nomme la section, ses trois options canoniques (a)/(b)/(c) en une ligne chacune, et la règle N/A explicite. Injectée dans `PROMPT` au site mika#2178/#2211, **après** l'injection de `_PR_BODY_CONTAINMENT_RULE` — les trois invariants de position documentés en commentaire au-dessus de ce site restent vrais et la première ligne du `PROMPT` reste exactement `<repo>#<num>` (contrat mika#138). Conditionnée `[ "$SKILL" = "dev-groom" ]` (D5) : le site d'injection voisin est inconditionnel dans la branche worktree, la condition est donc à écrire, pas à hériter. |
-| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, à l'intérieur de la branche `sha256` **réussie** (`pre_hash != post_hash`) : si les findings réclamaient `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
+| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, à l'intérieur de la branche `sha256` **réussie** (`pre_hash != post_hash`) : si **le findings-file reçu en `$1`** (`$WORKTREE_DIR/.iterate/findings-1.md`, capturé dans `findings_file` à l'entrée — D4) réclamait `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. La relance est une invocation directe du pilote dans la même exécution de la fonction, **jamais une récursion sur `_launch_revise_pilot`** : le prédicat ne doit à aucun moment relire `findings-1-fd.md`, sous peine de devenir auto-entretenu (D4, T11). Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
 | **U2b** | *(idem)* | **Terminaison, et la distinction qui la rend vraie :** après la seconde tentative, la section est re-testée **pour journaliser, jamais pour reboucler**. La relance est gardée par `_FD_REVISE_RETRIED` (U3), donc un second échec ne peut que produire `fire_disposition_still_missing_after_retry` et rendre la main — il n'existe aucun chemin qui réarme le lancement. C'est ce qui réconcilie « une seule relance » (R3, budget) et AC7 (l'événement doit savoir si la section manque encore) : le prédicat est évalué deux fois, il n'autorise l'action qu'une. |
 | **U3** | `skills/bundled/_shared/dispatch-lib.sh` | Un compteur de garde (`_FD_REVISE_RETRIED`) explicite, remis à zéro à l'entrée de `_launch_revise_pilot`, pour que la terminaison soit lisible sans dérouler le flot de contrôle. |
-| **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Les dix tests T1–T10 — voir § Verification Contract. Portent le harnais de 31 à 41 ; aucune famille d'assertion nouvelle. |
+| **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Les onze tests T1–T11 — voir § Verification Contract. Portent le harnais de 31 à 42 ; aucune famille d'assertion nouvelle. |
 | **U5** | `docs/solutions/best-practices/fire-disposition-doctrine.md` | Section « Site de production » : la doctrine décrit aujourd'hui la règle et son gate, jamais qui écrit la section. Ajouter les deux sites (prescription `PROMPT`, rattrapage revise) et le renvoi au suivi `mika-platform`. |
 
 ### Journal
@@ -320,10 +345,21 @@ pilote) :
   attendu : rare.** Chaque ligne est une itération architecte que la boucle n'a
   pas gaspillée.
 - `fire_disposition_still_missing_after_retry` — la seconde tentative n'a pas
-  produit la section ; le plan part au second-pass en sachant qu'il sera refusé.
-  **Régime attendu : zéro.** Une occurrence soutenue dit que le pilote de revise
-  ne sait pas écrire la section, donc que le correctif à faire est le suivi
+  produit la section ; le plan part au second-pass, où il sera prévisiblement
+  refusé. **Régime attendu : zéro.** Une occurrence soutenue dit que le pilote de
+  revise ne sait pas écrire la section, donc que le correctif à faire est le suivi
   `mika-platform` (`/mika-revise-plan`), **pas** un troisième essai ici.
+
+**Le consommateur de ces deux événements est l'opérateur, jamais la boucle.**
+Ce sont des lignes `stderr` lues à la main ou par analyse de logs (mika#2205) ;
+**aucune branche de `dispatch-lib` ne les relit et aucune décision ne les
+consulte.** La boucle continue bit pour bit comme avant l'émission : seul le
+journal change. La formulation « le plan part au second-pass en sachant qu'il
+sera refusé » du plan précédent se lisait comme un mécanisme — elle ne l'était
+pas, la boucle ne *sait* rien. Cette ligne verrouille aussi le refus d'un
+troisième essai contre une future « amélioration » qui transformerait l'événement
+en signal de contrôle : un événement d'observabilité promu en entrée de décision
+est un changement de contrat, pas un réglage.
 
 L'absence de la première ligne n'est jamais à elle seule une preuve de succès :
 elle se lit aussi « aucun groom n'a tourné ». Lire le volume de dispatches
@@ -338,7 +374,7 @@ de test au 2026-09-20, inchangé depuis la mesure du 19/09
 (`grep -cE '^test_[a-z0-9_]+\(\)' skills/bundled/_shared/test-dispatch-lib.sh`)
 — et porte déjà les deux familles employées ici : assertions de **forme de code**
 (`declare -f` + `assert_contains`) et assertions **comportementales** sur worktree
-temporaire. T1–T10 portent le total à 41 ; aucune famille nouvelle n'est requise.
+temporaire. T1–T11 portent le total à 42 ; aucune famille nouvelle n'est requise.
 
 | # | Test | Ce qu'il attrape |
 |---|---|---|
@@ -350,14 +386,18 @@ temporaire. T1–T10 portent le total à 41 ; aucune famille nouvelle n'est requ
 | T6 | **Contrôle négatif** : findings sans mention de FD ⇒ zéro relance | R4 — la garde n'est pas inerte mais bavarde |
 | T7 | **Contrôle négatif** : plan révisé portant déjà `^## Fire-Disposition` ⇒ zéro relance | R4 — le chemin nominal ne paie rien |
 | T8 | Findings-file illisible ⇒ zéro relance, retour inchangé | R5 — fail-safe |
-| T9 | Forme de code : le bras de garde ne contient aucun appel `_arch_ask` | R3 — un futur éditeur qui « améliorerait » la garde en redemandant l'avis de l'architecte doublerait le budget LLM sans qu'aucun test de comportement ne rougisse |
+| T9 | Forme de code : le bras de garde ne contient aucun appel `_arch_ask`, **et la table d'exceptions du scan est assertée vide à l'exécution** (`zero entries`) | R3 — un futur éditeur qui « améliorerait » la garde en redemandant l'avis de l'architecte doublerait le budget LLM sans qu'aucun test de comportement ne rougisse. L'assertion de vacuité fait rougir le test **le jour où** une exception est ajoutée, pas seulement quand elle devient stale (§ Fire-Disposition) |
 | T10 | Comportemental : seconde tentative **échouée** ⇒ `fire_disposition_still_missing_after_retry` émis exactement une fois sur `stderr`, retour inchangé, et **aucune troisième** relance | AC7, et la terminaison de U2b. Sans lui, une garde qui rendrait la main en silence sur ce chemin passerait T5 en vert : l'échec de second tour deviendrait indistinguable d'un succès, ce qui est précisément l'angle mort que le plan reproche au critère `sha256` |
+| T11 | **Contrôle de source** : le premier terme du prédicat lit le findings-file reçu en `$1`, et rien d'autre. Deux moitiés — (a) forme de code : le corps du bras de garde ne relit ni `findings-1-fd.md` ni `$findings_dir`, et n'appelle pas `_launch_revise_pilot` (pas de récursion) ; (b) comportemental : un findings-file de première passe **sans** mention de FD, sur un plan révisé **sans** la section, produit zéro relance — y compris après qu'un `findings-1-fd.md` a été laissé dans `.iterate/` par un dispatch antérieur | F1 — le prédicat auto-entretenu. Un implémenteur qui lit le findings ciblé (qui contient nécessairement la chaîne, c'est son objet) rend le premier terme vrai par construction : la garde relance même quand l'architecte n'a rien demandé, `_FD_REVISE_RETRIED` borne la boucle, et **T5, T6, T8 restent tous verts**. C'est la seule défaillance de cette famille qu'aucun autre test ne voit |
 
-**T3, T6 et T7 sont porteurs, pas décoratifs.** Sans eux, une garde qui relance
-*toujours* passerait T5 en vert tout en doublant le coût de chaque grooming du
-dépôt. T9 est structurel pour la même raison qu'il est structurel ailleurs dans
-ce dépôt : la régression qu'il attrape ne rendrait aucune décision fausse, elle
-changerait le budget en silence.
+**T3, T6, T7 et T11 sont porteurs, pas décoratifs.** Sans les trois premiers, une
+garde qui relance *toujours* passerait T5 en vert tout en doublant le coût de
+chaque grooming du dépôt ; sans T11, une garde qui relance toujours **pour une
+autre raison** — la confusion de source — y passerait aussi, et les trois
+contrôles négatifs existants ne la verraient pas (T6 exerce un findings-file de
+première passe propre, pas la lecture du mauvais fichier). T9 est structurel pour
+la même raison qu'il est structurel ailleurs dans ce dépôt : la régression qu'il
+attrape ne rendrait aucune décision fausse, elle changerait le budget en silence.
 
 ---
 
@@ -389,42 +429,65 @@ critères ci-dessous sont dérivés des Requirements et du Verification Contract
   déjà présente, findings-file illisible — le nombre de relances est zéro et la
   valeur de retour est celle d'avant le correctif. (T6, T7, T8)
 - **AC6** — Aucun chemin introduit par ce plan n'appelle `_arch_ask`. Le nombre
-  d'appels architecte par grooming reste de deux au maximum. (T9)
+  d'appels architecte par grooming reste de deux au maximum, et la table
+  d'exceptions du scan T9 est **vide, assertée telle à l'exécution**. (T9)
 - **AC7** — `fire_disposition_still_missing_after_retry` est émis, et lui seul,
   quand la seconde tentative échoue : la boucle continue vers le second-pass au
-  lieu de s'interrompre, et **aucune troisième relance n'a lieu**. (T10)
+  lieu de s'interrompre, et **aucune troisième relance n'a lieu**. C'est un
+  événement `stderr` **d'observabilité pure** — consommé par l'opérateur et
+  l'analyse de logs (mika#2205), relu par aucune branche de `dispatch-lib`, sans
+  effet sur le flot de la boucle. AC7 n'exige donc **aucun** comportement de la
+  boucle au-delà de la non-relance : le critère porte sur l'émission et sur
+  l'absence de troisième essai, jamais sur une réaction. (T10)
 - **AC8** — `docs/solutions/best-practices/fire-disposition-doctrine.md` nomme les
   deux sites de production et le ticket de suivi `mika-platform`.
+- **AC9** — Le premier terme du prédicat de la garde lit le findings-file de
+  première passe reçu en `$1` (`$WORKTREE_DIR/.iterate/findings-1.md`) et
+  **jamais** le findings ciblé `findings-1-fd.md` que la garde écrit elle-même ;
+  aucune récursion sur `_launch_revise_pilot`. Un `findings-1-fd.md` résiduel
+  dans `.iterate/` ne rend aucun terme vrai. (T11)
 
 ---
 
 ## Fire-Disposition
 
 Requise par le Fire-Disposition Gate (mika#1574). Les livrables détecteurs de ce
-plan sont les dix tests T1–T10 de U4, dont **T9 est un scan de forme de code** —
-la classe qui peut tirer sur de l'existant.
+plan sont les onze tests T1–T11 de U4, dont **T9 et la moitié (a) de T11 sont des
+scans de forme de code** — la classe qui peut tirer sur de l'existant.
 
-**Option retenue : (a) exception nommée — table vide, et la vacuité est assertée.**
+**Option retenue : (a) exception nommée — table vide, et la vacuité est assertée
+à l'exécution, aujourd'hui.**
 
-- **T1–T8 et T10** sont des tests de comportement **sur du code que ce plan crée**
-  (`_FIRE_DISPOSITION_RULE`, le bras de garde de `_launch_revise_pilot`, le
-  compteur `_FD_REVISE_RETRIED`). Ils ne peuvent structurellement pas tirer sur de
-  l'existant : leur sujet n'existait pas avant ce plan. T10 en particulier asserte
-  l'émission d'un événement que ce plan introduit, sur un chemin que ce plan
-  introduit. Aucune exception concevable.
-- **T9** est le seul à scanner du code préexistant — le corps de
-  `_launch_revise_pilot`. Son prédicat porte sur le **bras de garde introduit par
-  U2**, jamais sur la fonction entière : `_launch_revise_pilot` ne contient aucun
-  appel `_arch_ask` aujourd'hui. Re-vérifié au 2026-09-20 : la fonction occupe
-  les lignes 5317–5377 et n'en contient aucun ; les appels vivent dans
-  `_iterate_groom_loop` (premier à 5732), fonction distincte. La table
-  d'exceptions est donc
-  **vide**, et T9 porte l'assertion auto-nettoyante correspondante : *si le scan
-  devait un jour exempter une occurrence, l'exemption doit être nommée ici et
-  datée.* Une table vide assertée vide est ce qui distingue « aucune violation »
-  de « le scan ne regarde rien » — modèle repris de
-  `scripts/test-guard-shared-checkout.sh` (« Fire-Disposition — allowlist: zero
-  entries », assertée).
+- **T1–T8, T10 et la moitié (b) de T11** sont des tests de comportement **sur du
+  code que ce plan crée** (`_FIRE_DISPOSITION_RULE`, le bras de garde de
+  `_launch_revise_pilot`, le compteur `_FD_REVISE_RETRIED`). Ils ne peuvent
+  structurellement pas tirer sur de l'existant : leur sujet n'existait pas avant
+  ce plan. T10 en particulier asserte l'émission d'un événement que ce plan
+  introduit, sur un chemin que ce plan introduit. Aucune exception concevable.
+- **T9 et T11(a)** scannent du code préexistant — le corps de
+  `_launch_revise_pilot`. Leur prédicat porte sur le **bras de garde introduit
+  par U2**, jamais sur la fonction entière : `_launch_revise_pilot` ne contient
+  aujourd'hui ni appel `_arch_ask`, ni lecture de `findings-1-fd.md`, ni appel
+  récursif à elle-même. Re-vérifié au 2026-09-20 : la fonction occupe les lignes
+  5317–5377 et n'en contient aucun ; les appels `_arch_ask` vivent dans
+  `_iterate_groom_loop` (premier à 5732), fonction distincte.
+
+**Table d'exceptions : zéro entrée — et c'est une assertion exécutable, pas une
+consigne à l'éditeur futur.** T9 asserte *à l'exécution* que la table
+d'exceptions du scan est vide (`zero entries`), sur le modèle de
+`scripts/test-guard-shared-checkout.sh` (« Fire-Disposition — allowlist: zero
+entries », assertée). Le test rougit donc **le jour où** quelqu'un ajoute une
+exception, pas seulement quand elle devient stale. Une table vide assertée vide
+est aussi ce qui distingue « aucune violation » de « le scan ne regarde rien ».
+
+Toute entrée future dans cette table doit porter **les trois** propriétés que
+l'option (a) du gate exige, jamais la seule troisième : (1) **nommer la donnée
+précise** qui déclenche l'exemption (le site scanné et la raison pour laquelle
+son occurrence n'est pas une violation) ; (2) **référencer un ticket de suivi**
+qui la retire ; (3) **porter une assertion auto-nettoyante** qui rougit le jour
+où la donnée nommée disparaît. Une exemption qui n'a pas les trois est un
+contournement du scan avec une ligne de commentaire par-dessus, et la version
+précédente de cette section n'exigeait que (3) — d'où la présente reformulation.
 
 **Ce qui n'est pas un détecteur ici, et pourquoi la distinction compte.** U1 et U2
 sont du **code de production** : U1 pose une chaîne dans un prompt, U2 ajoute une
@@ -476,7 +539,7 @@ indépendant de ce ticket, **ticket de suivi**.
 | Risque | Portée | Traitement |
 |---|---|---|
 | Le prompt de groom s'allonge | ~10 lignes sur un prompt qui porte déjà le corps du ticket (≤ 16 KiB, mika#2178) et la règle mika#2211 | Négligeable et borné ; précédent direct |
-| La garde relance un revise inutile | Coût : une session pilote | Trois contrôles négatifs (T6, T7, T8) ; prédicat conjonctif ; terminaison par compteur explicite (U3) |
+| La garde relance un revise inutile | Coût : une session pilote | Quatre contrôles négatifs (T6, T7, T8, T11) ; prédicat conjonctif **dont la source est nommée** (D4) ; terminaison par compteur explicite (U3) |
 | Le pilote de revise ne sait toujours pas écrire la section | La seconde tentative échoue | `fire_disposition_still_missing_after_retry` le dit, et **désigne le suivi `mika-platform`** plutôt qu'un troisième essai ici |
 | La prescription dérive du gate architecte | Deux formulations de mika#1574 | La règle U1 cite la doctrine par référence (`mika#1574`, trois options nommées), elle ne la reformule pas |
 
@@ -492,3 +555,47 @@ indépendant de ce ticket, **ticket de suivi**.
 - mika#2120 — `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
 - mika#1415 — `_seed_worktree_slash_commands` : pourquoi les commandes ne sont pas dans ce dépôt
 - mika#2286 — l'essai 5, dont ce ticket est le prérequis direct
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — révision sur les trois findings de la première passe
+  architecte (F1–F3, tous *sharpening*, aucun bloquant).
+  - **F1 addressed** — la source du premier terme du prédicat est désormais
+    nommée : `$1` de `_launch_revise_pilot`, capturée dans `findings_file` à
+    l'entrée, c'est-à-dire `$WORKTREE_DIR/.iterate/findings-1.md` écrit par
+    `_iterate_groom_loop` (ligne 5829 au 2026-09-20, passé ligne 5835). La
+    relecture de `findings-1-fd.md` comme source est **interdite** et la raison
+    est écrite (prédicat auto-entretenu, vrai par construction, invisible à T5) ;
+    le corollaire d'implémentation — pas de récursion sur `_launch_revise_pilot`,
+    la relance est une invocation directe du pilote — est énoncé en D4 et repris
+    en U2. Ajout de **T11**, le contrôle de source en deux moitiés (forme de code
+    + comportemental avec un `findings-1-fd.md` résiduel dans `.iterate/`), et de
+    **AC9**. Sites touchés : D4, table d'ancrage (deux lignes), U2, U4, § Verification
+    Contract, § Risques, § Acceptance criteria.
+    *Citation préservée : review-guide.md § KISS / Orthogonality — un prédicat
+    dont la source d'entrée n'est pas nommée laisse à l'implémenteur un choix que
+    le plan a les moyens de trancher.*
+  - **F2 addressed** — la vacuité de la table d'exceptions T9 est devenue une
+    **assertion exécutable portant sur le présent** (`zero entries`, rougit le
+    jour de l'ajout, pas seulement quand l'exemption devient stale), sur le modèle
+    de `scripts/test-guard-shared-checkout.sh`. Toute entrée future doit porter
+    **les trois** propriétés de l'option (a) — donnée nommée, tracker référencé,
+    assertion de staleness — et non la seule troisième comme le formulait la
+    rev 1. Sites touchés : § Fire-Disposition, T9, AC6.
+    *Citation préservée : Fire-Disposition Gate, option (a) — « Each exception
+    must: (1) name the specific data triggering it, (2) reference a follow-up
+    tracker issue, (3) include a self-cleaning assertion ».*
+  - **F3 addressed** — le consommateur des deux événements est nommé : opérateur
+    et analyse de logs (mika#2205), **relu par aucune branche de `dispatch-lib`,
+    sans effet sur le flot de la boucle**. La formulation « le plan part au
+    second-pass en sachant qu'il sera refusé » — une prédiction qui se lisait
+    comme un mécanisme — est remplacée. AC7 énonce explicitement qu'il n'exige
+    aucun comportement de la boucle au-delà de la non-relance, ce qui verrouille
+    le refus d'un troisième essai contre une future promotion de l'événement en
+    signal de contrôle. Sites touchés : § Journal, AC7.
+    *Citation préservée : review-guide.md § YAGNI + D2 motif 3 du plan
+    (« Elle déplacerait le blocage sans le lever »).*
+  - Aucun AC affaibli ; le périmètre, les décisions D1–D5 et le budget architecte
+    (R3) sont inchangés. Le harnais passe de 41 à 42 tests attendus (T11).
