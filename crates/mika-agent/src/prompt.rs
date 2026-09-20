@@ -1316,6 +1316,84 @@ fn write_data_grade_doctrine_section_compact(prompt: &mut String) {
     prompt.push_str(DATA_GRADE_DOCTRINE_COMPACT);
 }
 
+// ---------------------------------------------------------------------------
+// mika#1925 — stop-signal contract on the compact-provider path
+// ---------------------------------------------------------------------------
+
+/// Abbreviated *persist* half of the stop-signal contract (mika#1813 → mika#1925).
+///
+/// **Rendered unconditionally, and that is the load-bearing decision of
+/// mika#1925.** The ticket's AC1 asks only for a block gated on
+/// `stopped_topics` being non-empty — but on this path that state is
+/// *unreachable*: `build_compact_system_prompt` renders no `## Instructions`
+/// section, so the rule telling the agent to persist a stop-signal was served
+/// on no conversation turn of this provider, and `build_silent_prompt` carries
+/// the *consult* rule only. With nothing instructing the agent to write a
+/// `stop_topic_*` preference, `search_preferences(STOP_TOPIC_PREFIX)` stays
+/// empty for ever and a conditional block never renders. Wiring the conditional
+/// half alone would have produced a green test suite over a dead path — the
+/// literal shape of the defect this ticket exists to close.
+///
+/// It carries the AC2 distinction (a stop is not a gag: a direct question stays
+/// answerable) in line, deliberately duplicating the one in
+/// [`STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT`]. The two are read at different
+/// moments — one when the user says stop, the other when the agent considers
+/// raising a subject — and a compact model does not go looking for a clause
+/// three sections up. Same choice as the two reference builders, which also
+/// carry it in both the section preamble and the instruction rule.
+///
+/// **Carries no `## ` heading, on purpose:** it is a rule, not a section, so
+/// the nominal case (no stopped topic) adds no section to the compact prompt
+/// and the pre-mika#1925 shape is preserved byte for byte apart from this rule.
+///
+/// Budget: const-asserted below at 600 bytes, **on this constant alone**. No
+/// const-assert can bound the total — that depends on `soul.md` and on the
+/// injected preference values, neither known at compile time — so the
+/// `total ≤ 5120` unit test
+/// (`mika1925_compact_prompt_stays_within_budget_with_stopped_topics`) is the
+/// net that sees the sum, not a duplicate of this assertion.
+const STOP_SIGNAL_PERSIST_COMPACT: &str = "Stop signals: when the user asks you to stop bringing a subject up (\"stop\", \
+     \"arrête\", \"no more\", \"laisse tomber\"), acknowledge briefly AND call \
+     store_fact(category='preference', key='stop_topic_<short-slug>', value='<one \
+     line: what to stop, with today's date>') in the SAME turn. <short-slug> is \
+     lowercase kebab-case: subject `web-config` → key='stop_topic_web-config'. \
+     A direct question about a stopped subject is not a re-opening — answer it \
+     normally; what you stop is raising it yourself.\n";
+
+// Compile-time budget assertion — scoped to this constant, see its doc comment
+// for why no const-assert of the total can exist (mika#1925).
+const _: () = assert!(
+    STOP_SIGNAL_PERSIST_COMPACT.len() < 600,
+    "STOP_SIGNAL_PERSIST_COMPACT exceeds 600-byte budget — see mika#1925 plan"
+);
+
+/// Abbreviated preamble of the *consult* half (mika#1813 → mika#1925).
+///
+/// Rendered under a `## Stopped Topics` heading when `stopped_topics` is
+/// non-empty, immediately before the `<stopped-topics>` block — the same shape
+/// as [`build_system_prompt`] and [`build_silent_prompt`], abbreviated in
+/// content. The form is a deliberate mirror rather than an invention: the risk
+/// the compact prompt exists to avoid (OOD-prior-dominated completion of
+/// markdown structure) is **not measurable in this repository** — no MikaModel
+/// endpoint exists here — and when one cannot measure, one does not depart from
+/// the known-good shape. What that mirror costs is named: the
+/// `<stopped-topics>` block is the first XML tag rendered on this path.
+/// `sanitize_label` already strips `<`, `>`, `\n`, `\r` from injected content,
+/// so a hostile preference value cannot close the tag; the residual risk is one
+/// of completion, and it belongs to the calibration pass (AC4) documented at
+/// [`build_compact_system_prompt`].
+///
+/// Budget: const-asserted below at 300 bytes, on this constant alone — same
+/// scoping note as [`STOP_SIGNAL_PERSIST_COMPACT`].
+const STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT: &str = "The user asked you NOT to re-initiate on these subjects. Do not raise them \
+     yourself. A direct question about one of them is not a re-opening — you may \
+     still answer it.\n";
+
+const _: () = assert!(
+    STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT.len() < 300,
+    "STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT exceeds 300-byte budget — see mika#1925 plan"
+);
+
 /// Write the current time section with optional timezone.
 fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone: Option<&str>) {
     prompt.push_str("## Current Time\n");
@@ -1811,14 +1889,49 @@ Core memory tracks key people briefly — the people table is the full record.\n
 /// is gated upstream at the call site (see `is_compact_provider` check in
 /// `agent.rs`), not inside this builder.
 ///
-/// **mika#1813 carve-out (tracked in mika#1925):** the stop-signal contract
-/// (`<stopped-topics>` block + persist/consult rules) is intentionally NOT
-/// rendered here — the compact budget cannot afford it and the MikaModel
-/// provider is not currently used by family-tier or operator-tier agents in
-/// production. mika#1925 tracks wiring a size-capped variant when MikaModel
-/// goes live for real tenants. The `stopped_topics` field on `PromptContext`
-/// is accepted by this builder to keep the type signature uniform across the
-/// three builders; it is deliberately unused here.
+/// **mika#1925 — the stop-signal contract (mika#1813) is rendered here, and
+/// the reasoning behind its shape is not what the carve-out it replaces said.**
+/// Three things are worth knowing before editing it:
+///
+/// 1. **This was never a byte budget.** The carve-out claimed "the compact
+///    budget cannot afford it"; measured, the sections above total ≈ 431 bytes
+///    against the 5120 asserted ceiling — 91 % unused, and the *full* mika#1813
+///    contract would have fitted three times over. What actually bit was the
+///    section-count assertion in
+///    `test_build_compact_system_prompt_size_bound`, and behind it the OOD
+///    failure mode this builder exists to avoid: served full context, the
+///    provider completes markdown structure instead of acting as an agent
+///    (fictional `## Summary / Completed Tasks / Pending` reports). The fiction
+///    observed was made of *headings*. So the form is what is dangerous, not
+///    the mass — and any future justification written in bytes would be false.
+/// 2. **The form is the deliberate mirror of the two other builders**, not an
+///    invention, because the OOD risk is structurally unmeasurable here (no
+///    MikaModel endpoint exists in this repository; `default_base_url` is an
+///    Ollama-shaped `http://localhost:11434` nothing serves). One does not
+///    depart from a known-good shape on an unverifiable intuition.
+/// 3. **The *persist* rule is unconditional, and must stay so.** Conditioned on
+///    `stopped_topics` being non-empty — the letter of mika#1925's AC1 — it
+///    would be unreachable: this builder renders no `## Instructions`, so
+///    nothing would ever tell a MikaModel agent to write a `stop_topic_*`
+///    preference, the block would never fill, and the wire-up would be a no-op
+///    with a green test suite over it. See [`STOP_SIGNAL_PERSIST_COMPACT`].
+///    `mika1925_compact_prompt_renders_persist_even_with_no_stopped_topics`
+///    is what stops a later "simplification" from putting it back under the
+///    condition.
+///
+/// **AC4 is NOT satisfied, and is a blocking precondition rather than a
+/// deferral.** mika#1925 asks for a calibration pass on MikaModel (mika#1190
+/// discipline). It is not executable in this repository, for three independent
+/// reasons: no MikaModel endpoint exists; `calibration::providers::create_real_provider`
+/// returns `None` for any provider without a `MIKA_<PREFIX>_API_KEY` and
+/// exempts only `ProviderKind::Ollama`, so MikaModel cannot even be
+/// instantiated without setting a key it has no use for; and none of the four
+/// role suites (`mika_dev`, `mika_arch`, `mika_qa`, `mika_orchestrator`)
+/// exercises a conversational agent or the stop-signal contract, so running one
+/// "on MikaModel" would scrupulously measure something else. It was not
+/// simulated with a mock — a `MockLlmProvider` validates prompt *shape*, never
+/// model *obedience*. **Before MikaModel serves a real tenant, run that
+/// calibration pass**; the three dependencies above are what it costs.
 pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     let mut prompt = String::with_capacity(512);
 
@@ -1876,6 +1989,26 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     // mika#1798: abbreviated non-transit doctrine — ~250 chars, hard-capped at
     // 400. Preserves the HARD-NO invariant even in the compact budget.
     write_data_grade_doctrine_section_compact(&mut prompt);
+
+    // mika#1925 — stop-signal contract (mika#1813), in the shape of the two
+    // other builders: the block first (context), the rule after (instruction).
+    //
+    // The block is conditional, as AC1 asks. The `persist` rule below is NOT —
+    // see the point 3 of this function's doc comment and
+    // `STOP_SIGNAL_PERSIST_COMPACT`: conditioned, it would never be served, and
+    // the block it fills would never fill.
+    if !ctx.stopped_topics.is_empty() {
+        prompt.push_str("## Stopped Topics\n");
+        prompt.push_str(STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT);
+        prompt.push_str("<stopped-topics>\n");
+        for pref in ctx.stopped_topics {
+            let cat = sanitize_label(&pref.category);
+            let val = sanitize_label(&pref.value);
+            writeln!(prompt, "- {cat}: {val}").unwrap();
+        }
+        prompt.push_str("</stopped-topics>\n\n");
+    }
+    prompt.push_str(STOP_SIGNAL_PERSIST_COMPACT);
 
     prompt
 }
@@ -4710,21 +4843,33 @@ inject = false
             prompt.len()
         );
 
-        // AC1: ≤4 sections. The compact prompt's section budget grew from 2 to
-        // 4 as load-bearing doctrines were baked in — each addition is a
-        // structural guardrail the compact/MikaModel provider cannot skip:
+        // AC1: ≤5 sections. The compact prompt's section budget grew from 2 to
+        // 4 and then to 5 as load-bearing doctrines were baked in — each
+        // addition is a structural guardrail the compact/MikaModel provider
+        // cannot skip:
         //   1. ## Personality (soul first-line, when non-empty)
         //   2. ## Identity (agent name)
         //   3. ## Runtime (mika#1815 — ground-truth model identity so the
         //      compact provider can answer "which model?" without confabulating)
         //   4. ## Data-Grade Doctrine (mika#1798 — abbreviated HARD-NO
         //      non-transit invariant, ~400-char budget const-asserted)
+        //   5. ## Stopped Topics (mika#1925 — the mika#1813 suppression list;
+        //      CONDITIONAL, rendered only when the user has actually asked for
+        //      a subject to be dropped, so it costs nothing on the nominal
+        //      turn. Its companion `persist` rule is unconditional but carries
+        //      no heading, which is why the fixture below — `stopped_topics:
+        //      &[]` — still counts four.)
         // Each section is individually budget-capped; the overall ≤5 KB bound
         // (asserted above) is the load-bearing size guarantee.
+        //
+        // The count is the barrier this builder actually has — the byte budget
+        // is ~91 % unused (mika#1925 D1). Raising it again means naming the
+        // section, its ticket, and what it guarantees, exactly as above; a bump
+        // without that paragraph is how a reasoned growth becomes a drift.
         let section_count = prompt.matches("## ").count();
         assert!(
-            section_count <= 4,
-            "compact prompt has {} sections, exceeds 4-section limit",
+            section_count <= 5,
+            "compact prompt has {} sections, exceeds 5-section limit",
             section_count
         );
 
@@ -4777,6 +4922,14 @@ inject = false
         // after Identity/Runtime. Three sections total with empty soul:
         // ## Identity + ## Runtime + ## Data-Grade Doctrine.
         assert!(prompt.contains("## Data-Grade Doctrine"));
+        // mika#1925 negative control, and the `3` is the assertion: the fixture
+        // carries `stopped_topics: &[]`, so the nominal turn gains the `persist`
+        // rule — which has no heading, by design — and NOT a fifth section.
+        // If this count ever has to move for any reason other than a genuinely
+        // new section, a section is being rendered that should not be: halt and
+        // re-read the section-budget paragraph in
+        // `test_build_compact_system_prompt_size_bound` rather than adjusting
+        // the number to make the test pass.
         assert_eq!(prompt.matches("## ").count(), 3);
     }
 
@@ -5256,13 +5409,17 @@ inject = false
         assert_eq!(filtered[0].category, "stop_topic_web-config");
     }
 
+    /// The inversion of a carve-out pinning test (mika#1925).
+    ///
+    /// Its predecessor, `test_compact_prompt_omits_stopped_topics_block_by_design`,
+    /// asserted the *absence* of the mika#1813 contract on this path and said
+    /// so in as many words: "so a future wire-up is deliberate (test flips)
+    /// rather than accidental". mika#1925 is that wire-up, and this is the
+    /// flip. Read it as a filiation, not as an assertion born from nowhere:
+    /// three sibling carve-outs (mika#1814, mika#2290, mika#2292) remain in
+    /// force on this builder and keep their own pinning tests green, untouched.
     #[test]
-    fn test_compact_prompt_omits_stopped_topics_block_by_design() {
-        // The compact prompt (ProviderKind::MikaModel) is intentionally
-        // silent on stop-topics — the ≤5 KB budget cannot afford them and
-        // MikaModel is not currently used for production agents. This test
-        // pins the carve-out documented at build_compact_system_prompt so a
-        // future wire-up is deliberate (test flips) rather than accidental.
+    fn mika1925_compact_prompt_renders_the_stop_signal_contract() {
         let identity = test_identity();
         let stops = vec![stop_topic_pref(
             "web-config",
@@ -5287,17 +5444,137 @@ inject = false
             persona_profile: PersonaProfile::Operator,
         };
         let prompt = build_compact_system_prompt(&ctx);
+
+        // AC1 — the consult half: section, preamble, block, injected content.
+        assert!(
+            prompt.contains("## Stopped Topics"),
+            "compact prompt must carry the stop-topics section header"
+        );
+        assert!(
+            prompt.contains("<stopped-topics>") && prompt.contains("</stopped-topics>"),
+            "compact prompt must emit the stop-topics block"
+        );
+        assert!(
+            prompt.contains("stop_topic_web-config"),
+            "the injected preference category must reach the block"
+        );
+        assert!(
+            prompt.contains("user asked to stop, 2026-08-19"),
+            "the injected preference value must reach the block"
+        );
+
+        // The persist half (mika#1925 D3) — the rule the ticket does not ask
+        // for and without which the block above could never fill.
+        assert!(
+            prompt.contains("store_fact(category='preference', key='stop_topic_<short-slug>'"),
+            "compact prompt must carry the persist rule with the exact key shape"
+        );
+
+        // AC2 — stop != question, carried in BOTH halves. Counting rather than
+        // asserting presence: a single occurrence would mean one half lost it,
+        // and the two are read at different moments (see the constants' docs).
+        assert_eq!(
+            prompt.matches("not a re-opening").count(),
+            2,
+            "the stop-is-not-a-gag distinction must be carried in both halves"
+        );
+    }
+
+    /// The test that carries mika#1925 D3 — the finding of that grooming.
+    ///
+    /// Without it, a later "simplification" putting the persist rule back under
+    /// `!stopped_topics.is_empty()` would restore the inert path and nothing
+    /// would redden: the conditional block would still render correctly *when
+    /// fed*, and on a MikaModel tenant it would never be fed, because no other
+    /// prompt on that path instructs the agent to write a `stop_topic_*`
+    /// preference (`build_compact_system_prompt` renders no `## Instructions`,
+    /// and `build_silent_prompt` carries the consult rule only).
+    #[test]
+    fn mika1925_compact_prompt_renders_persist_even_with_no_stopped_topics() {
+        let identity = test_identity();
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+
+        assert!(
+            prompt.contains("store_fact(category='preference', key='stop_topic_<short-slug>'"),
+            "the persist rule is unconditional — see mika#1925 D3"
+        );
+        // The nominal case stays what it was, plus that one rule: no section is
+        // added, no XML tag is opened.
+        assert!(
+            !prompt.contains("## Stopped Topics"),
+            "no section when there is nothing to list"
+        );
         assert!(
             !prompt.contains("<stopped-topics>"),
-            "compact prompt must not emit the stop-topics block (carve-out)"
+            "no block when there is nothing to list"
         );
+    }
+
+    /// AC1's size half, on the full shape (mika#1925).
+    ///
+    /// This is the only guard that sees the **sum** and the only one that sees
+    /// the injected content: each `const _: () = assert!(…)` bounds one
+    /// constant in isolation, and no const-assert of the total can exist (it
+    /// depends on `soul.md` and on preference values, unknown at compile time).
+    /// An edit inflating the consult preamble passes the persist const-assert
+    /// without learning anything, and lands here.
+    #[test]
+    fn mika1925_compact_prompt_stays_within_budget_with_stopped_topics() {
+        let identity = test_identity();
+        let long = "user asked to stop, 2026-08-19 — ".repeat(20);
+        let stops = vec![
+            stop_topic_pref("web-config", &long),
+            stop_topic_pref("budget-review", &long),
+            stop_topic_pref("holiday-planning", &long),
+        ];
+        let ctx = PromptContext {
+            soul_content: "You are a sharp, proactive executive assistant.",
+            identity: &identity,
+            core_memory: &[],
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: None,
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &stops,
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+        };
+        let prompt = build_compact_system_prompt(&ctx);
+
         assert!(
-            !prompt.contains("Stopped Topics"),
-            "compact prompt must not emit the stop-topics section header"
+            prompt.len() <= 5120,
+            "compact prompt is {} bytes with three stopped topics, exceeds 5 KB",
+            prompt.len()
         );
+        // `sanitize_label` caps each injected field at 200 chars — the bound
+        // above holds because of it, not by luck.
         assert!(
-            !prompt.contains("Respect stop signals"),
-            "compact prompt must not carry stop-signal rules"
+            !prompt.contains(&long),
+            "an over-long preference value must be truncated by sanitize_label"
         );
     }
 
