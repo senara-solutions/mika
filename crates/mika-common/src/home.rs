@@ -2076,6 +2076,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn temp_relapse_early() {
+        let tmp = tempfile::tempdir().unwrap();
+        bootstrap(&tmp.path().join("x")).unwrap();
+    }
+
     // -- mika#2073 — the tier is posed, and the environment cannot move it ---
 
     /// **The deterministic positive control** (mika#2073).
@@ -2130,27 +2136,58 @@ mod tests {
 
     // -- mika#2073 — no bare test reads the tier from the process environment --
 
-    /// The inner text of a line that is *exactly* an attribute, or `None`.
+    /// The joined inner text of the attribute starting at `lines[i]`, and the
+    /// index just past it. `None` when `lines[i]` does not start an attribute.
     ///
-    /// The predicate below is on an **attribute**, never on the presence of a
-    /// string, and this function is what makes that true: `use serial_test::serial;`
-    /// sits in this very module and carries the token without decorating anything.
-    fn attribute_inner(line: &str) -> Option<&str> {
-        let trimmed = line.trim();
-        Some(trimmed.strip_prefix("#[")?.strip_suffix(']')?.trim())
+    /// **Attributes may span lines** — `#[tokio::test(\n flavor = "multi_thread"\n)]`
+    /// is ordinary rustfmt output past the line budget. A one-line reader
+    /// returns `None` for it, the whole attribute block goes unrecognized, and
+    /// the test item below it is skipped **in silence**: a false negative that
+    /// looks exactly like a clean file. So the bracket depth is followed across
+    /// lines.
+    ///
+    /// The predicate is on an **attribute**, never on the presence of a string,
+    /// and this function is what makes that true: `use serial_test::serial;`
+    /// sits in this very module and carries the token without decorating
+    /// anything.
+    fn attribute_at(lines: &[&str], i: usize) -> Option<(String, usize)> {
+        if !lines.get(i)?.trim_start().starts_with("#[") {
+            return None;
+        }
+        let mut joined = String::new();
+        let mut depth = 0i32;
+        let mut j = i;
+        while j < lines.len() {
+            let piece = lines[j].trim();
+            for c in piece.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(piece);
+            j += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+        if depth > 0 {
+            return None; // unterminated: not an attribute we can read
+        }
+        let inner = joined.trim().strip_prefix("#[")?.strip_suffix(']')?.trim();
+        Some((inner.to_string(), j))
     }
 
     /// Does this attribute make the item below it a test that `libtest` may run
     /// **in parallel with the others**? `#[tokio::test]` answers yes exactly as
     /// `#[test]` does: `#[serial]` and libtest's thread pool are two distinct
     /// mechanisms, and a multi-thread tokio flavour protects nothing here.
-    fn is_test_attribute(line: &str) -> bool {
-        match attribute_inner(line) {
-            Some(inner) => {
-                inner == "test" || inner == "tokio::test" || inner.starts_with("tokio::test(")
-            }
-            None => false,
-        }
+    fn inner_is_test(inner: &str) -> bool {
+        inner == "test" || inner == "tokio::test" || inner.starts_with("tokio::test(")
     }
 
     /// `#[serial]` has two spellings in this tree — the bare one and
@@ -2158,14 +2195,17 @@ mod tests {
     /// setters of `mika-agent`'s tier guard). Recognizing only the first would
     /// make the guard shout at correct code, and a guard that shouts at correct
     /// code is a guard somebody silences.
+    fn inner_is_serial(inner: &str) -> bool {
+        let head = inner.split('(').next().unwrap_or(inner).trim();
+        head == "serial" || head == "serial_test::serial"
+    }
+
+    fn is_test_attribute(line: &str) -> bool {
+        attribute_at(&[line], 0).is_some_and(|(inner, _)| inner_is_test(&inner))
+    }
+
     fn is_serial_attribute(line: &str) -> bool {
-        match attribute_inner(line) {
-            Some(inner) => {
-                let head = inner.split('(').next().unwrap_or(inner).trim();
-                head == "serial" || head == "serial_test::serial"
-            }
-            None => false,
-        }
+        attribute_at(&[line], 0).is_some_and(|(inner, _)| inner_is_serial(&inner))
     }
 
     /// Does `line` **call** `name`?
@@ -2220,38 +2260,96 @@ mod tests {
     struct TierScan {
         offenders: Vec<String>,
         tests_seen: usize,
+        /// Test items whose body did not close where the source says it closes.
+        /// **Not a diagnostic — a failure.** See the guard.
+        desyncs: Vec<String>,
     }
 
-    /// Brace movement contributed by a line, ignoring line comments, string and
-    /// char literals — a `"{name}"` in an assertion message must not move the
-    /// scanner's idea of where a test body ends. Returns `(delta, saw_open)`;
-    /// `saw_open` is separate because a line like `unsafe { … };` has a delta of
-    /// zero and still opens the item's block.
-    fn brace_scan(line: &str) -> (i32, bool) {
-        let chars: Vec<char> = line.chars().collect();
+    /// Lexer state that must survive the end of a line.
+    ///
+    /// A Rust string literal may span lines — `r#"…"#` blocks do it routinely,
+    /// and this very module contains one. A per-line scanner resets at each
+    /// newline, so a `}` sitting inside such a literal reads as a closing brace
+    /// and ends a test body early: every line after it escapes the scan, the
+    /// item count is unchanged, and the guard stays **green** while blind. That
+    /// is the same shape as the defect this whole ticket closes, one level down,
+    /// so the state is carried rather than reset.
+    #[derive(Default)]
+    struct Lex {
+        in_string: bool,
+        /// `Some(n)` inside a raw string opened with `n` hashes (`r##"` → 2).
+        in_raw: Option<usize>,
+        in_block_comment: bool,
+    }
+
+    /// Brace movement contributed by a line, ignoring comments and string, raw
+    /// string and char literals. Returns `(delta, saw_open)`; `saw_open` is
+    /// separate because a line like `unsafe { … };` has a delta of zero and
+    /// still opens the item's block.
+    fn brace_scan(line: &str, lex: &mut Lex) -> (i32, bool) {
+        let c: Vec<char> = line.chars().collect();
         let mut depth = 0i32;
         let mut saw_open = false;
-        let mut in_string = false;
-        let mut in_char = false;
         let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if in_string || in_char {
-                if c == '\\' {
+        while i < c.len() {
+            if lex.in_block_comment {
+                if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    lex.in_block_comment = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(hashes) = lex.in_raw {
+                if c[i] == '"' && c[i + 1..].iter().take(hashes).all(|h| *h == '#') {
+                    lex.in_raw = None;
+                    i += 1 + hashes;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if lex.in_string {
+                match c[i] {
+                    '\\' => i += 2,
+                    '"' => {
+                        lex.in_string = false;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+                continue;
+            }
+            match c[i] {
+                '/' if c.get(i + 1) == Some(&'/') => break,
+                '/' if c.get(i + 1) == Some(&'*') => {
+                    lex.in_block_comment = true;
                     i += 2;
                     continue;
                 }
-                if (in_string && c == '"') || (in_char && c == '\'') {
-                    in_string = false;
-                    in_char = false;
+                'r' if matches!(c.get(i + 1), Some('"') | Some('#')) => {
+                    let hashes = c[i + 1..].iter().take_while(|h| **h == '#').count();
+                    if c.get(i + 1 + hashes) == Some(&'"') {
+                        lex.in_raw = Some(hashes);
+                        i += 2 + hashes;
+                        continue;
+                    }
+                    i += 1;
+                    continue;
                 }
-                i += 1;
-                continue;
-            }
-            match c {
-                '/' if chars.get(i + 1) == Some(&'/') => break,
-                '"' => in_string = true,
-                '\'' => in_char = true,
+                '"' => lex.in_string = true,
+                // A `'` is a char literal only when it closes within three or
+                // four characters; otherwise it is a lifetime or a loop label,
+                // and consuming the rest of the line would desync the walk.
+                '\'' => {
+                    let esc = c.get(i + 1) == Some(&'\\');
+                    let close = if esc { i + 3 } else { i + 2 };
+                    if c.get(close) == Some(&'\'') {
+                        i = close + 1;
+                        continue;
+                    }
+                }
                 '{' => {
                     depth += 1;
                     saw_open = true;
@@ -2273,22 +2371,24 @@ mod tests {
     fn scan_bare_tests_reading_the_tier(source: &str) -> TierScan {
         let lines: Vec<&str> = source.lines().collect();
         let mut offenders = Vec::new();
+        let mut desyncs = Vec::new();
         let mut tests_seen = 0usize;
         let mut i = 0;
 
         while i < lines.len() {
-            if attribute_inner(lines[i]).is_none() {
+            let Some((first_inner, mut next)) = attribute_at(&lines, i) else {
                 i += 1;
                 continue;
-            }
+            };
             // One contiguous attribute block, then the item it decorates.
-            let mut is_test = false;
-            let mut is_serial = false;
-            while i < lines.len() && attribute_inner(lines[i]).is_some() {
-                is_test |= is_test_attribute(lines[i]);
-                is_serial |= is_serial_attribute(lines[i]);
-                i += 1;
+            let mut is_test = inner_is_test(&first_inner);
+            let mut is_serial = inner_is_serial(&first_inner);
+            while let Some((inner, after)) = attribute_at(&lines, next) {
+                is_test |= inner_is_test(&inner);
+                is_serial |= inner_is_serial(&inner);
+                next = after;
             }
+            i = next;
             if !is_test || i >= lines.len() {
                 continue;
             }
@@ -2296,12 +2396,15 @@ mod tests {
 
             let signature_at = i;
             let signature = lines[i].trim().to_string();
+            let indent: String = lines[i].chars().take_while(|c| c.is_whitespace()).collect();
+            let mut lex = Lex::default();
             let mut depth = 0i32;
             let mut opened = false;
             let mut body: Vec<(usize, &str)> = Vec::new();
+            let mut closed_at: Option<usize> = None;
             while i < lines.len() {
                 let line = lines[i];
-                let (delta, saw_open) = brace_scan(line);
+                let (delta, saw_open) = brace_scan(line, &mut lex);
                 opened |= saw_open;
                 depth += delta;
                 // The signature itself is not a call site: a test *named* after
@@ -2314,8 +2417,33 @@ mod tests {
                 body.push((i, scanned));
                 i += 1;
                 if opened && depth <= 0 {
+                    closed_at = Some(i - 1);
                     break;
                 }
+            }
+
+            // **Self-check, and it is the load-bearing half of this scanner.**
+            // Every other way this walk can go wrong is silent: an item's body
+            // ends early, the lines after it are never examined, the item count
+            // is unchanged, and the guard reports a clean file. rustfmt closes a
+            // test item with `<indent>}` and nothing else, so anything else here
+            // means the walk lost the thread — which is reported as a failure,
+            // never swallowed (mika#2205: a scan that silently read nothing
+            // reads exactly like a scan that found nothing).
+            match closed_at {
+                Some(n) if lines[n] == format!("{indent}}}") => {}
+                Some(n) => desyncs.push(format!(
+                    "  line {} in `{}` — body closed on {:?}, expected {:?}",
+                    n + 1,
+                    signature,
+                    lines[n],
+                    format!("{indent}}}")
+                )),
+                None => desyncs.push(format!(
+                    "  line {} in `{}` — body never closed before end of file",
+                    signature_at + 1,
+                    signature
+                )),
             }
 
             if is_serial {
@@ -2336,6 +2464,7 @@ mod tests {
         TierScan {
             offenders,
             tests_seen,
+            desyncs,
         }
     }
 
@@ -2371,15 +2500,30 @@ mod tests {
         let scan = scan_bare_tests_reading_the_tier(&source);
 
         // A scan that silently read nothing is indistinguishable from a clean
-        // tree (class mika#2205). On a single file a drifted path or a
-        // desynchronized walk both surface here first.
+        // tree (class mika#2205). On a single file a drifted path surfaces here
+        // first.
         assert!(
             scan.tests_seen >= 40,
             "the guard saw only {} test items in {} — it is not reading the file \
-             it thinks it is, or the walk desynchronized. Its green means nothing \
-             until this number is plausible.",
+             it thinks it is. Its green means nothing until this number is \
+             plausible.",
             scan.tests_seen,
             this_file.display()
+        );
+
+        // The item count cannot see the *other* way this walk fails: a body that
+        // ends early still counts as one item, and every line after it escapes
+        // the scan while the guard reports green. So the walk states where each
+        // body closed, and a mismatch is a failure rather than a note.
+        assert!(
+            scan.desyncs.is_empty(),
+            "mika#2073 — the source walk lost the thread on {} test item(s):\n{}\n\n\
+             This is NOT a finding about the tests; it is the guard telling you it \
+             cannot see. Until it is fixed, a green result attests nothing. The \
+             usual cause is a literal or comment shape `brace_scan` does not carry \
+             correctly across lines.",
+            scan.desyncs.len(),
+            scan.desyncs.join("\n")
         );
 
         assert!(
@@ -2493,7 +2637,7 @@ mod tests {
         // signature counts as a call site. This half does. Built with `format!`
         // for the same reason the tokens above are recomposed.
         let fabricated = format!(
-            r#"
+            r##"
 mod tests {{
     #[test]
     fn a_bare_test_that_relapses() {{
@@ -2528,20 +2672,60 @@ mod tests {{
     fn a_test_merely_named_after_{boot}) {{
         assert!(true);
     }}
+
+    // A multi-line raw string carrying an unbalanced `}}` on a line of its own.
+    // A per-line lexer ends this body here, and every test below escapes.
+    #[test]
+    fn a_test_holding_a_multiline_literal() {{
+        let fixture = r#"a fixture line
+    }}
+still inside the literal"#;
+        let _ = fixture;
+        {boot}&home).unwrap();
+    }}
+
+    // rustfmt splits a long attribute; a one-line reader returns None for it
+    // and skips the whole item without saying so.
+    #[tokio::test(
+        flavor = "multi_thread",
+        worker_threads = 2
+    )]
+    async fn a_test_behind_a_multiline_attribute() {{
+        {fresh}home).unwrap();
+    }}
 }}
-"#
+"##
         );
         let scan = scan_bare_tests_reading_the_tier(&fabricated);
+        assert!(
+            scan.desyncs.is_empty(),
+            "the walk must stay in sync on the fabricated source:\n{}",
+            scan.desyncs.join("\n")
+        );
         assert_eq!(
-            scan.tests_seen, 6,
-            "the walk must find every test item in the fabricated source, got {}",
+            scan.tests_seen, 8,
+            "the walk must find every test item in the fabricated source — \
+             including the one behind a multi-line attribute — got {}",
             scan.tests_seen
         );
         assert_eq!(
             scan.offenders.len(),
-            2,
-            "exactly the two bare relapses must be reported, got:\n{}",
+            4,
+            "the four bare relapses must be reported, got:\n{}",
             scan.offenders.join("\n")
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_test_holding_a_multiline_literal")),
+            "a `}}` inside a multi-line literal must not end the body early — \
+             that failure is silent, and silence is what this ticket is about"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_test_behind_a_multiline_attribute")),
+            "a test behind a multi-line attribute must still be seen"
         );
         assert!(
             scan.offenders
