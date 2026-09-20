@@ -1755,6 +1755,131 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **SilentTrigger variants:** `Heartbeat`, `Reflection`, `Callback`, `SkillRun`, `Reminder`, `PostCallbackAdvance` (#991), `DeferredDispatch` (mika#1011). Each produces correct system-prompt framing. `PostCallbackAdvance` is an engine-side structural backstop — fired by the dispatcher after a milestone/project-context callback turn completes without advancing the queue. `DeferredDispatch` is an engine-side auto-recovery for `global_dispatch_active` rejections — when `run_claude_pilot` is rejected because another dispatch is active, the engine registers a `pending` callback task with label `long_running:run_claude_pilot:deferred`. When the blocking dispatch completes, the deferred callback is promoted (status → `completed`) and dispatched on the next engine tick as a `DeferredDispatch` turn whose only required action is `run_claude_pilot` (enforced by the `deferred_dispatch_action` INTENT_GUARD). **Promotion paths (mika#1070):** (1) Inline — `dispatch_next_deferred_callback()` (`pub(crate)`) fires after `mark_task_delivered` on a non-deferred callback. mika#1124 re-added the inline anti-cascade guard at `dispatcher.rs:495`: when a `:deferred` wrapper itself completes (e.g., the silent turn no-ops), inline chain-promotion is SKIPPED — relying on the periodic backstop instead. This prevents the no-op-cascade failure mode where N wrappers drain the queue inline without ever dispatching. Real (non-deferred) callback completions still chain-promote immediately. (2) Periodic backstop — `promote_pending_deferred_if_idle()` runs every `DB_SCAN_INTERVAL_TICKS` (60 ticks), iterates over the `dispatch_class` values (`DISPATCH_CLASSES = &["implement", "groom"]` — pinned to `derive_dispatch_class` at `skills/executor.rs` via a shape test in `engine.rs`), checks `has_any_active_callback_for_class(class)` (excludes deferred wrappers via `label NOT LIKE '%:deferred'`, scopes by `COALESCE(dispatch_class, 'implement') = ?`), and promotes one wrapper per idle class per tick via `dispatch_next_deferred_callback_for_class(class)` (mika#1175). Per-class iteration prevents cross-class throughput halving when wrappers from multiple classes are co-pending. Placed BEFORE `dispatch_undelivered_callbacks` for same-tick dispatch. Fail-closed per-class on DB errors — one class's check error does not stall the other. The agent-wide siblings `has_any_active_callback()` and `dispatch_next_deferred_callback()` are kept for the inline-promotion path in `handle_task_complete` (out-of-scope for #1175, see plan § Open question 1). **Both slot predicates must exclude `:deferred` wrappers (mika#1163).** `has_any_active_callback`/`has_any_active_callback_for_class` (engine backstop) AND `has_active_callback_tasks_excluding` (per-class gate inside `validate_dispatch_readiness`) all apply `label NOT LIKE '%:deferred'`. The earlier asymmetric version caused a multi-wrapper deadlock: when two parents each held a pending wrapper, every dispatch attempt from one wrapper saw the OTHER wrapper as slot-occupied and registered yet another wrapper, with no real dispatch ever spawning. **AgentBusy recovery (mika#1070):** when `dispatch_resume_agent` returns `AgentBusy` in `handle_task_complete`, the callback keeps `completed` status (not reset to `pending`) with `next_fire_at` set to now+30s for retry delay. `dispatch_undelivered_callbacks` has a `next_fire_at` guard that skips tasks whose retry delay has not expired. γ composition: the LLM's `send_message` notification and the engine's deferred callback are independent; `validate_dispatch_readiness()` arbitrates any race. Per-agent cap of 10 pending deferred callbacks prevents flood. `cancel_task()` cascades to callback children (both immediate and deferred). **No-op wrapper detection (mika#1172 R9):** When a `:deferred` wrapper completes, the dispatcher checks `has_non_deferred_active_callback_child(parent_task_id)`. If no active child exists, emits `deferred_dispatch_noop_completion` WARN + audit event — the silent turn failed to spawn a real dispatch (mika#1124 regression signal). **Dispatch lifecycle audit events (mika#1172 W4):** Three events written to `audit_events`: `deferred_dispatch_promoted` (on each inline or periodic backstop promotion, with promoted task ID), `deferred_dispatch_registered` (on deferred callback registration at `global_dispatch_active` rejection), `deferred_dispatch_noop_completion` (on no-op wrapper detection). Promote methods (`promote_next_deferred_callback`, `promote_next_deferred_callback_for_class`) return `Option<String>` (promoted task ID) instead of `bool` to enable meaningful audit event resource_id. **(3) Force-promote (mika#1453)** — `promote_deferred_callback` agent tool (fail-closed: rejects when slot busy, no override) and `mika tasks promote-deferred <class>` CLI verb (with `--override` for cancel-then-promote). Both call `force_promote_deferred_for_class()` which shares the `has_any_active_callback_for_class()` predicate (mika#1163 parity). `find_active_callback_for_class()` identifies the blocker for the CLI override path. Three audit event types: `deferred_dispatch_force_promote_succeeded`, `deferred_dispatch_force_promote_rejected_slot_busy`, `deferred_dispatch_force_promote_override`. **What the stuck-pending reaper makes of a promoted wrapper (mika#2181).** Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later under a slow model. For the reaper's predicate (`find_orphaned_pending_issue_tasks`) a deferred wrapper therefore counts as **live** when it is `pending`, **or** `completed` with a `completed_at` newer than `now - MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (default 2700s, `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`). The bound is load-bearing, not a rounding: on the silent-turn error path the wrapper is re-armed but never marked `delivered`, so it stays `completed` forever, and an unbounded predicate would turn that corpse into a permanent shield against repair. `delivered`, `failed` and `cancelled` are never live. `has_live_deferred_wrapper_child` (renamed from `has_pending_deferred_wrapper_child`) answers the same question with the same predicate — the two must not diverge. The `mika tasks stuck` probe takes the same two windows as the reaper, so probe and engine report on one population.
 
+#### A represented parent has nothing to repair (mika#2413)
+
+**The failure, measured 2026-09-19.** Three tickets were un-parked at once
+(#2237, #1952, #2025) and the three grooms serialised on the single `groom`
+slot. The third one's parent (`e7c4e9ad`) produced four `expired` wrappers in
+twenty minutes and went **`failed` at 19:19:45Z**. The loop self-healed later —
+`stuck_ready_reconcile` re-dispatched and #2025 groomed — but at the cost of a
+whole cycle and a transient `failed` visible on every operator surface.
+
+**There is no TTL, and nothing expired by the clock.** Both wrapper creation
+sites (`register_deferred_callback`, `rearm_deferred_callback`) build their
+`NewTask` with `timeout_at: None`, and `expired` is mika#2169's *terminal
+vocabulary* (`mark_deferred_wrapper_noop`: the turn happened and dispatched
+nothing), not a deadline. The bound actually crossed was `MAX_STUCK_REARMS = 2`
+— a **repair budget**, and the parent died in
+`rearm_consumed_deferred_wrapper`'s `Unrepairable` arm, in the same second as
+the third consumption. That simultaneity is the signature; no delay produces it.
+
+**The self-sustaining loop, which is the real finding.** Contention explains only
+the *first* re-arm; what condemned the parent is that the re-arm manufactured the
+condition making the next turn sterile. Three individually-correct mechanisms
+compose: (1) the re-arm posts a `pending` wrapper so the parent stays represented
+(mika#2045), on top of the one `register_deferred_callback` already posted on the
+`global_dispatch_active` refusal; (2) `execute_long_running`'s mika#1205
+`already_deferred` intercept short-circuits on any `pending` wrapper **before**
+`validate_dispatch_readiness`, so the next turn tests nothing — including when the
+slot has since freed; (3) R9 (`has_non_deferred_active_callback_child`, whose SQL
+carries `label NOT LIKE '%:deferred'`) cannot see that fresh wrapper, so the turn
+that correctly re-queued is counted a no-op and re-armed again. Two confusions
+compose: **R9 confuses "did nothing" with "re-queued correctly"**, and **the budget
+confuses "will never dispatch" with "is waiting its turn"**.
+
+**The fix is a predicate on the parent's state, never a list of causes.** A cause
+list is an implicit wire format that drifts — a fifth cause would inherit the
+wrong default — and the cause is not the right question anyway. The question the
+re-arm exists to ask is *"does anything still represent this parent in the
+queue?"*, and it already had an exact answer: `has_live_deferred_wrapper_child`
+(mika#2181). So `rearm_deferred_callback` returns the new
+`RearmOutcome::AlreadyRepresented` — **no wrapper created, no counter touched** —
+when the parent carries a live wrapper. That single predicate closes both
+confusions: no surplus wrapper, so the mika#1205 intercept stops short-circuiting
+every turn, and a turn that finds the slot free dispatches for real.
+
+**Two details that look incidental and are not.** (a) The **consumed wrapper is
+excluded by id** (`find_live_deferred_wrapper_child(..., exclude_task_id)`): on the
+`silent_turn_error` path it is still `completed` with a fresh `completed_at`, so
+without the exclusion it would count itself as live and mika#2045's repair would
+be dead on that path for the whole liveness window. (b) The guard is **fail-safe
+towards repairing** — the opposite of the `has_non_deferred_active_callback_child`
+guard immediately above it, which fails closed. An unreadable read must not be
+read as "the parent is represented": that would leave a parent with nothing in the
+queue and nothing to put anything back, never repaired and never expired. A wrong
+"I repair" costs one point of a budget of two; a wrong "it is represented" costs
+the parent.
+
+**The guard lives in the function, and the enum makes the reapers say so.** Four
+call sites reach the re-arm chain (`rearm_consumed_deferred_wrapper` ×2, the
+stuck-pending reaper, the L3b stale-blocked sweep); putting the guard at the
+callers would fork it four ways — the class `grooming_marker` (mika#2158) had to
+close once here. The new variant is a fourth `RearmOutcome` rather than a third
+use of `NotNow` for two reasons: only this path owes the consumed wrapper an
+honest terminal record (a `NotNow` from `has_non_deferred_active_callback_child`
+means the turn genuinely dispatched, and writing `expired` there would deny a real
+dispatch), and both reapers treat any non-`Rearmed`/non-`NotNow` outcome as grounds
+to **expire the parent** — so the stuck-pending reaper's two `if`s became a `match`,
+and a variant added and forgotten there now fails to compile instead of destroying
+tasks.
+
+**U2 — the consumed wrapper still gets its record.** `AlreadyRepresented` writes
+`mark_deferred_wrapper_noop` with a reason naming *parent déjà représenté*. Not
+tidiness: on the `silent_turn_error` path the wrapper would otherwise stay
+`completed`, which is exactly the status `count_promoted_undelivered_wrappers`
+(L2b) reads as "promoted, never taken" — so the starvation indicator would fire
+on a healthy regime, and an indicator that fires in the nominal regime is an
+indicator that gets muted.
+
+**A counter the success never clears ends up bounding something else.**
+`increment_stuck_rearm_count` was the only writer, so the counter was monotone for
+the row's whole life — and a groom parent **becomes** the implementation parent
+(mika#1614 task reuse, `update_task_dispatch_class` flips `groom` → `implement` on
+the same row). Two contentions suffered while grooming therefore condemned the
+implementation before it began. `reset_stuck_rearm_count` clears it in
+`execute_long_running`, **after** `spawn_long_running_exec`. **The discriminant is
+"having reached a real dispatch", never "having started one"** — that is what
+separates it from the reset mika#2158 had to remove, which fired on
+`in_flight_self_dev` (the very action the counter counted) and made the counter
+unreachable, 31 re-drives reading 1. Moving this call earlier is the regression,
+and `mika2413_a_refused_dispatch_does_not_reset_the_repair_budget` is what
+reddens if anyone does.
+
+**What did NOT change, and the PR says so in answer to the 20/09 operator note:**
+no dispatch policy. The `groom` cap stays 1 (`max_concurrent_for_class`, `_ => 1`),
+the arch-seat serialisation is untouched, no TTL is introduced, no retry is added
+(AC4 — this work *removes* undue budget spends and one surplus wrapper),
+`MAX_STUCK_REARMS` stays 2, `MAX_PENDING_DEFERRED_CALLBACKS` stays 10, and no
+environment variable is created.
+
+**Operator surfaces.** `deferred_rearm_skipped_parent_represented` (INFO — fields
+`parent_task_id`, `task_id` (the consumed wrapper), `live_wrapper_id`, `cause`,
+`dispatch_class`). **Expected regime: non-empty under multi-un-parking, silent
+outside contention** — it is the direct measure that the guard bites, and without
+it a suppressed re-arm would read exactly like a re-arm that never had a reason to
+happen (class mika#2205). Deliberately INFO-only, no `audit_events` row: the
+population is one or two lines per parent per contention episode, and a durable row
+per tick would be the churn mika#2131 bounds. `stuck_rearm_count_reset` (INFO) — a
+budget cleared without a trace is the thing nobody can audit afterwards. The number
+that says whether the fix took is the distribution of exhaustion causes:
+
+```sql
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_unrepairable_parent_failed' GROUP BY 1;
+```
+
+**Post-deploy probe, and its three halts.** At the next real un-parking of N≥3,
+`deferred_rearm_skipped_parent_represented` must be non-empty and
+`deferred_dispatch_unrepairable_parent_failed` empty for the `groom` class.
+*Halt 1* — the second is non-empty with `cause = "noop_completion"` while the
+first is empty: the guard is not biting. **Do not raise `MAX_STUCK_REARMS`**;
+check the liveness window first. *Halt 2* — the first is non-empty and the parent
+dies anyway: a fifth path is spending the budget. Read the `cause` and establish
+the site before touching the predicate. *Halt 3* —
+`deferred_dispatch_promotion_starved` (L2b) starts firing on a healthy regime: the
+terminal record of U2 is not landing; post the record rather than mute the
+indicator.
+
 **Dispatcher-source arbitration (mika#1948, Porte 2).** Three dispatchers share the per-class exec slots: the **autonomous loop** (`mika_dev` — ready-label, wip-rescue mika#1852, auto-feeder mika#1863, auto-pull mika#1824), the **milestone manager** (`mika_manager`, gated behind Phase 2 promotion), and the **operator** (`operator` — interactive `/mika`, `/mika-spawn`, `mika tasks promote-deferred`). `tasks.dispatcher_source` (v51, nullable, CHECK-pinned to those three values) records which one initiated a task. NULL means a pre-v51 row and reads as `mika_dev` via `COALESCE` — the autonomous loop was the only dispatcher before the column existed. Write it with `set_task_dispatcher_source()`, a deliberate separate write rather than a `NewTask` field: `NewTask` has ~175 construction sites and all but a handful are the loop, whose correct value is exactly the NULL default.
 
 **This is NOT the `dispatch:*` seat label (mika#2084).** The seat (`webhook_dispatch::CURRENT_DISPATCH_SEAT`, values `loop|ssc|mpc`) says which *engine* owns a TICKET and is carried on the GitHub issue; the seat gate in `validate_dispatch_readiness` refuses a ticket belonging to another engine. `dispatcher_source` says which *role inside one engine* asked for the work, and arbitrates the exec slot among them. Neither subsumes the other; they are deliberately not merged into one column.

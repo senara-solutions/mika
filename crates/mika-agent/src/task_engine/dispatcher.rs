@@ -2565,6 +2565,12 @@ impl TaskDispatcher {
             &task.action_config,
             dispatch_class,
             cause,
+            // mika#2413 — the wrapper whose sterility we are treating is not
+            // evidence that its own parent is represented. On this path it is
+            // `delivered` (R9) or still `completed` (`silent_turn_error`), and
+            // the second shape would count itself as live for the whole
+            // liveness window.
+            Some(task.id.as_str()),
         )
         .await;
 
@@ -2602,6 +2608,30 @@ impl TaskDispatcher {
                     cause,
                     "re-arm refused for a transient reason — retrying next tick"
                 );
+            }
+            // mika#2413 — the nominal path under slot contention. Nothing was
+            // repaired because nothing was broken, but this wrapper's turn did
+            // happen and dispatched nothing, so it gets the terminal record
+            // mika#2169's vocabulary owes it.
+            //
+            // Writing it is the point rather than tidiness. On the
+            // `silent_turn_error` path the wrapper is still `completed`, and
+            // `count_promoted_undelivered_wrappers` (L2b) reads exactly that
+            // status as "promoted, never taken" — so leaving it would make the
+            // starvation indicator fire on a healthy regime, and an indicator
+            // that fires in the nominal regime is an indicator that gets muted.
+            // `mark_deferred_wrapper_noop` is guarded on the label and on a
+            // `completed`/`delivered` departure status, so it is idempotent and
+            // a no-op on the paths where it does not apply.
+            RearmOutcome::AlreadyRepresented => {
+                self.record_wrapper_noop(
+                    &task.id,
+                    &format!(
+                        "noop: aucun dispatch produit (cause={cause}) — \
+                         parent déjà représenté, aucun budget dépensé"
+                    ),
+                )
+                .await;
             }
             RearmOutcome::Unrepairable => {
                 let reason = format!(
