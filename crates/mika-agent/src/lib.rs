@@ -57,3 +57,4 @@ pub mod validate;
 pub(crate) mod webhook_dispatch;
 pub mod well_known_agents;
 pub mod wip_rescue;
+pub mod worktree_reaper;

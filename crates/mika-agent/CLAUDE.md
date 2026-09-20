@@ -936,14 +936,88 @@ STOP). What makes that acceptable is the **visibility**, not the reasoning: the
 operator sees the effect in ≤ 10 min. If the reader ever becomes fallible in a way
 the operator cannot observe (DB, network), redo the trade-off rather than transport it.
 
-**Scope:** `auto_pull` only. `is_stopped`/`stop_file_path` are parameterized by scan
-name so extending to `wip_rescue` / `qa_review_reconcile` is one line each — not done
-here, because stopping QA review is not the same decision as stopping the feeder.
+**Scope: `auto_pull`, then `worktree_reap` (mika#2420).** `is_stopped`/`stop_file_path`
+are parameterized by scan name, and mika#2329 shipped that parameterization while
+explicitly refusing to use it twice, for want of a measured need: *"stopping QA review
+is not the same decision as stopping the feeder."* **A destructive operation is
+precisely that need** — during an incident one wants to stop what *deletes* without
+restarting mika-spirit, which is the thing one least wants to do with dispatches in
+flight. `wip_rescue` and `qa_review_reconcile` still have **no** switch: stopping them
+destroys nothing, and shipping gestures nobody asked for stays YAGNI.
 Structural guard `mika2329_le_chemin_du_fichier_sentinelle_a_un_seul_lecteur` refuses
-a second occurrence of the path literal under `src/`; a copy would make no decision
-wrong the day it is written, which is exactly why no behavioural test can see it
-(`grooming_marker` precedent). Operator surfaces, the exact gesture, and the
-post-deploy probe: root `CLAUDE.md` § *Optional (STOP global à chaud — mika#2329)*.
+a second occurrence of **either** scan's path literal under `src/` — extended with the
+second scan in the same commit, because a scan born outside the guard is a scan on
+which the `grooming_marker` lesson replays. A copy would make no decision wrong the day
+it is written, which is exactly why no behavioural test can see it. Note the guard is
+deliberately literal: naming the sentinel path in a *doc comment* is a hit too, so both
+call sites reference the constant and the operator-facing path lives in `CLAUDE.md`.
+Operator surfaces, the exact gesture, and the post-deploy probe: root `CLAUDE.md`
+§ *Optional (STOP global à chaud — mika#2329)* and § *Optional (terminal-worktree
+reaper — mika#2420)*.
+
+### Terminal-Worktree Reaper (mika#2420)
+
+`worktree_reaper` — the **fifth** recurring scan, beside `auto_pull`, `wip_rescue` and
+`qa_review_reconcile` in `task_engine/dispatcher.rs`, carried by mika-dev, cron
+`0 */10 * * * *`. It removes the dispatch worktrees under `.claude/worktrees/` whose PR
+is terminal — and their `target/` with them, which is the 25-to-44-Go consumer the
+founding ticket measures. Outside the LLM, outside the pilot session, triggered by time.
+
+**It is the only scan of the family whose action is destructive and irreversible**, and
+three things follow from that, in this order in the body of `dispatch_worktree_reap`:
+the STOP short-circuit is **first**, before any token resolution; the disposition is
+gated separately from the detection (`MIKA_WORKTREE_REAP_DISPOSITION=observe`); and
+every term of the predicate is fail-safe towards *keep*.
+
+**Three measurements moved the diagnosis, and they are the first deliverable.** The
+ticket reads prior art **#1694** as "closed but ineffective". (M1) It is a **dormeur**,
+a live line of `docs/dormeurs.md` whose wake condition is now met — mika#2420 is its
+*wake*, and U6 removes the line per the register's contract. (M2) Its logic **never
+reached `main`**: commit `097cc66c` carries a real implementation saved as `wip()` by
+the mika#1282 recovery and never promoted. (M3) Its own doc admits the defect in
+writing — *"layers A/B clean up whatever slips through"* — where A and B are **manual**
+and C is a `pull_request.closed` webhook handler, i.e. a **single non-replayable event**
+losable in the four places mika#2334 already had to name. The gesture whose three-hour
+half-life the ticket measures *is* layer B.
+
+**Shape.** `screen_worktrees` (T1–T6) and `apply_work_states` (T7) are pure functions
+carrying the whole decision; `select_worktrees_to_reap` composes them for tests while
+production calls them in sequence so the two `git` subprocesses of T7 are only paid for
+the survivors of T1–T6. The registry is read from `git worktree list --porcelain` —
+**the worktree path is declared, never derived** (mika-platform#58) — and `prunable`
+entries are dropped (they belong to `git worktree prune`, their directory is already
+gone). One `gh pr list --state all` per repo per tick; the `owner/repo` is derived from
+`git remote get-url origin` rather than declared in a second list to keep in sync.
+
+**The cap is a cap on writes**, applied by the caller after the filter (mika#2347's
+lesson transposed): applied upstream it would cap *skips*, and refused candidates would
+consume the tick in place of treatable ones. Pinned by
+`mika2420_un_refus_ne_consomme_pas_la_place_dun_traitable`.
+
+**Token** via `resolve_periodic_scan_token` (PAT-first, App fallback), covered by the
+mika#2205 structural guard, which was extended to this fifth scan in the same commit.
+The scan writes **nothing** on the forge (`gh pr list` is its only call), so there is no
+author for GitHub to read in the ADR-008 sense and no
+`resolve_periodic_scan_label_token`. `PeriodicScan` gained a variant, so
+`mika2334_every_scan_variant_is_covered` fails to compile until the guards enumerate it.
+
+**SOLE WRITER** of the `worktree_reaped` audit `tool_name`, pinned by a source scan —
+that is what makes `SELECT … WHERE tool_name = 'worktree_reaped'` the exact list of
+worktrees the loop removed, i.e. the ticket's guard-rail 3. Refusals are written under
+`worktree_reap_skipped`, keyed `worktree:<path>@<motif>` and **deduplicated on 24 h**
+(mika#2131): a dirty worktree of a merged PR would otherwise write a row every ten
+minutes, and a motif *change* rewrites because it is a state change.
+
+**The negative control is what makes the positive one mean anything, and it had to
+assert the motif.** A vacuity-only assertion is **insensitive for T3 and T4**, both
+absorbed downstream by T5 (no known PR ⇒ no `closedAt` ⇒ refused; an open PR carries
+`closedAt: null` ⇒ refused). Verified by mutation, not by reasoning: removing T3 shifts
+the motif from `pr_unknown` to `pr_closed_at_unreadable` while leaving a vacuity-only
+test green. All seven terms were mutated one at a time and each was observed red.
+
+**Config, the eleven motifs, the four halts and the named residual risk** (an absent
+`refs/remotes/origin/<branch>` reads `Clean`, not `Unreadable`): root `CLAUDE.md`
+§ *Optional (terminal-worktree reaper — mika#2420)*.
 
 ### Unknown-Trigger Veto Lift (mika#2337)
 
