@@ -19,6 +19,7 @@
 //! entry: this handler runs **before** the LLM turn; the guard runs **after**
 //! the LLM turn. Two layers, two failure modes.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -112,6 +113,9 @@ pub(crate) enum ReadyLabelGate {
     RepoNotDispatchable,
     /// Gate 2c — a pilot is still running for this issue (mika#2279).
     PilotInFlight,
+    /// Gate 2d — the host egress relay is down, so no pilot can leave contained
+    /// (mika#2049).
+    EgressRelayDown,
     /// Step 3 — no GitHub token resolved.
     NoToken,
     /// Step 4 — `gh issue view` failed.
@@ -146,6 +150,10 @@ impl ReadyLabelGate {
             Self::ParseFailed => "parse_failed",
             Self::RepoNotDispatchable => "repo_not_dispatchable",
             Self::PilotInFlight => "pilot_in_flight",
+            // mika#2049 — the SAME value as `auto_pull`'s `FILTER_EGRESS_DOWN`,
+            // deliberately: one cause, two audit surfaces. Pinned on both sides
+            // by `auto_pull::tests::mika2131_filter_names_are_a_wire_format`.
+            Self::EgressRelayDown => "egress_relay_down",
             Self::NoToken => "no_token",
             Self::BodyFetchFailed => "body_fetch_failed",
             Self::SeatMismatch => "seat_mismatch",
@@ -333,6 +341,7 @@ pub async fn try_handle_ready_label_dispatch(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    global_home_dir: &Path,
 ) -> VerdictAction {
     try_handle_ready_label_dispatch_with_fetcher(
         text,
@@ -342,6 +351,7 @@ pub async fn try_handle_ready_label_dispatch(
         session_id,
         trace_id,
         skills,
+        global_home_dir,
         |owner_repo, number, token| async move {
             fetch_issue_body_and_labels_via_gh(&owner_repo, number, &token).await
         },
@@ -384,6 +394,12 @@ pub async fn try_handle_ready_label_dispatch_with_fetcher<F, Fut>(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    // The **global** home, for the mika#2049 egress-relay gate. Passed rather
+    // than resolved here: the stamp is written by the dispatch child under
+    // `$HOME/.mika`, and the engine must read it under the same home its own
+    // `global_home_dir` resolves — see `pilot_egress_stamp`'s module doc on what
+    // a divergence between the two costs.
+    global_home_dir: &Path,
     fetch_issue: F,
 ) -> VerdictAction
 where
@@ -424,6 +440,7 @@ where
         session_id,
         trace_id,
         skills,
+        global_home_dir,
         fetch_issue,
     )
     .await;
@@ -452,6 +469,8 @@ async fn try_handle_ready_label_dispatch_inner<F, Fut>(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    // mika#2049 — see the wrapper's note on why this is passed, not resolved.
+    global_home_dir: &Path,
     fetch_issue: F,
 ) -> (VerdictAction, ReadyLabelGate)
 where
@@ -630,6 +649,89 @@ where
                 ),
             },
             ReadyLabelGate::PilotInFlight,
+        );
+    }
+
+    // 2d. Egress-relay gate (mika#2049). The host egress relay is down, so
+    //     `dispatch-lib` would refuse this launch anyway (fail-closed since the
+    //     operator decision of 2026-09-20). Refusing here spends no token, no
+    //     `gh issue view`, creates no tracking row and queues no deferred
+    //     dispatch — the same property the three gates above state.
+    //
+    //     THIS GATE PROTECTS NOTHING, and saying so is what keeps it honest. The
+    //     protection is the shell guard, which probes the socket on every
+    //     dispatch and reads no persistent state. This is an economy: it keeps a
+    //     relay outage from burning tickets' re-drive budget, which is what
+    //     turns « the loop resumes on its own » into a fact rather than a hope.
+    //     Anyone tempted to harden it because it is fail-open should know the
+    //     safety does not rest on it; anyone tempted to make the SHELL guard read
+    //     this stamp would turn the protection into a cache, and a stale cache is
+    //     a fail-open with one more step.
+    //
+    //     Placement mirrors 2c and for the same reasons: after the cheap
+    //     in-memory gates, before step 3's token resolution. Ordering against 2c
+    //     is deliberate — a ticket both in flight and behind a dead relay is
+    //     refused as "in flight", because that pilot started before the outage
+    //     and its own refusal is the more precise statement.
+    //
+    //     Refusal returns `Handled`, never `Passthrough` — for the fifth time in
+    //     this function and for the reason written at each of the other four.
+    //
+    //     Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+    //     "serving" and the dispatch proceeds exactly as before this gate
+    //     existed. None of those readings can open the network.
+    if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } =
+        crate::pilot_egress_stamp::relay_verdict(
+            global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        )
+    {
+        let owner_repo = location.owner_repo();
+        // WARN, not INFO — unlike 2c, this is not a nominal consequence of how
+        // the feeder and the webhook compose. A `ready` event refused because the
+        // host relay is down means the loop is stopped, which is the cost the
+        // operator accepted in writing and wants to see.
+        warn!(
+            event = "ready_label_egress_relay_down",
+            repo = %owner_repo,
+            num = location.number,
+            motif = %motif,
+            age_secs,
+            "ready_label_handler: `ready` event refused — the host egress relay is \
+             down, so no pilot can leave contained (mika#2049). The ticket keeps \
+             its label and is not parked."
+        );
+
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_egress_relay_down",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} refused=egress_relay_down motif={} stamp_age_secs={}",
+                    owner_repo, location.number, motif, age_secs
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write egress-relay refusal audit event \
+                 (non-fatal)"
+            );
+        }
+
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_egress_relay_down_pre_digest(location, &motif),
+            },
+            ReadyLabelGate::EgressRelayDown,
         );
     }
 
@@ -1250,6 +1352,42 @@ fn format_pilot_in_flight_pre_digest(
     )
 }
 
+/// Pre-digest for a `ready` event refused because the host egress relay is down
+/// (mika#2049).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as its
+/// four neighbours.
+///
+/// Two things it must say and a third it must not. It names **which organ is
+/// broken** (the relay, not the ticket and not the worktree) and **that no
+/// gesture is owed on the ticket** — the loop resumes on its own once the relay
+/// serves, which is the operator's own acceptance criterion. It does NOT
+/// prescribe a remedy on the relay: the model reading this cannot restart a host
+/// daemon, and telling it to try would invite exactly the fabricated-action turn
+/// the house guards against. The remedy travels on the escalation channel and in
+/// the runbook, to a human who can act.
+fn format_egress_relay_down_pre_digest(loc: &ReadyLabelLocation, motif: &str) -> String {
+    let owner_repo = loc.owner_repo();
+    let number = loc.number;
+    format!(
+        "<ready_label_handler>\n\
+         DISPATCH REFUSED — the host egress relay is down ({motif}), so no pilot \
+         can be launched with its network cut (mika#2049).\n\n\
+         {owner_repo}#{number} keeps its `ready` label and is NOT parked. No task \
+         was created, no dispatch was deferred, no re-drive budget was spent. The \
+         loop resumes on its own once the relay serves again — no gesture is owed \
+         on this ticket.\n\n\
+         You MUST NOT:\n\
+         - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
+         - call `create_task` for this issue\n\
+         - remove, re-add or re-trigger the `ready` label\n\
+         - claim the relay has been restarted, or attempt to restart it\n\n\
+         An operator has already been escalated to on the notification channel. \
+         Acknowledge and end the turn.\n\
+         </ready_label_handler>"
+    )
+}
+
 /// Pre-digest for a `ready` event on a ticket an operator is holding
 /// (mika#2263 défaut (c)).
 ///
@@ -1546,6 +1684,7 @@ mod tests {
             Self::ParseFailed,
             Self::RepoNotDispatchable,
             Self::PilotInFlight,
+            Self::EgressRelayDown,
             Self::NoToken,
             Self::BodyFetchFailed,
             Self::SeatMismatch,
@@ -1573,17 +1712,18 @@ mod tests {
                 Self::ParseFailed => 1,
                 Self::RepoNotDispatchable => 2,
                 Self::PilotInFlight => 3,
-                Self::NoToken => 4,
-                Self::BodyFetchFailed => 5,
-                Self::SeatMismatch => 6,
-                Self::OperatorHeld => 7,
-                Self::TaskCreateFailed => 8,
-                Self::ToolNotFound => 9,
-                Self::ToolNotLongRunning => 10,
-                Self::DispatchReadinessFailed => 11,
-                Self::CallbackCreateFailed => 12,
-                Self::HandlerNotFound => 13,
-                Self::Dispatched => 14,
+                Self::EgressRelayDown => 4,
+                Self::NoToken => 5,
+                Self::BodyFetchFailed => 6,
+                Self::SeatMismatch => 7,
+                Self::OperatorHeld => 8,
+                Self::TaskCreateFailed => 9,
+                Self::ToolNotFound => 10,
+                Self::ToolNotLongRunning => 11,
+                Self::DispatchReadinessFailed => 12,
+                Self::CallbackCreateFailed => 13,
+                Self::HandlerNotFound => 14,
+                Self::Dispatched => 15,
             }
         }
     }
@@ -1836,9 +1976,10 @@ mod tests {
         }
         assert_eq!(
             ReadyLabelGate::ALL.len(),
-            15,
-            "the handler has fifteen ways out (mika#2323 M3); if that changed, update the \
-             inventory in CLAUDE.md in the same commit"
+            16,
+            "the handler has sixteen ways out (mika#2323 M3, +1 for the mika#2049 \
+             egress-relay gate); if that changed, update the inventory in CLAUDE.md \
+             in the same commit"
         );
     }
 

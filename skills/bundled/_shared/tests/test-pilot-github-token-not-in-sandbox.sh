@@ -46,7 +46,9 @@ assert_eq() {
 FAKE_TOKEN="ghp_2056abcdef2056abcdef2056abcdef2056abcd"
 
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2056-XXXXXX")
-trap 'rm -rf "$TMPROOT"' EXIT
+# mika#2049 — the fabricated relay's listener dies with the temp tree. Guarded:
+# the helper is sourced later and may never be, if bwrap is absent.
+trap 'if declare -F stop_fake_egress_relay >/dev/null 2>&1; then stop_fake_egress_relay; fi; rm -rf "$TMPROOT"' EXIT
 export HOME="$TMPROOT/home"
 WORKTREE_DIR="$TMPROOT/worktree"
 mkdir -p "$HOME" "$WORKTREE_DIR" "$HOME/.mika/data/pilot-transcripts"
@@ -164,9 +166,15 @@ echo "----------------------------------------------------------------"
 if ! command -v bwrap >/dev/null 2>&1; then
     echo "  ⊘ real-sandbox checks skipped — bwrap not installed on PATH"
 else
-    # Neutralise the daemon launchers so no real egress proxy / mitmproxy is
-    # spawned by this test; Phase 2a (fs cut) is enough to prove env/fs absence.
-    _ensure_pilot_egress_proxy() { return 1; }
+    # mika#2049 — a SERVING relay, fabricated. This used to stub the launcher to
+    # `return 1`, which exercised the Phase 2a fallback (fs cut, network open).
+    # That fallback no longer exists: the posture is fail-closed, so `return 1`
+    # now makes `_run_pilot_sandboxed` refuse and there would be no sandbox left
+    # to inspect. The credential-absence invariant (mika#2056) is unchanged;
+    # only the preparation moved. See lib-fake-egress-relay.sh.
+    # shellcheck source=skills/bundled/_shared/tests/lib-fake-egress-relay.sh
+    source "$SCRIPT_DIR/lib-fake-egress-relay.sh"
+    stub_serving_egress_relay "$TMPROOT"
     _ensure_pilot_helper() { return 1; }
 
     # Production shape: empty secret allowlist (the mika#2056 state).

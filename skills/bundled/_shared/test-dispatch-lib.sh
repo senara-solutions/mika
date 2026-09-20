@@ -4495,12 +4495,20 @@ time.sleep(30)
     i=0
     while [ $i -lt 20 ] && [ ! -f "$marker" ]; do sleep 0.05; i=$((i + 1)); done
     [ -f "$marker" ] && launched=yes
-    # Order matters: the missing-binary line ends in "(falling back to fs-only)",
-    # so matching fs-only first would swallow it and make the two fallbacks
-    # indistinguishable -- the exact confusion the last assertion guards against.
+    # mika#2049 re-tokenised these two lines. Pre-2049 BOTH ended in "(falling
+    # back to fs-only)" and only one carried a stable token, so this `case` had
+    # to be ordered defensively to keep them apart -- and an operator using
+    # `pilot_egress_guard.unreachable` as THE predicate read a nominal regime on
+    # a fleet whose proxy binary was never deployed (the gap mika#2050 had to
+    # document). Each cause now carries its own token, so the two arms are
+    # disjoint by construction rather than by ordering.
+    #
+    # The strings no longer say "falling back" because nothing falls back any
+    # more: the caller refuses. Leaving them would have made Signal S (mika#2050)
+    # count a population that can no longer exist.
     case "$out" in
-        *"Phase 2b network cut disabled"*) msg=phase2b ;;
-        *"falling back to fs-only"*) msg=fs-only ;;
+        *"pilot_egress_guard.binary_missing"*) msg=binary-missing ;;
+        *"pilot_egress_guard.unreachable"*) msg=unreachable ;;
         *"pilot-egress-proxy launched"*) msg=launched-ok ;;
         *) msg=none ;;
     esac
@@ -4510,8 +4518,8 @@ time.sleep(30)
 
 # THE regression. Pre-fix this is "rc=0 launched=yes msg=launched-ok": the
 # orphan file satisfies [ -S ], the guard affirms a launch that never happened.
-assert_eq "orphan socket + proxy that dies before binding => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "orphan socket + proxy that dies before binding => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies)"
 
 # The liveness probe must still recognise a real listener after the probe was
@@ -4521,20 +4529,22 @@ assert_eq "live listener => already-alive, proxy not relaunched" \
     "$(_egress_guard_probe live dies)"
 
 # No file at the path: this already worked pre-fix. Locks it against regression.
-assert_eq "no socket at path + proxy that dies => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "no socket at path + proxy that dies => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe absent dies)"
 
-# The two fallbacks must stay distinguishable: a missing binary is a deploy
-# state, an unreachable socket is a runtime failure. Same rc, different line.
-assert_eq "missing proxy binary => Phase 2b disabled, not fs-only" \
-    "rc=1 launched=no msg=phase2b" \
+# The two causes must stay distinguishable: a missing binary is a deploy state
+# (remedy: `make install`), an unreachable socket is a runtime failure (remedy:
+# restart the relay). Same rc, different token, different gesture -- which is
+# why mika#2049 gave each one a token of its own.
+assert_eq "missing proxy binary => binary_missing, not unreachable" \
+    "rc=1 launched=no msg=binary-missing" \
     "$(_egress_guard_probe ghost missing)"
 
 # The probe passes the path as argv, never interpolated into python source
 # (plan KTD2). A quote in the path used to be a syntax error waiting to happen.
 assert_eq "socket path containing a single quote does not break the probe" \
-    "rc=1 launched=yes msg=fs-only" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies "mika'\''egress.sock")"
 
 # R8: no fake-proxy output may reach the operational proxy log.
