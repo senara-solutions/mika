@@ -7,11 +7,29 @@
 **Défaut de flotte visé :** tenant cloud grand-public, `MIKA_AGENT_TIER=family`,
 modèle `z-ai/glm-5.2`
 
-> **Note de re-grooming (2026-09-20).** Ce plan a été écrit le 18/09 et relu
-> contre le code de HEAD le 20/09. Cinq corrections ont été portées, dont une
-> qui change la conception : § 4a change le **site de vérité** de l'axe langue.
-> Les quatre autres sont des dérives de référence et sont listées en § 8, avec
-> ce qu'elles enseignent sur la façon d'ancrer un plan.
+> **Note de re-grooming (2026-09-20, première passe).** Ce plan a été écrit le
+> 18/09 et relu contre le code de HEAD le 20/09. Cinq corrections ont été
+> portées, dont une qui change la conception : § 4a change le **site de vérité**
+> de l'axe langue. Les quatre autres sont des dérives de référence et sont
+> listées en § 8, avec ce qu'elles enseignent sur la façon d'ancrer un plan.
+>
+> **Note de re-grooming (2026-09-20, seconde passe).** Chaque site nommé par ce
+> plan a été revérifié contre HEAD, un par un : les neuf em-dashes de
+> `FAMILY_SOUL` et son sentinelle en dernière ligne, les trois assembleurs, les
+> trois sites `strip_internal_tags`, la lecture `get_customer_config("timezone")`
+> dans `load_agent_context`, le refus de `## Current Time` et le
+> `section_count <= 5` du compact, la position 5e de la dernière garde de la
+> famille. **Zéro dérive** — le code n'a pas bougé sous le plan en deux jours, et
+> il n'y a donc rien à ajouter à § 8, qui recense des dérives et pas des lacunes.
+>
+> Ce qui a été trouvé est d'une autre nature : une **lacune d'instrumentation du
+> plan lui-même**, révélée par la relecture de mika#2358 (déployé le 17/09, trois
+> jours avant ce plan, dans le fichier même que § 4a propose de modifier). Ce
+> ticket livre **deux** surfaces là où ce plan n'en prévoyait qu'une — le palier
+> « valeur illisible » *et* l'événement de provenance — et c'est la seconde qui
+> tranche la halte la plus probable de l'axe 2. Corrigé en § 4a (le modèle
+> d'implémentation est nommé), en § 6 (cinquième signal + sonde 2 réécrite) et
+> dans la Definition of Done.
 
 ---
 
@@ -332,7 +350,31 @@ paramètre de `run_loop` pour la garde, sur le modèle de `loaded_skill_names`
 (mika#2355). C'est un filetage de champ, pas un nouveau mécanisme — et c'est le
 **même** filetage quel que soit le site de vérité choisi, ce qui est précisément
 pourquoi le choix du site se décide sur les quatre mesures de R5 et non sur le
-coût du filetage.
+coût du filetage. Vérifié contre HEAD : la lecture `timezone` est une ligne de
+`load_agent_context`, le champ est déjà sur la struct, et il est déjà threadé aux
+**trois** contextes d'appel.
+
+**Le modèle d'implémentation est nommé, pas décrit — mika#2358, même fichier,
+trois jours avant ce plan.** `PROACTIVE_DAILY_BUDGET_KEY` a exactement la forme
+que cet axe demande, et la copier est plus court que la re-concevoir. Quatre
+pièces à reprendre telles quelles :
+
+| pièce mika#2358 | équivalent ici |
+|---|---|
+| `PROACTIVE_DAILY_BUDGET_KEY` (constante nommée dans `SETTABLE_CONFIG_KEYS`) | `TENANT_LANGUAGE_KEY` |
+| bras dédié de `validate_config_value` avec message nommant le domaine | bras `{fr, en}` |
+| `ResolvedProactiveBudget { budget, source }` + `ProactiveBudgetSource::{Config, Default}` avec son `as_str()` de format de fil | `ResolvedTenantLanguage` + sa provenance |
+| `proactive_budget_invalid` (WARN) **et** `proactive_budget_resolved` (INFO dédupliqué) | § 6, et voir ci-dessous |
+
+**La quatrième ligne est celle que la première passe de ce plan avait à moitié
+manquée.** mika#2358 livre **deux** événements et non un : le WARN du palier
+« illisible » *et* l'INFO de provenance. Ce plan ne prévoyait que le premier.
+Or les deux répondent à des questions différentes — « quelqu'un a-t-il écrit une
+valeur hors domaine ? » contre « quelle langue est réellement en vigueur pour ce
+tenant ? » — et c'est la seconde qui sépare les deux causes d'un symptôme
+persistant. Le doc-comment de `ProactiveBudgetSource` cite mika#2293 mot pour
+mot sur ce point, et la raison vaut identiquement ici : *un réglage qu'on ne peut
+pas observer n'est pas un réglage, c'est un espoir.*
 
 **Pourquoi l'absence ne vaut pas « la langue de la persona ».** `FAMILY_SOUL`
 prescrit le français en dur, et mika#2023 a nommé par écrit le prix de ce
@@ -483,6 +525,7 @@ contredire.
 | 1 | garde structurelle : scan de source, `strip_internal_tags` suivi du normaliseur aux trois sites | un quatrième site muet — halte, pas d'allowlist |
 | 2 | `config_keys::tests::mika2247_language_three_states` | qu'une absence arme quoi que ce soit |
 | 2 | `config_keys::tests::mika2247_unknown_value_is_refused_at_the_door` | une valeur hors `{fr, en}` acceptée par `set_config` |
+| 2 | `config_keys::tests::mika2247_resolved_source_is_a_wire_format` | deux orthographes d'une provenance, qui couperaient une population en deux sans le dire (modèle `ProactiveBudgetSource::as_str`) |
 | 2 | `guards::tests::mika2247_short_text_is_undetermined` | le faux positif sur « OK » / « Bonjour 🌸 » |
 | 2 | `tests/eval/doctrine_regressions/` : le fil mesuré (EN puis FR), **plus** un contrôle négatif par état | une garde qui fire en `Unknown` |
 | 3 | `prompt::tests::mika2247_local_time_is_computed_not_inferred` | le retour à UTC seul |
@@ -509,6 +552,18 @@ un prédicat n'en lisant qu'une.
 - `tenant_language_unrecognized_value` (WARN) — **zéro attendu** ; ne peut venir
   que d'une écriture hors outil, `validate_config_value` refusant à la porte.
   Nomme la valeur entre guillemets, pour qu'un espace parasite se voie.
+- `tenant_language_resolved` (INFO — champs `agent_id`, `language`, `source`) —
+  **la réponse à « quelle langue est en vigueur pour ce tenant ? », sans lire la
+  base.** Modèle et raison : `proactive_budget_resolved` (mika#2358), lui-même
+  calqué sur `llm_budget_resolved` (mika#2293). Deux valeurs de `source` et
+  elles nomment deux remèdes opposés : `config` → la consigne est en vigueur,
+  donc un symptôme survivant est imputable à autre chose (et c'est § 5a du
+  chemin compact qu'il faut lire en premier) ; `default` → l'écriture n'a pas
+  atterri, la cause est dans `set_config` ou dans le tour qui aurait dû
+  l'appeler, **pas** dans la garde. Dédupliqué sur le couple résolu, comme ses
+  deux aînés : une répétition à l'identique est tue, un **changement** est
+  ré-émis — c'est ce qui rend « l'utilisateur a demandé l'anglais en cours de
+  fil » lisible sur une ligne.
 
 En base : `SELECT * FROM audit_events WHERE tool_name = 'set_config';` répond à
 « quand la langue de ce tenant a-t-elle été posée, et par quelle session ? » —
@@ -525,10 +580,30 @@ borne, et son effet est vérifiable par test plutôt que par grep.
    sont verts signifie un **quatrième** chemin de sortie — l'établir, ne pas
    élargir le normaliseur au gateway par réflexe.
 2. **AC2.** Poser `language = fr` sur le tenant mesuré **par la conversation**
-   (c'est le chemin qu'on teste), vérifier la ligne `## Runtime`, puis rejouer
-   le fil bilingue. *Halte* : si la bascule persiste avec
-   `guard.response_language_drift` **vide**, le tour passe par un assembleur que
-   la garde ne traverse pas ; établir lequel d'abord.
+   (c'est le chemin qu'on teste, et c'est le seul qui atteste que la clé est
+   réglable sans redéploiement), puis lire la provenance avant de rejouer quoi
+   que ce soit :
+   ```bash
+   grep tenant_language_resolved "$MIKA_SPIRIT_LOG_FILE" \
+     | jq 'select(.agent_id == "<tenant>") | {language, source}'
+   ```
+   Attendu : `{"language": "fr", "source": "config"}`. Rejouer ensuite le fil
+   bilingue mesuré. **Trois haltes, et l'ordre est celui du coût.**
+   *Halte 2a — `source: "default"`* : l'écriture n'a pas atterri. **Ne pas
+   toucher à la garde ni au détecteur** — la cause est dans `set_config` ou dans
+   le tour qui aurait dû l'appeler, et aucun réglage du seuil ne la corrigera.
+   *Halte 2b — aucune ligne du tout alors que le tenant a tourné* : le binaire
+   servi est antérieur au correctif (classe mika#2340) ; établir le déploiement
+   avant toute conclusion sur le texte. *Halte 2c — `source: "config"` et la
+   bascule persiste avec `guard.response_language_drift` **vide*** : le tour
+   passe par un assembleur que la garde ne traverse pas ; **lire d'abord le
+   carve-out compact de § 5a**, puis établir lequel.
+
+   *(Cette sonde demandait en première passe de « vérifier la ligne
+   `## Runtime` » — ce qui exige d'armer `MIKA_LOG_LLM_BODIES` **sur
+   mika-spirit** et de le redémarrer, mika#2220. Un grep répond à la même
+   question sans toucher au service, et c'est précisément ce que l'événement de
+   provenance achète.)*
 3. **AC3.** Une salutation le soir, fuseau déclaré, puis la même **sans** fuseau.
    Le second cas doit produire une salutation non horodatée, pas un pari.
 4. **Contrôle négatif opérateur.** Sur la station de Vincent (tier `default`,
@@ -612,6 +687,11 @@ demande d'écrire.
       états, lue dans `load_agent_context` à côté de `timezone`, filetée vers
       `PromptContext` / `SilentPromptContext` et vers `run_loop`.
 - [ ] `## Runtime` porte la langue déclarée ; **rien** en `Unknown`.
+- [ ] `tenant_language_resolved` émis (INFO, dédupliqué sur le couple résolu),
+      portant `source` à deux valeurs — sur le modèle de
+      `proactive_budget_resolved` (mika#2358), et **indépendant de tout réglage
+      de télémétrie** : c'est un événement de configuration, qui doit rester
+      lisible précisément quand on a réduit le bruit.
 - [ ] Garde `response_language_drift` : un re-prompt, fail-open sur indécidable,
       résidu nommé par `_uncorrected`, non sautée par `skip_remaining_guards`.
 - [ ] `write_time_section` pose l'heure locale et le moment de la journée
@@ -626,7 +706,10 @@ demande d'écrire.
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt` verts ;
       `scripts/check-byte-slices.sh` vert.
 - [ ] Root `CLAUDE.md` documente la clé `language` (trois états, réglable par
-      `set_config` et `/config set`, hot-swappable) et les quatre signaux de grep.
+      `set_config` et `/config set`, hot-swappable) et les **cinq** signaux de
+      grep, dans le voisinage de mika#2358 — un opérateur qui cherche « comment
+      épingler la langue d'un tenant » cherche là où il a trouvé « comment
+      borner ses messages proactifs ».
 - [ ] `crates/mika-agent/CLAUDE.md` documente les deux nouvelles gardes dans la
       table fabrication/registre, et `crates/mika-common/CLAUDE.md` le
       normaliseur dans § *Text*.
