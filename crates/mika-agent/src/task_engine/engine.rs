@@ -1125,6 +1125,10 @@ impl TaskEngine {
                         &config,
                         &candidate.dispatch_class,
                         "stuck_pending_reaper",
+                        // mika#2413 — no wrapper is being consumed here: the
+                        // reaper acts on a parent, not on a turn. Nothing to
+                        // take out of the population.
+                        None,
                     )
                     .await
                 }
@@ -1133,47 +1137,65 @@ impl TaskEngine {
                 None => RearmOutcome::Unrepairable,
             };
 
-            if outcome == RearmOutcome::NotNow {
-                debug!(
-                    task_id = %candidate.id,
-                    issue = %candidate.reference_url,
-                    "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
-                );
-                continue;
-            }
-
-            if outcome == RearmOutcome::Rearmed {
-                info!(
-                    event = "stuck_pending_task_rearmed",
-                    task_id = %candidate.id,
-                    issue = %candidate.reference_url,
-                    age_seconds = candidate.age_seconds,
-                    previous_rearm_count = candidate.rearm_count,
-                    wrappers_seen = %wrappers_seen,
-                    "orphaned pending task re-armed instead of expired"
-                );
-                if let Err(e) = self
-                    .db
-                    .log_audit_event(
-                        &system_session,
-                        "stuck_pending_task_rearmed",
-                        &format!("task:{}", candidate.id),
-                        Some("pending"),
-                        Some("pending"),
-                        Some(&format!(
-                            "issue:{} age_seconds:{} rearm_count:{} {}",
-                            candidate.reference_url,
-                            candidate.age_seconds,
-                            candidate.rearm_count,
-                            wrappers_seen
-                        )),
-                        None,
-                    )
-                    .await
-                {
-                    warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
+            // A `match` rather than the two `if`s this used to be (mika#2413):
+            // the fall-through arm expires the parent, so a variant added to
+            // `RearmOutcome` and forgotten here would destroy tasks instead of
+            // failing to compile.
+            match outcome {
+                RearmOutcome::NotNow => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
+                    );
+                    continue;
                 }
-                continue;
+                // Unreachable in practice — `find_orphaned_pending_issue_tasks`
+                // clause (1) already excludes a parent with a live wrapper —
+                // but the two predicates are maintained apart, and the safe
+                // reading of a disagreement is "leave it alone".
+                RearmOutcome::AlreadyRepresented => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stuck-pending reaper: parent already represented — nothing to repair"
+                    );
+                    continue;
+                }
+                RearmOutcome::Rearmed => {
+                    info!(
+                        event = "stuck_pending_task_rearmed",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        wrappers_seen = %wrappers_seen,
+                        "orphaned pending task re-armed instead of expired"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stuck_pending_task_rearmed",
+                            &format!("task:{}", candidate.id),
+                            Some("pending"),
+                            Some("pending"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{} {}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count,
+                                wrappers_seen
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
+                    }
+                    continue;
+                }
+                RearmOutcome::Unrepairable => {}
             }
 
             // Repair is not available any more. Cancel surviving wrappers FIRST:
@@ -1502,6 +1524,9 @@ impl TaskEngine {
                         &config,
                         &candidate.dispatch_class,
                         "stale_blocked_dispatch",
+                        // mika#2413 — the sweep acts on a parent, not on a
+                        // consumed turn: no wrapper to take out.
+                        None,
                     )
                     .await
                 }
@@ -1514,6 +1539,16 @@ impl TaskEngine {
                         task_id = %candidate.id,
                         issue = %candidate.reference_url,
                         "stale_blocked_dispatch: repair refused for a transient reason — retrying next tick"
+                    );
+                }
+                // mika#2413 — the parent was returned to `pending` just above
+                // and a live wrapper already represents it, so the queue will
+                // carry it on its own. Nothing to repair, nothing to expire.
+                RearmOutcome::AlreadyRepresented => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stale_blocked_dispatch: parent already represented — nothing to repair"
                     );
                 }
                 RearmOutcome::Rearmed => {
@@ -6029,6 +6064,359 @@ mod tests {
             parent.status, "blocked",
             "a refusal that is not a slot refusal is none of this sweep's business"
         );
+    }
+
+    // ---- mika#2413 — a groom queued behind the arch seat spends no budget ----
+
+    const PARENT_2025: &str = "e7c4e9ad-0000-4000-8000-000000000001";
+
+    /// The 2026-09-19 shape: `#2025`'s groom parent, `pending`, `groom` class,
+    /// with the arch seat held by another groom.
+    async fn seed_2413_groom_parent(db: &AsyncDatabase, metadata: Option<&str>) {
+        db.with_db({
+            let metadata = metadata.map(str::to_string);
+            move |d| {
+                d.conn.execute(
+                    "INSERT INTO tasks
+                         (id, agent_id, depth, label, trigger_type, action_type,
+                          action_config, status, reference_url, source, type,
+                          metadata, dispatch_class, created_at, updated_at)
+                     VALUES (?1, 'mika', 0, 'ready-label: senara-solutions/mika#2025',
+                             'manual', 'none', '{}', 'pending',
+                             'https://github.com/senara-solutions/mika/issues/2025',
+                             'self_dev', 'issue', ?2, 'groom',
+                             '2026-09-19T18:55:00Z', '2026-09-19T18:55:00Z')",
+                    rusqlite::params![PARENT_2025, metadata],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// One deferred wrapper of `#2025`'s parent, in a chosen status.
+    async fn seed_2413_wrapper(db: &AsyncDatabase, id: &str, status: &str) {
+        let config = rebuild_deferred_action_config(
+            PARENT_2025,
+            "https://github.com/senara-solutions/mika/issues/2025",
+            "groom",
+        )
+        .unwrap();
+        db.with_db({
+            let (id, status) = (id.to_string(), status.to_string());
+            move |d| {
+                d.conn.execute(
+                    "INSERT INTO tasks
+                         (id, agent_id, parent_task_id, depth, label, trigger_type,
+                          action_type, action_config, status, source, dispatch_class,
+                          completed_at, created_at, updated_at)
+                     VALUES (?1, 'mika', ?2, 0, ?3, 'callback', 'resume_agent', ?4, ?5,
+                             'deferred_dispatch', 'groom',
+                             CASE WHEN ?5 IN ('completed','delivered','expired')
+                                  THEN strftime('%Y-%m-%dT%H:%M:%SZ','now') END,
+                             strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                             strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                    rusqlite::params![
+                        id,
+                        PARENT_2025,
+                        crate::agent::DEFERRED_DISPATCH_LABEL,
+                        config,
+                        status
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// V1 (AC3) — the founding trace, three rounds deep, and the parent survives.
+    ///
+    /// Each round is one full turn of the loop mika#2413 measured: a wrapper is
+    /// promoted and consumed while another groom holds the arch seat, the turn's
+    /// `run_claude_pilot` is refused on `global_dispatch_active` and posts its
+    /// own replacement wrapper, then R9 calls the re-arm on the consumed one.
+    /// Before the fix that re-arm created a *second* wrapper and spent a point of
+    /// budget, and three rounds killed the parent at 19:19:45Z.
+    ///
+    /// The invariant asserted at every round is the one that matters
+    /// operationally: **exactly one live wrapper, and a budget still at zero**.
+    /// One wrapper is what keeps the mika#1205 `already_deferred` intercept from
+    /// short-circuiting the next turn before it even tests the slot.
+    #[tokio::test]
+    async fn mika2413_a_groom_queued_behind_the_arch_seat_spends_no_budget() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        seed_2413_groom_parent(&db, None).await;
+
+        // Round 1 uses the wrapper the refusal posted at dispatch time.
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-000000000001", "pending").await;
+
+        let rounds = [
+            (
+                "5e935a39-0000-4000-8000-000000000001",
+                "e3db2a79-0000-4000-8000-000000000002",
+            ),
+            (
+                "e3db2a79-0000-4000-8000-000000000002",
+                "228efb7b-0000-4000-8000-000000000003",
+            ),
+            (
+                "228efb7b-0000-4000-8000-000000000003",
+                "aa0a5d9d-0000-4000-8000-000000000004",
+            ),
+        ];
+
+        for (round, (consumed, replacement)) in rounds.iter().enumerate() {
+            // Promotion, then the turn returns: `completed` -> `delivered`.
+            db.update_task_status(consumed, "completed").await.unwrap();
+            db.mark_task_delivered(consumed).await.unwrap();
+            // The refused turn registered its own replacement — this is
+            // `register_deferred_callback`, not the re-arm.
+            seed_2413_wrapper(&db, replacement, "pending").await;
+
+            let wrapper = db.get_task(consumed).await.unwrap().unwrap();
+            dispatcher
+                .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+                .await;
+
+            let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "pending",
+                "round {round}: a groom waiting for the arch seat must never be failed"
+            );
+            assert_eq!(
+                db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+                0,
+                "round {round}: waiting for a busy slot is not a repair, so it spends nothing"
+            );
+
+            let live: Vec<_> = wrappers_of(&db, PARENT_2025)
+                .await
+                .into_iter()
+                .filter(|w| w.status == "pending")
+                .collect();
+            assert_eq!(
+                live.len(),
+                1,
+                "round {round}: exactly one wrapper may represent the parent — a second one \
+                 makes the mika#1205 intercept short-circuit the next turn before it tests the slot"
+            );
+            assert_eq!(live[0].id, *replacement, "round {round}");
+
+            // U2 — the consumed wrapper gets the honest terminal record rather
+            // than staying `delivered` (a word reserved for a turn that
+            // dispatched) or `completed` (which L2b counts as starvation).
+            let consumed_row = db.get_task(consumed).await.unwrap().unwrap();
+            assert_eq!(consumed_row.status, "expired", "round {round}");
+            let result = consumed_row.result.unwrap_or_default();
+            assert!(
+                result.contains("déjà représenté"),
+                "round {round}: the record must name why nothing was repaired, got: {result}"
+            );
+        }
+
+        // The seat frees: the turn dispatches for real, and the re-arm stands
+        // down on the pre-existing guard rather than on the new one.
+        let last = "aa0a5d9d-0000-4000-8000-000000000004";
+        db.update_task_status(last, "completed").await.unwrap();
+        db.mark_task_delivered(last).await.unwrap();
+        db.create_task(NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(PARENT_2025.to_string()),
+            depth: 1,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let wrapper = db.get_task(last).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "the real dispatch is in flight");
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2025).await.unwrap(), 0);
+    }
+
+    /// V2 — the negative control, without which V1 proves nothing.
+    ///
+    /// Two halves that differ by **one row**: whether a live sibling wrapper
+    /// represents the parent. If the guard read anything other than that
+    /// population — the cause, the class, the clock — both halves would come out
+    /// the same and V1 would pass against a predicate that decides nothing.
+    ///
+    /// The second half is also the ticket's trace verbatim: with no sibling, the
+    /// three consumptions of 19:03:54 / 19:18:45 / 19:19:45 spend the budget and
+    /// the parent dies on the third. **That half must keep passing** — mika#2413
+    /// narrows which causes spend the mika#2045 budget, it does not remove it.
+    ///
+    /// Reddens on `main` on the first half: there the sibling changes nothing,
+    /// the re-arm succeeds, and `stuck_rearm_count` reaches 1.
+    #[tokio::test]
+    async fn mika2413_the_guard_reads_the_wrapper_population_and_nothing_else() {
+        // Half A — a live sibling exists: refuse, spend nothing.
+        {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            seed_2413_groom_parent(&db, None).await;
+            seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-00000000000a", "delivered").await;
+            seed_2413_wrapper(&db, "e3db2a79-0000-4000-8000-00000000000b", "pending").await;
+
+            let consumed = db
+                .get_task("5e935a39-0000-4000-8000-00000000000a")
+                .await
+                .unwrap()
+                .unwrap();
+            dispatcher
+                .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+                .await;
+
+            assert_eq!(
+                db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+                0,
+                "a represented parent spends nothing"
+            );
+            assert_eq!(
+                wrappers_of(&db, PARENT_2025).await.len(),
+                2,
+                "no replacement may be created on top of a live wrapper"
+            );
+        }
+
+        // Half B — no sibling: the mika#2045 ladder runs to the end, exactly as
+        // it did on 2026-09-19.
+        {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            seed_2413_groom_parent(&db, None).await;
+
+            let consumed_ids = [
+                "5e935a39-0000-4000-8000-0000000000b1",
+                "e3db2a79-0000-4000-8000-0000000000b2",
+                "228efb7b-0000-4000-8000-0000000000b3",
+            ];
+            for id in consumed_ids {
+                seed_2413_wrapper(&db, id, "delivered").await;
+                let consumed = db.get_task(id).await.unwrap().unwrap();
+                dispatcher
+                    .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+                    .await;
+                // The replacement the re-arm created is consumed in its turn,
+                // so the next round starts unrepresented again.
+                for w in wrappers_of(&db, PARENT_2025).await {
+                    if w.status == "pending" {
+                        db.update_task_status(&w.id, "completed").await.unwrap();
+                        db.mark_task_delivered(&w.id).await.unwrap();
+                    }
+                }
+            }
+
+            let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "failed",
+                "a parent whose turns genuinely never dispatch must still terminate (mika#2045)"
+            );
+            let result = parent.result.unwrap_or_default();
+            assert!(
+                result.contains("re-armement différé épuisé"),
+                "the failure must still name the exhausted budget, got: {result}"
+            );
+        }
+    }
+
+    /// V4 — non-regression on mika#1124: the new arm removes a creation, it
+    /// triggers none. Nothing is promoted, no wrapper is born, no child appears.
+    #[tokio::test]
+    async fn mika2413_the_skipped_rearm_creates_nothing_at_all() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        seed_2413_groom_parent(&db, None).await;
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-0000000000c1", "delivered").await;
+        seed_2413_wrapper(&db, "e3db2a79-0000-4000-8000-0000000000c2", "pending").await;
+
+        let before = db.get_child_tasks(PARENT_2025).await.unwrap().len();
+        let consumed = db
+            .get_task("5e935a39-0000-4000-8000-0000000000c1")
+            .await
+            .unwrap()
+            .unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+            .await;
+
+        assert_eq!(
+            db.get_child_tasks(PARENT_2025).await.unwrap().len(),
+            before,
+            "no child may be created"
+        );
+        let sibling = db
+            .get_task("e3db2a79-0000-4000-8000-0000000000c2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sibling.status, "pending",
+            "the live wrapper must not be promoted by the refusal"
+        );
+    }
+
+    /// The consumed wrapper is not evidence that its own parent is represented.
+    /// Without the exclusion, the `silent_turn_error` path — where the wrapper is
+    /// still `completed` with a fresh `completed_at` — would refuse every re-arm
+    /// for the whole liveness window, and mika#2045's repair would be dead on
+    /// that path.
+    #[tokio::test]
+    async fn mika2413_a_wrapper_cannot_represent_its_own_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        seed_2413_groom_parent(&db, None).await;
+        // Promotion wrote `completed`; the turn errored, so nothing wrote
+        // `delivered`. This is the mika#2045 `silent_turn_error` shape.
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-0000000000d1", "completed").await;
+
+        let consumed = db
+            .get_task("5e935a39-0000-4000-8000-0000000000d1")
+            .await
+            .unwrap()
+            .unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&consumed, "silent_turn_error")
+            .await;
+
+        assert_eq!(
+            db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+            1,
+            "the consumed wrapper must be out of the population — otherwise this path never repairs"
+        );
+        let live: Vec<_> = wrappers_of(&db, PARENT_2025)
+            .await
+            .into_iter()
+            .filter(|w| w.status == "pending")
+            .collect();
+        assert_eq!(live.len(), 1, "the parent must be represented again");
     }
 
     /// L2b measures and mutates nothing. A wrapper promoted long ago is

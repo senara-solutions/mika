@@ -1196,6 +1196,24 @@ impl AsyncDatabase {
         .await
     }
 
+    /// The live deferred wrapper representing the parent, if any, with one
+    /// wrapper optionally taken out of the population (mika#2413).
+    /// See [`Database::find_live_deferred_wrapper_child`].
+    pub async fn find_live_deferred_wrapper_child(
+        &self,
+        parent_task_id: &str,
+        promoted_liveness_seconds: i64,
+        exclude_task_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        let x = exclude_task_id.map(str::to_owned);
+        self.with_db(move |db| {
+            db.find_live_deferred_wrapper_child(&a, &p, promoted_liveness_seconds, x.as_deref())
+        })
+        .await
+    }
+
     /// Find `pending` self_dev issue parents that no callback child represents
     /// any more (mika#2045). See [`Database::find_orphaned_pending_issue_tasks`].
     pub async fn find_orphaned_pending_issue_tasks(
@@ -1264,6 +1282,13 @@ impl AsyncDatabase {
         let t = task_id.to_owned();
         self.with_db(move |db| db.increment_stuck_rearm_count(&t))
             .await
+    }
+
+    /// Reset `metadata.stuck_rearm_count` on proof of a real dispatch
+    /// (mika#2413). See [`Database::reset_stuck_rearm_count`].
+    pub async fn reset_stuck_rearm_count(&self, task_id: &str) -> Result<bool> {
+        let t = task_id.to_owned();
+        self.with_db(move |db| db.reset_stuck_rearm_count(&t)).await
     }
 
     /// Parents the reaper is sheltering only because a promoted wrapper is still
