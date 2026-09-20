@@ -28,14 +28,17 @@ that exposes browser automation tools.
 
 ## 2. Configure the MCP Server
 
-Add Playwright MCP to your agent's `mcp.json` using the CLI:
+MCP configuration is **operator-global, not per-agent** (mika#1737): adding
+Playwright activates it for every agent on this installation. Add it with the
+CLI:
 
 ```sh
 mika mcp add playwright --transport stdio --command npx --args -y @playwright/mcp
 ```
 
-Or edit `~/.mika/mcp.json` (or `~/.mika/agents/<name>/mcp.json` in multi-agent
-mode) directly:
+Or edit the operator-global file directly —
+`~/.config/mika/mcp-servers.json`, or whatever
+[mcp.md § 1](mcp.md) resolves for your environment:
 
 ```json
 {
@@ -50,7 +53,9 @@ mode) directly:
 }
 ```
 
-Restart Mika after changing `mcp.json` -- MCP servers connect on startup.
+Restart **mika-spirit** after changing the file -- MCP servers connect on
+startup, and `mika ask` runs its turn inside the daemon rather than connecting
+on its own.
 
 ---
 
