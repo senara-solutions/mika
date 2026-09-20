@@ -100,9 +100,53 @@ n'est plus lu.**
 
 ## M1 — L'inventaire exhaustif des sites de match (exigence Prime)
 
-Relevé sur l'arbre à `17f42a6b`, par recherche sur `crates/`, `scripts/`,
-`skills/`, `.github/`, `.claude/`. **C'est la table que le lint doit refléter**,
-et AC2 exige qu'elle vive dans un fichier unique plutôt que dans ce plan.
+### M1.0 — Le relevé est produit par une commande, jamais tenu à la main
+
+**La première version de ce plan présentait la table ci-dessous comme « relevé
+sur l'arbre à `17f42a6b` », sans livrer le geste qui la produit. C'était une
+promesse, pas une preuve — et la révision l'a démontré sur elle-même : le relevé
+était *exact* sur chacune de ses lignes et *incomplet*, ratant
+`dispatch-lib.sh::_extract_plan_path` (`grep -oP '^> - \*\*Plan:\*\* `\K…'`,
+ligne 6581), qui est le lecteur le plus strict du callout `Plan` de tout le
+dépôt.** Un relevé manuel peut être juste et manquer un site ; c'est précisément
+la classe que AC4 existe pour fermer, et il serait incohérent de fonder AC2 sur
+le mécanisme que AC4 déclare insuffisant.
+
+Le plan livre donc **`scripts/canonical-tokens-survey.sh`** — le producteur du
+relevé, exécutable par un tiers, dont la sortie est l'entrée de la colonne
+`site de match` du TSV :
+
+```sh
+# Énumère tout site de match candidat : littéral de callout, token de verdict,
+# clé de marqueur, préfixe webhook — dans les cinq formes de lecture strictes
+# que le dépôt emploie (Regex::new, starts_with, strip_prefix, match_indices,
+# grep -E/-oE/-oP, sed -n 's/^…/').
+scripts/canonical-tokens-survey.sh            # tableau lisible (fichier, symbole, forme, littéral)
+scripts/canonical-tokens-survey.sh --tsv      # colonnes 1 et 3 du TSV, prêtes à diff
+scripts/canonical-tokens-survey.sh --check    # diff contre le TSV livré ; rouge sur divergence
+```
+
+Le mode `--check` **est** le scan M5 dans sa moitié shell : le relevé et la garde
+d'exhaustivité partagent un lecteur, pour la raison que `grooming_marker.rs` a
+déjà dû écrire — deux lecteurs d'une même question divergent, et la divergence
+est silencieuse (mika#2158 : deux regex de marqueur ont répondu différemment
+pendant des mois sans que rien ne casse).
+
+**Le TSV désigne un site par son symbole, jamais par un numéro de ligne.** Un
+numéro pourrit au premier commit qui insère une ligne au-dessus, et il pourrit
+*en silence* : la colonne resterait syntaxiquement valide en désignant autre
+chose. Le format est `chemin::symbole` (`crates/mika-agent/src/auto_pull.rs::PLAN_CALLOUT_RE`,
+`skills/bundled/_shared/dispatch-lib.sh::_extract_plan_path`). Les numéros de
+ligne des tables ci-dessous sont donnés **à titre de repère de lecture à
+`17f42a6b`** et ne sont pas ce que le TSV porte.
+
+### M1.1 — La classification, seule part qui reste au plan
+
+Ce que la commande ne peut pas produire, c'est la colonne `classe` : décider
+qu'un lecteur est tolérant ou strict est une lecture de son code, pas un motif
+textuel. **C'est la seule part de M1 que ce plan revendique**, et c'est celle qui
+porte R1. **C'est la table que le lint doit refléter**, et AC2 exige qu'elle vive
+dans un fichier unique plutôt que dans ce plan.
 
 ### Classe A — lecteur TOLÉRANT (hors périmètre du lint, par décision)
 
@@ -125,7 +169,8 @@ les accuse toutes les six.
 |---|---|---|
 | `> - **Grooming history:**` | `grooming_marker.rs:CALLOUT_LINE_RE` | `(?m)^` ancré, littéral |
 | `> - **Plan:** \`…docs/plans/…\`` | `auto_pull.rs:562` | `(?m)^` ancré ; un segment de dépôt optionnel (mika#2120) |
-| `> - **Plan:**` | `dispatch-lib.sh:1870,2284` | `sed`/`grep -E` ancré |
+| `> - **Plan:**` | `dispatch-lib.sh:1870,2284` | `sed -n 's/^…/` et `grep -qE '^…'` ancrés |
+| `> - **Plan:** \`…docs/plans/…\`` | `dispatch-lib.sh:6581` (`_extract_plan_path`) | `grep -oP '^…\K'` ancré — **le lecteur le plus strict du dépôt**, et celui que le relevé manuel avait raté (M1.0) |
 | `> - **Branch:**` | `auto_pull.rs:865` | `(?m)^` ancré, littéral |
 | `GROOMED`, `ESCALATE[DS]?` | `grooming_marker.rs:VERDICT_TOKEN_RE` | `\b…\b`, **casse stricte** |
 | `READY` (1ʳᵉ passe) | `grooming_marker.rs:FIRST_PASS_READY_RE` grp 1 | **casse stricte** |
@@ -268,6 +313,97 @@ ne peut pas être vert par accord avec son auteur : il lit l'arbre, pas le plan.
 
 ---
 
+## Fire-Disposition
+
+Ce plan livre **six détecteurs** qui peuvent tirer sur des données préexistantes.
+Le gate mika#1574 exige que chacun nomme sa disposition — (a) exception
+d'allowlist nommée, (b) landing désarmé, (c) halt-and-surface — plutôt que de la
+laisser au pilote. Ce que la table tranche n'est pas « que se passe-t-il si tout
+va bien » mais **« que fait l'implémenteur le jour où V5 rougit »**, qui est une
+décision de design et non une contingence.
+
+| # | détecteur | surface | tire-t-il à HEAD ? | disposition |
+|---|---|---|---|---|
+| D1 | L1–L4 (sous-chaîne, casse, préfixe de callout, jeton traduit) | S1 — prescripteurs | **à mesurer** (V5) | **(a)** exception nommée par site, avec ticket de suivi et assertion auto-nettoyante |
+| D2 | L5 (label non déclaré) | S1 — prescripteurs | **à mesurer** (V5b) | **(a)**, même forme que D1 |
+| D3 | L1–L4 | S2 — corps de PR | **à mesurer** (V5c, F3) | **(b)** landing désarmé si l'échantillon rougit — le lint est livré en annotation sur S2 et armé par un commit suivant |
+| D4 | L1–L4 | S3 — corps de tickets | **oui, par construction** | **(b)** désarmé *structurellement* et définitivement : S3 est une annotation, jamais un gate (M2) |
+| D5 | `mika2201_every_match_site_is_declared` | arbre entier | **oui, avec certitude** | **(c)** halt-and-surface pendant l'implémentation, résolu en **déclarant le site dans le TSV** |
+| D6 | `canonical-tokens-survey.sh --check` | arbre entier | **oui, avec certitude** | **(c)**, identique à D5 — même lecteur, même résolution |
+
+### Résultat mesuré à l'implémentation (2026-09-20)
+
+Le *Definition of Done* exige que V5/V5b/V5c soient mesurés et leur résultat
+reporté ici avant le merge. Voici ce qu'ils ont donné.
+
+| # | mesure | résultat | disposition appliquée |
+|---|---|---|---|
+| D1 (V5) | L1–L4 sur S1 | **zéro accusation** | rien à faire ; le fichier d'exceptions reste **vide** |
+| D2 (V5b) | L5 sur S1 | **une accusation** — `needs-multi-agent-review`, écrit par `_finalize_pr_gate` en `--add-label … \|\| true`, déclaré nulle part | **non** la disposition (a) : le remède juste est la **réparation**, faite dans le même commit — le label est déclaré dans `.github/labels.yml`, comme mika#2199 l'a fait pour `human-review-required`. Une exception aurait pérennisé un label d'enforcement supprimable en silence, c'est-à-dire la panne que la règle existe pour voir |
+| D3 (V5c) | L1–L4 sur un échantillon S2 | **non mesurable** — `gh` n'est pas authentifié dans le bac à sable de dispatch, l'échantillon n'a pas pu être récupéré | **(b) désarmé**. Le plan prévoyait le cas « rouge », pas le cas « non mesurable » ; la lecture sûre est la même — *ne pas armer ce qu'on n'a pas mesuré*. La condition d'armement et le geste (retirer une ligne `continue-on-error`) sont écrits dans `pr-body-validation.yml` |
+| D4 | — | conforme | annotation, jamais un gate |
+| D5 | scan Rust | **a tiré**, 1 site : `executor.rs::check_grooming_markers`, lecteur par `contains` que le survey ne voit pas | **(c)** appliqué : site **déclaré** dans le TSV, allowlist toujours vide |
+| D6 | `--check` | **a tiré** au premier jet, puis vert | **(c)** appliqué : le TSV est **produit** depuis la sortie du survey |
+
+**Un sixième détecteur non prévu par la table, et c'est le plus instructif.** Le
+lint accusait le **plan de ce ticket même** (2 × L4) : son § M4 décrit la règle
+en citant les formes fautives entre backticks. Le corps de PR l'aurait fait
+aussi, et tout ticket futur discutant de la règle. C'est R4 sous sa forme la plus
+pure — *un document qui explique le lint fait rougir le lint, et le lint se fait
+désarmer*. Remède **structurel** et non une exception : un jeton cité dans un
+span de code inline ou un bloc clôturé est une **mention**, jamais une
+instruction. C'est le geste qu'`auto_pull::is_groomed` fait déjà pour la même
+raison (mika#2120), et la classe du faux positif du Signal S (mika#2050). Non
+appliqué à L5, où l'instruction `gh` d'un prescripteur markdown vit
+nécessairement dans un bloc.
+
+### D1/D2 — la forme exacte d'une exception, si V5 rougit
+
+Une exception n'est jamais un motif large. Elle est une ligne de
+`scripts/canonical-tokens-exceptions.tsv` portant **quatre champs obligatoires** :
+`fichier`, `jeton`, `ticket de suivi`, `date`. Et elle porte son **assertion
+auto-nettoyante** : le lint refuse une exception dont le fichier ne contient plus
+le jeton accusé. Une exception qui survit à sa cause est la manière dont une
+allowlist devient le tiroir fourre-tout de R4 ; l'assertion est ce qui l'empêche,
+et elle rougit **le jour de la réparation**, pas des mois après.
+
+**Le fichier d'exceptions est livré vide.** S'il est non vide au moment du merge,
+son contenu est la mesure du défaut préexistant et chaque ligne a son ticket.
+
+### D3 — pourquoi S2 est la seule surface qui peut lander désarmée
+
+D1 et D3 exécutent les **mêmes règles**, mais pas sur la même population :
+S1 est un ensemble **fini, versionné et relu** (une trentaine de prescripteurs),
+tandis que S2 est un flux dont l'échantillon mesurable est un passé qu'on ne peut
+pas corriger — une PR mergée ne se ré-écrit pas. Sur S1, une accusation est un
+fichier à corriger dans le même commit ; sur S2, une accusation sur les PR
+ouvertes au moment du déploiement bloquerait un travail en vol pour une forme que
+personne ne lui avait demandée. D'où la disposition (b) **conditionnelle** : si
+V5c est propre, S2 land armé avec S1 ; s'il rougit, S2 land en annotation et
+l'armement est un commit distinct, après correction des PR concernées.
+
+**Ce n'est pas une réduction d'AC1** : AC1 est ratifiée sur S2 comme gate
+bloquant, et la disposition (b) porte sur la *fenêtre de déploiement*, pas sur la
+cible. La condition d'armement est écrite et vérifiable (V5c vert), donc elle ne
+peut pas devenir un désarmement permanent qu'on aurait oublié d'armer.
+
+### D5/D6 — pourquoi la certitude de tirer n'est pas un problème
+
+Ces deux-là **tirent à coup sûr**, et c'est voulu : M1.0 a déjà mesuré qu'un
+relevé manuel manque des sites. Leur premier tir *est* le complément de M1. La
+doctrine est écrite en M5 et elle ne souffre aucune exception : **on déclare dans
+le TSV, on n'allowliste pas.** Il n'existe donc pas de fichier d'exceptions pour
+D5/D6 — l'allowlist est vide et le reste, et le jour où le scan tire, la
+résolution est une ligne de TSV. Un site de match qu'on ne veut pas déclarer est
+un site de match qu'il faut supprimer.
+
+**Conséquence sur l'ordre d'implémentation** : D6 s'exécute **avant** que le TSV
+soit figé (il le produit), D5 **après** (il le vérifie). Les inverser ferait
+passer la garde d'exhaustivité pour verte par accord avec son propre producteur —
+c'est exactement ce que M6 (Author ≠ outside-check) interdit.
+
+---
+
 ## Verification Contract
 
 | # | Quoi | Comment |
@@ -276,32 +412,55 @@ ne peut pas être vert par accord avec son auteur : il lit l'arbre, pas le plan.
 | V2 | « seconde passe » dans un callout **passe** | fixture `…/seconde-passe.md`, attendue **verte** — garde de non-régression de R1 |
 | V3 | `> - **Plan :**` (espace typographique FR) rougit | fixture `…/plan-espace-fr.md` |
 | V4 | `groomed` minuscule dans un callout rougit | fixture `…/verdict-minuscule.md` |
-| V5 | Le dépôt à HEAD passe le lint sur S1 | `scripts/check-canonical-tokens.sh` exécuté sur l'arbre — **zéro accusation** |
+| V5 | **L1–L4 à HEAD sur S1** | `scripts/check-canonical-tokens.sh` sur l'arbre — **zéro accusation** |
+| V5b | **L5 à HEAD sur S1** | même script, règle L5 seule, confrontée à `.github/labels.yml` — **zéro accusation** |
+| V5c | **L1–L4 sur un échantillon S2** | même script sur les corps des **PR ouvertes + les 50 dernières PR mergées** (`gh pr list --state all --limit 50 --json body`) — **zéro accusation** ; conditionne l'armement de D3 |
 | V6 | Le scan d'exhaustivité voit chaque site de M1 | `cargo test -p mika-agent mika2201_every_match_site_is_declared` |
+| V6b | Le relevé et le TSV concordent | `scripts/canonical-tokens-survey.sh --check` — **zéro divergence** (F2) |
 | V7 | Un nouveau site de classe B non déclaré fait rougir | test négatif : fichier temporaire portant `Regex::new(r"\bGROOMED\b")` |
+| V7b | Une exception périmée fait rougir | test négatif : ligne d'exception dont le fichier ne porte plus le jeton — assertion auto-nettoyante de D1 |
 | V8 | Le lint a son test | `scripts/test-check-canonical-tokens.sh`, patron des huit `test-check-*.sh` |
 | V9 | CI le fait tourner | job `canonical-tokens-lint` dans `ci.yml` |
 
-**V5 est le contrôle de non-vacuité inverse, et il est porteur** : un lint qui
-accuse l'arbre à sa naissance est un lint qui sera désarmé (R4).
+**V5, V5b et V5c sont le contrôle de non-vacuité inverse, et ils sont porteurs** :
+un lint qui accuse l'arbre à sa naissance est un lint qui sera désarmé (R4). Leur
+séparation en trois est la réponse à F3 — la première version ne mesurait que S1
+alors que S2 est un gate bloquant lui aussi, ce qui laissait la surface S2 exposée
+au mode de panne de R4 sans qu'aucun chiffre ne le dise. **Le résultat de chacun
+alimente la table Fire-Disposition** : V5/V5b décident si D1/D2 ont besoin
+d'exceptions nommées, V5c décide si D3 land armé ou désarmé.
+
+**Pourquoi l'échantillon S2 est « ouvertes + 50 dernières mergées » et pas
+l'historique.** Les PR ouvertes sont la population que le gate bloquerait *le jour
+même* — c'est la mesure du coût immédiat. Les 50 dernières mergées mesurent la
+**tendance du producteur** (pilote + opérateur) : si la forme fautive y est
+absente, elle n'apparaîtra pas demain. Remonter plus loin mesurerait un producteur
+qui n'existe plus, et le bearing Prime interdit déjà la migration rétroactive.
 
 ---
 
 ## Definition of Done
 
+- `scripts/canonical-tokens-survey.sh` livré (`--tsv`, `--check`) — **le
+  producteur du relevé**, sans lequel AC2 reste une promesse (F2/M1.0).
 - `scripts/canonical-tokens.tsv` livré, quatre colonnes, classes A et B peuplées
-  depuis M1.
+  **depuis la sortie du survey**, colonne `site de match` au format
+  `chemin::symbole` (jamais un numéro de ligne).
+- `scripts/canonical-tokens-exceptions.tsv` livré **vide**, quatre champs
+  obligatoires, assertion auto-nettoyante (Fire-Disposition D1).
 - `scripts/check-canonical-tokens.sh` + `scripts/test-check-canonical-tokens.sh`
   livrés, patron `check-*.sh` du dépôt.
 - Job `canonical-tokens-lint` dans `.github/workflows/ci.yml` (S1) et passe
-  ajoutée à `pr-body-validation.yml` (S2).
+  ajoutée à `pr-body-validation.yml` (S2) — **armée si V5c est vert, en
+  annotation sinon** (Fire-Disposition D3).
 - Workflow `issue-token-annotate.yml` (S3), **non bloquant**, borné à l'époque de
   déploiement.
 - Scan `mika2201_every_match_site_is_declared`, allowlist vide.
 - Quatre fixtures V1–V4, dont **une verte** (V2).
-- `CLAUDE.md` : entrée nommant le lint, sa **classe A** et la doctrine « on
-  déclare, on n'allowliste pas ».
-- V1–V9 verts.
+- `CLAUDE.md` : entrée nommant le lint, sa **classe A**, la doctrine « on
+  déclare, on n'allowliste pas », et **le statut d'armement réel de S2**.
+- V1–V9 verts, V5/V5b/V5c mesurés et leur résultat reporté dans la table
+  Fire-Disposition du plan avant le merge.
 
 ---
 
@@ -363,3 +522,41 @@ résultat, pas une panne du lint. Une accusation soutenue sur les **corps de PR*
 sans qu'aucun prescripteur ne rougisse signifie au contraire que la forme fautive
 naît du pilote et non du prompt : **halte** — ne pas élargir le lint, établir
 quel chemin l'écrit.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — révision suite au premier passage architecte
+  (`Disposition: ITERATE`, findings F1–F3).
+  - **F1 (bloquant) — adressée** par la nouvelle section `## Fire-Disposition` :
+    six détecteurs nommés (D1–D6), chacun avec sa surface, son statut « tire-t-il
+    à HEAD » et sa disposition au sens mika#1574. La forme exacte d'une exception
+    est spécifiée (quatre champs obligatoires, fichier livré vide, assertion
+    auto-nettoyante), et l'ordre d'implémentation D6→TSV→D5 est contraint pour ne
+    pas faire passer la garde d'exhaustivité pour verte par accord avec son propre
+    producteur (M6, *Author ≠ outside-check*).
+  - **F2 (bloquant) — adressée** par M1.0 : le plan livre
+    `scripts/canonical-tokens-survey.sh` (`--tsv`, `--check`) comme **producteur**
+    du relevé, et ne revendique plus que la colonne `classe` (M1.1), seule part
+    qu'une commande ne peut pas produire. Le TSV désigne un site par
+    `chemin::symbole` et non par un numéro de ligne, qui pourrirait en silence.
+    **La révision a validé le finding sur pièce** : le relevé manuel de rev 1
+    était exact ligne à ligne mais **incomplet**, ratant
+    `dispatch-lib.sh::_extract_plan_path` (ligne 6581), lecteur le plus strict du
+    callout `Plan` — site désormais ajouté à la table de classe B. Le mode
+    `--check` est la moitié shell du scan M5, partagée à dessein (un lecteur, pas
+    deux : leçon mika#2158).
+  - **F3 (sharpening) — adressée** par la scission de V5 en V5/V5b/V5c : S1 règles
+    L1–L4, S1 règle L5, et **S2 sur un échantillon** (PR ouvertes + 50 dernières
+    mergées). Le choix de l'échantillon est motivé (coût immédiat + tendance du
+    producteur ; l'historique lointain mesurerait un producteur qui n'existe
+    plus). S2 n'est **pas** déclaré structurellement exempt : la disposition D3
+    conditionne son armement au résultat de V5c, avec landing en annotation si
+    l'échantillon rougit — et la condition d'armement est écrite et vérifiable,
+    donc elle ne peut pas devenir un désarmement permanent oublié.
+  - Ajouts au *Definition of Done* correspondants (survey, fichier d'exceptions,
+    statut d'armement de S2 reporté dans `CLAUDE.md`), et V6b/V7b au *Verification
+    Contract*.
+  - **Aucun AC affaibli.** AC1 reste bloquante sur S1 et S2 ; AC2 gagne son
+    mécanisme de confrontation ; AC3 et AC4 sont inchangées.
