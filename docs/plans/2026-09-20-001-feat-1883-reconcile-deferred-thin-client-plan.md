@@ -42,13 +42,37 @@ Par flag du ticket :
   autorité pendant que le tour tournait chez spirit sous celui du `config.toml`.
   C'est la classe de défaut à laquelle appartient aussi le point 2 ci-dessous,
   et c'est pour ça que ce plan la nomme plutôt que de la contourner.
-- **`--enable-skill` (moitié additive) : refusé, avec raison écrite** (mika#2363,
-  reportée dans `CLAUDE.md`). Elle laisserait tout appelant authentifié de
-  `/a2a/{agent}` forcer une skill de l'agent en `always_on` — élargir une surface
-  depuis le réseau. Ce refus n'est pas à relitiger ici.
-- **`--disable-skill` : toujours inerte, et non tranché.** L'argument de refus de
-  mika#2363 ne s'y applique pas : retirer une skill est strictement subtractif.
-  C'est le seul morceau du point 1 encore ouvert. Le § 3 l'arbitre.
+- **`--enable-skill` (moitié additive) : refusé, avec raison écrite.** Elle
+  laisserait tout appelant authentifié de `/a2a/{agent}` forcer une skill de
+  l'agent en `always_on` — élargir une surface depuis le réseau. Ce refus n'est
+  pas à relitiger ici.
+
+  **Où ce refus est écrit, et où il ne l'est pas** (rectification rev 2, F1).
+  Le corps du ticket **mika#2363 ne le porte pas** : ce ticket s'intitule
+  « Réduire la taille d'entrée d'un tour mika-arch (brief) sous le plafond HTTP
+  — lever de fond #2362 D2 » et traite du volume du brief architecte. Ce qu'il a
+  **livré** est `--only-skill`, et c'est le substrat écrit par sa PR qui porte le
+  refus de la moitié additive, à trois sites vérifiables ce jour
+  (HEAD `10ad8f8a`, 2026-09-20) :
+
+  | site | ce qu'il pose |
+  |---|---|
+  | `crates/mika-a2a/src/params.rs:19-42` (doc-comment de `ONLY_SKILLS_KEY`) | « restricts the turn's skill registry … **by subtraction only** … The field can therefore never widen a turn's surface, **which is what makes it safe on an endpoint any authenticated caller can reach** » |
+  | `skills/bundled/_shared/dispatch-lib.sh:4688-4691` | « It is strictly subtractive — it evicts the sister passes, **it cannot activate anything** » |
+  | `CLAUDE.md` § mika#2304, « Hors périmètre, délibérément » | « `--enable-skill` / `--disable-skill`, la moitié **additive** du canal mika#1727, refusée par mika#2363 avec sa raison écrite (elle laisserait tout appelant authentifié forcer une skill en `always_on`) » |
+
+  Le troisième site est celui qui **attribue** le refus au numéro mika#2363 ;
+  les deux premiers sont ceux qui en portent la **raison**, dans le code, sans
+  dépendre d'une lecture de GitHub. Ce plan s'ancre désormais sur les deux
+  premiers, et ne cite le numéro que comme provenance du changement — la
+  distinction que F1 a correctement relevée : une citation n'est portante que si
+  elle résout, et un corps de ticket n'est pas son substrat.
+
+- **`--disable-skill` : toujours inerte, et non tranché.** L'argument de refus
+  ci-dessus ne s'y applique pas : retirer une skill est strictement subtractif —
+  exactement la propriété que le doc-comment d'`ONLY_SKILLS_KEY` nomme comme
+  *ce qui rend un champ sûr sur cet endpoint*. C'est le seul morceau du point 1
+  encore ouvert. Le § 3 l'arbitre.
 
 ### 1.3 Point 2 — `tokens.*` : ouvert, et le branchement évident est un piège
 
@@ -122,10 +146,40 @@ Trois gestes, dans cet ordre de valeur :
 
 Trois mesures décident, et elles pointent toutes dans le même sens.
 
-1. **Usage mesuré : zéro.** Recherche sur `skills/bundled/`, `scripts/`,
-   `.claude/`, `crates/` : aucun appelant n'utilise `--disable-skill`. La seule
-   occurrence de `--enable-skill` dans le substrat est **une assertion qu'il a
-   disparu** (`test-dispatch-lib.sh`, mika#2363 l'a retiré d'`_arch_ask`).
+1. **Usage mesuré : zéro appelant.** La mesure est donnée avec sa méthode, pour
+   être re-runnable (rev 2, F4) — un « personne ne l'utilise » est une
+   affirmation de mesure et doit porter sa commande, sa date et son commit-ish :
+
+   ```bash
+   # HEAD 10ad8f8a, 2026-09-20
+   grep -rn "\-\-disable-skill\|\-\-enable-skill" \
+     --include="*.sh" --include="*.rs" --include="*.toml" --include="*.json" \
+     skills scripts .claude crates
+   ```
+
+   Les `*.md` sont exclus **à dessein** : la documentation est le sujet du § 6,
+   pas la mesure d'usage. Résultat, `--disable-skill` — **5 occurrences, zéro
+   appelant** :
+
+   | site | nature |
+   |---|---|
+   | `crates/mika-cli/src/cli.rs:276,284,285,291,300` | la **définition** du flag et ses doc-comments |
+   | `crates/mika-cli/src/commands/ask.rs:359,390` | le commentaire de report et la validation de conflit |
+   | `crates/mika-agent/src/skills/mod.rs:3731` | une **comparaison** en commentaire (« evicted the same way `--disable-skill` evicts ») |
+
+   Aucune invocation `mika ask --disable-skill` dans `skills/`, `scripts/` ou
+   `.claude/`. Symétriquement pour `--enable-skill` : les occurrences de
+   `test-dispatch-lib.sh:597,6033` et `only_skills_arch_pass_2363.rs:112` sont
+   des **assertions qu'il a disparu**, et `dispatch-lib.sh:4680` est le
+   commentaire qui acte son retrait.
+
+   **Une exception, et elle est un livrable** (trouvée par cette mesure) :
+   `crates/mika-cli/src/commands/skills_variants.rs:514` **imprime à l'opérateur**
+   la ligne `mika ask --enable-skill skill-review "…"` comme geste de
+   régénération. Ce n'est pas un appelant exécuté, c'est pire — c'est du code
+   vivant qui **conseille** un drapeau inerte, donc la même classe de mensonge
+   que `docs/skills.md` mais dans un chemin que personne ne relit. Il rejoint le
+   § 6 (geste C, point 5) et AC7.
 2. **Le fil dirait trois choses au lieu de deux.** `cli.rs` pose déjà par écrit,
    sur `--only-skill`, que « three selection semantics on one turn is a
    composition nobody wants to debug ». Ajouter `mika.disabled_skills` à côté de
@@ -180,6 +234,23 @@ de cache de la même façon : `None + Some(n) = Some(n)`, et non `None`. Deux
 écritures manuelles est précisément la forme dont ce dépôt a déjà dû extraire un
 lecteur unique (mika#2158, `grooming_marker`).
 
+**Le côté producteur est tenu par un scan, pas par convention** (rev 2, F5).
+Tester le helper atteste que `None + Some(n) = Some(n)` est juste ; ça
+n'atteste pas que les **deux sites** y passent — or le risque que §4.1 nomme
+*est* la divergence des deux sites, pas la fausseté du helper. Un second site
+qui ré-écrirait la fusion à la main rendrait un total faux **avec tous les
+tests du helper au vert**, c'est-à-dire la panne silencieuse que ce dépôt
+ferme par un scan partout où il l'a rencontrée. La discipline de lecteur
+unique était appliquée au consommateur
+(`mika1883_both_client_surfaces_read_the_one_reader`) et seulement
+asserted-by-convention au producteur : la symétrie est rétablie par
+`mika1883_run_usage_accumulates_only_via_the_one_helper` — scan de source
+refusant, dans `agent_loop/`, toute addition sur les champs de `run_usage`
+hors de l'appel au helper (modèle `mika2131_exclusion_skips_never_return_to_an_uncollected_debug`
+et `mika2220_no_local_reparse_of_the_llm_bodies_env_var`). C'est le versant
+écrivain du même principe que mika#2158, que ce plan citait déjà pour le
+versant lecteur, et la forme que review-guide.md § DRY prescrit ici.
+
 ### 4.2 La continuation est comptée
 
 `attempt_continuation_turn` fait un appel LLM de plus, qui émet son propre
@@ -218,11 +289,26 @@ noms partagé par cinq fonctions sans rapport.
 `stamp_run_usage` n'écrit **rien** quand l'agrégat est `None`. Le client rend
 alors une absence, jamais un zéro.
 
-C'est le précédent `request_bytes` de mika#2331, mot pour mot : *« `null` n'est
-jamais `0` (aucune requête n'est vide, donc un zéro serait un mensonge
-lisible) »*. Aucun tour ne consomme zéro token d'entrée. Un `0` affiché serait
-indistinguable d'un tour réel et ferait croire à une mesure là où il n'y en a
-pas.
+Le précédent est celui de `request_bytes`. **Sa source exacte, rectifiée** (rev
+2, F2) : la formulation n'est pas dans le corps du ticket mika#2331 — qui porte
+sur le retry d'`_arch_ask` sur hang transport — mais dans `CLAUDE.md` § *Signal
+O — RT-005 per-turn token accounting*, paragraphe « Brief size, added by
+mika#2331 (AC1) », qui pose, en anglais et vérifié ce jour (HEAD `10ad8f8a`) :
+
+> They are `Option` and `null` is never `0` (no request is empty, so a zero
+> would be a readable lie).
+
+Ce plan citait une **traduction** de cette phrase en l'attribuant « mot pour
+mot » au ticket ; les deux moitiés de l'attribution étaient fausses (ni le
+ticket, ni verbatim), même si le principe est juste et le numéro de provenance
+correct. La citation est désormais au texte, avec sa vraie adresse.
+
+Le raisonnement s'y transpose **par analogie, pas par autorité** : là-bas
+aucune requête n'est vide, ici aucun tour ne consomme zéro token d'entrée. Un
+`0` affiché serait indistinguable d'un tour réel et ferait croire à une mesure
+là où il n'y en a pas. Si un relecteur récuse l'analogie, c'est ce raisonnement
+qu'il faut discuter — la décision est celle de ce plan, adossée à un précédent,
+et non déléguée à lui.
 
 Contrairement à `mika.effective_model` et `mika.session_isolated_applied`, ce
 champ n'est **pas** écrit inconditionnellement. La raison de leur
@@ -288,6 +374,15 @@ de livrer le canal, si elle cessait d'être vide.
    de lecture ; et le grep opérateur.
 4. **`docs/solutions/architecture-patterns/cli-skill-always-on-transient-override.md`**
    — même mensonge, même correction.
+5. **`crates/mika-cli/src/commands/skills_variants.rs:514`** — `run_regen`
+   **imprime** à l'opérateur `mika ask --enable-skill skill-review "…"` comme
+   geste de régénération d'une variante. Site trouvé par la mesure du § 3
+   (rev 2, F4), et le plus coûteux des quatre : les trois autres sont de la
+   documentation qu'on peut ne pas lire, celui-ci est une consigne qu'on
+   **suit**, imprimée par l'outil lui-même au moment où l'opérateur en a
+   besoin — elle produit un tour qui n'active pas `skill-review` et dont rien
+   ne dit qu'il ne l'a pas activée. Remplacer par `--only-skill skill-review`,
+   qui atteint spirit et porte la même intention.
 
 ---
 
@@ -321,7 +416,13 @@ de bout en bout d'un tour à N appels vérifie l'égalité des quatre champs.
   `--format json`.
 - `mika1883_cache_fields_accumulate_across_none_and_some` — `None + Some(n)`
   donne `Some(n)` ; un provider qui ne rapporte le cache que sur certains appels
-  ne fait pas disparaître le total.
+  ne fait pas disparaître le total. **Teste le helper**, pas les appelants.
+- `mika1883_run_usage_accumulates_only_via_the_one_helper` — scan de source
+  (rev 2, F5) : dans `crates/mika-agent/src/agent_loop/`, aucune addition sur
+  les champs de `run_usage` hors de l'appel à `LlmUsage::accumulate`. C'est le
+  pendant écrivain de `mika1883_both_client_surfaces_read_the_one_reader`, et le
+  seul des deux qui puisse voir un **second site** de fusion : le test
+  précédent resterait vert pendant qu'un total faux serait servi.
 - Le doc-comment de `RUN_USAGE_KEY` porte la sémantique (tour, pas campagne ;
   RAW, pas normalisé), comme ses cinq sœurs.
 
@@ -347,6 +448,52 @@ La somme des `input_tokens` des lignes doit égaler le `tokens.input` affiché.
 
 ---
 
+## Fire-Disposition
+
+Ajoutée en rev 2 (F3). Le plan livre des détecteurs — neuf tests dont deux
+scans de source, plus un avertissement runtime — et la question n'est pas
+« détectent-ils le défaut ? » (c'est le rôle du contrôle négatif du § 7.2) mais
+**« que se passe-t-il quand ils tirent sur la population déjà en place ? »**.
+
+**Branche (a) — allowlist nommée, zéro entrée.** Et c'est démontrable plutôt
+qu'espéré, parce que chaque détecteur porte sur une surface que ce plan
+introduit :
+
+| détecteur | population pré-existante | pourquoi zéro |
+|---|---|---|
+| les 7 tests comportementaux (`…sums_every_call…`, `…continuation_is_counted`, `…attests_nothing`, `…non_verbose_render…`, `…warn_on_stderr_only`, `…cache_fields_accumulate…`) | aucune | tests CI sur du code neuf ; aucun `Task.metadata["mika.run_usage"]` n'existe, la clé naît ici |
+| `mika1883_both_client_surfaces_read_the_one_reader` (scan lecteur) | aucune | `RUN_USAGE_KEY` n'existe pas encore : zéro décodage à allowlister |
+| `mika1883_run_usage_accumulates_only_via_the_one_helper` (scan écrivain) | aucune | le champ `run_usage` naît ici ; les deux seuls sites d'addition sont créés par cette PR et routent par construction vers le helper |
+| `cli_skill_flag_inert` (avertissement runtime) | **une, corrigée dans la même PR** | voir ci-dessous |
+
+Les deux scans sont donc livrés **sans clause d'exception** : une allowlist
+vide n'est pas un oubli mais la conséquence de l'ordre des choses, et la
+première entrée qu'un futur éditeur voudrait y ajouter sera précisément la
+divergence que le scan existe pour refuser. **Résolution prescrite quand un
+scan tire : retirer le second site, jamais l'allowlister** — la règle que
+`ACTOR_READING_PREDICATES_ALLOWED` (mika#2323) pose pour sa propre liste livrée
+vide.
+
+**Le seul détecteur à population non vide est `cli_skill_flag_inert`**, et elle
+vaut d'être nommée plutôt que rangée sous « zéro » : il tire sur tout appelant
+portant `--enable-skill` / `--disable-skill`. La mesure du § 3 en dénombre
+**zéro exécuté** et **une consigne imprimée** —
+`skills_variants.rs:514`, qui conseille `--enable-skill skill-review` à
+l'opérateur. Cette entrée unique est **éteinte par le geste C point 5 dans la
+même PR**, pas allowlistée : un détecteur qui tire sur une consigne que le même
+changement corrige n'a pas de population résiduelle. Le régime attendu au
+déploiement est donc zéro ligne, et le § 5 dit déjà ce qu'une ligne signifierait
+— un appelant à migrer vers `--only-skill`, c'est-à-dire la mesure qui
+rouvrirait un jour la décision du § 3.
+
+**Ce que la Fire-Disposition ne couvre pas, et c'est voulu :** le champ
+`tokens.*` du rendu `--verbose` n'est pas un détecteur — il ne refuse rien et
+ne fait échouer aucun tour. Sa population d'absence (spirit antérieur, tour
+sans usage lisible) est traitée en § 4.4 comme une **lecture**, pas comme un
+tir, et la halte 2 du § 7.3 en donne la conduite.
+
+---
+
 ## 8. Ce que ce travail n'achète pas
 
 - Il ne mesure pas les délégations ni les runs d'équipe (§ 2).
@@ -361,7 +508,7 @@ La somme des `input_tokens` des lignes doit égaler le `tokens.input` affiché.
 ## 9. Definition of Done
 
 - L'agrégat est sommé dans la boucle, continuation comprise, derrière un helper
-  unique.
+  unique — et un scan de source refuse un second site d'addition.
 - `AgentOutput.run_usage` traverse `A2aTurn` jusqu'à `stamp_run_usage`.
 - `params.rs` porte une clé et **un** lecteur ; les deux surfaces clientes
   l'utilisent.
@@ -371,8 +518,9 @@ La somme des `input_tokens` des lignes doit égaler le `tokens.input` affiché.
 - `--enable-skill` / `--disable-skill` émettent `cli_skill_flag_inert` sur stderr
   en nommant `--only-skill`.
 - Le commentaire de report de `ask.rs` a disparu.
-- `docs/skills.md`, `cli-skill-always-on-transient-override.md` et `CLAUDE.md`
-  disent l'état réel du canal.
+- `docs/skills.md`, `cli-skill-always-on-transient-override.md`, `CLAUDE.md`
+  **et `skills_variants.rs`** disent l'état réel du canal — le dernier cessant
+  de prescrire un drapeau inerte.
 - `cargo test`, `cargo clippy`, `cargo fmt` propres.
 
 ---
@@ -397,17 +545,84 @@ porte pas de section `## Acceptance criteria`).
 - **AC4 — Aucune régression de sortie.** Sans `--verbose`, la sortie des deux
   surfaces est byte-identique à celle d'avant, en texte comme en JSON.
 - **AC5 — Point 1 tranché par écrit.** L'état des trois flags est écrit dans
-  `CLAUDE.md` : `--model` livré (mika#2304), `--enable-skill` refusé avec sa
-  raison (mika#2363), `--disable-skill` non livré avec sa raison (usage mesuré
-  nul, troisième sémantique de sélection).
+  `CLAUDE.md` : `--model` livré (mika#2304) ; `--enable-skill` refusé avec sa
+  raison, **ancrée sur le doc-comment d'`ONLY_SKILLS_KEY` (`params.rs`) et sur
+  `dispatch-lib.sh:4688-4691`** — les deux sites qui portent la raison — le
+  numéro mika#2363 n'étant cité que comme provenance du changement ;
+  `--disable-skill` non livré avec sa raison (zéro appelant mesuré, troisième
+  sémantique de sélection). Toute citation de ce bloc résout sur un site
+  nommé.
 - **AC6 — Le no-op est dit.** Une invocation portant `--enable-skill` ou
   `--disable-skill` émet un avertissement nommant les skills, l'inertie, et
   `--only-skill` comme le canal qui atteint le serveur. L'avertissement est sur
   **stderr** ; `--format json` reste parsable sans changement.
-- **AC7 — La documentation cesse d'affirmer le faux.** `docs/skills.md` et
+- **AC7 — Plus aucune surface n'affirme ni ne conseille le faux.**
+  `docs/skills.md` et
   `docs/solutions/architecture-patterns/cli-skill-always-on-transient-override.md`
   ne décrivent plus `--enable-skill` / `--disable-skill` comme atteignant la
-  surface d'exécution.
+  surface d'exécution, **et `crates/mika-cli/src/commands/skills_variants.rs`
+  n'imprime plus `--enable-skill` comme geste à suivre** — il nomme
+  `--only-skill`. La vérification est la commande du § 3 rejouée : elle ne doit
+  plus rendre de site *prescriptif*, seulement la définition du flag, sa
+  validation de conflit et les assertions de retrait.
+- **AC9 — Un seul écrivain, deux sites d'addition.** Un scan de source refuse,
+  dans `agent_loop/`, toute addition sur les champs de `run_usage` hors de
+  l'appel à `LlmUsage::accumulate`. Il est livré **sans entrée d'exception**, et
+  sa résolution quand il tire est de retirer le second site, jamais de
+  l'allowlister.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-20)** — répond aux cinq findings de la première passe
+  architecte. Aucun finding n'a été écarté, et deux ont déplacé le contenu au-delà
+  de la correction demandée.
+
+  - **F1 (bloquant) — citation mika#2363 non résolvante.** Fondé. Vérifié ce
+    jour : le corps du ticket porte sur la taille du brief architecte, pas sur
+    le refus de la moitié additive. Le refus **existe** mais dans le substrat
+    écrit par sa PR. § 1.2 est ré-ancré sur trois sites nommés et vérifiables à
+    HEAD `10ad8f8a` — `params.rs:19-42` (« by subtraction only … never widen a
+    turn's surface … safe on an endpoint any authenticated caller can reach »),
+    `dispatch-lib.sh:4688-4691`, et `CLAUDE.md` § mika#2304 « Hors périmètre »,
+    ce dernier étant celui qui **attribue** le refus au numéro. Le plan ne cite
+    plus le numéro que comme provenance. AC5 porte désormais cette exigence
+    d'ancrage. Pas d'ESCALATE : le refus n'était pas introuvable, il était mal
+    adressé.
+  - **F2 (bloquant) — faux verbatim mika#2331.** Fondé sur les deux moitiés de
+    l'attribution. La phrase existe, en **anglais**, dans `CLAUDE.md` § Signal O
+    (« Brief size, added by mika#2331 (AC1) ») et non dans le corps du ticket ;
+    le plan en citait une traduction française comme un « mot pour mot ». § 4.4
+    cite maintenant le texte anglais en bloc-quote avec sa vraie adresse, et
+    présente la transposition comme une **analogie assumée par ce plan**, pas
+    comme une autorité empruntée.
+  - **F3 (bloquant) — `## Fire-Disposition` absente.** Ajoutée. Branche (a),
+    allowlist nommée à **zéro entrée**, démontrée détecteur par détecteur plutôt
+    qu'affirmée : chaque surface visée (`RUN_USAGE_KEY`, le champ `run_usage`,
+    les deux sites d'addition) naît dans cette PR. Un détecteur a une population
+    non vide — `cli_skill_flag_inert`, une entrée, `skills_variants.rs:514` — et
+    elle est **éteinte dans la même PR** plutôt qu'allowlistée ; la section le
+    dit au lieu de la ranger sous « zéro ». Résolution prescrite pour les deux
+    scans : retirer le second site, jamais l'allowlister (modèle mika#2323).
+  - **F4 (affûtage) — mesure `--disable-skill` sans poignée.** Fondé, et le plus
+    productif des cinq. § 3 porte la commande exacte, sa date, son commit-ish,
+    l'exclusion volontaire des `*.md` et le tableau des 5 occurrences par nature
+    — **zéro appelant**. Rejouer la mesure a fait apparaître un site que le plan
+    manquait : `skills_variants.rs:514` **imprime à l'opérateur** un geste
+    `--enable-skill` inerte. Ajouté au § 6 (geste C, point 5), à AC7, au § 9 et
+    à la Fire-Disposition. Le finding demandait une méthode ; il a rendu un
+    livrable.
+  - **F5 (affûtage) — invariant producteur non tenu.** Fondé : le test du helper
+    atteste la fusion, pas le routage des deux sites vers lui. Option (a)
+    retenue, celle que le finding jugeait la plus conforme aux précédents du
+    plan — `mika1883_run_usage_accumulates_only_via_the_one_helper` (§ 7.2), le
+    pendant écrivain du scan lecteur déjà prévu, plus le paragraphe de § 4.1 qui
+    dit pourquoi le test comportemental ne peut pas voir cette classe. AC9
+    ajoutée.
+
+  Aucune AC n'a été affaiblie. AC5 et AC7 sont **resserrées** (exigence
+  d'ancrage résolvant ; surface prescriptive ajoutée), AC9 est nouvelle.
 - **AC8 — Le report ne survit pas à sa résolution.** Le bloc « Deferred
   follow-ups » de `crates/mika-cli/src/commands/ask.rs` ne décrit plus les points
   1 et 2 comme ouverts.

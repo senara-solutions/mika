@@ -459,6 +459,9 @@ mod tests {
                 text: Some(text.to_string()),
                 thinking: None,
                 usage: None,
+                // A replayed fixture made no LLM call, so there is no usage to
+                // sum (mika#1883). Absence, not a zero.
+                run_usage: None,
                 // Fixture replaying a recorded response: the turn concluded.
                 deadline_exceeded: None,
                 // …and delivered whatever it sent (mika#2136).

@@ -263,6 +263,71 @@ pub struct LlmUsage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
+impl LlmUsage {
+    /// Fold one call's usage into a running per-turn total (mika#1883).
+    ///
+    /// # Why this is a helper and not two inline additions
+    ///
+    /// A turn's total is summed at **two** sites — the step loop and the
+    /// max-steps continuation bridge — and both have to treat the `Option`
+    /// cache fields the same way. Two hand-written folds is precisely the shape
+    /// this repo has already had to extract a single reader from (mika#2158,
+    /// `grooming_marker`): the day they disagree, the total is wrong and every
+    /// test of either site still passes. The source scan
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` refuses a third
+    /// site.
+    ///
+    /// # The rule on the cache fields
+    ///
+    /// `None + Some(n) = Some(n)`, never `None`. A provider that reports cache
+    /// metrics on some calls of a turn and not on others is the ordinary case
+    /// (Anthropic reports a cache write only on the call that creates the
+    /// breakpoint), so a fold that answered `None` whenever one side was absent
+    /// would erase a real measurement. `None + None` stays `None`: a `Some(0)`
+    /// there would assert a measured zero where nothing was measured — the same
+    /// distinction the whole per-turn field rests on.
+    ///
+    /// `input_tokens` / `output_tokens` are summed RAW, exactly as the
+    /// providers report them. The per-family asymmetry (Anthropic reports fresh
+    /// input; OpenAI-compatible rails report `prompt_tokens`, which *includes*
+    /// `cache_read`) is deliberately **not** normalised here — see
+    /// `mika_a2a::params::RUN_USAGE_KEY` for why.
+    ///
+    /// Addition saturates rather than wrapping: a wrapped total would be a
+    /// plausible small number, which is worse than a clamped large one.
+    pub fn accumulate(acc: Option<LlmUsage>, next: Option<&LlmUsage>) -> Option<LlmUsage> {
+        let Some(next) = next else {
+            return acc;
+        };
+        let Some(acc) = acc else {
+            return Some(next.clone());
+        };
+        Some(LlmUsage {
+            input_tokens: acc.input_tokens.saturating_add(next.input_tokens),
+            output_tokens: acc.output_tokens.saturating_add(next.output_tokens),
+            cache_creation_input_tokens: add_optional_tokens(
+                acc.cache_creation_input_tokens,
+                next.cache_creation_input_tokens,
+            ),
+            cache_read_input_tokens: add_optional_tokens(
+                acc.cache_read_input_tokens,
+                next.cache_read_input_tokens,
+            ),
+        })
+    }
+}
+
+/// `None + None = None`; anything else is a sum with the absent side read as 0.
+///
+/// See [`LlmUsage::accumulate`] for why the two halves of that rule are both
+/// load-bearing.
+fn add_optional_tokens(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
+}
+
 // -- Conversions from/to existing claude.rs types --
 
 impl From<crate::claude::ToolDefinition> for LlmToolDefinition {
@@ -351,6 +416,75 @@ pub fn response_content_to_blocks(content: &[LlmResponseContent]) -> Vec<LlmCont
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mika#1883 — `None + Some(n)` is `Some(n)`, never `None`.
+    ///
+    /// The cache fields are the only ones that can be absent, and a provider
+    /// that reports them on some calls of a turn and not on others is the
+    /// ordinary case, not the exotic one. A fold that answered `None` whenever
+    /// one side was absent would make a real cache read disappear from the
+    /// total — a silent undercount, which is the class this whole ticket is
+    /// about.
+    ///
+    /// This asserts the **helper**, not its callers: that the two sites route
+    /// through it is the source scan
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper`'s job.
+    #[test]
+    fn mika1883_cache_fields_accumulate_across_none_and_some() {
+        let no_cache = LlmUsage {
+            input_tokens: 10,
+            output_tokens: 1,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let with_cache = LlmUsage {
+            input_tokens: 20,
+            output_tokens: 2,
+            cache_creation_input_tokens: Some(7),
+            cache_read_input_tokens: Some(3),
+        };
+
+        // A turn whose first call reported no cache and whose second did.
+        let folded = LlmUsage::accumulate(
+            LlmUsage::accumulate(None, Some(&no_cache)),
+            Some(&with_cache),
+        )
+        .expect("two calls fold into a total");
+        assert_eq!(folded.input_tokens, 30);
+        assert_eq!(folded.output_tokens, 3);
+        assert_eq!(
+            folded.cache_creation_input_tokens,
+            Some(7),
+            "a cache write reported on one call of the turn must survive the fold"
+        );
+        assert_eq!(folded.cache_read_input_tokens, Some(3));
+
+        // The reverse order folds to the same total — absence on the *second*
+        // side must not erase what the first reported either.
+        let reversed = LlmUsage::accumulate(
+            LlmUsage::accumulate(None, Some(&with_cache)),
+            Some(&no_cache),
+        )
+        .expect("two calls fold into a total");
+        assert_eq!(reversed.cache_creation_input_tokens, Some(7));
+        assert_eq!(reversed.cache_read_input_tokens, Some(3));
+        assert_eq!(reversed.input_tokens, 30);
+
+        // Both sides absent stays absent: reporting `Some(0)` would assert a
+        // measured zero where no provider measured anything.
+        let neither =
+            LlmUsage::accumulate(LlmUsage::accumulate(None, Some(&no_cache)), Some(&no_cache))
+                .expect("two calls fold into a total");
+        assert_eq!(neither.cache_creation_input_tokens, None);
+        assert_eq!(neither.cache_read_input_tokens, None);
+
+        // Both identity directions. `None + None` is the unmeasured turn.
+        assert!(LlmUsage::accumulate(None, None).is_none());
+        let acc_only = LlmUsage::accumulate(Some(with_cache.clone()), None)
+            .expect("an accumulator survives a call that reported nothing");
+        assert_eq!(acc_only.input_tokens, 20);
+        assert_eq!(acc_only.cache_read_input_tokens, Some(3));
+    }
 
     /// Minimal request carrying only a system prompt and one user message.
     fn req(system: Option<&str>, messages: Vec<LlmMessage>) -> LlmRequest {

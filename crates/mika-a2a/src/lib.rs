@@ -11,8 +11,9 @@ pub use error::A2aError;
 pub use jsonrpc::{A2aMethod, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse};
 pub use params::{
     CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
-    ONLY_SKILLS_KEY, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, SendMessageConfiguration,
-    TaskIdParams, TaskQueryParams, attested_model, attested_session_isolation,
+    ONLY_SKILLS_KEY, RUN_USAGE_KEY, RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY,
+    SendMessageConfiguration, TaskIdParams, TaskQueryParams, attested_model, attested_run_usage,
+    attested_session_isolation,
 };
 pub use render::{EmptyKind, TaskRenderEmpty, render_task_text};
 pub use state_machine::TaskStateMachine;
