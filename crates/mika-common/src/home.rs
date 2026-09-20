@@ -83,8 +83,34 @@ pub enum PersonaProfile {
 /// (ruled out by Mika Prime, 2026-09-09). See mika#2247.
 pub const CHAMPION_PERSONA_PLACEHOLDER: PersonaProfile = PersonaProfile::Family;
 
+/// What [`AgentTier::parse`] made of a raw tier value: the tier it resolved to,
+/// and whether the value was one this binary knows.
+///
+/// `recognized == false` is **not** an error — parsing fails closed to the most
+/// restricted tools tier (mika#2023 AC2) and carries on. The flag exists so a
+/// caller can *name* the value it did not recognize (`mika agents reprovision`
+/// prints it between quotes) **without writing a second comparison against the
+/// tier vocabulary**. That second comparison is exactly what
+/// `home::tests::mika2230_le_tier_a_un_seul_analyseur` refuses: it would make no
+/// decision wrong the day it is written, and would diverge the day a fourth tier
+/// arrives, in silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierParse {
+    /// The resolved tier. Never `Err`: an unrecognized value lands on
+    /// [`AgentTier::FAIL_CLOSED_TIER`].
+    pub tier: AgentTier,
+    /// `false` when the value was non-empty and outside the recognized set.
+    pub recognized: bool,
+}
+
 impl AgentTier {
-    /// Resolve the tier from the `MIKA_AGENT_TIER` env var.
+    /// The single parser of a tier value, for every caller that holds one.
+    ///
+    /// [`Self::from_env`] reads `MIKA_AGENT_TIER` and hands the raw string here;
+    /// `mika agents reprovision --tier` hands its flag here (mika#2230). The
+    /// extraction is what keeps the mika#2023 fail-closed rule readable **once,
+    /// at its site** — a clap `ValueEnum` on the CLI side would have restated the
+    /// vocabulary and diverged the day a fourth tier arrives.
     ///
     /// Absent, empty, and `"default"` resolve to [`AgentTier::Default`] — an unset
     /// variable is the legitimate shape of the operator workstation, not a
@@ -96,25 +122,44 @@ impl AgentTier {
     /// an unrecognized value resolves **fail-closed** to the most restricted tools
     /// profile, still with the single `warn!` naming the offending value (visible
     /// in `MIKA_SPIRIT_LOG_FILE`).
+    pub fn parse(raw: &str) -> TierParse {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "default" => TierParse {
+                tier: Self::Default,
+                recognized: true,
+            },
+            "family" => TierParse {
+                tier: Self::Family,
+                recognized: true,
+            },
+            "champion" => TierParse {
+                tier: Self::Champion,
+                recognized: true,
+            },
+            _ => {
+                warn!(
+                    value = %raw,
+                    "agent tier value not recognized (MIKA_AGENT_TIER / --tier); \
+                     failing closed to the most restricted tools tier (mika#2023)"
+                );
+                TierParse {
+                    tier: Self::FAIL_CLOSED_TIER,
+                    recognized: false,
+                }
+            }
+        }
+    }
+
+    /// Resolve the tier from the `MIKA_AGENT_TIER` env var.
+    ///
+    /// A thin reader over [`Self::parse`]; the rules live there. Absence of the
+    /// variable is the one case `parse` never sees, and it resolves to
+    /// [`AgentTier::Default`].
     pub fn from_env() -> Self {
         match std::env::var("MIKA_AGENT_TIER") {
             Err(_) => Self::Default,
-            Ok(raw) => {
-                let normalized = raw.trim().to_ascii_lowercase();
-                match normalized.as_str() {
-                    "" | "default" => Self::Default,
-                    "family" => Self::Family,
-                    "champion" => Self::Champion,
-                    _ => {
-                        warn!(
-                            value = %raw,
-                            "MIKA_AGENT_TIER value not recognized; failing closed to the \
-                             most restricted tools tier (mika#2023)"
-                        );
-                        Self::FAIL_CLOSED_TIER
-                    }
-                }
-            }
+            Ok(raw) => Self::parse(&raw).tier,
         }
     }
 
@@ -172,14 +217,26 @@ impl AgentTier {
             && matches!(self.persona_profile(), PersonaProfile::Family)
     }
 
-    fn identity_toml(self) -> &'static str {
+    /// The `identity.toml` template this tier is provisioned with (tools axis).
+    ///
+    /// `pub` since mika#2230: `mika agents reprovision` re-applies this exact
+    /// template to a customer agent already on disk. It calls the accessor rather
+    /// than reaching for `DEFAULT_IDENTITY`/`FAMILY_IDENTITY` directly, so the
+    /// two-axis mapping of mika#2023 keeps a single reader.
+    pub fn identity_toml(self) -> &'static str {
         match self.tools_profile() {
             ToolsProfile::Operator => DEFAULT_IDENTITY,
             ToolsProfile::Family => FAMILY_IDENTITY,
         }
     }
 
-    fn soul_md(self) -> &'static str {
+    /// The `soul.md` template this tier is provisioned with (persona axis).
+    ///
+    /// `pub` for the same reason as [`Self::identity_toml`], and it is the half a
+    /// re-provision must not forget: writing the identity alone fabricates the
+    /// very drift the mika#1962 tier guard exists to catch (allowlist on one axis,
+    /// persona on the other).
+    pub fn soul_md(self) -> &'static str {
         match self.persona_profile() {
             PersonaProfile::Operator => DEFAULT_SOUL,
             PersonaProfile::Family => FAMILY_SOUL,
@@ -1808,5 +1865,158 @@ mod tests {
             AgentTier::Default,
             "an unset MIKA_AGENT_TIER is the legitimate operator workstation"
         );
+    }
+
+    // -- mika#2230 — the tier vocabulary has one parser ----------------------
+
+    /// `AgentTier::parse` is extracted, and `from_env` is a reader over it.
+    #[test]
+    fn mika2230_from_env_reads_the_extracted_parser() {
+        assert_eq!(AgentTier::parse("").tier, AgentTier::Default);
+        assert_eq!(AgentTier::parse("  Default  ").tier, AgentTier::Default);
+        assert_eq!(AgentTier::parse("FAMILY").tier, AgentTier::Family);
+        assert_eq!(AgentTier::parse("Champion").tier, AgentTier::Champion);
+        assert!(AgentTier::parse("champion").recognized);
+
+        let unknown = AgentTier::parse("zorglub");
+        assert!(
+            !unknown.recognized,
+            "an unrecognized value must be reportable as such, so a caller can \
+             name it without re-comparing against the tier vocabulary"
+        );
+        assert_eq!(
+            unknown.tier.tools_profile(),
+            ToolsProfile::Family,
+            "and it still fails closed (mika#2023 AC2)"
+        );
+    }
+
+    /// A line that compares a raw value against the tier vocabulary.
+    ///
+    /// The needles are recomposed with [`concat!`] rather than written whole:
+    /// this block is masked from the scan twice over (it is under `cfg(test)`,
+    /// and `home.rs` is excluded by path), so the recomposition buys nothing
+    /// *today* — it is written because a guard that becomes its own first
+    /// offender does not fail informatively, and the natural repair is to widen
+    /// it until it catches nothing. Same reasoning, same shape, as
+    /// `source_guard::tests::reimplements_the_boundary`.
+    fn reimplements_the_tier_parser(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        // Prose must stay able to describe what is forbidden, including this
+        // module's own doc comments, which name every tier by its literal.
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            return false;
+        }
+        let champion = concat!('"', "champion", '"');
+        if line.contains(champion) {
+            return true;
+        }
+        let family = concat!('"', "family", '"');
+        line.contains(family)
+            && ["=>", "==", "eq_ignore_ascii_case", "matches!"]
+                .iter()
+                .any(|shape| line.contains(shape))
+    }
+
+    /// **V20 — no second parser of the tier vocabulary.**
+    ///
+    /// `mika agents reprovision --tier` (mika#2230) is the second caller that
+    /// holds a raw tier value. The obvious implementation is a clap `ValueEnum`,
+    /// which restates `{default, family, champion}` on the CLI side — and with it
+    /// the fail-closed rule of mika#2023 AC2, which is the part that would
+    /// silently stop matching. No behavioural test can see that class: a second
+    /// parser makes no decision wrong the day it is written. It diverges at the
+    /// fourth tier, in silence, which is precisely the shape of the mika#2023
+    /// incident (a console that knew about a tier the binary did not).
+    ///
+    /// The primary needle is the literal `"champion"`, the one token of this
+    /// vocabulary that means nothing else in this tree; `"family"` is a common
+    /// enough word that it is only flagged in a comparison shape.
+    ///
+    /// **Disposition: halt-and-surface. There is no exception list and adding one
+    /// is not the remedy** — an allowlist born empty is a place to put the next
+    /// violation.
+    #[test]
+    fn mika2230_le_tier_a_un_seul_analyseur() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("mika-common sits at <workspace>/crates/mika-common");
+        let this_file = workspace.join("crates/mika-common/src/home.rs");
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut crates_scanned = 0usize;
+
+        for entry in std::fs::read_dir(workspace.join("crates"))
+            .expect("the guard must be able to read crates/")
+            .flatten()
+        {
+            let src = entry.path().join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            crates_scanned += 1;
+            let scanner = crate::source_guard::ProductionScanner::new(&src);
+            scanner.for_each(|path, production| {
+                if path == this_file {
+                    return; // the one legitimate site
+                }
+                for (n, line) in production.lines().enumerate() {
+                    if reimplements_the_tier_parser(line) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            });
+        }
+
+        assert!(
+            crates_scanned >= 4,
+            "the guard scanned {crates_scanned} crates — it is not reading the workspace"
+        );
+        assert!(
+            offenders.is_empty(),
+            "mika#2230 — {} site(s) compare a raw value against the tier vocabulary \
+             outside `AgentTier::parse`:\n{}\n\n\
+             WHY THIS MATTERS: a second parser makes no decision wrong the day it is \
+             written. It diverges the day a fourth tier arrives — and it takes the \
+             mika#2023 fail-closed rule with it, which is the half that fails \
+             silently. That is the incident mika#2023 was filed for: an upstream \
+             knowing about a tier the binary did not.\n\
+             FIX: call `AgentTier::parse(raw)` and read `TierParse::recognized` if \
+             you need to name an unrecognized value.\n\
+             There is NO exception list, and adding one is not the remedy.",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// V20's good-faith control — a detector verified only by its own green is
+    /// verified by nothing. Written against fabricated lines rather than by
+    /// editing real source.
+    #[test]
+    fn mika2230_the_tier_parser_guard_fires_on_a_relapse() {
+        for relapse in [
+            r#"            "family" => AgentTier::Family,"#,
+            r#"    #[value(name = "champion")]"#,
+            r#"        if raw.eq_ignore_ascii_case("family") { return Tier::Family; }"#,
+            r#"        matches!(raw, "family" | "default")"#,
+        ] {
+            assert!(
+                reimplements_the_tier_parser(relapse),
+                "the guard must catch a re-introduced parser: {relapse}"
+            );
+        }
+
+        for innocent in [
+            r#"    /// Selected when `MIKA_AGENT_TIER=family` (case-insensitive)."#,
+            r#"    // the "family" tier carries FAMILY_IDENTITY on the tools axis"#,
+            r#"        let label = tier_label("family");"#,
+            r#"        writeln!(out, "tier {tier:?} (via {provenance})")?;"#,
+        ] {
+            assert!(
+                !reimplements_the_tier_parser(innocent),
+                "the guard must not fire on: {innocent}"
+            );
+        }
     }
 }
