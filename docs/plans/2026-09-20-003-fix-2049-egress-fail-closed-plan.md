@@ -94,7 +94,7 @@ doit avoir été parqué du fait de la panne.
 
 ## 3. Design
 
-### 3.1 Trois gardes, et une seule d'entre elles protège
+### 3.1 Quatre gardes, et une seule d'entre elles protège
 
 C'est la propriété centrale du lot, et la confondre affaiblirait la protection :
 
@@ -103,6 +103,7 @@ C'est la propriété centrale du lot, et la confondre affaiblirait la protection
 | **C** | `dispatch-lib::_run_pilot_sandboxed` | **la protection** — refuse le lancement | **non**, sonde à chaque fois | fail-**closed** |
 | **B** | `auto_pull` Phase 2 (Rust) | économie — ne consomme pas de budget de re-drive | oui (stamp) | fail-**open** |
 | **A** | `ready_label_handler` (Rust) | économie — ne crée pas de tâche ni de différé | oui (stamp) | fail-**open** |
+| **D** | `self-dev-callback` (prompt) | **honnêteté** — le refus n'est pas rapporté comme un succès | non | — |
 
 **A et B sont des optimisations de confort opérateur, faillibles et fail-open ; C est la
 protection, inconditionnelle, et ne lit aucun état persistant.** Un futur lecteur tenté de durcir
@@ -110,6 +111,10 @@ A ou B au motif qu'elles sont fail-open doit savoir que la sûreté ne repose pa
 repose sur C, qui sonde le socket à chaque dispatch. Inversement, quiconque affaiblirait C en
 lui faisant lire le stamp de A/B transformerait la protection en cache, et un cache périmé est
 précisément un fail-open avec une étape de plus.
+
+**D ne protège rien et n'est pas optionnelle pour autant** (§3.5) : sans elle, le refus que C
+produit est classé *succès* par le callback, et le lot livrerait une protection qui ment sur son
+propre déclenchement.
 
 ### 3.2 Garde C — le refus (shell)
 
@@ -127,11 +132,18 @@ Motifs (vocabulaire fermé, un par cause de §1.1) :
 - `egress_bind_timeout` — lancé, pas de bind en 3 s.
 
 **Le site d'appel refuse**, dans le `else` de `dispatch-lib.sh:973`, en réutilisant le canal
-mika#2141 déjà câblé de bout en bout : `_PILOT_SANDBOX_REFUSAL=<texte> ; return 78`. Ce choix
-livre **le préalable 2 presque intégralement et gratuitement** — `_run_claude_pilot` classe déjà
-le code 78 en `CONTAINMENT REFUSAL (exit 78) — the pilot was never launched`
-(`dispatch-lib.sh:2654`), texte qui dit explicitement que ce n'est ni une dérive du pilote ni un
-échec de pipeline. Il ne reste qu'à enrichir le motif du **geste de remise en marche** (R2).
+mika#2141 déjà câblé : `_PILOT_SANDBOX_REFUSAL=<texte> ; return 78`. `_run_claude_pilot` classe
+déjà le code 78 en `CONTAINMENT REFUSAL (exit 78) — the pilot was never launched`
+(`dispatch-lib.sh:2661`, le motif interpolé à `:2663`), texte qui dit explicitement que ce n'est
+ni une dérive du pilote ni un échec de pipeline. Il reste à enrichir le motif du **geste de
+remise en marche** (R2).
+
+**Le canal est câblé jusqu'au `RESULT`, et pas au-delà — c'est là que le « gratuitement » se
+paie.** Une rédaction antérieure de ce plan disait que ce choix livrait le préalable 2 « presque
+intégralement et gratuitement ». La moitié *texte* est effectivement gratuite ; la moitié
+*classification* ne l'est pas, et la §3.5 la chiffre. Le lot ne peut pas s'appuyer sur la
+réutilisation de mika#2141 sans reprendre aussi ce qui, chez mika#2141, était resté dormant
+faute d'être emprunté.
 
 **Placement : avant `_stage_pilot_gh_token`, donc avant DEUX effets de bord et non un.** La
 séquence réelle est `_stage_pilot_gh_token` (`:970`) puis `_ensure_pilot_helper || true` (`:971`)
@@ -216,7 +228,7 @@ Le lot doit donc livrer, en plus de l'appel :
 
 - **une vérification de praticabilité au déploiement**, pas au runtime : établir que l'agent `mika`
   porte un `chat_id` non nul et que le gateway répond. C'est une case de la DoD et une étape du
-  runbook §3.5, pas une sonde sur le chemin critique de chaque dispatch ;
+  runbook §3.6, pas une sonde sur le chemin critique de chaque dispatch ;
 - **la trace en base comme filet nommé** : la notification est écrite **avant** la tentative
   d'envoi (ligne 60 avant ligne 73), donc une livraison morte laisse quand même la ligne dans la
   session `00000000-0000-0000-0000-700000710717`. C'est ce qui rend la halte (c) de §5.3
@@ -243,10 +255,14 @@ lecteur de la même question, ce que la maison a dû défaire une fois (`groomin
 **La péremption est load-bearing, pas un réglage.** Si A refuse sur stamp sans jamais re-sonder,
 personne ne sonde, le stamp ne se lève jamais et la boucle est bloquée **définitivement** — le
 mode de panne classique d'un disjoncteur sans ré-armement. Le stamp est donc réputé **périmé**
-au-delà de `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` (défaut `600`, soit un tick d'`auto_pull`) : passé ce
-délai A laisse passer, la garde C re-sonde, et soit elle réussit (stamp retiré, reprise annoncée)
-soit elle refuse (stamp rafraîchi, **pas** de nouvelle alerte). Le pire cas pendant une panne est
-donc une tentative de dispatch toutes les 10 minutes.
+au-delà de `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` : passé ce délai A laisse passer, la garde C
+re-sonde, et soit elle réussit (stamp retiré, reprise annoncée) soit elle refuse (stamp rafraîchi,
+**pas** de nouvelle alerte). Le pire cas pendant une panne est donc une tentative de dispatch par
+TTL écoulé.
+
+**Le défaut de ce TTL n'est pas libre** : il est contraint par le seuil de re-drive, et le
+dimensionner sur la cadence du tick d'`auto_pull` rend cette garde inatteignable. C'est
+l'objet de §3.4.1, à lire avant de toucher à la valeur.
 
 **Lecture fail-open, et c'est sûr ici précisément parce que C existe** : stamp absent, illisible,
 inparsable, horodatage dans le futur ⇒ traité comme « pas de panne » ⇒ le dispatch est tenté ⇒ la
@@ -263,11 +279,114 @@ garde C tranche sur une sonde fraîche. Aucune de ces lectures ne peut ouvrir le
   refuser (mika#2279). Nom de porte (format de fil `ready_label_outcome`, mika#2323) :
   **`egress_relay_down`**.
 
-**Ordre de livraison contraint.** La garde C **seule** satisfait R1 (la sûreté) mais **casse** R5.
-A et B seules ne protègent rien. Les trois vont dans le même lot ; si le lot devait être scindé,
-C ne peut pas partir sans B.
+#### 3.4.1 La péremption doit dépasser le seuil de re-drive, sinon la garde B ne mord jamais
 
-### 3.5 Préalable 3 — remise en marche outillée et runbook (R6)
+**C'est un défaut d'une rédaction antérieure de ce plan, et il annulait sa §1.3.** Le TTL y était
+posé à `600` s « soit un tick d'`auto_pull` », en raisonnant sur la *cadence du tick*. Le nombre
+qui gouverne n'est pas celui-là : c'est `STUCK_READY_THRESHOLD_DEFAULT_SECS = 900`
+(`auto_pull.rs:91`), l'âge que le label `ready` doit atteindre pour que Phase 2 re-drive. Avec
+`TTL = 600 < 900`, **le stamp est périmé à chaque fois que Phase 2 le regarde**, et l'arithmétique
+se déroule ainsi (Phase 2 re-drive par `remove` → `add`, ce qui remet l'âge du label à zéro) :
+
+| t | événement | `redrive_count` |
+|---|---|---|
+| 0 | panne ; dispatch refusé ; stamp écrit | 0 |
+| 900 | âge label = 900 ≥ seuil ; stamp vieux de 900 > 600 ⇒ **périmé, B laisse passer** ; re-drive ; C refuse ; stamp rafraîchi | 1 |
+| 1800 | idem | 2 |
+| 2700 | idem | 3 |
+| 3600 | `redrive_count` = 3 ≥ `MAX_REDRIVES_DEFAULT` (`auto_pull.rs:106`) ⇒ **abandon : `operator-review` posé, `ready` retiré** | — |
+
+**Une panne d'environ une heure parque donc chaque ticket — exactement le résultat que §1.3
+impute au monde *sans* garde B.** La garde, à ce dimensionnement, ne change pas une ligne du
+calcul : elle n'est jamais consultée avec un stamp frais sur le seul chemin qu'elle existe pour
+couvrir. R5 et AC5 resteraient ouverts, et la sonde (d) de §5.3 chercherait `egress_relay_down`
+dans `audit_events` sans jamais l'y trouver.
+
+**L'invariant à livrer, et il s'écrit comme un invariant, pas comme deux nombres.**
+`MIKA_PILOT_EGRESS_DOWN_TTL_SECS` doit rester **strictement supérieur** au seuil de stuck-ready
+effectif, avec marge. Défaut proposé : **`1800`** (deux fois le seuil). Le couplage est
+load-bearing et doit être écrit là où il se lit — dans le doc-comment de la constante, nommant
+`STUCK_READY_THRESHOLD_ENV` — faute de quoi quelqu'un baissera l'un des deux et rouvrira ce trou
+en silence. Précédent maison exact : mika#2362, où une enveloppe multiple exact du plafond rendait
+la dernière tentative nominale **inatteignable** sans qu'aucun test ne rougisse, parce que la
+relation entre les deux nombres n'était écrite nulle part.
+
+**Ce que le nouveau défaut coûte, nommé.** Le TTL borne la latence de reprise : le stamp n'est
+retiré que par un dispatch réussi, donc après le retour du relais la boucle repart en **au plus
+30 min** au lieu de 10. C'est conforme au test négatif de l'opérateur, qui exige une reprise
+*sans intervention sur les tickets* — jamais une reprise instantanée — et c'est le bon côté de
+l'arbitrage : trente minutes d'attente contre un ticket parqué qui, lui, exige un geste humain.
+
+**Alternative écartée** : faire rendre `Skip` à la garde B sur stamp présent **même périmé**. Elle
+ferme le tableau ci-dessus, mais rend le déblocage dépendant d'un dispatch qui ne viendra jamais —
+A et B bloquant tous les chemins, plus rien ne re-sonde et le stamp ne se lève pas. C'est le
+blocage définitif que §3.4 vient d'écarter, réintroduit par l'autre bout.
+
+**Ordre de livraison contraint.** La garde C **seule** satisfait R1 (la sûreté) mais **casse** R5.
+A et B seules ne protègent rien. D seule ne protège rien non plus mais évite un mensonge. Les
+quatre vont dans le même lot ; si le lot devait être scindé, C ne peut partir ni sans B **ni sans
+D** — sans B elle parque les tickets, sans D elle rapporte ses propres refus comme des succès.
+
+### 3.5 Garde D — sans discriminant, le callback classe le refus en SUCCÈS
+
+**Mesure, dans `skills/bundled/self-dev-callback/system_prompt.md`.** Le routage terminal y est
+binaire, et les deux branches sont écrites l'une sous l'autre :
+
+- `**On pipeline failure (callback contains "PIPELINE FAILURE:")**`
+- `**On success (no "PIPELINE FAILURE:" prefix)**`
+
+Le `RESULT` d'un refus (`dispatch-lib.sh:2659-2668`) ne contient **ni** `PIPELINE FAILURE:`,
+**ni** le mot `FAILED`, **ni** le préfixe `STATUS=CANCELLED_` dont le discriminant mika#749
+s'occupe en amont, **ni** `error_max_turns`. Le déclencheur secondaire de la classification
+pipeline exige en outre un `result` NULL ou vide — or il est renseigné. **Un refus de contenance
+tombe donc, littéralement, dans la branche `On success`**, dont la première instruction est
+d'aller chercher l'URL de la PR (`gh pr list --head <branch>`) et dont la sortie nominale est de
+notifier « claude-pilot completed for {repo}#{issue} » puis de poser la tâche `in_progress` avec
+« awaiting QA review ».
+
+**Ce n'est pas une hypothèse sur le modèle : c'est ce que la consigne prescrit.** Le comportement
+réel sera au mieux du bricolage hors consigne (la PR n'existe pas), au pire l'annonce d'un succès
+pour un pilote qui n'a jamais démarré — *sur le chemin même que le fail-closed rend nominal en cas
+de panne*. C'est la classe `assert_grounded` / `milestone-close-claim` que la maison traite le plus
+durement, et elle serait ici produite par le substrat, pas par une dérive du modèle.
+
+**Pourquoi ce trou n'a jamais coûté sous mika#2141.** Le refus gitdir est rare — il suppose un
+défaut de staging. Le fail-closed d'egress ne crée pas le trou, il le **rend emprunté** : pendant
+une panne de relais, chaque dispatch le traverse. Un défaut dormant qu'on met sur le chemin
+critique est à traiter dans le lot qui l'y met.
+
+**Le livrable.** Un discriminant de refus de contenance dans `self-dev-callback`, placé **avec**
+le discriminant cancel (mika#749) — c'est-à-dire **avant** la classification pipeline, pour la
+même raison qu'y est placé le sien :
+
+- **Prédicat** : le `RESULT` contient `CONTAINMENT REFUSAL (exit 78)`. À noter, et c'est une
+  contrainte de rédaction : le discriminant cancel est un `starts with`, celui-ci ne peut pas
+  l'être — le `RESULT` commence par `Log path: …` (`dispatch-lib.sh:2659`). Un `starts with`
+  recopié par analogie ne matcherait jamais et livrerait une garde inerte.
+- **Conduite** : **ne pas retry** (un retry immédiat re-frappe un relais toujours mort et brûle
+  `pipeline_retry_count` sur une cause qui n'est pas la sienne) ; **ne toucher à aucun label** —
+  la reprise est le métier d'`auto_pull`, et retirer `ready` ici casserait R5 par l'autre bout ;
+  rendre la tâche terminale avec un motif ; relayer à l'opérateur le texte du refus, qui porte
+  déjà la cause et le geste (R2).
+- **Vocabulaire** : le motif de `update_task_status` doit être distinct de `operator_cancel` et de
+  `signal_cancel`. Un refus de contenance n'est ni l'un ni l'autre, et les trois populations
+  doivent rester comptables séparément (doctrine mika#2131, et précédent direct : mika#2249 a dû
+  **pré-écrire** son propre discriminant pour ne pas être absorbé par une branche `CANCELLED_BY_*`
+  qui aurait fait lire « ne pas retenter » là où il fallait lire « le moteur a disposé »).
+
+**Pourquoi une consigne de prompt ici, alors que R3 refuse l'enforcement par prompt.** La règle
+(`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`) porte sur ce qui doit être
+**garanti** : la protection (C), l'alerte (§3.3), le filtre (B), la porte (A) sont tous du
+substrat déterministe, et aucun n'est confié à un tour LLM. D est d'une autre nature — le callback
+*est* un tour LLM par construction, sa classification est déjà prompt-portée de bout en bout, et
+ce lot ne peut pas convertir ce chemin en substrat sans réécrire `self-dev-callback` en entier.
+Ce qui est livré ici est donc l'ajout d'une **branche manquante à une machine à états qui en a
+déjà trois**, pas une nouvelle dépendance à l'obéissance du modèle : le défaut mesuré n'est pas
+que le modèle désobéit, c'est que la consigne prescrit aujourd'hui la mauvaise branche.
+Durcir davantage — une garde EndTurn sur l'annonce d'un succès sans PR — est **hors périmètre** et
+nommé comme tel en §6 : son lexique croiserait le trafic nominal de tous les callbacks sains.
+
+### 3.6 Préalable 3 — remise en marche outillée et runbook (R6)
 
 **Le geste existe déjà pour moitié** : `scripts/canary-pilot-containment --ensure-relay` appelle
 `_ensure_pilot_egress_proxy` et imprime `relay: up` / `relay: FAILED`. Il couvre le cas « mort
@@ -352,6 +471,17 @@ documenté contre un arrêt de rail non mesuré.
    `info` de reprise est émise.
 6. **aucun ticket n'est touché** — la garde B rend `Skip` et non `SkipAndResetBudget`
    (test Rust : `redrive_count` inchangé après un tick sur stamp frais).
+7. **le stamp est encore frais quand Phase 2 regarde** (§3.4.1) — test Rust sur les **valeurs par
+   défaut** : à un âge de label égal au seuil de stuck-ready, un stamp du même âge est jugé frais
+   et B rend `Skip`. C'est l'assertion qui tient l'invariant `TTL > seuil` ; sans elle, les deux
+   constantes peuvent dériver l'une par rapport à l'autre sans qu'aucun test ne rougisse
+   (mika#2362). Elle doit **échouer contre un TTL de 600 s**, ce qui est le contrôle négatif de la
+   correction elle-même.
+8. **un refus n'est pas rapporté comme un succès** (§3.5) — le `RESULT` produit par l'assertion 1
+   est passé au discriminant de `self-dev-callback` : il route vers la branche de refus de
+   contenance, et **non** vers `On success`. Vérifiable sans tour LLM en assertant que le texte
+   porte le marqueur `CONTAINMENT REFUSAL (exit 78)` que le discriminant cherche — l'obéissance du
+   modèle n'est pas testable ici, la présence du marqueur qu'il doit lire l'est.
 
 **Anti-vacuité** (plan KTD6, discipline déjà appliquée par le bloc mika#2041 voisin) : les
 assertions 1 et 3 doivent **échouer contre le code actuel** — aujourd'hui `rc=1` / `launched=yes` /
@@ -408,8 +538,20 @@ notification est en base :
 **(d) Halte — un ticket parqué malgré la garde B.** Lire
 `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'auto_pull_exclusion' GROUP BY 1;`
 La présence d'`egress_relay_down` prouve que B mord ; son absence pendant une panne dit que le
-stamp n'est pas lu (chemin, péremption, `MIKA_HOME`) — **réparer la lecture, ne pas allonger le
-budget de re-drive**, qui masquerait le symptôme sans toucher la cause.
+stamp n'est pas lu (chemin, `MIKA_HOME`) **ou qu'il est systématiquement périmé quand Phase 2
+regarde** — lire `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` contre
+`MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` **avant** toute autre hypothèse : un TTL retombé sous
+le seuil restaure exactement le tableau de §3.4.1, et la garde paraît alors absente alors qu'elle
+est seulement inatteignable. Dans tous les cas, **réparer la lecture, ne pas allonger le budget de
+re-drive**, qui masquerait le symptôme sans toucher la cause.
+
+**(f) Halte — un refus annoncé comme un succès.** Après un refus avéré (une ligne `CONTAINMENT
+REFUSAL` dans un `RESULT`), vérifier qu'aucune notification « claude-pilot completed » ne porte le
+même ticket et qu'aucune tâche n'est restée `in_progress` sur « awaiting QA review » sans PR. Une
+occurrence signifie que le discriminant de §3.5 n'est pas atteint — vérifier **d'abord** qu'il est
+écrit en `contains` et non en `starts with` (le `RESULT` commence par `Log path:`), avant de
+soupçonner le modèle. **Ne pas répondre à cette halte par une garde EndTurn** : voir §6, son
+lexique croiserait le trafic nominal.
 
 **(e) Contrôle négatif du déploiement.** L'absence de refus ne prouve pas que la garde est en
 vigueur : elle est identique à l'absence de panne. Pour établir le déploiement, exercer
@@ -420,7 +562,7 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 
 ## 6. Hors périmètre, délibérément
 
-- **Le relais wedgé** (accepte `connect()`, ne sert plus). Nommé en §3.5, doté d'un geste
+- **Le relais wedgé** (accepte `connect()`, ne sert plus). Nommé en §3.6, doté d'un geste
   (`--restart-relay`), **non détecté**. Le détecter demande une sonde applicative — une requête de
   bout en bout à travers le proxy — sur le chemin critique de chaque dispatch, dont le coût et le
   taux de faux positifs n'ont pas été mesurés. **Ticket de suivi**, préalable : une mesure de la
@@ -431,6 +573,16 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
 - **`MIKA_PILOT_SANDBOX=0`** — §4, opt-out explicite, conservé.
 - **L'allowlist de noms d'hôtes elle-même** (`scripts/mika-pilot-egress-proxy`). Ce ticket porte
   sur ce qui arrive **quand le contrôle ne démarre pas**, jamais sur ce que le contrôle autorise.
+- **Une garde EndTurn contre l'annonce d'un succès sans PR.** Elle fermerait la classe de §3.5 au
+  substrat plutôt qu'au prompt, et c'est la bonne direction à terme. Elle est écartée **sur
+  mesure**, pas par prudence : son lexique — « completed », « PR », « awaiting QA » — est le
+  vocabulaire nominal de *tous* les callbacks sains, dont le régime est précisément d'annoncer une
+  PR. Le taux de faux positifs porterait sur la population que la garde doit épargner, et un faux
+  positif y casse un tour de callback légitime. **Ticket de suivi**, préalable écrit : un
+  discriminant qui ne soit pas lexical (l'existence effective de la PR, lue et non dite).
+- **La conversion de `self-dev-callback` en classification de substrat.** La garde D ajoute une
+  branche à une machine à états prompt-portée ; elle ne change pas sa nature. Réécrire ce chemin
+  est un lot à soi seul, dont le blast radius est tous les dispatches.
 
 ---
 
@@ -445,13 +597,19 @@ binaire antérieur au correctif produit exactement le même silence (classe mika
       `chat_id` non nul en `customer_config` et une notification de test est reçue. Sans cette
       case, l'AC1 livre un appel émis et non une escalade lue.
 - [ ] `~/.mika/state/pilot-egress-down` est écrit/retiré par la garde C, avec péremption
-      `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` (défaut 600).
+      `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` (défaut **1800**).
+- [ ] **L'invariant `TTL > seuil de stuck-ready` est écrit dans le doc-comment de la constante**,
+      en nommant `STUCK_READY_THRESHOLD_ENV`, et tenu par l'assertion 7 de §5.1 (§3.4.1).
 - [ ] Garde B (`auto_pull` Phase 2, filtre `egress_relay_down`, verdict `Skip`) et garde A
       (`ready_label_handler`, porte `egress_relay_down`, refus `Handled`) livrées dans le même lot.
+- [ ] **Garde D** — `self-dev-callback` porte un discriminant de refus de contenance (prédicat
+      `contains`, jamais `starts with`), placé avec le discriminant cancel mika#749, sans retry,
+      sans toucher aux labels, avec un motif distinct d'`operator_cancel` et de `signal_cancel`.
 - [ ] `scripts/canary-pilot-containment --restart-relay` livré.
 - [ ] `docs/operator/pilot-egress-relay.md` livré, avec la note de désambiguïsation « egress
       pilote ≠ egress recherche ».
-- [ ] Les six assertions de §5.1 passent, et les assertions 1 et 3 échouent contre `HEAD`.
+- [ ] Les huit assertions de §5.1 passent ; les assertions 1 et 3 échouent contre `HEAD`, et
+      l'assertion 7 échoue contre un TTL de 600 s.
 - [ ] Les quatre tests de §5.2 sont migrés et verts.
 - [ ] `make test`, `cargo clippy`, `cargo fmt`, `make verify-bundled-skills` verts.
 - [ ] Les deux nouveaux noms de fil (`egress_relay_down` en filtre et en porte) sont épinglés par
@@ -485,8 +643,18 @@ runbook, avec un test. Vérifiable : `--restart-relay` + `docs/operator/pilot-eg
 lisible ; proxy relancé ⇒ le dispatch reprend. Vérifiable : §5.1 assertions 1, 2, 3, 5.
 
 **AC5 — Reprise sans intervention sur les tickets.** Aucun ticket n'est parqué
-(`operator-review`) ni n'a consommé de budget de re-drive du fait de la panne. Vérifiable : §5.1
-assertion 6.
+(`operator-review`) ni n'a consommé de budget de re-drive du fait de la panne. Vérifiable en
+**deux** moitiés, parce que la première ne suffit pas (§3.4.1) : *le verdict* de la garde B par
+§5.1 assertion 6 (`Skip`, jamais `SkipAndResetBudget`), *son atteignabilité* par l'assertion 7
+(le stamp est encore frais quand Phase 2 regarde). Une garde B correcte sur un stamp
+systématiquement périmé rend AC5 vert en test et faux en production.
+
+**AC8 — Un refus n'est pas rapporté comme un succès.** Le `RESULT` d'un refus de contenance est
+routé par `self-dev-callback` vers une branche de refus, jamais vers `On success` ; aucune
+notification n'annonce une PR ou une complétion. Vérifiable : §5.1 assertion 8. *Dérivé, non
+transcrit : ce critère ne figure pas dans le commentaire opérateur du 2026-09-20, il sort de la
+mesure de §3.5 — le fail-closed met sur le chemin nominal d'une panne un trou de classification
+jusqu'ici dormant.*
 
 **AC6 — Aucune régression de contenance.** Les quatre invariants de §5.2 restent testés et verts
 après migration.
