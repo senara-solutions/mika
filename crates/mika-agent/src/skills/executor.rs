@@ -2785,6 +2785,20 @@ pub(crate) enum RearmOutcome {
     Rearmed,
     /// Refused for a condition that clears by itself — try again next tick.
     NotNow,
+    /// Refused because the parent is already represented by a live deferred
+    /// wrapper: there is nothing to repair, so nothing to spend (mika#2413).
+    ///
+    /// A fourth variant rather than a third use of `NotNow`, for two reasons
+    /// that are both about what the caller does next. First, this is the
+    /// *nominal* path under slot contention — the others are a full queue or a
+    /// failed read — and it is the one that must leave the consumed wrapper an
+    /// honest terminal record, which `NotNow` must not do (a `NotNow` caused by
+    /// `has_non_deferred_active_callback_child` returning true means the turn
+    /// genuinely dispatched, and writing `expired` there would deny a real
+    /// dispatch). Second, the two reapers treat every non-`Rearmed`,
+    /// non-`NotNow` outcome as grounds to expire the parent, so a variant the
+    /// compiler forces them to name is the only safe way to add one here.
+    AlreadyRepresented,
     /// Refused for good: the repair budget is spent, or the dispatch cannot be
     /// reconstructed. Only this warrants expiring the task.
     Unrepairable,
@@ -2806,14 +2820,32 @@ pub(crate) enum RearmOutcome {
 /// inserts one row for *this* parent and hands the promotion decision back to
 /// `promote_pending_deferred_if_idle`, which checks the class slot first.
 ///
-/// The caller must distinguish the two ways a repair can be refused, because
-/// only one of them justifies destroying the task. See [`RearmOutcome`].
+/// The caller must distinguish the ways a repair can be refused, because only
+/// one of them justifies destroying the task. See [`RearmOutcome`].
+///
+/// # Invariant (mika#2413)
+///
+/// A parent that already carries a live deferred wrapper **is represented**:
+/// there is nothing to repair, and therefore nothing to spend. Such a call
+/// returns [`RearmOutcome::AlreadyRepresented`] without creating a wrapper and
+/// without touching the budget, whatever the `cause`.
+///
+/// That invariant is what breaks the self-sustaining loop mika#2413 measured.
+/// `register_deferred_callback` already posts a wrapper when
+/// `validate_dispatch_readiness` refuses on `global_dispatch_active`; re-arming
+/// on top of it produced a *second* one, and a second pending wrapper makes the
+/// mika#1205 `already_deferred` intercept short-circuit the next turn **before**
+/// it even tests the slot — so the turn after a re-arm is sterile by
+/// construction, is counted as a no-op by R9, and re-arms again. Three rounds,
+/// budget gone, parent `failed`, while the only thing that ever happened was
+/// another groom holding the slot.
 pub(crate) async fn rearm_deferred_callback(
     db: &AsyncDatabase,
     parent_task_id: &str,
     action_config: &str,
     dispatch_class: &str,
     cause: &str,
+    consumed_wrapper_id: Option<&str>,
 ) -> RearmOutcome {
     // Guard: if the parent already has an active non-deferred callback, the
     // turn did dispatch and there is nothing to repair. Fail-closed on a query
@@ -2832,6 +2864,56 @@ pub(crate) async fn rearm_deferred_callback(
                 "failed to check for non-deferred callback children — not re-arming"
             );
             return RearmOutcome::NotNow;
+        }
+    }
+
+    // mika#2413 — is the parent already represented in the queue?
+    //
+    // Placement is imposed: AFTER the guard above (the turn really dispatched:
+    // nothing to repair) and BEFORE `get_stuck_rearm_count`, so that a parent
+    // that is already represented never makes anyone read, let alone spend, a
+    // budget it has no reason to touch.
+    //
+    // `consumed_wrapper_id` takes the wrapper whose sterility we are treating
+    // out of the population. Without it, the `silent_turn_error` caller would
+    // see the consumed wrapper — still `completed`, `completed_at` fresh —
+    // count itself as live, and no re-arm would ever be possible on that path
+    // again.
+    //
+    // Fail-safe, and it points the OPPOSITE way from the guard just above:
+    // a read we could not make must not be read as "the parent is
+    // represented", because that would leave a parent with nothing in the queue
+    // and nothing to put something back — never repaired, never expired. So on
+    // error we fall through to the nominal path and repair. The asymmetry is
+    // the point: a wrong "I repair" costs one point of budget, a wrong "it is
+    // represented" costs a parent that nothing represents any more.
+    match db
+        .find_live_deferred_wrapper_child(
+            parent_task_id,
+            crate::task_engine::promoted_wrapper_liveness_secs(),
+            consumed_wrapper_id,
+        )
+        .await
+    {
+        Ok(Some(live_wrapper_id)) => {
+            info!(
+                event = "deferred_rearm_skipped_parent_represented",
+                parent_task_id,
+                task_id = consumed_wrapper_id.unwrap_or("-"),
+                live_wrapper_id = %live_wrapper_id,
+                cause,
+                dispatch_class,
+                "parent already represented by a live deferred wrapper — no re-arm, no budget spent"
+            );
+            return RearmOutcome::AlreadyRepresented;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                parent_task_id,
+                error = %e,
+                "failed to check for a live deferred wrapper — repairing on the nominal path"
+            );
         }
     }
 
@@ -3255,6 +3337,9 @@ async fn execute_long_running(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // mika#2413 U3 — kept for the post-spawn budget reset below; the binding
+    // above is moved into `build_callback_task`.
+    let parent_for_budget_reset = parent_task_id.clone();
 
     // Belt-and-suspenders (#955): validate_required_fields is the runtime guard,
     // but assert that required fields survived into the dispatch input as a
@@ -3348,6 +3433,37 @@ async fn execute_long_running(
         ctx.db.clone(),
         github_token.map(|s| s.to_string()),
     );
+
+    // mika#2413 U3 — a real dispatch just spawned, so the hypothesis the repair
+    // budget bounds ("this parent's turns never dispatch") is refuted by the
+    // facts. Placed AFTER the spawn on purpose: the discriminant is *having
+    // reached a real dispatch*, not *having started one*. Moving it earlier —
+    // to the readiness check, or to the callback-child creation that can still
+    // be followed by a missing-handler failure — would rebuild mika#2158's
+    // unreachable counter, where the action being counted was also the action
+    // that cleared it. Fire-and-forget: a failed reset costs one point of a
+    // budget of two, never the dispatch that just left.
+    if let Some(parent_id) = parent_for_budget_reset.as_deref() {
+        match ctx.db.reset_stuck_rearm_count(parent_id).await {
+            Ok(true) => {
+                info!(
+                    event = "stuck_rearm_count_reset",
+                    parent_task_id = parent_id,
+                    callback_task_id = %task_id,
+                    skill_tool = %skill_tool.definition.name,
+                    "real dispatch spawned — repair budget reset"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    parent_task_id = parent_id,
+                    error = %e,
+                    "failed to reset stuck_rearm_count after a real dispatch"
+                );
+            }
+        }
+    }
 
     ToolOutput::success(format!(
         "Task submitted (long-running). ID: {task_id}\n\
@@ -4821,6 +4937,107 @@ mod tests {
             callback_tasks[0].parent_task_id.as_deref(),
             Some(wi_id.as_str()),
             "callback task should link to parent task via parent_task_id"
+        );
+    }
+
+    /// U3 (mika#2413) — a real dispatch refutes the hypothesis the repair budget
+    /// bounds, so the counter goes back to zero.
+    ///
+    /// Why it matters beyond tidiness: `increment_stuck_rearm_count` was the only
+    /// writer, and mika#1614 task reuse flips the same row from `groom` to
+    /// `implement`. Two contentions suffered while grooming therefore condemned
+    /// the implementation before it started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2413_a_real_dispatch_resets_the_repair_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+
+        // Two contentions suffered earlier, through the production writer.
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+        assert_eq!(async_db.get_stuck_rearm_count(&wi_id).await.unwrap(), 2);
+
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        assert_eq!(
+            async_db.get_stuck_rearm_count(&wi_id).await.unwrap(),
+            0,
+            "a spawned non-deferred dispatch is proof the parent's turns do dispatch"
+        );
+    }
+
+    /// V5 (mika#2413) — the line that separates this reset from the one mika#2158
+    /// had to remove.
+    ///
+    /// That one fired on *having started* — the very action the counter counted —
+    /// which made the counter unreachable (31 re-drives reading 1). This one
+    /// fires on *having reached a real dispatch*. A dispatch attempt that is
+    /// **refused** must therefore leave the budget exactly where it was; if this
+    /// test ever goes green with the reset moved earlier, the regression is back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2413_a_refused_dispatch_does_not_reset_the_repair_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+
+        // The per-turn cap (#583): a dispatch already left in this turn, so this
+        // attempt is refused before anything spawns.
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(1),
+            originating_message: None,
+        };
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            output.is_error,
+            "the per-turn cap must refuse this dispatch"
+        );
+        assert!(output.content.contains("dispatch_limit_exceeded"));
+
+        assert_eq!(
+            async_db.get_stuck_rearm_count(&wi_id).await.unwrap(),
+            1,
+            "a refused attempt is not a dispatch — resetting here is the mika#2158 regression"
         );
     }
 
@@ -7797,6 +8014,7 @@ mod tests {
             &action_config,
             "implement",
             "noop_completion",
+            None,
         )
         .await;
 
@@ -7821,7 +8039,8 @@ mod tests {
                 &parent_id,
                 &action_config,
                 "groom",
-                "silent_turn_error"
+                "silent_turn_error",
+                None
             )
             .await,
             RearmOutcome::Rearmed
@@ -7848,22 +8067,34 @@ mod tests {
         );
     }
 
-    /// Termination: the budget bounds the total repairs, so a parent whose turns
-    /// never dispatch stops being re-armed and falls to the reaper.
+    /// V3 (mika#2413) — non-regression on mika#2045: the budget still bounds the
+    /// total repairs, so a parent whose turns *really* never dispatch stops
+    /// being re-armed and falls to the reaper. mika#2413 must not widen that
+    /// population by an inch.
+    ///
+    /// The consumption below marks each wrapper `delivered`, which is what the
+    /// engine does (`mark_task_delivered` runs before the R9 re-arm) and is the
+    /// only honest simulation now that liveness is a term of the decision.
+    /// Before mika#2413 the loop left them `completed`, which the engine only
+    /// ever does on the `silent_turn_error` path — and the new guard is
+    /// deliberately meant to refuse a re-arm in that state.
     #[tokio::test]
     async fn test_rearm_refuses_once_budget_is_exhausted() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
         for _ in 0..MAX_STUCK_REARMS {
             assert_eq!(
-                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                    .await,
                 RearmOutcome::Rearmed
             );
-            // Consume the wrapper the way promotion does.
+            // Consume the wrapper the way the engine does: promotion writes
+            // `completed`, delivery writes `delivered`.
             for child in db.get_child_tasks(&parent_id).await.unwrap() {
                 if child.label == crate::agent::DEFERRED_DISPATCH_LABEL && child.status == "pending"
                 {
                     db.update_task_status(&child.id, "completed").await.unwrap();
+                    db.mark_task_delivered(&child.id).await.unwrap();
                 }
             }
         }
@@ -7873,7 +8104,8 @@ mod tests {
             MAX_STUCK_REARMS
         );
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
             RearmOutcome::Unrepairable,
             "budget exhausted is terminal — the reaper may expire the task"
         );
@@ -7916,7 +8148,8 @@ mod tests {
         }
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
             RearmOutcome::NotNow,
             "a full queue clears on its own — the task must survive to be retried"
         );
@@ -7959,7 +8192,8 @@ mod tests {
         db.create_task(real_callback).await.unwrap();
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop").await,
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
             RearmOutcome::NotNow,
             "a live dispatch means nothing to repair — and nothing to expire either"
         );

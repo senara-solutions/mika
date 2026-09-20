@@ -1581,6 +1581,127 @@ fn test_has_live_deferred_wrapper_child() {
     );
 }
 
+/// mika#2413 — the boolean sibling is the exclusion-free case of the finder, so
+/// the two cannot drift. Asserted over the same status/age matrix the parity
+/// test above uses, because a delegation that silently stopped delegating would
+/// reopen exactly the fork `has_live_deferred_wrapper_child`'s own doc warns
+/// about.
+#[test]
+fn mika2413_the_boolean_sibling_is_the_finder_without_an_exclusion() {
+    let cases: &[(&str, Option<i64>)] = &[
+        ("pending", None),
+        ("completed", Some(0)),
+        ("completed", Some(3000)),
+        ("delivered", Some(0)),
+        ("cancelled", Some(0)),
+    ];
+
+    for (status, offset) in cases {
+        let db = db();
+        let parent_id = create_pending_issue_parent(&db, 2413, 11_455);
+        match offset {
+            Some(o) => attach_deferred_wrapper_at(&db, &parent_id, status, *o),
+            None => attach_deferred_wrapper(&db, &parent_id, status),
+        };
+
+        assert_eq!(
+            db.has_live_deferred_wrapper_child("mika", &parent_id, 2700)
+                .unwrap(),
+            db.find_live_deferred_wrapper_child("mika", &parent_id, 2700, None)
+                .unwrap()
+                .is_some(),
+            "the two entry points diverged on ({status}, {offset:?})"
+        );
+    }
+}
+
+/// mika#2413 — the exclusion takes exactly one wrapper out, and only that one.
+///
+/// This is what lets `rearm_deferred_callback` ask *"is this parent represented
+/// by anything OTHER than the wrapper whose sterility I am treating?"*. Without
+/// it, a wrapper still `completed` on the `silent_turn_error` path counts itself
+/// as live and that repair path dies for the whole liveness window.
+#[test]
+fn mika2413_the_exclusion_removes_only_the_named_wrapper() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2413, 100);
+    let consumed = attach_deferred_wrapper(&db, &parent_id, "completed");
+    db.conn
+        .execute(
+            "UPDATE tasks SET completed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
+            params![consumed],
+        )
+        .unwrap();
+
+    // On its own, the consumed wrapper would shelter its own parent.
+    assert!(
+        db.find_live_deferred_wrapper_child("mika", &parent_id, 2700, None)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.find_live_deferred_wrapper_child("mika", &parent_id, 2700, Some(&consumed))
+            .unwrap(),
+        None,
+        "excluded, it shelters nothing"
+    );
+
+    // A genuine sibling is found, and is the one reported.
+    let sibling = attach_deferred_wrapper(&db, &parent_id, "pending");
+    assert_eq!(
+        db.find_live_deferred_wrapper_child("mika", &parent_id, 2700, Some(&consumed))
+            .unwrap(),
+        Some(sibling.clone()),
+        "the exclusion must not hide the other wrappers"
+    );
+    // And excluding the sibling instead brings the consumed one back.
+    assert_eq!(
+        db.find_live_deferred_wrapper_child("mika", &parent_id, 2700, Some(&sibling))
+            .unwrap(),
+        Some(consumed),
+        "only the named id leaves the population"
+    );
+}
+
+/// mika#2413 U3 — the reset clears a spent budget and writes nothing otherwise.
+///
+/// The `> 0` guard is what keeps the nominal dispatch free of a write and makes
+/// the return value mean "there was something to clear", so the caller can log
+/// only the resets that carry information.
+#[test]
+fn mika2413_reset_stuck_rearm_count_only_writes_when_there_is_something_to_clear() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2413, 100);
+
+    assert!(
+        !db.reset_stuck_rearm_count(&parent_id).unwrap(),
+        "a counter already at zero is not a reset"
+    );
+
+    db.increment_stuck_rearm_count(&parent_id).unwrap();
+    db.increment_stuck_rearm_count(&parent_id).unwrap();
+    assert_eq!(db.get_stuck_rearm_count(&parent_id).unwrap(), 2);
+
+    assert!(db.reset_stuck_rearm_count(&parent_id).unwrap());
+    assert_eq!(db.get_stuck_rearm_count(&parent_id).unwrap(), 0);
+    assert!(
+        !db.reset_stuck_rearm_count(&parent_id).unwrap(),
+        "the reset is idempotent"
+    );
+
+    // Unreadable metadata is left alone rather than replaced: `increment`
+    // rebuilds a fresh object because it must still bound a corrupt row, but a
+    // reset has nothing to bound and no reason to overwrite.
+    db.conn
+        .execute(
+            "UPDATE tasks SET metadata = 'not json' WHERE id = ?1",
+            params![parent_id],
+        )
+        .unwrap();
+    assert!(!db.reset_stuck_rearm_count(&parent_id).unwrap());
+}
+
 /// AC4 (mika#2181): the audit rendering names every wrapper and its status,
 /// oldest first, and says so plainly when there is none.
 #[test]
