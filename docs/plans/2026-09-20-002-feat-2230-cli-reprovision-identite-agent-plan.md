@@ -456,7 +456,7 @@ tests`, `tempfile::TempDir`), sauf mention contraire.
 
 ---
 
-## 7. Acceptance criteria
+## Acceptance criteria
 
 Le corps du ticket ne porte pas de section `## Acceptance criteria`. Les
 critères ci-dessous sont dérivés de sa **Demande** (« une sous-commande CLI …
