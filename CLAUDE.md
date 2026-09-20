@@ -676,6 +676,75 @@ Optional (filet moteur du verdict QA — mika#2368):
   discriminant est `qa_build_callback::qa_verdict_required`, dont la conjonction
   les exclut chacun (mika#2355 AC9).
 
+### Une mémoire apprise d'un échec ne peut plus dégrader sans avoir tenté (mika#2237)
+
+**Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
+qui lit un `hold[review]` inattendu, ou qui cherche pourquoi une PR revue `pass`
+n'a pas été mergée, cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-09-08.** mika#2218 avait rendu `--approve` de
+  nouveau possible (identité de revue `mika-platform-qa`, distincte de l'auteur).
+  Sur la **première** revue post-déploiement — mika#2236, corps
+  `VERDICT: pass ✅` — mika-qa a posté en `--comment` **sans tenter `--approve`** :
+  argv `["pr","review","2236","--comment",…]`, zéro tentative. Le skill mappait
+  pourtant `pass → --approve`. Ce qui l'a emporté est la mémoire de l'agent — les
+  137 refus d'auto-approbation d'avant le fix. C2, le premier merge autonome, est
+  resté à moitié cassé jusqu'à une correction manuelle de la mémoire de mika-qa.
+- **La re-mesure qui décide du remède.** La même `mika-platform-qa`, le même jour,
+  a posté **trois revues `APPROVED`** (08:25Z, 08:47Z, 09:29Z). « Zéro tentative »
+  est donc vrai **de ce tour** et faux de la journée : la mémoire défensive n'était
+  pas un empêchement stable mais un arbitrage gagnant **par intermittence**. Un
+  remède côté mémoire (tag, invalidation datée) suppose un état persistant à
+  corriger ; ce qui est mesuré varie d'un tour à l'autre. Une garde qui lit l'argv
+  mord exactement sur les tours où la mémoire gagne et se tait sur les autres.
+- **Trois lignes pour lire l'état.** Chaîne de validation, échappatoire, mapping à
+  lecteur unique : `crates/mika-agent/CLAUDE.md` § *Verdict↔flag coherence gate*.
+
+  ```bash
+  grep pr_review_flag_refused                "$MIKA_SPIRIT_LOG_FILE" | jq -c '{verdict, flag_posted, pr}'
+  grep pr_review_flag_degraded_after_attempt "$MIKA_SPIRIT_LOG_FILE"
+  grep pr_review_flag_guard_abstained        "$MIKA_SPIRIT_LOG_FILE"
+  grep verdict_pass_without_approval         "$MIKA_SPIRIT_LOG_FILE"
+  ```
+  ```sql
+  SELECT after_value, count(*) FROM audit_events
+   WHERE tool_name = 'pr_review_flag_guard' GROUP BY 1;
+  ```
+
+- **`pr_review_flag_refused` non vide EST le résultat attendu, pas une panne.**
+  Chaque ligne est une dégradation que la mémoire poussait encore et que le moteur
+  a arrêtée : c'est la mesure de la rémanence, que rien ne donnait avant. Une
+  décroissance vers zéro dit que la mémoire s'est purgée ; un **plateau** dit
+  qu'elle se ré-écrit, et c'est **là** que le ticket de suivi sur le tagging des
+  mémoires défensives s'ouvre — avec un compte plutôt qu'avec une intuition.
+- **Halte 1 — `verdict_pass_without_approval` non vide après déploiement.** Une
+  revue a contourné la garde. **Ne pas élargir la garde par réflexe** : établir
+  d'abord *quel chemin* a posté (autre agent, `run_gh_subprocess`, binaire
+  antérieur — classe mika#2340) ; les trois remèdes diffèrent. Régime attendu :
+  zéro. C'est l'événement d'attribution dont l'**absence** a coûté onze jours au
+  défaut fondateur, complémentaire du miroir `verdict_approved_but_unclassified`
+  (mika#2239) et comptable séparément de lui.
+- **Halte 2 — `pr_review_flag_guard_abstained` soutenu.** L'historique
+  `tool_calls` n'est pas lisible, donc la direction `pass → comment` est inerte.
+  Vérifier `MIKA_STORE_TOOL_CALLS` **avant** de toucher au prédicat. (La direction
+  `block → approve` ne consulte aucun historique et reste ferme.)
+- **Halte 3 — des verdicts `pass` qui disparaissent au profit de `hold[review]`
+  sur des PR qui auraient dû passer.** C'est le contournement laissé ouvert : le
+  modèle dégrade son **verdict** au lieu de son flag. **Ne pas durcir la garde** —
+  elle ne peut pas savoir quel verdict est juste, et c'est écrit dans le corps de
+  son refus, qui nomme les deux voies correctes. Signal pour le scénario de
+  calibration `memory_vs_skill_no_verdict_degradation` et pour la formulation de
+  la clause de prompt. **Propriétaire et échéance :** relue par l'orchestrateur à
+  J+14, sur la distribution des `hold[review]` postés par `mika-platform-qa`
+  depuis le déploiement ; si la part monte sans que les PR concernées aient de
+  findings, c'est le contournement et le ticket de suivi s'ouvre avec ce compte.
+  La revue est un geste d'opérateur : rien dans le moteur ne peut la déclencher.
+- **Ce que ce travail ne fait PAS.** Il ne tague aucune mémoire et n'en invalide
+  aucune (voir la re-mesure ci-dessus) ; il ne compare pas sémantiquement mémoire
+  et skill (ce juge est la couche qui vient de faillir) ; et il ne généralise à
+  aucun autre mapping opérationnel — un seul est mesuré, et dessiner une
+  abstraction sur un point est ce qui produit la mauvaise abstraction.
+
 Optional (destructive-action grounding gate — mika#1646):
 - `MIKA_DEV_REPEAT_ACTION_WINDOW_SECS` — Window (seconds) within which a second `gh pr close` / `gh issue close` on the same target counts as a **repeat** and must acknowledge the prior one in its `--comment` (default `1800` = 30 min). Absent/empty → default; unparseable, `0`, or negative → default with a `destructive_window_invalid` WARN. Note `0` does **not** disable the check: on a destructive action an operator typo must not silently reopen the hole. Repeat detection reads the persisted `tool_calls` table scoped to the agent, so it survives a process restart and a deferred webhook replay — the founding incident's second close came from exactly such a replay, from a context sharing no memory with the first. Operator grep signal: `destructive_action_blocked` in `$MIKA_SPIRIT_LOG_FILE`; SQL surface: `SELECT * FROM audit_events WHERE tool_name = 'destructive_action_grounding'`.
 

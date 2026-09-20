@@ -14,7 +14,9 @@ use serde_json::json;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask};
-use mika_agent::server::verdict_handler::{VerdictAction, try_handle_pr_review_verdict};
+use mika_agent::server::verdict_handler::{
+    VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL, VerdictAction, try_handle_pr_review_verdict,
+};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::task_engine::types::{action_type, trigger_type};
 
@@ -1371,6 +1373,108 @@ async fn non_approved_review_passes_through() -> Result<()> {
             panic!("non-approved review should not be handled");
         }
     }
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// mika#2237 (U2 / V7) — the silent Passthrough becomes a named fact.
+//
+// A `VERDICT: pass` arriving under a non-approved review state is where the
+// autonomous pipeline stops. Until mika#2237 that happened with no WARN, no
+// audit row and no counter: mika#2236 sat in exactly this state and nothing in
+// the engine said so. The BEHAVIOUR is unchanged — Passthrough, no merge on a
+// `commented` review; what is added is attribution.
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn verdict_pass_without_approval_is_named_in_the_audit_ledger() -> Result<()> {
+    let db = test_db().await;
+    let text = pr_review_text(
+        "commented",
+        "senara-solutions/mika",
+        2236,
+        "mika-platform-qa",
+        // The literal body shape of the founding incident.
+        "VERDICT: pass \u{2705}\nDEPTH: code-level\n\nLooks good.",
+    );
+
+    let action = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        Some("fake-token"),
+        None,
+        SESSION_ID,
+        "trace-2237",
+        &test_skills(),
+    )
+    .await;
+
+    assert!(
+        matches!(action, VerdictAction::Passthrough { enrichment: None }),
+        "mika#2237 adds attribution, never a decision: the merge-safety gate still \
+         passes a non-approved `pass` through untouched"
+    );
+
+    let events = db
+        .get_audit_events(SESSION_ID)
+        .await
+        .expect("get audit events");
+    let row = events
+        .iter()
+        .find(|e| e.tool_name == VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL)
+        .expect(
+            "a `pass` verdict under a non-approved state must leave a named audit row — \
+             its absence is the eleven-day invisibility mika#2237 closes",
+        );
+    assert_eq!(row.target_key, "pr_review:senara-solutions/mika#2236");
+    assert_eq!(
+        row.after_value.as_deref(),
+        Some("commented"),
+        "the row carries the state actually observed, not a constant"
+    );
+
+    Ok(())
+}
+
+/// Negative control (V7, second half) — an APPROVED `pass` writes nothing.
+///
+/// Without this, the test above would pass just as well against an
+/// unconditional writer, and the event would stop meaning "the pipeline stopped
+/// here". No GitHub token, so the pass branch short-circuits before the merge
+/// path — the point is what is *not* in the ledger.
+#[tokio::test]
+async fn an_approved_pass_writes_no_unapproved_row() -> Result<()> {
+    let db = test_db().await;
+    let text = pr_review_text(
+        "approved",
+        "senara-solutions/mika",
+        2236,
+        "mika-platform-qa",
+        "VERDICT: pass\nDEPTH: code-level\n\nLooks good.",
+    );
+
+    let _ = try_handle_pr_review_verdict(
+        &text,
+        &db,
+        None,
+        None,
+        SESSION_ID,
+        "trace-2237-ok",
+        &test_skills(),
+    )
+    .await;
+
+    let events = db
+        .get_audit_events(SESSION_ID)
+        .await
+        .expect("get audit events");
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.tool_name == VERDICT_PASS_WITHOUT_APPROVAL_AUDIT_TOOL),
+        "an approved pass is the nominal path and must leave no attribution row"
+    );
+
     Ok(())
 }
 

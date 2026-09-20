@@ -1810,6 +1810,226 @@ pub fn undelivered_send_correction(u: &UndeliveredSends) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mika#2237 — le mapping verdict → flag de `gh pr review`
+// ---------------------------------------------------------------------------
+//
+// Sibling of mika#1646 above: same family (a pre-subprocess gate rather than an
+// EndTurn guard), same reason — the defect is the *call*, not a sentence, and by
+// the time an EndTurn arm ran the review would already be on GitHub.
+//
+// Founding incident (2026-09-08). mika#2218 restored `--approve` by giving the
+// reviewer a machine identity distinct from the author. On the first review
+// after that deploy — mika#2236, body `VERDICT: pass ✅` — mika-qa posted
+// `--comment` and never *tried* `--approve`: the argv recorded at 08:03:34Z is
+// `["pr","review","2236","--comment",…]`, with zero approve attempt. The skill
+// prompt mapped `pass → --approve`; what overrode it was the agent's own
+// learned memory of the 137 pre-fix self-approval refusals.
+//
+// Three design points, each of which the obvious implementation gets wrong:
+//
+// 1. **The conflict does not have to be detected semantically.** A comparator of
+//    "learned memory vs skill instruction" would need a judge and a lexicon —
+//    the very layer that just failed. The conflict *manifests* in an entirely
+//    structural form: a body carrying `VERDICT: pass` passed under `--comment`.
+//
+// 2. **The mapping has a single reader and is derived from `Verdict`.** Not a
+//    table transcribed from `qa-review/system_prompt.md`: the truth is the enum
+//    `server::verdict_handler` already consumes. That is not a style preference
+//    (mika#2158) but the condition of correctness — a hand-rolled
+//    `contains("VERDICT: pass")` would fail open on `VERDICT: pass ✅`, i.e. on
+//    the literal body of the founding incident, and be indistinguishable from a
+//    guard that works. Going through `parse_verdict` inherits the markdown
+//    emphasis tolerance of mika#1828 and the trailing-decoration fallback of
+//    mika#2239 for free — and inherits their bounds too (`VERDICT: pass — but
+//    see findings` stays `Missing`; leading decoration, `VERDICT: ✅ pass`, is
+//    out of `parse_verdict`'s perimeter per mika#2239 D-D, and this guard does
+//    NOT work around it: that would be the second reader this decision forbids).
+//
+// 3. **Degradation stays possible, but only AFTER a measured attempt.** A guard
+//    that always refused `--comment` on `pass` would turn a real constraint
+//    (GitHub genuinely refusing an approval) into an inability to post the
+//    review at all — the turn loops and dies. So the escape hatch is the whole
+//    fix rather than its softening, and it is what makes the ticket's second
+//    ask structural: a refusal means "was going to degrade without trying"
+//    (stale memory), the escape hatch means "tried and the door was shut" (a
+//    real constraint). Those two populations used to be separable only by
+//    reading argv by hand.
+
+/// Audit-event `tool_name` for every verdict↔flag decision (R3).
+///
+/// Same convention as [`DESTRUCTIVE_ACTION_AUDIT_TOOL`]: `audit_events` has no
+/// `event_type` column, `tool_name` is free-form TEXT, no migration.
+pub const PR_REVIEW_FLAG_AUDIT_TOOL: &str = "pr_review_flag_guard";
+
+/// The three mutually exclusive verdict flags `gh pr review` accepts.
+///
+/// Order matters only for reporting — `extract_pr_review_flag` returns the
+/// first one present in the argv, and `gh` itself rejects a call carrying two.
+///
+/// **Long forms only, and that is a decision — see
+/// `short_flag_forms_are_out_of_the_population_and_that_is_pinned`.** `gh` also
+/// accepts `-a` / `-c` / `-r`, which this guard does not recognize, so such a
+/// call falls open. That is the same bound the body reader already has
+/// (`extract_pr_review_body` reads `--body` and not `-b`), so the two halves of
+/// the recognition agree rather than half-engaging. Widening this list on its
+/// own would be **worse than the gap**: with no canonicalization, a correct
+/// `pr review N -a` on a `pass` body would read as posted `-a` ≠ required
+/// `--approve` and be refused — a legitimate review made impossible to post,
+/// which is the one thing R8 forbids.
+pub const PR_REVIEW_FLAGS: &[&str] = &["--approve", "--comment", "--request-changes"];
+
+/// Flags of `gh pr review` that consume a SEPARATE following argument.
+///
+/// Skipping their value is load-bearing: a review body legitimately quotes the
+/// flag names it is discussing (this very file does), and a naive scan would
+/// read `--approve` out of the prose and conclude the call carried it. Same
+/// hazard class as `VALUE_FLAGS` in `detect_destructive_action`, opposite
+/// direction — there a missed skip loses the target, here it invents a flag.
+const PR_REVIEW_VALUE_FLAGS: &[&str] = &["--body", "-b", "--body-file", "-F", "--repo", "-R"];
+
+/// The flag a classified verdict imposes on its own `gh pr review` call (D2).
+///
+/// Derived from the `Verdict` enum, never from the skill's prompt text. The
+/// agreement with the downstream gate is not a coincidence to be maintained by
+/// hand: `verdict_handler` refuses to merge a `pass` whose review `state` is not
+/// `approved`, so `pass` ⇒ `--approve` is that same contract read at the other
+/// end. `Missing` yields `None` — a body with no classifiable verdict is out of
+/// this guard's population entirely (fail-open, D1).
+pub(crate) fn required_review_flag(
+    verdict: &crate::server::verdict::Verdict,
+) -> Option<&'static str> {
+    use crate::server::verdict::Verdict;
+    match verdict {
+        Verdict::Pass => Some("--approve"),
+        // Both blocking classes post a comment. `--request-changes` is
+        // deliberately the mapping of NO verdict: qa-review's contract carries
+        // its disposition in the body's `VERDICT:` line, and GitHub's own
+        // CHANGES_REQUESTED state adds a second, unread source of truth.
+        Verdict::Block(_) | Verdict::Hold(_) => Some("--comment"),
+        Verdict::Missing { .. } => None,
+    }
+}
+
+/// The verdict flag actually present in a `gh pr review` argv.
+///
+/// Returns `None` when the argv is not a `pr review` or carries no verdict flag
+/// (`gh` then opens an editor, which cannot happen under our non-interactive
+/// spawn — such a call fails on its own and is none of this guard's business).
+pub(crate) fn extract_pr_review_flag(argv: &[String]) -> Option<&str> {
+    if argv.first().map(String::as_str) != Some("pr")
+        || argv.get(1).map(String::as_str) != Some("review")
+    {
+        return None;
+    }
+    let mut i = 2usize;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        // `--body=value` / `--repo=owner/repo`: the value cannot be mistaken
+        // for a separate argument, so one step is enough.
+        if arg.starts_with("--") && arg.contains('=') {
+            i += 1;
+            continue;
+        }
+        if let Some(flag) = PR_REVIEW_FLAGS.iter().find(|f| **f == arg) {
+            return Some(flag);
+        }
+        if PR_REVIEW_VALUE_FLAGS.contains(&arg) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Did THIS turn already try `--approve` on this PR, and did it fail? (D4)
+///
+/// `calls` is the turn's persisted `tool_calls`, read by `trace_id`, as
+/// `(tool_name, serialized_input, success)`. The success half is where A2's
+/// measurement lives: `spawn_and_collect` returns `ToolOutput::success` even on
+/// a non-zero exit, prefixing the content with `Exit code: N`, and
+/// `tool_execution::dispatch` turns that prefix into `success = false` for
+/// *every* tool. So `!success` covers the three populations that all mean "the
+/// agent tried and the door was shut": GitHub refused the approval (`gh` exits
+/// non-zero), `gh` could not be spawned, and an upstream gate refused the call.
+///
+/// Deliberately NOT narrowed to the non-zero-exit population: doing so would
+/// close the hatch on the two legitimate `is_error` shapes and recreate the very
+/// loop D5 exists to prevent. The one benign inclusion is `duplicate_pr_review`,
+/// where the agent already posted — harmless, because the session dedup guard in
+/// `run_gh` refuses the follow-up `--comment` the same way.
+pub(crate) fn approve_attempt_failed_in_turn<'a>(
+    calls: impl Iterator<Item = (&'a str, &'a str, bool)>,
+    pr_identifier: &str,
+) -> bool {
+    for (name, input, success) in calls {
+        if name != "run_gh" || success {
+            continue;
+        }
+        let Some(argv) = parse_run_gh_argv(input) else {
+            continue;
+        };
+        if extract_pr_review_flag(&argv) != Some("--approve") {
+            continue;
+        }
+        if pr_review_target(&argv).as_deref() == Some(pr_identifier) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The normalized PR identifier a `pr review` argv targets.
+///
+/// Normalization goes through the single reader of that format
+/// (`skills::builtin_handlers::normalize_pr_identifier`, which
+/// `make_pr_dedup_key` also uses) so a full URL and a bare number designate the
+/// same PR — both forms circulate inside one turn, as the mika#1834/#1836
+/// fixture shows. Re-deriving the URL shape here would be the second reader
+/// design point 2 above forbids.
+pub(crate) fn pr_review_target(argv: &[String]) -> Option<String> {
+    if argv.first().map(String::as_str) != Some("pr")
+        || argv.get(1).map(String::as_str) != Some("review")
+    {
+        return None;
+    }
+    let mut i = 2usize;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        if arg.starts_with('-') {
+            if arg.starts_with("--") && arg.contains('=') {
+                i += 1;
+            } else if PR_REVIEW_VALUE_FLAGS.contains(&arg) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(crate::skills::builtin_handlers::normalize_pr_identifier(arg).to_string());
+    }
+    None
+}
+
+/// Recover a `run_gh` argv from the JSON `tool_calls.input` row.
+///
+/// The row is `serde_json::to_string(arguments)` of the tool's own input, i.e.
+/// `{"command":[…],"repo":"…"}`. Parsing it rather than substring-matching is
+/// what lets `pr_review_target` normalize the identifier; a substring probe
+/// would have to re-implement the URL shape, and would match `#164` inside
+/// `#1644` the way mika#1646's DB query had to anchor against.
+fn parse_run_gh_argv(input: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    let command = value.get("command")?.as_array()?;
+    Some(
+        command
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3738,6 +3958,346 @@ mod tests {
             assert!(out.preview.chars().all(|c| c == 'é'));
             assert!(out.preview.len() <= 80);
             assert!(!out.preview.is_empty());
+        }
+    }
+
+    // -- mika#2237 — verdict ↔ `gh pr review` flag coherence --
+    mod mika2237 {
+        use super::super::*;
+        use crate::server::verdict::{Verdict, parse_verdict};
+
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// The argv of a `run_gh` call, serialized the way `tool_execution`
+        /// persists it into `tool_calls.input`.
+        fn row_input(parts: &[&str]) -> String {
+            serde_json::json!({ "command": parts }).to_string()
+        }
+
+        // -- required_review_flag: the mapping itself (D2) --
+
+        #[test]
+        fn pass_requires_approve_and_the_blocking_classes_require_comment() {
+            assert_eq!(required_review_flag(&Verdict::Pass), Some("--approve"));
+            assert_eq!(
+                required_review_flag(&Verdict::Block("ac".into())),
+                Some("--comment")
+            );
+            assert_eq!(
+                required_review_flag(&Verdict::Hold("review".into())),
+                Some("--comment")
+            );
+        }
+
+        /// A body with no classifiable verdict is out of the population — the
+        /// fail-open half of D1. A human or ad-hoc review with no `VERDICT:`
+        /// line must never be refused.
+        #[test]
+        fn a_missing_verdict_imposes_no_flag() {
+            assert_eq!(
+                required_review_flag(&Verdict::Missing { truncated: false }),
+                None
+            );
+            assert_eq!(
+                required_review_flag(&Verdict::Missing { truncated: true }),
+                None
+            );
+        }
+
+        /// The mapping agrees with the downstream gate, and this test is where
+        /// a future relaxation of either half reddens.
+        ///
+        /// `verdict_handler`'s `Verdict::Pass` arm refuses to merge unless the
+        /// GitHub review state is `approved`; `--approve` is the only flag that
+        /// produces that state. So `pass ⇒ --approve` is not a convention this
+        /// guard invented — it is that contract read at the other end.
+        #[test]
+        fn the_pass_mapping_is_the_downstream_merge_gate_read_upstream() {
+            assert_eq!(
+                required_review_flag(&Verdict::Pass),
+                Some("--approve"),
+                "verdict_handler refuses to merge a `pass` whose review state is not \
+                 `approved`; if this mapping changes, that gate must change with it"
+            );
+        }
+
+        // -- The nine body shapes (U4a table, F2b) --
+        //
+        // The guard never inspects the body itself: it calls `parse_verdict`,
+        // so it inherits mika#1828's emphasis tolerance and mika#2239's
+        // trailing-decoration fallback — AND their bounds. The last three rows
+        // are negative controls pinning those bounds as decisions rather than
+        // oversights.
+
+        fn body_with(verdict_line: &str) -> String {
+            format!("{verdict_line}\nDEPTH: code-level\nREASON: …")
+        }
+
+        fn flag_for_body(verdict_line: &str) -> Option<&'static str> {
+            required_review_flag(&parse_verdict(&body_with(verdict_line)))
+        }
+
+        /// The literal body of the founding incident (#2236) must NOT fail open.
+        ///
+        /// This is the row that matters most: a hand-rolled
+        /// `contains("VERDICT: pass")` would classify `VERDICT: pass ✅` as
+        /// nothing at all, be silent on exactly the population the ticket was
+        /// filed about, and be indistinguishable from a guard that works.
+        #[test]
+        fn the_literal_body_of_pr_2236_requires_approve() {
+            assert_eq!(flag_for_body("VERDICT: pass ✅"), Some("--approve"));
+        }
+
+        #[test]
+        fn inherited_body_shapes_map_to_their_flag() {
+            // Emphasis (mika#1828), decoration (mika#2239), and their pile-up.
+            assert_eq!(flag_for_body("**VERDICT: pass**"), Some("--approve"));
+            assert_eq!(flag_for_body("**VERDICT: pass ✅**"), Some("--approve"));
+            assert_eq!(flag_for_body("VERDICT: approved ✅"), Some("--approve"));
+            assert_eq!(flag_for_body("VERDICT: block[ac] ❌"), Some("--comment"));
+            assert_eq!(flag_for_body("VERDICT: hold[review] ⏸️"), Some("--comment"));
+        }
+
+        /// Negative control — the mika#1821 bound, inherited verbatim.
+        ///
+        /// A trailing comment is not decoration, so the value does not classify
+        /// and the review traverses without refusal.
+        #[test]
+        fn a_trailing_comment_stays_out_of_the_population() {
+            assert_eq!(flag_for_body("VERDICT: pass — but see findings"), None);
+        }
+
+        /// Negative control — an unknown token, decorated, is still unknown.
+        #[test]
+        fn an_unknown_decorated_token_stays_out_of_the_population() {
+            assert_eq!(flag_for_body("VERDICT: frobnicate ✅"), None);
+        }
+
+        /// Negative control, and a DECISION rather than a tolerated gap.
+        ///
+        /// Leading decoration is outside `parse_verdict`'s perimeter
+        /// (mika#2239 D-D, never measured). The guard inherits that bound as-is
+        /// and does not work around it: handling it here rather than in the
+        /// single reader would create the second reader D2 forbids. If leading
+        /// decoration ever enters `parse_verdict`, this test reddens and the
+        /// guard follows on its own.
+        #[test]
+        fn leading_decoration_is_out_of_scope_and_that_is_pinned() {
+            assert_eq!(
+                flag_for_body("VERDICT: ✅ pass"),
+                None,
+                "head decoration is mika#2239 D-D's stated non-perimeter; if this \
+                 reddens, `parse_verdict` grew to cover it and the guard follows — do \
+                 NOT handle it here"
+            );
+        }
+
+        // -- extract_pr_review_flag --
+
+        #[test]
+        fn the_posted_flag_is_read_whatever_its_position() {
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["pr", "review", "2236", "--comment"])),
+                Some("--comment")
+            );
+            assert_eq!(
+                extract_pr_review_flag(&argv(&[
+                    "pr",
+                    "review",
+                    "--approve",
+                    "--body",
+                    "x",
+                    "2236"
+                ])),
+                Some("--approve")
+            );
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["pr", "review", "7", "--request-changes"])),
+                Some("--request-changes")
+            );
+        }
+
+        /// A review body legitimately quotes the flag names it discusses — this
+        /// very repository's review bodies do. Reading `--approve` out of the
+        /// prose would invent a flag the call never carried.
+        #[test]
+        fn a_flag_name_quoted_inside_the_body_is_not_the_posted_flag() {
+            assert_eq!(
+                extract_pr_review_flag(&argv(&[
+                    "pr",
+                    "review",
+                    "2236",
+                    "--body",
+                    "The skill maps pass to --approve; I am posting --approve as required.",
+                    "--comment",
+                ])),
+                Some("--comment"),
+                "the value of --body must be skipped, not scanned"
+            );
+            assert_eq!(
+                extract_pr_review_flag(&argv(&[
+                    "pr",
+                    "review",
+                    "2236",
+                    "--body=mentions --approve inline",
+                    "--comment",
+                ])),
+                Some("--comment")
+            );
+        }
+
+        /// Negative control, and a DECISION rather than an overlooked gap.
+        ///
+        /// `gh` accepts `-a` / `-c` / `-r` as well, and this guard does not
+        /// recognize them, so such a call falls open. Two reasons it stays that
+        /// way. (a) The body reader has the same bound —
+        /// `extract_pr_review_body` reads `--body` and not `-b` — so the two
+        /// halves of the recognition are in agreement: the population is
+        /// long-form calls, which is what qa-review's own table prescribes
+        /// (`system_prompt.md:607-611`). (b) Adding the short forms to
+        /// `PR_REVIEW_FLAGS` **without canonicalizing them** would be worse
+        /// than the gap: a correct `pr review N -a` on a `pass` body would read
+        /// as posted `-a` ≠ required `--approve` and be refused, making a
+        /// legitimate review impossible to post — exactly what R8 forbids.
+        ///
+        /// If this ever needs closing, the change is a canonicalizing map
+        /// (`-a → --approve`, …) applied to BOTH the posted flag and the body
+        /// reader, never a wider list here alone.
+        #[test]
+        fn short_flag_forms_are_out_of_the_population_and_that_is_pinned() {
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["pr", "review", "2236", "-c"])),
+                None,
+                "short forms are unrecognized and fail open; if this reddens because \
+                 someone widened PR_REVIEW_FLAGS, check they also canonicalized — an \
+                 uncanonicalized `-a` refuses a CORRECT review"
+            );
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["pr", "review", "2236", "-a"])),
+                None
+            );
+        }
+
+        #[test]
+        fn a_non_review_argv_carries_no_review_flag() {
+            assert_eq!(extract_pr_review_flag(&argv(&["pr", "merge", "12"])), None);
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["issue", "view", "12"])),
+                None
+            );
+            assert_eq!(
+                extract_pr_review_flag(&argv(&["pr", "review", "12", "--body", "x"])),
+                None
+            );
+        }
+
+        // -- pr_review_target: URL ↔ bare number --
+
+        /// Both forms circulate inside one turn (the mika#1834/#1836 fixture),
+        /// so the hatch must recognize the attempt whichever one it used.
+        #[test]
+        fn a_full_url_and_a_bare_number_designate_the_same_pr() {
+            assert_eq!(
+                pr_review_target(&argv(&["pr", "review", "2236", "--approve"])).as_deref(),
+                Some("2236")
+            );
+            assert_eq!(
+                pr_review_target(&argv(&[
+                    "pr",
+                    "review",
+                    "https://github.com/senara-solutions/mika/pull/2236",
+                    "--approve",
+                ]))
+                .as_deref(),
+                Some("2236")
+            );
+        }
+
+        #[test]
+        fn the_value_of_a_flag_is_never_mistaken_for_the_target() {
+            assert_eq!(
+                pr_review_target(&argv(&[
+                    "pr",
+                    "review",
+                    "--body",
+                    "1638",
+                    "--approve",
+                    "2236"
+                ]))
+                .as_deref(),
+                Some("2236")
+            );
+        }
+
+        // -- approve_attempt_failed_in_turn: the D4 escape hatch --
+
+        /// The hatch opens on a FAILED `--approve` against the same PR.
+        #[test]
+        fn a_failed_approve_on_this_pr_opens_the_hatch() {
+            let input = row_input(&["pr", "review", "2236", "--approve", "--body", "…"]);
+            let calls = [("run_gh", input.as_str(), false)];
+            assert!(approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+
+        /// …and only then. A SUCCESSFUL approve is not an attempt that hit a
+        /// wall; it is a review already posted.
+        #[test]
+        fn a_successful_approve_does_not_open_the_hatch() {
+            let input = row_input(&["pr", "review", "2236", "--approve"]);
+            let calls = [("run_gh", input.as_str(), true)];
+            assert!(!approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+
+        /// The founding incident itself: no approve attempt at all. This is the
+        /// state a refusal is built on.
+        #[test]
+        fn a_turn_that_never_tried_approve_keeps_the_hatch_shut() {
+            let read = row_input(&["pr", "diff", "2236"]);
+            let list = row_input(&["pr", "list", "--state", "open"]);
+            let calls = [
+                ("run_gh", read.as_str(), true),
+                ("run_gh", list.as_str(), true),
+            ];
+            assert!(!approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+
+        /// A failed approve on a DIFFERENT PR must not excuse a degradation
+        /// here — the mika-qa batch-review shape (#1834/#1836) is a real turn
+        /// carrying several PRs.
+        #[test]
+        fn a_failed_approve_on_another_pr_does_not_open_the_hatch() {
+            let input = row_input(&["pr", "review", "1834", "--approve"]);
+            let calls = [("run_gh", input.as_str(), false)];
+            assert!(!approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+
+        /// The attempt is matched across identifier forms, in both directions.
+        #[test]
+        fn the_hatch_matches_a_url_attempt_against_a_bare_number_target() {
+            let input = row_input(&[
+                "pr",
+                "review",
+                "https://github.com/senara-solutions/mika/pull/2236",
+                "--approve",
+            ]);
+            let calls = [("run_gh", input.as_str(), false)];
+            assert!(approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+
+        /// A failed call of another tool, or an unparseable input row, is not
+        /// an approve attempt — and must not crash the scan.
+        #[test]
+        fn unrelated_and_unreadable_rows_are_skipped() {
+            let other = row_input(&["pr", "review", "2236", "--comment"]);
+            let calls = [
+                ("run_shell", other.as_str(), false),
+                ("run_gh", "not json at all", false),
+                ("run_gh", "{\"repo\":\"o/r\"}", false),
+                ("run_gh", other.as_str(), false),
+            ];
+            assert!(!approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
         }
     }
 }
