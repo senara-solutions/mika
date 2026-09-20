@@ -76,26 +76,32 @@ second-pass, qui ESCALATE — et l'unique itération a été dépensée pour rie
 
 ### Population
 
-Mesures prises sur cette branche au 2026-09-19, **chacune avec sa commande** —
+Mesures reprises sur cette branche au 2026-09-20, **chacune avec sa commande** —
 un chiffre dont la méthode n'est pas écrite n'est pas reproductible, et se lit
 comme faux dès que le lecteur choisit une autre regex :
 
 | Mesure | Commande | Compte |
 |---|---|---|
-| Plans datés | `ls docs/plans/ \| grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}-'` | 878 |
-| Section AC, forme canonique | `grep -lE '^## Acceptance criteria' docs/plans/20*.md \| wc -l` | 322 |
-| Section AC, toute profondeur/casse | `grep -liE '^#+ *Acceptance criteria' docs/plans/20*.md \| wc -l` | 593 |
-| Section FD, forme canonique | `grep -lE '^## Fire-Disposition' docs/plans/20*.md \| wc -l` | 70 |
+| Plans datés | `ls docs/plans/ \| grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}-'` | 903 |
+| Section AC, forme canonique | `grep -lE '^## Acceptance criteria' docs/plans/20*.md \| wc -l` | 347 |
+| Section AC, toute profondeur/casse | `grep -liE '^#+ *Acceptance criteria' docs/plans/20*.md \| wc -l` | 618 |
+| Section FD, forme canonique | `grep -lE '^## Fire-Disposition' docs/plans/20*.md \| wc -l` | 79 |
 
-**L'écart 322 / 593 sur la même section est lui-même un résultat**, et il porte :
+Les quatre chiffres ont bougé depuis la mesure du 19/09 (878 / 322 / 593 / 70) :
+la branche a rebasé sur `main` entre les deux. **Ce n'est pas du bruit, c'est la
+raison d'être du § Ancrage ci-dessous** — un plan dont les constats ne portent
+pas leur date se lit comme faux au premier rebase, et c'est la seule classe de
+défaut que ce re-groom a trouvée dans le plan précédent.
+
+**L'écart 347 / 618 sur la même section est lui-même un résultat**, et il porte :
 la moitié du corpus écrit le titre AC sous une autre profondeur ou une autre
 casse. Il rappelle que « la section est-elle là ? » n'a de réponse stable qu'avec
 sa regex — le fait même qui disqualifie une garde `grep` en CI (D2, motif 2).
 
 **La FD ajoutée après un ITERATE architecte : classe prouvée, compte borné.**
 La recherche lexicale liant `Fire-Disposition` à un finding architecte sur une
-même ligne rend **13** fichiers, dont le présent plan (qui cite le motif sans
-l'avoir subi) :
+même ligne rend **15** fichiers au 2026-09-20, dont le présent plan (qui cite le
+motif sans l'avoir subi) :
 
 ```sh
 grep -liE '(Fire.Disposition.{0,80}(soulev|mika-arch|F[0-9])|(soulev|mika-arch).{0,80}Fire.Disposition)' docs/plans/20*.md
@@ -103,7 +109,7 @@ grep -liE '(Fire.Disposition.{0,80}(soulev|mika-arch|F[0-9])|(soulev|mika-arch).
 
 C'est une **borne supérieure lexicale, pas un compte vérifié** : distinguer un
 plan qui a subi l'ITERATE d'un plan qui cite la doctrine demande de lire les
-treize. Le plan ne fabrique pas ce compte. Mais l'argument ne repose pas dessus —
+quinze. Le plan ne fabrique pas ce compte. Mais l'argument ne repose pas dessus —
 il repose sur l'**existence** de la classe, et deux témoins la prouvent, nommés
 et vérifiables à la ligne près :
 
@@ -118,7 +124,28 @@ Chacun a consommé une passe architecte pour ajouter une section d'une quinzaine
 de lignes que le groomeur pouvait écrire du premier coup. C'est le coût que ce
 plan supprime, et il suffit qu'il soit réel.
 
-Le ratio 70/878 (8,0 %) ne se lit **pas** comme un taux de défaut : la section est
+### Ce plan porte la section, et ce n'est PAS une réfutation du défaut
+
+L'objection saute aux yeux et un relecteur la fera : *ce plan-ci a été produit par
+le groom moteur et il porte `## Fire-Disposition` — le défaut est donc inexistant.*
+La chronologie la referme, et elle est écrite dans le ticket même (commentaire
+opérateur du 19/09, qui posait explicitement la mesure : « si son plan arrive
+devant l'architecte sans `## Fire-Disposition`, c'est n=2 »).
+
+La section est là parce qu'un **groom opérateur** l'a écrite à la main le 19/09,
+pas parce que le chemin moteur l'a produite. Les passages moteur qui ont suivi
+sont des **re-grooms idempotents** : l'étape 4 de `/mika-groom-plan-only`
+prescrit de réutiliser un plan existant comme point de départ, donc ils héritent
+de la section au lieu de la créer. Le chemin que le ticket accuse —
+`/ce:plan` sur un ticket vierge, sans plan préalable — **n'a jamais été exercé
+sur ce ticket.**
+
+Conséquence pour la lecture de la preuve : ce ticket ne fournit **ni** un n=2
+**ni** un contre-exemple. Il est muet sur sa propre question, et la mesure
+opérateur reste ouverte. Les deux témoins nommés ci-dessus (fix-2126, fix-2228)
+restent la preuve de la classe ; ce plan n'en est pas un troisième.
+
+Le ratio 79/903 (8,7 %) ne se lit **pas** comme un taux de défaut : la section est
 **conditionnelle** (mika#1574 : « Plan has no detector-class deliverables ⇒ gate
 is N/A »). Il n'existe aucun moyen déterministe de compter la population qui
 *aurait dû* la porter — l'obstacle même qui disqualifie la garde CI (D2).
@@ -242,17 +269,43 @@ la population (R5), il ne l'y fait pas entrer.
 ### D5 — La prescription est conditionnée à `dev-groom`
 
 `$SKILL` est le discriminant, déjà disponible dans `_set_up_worktree` et déjà
-employé au même endroit (`dispatch-lib.sh:2203`). Injecter la règle pour
-`dev-pilot` serait du bruit dans le prompt d'un pilote qui n'écrit pas de plan.
+employé dans cette fonction (neuf occurrences de `[ "$SKILL" = "dev-groom" ]`
+dans le fichier au 2026-09-20). Injecter la règle pour `dev-pilot` serait du
+bruit dans le prompt d'un pilote qui n'écrit pas de plan.
+
+Le point d'attention pour l'implémenteur : le site d'injection voisin
+(`_PR_BODY_CONTAINMENT_RULE`) est **inconditionnel** dans la branche worktree —
+il s'applique à tous les skills, ce qui est correct pour lui et ne le serait pas
+ici. La condition U1 est donc à écrire explicitement ; la copier du voisin la
+perdrait, et T3 est le contrôle négatif qui attrape exactement cet écart.
 
 ---
 
 ## Implementation Units
 
+### Ancrage — par symbole, jamais par numéro de ligne
+
+**Aucun site d'implémentation de ce plan n'est désigné par un numéro de ligne**,
+et c'est un constat gagné plutôt qu'une préférence de style : la version du
+19/09 citait cinq lignes (`~1935`, `~2480`, `5255`, `2203`) et **les cinq avaient
+dérivé** au rebase du lendemain, sans qu'aucun des faits qu'elles désignaient ne
+change. Un implémenteur qui ouvre `~l.1935` ne trouve rien ; un implémenteur qui
+cherche `_PR_BODY_CONTAINMENT_RULE` trouve toujours. Les numéros ci-dessous sont
+donnés **entre parenthèses et datés**, comme indication de lecture — jamais comme
+adresse.
+
+| Ancre (stable) | Ligne au 2026-09-20 | Rôle |
+|---|---|---|
+| `_PR_BODY_CONTAINMENT_RULE=` (définition) | 2003 | Voisin de la constante U1 |
+| `PROMPT=$(printf … "$_PR_BODY_CONTAINMENT_RULE")` | 2587 | Site d'injection U1 |
+| `_launch_revise_pilot()` | 5317–5377 | Fonction hôte de U2 |
+| `if [ "$pre_hash" != "$post_hash" ]` | 5370 | Branche de greffe U2 |
+| `_arch_ask()` / premier appel `_arch_ask_with_retry` | 4768 / 5732 | Hors `_launch_revise_pilot` — fonde T9 |
+
 | # | Fichier | Changement |
 |---|---|---|
-| **U1** | `skills/bundled/_shared/dispatch-lib.sh` | Constante `_FIRE_DISPOSITION_RULE`, posée à côté de `_PR_BODY_CONTAINMENT_RULE` (~l.1935). Elle nomme la section, ses trois options canoniques (a)/(b)/(c) en une ligne chacune, et la règle N/A explicite. Injectée dans `PROMPT` au site mika#2178/#2211 (~l.2480), **après** `_PR_BODY_CONTAINMENT_RULE` — les trois invariants de position documentés au site restent vrais et la première ligne du `PROMPT` reste exactement `<repo>#<num>` (contrat mika#138). Conditionnée `[ "$SKILL" = "dev-groom" ]` (D5). |
-| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, après la comparaison `sha256` **réussie** (branche `pre_hash != post_hash`, l.5255) : si les findings réclamaient `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
+| **U1** | `skills/bundled/_shared/dispatch-lib.sh` | Constante `_FIRE_DISPOSITION_RULE`, posée à côté de `_PR_BODY_CONTAINMENT_RULE`. Elle nomme la section, ses trois options canoniques (a)/(b)/(c) en une ligne chacune, et la règle N/A explicite. Injectée dans `PROMPT` au site mika#2178/#2211, **après** l'injection de `_PR_BODY_CONTAINMENT_RULE` — les trois invariants de position documentés en commentaire au-dessus de ce site restent vrais et la première ligne du `PROMPT` reste exactement `<repo>#<num>` (contrat mika#138). Conditionnée `[ "$SKILL" = "dev-groom" ]` (D5) : le site d'injection voisin est inconditionnel dans la branche worktree, la condition est donc à écrire, pas à hériter. |
+| **U2** | `skills/bundled/_shared/dispatch-lib.sh` | Dans `_launch_revise_pilot`, à l'intérieur de la branche `sha256` **réussie** (`pre_hash != post_hash`) : si les findings réclamaient `Fire-Disposition` et que le plan révisé ne porte toujours pas `^## Fire-Disposition`, écrire un findings-file ciblé (`findings-1-fd.md`) et relancer le pilote de revise **une seule fois**. Le retour reste `0` (le plan *a* changé au premier tour) — la garde ajoute une tentative, elle ne crée pas de mode d'échec. |
 | **U2b** | *(idem)* | **Terminaison, et la distinction qui la rend vraie :** après la seconde tentative, la section est re-testée **pour journaliser, jamais pour reboucler**. La relance est gardée par `_FD_REVISE_RETRIED` (U3), donc un second échec ne peut que produire `fire_disposition_still_missing_after_retry` et rendre la main — il n'existe aucun chemin qui réarme le lancement. C'est ce qui réconcilie « une seule relance » (R3, budget) et AC7 (l'événement doit savoir si la section manque encore) : le prédicat est évalué deux fois, il n'autorise l'action qu'une. |
 | **U3** | `skills/bundled/_shared/dispatch-lib.sh` | Un compteur de garde (`_FD_REVISE_RETRIED`) explicite, remis à zéro à l'entrée de `_launch_revise_pilot`, pour que la terminaison soit lisible sans dérouler le flot de contrôle. |
 | **U4** | `skills/bundled/_shared/test-dispatch-lib.sh` | Les dix tests T1–T10 — voir § Verification Contract. Portent le harnais de 31 à 41 ; aucune famille d'assertion nouvelle. |
@@ -281,7 +334,8 @@ elle se lit aussi « aucun groom n'a tourné ». Lire le volume de dispatches
 ## Verification Contract
 
 Le harnais `skills/bundled/_shared/test-dispatch-lib.sh` existe — **31** fonctions
-de test au 2026-09-19 (`grep -cE '^test_[a-z0-9_]+\(\)' skills/bundled/_shared/test-dispatch-lib.sh`)
+de test au 2026-09-20, inchangé depuis la mesure du 19/09
+(`grep -cE '^test_[a-z0-9_]+\(\)' skills/bundled/_shared/test-dispatch-lib.sh`)
 — et porte déjà les deux familles employées ici : assertions de **forme de code**
 (`declare -f` + `assert_contains`) et assertions **comportementales** sur worktree
 temporaire. T1–T10 portent le total à 41 ; aucune famille nouvelle n'est requise.
@@ -361,8 +415,10 @@ la classe qui peut tirer sur de l'existant.
 - **T9** est le seul à scanner du code préexistant — le corps de
   `_launch_revise_pilot`. Son prédicat porte sur le **bras de garde introduit par
   U2**, jamais sur la fonction entière : `_launch_revise_pilot` ne contient aucun
-  appel `_arch_ask` aujourd'hui (vérifié : les appels `_arch_ask` vivent dans
-  `_iterate_groom_loop`, fonction distincte). La table d'exceptions est donc
+  appel `_arch_ask` aujourd'hui. Re-vérifié au 2026-09-20 : la fonction occupe
+  les lignes 5317–5377 et n'en contient aucun ; les appels vivent dans
+  `_iterate_groom_loop` (premier à 5732), fonction distincte. La table
+  d'exceptions est donc
   **vide**, et T9 porte l'assertion auto-nettoyante correspondante : *si le scan
   devait un jour exempter une occurrence, l'exemption doit être nommée ici et
   datée.* Une table vide assertée vide est ce qui distingue « aucune violation »
@@ -379,9 +435,10 @@ délibéré : un U2 qui échouerait sur section manquante aurait déplacé l'ESC
 d'une porte, ce que D2 refuse explicitement.
 
 **Aucun plan existant n'est relu.** Ce travail ne touche ni `verify-pipeline.sh`
-(D2) ni aucun chemin lisant `docs/plans/**` en masse. Les **808** plans sans
-`## Fire-Disposition` (878 − 70, § Population) restent exactement ce qu'ils sont ;
-aucune garde introduite ici ne les regarde.
+(D2) ni aucun chemin lisant `docs/plans/**` en masse. Les **824** plans sans
+`## Fire-Disposition` (903 − 79, § Population) restent exactement ce qu'ils sont ;
+aucune garde introduite ici ne les regarde. Ce compte croît à chaque plan écrit —
+c'est précisément pourquoi il n'est **pas** un seuil et ne gouverne rien.
 
 ---
 
