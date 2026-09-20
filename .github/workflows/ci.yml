@@ -210,6 +210,30 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-a2a-timeout-literals.sh
 
+  canonical-tokens-lint:
+    name: Canonical Token Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The list must be EXHAUSTIVE against the code that matches (mika#2201,
+      # Prime's closing bound). This mode is the shell half of that guard; the
+      # Rust half runs in the normal `cargo test` job
+      # (canonical_tokens::tests::mika2201_*). They are complementary, not
+      # redundant: one starts from the reading FORM, the other from the TOKEN.
+      - name: Confront the canonical list to the tree (mika#2201)
+        run: bash scripts/canonical-tokens-survey.sh --check
+      # The lint itself, on S1 — the repository's prescribers. A prompt that
+      # prescribes a wrong form reproduces it on every ticket it produces, which
+      # is where `seconde passe` would have become systematic again.
+      - name: Reject non-canonical machine tokens in prescribers (mika#2201)
+        run: bash scripts/check-canonical-tokens.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103). This suite also pins the half that
+      # matters most here: that the lint does NOT bite on `seconde passe`, which
+      # `grooming_marker.rs` reads by written decision (mika#2201 § R1).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-canonical-tokens.sh
+
   dispatch-seats-lint:
     name: Dispatch Seat Declaration Lint
     runs-on: ubuntu-22.04

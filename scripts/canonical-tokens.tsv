@@ -1,0 +1,241 @@
+# Canonical machine tokens, their match sites, and the tolerance of each reader.
+# mika#2201. ONE source of truth, two readers: scripts/check-canonical-tokens.sh
+# (the lint) and canonical_tokens::tests::mika2201_every_match_site_is_declared
+# (the exhaustiveness scan).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE RULE THIS FILE ENCODES, AND WHY IT IS NOT "MACHINE TOKENS ARE ENGLISH"
+#
+# Prime's bearing: ticket prose is French, machine tokens are exact canonical
+# English. Confronted to the code that matches — which is Prime's own closing
+# bound — the naive reading of that rule accuses two shapes this repository
+# reads DELIBERATELY WELL: `seconde passe` (bilingual by written decision in
+# `grooming_marker.rs` since mika#2158) and the paraphrase tier of
+# `_parse_disposition`. A lint red on the day it is born gets disarmed, and then
+# the regression it exists to catch passes in the noise.
+#
+# So the discriminator is the TOLERANCE OF THE READER, never the language of
+# the token:
+#
+#   class A — the reader READS the variant. The lint stays silent, entirely.
+#   class B — the reader MIS-reads it. The lint fires, per the axes below.
+#
+# `tolérance` is a WIRE FORMAT, consumed by the lint one rule at a time:
+#
+#   exact:line-anchored   `(?m)^…` / `grep -E '^…'` — position and case fixed
+#   exact:word-boundary   `\b…\b` — case fixed, position free
+#   exact:prefix          `starts_with` / `strip_prefix` — byte-exact prefix
+#   exact:literal         `grep -F`, `match_indices`, substring equality
+#   ci:line-anchored      `(?i)` — CASE IS READ; rule L2 must NOT fire here
+#   ci+emphasis:…         `(?i)` plus a markdown-emphasis run (mika#1828)
+#   paraphrase            a fuzzy tier reads reworded forms
+#   ci+fr:…               case-insensitive plus the listed French forms
+#
+# A token whose tolerance carries `ci` is one the lint may not accuse of case.
+# That column is the whole reason this file exists rather than a list of
+# spellings: without it, an author starting from the naive rule accuses every
+# class A row on his first run.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# HOW EACH HALF IS MAINTAINED, AND WHERE THE GUARANTEE STOPS
+#
+# TWO GUARDS, TWO DIRECTIONS, AND NEITHER IS THE OTHER'S COPY.
+#
+#   `canonical-tokens-survey.sh --check` starts from the reading FORM. Every
+#   strict site it finds must appear here, in either class. An undeclared one
+#   fails the build. Resolution is always to DECLARE — never to allowlist. A
+#   match site nobody wants to declare is a match site to delete (§ D5/D6).
+#
+#   `canonical_tokens::tests::mika2201_every_match_site_is_declared` starts from
+#   the TOKEN, which lets it see a reader the survey cannot — `contains` is not
+#   a survey form, measured: admitting it adds fourteen false rows for two real
+#   ones. `check_grooming_markers` below was found that way.
+#
+#   `…::mika2201_every_declared_symbol_still_exists` holds the STALE direction,
+#   by checking that each `chemin::symbole` still names something. That is the
+#   question asked directly, rather than inferred from a coincidence with a
+#   survey that structurally cannot produce a `(?i)` alternation or a fuzzy
+#   tier. Residual rot it does not catch, named rather than hidden: a row whose
+#   file and symbol both still exist but which no longer reads the token.
+#
+# Named consequence of classing by tolerance rather than by form: a strict site
+# could be written class A to escape the lint. That is a hand edit to a reviewed
+# file, not a silent drift, and its symbol is still checked.
+#
+# A `.github/labels.yml` site is out of the survey's perimeter by construction
+# (it is not source) and is never compared in either direction.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# jeton	classe	site de match	tolérance
+
+# ═══ Class A — TOLERANT readers. Out of the lint's perimeter, BY MEASUREMENT.
+#
+# These rows are the reason this file exists. Without them, an author starting
+# from "machine token = exact English" accuses every one of them — which is the
+# failure mode mika#2201 § R4 names, reached by its own remedy.
+
+# Not produced by the survey: `(?i)` alternations and fuzzy tiers are not strict
+# reading forms.
+second-pass	A	crates/mika-agent/src/grooming_marker.rs::LATER_PASS_RE	ci+fr:seconde passe,deuxième passe,deuxieme passe
+first-pass	A	crates/mika-agent/src/grooming_marker.rs::FIRST_PASS_READY_RE	ci+fr:première passe,premiere passe
+Disposition:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition_fuzzy	paraphrase
+Verdict:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict_fuzzy	paraphrase
+rescue-pipeline-verified	A	crates/mika-agent/src/wip_rescue.rs::pipeline_verified	ci+space — the VALUE only; the KEY is class B below
+Closes #N	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
+Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
+
+# `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
+# first tier is a strict `grep -oE` — and they are class A anyway. That is a
+# rectification of the mika#2201 plan, which listed those two literals as class
+# B (§ M1, rows "dispatch-lib.sh:5168,5267" and "5177,5250"). Read at the
+# granularity this file designates — the function — both END on a `Tier 2
+# fallback` calling `_parse_*_fuzzy`, so a reworded disposition IS read.
+# Classing the strict tier B would describe a fast path and call it the reader.
+ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
+GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
+ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
+READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
+ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+
+# ═══ Class B — STRICT readers. The lint's perimeter.
+#
+# Produced by `canonical-tokens-survey.sh --tsv`, compared both ways. Re-run the
+# survey rather than hand-editing a site here.
+
+# ── Callout keys. Line-anchored and literal in every reader; one wrong
+# character makes a groomed ticket invisible to the feeder — mika#2120 measured
+# fifteen hours of idle loop on a single path prefix.
+> - **Branch:**	B	crates/mika-agent/src/auto_pull.rs::BRANCH_CALLOUT_RE	exact:line-anchored
+> - **Branch:**	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:literal
+# Found by the RUST half of the exhaustiveness guard, not by the survey — and
+# that is the pair working as designed. `check_grooming_markers` reads the key
+# by `contains`, a form the survey deliberately excludes from its perimeter
+# because it is the LOOSE one; declaring it strict would have put the tolerant
+# half of a documented asymmetry into the strict inventory. The scan starts from
+# the token instead of the form, so it sees what the survey cannot. Still class
+# B: `contains` on a literal key is byte-exact, so a translated or respaced key
+# is missed exactly as by an anchored reader — the asymmetry with `auto_pull` is
+# about the PATH shape, not about the key (grooming_marker.rs).
+> - **Branch:**	B	crates/mika-agent/src/skills/executor.rs::check_grooming_markers	exact:literal
+> - **Grooming history:**	B	crates/mika-agent/src/grooming_marker.rs::CALLOUT_LINE_RE	exact:line-anchored
+> - **Plan:**	B	crates/mika-agent/src/auto_pull.rs::PLAN_CALLOUT_RE	exact:line-anchored
+> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_committed_plan_on_branch	exact:line-anchored
+> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_extract_plan_path	exact:line-anchored
+> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_set_up_worktree	exact:literal
+
+# ── Verdict tokens. Case-sensitive by written decision: `GROOMED` is a token the
+# pipeline produces, "groomed" in prose is not one (grooming_marker.rs).
+ESCALATE	B	crates/mika-agent/src/grooming_marker.rs::VERDICT_TOKEN_RE	exact:word-boundary
+GROOMED	B	crates/mika-agent/src/grooming_marker.rs::VERDICT_TOKEN_RE	exact:word-boundary
+GROOMED	B	crates/mika-agent/src/grooming_marker.rs::grooming_verdict	exact:word-boundary
+READY	B	crates/mika-agent/src/grooming_marker.rs::FIRST_PASS_READY_RE	exact:literal
+GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:literal
+READY	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:literal
+
+# ── Callback-envelope grammar. `^Outcome: <TOKEN>`, `^STATUS=<TOKEN>` and the
+# crash/violation markers — all line-anchored or literal, no fuzzy tier behind.
+ESCALATE	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
+PLAN_COMMITTED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
+PLAN_GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
+PR_OPENED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
+PLAN_GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:literal
+PIPELINE_INCOMPLETE	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:literal
+PLAN_GROOMED	B	crates/mika-agent/src/task_state/tasks.rs::GROOM_SUCCESS_MARKER	exact:literal
+CANCELLED	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
+HANDLER CRASH	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
+PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
+PIPELINE_INCOMPLETE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
+STATUS	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
+STRUCTURAL VIOLATION	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
+PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_post_flight_recovery	exact:literal
+NO_PR	B	crates/mika-agent/src/task_engine/dispatcher.rs::RE_NO_PR	exact:line-anchored
+
+# ── Cancel-reason discriminators (mika#749, #2249). The shell TERM trap and
+# `self-dev-callback` read these byte-exact; a reworded one makes a reaped pilot
+# indistinguishable from an operator cancel, which is the mika#2249 failure.
+CANCELLED_BY_OPERATOR	B	crates/mika-agent/src/task_engine/process_kill.rs::CANCEL_REASON_OPERATOR	exact:literal
+CANCELLED_BY_SUPERSEDE	B	crates/mika-agent/src/task_engine/process_kill.rs::CANCEL_REASON_SUPERSEDED	exact:literal
+REAPED_PILOT_SILENT_STALL	B	crates/mika-agent/src/task_engine/process_kill.rs::CANCEL_REASON_PILOT_SILENT_STALL	exact:literal
+
+# ── Engine↔architect markers (mika#2037, #2338). The withheld-disposition
+# marker is matched at the START OF A LINE by `_parse_disposition` tier 0, and
+# the engine finding line by `_engine_escalation_line`.
+REVIEW-ANCHOR-MISSING	B	crates/mika-agent/src/agent_loop/mod.rs::DISPOSITION_WITHHELD_MARKER	exact:line-anchored
+BLOCKING	B	crates/mika-agent/src/agent_loop/mod.rs::REVIEW_ANCHOR_ENGINE_FINDING_MARKER	exact:line-anchored
+BLOCKING	B	skills/bundled/_shared/dispatch-lib.sh::_engine_escalation_line	exact:line-anchored
+
+# ── Architect decision marker (mika#1262), read off written architect text.
+DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal
+
+# ── Review-body grammar. THE READERS DISAGREE ON CASE, and the divergence is
+# real rather than an artefact of this table: `server/verdict.rs` tolerates case
+# and markdown emphasis (mika#1828), while `github_graphql` and
+# `builtin_handlers` use byte-exact `starts_with` / `strip_prefix`. So
+# `Verdict: pass` in lowercase IS read by the webhook handler and is NOT read by
+# the review-history reader. Declared as measured; unifying them is a decision
+# outside mika#2201, whose perimeter is the text, not the predicates.
+VERDICT	B	crates/mika-agent/src/server/verdict.rs::VERDICT_RE	ci+emphasis:line-anchored
+VERDICT	B	crates/mika-agent/src/github_graphql.rs::extract_latest_verdict	exact:prefix
+VERDICT	B	crates/mika-agent/src/calibration/roles/mika_qa.rs::run_verdict_format_canonical_shape	exact:literal
+VERDICT	B	crates/mika-agent/src/server/deadline_verdict.rs::DEADLINE_VERDICT_LINE	exact:literal
+DEPTH	B	crates/mika-agent/src/server/verdict.rs::DEPTH_RE	ci:line-anchored
+DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_present	exact:prefix
+
+# ── Gateway message prefixes. `starts_with` on every reader: a translated or
+# reworded prefix routes nowhere, silently.
+[GitHub]	B	crates/mika-agent/src/agent_loop/mod.rs::ANCHORING_PHRASES	exact:prefix
+[GitHub]	B	crates/mika-agent/src/agent_loop/mod.rs::webhook_zero_tools_trigger	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/ci_failure_handler.rs::parse_check_suite_failure	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/ci_success_handler.rs::parse_check_suite_success	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/draft_pr_opened_handler.rs::PR_OPENED_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/milestone_context_handler.rs::PR_CLOSED_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/upstream_close_handler.rs::ISSUE_CLOSED_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/upstream_close_handler.rs::PR_CLOSED_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-agent/src/server/verdict.rs::HEADER_RE	exact:line-anchored
+[GitHub]	B	crates/mika-agent/src/server/webhook_queue.rs::CHECK_SUITE_RE	exact:line-anchored
+[GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::CHECK_SUITE_RE	exact:line-anchored
+[GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::ISSUE_LABELED_RE	exact:line-anchored
+[GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::PR_ACTION_RE	exact:line-anchored
+[GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::classify_event	exact:prefix
+[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_unauthorized_webhook_dispatch	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
+[callback:	B	crates/mika-agent/src/agent_loop/mod.rs::ANCHORING_PHRASES	exact:prefix
+[callback:	B	crates/mika-agent/src/agent_loop/mod.rs::callback_milestone_advance_trigger	exact:prefix
+[callback:	B	crates/mika-agent/src/agent_loop/mod.rs::callback_trigger_active	exact:prefix
+[callback:deferred-dispatch]	B	crates/mika-agent/src/agent_loop/mod.rs::callback_trigger_active	exact:literal
+[callback:deferred-dispatch]	B	crates/mika-agent/src/agent_loop/mod.rs::deferred_dispatch_trigger	exact:literal
+[callback: long_running:build_mika]	B	crates/mika-agent/src/qa_build_callback.rs::BUILD_CALLBACK_MESSAGE_MARKER	exact:literal
+
+# ── Merge-ready signal (mika#2248), re-parsed by the merge actor.
+MERGE-READY-SIGNAL	B	crates/mika-common/src/forge_identity.rs::MERGE_READY_MARKER	exact:literal
+
+# ── Failed-send annex prefix (mika#2136).
+UNPARSEABLE TIMESTAMP	B	crates/mika-agent/src/server/handlers.rs::FAILED_SEND_UNPARSEABLE_PREFIX	exact:literal
+
+# ── Rescue marker KEY. The key is strict; its VALUE is tolerant (class A
+# above). `wip_rescue.rs` reads `<!-- rescue-pipeline-verified: … -->` by exact
+# key via `match_indices`, then accepts `Yes` / `:yes` / ` : Yes ` for the
+# value — two tolerances in one marker, which is exactly the distinction a
+# single-column list would lose.
+rescue-pipeline-verified	B	crates/mika-agent/src/wip_rescue.rs::PIPELINE_VERIFIED_KEY	exact:literal
+
+# ═══ Labels. Out of the survey's perimeter (not source), so never compared.
+#
+# Their own exhaustiveness guards are `scripts/check-dispatch-seats-declared.sh`
+# for the `dispatch:*` family and rule L5 of the lint for every label a
+# prescriber cites as a `--add-label` / `--remove-label` instruction.
+ready	B	.github/labels.yml::declared-labels	exact:literal
+blocked	B	.github/labels.yml::declared-labels	exact:literal
+operator-review	B	.github/labels.yml::declared-labels	exact:literal
+operator-gated	B	.github/labels.yml::declared-labels	exact:literal
+wip-rescue	B	.github/labels.yml::declared-labels	exact:literal
+human-review-required	B	.github/labels.yml::declared-labels	exact:literal
+needs-multi-agent-review	B	.github/labels.yml::declared-labels	exact:literal
+stale-against-main	B	.github/labels.yml::declared-labels	exact:literal
+rescue-after-review	B	.github/labels.yml::declared-labels	exact:literal
+origin:loop	B	.github/labels.yml::declared-labels	exact:literal
+origin:manual	B	.github/labels.yml::declared-labels	exact:literal
+origin:spawn	B	.github/labels.yml::declared-labels	exact:literal
