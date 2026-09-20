@@ -166,6 +166,104 @@ bytes (`routes.rs`). The unfinished half of mika#2134, unrelated to rendering, a
 covered incidentally by the fallback (a length 400 fails identically on the second
 send and returns that error). Follow-up ticket to open.
 
+## User-Facing Copy and Locale (mika#2025)
+
+**The gateway's own copy never traverses a persona**, so mika#2023 (the agent's
+English greeting) does not and cannot fix it: six of these messages are served
+*before* pairing, when there is no customer row and no agent to call.
+
+`copy.rs` is the **single producer**. `render(UserMessage, Locale) -> &'static
+str` matches on the **pair** with **no `_ =>` arm** — the compiler, not a
+reviewer, forces every new message and every new language to decide, on the
+`hosting_ground_truth_line` model (mika#2290, mika#2292). Fifteen static keys, no
+interpolation, two languages: an i18n framework would cost more than it returns,
+and a third language is a deliberate act the `match` makes non-forgettable.
+
+**Two guards, because the regression is invisible to behaviour.** A seventeenth
+hard-coded English literal at a send site makes no decision wrong — it restores
+the defect on one key, silently. So `routes::tests::mika2025_v10_*` scans
+production sources and refuses a string literal in any argument of
+`send_message`; `copy::tests::mika2025_v11_*` refuses a wildcard arm. **The V10
+allowlist (`SEND_MESSAGE_LITERAL_ALLOWED`) ships empty and stays empty**: when
+it reddens, the resolution is to add a `copy::` key, never an entry — an entry
+decides that one message is English-only for every user and needs its own ticket
+(the rule mika#2323 had to write for `ACTOR_READING_PREDICATES_ALLOWED`). Both
+carry a negative control on a fabricated input *and* an anti-vacuity count over
+the real tree, so "the scan found nothing" is distinguishable from "the scan
+looked at nothing" (mika#2205).
+
+**The signal is `message.from.language_code`, and the account column is
+deferred.** `resolve_locale` is the sole reader: prefix before the first `-`,
+ASCII-case-insensitive, `fr` → French, everything else → English. `from` was
+never deserialized before mika#2025, which is why no language signal existed
+anywhere in the process — the fix is one `#[serde(default)]` field and **zero
+migration**. `customers` has no locale column and adding one needs a *writer*,
+which is the `mika-cloud` console: until someone writes it the column is NULL and
+nothing changes for the user. The cascade is written gate-by-gate so that column
+inserts itself as one more rung in front of this one. **Named limit:**
+`language_code` is the language of the client's *Telegram interface*, not of
+their Mika account — a francophone whose phone is in English still gets English,
+and this does not close that. **Reopening criterion, a measurement not a hunch:**
+open the `mika-cloud` ticket the day a tenant is observed receiving a language
+that is not theirs *despite* this fix.
+
+**`/unlink`: the action leads, the warning follows.** The reported behaviour was
+a reader skimming "⚠️ … cannot be undone" and replying with the command they
+already knew — `/unlink` — instead of the one on the last line they never
+reached. Line order is the only half of the salience that survives
+`MIKA_TELEGRAM_HTML_RENDER=0` **and** mika#2291's plain-text fallback; the
+backticks are a reinforcement that degrades into a legible quotation. **The
+command is deliberately not bolded** — a raw `**` is precisely the marker whose
+cost mika#2291 measured on a live tenant.
+
+**Three states, three answers.** `ParsedMessage::Unlink` now carries the suffix
+the parser had always computed and discarded, so a *tried* confirmation
+(`/unlink oui`) gets a reply that says so and quotes it back, instead of the same
+reminder a bare `/unlink` gets. This half is **not optional**: serving the copy
+in French makes `/unlink confirmer` *more* likely, so the localization enlarges
+the population of the third state. `confirmer` therefore joins `confirm` as a
+recognized form — an input tolerance, never a second interface: the copy keeps
+prescribing `/unlink confirm` in both languages, and
+`copy::tests::mika2025_the_prescribed_command_is_the_parsed_command` is the only
+thing joining the two modules that spell it.
+
+**Operator surfaces** (`$MIKA_GATEWAY_LOG_FILE` or stdout). No `audit_events`
+row: the gateway sees every Telegram message of every tenant, and a row per
+resolved message is the churn mika#2131 bounds.
+
+- `gateway_locale_resolved` (INFO — `chat_id`, `locale`, `locale_source`).
+  Emitted on **command** paths only (`/start`, `/unlink`, `/unlink confirm`);
+  the `Text` path, which carries the volume, emits nothing. This is the answer to
+  "does this tenant get French, and through which gate?" without reading the
+  database (`llm_budget_resolved`'s lesson, mika#2293: *a setting you cannot
+  observe is not a setting*). `locale_source: default` is the **floor**, not a
+  gate — it covers an absent sender, an absent or unrecognized tag, **and an
+  explicit `en`**, so it does not by itself prove Telegram sent nothing.
+- `unlink_suffix_unrecognized` (INFO — `chat_id`, `locale`). **Expected regime:
+  NON-empty.** It measures whether the `confirmer` alias covers the forms people
+  actually type. **The refused suffix is never logged** — it is user content, at
+  the standard mika#2126 set and mika#2291 restated; it is quoted to the *user*,
+  not to the operator.
+
+**Post-deploy probe, and its three halts.** Replay on a francophone tenant:
+`/start` with an invalid invite, then `/unlink`, then `/unlink confirmer`.
+Expected: three French replies, the action on the first line of the second, the
+third releasing the binding.
+
+- **Halt 1 — replies stay English.** Read `gateway_locale_resolved` **before
+  touching the normalization**: `locale_source: "default"` means no gate selected
+  for that client, which is the population the deferred column would cover — a
+  result, not a fault. *No line at all* means the deployed binary predates the
+  fix: establish the deployment first (class mika#2340).
+- **Halt 2 — the user reads raw backticks.** Check `MIKA_TELEGRAM_HTML_RENDER`
+  and `telegram_html_render_fallback` **before removing the markdown from the
+  copy**: that is the named degradation, and if the fallback is firing it is
+  mika#2291 that has something to say, not this copy.
+- **Halt 3 — `unlink_suffix_unrecognized` is empty.** Do not conclude the third
+  state was imaginary: the event only fires on a *suffix*, and its absence may
+  simply mean nobody typed one. Confirm at least one `/unlink` was served before
+  concluding anything (mika#2205).
+
 ## Search Substrate (mika#1807 / mika#1971 → mika#2407)
 
 **This section is the documentation debt mika#2407 paid on the way.** Until it was

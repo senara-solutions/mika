@@ -148,6 +148,92 @@ Not chosen for v1 because Option 1's expected recovery (7/8 → 8/8 first-try
 rate under prompt reinforcement) is likely sufficient and Option 2 doubles the
 tool surface area for a bounded gain.
 
+## Follow-up fix — shipped 2026-09-19 (mika#1952), and what it changed here
+
+Option 1 shipped as written: the three `evidence` field descriptions carry the
+text above verbatim, from a **single** site
+(`tools::REFLECTION_EVIDENCE_FIELD_DESCRIPTION`), and the reflection prompt's
+`## Available tools` block names the requirement on each of the three gated
+lines.
+
+**Option 2 stayed out of scope, and a third way closed the contradiction
+instead.** The reason Option 2 was ever on the table is that
+`Tool::definition(&self)` takes no `ToolContext` and cannot know the mode — so
+"the schema itself enforces it" looked to require twin tools. It does not:
+`run_silent_agent` knows the trigger *and* still holds the schema as owned JSON
+before the `From<ToolDefinition> for LlmToolDefinition` conversion moves it
+verbatim. `agent_loop::apply_reflection_evidence_contract` appends `"evidence"`
+to the `required` array of the three tools on a reflection turn only. **Zero
+tool registered, zero removed** — the ticket's stated objection to Option 2 was
+the *surface* ("doubles the tool surface area"), and this adds none.
+
+**The runtime guard was NOT replaced.** Mika does not emit `strict: true`, and
+neither the Anthropic API nor the OpenAI-compatible rails refuse a call missing
+a `required` key server-side: `required` *orients* the model, it does not
+constrain it. `"evidence": ""` satisfies every `required` array ever written and
+still fails `check_reflection_evidence`'s `trim().is_empty()`. That gap is
+pinned by `mika1952_the_runtime_guard_is_still_the_hard_barrier` — read it
+before deleting the guard as redundant.
+
+### The probe, corrected — the query at the top of this doc does not measure what it claims
+
+Three defects, each checkable without deploying anything:
+
+1. **It does not filter reflection mode.** It counts every `update_fact` of the
+   tenant, conversation mode included, where the guard does not apply. The
+   discriminant is free: `dispatch_reflection` writes
+   `session_id = "reflection-<date>"`.
+2. **It has no statistical power.** N=17 over 30 days. A "< 5 %" threshold at
+   N≈17 cannot separate 0/17 from 1/17 — a single post-fix miss reads 5.9 % and
+   would "fail" a fix that works. That is a draw, not a criterion.
+3. **It can run on an empty population without saying so.**
+   `[reflection].enabled` defaults to `false` and the well-known identities are
+   forbidden from carrying a `[reflection]` section; `dispatch_reflection` also
+   skips when the user spoke in the last 30 minutes or there was no conversation
+   that day. **Zero failures is compatible with zero reflections**, and the
+   query returns the same number either way (class mika#2205).
+
+Corrected query:
+
+```sql
+SELECT tool_name,
+       COUNT(*) AS n,
+       SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed
+FROM tool_calls
+WHERE agent_id='mika'
+  AND session_id LIKE 'reflection-%'
+  AND tool_name IN ('update_fact','store_fact','update_core_memory')
+  AND created_at >= strftime('%Y-%m-%dT%H:%M:%SZ','now','-30 days')
+GROUP BY tool_name;
+```
+
+And the qualitative control, which is worth more than a rate at this N:
+
+```sql
+SELECT created_at, session_id, tool_name, output
+FROM tool_calls
+WHERE success=0 AND output LIKE 'Reflection mode requires%'
+ORDER BY created_at DESC;
+```
+
+**Expected regime: zero rows dated after the deploy.**
+
+**Reading protocol, with its halts.**
+
+- **Read `n` first.** `n = 0` means *nothing was measured* — check that
+  `[reflection].enabled = true` on the tenant and that `reflection-*` sessions
+  exist in the window. **Do not read zero failures as a success.**
+- `n > 0` with zero `Reflection mode requires%` rows ⇒ conforming, and stated as
+  "no miss observed at N=`<n>`", never as "< 5 %".
+- **Halt — the miss persists at the same rate.** The served schema is not the
+  one you think. Read the deployed binary's version before touching any text:
+  either it predates the fix (class mika#2340), or the turn goes through a path
+  `apply_reflection_evidence_contract` does not traverse. Establish which first.
+- **Halt — the miss disappears but `"evidence": ""` appears.** The model is
+  satisfying the schema without the contract. Neither the schema nor the prompt
+  is the remedy there; that is the `assert_grounded` family (mika#1331) and
+  wants its own ticket.
+
 ## Stale-commitment cleanup outcome
 
 - 2026-07-28 batch of 7 stale commitments (mika#1743's original report):
@@ -156,6 +242,15 @@ tool surface area for a bounded gain.
 - 2026-08-17 residual (id=52, Vincent-runway assertion): **still pending**.
   Deferred to the follow-up fix ticket for a supervised retry once Option 1 is
   deployed — cancellation would be trivial post-fix.
+  **mika#1952 AC4 (2026-09-19):** the gesture is an operator one, on the tenant's
+  `~/.mika/data/mika.db`, and its precondition is that mika#1952 is deployed
+  (`make deploy`) — retrying before that replays the defect. Choose `completed`
+  or `cancelled` (mika#1952 leaves both open), supply an `evidence` in the
+  format above citing session `reflection-2026-08-17`, then verify with
+  `SELECT id, status FROM commitments WHERE id=52 AND agent_id='mika';`.
+  **What succeeding proves: nothing about the fix.** A supervised retry already
+  succeeded before mika#1952 — that is the 7-of-8 self-recovery measured above.
+  The probe is the query in the previous section.
 
 ## Discipline anchors
 

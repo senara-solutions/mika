@@ -59,7 +59,7 @@ impl Tool for StoreFactTool {
                     },
                     "evidence": {
                         "type": "string",
-                        "description": "Required in reflection mode: cite a specific conversation timestamp and quote as justification for this change"
+                        "description": super::REFLECTION_EVIDENCE_FIELD_DESCRIPTION
                     }
                 },
                 "required": ["category"]
