@@ -20,6 +20,7 @@ pub mod skills;
 pub mod skills_variants;
 pub mod status;
 pub mod tasks;
+pub mod team_outcome;
 pub mod teams;
 pub mod token;
 pub mod webhook;

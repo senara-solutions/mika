@@ -46,6 +46,34 @@ The envelope itself is omitted only when all its fields are absent — non-verbo
 
 Scoped flags: `--agent <name>` (override active agent, most subcommands), `--team <name>` (team mode, chat and ask, mutually exclusive with `--agent` and `--model`). `mika ask --team <name> "goal"` runs the full team cycle non-interactively (progress to stderr, deliverable to stdout); `--format json` extends the schema with `team_run` metadata. `--run-id <uuid>` (requires `--team`) references a previous run's workspace as read-only context; `--last-run` (requires `--team`, conflicts with `--run-id`) resolves to the most recent finished team run automatically.
 
+**A failed team run does not look like a successful one (mika#1940).** `mika ask
+--team` exits **1** on every terminal failure — `Failed`, `FailedNoDelegation`
+(mika#1676) and `FailedTransport` (mika#1671) — and leaves **`stdout` empty**;
+the diagnostic goes to `stderr` in every format, and the text the run had
+produced before failing follows it behind a marker that says it is not a
+deliverable. Until mika#1940 the shell exit code was **0** on the last two, and
+text mode printed that partial text on `stdout` as if it were the answer:
+`engine.rs` sets `deliverable = Some(retry_reply)` on the very line that sets
+`FailedNoDelegation`, so the failing run always carried something plausible.
+
+The empty `stdout` is the half an exit code does not close: it is what stops
+`RESULT=$(mika ask --team X "goal")` from capturing a plausible answer to a
+question that failed. `--format json` and `--format yaml` are **unchanged on a
+successful run** (byte-identical) and gain one additive, `skip_serializing_if`-omitted
+field, `team_run.failure_reason`, so a script gets the reason without parsing
+`stderr`. `content` still carries `run.deliverable` — that format already
+discriminated correctly through `team_run.status`, and emptying it would remove
+information from a wire format that worked.
+
+**All team failures exit `1`, transport ones included.** `remote_ask` reserves
+`75` (`EXIT_TRANSPORT_FAILURE`) for retryable single-`mika ask` transport
+failures, and `_arch_ask_with_retry` retries on it; that budget is sized for one
+call, not for a whole team cycle whose automatic retry costs minutes and several
+LLM calls. The decision lives in `commands/team_outcome.rs`, the single reader
+both `mika ask --team` and `mika chat --team` classify through — and it names no
+`RunStatus` variant, reading `RunStatus::disposition()` instead, so a seventh
+variant fails to compile in `mika-agent` and nowhere here.
+
 **A lost reply is an error, not an empty answer (mika#2270).** On both paths — the
 local mika-spirit thin-client path and `--remote` — a `Task` the renderer cannot
 read makes `mika ask` exit **non-zero** with a message naming what was inspected
