@@ -102,7 +102,38 @@ conversion ne répare rien maintenant et empêche le retour du défaut le jour o
 quelqu'un ajoute une assertion de contenu dans `test_bootstrap_agent`. C'est ce
 qui fait d'AC2 une exigence de classe et non de ligne.
 
-### 1.5 Le vecteur symétrique, pour mémoire
+### 1.5 La phrase d'AC3 répond à un fait mesuré, pas à une précaution
+
+AC3 justifie sa phrase par « sans elle, le prochain test ajouté refera la même
+chose ». Ce n'est pas une hypothèse : **c'est déjà arrivé, et la trace est dans le
+fichier.** `test_bootstrap_fresh_install_writes_narrow_skill_allowlist` (`:1324`)
+porte ce doc-comment, écrit sous mika#1778 :
+
+> `#[serial]` (mika#1778): reads the default identity, which depends on
+> `MIKA_AGENT_TIER` being unset/default — must not race the family-tier serial tests.
+
+Son auteur a **vu** la course, l'a nommée correctement, et y a répondu par
+`#[serial]` — pour *son* test. Le raisonnement est juste et il s'arrête là où il
+fallait continuer : « must not race the family-tier **serial** tests » suppose que
+les concurrents dangereux sont sériels. Les huit tests nus de §1.4 ne le sont pas,
+et lisaient déjà la même variable au même moment, dix-huit mois avant que l'un
+d'eux ne tire.
+
+Deux conséquences pour la conception :
+
+1. **AC3 est bien formulé et la phrase exacte compte.** Ce qui manquait n'était pas
+   la conscience de l'état partagé — elle était présente et écrite — mais la moitié
+   qui dit que `#[serial]` ne borne *que* ses porteurs. Une reformulation plus
+   vague reproduirait exactement ce demi-raisonnement.
+2. **La phrase seule ne suffira pas** (§2.5). Un commentaire correct existait déjà
+   à un site de ce fichier et n'a pas empêché le défaut à huit autres. C'est
+   l'argument mesuré pour que la garde d'U5 soit structurelle : c'est elle, et non
+   le texte, que le prochain auteur de test rencontrera.
+
+Ce constat ne change aucune unité de travail — il durcit le choix d'U4 (écrire la
+phrase *avec* sa seconde moitié) et retire à U5 son air de précaution.
+
+### 1.6 Le vecteur symétrique, pour mémoire
 
 Trois des tests sériels font `remove_var` (`:1327`, `:1438`, `:1862`). Un test
 nu qui *attendrait* `Family` serait cassé par eux. Aucun n'existe aujourd'hui.
@@ -189,6 +220,12 @@ qui échoue une fois sur cent passe en CI. C'est la forme exacte que le dépôt
 traite ailleurs par un scan de source (mika#2131 : « la régression ne rendrait pas
 une décision fausse, elle la rendrait invisible »).
 
+**Et la garde documentaire a déjà été essayée sur ce fichier, sans succès**
+(§1.5) : un commentaire correct sur la course existe à `:1324` depuis mika#1778 et
+n'a protégé que le test qui le porte. L'argument pour un scan n'est donc pas
+seulement théorique — c'est la mesure que le texte seul n'atteint pas les sites
+qu'il ne touche pas.
+
 Garde : un test qui lit le source, trouve chaque `#[test]` **non-`#[serial]`**
 dont le corps appelle `bootstrap(` / `bootstrap_agent(` /
 `bootstrap_fresh_install(` / `AgentTier::from_env()`, et refuse.
@@ -260,6 +297,11 @@ Deux sites, deux registres :
   `#[serial]` ; un `#[test]` nu tourne en parallèle d'eux, et une variable
   d'environnement est un état partagé de processus.** Plus le geste correct :
   appeler la variante `_with_tier`.
+
+**La seconde moitié de cette phrase est celle qui manquait** (§1.5) : le
+doc-comment de `:1324` porte déjà la première. Écrire « attention à l'état
+partagé » sans « `#[serial]` ne borne que ses porteurs » reproduirait le
+demi-raisonnement qui a laissé huit tests nus en place.
 
 Une phrase répétée à huit sites serait bruit ; la garde d'U5 est ce qui fait que
 le prochain test la rencontre de toute façon.
