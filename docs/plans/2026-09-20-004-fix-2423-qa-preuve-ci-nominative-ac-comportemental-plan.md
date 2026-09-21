@@ -472,6 +472,35 @@ Vérifié par V8.
 
 ---
 
+## Révision post-revue (2026-09-21, PR #2438)
+
+La revue multi-lentilles de la PR a confirmé deux défauts du prédicat U1 tel qu'écrit,
+et le correctif reste à l'intérieur de la Décision 1 (commande × budget, jamais le nom du
+skill) :
+
+- **P0 — le scan « borné par identifiant » refusait l'étape 2 de `qa-review`.** L'unique
+  `run_shell` de l'étape 2 embarque le corps de PR verbatim dans un heredoc ; 31 des 40
+  derniers corps de PR de `mika` citent une commande de build en prose. Le scan par
+  sous-chaîne (modèle `run.sh`) les prenait tous, et la ligne 40 disait ensuite au modèle
+  de « continuer » sans les guards : un faux vert silencieux. **Remplacé par un ancrage au
+  début d'instruction** — le binaire doit être le premier token d'une instruction shell
+  (après `VAR=valeur`), corps de heredoc exclus. Le scan penche désormais vers le
+  **manque** (sous-shell, `$CARGO`, `sh -c`), rattrapé par U2, plutôt que vers le faux
+  refus, qui ferme une porte légitime. Tests V3 (prose quotée) et V3b (forme exacte de
+  l'étape 2, vus rouges sur l'ancien scan).
+- **P1 — un handler qui détache sa commande n'est pas borné par le budget.**
+  `tmux_create_session` (30 s, installé sur mika-dev et mika-qa) remet `command` à une
+  session détachée et revient en moins d'une seconde ; c'est la voie recommandée pour un
+  build long, et U1 la refusait. **Ajout de `detaches_command: bool` sur
+  `ToolHandler::Exec`** (défaut `false`, déclaré sur `tmux_create_session`) ; le prédicat
+  lit le modèle d'exécution du handler et rend `None` pour `detaches_command` comme pour
+  `long_running` — ce qui rend l'AC6 vraie par construction, indépendamment de la place
+  de la garde par rapport à la branche `long_running` (la phrase « avant la branche »
+  du site U1 n'est plus porteuse). Tests V3c et pin du manifeste `tmux`.
+- **P2 —** les lignes 12 et 32 du prompt recommandaient encore `npx tsc` via `run_shell`,
+  désormais un refus garanti (3 exécutions réussies mesurées en 30 jours) ; réécrites.
+- **P3 —** V7 découpait le prompt sur un décompte d'octets ; borné sur le contenu.
+
 ## Sources
 
 Tout ce qui est affirmé ici a été lu dans l'arbre à `HEAD = ba08a9bc`.
