@@ -86,8 +86,12 @@ Rust ni à ses sites d'appel : la garde elle-même est mika#2084, terminée. Il 
 - **R-4** — La pose ne contourne pas la garde : si le snapshot `LABELS` porte un
   `dispatch:*` autre que `dispatch:loop`, **aucun** `--add-label dispatch:loop` n'est
   émis, et une ligne nommée le dit. L'ordre est lecture-des-étiquettes puis estampille,
-  jamais l'inverse ; la lecture est **la même** que celle qui a servi au moteur, pas une
-  seconde. (AC3)
+  jamais l'inverse ; la lecture est celle que `_set_up_worktree` a déjà faite pour sa
+  propre garde #2012 — un seul `gh issue view` par dispatch, pas de second appel dans la
+  fonction. *(Précision post-revue #3 : ce n'est PAS la lecture du moteur — le moteur lit
+  GitHub en Rust, plus tôt, avant de lancer le handler ; une étiquette `dispatch:*` posée
+  entre les deux lectures apparaît ici comme `owned_by_other`, c'est la fenêtre que C-2
+  nomme.)* (AC3)
 - **R-5** — Le retrait est décidé et écrit : `dispatch:loop` est une **revendication
   vivante**, retirée à la sortie de dispatch-lib (chemin nominal, crash, annulation) ;
   la provenance permanente reste `origin:loop` sur la PR. (AC4)
@@ -307,12 +311,31 @@ Pourquoi **inconditionnel** (et non « seulement si j'ai posé ») :
 Ce que le retrait **ne touche jamais** : `dispatch:ssc`, `dispatch:mpc`, `ready`, ou
 toute autre étiquette. L'appel nomme `dispatch:loop` et rien d'autre.
 
-**Course examinée et bénigne.** Sur `dev-groom`, `_deliver_callback` déclenche le tour
+**Course examinée et bénigne côté moteur.** Sur `dev-groom`, `_deliver_callback` déclenche le tour
 de rappel de mika-dev, qui peut re-poser `ready` → `ready_label_handler` lit les
 étiquettes **avant** que le trap EXIT ait retiré `dispatch:loop`. Verdict :
 `OwnedByCurrentSeat` → passe. Après le retrait : `NoSeatLabel` → passe. Les deux
 ordres donnent le même résultat, parce que les deux étiquettes appartiennent au même
 siège.
+
+**Amendement post-revue (constat #2, reliability + adversarial, confirmé par le
+validateur).** La course est bénigne pour le *verdict*, pas pour l'*étiquette* : si le
+dispatch suivant lit `dispatch:loop` avant que le précédent l'ait retirée, il ne
+l'estampille pas (`already_owned`), et le retrait du précédent la lui enlève sous les
+pieds — il tourne alors toute sa vie sans revendication, la garde désarmée par le
+mécanisme censé l'armer. **Décision (option a du rapport) : le retrait se fait d'abord
+dans `_deliver_callback`, avant `mika ask --task-complete`** — le message qui permet à
+mika-dev de lancer le dispatch suivant ; le trap EXIT reste le filet crash/annulation,
+et `_release_issue_seat` abaisse `ISSUE_SEAT_CLAIMED` sur succès pour que le second site
+soit un no-op. Épinglé par la suite (ordre `release < mika ask` dans
+`_deliver_callback`, deux sites d'appel, flag abaissé T10, conservé T12). **Résidu nommé,
+non fermé ici :** deux dispatch-lib réellement vivants en même temps sur un même ticket
+(le bail de créneau est clé par `(agent_id, dispatch_class)`, pas par issue ; la voie
+`ready-label` le refuse via `live_pilot_for_issue`, les deux autres appelants de
+`validate_dispatch_readiness` non). Incidence non mesurée. Condition de réveil : un
+`dispatch_seat.already_owned` dans une trace de dispatch pendant que `tasks` montre un
+autre dispatch vivant sur le même `repo#N` → ticket côté moteur (option b : étendre la
+garde `live_pilot_for_issue` aux deux autres appelants).
 
 ### C-5 — Tests : `skills/bundled/_shared/tests/test_stamp_issue_seat.sh`
 
@@ -548,3 +571,7 @@ Reprises du ticket, avec le lieu du plan qui les tient.
 
 - 2026-09-21 — v1, /ce:plan via /mika-groom-ticket (orchestrateur MPC). mika-arch première
   passe : **Disposition: READY**, aucun finding bloquant (session `a3a926e5-f4d5-4fec-86c8-f869221f90e1`).
+- 2026-09-21 — v1.1, post `/ce:review` (6 relecteurs, 3 constats confirmés) : R-4 précisé
+  (la lecture est celle de dispatch-lib, pas du moteur) ; C-4 amendé (retrait avant le
+  rappel, résidu concurrent nommé avec sa condition de réveil) ; C-5 étendu (T7b, T13,
+  T14 comportemental sur la garde DRY_RUN, ordre dans `_deliver_callback`).
