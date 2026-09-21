@@ -376,7 +376,12 @@ assert_eq "trace file contains no credential-shaped value" "1" "$rc"
 # `++ printf ' %q' /bin/true`. That line carries the payload, never a secret
 # (the argv channel is audited above), so it alone is excluded — exactly, so
 # any other expanded printf still fails the assertion.
-rc=1; grep -E '\+\+ printf' "$TRACE" | grep -vqxF "++ printf ' %q' /bin/true" && rc=0
+# Here-string, not a pipe (mika#2055/#2432: `producer | grep -q` SIGPIPEs).
+# The `-n` guard matters: an empty here-string is one empty line, which
+# `grep -v` would count as an offending printf.
+_printf_lines=$(grep -E -- '\+\+ printf' "$TRACE" || true)
+rc=1
+[ -n "$_printf_lines" ] && grep -vqxF -- "++ printf ' %q' /bin/true" <<<"$_printf_lines" && rc=0
 assert_eq "trace carries no expanded process-substitution printf" "1" "$rc"
 
 rc=1; grep -q 'sentinel-after-sandbox-call' "$TRACE" && rc=0
