@@ -72,9 +72,9 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
 /// it). So: **spirit attests, the CLI renders. Never the reverse.**
 ///
 /// The structural half of that rule is
-/// `tests::mika2457_the_cli_resolves_no_budget_locally`, a source scan with an
-/// allowlist shipped empty. When it fires, the second reader is removed — not
-/// allowlisted.
+/// `budget_tests::mika2457_the_cli_resolves_no_budget_locally`, a source scan
+/// with an allowlist shipped empty. When it fires, the second reader is removed
+/// — not allowlisted.
 ///
 /// # "Not attested" is an answer, and it is the honest one
 ///
