@@ -5143,16 +5143,23 @@ mod tests {
         /// Le plafond de lecture est très en deçà du budget d'outil que
         /// `qa-review` déclare : le dépassement est une **abstention**, pas une
         /// erreur, donc il ne doit pas consommer l'enveloppe de l'outil.
+        ///
+        /// Les deux bornes sont posées en `const` block : les deux membres sont
+        /// des constantes, donc l'encadrement est vérifié **à la compilation**
+        /// plutôt qu'au lancement du test — un plafond déplacé hors de
+        /// `[5, 30[` ne compile plus, au lieu de rougir si quelqu'un pense à
+        /// lancer la suite.
         #[test]
         fn the_read_timeout_stays_well_under_the_tool_budget() {
-            assert!(
-                QA_CI_READ_TIMEOUT_SECS < 30,
-                "le plafond de lecture doit rester sous le timeout_secs de qa-review"
-            );
-            assert!(
-                QA_CI_READ_TIMEOUT_SECS >= 5,
-                "assez pour un aller-retour gh"
-            );
+            const {
+                assert!(
+                    QA_CI_READ_TIMEOUT_SECS < 30,
+                    "le plafond de lecture doit rester sous le timeout_secs de qa-review"
+                );
+            }
+            const {
+                assert!(QA_CI_READ_TIMEOUT_SECS >= 5, "assez pour un aller-retour gh");
+            }
         }
     }
 }
