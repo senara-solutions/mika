@@ -443,6 +443,20 @@ pub enum AgentsCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Show the LLM budget and model an agent is running under, with provenance
+    ///
+    /// Reads the record mika-spirit resolved when it initialized the agent. It
+    /// is deliberately NOT computed here: this process's environment is not the
+    /// server's, so a local resolution could report a setting that is not in
+    /// force, with the authority of a measurement (mika#2457).
+    Budget {
+        /// Agent to report on (defaults to --agent, then the active agent)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
     /// Re-apply the authoritative identity.toml and soul.md for an existing agent
     Reprovision {
         /// Agent name to re-provision

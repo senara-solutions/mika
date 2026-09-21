@@ -780,9 +780,7 @@ pub fn resolve_llm_budget_record(
         model: model.effective_model().unwrap_or("").to_string(),
         model_source: model.model_source_name().to_string(),
         model_config_key: model.model_config_key(),
-        resolved_at: chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string(),
+        resolved_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     }
 }
 
@@ -829,7 +827,11 @@ fn dedup_signature(record: &ResolvedBudgetRecord) -> String {
 }
 
 pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
-    emit_llm_budget_resolved(&resolve_llm_budget_record(agent_id, global_home, agent_home));
+    emit_llm_budget_resolved(&resolve_llm_budget_record(
+        agent_id,
+        global_home,
+        agent_home,
+    ));
 }
 
 /// Emit `llm_budget_resolved` for an already-resolved record (mika#2457).
@@ -1891,16 +1893,102 @@ mod tests {
         assert_eq!(env_record.total_source, "agent_config");
 
         // Position 1 — the per-agent `.env` beats the process env (mika#2218).
-        std::fs::write(
-            agent.join(".env"),
-            format!("{HTTP_TIMEOUT_ENV_VAR}=420\n"),
-        )
-        .unwrap();
+        std::fs::write(agent.join(".env"), format!("{HTTP_TIMEOUT_ENV_VAR}=420\n")).unwrap();
         let dotenv_record = check("position 1 (.env per-agent)");
         assert_eq!(dotenv_record.http_source, "agent_dotenv");
         assert_eq!(dotenv_record.http_timeout_secs, 420);
 
         clean_budget_env();
+    }
+
+    /// mika#2457 U1 — the record has **one** construction site.
+    ///
+    /// A source scan, because a behavioural test cannot see this class: a second
+    /// constructor would make no assertion fail the day it is written. It would
+    /// be a resolver free to diverge from this one — silently, later, with every
+    /// test still green. That is the class `grooming_marker` (mika#2158) had to
+    /// close after promotion and dispatch routing answered the same question
+    /// differently for months, and the reason the plan's Fire-Disposition puts
+    /// this detector under option (a) rather than calling it redundant.
+    ///
+    /// Scope: this crate, which owns the type, plus `mika-agent`, the one
+    /// consumer that holds a record and could be tempted to assemble its own in
+    /// `init_agent`. `mika-agent` is reached by relative path and **skipped when
+    /// absent** (a crates.io checkout of `mika-common` alone), so this half is
+    /// best-effort — the this-crate half below is not, and is asserted
+    /// non-vacuous.
+    ///
+    /// **Allowlist shipped empty, and it is not a slot**: when this fires, the
+    /// second constructor is removed, not listed.
+    #[test]
+    fn mika2457_the_record_has_a_single_construction_site() {
+        use crate::source_guard::ProductionScanner;
+
+        const ALLOWED: &[&str] = &[];
+        const NEEDLE: &str = "ResolvedBudgetRecord {";
+
+        let collect = |scanner: &ProductionScanner, label: &str| {
+            let mut hits: Vec<String> = Vec::new();
+            scanner.for_each(|path, source| {
+                let rel = path
+                    .strip_prefix(scanner.src_root())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                if ALLOWED.contains(&rel.as_str()) {
+                    return;
+                }
+                for (idx, line) in source.lines().enumerate() {
+                    // A doc-comment naming the type is not a construction of it.
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    // Two shapes carry the needle without constructing
+                    // anything, and both are excluded by their own syntax
+                    // rather than by a path allowlist: the declaration
+                    // (`pub struct ResolvedBudgetRecord {`) and a function's
+                    // return type followed by its body brace
+                    // (`) -> ResolvedBudgetRecord {`). A *real* construction
+                    // inside such a function still sits on its own line and is
+                    // caught, so neither exclusion widens the guard.
+                    if trimmed.starts_with("pub struct") || trimmed.starts_with("struct") {
+                        continue;
+                    }
+                    if line.contains("-> ResolvedBudgetRecord {") {
+                        continue;
+                    }
+                    if line.contains(NEEDLE) {
+                        hits.push(format!("{label}/{rel}:{}", idx + 1));
+                    }
+                }
+            });
+            hits
+        };
+
+        let own = ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            own.files().len() > 5,
+            "le scan doit voir ce crate, sinon il est vide de sens"
+        );
+        let mut hits = collect(&own, "mika-common");
+
+        let agent_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("mika-agent")
+            .join("src");
+        if agent_src.is_dir() {
+            hits.extend(collect(&ProductionScanner::new(&agent_src), "mika-agent"));
+        }
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "le record doit avoir UN seul constructeur (`resolve_llm_budget_record`) : \
+             un second serait libre d'en diverger, sans qu'aucune assertion ne rougisse \
+             le jour où il est écrit. Quand ce scan tire, on retire le second \
+             constructeur — on ne l'allowliste pas.\nsites trouvés : {hits:?}"
+        );
     }
 
     /// mika#2457 U1 — `resolved_at` dates the record and never keys it.
