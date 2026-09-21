@@ -848,6 +848,170 @@ fn test_count_active_callbacks_for_class_counts_dispatches_not_rows() {
     );
 }
 
+// ── mika#2162 V3/V4: garde et backstop voient la MÊME population ──
+
+/// **V3 — une ligne de rappel `action_type != 'resume_agent'` est un occupant
+/// pour les deux lecteurs.**
+///
+/// Rougit sur le code d'avant mika#2162 : le backstop portait
+/// `action_type = 'resume_agent'`, la garde non. Une ligne hors de cette valeur
+/// était donc *occupante pour la garde* et *invisible au backstop* — qui aurait
+/// promu un wrapper que la garde aurait refusé, c'est-à-dire exactement le
+/// réveil stérile de ce ticket.
+///
+/// La population concernée est **vide en production** (les quatre écrivains
+/// posent `RESUME_AGENT`), ce qui est ce qui rend le retrait du terme inerte et
+/// en fait la fermeture d'une mine plutôt que d'un défaut actif. Ce test pose
+/// donc la ligne à la main : c'est le seul moyen d'attester une divergence que
+/// la production n'exhibe pas encore.
+#[test]
+fn mika2162_a_non_resume_agent_callback_occupies_the_slot_for_both_readers() {
+    let db = db();
+
+    let parent = db
+        .create_task(&new_task("mika", "parent", "manual", "none"))
+        .unwrap();
+    let mut cb = new_task(
+        "mika",
+        "long_running:run_claude_pilot",
+        "callback",
+        // Délibérément autre chose que `resume_agent`.
+        "send_message",
+    );
+    cb.parent_task_id = Some(parent.clone());
+    db.create_task(&cb).unwrap();
+
+    // La garde (côté dispatch) : occupé pour un AUTRE parent.
+    let other_parent = "un-autre-parent";
+    assert!(
+        db.has_active_callback_tasks_excluding(other_parent, "mika", "implement")
+            .unwrap()
+            .is_some(),
+        "la garde doit voir cette ligne comme occupante"
+    );
+    assert_eq!(
+        db.count_active_callback_tasks_excluding(other_parent, "mika", "implement")
+            .unwrap(),
+        1
+    );
+
+    // Le backstop : même réponse. Avant mika#2162 il rendait 0.
+    assert!(
+        db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap(),
+        "le backstop doit voir la même ligne — sinon il promeut ce que la \
+         garde refusera"
+    );
+    assert_eq!(
+        db.count_active_callbacks_for_class("mika", "implement")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.find_active_callback_for_class("mika", "implement")
+            .unwrap()
+            .is_some(),
+        true,
+        "le lecteur du bloquant partage la même population"
+    );
+}
+
+/// **V4 — une ligne de rappel orpheline (sans parent) est libre pour les
+/// deux lecteurs.**
+///
+/// Rougit sur le code d'avant mika#2162 : la garde portait
+/// `parent_task_id IS NOT NULL`, le backstop non. Une ligne orpheline était
+/// donc comptée par le backstop et invisible à la garde.
+///
+/// Le sens de ce terme est **l'inverse du précédent** et c'est pourquoi il est
+/// conservé plutôt que retiré : il rétrécit la population de la **garde**, donc
+/// l'aligner revient à faire voir au backstop *moins* d'occupants — jamais
+/// plus. Ce qui en découle est la propriété de sur-ensemble : le backstop se
+/// retient au moins aussi souvent que la garde ne refuse.
+///
+/// **Le coût de ce choix est nommé et laissé ouvert** : une telle ligne reste
+/// invisible aux deux, donc n'occupe aucun créneau. `build_mika` et
+/// `deploy_mika` déclarent `"required": []` et sont `long_running`, donc
+/// peuvent en produire. Mesure préalable et ticket de suivi dans le corps de
+/// PR ; ce test **épingle l'état**, il ne le ratifie pas.
+#[test]
+fn mika2162_an_orphan_callback_row_is_free_for_both_readers() {
+    let db = db();
+
+    let mut orphan = new_task(
+        "mika",
+        "long_running:build_mika",
+        "callback",
+        "resume_agent",
+    );
+    orphan.parent_task_id = None;
+    db.create_task(&orphan).unwrap();
+
+    assert!(
+        db.has_active_callback_tasks_excluding("un-autre-parent", "mika", "implement")
+            .unwrap()
+            .is_none(),
+        "la garde ignore une ligne orpheline — elle ne peut pas nommer de bloquant"
+    );
+    assert_eq!(
+        db.count_active_callbacks_for_class("mika", "implement")
+            .unwrap(),
+        0,
+        "le backstop doit l'ignorer AUSSI — sinon il se retient là où la garde \
+         laisserait passer un second dispatch de la classe"
+    );
+    assert!(
+        !db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap()
+    );
+}
+
+/// Le compte de wrappers en attente par classe (mika#2162 U3) est bien scopé :
+/// c'est lui qui décide si la rétention mérite d'être dite.
+#[test]
+fn mika2162_pending_wrapper_count_is_class_scoped() {
+    let db = db();
+    assert_eq!(
+        db.count_pending_deferred_callbacks_for_class("mika", "implement")
+            .unwrap(),
+        0,
+        "zéro wrapper en attente ⇒ le backstop se tait"
+    );
+
+    let parent = db
+        .create_task(&new_task("mika", "parent", "manual", "none"))
+        .unwrap();
+    let mut wrapper = new_task(
+        "mika",
+        "long_running:run_claude_pilot:deferred",
+        "callback",
+        "resume_agent",
+    );
+    wrapper.parent_task_id = Some(parent.clone());
+    wrapper.dispatch_class = Some("groom".to_string());
+    db.create_task(&wrapper).unwrap();
+
+    assert_eq!(
+        db.count_pending_deferred_callbacks_for_class("mika", "groom")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.count_pending_deferred_callbacks_for_class("mika", "implement")
+            .unwrap(),
+        0,
+        "un wrapper `groom` ne doit pas faire parler la classe `implement`"
+    );
+
+    // Et il reste invisible à la clause d'occupation (mika#1163).
+    assert_eq!(
+        db.count_active_callbacks_for_class("mika", "groom")
+            .unwrap(),
+        0,
+        "un wrapper en attente n'occupe pas le créneau qu'il attend"
+    );
+}
+
 #[test]
 fn test_force_promote_slot_free_no_pending_wrapper() {
     let db = db();

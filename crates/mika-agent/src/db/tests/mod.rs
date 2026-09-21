@@ -124,6 +124,93 @@ fn dispatch_stamp_violations(path: &std::path::Path, src: &str) -> Vec<String> {
     violations
 }
 
+/// Sites qui écrivent la clause d'occupation d'un créneau de classe hors du
+/// site unique (mika#2162 U2), rendus sous la forme `<chemin>:<ligne>`.
+///
+/// **L'aiguille est une conjonction** : l'exclusion `:deferred` **et** un terme
+/// de classe, dans une fenêtre assez large pour couvrir une clause `WHERE`
+/// complète telle que `cargo fmt` la laisse. C'est la signature de la question
+/// « ce créneau de classe est-il occupé ? » ; les trois voisins qui posent une
+/// autre question en sortent par leur forme, jamais par exemption — voir
+/// `mika2162_le_predicat_doccupation_a_un_seul_site` pour la table.
+///
+/// Le site unique lui-même (`db/tasks.rs`, `class_slot_occupancy_where`) est
+/// écarté par son **chemin de définition**, pas par une allowlist : il est le
+/// seul endroit où la clause a le droit d'être écrite, et c'est le fichier
+/// entier qui l'héberge — les six consommateurs qui y vivent n'écrivent plus
+/// que `format!("… WHERE {}", class_slot_occupancy_where(…))`.
+///
+/// Deux écartements composés, dans cet ordre : la **classification par chemin**
+/// (mika#2321) écarte un fichier de test entièrement, puis le **masquage**
+/// (mika#2398) retire les régions de test d'un fichier de production. Les
+/// lignes de commentaire sont neutralisées — sans quoi la prose qui doit
+/// décrire la clause (dont le doc-comment de `class_slot_occupancy_where`)
+/// ferait rougir la garde.
+fn slot_occupancy_clause_violations(path: &std::path::Path, src: &str) -> Vec<String> {
+    if crate::source_scan::is_test_source_path(path) {
+        return Vec::new();
+    }
+    // Le site unique. Comparaison sur les composants de fin de chemin pour ne
+    // pas dépendre de la racine ni du séparateur de la plateforme.
+    if path.ends_with("db/tasks.rs") {
+        return Vec::new();
+    }
+
+    let production = mika_common::source_guard::mask_test_regions(src);
+    let code: String = production
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    const DEFERRED_EXCLUSION: &str = "label NOT LIKE '%:deferred'";
+    const CLASS_TERM: &str = "dispatch_class, 'implement')";
+    // Une clause WHERE complète tient largement dans cette fenêtre, même
+    // reformatée ; l'élargir ferait apparier deux requêtes voisines et
+    // distinctes.
+    const WINDOW: usize = 400;
+
+    let mut violations = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = code[from..].find(DEFERRED_EXCLUSION) {
+        let at = from + rel;
+        let start = at.saturating_sub(WINDOW);
+        let end = (at + WINDOW).min(code.len());
+        // Fenêtre bornée aux frontières de caractères : les doc-comments de ce
+        // dépôt sont en français et un slice au milieu d'un octet paniquerait.
+        let (start, end) = (
+            floor_char_boundary(&code, start),
+            ceil_char_boundary(&code, end),
+        );
+        if code[start..end].contains(CLASS_TERM) {
+            let line = code[..at].matches('\n').count() + 1;
+            violations.push(format!("{}:{line}", path.display()));
+        }
+        from = at + DEFERRED_EXCLUSION.len();
+    }
+    violations
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn make_task(label: &str) -> NewTask {
     NewTask {
         agent_id: "mika".to_string(),

@@ -1610,13 +1610,18 @@ impl AsyncDatabase {
             .await
     }
 
-    /// Check if any non-deferred callback task is active (mika#1070).
-    pub async fn has_any_active_callback(&self) -> Result<bool> {
+    /// Count pending deferred-dispatch wrappers of one class (mika#2162).
+    pub async fn count_pending_deferred_callbacks_for_class(
+        &self,
+        dispatch_class: &str,
+    ) -> Result<i64> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.has_any_active_callback(&a)).await
+        let c = dispatch_class.to_owned();
+        self.with_db(move |db| db.count_pending_deferred_callbacks_for_class(&a, &c))
+            .await
     }
 
-    /// Class-scoped sibling of `has_any_active_callback` (mika#1175).
+    /// Class-scoped occupancy predicate (mika#1175).
     pub async fn has_any_active_callback_for_class(&self, dispatch_class: &str) -> Result<bool> {
         let a = self.agent_id.clone();
         let c = dispatch_class.to_string();

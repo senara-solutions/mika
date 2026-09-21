@@ -146,6 +146,148 @@ fn mika2321_the_dispatch_stamp_guard_still_catches_a_production_site() {
     }
 }
 
+// ── mika#2162: « le créneau est-il occupé ? » a un seul site SQL ──
+
+/// Aucun site de production, hors [`crate::db::tasks::class_slot_occupancy_where`],
+/// n'écrit la clause d'occupation d'un créneau de classe.
+///
+/// **Pourquoi un scan de source et pas un test comportemental.** Une seconde
+/// écriture de la clause ne rend aucune décision fausse *le jour où elle est
+/// écrite* — les deux copies sont identiques. Elle diverge des mois plus tard,
+/// en silence, avec toutes les assertions vertes. C'est littéralement ce qui
+/// s'est produit ici : `count_active_callbacks_for_class` portait un
+/// doc-comment affirmant « with the identical WHERE clause » et deux termes de
+/// différence avec la garde (`action_type = 'resume_agent'` d'un côté,
+/// `parent_task_id IS NOT NULL` de l'autre). Même classe, même remède, que
+/// `grooming_marker::tests::no_grooming_regex_outside_this_module` (mika#2158).
+///
+/// **L'aiguille est la CONJONCTION des deux fragments qui définissent la
+/// question**, et ce choix est plus étroit que celui écrit dans le plan — qui
+/// proposait `trigger_type = 'callback'` ∧ `label NOT LIKE '%:deferred'`. Cette
+/// aiguille-là accuse `has_non_deferred_active_callback_child`, qui pose une
+/// *autre* question (« ce parent est-il représenté ? », clée sur
+/// `parent_task_id`, sans portée agent ni classe) et ne peut pas consommer la
+/// clause. L'allowlister aurait violé R3 dès la livraison. La conjonction
+/// retenue — `label NOT LIKE '%:deferred'` **et** un terme de classe — est
+/// exactement la signature de « ce créneau de classe est-il occupé ? », et
+/// laisse dehors, par leur forme et non par exemption, les trois voisins qui
+/// posent une autre question :
+///
+/// | méthode | pourquoi hors population |
+/// |---|---|
+/// | `has_non_deferred_active_callback_child` | pas de terme de classe |
+/// | `has_pending_operator_task_for_class` | pas d'exclusion `:deferred` |
+/// | `promote_next_deferred_callback_for_class` | égalité **positive** sur le label du wrapper |
+///
+/// **Allowlist livrée vide, à dessein.** Quand ce scan tire, on consomme le
+/// site unique — on n'allowliste pas. Un site qui ne *peut* pas le consommer
+/// pose une question différente, et c'est alors l'aiguille qu'il faut affiner,
+/// explicitement, pas une exemption à poser en passant.
+#[test]
+fn mika2162_le_predicat_doccupation_a_un_seul_site() {
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let mut violations: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+
+    scanner.for_each(|path, production| {
+        scanned += 1;
+        violations.extend(slot_occupancy_clause_violations(path, production));
+    });
+
+    assert!(
+        scanned > 0,
+        "la garde n'a scanné aucun fichier — chemin cassé"
+    );
+    assert!(
+        violations.is_empty(),
+        "mika#2162 R3 — ces sites écrivent la clause d'occupation hors du site \
+         unique : {violations:?}\n\
+         Consommez `class_slot_occupancy_where`. Si le site pose une AUTRE \
+         question, c'est l'aiguille de la garde qu'il faut affiner — et dans \
+         les deux cas c'est une décision explicite, pas une exemption."
+    );
+}
+
+/// **Contrôle négatif de la garde ci-dessus (V6a).**
+///
+/// Un scan inopérant se lit exactement comme un arbre propre (classe
+/// mika#2205), et c'est le mode de panne que la Fire-Disposition du plan exige
+/// d'exclure. Ce test prouve les trois moitiés sur des sources contrôlées :
+/// une copie de la clause est attrapée à un chemin de production, la même est
+/// écartée à un chemin de test, et les trois voisins légitimes ne sont pas
+/// accusés.
+#[test]
+fn mika2162_la_garde_attrape_encore_une_copie_de_production() {
+    let production = std::path::Path::new("/repo/crates/mika-agent/src/server/new_gate.rs");
+
+    // Une seconde écriture de la clause, telle qu'elle serait recopiée.
+    let offending = r#"
+            let sql = "SELECT COUNT(*) FROM tasks
+                 WHERE agent_id = ?1
+                   AND trigger_type = 'callback'
+                   AND status IN ('pending', 'in_progress')
+                   AND label NOT LIKE '%:deferred'
+                   AND COALESCE(dispatch_class, 'implement') = ?2";
+        "#;
+    assert_eq!(
+        slot_occupancy_clause_violations(production, offending).len(),
+        1,
+        "la garde ne détecte plus une copie de production — elle est devenue \
+         vacuous, ce qui ne casse rien et ne protège plus rien"
+    );
+
+    // La même source, à un chemin de test, est écartée entièrement.
+    for test_path in [
+        "/repo/crates/mika-agent/src/db/tests/tasks.rs",
+        "/repo/crates/mika-agent/src/perimeter/tests.rs",
+    ] {
+        assert!(
+            slot_occupancy_clause_violations(std::path::Path::new(test_path), offending).is_empty(),
+            "{test_path} est scanné comme de la production"
+        );
+    }
+
+    // Les trois voisins qui posent une autre question restent hors population,
+    // par leur forme. Si l'un d'eux se met à rougir, la table du doc-comment
+    // ci-dessus est fausse et c'est elle qu'il faut reprendre.
+    let per_parent = r#"
+            "SELECT COUNT(*) FROM tasks
+             WHERE parent_task_id = ?1
+               AND trigger_type = 'callback'
+               AND status IN ('pending', 'in_progress')
+               AND label NOT LIKE '%:deferred'"
+        "#;
+    let operator_priority = r#"
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND status = 'pending'
+               AND dispatcher_source = 'operator'
+               AND COALESCE(dispatch_class, 'implement') = ?2"
+        "#;
+    let wrapper_selection = r#"
+            "SELECT id FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+               AND label = 'long_running:run_claude_pilot:deferred'
+               AND COALESCE(dispatch_class, 'implement') = ?2"
+        "#;
+    for (name, src) in [
+        ("has_non_deferred_active_callback_child", per_parent),
+        ("has_pending_operator_task_for_class", operator_priority),
+        (
+            "promote_next_deferred_callback_for_class",
+            wrapper_selection,
+        ),
+    ] {
+        assert!(
+            slot_occupancy_clause_violations(production, src).is_empty(),
+            "{name} est accusé alors qu'il pose une autre question"
+        );
+    }
+}
+
 // ── mika#1948 Porte 2: exec-slot arbitration ──
 
 /// A fresh DB must carry the v51 surface without any migration running —

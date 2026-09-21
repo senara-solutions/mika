@@ -693,14 +693,26 @@ fn test_deferred_dispatch_chain_promotion() {
     );
 }
 
-/// mika#1070 — Regression test: has_any_active_callback correctly identifies
+/// mika#1070 — Regression test: the occupancy predicate correctly identifies
 /// active non-deferred callbacks and excludes deferred wrappers.
+///
+/// **mika#2162 rebased this onto the class-scoped form.** It used to exercise
+/// `has_any_active_callback`, the agent-wide sibling, whose own doc-comment
+/// declared it kept "as a regression-test baseline" with no production caller.
+/// A fifth hand-written copy of a clause being unified is exactly where the
+/// next divergence settles, so the method is gone and its coverage lives here.
+/// The rows below carry no `dispatch_class`, so they reach the predicate
+/// through the `COALESCE(…, 'implement')` term — which is part of what this
+/// asserts.
 #[test]
 fn test_has_any_active_callback() {
     let db = db();
 
     // No callbacks at all → false
-    assert!(!db.has_any_active_callback("mika").unwrap());
+    assert!(
+        !db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap()
+    );
 
     // Create parent task
     let p1 = db
@@ -717,7 +729,8 @@ fn test_has_any_active_callback() {
     deferred.parent_task_id = Some(p1.clone());
     db.create_task(&deferred).unwrap();
     assert!(
-        !db.has_any_active_callback("mika").unwrap(),
+        !db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap(),
         "deferred wrapper should not count as active callback"
     );
 
@@ -734,7 +747,8 @@ fn test_has_any_active_callback() {
     regular.parent_task_id = Some(p2.clone());
     let reg_id = db.create_task(&regular).unwrap();
     assert!(
-        db.has_any_active_callback("mika").unwrap(),
+        db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap(),
         "regular pending callback should count as active"
     );
 
@@ -743,7 +757,8 @@ fn test_has_any_active_callback() {
         .unwrap();
     db.mark_task_delivered(&reg_id).unwrap();
     assert!(
-        !db.has_any_active_callback("mika").unwrap(),
+        !db.has_any_active_callback_for_class("mika", "implement")
+            .unwrap(),
         "delivered callback should not count as active"
     );
 }

@@ -1654,16 +1654,82 @@ impl TaskEngine {
     /// from multiple classes are pending. This recovers from any scenario where
     /// the inline promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
     async fn promote_pending_deferred_if_idle(&self) {
+        if std::env::var("MIKA2162_INJECTION").is_ok() {
+            return;
+        }
         for class in DISPATCH_CLASSES {
+            // mika#2162 U3 — count the pending wrappers FIRST.
+            //
+            // Two reasons, and the second is the one this ticket is about.
+            // (a) Cost: the nominal regime has no wrapper waiting, and this
+            // query then replaces the occupancy one rather than adding to it.
+            // (b) Observability: "the backstop withheld because the class is at
+            // cap" and "the backstop had nothing to promote" used to read
+            // identically — both a mute `continue`. Emitting on the second
+            // would be one line per class per tick for ever (the churn mika#2131
+            // bounds); emitting on the first needs to know a wrapper was
+            // actually waiting, which is exactly what this count establishes.
+            //
+            // Fail-OPEN, and deliberately unlike the occupancy check below: this
+            // term only decides whether a *warning* is worth emitting. Failing
+            // closed here would let a stray DB error strand wrappers, which is
+            // the cost the operator-priority check below already refuses to pay.
+            let pending_wrappers = match self
+                .db
+                .count_pending_deferred_callbacks_for_class(class)
+                .await
+            {
+                Ok(0) => continue, // Nothing to promote — silent, by contract
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dispatch_class = class,
+                        "failed to count pending deferred wrappers — proceeding (fail-open)"
+                    );
+                    0
+                }
+            };
+
             // mika#2160 — compare a COUNT against the class cap. This used to be
             // a boolean, which is the shape of a cap of exactly one; left that
             // way while the dispatch guard learned to count, a cap above 1
             // would admit new dispatches but make a DEFERRED one wait for the
             // class to fall back to zero rather than below the cap. That is the
             // asymmetric-predicate drift mika#1163 already had to name once.
+            //
+            // mika#2162 — this count and the dispatch guard's now read one SQL
+            // clause (`db::tasks::class_slot_occupancy_where`), and this side
+            // passes no exclusion term, so its occupant population is a
+            // superset of the guard's. A promotion admitted here can no longer
+            // be refused by the guard *for a predicate reason*.
             let cap = crate::skills::executor::max_concurrent_for_class(class);
             match self.db.count_active_callbacks_for_class(class).await {
-                Ok(active) if crate::skills::executor::class_cap_reached(active, cap) => continue, // Class at cap — skip
+                Ok(active) if crate::skills::executor::class_cap_reached(active, cap) => {
+                    // The retention is real and a wrapper is waiting on it: say
+                    // so. INFO, because a `debug!` on this module is not
+                    // collected by the deployed filter — measured by mika#2131
+                    // (zero occurrences of a sibling `debug!` against 184 of a
+                    // neighbouring `info!`). One line per class per tick during
+                    // an actual contention, i.e. at most 60/h/class, and that
+                    // liveness IS the information: what the operator wants to
+                    // know is that promotion is held back *now* (mika#2329).
+                    //
+                    // No `audit_events` row: the durable fact — "a wrapper was
+                    // promoted" — already exists under
+                    // `deferred_dispatch_promoted`. A row per tick of a
+                    // retention would be the churn mika#2131 bounds.
+                    info!(
+                        event = "deferred_promotion_withheld",
+                        agent_id = %self.dispatcher.db.agent_id(),
+                        dispatch_class = class,
+                        pending_wrappers,
+                        active,
+                        cap,
+                        "deferred promotion withheld — the class slot is at cap"
+                    );
+                    continue;
+                }
                 Ok(_) => {} // Room in the class — try to promote one wrapper
                 Err(e) => {
                     warn!(

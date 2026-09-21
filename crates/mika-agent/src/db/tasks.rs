@@ -51,6 +51,105 @@
 // property is the entire reason the extraction is mechanical.
 use super::*;
 
+// ---------------------------------------------------------------------------
+// mika#2162 — « le créneau de classe C est-il occupé ? » a UN site SQL
+// ---------------------------------------------------------------------------
+
+/// Parameter layout of [`class_slot_occupancy_where`].
+///
+/// The exclusion term is the **only** admitted difference between the dispatch
+/// guard and the promotion backstop. Everything else — what makes a row an
+/// occupant — is shared, which is the whole point of mika#2162.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SlotExclusion {
+    /// The dispatch guard asks "is anyone *other than me* holding this class?".
+    /// Parameters: `?1` = excluded parent id, `?2` = agent id, `?3` = class.
+    ExcludingParent,
+    /// The backstop and the force-promote path ask "is anyone holding this
+    /// class?". Parameters: `?1` = agent id, `?2` = class.
+    None,
+}
+
+/// The WHERE clause answering **"is the dispatch slot of class C occupied?"**,
+/// written once (mika#2162).
+///
+/// # The divergence this closed
+///
+/// Five methods answered that question in two incompatible clauses, and a
+/// doc-comment claimed they were "identical":
+///
+/// | term | dispatch guard | promotion backstop |
+/// |---|---|---|
+/// | `action_type = 'resume_agent'` | absent | **present** |
+/// | `parent_task_id IS NOT NULL` | **present** | absent |
+///
+/// The two restrict in opposite directions, and only one direction is
+/// dangerous. `action_type` **shrank the backstop's** occupant set, so the
+/// backstop could read "free" where the guard would read "occupied" — a
+/// promotion that wakes, dispatches, and is refused: the sterile wake-up
+/// mika#2162 was filed on. It is therefore **dropped**. The population it
+/// silently excluded is empty today (all four production writers post
+/// `RESUME_AGENT`), so dropping it is inert and closes a mine rather than an
+/// active defect.
+///
+/// `parent_task_id IS NOT NULL` shrinks the **guard's** set instead, so it is
+/// **kept**: the backstop now sees no more than the guard, never fewer. The
+/// guard needs it structurally anyway — it returns a `parent_task_id` to name
+/// the blocker, and `!= ?1` requires non-nullity in SQL.
+///
+/// # The invariant that follows, and it is what R2 buys
+///
+/// The backstop passes no exclusion term, so **its occupant population is a
+/// superset of the guard's**. A backstop that sees *more* occupants withholds
+/// more often — never the reverse. A sterile wake-up *caused by predicate
+/// divergence* is therefore structurally impossible, whatever either caller
+/// later does with the count.
+///
+/// Note this does **not** close the one-tick TOCTOU between promotion and
+/// dispatch: promotion arms a turn that runs on the next tick, and the world
+/// can change in between. That residue is named rather than papered over, and
+/// `engine.rs`'s `deferred_promotion_withheld` is what makes it countable.
+///
+/// # Terms, and why each is there
+///
+/// - `trigger_type = 'callback'` + `status IN ('pending','in_progress')` — the
+///   row that makes a slot observably held (mika#1948: the lease arbitrates the
+///   *race*, this row records the *occupation*).
+/// - `parent_task_id IS NOT NULL` — see above. Its side effect is that an
+///   orphan callback row (no parent) is invisible to **both** readers; see the
+///   follow-up note on `build_mika` / `deploy_mika` in the PR body.
+/// - `COALESCE(dispatch_class, 'implement')` — pre-v34 NULL rows are
+///   `'implement'` (architect NF1, #1001).
+/// - `label NOT LIKE '%:deferred'` — mika#1163. A deferred wrapper is a pending
+///   marker waiting for promotion, not a dispatch occupying a slot. Without
+///   this, two parents each holding a wrapper deadlock: every dispatch attempt
+///   from one sees the OTHER as slot-occupied and registers yet another
+///   wrapper.
+///
+/// `alias` is `""` or `"t."` — the guard joins `tasks` to itself to read the
+/// parent's `dispatcher_source`, so it needs the qualified form, and one
+/// literal has to serve both.
+pub(super) fn class_slot_occupancy_where(alias: &str, exclusion: SlotExclusion) -> String {
+    let (agent_param, class_param) = match exclusion {
+        SlotExclusion::ExcludingParent => ("?2", "?3"),
+        SlotExclusion::None => ("?1", "?2"),
+    };
+    let exclusion_term = match exclusion {
+        SlotExclusion::ExcludingParent => {
+            format!("\n               AND {alias}parent_task_id != ?1")
+        }
+        SlotExclusion::None => String::new(),
+    };
+    format!(
+        "{alias}trigger_type = 'callback'
+               AND {alias}status IN ('pending', 'in_progress')
+               AND {alias}parent_task_id IS NOT NULL{exclusion_term}
+               AND {alias}agent_id = {agent_param}
+               AND COALESCE({alias}dispatch_class, 'implement') = {class_param}
+               AND {alias}label NOT LIKE '%:deferred'"
+    )
+}
+
 impl Database {
     pub fn create_task(&self, task: &NewTask) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -3176,16 +3275,10 @@ impl Database {
     /// whose parent differs from `excluded_parent_id` and whose dispatch class matches.
     /// Used by the per-class dispatch guard to enforce one-slot-per-class (#583, #1001).
     ///
-    /// Pre-v34 rows with `dispatch_class IS NULL` are treated as `'implement'` via
-    /// `COALESCE` — no application-layer NULL coercion needed (architect NF1).
+    /// The WHERE clause comes from [`class_slot_occupancy_where`] — see there for
+    /// the `COALESCE` on `dispatch_class`, the `:deferred` exclusion (mika#1163),
+    /// and why this is now the *one* site that writes it (mika#2162).
     ///
-    /// mika#1163: Excludes `:deferred` wrappers via `label NOT LIKE '%:deferred'`.
-    /// Deferred wrappers are pending markers waiting for promotion, NOT active
-    /// dispatches occupying a slot. Without this exclusion, two parents each
-    /// holding a pending wrapper deadlock — every dispatch attempt from one
-    /// wrapper sees the OTHER as slot-occupied and registers yet another
-    /// wrapper. Mirrors the equivalent clause in `has_any_active_callback`
-    /// (mika#1070), which the engine-level promotion backstop uses.
     /// Returns `(parent_task_id, callback_id, callback_label)` of the blocking
     /// callback, or `None` if no conflicting dispatch exists. The label enables
     /// callers to derive `blocker_kind` for rejection JSON (#1172 W3).
@@ -3195,7 +3288,7 @@ impl Database {
         agent_id: &str,
         dispatch_class: &str,
     ) -> Result<Option<BlockingDispatch>> {
-        let mut stmt = self.conn.prepare(
+        let sql = format!(
             // mika#1948: the blocking row's `dispatcher_source` rides along so a
             // rejection can name WHO holds the slot, not just that it is held.
             // Deliberately NOT wrapped in COALESCE here — the on-disk NULL of a
@@ -3206,15 +3299,11 @@ impl Database {
             "SELECT t.parent_task_id, t.id, t.label, p.dispatcher_source
              FROM tasks t
              LEFT JOIN tasks p ON p.id = t.parent_task_id
-             WHERE t.trigger_type = 'callback'
-               AND t.status IN ('pending', 'in_progress')
-               AND t.parent_task_id IS NOT NULL
-               AND t.parent_task_id != ?1
-               AND t.agent_id = ?2
-               AND COALESCE(t.dispatch_class, 'implement') = ?3
-               AND t.label NOT LIKE '%:deferred'
+             WHERE {}
              LIMIT 1",
-        )?;
+            class_slot_occupancy_where("t.", SlotExclusion::ExcludingParent),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params![excluded_parent_id, agent_id, dispatch_class])?;
         if let Some(row) = rows.next()? {
             Ok(Some(BlockingDispatch {
@@ -3231,11 +3320,13 @@ impl Database {
     /// How many *distinct* dispatches of this class are active for this agent,
     /// excluding `excluded_parent_id` (mika#2160).
     ///
-    /// The companion to [`Database::has_active_callback_tasks_excluding`], with
-    /// the identical WHERE clause. It exists because a configurable cap needs a
-    /// number and the predicate only ever answered "is there at least one" —
-    /// the shape of a cap of exactly 1. KTD5: the existing signature is left
-    /// alone, it has callers in production, in tests, and an async twin.
+    /// The companion to [`Database::has_active_callback_tasks_excluding`]: since
+    /// mika#2162 both read their WHERE clause from [`class_slot_occupancy_where`],
+    /// so "identical" is a property of the code rather than of a comment. It
+    /// exists because that predicate only ever answered "is there at least one"
+    /// — the shape of a cap of exactly 1 — while a configurable cap needs a
+    /// number. KTD5: the existing signature is left alone, it has callers in
+    /// production, in tests, and an async twin.
     ///
     /// `COUNT(DISTINCT parent_task_id)`, not `COUNT(*)`: a dispatch is a
     /// parent, and a parent that happens to carry two callback rows of the same
@@ -3247,16 +3338,14 @@ impl Database {
         agent_id: &str,
         dispatch_class: &str,
     ) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
+        let sql = format!(
             "SELECT COUNT(DISTINCT t.parent_task_id)
              FROM tasks t
-             WHERE t.trigger_type = 'callback'
-               AND t.status IN ('pending', 'in_progress')
-               AND t.parent_task_id IS NOT NULL
-               AND t.parent_task_id != ?1
-               AND t.agent_id = ?2
-               AND COALESCE(t.dispatch_class, 'implement') = ?3
-               AND t.label NOT LIKE '%:deferred'",
+             WHERE {}",
+            class_slot_occupancy_where("t.", SlotExclusion::ExcludingParent),
+        );
+        let count: i64 = self.conn.query_row(
+            &sql,
             params![excluded_parent_id, agent_id, dispatch_class],
             |row| row.get(0),
         )?;
@@ -3573,6 +3662,23 @@ impl Database {
     /// SQLite's scan order: before v52 the PRIMARY KEY made "the holder"
     /// singular and the question could not arise, and a caller that inherited
     /// that assumption would otherwise get a different answer run to run.
+    ///
+    /// # This is NOT the occupancy question (mika#2162)
+    ///
+    /// It answers *"is someone claiming this slot right now?"* — a question
+    /// about a **race**, live only for one TTL (120 s by default). It does not
+    /// answer *"is this slot occupied?"*: a dispatch runs for hours and its
+    /// lease lapses by design after the callback row exists, so reading this as
+    /// an occupancy check reports "free" for ~98 % of a live dispatch's life.
+    /// That lapse is the intended end of life, not drift — see
+    /// [`crate::db::DISPATCH_SLOT_LEASE_TTL_SECS`] for why mika#2162 refused to
+    /// renew the lease instead.
+    ///
+    /// The occupancy question has one reader, [`class_slot_occupancy_where`],
+    /// and every caller that must know whether a class is busy goes through it.
+    /// The one legitimate production caller of *this* method is
+    /// `TaskEngine::reap_stale_blocked_dispatch_tasks` (the mika#2169 L3b net),
+    /// which genuinely asks about a live claim.
     pub fn dispatch_slot_lease_holder(
         &self,
         agent_id: &str,
@@ -3878,6 +3984,39 @@ impl Database {
         Ok(count)
     }
 
+    /// Class-scoped sibling of [`Database::count_pending_deferred_callbacks`]
+    /// (mika#2162 U3).
+    ///
+    /// Answers "is there anything to promote in this class?", which is the term
+    /// that turns the promotion backstop's `continue` from mute into reportable:
+    /// zero pending wrappers means the backstop had nothing to do, and saying so
+    /// on every tick would be the churn mika#2131 bounds. Same label predicate
+    /// as its agent-wide twin, plus the `COALESCE` the class carries everywhere
+    /// else.
+    ///
+    /// Deliberately **not** read from [`class_slot_occupancy_where`]: this asks
+    /// the opposite question of the same rows — wrappers *are* the population,
+    /// where there they are the exclusion — and folding the two into one clause
+    /// would make a parameter of the very term whose asymmetry mika#1163 had to
+    /// name.
+    pub fn count_pending_deferred_callbacks_for_class(
+        &self,
+        agent_id: &str,
+        dispatch_class: &str,
+    ) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1
+               AND trigger_type = 'callback'
+               AND status = 'pending'
+               AND label = 'long_running:run_claude_pilot:deferred'
+               AND COALESCE(dispatch_class, 'implement') = ?2",
+            params![agent_id, dispatch_class],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Promote the next pending deferred-dispatch callback for dispatch (FIFO).
     ///
     /// Sets `next_fire_at` to now and marks with a synthetic result so the task
@@ -3968,56 +4107,30 @@ impl Database {
         Ok(if n > 0 { Some(task_id) } else { None })
     }
 
-    /// Returns true if any non-deferred callback task is in pending or in_progress
-    /// status (i.e., a dispatch slot is occupied). Was used by the engine-level
-    /// deferred-dispatch backstop (mika#1070). Post-mika#1175, the engine
-    /// backstop calls `has_any_active_callback_for_class` per-class; this
-    /// agent-wide form has no remaining production callers and is retained as
-    /// a regression-test baseline + as a sibling reference for the class-scoped
-    /// shape. See `has_any_active_callback_for_class` for production usage.
-    pub fn has_any_active_callback(&self, agent_id: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND trigger_type = 'callback'
-               AND action_type = 'resume_agent'
-               AND status IN ('pending', 'in_progress')
-               AND label NOT LIKE '%:deferred'",
-            params![agent_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    /// Class-scoped sibling of `has_any_active_callback`. Returns `true` if any
-    /// non-deferred callback task in the given `dispatch_class` is `pending` or
-    /// `in_progress` (i.e., the per-class dispatch slot is occupied). Used by
-    /// the periodic backstop's per-class slot check (mika#1175). Excludes
-    /// `:deferred` wrappers (parity with mika#1163's symmetric exclusion).
-    /// Pre-v34 NULL rows treated as 'implement' via COALESCE.
+    /// Class-scoped occupancy predicate: `true` if at least one dispatch of
+    /// `dispatch_class` occupies a per-class slot. Used by the periodic
+    /// backstop's force-promote sibling (mika#1175, mika#1453).
+    ///
+    /// Same WHERE clause as the dispatch guard, from the one site that writes
+    /// it — see [`class_slot_occupancy_where`].
     pub fn has_any_active_callback_for_class(
         &self,
         agent_id: &str,
         dispatch_class: &str,
     ) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks
-             WHERE agent_id = ?1
-               AND trigger_type = 'callback'
-               AND action_type = 'resume_agent'
-               AND status IN ('pending', 'in_progress')
-               AND label NOT LIKE '%:deferred'
-               AND COALESCE(dispatch_class, 'implement') = ?2",
-            params![agent_id, dispatch_class],
-            |row| row.get(0),
-        )?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM tasks WHERE {}",
+            class_slot_occupancy_where("", SlotExclusion::None),
+        );
+        let count: i64 = self
+            .conn
+            .query_row(&sql, params![agent_id, dispatch_class], |row| row.get(0))?;
         Ok(count > 0)
     }
 
     /// How many *dispatches* of this class occupy the per-class slots
     /// (mika#2160). Counting companion to
-    /// [`Database::has_any_active_callback_for_class`], with the identical
-    /// WHERE clause.
+    /// [`Database::has_any_active_callback_for_class`].
     ///
     /// It exists because that predicate is a boolean — the shape of a cap of
     /// exactly one — and it gates the deferred-promotion backstop
@@ -4028,27 +4141,33 @@ impl Database {
     /// **zero** rather than below the cap — the asymmetric-predicate drift
     /// mika#1163 names, rebuilt.
     ///
-    /// `COUNT(DISTINCT COALESCE(parent_task_id, id))`: a dispatch is a parent,
-    /// so two callback rows under one parent are one occupant. The COALESCE
-    /// keeps a parentless row counting as itself, preserving the boolean
-    /// predicate's answer for that shape rather than collapsing several such
-    /// rows into one.
+    /// **Its doc-comment used to claim "the identical WHERE clause" as the
+    /// dispatch guard's, and that was false in two terms** (mika#2162): this
+    /// side carried `action_type = 'resume_agent'` the guard did not, and the
+    /// guard carried `parent_task_id IS NOT NULL` this side did not. Both are
+    /// gone — the clause now comes from [`class_slot_occupancy_where`], the
+    /// single site, so the claim is a property of the code. The resulting
+    /// invariant is the one that matters: **the backstop's occupant population
+    /// is a superset of the guard's** (it passes no exclusion term), so a
+    /// backstop that promotes can never be contradicted by a guard that
+    /// refuses — which is the sterile wake-up this ticket closes.
+    ///
+    /// `COUNT(DISTINCT parent_task_id)`: a dispatch is a parent, so two
+    /// callback rows under one parent are one occupant. The `COALESCE(…, id)`
+    /// this carried before mika#2162 is moot now that the clause guarantees
+    /// `parent_task_id IS NOT NULL`.
     pub fn count_active_callbacks_for_class(
         &self,
         agent_id: &str,
         dispatch_class: &str,
     ) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT COALESCE(parent_task_id, id)) FROM tasks
-             WHERE agent_id = ?1
-               AND trigger_type = 'callback'
-               AND action_type = 'resume_agent'
-               AND status IN ('pending', 'in_progress')
-               AND label NOT LIKE '%:deferred'
-               AND COALESCE(dispatch_class, 'implement') = ?2",
-            params![agent_id, dispatch_class],
-            |row| row.get(0),
-        )?;
+        let sql = format!(
+            "SELECT COUNT(DISTINCT parent_task_id) FROM tasks WHERE {}",
+            class_slot_occupancy_where("", SlotExclusion::None),
+        );
+        let count: i64 = self
+            .conn
+            .query_row(&sql, params![agent_id, dispatch_class], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -4077,20 +4196,13 @@ impl Database {
         let active = self.count_active_callbacks_for_class(agent_id, dispatch_class)?;
         if max_slots > 0 && active >= max_slots {
             // Fetch the blocker's label for the rejection message.
+            let sql = format!(
+                "SELECT label FROM tasks WHERE {} LIMIT 1",
+                class_slot_occupancy_where("", SlotExclusion::None),
+            );
             let blocking_label: String = self
                 .conn
-                .query_row(
-                    "SELECT label FROM tasks
-                     WHERE agent_id = ?1
-                       AND trigger_type = 'callback'
-                       AND action_type = 'resume_agent'
-                       AND status IN ('pending', 'in_progress')
-                       AND label NOT LIKE '%:deferred'
-                       AND COALESCE(dispatch_class, 'implement') = ?2
-                     LIMIT 1",
-                    params![agent_id, dispatch_class],
-                    |row| row.get(0),
-                )
+                .query_row(&sql, params![agent_id, dispatch_class], |row| row.get(0))
                 .unwrap_or_else(|_| "<unknown>".to_string());
 
             return Ok(ForcePromoteResult::RejectedSlotBusy { blocking_label });
@@ -4104,32 +4216,22 @@ impl Database {
 
     /// Returns the task ID of the active non-deferred callback occupying the
     /// per-class dispatch slot. Same SQL predicate as
-    /// `has_any_active_callback_for_class` but `SELECT id LIMIT 1` instead of
-    /// `SELECT COUNT(*)`. Used by the CLI override path to identify the blocker
-    /// before cancellation (mika#1453).
-    ///
-    /// Paired predicate: shares the `:deferred` exclusion and COALESCE
-    /// semantics with `has_any_active_callback_for_class` — keep in sync
-    /// (mika#1163).
+    /// `has_any_active_callback_for_class` — literally so since mika#2162, both
+    /// reading [`class_slot_occupancy_where`] — with `SELECT id LIMIT 1`
+    /// instead of `SELECT COUNT(*)`. Used by the CLI override path to identify
+    /// the blocker before cancellation (mika#1453).
     pub fn find_active_callback_for_class(
         &self,
         agent_id: &str,
         dispatch_class: &str,
     ) -> Result<Option<String>> {
+        let sql = format!(
+            "SELECT id FROM tasks WHERE {} LIMIT 1",
+            class_slot_occupancy_where("", SlotExclusion::None),
+        );
         let id: Option<String> = self
             .conn
-            .query_row(
-                "SELECT id FROM tasks
-                 WHERE agent_id = ?1
-                   AND trigger_type = 'callback'
-                   AND action_type = 'resume_agent'
-                   AND status IN ('pending', 'in_progress')
-                   AND label NOT LIKE '%:deferred'
-                   AND COALESCE(dispatch_class, 'implement') = ?2
-                 LIMIT 1",
-                params![agent_id, dispatch_class],
-                |row| row.get(0),
-            )
+            .query_row(&sql, params![agent_id, dispatch_class], |row| row.get(0))
             .optional()?;
         Ok(id)
     }

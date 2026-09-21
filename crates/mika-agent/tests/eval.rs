@@ -180,7 +180,12 @@ mod eval {
     mod test_request_wellformedness;
     mod test_required_tools_gate;
     mod test_schema_divergence;
+
+    // mika#2162 — « le créneau est-il libre ? » a une seule réponse : le
+    // backstop de promotion et la garde de dispatch lisent une seule clause, et
+    // le bail expiré y est le contrôle négatif.
     mod test_self_knowledge_kg;
+    mod test_slot_occupancy_one_answer_2162;
     mod test_supersede_kills_live_pilot;
     mod test_task_not_found_retry;
     mod test_tool_call_secret_redaction;

@@ -285,6 +285,40 @@ pub const WORKTREE_CLAIM_PILOT_TTL_SECS: i64 = 21600;
 /// the duration of a real dispatch, so a lease can never outlive its work and
 /// block a slot that has legitimately freed. Overridable via
 /// `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS` for operational tuning.
+///
+/// # The lease is NOT renewed during a dispatch, and mika#2162 refused to make
+/// it so
+///
+/// A live dispatch runs for hours; this lease dies after two minutes. That is
+/// not drift — **the lease and the dispatch guard answer two different
+/// questions**. The lease arbitrates a *race* ("may I take this slot at this
+/// instant, in the window where nothing durable yet proves it is mine?"); the
+/// guard observes an *occupation* ("does an active callback row exist?"). Once
+/// the callback row exists, the lease is redundant and letting it lapse is its
+/// intended end of life — see `Database::try_acquire_dispatch_slot`,
+/// § *On the TTL, and why it is short*.
+///
+/// mika#2162 was filed on the reading that this gap was the defect, and offered
+/// a periodic heartbeat by the holder as one of two remedies. It was **refused**,
+/// for three reasons, each on its own sufficient:
+///
+/// 1. **It would create the second answer the ticket wants removed.** A beaten
+///    lease is a second durable occupancy marker beside the callback row, free
+///    to disagree with it — and the disagreement would then last as long as the
+///    dispatch instead of being bounded to one TTL.
+/// 2. **It needs a dead-holder detector**, which three mechanisms already do
+///    better than the absence of a heartbeat could: the PID watchdog (#959),
+///    the silent-stall reaper (mika#2249/#2277) and the phantom sweep
+///    (mika#1712). A fourth predicate to keep coherent with those three buys
+///    nothing.
+/// 3. **The short TTL is what keeps fail-closed from being loop-breaking.** A
+///    beaten lease surviving a zombie process blocks its class *for ever* —
+///    precisely what a short TTL exists to prevent.
+///
+/// So the occupancy question has exactly one reader:
+/// `db::tasks::class_slot_occupancy_where`. The only legitimate caller of
+/// [`Database::dispatch_slot_lease_holder`] is one asking *"is anyone claiming
+/// this slot right now?"* — see that method's own note.
 pub const DISPATCH_SLOT_LEASE_TTL_SECS: i64 = 120;
 
 /// Effective lease TTL, honouring the env override. Falls back to the default
