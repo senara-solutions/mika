@@ -40,7 +40,39 @@
 #      forms) but emits a warning directing operators to the with-reason
 #      form for auditability. Trailer is the residual escape hatch.
 #
-#   4. Reject — no exemption found, exit 1.
+#   4. Automated PR author (mika#2419):
+#      If the PR was opened by a recognized automated author
+#      (`dependabot[bot]` / `app/dependabot`, read from
+#      `.pull_request.user.login` in `GITHUB_EVENT_PATH`), BOTH bucket
+#      rejections are skipped. Such a PR has no plan doc and no
+#      `Pipeline-Exempt:` trailer by construction — nothing in its pipeline
+#      can produce one.
+#
+#      Scope: the two bucket checks ONLY. The mika#1600 `## Acceptance
+#      criteria` check above still applies — if an automated PR does carry a
+#      plan, that plan is still verified. An exemption should be the narrowest
+#      one that repairs the measured defect.
+#
+#      Discriminant is the AUTHOR, never the branch prefix.
+#      `.github/workflows/ci.yml` skips this whole job on
+#      `startsWith(github.head_ref, 'dependabot/')` because an `if:` expression
+#      has nothing else available; this script has `user.login`, and a branch
+#      prefix is spoofable (a human naming a branch `dependabot/foo` would walk
+#      through the plan gate). The two lists are deliberately NOT parity-linted:
+#      they answer different questions ("is a runner worth spending?" vs "is
+#      this PR subject to the gate?") and comparing branch prefixes to logins
+#      would compare two kinds of thing. The asymmetry of risk is what makes
+#      that acceptable — this script stricter than ci.yml yields a visible
+#      false `block`; this script more permissive is dangerous, and is bounded
+#      by an explicit two-login list no code path builds dynamically.
+#
+#      FAIL-CLOSED, and fail-closed here means CONTINUE WITHOUT EXEMPTING,
+#      never ABORT: no event file, unreadable file, absent field, empty login,
+#      or no `jq` on PATH => no exemption, checks proceed normally. A local run
+#      therefore never exempts. See the `2>/dev/null || echo ""` note at the
+#      resolution site for why the distinction is load-bearing under `set -e`.
+#
+#   5. Reject — no exemption found, exit 1.
 #
 # One-directional asymmetry (load-bearing):
 #   The `documentation` issue label and the `pipeline-exempt` PR label
@@ -235,9 +267,46 @@ if [[ "$EXEMPT_PR_LABEL_DOCS" == "0" ]] && command -v gh >/dev/null 2>&1 \
   fi
 fi
 
+# --- Automated PR author exemption (mika#2419) ---
+# Mirrors the intent of `.github/workflows/ci.yml`'s pipeline-artifacts branch
+# exclusion, on the author rather than the branch prefix. See mechanism 4 in
+# the header for the full rationale, the scope, and why the two lists are not
+# parity-linted.
+#
+# Exact equality against every entry — never a substring test: an author named
+# `not-dependabot[bot]` must not match `dependabot[bot]`. Both forms are listed
+# because `gh` renders the identity either way, and qa-review's Step 1.6
+# already recognizes both.
+AUTOMATED_PR_AUTHORS=("dependabot[bot]" "app/dependabot")
+EXEMPT_AUTOMATED_AUTHOR=0
+AUTOMATED_AUTHOR=""
+if [[ -n "${GITHUB_EVENT_PATH:-}" ]] && [[ -f "$GITHUB_EVENT_PATH" ]]; then
+  # `2>/dev/null || echo ""` is load-bearing, not defensive habit. This script
+  # runs under `set -euo pipefail` (see the top), so a bare
+  # `jq -r '...' "$GITHUB_EVENT_PATH"` ABORTS the whole script when `jq` is
+  # absent or the event file is malformed — with jq's exit code. qa-review's
+  # Step 2C reads any non-zero exit, without judgment, as `block[pipeline]`,
+  # so a PR that passes today would start failing: this exemption would
+  # produce the exact symptom it exists to close. Same defensive shape already
+  # used twice above (the mika#1395 live-label fallback).
+  # Pinned by F7 in scripts/verify-pipeline-test.sh.
+  _event_author=$(jq -r '.pull_request.user.login // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || echo "")
+  if [[ -n "$_event_author" ]]; then
+    for _known_author in "${AUTOMATED_PR_AUTHORS[@]}"; do
+      if [[ "$_event_author" == "$_known_author" ]]; then
+        EXEMPT_AUTOMATED_AUTHOR=1
+        AUTOMATED_AUTHOR="$_event_author"
+        break
+      fi
+    done
+  fi
+fi
+
 # --- Docs-only check (labels exempt source-required; trailer is escape hatch) ---
 if [[ -n "$DOCS_BUCKET" && -z "$SOURCE_BUCKET" ]]; then
-  if [ "$ISSUE_HAS_DOCUMENTATION_LABEL" = true ]; then
+  if [[ "$EXEMPT_AUTOMATED_AUTHOR" == "1" ]]; then
+    echo "info: [pipeline-exempt: automated-author] $AUTOMATED_AUTHOR: bucket checks skipped (mirrors ci.yml pipeline-artifacts branch exclusion, mika#2010)" >&2
+  elif [ "$ISSUE_HAS_DOCUMENTATION_LABEL" = true ]; then
     echo "info: [pipeline-exempt: issue-label] docs-only PR allowed by linked-issue documentation label (#$LINKED_ISSUE)" >&2
   elif [[ "$EXEMPT_PR_LABEL_DOCS" == "1" ]]; then
     echo "info: [pipeline-exempt: pr-label] docs-only PR allowed by pipeline-exempt PR label" >&2
@@ -259,7 +328,9 @@ fi
 
 # --- Code-only check (label does NOT exempt docs-required-when-source-changes) ---
 if [[ -z "$DOCS_BUCKET" && -n "$SOURCE_BUCKET" ]]; then
-  if [[ "$EXEMPT_CODE_ONLY" == "1" ]]; then
+  if [[ "$EXEMPT_AUTOMATED_AUTHOR" == "1" ]]; then
+    echo "info: [pipeline-exempt: automated-author] $AUTOMATED_AUTHOR: bucket checks skipped (mirrors ci.yml pipeline-artifacts branch exclusion, mika#2010)" >&2
+  elif [[ "$EXEMPT_CODE_ONLY" == "1" ]]; then
     if [ -n "$EXEMPT_CODE_REASON" ]; then
       echo "info: [pipeline-exempt: trailer] code-only PR allowed by Pipeline-Exempt trailer with reason: $EXEMPT_CODE_REASON" >&2
     else
