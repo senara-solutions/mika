@@ -2157,12 +2157,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn temp_relapse_early() {
-        let tmp = tempfile::tempdir().unwrap();
-        bootstrap(&tmp.path().join("x")).unwrap();
-    }
-
     // -- mika#2073 — the tier is posed, and the environment cannot move it ---
 
     /// **The deterministic positive control** (mika#2073).
@@ -2567,8 +2561,8 @@ mod tests {
     /// **Scope: this file only.** AC2 of mika#2073 says "audit of the same file",
     /// and six sibling sites in `mika-agent/src/well_known_agents.rs` carry the
     /// same armed mine without the mandate to convert them — a workspace-wide
-    /// scan would be red on them, i.e. undeliverable. The follow-up ticket widens
-    /// the scan and converts those six at the same commit, in that order.
+    /// scan would be red on them, i.e. undeliverable. The follow-up, mika#2471,
+    /// widens the scan and converts those six at the same commit, in that order.
     ///
     /// **Disposition: halt-and-surface. The allowlist is empty and there is no
     /// constant to add one to** — see the plan's Fire-Disposition section.
