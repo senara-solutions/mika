@@ -2086,6 +2086,115 @@ the site before touching the predicate. *Halt 3* —
 terminal record of U2 is not landing; post the record rather than mute the
 indicator.
 
+#### The stuck-pending verdict is re-checked against the world (mika#2185)
+
+`reap_orphaned_pending_issue_tasks` formed its candidate list with one
+`find_orphaned_pending_issue_tasks` and then decided — inventory, re-arm or
+expiry — on that snapshot. The dispatches of the **same tick** run detached
+(`dispatch_undelivered_callbacks`, `tokio::spawn`) and their completion path
+writes rows under the very parents being judged, so between the `SELECT` that
+produced the verdict *"nothing represents this parent"* and the write applying
+it, the premise can have become false.
+
+**The loop body is now a method.** `reap_one_orphaned_pending_candidate` takes
+the candidate **by value** and re-reads the world before acting on it. That is
+not decomposition for its own sake: re-running the scan inside the decision would
+*hide* the window — a parent that regained a wrapper vanishes from the scan's own
+result — which is exactly why the anti-vacuity replay drives this method rather
+than the reaper.
+
+**Both clauses are re-posed, because the scan posed both.**
+`find_orphaned_pending_issue_tasks` selects on *no live deferred wrapper* AND *no
+active non-deferred callback*. A re-verification covering only the first would
+leave the second as stale as before.
+
+- **Axis A** — `DeferredWrapperSummary::first_live` over the inventory
+  `summarize_deferred_wrappers_of_parent` already returned.
+- **Axis B** — `has_non_deferred_active_callback_child`.
+
+Both run **before** `latest_deferred_wrapper_action_config`, so they cover the
+re-arm branch *and* the `None -> Unrepairable` branch, which is the placement AC1
+prescribes.
+
+**AC4 is held by construction, not by proximity.** The audit line and the verdict
+must describe one moment, and two successive SELECTs never do — whichever runs
+first, one of them describes a state the other did not see. The only shape that
+holds it is **one read, two uses**, and it costs nothing extra:
+`summarize_deferred_wrappers_of_parent` already returns `(id, status,
+completed_at)`, the three fields the liveness predicate turns on. The consequence
+is that the inventory's `Err` arm stopped being a degraded audit string
+(`wrappers:unavailable`) and became a **skip**: a read that now decides cannot be
+allowed to decide when it failed.
+
+**The plan's own R2 was corrected by measurement, and the correction is the
+finding.** R1 established that the *re-arm* branch stopped being reproducible when
+mika#2413 gave `rearm_deferred_callback` its own liveness guard. Reading further:
+the **expiry** branch is not reproducible on the deferred-wrapper axis either. A
+wrapper that appears after the scan also supplies
+`latest_deferred_wrapper_action_config`, so the decision takes `Some(config)` and
+mika#2413 spares the parent — with the budget spent included, that guard sitting
+**before** `get_stuck_rearm_count`. What was genuinely open is axis B: a parent
+whose `reference_url` falls outside the GitHub-issue shape makes
+`rebuild_deferred_action_config` return `None`, the decision goes straight to
+`Unrepairable`, and the only re-check of that axis lives in the function that
+branch never calls — so the parent is expired while its real dispatch is starting.
+That is where the red is, and `mika2185_a_real_dispatch_that_starts_after_the_scan_spares_the_parent`
+is the replay; its wrapper-axis sibling says in its own doc that it is covered
+twice and is not the anti-vacuity proof.
+
+**Three fail-safe directions, two of them opposed — do not harmonise them.**
+
+| guard | direction | why |
+|---|---|---|
+| inventory read, here | fail-**closed** (skip) | a false "nothing represents it" **destroys** the parent; skipping costs 60 s |
+| active-callback re-check, here | fail-**closed** (skip) | same consequence, same answer |
+| mika#2413's live-wrapper check in `rearm_deferred_callback` | fail-**open** (repair) | a false "already represented" leaves a parent nothing will ever repair |
+
+The third guards an action of the opposite consequence. A future reader who
+"harmonises" it towards these two reopens mika#2413.
+
+**A third reader of the liveness criterion, and its price is paid in the same
+commit.** `DeferredWrapperSummary::first_live` joins the two SQL clauses as a Rust
+reader — the fork class `grooming_marker` (mika#2158) had to close once. The
+existing twin test
+(`db::tests::reapers::test_live_wrapper_predicate_agrees_with_orphan_clause`) went
+from two branches to three, fed from the reaper's own inventory source over the
+same nine-shape corpus.
+
+**Operator surfaces** (`$MIKA_SPIRIT_LOG_FILE`; no `audit_events` row — the
+population is one or two lines per parent per contention episode, and a durable
+row per tick would be the churn mika#2131 bounds):
+
+| event | level | expected regime | reading |
+|---|---|---|---|
+| `stuck_pending_skipped_wrapper_appeared` | INFO | non-empty under contention, silent outside it | the axis-A window closed on a healthy parent — the measure that the guard bites |
+| `stuck_pending_skipped_dispatch_in_flight` | INFO | same | the axis-B window closed on a healthy parent |
+| `stuck_pending_inventory_unreadable` | WARN | **zero** | a parent the reaper can neither repair nor expire; repair the read, never loosen the guard |
+| `stuck_pending_active_callback_unreadable` | WARN | **zero** | same, on the other axis — distinct name because the remedy is a different query |
+
+The two terminal events are unchanged (`stuck_pending_task_rearmed`,
+`stuck_pending_task_expired`) and keep their audit rows and their `wrappers_seen`
+field, now read at the exact moment of the decision.
+
+**What this does not buy.** The guard narrows the window, it does not remove it: a
+wrapper appearing between the re-check and `update_task_failed` — a few
+instructions later — is still invisible. Closing that last stretch needs a
+transaction spanning read and write, i.e. an `IMMEDIATE` write per candidate
+inside the reaper's loop: a real cost for an unmeasured gain, deliberately out of
+scope. Nor is the *cause* of the contention treated (several grooms serialised on
+one class slot); this stops it from killing healthy parents.
+
+**Deliberately out of scope, and each is its own ticket.** The `:deferred`
+exclusion in `get_child_tasks` / `task_active_dispatch` (declared out of scope by
+the ticket); `reap_stale_blocked_dispatch_tasks` (L3b), whose identical
+`action_config -> None -> Unrepairable` shape puts the parent back `pending`
+first, so its cost is an order of magnitude lower and mika#2045 repairs it on the
+next tick; and a SQL-level partial unique index on `pending` wrappers per parent —
+AC5 asks for an **assertion**, and that is what ships
+(`mika2185_a_reaping_tick_never_leaves_two_pending_wrappers`), because nothing at
+the SQL level enforces it today (`register_deferred_callback` bounds only a global
+count).
+
 **Dispatcher-source arbitration (mika#1948, Porte 2).** Three dispatchers share the per-class exec slots: the **autonomous loop** (`mika_dev` — ready-label, wip-rescue mika#1852, auto-feeder mika#1863, auto-pull mika#1824), the **milestone manager** (`mika_manager`, gated behind Phase 2 promotion), and the **operator** (`operator` — interactive `/mika`, `/mika-spawn`, `mika tasks promote-deferred`). `tasks.dispatcher_source` (v51, nullable, CHECK-pinned to those three values) records which one initiated a task. NULL means a pre-v51 row and reads as `mika_dev` via `COALESCE` — the autonomous loop was the only dispatcher before the column existed. Write it with `set_task_dispatcher_source()`, a deliberate separate write rather than a `NewTask` field: `NewTask` has ~175 construction sites and all but a handful are the loop, whose correct value is exactly the NULL default.
 
 **This is NOT the `dispatch:*` seat label (mika#2084).** The seat (`webhook_dispatch::CURRENT_DISPATCH_SEAT`, values `loop|ssc|mpc`) says which *engine* owns a TICKET and is carried on the GitHub issue; the seat gate in `validate_dispatch_readiness` refuses a ticket belonging to another engine. `dispatcher_source` says which *role inside one engine* asked for the work, and arbitrates the exec slot among them. Neither subsumes the other; they are deliberately not merged into one column.

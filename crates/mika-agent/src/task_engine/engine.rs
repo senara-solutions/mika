@@ -1073,207 +1073,356 @@ impl TaskEngine {
         );
 
         for candidate in candidates {
-            let system_session = format!("system-{}", self.db.agent_id());
+            self.reap_one_orphaned_pending_candidate(candidate, promoted_liveness_seconds)
+                .await;
+        }
+    }
 
-            // AC4 (mika#2181) — read the inventory ONCE, before the decision, so
-            // both terminal events carry the statuses that produced the verdict.
-            // The reaper is the component that judged "absent" via its query, so
-            // it is the reaper's event that must show what it saw. A failed read
-            // degrades the audit, never the repair.
-            let wrappers_seen = match self
-                .db
-                .summarize_deferred_wrappers_of_parent(&candidate.id)
-                .await
-            {
-                Ok(w) => crate::db::DeferredWrapperSummary::render(&w),
-                Err(e) => {
-                    warn!(
-                        task_id = %candidate.id,
-                        error = %e,
-                        "task_engine_stuck_pending_reaper: failed to inventory deferred wrappers"
-                    );
-                    "wrappers:unavailable".to_string()
-                }
-            };
+    /// Decide the fate of ONE stuck-pending candidate (mika#2185).
+    ///
+    /// Extracted from the loop body of
+    /// [`Self::reap_orphaned_pending_issue_tasks`] so the TOCTOU window the
+    /// ticket is about is addressable on its own: the candidate is a value the
+    /// `SELECT` produced at an earlier instant, and everything below re-reads
+    /// the world before acting on it.
+    ///
+    /// The candidate is passed by value rather than re-queried: re-running the
+    /// scan here would hide the very window under test, since a wrapper that
+    /// appeared meanwhile makes the parent vanish from the scan's own result.
+    async fn reap_one_orphaned_pending_candidate(
+        &self,
+        candidate: crate::db::OrphanedPendingTask,
+        promoted_liveness_seconds: i64,
+    ) {
+        let system_session = format!("system-{}", self.db.agent_id());
 
-            let action_config = match self
-                .db
-                .latest_deferred_wrapper_action_config(&candidate.id)
-                .await
-            {
-                Ok(Some(config)) => Some(config),
-                Ok(None) => rebuild_deferred_action_config(
+        // AC1/AC4 (mika#2185) — ONE read, TWO uses. The inventory is both
+        // what the terminal events report and what the decision turns on.
+        //
+        // AC4 asks the audit line and the re-verification to describe the
+        // same moment. Two successive SELECTs never do — whichever runs
+        // first, one of them describes a state the other did not see — so
+        // the only shape that holds it by construction is this one. It costs
+        // nothing extra: `summarize_deferred_wrappers_of_parent` already
+        // returns `(id, status, completed_at)`, the three fields the
+        // liveness predicate turns on.
+        //
+        // The `Err` arm is now a **skip**, not a degraded audit string. It
+        // used to render `wrappers:unavailable` and carry on, which only
+        // made sense while the read informed nothing but the log. Now that
+        // it decides, an unreadable inventory means the premise "nothing
+        // represents this parent" cannot be re-established, and the reaper
+        // must not act on a premise it cannot check.
+        let wrappers = match self
+            .db
+            .summarize_deferred_wrappers_of_parent(&candidate.id)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                // Fail-CLOSED, and deliberately the opposite of the
+                // mika#2413 guard inside `rearm_deferred_callback` two
+                // frames down. The two guard actions of opposite
+                // consequence: there, a false "already represented" leaves a
+                // parent nothing will ever repair, so an unreadable read
+                // must fall through to repairing; here, a false "nothing
+                // represents it" DESTROYS the parent, so an unreadable read
+                // must fall through to doing nothing. Skipping costs 60s.
+                // Do not "harmonise" one towards the other.
+                warn!(
+                    event = "stuck_pending_inventory_unreadable",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: deferred-wrapper inventory unreadable — \
+                     skipping this candidate (can neither repair nor expire it)"
+                );
+                return;
+            }
+        };
+
+        let wrappers_seen = crate::db::DeferredWrapperSummary::render(&wrappers);
+
+        // AC1 — re-pose the question the scan answered at an earlier instant.
+        // Dispatches from this same tick run detached
+        // (`dispatch_undelivered_callbacks`, `tokio::spawn`) and their
+        // completion path writes rows under this parent, so between the
+        // `SELECT` that produced this candidate and the write about to apply
+        // its verdict, the premise can have become false.
+        //
+        // **Both clauses, because the scan posed both.**
+        // `find_orphaned_pending_issue_tasks` selects on *no live deferred
+        // wrapper* AND *no active non-deferred callback*; a re-verification
+        // that re-posed only the first would leave the second exactly as stale
+        // as before. Axis A is below, axis B right after it.
+        //
+        // Placed BEFORE `action_config` so both cover both decision branches.
+        // The re-arm branch has carried its own guards since mika#2413
+        // (`rearm_deferred_callback` -> `AlreadyRepresented` on axis A,
+        // `NotNow` on axis B); the `None -> Unrepairable` branch never reaches
+        // that function, carries no guard of its own, and falls straight
+        // through to cancelling every surviving wrapper and expiring the
+        // parent.
+        //
+        // **Measured, and it corrects the plan's own R2.** On axis A the
+        // replay is vacuous: a wrapper that appears after the scan also
+        // supplies `latest_deferred_wrapper_action_config`, so the decision
+        // takes `Some(config)` and mika#2413 spares the parent — budget spent
+        // included, that guard sitting before `get_stuck_rearm_count`. Axis B
+        // is where the hole actually was: a parent whose `reference_url` is
+        // outside the GitHub-issue shape (so `rebuild_deferred_action_config`
+        // returns `None`) is expired while its real dispatch is starting, and
+        // the only re-check of that axis lives in the function that branch
+        // never calls. Test:
+        // `mika2185_a_real_dispatch_that_starts_after_the_scan_spares_the_parent`.
+        let now = crate::timestamp::now();
+
+        // Axis A — a live deferred wrapper queued or promoted for this parent.
+        if let Some(live) = crate::db::DeferredWrapperSummary::first_live(
+            &wrappers,
+            &now,
+            promoted_liveness_seconds,
+        ) {
+            info!(
+                event = "stuck_pending_skipped_wrapper_appeared",
+                task_id = %candidate.id,
+                issue = %candidate.reference_url,
+                age_seconds = candidate.age_seconds,
+                live_wrapper_id = %live.id,
+                live_wrapper_status = %live.status,
+                wrappers_seen = %wrappers_seen,
+                "stuck-pending reaper: a live wrapper represents this parent again — passing"
+            );
+            return;
+        }
+
+        // Axis B — the parent's real dispatch is in flight. Same fail-closed
+        // direction as the inventory read above, and for the same reason: an
+        // unreadable answer cannot re-establish "nothing represents this
+        // parent", and acting on a premise we could not check destroys the
+        // parent. Note this is the OPPOSITE direction from the identically
+        // named guard inside `rearm_deferred_callback`, whose `Err` arm also
+        // returns `NotNow` — there the two agree; it is the mika#2413 *live
+        // wrapper* guard, which fails open towards repairing, that must not be
+        // harmonised with either of these.
+        match self
+            .db
+            .has_non_deferred_active_callback_child(&candidate.id)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                info!(
+                    event = "stuck_pending_skipped_dispatch_in_flight",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    wrappers_seen = %wrappers_seen,
+                    "stuck-pending reaper: the parent's real dispatch is in flight again — passing"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    event = "stuck_pending_active_callback_unreadable",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: active-callback re-check unreadable — \
+                     skipping this candidate (can neither repair nor expire it)"
+                );
+                return;
+            }
+        }
+
+        let action_config = match self
+            .db
+            .latest_deferred_wrapper_action_config(&candidate.id)
+            .await
+        {
+            Ok(Some(config)) => Some(config),
+            Ok(None) => rebuild_deferred_action_config(
+                &candidate.id,
+                &candidate.reference_url,
+                &candidate.dispatch_class,
+            ),
+            Err(e) => {
+                warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to read the last wrapper config"
+                );
+                None
+            }
+        };
+
+        let outcome = match action_config {
+            Some(config) => {
+                crate::skills::executor::rearm_deferred_callback(
+                    &self.db,
                     &candidate.id,
-                    &candidate.reference_url,
+                    &config,
                     &candidate.dispatch_class,
-                ),
-                Err(e) => {
-                    warn!(
-                        task_id = %candidate.id,
-                        error = %e,
-                        "task_engine_stuck_pending_reaper: failed to read the last wrapper config"
-                    );
-                    None
-                }
-            };
+                    "stuck_pending_reaper",
+                    // mika#2413 — no wrapper is being consumed here: the
+                    // reaper acts on a parent, not on a turn. Nothing to
+                    // take out of the population.
+                    None,
+                )
+                .await
+            }
+            // The dispatch cannot be reconstructed at all, so no future tick
+            // will do better. Expiring frees the slot for a fresh task.
+            None => RearmOutcome::Unrepairable,
+        };
 
-            let outcome = match action_config {
-                Some(config) => {
-                    crate::skills::executor::rearm_deferred_callback(
-                        &self.db,
-                        &candidate.id,
-                        &config,
-                        &candidate.dispatch_class,
-                        "stuck_pending_reaper",
-                        // mika#2413 — no wrapper is being consumed here: the
-                        // reaper acts on a parent, not on a turn. Nothing to
-                        // take out of the population.
+        // A `match` rather than the two `if`s this used to be (mika#2413):
+        // the fall-through arm expires the parent, so a variant added to
+        // `RearmOutcome` and forgotten here would destroy tasks instead of
+        // failing to compile.
+        match outcome {
+            RearmOutcome::NotNow => {
+                debug!(
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
+                );
+                return;
+            }
+            // Reachable, and the nominal shape under contention since
+            // mika#2413: `rearm_deferred_callback` re-poses the liveness
+            // question itself, so a wrapper that appeared between THIS
+            // frame's re-verification above and the re-arm a few
+            // instructions later lands here. Second line of defence behind
+            // the mika#2185 guard, kept because `rearm_deferred_callback`
+            // has three other callers (`rearm_consumed_deferred_wrapper`
+            // twice, the L3b sweep) that do not pass through it.
+            //
+            // (This comment used to read "unreachable in practice"; that was
+            // true when `find_orphaned_pending_issue_tasks` clause (1) was
+            // the only predicate in play, and stopped being true the day the
+            // re-arm grew a guard of its own.)
+            RearmOutcome::AlreadyRepresented => {
+                debug!(
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    "stuck-pending reaper: parent already represented — nothing to repair"
+                );
+                return;
+            }
+            RearmOutcome::Rearmed => {
+                info!(
+                    event = "stuck_pending_task_rearmed",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    previous_rearm_count = candidate.rearm_count,
+                    wrappers_seen = %wrappers_seen,
+                    "orphaned pending task re-armed instead of expired"
+                );
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &system_session,
+                        "stuck_pending_task_rearmed",
+                        &format!("task:{}", candidate.id),
+                        Some("pending"),
+                        Some("pending"),
+                        Some(&format!(
+                            "issue:{} age_seconds:{} rearm_count:{} {}",
+                            candidate.reference_url,
+                            candidate.age_seconds,
+                            candidate.rearm_count,
+                            wrappers_seen
+                        )),
                         None,
                     )
                     .await
+                {
+                    warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
                 }
-                // The dispatch cannot be reconstructed at all, so no future tick
-                // will do better. Expiring frees the slot for a fresh task.
-                None => RearmOutcome::Unrepairable,
-            };
-
-            // A `match` rather than the two `if`s this used to be (mika#2413):
-            // the fall-through arm expires the parent, so a variant added to
-            // `RearmOutcome` and forgotten here would destroy tasks instead of
-            // failing to compile.
-            match outcome {
-                RearmOutcome::NotNow => {
-                    debug!(
-                        task_id = %candidate.id,
-                        issue = %candidate.reference_url,
-                        "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
-                    );
-                    continue;
-                }
-                // Unreachable in practice — `find_orphaned_pending_issue_tasks`
-                // clause (1) already excludes a parent with a live wrapper —
-                // but the two predicates are maintained apart, and the safe
-                // reading of a disagreement is "leave it alone".
-                RearmOutcome::AlreadyRepresented => {
-                    debug!(
-                        task_id = %candidate.id,
-                        issue = %candidate.reference_url,
-                        "stuck-pending reaper: parent already represented — nothing to repair"
-                    );
-                    continue;
-                }
-                RearmOutcome::Rearmed => {
-                    info!(
-                        event = "stuck_pending_task_rearmed",
-                        task_id = %candidate.id,
-                        issue = %candidate.reference_url,
-                        age_seconds = candidate.age_seconds,
-                        previous_rearm_count = candidate.rearm_count,
-                        wrappers_seen = %wrappers_seen,
-                        "orphaned pending task re-armed instead of expired"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .log_audit_event(
-                            &system_session,
-                            "stuck_pending_task_rearmed",
-                            &format!("task:{}", candidate.id),
-                            Some("pending"),
-                            Some("pending"),
-                            Some(&format!(
-                                "issue:{} age_seconds:{} rearm_count:{} {}",
-                                candidate.reference_url,
-                                candidate.age_seconds,
-                                candidate.rearm_count,
-                                wrappers_seen
-                            )),
-                            None,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
-                    }
-                    continue;
-                }
-                RearmOutcome::Unrepairable => {}
+                return;
             }
+            RearmOutcome::Unrepairable => {}
+        }
 
-            // Repair is not available any more. Cancel surviving wrappers FIRST:
-            // one promoted after the expiry would replay a dispatch against a
-            // dead parent while the `ready` sweep has already created a live
-            // replacement for the same issue.
-            match self
-                .db
-                .cancel_deferred_wrappers_of_parent(&candidate.id)
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    info!(
-                        task_id = %candidate.id,
-                        cancelled_wrappers = n,
-                        "cancelled surviving deferred wrappers before expiring the parent"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(
-                        task_id = %candidate.id,
-                        error = %e,
-                        "task_engine_stuck_pending_reaper: failed to cancel surviving wrappers"
-                    );
+        // Repair is not available any more. Cancel surviving wrappers FIRST:
+        // one promoted after the expiry would replay a dispatch against a
+        // dead parent while the `ready` sweep has already created a live
+        // replacement for the same issue.
+        match self
+            .db
+            .cancel_deferred_wrappers_of_parent(&candidate.id)
+            .await
+        {
+            Ok(n) if n > 0 => {
+                info!(
+                    task_id = %candidate.id,
+                    cancelled_wrappers = n,
+                    "cancelled surviving deferred wrappers before expiring the parent"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to cancel surviving wrappers"
+                );
+            }
+        }
+
+        match self
+            .db
+            .update_task_failed(&candidate.id, "stuck_pending_no_deferred_wrapper")
+            .await
+        {
+            Ok(true) => {
+                warn!(
+                    event = "stuck_pending_task_expired",
+                    task_id = %candidate.id,
+                    issue = %candidate.reference_url,
+                    age_seconds = candidate.age_seconds,
+                    rearm_count = candidate.rearm_count,
+                    wrappers_seen = %wrappers_seen,
+                    "orphaned pending task expired — slot freed for the ready sweep"
+                );
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &system_session,
+                        "stuck_pending_task_expired",
+                        &format!("task:{}", candidate.id),
+                        Some("pending"),
+                        Some("failed"),
+                        Some(&format!(
+                            "issue:{} age_seconds:{} rearm_count:{} {}",
+                            candidate.reference_url,
+                            candidate.age_seconds,
+                            candidate.rearm_count,
+                            wrappers_seen
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write stuck_pending_task_expired audit event");
                 }
             }
-
-            match self
-                .db
-                .update_task_failed(&candidate.id, "stuck_pending_no_deferred_wrapper")
-                .await
-            {
-                Ok(true) => {
-                    warn!(
-                        event = "stuck_pending_task_expired",
-                        task_id = %candidate.id,
-                        issue = %candidate.reference_url,
-                        age_seconds = candidate.age_seconds,
-                        rearm_count = candidate.rearm_count,
-                        wrappers_seen = %wrappers_seen,
-                        "orphaned pending task expired — slot freed for the ready sweep"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .log_audit_event(
-                            &system_session,
-                            "stuck_pending_task_expired",
-                            &format!("task:{}", candidate.id),
-                            Some("pending"),
-                            Some("failed"),
-                            Some(&format!(
-                                "issue:{} age_seconds:{} rearm_count:{} {}",
-                                candidate.reference_url,
-                                candidate.age_seconds,
-                                candidate.rearm_count,
-                                wrappers_seen
-                            )),
-                            None,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to write stuck_pending_task_expired audit event");
-                    }
-                }
-                Ok(false) => {
-                    debug!(
-                        task_id = %candidate.id,
-                        "stuck-pending reaper: task left pending state before expiry — no-op"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        task_id = %candidate.id,
-                        error = %e,
-                        "task_engine_stuck_pending_reaper: failed to expire the task"
-                    );
-                }
+            Ok(false) => {
+                debug!(
+                    task_id = %candidate.id,
+                    "stuck-pending reaper: task left pending state before expiry — no-op"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to expire the task"
+                );
             }
         }
     }
@@ -6944,6 +7093,331 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert!(details[0].contains(&spent[..8]), "got: {}", details[0]);
         assert!(details[0].contains("delivered@"), "got: {}", details[0]);
+    }
+
+    // -- mika#2185: the verdict is re-checked against the world, not against a
+    //    snapshot taken one SELECT ago --
+
+    /// Seed a `pending` self_dev issue parent carrying an arbitrary
+    /// `reference_url` (mika#2185).
+    ///
+    /// `find_orphaned_pending_issue_tasks` only demands `reference_url IS NOT
+    /// NULL`, while `rebuild_deferred_action_config` demands the
+    /// `https://github.com/<o>/<r>/issues/<n>` shape. A URL outside that shape
+    /// is therefore a *candidate* whose `action_config` is irreconstructible —
+    /// the R2-a producer of `None -> Unrepairable`, deterministic and needing no
+    /// injected DB failure.
+    async fn seed_pending_parent_with_reference_url(
+        db: &AsyncDatabase,
+        label: &str,
+        reference_url: &str,
+        age_secs: i64,
+    ) -> String {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(reference_url.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        backdate_created_at(db, &parent_id, age_secs).await;
+        parent_id
+    }
+
+    /// AC1 on the deferred-wrapper axis: a wrapper appearing between the scan
+    /// and the decision spares the parent.
+    ///
+    /// **This axis is covered twice, and the doc says so rather than letting a
+    /// reader mistake the test for an anti-vacuity proof.** It asserts the
+    /// *outcome* AC1 demands and passes on either guard: the mika#2185 one here,
+    /// or mika#2413's inside `rearm_deferred_callback` — the appeared wrapper
+    /// also supplies `latest_deferred_wrapper_action_config`, so the decision
+    /// takes the `Some(config)` branch and never reaches the unguarded one. The
+    /// anti-vacuity replay is its sibling
+    /// `mika2185_a_real_dispatch_that_starts_after_the_scan_spares_the_parent`,
+    /// on the axis where nothing was re-checked at all.
+    ///
+    /// What it still pins on its own: the guard runs **before**
+    /// `latest_deferred_wrapper_action_config`, so the sparing survives
+    /// `rearm_deferred_callback` losing its guard or gaining a variant.
+    ///
+    /// The window is driven without a `#[cfg(test)]` hook: the scan and the
+    /// decision are two separate calls, so the test performs the scan, inserts
+    /// the wrapper, then hands the *stale candidate* to the decision. Calling
+    /// the whole reaper instead would hide the very window under test — the scan
+    /// it re-runs no longer returns the parent, so nothing would be decided.
+    #[tokio::test]
+    async fn mika2185_a_wrapper_that_appears_after_the_scan_spares_the_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // R2-a: a reference_url outside the GitHub-issue shape makes
+        // `rebuild_deferred_action_config` return `None`, so the decision takes
+        // the unguarded `Unrepairable` branch.
+        let parent_id = seed_pending_parent_with_reference_url(
+            &db,
+            "ready-label: senara-solutions/mika#2185",
+            "https://example.invalid/not-a-github-issue",
+            11_455,
+        )
+        .await;
+
+        // 1. The scan. This is the instant the verdict "nothing represents this
+        //    parent" was formed.
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let candidates = db
+            .find_orphaned_pending_issue_tasks(grace, liveness)
+            .await
+            .unwrap();
+        let candidate = candidates
+            .into_iter()
+            .find(|c| c.id == parent_id)
+            .expect("the parent must be a candidate at scan time, or the replay proves nothing");
+
+        // 2. A concurrent dispatch completes and registers a fresh wrapper.
+        let wrapper_id = seed_wrapper_with_status(&db, &parent_id, "pending", None).await;
+
+        // 3. The decision, still holding the stale candidate.
+        engine
+            .reap_one_orphaned_pending_candidate(candidate, liveness)
+            .await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "pending",
+            "a parent represented again at decision time must not be expired"
+        );
+        let wrapper = db.get_task(&wrapper_id).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "pending",
+            "the freshly appeared wrapper must not be cancelled out from under its dispatch"
+        );
+        assert!(
+            reaper_audit_details(&db, "stuck_pending_task_expired", &parent_id)
+                .await
+                .is_empty(),
+            "no terminal event may be written for a turn that was passed"
+        );
+        assert!(
+            reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// T1 / AC2 — the anti-vacuity replay on the branch that was **measurably**
+    /// still open.
+    ///
+    /// Reading the code settled which branch that is, and it is not the one the
+    /// plan's R2 named. `find_orphaned_pending_issue_tasks` has two `NOT EXISTS`
+    /// clauses — no live deferred wrapper, **and** no active non-deferred
+    /// callback — and the re-verification the ticket asks for has to re-pose
+    /// *both*, because the scan posed both.
+    ///
+    /// On the deferred-wrapper axis the replay is vacuous, and that is a finding
+    /// rather than a gap: a wrapper appearing after the scan also supplies
+    /// `latest_deferred_wrapper_action_config`, so the decision takes the
+    /// `Some(config)` branch and mika#2413's guard inside
+    /// `rearm_deferred_callback` spares the parent — including with the budget
+    /// spent, since that guard sits **before** `get_stuck_rearm_count`.
+    ///
+    /// On the real-dispatch axis nothing did. The parent below carries a
+    /// `reference_url` outside the GitHub-issue shape, so
+    /// `rebuild_deferred_action_config` returns `None`, the decision takes
+    /// `None -> Unrepairable`, and `rearm_deferred_callback` — which owns the
+    /// only re-check of this axis (`has_non_deferred_active_callback_child` ->
+    /// `NotNow`) — is never called. The parent is expired while its real
+    /// dispatch is starting.
+    ///
+    /// Anti-vacuity: drop the `has_non_deferred_active_callback_child` re-check
+    /// from `reap_one_orphaned_pending_candidate` and this test fails with the
+    /// parent `failed`.
+    #[tokio::test]
+    async fn mika2185_a_real_dispatch_that_starts_after_the_scan_spares_the_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_parent_with_reference_url(
+            &db,
+            "ready-label: senara-solutions/mika#2185-real",
+            "https://example.invalid/not-a-github-issue",
+            11_455,
+        )
+        .await;
+
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let candidate = db
+            .find_orphaned_pending_issue_tasks(grace, liveness)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == parent_id)
+            .expect("the parent must be a candidate at scan time, or the replay proves nothing");
+
+        // The real dispatch starts: a non-deferred callback child appears.
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+
+        engine
+            .reap_one_orphaned_pending_candidate(candidate, liveness)
+            .await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "pending",
+            "a parent whose real dispatch just started must not be expired"
+        );
+        let callback = db.get_task(&callback_id).await.unwrap().unwrap();
+        assert_eq!(callback.status, "pending");
+        assert!(
+            reaper_audit_details(&db, "stuck_pending_task_expired", &parent_id)
+                .await
+                .is_empty(),
+            "no terminal event may be written for a turn that was passed"
+        );
+    }
+
+    /// T4 — the negative control, without which "the guard decides" would be
+    /// indistinguishable from "the guard blocks everything".
+    ///
+    /// Same stale-candidate replay, but nothing appears in the window: a parent
+    /// that is genuinely orphaned is still repaired.
+    #[tokio::test]
+    async fn mika2185_a_genuinely_orphaned_parent_is_still_rearmed() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2185, 11_455).await;
+        // Spent wrappers only: an inventory that is non-empty and entirely dead,
+        // so the guard has something to read and must still let the repair pass.
+        seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
+        seed_wrapper_with_status(&db, &parent_id, "cancelled", Some(60)).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(3000)).await;
+        assert!(
+            promoted_wrapper_liveness_secs() < 3000,
+            "test presumes a liveness window under 3000 s; \
+             MIKA_PROMOTED_WRAPPER_LIVENESS_SECS is set to {}",
+            promoted_wrapper_liveness_secs()
+        );
+
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let candidate = db
+            .find_orphaned_pending_issue_tasks(grace, liveness)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == parent_id)
+            .expect("a parent with only spent wrappers is orphaned");
+
+        engine
+            .reap_one_orphaned_pending_candidate(candidate, liveness)
+            .await;
+
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            1,
+            "the guard must not disarm the reaper on a real orphan"
+        );
+        assert!(
+            wrappers_of(&db, &parent_id)
+                .await
+                .iter()
+                .any(|w| w.status == "pending"),
+            "the repair's actual product is a fresh pending wrapper"
+        );
+    }
+
+    /// T5 / AC5 — a reaping tick never leaves two `pending` wrappers on one
+    /// parent.
+    ///
+    /// Not a tautology: nothing at the SQL level enforces per-parent uniqueness.
+    /// `register_deferred_callback` bounds only a **global** count
+    /// (`MAX_PENDING_DEFERRED_CALLBACKS`), and two `pending` wrappers on one
+    /// parent mutually block through `task_active_dispatch` — mika#1163's shape
+    /// brought down to the scale of a single parent.
+    #[tokio::test]
+    async fn mika2185_a_reaping_tick_never_leaves_two_pending_wrappers() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2185, 11_455).await;
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let candidate = db
+            .find_orphaned_pending_issue_tasks(grace, liveness)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == parent_id)
+            .expect("a wrapperless aged parent is orphaned");
+
+        // The wrapper appears after the scan — the exact race the re-arm would
+        // otherwise double.
+        seed_wrapper_with_status(&db, &parent_id, "pending", None).await;
+
+        engine
+            .reap_one_orphaned_pending_candidate(candidate, liveness)
+            .await;
+
+        let pending: Vec<_> = wrappers_of(&db, &parent_id)
+            .await
+            .into_iter()
+            .filter(|w| w.status == "pending")
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "two pending wrappers on one parent block each other through \
+             task_active_dispatch; got {pending:?}"
+        );
     }
 
     #[test]

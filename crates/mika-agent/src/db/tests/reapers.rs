@@ -1480,6 +1480,15 @@ fn test_find_orphaned_pending_shelters_pending_wrapper_with_stale_completed_at()
 /// the repo's own rule (docs/solutions/.../asymmetric-perimeter-predicate-drift)
 /// says a deliberate fork ships its parity test in the same commit. The two
 /// clauses are hand-synced SQL; this is what makes a one-sided edit fail.
+///
+/// **Three branches since mika#2185**, not two. That ticket added a Rust reader
+/// of the same criterion — `DeferredWrapperSummary::first_live`, which decides
+/// on the inventory the reaper has already read, because AC4 requires the audit
+/// line and the verdict to describe one moment and two successive SELECTs never
+/// do. A third reader is a third place to drift, and this is where that cost is
+/// paid: the Rust predicate is fed from
+/// `summarize_deferred_wrappers_of_parent` — the reaper's own source — on the
+/// same corpus, and compared against both SQL clauses.
 #[test]
 fn test_live_wrapper_predicate_agrees_with_orphan_clause() {
     // (wrapper status, completed_at offset or None) -> is the wrapper live?
@@ -1511,11 +1520,27 @@ fn test_live_wrapper_predicate_agrees_with_orphan_clause() {
             .find_orphaned_pending_issue_tasks("mika", 2700, 2700)
             .unwrap()
             .is_empty();
+        // mika#2185 — the Rust reader, fed exactly as the reaper feeds it.
+        let inventory = db
+            .summarize_deferred_wrappers_of_parent("mika", &parent_id)
+            .unwrap();
+        let rust_says_live = crate::db::DeferredWrapperSummary::first_live(
+            &inventory,
+            &crate::timestamp::now(),
+            2700,
+        )
+        .is_some();
 
         assert_eq!(
             twin_says_live, clause_says_live,
             "predicates diverged on ({status}, {offset:?}): \
                  has_live_deferred_wrapper_child={twin_says_live}, \
+                 orphan clause sheltered={clause_says_live}"
+        );
+        assert_eq!(
+            rust_says_live, clause_says_live,
+            "predicates diverged on ({status}, {offset:?}): \
+                 DeferredWrapperSummary::first_live={rust_says_live}, \
                  orphan clause sheltered={clause_says_live}"
         );
     }

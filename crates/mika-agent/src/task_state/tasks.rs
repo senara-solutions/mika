@@ -372,6 +372,60 @@ impl DeferredWrapperSummary {
             .join(",");
         format!("wrappers:{body}")
     }
+
+    /// The first **live** wrapper of an already-read inventory, or `None`
+    /// (mika#2185).
+    ///
+    /// Same predicate as clause (1) of
+    /// [`crate::db::Database::find_orphaned_pending_issue_tasks`] and as
+    /// [`crate::db::Database::find_live_deferred_wrapper_child`]: `pending` on
+    /// its status alone, or `completed` with a non-null `completed_at` strictly
+    /// newer than `now - promoted_liveness_seconds`. `delivered`, `failed` and
+    /// `cancelled` are spent wrappers, never live; a null `completed_at` cannot
+    /// prove its freshness and therefore does not shelter its parent.
+    ///
+    /// **Why a pure function and not a third SQL round-trip.** mika#2185 AC4
+    /// requires the audit inventory and the reaper's re-verification to read the
+    /// *same* moment. Two successive SELECTs never do, in either order — one of
+    /// them always describes a state the other did not see. The only shape that
+    /// holds AC4 by construction is *one read, two uses*, and
+    /// `summarize_deferred_wrappers_of_parent` already returns exactly the three
+    /// fields the predicate turns on. The named cost is that this is a **third**
+    /// reader of the liveness criterion (two SQL, one Rust), i.e. the fork class
+    /// `grooming_marker` (mika#2158) had to close once; it is paid by the
+    /// three-way parity test
+    /// `db::tests::reapers::test_live_wrapper_predicate_agrees_with_orphan_clause`.
+    ///
+    /// Input order is the query's (oldest first), which is the FIFO order
+    /// promotion uses — so the wrapper returned is the one that would fire next,
+    /// matching `find_live_deferred_wrapper_child`'s `ORDER BY created_at, id`.
+    ///
+    /// Bounds are compared as ISO 8601 strings, where lexicographic order *is*
+    /// chronological order (fixed-width UTC, the invariant `crate::timestamp`
+    /// poses), which is what the SQL does with `strftime`. If `now` itself
+    /// cannot be parsed the cutoff is unknown, and the fail-safe direction here
+    /// is towards **live**: a caller that cannot rule out a fresh wrapper must
+    /// not conclude the parent is unrepresented.
+    pub fn first_live<'a>(
+        wrappers: &'a [DeferredWrapperSummary],
+        now: &str,
+        promoted_liveness_seconds: i64,
+    ) -> Option<&'a DeferredWrapperSummary> {
+        let cutoff = crate::timestamp::parse(now).ok().map(|dt| {
+            crate::timestamp::format(&(dt - chrono::Duration::seconds(promoted_liveness_seconds)))
+        });
+
+        wrappers.iter().find(|w| match w.status.as_str() {
+            "pending" => true,
+            "completed" => match (&w.completed_at, &cutoff) {
+                (Some(at), Some(cutoff)) => at.as_str() > cutoff.as_str(),
+                // `now` is unreadable: freshness cannot be ruled out.
+                (Some(_), None) => true,
+                (None, _) => false,
+            },
+            _ => false,
+        })
+    }
 }
 
 /// A `blocked` self_dev issue parent refused on a busy dispatch slot, whose
@@ -470,4 +524,102 @@ pub struct TaskHealthSummary {
     pub active_tasks: Vec<Task>,
     /// Anomalous task states across all trigger types, capped at [`health_thresholds::MAX_ANOMALIES`].
     pub anomalies: Vec<TaskHealthAnomaly>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: &str = "2026-09-21T12:00:00Z";
+    const LIVENESS: i64 = 2700;
+
+    fn w(id: &str, status: &str, completed_at: Option<&str>) -> DeferredWrapperSummary {
+        DeferredWrapperSummary {
+            id: id.to_string(),
+            status: status.to_string(),
+            completed_at: completed_at.map(str::to_string),
+        }
+    }
+
+    fn live(wrappers: &[DeferredWrapperSummary]) -> Option<&DeferredWrapperSummary> {
+        DeferredWrapperSummary::first_live(wrappers, NOW, LIVENESS)
+    }
+
+    /// T6 — the nine shapes the SQL twin is pinned against
+    /// (`db::tests::reapers::test_live_wrapper_predicate_agrees_with_orphan_clause`),
+    /// each on its own so a failure names the shape (mika#2185).
+    #[test]
+    fn mika2185_first_live_on_each_shape() {
+        // `pending` is live on its status alone, whatever `completed_at` says.
+        assert!(live(&[w("a", "pending", None)]).is_some());
+        assert!(live(&[w("a", "pending", Some("1999-01-01T00:00:00Z"))]).is_some());
+
+        // `completed` inside the window is live: promotion writes `completed`,
+        // and the silent turn it feeds has not returned yet.
+        assert!(live(&[w("a", "completed", Some("2026-09-21T12:00:00Z"))]).is_some());
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:59:59Z"))]).is_some());
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:30:00Z"))]).is_some());
+
+        // Past the window it is a corpse, not a shield.
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:00:00Z"))]).is_none());
+
+        // A `completed` that cannot prove its freshness does not shelter.
+        assert!(live(&[w("a", "completed", None)]).is_none());
+
+        // Spent statuses are never live, however recent.
+        for spent in ["delivered", "failed", "cancelled"] {
+            assert!(
+                live(&[w("a", spent, Some(NOW))]).is_none(),
+                "{spent} must never shelter a parent"
+            );
+        }
+    }
+
+    /// The window boundary is **strict**, matching the SQL's `completed_at >
+    /// strftime(...)`. A wrapper landing exactly on the cutoff is not live; one
+    /// microsecond inside it is. Written out because "inclusive or exclusive"
+    /// is the detail a re-implementation gets wrong first.
+    #[test]
+    fn mika2185_first_live_window_boundary_is_exclusive() {
+        // NOW - 2700 s = 11:15:00Z
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:15:00Z"))]).is_none());
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:15:01Z"))]).is_some());
+        assert!(live(&[w("a", "completed", Some("2026-09-21T11:14:59Z"))]).is_none());
+    }
+
+    #[test]
+    fn mika2185_first_live_on_an_empty_inventory() {
+        assert!(live(&[]).is_none());
+    }
+
+    /// Input order is the query's (oldest first, the FIFO order promotion
+    /// uses), so the id returned is the one that would actually fire next —
+    /// which is what makes it worth naming in the log line.
+    #[test]
+    fn mika2185_first_live_returns_the_oldest_live_wrapper() {
+        let wrappers = vec![
+            w("spent", "delivered", Some(NOW)),
+            w("oldest-live", "completed", Some("2026-09-21T11:20:00Z")),
+            w("newer-live", "pending", None),
+        ];
+        assert_eq!(live(&wrappers).unwrap().id, "oldest-live");
+    }
+
+    /// Fail-safe on an unreadable `now`: the cutoff is unknown, so freshness
+    /// cannot be ruled out and a dated `completed` counts as live. The reaper's
+    /// direction is "when in doubt, do nothing"; a null `completed_at` still
+    /// proves nothing and still does not shelter.
+    #[test]
+    fn mika2185_first_live_fails_safe_on_an_unparsable_now() {
+        let dated = [w("a", "completed", Some("1999-01-01T00:00:00Z"))];
+        assert!(DeferredWrapperSummary::first_live(&dated, "not-a-timestamp", LIVENESS).is_some());
+
+        let undated = [w("a", "completed", None)];
+        assert!(
+            DeferredWrapperSummary::first_live(&undated, "not-a-timestamp", LIVENESS).is_none()
+        );
+
+        let spent = [w("a", "cancelled", Some("2026-09-21T11:59:59Z"))];
+        assert!(DeferredWrapperSummary::first_live(&spent, "not-a-timestamp", LIVENESS).is_none());
+    }
 }
