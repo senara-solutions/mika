@@ -54,6 +54,18 @@ Permitted post-callback actions are described prosaically in the success/failure
 - `STATUS=CANCELLED_BY_SIGNAL`: dispatch was terminated by signal (potentially operator-initiated cancel without the pre-write path, or external signal). Treat as operator-cancel for retry-decision purposes (do NOT retry). Call `update_task_status(task_id, "cancelled")` with metadata `{"cancelled_reason": "signal_cancel"}`. Call `send_message`: "Dispatch terminated by signal — not retrying. Issue status unchanged." Proceed to Step 6.
 - Anything else (no `STATUS=CANCELLED_` prefix): fall through to existing classification paths below.
 
+**Containment-refusal discriminator (mika#2049 — MANDATORY, BEFORE pipeline result classification):**
+
+> **Predicate:** `RESULT` **contains** the literal `CONTAINMENT REFUSAL (exit 78)`. Use `contains`, NEVER `starts with`: this `RESULT` begins with `Log path: …`.
+>
+> **Why:** it has no failure marker and a non-empty result, so without this branch it falls into `On success` and announces a PR that does not exist. No pilot ran; in a relay outage every dispatch lands here.
+>
+> 1. **Do NOT retry** (relay still down; would burn `pipeline_retry_count`).
+> 2. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`): `auto_pull` resumes the ticket as-is.
+> 3. `update_task_status(task_id, "failed")` with metadata `{"containment_refusal": true, "refusal_reason": "<cause line from RESULT>"}` — distinct from `operator_cancel`/`signal_cancel`, countable apart (mika#2131).
+> 4. `send_message` with the refusal text **verbatim** (names cause + remedy).
+> 5. Proceed to Step 6. Never announce a PR, completion, or "awaiting QA review".
+
 **Pipeline result classification (MANDATORY — before generic failure handling):**
 
 > **Primary trigger (marker-match):** `tasks.result` contains literal substring `error_max_turns` → run grounding check.

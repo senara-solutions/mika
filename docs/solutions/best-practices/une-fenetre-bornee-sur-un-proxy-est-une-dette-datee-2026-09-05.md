@@ -95,6 +95,51 @@ plus longtemps. Le résidu se retire par une mesure **directe** de vivacité —
 récence des lignes d'activité, la forme que [[1652-team-runs-orphan-reaper-and-tool-error-as-ok-not-err]]
 emploie déjà pour les team runs — pas par un proxy plus large.
 
+#### La dette est acquittée pour la cause A (mika#2184, 2026-09-21)
+
+Ce paragraphe prescrit de **nommer** la mesure qui retire la dette. Il doit donc
+dire quand elle arrive — et, surtout, **ce qu'elle ne couvre pas**. Une dette
+qu'on déclare soldée sans dire son reste est une dette qu'on a seulement cessé
+de regarder.
+
+mika#2184 livre la mesure directe : `find_deferred_wrapper_activity_age_secs`
+joint `parente → wrappers différés → sessions (sessions.task_id) → llm_calls /
+tool_calls` — **par égalité**, pas par le `LIKE` sur `session_id` auquel
+mika#1652 doit se rabattre, la colonne `sessions.task_id` existant depuis la v19
+et étant écrite par `dispatch_resume_agent` lui-même. Le seuil
+(`MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS`, 600 s) ne rentre **pas** dans la SQL :
+la requête rend un **âge**, une fonction pure le classe, et l'épargne se
+journalise — parce que le défaut nommé au § 2 ci-dessus était précisément une
+épargne muette dans un `NOT EXISTS`, et le reproduire une deuxième fois dans la
+même fonction aurait re-creusé le trou qu'on venait de combler.
+
+**Mais la lecture qui a produit ce paragraphe était incomplète, et la
+rectification est ce qui compte ici.** Un wrapper `completed` non `delivered`
+au-delà de la fenêtre a **trois** causes, et elles ne se mesurent pas de la même
+façon :
+
+| # | cause | activité sur la session du wrapper ? | statut |
+|---|---|---|---|
+| A | le tour tourne et est lent | **oui** | **acquittée** par mika#2184 |
+| B | `AgentBusy` : le lock est pris ailleurs | **non** — `dispatch_resume_agent` rend `Err` *avant* d'ouvrir la session | **non couverte**, suivi nommé |
+| C | redémarrage du service pendant l'attente | **non** — rien ne tournait | traitée par l'**aveu**, pas par la mesure |
+
+Le § ci-dessus affirmait que la traîne se retirait par la mesure directe. C'est
+vrai de A seulement. **Si la traîne est faite de B et de C, une mesure d'activité
+ne la couvre pas — parce qu'il n'y a rien à mesurer.** Pour C, le remède n'est pas
+un capteur mais une tri-valeur : un process dont l'uptime est inférieur à la
+fenêtre n'a **pas pu** observer, donc « zéro ligne » n'y est pas un silence
+(`NotYetObservable`, forme [[2277]]). Pour B, mika#2184 **refuse** de couvrir avec
+sa raison écrite : le seul signal disponible serait « l'agent a de l'activité
+ailleurs », vrai quasi en permanence sur mika-dev, et la garde cesserait de
+refuser quoi que ce soit tout en produisant des lignes d'épargne rassurantes.
+
+**Corollaire qui généralise, et c'est la part transportable :** une mesure
+directe n'est directe que sur la population où le phénomène *produit un signal*.
+Avant de déclarer qu'elle retire une dette, caractériser la population — sinon on
+remplace un proxy par un capteur qui ne regarde pas où le défaut se produit, et
+le vert obtenu est le « rouge vacuux » que le § suivant condamne.
+
 ## Deux prédicats nommés comme équivalents doivent l'être structurellement
 
 `has_pending_deferred_wrapper_child` posait la même question que la clause du

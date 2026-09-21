@@ -28,6 +28,7 @@ pub mod milestone_manager;
 pub mod operational;
 pub mod panic_hook;
 pub mod perimeter;
+pub mod pilot_egress_stamp;
 pub mod planning;
 pub mod post_condition;
 pub mod pricing;

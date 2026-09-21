@@ -1983,6 +1983,139 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **SilentTrigger variants:** `Heartbeat`, `Reflection`, `Callback`, `SkillRun`, `Reminder`, `PostCallbackAdvance` (#991), `DeferredDispatch` (mika#1011). Each produces correct system-prompt framing. `PostCallbackAdvance` is an engine-side structural backstop — fired by the dispatcher after a milestone/project-context callback turn completes without advancing the queue. `DeferredDispatch` is an engine-side auto-recovery for `global_dispatch_active` rejections — when `run_claude_pilot` is rejected because another dispatch is active, the engine registers a `pending` callback task with label `long_running:run_claude_pilot:deferred`. When the blocking dispatch completes, the deferred callback is promoted (status → `completed`) and dispatched on the next engine tick as a `DeferredDispatch` turn whose only required action is `run_claude_pilot` (enforced by the `deferred_dispatch_action` INTENT_GUARD). **Promotion paths (mika#1070):** (1) Inline — `dispatch_next_deferred_callback()` (`pub(crate)`) fires after `mark_task_delivered` on a non-deferred callback. mika#1124 re-added the inline anti-cascade guard at `dispatcher.rs:495`: when a `:deferred` wrapper itself completes (e.g., the silent turn no-ops), inline chain-promotion is SKIPPED — relying on the periodic backstop instead. This prevents the no-op-cascade failure mode where N wrappers drain the queue inline without ever dispatching. Real (non-deferred) callback completions still chain-promote immediately. (2) Periodic backstop — `promote_pending_deferred_if_idle()` runs every `DB_SCAN_INTERVAL_TICKS` (60 ticks), iterates over the `dispatch_class` values (`DISPATCH_CLASSES = &["implement", "groom"]` — pinned to `derive_dispatch_class` at `skills/executor.rs` via a shape test in `engine.rs`), checks `has_any_active_callback_for_class(class)` (excludes deferred wrappers via `label NOT LIKE '%:deferred'`, scopes by `COALESCE(dispatch_class, 'implement') = ?`), and promotes one wrapper per idle class per tick via `dispatch_next_deferred_callback_for_class(class)` (mika#1175). Per-class iteration prevents cross-class throughput halving when wrappers from multiple classes are co-pending. Placed BEFORE `dispatch_undelivered_callbacks` for same-tick dispatch. Fail-closed per-class on DB errors — one class's check error does not stall the other. The agent-wide siblings `has_any_active_callback()` and `dispatch_next_deferred_callback()` are kept for the inline-promotion path in `handle_task_complete` (out-of-scope for #1175, see plan § Open question 1). **Both slot predicates must exclude `:deferred` wrappers (mika#1163).** `has_any_active_callback`/`has_any_active_callback_for_class` (engine backstop) AND `has_active_callback_tasks_excluding` (per-class gate inside `validate_dispatch_readiness`) all apply `label NOT LIKE '%:deferred'`. The earlier asymmetric version caused a multi-wrapper deadlock: when two parents each held a pending wrapper, every dispatch attempt from one wrapper saw the OTHER wrapper as slot-occupied and registered yet another wrapper, with no real dispatch ever spawning. **AgentBusy recovery (mika#1070):** when `dispatch_resume_agent` returns `AgentBusy` in `handle_task_complete`, the callback keeps `completed` status (not reset to `pending`) with `next_fire_at` set to now+30s for retry delay. `dispatch_undelivered_callbacks` has a `next_fire_at` guard that skips tasks whose retry delay has not expired. γ composition: the LLM's `send_message` notification and the engine's deferred callback are independent; `validate_dispatch_readiness()` arbitrates any race. Per-agent cap of 10 pending deferred callbacks prevents flood. `cancel_task()` cascades to callback children (both immediate and deferred). **No-op wrapper detection (mika#1172 R9):** When a `:deferred` wrapper completes, the dispatcher checks `has_non_deferred_active_callback_child(parent_task_id)`. If no active child exists, emits `deferred_dispatch_noop_completion` WARN + audit event — the silent turn failed to spawn a real dispatch (mika#1124 regression signal). **Dispatch lifecycle audit events (mika#1172 W4):** Three events written to `audit_events`: `deferred_dispatch_promoted` (on each inline or periodic backstop promotion, with promoted task ID), `deferred_dispatch_registered` (on deferred callback registration at `global_dispatch_active` rejection), `deferred_dispatch_noop_completion` (on no-op wrapper detection). Promote methods (`promote_next_deferred_callback`, `promote_next_deferred_callback_for_class`) return `Option<String>` (promoted task ID) instead of `bool` to enable meaningful audit event resource_id. **(3) Force-promote (mika#1453)** — `promote_deferred_callback` agent tool (fail-closed: rejects when slot busy, no override) and `mika tasks promote-deferred <class>` CLI verb (with `--override` for cancel-then-promote). Both call `force_promote_deferred_for_class()` which shares the `has_any_active_callback_for_class()` predicate (mika#1163 parity). `find_active_callback_for_class()` identifies the blocker for the CLI override path. Three audit event types: `deferred_dispatch_force_promote_succeeded`, `deferred_dispatch_force_promote_rejected_slot_busy`, `deferred_dispatch_force_promote_override`. **What the stuck-pending reaper makes of a promoted wrapper (mika#2181).** Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later under a slow model. For the reaper's predicate (`find_orphaned_pending_issue_tasks`) a deferred wrapper therefore counts as **live** when it is `pending`, **or** `completed` with a `completed_at` newer than `now - MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (default 2700s, `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`). The bound is load-bearing, not a rounding: on the silent-turn error path the wrapper is re-armed but never marked `delivered`, so it stays `completed` forever, and an unbounded predicate would turn that corpse into a permanent shield against repair. `delivered`, `failed` and `cancelled` are never live. `has_live_deferred_wrapper_child` (renamed from `has_pending_deferred_wrapper_child`) answers the same question with the same predicate — the two must not diverge. The `mika tasks stuck` probe takes the same two windows as the reaper, so probe and engine report on one population.
 
+#### The direct measure that succeeds the proxy window (mika#2184)
+
+**What mika#2181 could not reach, measured.** Its window is a proxy on the
+*promotion* instant, and the residue is in the code's own doc-comment: over 30
+days, **139 of 799** delivered wrappers (17 %) delivered past 2700 s, **81** of
+their parents were expired `stuck_pending_no_deferred_wrapper`, and **8** of
+those were expired **2820–4996 s** after promotion — out of reach of *any* value
+of the constant compatible with a useful reaper. Widening it is the wrong reflex,
+and the ticket's argument for that is the one worth keeping: a wrapper delayed by
+a restart is a **healthy** wrapper, so a bigger number buys coverage by blinding
+the reaper for longer. *A window on a proxy is a dated debt*
+(`docs/solutions/best-practices/une-fenetre-bornee-sur-un-proxy-est-une-dette-datee-2026-09-05.md`).
+
+**The chain is joined by equality, and it already existed.** The turn consuming a
+promoted wrapper is a `SilentTrigger::DeferredDispatch`, and
+`dispatch_resume_agent` opens its session with
+`create_session_with_parent(…, task_id = Some(&task.id))` where `task.id` is **the
+wrapper**. So `parent → wrappers (label = DEFERRED_DISPATCH_LABEL) → sessions
+(sessions.task_id = wrapper.id) → llm_calls / tool_calls`. Stricter than mika#1652,
+which has to fall back on `session_id LIKE 'team-' || r.id || '%'`. The `task_id`
+column has existed since v19: no migration, no column.
+
+**Three causes of delay, and they do NOT share a measure — this is the ticket's
+own premise, corrected.** The ticket writes that the silent turn "produces those
+same rows". True *when the turn runs*. A wrapper `completed` and not `delivered`
+past 2700 s has three causes: **(A)** the turn runs and is slow — the AC1 case,
+and the only one an activity measure covers; **(B)** `AgentBusy` — the agent lock
+is held elsewhere and `dispatch_resume_agent` returns `Err` **before**
+`create_session_with_parent`, so there is no session and nothing to measure;
+**(C)** a service restart — nothing was running, and neither was the reaper.
+This work closes **A** by measurement and **C** by an admission (see
+`NotYetObservable` below); **B is not covered, and the refusal is reasoned** —
+the only available signal would be "the agent has activity somewhere else", which
+is true almost permanently on mika-dev and would disarm the reaper under cover of
+precision. Follow-up named.
+
+**Filtered in the application, never as a third `NOT EXISTS`.** The reflex would
+be one more clause in `find_orphaned_pending_issue_tasks`. Refused, and the
+refusal is written in the doc mika#2181 itself shipped: *"the shelter lives in a
+SQL `NOT EXISTS`: a sheltered parent never becomes a candidate and never traverses
+the application. No log, no audit, no counter […] indistinguishable from a healthy
+regime."* That is the defect mika#2181 had to repair after the fact with
+`find_parents_sheltered_by_promoted_wrapper`; doing it a second time in the same
+function would re-dig the hole just filled. The SQL yields the candidates (proxy
+window included, unchanged) and the direct measure filters afterwards, where it
+can log.
+
+**The DB returns an AGE, not a boolean.** `find_deferred_wrapper_activity_age_secs`
+— `None` when no row exists, and `None` is never `0` (mika#2331). Three reasons in
+order of weight: the threshold leaves the SQL and becomes a parameter of a pure
+function, testable at its boundaries without a database; the log line can then
+*name* the age, which mika#2277 paid dearly for not doing (two false positives read
+"nominal" on first inspection because one age was reported on a disposition
+crossing three); and a negative age (clock skew) clamps to `0` — "very recent",
+never "very old", fail-safe towards sparing.
+
+**Four states, and the disposition follows BOUNDEDNESS, not certainty.**
+`classify_wrapper_activity(last_activity_age_secs, window_secs, engine_uptime_secs,
+telemetry_armed)` is a pure function reading no global state; the disposition is an
+exhaustive `match` with **no `_ =>` arm** (the `hosting_ground_truth_line` pattern,
+mika#2290).
+
+| state | disposition | why |
+|---|---|---|
+| `Active` | **spare** | the turn is demonstrably working |
+| `NotYetObservable` | **spare** | the ignorance is **bounded**: it extinguishes itself as soon as uptime exceeds the window. Covers cause C |
+| `Silent` | reap | today's behaviour, bit for bit |
+| `NotRecorded` | reap + WARN | the ignorance is **permanent**: sparing here would restore the corpse-shield mika#2181 had to bound |
+
+*What cannot extinguish itself cannot spare.* `NotYetObservable` and `NotRecorded`
+are two variants rather than one `Unobservable { reason }` precisely because their
+disposition differs — **a reason that decides is not a reason, it is a state**.
+`telemetry_armed = store_llm_calls || store_tool_calls` is a setting that is
+**read**, never inferred from an absence of rows: telling "telemetry is off" from
+"the agent did nothing" is impossible by observation, which is the confusion
+mika#2277 condemns.
+
+**`MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS`**, default **600 s** = 2× the default
+turn envelope (`AGENT_TOTAL_TIMEOUT` 300 s, mika#2189), so it covers a whole turn
+*and* the interval to the next call with a factor of 2 of margin. Deliberately
+twice mika#1652's 300 s for team runs: the expensive error here is killing a live
+turn. House three-tier parse, plus a 30-day clamp — **not** the anti-`strftime`
+mechanism of `PROMOTED_WRAPPER_LIVENESS_MAX_SECS` (this threshold never enters the
+SQL), but the coherence of the knob: an absurd setting would spare every parent for
+ever, which is what `NotRecorded` already refuses on the other axis.
+
+**Two event names, and that rectifies AC4's letter while holding its intent.** AC4
+asks that `stuck_pending_sheltered_by_promoted_wrapper` "distinguish the two spare
+causes"; the literal reading is a `cause` field on that event. **Refused:** its name
+*carries* its cause, so routing an unrelated spare through it would make the name
+false and split in two the population mika#2181's probe counts to measure whether
+its debt is retiring. The house has an established way to keep two populations
+countable apart and has used it three times — `phantom_aged_out` /
+`phantom_sweep_spared` (mika#2156), `qa_deadline_verdict` / `qa_callback_verdict`
+(mika#2368), `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). So
+`stuck_pending_sheltered_by_promoted_wrapper` is **untouched** and
+`stuck_pending_sheltered_by_activity` is its sibling, each SOLE WRITER of its own
+name, pinned by `mika2184_the_two_spare_causes_have_one_writer_each`.
+
+**One reader, held by a source scan.** `mika2184_wrapper_activity_has_a_single_reader`
+refuses a second production site joining `tasks → sessions → llm_calls/tool_calls`,
+**allowlist shipped empty** — when it fires, remove the second site, do not exempt
+it. That is the `grooming_marker` lesson (mika#2158), which this very file has
+already paid a second time with `has_pending_deferred_wrapper_child`. The needle is
+a conjunction of three terms, each added by a measured false positive: it must not
+accuse `find_stuck_team_runs` (whose join is a `LIKE` on `session_id`) nor Signal A
+of `get_task_health_summary` (which walks the same three tables in the opposite
+direction). **Deliberately not unified with mika#1652:** disjoint populations,
+different joins — an abstraction drawn over two points whose joins differ is the
+wrong abstraction. What is shared is the *pattern*, not the code.
+
+**What a fresh process means for tests.** A newly constructed `TaskEngine` has zero
+uptime, so `classify_wrapper_activity` answers `NotYetObservable` and the reaper
+spares **everything** — correctly. Every reaper test that expects an action
+therefore declares that precondition through the `observing_engine` helper, rather
+than inheriting it from `Instant::now()` happening to be old enough.
+
+**The phantom-sweep sibling (comment 1 of mika#2184) is a SEPARATE fix, and the
+reason is structural.** A NULL-PID `action_type='none'` tracking row queued behind
+a busy slot produces **no** `llm_calls` and **no** `tool_calls`: it has not started.
+Measuring activity would spare it exactly zero times. Its discriminant is already
+named, in writing, in `dispatch_liveness`'s own doc-comment — *"a tracking row still
+waiting for a dispatch slot has no PID-carrying child at all — only a deferred
+wrapper — so this guard cannot see it"* — and the remedy there is to consult the
+deferred wrapper (`has_live_deferred_wrapper_child`, a predicate that already exists
+and has nothing to do with activity). Different population, different discriminant,
+different blast radius. **Precondition before opening it:** establish that the class
+still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since
+raised the grace to 14400 s.
+
+Operator surfaces, the five probes and their halts: root `CLAUDE.md`
+§ *Optional (mesure directe de vivacité du tour différé — mika#2184)*.
+
 #### A represented parent has nothing to repair (mika#2413)
 
 **The failure, measured 2026-09-19.** Three tickets were un-parked at once
