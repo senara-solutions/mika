@@ -19,9 +19,24 @@
 # suivi arrive avec le checkout, sans geste d'installation — la seule forme que
 # le ticket n'a pas déjà réfutée par l'expérience.
 #
-# DEUX MODES :
-#   hook      — charge utile JSON du hook Claude Code sur stdin (production)
-#   --decide  — fonction pure (project-dir, cwd, commande) pour le harnais de test
+# TROIS MODES :
+#   hook             — charge utile JSON du hook Claude Code sur stdin (production)
+#   --decide         — fonction pure (project-dir, cwd, commande) pour le harnais
+#   --decide-primary — fonction pure (platform-dir, cwd, commande) — mika#2449
+#
+# LE SECOND PRÉDICAT (mika#2449) PARTAGE LE PARSEUR ET INVERSE LA POPULATION.
+# mika#2107 protège une session-worktree contre l'arbre partagé : son T1
+# exempte PAR CONSTRUCTION toute session non enracinée dans un worktree lié.
+# Or le producteur mesuré du checkout principal sali (mika#2449, `tool_calls`
+# 1835d8bb / eba3682f / 930f5200 du 2026-09-20) est mika-qa par `run_shell` —
+# un agent SANS worktree, dont le cwd est le répertoire du skill et dont la
+# commande fait `cd ~/workspace/mika-platform/mika && git checkout <ref> --
+# <paths>`. Il est hors population de mika#2107 quel que soit son geste.
+# `--decide-primary` remplace T1/T4 par « la cible effective est un checkout
+# PRINCIPAL sous <platform-dir> » (`.git` est un RÉPERTOIRE, pas le fichier
+# `gitdir:` d'un worktree lié — la distinction de T1, lue dans l'autre sens) et
+# T3 par l'invariant d'un checkout de déploiement (voir verb_is_deploy_safe).
+# Les deux modes coexistent ; aucun ne se substitue à l'autre.
 #
 # CETTE GARDE DÉFEND CONTRE L'ACCIDENT, PAS CONTRE UN ADVERSAIRE. Un chemin
 # obfusqué n'est pas la classe mesurée ; le mur, c'est le bac à sable de
@@ -102,6 +117,19 @@ scrub_secrets() {
 # ---------------------------------------------------------------------------
 normalize_path() {
 	local path=$1 base=$2
+	# `~` et `$HOME` — les trois commandes de M0 (mika#2449) écrivent
+	# `cd ~/workspace/mika-platform/mika`. Sans cette expansion le tilde
+	# était traité comme un répertoire relatif nommé `~`, et la cible
+	# se normalisait HORS de la plateforme : la garde laissait passer
+	# exactement la forme mesurée. Expansion lexicale, sans fork.
+	case $path in
+	'~') path=${HOME:-/} ;;
+	'~/'*) path="${HOME:-}/${path#\~/}" ;;
+	'$HOME') path=${HOME:-/} ;;
+	'$HOME/'*) path="${HOME:-}/${path#\$HOME/}" ;;
+	'${HOME}') path=${HOME:-/} ;;
+	'${HOME}/'*) path="${HOME:-}/${path#\$\{HOME\}/}" ;;
+	esac
 	case $path in
 	/*) ;;
 	*) path="$base/$path" ;;
@@ -291,6 +319,97 @@ verb_is_read_only() {
 }
 
 # ---------------------------------------------------------------------------
+# verb_is_deploy_safe <verb> <args…> — mika#2449, D7
+#
+# LE PRÉDICAT DU MODE PRIMAIRE EST L'INVARIANT D'UN CHECKOUT DE DÉPLOIEMENT,
+# PAS « TOUTE MUTATION ». Refuser toute écriture git dans le checkout principal
+# casserait la boucle : mika-dev y synchronise main par `run_shell`
+# (`git fetch origin && git merge --ff-only origin/main`, mesuré 09-09, 09-16,
+# 09-17, 09-20), y enlève des worktrees et y supprime des branches locales.
+# Ces gestes PRÉSERVENT ce qu'un checkout de déploiement doit être :
+#     arbre = index = HEAD, HEAD sur l'histoire first-parent de origin/main.
+#
+# Admis (préservent l'invariant) : toute lecture (verb_is_read_only, composé
+# et non dupliqué) ; fetch, ls-remote, remote, push (remote seul) ;
+# pull/merge AVEC `--ff-only` cherché dans les arguments du verbe ;
+# worktree * ; branch sans -f/--force/-m/-M/--move/-c/-C/--copy (lister, -d/-D,
+# --show-current, -u : aucune ne déplace une ref sous HEAD) ; tag ; prune ; gc ;
+# `checkout -- <paths>` et `restore <paths>` sans --source/--staged (relisent
+# l'index : inertes si l'invariant tient).
+#
+# Refusés (peuvent le rompre) : checkout <ref> / <ref> -- <paths> / -b / -B /
+# --force / --detach ; switch ; restore --source / --staged ; stash (nu, push,
+# pop, apply, drop, clear — `list`/`show` sont des lectures) ; pull/merge sans
+# --ff-only ; rebase, cherry-pick, revert, am, apply ; branch -f/-m/-M/-c/-C
+# (`branch -f main <sha>` déplace la ref sous HEAD sans toucher l'arbre —
+# population mesurée 0, refusé PAR CONSTRUCTION) ; reset, clean, add, rm, mv,
+# commit, update-index ; et TOUT verbe inconnu de cette table — fail-closed
+# sur l'inconnu, parce que c'est une garde d'écriture et que la lecture est
+# déjà énumérée.
+#
+# Ce que ce tableau NE couvre PAS, nommé : un script du dépôt qui mute
+# (`make …`, `scripts/mika-platform-sync-main`) n'est pas parsé — la garde lit
+# une ligne de commande, pas ce qu'un script fait. Même limite que mika#2107 a
+# écrite pour elle-même. La population mesurée (2 972 commandes depuis le
+# 01/09) passe intégralement par `git` en clair.
+#
+# Résolution quand il tire sur un besoin légitime : ajouter la FORME du verbe
+# (jamais l'agent, jamais le chemin) avec une ligne disant en quoi elle
+# préserve l'invariant ; si elle ne le préserve pas, la réponse est un
+# worktree détaché, pas une entrée.
+# ---------------------------------------------------------------------------
+verb_is_deploy_safe() {
+	local verb=$1
+	shift
+	local -a args=("$@")
+	local tok
+
+	verb_is_read_only "$verb" "${args[@]+"${args[@]}"}" && return 0
+
+	case $verb in
+	fetch | ls-remote | remote | push | prune | gc | tag | worktree)
+		return 0
+		;;
+	pull | merge)
+		for tok in "${args[@]+"${args[@]}"}"; do
+			[ "$tok" = --ff-only ] && return 0
+		done
+		return 1
+		;;
+	branch)
+		for tok in "${args[@]+"${args[@]}"}"; do
+			case $tok in
+			-f | --force | -m | -M | --move | -c | -C | --copy) return 1 ;;
+			# Formes combinées (`-fd`, `-Mf`) : refusées dès qu'une lettre
+			# de déplacement/forçage apparaît dans un groupe court.
+			-[a-zA-Z]*[fmMcC]* | -[fmMcC][a-zA-Z]*) return 1 ;;
+			esac
+		done
+		return 0
+		;;
+	checkout)
+		# Seule la forme `checkout -- <paths>` relit l'index sans toucher
+		# HEAD. Le `--` doit être le PREMIER argument : `checkout <ref> --
+		# <paths>` est le geste du sinistre, et `checkout -q -- x` est une
+		# forme que personne n'a mesurée — on la refuse plutôt que de la
+		# deviner.
+		[ "${args[0]:-}" = -- ] && return 0
+		return 1
+		;;
+	restore)
+		for tok in "${args[@]+"${args[@]}"}"; do
+			case $tok in
+			-s | --source | --source=* | -S | --staged | -W | --worktree) return 1 ;;
+			esac
+		done
+		[ "${#args[@]}" -gt 0 ] && return 0
+		return 1
+		;;
+	esac
+	return 1
+}
+
+# ---------------------------------------------------------------------------
 # decide_command <project_dir> <cwd> <command>
 #
 # Fonction pure. Rend 0 (allow) ou 1 (deny, motif sur stdout).
@@ -308,20 +427,25 @@ verb_is_read_only() {
 # écriture git dans un arbre partagé », qui casserait la maintenance légitime
 # (/mika-platform-sync-main) dès le premier tick.
 # ---------------------------------------------------------------------------
+# Mode du prédicat : `worktree` (mika#2107, défaut) ou `primary` (mika#2449).
+# Une variable de fichier plutôt qu'un quatrième argument : les adaptateurs
+# d'E/S la posent, le parseur ne la voit qu'à ses deux points de décision.
+GUARD_MODE=worktree
+
 decide_command() {
 	local project_dir=$1 cwd=$2 command=$3
+	local mode_tag=''
+	[ "$GUARD_MODE" = primary ] && mode_tag='mode=primary '
 
-	# Dérogation — geste explicite, journalisé (AC5).
+	# Dérogation — geste explicite, journalisé (AC5). Le MÊME levier désarme
+	# les deux modes (mika#2449 D6) : une variable, un geste, une ligne.
 	if [ "${MIKA_GUARD_SHARED_CHECKOUT:-1}" = 0 ]; then
 		local scrubbed_bypass
 		scrubbed_bypass=$(scrub_secrets "$command")
-		guard_log "bypass MIKA_GUARD_SHARED_CHECKOUT=0 project=$project_dir cmd=${scrubbed_bypass:0:160}"
+		guard_log "${mode_tag}bypass MIKA_GUARD_SHARED_CHECKOUT=0 project=$project_dir cmd=${scrubbed_bypass:0:160}"
 		return 0
 	fi
 
-	# T1 — worktree lié. Dans un worktree lié, `.git` est un FICHIER portant
-	# `gitdir: …`. Un stat, aucun fork : c'est la sortie allow immédiate du cas
-	# nominal, et le budget de ce script est un appel Bash de chaque session.
 	[ -n "$project_dir" ] || return 0
 	# Un project-dir relatif se normaliserait en `/`, après quoi tout chemin est
 	# « dans » l'ancre et la garde est désactivée SANS RIEN DIRE. En production
@@ -331,7 +455,18 @@ decide_command() {
 	/*) ;;
 	*) return 0 ;;
 	esac
-	[ -f "$project_dir/.git" ] || return 0
+	if [ "$GUARD_MODE" = primary ]; then
+		# L'ancre du mode primaire est la RACINE DE LA PLATEFORME, pas un
+		# worktree : sans elle il n'y a rien à protéger (tenant sans
+		# plateforme), et c'est un allow silencieux — le fail-open est dit
+		# par l'appelant (run.sh), pas ici.
+		[ -d "$project_dir" ] || return 0
+	else
+		# T1 — worktree lié. Dans un worktree lié, `.git` est un FICHIER portant
+		# `gitdir: …`. Un stat, aucun fork : c'est la sortie allow immédiate du cas
+		# nominal, et le budget de ce script est un appel Bash de chaque session.
+		[ -f "$project_dir/.git" ] || return 0
+	fi
 
 	project_dir=$(normalize_path "$project_dir" /)
 	[ -n "$cwd" ] || cwd=$project_dir
@@ -538,6 +673,56 @@ decide_command() {
 			esac
 		fi
 
+		if [ "$GUARD_MODE" = primary ]; then
+			# ---- mika#2449 — mode primaire ---------------------------------
+			# P3 — l'allow-list de déploiement (D7). Vérifiée AVANT tout
+			# fork : `show`/`diff`/`log`/`fetch` sont ~97 % du trafic mesuré.
+			verb_is_deploy_safe "$verb" "${verb_args[@]+"${verb_args[@]}"}" && continue
+
+			# P1 — la cible existe. Un répertoire absent fait échouer la
+			# commande d'elle-même ; refuser n'ajouterait qu'un faux positif.
+			[ -d "$target" ] || continue
+
+			# RÉSOLUTION PHYSIQUE, et elle est porteuse : M0 traverse le
+			# symlink `~/workspace` → `/data/workspace`. Une comparaison
+			# lexicale contre un platform-dir résolu par `pwd -P` (run.sh,
+			# dispatch-lib.sh:7401, deploy-mika/handlers/run.sh) rendrait
+			# « hors plateforme » pour la forme exacte du sinistre.
+			local phys
+			phys=$(cd -- "$target" 2>/dev/null && pwd -P) || continue
+			[ -n "$phys" ] && target=$phys
+
+			# P2 — sous la plateforme ? Sinon hors population (un dépôt
+			# quelconque, /tmp, un clone de test).
+			path_is_within "$target" "$project_dir" || continue
+
+			# P4 — la cible est un checkout PRINCIPAL : `.git` est un
+			# RÉPERTOIRE. Un worktree lié (`.claude/worktrees/<slug>/<repo>`)
+			# porte un fichier `gitdir:` et sort ici — c'est la population
+			# de mika#2107, pas celle-ci. Au plus UN rev-parse.
+			local toplevel
+			toplevel=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || continue
+			[ -n "$toplevel" ] || continue
+			toplevel=$(normalize_path "$toplevel" /)
+			[ -d "$toplevel/.git" ] || continue
+			path_is_within "$toplevel" "$project_dir" || continue
+
+			# Les quatre termes tiennent. Le refus nomme la cible, le verbe,
+			# le remède (la recette de worktree détaché que qa-review § 2B
+			# prescrit déjà) ET la dérogation (D8, modèle mika#1475/mika#2107).
+			printf 'REFUS (%s, mika#2449): `git %s` vise le checkout principal %s\n' "$GUARD_NAME" "$verb" "$toplevel"
+			printf '       qui est un checkout de déploiement (arbre = index = HEAD sur origin/main).\n'
+			printf '  Commande:    %s\n' "${line# }"
+			printf '  Remède:      R=%s; W=$(mktemp -d); git -C "$R" worktree add --detach "$W" <ref> && (cd "$W" && …); git -C "$R" worktree remove --force "$W"\n' "$toplevel"
+			printf '               (pour lire un fichier d'"'"'une branche : git -C %s show <branch>:<path>)\n' "$toplevel"
+			printf '  Admis ici:   fetch, pull --ff-only, merge --ff-only, worktree *, branch (sans -f/-m/-c), push, toute lecture\n'
+			printf '  Dérogation:  MIKA_GUARD_SHARED_CHECKOUT=0 (geste opérateur, journalisé, dit à chaque appel)\n'
+			local scrubbed_primary
+			scrubbed_primary=$(scrub_secrets "$command")
+			guard_log "mode=primary deny platform=$project_dir target=$toplevel verb=$verb cmd=${scrubbed_primary:0:160}"
+			return 1
+		fi
+
 		# Sous le worktree de la session → le cas nominal, sans aucun fork.
 		path_is_within "$target" "$project_dir" && continue
 
@@ -680,6 +865,20 @@ run_hook_mode() {
 }
 
 main() {
+	if [ "${1:-}" = --decide-primary ]; then
+		shift
+		[ "$#" -eq 3 ] || {
+			printf 'usage: %s --decide-primary <platform-dir> <cwd> <command>\n' "${0##*/}" >&2
+			return 64
+		}
+		GUARD_MODE=primary
+		local reason_p
+		if reason_p=$(decide_command "$1" "$2" "$3"); then
+			return 0
+		fi
+		printf '%s\n' "$reason_p"
+		return 1
+	fi
 	if [ "${1:-}" = --decide ]; then
 		shift
 		[ "$#" -eq 3 ] || {
