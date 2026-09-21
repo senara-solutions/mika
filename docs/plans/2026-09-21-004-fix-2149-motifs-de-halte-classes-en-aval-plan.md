@@ -104,7 +104,11 @@ occurrence, au lieu de rejoindre silencieusement la prose.
   `GuardrailAbortReason.guardrail` dans `types.py` quand le dépôt claude-pilot
   est accessible, et exige que chaque valeur ait une famille ≠ `unknown`.
   S'il n'est pas accessible, le test le dit sur une ligne visible et ne
-  prétend pas avoir couvert.
+  prétend pas avoir couvert. **L'armement est lui-même sondé** : la garde
+  émet exactement un des deux marqueurs `DRIFT-GUARD: armed against <path>`
+  ou `DRIFT-GUARD: SKIP — types.py unreachable`, et une assertion compagne
+  exige qu'un seul des deux soit sorti — un vert nu sans marqueur est
+  impossible (F1, première passe architecte).
 - **R-6 (chemin de repli)** — la voie de secours qui gratte `[guardrail] <x>:`
   dans le stderr (quand le JSON n'a pas de subtype) alimente la même table :
   une halte n'est jamais classée `unknown` parce qu'elle est arrivée par le
@@ -222,12 +226,36 @@ les deux ont `claude-pilot/` à un ou trois niveaux au-dessus — le test essaie
 les deux, puis la variable). S'il le trouve : extrait le bloc
 `guardrail: Literal[ … ]` par `sed`, et pour chaque valeur entre guillemets,
 `assert_not_contains "drift: $v" "unknown" "$(_halt_family "$v" | cut -d'|' -f1)"` (helper existant, `test-dispatch-lib.sh:73`). S'il ne le
-trouve pas : `echo "SKIP: drift guard — claude-pilot types.py not reachable
-(set CLAUDE_PILOT_TYPES)"` et **aucune assertion**, pour que le vert ne mente
-pas.
+trouve pas : `echo "DRIFT-GUARD: SKIP — types.py unreachable (set
+CLAUDE_PILOT_TYPES)"` et **aucune assertion de contenu**, pour que le vert ne
+mente pas.
+
+**L'armement est sondé, pas supposé (F1).** Un `SKIP` noyé dans plusieurs
+milliers de lignes de sortie est indiscernable d'un vert pour l'œil qui lit
+la dernière ligne. La garde émet donc **exactement un** marqueur, sur stdout,
+en tête de bloc :
+
+```
+DRIFT-GUARD: armed against /data/workspace/mika-platform/claude-pilot/src/claude_pilot/types.py (8 values)
+```
+ou
+```
+DRIFT-GUARD: SKIP — types.py unreachable (set CLAUDE_PILOT_TYPES)
+```
+
+et le bloc se termine par une assertion compagne sur sa propre sortie
+capturée : `assert_eq "T6-arm: exactly one DRIFT-GUARD marker" 1 "$(grep -c
+'^DRIFT-GUARD: ' <<<"$T6_OUT")"`. Le compteur `SKIPPED` du résumé final
+(`PASS/FAIL/SKIPPED`) est incrémenté sur la voie `SKIP`, et la ligne de
+résumé l'imprime — ce compteur **n'existe pas aujourd'hui** (`grep -c SKIPPED
+test-dispatch-lib.sh` → 0, seuls `PASS`/`FAIL` existent, `:47-85`) ; la
+Phase 3 l'ajoute à côté des deux autres et l'imprime au résumé final. Ainsi, sur le
+poste de dispatch, un `make test` dont `types.py` aurait disparu (checkout
+déplacé, dépôt absent, variable mal posée) rend un résumé qui dit `SKIPPED: 1`
+et un marqueur `SKIP` grep-able — jamais un vert nu.
 
 Le test tourne sur le poste de dispatch (où claude-pilot est toujours présent —
-c'est lui qu'il dispatche). En CI, il saute et le dit.
+c'est lui qu'il dispatche). En CI, il saute et le dit — par le même marqueur.
 
 ---
 
@@ -245,8 +273,12 @@ ligne (T2).
 ### D-2 — Garde de dérive (C-5, Phase 3)
 
 **Tire quand** : `types.py` porte une valeur que la table ne connaît pas.
-**Fait** : rouge dans `test-dispatch-lib.sh`, en nommant la valeur. **Ne tire
-pas** en CI sans claude-pilot : ligne `SKIP:` visible.
+**Fait** : rouge dans `test-dispatch-lib.sh`, en nommant la valeur.
+**Quand elle ne s'arme pas** (types.py injoignable, CI ou poste dérangé) :
+marqueur `DRIFT-GUARD: SKIP` en tête de bloc, `SKIPPED` incrémenté au résumé,
+aucune assertion de contenu. **Contrôle négatif d'armement** (F1) : le bloc
+asserte qu'exactement un marqueur `DRIFT-GUARD:` est sorti — un vert sans
+marqueur est un rouge.
 
 ### D-3 — `(HTTP n)` sur la ligne `Halt:` (C-3, Phase 1)
 
@@ -281,7 +313,8 @@ ci-dessus **écrivent** ; aucune ne **branche**.
 6. Étendre `_classify_probe` d'un sixième argument `api_error_status`
    (`test-dispatch-lib.sh:3920`), exporté comme `API_ERROR_STATUS`.
 7. Réécrire le commentaire `:4108-4116` (renvoi, plus d'énumération).
-8. Ajouter les sondes T1..T6 dans le bloc mika#1772 existant.
+8. Ajouter le compteur `SKIPPED` (à côté de `PASS`/`FAIL`, imprimé au
+   résumé) puis les sondes T1..T6 et T6-arm dans le bloc mika#1772 existant.
 
 ### Phase 4 — Documentation
 
@@ -314,9 +347,17 @@ avant tout push (les sondes sont le vert). Une seule PR.
 - **T5** — mode `banner` porte les deux lignes (`awaiting_tool` →
   `tool_never_returned`).
 - **T6** — garde de dérive (C-5) : rouge si une valeur du `Literal` est
-  `unknown` ; `SKIP:` visible sinon. **Rouge-avant** : exécuter T6 avec la
-  table amputée de `prompt_cache_dead` et voir le rouge nommer
-  `prompt_cache_dead` avant de restaurer.
+  `unknown` ; marqueur `DRIFT-GUARD: SKIP` + `SKIPPED` sinon. **Rouge-avant** :
+  exécuter T6 avec la table amputée de `prompt_cache_dead` et voir le rouge
+  nommer `prompt_cache_dead` avant de restaurer.
+- **T6-arm** (F1) — armement : `grep -c '^DRIFT-GUARD: '` sur la sortie
+  capturée du bloc vaut exactement 1. **Deux contrôles dans le même appel** :
+  (a) `CLAUDE_PILOT_TYPES=/nonexistent bash test-dispatch-lib.sh` → le
+  marqueur est `SKIP`, le résumé porte `SKIPPED: 1`, aucune assertion de
+  contenu T6 n'a tourné ; (b) chemin réel → le marqueur est `armed against
+  <path> (8 values)` et T6 a produit 8 assertions. Le rouge-avant de T6-arm :
+  supprimer temporairement l'`echo` du marqueur et voir l'assertion compagne
+  rougir.
 - **Rouge-avant global** : T1 et T2 doivent être rouges sur `main@2b5456cc`
   (pas de ligne `Halt class:`) et verts après Phase 1 — terme par terme.
 
@@ -327,6 +368,12 @@ avant tout push (les sondes sont le vert). Une seule PR.
   et `Retry hint:`. Sans les deux lignes → le binaire/skill déployé n'est pas
   celui de la PR (`feedback_mika_skills_update_noop_verify_prompt_by_diff`) :
   `diff` le fichier résolu en prod vs le dépôt avant de conclure.
+- **Armement de la garde sur le poste de dispatch (F1)** : après merge et
+  `make deploy`, `make -C mika test 2>&1 | grep -E '^DRIFT-GUARD: |SKIPPED'`
+  doit rendre `DRIFT-GUARD: armed against …/claude-pilot/src/claude_pilot/types.py (8 values)`
+  et `SKIPPED: 0`. Un `SKIP` ici est une halte : la garde n'est pas armée sur
+  la machine qu'elle protège — poser `CLAUDE_PILOT_TYPES` ou rétablir le
+  checkout avant de dire « couvert ».
 - **Condition de réveil du suivant (politique de retry)** : **n≥3 haltes
   d'une même famille** dont on peut dire, journal en main, si la relance
   aveugle a servi ou reproduit. À ce moment le ticket de gate se dépose avec
@@ -343,7 +390,8 @@ avant tout push (les sondes sont le vert). Une seule PR.
 - [ ] `Halt class:` / `Retry hint:` dans les deux modes, y compris via repli.
 - [ ] `halt_family.unknown` sur stderr pour tout subtype hors table.
 - [ ] Commentaires `:3013-3021` et test `:4108-4116` sans énumération périmable.
-- [ ] T1..T6 verts ; rouge-avant constaté sur T1, T2, T6.
+- [ ] T1..T6 verts ; rouge-avant constaté sur T1, T2, T6, T6-arm.
+- [ ] `DRIFT-GUARD:` : exactement un marqueur par run ; `SKIPPED` au résumé.
 - [ ] Aucune ligne modifiée dans `self-dev-callback/system_prompt.md` ni dans
   `claude-pilot/` (diff de PR à vérifier).
 - [ ] Entrée `docs/solutions/best-practices/` commise.
@@ -355,9 +403,16 @@ avant tout push (les sondes sont le vert). Une seule PR.
 - **AC3 (point 2, dérive)** — Un subtype absent de la table produit `Halt class: unknown`, `Retry hint: investigate` et la ligne stderr `dispatch-lib: halt_family.unknown subtype=<x>` ; un subtype connu ne produit pas cette ligne (T2, contrôle négatif).
 - **AC4 (point 3)** — `api_error_status` est lu depuis le JSON et rendu `(HTTP <n>)` sur la ligne `Halt:` quand présent, absent sinon (T3, deux contrôles). Zéro modification dans `claude-pilot/`.
 - **AC5 (repli)** — Une halte connue seulement par la ligne `[guardrail]` du stderr (ANSI compris) reçoit la même classe que si le JSON l'avait portée (T4).
-- **AC6 (garde)** — `test-dispatch-lib.sh` lit le `Literal` de `types.py` quand il est accessible et échoue en nommant toute valeur non classée ; sinon imprime `SKIP:` et n'affirme rien (T6, rouge-avant constaté).
+- **AC6 (garde)** — `test-dispatch-lib.sh` lit le `Literal` de `types.py` quand il est accessible et échoue en nommant toute valeur non classée ; sinon imprime `DRIFT-GUARD: SKIP`, incrémente `SKIPPED` au résumé et n'affirme rien sur le contenu (T6, rouge-avant constaté).
+- **AC6-arm (garde armée, F1)** — Chaque run émet exactement un marqueur `DRIFT-GUARD:` (`armed against <path> (<n> values)` ou `SKIP — …`) et une assertion compagne l'exige ; `CLAUDE_PILOT_TYPES=/nonexistent` rend `SKIP` + `SKIPPED: 1`, le chemin réel rend `armed` + 8 assertions (T6-arm, deux contrôles).
 - **AC7 (périmètre)** — Le diff de la PR ne touche ni `self-dev-callback/system_prompt.md` ni aucun fichier hors `skills/bundled/_shared/{dispatch-lib,test-dispatch-lib}.sh` et `docs/`.
 
 ## Revision history
 
 - 2026-09-21 — v1 (/ce:plan, orchestrateur). Prémisses re-mesurées P1–P4.
+- 2026-09-21 — v2 : première passe mika-arch (session
+  `1e8d4d67-d9ca-48af-9524-16a5fe0ba34f`, ITERATE, F1 bloquant). La garde de
+  dérive sonde son propre armement : marqueur `DRIFT-GUARD:` unique par run,
+  compteur `SKIPPED` au résumé, assertion compagne T6-arm à deux contrôles,
+  sonde post-déploiement sur le poste de dispatch (R-5, C-5, D-2, T6-arm,
+  AC6-arm). Q1/Q2/Q5 validées sans changement.
