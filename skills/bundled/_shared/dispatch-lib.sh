@@ -1543,6 +1543,68 @@ _scrub_env() {
     unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 }
 
+# ---------------------------------------------------------------------------
+# mika#1943 — un chemin qu'on ne peut pas PROUVER worktree n'est pas supprimé
+# ---------------------------------------------------------------------------
+#
+# L'incident du 28/07 : un nettoyage automatisé a emporté `/data/workspace/bbytaa`,
+# un répertoire qui n'était protégé par aucune liste — il était protégé par les
+# instantanés btrbk qui l'encadraient. Le ticket prescrivait une **denylist**
+# (`^/data/workspace/[^/]+/?$` refusé). Ce qui est livré ici est l'inverse, et
+# strictement plus fort : une **allowlist positive**, alignée terme pour terme sur
+# `worktree_reaper::is_managed_worktree_path` (mika#2420, `crates/mika-agent/src/`).
+#
+# Trois raisons, dont la troisième décide :
+#
+#   1. Une denylist est fausse le jour où un répertoire précieux n'y figure pas —
+#      c'est-à-dire le jour où elle servirait. `/data/workspace/bbytaa` n'aurait
+#      été dans aucune liste écrite avant lui.
+#   2. Deux sémantiques opposées pour une même question dans un même dépôt est la
+#      divergence programmée que `grooming_marker` (mika#2158) a dû fermer une
+#      fois : deux prédicats répondant différemment à « ce chemin est-il
+#      supprimable ». Le reaper décide par allowlist ; cette garde aussi.
+#   3. `/data/workspace/` est le disque de cette machine, pas une propriété du
+#      système. Coder ce préfixe en dur ne protégerait que gentux et serait muet
+#      partout ailleurs — un garde-fou qui *paraît* poser une règle générale.
+#      `/.claude/worktrees/` est, lui, une propriété structurelle du layout.
+#
+# L'asymétrie qui décide du fail-safe, écrite avant le reste : un faux négatif
+# laisse un worktree résiduel sur le disque — le reaper mika#2420 le ramasse au
+# tick suivant, ou l'opérateur ; coût borné, quelques Go, temporaire. Un faux
+# positif supprime un répertoire qui n'est pas un worktree : irréversible, et
+# c'est l'incident du 28/07. **Donc tout terme illisible conserve**, exactement
+# comme le reaper, délibérément, pour que les deux gardes ne puissent pas se
+# contredire.
+#
+# Une fonction, et pas une garde recopiée à chaque site : il y a cinq sites
+# destructifs dans ce fichier, donc cinq occasions de diverger.
+#
+# Les marqueurs `# mika1943:T<n>` en fin de ligne ne sont pas décoratifs : la
+# suite de tests neutralise **un** terme à la fois par `sed` et vérifie que le
+# refus correspondant disparaît. Renommer un marqueur ou fusionner deux termes
+# fait rougir `MUTATION_ABSENTE` plutôt que de désarmer la vérification en
+# silence. Une conjonction ne se teste pas en désarmant tous ses termes ensemble
+# (leçon mika#2277).
+_MIKA_MANAGED_WORKTREE_SEGMENT='/.claude/worktrees/'
+
+# Émetteur du refus. Séparé de la décision : celle-ci a un lecteur unique, mais
+# dire le refus n'est pas décider. Sans cette ligne, un refus se lirait
+# exactement comme une absence de travail (classe mika#2205).
+_refuse_unsafe_removal() {
+    echo "dispatch_lib_unsafe_removal_refused: site=$1 term=$3 path='$2' (mika#1943)" >&2
+}
+
+# Args: $1 = chemin candidat, $2 = nom du site appelant (pour le diagnostic).
+# Rend 0 si le chemin est un worktree géré supprimable, non-zéro sinon.
+_assert_removable_worktree_path() {
+    local path="${1-}" site="${2:-unknown}"
+    case "$path" in "") _refuse_unsafe_removal "$site" "$path" empty; return 1 ;; esac                                            # mika1943:T1
+    case "$path" in /*) : ;; *) _refuse_unsafe_removal "$site" "$path" not_absolute; return 1 ;; esac                             # mika1943:T2
+    case "$path" in */../*|*/..) _refuse_unsafe_removal "$site" "$path" parent_dir_component; return 1 ;; esac                    # mika1943:T3
+    case "$path" in *"$_MIKA_MANAGED_WORKTREE_SEGMENT"*) : ;; *) _refuse_unsafe_removal "$site" "$path" outside_managed_root; return 1 ;; esac  # mika1943:T4
+    return 0
+}
+
 # mika#1414: Pre-rebase worktree cleanup for the resume path.
 #
 # On a resume dispatch _set_up_worktree() reuses an existing worktree, then
@@ -1607,7 +1669,13 @@ _clean_worktree_for_rebase() {
     # duplicated patterns. They can drift; when you add a path here, add it to
     # the classifier too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
-    rm -rf "$wt/.iterate" 2>/dev/null || true
+    # mika#1943: `$wt` a déjà prouvé qu'il est un dépôt git (garde en tête de
+    # fonction), jamais qu'il est un worktree GÉRÉ — et c'est la seconde moitié
+    # qui manquait. Sur refus on saute ce reset chirurgical : le tier 3
+    # ci-dessous (stash + reset) ramasse le résidu, donc le coût est borné.
+    if _assert_removable_worktree_path "$wt" clean_worktree_for_rebase; then
+        rm -rf "$wt/.iterate" 2>/dev/null || true
+    fi
     git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
     git -C "$wt" checkout HEAD -- .claude/commands/ 2>/dev/null || true
 
@@ -2230,7 +2298,26 @@ _set_up_worktree() {
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
 
         # Worktree path is centralized in mika-platform/scripts/derive-worktree-path
-        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
+        #
+        # mika#1943 — la racine. Le code de sortie n'était pas vérifié, et ce
+        # fichier n'a ni `set -e` ni `set -u` : un script absent (il vit dans
+        # mika-platform, un AUTRE dépôt, donc son absence n'est pas une
+        # hypothèse d'école) ou en échec rendait une chaîne vide qui se
+        # propageait en silence jusqu'à la comparaison d'égalité ci-dessous —
+        # laquelle ÉLIT une cible de suppression — puis jusqu'aux deux
+        # `worktree remove --force`.
+        #
+        # Le `|| WORKTREE_DIR=""` efface délibérément toute sortie produite par
+        # un appel qui a échoué : un script qui sort non-zéro en ayant tout de
+        # même imprimé quelque chose n'a rien prouvé, et c'est le sens sûr.
+        # Abandonner le dispatch est le bon arbitrage — il n'y a rien à faire
+        # sans worktree, et `return 1` est déjà la sortie d'échec de cette
+        # fonction (cf. `worktree_setup_failed` plus bas).
+        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO") || WORKTREE_DIR=""
+        if [ -z "$WORKTREE_DIR" ]; then
+            echo "[dispatch-lib] worktree_path_derivation_failed: branch=$BRANCH repo=$REPO script=$PLATFORM_DIR/scripts/derive-worktree-path — aborting rather than propagating an empty path to a removal site (mika#1943)" >&2
+            return 1
+        fi
 
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
@@ -2242,7 +2329,13 @@ _set_up_worktree() {
         local existing_wt
         existing_wt=$(git -C "$SUB_REPO_DIR" worktree list --porcelain 2>/dev/null \
             | awk -v b="refs/heads/$BRANCH" '/^worktree / {wt = substr($0, 10)} $0 == "branch " b {print wt; exit}')
-        if [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
+        # mika#1943: `$WORKTREE_DIR` en tête, et non vide. C'est la comparaison
+        # qui ÉLIT la cible du `worktree remove --force` ci-dessous : avec un
+        # côté vide, TOUT worktree existant devient « non canonique ». La racine
+        # ci-dessus rend le cas inatteignable ; on pose quand même le terme,
+        # parce qu'une garde qui dépend d'un seul point de contrôle en amont
+        # n'est pas une garde.
+        if [ -n "$WORKTREE_DIR" ] && [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
             echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
             if [ -d "$existing_wt" ]; then
                 local dirty_state
@@ -2259,14 +2352,28 @@ _set_up_worktree() {
                     fi
                 fi
             fi
-            git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            # mika#1943: le relic vient du registre git, donc `git worktree
+            # remove` le refuserait s'il n'en était pas un — mais c'est git qui
+            # protège, pas dispatch-lib, et un registre porte ce qu'on y a mis.
+            # Sur refus on ne supprime pas : le `worktree add` plus bas échouera
+            # alors bruyamment (`worktree_setup_failed`), ce qui est le bon sens
+            # de l'asymétrie — un worktree résiduel contre une suppression
+            # irréversible.
+            if _assert_removable_worktree_path "$existing_wt" set_up_worktree_relic; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            fi
         fi
 
         # Reuse existing worktree if valid
         if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            # mika#1943: nettoyage d'une entrée de registre périmée avant le
+            # `worktree add`. Sur refus on saute la suppression et on laisse le
+            # `add` décider : s'il échoue, il le dit (`worktree_setup_failed`).
+            if _assert_removable_worktree_path "$WORKTREE_DIR" set_up_worktree_stale; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
             # mika#1311: when origin/$BRANCH already exists from a prior
             # successful dispatch, base the worktree on it (preserves prior
             # history) rather than creating a fresh local branch from
@@ -2504,9 +2611,17 @@ _handle_dry_run() {
                 --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
                 --arg entry_command "$ENTRY_COMMAND" \
                 '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt, entry_command:$entry_command}'
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
-            rmdir "$PARENT_DIR" 2>/dev/null || true
+            # mika#1943: cinquième site destructif, absent de la table du plan et
+            # trouvé à la lecture. L'invariant du Product Contract porte sur
+            # *tout* site de suppression, pas sur la liste énumérée.
+            if _assert_removable_worktree_path "$WORKTREE_DIR" handle_dry_run; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
+            # `rmdir` n'est pas gardé, et c'est mesuré plutôt que négligé : il ne
+            # retire qu'un répertoire VIDE, donc il ne peut emporter aucun
+            # contenu — la classe de l'incident du 28/07 lui est inatteignable.
+            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo) || PARENT_DIR=""
+            [ -n "$PARENT_DIR" ] && rmdir "$PARENT_DIR" 2>/dev/null || true
         else
             jq -n --arg prompt "$PROMPT" \
                 '{dry_run:true, repo:null, issue:null, branch:null, worktree_dir:null, prompt:$prompt}'
@@ -5270,6 +5385,10 @@ _cleanup_iterate_findings() {
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
     local findings_dir="$WORKTREE_DIR/.iterate"
     [ -d "$findings_dir" ] || return 0
+    # mika#1943: le `[ -d ]` ci-dessus prouve que le chemin existe, jamais qu'il
+    # est à nous. Sur refus on conserve — les findings sont de toute façon un
+    # artefact forensique dont la préservation est le défaut sur ESCALATE.
+    _assert_removable_worktree_path "$findings_dir" cleanup_iterate_findings || return 0
     rm -rf "$findings_dir" 2>/dev/null || true
     echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
 }

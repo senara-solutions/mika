@@ -10,7 +10,7 @@ export function OpenSource() {
           className="relative overflow-hidden rounded-3xl border border-white/[0.05] p-14 text-center sm:p-20"
           style={{
             background:
-              "linear-gradient(135deg, rgba(124,106,247,0.08) 0%, rgba(124,106,247,0.02) 50%, rgba(124,106,247,0.06) 100%)",
+              "linear-gradient(135deg, color-mix(in srgb, var(--color-accent) 8%, transparent) 0%, color-mix(in srgb, var(--color-accent) 2%, transparent) 50%, color-mix(in srgb, var(--color-accent) 6%, transparent) 100%)",
           }}
         >
           {/* Glow accents */}
