@@ -370,7 +370,13 @@ assert_eq "trace file contains no credential-shaped value" "1" "$rc"
 # `NAME=value`, so a `+ GH_TOKEN=...` line would be scrubbed on the way to the
 # callback — but `++ printf %s <value>` from an untraced-suppressed process
 # substitution would not be, and that is what reaches the caller.
-rc=1; grep -qE '\+\+ printf' "$TRACE" && rc=0
+#
+# mika#2049 — with Phase 2b now the default, the traced call also re-quotes the
+# PAYLOAD argv (`quoted_argv=$(printf ' %q' "$@")`), which traces as
+# `++ printf ' %q' /bin/true`. That line carries the payload, never a secret
+# (the argv channel is audited above), so it alone is excluded — exactly, so
+# any other expanded printf still fails the assertion.
+rc=1; grep -E '\+\+ printf' "$TRACE" | grep -vqxF "++ printf ' %q' /bin/true" && rc=0
 assert_eq "trace carries no expanded process-substitution printf" "1" "$rc"
 
 rc=1; grep -q 'sentinel-after-sandbox-call' "$TRACE" && rc=0

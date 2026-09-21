@@ -333,6 +333,7 @@ async fn emit_ready_label_outcome(
 /// degraded path. Returns `VerdictAction::Passthrough` when the event is not a
 /// ready-label marker, when parsing fails, or when a required precondition
 /// (github token, issue body fetch, task pre-create) cannot be satisfied.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ready_label_dispatch(
     text: &str,
     db: &AsyncDatabase,
