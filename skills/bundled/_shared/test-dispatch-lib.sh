@@ -4504,12 +4504,20 @@ time.sleep(30)
     i=0
     while [ $i -lt 20 ] && [ ! -f "$marker" ]; do sleep 0.05; i=$((i + 1)); done
     [ -f "$marker" ] && launched=yes
-    # Order matters: the missing-binary line ends in "(falling back to fs-only)",
-    # so matching fs-only first would swallow it and make the two fallbacks
-    # indistinguishable -- the exact confusion the last assertion guards against.
+    # mika#2049 re-tokenised these two lines. Pre-2049 BOTH ended in "(falling
+    # back to fs-only)" and only one carried a stable token, so this `case` had
+    # to be ordered defensively to keep them apart -- and an operator using
+    # `pilot_egress_guard.unreachable` as THE predicate read a nominal regime on
+    # a fleet whose proxy binary was never deployed (the gap mika#2050 had to
+    # document). Each cause now carries its own token, so the two arms are
+    # disjoint by construction rather than by ordering.
+    #
+    # The strings no longer say "falling back" because nothing falls back any
+    # more: the caller refuses. Leaving them would have made Signal S (mika#2050)
+    # count a population that can no longer exist.
     case "$out" in
-        *"Phase 2b network cut disabled"*) msg=phase2b ;;
-        *"falling back to fs-only"*) msg=fs-only ;;
+        *"pilot_egress_guard.binary_missing"*) msg=binary-missing ;;
+        *"pilot_egress_guard.unreachable"*) msg=unreachable ;;
         *"pilot-egress-proxy launched"*) msg=launched-ok ;;
         *) msg=none ;;
     esac
@@ -4519,8 +4527,8 @@ time.sleep(30)
 
 # THE regression. Pre-fix this is "rc=0 launched=yes msg=launched-ok": the
 # orphan file satisfies [ -S ], the guard affirms a launch that never happened.
-assert_eq "orphan socket + proxy that dies before binding => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "orphan socket + proxy that dies before binding => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies)"
 
 # The liveness probe must still recognise a real listener after the probe was
@@ -4530,20 +4538,22 @@ assert_eq "live listener => already-alive, proxy not relaunched" \
     "$(_egress_guard_probe live dies)"
 
 # No file at the path: this already worked pre-fix. Locks it against regression.
-assert_eq "no socket at path + proxy that dies => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "no socket at path + proxy that dies => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe absent dies)"
 
-# The two fallbacks must stay distinguishable: a missing binary is a deploy
-# state, an unreachable socket is a runtime failure. Same rc, different line.
-assert_eq "missing proxy binary => Phase 2b disabled, not fs-only" \
-    "rc=1 launched=no msg=phase2b" \
+# The two causes must stay distinguishable: a missing binary is a deploy state
+# (remedy: `make install`), an unreachable socket is a runtime failure (remedy:
+# restart the relay). Same rc, different token, different gesture -- which is
+# why mika#2049 gave each one a token of its own.
+assert_eq "missing proxy binary => binary_missing, not unreachable" \
+    "rc=1 launched=no msg=binary-missing" \
     "$(_egress_guard_probe ghost missing)"
 
 # The probe passes the path as argv, never interpolated into python source
 # (plan KTD2). A quote in the path used to be a syntax error waiting to happen.
 assert_eq "socket path containing a single quote does not break the probe" \
-    "rc=1 launched=yes msg=fs-only" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies "mika'\''egress.sock")"
 
 # R8: no fake-proxy output may reach the operational proxy log.
@@ -5106,13 +5116,19 @@ CP_BUILT_FLAGS=$(printf '%s\n%s\n' "$CP_LITERAL_FLAGS" "$CP_VAR_FLAGS" | grep -v
 # surviving one carries seven flags on its own, so the total never drops
 # (measured). Pinning the site count means a renamed, reordered, or added
 # launch point turns red instead of evaporating.
+#
+# Count moved 3 → 4 on 2026-09-21 (mika#2306): the Fire-Disposition retry in
+# `_fd_retry_if_section_still_missing` is a fourth launch point, deliberately a
+# direct invocation rather than a recursion into `_launch_revise_pilot` — the
+# recursion would make the retry's own findings-file the predicate's input and
+# render its first term true by construction.
 CP_SITE_COUNT=$(printf '%s\n' "$CP_INVOCATIONS" | grep -c . || true)
-if [ "$CP_SITE_COUNT" -eq 3 ]; then
+if [ "$CP_SITE_COUNT" -eq 4 ]; then
     PASS=$((PASS + 1))
-    echo "  ✓ all 3 claude-pilot launch sites are in the guard's sight"
+    echo "  ✓ all 4 claude-pilot launch sites are in the guard's sight"
 else
     FAIL=$((FAIL + 1))
-    echo "  ✗ expected 3 claude-pilot launch sites, saw $CP_SITE_COUNT"
+    echo "  ✗ expected 4 claude-pilot launch sites, saw $CP_SITE_COUNT"
     echo "    A site the guard cannot see is a site it cannot police. If a launch"
     echo "    point was legitimately added or removed, update this count."
 fi
@@ -5852,7 +5868,11 @@ assert_eq "mika#2165: chaque lecture de \$_PILOT_LOG_DIR appelle le résolveur s
 # relit — l'invariant à trois têtes casse sans qu'aucun test structurel ne bouge.
 assert_eq "mika#2165: aucun --log-dir nu ne subsiste" "0" \
     "$(grep -cE -- '--log-dir([[:space:]]+--|[[:space:]]*$)' "$DISPATCH_LIB" || true)"
-assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "2" \
+#
+# Compte passé de 2 à 3 le 2026-09-21 (mika#2306) : la relance Fire-Disposition
+# est un troisième lancement, et elle reproduit la forme co-localisée ci-dessus
+# plutôt que de lire une valeur héritée du lancement nominal.
+assert_eq "mika#2165: chaque --log-dir est valué par le résolveur" "3" \
     "$(grep -cF -- '--log-dir "$_PILOT_LOG_DIR"' "$DISPATCH_LIB" || true)"
 
 # L'assertion de comportement : la surcharge posée APRÈS le source est honorée.
@@ -6537,6 +6557,368 @@ assert_eq "mika#1943 U2: exactement trois 'worktree remove --force' recensés" \
 _MIKA1943_RMRF_WT=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -cE 'rm -rf "\$(wt|WORKTREE_DIR|findings_dir)' || true)
 assert_eq "mika#1943 U2: exactement deux 'rm -rf' sur un chemin de worktree" \
     "2" "$_MIKA1943_RMRF_WT"
+
+# ============================================================================
+# mika#2306 — la section `## Fire-Disposition` a un site de production (T1–T11)
+# ============================================================================
+#
+# Ce que ces onze détecteurs mesurent. Avant mika#2306, aucun canal que CE dépôt
+# contrôle ne prescrivait `## Fire-Disposition` : `/ce:plan` est un plugin tiers
+# qui ignore mika#1574, les trois commandes de groom vivent dans mika-platform,
+# et `grep -n "Fire-Disposition" .claude/commands/*.md` rendait zéro. Un plan
+# neuf livrant un détecteur arrivait donc devant mika-arch sans la section, et
+# l'unique itération de la boucle était dépensée sur un motif formel — puis le
+# gate de seconde passe, sans recours, rendait ESCALATE.
+#
+# Les deux moitiés sont livrées ensemble à dessein : la prescription (T1–T4)
+# ne tiendrait pas seule, et le rattrapage (T5–T11) ne tiendrait pas seul non
+# plus. Les quatre contrôles négatifs (T3, T6, T7, T11) sont porteurs, pas
+# décoratifs : sans eux, une garde qui relance TOUJOURS passerait T5 en vert
+# tout en doublant le coût de chaque grooming du dépôt.
+
+echo ""
+echo 'Test: mika#2306 — site de production de `## Fire-Disposition` (T1–T11)'
+echo "-----------------------------------------------------------------------"
+
+# --- Outillage local de section ---------------------------------------------
+
+# Réplique le site d'injection de `_set_up_worktree` : contexte de ticket, puis
+# règle de corps de PR (inconditionnelle), puis règle Fire-Disposition
+# (conditionnée au skill). T2/T3 assertent sur CETTE chaîne ; T4 asserte que
+# l'expression source est littéralement celle répliquée ici, donc le miroir ne
+# peut pas dériver en silence (patron mika#2178 T3).
+_t2306_inject() {
+    local skill="$1" repo="${2:-mika}" issue_num="${3:-2306}"
+    local prompt="${repo}#${issue_num}"
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
+    if [ "$skill" = "dev-groom" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
+    fi
+    printf '%s' "$prompt"
+}
+
+# Sonde comportementale de `_launch_revise_pilot`.
+#
+# Elle exerce la VRAIE fonction : seul `_run_pilot_sandboxed` est neutralisé
+# (par redéfinition locale au sous-shell, jamais par une chaîne écrite à la
+# main), ce qui est la seule façon de prouver que le compte de relances vient de
+# la garde et de rien d'autre. Chaque invocation du pilote simulé incrémente un
+# compteur sur disque et applique la mutation demandée au plan — modifier le
+# plan est indispensable, sans quoi `pre_hash == post_hash` et le flot tombe
+# dans la branche d'échec avant d'atteindre la garde.
+#
+# $1 = contenu de .iterate/findings-1.md
+# $2 = le plan initial porte-t-il déjà la section ? (yes|no)
+# $3 = comportement du pilote simulé :
+#      never  — ne l'ajoute jamais
+#      second — l'ajoute à la deuxième invocation
+#      wipe   — supprime le findings-file de première passe (fail-safe en vol)
+# $4 = (optionnel) "residual-fd" dépose un findings-1-fd.md résiduel
+# Rend : "<rc>|<nombre d'invocations du pilote>|<stderr>"
+_t2306_revise_probe() {
+    local t2306_findings="$1" t2306_has_section="$2" t2306_behaviour="$3" t2306_extra="${4:-}"
+    local t2306_root t2306_wt t2306_plan t2306_counter t2306_err t2306_rc
+    t2306_root=$(mktemp -d)
+    t2306_wt="$t2306_root/.claude/worktrees/fix-2306-probe/mika"
+    mkdir -p "$t2306_wt/docs/plans" "$t2306_wt/.iterate"
+    t2306_plan="$t2306_wt/docs/plans/2026-09-21-001-fix-2306-sonde-plan.md"
+
+    # > 500 octets : `_find_issue_plan` filtre les plans plus courts (mika#1033).
+    # Le remplissage est volontairement large — un plan qui tombe SOUS le seuil
+    # fait rendre « no plan file to revise », c'est-à-dire un vert qui n'a rien
+    # exercé de la garde. C'est le premier défaut que cette sonde a eu.
+    {
+        printf '# mika#2306 — plan de sonde\n\n**Ticket :** mika issue#2306\n\n## Problème\n\n'
+        printf 'Corps de remplissage pour franchir le filtre des 500 octets applique par\n'
+        printf '_find_issue_plan a tous ses tiers de decouverte. Ce texte ne porte aucune\n'
+        printf 'signification pour la sonde : seules comptent sa longueur, et la presence\n'
+        printf "ou l'absence de la section testee.\n\n"
+        printf 'Le seuil existe pour ecarter les fichiers-fantomes et les ebauches vides ;\n'
+        printf "il s'applique identiquement aux trois tiers de decouverte, donc un plan\n"
+        printf 'trop court est invisible quelle que soit la façon dont il est nomme. Une\n'
+        printf 'sonde qui passe sous ce seuil ne mesure rien et le dit mal : elle rend\n'
+        printf 'exactement le meme « plan introuvable » que la garde de fonction.\n\n'
+        printf '## Implementation Units\n\nU1 — un livrable detecteur quelconque.\n\n'
+        if [ "$t2306_has_section" = "yes" ]; then
+            printf '## Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n'
+        fi
+        printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
+    } > "$t2306_plan"
+
+    printf '%s\n' "$t2306_findings" > "$t2306_wt/.iterate/findings-1.md"
+    if [ "$t2306_extra" = "residual-fd" ]; then
+        printf 'Fire-Disposition — residu laisse par un dispatch anterieur.\n' \
+            > "$t2306_wt/.iterate/findings-1-fd.md"
+    fi
+
+    t2306_counter="$t2306_root/pilot-invocations"
+    printf '0\n' > "$t2306_counter"
+
+    # UNE seule exécution : le rc transite par un fichier plutôt que par une
+    # seconde passe. Rejouer la fonction avec un pilote inerte donnerait
+    # `pre_hash == post_hash`, donc un rc de 1 sans rapport avec ce qui est
+    # mesuré — un faux vert sur la moitié fail-safe.
+    t2306_err=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        # Neutralisation RÉELLE : seul le lancement du pilote est shadowé, tout
+        # le reste de `_launch_revise_pilot` s'exécute tel quel. C'est la seule
+        # façon de prouver que le compte de relances vient de la garde.
+        _run_pilot_sandboxed() {
+            local n; n=$(( $(cat "$t2306_counter") + 1 ))
+            printf '%s\n' "$n" > "$t2306_counter"
+            case "$t2306_behaviour" in
+                wipe) rm -f "$t2306_wt/.iterate/findings-1.md" ;;
+                second) [ "$n" -ge 2 ] && printf '\n## Fire-Disposition\n\nOption (a).\n' >> "$t2306_plan" ;;
+            esac
+            # Mutation inconditionnelle : sans elle le sha ne bouge pas, et la
+            # branche de succès — donc la garde — n'est jamais atteinte.
+            printf '\n<!-- revise %s -->\n' "$n" >> "$t2306_plan"
+            return 0
+        }
+        set +e
+        WORKTREE_DIR="$t2306_wt" ISSUE_NUM="2306" REPO="mika" LOG_ID="t2306" \
+            CWD_ARGS="--cwd $t2306_wt" \
+            _launch_revise_pilot "$t2306_wt/.iterate/findings-1.md" 2>&1 >/dev/null
+        printf '%s\n' "$?" > "$t2306_root/rc"
+    )
+    t2306_rc=$(cat "$t2306_root/rc")
+    printf '%s|%s|%s' "$t2306_rc" "$(cat "$t2306_counter")" "$t2306_err"
+    rm -rf "$t2306_root"
+}
+
+# Le champ 3 est du stderr libre — multiligne, et pouvant contenir des `|`. Un
+# `cut` nu le traiterait ligne par ligne et rendrait, pour les champs 1 et 2,
+# les lignes de stderr qui ne portent aucun délimiteur. Deuxième défaut que
+# cette sonde a eu, et il produisait des `expected: 1 / actual: 1` illisibles.
+_t2306_field() { printf '%s' "$2" | head -1 | cut -d'|' -f"$1"; }
+_t2306_err()   { printf '%s' "$1" | sed '1s/^[0-9]*|[0-9]*|//'; }
+
+T2306_FINDINGS_WITH_FD="F1 [BLOQUANT] — le plan livre des tests et ne porte pas de section
+\`## Fire-Disposition\`. Ajoute-la en nommant l'une des trois options de mika#1574.
+
+Disposition: ITERATE"
+T2306_FINDINGS_WITHOUT_FD="F1 [BLOQUANT] — l'unité U2 laisse le choix de la structure de
+données à l'implémenteur. Tranche-le dans le plan.
+
+Disposition: ITERATE"
+
+T2306_LIB_SRC=$(cat "$DISPATCH_LIB")
+T2306_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+T2306_REVISE_SRC=$(declare -f _launch_revise_pilot)
+T2306_GUARD_SRC=$(declare -f _fd_retry_if_section_still_missing)
+
+# --- T1 : la règle existe et dit quoi écrire ---------------------------------
+#
+# Une règle tronquée qui prescrit la section sans nommer ses options ferait
+# inventer une quatrième disposition au groomeur — pire que le silence, parce
+# qu'elle passerait le `grep` du gate et échouerait sur son contenu.
+
+assert_eq "T1: _FIRE_DISPOSITION_RULE est définie et non vide" "non-vide" \
+    "$([ -n "${_FIRE_DISPOSITION_RULE:-}" ] && echo non-vide || echo vide)"
+assert_contains "T1: la règle nomme la section exacte" \
+    '## Fire-Disposition' "${_FIRE_DISPOSITION_RULE:-}"
+assert_contains "T1: la règle nomme l'option (a)" "(a)" "${_FIRE_DISPOSITION_RULE:-}"
+assert_contains "T1: la règle nomme l'option (b)" "(b)" "${_FIRE_DISPOSITION_RULE:-}"
+assert_contains "T1: la règle nomme l'option (c)" "(c)" "${_FIRE_DISPOSITION_RULE:-}"
+assert_contains "T1: la règle cite la doctrine par référence plutôt que de la reformuler" \
+    "mika#1574" "${_FIRE_DISPOSITION_RULE:-}"
+# La conditionnalité est la moitié que l'option (a) du gate rend explicite :
+# sans elle, un groomeur ajouterait la section à tout plan, ce qui contredit
+# « Plan has no detector-class deliverables ⇒ gate is N/A ».
+assert_contains "T1: la règle dit que la section n'est PAS requise sans détecteur" \
+    "N/A" "${_FIRE_DISPOSITION_RULE:-}"
+
+# --- T2 : la prescription atteint le groomeur --------------------------------
+
+T2306_PROMPT_GROOM=$(_t2306_inject "dev-groom")
+assert_contains "T2: la règle est injectée dans le PROMPT pour SKILL=dev-groom" \
+    '## Fire-Disposition' "$T2306_PROMPT_GROOM"
+assert_contains "T2: et le site d'injection existe bien dans _set_up_worktree" \
+    '_FIRE_DISPOSITION_RULE' "$T2306_SUW_SRC"
+
+# --- T3 : contrôle négatif — dev-pilot ne la reçoit pas ----------------------
+#
+# Porteur, pas décoratif : le site voisin (`_PR_BODY_CONTAINMENT_RULE`) est
+# inconditionnel dans cette branche, donc la condition se PERD en copiant le
+# voisin. C'est exactement l'écart que ce test attrape — et il ne rendrait
+# aucune décision fausse, il mettrait juste du bruit dans le prompt de tout
+# pilote d'implémentation.
+
+T2306_PROMPT_PILOT=$(_t2306_inject "dev-pilot")
+assert_not_contains "T3: la règle n'est PAS injectée pour SKILL=dev-pilot" \
+    '## Fire-Disposition' "$T2306_PROMPT_PILOT"
+assert_contains "T3: mais dev-pilot reçoit bien la règle inconditionnelle voisine" \
+    "RÈGLE DE DISPATCH (mika#2211)" "$T2306_PROMPT_PILOT"
+# La garde est lue par POSITION dans les lignes de code, pas par un `grep -B`
+# à fenêtre fixe : une ligne de commentaire ajoutée demain entre les deux
+# déplacerait la fenêtre et rendrait le test vert pour la mauvaise raison.
+T2306_SUW_CODE=$(printf '%s\n' "$T2306_SUW_SRC" | grep -v '^[[:space:]]*#')
+T2306_FD_INJ_LN=$(printf '%s\n' "$T2306_SUW_CODE" | grep -n '_FIRE_DISPOSITION_RULE' | head -1 | cut -d: -f1)
+T2306_FD_PREV_LN=""
+if [ -n "$T2306_FD_INJ_LN" ] && [ "$T2306_FD_INJ_LN" -gt 1 ]; then
+    T2306_FD_PREV_LN=$(printf '%s\n' "$T2306_SUW_CODE" | sed -n "$((T2306_FD_INJ_LN - 1))p")
+fi
+assert_contains "T3: la ligne de code qui précède l'injection est la garde sur le skill" \
+    'if [ "$SKILL" = "dev-groom" ]; then' "$T2306_FD_PREV_LN"
+
+# --- T4 : contrat mika#138 et fidélité du miroir -----------------------------
+#
+# Invariant de position 2 : si la première ligne de PROMPT cesse d'être
+# `<repo>#<num>`, la regex ancrée de `_set_up_worktree` manque, le dispatch
+# tombe en mode free-text et AUCUN worktree n'est créé. Régression de premier
+# ordre, et invisible à toute assertion sur le contenu de la règle.
+
+assert_eq "T4: la première ligne du PROMPT reste exactement mika#2306" "mika#2306" \
+    "$(printf '%s' "$T2306_PROMPT_GROOM" | head -1)"
+assert_eq "T4: idem sur le chemin dev-pilot" "mika#2306" \
+    "$(printf '%s' "$T2306_PROMPT_PILOT" | head -1)"
+assert_contains "T4: l'expression source est littéralement celle que le miroir T2/T3 réplique" \
+    'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_FIRE_DISPOSITION_RULE")' "$T2306_LIB_SRC"
+# La règle est appendue APRÈS celle de mika#2211 : l'inverse laisserait la règle
+# de corps de PR en dernier sur le chemin dev-groom, or la recency est le seul
+# levier qu'a une règle en fin d'un prompt de 16 KiB.
+assert_eq "T4: l'injection FD suit celle de mika#2211" "yes" \
+    "$(_t2178_after '"$PROMPT" "$_FIRE_DISPOSITION_RULE")' '"$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")')"
+
+# --- T5 : le cœur du correctif ----------------------------------------------
+#
+# Findings réclamant la section + plan révisé qui ne la porte toujours pas
+# ⇒ exactement UNE relance (deux invocations du pilote : la nominale et elle).
+
+T2306_T5=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "never")
+assert_eq "T5: findings réclamant FD + section absente ⇒ exactement une relance" \
+    "2" "$(_t2306_field 2 "$T2306_T5")"
+assert_contains "T5: et la relance est DITE, pas silencieuse" \
+    "fire_disposition_revise_retried" "$T2306_T5"
+assert_eq "T5: la valeur de retour reste 0 — la garde ajoute une tentative, pas un mode d'échec" \
+    "0" "$(_t2306_field 1 "$T2306_T5")"
+
+# Et quand la seconde tentative réussit, elle se tait : l'événement d'échec est
+# réservé à l'échec, sinon il ne mesure plus rien.
+T2306_T5B=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "second")
+assert_eq "T5: seconde tentative réussie ⇒ toujours une seule relance" \
+    "2" "$(_t2306_field 2 "$T2306_T5B")"
+assert_not_contains "T5: et aucun événement d'échec n'est émis quand la section arrive" \
+    "fire_disposition_still_missing_after_retry" "$T2306_T5B"
+
+# --- T6 : contrôle négatif — l'architecte n'a rien demandé -------------------
+
+T2306_T6=$(_t2306_revise_probe "$T2306_FINDINGS_WITHOUT_FD" "no" "never")
+assert_eq "T6: findings sans mention de FD ⇒ zéro relance" \
+    "1" "$(_t2306_field 2 "$T2306_T6")"
+assert_not_contains "T6: et rien n'est journalisé" \
+    "fire_disposition_revise_retried" "$T2306_T6"
+
+# --- T7 : contrôle négatif — le revise a fait son travail -------------------
+
+T2306_T7=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "yes" "never")
+assert_eq "T7: section déjà présente ⇒ zéro relance (le chemin nominal ne paie rien)" \
+    "1" "$(_t2306_field 2 "$T2306_T7")"
+assert_not_contains "T7: et rien n'est journalisé" \
+    "fire_disposition_revise_retried" "$T2306_T7"
+
+# --- T8 : fail-safe — une information illisible sort de la population --------
+#
+# Deux moitiés. (a) À l'entrée : la garde préexistante rend 1, et la garde FD
+# n'y change rien. (b) EN VOL : le pilote de revise supprime le findings-file
+# entre-temps. C'est la seule forme que l'illisibilité peut réellement prendre
+# ici — l'entrée est déjà gardée — et elle doit sortir le dispatch de la
+# population, jamais l'y faire entrer.
+
+assert_eq "T8 (a): findings illisible à l'entrée ⇒ retour 1, inchangé" "1" \
+    "$(WORKTREE_DIR="/tmp" ISSUE_NUM="2306" _launch_revise_pilot "/nonexistent/findings-2306.md" 2>/dev/null; echo $?)"
+
+T2306_T8=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "wipe")
+assert_eq "T8 (b): findings disparu en vol ⇒ zéro relance" \
+    "1" "$(_t2306_field 2 "$T2306_T8")"
+assert_eq "T8 (b): et la valeur de retour reste celle d'avant le correctif" \
+    "0" "$(_t2306_field 1 "$T2306_T8")"
+
+# --- T9 : le budget architecte est intact ------------------------------------
+#
+# Structurel, et il l'est pour la raison qui rend ces scans nécessaires ailleurs
+# dans ce dépôt : la régression qu'il attrape ne rendrait AUCUNE décision
+# fausse. Un futur éditeur qui « améliorerait » la garde en redemandant l'avis
+# de l'architecte doublerait le budget LLM par grooming sans qu'un seul test de
+# comportement ne rougisse.
+
+assert_eq "T9: zéro appel _arch_ask dans _launch_revise_pilot" "0" \
+    "$(printf '%s\n' "$T2306_REVISE_SRC" | grep -c '_arch_ask' || true)"
+assert_eq "T9: zéro appel _arch_ask dans la garde de rattrapage" "0" \
+    "$(printf '%s\n' "$T2306_GUARD_SRC" | grep -c '_arch_ask' || true)"
+
+# Fire-Disposition, option (a) — la table d'exceptions de CE scan est vide, et
+# la vacuité est assertée À L'EXÉCUTION (modèle scripts/test-guard-shared-checkout.sh).
+# Le test rougit donc LE JOUR où une exception est ajoutée, pas seulement quand
+# elle devient stale. Une table vide assertée vide est aussi ce qui distingue
+# « aucune violation » de « le scan ne regarde rien ».
+#
+# Toute entrée future doit porter LES TROIS propriétés que l'option (a) exige —
+# (1) nommer la donnée précise, (2) référencer un ticket de suivi, (3) porter une
+# assertion auto-nettoyante — et non la seule troisième.
+T2306_ARCH_ASK_ALLOWLIST=()
+assert_eq "T9: table d'exceptions du scan _arch_ask — zero entries" "0" \
+    "${#T2306_ARCH_ASK_ALLOWLIST[@]}"
+# Contre-vacuité : le scan doit voir quelque chose. `_iterate_groom_loop`, la
+# fonction voisine, en contient bien — sinon un `grep -c` qui rend 0 partout
+# prouverait seulement que la source n'est pas lue.
+_T2306_ITERATE_SRC=$(declare -f _iterate_groom_loop)
+if [ "$(printf '%s\n' "$_T2306_ITERATE_SRC" | grep -c '_arch_ask' || true)" -gt 0 ]; then
+    assert_eq "T9 contre-vacuité: le scan voit bien les _arch_ask de _iterate_groom_loop" "ok" "ok"
+else
+    assert_eq "T9 contre-vacuité: le scan voit bien les _arch_ask de _iterate_groom_loop" "ok" \
+        "le scan ne trouve aucun _arch_ask nulle part — il ne regarde rien"
+fi
+
+# --- T10 : terminaison, et l'échec de second tour est DIT --------------------
+#
+# Sans ce test, une garde qui rendrait la main en silence sur ce chemin
+# passerait T5 en vert : l'échec de second tour deviendrait indistinguable d'un
+# succès — précisément l'angle mort que ce correctif reproche au critère sha256.
+
+assert_contains "T10: seconde tentative échouée ⇒ fire_disposition_still_missing_after_retry" \
+    "fire_disposition_still_missing_after_retry" "$T2306_T5"
+assert_eq "T10: émis exactement une fois" "1" \
+    "$(_t2306_err "$T2306_T5" | grep -c 'fire_disposition_still_missing_after_retry' || true)"
+assert_eq "T10: et AUCUNE troisième relance" "2" "$(_t2306_field 2 "$T2306_T5")"
+# La terminaison est lisible sans dérouler le flot : un compteur explicite, armé
+# AVANT toute action, donc un échec en aval ne peut pas rouvrir le budget.
+assert_contains "T10: le compteur de garde existe et est armé avant l'action" \
+    "_FD_REVISE_RETRIED=1" "$T2306_GUARD_SRC"
+assert_contains "T10: et il est remis à zéro à chaque entrée de _launch_revise_pilot" \
+    "_FD_REVISE_RETRIED=0" "$T2306_REVISE_SRC"
+
+# --- T11 : contrôle de source — le prédicat auto-entretenu ------------------
+#
+# La seule défaillance de cette famille qu'aucun autre test ne voit. Un
+# implémenteur qui lit le findings CIBLÉ (qui contient nécessairement la chaîne,
+# c'est son objet) rend le premier terme vrai par construction : la garde
+# relance même quand l'architecte n'a rien demandé, le compteur borne la boucle,
+# et T5, T6, T8 restent TOUS verts. T6 exerce un findings de première passe
+# propre, pas la lecture du mauvais fichier.
+
+# (a) forme de code : aucune ligne qui manipule le findings ciblé ne l'interroge,
+#     et la relance n'est pas une récursion.
+T2306_FD_VAR_LINES=$(printf '%s\n' "$T2306_GUARD_SRC" | grep 'fd_findings_file' || true)
+assert_eq "T11 (a): aucune ligne touchant findings-1-fd.md ne l'interroge par grep" "0" \
+    "$(printf '%s\n' "$T2306_FD_VAR_LINES" | grep -c 'grep' || true)"
+assert_eq "T11 (a): et la garde ne se relance pas par récursion sur _launch_revise_pilot" "0" \
+    "$(printf '%s\n' "$T2306_GUARD_SRC" | grep -c '_launch_revise_pilot' || true)"
+# Contre-vacuité de la moitié (a) : la garde manipule réellement ce fichier.
+assert_eq "T11 (a) contre-vacuité: la garde écrit bien un findings ciblé" "yes" \
+    "$([ -n "$T2306_FD_VAR_LINES" ] && echo yes || echo non-trouvé)"
+# Et le terme 1 lit bien le paramètre reçu, pas un chemin reconstruit.
+assert_contains "T11 (a): le terme 1 interroge le findings de première passe reçu en argument" \
+    'first_pass_findings' "$(printf '%s\n' "$T2306_GUARD_SRC" | grep 'Fire-Disposition' | grep 'grep -qF' || true)"
+
+# (b) comportemental : un findings-1-fd.md résiduel laissé par un dispatch
+#     antérieur ne rend aucun terme vrai.
+T2306_T11=$(_t2306_revise_probe "$T2306_FINDINGS_WITHOUT_FD" "no" "never" "residual-fd")
+assert_eq "T11 (b): un findings-1-fd.md résiduel ne déclenche aucune relance" \
+    "1" "$(_t2306_field 2 "$T2306_T11")"
+assert_not_contains "T11 (b): et rien n'est journalisé" \
+    "fire_disposition_revise_retried" "$T2306_T11"
 
 # --- Summary ---
 

@@ -762,6 +762,34 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         mika_common::logging::print_banner("mika-spirit", env!("CARGO_PKG_VERSION"));
     }
 
+    // mika#2446 R-2 — la version réellement en exécution, dans le journal.
+    //
+    // Le banner ci-dessus sert un autre public : il ne part que sur **stdout**,
+    // uniquement en format `pretty`, et ne porte que la version sémantique —
+    // jamais `GIT_HASH`. Un opérateur qui lit `$MIKA_SPIRIT_LOG_FILE` ne pouvait
+    // donc pas établir quel commit tourne, ce que la surface opérateur de
+    // mika#2337 lui demande pourtant de faire en premier.
+    //
+    // Émis **une fois par processus, sur toutes les branches, y compris saine** —
+    // doctrine mika#2293 : un réglage qu'on ne peut pas observer n'est pas un
+    // réglage, c'est un espoir. Et son **absence** est elle-même de
+    // l'information : un journal qui tourne sans cette ligne dit que le binaire
+    // servi est antérieur à ce correctif (classe mika#2340) — établir le
+    // déploiement avant toute conclusion sur le routage.
+    {
+        let attribution = task_engine::dispatcher::binary_attribution();
+        info!(
+            target: "mika::otel",
+            event = "task_engine_trigger_registry",
+            version = %attribution.version,
+            git_hash = %attribution.git_hash,
+            process_id = attribution.process_id,
+            process_name = %attribution.process_name,
+            routable_triggers = %attribution.routable_triggers,
+            "mika-spirit starting: this binary routes these run_skill triggers"
+        );
+    }
+
     // Auto-migrate to multi-agent layout if needed
     home::migrate_to_multi_agent(global_home)?;
 

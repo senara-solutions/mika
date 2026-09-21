@@ -65,6 +65,7 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         stopped_topics: &[],
         deployment: mika_common::home::Deployment::Unknown,
         persona_profile: mika_common::home::PersonaProfile::Operator,
+        tenant_language: None,
     }
 }
 

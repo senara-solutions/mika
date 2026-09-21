@@ -34,6 +34,17 @@
 //! - `doctrine:material-doctrine-answerable` — post-fix success tag (the
 //!   material register is in the served prompt under its aliases, so the
 //!   question resolves to a substantial answer carrying each stance's *why*).
+//! - `register:em-dash-emitted` — pre-fix failure tag (mika#2247: the
+//!   general-public tenant's delivered text carried U+2014, one occurrence of
+//!   which was `FAMILY_SOUL` copied verbatim).
+//! - `register:em-dash-normalised` — post-fix success tag (the three output
+//!   sites compose the tag strip with the typographic normaliser, and the
+//!   operator register is deliberately untouched).
+//! - `register:language-drifted` — pre-fix failure tag (EN↔FR flip inside one
+//!   thread on a tenant whose persona prescribes French).
+//! - `register:language-held` — post-fix success tag (guard 5f caught the
+//!   drift on a tenant that declared its language, and left an undeclared one
+//!   alone).
 //!
 //! Namespace convention per `docs/architecture/kg-implementation-conventions.md`
 //! § C3 — parallel to `#741 grounding:*` and `#740 self-knowledge:*`.
@@ -93,3 +104,17 @@ pub mod false_local_hosting_claim_caught;
 // therefore ships disarmed with its reasoning at the site.
 pub mod doctrine_mika_answer_replayed;
 pub mod doctrine_mika_section_rendered;
+
+// --- mika#2247: the general-public tenant holds its register ---
+//
+// Same module, third time, and the criterion is the one mika#2290 wrote here:
+// the failure class is the **shape of the agent's own text** against a
+// load-bearing product invariant, with no fabrication of evidence involved. A
+// register is such an invariant on the family tier — its persona is a product
+// decision Vincent approved, not a style preference.
+//
+// Distinct tag entries (`register:*`) keep the populations countable apart, and
+// the file carries both axes that have a production path: the typographic
+// normalisation (AC1) and the language-drift guard (AC2). AC3's production half
+// is the `## Current Time` section, pinned in `prompt::tests::mika2247_*`.
+pub mod tenant_register_held;

@@ -286,6 +286,33 @@ _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 
+# mika#2049: the relay-down stamp. Written HERE (shell), read by the engine
+# (Rust) — the first file under `state/` to cross that boundary in this
+# direction, so the convention is posed here rather than inherited.
+#
+# `$HOME/.mika` IS WRITTEN IN FULL, DELIBERATELY. Do NOT "harmonise" this on the
+# `${MIKA_HOME:-$HOME/.mika}` pattern used by `MIKA_PR_ORIGIN_EPOCH_FILE` a few
+# thousand lines below: `scrub_mika_env_vars` (crates/mika-agent/src/skills/
+# executor.rs) strips EVERY `MIKA_*` variable from the dispatch child, `MIKA_HOME`
+# included, so that `:-` has already fallen back by the time the line runs. It is
+# code that looks like it handles the case and does not — and here the mistake is
+# not cosmetic: the engine resolves the same path through `global_home_dir`, which
+# DOES honour `MIKA_HOME`, so on an installation that sets it the two ends would
+# name two different files. The stamp would be written in one place and looked for
+# in another; gardes A and B, fail-open by construction, would read "no outage" and
+# let every dispatch through — R5 false in production with a green test suite.
+#
+# Reader (sole): crates/mika-agent/src/pilot_egress_stamp.rs. The invariant is
+# written at both ends and held by the source scan in test-dispatch-lib.sh.
+_PILOT_EGRESS_DOWN_STAMP="$HOME/.mika/state/pilot-egress-down"
+
+# Closed vocabulary of refusal motives, one per failure cause. Kept apart
+# because the remedies differ — deploy the binary vs restart the relay — and the
+# two populations must stay countable separately (precedent: `below_threshold`
+# vs `no_ready_label_event`, mika#2131).
+_PILOT_EGRESS_MOTIF_BINARY_MISSING="egress_binary_missing"
+_PILOT_EGRESS_MOTIF_BIND_TIMEOUT="egress_bind_timeout"
+
 # Helper daemon for anthropic api chain (2026-08-05).
 # Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
 # Makefile install target); NOT a hardcoded repo path (would fail when
@@ -485,12 +512,46 @@ except OSError:
 }
 
 # Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
-# calls, verifies the daemon is alive and returns. Fail-open on missing binary
-# (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
-# network open) so the pilot still functions during the deploy window.
+# calls, verifies the daemon is alive and returns.
+#
+# POSTURE: FAIL-CLOSED (mika#2049, operator decision of 2026-09-20 — option 1,
+# taken by Vincent after a bearing from Prime). Egress unavailable ⇒ the dispatch
+# is refused; the pilot never leaves without its network cut. The escape-hatch
+# variant (option 2) was ruled out in writing: « it recreates the fail-open under
+# another name, and a WARN under load is read by nobody. » There is therefore NO
+# environment variable that lifts the refusal.
+#
+# Until 2026-09-20 this returned 1 on every cause and the caller read that 1 as
+# "launch in Phase 2a" — filesystem cut kept, NETWORK OPEN. The written
+# justification was #1894's deploy window, closed long since; the posture was
+# inherited rather than decided. What is being protected is a hostname allowlist
+# applied to an autonomous agent executing code it wrote itself, so "failing
+# open" means the control is lifted at the exact moment it cannot start.
+#
+# THIS FUNCTION DOES NOT DECIDE — it reports. The return code is unchanged (0 =
+# the relay serves, 1 = it does not; `scripts/canary-pilot-containment
+# --ensure-relay` depends on it) and the cause is posted in
+# `$_PILOT_EGRESS_ABORT`, on the exact model of `$_PILOT_GITDIR_BIND_ABORT`. The
+# refusal itself belongs to `_run_pilot_sandboxed`, which is the only place that
+# knows a pilot was about to be launched.
 _ensure_pilot_egress_proxy() {
+    # NOT `local`: bash `local` is invisible to the caller, and the caller is
+    # where the operator-facing refusal is built (same reasoning, same shape as
+    # `_PILOT_SANDBOX_REFUSAL`). Cleared on entry so a stale value from an
+    # earlier call in the same shell can never be read as this call's verdict.
+    _PILOT_EGRESS_ABORT=""
     if [ ! -x "$_PILOT_EGRESS_PROXY_BIN" ]; then
-        echo "dispatch-lib: mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — Phase 2b network cut disabled (falling back to fs-only)" >&2
+        _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BINARY_MISSING"
+        # mika#2049: the message no longer says "falling back to fs-only" —
+        # nothing falls back any more, and Signal S (mika#2050) greps that exact
+        # string to count dispatches that ran WITHOUT the network cut. Leaving it
+        # would make an instrument report a population that can no longer exist.
+        # Each cause now carries its own stable token, which is the half
+        # mika#2050 had to document as missing: `pilot_egress_guard.unreachable`
+        # covered the bind timeout alone, so an operator using it as the
+        # predicate read a nominal regime on a fleet whose proxy binary was never
+        # deployed.
+        echo "dispatch-lib: pilot_egress_guard.binary_missing mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
     # Liveness probe: is anyone actually listening?
@@ -528,11 +589,103 @@ _ensure_pilot_egress_proxy() {
         sleep 0.1
     done
     if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
-        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — falling back to fs-only" >&2
+        _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT"
+        # See the sibling message above on why "falling back to fs-only" is gone.
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
     echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
     return 0
+}
+
+# --- mika#2049: the refusal, its stamp, and its escalation -------------------
+
+# The remedy sentence for one motive. The refusal text has to name BOTH the cause
+# and the gesture (R2): an operator reading `CONTAINMENT REFUSAL` at 3am needs to
+# know which organ to repair, and the two causes call for opposite gestures.
+_pilot_egress_remedy() {
+    case "$1" in
+        "$_PILOT_EGRESS_MOTIF_BINARY_MISSING")
+            printf '%s' "The egress relay binary is absent from $_PILOT_EGRESS_PROXY_BIN. Deploy it with \`make install\` on the dispatch host, then re-dispatch."
+            ;;
+        "$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT")
+            printf '%s' "The egress relay did not bind $_PILOT_EGRESS_SOCK within 3s. Restart it with \`scripts/canary-pilot-containment --restart-relay\`, read \${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log (or /tmp/mika-pilot-egress-proxy.log) for why it died, then re-dispatch."
+            ;;
+        *)
+            # Unreachable through the two motives above, and deliberately not a
+            # silent empty string: a refusal whose remedy is blank sends the
+            # operator looking for a bug in the wrong organ.
+            printf '%s' "Cause unrecognised by \`_pilot_egress_remedy\` — see the dispatch stderr log, then runbook docs/operator/pilot-egress-relay.md."
+            ;;
+    esac
+}
+
+# Escalate on a channel someone actually reads (R3), deterministically — no LLM
+# turn, no prompt instruction (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+#
+# `|| true` EVERYWHERE, and the order is the point: the refusal is the
+# protection, the alert is the information, and an alert that fails must never
+# hand the launch back to the pilot.
+#
+# WHAT THIS CANNOT TELL YOU: `mika notify` returns Ok(()) even when Telegram
+# delivery fails — the failure is caught, printed to its own stderr, and
+# swallowed (crates/mika-cli/src/commands/notify.rs). Only a DB write failure
+# makes it non-zero. So this call site can NEVER know whether the alert reached
+# anyone, and no amount of shell here would change that. What makes the channel
+# real is a DEPLOYMENT-TIME precondition — the `mika` agent must carry a non-null
+# `chat_id` in `customer_config` — checked in the runbook, not on the critical
+# path of every dispatch. The notification is written to the DB BEFORE the send
+# is attempted, so a dead gateway still leaves the line in session
+# 00000000-0000-0000-0000-700000710717; that is what makes halt (c) of the plan
+# decidable.
+_pilot_egress_notify() {
+    local severity="$1" text="$2"
+    if ! command -v mika >/dev/null 2>&1; then
+        echo "dispatch-lib: \`mika\` not on PATH — egress escalation not emitted: $text" >&2
+        return 0
+    fi
+    mika notify --channel telegram --severity "$severity" --text "$text" >/dev/null 2>&1 || true
+    return 0
+}
+
+# Record the outage and escalate ONCE per episode (R4).
+#
+# Deduplication is by the stamp's presence, not by a counter: a proxy outage
+# spanning an hour produces one alert, not one per dispatch. The stamp is also
+# what gardes A and B read to stop consuming tickets' re-drive budget, which is
+# why its CONTENT is read (unlike `auto-pull-stop`, mika#2329, whose content is
+# deliberately never read) — the engine needs the age to decide staleness.
+_pilot_egress_mark_down() {
+    local motif="$1" remedy="$2" was_down=0
+    [ -f "$_PILOT_EGRESS_DOWN_STAMP" ] && was_down=1
+
+    mkdir -p "$(dirname "$_PILOT_EGRESS_DOWN_STAMP")" 2>/dev/null || true
+    # `<RFC3339-UTC> <motif>`, one line. Written on every refusal (refreshing the
+    # timestamp), so the engine's staleness window measures the LAST refusal
+    # rather than the first — without that refresh a long outage would look stale
+    # after one TTL and gardes A/B would stop biting for the rest of it.
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$motif" \
+        > "$_PILOT_EGRESS_DOWN_STAMP" 2>/dev/null \
+        || echo "dispatch-lib: could not write the egress-down stamp at $_PILOT_EGRESS_DOWN_STAMP — the engine will keep consuming tickets' re-drive budget during this outage (mika#2049)" >&2
+
+    if [ "$was_down" -eq 0 ]; then
+        _pilot_egress_notify escalate \
+            "🚨 Egress relay DOWN — pilot dispatch refused (fail-closed, mika#2049). Cause: $motif. $remedy Tickets are NOT being parked; the loop resumes on its own once the relay serves again."
+    fi
+}
+
+# The relay serves. If it did not last time, say so and clear the stamp.
+#
+# An announced resumption is half of R4: a rail that restarts without saying so
+# leaves the operator facing a silence they cannot tell from a persistent outage.
+# Modelled on `auto_pull_stop_armed` / `auto_pull_stop_lifted` (mika#2329) — a
+# transition, never a repeated state.
+_pilot_egress_mark_up() {
+    [ -f "$_PILOT_EGRESS_DOWN_STAMP" ] || return 0
+    rm -f "$_PILOT_EGRESS_DOWN_STAMP" 2>/dev/null || true
+    echo "dispatch-lib: pilot_egress_guard.recovered egress relay is serving again — dispatch resumed (mika#2049)" >&2
+    _pilot_egress_notify info \
+        "✅ Egress relay back up — pilot dispatch resumed (mika#2049). No action needed on tickets."
 }
 
 # Passthrough env allowlist: after `--clearenv`, these vars are re-injected
@@ -940,14 +1093,25 @@ _run_pilot_sandboxed() {
     # to the caller, and the caller is where the operator-facing RESULT is built.
     _PILOT_SANDBOX_REFUSAL=""
     if ! _stage_pilot_gitconfig; then
-        _PILOT_SANDBOX_REFUSAL="the sandbox git config could not be staged at $_PILOT_GITCONFIG_HOST, so the pilot would have had no committer identity and no https remote"
+        # mika#2049: the remedy sentence moved INTO the motive. It used to be a
+        # fixed tail on the RESULT block ("Fix the worktree, then re-dispatch."),
+        # written for these two gitdir causes and therefore wrong for every other
+        # containment refusal — an egress refusal has a healthy worktree and a
+        # broken relay. Carrying the remedy here makes the refusal text entirely
+        # motive-borne, so the next containment refusal needs no edit to that block.
+        _PILOT_SANDBOX_REFUSAL="the sandbox git config could not be staged at $_PILOT_GITCONFIG_HOST, so the pilot would have had no committer identity and no https remote.
+
+Fix the worktree, then re-dispatch."
         echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
         return 78
     fi
     local -a _PILOT_GITDIR_BIND_ARGS=()
     local _PILOT_GITDIR_BIND_ABORT=""
     if ! _pilot_gitdir_bind_args "${WORKTREE_DIR:-}"; then
-        _PILOT_SANDBOX_REFUSAL="$_PILOT_GITDIR_BIND_ABORT"
+        # See the sibling above on why the remedy travels with the motive.
+        _PILOT_SANDBOX_REFUSAL="$_PILOT_GITDIR_BIND_ABORT
+
+Fix the worktree, then re-dispatch."
         echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
         return 78
     fi
@@ -958,19 +1122,71 @@ _run_pilot_sandboxed() {
     local -a _PILOT_LOG_BIND_ARGS=()
     _pilot_log_bind_args
 
-    # Phase 2b: launch host-side egress proxy (idempotent). If it's not
-    # available (binary missing, first deploy), returns non-zero and we run
-    # in Phase 2a mode (fs cut only, network open) — degraded but functional.
+    # Phase 2b: the host-side egress proxy. FAIL-CLOSED since mika#2049 — if the
+    # relay does not serve, the dispatch is refused and no pilot is launched.
     local -a net_bwrap_args=()
     local -a net_setenv_args=()
     local sandbox_entrypoint_prefix=""
+
+    # PLACEMENT: above `_stage_pilot_gh_token` and `_ensure_pilot_helper`, hence
+    # above TWO side effects rather than one.
+    #
+    #   * `_stage_pilot_gh_token` refreshes a host GitHub credential on disk. Not
+    #     a new leak — the file already lives between two dispatches — but a
+    #     credential refreshed for a launch that will not happen.
+    #   * `_ensure_pilot_helper` STARTS A DAEMON. A refusal posted after it would
+    #     leave one helper started behind every refused dispatch, on every
+    #     attempt of an outage.
+    #
+    # House precedent points the same way: gate 2c of mika#2279 is placed "before
+    # step 3, hence with no token resolution".
+    #
+    # ORDERING CONSTRAINT NOT TO BREAK when moving this: the mika#2056 comment
+    # below requires the token to be staged BEFORE the helper, "so the mitmdump
+    # github addon has a fresh credential to inject on its very first request".
+    # Lifting the refusal above the pair preserves that order intact; inserting
+    # it BETWEEN the two would break it.
+    if ! _ensure_pilot_egress_proxy; then
+        local _egress_motif="${_PILOT_EGRESS_ABORT:-egress_unavailable}"
+        local _egress_remedy
+        _egress_remedy="$(_pilot_egress_remedy "$_egress_motif")"
+
+        _PILOT_SANDBOX_REFUSAL="the host egress relay is not serving, so the pilot would have run with filesystem containment only and an OPEN NETWORK — which is the posture mika#2049 closed on 2026-09-20 (operator decision: fail-closed, no escape hatch).
+
+Cause: $_egress_motif
+Remedy: $_egress_remedy"
+
+        echo "dispatch-lib: refusing to launch the pilot — egress relay unavailable ($_egress_motif) (mika#2049)" >&2
+
+        # Stamp + escalate AFTER the refusal text is built and BEFORE returning,
+        # so a failure in either cannot change the verdict. Both are `|| true`
+        # internally: the refusal is the protection, the alert is information.
+        _pilot_egress_mark_down "$_egress_motif" "$_egress_remedy"
+
+        return 78
+    fi
+
+    # The relay serves. If a previous dispatch was refused, this is the
+    # resumption — announce it and clear the stamp (R4).
+    _pilot_egress_mark_up
+
     # mika#2056: stage the token host-side BEFORE the helper daemon is ensured,
     # so the mitmdump github addon has a fresh credential to inject on its very
     # first request.
     _stage_pilot_gh_token
     _ensure_pilot_helper || true
 
-    if _ensure_pilot_egress_proxy; then
+    # Unconditional since mika#2049 — the `if _ensure_pilot_egress_proxy; then`
+    # that used to guard this block is gone, because its `else` (Phase 2a, network
+    # open) no longer exists: the refusal above returns 78 instead.
+    #
+    # Kept as a brace group rather than de-indented, deliberately: this is the
+    # containment shape, and a diff that shows ninety-nine unchanged lines is
+    # worth more to a reviewer here than four columns of whitespace. A brace group
+    # runs in the CURRENT shell — no subshell — so `net_bwrap_args`,
+    # `net_setenv_args` and `sandbox_entrypoint_prefix` are set for the caller
+    # exactly as they were under the `if`.
+    {
         # Full Phase 2b: unshare-net + bind unix socket + wrap with in-sandbox
         # TCP→unix shim + HTTPS_PROXY pointing at shim.
         net_bwrap_args=(
@@ -1068,7 +1284,7 @@ _run_pilot_sandboxed() {
         # CA bundle is assembled and GIT_SSL_CAINFO / SSL_CERT_FILE et al. are
         # exported before the pilot's first `git push` / `gh` call.
         sandbox_entrypoint_prefix="/bin/sh"
-    fi
+    }
 
     local -a setenv_args=()
     local var
@@ -2009,6 +2225,56 @@ et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\`
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
 
+# mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
+# de grooming.
+#
+# Le défaut qu'elle ferme : `/ce:plan` est un plugin tiers
+# (`compound-engineering`) qui n'a aucune connaissance de mika#1574, donc un plan
+# neuf livrant un détecteur arrive devant mika-arch sans la section que son
+# Fire-Disposition Gate exige. L'architecte rend alors ITERATE — à juste titre —
+# et l'unique itération de `_iterate_groom_loop` est dépensée sur un motif
+# purement formel, évitable en amont. Au second passage le gate est sans recours
+# (« No ITERATE exists at second pass per the two-pass limit »), donc le ticket
+# ESCALATE et la boucle ne dispatche jamais l'implémentation.
+#
+# C'est exactement la configuration que le Acceptance-Criteria Gate décrit déjà
+# mot pour mot pour sa section sœur : « Grooming is the surface we control
+# between the third-party producer and our validator. » `## Acceptance criteria`
+# a reçu ce traitement (mika#1600/#1627) ; `## Fire-Disposition` ne l'avait
+# jamais reçu.
+#
+# La règle vit ICI et non dans `.claude/commands/mika-groom-plan-only.md` pour la
+# même raison que `_PR_BODY_CONTAINMENT_RULE` ci-dessus : les trois commandes de
+# groom vivent dans `senara-solutions/mika-platform` et sont semées dans le
+# worktree par `_seed_worktree_slash_commands` (mika#1415), donc un ticket ouvert
+# sur `senara-solutions/mika` ne peut pas les éditer. Ce PROMPT est le seul canal
+# que ce dépôt contrôle. La moitié commandes est nommée en suivi, pas simulée.
+#
+# Ce n'est pas le prompt-enforcement que
+# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` condamne :
+# la leçon de mika#2120 porte sur une consigne qui dépend qu'un opérateur pense à
+# la taper. Une constante injectée par le substrat à chaque dispatch ne dépend
+# d'aucune mémoire — et la moitié structurelle est livrée à côté (le rattrapage
+# de `_launch_revise_pilot`), ce que cette doctrine prescrit justement.
+#
+# Elle cite mika#1574 par référence et nomme ses trois options ; elle ne
+# reformule pas la doctrine, pour que les deux ne puissent pas diverger.
+_FIRE_DISPOSITION_RULE="RÈGLE DE GROOMING (mika#2306) — un plan qui livre un détecteur porte \`## Fire-Disposition\`.
+Détecteur = tout livrable dont la fonction primaire est de signaler une violation : test,
+assertion, règle de lint, garde CI, validateur de schéma, scan structurel, garde EndTurn —
+tout code dont le chemin de succès est « aucune violation trouvée ».
+Si le plan en livre au moins un, il DOIT porter une section \`## Fire-Disposition\` nommant
+l'une des trois options canoniques de mika#1574, avec son détail d'implémentation :
+(a) exception nommée en allowlist (défaut) — chaque violation existante reçoit une entrée
+    grep-visible qui nomme la donnée précise, référence un ticket de suivi, et porte une
+    assertion auto-nettoyante qui rougit quand l'exception devient stale ;
+(b) livrer désarmé — le détecteur atterrit avec \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent,
+    plus un suivi tracké pour l'armer ;
+(c) halte-et-remontée — l'implémentation s'arrête et remonte à l'opérateur pour cadrage.
+Si le plan ne livre AUCUN détecteur, la section n'est pas requise (gate N/A) : ne l'invente pas.
+Sans elle, mika-arch rend ITERATE en première passe et ESCALATE en seconde — et la seconde
+passe est sans recours."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -2586,6 +2852,23 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
+        # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
+        #
+        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
+        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
+        # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
+        # donc à écrire explicitement, jamais à hériter du voisin : la copier
+        # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
+        #
+        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
+        # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
+        if [ "$SKILL" = "dev-groom" ]; then
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
+        fi
+
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
         # Save pre-run remote HEAD for pilot push guard (mika#1318).
@@ -2770,16 +3053,28 @@ ${PILOT_OUTPUT_RAW}"
         # mika#2141: 78 is _run_pilot_sandboxed refusing to launch. No pilot
         # process ever existed, so "FAILED (exit code 78)" with an empty stdout
         # would send the operator hunting for pilot drift that cannot be there.
-        # The reason lives in $_PILOT_GITDIR_BIND_ABORT and on stderr; carry it.
+        # The reason lives in $_PILOT_SANDBOX_REFUSAL and on stderr; carry it.
+        #
+        # mika#2049: the block no longer ends on "Fix the worktree, then
+        # re-dispatch." That sentence was written for the two gitdir causes and
+        # is FALSE for an egress refusal, whose worktree is healthy and whose
+        # broken organ is the relay — a contradiction inside the only text AC2
+        # makes readable, pointing the operator at the wrong organ at exactly the
+        # moment they read fast. The remedy now travels inside the motive (see
+        # the two `_PILOT_SANDBOX_REFUSAL` sites), so the text is entirely
+        # motive-borne and the next containment refusal needs no edit here.
+        #
+        # The sentence that REMAINS is the one true of every cause: this is a
+        # refusal, not drift and not a pipeline failure.
         _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
 CONTAINMENT REFUSAL (exit 78) — the pilot was never launched.
 
-${_PILOT_SANDBOX_REFUSAL:-The sandbox git setup could not be built safely; see the stderr log.}
+${_PILOT_SANDBOX_REFUSAL:-The sandbox could not be built safely; see the stderr log.}
 
 This is not pilot drift and not a pipeline failure: dispatch-lib declined to
-build the sandbox rather than mount something it could not justify (mika#2141).
-Fix the worktree, then re-dispatch."
+build the sandbox rather than launch something it could not contain
+(mika#2141, mika#2049)."
     else
         _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
@@ -5324,9 +5619,17 @@ _launch_revise_pilot() {
     # detect revision via sha256 of the plan file before-and-after. Identical
     # content = "no revision happened" = caller falls through.
     #
-    # Args: $1 = absolute path to findings file
+    # Args: $1 = absolute path to findings file — le findings-file de PREMIÈRE
+    #            passe (`$WORKTREE_DIR/.iterate/findings-1.md`, écrit par
+    #            `_iterate_groom_loop` depuis la sortie architecte). C'est la
+    #            source UNIQUE du premier terme du prédicat mika#2306 ci-dessous.
     # Returns: 0 if plan content changed, 1 otherwise (missing args, no plan
     #          found, pilot failed to revise).
+
+    # mika#2306 — compteur de garde du rattrapage Fire-Disposition, remis à zéro
+    # à CHAQUE entrée. Global à dessein (pas de `local`) : la terminaison doit
+    # être lisible sans dérouler le flot de contrôle, et le test T10 la lit.
+    _FD_REVISE_RETRIED=0
 
     local findings_file="$1"
     [ -r "$findings_file" ] || {
@@ -5369,11 +5672,137 @@ _launch_revise_pilot() {
 
     if [ "$pre_hash" != "$post_hash" ]; then
         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
+        _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
         return 0
     else
         echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
         return 1
     fi
+}
+
+# mika#2306 — le rattrapage Fire-Disposition, greffé sur la branche `sha256`
+# RÉUSSIE de `_launch_revise_pilot`.
+#
+# Le défaut qu'il ferme : le critère de convergence du revise est « le contenu a
+# changé », jamais « le finding a été traité ». Un revise qui corrige une virgule
+# sans ajouter la section réclamée est, pour la boucle, indistinguable d'un
+# revise réussi ; elle enchaîne sur le second passage, qui ESCALATE, et l'unique
+# itération a été dépensée pour rien.
+#
+# Le prédicat est une CONJONCTION DE DEUX `grep`, jamais un jugement :
+#   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
+#      contient la chaîne `Fire-Disposition` (le vocabulaire imposé par son
+#      propre gate) ;
+#   2. la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
+#
+# La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
+# `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
+# findings ciblé que cette fonction écrit elle-même (`findings-1-fd.md`) est
+# INTERDIT comme source : il contient nécessairement la chaîne `Fire-Disposition`
+# puisque c'est son objet, donc un prédicat qui le relirait serait vrai par
+# construction — la garde relancerait même quand l'architecte n'a rien demandé,
+# et le test de relance-unique resterait vert sur une garde qui ne regarde plus
+# la sortie architecte. Le compteur casserait la boucle infinie ; il ne rendrait
+# pas le défaut visible. Même raison pour l'absence de récursion sur
+# `_launch_revise_pilot` : elle ferait de `findings-1-fd.md` le `$1` du second
+# tour, c'est-à-dire exactement la confusion de source interdite.
+#
+# Si l'un des deux termes est faux, RIEN ne se passe : comportement d'avant le
+# correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a
+# fait son travail ne paie rien. Un findings-file illisible sort le dispatch de
+# la population plutôt que de l'y faire entrer.
+#
+# Le BUDGET ARCHITECTE est inchangé : aucun appel `_arch_ask` sur ce chemin. Ce
+# qui est élargi est le budget du *revise*, qui n'est le contrat de personne —
+# et d'une seule tentative. Cette fonction ne REFUSE jamais rien : elle réessaie,
+# puis laisse passer en journalisant. Un échec dur ici aurait déplacé l'ESCALATE
+# d'une porte au lieu de le lever.
+#
+# Args: $1 = findings-file de première passe (source du terme 1)
+#       $2 = chemin du plan révisé (sujet du terme 2)
+# Returns: toujours 0 — l'appelant a déjà décidé que le plan a changé.
+_fd_retry_if_section_still_missing() {
+    local first_pass_findings="$1" plan_path="$2"
+
+    # Budget : une seule relance par invocation de `_launch_revise_pilot`.
+    [ "${_FD_REVISE_RETRIED:-0}" -eq 0 ] || return 0
+    # Fail-safe : une information illisible SORT de la population.
+    [ -r "$first_pass_findings" ] || return 0
+    [ -r "$plan_path" ] || return 0
+
+    # Terme 1 — l'architecte a réclamé la section.
+    grep -qF -- 'Fire-Disposition' "$first_pass_findings" 2>/dev/null || return 0
+    # Terme 2 — le plan révisé ne la porte toujours pas.
+    ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0
+
+    # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
+    _FD_REVISE_RETRIED=1
+
+    local fd_findings_file="${first_pass_findings%/*}/findings-1-fd.md"
+    printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2306), pas par l'architecte.
+
+F-FD [BLOQUANT] — la section \`## Fire-Disposition\` que la première passe
+architecte a réclamée est TOUJOURS ABSENTE du plan révisé.
+
+Le plan a bien été modifié, mais le finding n'a pas été traité. En l'état il part
+au second passage architecte, où le Fire-Disposition Gate est SANS RECOURS
+(« No ITERATE exists at second pass per the two-pass limit ») : le verdict sera
+ESCALATE et le ticket ne sera jamais implémenté.
+
+Action demandée, et elle seule : ajouter au plan une section \`## Fire-Disposition\`
+nommant l'une des trois options canoniques de mika#1574, avec son détail
+d'implémentation —
+  (a) exception nommée en allowlist (défaut) : chaque violation existante reçoit
+      une entrée grep-visible qui nomme la donnée précise, référence un ticket de
+      suivi, et porte une assertion auto-nettoyante ;
+  (b) livrer désarmé : \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent, plus un suivi
+      tracké pour l'armer ;
+  (c) halte-et-remontée : l'implémentation s'arrête et remonte à l'opérateur.
+
+Si — et seulement si — le plan ne livre réellement AUCUN détecteur (test,
+assertion, lint, garde CI, validateur, scan structurel, garde EndTurn), dis-le
+explicitement dans la section plutôt que d'inventer une disposition : le gate est
+alors N/A et cette phrase est ce qui le rend lisible.
+
+Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
+        echo "WARN: fire_disposition_retry_findings_unwritable: cannot write $fd_findings_file — skipping retry" >&2
+        return 0
+    }
+
+    echo "fire_disposition_revise_retried: ${REPO:-?}#${ISSUE_NUM:-?} — section absente du plan révisé alors que les findings de première passe la réclamaient ; relance unique du pilote de revise avec $(basename "$fd_findings_file")" >&2
+
+    local fd_log_id="${LOG_ID:-unknown}-revise-fd-$(date +%s)"
+    local fd_stdout; fd_stdout=$(mktemp /tmp/revise-fd-stdout-XXXXXX)
+    local fd_stderr; fd_stderr=$(mktemp /tmp/revise-fd-stderr-XXXXXX)
+
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+        --command "/mika-revise-plan" $CWD_ARGS \
+        -- "@${fd_findings_file}" \
+        >"$fd_stdout" 2>"$fd_stderr"
+    set -e
+    rm -f "$fd_stdout" "$fd_stderr"
+
+    # La section est re-testée POUR JOURNALISER, jamais pour reboucler : le
+    # compteur est déjà armé, donc aucun chemin ne réarme le lancement. C'est ce
+    # qui réconcilie « une seule relance » et « l'événement doit savoir si la
+    # section manque encore » — le prédicat est évalué deux fois, il n'autorise
+    # l'action qu'une.
+    #
+    # Les deux événements sont de l'OBSERVABILITÉ PURE : consommés par
+    # l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche
+    # de ce fichier, sans effet sur le flot de la boucle. Régime attendu :
+    # `fire_disposition_revise_retried` rare, `fire_disposition_still_missing_after_retry`
+    # à zéro. Une occurrence soutenue du second dit que le pilote de revise ne
+    # sait pas écrire la section — donc que le correctif est côté
+    # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
+    if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then
+        echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
+    fi
+
+    return 0
 }
 
 _cleanup_iterate_findings() {

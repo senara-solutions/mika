@@ -42,7 +42,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
 - `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+install+restart), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
-- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues)
+- `.claude/commands/` — Claude Code slash commands. **This repo tracks exactly four** (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues). The orchestration commands (`/mika-groom-ticket`, `/mika-groom-plan-only`, `/mika-groom-milestone`, `/mika-revise-plan`, …) live in `mika-platform` — removed from here deliberately by `b831cbd5` (2026-05-26) — and are seeded into each dispatch worktree by `_seed_worktree_slash_commands` (mika#1415), which also hides them from `git status`. **So a ticket opened on `senara-solutions/mika` cannot edit them, and their absence from `git ls-files .claude/commands/` while they sit on disk is the nominal state, never evidence of a deletion** (misread that way once — mika-qa on PR#1994 — then re-established from scratch twice more, by mika#2306 and mika#2001). The one command that settles it: `git log --oneline --all -- .claude/commands/`. Full reasoning: `docs/solutions/architecture-patterns/seed-scaffold-into-tracked-worktree-dir-via-git-exclude.md` § Effet de lecture.
 
 ## Versioning
 
@@ -183,7 +183,7 @@ For detailed architecture of each subsystem, see the crate-level CLAUDE.md files
 - **A2A protocol** — v0.3, JSON-RPC, task state machine. See `crates/mika-a2a/CLAUDE.md`.
 - **Knowledge Graph** — Three-layer KG (domain/lexical/subject) in SQLite. Domain graph builder (deterministic, startup) projects skills/tools/agents/problem_types/concepts into `kg_entities`/`kg_relationships`. Concept entities (#928) use hierarchical naming (`concept:cross-repo:*`, `concept:infra:*`) to cover cross-repo workflow and Helm/K8s infrastructure concepts for mika-platform and mika-cloud corpora. Lexical ingestor (#689) chunks `docs/solutions/**/*.md` per-agent into `kg_chunks` + FTS5/vec search. Subject extractor (#690) runs LLM-based NER to extract entities and fact triples from chunks into `kg_subject_entities`/`kg_subject_relationships` with provenance tracking. Extraction runs async at startup (background per-agent) and sync on compound hook. Entity resolver (#691) bridges subject graph to domain graph via two-stage pipeline (exact-match then LLM disambiguation) into `kg_subject_resolutions`/`kg_resolutions_log`. Resolution runs async at startup and as background spawn after compound extraction. Per-agent KG scoping via `identity.toml` `[kg]` section (#778) — `enabled` (default true) and `docs_root` (optional) control per-agent corpus isolation; agents with matching `docs_root` share extraction via `docs_root_hash` (v27). **KG topology (#800):** mika-arch is the sole KG consumer among well-known agents; mika-dev and mika-qa are provisioned with `[kg].enabled = false` (zero `query_knowledge_graph` usage — retrieval goes through `search_memory`). Re-enable per-agent with one identity.toml edit + restart if a dev/qa flow needs KG. See `crates/mika-agent/CLAUDE.md`.
 - **Docker images:** Multi-stage builds with BuildKit cache. `Dockerfile.agent` (95MB) for per-customer containers. `Dockerfile.gateway` for the stateless gateway. Both use rustls, non-root user `mika` (UID 1000). Release profile: LTO + strip. `docker-compose.yml` defines agent, gateway, and postgres services. **Host dependency:** `jq` is required by all skill handler scripts.
-- **CI/CD:** Five GitHub Actions workflows: `ci.yml` (PR checks), `pr-body-validation.yml` (PR body validation), `release-pr.yml` (versioning/changelog via release-please — **disabled** since 2026-08-29, `workflow_dispatch` only; see mika#2048), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@samidarko/ui` to npmjs.org as a public package). All actions pinned to commit SHAs. CI includes a `byte-slice-lint` job that runs `scripts/check-byte-slices.sh` to prevent unsafe `&str` byte-slicing patterns that panic on multi-byte UTF-8 (#764), a `loop-select-lint` job that runs `scripts/check-loop-select.sh` to reject `tokio::select!` inside `run_loop`'s body — the deadline-check guarantee depends on iteration-top semantics not being shadowed (#848), an `a2a-timeout-literal-lint` job that runs `scripts/check-a2a-timeout-literals.sh` to reject a call budget written as a literal at the site that bounds it on the a2a path — the predicate is on the **bounding site**, never on the value, because "duration ≥ 60 s" also catches cache TTLs and JWT lifetimes and an allowlist full of those is where the regression would pass unnoticed (#2309), and a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime-server, mika-runtime-gateway, mika-runtime-cli, mika-runtime-all) on every PR to catch structural bugs before merge. **PR Body Validation (#527):** `pr-body-validation.yml` runs `scripts/check-pr-body-consistency.sh` on every `pull_request` event (opened, edited, synchronize). Two checks: (a) closure-consistency — when the PR body declares `Closes #N`, the script walks #N's formal sub-issues via GitHub GraphQL `trackedIssues`; if any are OPEN and not acknowledged, the gate hard-fails (`exit 1`); (b) follow-up tracker — when the body contains a deferral trigger phrase (e.g., "will be fixed in a follow-up", "deferred to a separate PR"), a `Tracked in: <ref>` line naming the tracker issue/PR is required. To resolve failures: add `Tracked in: senara-solutions/<repo>#<number>` lines to the PR body for each deferred item, or close the sub-issues in the same PR.
+- **CI/CD:** Five GitHub Actions workflows: `ci.yml` (PR checks), `pr-body-validation.yml` (PR body validation), `release-pr.yml` (versioning/changelog via release-please — **disabled** since 2026-08-29, `workflow_dispatch` only; see mika#2048), `release.yml` (cross-platform binaries), `publish-ui.yml` (`@samidarko/ui` to npmjs.org as a public package). All actions pinned to commit SHAs. CI includes a `byte-slice-lint` job that runs `scripts/check-byte-slices.sh` to prevent unsafe `&str` byte-slicing patterns that panic on multi-byte UTF-8 (#764), a `loop-select-lint` job that runs `scripts/check-loop-select.sh` to reject `tokio::select!` inside `run_loop`'s body — the deadline-check guarantee depends on iteration-top semantics not being shadowed (#848), an `a2a-timeout-literal-lint` job that runs `scripts/check-a2a-timeout-literals.sh` to reject a call budget written as a literal at the site that bounds it on the a2a path — the predicate is on the **bounding site**, never on the value, because "duration ≥ 60 s" also catches cache TTLs and JWT lifetimes and an allowlist full of those is where the regression would pass unnoticed (#2309), a `landing-tokens-lint` job that runs `scripts/check-landing-tokens.sh` to reject any colour literal under `site/src/` or `site/index.html` — the landing consumes the rulebook §2 palette from `@samidarko/ui/theme.css`, so a hardcoded colour is one that stops tracking the rulebook silently, and the rule is on the **shape** rather than on a list of superseded values, because the realistic regression is not retyping `#7c6af7` but writing a purple that looked close enough (mika#1804; the three macOS window-chrome pips of the terminal mockups are the named by-value exception, never a by-file one), and a `docker-build` job that builds all Dockerfiles (agent, gateway, mika-os, mika-runtime-server, mika-runtime-gateway, mika-runtime-cli, mika-runtime-all) on every PR to catch structural bugs before merge. **PR Body Validation (#527):** `pr-body-validation.yml` runs `scripts/check-pr-body-consistency.sh` on every `pull_request` event (opened, edited, synchronize). Two checks: (a) closure-consistency — when the PR body declares `Closes #N`, the script walks #N's formal sub-issues via GitHub GraphQL `trackedIssues`; if any are OPEN and not acknowledged, the gate hard-fails (`exit 1`); (b) follow-up tracker — when the body contains a deferral trigger phrase (e.g., "will be fixed in a follow-up", "deferred to a separate PR"), a `Tracked in: <ref>` line naming the tracker issue/PR is required. To resolve failures: add `Tracked in: senara-solutions/<repo>#<number>` lines to the PR body for each deferred item, or close the sub-issues in the same PR.
 
 ## Orchestrator Role Transfer (mika#1641)
 
@@ -473,6 +473,19 @@ Optional (callback watchdog):
 - `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` — Grace window (seconds) before the childless-parent reaper transitions a `self_dev` **issue** parent left `in_progress` with **zero** callback children to `failed` (default: 1800, 30 min). The deterministic backstop for silent pilot death (#1687): a parent that reached `in_progress` without ever recording a callback child falls through both orphan reapers (they INNER-JOIN a delivered callback child) and the watchdog (it keys off the callback child's PID). Deliberately far larger than the orphan reaper's 600s grace because a legitimately-dispatching parent is childless only for the sub-second window between its `pending → in_progress` transition and the callback-child row commit. Invalid/≤0 values fall back to the default (WARN-logged). Runs every 60-tick DB scan. Grep `task_engine_childless_reaper.reaped` in `$MIKA_SPIRIT_LOG_FILE` for each silent-pilot death made visible + terminal; sustained >5/day signals an upstream dispatch-path root cause (this reaper is the visibility/terminal backstop, not the primary fix).
 - `MIKA_STUCK_PENDING_REAPER_GRACE_SECS` — Grace window (seconds) before the stuck-pending reaper acts on a `pending` `self_dev` **issue** parent that no callback child represents any more (default: 2700, 45 min; mika#2045). The nominal `pending → failed` transition was measured at 17–25 min, so 45 min sits at 1.8x the top of that window and a merely slow task is never touched. Invalid/≤0 values fall back to the default (WARN-logged). Shared with the `mika tasks stuck` probe so operator and engine report on one population.
 - `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` — Window (seconds) during which a *promoted* deferred wrapper still counts as representing its parent for the stuck-pending reaper (default: 2700, deliberately equal to the grace above; mika#2181). Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later. Counting `pending` alone made the reaper call a healthy parent unrepresented milliseconds after promotion and burn its re-arm budget in two ticks. The window is **bounded** because on the silent-turn error path a wrapper stays `completed` forever, and an unbounded predicate would make that corpse a permanent shield against repair. Invalid/≤0 **and values above 30 days** fall back to the default (WARN-logged) — the upper clamp is load-bearing: SQLite returns NULL for an out-of-range `strftime` modifier, so an absurd override would silently restore the mika#2181 predicate rather than widen the window. Grep `stuck_pending_sheltered_by_promoted_wrapper` in `$MIKA_SPIRIT_LOG_FILE` to see which parents the window is currently holding back — sparing happens inside SQL, so without that line an empty reaper reads the same whether it is idle or withholding.
+- `MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS` — Window (seconds) within which an **activity row** on a deferred wrapper's session proves the turn is working, and spares its parent from the stuck-pending reaper **whatever the age of its promotion** (default `600`; mika#2184). The direct measure that succeeds the proxy window above; the two coexist, the proxy filtering first in SQL and this one afterwards in the application, where it can log what it saw.
+
+  **Why the constant above could not be raised instead, measured.** Over 30 days, **139 of 799** delivered wrappers (17 %) delivered past 2700 s, **81** of their parents were expired `stuck_pending_no_deferred_wrapper`, and **8** of those were expired **2820–4996 s** after promotion — out of reach of *any* value of `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` compatible with a useful reaper. And the argument cuts the other way from how it reads: a wrapper delayed by a service restart is a **healthy** wrapper, i.e. exactly the one that must not be killed, so a bigger number buys coverage by blinding the reaper for longer. *A window on a proxy is a dated debt.*
+
+  **600 s** = 2× the default turn envelope (`AGENT_TOTAL_TIMEOUT` 300 s, mika#2189), which covers a whole turn *and* the interval to the next call with a factor of 2 of margin — deliberately twice mika#1652's 300 s for team runs, because the expensive error here is killing a live turn. House three-tier parse (absent/empty → default; unreadable, `0`, negative, or **above 30 days** → default with a WARN naming the value between quotes). The clamp is **not** the anti-`strftime` mechanism of its neighbour — this threshold never enters the SQL — it is the coherence of the knob: an absurd setting would spare every parent for ever.
+
+  **Three causes of delay, and they do not share a measure.** (A) the turn runs and is slow — the case this closes; (B) `AgentBusy`, where `dispatch_resume_agent` returns before opening a session, so **there is nothing to measure** — not covered, and the refusal is reasoned: the only available signal would be "the agent has activity elsewhere", true almost permanently on mika-dev, which would disarm the reaper under cover of precision (**follow-up named**); (C) a service restart, covered not by a measurement but by the admission that none took place — a process whose uptime is under the window **could not have observed** it, so zero rows there is an unavailability, not a silence. *What cannot extinguish itself cannot spare*: that is why a disarmed telemetry (`MIKA_STORE_LLM_CALLS` and `MIKA_STORE_TOOL_CALLS` both off) **reaps** with a WARN, while a young process spares.
+
+  **Operator surfaces.** `grep stuck_pending_sheltered_by_activity "$MIKA_SPIRIT_LOG_FILE" | jq -c '{task_id, issue, last_activity_secs, cause}'` — `cause` ∈ `{"active", "not_yet_observable"}`, and `last_activity_secs` is `null` on the second (mika#2331: `null` is never `0`). SQL: `SELECT count(*) FROM audit_events WHERE tool_name = 'stuck_pending_sheltered_by_activity';`. **This name is deliberately distinct from `stuck_pending_sheltered_by_promoted_wrapper`, which is untouched** — that one *carries its own cause*, and routing an unrelated spare through it would make the name false and split in two the population mika#2181's probe counts. Two names, two counts, subtractable. Same established motif as `phantom_aged_out` / `phantom_sweep_spared` (mika#2156). Each is SOLE WRITER of its name, pinned by a source scan.
+
+  **Five probes, and their halts.** **(1) Characterisation, to run BEFORE concluding on AC2:** on `~/.mika/data/mika.db`, for parents expired `stuck_pending_no_deferred_wrapper`, measure how many carried activity on one of their deferred wrappers' sessions in the 600 s before expiry. *Halt 1* — if the proportion is **nil**, the tail is made of B and/or C and **this ticket does not close the residue**: do not widen the window by reflex (that is the very gesture the ticket refuses), read which cause dominates, and open the follow-up or note that the uptime guard suffices for C. **(2) The measure bites (48 h):** expected regime **non-empty and low** — each line is a healthy parent the reaper was about to kill. *Halt 2* — if the count carries nominal traffic (several spares an hour on different parents), the measure is no longer sparing, it is disarming: establish *which* predicate is too wide before tuning anything. **This is a spare term, not a path.** **(3) The proxy debt retires:** `grep stuck_pending_sheltered_by_promoted_wrapper "$MIKA_SPIRIT_LOG_FILE" | wc -l` should **decrease** relative to probe 2. A joint plateau says the two protect disjoint populations, which is a **result** to write down, not a breakage. **(4) Both inertias are mute:** `grep stuck_pending_activity_not_recorded` and `grep stuck_pending_activity_window_invalid` — expected **zero** each. *Halt 3* — any hit on the first is a reaper running without its direct measure, i.e. this ticket rendered inert by a setting: check `store_llm_calls` / `store_tool_calls` first, do not touch the predicate. **(5) Negative control:** `stuck_pending_task_expired` must **keep** appearing. Zero expiries over a week means the reaper has stopped reaping altogether — the fault probe 2 looks for, seen from the other end. *A silent reaper reads exactly like a reaper with nothing to do* (mika#2205).
+
+  **Out of scope, deliberately:** the mika#2181 predicate itself (merged, correct in its domain, and the proxy window is kept unchanged under the direct measure); the reaper's TOCTOU; and the **phantom-sweep sibling** of this ticket's first comment — a NULL-PID `action_type='none'` row queued behind a busy slot produces **no** activity row at all, so measuring activity would spare it exactly zero times. Its discriminant is different (`has_live_deferred_wrapper_child`, already named in `dispatch_liveness`'s doc-comment as the hole in its guard), its population is different, its blast radius is different. **Follow-up, with its precondition:** establish that the class still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since raised the grace to 14400 s (`SELECT date(created_at), count(*) FROM audit_events WHERE tool_name = 'phantom_aged_out' AND created_at > '2026-09-10' GROUP BY 1;` — zero rows means **do not open it**, a second discriminant would be a guard with no population).
 - `MIKA_PHANTOM_SWEEP_AGE_SECONDS` — Grace period (seconds) before the watchdog phantom sweep transitions a NULL-PID `action_type='none'` tracking row that has been `in_progress`/`blocked` past this threshold to `failed` (mika#1712, default `14400` since mika#2156 — see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS` for the measured rationale). Startup sweep (AC5) still runs at age=0, but neither path is decided by the clock alone any more: since mika#2156 both consult the row's dispatch child and spare it while that process is alive, because a tracking row's `updated_at` is never bumped while its dispatch works. The SQL cutoff is `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-<n> seconds')`. Sweep telemetry: a per-row `audit_events` row with `tool_name='phantom_aged_out'` for each transition written and `tool_name='phantom_sweep_spared'` for each one the liveness guard withheld (mika#2156); a per-row `phantom_sweep_spared` INFO log line (fields: `source`, `task_id`, `child_task_id`, `process_id`, `updated_at`); a per-pass `phantom_sweep_complete` INFO log line (fields: `source` in `{"startup_sweep","watchdog_tick"}`, `count`, `spared_count`, `error_count`, `lookup_error_count`, `unusable_child_count`, `agent_id`); and `phantom_sweep_large_backlog` WARN when a single pass sweeps >100 rows (it still keys on `count`, so sparing never triggers it — anomalous state, feeds the mika#1934 cause-racine investigation).
 
 Optional (pilot silent-stall reaper — mika#2249):
@@ -1572,6 +1585,123 @@ Optional (terminal-worktree reaper — mika#2420):
 - **Named residual risk.** When `refs/remotes/origin/<branch>` is **absent**, T7 reads `Clean` rather than `Unreadable`: this term is only reached for a worktree whose PR is terminal, hence whose branch *was* pushed, so the ref's absence means the remote deleted it after the PR closed. Reading it as unreadable would keep nearly the whole targeted population, i.e. make the scan inert exactly where it must serve (class mika#2205). The cost, stated: a PR **closed without merging** whose remote branch was deleted will see its commits go with the worktree — they remain reachable in the PR's history on GitHub, and the dirty half still protects **uncommitted** work.
 - **Out of scope, deliberately:** layers A and B of #1694 (`worktrees-audit` / `worktrees-clean`, in the mika-platform repo) are unchanged and remain the manual gesture; remote branches; the `target/` of open PRs (HALT 2); and reopening #1694 itself, which is an orchestrator gesture the PR body signals rather than performs.
 
+### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
+
+**Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
+qui voit rougir `canonical-tokens-lint`, ou qui se demande s'il peut écrire un
+callout en français, cherche dans ce voisinage.
+
+- **La règle, et ce qu'elle n'est PAS.** Le bearing Prime dit : prose des tickets
+  en français, jetons machine en anglais canonique exact. Confrontée au code qui
+  matche — la borne de fermeture de Prime elle-même — la lecture naïve de cette
+  règle **accuse deux formes que le dépôt lit délibérément bien** :
+  « seconde passe » (`grooming_marker.rs::LATER_PASS_RE` est bilingue **par
+  décision écrite** depuis mika#2158) et les paraphrases de
+  `_parse_disposition`. La règle en vigueur est donc :
+
+  > **Une forme qu'un lecteur strict ne voit pas est refusée ; une forme qu'un
+  > lecteur tolérant voit est admise.**
+
+  Le discriminant est la **tolérance du lecteur**, jamais la langue du jeton.
+- **`scripts/canonical-tokens.tsv` — un fichier, quatre colonnes, deux lecteurs**
+  (le lint shell et le scan Rust). `classe` décide si le lint accuse (`B`) ou se
+  tait (`A`) ; `site de match` au format `chemin::symbole` (**jamais un numéro de
+  ligne**, qui pourrit en silence) est ce qui rend la liste *confrontable* ;
+  `tolérance` est la colonne que l'intuition omet et celle qui empêche la
+  ré-accusation de « seconde passe ». **Format de fil** : `exact:line-anchored`,
+  `exact:word-boundary`, `exact:prefix`, `exact:literal`, `ci:line-anchored`,
+  `ci+emphasis:…`, `paraphrase`, `ci+fr:…`. Un jeton dont la tolérance porte `ci`
+  ne peut pas être accusé de casse.
+- **Le relevé est PRODUIT, jamais tenu à la main.**
+  `scripts/canonical-tokens-survey.sh` (`--tsv`, `--check`). La première version
+  du plan présentait son inventaire comme « relevé sur l'arbre » sans livrer le
+  geste qui le produit, et la révision l'a démontré sur elle-même : le relevé
+  était exact ligne à ligne et **incomplet**, ratant
+  `dispatch-lib.sh::_extract_plan_path`, le lecteur le plus strict du callout
+  `Plan`. Le survey livré en trouve **74**, dont une douzaine que le plan ne
+  listait pas.
+- **Deux gardes, deux directions, et aucune n'est la copie de l'autre.**
+  `--check` part de la **forme de lecture** (`Regex::new`, `starts_with`,
+  `strip_prefix`, `match_indices`, `grep`, `sed -n`, une constante nommée
+  `*_MARKER|_PREFIX|_KEY|_LINE`) ; `canonical_tokens::tests::mika2201_every_match_site_is_declared`
+  part du **jeton**, ce qui lui fait voir un lecteur par `contains` que le survey
+  ne voit pas — c'est ainsi que `executor.rs::check_grooming_markers` a été
+  trouvé. La direction « périmée » est tenue par
+  `…::mika2201_every_declared_symbol_still_exists`, qui pose la question
+  directement au lieu de l'inférer d'une coïncidence avec un survey.
+  **`contains` est hors du survey par mesure** : l'y admettre ajoute quatorze
+  lignes fausses pour deux vraies.
+- **Cinq règles, toutes négatives.** Aucune ne dit « ce texte doit contenir X » :
+  un lint qui exige une forme sur un corps libre accuse toute prose. L1
+  sous-chaîne ambiguë **dans une ligne de callout** (`ESCALATE-divergence`) ; L2
+  casse d'un token de verdict, **sauf tolérance `ci`** ; L3 clé de callout
+  quasi-variante (espace typographique FR, casse, traduction listée) — **et pas**
+  « toute clé hors des trois canoniques », le flux milestone écrivant
+  légitimement `Sub-issues:` / `Sequencing record:` / `Coordination branch:` ;
+  L4 espace avant les deux-points d'une étiquette de protocole ; L5 label écrit
+  en **instruction** (`--add-label` / `--remove-label`) et non déclaré.
+- **Un jeton cité entre backticks ou dans un bloc clôturé est une mention, jamais
+  une instruction** — mesuré sur le plan de ce ticket même, dont le § M4 décrit
+  la règle L4 en citant les formes fautives et faisait rougir le lint. Même geste
+  et même raison qu'`auto_pull::is_groomed` (mika#2120), même classe que le faux
+  positif du Signal S (mika#2050). Ne s'applique **pas** à L5 : dans un
+  prescripteur markdown, une instruction `gh` vit nécessairement dans un bloc.
+- **Trois surfaces, trois statuts, et l'une n'est pas un gate.** S1 les
+  prescripteurs du dépôt — **gate CI bloquant** (`canonical-tokens-lint`), le
+  levier structurel : un prompt qui prescrit une forme fausse la reproduit sur
+  *tous* les tickets qu'il produit. S2 les corps de PR — **livré désarmé**
+  (`continue-on-error`), voir la halte ci-dessous. S3 les corps de tickets —
+  **annotation non bloquante** (`issue-token-annotate.yml`), parce que GitHub
+  n'offre **aucun** gate sur une issue ; prétendre en livrer un annoncerait une
+  protection qui n'existe pas. S3 est borné à son époque (`opened`/`edited`) : le
+  bearing interdit la migration rétroactive de la prose.
+- **« On déclare, on n'allowliste pas. »** Quand le scan d'exhaustivité tire, la
+  résolution est **une ligne de TSV** — jamais une exemption. Son allowlist est
+  livrée vide et un test refuse qu'elle cesse de l'être. Le fichier
+  `scripts/canonical-tokens-exceptions.tsv` existe pour le **lint** (une
+  accusation sur un texte préexistant), quatre champs obligatoires, **livré
+  vide**, et porte son **assertion auto-nettoyante** : une exception dont le
+  fichier ne contient plus le jeton fait rougir — le jour de la réparation, pas
+  des mois après.
+- **Ce que ce travail a trouvé en se construisant.**
+  `needs-multi-agent-review`, écrit par `_finalize_pr_gate` (`dispatch-lib.sh`)
+  en `--add-label … || true`, n'était **déclaré nulle part**. Cinquième
+  occurrence de la classe
+  `un-label-denforcement-non-declare-echoue-en-silence` : `delete-other-labels:
+  true` l'aurait supprimé du dépôt et de chaque PR le portant, sans événement ni
+  journal, pendant que son écriture échouait en silence des deux côtés. **Réparé
+  dans le même commit** en le déclarant, comme mika#2199 l'a fait pour
+  `human-review-required`.
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal.
+  Le lint est un gate : son signal est son propre rouge, et **son silence sur S3
+  ne prouve rien** — une annotation que personne ne lit est un silence avec une
+  ligne de plus. La seule mesure est le taux d'accusation sur S1+S2, **régime
+  attendu zéro**. Une accusation soutenue sur un prescripteur signifie que ce
+  prescripteur prescrit une forme fausse depuis un moment : c'est un résultat,
+  pas une panne du lint.
+- **Halte 1 — armer S2.** Le gate S2 est livré **désarmé** parce que sa mesure de
+  pré-vol (V5c : le lint propre sur les PR ouvertes + les 50 dernières mergées)
+  **n'était pas exécutable** au moment de la livraison, `gh` n'étant pas
+  authentifié dans le bac à sable de dispatch. Le plan prévoyait le cas « rouge »,
+  pas le cas « non mesurable » ; la lecture sûre est la même — **ne pas armer ce
+  qu'on n'a pas mesuré**. La condition d'armement et le geste (retirer une ligne
+  `continue-on-error`) sont écrits dans `pr-body-validation.yml`, donc ce n'est
+  pas un désarmement permanent qu'on aurait oublié d'armer. **Ce n'est pas une
+  réduction d'AC1** : AC1 est ratifiée sur S2 comme gate bloquant, la disposition
+  porte sur la *fenêtre de déploiement*.
+- **Halte 2 — accusation soutenue sur les corps de PR sans qu'aucun prescripteur
+  ne rougisse.** La forme fautive naît alors du pilote et non du prompt :
+  **ne pas élargir le lint**, établir quel chemin l'écrit.
+- **Halte 3 — le lint rougit sur une forme que la machine lit.** C'est la
+  régression que la fixture `seconde-passe.md` existe pour dire (elle doit rester
+  **verte**). Le remède est la colonne `tolérance` du TSV, jamais une exception.
+- **Hors périmètre, délibérément.** La classe A (six lecteurs mesurément
+  tolérants) ; la migration rétroactive des corps existants ; resserrer
+  `VERDICT_TOKEN_RE`, écarté par mika#2188 avec sa raison ; et **`post-launch`**,
+  employé par le commentaire opérateur de ce ticket et déclaré nulle part — réel,
+  adjacent, mais ce n'est pas un label d'enforcement (sa perte coûte un parking,
+  pas une garde) : **ticket de suivi**.
+
 ### Une consigne de fréquence a un site d'inscription (mika#2358)
 
 **Ce ne sont pas des variables d'environnement mais des clés `customer_config`**,
@@ -1757,6 +1887,220 @@ borner les messages proactifs d'un tenant » cherche ici.
   registre portant deux récurrences de même intention sous deux labels. Le framing
   du tour heartbeat n'est pas touché (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`),
   donc aucune régression de ton n'est introduite.
+
+### Le tenant grand-public tient son registre : typographie, langue, heure locale (mika#2247)
+
+**Une clé `customer_config`, pas une variable d'environnement** — `language`,
+per-tenant, réglable par l'outil `set_config` **déjà exposé au modèle** et par le
+`/config set` opérateur, comme les deux clés de mika#2358 juste au-dessus. Elle
+est documentée ici parce qu'un opérateur qui cherche « comment épingler la langue
+d'un tenant » cherche là où il a trouvé « comment borner ses messages
+proactifs ».
+
+- **Le défaut, mesuré le 2026-09-06 (captures Telegram MikaSenara).** Trois
+  fuites de registre dans un même fil, sur un tier dont la persona prescrit le
+  français, le `tu` et zéro jargon : des em-dashes U+2014 en sortie, une bascule
+  EN↔FR au sein du fil, et une « belle journée » envoyée le soir.
+
+- **Ce que la lecture du code a déplacé, et c'est le premier livrable.** Le
+  commentaire opérateur du 08/09 posait les trois fuites comme *« pilotées par le
+  modèle z-ai/glm-5.2, pas un bug de code »*. Trois mesures corrigent ce
+  diagnostic, et chacune change le remède. **(R1)** Une des trois occurrences
+  em-dash est **copiée mot pour mot de `FAMILY_SOUL`** : la ligne
+  `> Pas besoin de rien connaître — tu me parles` vivait dans la section
+  `## First-turn opening (référence : persona verbatim approuvé)`, celle que le
+  modèle reproduit à l'ouverture de chaque tenant. La persona ne se contentait
+  pas de « ne pas l'interdire », elle le **prescrivait**, sous la forme la plus
+  contraignante qu'un prompt connaisse — un exemple approuvé. Le premier geste
+  n'était donc pas d'ajouter une règle en concurrence avec un exemple, c'était de
+  **cesser de prescrire**. **(R2)** La langue **était déjà épinglée** dans
+  `FAMILY_SOUL`, deux fois, dont une en gras, et la dérive a eu lieu quand même :
+  une troisième formulation aurait rejoué la classe que
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` borne.
+  Ce qui manquait était un axe **déclaré** et une moitié structurelle. **(R3)**
+  Le prompt ne posait **aucune** heure locale : il posait UTC et laissait le
+  modèle faire deux inférences non outillées. Pas un défaut de consigne — une
+  absence de fait, la forme exacte que mika#2290 a dû nommer pour l'hébergement.
+
+- **Portée effective, dite plutôt que découverte.** `customer_config` est une
+  table de la base de l'agent, donc la clé est **par agent**. Les agents
+  d'ingénierie (mika-dev, mika-qa, mika-arch) ne la portent pas : `Unknown`, rien
+  n'est posé, rien n'est gardé, comportement d'aujourd'hui mot pour mot. C'est le
+  résultat voulu.
+
+- `language` — `fr` ou `en`, et **rien d'autre**. C'est la borne du détecteur de
+  dérive : une valeur hors de cet ensemble est refusée **à la porte** par
+  `validate_config_value`, plutôt que d'armer une garde qui ne sait pas la
+  mesurer. Trois états : `fr`/`en` → le fait est posé dans `## Runtime` et la
+  garde 5f s'arme ; absente ou vide → **rien n'est posé, rien n'est gardé** ;
+  illisible (écriture directe en base, hors outil) → idem, **plus un WARN nommant
+  la valeur entre guillemets**.
+
+  **L'absence ne vaut pas « la langue de la persona », et le refus est mesuré.**
+  `FAMILY_SOUL` prescrit le français en dur, et mika#2023 a nommé par écrit le
+  prix de ce codage : *« un champion anglophone obtient l'image miroir du bug
+  pour lequel mika#2023 a été ouvert »*. Faire de l'absence un français implicite
+  écrirait ce défaut à un second endroit ; le déduire du locale du compte est
+  précisément ce que Prime a tranché le 2026-09-09 (« un choix produit déguisé en
+  défaut technique »), arbitrage que mika#2290 avait déjà dû reporter une fois.
+
+  **Le hot-swap n'est pas un bonus, c'est l'exigence.** « Parle-moi en anglais »
+  est une demande conversationnelle ordinaire. Un axe non hot-swappable la
+  rendrait inexécutable — et mika#2358 a mesuré ce que coûte une demande de
+  réglage inexécutable. Quatre mesures ont écarté la variable d'environnement que
+  le plan proposait d'abord, dont une éliminatoire : **rien n'émet
+  `MIKA_TENANT_LANGUAGE`**, donc l'axe aurait été entièrement inerte au
+  déploiement et le tenant mesuré — la seule population qui existe — n'aurait pas
+  été servi. mika#2290 a accepté cette dépendance pour son signal `cloud` ; il
+  pouvait se le permettre, sa garde 5d lisant le texte sortant. Ici la garde
+  dépend de la valeur. Forme identique, conséquence inverse.
+
+  **Le risque du site, nommé plutôt que découvert.** Une garde armée par une
+  valeur que le modèle peut lui-même écrire n'est pas une garde contre un modèle
+  malveillant, et n'a jamais prétendu l'être : elle protège contre la **dérive**,
+  le tour qui bascule en EN alors que `fr` est posé. Changer délibérément la clé
+  est un **acte**, tracé par la ligne `audit_events` que `set_config` écrit déjà.
+  Même arbitrage que `timezone`, réglable par le modèle depuis toujours.
+
+- **Aucune variable d'environnement n'est créée**, et aucun réglage existant ne
+  bouge. Le découpage du moment de la journée (`morning` 05-11, `afternoon`
+  12-17, `evening` 18-22, `night` 23-04) est une constante nommée de
+  `prompt.rs`, pas une clé.
+
+- **Trois axes, trois mécanismes différents, et la différence est le cœur du
+  travail.**
+  - *Typographie (AC1)* — **une substitution, pas une garde.** Une garde EndTurn
+    dispose d'un budget d'un seul re-prompt ; face à un modèle qui produit des
+    em-dashes par style, elle firerait à chaque tour, dépenserait son budget et
+    **laisserait tout de même passer** — la forme littérale de ce que mika#2368 a
+    dû rattraper par un filet moteur. Un em-dash n'est pas une affirmation fausse
+    qu'il faut faire *réécrire* : c'est un défaut de **rendu**, dont la réparation
+    correcte est mécanique et préserve le sens. `mika_common::text::normalize_typography_for_persona`
+    est le **site unique du croisement persona** (`match` exhaustif sans `_ =>`),
+    appliqué aux **trois** sites de sortie immédiatement après
+    `strip_internal_tags` : extraction EndTurn, tour de continuation, outil
+    `send_message`. L'ordre est porteur sur ce dernier : normaliser **avant** que
+    `cleaned` ne soit capturé est obligatoire, le `DeliveryVerdict` de mika#2136
+    comparant des textes par égalité. `DEFAULT_SOUL` et le registre opérateur ne
+    sont **pas** touchés : l'acceptance parle du tenant grand-public, et la
+    ponctuation soignée est le registre que Vincent a choisi pour lui-même.
+  - *Langue (AC2)* — **bornée et mesurée, pas garantie.** La langue d'un texte ne
+    se corrige pas mécaniquement, donc le mécanisme est un re-prompt à budget un
+    (garde 5f), dont le résidu est compté par
+    `guard.response_language_drift_uncorrected`. Le mot « tenue » de l'acceptance
+    est donc livré comme *borné et mesuré*. Si la mesure post-déploiement montre
+    un résidu non négligeable, le remède est un filet moteur (forme mika#2368),
+    **pas un second re-prompt — et c'est un ticket, pas un réglage**.
+  - *Heure locale (AC3)* — **le fait est calculé et posé** ; la garde 5g n'est
+    qu'un filet derrière lui, d'où son lexique **fermé et étroit** là où celui de
+    5f est une mesure.
+
+- **Fail-open partout où le signal manque.** Détecteur de langue : un texte trop
+  court, purement emoji, un nom propre seul ou du code rend `Undetermined` et la
+  garde **ne fire pas** — « Bonjour 🌸 », « OK », « All good » sont indécidables
+  et doivent le rester, un faux positif sur un tenant grand-public coûtant une
+  réponse retardée pour rien. Garde de salutation : sans fuseau déclaré il n'y a
+  pas d'heure locale, donc rien qu'une salutation puisse contredire — et le
+  prompt a déjà interdit la salutation horodatée sur ce chemin.
+
+- **Le chemin compact suit mika#2290 au lieu d'en diverger.** `build_compact_system_prompt`
+  ne rend ni la ligne d'heure locale ni la ligne de langue. Trois faits le
+  refusent et le troisième est le seul qui compte : le test de forme du compact
+  refuse explicitement `## Current Time` et son assertion de compte de sections
+  exige désormais par écrit qu'une augmentation nomme la section, son ticket et
+  ce qu'elle garantit ; le carve-out mika#2290 est écrit sur le site avec son
+  raisonnement ; **et ce raisonnement s'applique ici mot pour mot** — les gardes
+  5f et 5g lisent le texte sortant, pas le prompt, donc elles protègent ce chemin
+  que la ligne y soit rendue ou non. Coût nommé et réel : sur MikaModel le modèle
+  n'a pas le fait posé et les gardes y travaillent seules. Régime hérité de
+  mika#2290, joint au même suivi (mika#1925). Épinglé **comme décision**, pas
+  comme oubli, par `prompt::tests::mika2247_compact_prompt_omits_the_local_time_line`.
+
+- **Surfaces opérateur** — cinq signaux dans `$MIKA_SPIRIT_LOG_FILE` :
+  - `tenant_language_resolved` (INFO — champs `agent_id`, `language`, `source`)
+    — **la réponse à « quelle langue est en vigueur pour ce tenant ? », sans lire
+    la base.** Modèle et raison : `proactive_budget_resolved` (mika#2358),
+    lui-même calqué sur `llm_budget_resolved` (mika#2293) — *un réglage qu'on ne
+    peut pas observer n'est pas un réglage, c'est un espoir.* Deux valeurs de
+    `source`, et elles nomment deux remèdes opposés : `config` → la consigne est
+    en vigueur, donc un symptôme survivant est imputable à autre chose (et c'est
+    le carve-out compact qu'il faut lire en premier) ; `default` → l'écriture n'a
+    pas atterri, la cause est dans `set_config` ou dans le tour qui aurait dû
+    l'appeler, **pas** dans la garde. Dédupliqué sur le couple résolu, comme ses
+    deux aînés : une répétition à l'identique est tue, un **changement** est
+    ré-émis — c'est ce qui rend « l'utilisateur a demandé l'anglais en cours de
+    fil » lisible sur une ligne. **Indépendant de tout réglage de télémétrie** :
+    c'est un événement de configuration, qui doit rester lisible précisément
+    quand on a réduit le bruit.
+  - `tenant_language_unrecognized_value` (WARN) — **zéro attendu** ; ne peut
+    venir que d'une écriture hors outil, `validate_config_value` refusant à la
+    porte. Nomme la valeur entre guillemets, pour qu'un espace parasite se voie.
+  - `guard.response_language_drift` (WARN) — régime attendu **faible mais non
+    nul** ; chaque ligne est un tour rattrapé. Un flot soutenu sur un même tenant
+    dit que la moitié intention n'atteint pas ce chemin : **vérifier le carve-out
+    compact avant de toucher au détecteur**.
+  - `guard.response_language_drift_uncorrected` (WARN) — **zéro attendu**. C'est
+    la seule population que la garde ne ferme pas ; sans cet événement elle
+    serait indistinguable d'un tour sain.
+  - `guard.time_of_day_greeting_mismatch` (+ `_uncorrected`) — même lecture.
+
+  Les deux gardes rejoignent la famille #953 : elles portent un
+  `guard_correlation_id` qui se joint à `guard.correction_accepted`. **Le
+  normaliseur typographique n'émet rien, délibérément** : il tourne sur tous les
+  tours famille, une ligne par tour serait le churn que la doctrine mika#2131
+  borne, et son effet est vérifiable par test plutôt que par grep. En base :
+  `SELECT * FROM audit_events WHERE tool_name = 'set_config';` répond à « quand
+  la langue de ce tenant a-t-elle été posée, et par quelle session ? » —
+  `set_config` écrit déjà cette ligne, rien n'est ajouté.
+
+- **Sondes post-déploiement, et leurs haltes.**
+  1. *AC1, 48 h* — rejouer les trois échanges mesurés sur un tenant famille :
+     zéro U+2014 en sortie. **Halte** : un em-dash qui réapparaît alors que les
+     tests sont verts signifie un **quatrième** chemin de sortie — l'établir, ne
+     **pas** élargir le normaliseur au gateway par réflexe (il ignore la persona,
+     et depuis mika#2291 il rend du HTML pour tout le monde, donc normaliser là
+     toucherait le registre opérateur que l'acceptance exclut).
+  2. *AC2* — poser `language = fr` sur le tenant mesuré **par la conversation**
+     (c'est le chemin qu'on teste, et le seul qui atteste que la clé est réglable
+     sans redéploiement), puis lire la provenance **avant** de rejouer quoi que
+     ce soit :
+     ```bash
+     grep tenant_language_resolved "$MIKA_SPIRIT_LOG_FILE" \
+       | jq 'select(.agent_id == "<tenant>") | {language, source}'
+     ```
+     Attendu : `{"language": "fr", "source": "config"}`. Rejouer ensuite le fil
+     bilingue mesuré. **Trois haltes, dans l'ordre du coût.** *2a — `source:
+     "default"`* : l'écriture n'a pas atterri ; **ne pas toucher à la garde ni au
+     détecteur**, la cause est dans `set_config` ou dans le tour qui aurait dû
+     l'appeler, et aucun réglage du seuil ne la corrigera. *2b — aucune ligne du
+     tout alors que le tenant a tourné* : le binaire servi est antérieur au
+     correctif (classe mika#2340) ; établir le déploiement avant toute conclusion
+     sur le texte. *2c — `source: "config"` et la bascule persiste avec
+     `guard.response_language_drift` **vide*** : le tour passe par un assembleur
+     que la garde ne traverse pas — **lire d'abord le carve-out compact**, puis
+     établir lequel.
+  3. *AC3* — une salutation le soir, fuseau déclaré, puis la même **sans** fuseau.
+     Le second cas doit produire une salutation non horodatée, pas un pari.
+  4. *Contrôle négatif opérateur* — sur la station de Vincent (tier `default`,
+     aucune clé `language`) : em-dashes préservés, aucune garde armée. **Halte** :
+     toute garde qui fire côté opérateur est une fuite de portée — désarmer et
+     réparer le croisement persona, **pas le seuil**.
+
+- **Hors périmètre, délibérément.** Le **changement de modèle** (`z-ai/glm-5.2` →
+  autre) pour les tenants famille : deux tickets, (a) le geste de
+  provisionnement côté `mika-cloud`, hors de ce workspace, et (b) **une suite de
+  calibration tier famille**, qui n'existe pas (les quatre suites couvrent
+  mika-dev, mika-arch, mika-qa, mika-orchestrator) et sans laquelle mika#1190
+  interdit l'échange. C'est aussi l'argument pour faire le présent travail
+  d'abord : les moitiés structurelles tiennent sous n'importe quel modèle, alors
+  qu'un échange de modèle ne ferme aucun des trois axes de façon vérifiable et
+  rouvre les trois le jour du modèle suivant. Également hors périmètre : toute
+  langue hors `{fr, en}` (le détecteur ne sait pas les mesurer, elles sont
+  refusées à l'écriture, le tenant reste au comportement d'aujourd'hui) ; un
+  filet moteur pour la langue, **conditionné à la mesure du résidu
+  `_uncorrected`** — instruire avant de mesurer serait construire sur une
+  hypothèse ; et mika#2245 (défaut-racine de contexte) plus le ticket frère
+  « boilerplate », que le ticket pose lui-même comme trois clusters distincts.
 
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)

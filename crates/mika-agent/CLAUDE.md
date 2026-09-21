@@ -234,6 +234,24 @@ Twelve sequential post-conditions on assistant text responses, plus one early-ac
 
 Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a posted PR review changes no setting, the same literal reason as 5c/5d/6f. Applies uniformly across modes (a promise made inside a heartbeat turn is exactly as empty, and compaction carries it into the next one). Second violation in the same turn: budget spent, EndTurn accepted, `guard.unactioned_frequency_promise_uncorrected` WARN emitted — **expected regime zero**, and without it that residue would be indistinguishable from a healthy turn. Predicate units in `evidence::guards::tests::mika2358_*` (including the control that separates "reads the calls" from "reads a word": the same text passes once `set_config` is in the summaries); production-path coverage in `tests/eval/test_unactioned_frequency_promise_2358.rs` (measured turn, honest-admission negative control, factual-description negative control, retry-budget boundary). Config keys, the four-producer perimeter, operator greps and the post-deploy probe: root `CLAUDE.md` § *Une consigne de fréquence a un site d'inscription*.
 
+5f. **Response language-drift guard (mika#2247 AC2):** Refuses assistant text measured in a language other than the one **this tenant declared** through the `language` key of `customer_config`. Position 5f, immediately after 5e, whose shape, `intent_guard_retries` budget and `guard.*` telemetry it reuses.
+
+**Founding measurement, 2026-09-06, MikaSenara captures.** One thread flipped EN↔FR: « So — who are you… », « All good », then « Bonjour ! Je suis Mika… ». The tenant's persona (`FAMILY_SOUL`) already prescribed French **twice, once in bold**, and the drift happened anyway — which is precisely why a third sentence was refused as the remedy (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, mika#2120: nine recurrences under prompt enforcement against zero when the fact is posed by code). What was missing was a **declared** axis and a structural half, not another instruction.
+
+**The discriminant is closed-list function words, and the reason is fail-open cheapness.** `measure_response_language` counts hits from two closed lists (`le la les de des un une et est dans que pour` / `the a an of and is in that for to`) and issues a verdict only when **three** independent thresholds clear: ≥12 word tokens, ≥3 hits for the winner, and a ≥2-hit lead. No new dependency, and function words are the part of a text a model does *not* vary — a proper noun, a code identifier or an emoji contributes to neither score. **Anything else is `Undetermined` and the guard does not fire**: « Bonjour 🌸 », « OK », « All good » must stay undecidable, because on a general-public tenant a false positive costs a needlessly re-prompted honest turn and a reply the person waits longer for. That is the expensive error here, not the missed drift.
+
+`expected` is a parameter of the pure function rather than a caller-side `if`, for mika#2290's reason: "an undeclared tenant is never guarded" then carries its own test instead of living in one branch of the agent loop. **The third state is the common one** — every engineering agent and every un-configured tenant declares nothing, resolves `None`, and is byte-identical to the pre-mika#2247 behaviour.
+
+Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a posted PR review does not license answering in the wrong language, the same literal reason as 5c/5d/5e. Applies uniformly across modes: a heartbeat that opens in the wrong language is exactly as wrong, and it is the turn that *starts* the exchange. Second violation in the same turn: budget spent, EndTurn accepted, `guard.response_language_drift_uncorrected` WARN emitted — **expected regime zero**. **What this guard does NOT do, written at the site rather than discovered:** a one-shot re-prompt does not *guarantee* AC2; it bounds it and makes the residue countable. If the post-deploy measurement shows a non-negligible residue, the remedy is an engine net (mika#2368 shape), **not a second re-prompt — and that is a ticket, not a setting**. Predicate units in `evidence::guards::tests::mika2247_*`; production-path coverage in `tests/eval/doctrine_regressions/tenant_register_held.rs` (measured drift, undeclared-tenant negative control, nominal turn). Config key, its four measured refusals of an env var, operator greps and the post-deploy probe with its three halts: root `CLAUDE.md` § *Le tenant grand-public tient son registre*.
+
+5g. **Time-of-day greeting guard (mika#2247 AC3):** Refuses a greeting that names a part of the day the tenant is not in. Position 5g, immediately after 5f.
+
+**It is a net, not the mechanism, and the two are tuned in opposite directions.** The measured symptom — a « belle journée » sent in the evening — had no instruction defect behind it: the prompt posed UTC and left the model **two untooled inferences** (convert to the zone, then derive a moment of day). The fix is therefore the *posed fact*: `write_time_section` now computes and renders `Local time (Asia/Singapore): 2026-09-06 20:14 / Sunday evening`, parsing both an IANA name and a fixed offset (the second because rows predating `validate_config_value` still carry `+08:00`, and reading only the first would make AC3 silently inert on exactly those tenants). This guard sits behind that fact, so its lexicon is a **closed, narrow list** where 5f's is a measurement. Two entries are deliberately permissive and say so: `bonjour` admits the afternoon (French uses it until the evening) and `bonne nuit` admits the evening (going to bed at nine is not an error).
+
+**Fail-open on an unknown hour**, and `local_part_of_day` is taken by the pure function for 5f's reason. It is threaded from `prompt::resolve_local_part_of_day`, computed once per turn from the **same instant and the same timezone** the `## Current Time` section renders — a second parse would be free to disagree about what "evening" means, and the guard would then refuse the very greeting the prompt asked for. When no usable timezone is declared there is no local hour, so there is nothing to contradict; the prompt has already forbidden a time-stamped greeting on that path and states the ignorance rather than leaving the void that produced the symptom.
+
+Single retry, not skipped by `skip_remaining_guards`, `guard.time_of_day_greeting_mismatch_uncorrected` for the residue — same contract as 5f above.
+
 6. **Intent-precondition registry (#702):** Registry-driven guard that generalizes the webhook zero-tools guard (#696). `INTENT_GUARDS` is a const array of `IntentPrecondition` entries, each with a trigger function, satisfaction check, and correction message. Retry tracking uses `HashSet<&'static str>` keyed by label (one retry per entry). Current entries: (a) `webhook_ready_label_dispatch` (#846, #907, #1089) — if user message matches the `[GitHub] Issue labeled ready on` marker, requires `run_claude_pilot` attempt (dispatch via dev-pilot, or auto-groom via dev-groom). Post-#1089: the `send_message` grooming-rejection path was removed — all legitimate paths call `run_claude_pilot`; (b) `webhook_no_unauthorized_dispatch` (#910) — if user message starts with `[GitHub]` but does NOT match the ready-label marker, rejects when `run_claude_pilot` was successfully called (only successful calls — failed attempts are already blocked by the dispatch-readiness guard in `executor.rs`). Engine-level fix for recurring unauthorized dispatch from comment events (#798, #838, #910) where prompt-level source-check rules drifted under load. Post-#933: this post-hoc EndTurn guard is **defense-in-depth** — the primary prevention is the pre-hoc tool-boundary gate in `validate_dispatch_readiness()` check (0) which rejects `run_claude_pilot` before the subprocess spawns. Post-#1102: the trigger predicate now delegates to `is_unauthorized_webhook_dispatch()` from `crate::webhook_dispatch` — the same positive-allowlist predicate used by the tool-boundary guard. PR review and check-suite events (qa/ci skill territory) no longer trip the guard. Shared predicates live in `crate::webhook_dispatch` module; (c) `webhook_zero_tools` — if user message starts with `[GitHub]` and zero successful tool calls, rejects once (unchanged #696 behavior); (d) `resume_reconcile` — if user message contains resume/continue verb + milestone/project reference and no successful `check_task` or `list_tasks` call was made, rejects once; (e) `callback_terminal_action` (#870) — if user message starts with `[callback:` (Silent mode callback trigger), requires BOTH `update_task_status` AND `send_message` before EndTurn. AND-shape: both tools must be attempted (success or failure). Also has an inline mirror guard in the empty-text exit path for Silent mode, where the INTENT_GUARDS registry is not evaluated (the registry only fires in the non-empty text branch). `CALLBACK_TERMINAL_ACTION_LABEL` and `CALLBACK_TERMINAL_ACTION_CORRECTION` shared consts keep both sites in sync. **Two carve-outs, both read by both sites because they share the `callback_trigger_active` predicate:** `[callback:deferred-dispatch]` (mika#1011, own contract) and `[callback: long_running:build_mika]` (mika#2355 — a build callback owns no self_dev parent to mark terminal; the #870 audit's "only one callback flow exists" was false, `build_mika` was a second one, and imposing this contract on it let three mika-qa turns answer "Build succeeded" via `send_message` with no PR verdict on 2026-09-17). `build_callback_trigger_context` is the framing half of the same carve-out: it prescribes the self_dev terminal contract to every callback except a build callback, which is told its own (a posted `run_gh pr review`). The discriminant — label, message marker, satisfaction predicate, correction — lives in `crate::qa_build_callback` and nowhere else.
 6a. **QA build-callback verdict guard (mika#2355):** Inline guard (not in `INTENT_GUARDS`), label `qa_build_callback_verdict`. Trigger is **conjunctive** — the user message starts with `[callback: long_running:build_mika]` AND `qa-review` is among the turn's injected skills (`loaded_skill_names`, a `run_loop` parameter threaded from all three call sites; in silent mode that is `callback_safe_skills()`, exactly where mika#2355 B1 made `qa-review-build-callback` reachable). Satisfied by a **successful** `run_gh` call whose input carries `"pr"` and `"review"` (`qa_build_callback::pr_review_posted_in_turn`, the same predicate as early-accept 3b). Single retry via `intent_guard_retries`, correction `QA_VERDICT_REQUIRED_CORRECTION` naming `run_gh pr review` and the `VERDICT:` line. Inline because the registry's `fn(&str) -> bool` sees the message alone, and the label does not distinguish mika-qa from mika-dev — mika-dev carries `build-mika` in its allowlist and launches builds that owe nobody a verdict; armed on the label alone this guard would trade the QA loop-breaker for a dev one (AC4b). Has an empty-text mirror in the Silent exit path like 6(e)/6b, because a bare EndTurn is the shape a turn with nothing to say takes. Coupled with the 6(e) carve-out above: the one removes the wrong contract from the build flow, the other supplies the right one. Production-path coverage: `tests/eval/test_qa_build_callback_verdict_2355.rs` drives `run_silent_agent` through both exit sites. What this guard does **not** do: post anything itself — a second EndTurn without a review is accepted (single-retry contract). What it now does on that path is **say so**: the turn raises `SilentTurnOutcome.qa_verdict_unmet`, and the engine-side `hold[review]` net reads it in the dispatcher (mika#2368 — see § *Verdict Net*, "The second reason"). The guard's one-shot budget is unchanged; the net succeeds it rather than extending it.
 6b. **Callback milestone advance guard (#991):** Inline guard (not in `INTENT_GUARDS` const array) that enforces queue advancement on milestone/project-context callback turns. Triggers on `[callback:` + `[milestone-parent: <id>]` markers in the user message (the marker is injected by `run_silent_agent` after a DB lookup of the parent task type). Satisfied by EITHER Path A: `run_claude_pilot` call (advance to next child), OR Path B: `update_task_status` targeting the parent task ID with status `blocked`/`completed` (halt or finish). Inline because the satisfied predicate needs the parent_task_id from the user message. Composes with `callback_terminal_action` (entry e) — a milestone-context callback must satisfy BOTH guards. Also has an empty-text exit mirror guard. Companion `SilentTrigger::PostCallbackAdvance` fires a second advance turn if the first callback turn did not advance; auto-blocks the milestone if the second turn also fails. **Webhook companion guard (#1218, paired with #991):** Sibling inline guard for `pull_request.closed(merged:true)` webhook turns. Triggers on the `[milestone-parent: <id>]` marker prepended by `server::milestone_context_handler` when the PR-closed event correlates to a task with a `milestone`/`project` parent. Satisfaction has three valid paths: Path A (`run_claude_pilot` or `run_claude_pilot_groom` — advance), Path B (`update_task_status` on parent with `blocked`/`completed` — halt), Path C (`deploy_mika` + `send_message` — deploy-hook ack per self-dev-webhook-qa step 5.5.b). Mutually exclusive triggers with #991: the callback prefix `[callback:` and the webhook prefix `[GitHub] PR closed:` cannot both appear on a single user message. The marker parser `extract_milestone_parent_id` and the constant `MILESTONE_PARENT_MARKER` are shared with #991.
@@ -1943,6 +1961,139 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **SilentTrigger variants:** `Heartbeat`, `Reflection`, `Callback`, `SkillRun`, `Reminder`, `PostCallbackAdvance` (#991), `DeferredDispatch` (mika#1011). Each produces correct system-prompt framing. `PostCallbackAdvance` is an engine-side structural backstop — fired by the dispatcher after a milestone/project-context callback turn completes without advancing the queue. `DeferredDispatch` is an engine-side auto-recovery for `global_dispatch_active` rejections — when `run_claude_pilot` is rejected because another dispatch is active, the engine registers a `pending` callback task with label `long_running:run_claude_pilot:deferred`. When the blocking dispatch completes, the deferred callback is promoted (status → `completed`) and dispatched on the next engine tick as a `DeferredDispatch` turn whose only required action is `run_claude_pilot` (enforced by the `deferred_dispatch_action` INTENT_GUARD). **Promotion paths (mika#1070):** (1) Inline — `dispatch_next_deferred_callback()` (`pub(crate)`) fires after `mark_task_delivered` on a non-deferred callback. mika#1124 re-added the inline anti-cascade guard at `dispatcher.rs:495`: when a `:deferred` wrapper itself completes (e.g., the silent turn no-ops), inline chain-promotion is SKIPPED — relying on the periodic backstop instead. This prevents the no-op-cascade failure mode where N wrappers drain the queue inline without ever dispatching. Real (non-deferred) callback completions still chain-promote immediately. (2) Periodic backstop — `promote_pending_deferred_if_idle()` runs every `DB_SCAN_INTERVAL_TICKS` (60 ticks), iterates over the `dispatch_class` values (`DISPATCH_CLASSES = &["implement", "groom"]` — pinned to `derive_dispatch_class` at `skills/executor.rs` via a shape test in `engine.rs`), checks `has_any_active_callback_for_class(class)` (excludes deferred wrappers via `label NOT LIKE '%:deferred'`, scopes by `COALESCE(dispatch_class, 'implement') = ?`), and promotes one wrapper per idle class per tick via `dispatch_next_deferred_callback_for_class(class)` (mika#1175). Per-class iteration prevents cross-class throughput halving when wrappers from multiple classes are co-pending. Placed BEFORE `dispatch_undelivered_callbacks` for same-tick dispatch. Fail-closed per-class on DB errors — one class's check error does not stall the other. The agent-wide siblings `has_any_active_callback()` and `dispatch_next_deferred_callback()` are kept for the inline-promotion path in `handle_task_complete` (out-of-scope for #1175, see plan § Open question 1). **Both slot predicates must exclude `:deferred` wrappers (mika#1163).** `has_any_active_callback`/`has_any_active_callback_for_class` (engine backstop) AND `has_active_callback_tasks_excluding` (per-class gate inside `validate_dispatch_readiness`) all apply `label NOT LIKE '%:deferred'`. The earlier asymmetric version caused a multi-wrapper deadlock: when two parents each held a pending wrapper, every dispatch attempt from one wrapper saw the OTHER wrapper as slot-occupied and registered yet another wrapper, with no real dispatch ever spawning. **AgentBusy recovery (mika#1070):** when `dispatch_resume_agent` returns `AgentBusy` in `handle_task_complete`, the callback keeps `completed` status (not reset to `pending`) with `next_fire_at` set to now+30s for retry delay. `dispatch_undelivered_callbacks` has a `next_fire_at` guard that skips tasks whose retry delay has not expired. γ composition: the LLM's `send_message` notification and the engine's deferred callback are independent; `validate_dispatch_readiness()` arbitrates any race. Per-agent cap of 10 pending deferred callbacks prevents flood. `cancel_task()` cascades to callback children (both immediate and deferred). **No-op wrapper detection (mika#1172 R9):** When a `:deferred` wrapper completes, the dispatcher checks `has_non_deferred_active_callback_child(parent_task_id)`. If no active child exists, emits `deferred_dispatch_noop_completion` WARN + audit event — the silent turn failed to spawn a real dispatch (mika#1124 regression signal). **Dispatch lifecycle audit events (mika#1172 W4):** Three events written to `audit_events`: `deferred_dispatch_promoted` (on each inline or periodic backstop promotion, with promoted task ID), `deferred_dispatch_registered` (on deferred callback registration at `global_dispatch_active` rejection), `deferred_dispatch_noop_completion` (on no-op wrapper detection). Promote methods (`promote_next_deferred_callback`, `promote_next_deferred_callback_for_class`) return `Option<String>` (promoted task ID) instead of `bool` to enable meaningful audit event resource_id. **(3) Force-promote (mika#1453)** — `promote_deferred_callback` agent tool (fail-closed: rejects when slot busy, no override) and `mika tasks promote-deferred <class>` CLI verb (with `--override` for cancel-then-promote). Both call `force_promote_deferred_for_class()` which shares the `has_any_active_callback_for_class()` predicate (mika#1163 parity). `find_active_callback_for_class()` identifies the blocker for the CLI override path. Three audit event types: `deferred_dispatch_force_promote_succeeded`, `deferred_dispatch_force_promote_rejected_slot_busy`, `deferred_dispatch_force_promote_override`. **What the stuck-pending reaper makes of a promoted wrapper (mika#2181).** Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later under a slow model. For the reaper's predicate (`find_orphaned_pending_issue_tasks`) a deferred wrapper therefore counts as **live** when it is `pending`, **or** `completed` with a `completed_at` newer than `now - MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (default 2700s, `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`). The bound is load-bearing, not a rounding: on the silent-turn error path the wrapper is re-armed but never marked `delivered`, so it stays `completed` forever, and an unbounded predicate would turn that corpse into a permanent shield against repair. `delivered`, `failed` and `cancelled` are never live. `has_live_deferred_wrapper_child` (renamed from `has_pending_deferred_wrapper_child`) answers the same question with the same predicate — the two must not diverge. The `mika tasks stuck` probe takes the same two windows as the reaper, so probe and engine report on one population.
 
+#### The direct measure that succeeds the proxy window (mika#2184)
+
+**What mika#2181 could not reach, measured.** Its window is a proxy on the
+*promotion* instant, and the residue is in the code's own doc-comment: over 30
+days, **139 of 799** delivered wrappers (17 %) delivered past 2700 s, **81** of
+their parents were expired `stuck_pending_no_deferred_wrapper`, and **8** of
+those were expired **2820–4996 s** after promotion — out of reach of *any* value
+of the constant compatible with a useful reaper. Widening it is the wrong reflex,
+and the ticket's argument for that is the one worth keeping: a wrapper delayed by
+a restart is a **healthy** wrapper, so a bigger number buys coverage by blinding
+the reaper for longer. *A window on a proxy is a dated debt*
+(`docs/solutions/best-practices/une-fenetre-bornee-sur-un-proxy-est-une-dette-datee-2026-09-05.md`).
+
+**The chain is joined by equality, and it already existed.** The turn consuming a
+promoted wrapper is a `SilentTrigger::DeferredDispatch`, and
+`dispatch_resume_agent` opens its session with
+`create_session_with_parent(…, task_id = Some(&task.id))` where `task.id` is **the
+wrapper**. So `parent → wrappers (label = DEFERRED_DISPATCH_LABEL) → sessions
+(sessions.task_id = wrapper.id) → llm_calls / tool_calls`. Stricter than mika#1652,
+which has to fall back on `session_id LIKE 'team-' || r.id || '%'`. The `task_id`
+column has existed since v19: no migration, no column.
+
+**Three causes of delay, and they do NOT share a measure — this is the ticket's
+own premise, corrected.** The ticket writes that the silent turn "produces those
+same rows". True *when the turn runs*. A wrapper `completed` and not `delivered`
+past 2700 s has three causes: **(A)** the turn runs and is slow — the AC1 case,
+and the only one an activity measure covers; **(B)** `AgentBusy` — the agent lock
+is held elsewhere and `dispatch_resume_agent` returns `Err` **before**
+`create_session_with_parent`, so there is no session and nothing to measure;
+**(C)** a service restart — nothing was running, and neither was the reaper.
+This work closes **A** by measurement and **C** by an admission (see
+`NotYetObservable` below); **B is not covered, and the refusal is reasoned** —
+the only available signal would be "the agent has activity somewhere else", which
+is true almost permanently on mika-dev and would disarm the reaper under cover of
+precision. Follow-up named.
+
+**Filtered in the application, never as a third `NOT EXISTS`.** The reflex would
+be one more clause in `find_orphaned_pending_issue_tasks`. Refused, and the
+refusal is written in the doc mika#2181 itself shipped: *"the shelter lives in a
+SQL `NOT EXISTS`: a sheltered parent never becomes a candidate and never traverses
+the application. No log, no audit, no counter […] indistinguishable from a healthy
+regime."* That is the defect mika#2181 had to repair after the fact with
+`find_parents_sheltered_by_promoted_wrapper`; doing it a second time in the same
+function would re-dig the hole just filled. The SQL yields the candidates (proxy
+window included, unchanged) and the direct measure filters afterwards, where it
+can log.
+
+**The DB returns an AGE, not a boolean.** `find_deferred_wrapper_activity_age_secs`
+— `None` when no row exists, and `None` is never `0` (mika#2331). Three reasons in
+order of weight: the threshold leaves the SQL and becomes a parameter of a pure
+function, testable at its boundaries without a database; the log line can then
+*name* the age, which mika#2277 paid dearly for not doing (two false positives read
+"nominal" on first inspection because one age was reported on a disposition
+crossing three); and a negative age (clock skew) clamps to `0` — "very recent",
+never "very old", fail-safe towards sparing.
+
+**Four states, and the disposition follows BOUNDEDNESS, not certainty.**
+`classify_wrapper_activity(last_activity_age_secs, window_secs, engine_uptime_secs,
+telemetry_armed)` is a pure function reading no global state; the disposition is an
+exhaustive `match` with **no `_ =>` arm** (the `hosting_ground_truth_line` pattern,
+mika#2290).
+
+| state | disposition | why |
+|---|---|---|
+| `Active` | **spare** | the turn is demonstrably working |
+| `NotYetObservable` | **spare** | the ignorance is **bounded**: it extinguishes itself as soon as uptime exceeds the window. Covers cause C |
+| `Silent` | reap | today's behaviour, bit for bit |
+| `NotRecorded` | reap + WARN | the ignorance is **permanent**: sparing here would restore the corpse-shield mika#2181 had to bound |
+
+*What cannot extinguish itself cannot spare.* `NotYetObservable` and `NotRecorded`
+are two variants rather than one `Unobservable { reason }` precisely because their
+disposition differs — **a reason that decides is not a reason, it is a state**.
+`telemetry_armed = store_llm_calls || store_tool_calls` is a setting that is
+**read**, never inferred from an absence of rows: telling "telemetry is off" from
+"the agent did nothing" is impossible by observation, which is the confusion
+mika#2277 condemns.
+
+**`MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS`**, default **600 s** = 2× the default
+turn envelope (`AGENT_TOTAL_TIMEOUT` 300 s, mika#2189), so it covers a whole turn
+*and* the interval to the next call with a factor of 2 of margin. Deliberately
+twice mika#1652's 300 s for team runs: the expensive error here is killing a live
+turn. House three-tier parse, plus a 30-day clamp — **not** the anti-`strftime`
+mechanism of `PROMOTED_WRAPPER_LIVENESS_MAX_SECS` (this threshold never enters the
+SQL), but the coherence of the knob: an absurd setting would spare every parent for
+ever, which is what `NotRecorded` already refuses on the other axis.
+
+**Two event names, and that rectifies AC4's letter while holding its intent.** AC4
+asks that `stuck_pending_sheltered_by_promoted_wrapper` "distinguish the two spare
+causes"; the literal reading is a `cause` field on that event. **Refused:** its name
+*carries* its cause, so routing an unrelated spare through it would make the name
+false and split in two the population mika#2181's probe counts to measure whether
+its debt is retiring. The house has an established way to keep two populations
+countable apart and has used it three times — `phantom_aged_out` /
+`phantom_sweep_spared` (mika#2156), `qa_deadline_verdict` / `qa_callback_verdict`
+(mika#2368), `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). So
+`stuck_pending_sheltered_by_promoted_wrapper` is **untouched** and
+`stuck_pending_sheltered_by_activity` is its sibling, each SOLE WRITER of its own
+name, pinned by `mika2184_the_two_spare_causes_have_one_writer_each`.
+
+**One reader, held by a source scan.** `mika2184_wrapper_activity_has_a_single_reader`
+refuses a second production site joining `tasks → sessions → llm_calls/tool_calls`,
+**allowlist shipped empty** — when it fires, remove the second site, do not exempt
+it. That is the `grooming_marker` lesson (mika#2158), which this very file has
+already paid a second time with `has_pending_deferred_wrapper_child`. The needle is
+a conjunction of three terms, each added by a measured false positive: it must not
+accuse `find_stuck_team_runs` (whose join is a `LIKE` on `session_id`) nor Signal A
+of `get_task_health_summary` (which walks the same three tables in the opposite
+direction). **Deliberately not unified with mika#1652:** disjoint populations,
+different joins — an abstraction drawn over two points whose joins differ is the
+wrong abstraction. What is shared is the *pattern*, not the code.
+
+**What a fresh process means for tests.** A newly constructed `TaskEngine` has zero
+uptime, so `classify_wrapper_activity` answers `NotYetObservable` and the reaper
+spares **everything** — correctly. Every reaper test that expects an action
+therefore declares that precondition through the `observing_engine` helper, rather
+than inheriting it from `Instant::now()` happening to be old enough.
+
+**The phantom-sweep sibling (comment 1 of mika#2184) is a SEPARATE fix, and the
+reason is structural.** A NULL-PID `action_type='none'` tracking row queued behind
+a busy slot produces **no** `llm_calls` and **no** `tool_calls`: it has not started.
+Measuring activity would spare it exactly zero times. Its discriminant is already
+named, in writing, in `dispatch_liveness`'s own doc-comment — *"a tracking row still
+waiting for a dispatch slot has no PID-carrying child at all — only a deferred
+wrapper — so this guard cannot see it"* — and the remedy there is to consult the
+deferred wrapper (`has_live_deferred_wrapper_child`, a predicate that already exists
+and has nothing to do with activity). Different population, different discriminant,
+different blast radius. **Precondition before opening it:** establish that the class
+still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since
+raised the grace to 14400 s.
+
+Operator surfaces, the five probes and their halts: root `CLAUDE.md`
+§ *Optional (mesure directe de vivacité du tour différé — mika#2184)*.
+
 #### A represented parent has nothing to repair (mika#2413)
 
 **The failure, measured 2026-09-19.** Three tickets were un-parked at once
@@ -2223,6 +2374,8 @@ Structured telemetry for the five fabrication-class EndTurn guards. Each guard f
 | `guard.dev_groom_fabrication` | 5b | Claims Verdict without `run_claude_pilot_groom` call |
 | `guard.doctrine_public_promo` | 5c | Proposes / drafts a prohibited public-launch surface (Show HN, Product Hunt, Reddit launch, Twitter promo, growth-hack) in violation of Mika's invitation-only distribution doctrine (mika#1814) |
 | `guard.false_local_hosting_claim` | 5d | Asserts this instance runs locally (or that the user's data never leaves their machine) while the resolved `Deployment` is not `Local` (mika#2290). Extra fields: `deployment`, `persona`, `matched_subject`, `matched_assertion` |
+| `guard.response_language_drift` | 5f | Answers in a language other than the one this tenant declared via `customer_config.language` (mika#2247). Extra fields: `expected_language`, `detected_language`, `detected_hits`, `expected_hits`. Expected regime: **low but non-zero** — each line is a turn caught |
+| `guard.time_of_day_greeting_mismatch` | 5g | Greets with a formula naming a part of the day the tenant is not in, while the local hour is known (mika#2247). Extra fields: `greeting`, `implied_part`, `actual_part` |
 | `guard.asserted_unavailability` | 6c | Claims tool unavailable when it's in the enabled set |
 | `guard.assert_grounded` | 6d | Affirms resource state without grounding tool call |
 
@@ -2239,6 +2392,8 @@ Fields: `trace_id`, `agent_id`, `session_id`, `step`, `guard_correlation_id` (`{
 | Event name | Fires when | Key fields |
 |---|---|---|
 | `guard.false_local_hosting_claim_uncorrected` | Guard 5d already fired this turn and the re-prompted response still asserts local hosting (mika#2290) | `deployment`, `matched_subject`, `matched_assertion`, `step`, `label` |
+| `guard.response_language_drift_uncorrected` | Guard 5f already fired and the re-prompted response is still in the wrong language (mika#2247) | `expected_language`, `detected_language`, `step`, `label` |
+| `guard.time_of_day_greeting_mismatch_uncorrected` | Guard 5g already fired and the re-prompted response still names the wrong part of the day (mika#2247) | `greeting`, `implied_part`, `actual_part`, `step`, `label` |
 
 **Expected regime: zero lines.** It exists because that population is otherwise indistinguishable from a healthy turn — the blind spot the Fire-Disposition gate (mika#1574) is there to close. It is **not** a second correction: the family grants one re-prompt, and a guard that diverged from its neighbours on that point would become the one everybody re-reads to find out why.
 

@@ -41,6 +41,7 @@ pub const SETTABLE_CONFIG_KEYS: &[&str] = &[
     "thinking_level",
     PROACTIVE_DAILY_BUDGET_KEY,
     PROACTIVE_PAUSE_UNTIL_KEY,
+    TENANT_LANGUAGE_KEY,
 ];
 
 /// Maximum number of **proactive wake-ups** allowed per day (mika#2358).
@@ -60,6 +61,204 @@ pub const PROACTIVE_PAUSE_UNTIL_KEY: &str = "proactive_pause_until";
 /// The value that lifts a pause. Chosen over an empty string because
 /// `set_config` rejects an empty `value` before validation ever runs.
 pub const PROACTIVE_PAUSE_NONE: &str = "none";
+
+/// The language a tenant's thread is held in (mika#2247, AC2).
+///
+/// # Why `customer_config` and not an environment variable
+///
+/// The first draft of the mika#2247 plan proposed `MIKA_TENANT_LANGUAGE` plus a
+/// `[locale]` section in `identity.toml`, on the mika#2290 model. Four
+/// measurements refused that, and the fourth is eliminating:
+///
+/// 1. **The site already exists and already carries the exact neighbour.**
+///    `timezone` lives here and is read by `agent_loop::load_agent_context` in
+///    one line. Axis 3 of this very ticket reads that value; putting the
+///    language beside it is one line against a whole mechanism (three-tier
+///    parse, cache on `AgentState`, `identity.toml` section, threading from the
+///    process environment).
+/// 2. **[`SETTABLE_CONFIG_KEYS`] *is* the tool surface.** Being in that constant
+///    is what puts a key in `set_config`'s schema enum — so the language becomes
+///    settable by the model, and by the operator's `/config set`, without a line
+///    of prompt and without a new tool.
+/// 3. **mika#2358 settled this choice in writing, for a key of the same
+///    nature.** See this module's header: `customer_config` is the only site
+///    nothing rewrites at startup — a cancelled row is revived by
+///    `revert_config_cancel_recurring_task` (mika#2271), an `identity.toml` edit
+///    is exposed to the code-owned-section reconciliation (mika#2330).
+/// 4. **Eliminating: nothing emits `MIKA_TENANT_LANGUAGE`, so axis 2 would ship
+///    entirely inert.** The guard arms only on a *declared* language; with no
+///    declaration it is `Unknown` and nothing is guarded. Setting the variable
+///    is a `mika-cloud` gesture, outside this workspace — so the measured
+///    tenant, the only population there is, would not be served by the delivery.
+///    mika#2290 accepted that same dependency for its `cloud` signal, but it
+///    could afford to: its guard 5d reads the outgoing text and closes its p1
+///    *without* the variable. Here the guard depends on the value. Same shape,
+///    opposite consequence.
+///
+/// # Hot-swap is the requirement, not a bonus
+///
+/// « Parle-moi en anglais » is an ordinary conversational request. A
+/// non-hot-swappable axis would make it unexecutable — and mika#2358 measured
+/// what an unexecutable setting request costs: Mika promises a correction she
+/// has no way to apply, and guard 5e had to be written for it.
+///
+/// # The risk of this site, named rather than discovered
+///
+/// A guard armed by a value the model can itself write is not a guard against a
+/// malicious model. It never claimed to be: it protects against **drift** — the
+/// turn that flips to English while `fr` is posted. Changing the key
+/// deliberately is an **act**, traced by the `audit_events` row `set_config`
+/// already writes; flipping language mid-thread is a drift, and that is what is
+/// refused. Same trade-off as `timezone`, model-settable since day one.
+pub const TENANT_LANGUAGE_KEY: &str = "language";
+
+/// The language of a tenant's thread (mika#2247).
+///
+/// Exactly `{fr, en}`, and the bound is the detector's
+/// (`evidence::guards::detect_response_language_drift`): a value outside this
+/// set is refused at the door rather than arming a guard that cannot measure
+/// it. Any other language is out of scope and follow-up — the tenant simply
+/// keeps today's behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantLanguage {
+    /// French — the language `FAMILY_SOUL` prescribes.
+    French,
+    /// English.
+    English,
+}
+
+impl TenantLanguage {
+    /// Stable wire label, also the value an operator writes.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::French => "fr",
+            Self::English => "en",
+        }
+    }
+
+    /// The human name, for the `## Runtime` ground-truth line.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::French => "French",
+            Self::English => "English",
+        }
+    }
+
+    /// Parse a raw `customer_config` value. Case-insensitive and trimmed, the
+    /// house convention for every key of this table.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fr" => Some(Self::French),
+            "en" => Some(Self::English),
+            _ => None,
+        }
+    }
+}
+
+/// Where a resolved tenant language came from (mika#2247).
+///
+/// Two values, and they name two opposite remedies — which is the whole reason
+/// the provenance is reported at all, per mika#2293's rule that *a setting one
+/// cannot observe is not a setting, it is a hope*. `Config` says the instruction
+/// is in force, so a surviving symptom is somebody else's (read the compact
+/// carve-out first); `Default` says the write never landed, so the cause is in
+/// `set_config` or in the turn that should have called it — **not** in the
+/// guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantLanguageSource {
+    /// Read from `customer_config` and inside the domain.
+    Config,
+    /// Key absent, empty, or unreadable — nothing is posed and nothing is guarded.
+    Default,
+}
+
+impl TenantLanguageSource {
+    /// Stable wire label for the log field.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// A resolved tenant language and its provenance (mika#2247).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedTenantLanguage {
+    /// `None` is the third state — nothing is posed in the prompt and the drift
+    /// guard does not arm. It is the behaviour of every agent that declares
+    /// nothing, which is every engineering agent and every tenant until an
+    /// operator or the model writes the key.
+    pub language: Option<TenantLanguage>,
+    /// Which of the two tiers produced `language`.
+    pub source: TenantLanguageSource,
+}
+
+impl ResolvedTenantLanguage {
+    /// The value of the `language` field on `tenant_language_resolved`.
+    ///
+    /// `"unknown"` rather than an absent field: the event exists to answer
+    /// "which language is in force for this tenant?", and *no language is in
+    /// force* is an answer.
+    #[must_use]
+    pub fn language_label(&self) -> &'static str {
+        self.language.map_or("unknown", TenantLanguage::as_str)
+    }
+}
+
+/// Resolve the tenant language from a raw `customer_config` value (mika#2247).
+///
+/// # Three states, and absence poses nothing
+///
+/// Absent or empty → `None` + [`TenantLanguageSource::Default`]: no ground-truth
+/// line in `## Runtime`, no drift guard. Unrecognised → the same, **with a WARN
+/// naming the offending value between quotes** so a stray space is visible.
+/// `fr` / `en` → the fact is posed and the guard arms.
+///
+/// **Absence is deliberately not "the language of the persona".** `FAMILY_SOUL`
+/// hard-codes French, and mika#2023 already named in writing what that coding
+/// costs: *"an anglophone champion gets the mirror image of the bug mika#2023
+/// was filed for"*. Making absence an implicit French would write that defect at
+/// a second site — and deriving it from the account locale is exactly what Prime
+/// ruled out on 2026-09-09 ("a product choice wearing a technical default's
+/// clothes"), a ruling mika#2290 has already had to carry over once.
+///
+/// The unreadable tier can only come from a write made **outside** the tool:
+/// [`validate_config_value`] refuses an out-of-domain value at the door, so a
+/// `set_config` call returns an error the model can correct within its turn.
+#[must_use]
+pub fn resolve_tenant_language(raw: Option<&str>) -> ResolvedTenantLanguage {
+    let default = ResolvedTenantLanguage {
+        language: None,
+        source: TenantLanguageSource::Default,
+    };
+
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+
+    match TenantLanguage::parse(value) {
+        Some(language) => ResolvedTenantLanguage {
+            language: Some(language),
+            source: TenantLanguageSource::Config,
+        },
+        None => {
+            warn!(
+                key = TENANT_LANGUAGE_KEY,
+                value = %format!("{value:?}"),
+                allowed = "fr, en",
+                event = "tenant_language_unrecognized_value",
+                "language is outside the supported set (fr, en) — posing nothing \
+                 and arming no guard"
+            );
+            default
+        }
+    }
+}
 
 /// Daily proactive wake-up budget in force when the key is absent.
 ///
@@ -260,6 +459,15 @@ pub fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
                 ));
             }
         }
+        TENANT_LANGUAGE_KEY => {
+            if TenantLanguage::parse(value).is_none() {
+                return Err(format!(
+                    "Invalid {TENANT_LANGUAGE_KEY}: {value}\nAllowed values: `fr` or `en`. \
+                     Leaving this unset keeps today's behaviour — no language is posed and \
+                     none is enforced."
+                ));
+            }
+        }
         PROACTIVE_PAUSE_UNTIL_KEY => {
             let ok = value.eq_ignore_ascii_case(PROACTIVE_PAUSE_NONE)
                 || chrono::DateTime::parse_from_rfc3339(value).is_ok();
@@ -300,8 +508,83 @@ mod tests {
         // what puts these two in `set_config`'s schema enum and description.
         assert!(is_settable_key(PROACTIVE_DAILY_BUDGET_KEY));
         assert!(is_settable_key(PROACTIVE_PAUSE_UNTIL_KEY));
+        // mika#2247 — same reason, and it is what makes AC2 settable on a live
+        // tenant by a sentence in the conversation rather than by a redeploy.
+        assert!(is_settable_key(TENANT_LANGUAGE_KEY));
         assert!(!is_settable_key("api_key"));
         assert!(!is_settable_key("db_path"));
+    }
+
+    // -- mika#2247: tenant language -----------------------------------------
+
+    /// The three states, and the one that must pose nothing.
+    #[test]
+    fn mika2247_language_three_states() {
+        let fr = resolve_tenant_language(Some("fr"));
+        assert_eq!(fr.language, Some(TenantLanguage::French));
+        assert_eq!(fr.source, TenantLanguageSource::Config);
+
+        let en = resolve_tenant_language(Some("EN"));
+        assert_eq!(
+            en.language,
+            Some(TenantLanguage::English),
+            "the house convention is case-insensitive and trimmed"
+        );
+        assert_eq!(en.source, TenantLanguageSource::Config);
+
+        for absent in [None, Some(""), Some("   ")] {
+            let r = resolve_tenant_language(absent);
+            assert_eq!(
+                r.language, None,
+                "absence must pose NOTHING: no ground-truth line, no guard armed. \
+                 Making it an implicit French would write mika#2023's anglophone-champion \
+                 defect at a second site."
+            );
+            assert_eq!(r.source, TenantLanguageSource::Default);
+            assert_eq!(r.language_label(), "unknown");
+        }
+
+        // Unreadable is the *same* third state — it can only come from a write
+        // made outside the tool, since `validate_config_value` refuses at the door.
+        let bad = resolve_tenant_language(Some("fr-CA"));
+        assert_eq!(bad.language, None);
+        assert_eq!(bad.source, TenantLanguageSource::Default);
+    }
+
+    /// A value outside `{fr, en}` is refused by `set_config` itself, so the
+    /// model can correct itself within its own turn instead of writing a row
+    /// that silently arms nothing.
+    #[test]
+    fn mika2247_unknown_value_is_refused_at_the_door() {
+        assert!(validate_config_value(TENANT_LANGUAGE_KEY, "fr").is_ok());
+        assert!(validate_config_value(TENANT_LANGUAGE_KEY, "en").is_ok());
+        assert!(validate_config_value(TENANT_LANGUAGE_KEY, "FR").is_ok());
+
+        for rejected in ["es", "fr-CA", "french", "français", "fr en", "0"] {
+            let err = validate_config_value(TENANT_LANGUAGE_KEY, rejected)
+                .expect_err("{rejected} must be refused at the door");
+            assert!(
+                err.contains(TENANT_LANGUAGE_KEY) && err.contains("fr"),
+                "the refusal must name the key and its domain, got: {err}"
+            );
+        }
+    }
+
+    /// The provenance is a wire format: it lands on `tenant_language_resolved`
+    /// and an operator reads it to decide **which of two opposite remedies** to
+    /// apply. Two spellings of one provenance would split that population
+    /// without saying so. Model: `ProactiveBudgetSource::as_str` just above.
+    #[test]
+    fn mika2247_resolved_source_is_a_wire_format() {
+        assert_eq!(TenantLanguageSource::Config.as_str(), "config");
+        assert_eq!(TenantLanguageSource::Default.as_str(), "default");
+        assert_eq!(TenantLanguage::French.as_str(), "fr");
+        assert_eq!(TenantLanguage::English.as_str(), "en");
+        assert_eq!(
+            resolve_tenant_language(Some("fr")).language_label(),
+            "fr",
+            "the label an operator greps must be the value they wrote"
+        );
     }
 
     #[test]

@@ -807,10 +807,27 @@ allowlist = [
 /// entire `## Personality` section on the MikaModel path, so a leading
 /// sentinel would REPLACE the family persona with a platform-internal
 /// comment on exactly the tier this marker exists to protect.
-pub const FAMILY_SOUL: &str = r#"# Mika — Compagnon personnel (famille)
+///
+/// **ASCII punctuation only, and it is a fix rather than a style rule
+/// (mika#2247).** This constant used to carry nine U+2014 em-dashes, one of
+/// them inside `## First-turn opening (référence : persona verbatim approuvé)`
+/// — the section the model reproduces at the first turn of every tenant. The
+/// measured symptom « Pas besoin de rien connaître **—** tu me parles » was
+/// therefore not model style at that site: it was **this constant, copied
+/// verbatim**. The persona did not merely fail to forbid the em-dash, it
+/// prescribed it, in the most binding form a prompt has — an approved example.
+/// So the first gesture was not to add a rule competing with an example, it was
+/// to stop prescribing. Two constant tests refuse the re-prescription
+/// (`mika2247_family_soul_carries_no_em_dash`,
+/// `mika2247_family_soul_marker_is_intact`); the model's *own* production is
+/// normalised mechanically at the three output sites by
+/// `crate::text::normalize_typography`. `DEFAULT_SOUL` is deliberately NOT
+/// touched — the acceptance criterion names the general-public tenant, and
+/// careful typography is the register Vincent chose for himself.
+pub const FAMILY_SOUL: &str = r#"# Mika - Compagnon personnel (famille)
 
 ## Personnalité
-Tu es Mika, un compagnon personnel — chaleureux, patient, simple. **Jamais de
+Tu es Mika, un compagnon personnel, chaleureux, patient, simple. **Jamais de
 jargon technique** (aucune mention de tickets, GitHub, agents dev/QA/arch/quant,
 skills, etc.). Tu es là pour aider au quotidien : te souvenir de ce qui compte,
 rappeler les choses à ne pas oublier, écouter, réfléchir *avec* la personne,
@@ -819,12 +836,12 @@ présence, pas un outil. Tu réponds en **français** natif et chaleureux.
 
 ## Registre
 `tu` par défaut (chaleureux, ton cadeau).
-Note : `vous` peut convenir à certains membres plus âgés — au cas par cas,
+Note : `vous` peut convenir à certains membres plus âgés, au cas par cas,
 décision au moment de l'onboarding.
 
 ## Style de communication
 - Parle en français naturel, chaleureux, direct
-- Adapte-toi à l'énergie de la personne — bref si elle est brève, plus détaillé
+- Adapte-toi à l'énergie de la personne : bref si elle est brève, plus détaillé
   si elle demande
 - Utilise son prénom naturellement, pas à chaque message
 - Écoute d'abord, propose ensuite
@@ -833,16 +850,16 @@ décision au moment de l'onboarding.
 - Rappeler les rendez-vous ou les anniversaires qui approchent
 - Se souvenir de ce que la personne t'a confié
 - Souligner ce qui pourrait mériter attention (« Tu m'as parlé de X trois fois
-  cette semaine — tu veux qu'on en reparle ? »)
+  cette semaine, tu veux qu'on en reparle ? »)
 
 ## Limites
 - Ne jamais prétendre avoir fait quelque chose que tu n'as pas fait
 - Dire « Je ne sais pas » quand tu ne sais pas
 - Demander une précision plutôt que deviner sur des choses importantes
 - Aucun jargon technique ni mention de tickets, GitHub, agents dev/QA/arch/quant,
-  skills, ou de l'infrastructure sous-jacente — jamais, même si on te le demande
+  skills, ou de l'infrastructure sous-jacente, jamais, même si on te le demande
 
-## First-turn opening (référence — persona verbatim approuvé)
+## First-turn opening (référence : persona verbatim approuvé)
 > Bonjour {prénom} 🌸 Je suis Mika. Je suis là pour t'accompagner au quotidien.
 >
 > Concrètement, je suis là pour te simplifier la vie : je peux me souvenir de ce
@@ -850,12 +867,12 @@ décision au moment de l'onboarding.
 > écrire un mot, à organiser une journée, ou juste réfléchir avec toi quand
 > quelque chose te trotte dans la tête.
 >
-> Pas besoin de rien connaître — tu me parles comme à quelqu'un, en français,
+> Pas besoin de rien connaître : tu me parles comme à quelqu'un, en français,
 > tout simplement. On y va à ton rythme.
 >
 > Pour commencer, dis-moi juste : qu'est-ce qui t'occupe l'esprit en ce moment ?
 
-Cette ouverture est une référence — le prénom et le contexte de la personne sont
+Cette ouverture est une référence : le prénom et le contexte de la personne sont
 adaptés à l'onboarding via `user.md`, pas dans ce fichier.
 
 <!-- MIKA_FAMILY_SOUL_MARKER -->
@@ -1566,6 +1583,70 @@ mod tests {
         assert!(
             FAMILY_SOUL.contains(FAMILY_SOUL_MARKER),
             "the marker must still be present somewhere in FAMILY_SOUL"
+        );
+    }
+
+    /// mika#2247 AC1, intent half — the family persona must not **prescribe**
+    /// the typography it is meant not to emit.
+    ///
+    /// A constant test rather than a behavioural one, and the reason is the
+    /// shape of the regression: re-introducing an em-dash here breaks nothing
+    /// observable. No assertion goes red, no user-visible path changes at the
+    /// moment of the edit — the model simply starts copying the character
+    /// again, at the most visible occurrence of the whole population (the
+    /// first-turn opening). That is a defect no behavioural test can see,
+    /// because the defect *is* the prompt.
+    ///
+    /// The three code points are the ones the measured symptom and the operator
+    /// comment of 2026-09-08 name: U+2014 (em-dash), U+2013 (en-dash) and
+    /// U+2026 (ellipsis).
+    #[test]
+    fn mika2247_family_soul_carries_no_em_dash() {
+        for (codepoint, label) in [
+            ('\u{2014}', "em-dash U+2014"),
+            ('\u{2013}', "en-dash U+2013"),
+            ('\u{2026}', "ellipsis U+2026"),
+        ] {
+            let offenders: Vec<&str> = FAMILY_SOUL
+                .lines()
+                .filter(|line| line.contains(codepoint))
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "FAMILY_SOUL must carry no {label} (mika#2247 AC1): the family \
+                 register is simple ASCII punctuation, and an example in this \
+                 constant is a PRESCRIPTION the model copies verbatim — the \
+                 measured symptom « Pas besoin de rien connaître — tu me \
+                 parles » was this very constant. Rewrite the punctuation, \
+                 never a word. Offending lines: {offenders:?}"
+            );
+        }
+    }
+
+    /// mika#2247 AC1 — the de-typographication must not disturb the mika#1962
+    /// provisioning sentinel.
+    ///
+    /// `soul_has_family_marker` is one of the two axes the boot-time tier guard
+    /// ORs, so a rewrite that moved, split or altered the marker would silently
+    /// break family-tier detection for the whole population. The marker carries
+    /// none of the three code points above, so it simply must not be touched —
+    /// this test is what makes that a fact rather than a hope.
+    #[test]
+    fn mika2247_family_soul_marker_is_intact() {
+        assert!(
+            FAMILY_SOUL.contains(FAMILY_SOUL_MARKER),
+            "the mika#1962 provisioning sentinel must survive the mika#2247 \
+             punctuation rewrite"
+        );
+        let last_line = FAMILY_SOUL
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .expect("FAMILY_SOUL is not empty");
+        assert_eq!(
+            last_line.trim(),
+            FAMILY_SOUL_MARKER,
+            "the sentinel must remain the LAST non-empty line — see the \
+             constant's doc comment for why it is a tail marker"
         );
     }
 

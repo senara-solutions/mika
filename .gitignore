@@ -59,3 +59,6 @@ lefthook-local.yml
 # failed `gh pr create` that leaves the file behind can no longer trip the
 # mika#1282 wip-rescue recovery it was written to avoid.
 /pr-body.md
+
+# CE review-run artifacts (ne jamais committer)
+.ce-review-run/

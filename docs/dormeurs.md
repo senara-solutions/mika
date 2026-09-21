@@ -45,6 +45,7 @@ son historique) et retirer la ligne d'ici.
 | [#2139](https://github.com/senara-solutions/mika/issues/2139) | migration de la famille `opentelemetry` d'un seul bloc (0.31 → 0.32) | quand `opentelemetry`, `opentelemetry_sdk` et `opentelemetry-otlp` ont une version **mutuellement alignée** publiée sur crates.io |
 | [#2150](https://github.com/senara-solutions/mika/issues/2150) | vérifier que le sweep des lignes fantômes tend vers zéro (AC6 de #1934) | **le 2026-09-10 ou après**, soit sept jours pleins après le déploiement du correctif de #1934 |
 | [#1812](https://github.com/senara-solutions/mika/issues/1812) | SearXNG auto-hébergé comme chemin d'escalade pour la recherche sous contrôle d'egress (design-only) | quand le **trigger E6** de mika#1806 est activé — c'est-à-dire quand une décision opérateur ouvre la contingence « backend de recherche sous contrôle d'egress ». Aucun build avant. |
+| [#2357](https://github.com/senara-solutions/mika/issues/2357) | callback-* mika-dev muets sur glm-5.3 (tours vides, stop_reason error, input 0) | quand le modèle actif de mika-dev redevient `glm-5.3` (essai relancé) — vérifiable via `config.toml`/`turn_usage` ; aujourd'hui `glm-5.2` (possédé, quality-first), donc dormant |
 
 ## Ce qui n'entre pas ici
 
