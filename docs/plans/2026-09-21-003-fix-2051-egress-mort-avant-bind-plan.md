@@ -121,6 +121,15 @@ des deux côtés, elle n'est simplement pas imprimée du côté échec.
   suspicion de ce plan, levée par lecture.
 - **Les hypothèses que le ticket réfute restent réfutées** : le déliement de
   socket éventée (`:1297-1310`) tourne bien, `stat` est importé (`:66`).
+- **`make verify-egress-no-log` est un faux voisin, et il faut le dire avant
+  qu'il ne fasse hésiter.** La cible existe (`Makefile:191`) et son nom contient
+  « egress », mais elle scanne `crates/mika-gateway/src/egress_search/` — le
+  substrat de **recherche** egress (mika#1810 E4 / mika#2054, discipline Q4
+  no-retention) — et non le proxy d'egress du pilote. Il y a deux « egress »
+  dans ce dépôt et ce plan ne touche qu'à l'autre. **Conséquence pratique :
+  la discipline no-log ne s'applique pas à U2**, qui ajoute précisément de
+  l'information à une ligne de journal. Un implémenteur qui confond les deux
+  s'auto-censurerait sur le seul livrable de code du plan.
 
 ---
 
@@ -272,21 +281,75 @@ dans le `pid=` du `.begin` du journal du proxy.
   aujourd'hui (vérifié : aucun arrière-plan ne s'interpose), mais la lecture ne
   dépend plus d'un invariant à distance.
 
-**Le point d'insertion est contraint, et c'est lui qui protège les greps.** Le
-pid s'insère **avant** le tiret cadratin, entre `within 3s` et
-`— falling back to fs-only` :
+**La contrainte porte sur un invariant, pas sur une position — et v2 l'écrivait
+trop fort.** Trois prédicats du Signal S mordent sur cette famille de lignes
+(`CLAUDE.md:268`, `:271`, `:272`) :
+
+| prédicat publié | ce qu'il couvre |
+|---|---|
+| `^dispatch-lib: .*falling back to fs-only` | **toute** la population de repli (les deux voies) |
+| `^dispatch-lib: pilot_egress_guard.unreachable` | le discriminant « le proxy est mort » |
+| `^dispatch-lib: pilot-egress-proxy launched` | le contrôle positif |
+
+L'invariant à tenir est donc : **l'ancre `^dispatch-lib: ` reste en tête, le
+token `pilot_egress_guard.unreachable` reste immédiatement après, et la
+sous-chaîne `falling back to fs-only` reste contiguë et intacte.** Tout point
+d'insertion qui respecte ces trois choses est conforme — y compris une fin de
+ligne. v2 écrivait qu'insérer le pid *après le tiret cadratin* « couperait la
+sous-chaîne publiée en deux » : c'est faux tel quel, puisque
+`… — falling back to fs-only (pid N)` la laisse intacte. Ce qui casserait est
+d'insérer **à l'intérieur** de la sous-chaîne. La distinction compte, parce que
+ce plan refuse d'affirmer ce qu'il n'a pas mesuré, et une interdiction qui ne
+tient pas fait douter des autres.
+
+Forme retenue — le pid **avant** le tiret, comme un choix motivé et non comme
+la seule option conforme :
 
 ```
 dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind <sock> within 3s (pid <proxy_pid>) — falling back to fs-only
 ```
 
-Le texte existant n'est pas réécrit : le token `pilot_egress_guard.unreachable`
-et la sous-chaîne `falling back to fs-only` sont **tous deux** des prédicats
-publiés du Signal S, et la ligne reste ancrée à `^dispatch-lib: `. Insérer le
-pid **après** le tiret couperait la sous-chaîne publiée en deux et rendrait
-muet le prédicat qui couvre *toute* la population de repli — c'est-à-dire qu'on
-casserait l'instrument du Signal S en croyant l'améliorer. Le pid s'ajoute en
-amont du tiret ; rien ne bouge de ce sur quoi les greps mordent (V7).
+La raison est de lecture, pas de grep : le tiret sépare le **constat** (ce
+proxy-là, identifié, n'a pas bindé) de sa **conséquence** (on retombe en
+fs-only). Le pid qualifie le constat ; le poser après le tiret l'attacherait à
+la conséquence, qui ne lui appartient pas. V7 vérifie l'invariant, pas la
+position.
+
+**Et la ligne 493 ne bouge pas.** La voie « binaire absent » porte elle aussi
+`falling back to fs-only` — c'est ce qui fait du premier prédicat la couverture
+de toute la population — mais elle n'a lancé aucun proxy, donc elle n'a pas de
+pid à nommer. Lui en inventer un serait une affirmation fausse.
+
+**Le harnais de test existe déjà, et il jette la ligne — c'est la contrainte
+qui décide la forme de V3.** `_egress_guard_probe`
+(`test-dispatch-lib.sh:4437`, posé par mika#2041) exerce déjà le vrai
+`_ensure_pilot_egress_proxy` contre un faux proxy qui meurt avant de binder —
+c'est-à-dire exactement la population dont V3 a besoin, et il n'y a donc
+**aucun second harnais à écrire**. Mais il **classe** la sortie en un token
+(`case "$out" in … msg=fs-only …`, `:4510-4515`) puis jette le texte : il ne
+rend que `rc=… launched=… msg=…`. La ligne, que V3 doit inspecter, n'en sort
+pas.
+
+Et on ne peut pas se contenter d'y ajouter un champ : **cinq assertions
+existantes comparent cette chaîne par égalité stricte** (`:4522`, `:4528`,
+`:4533`, `:4539`, `:4545`), donc même un ajout en fin de chaîne les fait toutes
+rougir. Deux voies, et le plan retient la seconde :
+
+- étendre `_egress_guard_probe` et mettre à jour les cinq assertions — cinq
+  lignes touchées pour un besoin qui n'en concerne qu'une ;
+- **ajouter une fonction sœur** qui rend la ligne brute (`_egress_guard_line`,
+  même fabrication de faux proxy, retour non classé). Aucune assertion
+  existante n'est touchée, et la séparation dit ce qu'elle fait : l'une teste
+  la **décision**, l'autre le **texte**.
+
+Deux invariants du harnais à ne pas casser en le doublant : la redirection de
+`MIKA_PILOT_EGRESS_LOG_DIR` vers un temporaire — sans elle la sortie du faux
+proxy atterrit dans le journal opérationnel, celui-là même que ce ticket existe
+pour rendre lisible, et l'assertion `:4550` le vérifie ; et l'**ordre** du
+`case` (`:4507-4509`, commenté comme portant), qui teste `Phase 2b` avant
+`fs-only` parce que la ligne du binaire absent contient les deux. U2 ne modifie
+que la ligne 531, donc ce classement reste exact — mais c'est le genre
+d'invariant qu'on casse sans le voir.
 
 ### U3 — L'artefact durable et la procédure de mesure (R3, R4)
 
@@ -312,20 +375,29 @@ une entrée courte qui porte :
   n'attesterait rien de la surface opérateur. Contrôle négatif : avant ce
   travail, `CLAUDE.md` en portait **zéro**.
 - **V2** — `make test-dispatch-lib` passe, assertion U2 comprise.
-- **V3** — Nouvelle assertion dans `test-dispatch-lib.sh` : sur un chemin de
-  socket qui ne bindera jamais, la ligne `pilot_egress_guard.unreachable`
-  contient un pid numérique **et** garde son ancre `^dispatch-lib: ` et sa
-  sous-chaîne `falling back to fs-only`.
+- **V3** — Nouvelle assertion dans `test-dispatch-lib.sh`, portée par une
+  fonction sœur de `_egress_guard_probe` qui rend la ligne brute (U2) : sur un
+  chemin de socket qui ne bindera jamais, la ligne
+  `pilot_egress_guard.unreachable` contient un pid numérique **et** garde son
+  ancre `^dispatch-lib: ` et sa sous-chaîne `falling back to fs-only` contiguë.
 - **V4 — contrôle négatif de V3** : sans le changement U2, l'assertion rougit.
   Sans lui, V3 ne distingue pas « le pid est imprimé » de « l'assertion est
   triviale ».
+- **V4b** — Les cinq assertions existantes de `_egress_guard_probe` (`:4522`,
+  `:4528`, `:4533`, `:4539`, `:4545`) passent **inchangées**, et l'assertion
+  `:4550` (« aucune sortie de faux proxy dans le journal opérationnel ») aussi.
+  C'est le contrôle que la fonction sœur n'a pas été obtenue en cassant le
+  harnais qu'elle double.
 - **V5** — `scripts/test-pilot-egress-proxy-status.py` passe **inchangé** :
   aucune ligne de `scripts/mika-pilot-egress-proxy` n'est touchée (contrôle de
   D1 / hors-périmètre).
 - **V6** — `git diff --stat` ne liste pas `scripts/mika-pilot-egress-proxy`.
-- **V7** — Les greps publiés du Signal S mordent toujours sur la ligne modifiée
-  (vérifié en exécutant les deux prédicats publiés contre la sortie produite en
-  V3).
+- **V7** — Les **trois** prédicats publiés du Signal S (`CLAUDE.md:268`, `:271`,
+  `:272`) mordent toujours, vérifiés en les exécutant contre la sortie produite
+  en V3. Le prédicat porte sur l'invariant — ancre en tête, token contigu,
+  sous-chaîne `falling back to fs-only` intacte — **jamais sur la position du
+  pid** : une assertion sur la position figerait une forme de rédaction là où
+  ce qui compte est ce sur quoi les greps mordent.
 
 ---
 
@@ -446,6 +518,15 @@ prudence »).
   et l'asymétrie pid succès/échec aux lignes 531 et 534.
 - `skills/bundled/_shared/dispatch-lib.sh:473-485` —
   `_pilot_egress_sock_connectable`, avant-plan : pourquoi `$!` tient encore.
+- `skills/bundled/_shared/test-dispatch-lib.sh:4388-4551` — le harnais egress
+  de mika#2041 : `_egress_guard_probe` (`:4437`), son classement en token
+  (`:4507-4515`), ses cinq assertions à égalité stricte (`:4522`, `:4528`,
+  `:4533`, `:4539`, `:4545`) et la garde de non-pollution du journal
+  opérationnel (`:4550`).
+- `CLAUDE.md:268`, `:271`, `:272` — les trois prédicats publiés du Signal S,
+  l'invariant que V7 vérifie ; `:273` — la Remedy qu'U1 enrichit.
+- `Makefile:191` — `verify-egress-no-log` : faux voisin, porte sur
+  `crates/mika-gateway/src/egress_search/`, pas sur le proxy du pilote.
 - `CLAUDE.md` § *Signal S* — la surface opérateur, et sa Remedy à enrichir.
 - mika#2041 — la garde qui rendait cette classe muette (corrigée) ;
   `docs/solutions/best-practices/a-guard-must-observe-not-assert-2026-08-29.md`.
@@ -476,6 +557,39 @@ prudence »).
   (a) U2 nomme désormais le **point d'insertion** du pid — avant le tiret
   cadratin — parce que l'insérer après couperait la sous-chaîne publiée
   `falling back to fs-only` et casserait le prédicat qui couvre toute la
-  population de repli ; (b) les références au proxy passent d'une plage
+  population de repli — **affirmation corrigée en v3, elle était trop forte** ;
+  (b) les références au proxy passent d'une plage
   approximative à des lignes vérifiées (1269 / 1284 / 1292 / 1325, plus le
   déliement 1299-1306) ; (c) cette entrée.
+- **v3 (2026-09-21)** — Re-groom. Les assertions portantes re-confrontées à
+  `HEAD` (`4e521a87`, branche à jour avec `origin/main`) tiennent **toutes** :
+  `ed8d0e2b` ancêtre et titre exact ; `pilot_egress_startup` toujours à **zéro**
+  dans `CLAUDE.md` et présent dans **un seul** markdown — ce plan ; asymétrie
+  pid aux lignes 531/534 inchangée ; aucun arrière-plan entre le `nohup` (512)
+  et la garde ; proxy `1269/1284/1292/1299/1325` et tests `1450/1467` exacts ;
+  `make test-dispatch-lib` (`Makefile:158`). **Aucune décision, aucune AC,
+  aucun périmètre n'a changé.** Une correction et deux ajouts.
+  **(a) Correction — v2 affirmait plus que la mesure ne porte.** « Insérer le
+  pid après le tiret cadratin couperait la sous-chaîne publiée en deux » est
+  faux tel qu'écrit : `— falling back to fs-only (pid N)` la laisse intacte.
+  Seule une insertion *à l'intérieur* de la sous-chaîne casserait. U2 et V7
+  portent désormais sur l'**invariant** — ancre `^dispatch-lib: ` en tête, token
+  contigu, sous-chaîne intacte — et présentent la position avant-tiret comme un
+  choix motivé par la lecture (le pid qualifie le constat, pas la conséquence),
+  non comme la seule forme conforme. Corrigé parce qu'un plan qui refuse
+  d'affirmer sans mesure ne peut pas s'autoriser une interdiction qui ne tient
+  pas à la vérification.
+  **(b) Ajout — le harnais de test existe déjà et jette la ligne.**
+  `_egress_guard_probe` (`test-dispatch-lib.sh:4437`, mika#2041) exerce déjà le
+  vrai `_ensure_pilot_egress_proxy` contre un proxy qui meurt avant de binder —
+  donc aucun second harnais à écrire — mais il classe la sortie en un token et
+  ne rend que `rc=/launched=/msg=`. Cinq assertions comparent cette chaîne par
+  égalité stricte, donc l'étendre les fait toutes rougir : V3 passe par une
+  **fonction sœur** rendant la ligne brute, et V4b vérifie que le harnais
+  doublé n'a pas été cassé. Sans cette lecture, un implémenteur découvrait la
+  contrainte après coup.
+  **(c) Ajout — `verify-egress-no-log` est un faux voisin.** La cible scanne
+  `crates/mika-gateway/src/egress_search/` (mika#1810 E4, discipline Q4
+  no-retention), pas le proxy du pilote : il y a deux « egress » dans ce dépôt.
+  La discipline no-log ne s'applique donc **pas** à U2, dont tout le livrable
+  est précisément d'ajouter de l'information à une ligne de journal.
