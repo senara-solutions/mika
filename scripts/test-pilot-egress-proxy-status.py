@@ -1257,8 +1257,11 @@ class ForeignLineFilterTests(unittest.TestCase):
         # still has a caller. Sets, not counts: the one composed call
         # (`_log(f"{line} {detail}")`) is invisible to the regex and needs not
         # be seen, its `[anthropic-proxy]` prefix is already found six times.
+        # Any bracketed first token in either quote style counts (digits,
+        # uppercase, underscores included), so a new emitter cannot slip past
+        # this guard on the shape of its name alone.
         source = _PROXY_PATH.read_text(encoding="utf-8")
-        found = set(re.findall(r'_log\(\s*f?"(\[[a-z-]+\])', source, re.MULTILINE))
+        found = set(re.findall(r'''_log\(\s*f?["'](\[[^\]]+\])''', source, re.MULTILINE))
         self.assertTrue(found, "regex found no _log( prefix in the proxy source")
         self.assertEqual(
             found,
