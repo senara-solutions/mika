@@ -608,29 +608,6 @@ static LAST_EMITTED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 /// copy, which is the same value by a longer route.
 const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 
-/// Emit `llm_budget_resolved` for one agent — the line that answers "under
-/// which plafond did this turn run?" (mika#2293 AC1).
-///
-/// # Ungated on purpose
-///
-/// This does not depend on `MIKA_STORE_LLM_CALLS`. It is a *configuration*
-/// event, not call telemetry, and it has to stay readable precisely when an
-/// operator has turned telemetry off to cut noise.
-///
-/// # Deduplicated, which is not the same as gated
-///
-/// Provider construction is a per-turn event, not a per-boot one. The
-/// deduplication bounds the repetition; it subordinates the event to no
-/// setting. A pair that *changes* is re-emitted in full.
-///
-/// # What this deliberately does not see
-///
-/// Called from the two sites that already know which agent they are building
-/// for. The per-skill `[llm]` override path (`agent_loop`'s `make_provider_for`)
-/// is **out of scope for mika#2293** and emits nothing: the question the ticket
-/// asks is about an agent's *nominal* budget, not what a skill overrides for one
-/// turn. Said here so a reader looking for an override's budget knows it was
-/// never written, rather than concluding the instrument is broken.
 /// One agent's resolved budget and model, as a value (mika#2457).
 ///
 /// # Why this type exists
@@ -653,9 +630,10 @@ const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 /// does not redo it. It is deliberately **absent from
 /// [`dedup_signature`]** — two identical resolutions at two instants must stay
 /// one line, or the field meant to document the deduplication would annul it.
-/// The existing mika#2293 and mika#2280 dedup tests are what pin that, for free:
-/// they compare two signatures computed from two separate resolutions, so a
-/// `resolved_at` leaking into the key turns them red.
+/// Pinned by `mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key`,
+/// which **forces** two distinct instants: the field is stamped to the second,
+/// so two resolutions back to back almost always carry the same string, and a
+/// test relying on the clock to separate them would stay green over the leak.
 ///
 /// # Why it is a value and not a re-resolution
 ///
@@ -826,6 +804,13 @@ fn dedup_signature(record: &ResolvedBudgetRecord) -> String {
     )
 }
 
+/// Resolve `agent_id`'s budget and emit `llm_budget_resolved` for it — the line
+/// that answers "under which plafond did this turn run?" (mika#2293 AC1).
+///
+/// Since mika#2457 this is [`resolve_llm_budget_record`] followed by
+/// [`emit_llm_budget_resolved`], which carries the gating, deduplication and
+/// scope doctrine; kept for the callers that have no use for the record itself
+/// (`teams::engine`).
 pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
     emit_llm_budget_resolved(&resolve_llm_budget_record(
         agent_id,
@@ -1238,10 +1223,11 @@ mod tests {
         // Reads the emitter's own key rather than rebuilding it: a hand-written
         // copy here is what broke when mika#2362 extended the signature.
         //
-        // mika#2457 — it now reads the emitter's own *record*, so two calls
-        // carry two distinct `resolved_at` instants. That makes the equality
-        // assertions below a free negative control on the new field: the day
-        // `resolved_at` leaks into the signature, they go red.
+        // mika#2457 — it now reads the emitter's own *record*. That is NOT a
+        // control on `resolved_at`: the field is stamped to the second, so two
+        // calls back to back almost always carry the same string. The leak is
+        // pinned by `mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key`,
+        // which forces the two instants apart.
         let signature_now =
             || dedup_signature(&resolve_llm_budget_record("mika-arch", &global, &agent));
 
@@ -1993,12 +1979,15 @@ mod tests {
 
     /// mika#2457 U1 — `resolved_at` dates the record and never keys it.
     ///
-    /// The explicit half of the free control the two dedup tests above now
-    /// carry. It is written separately because those tests would go red for
-    /// *any* signature drift, and a reader hunting that failure needs one test
-    /// naming the field responsible. Both halves are asserted in one call: that
-    /// the field is populated (a record nobody can date is the ambiguity § 6
-    /// exists to resolve) and that two distinct resolutions still deduplicate.
+    /// The only control on that key. `resolved_at` is stamped to the second, so
+    /// two resolutions back to back almost always carry the same string and a
+    /// signature that included it would still compare equal — green over the
+    /// leak, red only when a run happened to straddle a second boundary. The
+    /// second record is therefore the first one **re-dated by hand**, and the
+    /// test first asserts the two instants differ (the negative control)
+    /// before asserting the signatures are still equal. It also asserts the field is
+    /// populated: a record nobody can date is the ambiguity § 6 exists to
+    /// resolve.
     #[test]
     #[serial]
     fn mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key() {
@@ -2011,12 +2000,21 @@ mod tests {
         .unwrap();
 
         let first = resolve_llm_budget_record("mika-arch", &global, &agent);
-        let second = resolve_llm_budget_record("mika-arch", &global, &agent);
+        // Re-dated by hand rather than resolved a second time: the clock would
+        // almost always hand back the same second, and the control would be
+        // a flake instead of a guard.
+        let mut second = first.clone();
+        second.resolved_at = "1970-01-01T00:00:00Z".to_string();
 
         assert!(
             chrono::DateTime::parse_from_rfc3339(&first.resolved_at).is_ok(),
             "resolved_at doit être un instant RFC 3339 lisible, pas une chaîne libre : {}",
             first.resolved_at
+        );
+        assert_ne!(
+            first.resolved_at, second.resolved_at,
+            "contrôle négatif : les deux enregistrements doivent porter deux instants \
+             distincts, sinon l'égalité ci-dessous ne prouve rien"
         );
         assert_eq!(
             dedup_signature(&first),

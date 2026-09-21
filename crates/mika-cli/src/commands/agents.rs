@@ -83,6 +83,15 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
 /// agent this server does not serve, a daemon that is down — and that ambiguity
 /// is preferable to a wrong number, which is the population mika#2304 had to
 /// name for exactly this reason.
+///
+/// # The cause is said, even though the values are not
+///
+/// "No values" does not license a false *explanation*. A `401` (this shell's
+/// `MIKA_INTERNAL_TOKEN` is not the server's), a `5xx`, or a body the mirror
+/// cannot read (version skew) are not "unreachable, predating the fix, or not
+/// serving this agent", and printing that sentence for them sends the operator
+/// after the wrong remedy. So the fetch returns an [`UnattestedCause`] and the
+/// render names it — still with no budget value.
 async fn budget(name: &str, format: &OutputFormat, out: &mut impl Write) -> Result<()> {
     let base = crate::commands::dashboard::spirit_url();
     let url = format!(
@@ -100,16 +109,21 @@ async fn budget(name: &str, format: &OutputFormat, out: &mut impl Write) -> Resu
         .await;
 
     let record = match response {
-        Ok(resp) if resp.status().is_success() => resp
+        Err(_) => Err(UnattestedCause::Unreachable),
+        Ok(resp) if !resp.status().is_success() => {
+            Err(UnattestedCause::Status(resp.status().as_u16()))
+        }
+        Ok(resp) => resp
             .json::<serde_json::Value>()
             .await
             .ok()
-            .and_then(|v| serde_json::from_value::<BudgetRecord>(v["budget"].clone()).ok()),
-        _ => None,
+            .and_then(|v| serde_json::from_value::<BudgetRecord>(v["budget"].clone()).ok())
+            .ok_or(UnattestedCause::Malformed),
     };
 
-    let Some(record) = record else {
-        return render_unattested(name, format, &base, out);
+    let record = match record {
+        Ok(record) => record,
+        Err(cause) => return render_unattested(name, format, &base, cause, out),
     };
 
     match format {
@@ -218,40 +232,86 @@ fn render_budget_text(record: &BudgetRecord, out: &mut impl Write) -> Result<()>
     Ok(())
 }
 
+/// Why the server attested nothing (mika#2457).
+///
+/// Every variant still renders **no value**; what they separate is the remedy.
+/// A `404` keeps the ambiguous sentence (a binary predating the route and an
+/// agent this server does not serve answer identically), the others do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnattestedCause {
+    /// No HTTP answer at all: refused, timed out, DNS — the daemon is down or
+    /// `MIKA_SPIRIT_URL` points elsewhere.
+    Unreachable,
+    /// The server answered with a non-2xx status.
+    Status(u16),
+    /// A 2xx whose body this CLI's mirror cannot read — version skew between the
+    /// CLI and the spirit it talks to.
+    Malformed,
+}
+
+impl UnattestedCause {
+    /// Wire value of the `reason` field in JSON/YAML — scripts branch on it.
+    fn reason(self) -> &'static str {
+        match self {
+            UnattestedCause::Unreachable => "unreachable",
+            UnattestedCause::Status(401 | 403) => "unauthorized",
+            UnattestedCause::Status(404) => "not_found",
+            UnattestedCause::Status(_) => "http_error",
+            UnattestedCause::Malformed => "malformed_response",
+        }
+    }
+
+    /// The one sentence the text render gives as the cause.
+    fn explain(self, base: &str) -> String {
+        match self {
+            UnattestedCause::Unreachable => {
+                format!("  mika-spirit à {base} est injoignable.")
+            }
+            UnattestedCause::Status(code @ (401 | 403)) => format!(
+                "  mika-spirit à {base} a refusé le jeton ({code}) : le \
+                 MIKA_INTERNAL_TOKEN de ce shell n'est pas celui du serveur."
+            ),
+            UnattestedCause::Status(404) => format!(
+                "  mika-spirit à {base} a répondu 404 : binaire antérieur au \
+                 correctif, ou il ne sert pas cet agent."
+            ),
+            UnattestedCause::Status(code) => {
+                format!("  mika-spirit à {base} a répondu {code}.")
+            }
+            UnattestedCause::Malformed => format!(
+                "  mika-spirit à {base} a répondu, mais son record est illisible \
+                 par ce CLI (versions divergentes ?)."
+            ),
+        }
+    }
+}
+
 /// Render the "this server attested nothing" population — with no values.
 fn render_unattested(
     name: &str,
     format: &OutputFormat,
     base: &str,
+    cause: UnattestedCause,
     out: &mut impl Write,
 ) -> Result<()> {
+    // One value for both structured formats, so a field added here cannot
+    // reach one serializer and miss the other.
+    let mut payload = serde_json::json!({
+        "agent_id": name,
+        "attested": false,
+        "spirit_url": base,
+        "reason": cause.reason(),
+    });
+    if let UnattestedCause::Status(code) = cause {
+        payload["status"] = serde_json::json!(code);
+    }
     match format {
-        OutputFormat::Json => writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "agent_id": name,
-                "attested": false,
-                "spirit_url": base,
-            }))?
-        )?,
-        OutputFormat::Yaml => writeln!(
-            out,
-            "{}",
-            serde_yaml::to_string(&serde_json::json!({
-                "agent_id": name,
-                "attested": false,
-                "spirit_url": base,
-            }))?
-        )?,
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&payload)?)?,
         OutputFormat::Text => {
             writeln!(out, "{name}")?;
             writeln!(out, "  (non attesté — ce serveur n'a rien attesté)")?;
-            writeln!(
-                out,
-                "  mika-spirit à {base} est injoignable, antérieur au correctif, \
-                 ou ne sert pas cet agent."
-            )?;
+            writeln!(out, "{}", cause.explain(base))?;
             writeln!(
                 out,
                 "  Aucune valeur locale n'est affichée : la résoudre ici lirait \
@@ -1388,6 +1448,94 @@ mod budget_tests {
             "un record non attesté ne porte aucune valeur : {json}"
         );
 
+        unsafe {
+            std::env::remove_var("MIKA_SPIRIT_URL");
+            std::env::remove_var("MIKA_INTERNAL_TOKEN");
+        }
+    }
+
+    /// mika#2457 — a server that ANSWERS without attesting is not told apart
+    /// by "no values" alone: the render names the cause.
+    ///
+    /// The negative control above only drives connection-refused. A `401` (a
+    /// stale `MIKA_INTERNAL_TOKEN`), a `5xx`, and a 2xx body the mirror cannot
+    /// read used to share its sentence — "unreachable, predating the fix, or not
+    /// serving this agent" — which is a false diagnosis for all three. Each case
+    /// here must still print no value, and must say which answer it got.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2457_a_non_2xx_or_unreadable_answer_names_its_cause() {
+        use axum::{Router, http::StatusCode, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/api/v1/agents/denied/budget",
+                get(|| async { (StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}") }),
+            )
+            .route(
+                "/api/v1/agents/broken/budget",
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            )
+            .route(
+                "/api/v1/agents/skewed/budget",
+                get(|| async { (StatusCode::OK, "{\"budget\":{\"agent_id\":\"skewed\"}}") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Safety: test-only env vars, serialized by `#[serial]`.
+        unsafe {
+            std::env::set_var("MIKA_SPIRIT_URL", format!("http://{addr}"));
+            std::env::set_var("MIKA_INTERNAL_TOKEN", "ab".repeat(32));
+        }
+
+        for (agent, needle, reason, status) in [
+            ("denied", "MIKA_INTERNAL_TOKEN", "unauthorized", Some(401)),
+            ("broken", "a répondu 500", "http_error", Some(500)),
+            ("ghost", "a répondu 404", "not_found", Some(404)),
+            ("skewed", "illisible", "malformed_response", None),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Text, &mut out).await.unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("non attesté"), "{agent} : {text}");
+            assert!(
+                text.contains(needle),
+                "{agent} : la cause réelle doit être nommée ({needle}) : {text}"
+            );
+            if agent != "ghost" {
+                assert!(
+                    !text.contains("antérieur au correctif"),
+                    "{agent} : le diagnostic 404 ne doit pas couvrir une autre \
+                     réponse : {text}"
+                );
+            }
+
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Json, &mut out).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(json["attested"], false, "{agent} : {json}");
+            assert_eq!(json["reason"], reason, "{agent} : {json}");
+            assert_eq!(json["status"].as_u64(), status, "{agent} : {json}");
+            assert!(
+                json["http_timeout_secs"].is_null() && json["model"].is_null(),
+                "{agent} : un record non attesté ne porte aucune valeur : {json}"
+            );
+
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Yaml, &mut out).await.unwrap();
+            let yaml: serde_json::Value =
+                serde_yaml::from_slice(&out).expect("the YAML render must parse");
+            assert_eq!(yaml["reason"], reason, "{agent} (yaml) : {yaml}");
+            assert_eq!(yaml["attested"], false, "{agent} (yaml) : {yaml}");
+        }
+
+        server.abort();
         unsafe {
             std::env::remove_var("MIKA_SPIRIT_URL");
             std::env::remove_var("MIKA_INTERNAL_TOKEN");
