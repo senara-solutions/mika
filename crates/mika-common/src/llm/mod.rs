@@ -26,7 +26,8 @@ pub use budget::{
 };
 pub use budget_provenance::{
     BudgetProvenance, BudgetSource, MODEL_SOURCE_UNKNOWN_PROVIDER, ModelProvenance,
-    ResolvedBudgetValue, ResolvedTextValue, log_llm_budget_resolved,
+    ResolvedBudgetRecord, ResolvedBudgetValue, ResolvedTextValue, emit_llm_budget_resolved,
+    log_llm_budget_resolved, resolve_llm_budget_record,
 };
 pub use error::LlmError;
 pub use model_override::{
