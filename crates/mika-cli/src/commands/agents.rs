@@ -1352,7 +1352,9 @@ mod budget_tests {
         unsafe {
             // Port 1 is reserved and never listening — the "daemon is down" case.
             std::env::set_var("MIKA_SPIRIT_URL", "http://127.0.0.1:1");
-            std::env::set_var("MIKA_INTERNAL_TOKEN", "test-token");
+            // Well-formed (64 hex): `#[serial]` does not fence unmarked tests
+            // that call `Settings::load`, which rejects a malformed token.
+            std::env::set_var("MIKA_INTERNAL_TOKEN", "ab".repeat(32));
         }
 
         let mut out: Vec<u8> = Vec::new();
