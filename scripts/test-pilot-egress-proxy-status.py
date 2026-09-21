@@ -42,26 +42,75 @@ from importlib.machinery import SourceFileLoader
 # `grep 2026-08-28` composes across both files. The tests below assert the
 # stamp is present and parseable, then strip it so the message-shape assertions
 # established by mika#1901 keep reading against the un-prefixed text.
+# mika#2152: the assertion holds on the PROXY's lines — see `_PROXY_PREFIXES`
+# and `_FOREIGN_LINE_RES` below for how a captured line is classified first.
 _TS_PREFIX_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (?P<rest>.*)$"
 )
 
+# mika#2152: `_strip_ts` asserts the timestamp only on lines the proxy is the
+# author of. Authorship is decidable by prefix: `_log` is the proxy's sole
+# emitter and every message it is handed opens with one of these. Adding a
+# prefix to the proxy without adding it here fails `test_prefix_inventory_*`
+# AND every helper caller ("unknown prefix") — loud on purpose (AC3).
+_PROXY_PREFIXES: tuple[str, ...] = (
+    "[egress]",
+    "[egress-shim]",
+    "[anthropic-proxy]",
+    "[mitm-forward]",
+)
+
+# Lines other writers put on the SAME stderr the tests capture. Each entry is
+# a source we have seen and deliberately excluded from the timestamp assertion,
+# never a wildcard. Today: asyncio's slow-callback warning, armed because
+# `IsolatedAsyncioTestCase` runs its loop in debug mode; it reaches the
+# redirected stderr through `logging.lastResort`. Run 33715931630, 2026-09-03.
+_FOREIGN_LINE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^Executing <(?:Task|Handle|TimerHandle)\b.*> took \d+\.\d+ seconds$"),
+)
+
 
 def _strip_ts(test: unittest.TestCase, lines: list[str]) -> list[str]:
-    """Assert every non-empty line is timestamped + parseable, return the
-    message bodies with the stamp removed. Enforcing this on the shared test
-    helpers makes AC1 (all lines stamped) hold across every logging path these
-    tests already exercise, not just the ones that name the timestamp."""
+    """Return the message bodies of the PROXY's lines, stamp removed, having
+    asserted each one is timestamped + parseable (mika#2030 AC1). Enforcing
+    this on the shared test helper makes AC1 hold across every logging path
+    these tests already exercise, not just the ones that name the timestamp.
+
+    The captured stderr is shared: asyncio's debug loop writes here too
+    (mika#2152). So every line is classified before anything is asserted:
+      * a known foreign line (`_FOREIGN_LINE_RES`) is skipped — not the
+        proxy's, not its invariant;
+      * a proxy line (opens with one of `_PROXY_PREFIXES`, after its stamp)
+        must be stamped — a bare one fails, that is the AC2 the helper exists
+        to hold;
+      * anything else fails: an unlisted prefix means the proxy grew an
+        emitter nobody inventoried; an unlisted foreign line means a new
+        writer shares the stream. Both are for a human to classify, never
+        for the helper to ignore.
+    """
     stripped: list[str] = []
     for line in lines:
         if not line:
             continue
+        if any(pattern.match(line) for pattern in _FOREIGN_LINE_RES):
+            continue
         match = _TS_PREFIX_RE.match(line)
-        test.assertIsNotNone(match, f"log line is not timestamped: {line!r}")
-        assert match is not None  # for type-checkers; assertIsNotNone already failed
+        if match is None:
+            if line.startswith(_PROXY_PREFIXES):
+                test.fail(f"proxy log line is not timestamped: {line!r}")
+            test.fail(
+                f"unclassified stderr line (neither a proxy prefix in "
+                f"{_PROXY_PREFIXES} nor a listed foreign source): {line!r}"
+            )
         # A stamp that is merely shaped right is not enough — it must parse.
         datetime.datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ")
-        stripped.append(match.group("rest"))
+        rest = match.group("rest")
+        if not rest.startswith(_PROXY_PREFIXES):
+            test.fail(
+                f"timestamped line carries an unknown prefix — add it to "
+                f"_PROXY_PREFIXES if the proxy now emits it: {line!r}"
+            )
+        stripped.append(rest)
     return stripped
 
 # `scripts/mika-pilot-egress-proxy` has no .py extension (it is installed as a
