@@ -81,6 +81,47 @@ these close the intra-binary divergence; none of them would have caught the
 **mika#2446 est la deuxième occurrence de cette classe**, après
 `qa_review_reconcile` le 2026-09-16.
 
+### Le relevé, joint plutôt qu'asserté (F2)
+
+Le compte de triggers n'est pas une estimation : il est relevé sur ce checkout
+(HEAD `1c1ec0d7`, 2026-09-21) par le même prédicat que la garde de classe
+mika#2337 — les appels à `task_engine::ensure_recurring_task`, seul enregistreur
+de récurrences `run_skill`. **Sept enregistrements, sept triggers distincts, tous
+dans `crates/mika-agent/src/server/mod.rs`** :
+
+| # | ligne | label / trigger | bras du `match` |
+|---|---|---|---|
+| 1 | `server/mod.rs:1617` | `heartbeat` | `dispatcher.rs:591` |
+| 2 | `server/mod.rs:1629` | `reflection` | `dispatcher.rs:592` |
+| 3 | `server/mod.rs:1652` | `auto_pull_groomed` | `dispatcher.rs:593` |
+| 4 | `server/mod.rs:1674` | `wip_rescue` | `dispatcher.rs:594` |
+| 5 | `server/mod.rs:1708` | `qa_review_reconcile` | `dispatcher.rs:595` |
+| 6 | `server/mod.rs:1741` | `worktree_reap` | `dispatcher.rs:596` |
+| 7 | `server/mod.rs:1760` | `curator_review` | `dispatcher.rs:597` |
+
+Le `match` de `dispatch_run_skill` (`dispatcher.rs:590-605`) porte exactement ces
+sept bras plus le catch-all `other =>` de mika#2337. L'égalité ensembliste est
+donc vraie **au présent**, ce qui est la condition de recevabilité de la garde
+C-1 (voir § *Fire-Disposition*).
+
+**Deux call-sites hors de cette population, et leur absence est raisonnée.**
+`crates/mika-cli/src/commands/chat.rs:230` et `:245` enregistrent `heartbeat` et
+`reflection` — deux triggers **déjà** dans le tableau, donc le relevé est complet
+malgré le périmètre du scanner (`ProductionScanner::for_crate` est ancré sur
+`crates/mika-agent/`, mika#2398). C'est en revanche un fait qui **affine la sonde
+C** : un `mika chat` ne peut *enregistrer* ni `worktree_reap` ni aucun des cinq
+autres, mais son `TaskEngine` **tire toute ligne due de la base**, y compris
+celles qu'un `mika-spirit` a posées. La population « `process_name = mika` »
+reste donc ouverte, et le champ `process_name` (C-2) est ce qui la tranchera.
+
+**Le libellé est indexé sur la donnée, pas sur le chiffre.** Partout ailleurs
+dans ce plan, la couverture est énoncée comme *« chaque membre de
+`ROUTABLE_TRIGGERS` »* et jamais comme *« les sept »* : un huitième trigger posé
+demain rendrait le chiffre faux en silence, alors qu'il entre de lui-même dans la
+constante et dans les deux gardes qui la lisent. Le nombre n'apparaît qu'ici,
+daté et ancré sur un relevé — leçon `canonical-tokens-survey`, où le relevé
+manuel avait raté `_extract_plan_path`.
+
 ### Le défaut réel : la ligne affirme sa cause sans la porter
 
 La ligne de mort (`crates/mika-agent/src/task_engine/engine.rs:4260`) écrit :
@@ -161,7 +202,16 @@ attendre 24 h ni éditer la base**.
   serait strictement pire que pas d'inventaire.
 - **R-7 — Aucun comportement de dispatch, de veto ou de reaper n'est modifié.** Le
   périmètre est l'attribution, l'observabilité, la couverture de test et la
-  réparabilité.
+  réparabilité. Aucune ligne de production n'est déplacée : les propriétés dont ce
+  plan dépend (au premier chef la position du STOP en tête de
+  `dispatch_worktree_reap`) sont **vérifiées présentes puis épinglées**, jamais
+  prescrites — voir § *Fire-Disposition* D-3.
+- **R-8 — Chaque détecteur livré déclare sa disposition avant d'atterrir.** Un
+  détecteur dont le succès est « aucune violation » n'atterrit pas sans que soit
+  nommé ce qui se passe quand il tire sur l'existant : exception nommée avec
+  tracker et auto-nettoyage, atterrissage désactivé tracé, ou halt-and-surface. Une
+  exception « zéro entrée » n'est recevable qu'**assertée au présent**, depuis un
+  relevé daté.
 
 ---
 
@@ -235,7 +285,7 @@ toucher au code, classe mika#2340.
 `fire_recurring` (dans `tests/eval/test_recurring_trigger_wiring_2337.rs`) est
 **déjà paramétrée** par label et `action_config`, et panique si le moteur n'a
 jamais fait feu — elle ne peut donc pas être verte sans avoir tiré. Il reste à
-l'appliquer aux sept triggers au lieu d'un.
+l'appliquer à **chaque membre de `ROUTABLE_TRIGGERS`** au lieu d'un.
 
 La difficulté réelle n'est pas la boucle, c'est l'**herméticité**, et elle diffère
 par trigger. Le point de sûreté central :
@@ -246,10 +296,28 @@ par trigger. Le point de sûreté central :
 > dépend d'un `Settings::load` qui lit l'environnement.
 
 Donc, pour ce trigger, la sonde **arme le STOP** (`auto_pull_stop::WORKTREE_REAP_SCAN`,
-fichier sentinelle sous un `global_home_dir` temporaire). Ce court-circuit est en
-**tête** de `dispatch_worktree_reap` — avant la résolution du jeton et avant tout
-`git` (`dispatcher.rs:1859`) — donc même un jeton qui fuiterait ne toucherait rien.
-Herméticité **par construction**, pas par absence.
+fichier sentinelle sous un `global_home_dir` temporaire).
+
+**Le STOP est DÉJÀ en tête, et rien n'est déplacé (F3).** La v1 écrivait « ce
+court-circuit est en tête », ce qui pouvait se lire comme une prescription de
+déplacement — donc comme une modification de comportement, incompatible avec
+R-7/AC9. Vérification faite sur ce checkout : `dispatch_worktree_reap`
+(`dispatcher.rs:1850`) ouvre sur le test `auto_pull_stop::is_stopped`
+(`dispatcher.rs:1859`), **avant** la résolution du jeton (`dispatcher.rs:1903`) et
+avant tout `git`, avec le raisonnement écrit sur le site par mika#2420 : *« pendant
+un incident, ce qu'on veut arrêter le plus vite est ce qui supprime »*. La sonde
+**consomme** cette propriété ; elle ne la crée pas et ne la déplace pas. Même un
+jeton qui fuiterait ne toucherait rien. Herméticité **par construction**, pas par
+absence.
+
+Cette propriété étant désormais **portante pour la sûreté d'un test destructif**,
+elle est épinglée : une garde de source asserte que le test `is_stopped(…
+WORKTREE_REAP_SCAN)` précède, dans le corps de `dispatch_worktree_reap`, la
+première occurrence de `resolve_github_token` et la première invocation de `git`.
+Un futur éditeur qui insérerait une résolution de jeton avant le STOP ferait
+rougir ce test au lieu de rendre la sonde silencieusement destructive. C'est un
+**ajout de garde sur un comportement inchangé** — R-7/AC9 restent exacts, sans
+amendement.
 
 La sonde est structurée par une table `(trigger, armement d'herméticité)` et le
 test **échoue si un membre de `ROUTABLE_TRIGGERS` n'a pas d'entrée**. C'est le
@@ -257,10 +325,10 @@ patron « `match` exhaustif sans bras `_ =>` » de la maison transposé à une d
 de test : ajouter un trigger force à décider comment le rendre hermétique, au lieu
 de le laisser silencieusement hors couverture.
 
-**Assertion, et pourquoi ce n'est pas « la tâche est replanifiée ».** Les sept
-triggers ont des pré-filtres différents (budget proactif, jeton, répertoire de
-dépôt, STOP, requête DB pure) et certains peuvent légitimement rendre `Err` dans
-un harnais hermétique. L'assertion porte donc sur **la mort par catch-all**, seule
+**Assertion, et pourquoi ce n'est pas « la tâche est replanifiée ».** Les membres
+de `ROUTABLE_TRIGGERS` ont des pré-filtres différents (budget proactif, jeton,
+répertoire de dépôt, STOP, requête DB pure) et certains peuvent légitimement
+rendre `Err` dans un harnais hermétique. L'assertion porte donc sur **la mort par catch-all**, seule
 chose que la sonde prétend mesurer :
 
 - le `result` ne contient pas `unknown run_skill trigger` ;
@@ -326,50 +394,168 @@ intermédiaire court-circuite ou s'abstient.
 
 ---
 
+## Fire-Disposition
+
+Ce plan livre **cinq détecteurs** — quatre gardes automatiques dont le succès est
+« aucune violation », plus une vérification manuelle dont le succès est l'inverse.
+Aucun ne peut atterrir sans que soit nommé, à l'avance, ce qui se passe quand il
+tire sur l'existant. La disposition est donnée détecteur par détecteur, avec la
+mesure qui la fonde.
+
+### D-1 — Garde de cohérence `ROUTABLE_TRIGGERS` ↔ bras du `match` (C-1, Phase 1)
+
+**Option (a) — exception nommée, avec zéro entrée, assertée au présent.**
+
+Le relevé ci-dessus (§ *Le relevé, joint plutôt qu'asserté*) établit sur ce
+checkout que les bras littéraux du `match` (`dispatcher.rs:591-597`) et les sept
+triggers enregistrés coïncident exactement. La constante est écrite dans le même
+commit que la garde, **depuis ce relevé** : l'égalité ensembliste est donc vraie
+au moment de l'atterrissage, et la garde atterrit **verte sans aucune exception**.
+
+L'allowlist est livrée **vide** et c'est un choix de forme, pas un hasard : la
+résolution quand cette garde tire est de **corriger la constante**, jamais d'y
+ajouter une entrée — une exception ici recréerait très exactement le défaut que la
+garde existe pour interdire, un inventaire qui ment. Le patron est celui de
+`ACTOR_READING_PREDICATES_ALLOWED` (mika#2323) et de
+`mika1883_run_usage_accumulates_only_via_the_one_helper` (allowlist vide, *« quand
+il tire, on retire le second site, on ne l'allowliste pas »*).
+
+**Auto-nettoyage :** sans objet — il n'y a rien à nettoyer. Si l'allowlist devait
+un jour recevoir une entrée, le commentaire du site prescrit d'ouvrir un ticket et
+de dater l'entrée, jamais de la laisser dormir.
+
+### D-2 — Test de complétude d'herméticité de la sonde (C-4, Phase 3)
+
+**Option (a) — exception nommée, avec zéro entrée, assertée au présent.**
+
+La table `(trigger, armement d'herméticité)` est écrite dans le même commit, avec
+une entrée pour **chacun** des sept membres relevés. Le test de complétude
+atterrit donc vert, sans exemption.
+
+Il n'y a **pas d'allowlist du tout** pour ce détecteur, et c'est délibéré : une
+entrée « ce trigger est dispensé d'armement » signifierait « ce trigger est tiré
+en test sans ceinture », c'est-à-dire la possibilité qu'une sonde supprime de
+vrais worktrees sur la machine d'un opérateur. La seule résolution admise quand ce
+test tire est **d'écrire l'armement du nouveau trigger**. C'est le patron
+« `match` exhaustif sans bras `_ =>` » (mika#2290, mika#2358) : le compilateur ne
+peut pas forcer une donnée de test, ce test le fait à sa place.
+
+### D-3 — Test de position du STOP dans `dispatch_worktree_reap` (C-4, Phase 3)
+
+**Option (a) — exception nommée, avec zéro entrée, assertée au présent.**
+
+Mesuré sur ce checkout : `is_stopped(… WORKTREE_REAP_SCAN)` est à
+`dispatcher.rs:1859`, la résolution du jeton à `dispatcher.rs:1903`, et aucun
+`git` n'est invoqué entre les deux. La garde atterrit verte.
+
+Quand elle tire, la résolution est de **remettre le STOP en tête**, jamais de
+l'exempter : la propriété qu'elle épingle est ce qui rend la sonde D-2 non
+destructive, donc une exception ici désarmerait silencieusement la ceinture d'un
+test qui supprime des répertoires. Le message d'échec le dit à celui qui le lira.
+
+### D-4 — Non-vacuité des champs d'attribution (C-2, Phase 2)
+
+**Option (c) — halt-and-surface.**
+
+Ce détecteur est de nature différente des trois précédents : il n'inspecte pas la
+source mais la **valeur émise** par la ligne de mort. Sa disposition ne peut donc
+pas être une allowlist.
+
+Précision apportée par la mesure — `mika_common::build_info::tests::git_hash_is_never_empty`
+**existe déjà** et couvre la constante. Le test de ce plan est donc son complément
+et non son jumeau : il asserte que le **champ** `binary_git_hash` de l'événement
+`recurring_unknown_trigger` est présent et non vide, c'est-à-dire que le câblage
+entre la constante et la ligne tient. La distinction est porteuse : une constante
+saine câblée sur rien produirait une ligne muette avec un test vert.
+
+**Quand il tire : halte.** Un champ d'attribution vide signifie qu'un binaire ne
+peut pas énoncer sa propre provenance sur le seul chemin où cette provenance est
+décisive — donc que l'instrument livré par ce plan ne tient pas sa promesse R-1.
+Ce n'est ni une exception à inscrire ni un atterrissage à désactiver : c'est le
+correctif qui est faux. Noter la distinction que le plan tient par ailleurs
+(§ C-2) : `GIT_HASH == "unknown"` est une **réponse valide** (build hors checkout)
+et ne fait pas rougir ; seul le **vide** le fait.
+
+### D-5 — Contrôle négatif obligatoire (Contrat de vérification)
+
+**Option (c) — halt-and-surface, et sa polarité est inversée.**
+
+Les quatre détecteurs ci-dessus réussissent en ne tirant pas. Celui-ci réussit en
+**tirant** : retirer temporairement le bras `"worktree_reap" =>` doit faire rougir
+*à la fois* D-1 et la sonde de tir. Sa disposition se lit donc à l'envers.
+
+**Si les tests restent verts après le retrait du bras : halte immédiate, et ne pas
+livrer.** Une sonde verte dans cette condition ne mesure rien — c'est précisément
+l'erreur que ce ticket existe pour ne pas rejouer (mika#2205 : *« un scan
+silencieusement inactif se lit exactement comme un scan qui n'a rien trouvé à
+faire »*). Le remède est de réparer le détecteur, jamais d'accepter son silence.
+Le résultat de ce contrôle est consigné dans le corps de la PR, faute de quoi rien
+n'atteste qu'il a été exécuté.
+
+### Ce que cette section ne couvre pas
+
+Les cinq gardes mika#2337 existantes sont **inchangées** et déjà vertes sur ce
+checkout (§ R3) : elles ne sont pas des livrables de ce plan et n'ont donc pas de
+disposition à déclarer ici. Aucun détecteur de ce plan n'est livré désactivé
+(option (b)) : l'option existe et n'est retenue nulle part, parce que les quatre
+gardes automatiques sont vertes au présent — un atterrissage désactivé serait une
+prudence sans population, c'est-à-dire la forme que mika#2272 a dû défaire une
+fois (*« zéro était l'absence de mesure, pas la présence de prudence »*).
+
+---
+
 ## Phases d'implémentation
 
 ### Phase 1 — L'inventaire et sa garde (C-1, R-6)
 
-1. `ROUTABLE_TRIGGERS` dans `dispatcher.rs`, adjacent au `match`.
-2. Garde de source dans `test_recurring_trigger_wiring_2337.rs` : égalité
+1. `ROUTABLE_TRIGGERS` dans `dispatcher.rs`, adjacent au `match`, peuplée depuis
+   le relevé daté ci-dessus.
+2. Garde de source dans `test_recurring_trigger_wiring_2337.rs` (**D-1**) : égalité
    ensembliste entre les bras littéraux du `match` et la constante, en réutilisant
    l'extracteur existant. Contrôle de bonne foi : la population extraite est non
-   vide.
+   vide. Allowlist livrée vide (voir § *Fire-Disposition* D-1).
 
 ### Phase 2 — L'attribution (C-2, C-3, R-1, R-2)
 
 3. Champs d'attribution sur le `warn!` et sur le `reasoning` de la ligne
    `audit_events`, au site `engine.rs:4223`.
 4. `task_engine_trigger_registry` au démarrage de `run_server`.
-5. Tests : le contrôle négatif `zorglub` existant atteste désormais la présence et
-   la non-vacuité des champs d'attribution ; un test asserte que
-   `binary_git_hash` n'est jamais vide (jumeau de `build_info::tests::git_hash_is_never_empty`).
+5. Tests (**D-4**) : le contrôle négatif `zorglub` existant atteste désormais la
+   présence et la non-vacuité des champs d'attribution — l'assertion porte sur le
+   **champ émis**, `build_info::tests::git_hash_is_never_empty` couvrant déjà la
+   constante côté `mika-common` (voir § *Fire-Disposition* D-4). `GIT_HASH ==
+   "unknown"` est une réponse valide et ne fait pas rougir ; seul le vide le fait.
 
 ### Phase 3 — La sonde exhaustive (C-4, R-3)
 
 6. Table `(trigger, armement)` et boucle de tir sur `ROUTABLE_TRIGGERS`.
 7. Armement STOP pour `worktree_reap` (ceinture anti-destruction), jeton absent
    pour les scans de forge, provider factice pour les tours silencieux.
-8. Test de complétude : tout membre de `ROUTABLE_TRIGGERS` sans entrée dans la
-   table fait rougir.
+8. Test de complétude (**D-2**) : tout membre de `ROUTABLE_TRIGGERS` sans entrée
+   dans la table fait rougir. Aucune allowlist (voir § *Fire-Disposition* D-2).
+9. Garde de position (**D-3**) : dans le corps de `dispatch_worktree_reap`, le test
+   `is_stopped(… WORKTREE_REAP_SCAN)` précède la première résolution de jeton et
+   la première invocation de `git`. **Aucun code de production n'est déplacé** —
+   la propriété est déjà vraie (`dispatcher.rs:1859` contre `:1903`) ; la garde
+   l'épingle parce que la sûreté de la sonde en dépend désormais.
 
 ### Phase 4 — Le ré-armement (C-5, R-4, R-5)
 
-9. `RECURRING_OPERATOR_REARM_PATH` dans `db.rs`, exclusion dans la requête
-   `dead_sibling` de `db/tasks.rs`, fonction `rearm_recurring_task`.
-10. Sous-commande `TaskCommand::Rearm { label }` dans `cli.rs` + `commands/tasks.rs`.
-11. Tests `db::tests` : le marqueur lève le veto pour son label seul ; **tout autre
+10. `RECURRING_OPERATOR_REARM_PATH` dans `db.rs`, exclusion dans la requête
+    `dead_sibling` de `db/tasks.rs`, fonction `rearm_recurring_task`.
+11. Sous-commande `TaskCommand::Rearm { label }` dans `cli.rs` + `commands/tasks.rs`.
+12. Tests `db::tests` : le marqueur lève le veto pour son label seul ; **tout autre
     décès continue d'armer le veto** (jumeau de
     `mika2337_any_other_death_still_arms_the_veto`) ; un trigger non routable est
     refusé.
 
 ### Phase 5 — Documentation
 
-12. `crates/mika-agent/CLAUDE.md` § *Unknown-Trigger Veto Lift* : l'attribution,
+13. `crates/mika-agent/CLAUDE.md` § *Unknown-Trigger Veto Lift* : l'attribution,
     le geste de ré-armement, et la mise à jour de la surface opérateur — la phrase
     *« establish the version of the running binary instead »* nomme désormais
     l'instrument qui le permet.
-13. `CLAUDE.md` racine : `mika tasks rearm` dans la liste des commandes.
+14. `CLAUDE.md` racine : `mika tasks rearm` dans la liste des commandes.
 
 ---
 
@@ -381,10 +567,13 @@ intermédiaire court-circuite ou s'abstient.
   ré-armement.
 - `cargo test -p mika-cli` — surface CLI.
 - `make lint && make fmt && make test`.
-- **Contrôle négatif obligatoire** : retirer temporairement le bras
-  `"worktree_reap" =>` doit faire rougir *à la fois* la garde d'inventaire (C-1) et
+- **Contrôle négatif obligatoire (D-5)** : retirer temporairement le bras
+  `"worktree_reap" =>` doit faire rougir *à la fois* la garde d'inventaire (D-1) et
   la sonde de tir (C-4). Une sonde qui resterait verte ne mesurerait rien — c'est
-  l'erreur que ce ticket existe pour ne pas rejouer.
+  l'erreur que ce ticket existe pour ne pas rejouer. **Sa polarité est inversée :
+  un vert ici est une halte**, pas un succès (voir § *Fire-Disposition* D-5). Le
+  résultat est consigné dans le corps de la PR, faute de quoi rien n'atteste que
+  le contrôle a été exécuté.
 
 ### Sondes post-déploiement, et leurs haltes
 
@@ -431,14 +620,18 @@ Un même label ré-armé plusieurs fois signifie que la correction n'a pas pris 
 
 ## Definition of Done
 
-- [ ] `ROUTABLE_TRIGGERS` existe, site unique, garde de cohérence avec le `match` verte.
+- [ ] `ROUTABLE_TRIGGERS` existe, site unique, garde de cohérence avec le `match`
+      verte (**D-1**), allowlist vide.
 - [ ] `recurring_unknown_trigger` (log + `audit_events`) porte version, empreinte
-      git, pid, nom de processus et inventaire.
+      git, pid, nom de processus et inventaire ; les champs sont non vides (**D-4**).
 - [ ] `task_engine_trigger_registry` est émis une fois par démarrage de mika-spirit.
-- [ ] Les sept triggers enregistrés sont tirés par le chemin récurrent dans la
-      sonde ; un trigger sans armement d'herméticité fait rougir.
+- [ ] **Chaque membre de `ROUTABLE_TRIGGERS`** est tiré par le chemin récurrent
+      dans la sonde ; un trigger sans armement d'herméticité fait rougir (**D-2**).
 - [ ] La sonde `worktree_reap` est hermétique **par le STOP**, pas par l'absence de
-      jeton.
+      jeton ; la position du STOP est épinglée (**D-3**) sans qu'aucun code de
+      production soit déplacé.
+- [ ] La section § *Fire-Disposition* couvre les cinq détecteurs livrés, et chacun
+      atterrit conformément à sa disposition déclarée.
 - [ ] `mika tasks rearm <label>` lève le veto per-label, trace l'acte, ré-enregistre,
       et refuse un trigger non routable.
 - [ ] mika#1742 reste armé pour toute autre cause de décès (test).
@@ -470,10 +663,15 @@ et des Requirements ci-dessus.
 - **AC4** — Une sonde tire **chaque** trigger enregistré par le chemin récurrent
   réel (`ensure_recurring_task` → `tick` → `fire_task` → `dispatch`), sans réseau,
   et échoue si l'un tombe dans le catch-all. La sonde de `worktree_reap` ne peut
-  supprimer aucun worktree, et cette impossibilité est structurelle (STOP en tête
-  de dispatch), pas circonstancielle.
+  supprimer aucun worktree, et cette impossibilité est structurelle — le STOP est
+  **déjà** en tête de dispatch (`dispatcher.rs:1859`, mika#2420) et une garde
+  l'épingle (D-3) — pas circonstancielle.
 - **AC5** — Ajouter un trigger sans décider de son herméticité de test fait
   **rougir un test**, jamais passer en silence.
+- **AC5b** — Chacun des cinq détecteurs livrés porte une disposition déclarée
+  avant son atterrissage (§ *Fire-Disposition*) : quatre gardes vertes au présent
+  avec allowlist vide ou absente, une vérification manuelle à polarité inversée
+  dont le vert est une halte.
 - **AC6** — `mika tasks rearm <label>` ré-arme une récurrente morte sans attendre
   la fenêtre de 24 h et sans édition manuelle de la base ; l'acte est tracé dans
   `audit_events`.
@@ -484,7 +682,11 @@ et des Requirements ci-dessus.
   pinne.
 - **AC9** — Aucun comportement de dispatch, de veto, de reaper ou de scan
   périodique n'est modifié. Le périmètre est attribution, observabilité, couverture
-  et réparabilité.
+  et réparabilité. **Vérifié plutôt qu'asserté** : la seule modification de
+  comportement que la v1 pouvait laisser croire — déplacer le STOP en tête de
+  `dispatch_worktree_reap` — n'en est pas une, le STOP y étant déjà
+  (`dispatcher.rs:1859` contre une résolution de jeton à `:1903`). Ce plan ajoute
+  une garde sur cette propriété (D-3) et ne déplace aucune ligne de production.
 - **AC10** — La contradiction apparente du ticket (« le binaire porte l'arm et
   pourtant le catch-all mord ») est **rendue falsifiable** par les sondes C, avec
   une halte explicite pour chacune des trois lectures possibles — dont la
@@ -501,3 +703,48 @@ et des Requirements ci-dessus.
   d'attribution**, et le travail est recentré sur : inventaire à site unique,
   preuve portée par la ligne de mort, attestation au démarrage, sonde de tir
   exhaustive et hermétique, ré-armement opérateur sanctionné.
+- **rev 2 (2026-09-21)** — Première passe architecte : `Disposition: ITERATE`
+  (F1 bloquant, F2/F3 affûtages). Trois findings traités, chacun par mesure sur le
+  checkout plutôt que par reformulation.
+  - **F1 (BLOCKING) adressé** — ajout de la section `## Fire-Disposition`, qui
+    nomme les **cinq** détecteurs livrés et la disposition de chacun : D-1 (garde
+    d'inventaire) et D-2 (complétude d'herméticité) en option (a) *exception
+    nommée à zéro entrée, assertée au présent* depuis le relevé daté, avec
+    allowlist livrée vide pour l'une et absente pour l'autre, et la résolution
+    prescrite quand elles tirent (corriger la constante / écrire l'armement, jamais
+    allowlister) ; D-3 (position du STOP) en option (a) pour la même raison ; D-4
+    (non-vacuité des champs d'attribution) en option (c) *halt-and-surface*,
+    puisque sa nature — une valeur émise, non une source — exclut toute allowlist ;
+    D-5 (contrôle négatif) en option (c) **à polarité inversée**, son vert étant
+    une halte. Un requirement R-8 porte la règle, un AC5b la rend vérifiable.
+    Ajout au passage d'une rectification que la mesure a imposée : D-4 n'est pas le
+    « jumeau » de `build_info::tests::git_hash_is_never_empty` (qui existe déjà et
+    couvre la constante) mais son complément — il asserte le **câblage** vers le
+    champ émis, une constante saine branchée sur rien produisant une ligne muette
+    avec un test vert. Citation préservée : Fire-Disposition Gate (mika#1574),
+    branche 2.
+  - **F2 (sharpening) adressé** — le chiffre « sept » n'est plus asserté : la
+    nouvelle sous-section *Le relevé, joint plutôt qu'asserté* joint le survey des
+    call-sites `ensure_recurring_task` (HEAD `1c1ec0d7`), avec un tableau
+    trigger → ligne d'enregistrement → bras du `match`, et établit l'égalité
+    ensembliste au présent. Les trois occurrences du chiffre ailleurs dans le plan
+    sont réindexées sur `ROUTABLE_TRIGGERS`, le nombre ne subsistant que dans le
+    relevé daté. Le survey a par ailleurs produit deux faits que le plan intègre :
+    deux call-sites hors du périmètre du scanner (`mika-cli/commands/chat.rs:230`
+    et `:245`) n'enregistrent que `heartbeat` et `reflection`, donc le relevé reste
+    complet — **et** un `mika chat` tirant toute ligne due de la base, la population
+    « `process_name = mika` » de la sonde C reste ouverte, ce que le plan dit
+    désormais explicitement. Citation préservée : review-guide § KISS,
+    discipline citation-or-silence, leçon `canonical-tokens-survey`.
+  - **F3 (sharpening) adressé — par tranchage, dans le sens « déjà en tête ».**
+    Vérification faite : `dispatch_worktree_reap` (`dispatcher.rs:1850`) ouvre sur
+    `auto_pull_stop::is_stopped` (`:1859`), **avant** la résolution du jeton
+    (`:1903`) et avant tout `git`, avec le raisonnement écrit sur le site par
+    mika#2420. C-4 ne prescrit donc aucun déplacement : il **consomme** une
+    propriété existante. R-7 et AC9 sont conservés intacts et **renforcés** par la
+    mesure au lieu d'être amendés ; une garde de position (D-3) épingle la
+    propriété, parce que la sûreté d'une sonde destructive en dépend désormais.
+    Citation préservée : review-guide § Orthogonality, cohérence Requirements ↔
+    Conception.
+  - **Aucun AC affaibli.** AC4 est resserré (l'impossibilité structurelle est
+    désormais sourcée et épinglée), AC9 gagne sa vérification, et AC5b s'ajoute.
