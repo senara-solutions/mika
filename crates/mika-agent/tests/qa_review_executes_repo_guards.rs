@@ -140,6 +140,52 @@ fn prompt_does_not_reimplement_the_plan_doc_presence_check() {
     }
 }
 
+/// mika#2419 — Step 2B's synthetic event must carry the PR author.
+///
+/// ## Why a structural guard and not a behavioural test
+///
+/// `scripts/verify-pipeline.sh` learned an automated-author exemption
+/// (`.pull_request.user.login` against a two-login list). Its only qa-side
+/// caller is the `run_shell` command Step 2B prescribes, which builds the
+/// `GITHUB_EVENT_PATH` payload by hand. Before mika#2419 that payload carried
+/// `number` and `labels` and nothing else — so the guard would have known a
+/// rule its caller never gave it the means to apply (class mika#2205).
+///
+/// Removing the field again would make **no decision wrong**: every case of
+/// `scripts/verify-pipeline-test.sh` (F1–F7 included) drives the script
+/// directly and would stay green, while the exemption went inert in
+/// production. That is precisely the class a source scan exists to hold.
+#[test]
+fn step_2b_synthetic_event_carries_the_pr_author() {
+    let prompt = qa_review_prompt();
+
+    // The payload itself. Asserted as the literal Step 2B prints, because the
+    // guard reads `.pull_request.user.login` and nothing else — a payload that
+    // nested the login anywhere else would parse and resolve to empty, i.e.
+    // fail closed, i.e. reproduce the defect while looking correct.
+    assert!(
+        prompt.contains(r#""user":{"login":"<author>"}"#),
+        "qa-review/system_prompt.md Step 2B no longer builds the synthetic \
+         event with `\"user\":{{\"login\":\"<author>\"}}`.\n\
+         `scripts/verify-pipeline.sh` reads `.pull_request.user.login` for its \
+         automated-author exemption (mika#2419). Without the field the guard \
+         resolves an empty login, grants no exemption, and every dependabot \
+         Cargo.lock-only PR goes back to `block[pipeline]` — the mika#2415 \
+         symptom — with the whole shell test suite still green."
+    );
+
+    // And the field must be taken off `qa_pr_view` rather than invented: it is
+    // already in that handler's SAFE_FIELDS, which is what makes the payload
+    // reproducible from live PR metadata.
+    assert!(
+        prompt.contains("`labels`, `author`, and `body` from Step 1's `qa_pr_view`"),
+        "qa-review/system_prompt.md Step 2B no longer extracts `author` from \
+         Step 1's `qa_pr_view` output (mika#2419). The synthetic event's \
+         `user.login` has to come from the PR's real author; sourcing it \
+         anywhere else makes the exemption unreproducible."
+    );
+}
+
 #[test]
 fn prompt_requires_the_guard_output_to_be_quoted_verbatim() {
     let prompt = qa_review_prompt();
