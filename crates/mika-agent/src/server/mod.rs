@@ -153,6 +153,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/agents/{id}/audit", get(dashboard::handle_agent_audit))
         .route("/agents/{id}/facts", get(dashboard::handle_agent_facts))
+        // mika#2457 — the budget and model this agent is running under, with
+        // the provenance of each half. Serves the record frozen at `init_agent`;
+        // never re-reads the disk.
+        .route("/agents/{id}/budget", get(dashboard::handle_agent_budget))
         .route("/sessions", get(dashboard::handle_sessions_list))
         .route("/sessions/{id}", get(dashboard::handle_session_detail))
         .route(
@@ -473,7 +477,15 @@ async fn init_agent(
     // Out of scope, and deliberately: the per-skill `[llm]` override path
     // (`agent_loop`'s `make_provider_for`) emits nothing. mika#2293 asks about
     // an agent's *nominal* budget, not what a skill overrides for one turn.
-    mika_common::llm::log_llm_budget_resolved(agent_name, global_home, agent_home);
+    //
+    // mika#2457 — the record is KEPT, not just emitted. `GET /api/v1/agents/
+    // {id}/budget` serves this exact value, so the answer an operator reads is
+    // the one this init resolved, at the instant it stamped `resolved_at`.
+    // Resolving a second time at request time would read the *reader's* process
+    // environment and could report a setting that is not in force.
+    let budget_record =
+        mika_common::llm::resolve_llm_budget_record(agent_name, global_home, agent_home);
+    mika_common::llm::emit_llm_budget_resolved(&budget_record);
     let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
@@ -656,6 +668,7 @@ async fn init_agent(
         webhook_queue_v2,
         kg_config,
         canonical_session_id,
+        budget_record: Arc::new(budget_record),
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -2043,6 +2056,21 @@ mod tests {
         agent_settings: Settings,
         tier: mika_common::home::AgentTier,
     ) -> AppState {
+        test_state_full(
+            agent_settings,
+            tier,
+            std::path::PathBuf::from("/tmp/mika-test"),
+        )
+    }
+
+    /// Same as [`test_state_with_settings_and_tier`] but lets the caller pin the
+    /// agent's home directory — used by the mika#2457 freshness test, which must
+    /// resolve the budget record from a home it can then mutate on disk.
+    fn test_state_full(
+        agent_settings: Settings,
+        tier: mika_common::home::AgentTier,
+        home_dir: std::path::PathBuf,
+    ) -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
         let llm = mika_common::llm::dummy_provider();
@@ -2065,7 +2093,6 @@ mod tests {
             a2a_wait_slots: Arc::new(tokio::sync::Semaphore::new(
                 agent_settings.effective_a2a_queue_max_depth(),
             )),
-            home_dir: std::path::PathBuf::from("/tmp/mika-test"),
             embedding_client: None,
             mcp_manager: None,
             settings: agent_settings,
@@ -2080,6 +2107,13 @@ mod tests {
                 reason: crate::kg::config::DisabledReason::OperatorOptOut,
             },
             canonical_session_id: None,
+            // mika#2457 — resolved from the agent's home exactly as `init_agent`
+            // does, so a test state carries a record with the same provenance
+            // semantics as production rather than a hand-built fixture.
+            budget_record: Arc::new(mika_common::llm::resolve_llm_budget_record(
+                "mika", &home_dir, &home_dir,
+            )),
+            home_dir,
         };
 
         let agents = dashmap::DashMap::new();
@@ -4420,6 +4454,141 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["total"].is_number());
         assert!(json["data"].is_array());
+    }
+
+    /// mika#2457 U3 — a served agent gets its record, an unknown one gets a
+    /// 404 and **never** a computed default.
+    ///
+    /// Both halves in one call. A test asserting only the 200 would pass over a
+    /// route that manufactured a record for any name asked of it, which is the
+    /// false green the whole ticket is about: the point of this surface is that
+    /// a number it prints was *measured*, so a 404 has to mean "this server has
+    /// not resolved that agent" rather than "here is what it would be".
+    #[tokio::test]
+    async fn mika2457_budget_route_serves_the_record_or_404s() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents/mika/budget")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let budget = &json["budget"];
+        assert_eq!(budget["agent_id"], "mika");
+        assert!(
+            budget["http_timeout_secs"].is_number(),
+            "le plafond doit être servi"
+        );
+        assert!(
+            budget["http_source"].is_string(),
+            "la provenance est la moitié qui tranche les trois mondes — elle doit être servie"
+        );
+        assert!(
+            budget["model_config_key"].is_string(),
+            "la clé qu'un opérateur éditerait doit être servie"
+        );
+        assert!(
+            !budget["resolved_at"].as_str().unwrap_or("").is_empty(),
+            "un record non daté ne dit pas de quand il est vrai (mika#2457 F3)"
+        );
+
+        // Negative control: an agent this server does not serve.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents/inexistant/budget")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "un agent non résolu n'a pas de budget « en vigueur » à rapporter, \
+             et en inventer un serait le faux vert que U1/U2 existent pour empêcher"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["budget"].is_null(),
+            "un 404 ne doit porter aucun budget, même par défaut"
+        );
+    }
+
+    /// mika#2457 U2 — the route serves the record of the **init**, not the disk.
+    ///
+    /// Same shape and same reason as `agent_state_tier_survives_env_drift`
+    /// (mika#1962): the record is *not hot-swappable* by contract, because it
+    /// reports the state the agent **runs under**. A route that re-read the
+    /// `config.toml` per request would answer "what the disk says now" to a
+    /// question about what is in force — and on a host where a service variable
+    /// shadows that file, it would answer it wrongly while looking measured.
+    ///
+    /// **The middle assertion is load-bearing**: without proving the disk
+    /// actually moved, a green here would be compatible with a test that never
+    /// mutated anything.
+    #[tokio::test]
+    async fn mika2457_the_route_serves_the_record_of_the_init_not_the_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::write(
+            home.join("config.toml"),
+            "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n",
+        )
+        .unwrap();
+
+        let state = test_state_full(
+            test_settings(),
+            mika_common::home::AgentTier::Default,
+            home.clone(),
+        );
+        state.ready.store(true, Ordering::Release);
+
+        // The disk moves AFTER the agent was initialized — the shape of an
+        // out-of-repo edit on a running server (mika#2328's measured drift).
+        std::fs::write(
+            home.join("config.toml"),
+            "llm_http_timeout_secs = 111\nagent_total_timeout_secs = 900\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mika_common::llm::resolve_llm_budget_record("mika", &home, &home).http_timeout_secs,
+            111,
+            "le disque doit avoir réellement bougé, sinon ce test ne prouve rien"
+        );
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents/mika/budget")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["budget"]["http_timeout_secs"], 240,
+            "la route doit servir le record de l'init : un recalcul par requête \
+             est le faux vert mika#2304 (afficher ce qui est demandé, pas ce qui tourne)"
+        );
     }
 
     // ===== Dashboard toggle endpoint tests =====
