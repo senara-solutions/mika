@@ -1217,6 +1217,55 @@ class ForeignLineFilterTests(unittest.TestCase):
         )
         self.assertEqual(stripped, ["[egress] ALLOW 127.0.0.1:0"])
 
+    def test_handle_and_timer_handle_shapes_are_foreign_too(self) -> None:
+        # `asyncio.base_events._format_handle` renders three shapes: the Task's
+        # repr, a Handle's, a TimerHandle's. The first two are frozen samples;
+        # the third is derived from the same formatter, since nothing in this
+        # suite schedules a timer under the debug loop.
+        timer_line = (
+            "Executing <TimerHandle when=12.5 _set_result_unless_cancelled(<Future pending>) "
+            "at /usr/lib/python3.14/asyncio/futures.py:311 created at "
+            "/usr/lib/python3.14/asyncio/base_events.py:711> took 0.000 seconds"
+        )
+        self.assertEqual(_strip_ts(self, [_OBSERVED_HANDLE_LINE, timer_line]), [])
+
+    def test_bare_proxy_line_still_fails(self) -> None:
+        # AC2 — the non-negotiable negative control, term by term: a line the
+        # proxy authored that is NOT stamped must still turn the test red,
+        # whichever of the four prefixes it carries. A helper that accepted any
+        # line would have swapped a flaky test for a useless one.
+        for prefix in _PROXY_PREFIXES:
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(AssertionError, "not timestamped"):
+                    _strip_ts(self, [f"{prefix} ERROR x"])
+
+    def test_timestamped_line_with_unknown_prefix_fails(self) -> None:
+        # AC3 — a stamped line whose prefix nobody inventoried is a new proxy
+        # emitter (or a stamped stranger): red, with the remedy in the message.
+        with self.assertRaisesRegex(AssertionError, "unknown prefix"):
+            _strip_ts(self, ["2026-09-21T00:00:00.000Z [new-thing] hi"])
+
+    def test_unclassified_line_fails(self) -> None:
+        # AC3 — neither a proxy prefix nor a listed foreign source: a new writer
+        # shares the stream, and the helper refuses to ignore it in silence.
+        with self.assertRaisesRegex(AssertionError, "unclassified"):
+            _strip_ts(self, ["some other writer"])
+
+    def test_prefix_inventory_matches_the_proxy_source(self) -> None:
+        # D-1 — the compile-time half of AC3: every literal prefix a `_log(`
+        # call opens with is in `_PROXY_PREFIXES`, and every inventoried prefix
+        # still has a caller. Sets, not counts: the one composed call
+        # (`_log(f"{line} {detail}")`) is invisible to the regex and needs not
+        # be seen, its `[anthropic-proxy]` prefix is already found six times.
+        source = _PROXY_PATH.read_text(encoding="utf-8")
+        found = set(re.findall(r'_log\(\s*f?"(\[[a-z-]+\])', source, re.MULTILINE))
+        self.assertTrue(found, "regex found no _log( prefix in the proxy source")
+        self.assertEqual(
+            found,
+            set(_PROXY_PREFIXES),
+            f"source vs inventory differ by {found ^ set(_PROXY_PREFIXES)}",
+        )
+
 
 # ---------------------------------------------------------------------------
 # mitmproxy addon (the CONNECT path)
