@@ -416,3 +416,10 @@ avant tout push (les sondes sont le vert). Une seule PR.
   compteur `SKIPPED` au résumé, assertion compagne T6-arm à deux contrôles,
   sonde post-déploiement sur le poste de dispatch (R-5, C-5, D-2, T6-arm,
   AC6-arm). Q1/Q2/Q5 validées sans changement.
+- 2026-09-21 — v3 : reprise `/ce:plan` en mode confiance depuis le pipeline
+  `/mika` (spawn `mika-mika-2149`). Toutes les ancres re-sondées sur
+  `origin/main@2b5456cc` : `dispatch-lib.sh:3016/:3022/:3099/:3412`,
+  `test-dispatch-lib.sh:3920/:4110`, `types.py:286-295` (8 valeurs),
+  `agent.py:54` (`SDK_TERMINATION_SUBTYPES`), `agent.py:906`
+  (`transport_message_too_large` → `status: terminated`), `ui.py:113` (format
+  ANSI de la ligne `[guardrail]`). Aucune dérive ; aucun changement de contenu.
