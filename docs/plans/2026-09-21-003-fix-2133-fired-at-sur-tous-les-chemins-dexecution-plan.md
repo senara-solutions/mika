@@ -434,6 +434,30 @@ Disposition d'un futur site : **halt-and-surface**, mot pour mot comme mika#2335
 — ni entrée de registre posée en passant, ni `#[ignore]`. La question « ce site
 démarre-t-il un travail ou non ? » ne se pré-tranche pas ici.
 
+**Ce que la garde ne couvre pas, et c'est écrit ici plutôt que découvert :
+une absence d'appel.** U4 scanne des **écritures** littérales de `fired_at =` ;
+elle ne voit pas un chemin qui *aurait dû* estampiller et ne le fait pas. La
+population exposée est nommable précisément, parce qu'U3 est branché sur
+`is_callback` dans `dispatch_resume_agent` — et que **la branche `else` de ce
+site est un fourre-tout** (`Reminder path`), vérifié à `c8520787` : tout
+`trigger_type` qui n'est pas `callback` y tombe. Aujourd'hui c'est correct, les
+reminders étant déjà estampillés en amont par `claim_and_fire_task` (D4).
+
+> **Si un nouveau `trigger_type` traverse `dispatch_resume_agent` sans passer
+> par `claim_and_fire_task`, il faut décider s'il doit être estampillé par
+> `stamp_task_fired_at_if_null` — la garde U4 ne couvre pas cette absence.**
+
+Et le coût de l'omission n'est pas seulement une colonne vide de plus. C'est la
+classe d'échec que mika#2263 a mesurée sur ce champ exact : *« Toute
+sonde/faucheur qui filtre `fired_at IS NULL` … voit ces rows comme
+non-dispatchées et NE les balaie PAS — le zombie est invisible à cette classe de
+faucheur. »* Une population non estampillée n'est pas seulement invisible aux
+sondes S1–S4 : **elle est invisible au filet, parce que le filet ne sait pas
+qu'elle existe.** Un scan capable de voir cette absence demanderait une analyse
+de flot que cette famille de gardes n'a pas (même limite que le coût lexical
+nommé au § Fire-Disposition) ; ce qui est disponible, et qui est livré, est que
+la question soit posée par écrit au site où le prochain éditeur la rencontrera.
+
 ### U5 — Tests comportementaux
 
 `crates/mika-agent/tests/eval/test_dispatch_fired_at_stamped.rs`, en extension
@@ -468,7 +492,7 @@ garde nomme le site.
 
 ### U6 — La raison écrite (D6, R7)
 
-Trois écritures, aucune n'étant un changement de comportement :
+**Quatre** écritures, aucune n'étant un changement de comportement :
 
 1. **Doc-comment sur `get_active_callback_tasks_with_pid`** (`db/tasks.rs:2976`)
    — sa population est vide par construction, le PID vivant sur une ligne
@@ -477,7 +501,15 @@ Trois écritures, aucune n'étant un changement de comportement :
 2. **Entrée `CLAUDE.md`**, au voisinage des signaux de tâches : la phrase de D7,
    le tableau des quatre chemins et de leur écrivain, et la requête AC5 comme
    sonde opérateur.
-3. **Le suivi nommé** dans le corps de PR et au § Suivi ci-dessous.
+3. **Le corps de mika#2133 lui-même** — la quatrième écriture, et celle sans
+   laquelle R7 n'est pas tenu. Les deux premières vivent dans le code et dans
+   `CLAUDE.md` ; **le lecteur du ticket ne lit ni l'un ni l'autre**, et c'est
+   très précisément sur le ticket que le commentaire 1 refuse « le silence
+   actuel ». Deux gestes, détaillés au Definition of Done : un encadré daté
+   rectifiant la mesure du 2026-09-01, et un commentaire d'avis d'édition
+   nommant la branche AC7 retenue. Convention de rectification des corps de
+   tickets : mika#2169 / mika#2158, appliquée sur mika#2162.
+4. **Le suivi nommé** dans le corps de PR et au § Suivi ci-dessous.
 
 ---
 
@@ -575,6 +607,27 @@ exécute**. Le champ devient lisible ; il ne devient pas surveillé.
 - Le corps de PR relève S1 à S4 comme sondes à exécuter après déploiement, avec
   la valeur de référence de S4 relevée avant.
 - Le suivi D6 est ouvert et nommé dans le corps de PR.
+- **Le corps de mika#2133 est rectifié** par un encadré daté reflétant la mesure
+  à `c8520787` — poches `manual` et `callback`-avec-pilote closes respectivement
+  par mika#2335 et mika#2263, restent `a2a` et `callback`-sans-pilote —, la
+  mesure d'origine du 2026-09-01 étant **conservée et datée** plutôt que
+  remplacée : c'est elle qui explique pourquoi le ticket a été ouvert.
+  Convention de rectification des corps de tickets : mika#2169 / mika#2158,
+  appliquée sur mika#2162.
+- **Un commentaire d'avis d'édition est posté sur mika#2133**, nommant la
+  branche AC7 retenue — seconde branche, la raison écrite (U6), sur le blast
+  radius mesuré en D6 — et le suivi qui porte la première.
+  **Pourquoi ce geste est au DoD et pas seulement dans U6** : le commentaire 1
+  n'accepte que deux issues, « un état intermédiaire … **ou** une raison écrite
+  quelque part … mais pas le silence actuel ». Une raison qui ne vit que dans un
+  doc-comment (`db/tasks.rs:2976`) et dans `CLAUDE.md` n'atteint pas le lecteur
+  du ticket, pour qui le silence demeure entier. Sans ces deux gestes, **R7
+  n'est pas tenu et AC7 n'est pas livré** — un futur lecteur de mika#2133 y
+  trouverait une mesure périmée de quatre mois et aucune trace de la décision.
+- **Si l'un des deux gestes n'est pas exécutable** par l'implémenteur (portée
+  outillée, jeton), il est **nommé comme tel dans le corps de PR** avec le
+  contenu à poser, à destination de l'orchestrateur — jamais silencieusement
+  omis, le silence sur le ticket étant exactement ce que ce DoD ferme.
 
 ---
 
@@ -619,6 +672,12 @@ Transcrits du ticket, avec leur disposition dans ce plan.
   faisant foi est par ailleurs déjà rendu à l'opérateur par `PilotLiveness`
   (mika#2335), ce qui retire du besoin la corrélation manuelle avec `ps` que le
   commentaire nomme.
+  **« Quelque part » a un lieu, et c'est le ticket.** Cet AC n'est pas tenu par
+  le doc-comment et l'entrée `CLAUDE.md` seuls : ils sont lus par qui lit le
+  code, pas par qui lit mika#2133. L'AC7 est livré quand les quatre écritures
+  d'U6 le sont, **y compris la rectification du corps et le commentaire d'avis
+  d'édition** portés au Definition of Done. C'est la condition qui rend vraie la
+  phrase « le silence actuel cesse ».
 
 ---
 
@@ -670,6 +729,13 @@ dessous. C'est la même limite que la garde mika#2335 documente pour elle-même
 (« portée lexicale sur le littéral `"in_progress"`, et c'est un coût assumé ») :
 un scan sémantique demanderait une analyse de flot que cette famille de gardes
 n'a pas. La limite est écrite sur la garde, pas découverte plus tard.
+
+**Seconde limite, de nature différente et plus coûteuse : la garde voit des
+écritures, jamais des absences.** Un chemin qui aurait dû appeler
+`stamp_task_fired_at_if_null` et ne l'appelle pas la laisse verte. Le cas
+concret — un nouveau `trigger_type` traversant `dispatch_resume_agent`, dont la
+branche `else` est un fourre-tout — est nommé en toutes lettres au § U4, avec la
+décision qu'il appelle et le mode de panne de mika#2263 qu'il rejoue.
 
 ---
 
@@ -729,3 +795,22 @@ n'a pas. La limite est écrite sur la garde, pas découverte plus tard.
   mika#2335 et mika#2263 ; restent `a2a` et `callback`-sans-pilote. Tranche le
   second symptôme du commentaire 1 par la branche « raison écrite » que ce
   commentaire déclare acceptable, sur le blast radius mesuré du watchdog #959.
+- **v2** (2026-09-21) — révision sur la première passe architecte (ITERATE).
+  **F1 (BLOCKING) adressée** : le Definition of Done exige désormais les deux
+  gestes sur le ticket — encadré daté rectifiant la mesure du 2026-09-01
+  (conservée, non remplacée) et commentaire d'avis d'édition nommant la branche
+  AC7 retenue —, avec la convention citée (mika#2169 / mika#2158, appliquée sur
+  mika#2162) et une clause de remontée dans le corps de PR si l'un des deux
+  n'est pas exécutable par l'implémenteur. U6 passe de trois à quatre écritures
+  et l'AC7 dit maintenant que « quelque part » a un lieu : le ticket, un
+  doc-comment et `CLAUDE.md` n'atteignant pas son lecteur.
+  **F2 (sharpening) adressée** : § U4 nomme la limite « la garde voit des
+  écritures, jamais des absences », avec la question à trancher si un nouveau
+  `trigger_type` traverse `dispatch_resume_agent` sans passer par
+  `claim_and_fire_task`, et la citation de mika#2263 sur le zombie invisible au
+  faucheur. Le § Fire-Disposition y renvoie en seconde limite. Précision
+  vérifiée en chemin à `c8520787`, qui rend la limite plus aiguë que la finding
+  ne la formulait : la branche `else` de `dispatch_resume_agent` est un
+  fourre-tout (`Reminder path`), donc un nouveau `trigger_type` y tomberait
+  silencieusement.
+  Aucune AC affaiblie ; aucune décision D1–D7 modifiée ; aucun périmètre élargi.
