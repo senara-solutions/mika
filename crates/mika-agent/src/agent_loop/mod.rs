@@ -87,6 +87,21 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
 
+/// `response_chars` for a call site that has **no response to measure** — an
+/// error arm, a transport timeout, a deadline abort (mika#1910 U1).
+///
+/// `null`, never `0`: the rule mika#2331 wrote on `request_bytes` one struct
+/// away. `0` says *"measured, and the model produced nothing"* — which is the
+/// entire class mika#1910 exists to count. Writing it where no call returned
+/// would put a readable lie in the one column the measurement reads.
+///
+/// **This constant is the guard's predicate, not decoration.** A grep cannot
+/// decide *"is this line inside an `Err` arm?"* — the approximations fail in
+/// both directions. It can decide exactly *"did the author write the token that
+/// says **I know this site measures nothing**?"*. See
+/// [`tests::mika1910_every_unmeasured_site_declares_itself`].
+const RESPONSE_CHARS_UNMEASURED: Option<i64> = None;
+
 /// Slack added to a rail's declared worst case before the `run_loop` watchdog
 /// cuts an LLM call (mika#2342 D3).
 ///
@@ -775,6 +790,29 @@ async fn attempt_continuation_turn(
             );
             let stop = format!("{:?}", resp.stop_reason);
             let usage = resp.usage;
+            // mika#1910 U1/U2 — what this turn produced, by the canonical
+            // serializer (the one that feeds `llm_calls.response_text`), so the
+            // count on the log and the text in the DB describe one object.
+            //
+            // Tools are disabled on this turn (`request.tools = None` above),
+            // so the serializer sees text blocks only: here, and only here, is
+            // `response_chars` unambiguously a count of text. That is also
+            // exactly where the mika#1910 symptom lands — `max_steps` burnt,
+            // then a final message that is empty.
+            let response_text = mika_common::llm::serialize_response_text(
+                &resp.content,
+                mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+            );
+            let reasoning_text = resp.reasoning.as_deref().map(|r| {
+                mika_common::llm::truncate_chars(r, mika_common::llm::MAX_RESPONSE_TEXT_CHARS)
+            });
+            // `Some(0)` on an empty response, never `None`: the call returned,
+            // so it was measured. See the sibling site in `run_loop`.
+            let response_chars = Some(
+                response_text
+                    .as_deref()
+                    .map_or(0, |t| t.chars().count() as i64),
+            );
             // Always call — `save_continuation_llm_call` emits the ungated
             // `turn_usage` log (mika#1889 R2/D2) and internally gates the DB
             // write on `store_llm_calls`.
@@ -793,6 +831,9 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                response_text.as_deref(),
+                reasoning_text.as_deref(),
+                response_chars,
                 store_llm_calls,
             )
             .await;
@@ -830,6 +871,11 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                None,
+                None,
+                // The provider errored: no response exists to measure
+                // (mika#1910 R5, population (b)).
+                RESPONSE_CHARS_UNMEASURED,
                 store_llm_calls,
             )
             .await;
@@ -863,6 +909,11 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                None,
+                None,
+                // The deadline clamp cut the call: nothing came back to
+                // measure (mika#1910 R5, population (b)).
+                RESPONSE_CHARS_UNMEASURED,
                 store_llm_calls,
             )
             .await;
@@ -892,6 +943,22 @@ async fn attempt_continuation_turn(
 /// `tool_use_in_turn` is always `false` here: the continuation turn is
 /// text-only (see `attempt_continuation_turn` which sets `request.tools = None`
 /// before the call), so no observable tool_use can ever occur.
+///
+/// # What this function used to refuse to say (mika#1910)
+///
+/// Until mika#1910 it passed `None, None` to `save_llm_call` at the
+/// `response_text` / `reasoning` positions **on every branch, success
+/// included**, and its `turn_usage` line carried no measure of produced text at
+/// all. So on the continuation turn — the one place in this engine where the
+/// mika#1910 symptom lands (`max_steps` burnt, tools off, final message empty)
+/// — `response_text IS NULL` was true **100 % of the time**, whether the turn
+/// had produced a summary or nothing.
+///
+/// The column that would have carried the emptiness was unconditionally null on
+/// the only row that mattered, and the log carried no count. Neither surface
+/// could measure the class. Both now can: the count on the **ungated** log
+/// (the measurement), the text in the **gated** DB row (the diagnosis — read
+/// one occurrence once the count signals one).
 #[allow(clippy::too_many_arguments)]
 async fn save_continuation_llm_call(
     db: &AsyncDatabase,
@@ -908,6 +975,15 @@ async fn save_continuation_llm_call(
     prompt_variant: Option<&str>,
     system_prompt_bytes: Option<i64>,
     request_bytes: Option<i64>,
+    // mika#1910 U2 — the serialized response and its extended-thinking text,
+    // for the gated DB row.
+    response_text: Option<&str>,
+    reasoning: Option<&str>,
+    // mika#1910 U1 — the count, for the ungated log. Passed rather than derived
+    // from `response_text`: `None` there is ambiguous between "the call
+    // errored" and "the call returned an empty response", and those two are
+    // precisely the populations R5 forbids merging.
+    response_chars: Option<i64>,
     store_llm_calls: bool,
 ) {
     // Emit turn_usage log FIRST and unconditionally (R2/D2 — decoupled from
@@ -927,6 +1003,7 @@ async fn save_continuation_llm_call(
         latency_ms,
         request_bytes,
         system_prompt_bytes,
+        response_chars,
     );
     emit_turn_usage(
         db.agent_id(),
@@ -969,8 +1046,10 @@ async fn save_continuation_llm_call(
             error,
             u32::MAX,
             prompt_variant,
-            None,
-            None,
+            // mika#1910 U2 — these two positions carried a literal `None` on
+            // every branch, success included. That is the lacuna.
+            response_text,
+            reasoning,
             system_prompt_bytes,
             request_bytes,
         )
@@ -1494,16 +1573,29 @@ async fn run_loop(
         };
         let llm_call_latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
+        // Serialize response content: text blocks + tool call summaries.
+        //
+        // mika#1910 U1 — hoisted OUT of the `store_llm_calls` gate below, and
+        // the placement is the unit's whole point. `turn_usage` is the ungated
+        // measurement channel (D2/R2: *the log stream is the primary-outcome
+        // channel and MUST NOT be silenced by the DB-persistence flag*), so a
+        // count computed inside the gate would make the mika#1910 measurement
+        // disappear the day an operator turned DB persistence off to cut noise.
+        // The DB write below reads the same value, so the two surfaces cannot
+        // diverge — which is the property, not an optimisation.
+        let response_text = match &llm_result {
+            Ok(resp) => mika_common::llm::serialize_response_text(
+                &resp.content,
+                mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+            ),
+            Err(_) => None,
+        };
+
         // Record the LLM call in the database (success or error)
         let llm_call_id = if store_llm_calls {
             let id = uuid::Uuid::new_v4().to_string();
             match &llm_result {
                 Ok(resp) => {
-                    // Serialize response content: text blocks + tool call summaries
-                    let response_text = mika_common::llm::serialize_response_text(
-                        &resp.content,
-                        mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
-                    );
                     let reasoning_text = resp.reasoning.as_deref().map(|r| {
                         mika_common::llm::truncate_chars(
                             r,
@@ -1590,6 +1682,17 @@ async fn run_loop(
                     llm_call_latency_ms,
                     request_bytes,
                     Some(system_prompt_len as i64),
+                    // mika#1910 U1 — `Some(0)`, never `None`, when the
+                    // serializer returned nothing: this call DID return, so the
+                    // response WAS measured and it measured zero. That is the
+                    // mika#1910 class itself. Collapsing it to `null` would put
+                    // the very population the ticket counts into the
+                    // "not measured" bucket, which is the R5 trap one arm down.
+                    Some(
+                        response_text
+                            .as_deref()
+                            .map_or(0, |t| t.chars().count() as i64),
+                    ),
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -1615,6 +1718,10 @@ async fn run_loop(
                     llm_call_latency_ms,
                     request_bytes,
                     Some(system_prompt_len as i64),
+                    // No response exists on this arm, so there is nothing to
+                    // measure and `0` would be a readable lie (mika#1910 R5,
+                    // population (b)).
+                    RESPONSE_CHARS_UNMEASURED,
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -8432,6 +8539,36 @@ struct TurnUsageFields {
     request_bytes: Option<i64>,
     /// Bytes of the assembled system prompt for this turn (mika#2331 AC1).
     system_prompt_bytes: Option<i64>,
+    /// Characters of the text this call produced (mika#1910 U1).
+    ///
+    /// **A count, therefore a RAW dimension** — never `is_empty`, never a
+    /// `phase`, never a `role`. The threshold that turns a count into a class
+    /// is the offline analyzer's (`scripts/measure-empty-turns`), per the Prime
+    /// hard condition #1 stated above and Signal O's doctrine: *the boundary is
+    /// defined by the analyzer, not baked into the thermometer*.
+    ///
+    /// **Source of truth:** the character count of
+    /// [`mika_common::llm::serialize_response_text`]'s output — **the same
+    /// serializer that feeds `llm_calls.response_text`**. Two measurements of
+    /// "the response" free to diverge would be a second reader; the identity of
+    /// source is the property, not an implementation detail.
+    ///
+    /// Two consequences of that choice, which the analyzer must know:
+    ///
+    /// - The serializer **includes tool calls**, as `[Tool Call: name(args)]`.
+    ///   On an in-loop turn `response_chars > 0` therefore does **not** mean
+    ///   "text was produced", and the count must be read together with
+    ///   `tool_use_in_turn`. On the **continuation** turn tools are disabled
+    ///   (`attempt_continuation_turn` sets `request.tools = None`), so there the
+    ///   measure is text alone — and that is exactly where the mika#1910 class
+    ///   lives, so that is where the semantics are unambiguous.
+    /// - It applies `strip_internal_tags` and returns `None` when the result is
+    ///   empty, so a response made **only** of internal tags counts `0`. A real,
+    ///   bounded false positive, named here and isolable from the analyzer's
+    ///   output rather than absorbed into its predicate.
+    ///
+    /// `null` is not `0` — see [`RESPONSE_CHARS_UNMEASURED`].
+    response_chars: Option<i64>,
 }
 
 /// Pure builder: maps a per-turn observation into `TurnUsageFields` (mika#1889).
@@ -8464,6 +8601,7 @@ fn build_turn_usage_fields(
     latency_ms: u64,
     request_bytes: Option<i64>,
     system_prompt_bytes: Option<i64>,
+    response_chars: Option<i64>,
 ) -> TurnUsageFields {
     let (input, output, cache_read, cache_write) = match usage {
         Some(u) => (
@@ -8486,6 +8624,7 @@ fn build_turn_usage_fields(
         status: status.to_string(),
         request_bytes,
         system_prompt_bytes,
+        response_chars,
     }
 }
 
@@ -8531,6 +8670,10 @@ fn emit_turn_usage(
         // distinction the two fields exist to carry (mika#2331 D6).
         request_bytes = ?fields.request_bytes,
         system_prompt_bytes = ?fields.system_prompt_bytes,
+        // mika#1910 U1 — same `?` and the same reason: on the continuation
+        // line, `0` and `null` are the two answers the whole measurement turns
+        // on, and a field that flattened them would restore the defect.
+        response_chars = ?fields.response_chars,
         "turn usage"
     );
 }
@@ -14906,7 +15049,17 @@ mod tests {
     #[test]
     fn build_turn_usage_success_with_cache_passes_through_tokens() {
         let u = usage_with_cache();
-        let f = build_turn_usage_fields(3, Some(&u), "ToolUse", true, "success", 250, None, None);
+        let f = build_turn_usage_fields(
+            3,
+            Some(&u),
+            "ToolUse",
+            true,
+            "success",
+            250,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.step, 3);
         assert_eq!(f.input_tokens, 1234);
         assert_eq!(f.output_tokens, 567);
@@ -14927,7 +15080,17 @@ mod tests {
         // still be jq-parseable unconditionally — `None` → `0`, never a missing
         // field. This is the load-bearing analyzer-shape invariant.
         let u = usage_without_cache();
-        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
+        let f = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.input_tokens, 10);
         assert_eq!(f.output_tokens, 20);
         assert_eq!(f.cache_read_tokens, 0);
@@ -14941,7 +15104,7 @@ mod tests {
         // Error/timeout arms have no `LlmUsage`. R3 mandates the event still
         // fires so the covariable "turns" count is not silently undercounted —
         // the tokens roll to zero but the row exists.
-        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None);
+        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None, None);
         assert_eq!(f.step, 7);
         assert_eq!(f.input_tokens, 0);
         assert_eq!(f.output_tokens, 0);
@@ -14971,6 +15134,7 @@ mod tests {
             100,
             None,
             None,
+            None,
         );
         assert_eq!(f.step, u32::MAX);
     }
@@ -14984,9 +15148,18 @@ mod tests {
         // otherwise-identical inputs.
         let u = usage_without_cache();
         let f_true =
-            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None);
-        let f_false =
-            build_turn_usage_fields(1, Some(&u), "EndTurn", false, "success", 0, None, None);
+            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None, None);
+        let f_false = build_turn_usage_fields(
+            1,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert!(f_true.tool_use_in_turn);
         assert!(!f_false.tool_use_in_turn);
         // No `phase`/`is_planning`/`role` field exists on the struct — D1/R5
@@ -15000,8 +15173,17 @@ mod tests {
         // measurement (wall-clock of the HTTP call), not an estimand
         // component. Verified here as a pure pass-through.
         let u = usage_without_cache();
-        let f =
-            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345, None, None);
+        let f = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            12345,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.latency_ms, 12345);
     }
 
@@ -15024,12 +15206,22 @@ mod tests {
             0,
             Some(59_812),
             Some(48_000),
+            None,
         );
         assert_eq!(measured.request_bytes, Some(59_812));
         assert_eq!(measured.system_prompt_bytes, Some(48_000));
 
-        let unmeasured =
-            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
+        let unmeasured = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert_eq!(unmeasured.request_bytes, None);
         assert_eq!(unmeasured.system_prompt_bytes, None);
         assert_ne!(unmeasured.request_bytes, Some(0));
@@ -15050,6 +15242,7 @@ mod tests {
             420_000,
             Some(59_812),
             Some(48_000),
+            None,
         );
         assert_eq!(f.input_tokens, 0, "no usage on the error arm — unchanged");
         assert_eq!(
