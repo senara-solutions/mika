@@ -100,6 +100,12 @@ cleanup() {
               >/dev/null 2>&1 || true
     fi
     git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    # mika#2049 — kill the fabricated relay's listener. Declared before the
+    # helper is sourced, so guarded: `stop_fake_egress_relay` may not exist yet
+    # if the suite skips out early.
+    if declare -F stop_fake_egress_relay >/dev/null 2>&1; then
+        stop_fake_egress_relay
+    fi
     rm -rf "$TMPROOT"
 }
 trap cleanup EXIT
@@ -139,10 +145,16 @@ GITCFG
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
 
-# No real egress proxy / mitmproxy for a test. Phase 2a (fs cut) exercises the
-# fallback bwrap construction — the degraded path, which must carry the gitdir
-# binds too; wiring only the Phase 2b branch is a named risk of this ticket.
-_ensure_pilot_egress_proxy() { return 1; }
+# mika#2049 — a SERVING relay, fabricated. This used to stub the launcher to
+# `return 1` to exercise the Phase 2a fallback (fs cut, network open). That
+# fallback no longer exists: the egress posture is fail-closed, so `return 1`
+# makes `_run_pilot_sandboxed` refuse and this suite would have no launch left
+# to inspect. The gitdir binds it guards (mika#2141) are unchanged — only the
+# preparation moved, which is what makes this a mechanical translation and not
+# a change of meaning. See lib-fake-egress-relay.sh for what is forbidden here.
+# shellcheck source=skills/bundled/_shared/tests/lib-fake-egress-relay.sh
+source "$SCRIPT_DIR/lib-fake-egress-relay.sh"
+stub_serving_egress_relay "$TMPROOT"
 _ensure_pilot_helper() { return 1; }
 _PILOT_SANDBOX_SECRET_ALLOWLIST=()
 
