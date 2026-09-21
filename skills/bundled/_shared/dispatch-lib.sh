@@ -1560,8 +1560,10 @@ _dispatch_lib_term_trap() {
 
 _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
-    # mika#2155: the claim dies with the dispatch, on every exit. Before the
-    # CALLBACK_SENT guard on purpose — the nominal path returns early there.
+    # mika#2155: crash/cancel backstop for the claim — the nominal path already
+    # released in _deliver_callback (and lowered the flag, so this is a no-op
+    # there). Before the CALLBACK_SENT guard on purpose: the nominal path
+    # returns early there, and a failed nominal release still needs this retry.
     _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
@@ -6486,11 +6488,13 @@ _record_pr_origin_epoch() {
 # permanent; `dispatch:loop` on the issue answers "who is writing on this branch
 # right now?" and lives exactly as long as the dispatch — see _release_issue_seat.
 #
-# `labels_csv` is the snapshot _set_up_worktree already fetched — the SAME
-# labels the engine's seat gate read, not a second round trip (mika#2178: two
-# reads at two instants re-open the window that ticket closed). Passing it in
-# also makes the function testable with the three label populations injected
-# directly.
+# `labels_csv` is the snapshot _set_up_worktree already fetched for its own
+# #2012 gate — one `gh issue view` per dispatch (mika#2178), no second read
+# inside this function. The engine's seat gate read GitHub separately and
+# earlier, in Rust (executor.rs fetch_issue_labels_unless_pull_request), before
+# it spawned this handler: a `dispatch:*` posed between that read and this one
+# shows up here as owned_by_other. Passing the snapshot in also makes the
+# function testable with the three label populations injected directly.
 #
 # Three outcomes, on that snapshot:
 #   another dispatch:* present  → dispatch_seat.owned_by_other, NO write (AC3)
@@ -6547,8 +6551,15 @@ _stamp_issue_seat() {
 
 # _release_issue_seat <repo> <issue_num> — end the loop's live claim (AC4).
 #
-# Decision (mika#2155 C-4): dispatch:loop is retired when dispatch-lib exits, on
-# every path — nominal, crash, cancel. Kept past the exit it would answer "who
+# Decision (mika#2155 C-4): dispatch:loop is retired BEFORE the callback that
+# lets mika-dev start the next dispatch on this ticket (`_deliver_callback`,
+# ahead of `mika ask --task-complete`), and again at the head of the EXIT trap
+# as the crash/cancel backstop. Two sites, one claim: the first successful
+# release drops ISSUE_SEAT_CLAIMED, the second is then a no-op. Releasing after
+# the callback instead would leave a window where the next dispatch reads a
+# label its predecessor is about to remove, does not stamp (already_owned), and
+# then runs unclaimed for its whole life — the seat gate disarmed by the very
+# mechanism meant to arm it (review finding #2). Kept past the exit it would answer "who
 # is writing on this branch?" with a name when nobody is: between a groom and
 # its implement, between an open PR and its review, a human seat may take the
 # branch, and a `dispatch:mpc` posed beside a stale `dispatch:loop` reads
@@ -6569,6 +6580,10 @@ _release_issue_seat() {
     [ "${ISSUE_SEAT_CLAIMED:-0}" = "1" ] || return 0
     [ -n "$repo" ] && [ -n "$issue" ] || return 0
     if timeout 15 gh issue edit "$issue" --repo "senara-solutions/${repo}" --remove-label dispatch:loop >/dev/null 2>&1; then
+        # The claim is over: the second site (callback, then exit trap) becomes
+        # a no-op instead of a second, idempotent-but-pointless API call. On
+        # failure the flag stays up so that later site retries once more.
+        ISSUE_SEAT_CLAIMED=0
         echo "dispatch_seat.released: ${repo}#${issue} no longer carries dispatch:loop" >&2
         return 0
     fi
@@ -7075,6 +7090,10 @@ _deliver_callback() {
     # a callback does not arrive. Its own failure is announced rather than
     # swallowed — a silent gate is the defect this ticket exists to remove.
     _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the callback unchanged" >&2
+    # mika#2155: end the loop's live claim BEFORE the message that can start
+    # the next dispatch on this ticket. No-op unless _set_up_worktree claimed
+    # (ISSUE_SEAT_CLAIMED=1); the EXIT trap repeats it only if this one failed.
+    _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     set +e
     if [ -n "$AGENT" ]; then
         mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"

@@ -149,7 +149,8 @@ for tc in \
     "T4|ready,dispatch:ssc" \
     "T5|dispatch:mpc,ready" \
     "T6|dispatch:ssc,dispatch:loop" \
-    "T7|dispatch:zorglub"; do
+    "T7|dispatch:zorglub" \
+    "T7b|dispatch:ssc,dispatch:mpc"; do
     name="${tc%%|*}"; labels="${tc#*|}"
     echo "-- $name owned by other: '$labels' --"
     reset_stub
@@ -195,7 +196,9 @@ reset_stub
 export GH_MODE=ok
 ISSUE_SEAT_CLAIMED=1
 rc=0
-err=$(_release_issue_seat "mika" "2155" 2>&1 >/dev/null) || rc=$?
+# Called in THIS shell (not a $(...) subshell): T10 reads the flag afterwards.
+_release_issue_seat "mika" "2155" 2>"$STUB_DIR/err" >/dev/null || rc=$?
+err=$(cat "$STUB_DIR/err")
 log=$(cat "$GH_LOG")
 assert_eq "T10 returns 0" "0" "$rc"
 assert_contains "T10 removes dispatch:loop" "$log" \
@@ -207,6 +210,10 @@ assert_not_contains "T10 never touches ready" "$log" "ready"
 assert_not_contains "T10 never touches dispatch:mpc" "$log" "dispatch:mpc"
 assert_not_contains "T10 never touches dispatch:ssc" "$log" "dispatch:ssc"
 assert_contains "T10 names the release" "$err" "dispatch_seat.released"
+assert_eq "T10 a successful release ends the claim (flag -> 0)" "0" "${ISSUE_SEAT_CLAIMED:-unset}"
+rc=0; _release_issue_seat "mika" "2155" || rc=$?
+assert_eq "T10 a second release after success is a no-op: rc 0" "0" "$rc"
+assert_eq "T10 a second release after success makes no gh call" "1" "$(wc -l < "$GH_LOG")"
 
 # ── T11. Release without a claim → no call ──────────────────────────────────
 echo "-- T11 release, never claimed --"
@@ -230,13 +237,57 @@ reset_stub
 export GH_MODE=always-fails
 ISSUE_SEAT_CLAIMED=1
 rc=0
-err=$(_release_issue_seat "mika" "2155" 2>&1 >/dev/null) || rc=$?
+_release_issue_seat "mika" "2155" 2>"$STUB_DIR/err" >/dev/null || rc=$?
+err=$(cat "$STUB_DIR/err")
 assert_eq "T12 returns 1" "1" "$rc"
 assert_contains "T12 names the failure" "$err" "dispatch_seat.release_failed"
 assert_eq "T12 exactly one attempt" "1" "$(wc -l < "$GH_LOG")"
+assert_eq "T12 a failed release keeps the claim (flag stays 1) so the next site retries" "1" "${ISSUE_SEAT_CLAIMED:-unset}"
 rc=0
 ( set -e; _release_issue_seat "mika" "2155" 2>/dev/null || true; echo "still-here" ) > "$STUB_DIR/cont" || rc=$?
 assert_eq "T12 a '|| true' caller continues" "still-here" "$(cat "$STUB_DIR/cont")"
+
+# ── T13. Stale residue heals as a sequence: already_owned → claim → release ─
+# A dispatch killed without its trap leaves dispatch:loop behind. The next
+# dispatch on the ticket reads it already_owned (no write), still counts as a
+# claim (the callsite sets the flag regardless of rc), and its release removes
+# it exactly once. T2 and T10 pin the halves; this pins the sequence.
+echo "-- T13 stale residue heals across stamp then release --"
+reset_stub
+export GH_MODE=ok
+_stamp_issue_seat "mika" "2155" "ready,dispatch:loop" 2>/dev/null || true
+ISSUE_SEAT_CLAIMED=1
+_release_issue_seat "mika" "2155" 2>/dev/null || true
+assert_eq "T13 exactly one gh call across the sequence" "1" "$(wc -l < "$GH_LOG")"
+assert_contains "T13 and it is the release" "$(cat "$GH_LOG")" "--remove-label dispatch:loop"
+assert_not_contains "T13 no re-stamp happened" "$(cat "$GH_LOG")" "--add-label"
+
+# ── T14. The DRY_RUN guard at the callsite, evaluated for real ──────────────
+# The guard is three lines of production shell that no unit test reaches:
+# a structural grep only pins that the token DRY_RUN sits nearby. Extract the
+# real block from dispatch-lib and evaluate it with a spy in place of
+# _stamp_issue_seat, so an inverted guard (stamp on dry run, skip on real
+# dispatch) turns this red instead of merging clean.
+echo "-- T14 DRY_RUN guard, evaluated from the real source --"
+guard_block=$(awk '/mika#2155: claim the ticket for the loop BEFORE/,/^        fi$/' "$DISPATCH_LIB")
+assert_contains "T14 extracted the guard block (positive control on the extraction)" "$guard_block" '_stamp_issue_seat "$REPO" "$ISSUE_NUM" "$LABELS"'
+for tc in "true|skip" "1|skip" "false|stamp" "|stamp" "0|stamp"; do
+    val="${tc%%|*}"; want="${tc#*|}"
+    SPY_LOG="$STUB_DIR/spy.log"; : > "$SPY_LOG"
+    out=$(
+        REPO=mika; ISSUE_NUM=2155; LABELS="bug,ready"; DRY_RUN="$val"; ISSUE_SEAT_CLAIMED=0
+        _stamp_issue_seat() { printf 'spy %s %s %s\n' "$1" "$2" "$3" >> "$SPY_LOG"; return 0; }
+        eval "$guard_block"
+        printf 'claimed=%s' "$ISSUE_SEAT_CLAIMED"
+    )
+    if [ "$want" = "skip" ]; then
+        assert_eq "T14 DRY_RUN='$val' skips the stamp" "0" "$(wc -l < "$SPY_LOG")"
+        assert_eq "T14 DRY_RUN='$val' leaves the claim flag down" "claimed=0" "$out"
+    else
+        assert_contains "T14 DRY_RUN='$val' stamps with the callsite's arguments" "$(cat "$SPY_LOG")" "spy mika 2155 bug,ready"
+        assert_eq "T14 DRY_RUN='$val' raises the claim flag" "claimed=1" "$out"
+    fi
+done
 
 # ── Every gh call is bounded ────────────────────────────────────────────────
 # One callsite is the crash/cancel exit trap, whose job is to get RESULT back to
@@ -256,9 +307,9 @@ echo "-- structural: callsites are fail-open --"
 stamp_sites=$(grep -n '_stamp_issue_seat "' "$DISPATCH_LIB" | grep -v '^[0-9]*: *#' || true)
 release_sites=$(grep -n '_release_issue_seat "' "$DISPATCH_LIB" | grep -v '^[0-9]*: *#' || true)
 assert_eq "exactly one stamp callsite" "1" "$(printf '%s\n' "$stamp_sites" | grep -c . || true)"
-assert_eq "exactly one release callsite" "1" "$(printf '%s\n' "$release_sites" | grep -c . || true)"
+assert_eq "exactly two release callsites (callback, then exit trap)" "2" "$(printf '%s\n' "$release_sites" | grep -c . || true)"
 assert_contains "the stamp callsite ends in '|| true'" "$stamp_sites" "|| true"
-assert_contains "the release callsite ends in '|| true'" "$release_sites" "|| true"
+assert_eq "both release callsites end in '|| true'" "2" "$(printf '%s\n' "$release_sites" | grep -c '|| true' || true)"
 
 # ── Structural: the stamp site sits after the last no-dispatch exit and before
 #    the first mutation (AC1 at the site, D-1) ────────────────────────────────
@@ -270,17 +321,26 @@ setup_start=$(grep -n '^_set_up_worktree() {' "$DISPATCH_LIB" | cut -d: -f1)
 stamp_line=$(printf '%s\n' "$stamp_sites" | cut -d: -f1 | head -1)
 gate_line=$(grep -n 'dispatch_gate_groom_refused' "$DISPATCH_LIB" | grep -v '^[0-9]*: *#' | cut -d: -f1 | head -1)
 fetch_line=$(grep -n 'git -C "\$SUB_REPO_DIR" fetch origin main' "$DISPATCH_LIB" | cut -d: -f1 | head -1)
-dry_run_line=$(grep -n 'DRY_RUN' "$DISPATCH_LIB" | cut -d: -f1 | awk -v s="$stamp_line" '$1 < s' | tail -1)
+dry_run_line=$(grep -n '^ *if \[ "\$DRY_RUN" != "true" \] && \[ "\$DRY_RUN" != "1" \]; then' "$DISPATCH_LIB" | cut -d: -f1 | awk -v s="$stamp_line" '$1 < s' | tail -1)
 assert_lt "stamp site is inside _set_up_worktree" "$setup_start" "$stamp_line"
 assert_lt "stamp site is after the #2012 groom gate" "$gate_line" "$stamp_line"
 assert_lt "stamp site is before the first mutation (git fetch origin main)" "$stamp_line" "$fetch_line"
-assert_lt "stamp site is guarded by a DRY_RUN check just above it" "$((stamp_line - 8))" "$dry_run_line"
+assert_eq "stamp site is the line right under the real DRY_RUN if-guard" "$((stamp_line - 1))" "$dry_run_line"
 
 # ── Structural: the release is the first useful line of the EXIT trap, before
 #    the CALLBACK_SENT early return (C-4) ───────────────────────────────────
 echo "-- structural: the release runs on every exit path --"
+# The claim must be gone BEFORE `mika ask --task-complete`: that message is
+# what lets mika-dev start the next dispatch on this ticket, and a next
+# dispatch that reads a label its predecessor is about to remove would run
+# unclaimed for its whole life (review finding #2 on mika#2155).
+cb_start=$(grep -n '^_deliver_callback() {' "$DISPATCH_LIB" | cut -d: -f1)
+cb_release=$(printf '%s\n' "$release_sites" | cut -d: -f1 | awk -v s="$cb_start" '$1 > s' | head -1)
+cb_ask=$(awk -v s="$cb_start" 'NR > s && /mika ask --task-id "\$TASK_ID" --task-complete/ { print NR; exit }' "$DISPATCH_LIB")
+assert_lt "release is inside _deliver_callback" "$cb_start" "$cb_release"
+assert_lt "release runs before mika ask --task-complete" "$cb_release" "$cb_ask"
 trap_start=$(grep -n '^_dispatch_lib_exit_trap() {' "$DISPATCH_LIB" | cut -d: -f1)
-release_line=$(printf '%s\n' "$release_sites" | cut -d: -f1 | head -1)
+release_line=$(printf '%s\n' "$release_sites" | cut -d: -f1 | awk -v s="$trap_start" '$1 > s' | head -1)
 guard_line=$(awk -v s="$trap_start" 'NR > s && /"\$CALLBACK_SENT" -eq 1/ { print NR; exit }' "$DISPATCH_LIB")
 assert_lt "release is inside the exit trap" "$trap_start" "$release_line"
 assert_lt "release runs before the CALLBACK_SENT early return" "$release_line" "$guard_line"
