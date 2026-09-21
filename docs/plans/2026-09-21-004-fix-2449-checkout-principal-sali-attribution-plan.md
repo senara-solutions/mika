@@ -205,6 +205,18 @@ Il énumère **déjà** les checkouts via `MIKA_WORKTREE_REAP_REPO_DIRS` (défau
 nouveau scan récurrent. Refusé : un cinquième scan ; et `MIKA_WIP_RESCUE_REPO_DIR`,
 qui ne porte qu'un checkout.
 
+**Pourquoi U3 reste justifié une fois U4 posé (F4).** U4 couvre le geste
+casual en clair par `run_shell` — 100 % du trafic mesuré, et rien d'autre. U3
+couvre ce que U4 ne voit **pas par construction** : un script du dépôt qui mute
+(`make …`, un `scripts/*` — D7 le nomme comme hors couverture), un geste
+humain, un producteur hors `run_shell` (la halte 4 des Sondes est écrite pour
+cette population), et un bypass opérateur oublié (F3). Et U3 est ce qui **date**
+la prochaine occurrence : sans lui, la requête d'attribution 1b n'a pas de
+bornes, et la détection redevient le rebuild bloqué — c'est-à-dire, comme
+mika#2107 l'a écrit pour le checkout détaché, *au pire moment*. Deux
+responsabilités, deux unités : la garde empêche le geste, la sonde mesure
+l'état. Coût : un `git status --porcelain` par tick, fail-open, dédupliqué.
+
 ### D3 — La sonde DATE, et sa ligne d'audit dit COMMENT nommer
 
 Elle rapporte le checkout, le compte, les chemins (plafonnés), l'instant, et
@@ -284,9 +296,17 @@ chose qui distingue « rien à refuser » de « rien n'est armé » (mika#2107, 
 phrase). Ce coût est accepté pour la même raison que #2107 : un fail-closed
 coucherait `run_shell` pour tout agent d'un poste mal configuré.
 
-**La dérogation est le même levier, lu au même endroit.**
-`MIKA_GUARD_SHARED_CHECKOUT=0` désarme aussi ce mode (une variable, un geste,
-journalisé) ; elle est lue avant le scrub, comme le chemin.
+**La dérogation est le même levier, lu au même endroit — et elle est DITE à
+chaque invocation.** `MIKA_GUARD_SHARED_CHECKOUT=0` désarme aussi ce mode (une
+variable, un geste, journalisé) ; elle est lue avant le scrub, comme le chemin.
+Quand elle est posée, `run.sh` émet sur stderr, **à chaque appel**,
+`shell-exec: shared-checkout guard disarmed by MIKA_GUARD_SHARED_CHECKOUT=0
+(operator override)` — la même discipline que la ligne « script absent » : un
+bypass posé pour une intervention puis oublié serait sinon une garde
+silencieusement absente pour tous les agents, indistinguable d'une garde qui n'a
+rien eu à refuser (F3 ; mika#2107, mika#2329 : pour un interrupteur, la vivacité
+*est* l'information). Une ligne par appel plutôt qu'au premier : le handler est
+un process par appel, il n'a pas d'état « premier ».
 
 ### D7 — Le prédicat de R4 est l'INVARIANT d'un checkout de déploiement, pas « toute mutation »
 
@@ -308,7 +328,7 @@ admettre ceux qui le préservent.**
 | toute lecture (`verb_is_read_only` de #2107 : `show`, `diff`, `log`, `status`, `rev-parse`, `ls-files`, `merge-base`, `stash list`/`show`, …) | `checkout <ref>`, `checkout <ref> -- <paths>`, `checkout -b/-B/--force/--detach`, `switch`, `restore` (`--source`, `--staged`) |
 | `fetch`, `ls-remote`, `remote`, `push` (remote seul) | `stash` nu, `push`, `pop`, `apply`, `drop`, `clear` |
 | `pull --ff-only`, `merge --ff-only` (**avec** le drapeau, positionnel) | `pull` / `merge` **sans** `--ff-only`, `rebase`, `cherry-pick`, `revert`, `am`, `apply` |
-| `worktree add/remove/prune/list`, `branch` (toutes formes : elles ne touchent pas l'arbre du principal), `tag`, `prune`, `gc` | `reset` (toutes formes), `clean`, `add`, `rm`, `mv`, `commit`, `update-index` |
+| `worktree add/remove/prune/list`, `branch` **sans** `-f`/`--force`/`-m`/`-M`/`--move`/`-c`/`-C`/`--copy` (liste, `-v`, `--show-current`, `-a`/`-r`, `-d`/`-D` : aucune ne déplace une ref sous HEAD), `tag`, `prune`, `gc` | `branch -f/-m/-M/-c/-C` (**F2** : `branch -f main <sha>` déplace la ref sous HEAD et rompt l'invariant sans toucher l'arbre — population mesurée : 0, refusé **par construction**, pas sur la population passée), `reset` (toutes formes), `clean`, `add`, `rm`, `mv`, `commit`, `update-index` |
 | `checkout -- <paths>` (relit l'index : inerte si l'invariant tient) | tout verbe inconnu du tableau (**fail-closed sur l'inconnu**, parce que c'est une garde d'écriture et que la lecture est déjà énumérée) |
 
 `--ff-only` est cherché dans les arguments du verbe, pas dans la ligne : un
@@ -422,7 +442,9 @@ et seul le second est un signal de R3.
    **les trois commandes de M0 verbatim → deny** (plus `fa92720d` et
    `d53b91e3`), les formes mika-dev admises → allow (`fetch && merge --ff-only`,
    `pull --ff-only`, `worktree remove … && push origin --delete`, `branch -D`),
-   `merge origin/main --no-edit` → deny, un `checkout <ref> -- <paths>` **dans un
+   `merge origin/main --no-edit` → deny, `branch -f main <sha>` et `branch -m
+   main autre` → deny (F2), `branch -D fix/x` et `branch --show-current` →
+   allow, un `checkout <ref> -- <paths>` **dans un
    worktree lié** sous `.claude/worktrees/` → allow (hors population), un chemin
    hors platform-dir → allow, `-C <principal>` sans `cd` → deny, `pushd` → deny.
 4. `scripts/test-shell-exec-guard.sh` (nouveau, câblé dans `Makefile` +
@@ -432,7 +454,9 @@ et seul le second est un signal de R3.
    commence par `REFUS (shared-checkout-guard`, exit 1, **et l'arbre du
    principal est intact** (le test git est le contrôle qui compte) ; une lecture
    → exit 0 ; plateforme absente → exit 0 sans ligne ; plateforme présente sans
-   script → exit 0 **avec** la ligne fail-open.
+   script → exit 0 **avec** la ligne fail-open ; `MIKA_GUARD_SHARED_CHECKOUT=0`
+   posé → une des trois commandes de M0 passe (exit 0) **et** la ligne
+   « disarmed … (operator override) » est sur stderr (F3).
 
 ### U5 — Les noms de fil et leur SOLE WRITER (R7)
 
@@ -552,11 +576,12 @@ Aucun `#[ignore]`, aucune période de grâce, aucun nettoyage préalable (R5).
    `worktree remove … && push origin --delete <b>`, `branch -D`, `show`, `diff`,
    `log`, `stash list`, `checkout -- <paths>` → allow. `merge origin/main
    --no-edit`, `stash`, `stash pop`, `reset --hard`, `checkout <ref>`,
-   `checkout --force <ref>` → deny. Terme par terme (`feedback_red_before_control_is_term_by_term`).
+   `checkout --force <ref>`, `branch -f main <sha>` → deny. Terme par terme (`feedback_red_before_control_is_term_by_term`).
 7. **U4, hors population** : même `checkout <ref> -- <paths>` dans un worktree
    lié `.claude/worktrees/x/mika` → allow ; dans `/tmp/autre-depot` → allow ;
    plateforme absente → allow sans ligne ; plateforme présente sans script →
-   allow **avec** la ligne fail-open.
+   allow **avec** la ligne fail-open ; dérogation posée → allow **avec** la
+   ligne « disarmed » (F3).
 8. **U4, D6** : `run.sh` lit `MIKA_PLATFORM_DIR` avant le scrub — test : poser
    la variable sur un chemin de fixture, vérifier que la garde vise ce chemin
    (et non `$HOME/workspace/…`).
@@ -578,14 +603,19 @@ Aucun `#[ignore]`, aucune période de grâce, aucun nettoyage préalable (R5).
 - `CLAUDE.md` porte les surfaces, les régimes, les haltes et la requête.
 - Aucun nettoyage automatique (R5), aucune variable d'environnement créée.
 - Les dispositions du § Fire-Disposition sont celles posées.
+- **Le titre du ticket est corrigé** pour nommer le producteur mesuré, avec un
+  commentaire d'avis d'édition (convention mika#2169/#2158 — rectification
+  corps **et** titre quand le plan réfute le ticket). Livré par l'orchestrateur
+  au grooming, après la pose du callout `Branch:` (le slug est dérivé du
+  callout en priorité ; le titre ne le fait plus dériver une fois le callout
+  posé — mika#844).
 
 ## Acceptance criteria
 
 Le ticket ne porte pas de section `## Acceptance criteria` ; les critères
 ci-dessous sont dérivés des Requirements et du Verification Contract. Le corps
-du ticket est mis à jour par l'orchestrateur avec la mesure M0 (le titre et la
-« conclusion » initiale nommaient trois pilotes ; le producteur mesuré est
-mika-qa).
+du ticket a été mis à jour par l'orchestrateur avec la mesure M0 le 2026-09-22 ;
+le titre l'est au même grooming (AC9), et non « plus tard » (F1).
 
 - **AC1** — La prémisse est tranchée par écrit, mesure à l'appui : (a) et (c)
   réfutés (M1) ; (b) réfuté comme opération, confirmé comme prescription (M2) ;
@@ -608,6 +638,10 @@ mika-qa).
   dispatch n'est refusé et aucun tick ne peut échouer à cause des sondes.
 - **AC8** — `qa-review` nomme le refus et renvoie au worktree détaché de § 2B
   pour exécuter un fichier de la PR.
+- **AC9** — Le titre de mika#2449 nomme le producteur mesuré (mika-qa,
+  `git checkout <ref> -- <paths>` via `run_shell`) et non « 3 pilotes », et le
+  ticket porte un commentaire d'avis d'édition datant la rectification
+  (corps + titre). Vérifiable par `gh issue view 2449 --json title`.
 
 ## Sondes post-déploiement, et leurs haltes
 
@@ -644,6 +678,7 @@ grep 'mode=primary' "${MIKA_HOME:-$HOME/.mika}/state/shared-checkout-guard.log" 
 # 3b. CONTRÔLE POSITIF — la garde est-elle seulement branchée sur ce binaire ?
 grep -c 'guard-shared-checkout' ~/.mika/skills/shell-exec/handlers/run.sh   # attendu : ≥ 1
 grep 'shared-checkout guard not found' "$MIKA_SPIRIT_LOG_FILE"               # attendu : vide
+grep 'shared-checkout guard disarmed'  "$MIKA_SPIRIT_LOG_FILE"               # attendu : vide hors intervention
 ```
 
 **Halte 1 — la sonde 1a est vide pendant que le checkout est visiblement sale.**
@@ -697,6 +732,17 @@ lexicale, il achète le geste casual — le seul mesuré — pas l'adversaire.
 
 ## Revision history
 
+- **rev 4 (2026-09-22)** : addressed mika-arch first-pass (session
+  `d956fb91`, ITERATE). **F1 (BLOCKING)** — la correction du **titre** du
+  ticket est un livrable, pas une promesse : DoD + **AC9** + commentaire d'avis
+  d'édition (convention mika#2169/#2158). **F2** — `branch` restreint dans la
+  table D7 : `-f/-m/-M/-c/-C` refusés (déplacement de ref sous HEAD), cas
+  `branch -f main <sha>` → deny ajouté aux harnais U4.3 et V6. **F3** — la
+  dérogation `MIKA_GUARD_SHARED_CHECKOUT=0` est **dite** à chaque appel
+  (ligne stderr « disarmed … (operator override) »), cas ajouté à U4.4/V7, grep
+  ajouté à la sonde 3b. **F4** — la justification de U3 après U4 est écrite
+  dans D2 (couvre script du dépôt, geste humain, hors-`run_shell`, bypass
+  oublié ; date la prochaine occurrence). Aucun AC affaibli.
 - **rev 3 (2026-09-22, grooming orchestrateur)** : **le producteur est mesuré et
   nommé** (M0 : `tool_calls` `1835d8bb`, `eba3682f`, `930f5200` — mika-qa,
   `git checkout <ref> -- <paths>` via `run_shell`, recoupé aux revues QA de
