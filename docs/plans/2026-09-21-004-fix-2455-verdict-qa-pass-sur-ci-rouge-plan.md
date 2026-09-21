@@ -176,8 +176,13 @@ sa justesse.
   `block[ci]`, `block[dependency]`, `block[security]`, `block[pipeline]` et un
   corps sans `VERDICT:` passent inchangés.
 - **R4** — Le gate ne rend **jamais** la CI lisible au modèle autrement que par
-  le corps de son refus : `qa_pr_view` n'est pas touché, le périmètre `gh` de
-  qa-review n'est pas élargi, aucune règle de prompt n'est retirée.
+  le corps de son refus : la **capacité** de `qa_pr_view` n'est pas touchée (sa
+  liste `SAFE_FIELDS` et sa validation anti-injection d'option sont inchangées
+  au caractère près), le périmètre `gh` de qa-review n'est pas élargi, aucune
+  règle de prompt n'est retirée. *R4 porte sur la capacité, pas sur l'octet :
+  U5 répare une référence de documentation cassée dans un commentaire de
+  `qa_pr_view.sh`, ce qui n'ouvre aucune capacité — la DoD nomme la commande qui
+  sépare les deux.*
 - **R5** — Un signal CI illisible (pas de token, pas de repo, `gh` en échec,
   timeout, sortie non parsable) **n'est jamais un terme satisfait** : le gate
   s'abstient et le dit.
@@ -327,9 +332,27 @@ refuse pour tête obsolète, et
 ticket) est la moitié « commit périmé » du même problème. Refuser est donc
 cohérent, et c'est la direction sûre.
 
-Comparer explicitement à `headRefOid` est écarté : cela demanderait un second
-appel `gh` par revue pour trancher un cas déjà couvert en aval, et produirait
-une abstention là où le refus est juste.
+Comparer explicitement à `headRefOid` est écarté, **et la raison portée n'est
+pas le coût de l'appel.** Le coût est nul ou presque : `headRefOid` figure déjà
+dans les `SAFE_FIELDS` de `qa_pr_view.sh:34`, donc la tête que le reviewer a lue
+est déjà connue du chemin — invoquer un « second appel `gh` » comme
+justification serait faux, et surtout ce serait la mauvaise raison.
+
+La vraie raison est que **la direction du refus est sûre de toute façon** : si
+la tête a bougé, le `pass` porte sur un diff que la tête courante ne contient
+plus, il est périmé, et le refuser est juste. Comparer les deux têtes ne
+produirait donc pas une meilleure décision — elle produirait une **abstention**
+là où le refus est correct, c'est-à-dire un affaiblissement du gate présenté
+comme une précision.
+
+*Conséquence pour un relecteur futur, écrite parce que c'est elle qui se perd :*
+si vous voyez ici une optimisation évidente (« la tête est déjà dans la payload,
+autant comparer »), vous êtes en train de rouvrir un cas que ce plan laisse
+**délibérément** fermé du côté du refus. Le cas « tête bougée » n'est pas un
+angle mort à combler, c'est une population que D7 range du côté sûr. Citation :
+review-guide § citation-or-silence (la justification portée doit être la vraie),
+et `feedback_verify_approved_commit_equals_head_before_mergeable`, qui est la
+moitié « commit périmé » du même problème.
 
 ## Scope Boundaries
 
@@ -402,9 +425,44 @@ Branchement dans `run_gh` **immédiatement après**
 `validate_pr_review_flag_coherence` (`builtin_handlers.rs:3240`), avec le
 commentaire qui dit pourquoi cet ordre (D1).
 
-Le corps du refus ne doit contenir **aucune** ligne `VERDICT:` complète : elle
-serait relue par le parseur de trailer au tour suivant. Nommer les tokens entre
-backticks.
+**Forme du corps du refus, et pourquoi un seul token est masqué.** La contrainte
+exacte est : **aucune ligne du corps ne doit commencer par `VERDICT:`** — après
+espaces de tête et after emphase markdown éventuelle, et quelle que soit la
+casse. Les tokens `block[ci]` et `hold[review]` sont au contraire nommés **en
+clair, entre backticks, au milieu d'une phrase**, et c'est sûr.
+
+L'asymétrie n'est pas un oubli : elle est dérivée de la forme des deux lecteurs,
+et chacun a été relu pour ce plan.
+
+1. `parse_verdict` (`server/verdict.rs:235`) capture par
+   `VERDICT_RE = (?mi)^\s*[*_]*\s*VERDICT:\s*(.+)$` (`verdict.rs:54`). Le motif
+   est **ancré en début de ligne sur le littéral `VERDICT:`** : un token nu
+   `block[ci]` au fil d'une phrase n'a aucun moyen de le satisfaire. Ce qui le
+   satisferait, en revanche, c'est n'importe quelle ligne commençant par
+   `VERDICT:` — y compris indentée, y compris en gras, y compris à l'intérieur
+   d'un bloc de code, la regex ne connaissant pas les clôtures. D'où la
+   formulation ci-dessus, **plus forte** que « aucune ligne `VERDICT:`
+   complète » : c'est le *préfixe de ligne* qui est interdit, pas la ligne
+   canonique entière.
+2. `validate_tool_arg_suffixes` (`builtin_handlers.rs:2096`) cherche la **ligne
+   complète** (`"VERDICT: block[ci]"`, via `str::contains`) dans les trois
+   dernières lignes non vides — et il lit l'argument `pr_review_body` d'un appel
+   `run_gh`, **jamais** le corps d'un `ToolOutput::error`. Il est donc hors
+   d'atteinte du corps du refus dans les deux sens : ni déclenchable par lui, ni
+   satisfait par un token nu.
+
+**Conséquence, et c'est la direction sûre :** masquer aussi `block[ci]` et
+`hold[review]` ne protégerait de rien (aucun lecteur ne les capte hors préfixe)
+et coûterait la lisibilité du remède — un refus qui n'ose pas nommer sa sortie
+est le mode de panne que D3 existe pour éviter. **Ne pas généraliser ce
+raisonnement par analogie :** il tient parce que les deux lecteurs ont été lus,
+pas parce que « seul `VERDICT:` compte » serait une règle. Toute nouvelle
+grammaire de verdict ancrée autrement rouvrirait la question — c'est la borne
+que `verdict.rs:200-217` écrit déjà pour ses propres exemptions. Citation : U2
++ mika#2201 (`check-canonical-tokens.sh`, qui vérifie la casse des tokens et
+l'absence d'espace avant les deux-points, et dont L1/L4 portent précisément sur
+les lignes de callout — pas sur les mentions entre backticks, qu'il traite comme
+des mentions et non des instructions).
 
 ### U3 — Le kill-switch (R7, D5)
 
@@ -454,6 +512,14 @@ qu'aucune assertion ne rougisse.
 - Réparer la référence cassée de `qa_pr_view.sh:12` (M2) — la remplacer par les
   sites qui portent encore le raisonnement, sans réécrire la décision.
 
+  **Borne explicite, parce que ce point touche R4.** C'est le **seul** hunk
+  autorisé sur ce fichier : la ligne `SAFE_FIELDS` (`:34`) et la validation
+  anti-injection d'option (`:25-31`) ne bougent pas d'un caractère. La
+  distinction porte : réparer un lien de documentation dans un commentaire
+  n'ouvre aucune capacité, alors que toucher `SAFE_FIELDS` rouvrirait exactement
+  la décision de M2. La DoD nomme la commande qui sépare les deux, et c'est le
+  `grep` sur `SAFE_FIELDS` — pas le `git diff` — qui porte l'invariant.
+
 ## Verification Contract
 
 ### Séquence rouge prescrite
@@ -495,8 +561,51 @@ sont vérifiées (mika#2201).
       est rouge, avant tout sous-processus, et le corps du refus nomme les
       checks rouges et les deux sorties correctes.
 - [ ] Aucun autre verdict, et aucun corps sans `VERDICT:`, n'est affecté.
-- [ ] `qa_pr_view`, `QA_REVIEW_GH_ALLOWED` et les règles de prompt « ne fetch
-      pas la CI » sont **inchangés** (diff vide sur ces trois surfaces).
+- [ ] **R4, surface 1 — la capacité de `qa_pr_view` est inchangée.** Vérifié
+      par une commande, pas par lecture :
+      ```
+      grep -n 'SAFE_FIELDS=' skills/bundled/qa-review/handlers/qa_pr_view.sh
+      # attendu, au caractère près :
+      # SAFE_FIELDS="title,body,additions,deletions,files,labels,state,headRefName,headRefOid,baseRefName,author"
+      git fetch origin && git diff origin/main -- skills/bundled/qa-review/handlers/qa_pr_view.sh
+      # attendu : vide, OU un hunk unique sur la ligne de commentaire `See: docs/solutions/…` (U5)
+      ```
+      La seconde commande est ce qui sépare « capacité intacte » de « fichier
+      intact » : U5 modifie ce fichier par conception, et R4 ne l'interdit pas —
+      la première commande est celle qui porte l'invariant.
+- [ ] **R4, surface 2 — `QA_REVIEW_GH_ALLOWED` est inchangé.** Un `git diff` de
+      fichier ne convient pas : U2 modifie `builtin_handlers.rs` par
+      construction. La commande porte sur le **bloc** de la constante :
+      ```
+      diff <(git show origin/main:crates/mika-agent/src/skills/builtin_handlers.rs \
+               | sed -n '/^const QA_REVIEW_GH_ALLOWED/,/^];/p') \
+           <(sed -n '/^const QA_REVIEW_GH_ALLOWED/,/^];/p' \
+               crates/mika-agent/src/skills/builtin_handlers.rs)
+      # attendu : vide
+      ```
+- [ ] **R4, surface 3 — les règles de prompt « ne fetch pas la CI » sont
+      inchangées.** Deux commandes, et la seconde n'est pas redondante :
+      ```
+      git fetch origin && git diff origin/main --stat -- \
+        skills/bundled/qa-review/ skills/bundled/qa-review-build-callback/
+      # attendu : vide
+      grep -c 'Do NOT fetch or reason about GitHub CI status' \
+        skills/bundled/qa-review/system_prompt.md \
+        skills/bundled/qa-review-build-callback/system_prompt.md
+      # attendu : 1 pour chacun des deux fichiers
+      ```
+      Le `grep` survit à un rebase, à un `git diff` mal basé et à un
+      déplacement de la règle dans le fichier ; le `diff` ne survit à aucun des
+      trois. C'est le `grep` qui porte l'invariant, le `diff` qui donne la
+      portée.
+- [ ] **La base de comparaison est `origin/main`, jamais `main`, et c'est
+      mesuré.** Au moment de la rédaction, `main` local était `acd7ac2f` et
+      `origin/main` `acd3980c` : `git diff main -- skills/bundled/qa-review/`
+      rendait **six lignes** de mika#2419 avant qu'une seule ligne de ce
+      correctif soit écrite. Une case DoD basée sur `main` aurait donc rougi
+      faussement, et l'aurait fait d'une manière qu'on impute spontanément au
+      correctif. Le `git fetch origin` en tête de chaque commande n'est pas
+      décoratif.
 - [ ] Toute impossibilité de lire la CI abstient et émet
       `qa_ci_coherence_abstained` avec son `reason`.
 - [ ] `pending` ne refuse jamais.
@@ -568,11 +677,34 @@ gh pr view 2461 --repo senara-solutions/mika --json reviews,statusCheckRollup
 Comparer l'horodatage de la revue `mika-platform-qa` à celui de conclusion des
 checks.
 
-**Halte 1 — si les deux étaient `pending` au moment du verdict**, ce gate ne
-ferme aucun des deux cas mesurés. Ne pas élargir le gate au `pending` par
-réflexe : ce serait refuser le cas nominal (M5). Le résultat oriente vers le
-ticket de suivi nommé en Scope Boundaries (ne réviser que sur CI conclue), et
-il faut l'écrire comme un résultat, pas comme un échec.
+**La sonde a trois branches, et chacune est un résultat à écrire.** Une halte
+qui n'en nomme que deux laisse la troisième — la plus probable — se lire comme
+un demi-échec, ce qu'elle n'est pas.
+
+- **(a) Les deux checks étaient terminés rouges au moment du verdict.** Le gate
+  ferme les deux cas mesurés. AC1 est confirmée sur la population réelle, et le
+  ticket de suivi « ne réviser que sur CI conclue » (Scope Boundaries) perd sa
+  précondition — il reste ouvrable, il n'est plus appelé par cette mesure.
+- **(b) Cas mixte — un terminé, un `pending`.** Le gate ferme **un cas sur
+  deux**, et c'est un résultat complet, pas une moitié de correctif. Ce qu'il
+  établit est précisément ce que ni l'un ni l'autre des cas extrêmes
+  n'établirait : que **les deux populations existent réellement** dans le parc,
+  donc que le gate est nécessaire *et* insuffisant. C'est la branche qui appelle
+  le ticket de suivi avec la meilleure évidence — un cas documenté de chaque
+  côté de la frontière. Consigne de conduite identique aux deux autres branches :
+  **ne pas élargir le gate au `pending`** au motif qu'« il en restait un ».
+  L'écrire comme la mesure qu'elle est : « le gate ferme la population terminée,
+  la population `pending` est attestée à n=1, suivi ouvert ».
+- **(c) Les deux étaient `pending`.** Le gate ne ferme aucun des deux cas
+  mesurés. Ne pas élargir au `pending` par réflexe : ce serait refuser le cas
+  nominal (M5). Le résultat oriente vers le même ticket de suivi, avec l'urgence
+  la plus forte — et il faut l'écrire comme un résultat, pas comme un échec :
+  le gate reste juste (il refuse ce qu'il peut observer), sa population est
+  simplement ailleurs.
+
+Dans les trois cas, ce que la mesure décide est la **taille** de ce que le plan
+ferme, jamais sa justesse (M5). Citation : review-guide § KISS — la mesure
+dimensionne, elle ne redessine pas.
 
 ### Sonde 2 — Le gate mord (48 h)
 
@@ -627,8 +759,9 @@ sa formulation (R2/AC4).
   alors que la CI était `pending`, et qui rougit ensuite, reste visible et
   trompeur (M5). Ce qui couvre alors est en aval : `pr_merge_with_gate` refuse
   le merge, `self-dev-webhook-ci` dispatche un fix.
-- **Il ne ferme pas la population `pending`**, qui est peut-être la population
-  des deux cas mesurés — sonde 1 le dira.
+- **Il ne ferme pas la population `pending`**, qui est peut-être celle de l'un
+  des deux cas mesurés, ou des deux — sonde 1 le dira, et ses trois branches
+  sont écrites comme trois résultats.
 - **Il ne double pas le gate de merge** (M1) et n'ajoute aucune garantie de
   merge.
 - **Il ne donne aucune connaissance nouvelle au reviewer** : le modèle ne voit
@@ -671,3 +804,54 @@ sa formulation (R2/AC4).
   produirait un interblocage avec mika#2237 donc il porte sur le verdict
   (M4/D1). Le `pending` est nommé comme la borne de ce que le plan ferme, et sa
   mesure est une précondition de conclusion (M5, sonde 1).
+- **v2** (2026-09-21) — 1re passe architecte, `Disposition: ITERATE`, quatre
+  findings de resserrage, **toutes adressées** :
+  - **F1** (Halte 1 ne nommait que deux branches sur trois) — la sonde 1 est
+    réécrite en trois branches explicites (a) deux terminés / (b) **cas mixte** /
+    (c) deux `pending`, chacune écrite comme un résultat avec sa conduite. La
+    branche (b) est nommée comme celle qui porte la meilleure évidence pour le
+    ticket de suivi, puisqu'elle atteste les deux populations à la fois. La
+    consigne « ne pas élargir au `pending` par réflexe » est répétée sur les
+    trois branches plutôt que sur une seule. Citation préservée : review-guide
+    § KISS + M5 (la mesure dimensionne, elle ne redessine pas).
+  - **F2** (case DoD « diff vide sur ces trois surfaces » non opérationnalisable)
+    — la case unique est éclatée en trois cases, **une commande nommée par
+    surface** : `grep` sur `SAFE_FIELDS` pour `qa_pr_view`, `diff` du **bloc** de
+    la constante pour `QA_REVIEW_GH_ALLOWED` (un `git diff` de fichier ne pouvant
+    pas convenir, `builtin_handlers.rs` étant modifié par U2), `git diff` +
+    `grep` littéral pour les règles de prompt, avec la raison pour laquelle le
+    second n'est pas redondant. Une quatrième case a été ajoutée sur la **base de
+    comparaison** : la vérification a montré que `git diff main` rend six lignes
+    de mika#2419 aujourd'hui, avant tout correctif (`main` local `acd7ac2f` en
+    retard sur `origin/main` `acd3980c`) — la case naïve aurait rougi faussement
+    et l'aurait fait d'une façon qu'on impute spontanément au correctif. En
+    creusant F2, une **contradiction interne** est apparue entre U5 (réparer la
+    référence cassée de `qa_pr_view.sh:12`) et la case « diff vide » : elle est
+    levée en précisant R4 (elle porte sur la **capacité**, pas sur l'octet) et en
+    bornant U5 au seul hunk du commentaire. Citation préservée : § Verification
+    Contract (rouge avant vert, sous peine de ne rien attester).
+  - **F3** (D7 justifiait l'écart de `headRefOid` par le coût d'un appel) — D7 est
+    reformulée pour porter **la direction sûre du refus** comme raison. La lecture
+    du code a montré que l'argument du coût était non seulement secondaire mais
+    **faux** : `headRefOid` figure déjà dans les `SAFE_FIELDS` de
+    `qa_pr_view.sh:34`. Un paragraphe nomme explicitement l'« optimisation »
+    qu'un relecteur futur tenterait et dit pourquoi elle rouvrirait un cas
+    délibérément rangé du côté sûr. Citation préservée : review-guide
+    § citation-or-silence.
+  - **F4** (asymétrie non expliquée entre `VERDICT:` masqué et `block[ci]` /
+    `hold[review]` nommés en clair) — **confirmé que seul le préfixe de ligne
+    `VERDICT:` est relu**, par relecture des deux lecteurs : `VERDICT_RE`
+    (`verdict.rs:54`) est ancré `^\s*[*_]*\s*VERDICT:` et ne peut pas capter un
+    token nu au fil d'une phrase ; `validate_tool_arg_suffixes`
+    (`builtin_handlers.rs:2096`) cherche la ligne **complète** dans les trois
+    dernières lignes non vides de `pr_review_body`, et ne lit jamais un
+    `ToolOutput::error`. La contrainte U2 est **renforcée** au passage : c'est le
+    *préfixe de ligne* qui est interdit (y compris indenté, en gras ou dans un
+    bloc de code, la regex ne connaissant pas les clôtures), ce qui est plus fort
+    que « aucune ligne `VERDICT:` complète ». La non-généralisation est écrite :
+    le raisonnement tient parce que les deux lecteurs ont été lus, pas parce
+    qu'une règle « seul `VERDICT:` compte » existerait. Citation préservée : U2 +
+    mika#2201.
+
+  Aucun AC n'a été affaibli ; AC5 gagne sa vérification opérationnelle via les
+  trois cases de F2, et la sonde 1 reste la précondition de conclusion sur AC1.
