@@ -299,6 +299,8 @@ mika#2329 : ce que l'opérateur veut savoir est que la promotion est retenue
 - L'unification du prédicat d'occupation de créneau et sa garde structurelle.
 - L'observabilité de la rétention de promotion.
 - La consignation écrite du refus D1, au site de la constante.
+- La rectification du corps de mika#2162 par encadré daté (U6) — le contrat ne
+  peut pas rester rédigé sur une prémisse que le correctif réfute.
 
 **Hors périmètre, nommé :**
 - **N'importe quelle valeur de réglage** (R6) : TTL du bail, cap `implement`, cap
@@ -390,6 +392,49 @@ la même raison qui a fait écrire M2 au site de `try_acquire_dispatch_slot`.
   affirme *identical* n'est pas un test » — troisième occurrence après mika#2158
   et mika#1163.
 
+### U6 — Le corps du ticket est rectifié, parce que le contrat est versionné *(M1, M2, D4 ; AC5)*
+
+Ce plan livre **autre chose que ce que le corps du ticket raconte** : la prémisse
+causale (« le chemin de reprise différée lit le bail ») est réfutée par M1, la
+lecture de M2 fait du bail expiré pendant le dispatch un comportement voulu, et
+D4 rétrécit délibérément la lettre d'AC5. Laisser le corps en l'état, c'est
+laisser le contrat rédigé sur une prémisse que son propre correctif déclare
+fausse — et la prochaine lecture repartira de là.
+
+**Le corps de mika#2162 est donc corrigé par encadré daté**, en conservant la
+mesure d'origine (les huit réveils, les deux refus à la seconde), et en posant :
+
+1. La prémisse causale est réfutée — **aucun chemin de reprise différée n'a
+   jamais lu le bail** ; le tableau « les deux lectures » oppose un lecteur à une
+   fonction que personne n'appelait au jour de la mesure (M1, avec ses deux
+   commandes de reproduction).
+2. Le bail qui expire pendant le dispatch est le **comportement recherché**,
+   écrit au site de `try_acquire_dispatch_slot` (M2). Les « 98 % de la vie du
+   dispatch » sont la propriété, pas l'écart.
+3. La classe que le ticket nomme est **réelle et atteignable**, mais sur un autre
+   axe : la divergence M3 entre deux familles de prédicats d'occupation.
+4. **AC5 est restreint** : le réveil stérile *par divergence de prédicat* devient
+   structurellement impossible ; **le résidu TOCTOU d'un tick n'est pas fermé et
+   ne peut pas l'être** sans placer un spawn de processus dans une transaction
+   SQLite `IMMEDIATE` (D4). Il est nommé, et U3 le rend comptable.
+5. AC1 est traité par la **branche B** ; la branche A (bail renouvelé) est
+   refusée avec sa raison (D1), ce qui rend AC4 sans objet.
+
+Plus un **commentaire d'avis d'édition** sur le ticket, pour que la rectification
+ne soit pas une réécriture silencieuse — c'est la moitié qui distingue un
+contrat corrigé d'un contrat récrit.
+
+Convention du projet, non inventée ici : le corps de mika#2169 porte son encadré
+« Correction mesurée — 2026-09-04 » avec la mesure d'origine conservée, et le
+corps de mika#2158 porte son enrichissement de grooming posé dans le corps
+« parce qu'un commentaire n'atteint pas le pilote ». Le corps de ticket est un
+contrat versionné, corrigé par encadré daté — jamais par un commentaire seul, que
+la relecture suivante ne verra pas, et jamais par une édition muette.
+
+**Geste d'opérateur, pas de moteur.** Aucune ligne de code ne l'exécute, et rien
+dans ce dépôt ne peut le déclencher ; il est au DoD pour être fait, pas pour être
+automatisé.
+
 ---
 
 ## Verification Contract
@@ -431,7 +476,7 @@ grep deferred_promotion_withheld "$MIKA_SPIRIT_LOG_FILE" \
 
 ## Definition of Done
 
-- U1–U5 livrés.
+- U1–U6 livrés.
 - V1–V8 verts ; V6a vérifié rouge par mutation ; V6b relevé et reporté dans le
   corps de PR.
 - Aucune valeur de réglage modifiée (R6), aucune variable d'environnement créée
@@ -441,6 +486,8 @@ grep deferred_promotion_withheld "$MIKA_SPIRIT_LOG_FILE" \
 - Le corps de PR porte : la rectification M1/M2 en tête, le refus D1 avec sa
   raison, la faille D3 nommée avec son compte V6b et son ticket de suivi, et la
   limite M5 (l'épisode du 2026-09-03 n'est pas attribué).
+- **Le corps de mika#2162 est corrigé par encadré daté**, avec commentaire d'avis
+  d'édition sur le ticket — avant ou à la livraison. Voir U6.
 
 ---
 
@@ -473,18 +520,26 @@ grep deferred_promotion_withheld "$MIKA_SPIRIT_LOG_FILE" \
 | AC2 | V1, avec V2 en contrôle négatif | — |
 | AC3 | V5 — non-régression, rien n'est touché | — |
 | AC4 | **Sans objet** puisque la branche A est refusée | Le conditionnel de l'AC est honoré ; le refus est écrit au site de la constante (U4), pas seulement ici |
-| AC5 | U1 rend le réveil stérile **par divergence de prédicat** structurellement impossible | **Le TOCTOU d'un tick n'est pas fermé** (D4) et ne peut pas l'être sans mettre un spawn dans une transaction SQLite. Il est nommé, et U3 le rend comptable |
+| AC5 | U1 rend le réveil stérile **par divergence de prédicat** structurellement impossible | **Le TOCTOU d'un tick n'est pas fermé** (D4) et ne peut pas l'être sans mettre un spawn dans une transaction SQLite. Il est nommé, U3 le rend comptable, et le rétrécissement de la lettre d'AC5 est inscrit **sur le contrat lui-même** par U6 — pas seulement dans ce plan |
 
 ---
 
 ## Fire-Disposition
 
-**Le livrable détecteur de ce plan est U2**, un scan de source. Il **ne doit pas
-tirer** à la livraison : U1 consomme le site unique partout, donc l'arbre est
-conforme par construction. Sa disposition est donc *armé et silencieux*, et V6a
-est ce qui prouve qu'il n'est pas silencieux par inertie — la mutation manuelle
-le vérifie rouge avant la livraison, faute de quoi un scan inopérant se lirait
-exactement comme un arbre propre (classe mika#2205).
+**Le livrable détecteur de ce plan est U2**, un scan de source.
+
+**Disposition : (a) Named allowlist exception — zero entries.** L'allowlist
+existe, elle est nommée, et elle est **livrée vide** ; la conduite quand le scan
+tire est « on consomme le site unique, on n'allowliste pas ». Les deux autres
+options canoniques sont écartées : (b) *ship it firing* ne s'applique pas — il
+n'y a rien à accuser, U1 rend l'arbre conforme par construction ; (c) *ship it
+disarmed* serait un scan qu'on livre inopérant, c'est-à-dire exactement le mode
+de panne que V6a existe pour exclure.
+
+Il **ne doit donc pas tirer** à la livraison, et V6a est ce qui prouve qu'il
+n'est pas silencieux par inertie — la mutation manuelle le vérifie rouge avant la
+livraison, faute de quoi un scan inopérant se lirait exactement comme un arbre
+propre (classe mika#2205).
 
 **U3 n'est pas un détecteur** : `deferred_promotion_withheld` mesure une rétention
 légitime, pas une violation. Son régime attendu est non vide, et aucune de ses
@@ -532,4 +587,23 @@ couche plus haut.
 
 ## Revision history
 
+- **rev 2 (2026-09-21)** — première passe architecte, `Disposition: ITERATE`.
+  - **F1 (BLOCKING)** adressé par **U6**, nouvelle unité d'implémentation : le
+    corps de mika#2162 est corrigé par encadré daté (prémisse M1/M2 réfutée, AC5
+    restreint au réveil stérile *par divergence de prédicat*, résidu TOCTOU
+    nommé) avec commentaire d'avis d'édition, et la ligne correspondante est
+    ajoutée au DoD. Le finding notait justement que le DoD n'exigeait la
+    rectification que dans le corps de **PR**, laissant le ticket rédigé sur une
+    prémisse que son propre correctif déclare fausse. La convention est citée à
+    sa source (corps de mika#2169, encadré « Correction mesurée » ; corps de
+    mika#2158, enrichissement posé dans le corps). Répercuté sur les *Scope
+    Boundaries* (périmètre) et sur la réserve d'AC5 de la table de
+    correspondance, pour que le rétrécissement de la lettre d'AC5 soit tracé sur
+    le contrat et pas seulement dans ce plan.
+  - **F2 (sharpening)** adressé en taguant la disposition de U2 de l'option
+    canonique **« (a) Named allowlist exception — zero entries »** (mika#1574,
+    trois options canoniques), avec le refus explicite des deux autres. La
+    substance était déjà présente ; seule la lettre manquait.
+  - Aucune AC affaiblie, aucun réglage touché : R6/R7 restent vérifiables au
+    diff.
 - **2026-09-21** — version initiale (grooming autonome, mika#2162).
