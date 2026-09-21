@@ -475,6 +475,118 @@ Optional (callback watchdog):
 - `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` — Window (seconds) during which a *promoted* deferred wrapper still counts as representing its parent for the stuck-pending reaper (default: 2700, deliberately equal to the grace above; mika#2181). Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later. Counting `pending` alone made the reaper call a healthy parent unrepresented milliseconds after promotion and burn its re-arm budget in two ticks. The window is **bounded** because on the silent-turn error path a wrapper stays `completed` forever, and an unbounded predicate would make that corpse a permanent shield against repair. Invalid/≤0 **and values above 30 days** fall back to the default (WARN-logged) — the upper clamp is load-bearing: SQLite returns NULL for an out-of-range `strftime` modifier, so an absurd override would silently restore the mika#2181 predicate rather than widen the window. Grep `stuck_pending_sheltered_by_promoted_wrapper` in `$MIKA_SPIRIT_LOG_FILE` to see which parents the window is currently holding back — sparing happens inside SQL, so without that line an empty reaper reads the same whether it is idle or withholding.
 - `MIKA_PHANTOM_SWEEP_AGE_SECONDS` — Grace period (seconds) before the watchdog phantom sweep transitions a NULL-PID `action_type='none'` tracking row that has been `in_progress`/`blocked` past this threshold to `failed` (mika#1712, default `14400` since mika#2156 — see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS` for the measured rationale). Startup sweep (AC5) still runs at age=0, but neither path is decided by the clock alone any more: since mika#2156 both consult the row's dispatch child and spare it while that process is alive, because a tracking row's `updated_at` is never bumped while its dispatch works. The SQL cutoff is `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-<n> seconds')`. Sweep telemetry: a per-row `audit_events` row with `tool_name='phantom_aged_out'` for each transition written and `tool_name='phantom_sweep_spared'` for each one the liveness guard withheld (mika#2156); a per-row `phantom_sweep_spared` INFO log line (fields: `source`, `task_id`, `child_task_id`, `process_id`, `updated_at`); a per-pass `phantom_sweep_complete` INFO log line (fields: `source` in `{"startup_sweep","watchdog_tick"}`, `count`, `spared_count`, `error_count`, `lookup_error_count`, `unusable_child_count`, `agent_id`); and `phantom_sweep_large_backlog` WARN when a single pass sweeps >100 rows (it still keys on `count`, so sparing never triggers it — anomalous state, feeds the mika#1934 cause-racine investigation).
 
+### `fired_at` est le premier instant où le moteur a travaillé sous une ligne (mika#2133)
+
+**Aucune variable d'environnement, aucune migration.** Cette entrée est ici parce
+que l'opérateur qui lit une ligne `tasks` pour savoir si un travail a démarré —
+et tous les faucheurs ci-dessus le font — a besoin de savoir ce que cette colonne
+dit sur chaque chemin.
+
+- **La sémantique, en une phrase qui couvre les quatre chemins :** `fired_at` est
+  **le premier instant où le moteur a commencé à travailler sous cette ligne** —
+  et pour une récurrente, le **dernier** tir.
+
+  | chemin | écrivain | instant posé |
+  |---|---|---|
+  | ordonnanceur (`recurring`, `time`) | `claim_and_fire_task` | la réclamation — **écrase** à chaque tir (D4) |
+  | dispatch d'un parent (`manual`) | `mark_parent_dispatched` (mika#2335) | le spawn |
+  | `callback` **avec** pilote | `set_task_process_id` (mika#2263) | le spawn |
+  | `callback` **sans** pilote | `stamp_task_fired_at_if_null` (mika#2133) | le début de son tour de livraison |
+  | `a2a` | `a2a_update_task_state` (mika#2133) | la transition `working` |
+
+  Ce ne sont pas cinq définitions mais une seule appliquée à plusieurs natures de
+  travail, et c'est la clause NULL-only qui la rend vraie : sur une ligne portant
+  un pilote, la livraison arrive après le spawn et ne réécrit rien.
+
+- **L'acte d'estampiller a une seule définition textuelle**,
+  `db::tasks::FIRED_AT_STAMP_IF_NULL`, interpolée par les quatre écrivains
+  NULL-only. `claim_and_fire_task` est l'exception **déclarée** (« dernier tir »)
+  et non exemptée : le registre `FIRED_AT_LITERAL_WRITERS` la nomme avec sa
+  raison, un scan de source refuse un cinquième écrivain littéral, et la
+  comparaison est **double sens** — une entrée dont le site a disparu rougit,
+  sans quoi elle exempterait silencieusement un futur homonyme.
+
+- **Ce qui reste légitimement NULL, et c'est tout l'intérêt de la colonne.** Une
+  tâche jamais tirée. En production la population témoin est la branche
+  `returnImmediately` de `message/send` : elle crée la ligne, la rend en
+  `submitted`, n'exécute aucun tour. **Un correctif qui aurait estampillé à la
+  création aurait rendu la colonne pleine et toujours aussi muette** — le défaut
+  déplacé d'un cran.
+
+- **Ce que le correctif rend possible :** `pending` depuis longtemps **sans**
+  `fired_at` redevient « jamais démarrée », et `in_progress` **avec** un
+  `fired_at` ancien devient « démarrée et bloquée ». Deux états jusque-là
+  indistinguables — et c'est très exactement la question qu'on pose à cette table
+  quand la boucle inquiète. Le 2026-09-01, une file de dix tâches `mika-dev` a été
+  lue comme figée sur le critère « `in_progress` sans `fired_at` » alors que 121
+  tâches se terminaient dans l'heure : le champ était vide sur **tout** ce chemin,
+  donc ne discriminait rien.
+
+- **Sondes opérateur, et leurs haltes.** La base n'étant pas lisible depuis le bac
+  à sable de dispatch, ces mesures sont structurellement post-déploiement.
+
+  ```sql
+  -- S1 (non-vacuité) : `a2a` doit quitter le zéro sur une fenêtre POSTÉRIEURE
+  SELECT trigger_type, COUNT(*), SUM(fired_at IS NOT NULL)
+    FROM tasks WHERE created_at > '<instant du déploiement>' GROUP BY 1;
+
+  -- S2 (attribution) : la poche « callback sans pilote » est-elle non vide ?
+  SELECT COUNT(*) FROM tasks
+   WHERE trigger_type = 'callback' AND process_id IS NULL
+     AND fired_at IS NOT NULL AND created_at > '<instant du déploiement>';
+
+  -- S3 (contrôle négatif en production) : attendu ZÉRO
+  SELECT COUNT(*) FROM tasks
+   WHERE trigger_type = 'a2a' AND status = 'pending' AND fired_at IS NOT NULL
+     AND created_at > '<instant du déploiement>';
+
+  -- S4 (non-régression historique) : à relever AVANT le déploiement, ne doit pas bouger
+  SELECT COUNT(*) FROM tasks
+   WHERE fired_at IS NOT NULL AND created_at < '<instant du déploiement>';
+  ```
+
+  **Halte S1 — `a2a` reste à zéro alors que des tours a2a ont tourné :** ne pas
+  élargir le prédicat par réflexe. Établir d'abord que le binaire servi porte le
+  correctif (classe mika#2340) ; un `a2a` à zéro sur un binaire antérieur est le
+  résultat attendu, pas un défaut du prédicat.
+  **Lecture de S1 :** `callback` est **déjà** non nul depuis mika#2263 — le lire
+  comme une preuve de ce correctif serait attribuer à ce travail ce qu'un autre a
+  livré ; c'est la lecture que S2 existe pour éviter.
+  **Lecture de S2 :** zéro **n'est pas une panne** — il signifie que tout callback
+  porte un pilote et que cet écrivain est un filet sans population. C'est un
+  résultat, à écrire comme tel, et c'est alors le filet qui mérite d'être
+  réinterrogé, pas le prédicat élargi.
+  **Halte S3 — une seule ligne :** c'est le défaut d'AC3 réalisé, la colonne
+  devenue pleine et toujours muette. Désarmer par revert **avant** diagnostic.
+  **Halte S4 — la valeur a bougé :** un écrivain rétro-estampille, ce qu'aucune
+  ligne de ce travail ne produit.
+
+- **Le statut d'une ligne `callback` ne dit toujours PAS « un pilote travaille »,
+  et c'est une décision.** Une ligne callback porte son PID en `pending`, donc un
+  garde-tableau qui compte `status='in_progress'` affiche zéro pendant qu'un
+  pilote travaille. Poser `in_progress` y ferait entrer d'un coup **toute** la
+  population des pilotes vivants dans `get_active_callback_tasks_with_pid`, la
+  requête du watchdog #959 — **qui marque la tâche `failed`** quand le processus
+  meurt. mika#2272 a borné ce périmètre par écrit (« élargir cette population-là
+  change qui marque une tâche `failed` … blast radius distinct, ticket distinct »),
+  donc le faire ici serait rouvrir en passant un périmètre qu'un ticket voisin a
+  fermé — un changement de comportement moteur habillé en observabilité.
+  **Ce que l'opérateur a à la place, et qui est un signal plus juste :**
+  `mika tasks <id>` affiche une ligne `Dispatch pilot:` alimentée par
+  `PilotLiveness` (mika#2335) — PID vérifié par `process_start_time` et mtime du
+  log du pilote. La corrélation manuelle avec `ps` est donc déjà retirée de la
+  charge de l'opérateur. **Suivi nommé :** un état intermédiaire pour la ligne
+  callback en travail, dont le préalable écrit est de décider qui marque `failed`
+  quand un pilote meurt une fois la population du watchdog non vide.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal
+  nouveau : le défaut est une colonne vide, et **une colonne vide ne s'émet pas**.
+  Les seuls instruments sont les quatre requêtes ci-dessus, et leur silence ne
+  prouve rien tant que personne ne les exécute. Le champ devient lisible ; il ne
+  devient pas surveillé. Les lignes **historiques** ne sont pas rétro-estampillées
+  (AC6) : une estampille inventée après coup est pire qu'une absente, elle a l'air
+  d'une mesure.
+
 Optional (pilot silent-stall reaper — mika#2249):
 - **The failure this closes.** Two mika#2246 dispatches ran **2 h 18** and **58 min** with their process alive, their task `in_progress`, an empty `result`, no terminal marker in the log and no callback — until an operator disposed of them by hand. Every existing reaper fires on **task state** (`engine.rs` orphan-on-startup, stuck-`pending`, stale-`blocked`, the two self_dev parent reapers) and the PID watchdog fires on a **dead** process, so a live-and-mute dispatch was structurally invisible to all of them.
 - **The detector must be EXTERNAL to the pilot, and that word is the whole design.** Both wedged pilots ran with a working internal watchdog compiled in — `toolWaitCeiling=1800s modelWaitCeiling=900s` appear in all three logs, fields that only exist post-cpp#145 — and neither fired. A watchdog starved inside the pilot's own event loop cannot fire on a pilot-side timer either, whatever that timer measures. Hardening claude-pilot's internal watchdog is the companion ticket `senara-solutions/claude-pilot#168`, not a substitute for this one.
