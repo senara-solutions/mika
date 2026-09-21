@@ -77,7 +77,7 @@
 //! Et la sonde elle-même, [`mika2446_chaque_trigger_routable_est_tire`], tire
 //! **chaque** membre de l'inventaire par le chemin récurrent réel.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
