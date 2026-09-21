@@ -89,8 +89,8 @@ Le parent ne porte que les répertoires intermédiaires matérialisés par bwrap
 pour ses binds, sur tmpfs. Trois faits de code complètent la mesure : l'unique
 bind rw d'un arbre de travail est le worktree (`--bind "$WORKTREE_DIR"`) ;
 `--chdir "$WORKTREE_DIR"` et `--clearenv` sont posés ; les **trois** sites de
-lancement pilote passent par `_run_pilot_sandboxed` (`dispatch-lib.sh:2761`,
-`:5434`, `:5553`). **Candidats (a) et (c) : réfutés** pour tout pilote contenu.
+lancement pilote passent par `_run_pilot_sandboxed` (`dispatch-lib.sh:2977`,
+`:5662`, `:5781`). **Candidats (a) et (c) : réfutés** pour tout pilote contenu.
 Et (c) est réfuté une troisième fois pour les **handlers exec** : le moteur les
 lance avec `cmd.current_dir(skill_dir)` (`skills/executor.rs:848`), jamais avec
 le cwd de mika-spirit — qui **est** bien `/data/workspace/mika-platform/mika`
@@ -103,9 +103,9 @@ M0 rend la réserve de cette mesure caduque : la voie pilote n'a pas seulement
 ### M2 — Ce que la mesure DÉPLACE : dispatch-lib n'opère pas dans main, il y ENVOIE l'opérateur
 
 Les **onze** opérations `git -C "$SUB_REPO_DIR"` de `dispatch-lib.sh` ont été
-relevées une par une : `fetch` (2348, 2448), `worktree list` (2380),
-`worktree remove` (2413, 2425, 2685), `ls-remote` (2447), `worktree add`
-(2449, 2451, 2455, 2457). **Aucune ne mute l'arbre de travail du checkout
+relevées une par une : `fetch` (2564, 2664), `worktree list` (2596),
+`worktree remove` (2629, 2641, 2901), `ls-remote` (2663), `worktree add`
+(2665, 2667, 2671, 2673). **Aucune ne mute l'arbre de travail du checkout
 principal.** Le candidat (b), pris comme *opération*, est réfuté.
 
 Mais il est **confirmé comme prescription** — un second producteur, latent, de
@@ -114,15 +114,15 @@ récupération divergent :
 
 | Site | Ligne | Message |
 |---|---|---|
-| A — `_clean_worktree_for_rebase` | 1695 | `recover with: git -C ${wt} stash apply …` → **le worktree** |
-| B — `_set_up_worktree` (relic) | 2399 | `recover with: git -C $SUB_REPO_DIR stash apply …` → **le checkout principal** |
+| A — `_clean_worktree_for_rebase` | 1911 | `recover with: git -C ${wt} stash apply …` → **le worktree** |
+| B — `_set_up_worktree` (relic) | 2615 | `recover with: git -C $SUB_REPO_DIR stash apply …` → **le checkout principal** |
 
 Exécutée, la prescription du site B dépose le contenu d'un worktree, **non
 committé**, dans le checkout principal. Le lecteur de ce message est un acteur
 non contenu (l'opérateur sur un dispatch échoué, ou mika-dev lisant la sortie
 d'un dispatch en échec — le tuyau stderr n'est lu que dans cette branche, D1).
 **Ce n'est pas une faute de frappe.** Au site B, le worktree est **supprimé
-quatorze lignes plus bas** (`worktree remove --force`, 2413) : au moment où
+quatorze lignes plus bas** (`worktree remove --force`, 2629) : au moment où
 l'opérateur lit le message, le répertoire que le site A nommerait n'existe plus.
 Remplacer `$SUB_REPO_DIR` par `$existing_wt` produirait une consigne qui échoue ;
 le remède nomme le worktree **canonique** (`$WORKTREE_DIR`, créé juste après sur
@@ -188,7 +188,7 @@ nomme (§ Sondes, sonde 1b).
 ### D1 — Le sink de R3 est le moteur, PAS dispatch-lib
 
 `_set_up_worktree` tourne au niveau de `dispatch_claude_pilot`, **hors** de la
-redirection `2>"$STDERR_FILE"` qui n'enveloppe que la ligne 2761. Sa stderr est
+redirection `2>"$STDERR_FILE"` qui n'enveloppe que la ligne 2977. Sa stderr est
 le `Stdio::piped()` de `spawn_long_running_exec`, que l'exécuteur lit
 **uniquement** dans sa branche `if !status.success()` : sur un dispatch qui
 réussit, les lignes n'atterrissent dans **aucun fichier** — le diagnostic écrit
@@ -388,7 +388,7 @@ la documentation des surfaces.
 
 ### U1 — La prescription réparée (R1)
 
-`skills/bundled/_shared/dispatch-lib.sh` ~2399. Le message nomme `$WORKTREE_DIR`
+`skills/bundled/_shared/dispatch-lib.sh` ~2615. Le message nomme `$WORKTREE_DIR`
 et porte une butée explicite : ne pas appliquer dans le checkout principal.
 Marqueur `mika#2449` et une ligne de raison (pourquoi pas `$existing_wt` : il
 est supprimé quatorze lignes plus bas).
@@ -411,7 +411,7 @@ pour la décision (propre / sale+liste / illisible), testable sans git. Émissio
 `main_checkout_dirty` (WARN + `audit_events`, `tool_name = 'main_checkout_dirty'`,
 `target_key = <repo_dir>`), dédupliquée par `(checkout, empreinte)` sur 24 h
 via `audit_events`, modèle de l'exclusion mika#2131. Chemins plafonnés (20,
-comme `DIRTY_FILES` en 3486), **jamais** de contenu de fichier. Le `reasoning`
+comme `DIRTY_FILES` en 3714), **jamais** de contenu de fichier. Le `reasoning`
 porte la requête d'attribution de § Sondes 1b, avec la borne basse = l'instant
 du dernier tick propre (lu depuis la dernière ligne d'audit du même checkout,
 ou « inconnu » si aucune).
@@ -500,7 +500,7 @@ dans l'arbre à `b74f7e7c` et dans `mika.db` au 2026-09-22, pas supposées.
 
 ### U2 — deux sites, une violation à la pose, zéro au land
 
-Sites `1695` (conforme) et `2399` (violation), corrigée par U1 **dans le même
+Sites `1911` (conforme) et `2615` (violation), corrigée par U1 **dans le même
 commit**. **Disposition (a), allowlist livrée vide.** Résolution quand il tire :
 corriger le message, jamais ajouter une entrée. Contrôle de bonne foi ≥ 2 sites.
 
@@ -732,6 +732,16 @@ lexicale, il achète le geste casual — le seul mesuré — pas l'adversaire.
 
 ## Revision history
 
+- **rev 5 (2026-09-22, reprise pré-implémentation)** : `origin/main` fusionné
+  dans la branche (`4bd654fe`, apporte #2439 et #2448 ; `dispatch-lib.sh`
+  +216 lignes). Ancres de ligne re-mesurées et mises à jour : site A `1695`→`1911`,
+  site B `2399`→`2615`, `worktree remove` du site B `2413`→`2629`, sites
+  `_run_pilot_sandboxed` `2761/5434/5553`→`2977/5662/5781`, les onze
+  `git -C "$SUB_REPO_DIR"` renumérotées, `DIRTY_FILES` `3486`→`3714`. Ancres
+  Rust (`reap_terminal_worktrees` 1065, `worktree_reap_no_checkout` 1098,
+  sole-writer 1869), `executor.rs:848`, `ci.yml:283`, `dispatch-lib.sh:7401`
+  et `deploy-mika/handlers/run.sh:9-10` inchangées. Aucun contenu de décision,
+  d'unité, de contrat ni d'AC modifié.
 - **rev 4 (2026-09-22)** : addressed mika-arch first-pass (session
   `d956fb91`, ITERATE). **F1 (BLOCKING)** — la correction du **titre** du
   ticket est un livrable, pas une promesse : DoD + **AC9** + commentaire d'avis
