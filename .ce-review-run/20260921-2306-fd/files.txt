@@ -1,4 +1,0 @@
-docs/plans/2026-09-19-002-fix-2306-la-section-fire-disposition-a-un-site-de-production-plan.md
-docs/solutions/best-practices/fire-disposition-doctrine.md
-skills/bundled/_shared/dispatch-lib.sh
-skills/bundled/_shared/test-dispatch-lib.sh
