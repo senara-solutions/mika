@@ -241,8 +241,12 @@ fn lines_starting_outside_a_literal(lines: &[&str]) -> Vec<bool> {
 
 /// Carried across lines, because raw string literals routinely span them — the
 /// test fixtures in this repo quote whole Rust files, closing brace included.
+///
+/// `pub(crate)` together with [`scan_line`] so that a guard needing to know
+/// "what is code on this line" asks here instead of carrying a second lexer
+/// (`home.rs`'s mika#2073 test-body walk is the first such reader).
 #[derive(Debug, Default, Clone, Copy)]
-struct LexState {
+pub(crate) struct LexState {
     in_block_comment: bool,
     in_string: bool,
     in_raw_string: Option<usize>,
@@ -258,7 +262,11 @@ impl LexState {
 ///
 /// `sink` returns `true` to stop; `scan_line` then returns `true` too, leaving
 /// `state` where it stopped. Line comments end the line's code, never the state.
-fn scan_line<F: FnMut(usize, u8) -> bool>(state: &mut LexState, line: &str, mut sink: F) -> bool {
+pub(crate) fn scan_line<F: FnMut(usize, u8) -> bool>(
+    state: &mut LexState,
+    line: &str,
+    mut sink: F,
+) -> bool {
     let b = line.as_bytes();
     let mut p = 0usize;
     while p < b.len() {

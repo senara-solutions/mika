@@ -2270,9 +2270,14 @@ mod tests {
     /// setters of `mika-agent`'s tier guard). Recognizing only the first would
     /// make the guard shout at correct code, and a guard that shouts at correct
     /// code is a guard somebody silences.
+    ///
+    /// **Only the unkeyed form counts.** `serial_test` sequences a keyed group
+    /// (`#[serial(tier)]`) against its own key alone, never against the unkeyed
+    /// group every `MIKA_AGENT_TIER` setter in this file carries — so a keyed
+    /// test still races them, and exempting it would be a silent hole. It is
+    /// scanned as a bare test.
     fn inner_is_serial(inner: &str) -> bool {
-        let head = inner.split('(').next().unwrap_or(inner).trim();
-        head == "serial" || head == "serial_test::serial"
+        inner == "serial" || inner == "serial_test::serial"
     }
 
     fn is_test_attribute(line: &str) -> bool {
@@ -2340,100 +2345,38 @@ mod tests {
         desyncs: Vec<String>,
     }
 
-    /// Lexer state that must survive the end of a line.
-    ///
-    /// A Rust string literal may span lines — `r#"…"#` blocks do it routinely,
-    /// and this very module contains one. A per-line scanner resets at each
-    /// newline, so a `}` sitting inside such a literal reads as a closing brace
-    /// and ends a test body early: every line after it escapes the scan, the
-    /// item count is unchanged, and the guard stays **green** while blind. That
-    /// is the same shape as the defect this whole ticket closes, one level down,
-    /// so the state is carried rather than reset.
-    #[derive(Default)]
-    struct Lex {
-        in_string: bool,
-        /// `Some(n)` inside a raw string opened with `n` hashes (`r##"` → 2).
-        in_raw: Option<usize>,
-        in_block_comment: bool,
-    }
-
     /// Brace movement contributed by a line, ignoring comments and string, raw
     /// string and char literals. Returns `(delta, saw_open)`; `saw_open` is
     /// separate because a line like `unsafe { … };` has a delta of zero and
     /// still opens the item's block.
-    fn brace_scan(line: &str, lex: &mut Lex) -> (i32, bool) {
-        let c: Vec<char> = line.chars().collect();
+    ///
+    /// **The lexer state must survive the end of a line.** A Rust string
+    /// literal may span lines — `r#"…"#` blocks do it routinely, and this very
+    /// module contains one. A per-line scanner resets at each newline, so a `}`
+    /// sitting inside such a literal reads as a closing brace and ends a test
+    /// body early: every line after it escapes the scan, the item count is
+    /// unchanged, and the guard stays **green** while blind. That is the same
+    /// shape as the defect this whole ticket closes, one level down, so the
+    /// state is carried rather than reset.
+    ///
+    /// The lexing itself is `source_guard::scan_line`, the crate's single
+    /// "what is code on this line" reader (mika#2398): a private copy here had
+    /// already drifted from it, closing a raw string on a `"` at end of line
+    /// with too few trailing hashes. Only the brace counting is local.
+    fn brace_scan(line: &str, lex: &mut crate::source_guard::LexState) -> (i32, bool) {
         let mut depth = 0i32;
         let mut saw_open = false;
-        let mut i = 0;
-        while i < c.len() {
-            if lex.in_block_comment {
-                if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    lex.in_block_comment = false;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            if let Some(hashes) = lex.in_raw {
-                if c[i] == '"' && c[i + 1..].iter().take(hashes).all(|h| *h == '#') {
-                    lex.in_raw = None;
-                    i += 1 + hashes;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            if lex.in_string {
-                match c[i] {
-                    '\\' => i += 2,
-                    '"' => {
-                        lex.in_string = false;
-                        i += 1;
-                    }
-                    _ => i += 1,
-                }
-                continue;
-            }
-            match c[i] {
-                '/' if c.get(i + 1) == Some(&'/') => break,
-                '/' if c.get(i + 1) == Some(&'*') => {
-                    lex.in_block_comment = true;
-                    i += 2;
-                    continue;
-                }
-                'r' if matches!(c.get(i + 1), Some('"') | Some('#')) => {
-                    let hashes = c[i + 1..].iter().take_while(|h| **h == '#').count();
-                    if c.get(i + 1 + hashes) == Some(&'"') {
-                        lex.in_raw = Some(hashes);
-                        i += 2 + hashes;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-                '"' => lex.in_string = true,
-                // A `'` is a char literal only when it closes within three or
-                // four characters; otherwise it is a lifetime or a loop label,
-                // and consuming the rest of the line would desync the walk.
-                '\'' => {
-                    let esc = c.get(i + 1) == Some(&'\\');
-                    let close = if esc { i + 3 } else { i + 2 };
-                    if c.get(close) == Some(&'\'') {
-                        i = close + 1;
-                        continue;
-                    }
-                }
-                '{' => {
+        crate::source_guard::scan_line(lex, line, |_, byte| {
+            match byte {
+                b'{' => {
                     depth += 1;
                     saw_open = true;
                 }
-                '}' => depth -= 1,
+                b'}' => depth -= 1,
                 _ => {}
             }
-            i += 1;
-        }
+            false
+        });
         (depth, saw_open)
     }
 
@@ -2472,7 +2415,7 @@ mod tests {
             let signature_at = i;
             let signature = lines[i].trim().to_string();
             let indent: String = lines[i].chars().take_while(|c| c.is_whitespace()).collect();
-            let mut lex = Lex::default();
+            let mut lex = crate::source_guard::LexState::default();
             let mut depth = 0i32;
             let mut opened = false;
             let mut body: Vec<(usize, &str)> = Vec::new();
@@ -2625,11 +2568,13 @@ mod tests {
     /// green is verified by nothing. Written against **fabricated** lines and a
     /// fabricated source, never by editing real source.
     ///
-    /// Two of the shapes below do not occur in the file actually scanned
-    /// (`home.rs` has zero tokio tests and no `#[serial_test::serial]` in
-    /// attribute position — only the `use` at the head of this module). This
-    /// control is therefore their **sole** attestation, which is exactly why it
-    /// cannot be trimmed.
+    /// Three of the shapes below do not occur in the file actually scanned
+    /// (`home.rs` has zero tokio tests, no keyed `#[serial(…)]`, and no
+    /// `#[serial_test::serial]` in attribute position — only the `use` at the
+    /// head of this module). This control is therefore their **sole**
+    /// attestation, which is exactly why it cannot be trimmed. The same holds
+    /// for the desync self-check's two failure arms, which a well-formed file
+    /// never reaches.
     #[test]
     fn mika2073_the_guard_fires_on_a_relapse() {
         // The forbidden call tokens are recomposed with `concat!` rather than
@@ -2696,6 +2641,12 @@ mod tests {
                 "the guard must recognize both spellings of serial: {serial_attr}"
             );
         }
+        // A keyed group is sequenced against its own key only, so it does not
+        // protect a test from the unkeyed setters of this file.
+        assert!(
+            !is_serial_attribute("    #[serial(tier)]"),
+            "a keyed `#[serial(…)]` must not exempt a test from the scan"
+        );
         // Measured in this very module (`:980`): the token without the attribute.
         assert!(
             !is_serial_attribute("    use serial_test::serial;"),
@@ -2739,6 +2690,12 @@ mod tests {{
     }}
 
     #[test]
+    #[serial(tier)]
+    fn a_keyed_serial_test_that_relapses() {{
+        {boot}&home).unwrap();
+    }}
+
+    #[test]
     fn a_converted_test() {{
         bootstrap_with_tier(&home, AgentTier::Default).unwrap();
     }}
@@ -2778,15 +2735,15 @@ still inside the literal"#;
             scan.desyncs.join("\n")
         );
         assert_eq!(
-            scan.tests_seen, 8,
+            scan.tests_seen, 9,
             "the walk must find every test item in the fabricated source — \
              including the one behind a multi-line attribute — got {}",
             scan.tests_seen
         );
         assert_eq!(
             scan.offenders.len(),
-            4,
-            "the four bare relapses must be reported, got:\n{}",
+            5,
+            "the five bare relapses must be reported, got:\n{}",
             scan.offenders.join("\n")
         );
         assert!(
@@ -2814,6 +2771,47 @@ still inside the literal"#;
                 .any(|o| o.contains("an_async_bare_test_that_relapses")),
             "the bare `#[tokio::test]` relapse must be reported — `#[serial]` and \
              libtest's thread pool are two different mechanisms"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_keyed_serial_test_that_relapses")),
+            "a keyed `#[serial(tier)]` relapse must be reported — it runs in \
+             parallel with the unkeyed setters"
+        );
+
+        // -- the self-check fires ---------------------------------------------
+        // Every item above closes cleanly, so the two failure arms of the desync
+        // self-check are only reached here: a body that closes on a line other
+        // than `<indent>}`, and a body that never closes. A self-check never
+        // shown to fire is verified by nothing.
+        let desynced = r#"
+mod tests {
+    #[test]
+    fn a_test_closing_on_its_signature_line() { assert!(true); }
+
+    #[test]
+    fn a_test_that_never_closes() {
+        let _ = 1;
+"#;
+        let scan = scan_bare_tests_reading_the_tier(desynced);
+        assert_eq!(
+            scan.desyncs.len(),
+            2,
+            "both failure arms of the self-check must fire, got:\n{}",
+            scan.desyncs.join("\n")
+        );
+        assert!(
+            scan.desyncs[0].contains("a_test_closing_on_its_signature_line")
+                && scan.desyncs[0].contains("expected"),
+            "an early close must be reported as a desync: {}",
+            scan.desyncs[0]
+        );
+        assert!(
+            scan.desyncs[1].contains("a_test_that_never_closes")
+                && scan.desyncs[1].contains("never closed"),
+            "a body that runs off the end of the source must be reported: {}",
+            scan.desyncs[1]
         );
     }
 }
