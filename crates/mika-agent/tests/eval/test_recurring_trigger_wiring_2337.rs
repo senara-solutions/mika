@@ -206,6 +206,61 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// mika#2446 — l'appel à `ensure_recurring_task` situé à `call_idx` est-il le
+/// ré-enregistrement de `rearm_recurring_task`, précédé dans le même corps par
+/// le test `is_routable_trigger(` ?
+///
+/// Borné à `task_engine/mod.rs` et à cette seule fonction : l'exception est un
+/// site, pas une forme. Le corps est délimité par la déclaration de
+/// `rearm_recurring_task` et l'appel lui-même ; une autre déclaration `fn`
+/// entre les deux signifie que l'appel n'est pas dans ce corps.
+fn operator_rearm_site_is_routability_gated(rel: &str, src: &str, call_idx: usize) -> bool {
+    if rel != "task_engine/mod.rs" {
+        return false;
+    }
+    let Some(fn_start) = src[..call_idx].rfind("fn rearm_recurring_task(") else {
+        return false;
+    };
+    let body = &src[fn_start + "fn rearm_recurring_task(".len()..call_idx];
+    !body.contains("\nfn ") && !body.contains(" fn ") && body.contains("is_routable_trigger(")
+}
+
+/// mika#2446 — l'exception ci-dessus existe, est unique, et son précondition
+/// tient : dans `rearm_recurring_task`, le refus de routabilité précède le
+/// ré-enregistrement. Si un futur éditeur déplace l'appel avant le test (ou
+/// retire le test), ce test rougit — et la garde de classe retombe dans sa
+/// halte au lieu de laisser passer un enregistrement non gardé.
+#[test]
+fn mika2446_le_reenregistrement_operateur_est_garde_par_la_routabilite() {
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = scanner.src_root().to_path_buf();
+
+    let mut gated_sites = 0usize;
+    for path in scanner.files() {
+        let production = scanner.production_of(&path);
+        let src = production.as_str();
+        let rel = path
+            .strip_prefix(&src_dir)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let mut from = 0usize;
+        while let Some(rel_idx) = src[from..].find("ensure_recurring_task(") {
+            let idx = from + rel_idx;
+            from = idx + "ensure_recurring_task(".len();
+            if operator_rearm_site_is_routability_gated(&rel, src, idx) {
+                gated_sites += 1;
+            }
+        }
+    }
+    assert_eq!(
+        gated_sites, 1,
+        "exactement un site de ré-enregistrement opérateur doit être reconnu, \
+         et il doit être précédé du test de routabilité"
+    );
+}
+
 /// Les triggers `run_skill` enregistrés en production : `trigger → site`.
 ///
 /// La population est celle des **appels** à `task_engine::ensure_recurring_task`,
@@ -256,6 +311,20 @@ fn registered_triggers() -> BTreeMap<String, String> {
                  4e (`action_config`). Si la signature a changé, c'est ici qu'il \
                  faut la suivre — pas dans une exemption."
             );
+
+            // mika#2446 — une seule exception, nommée : le ré-armement
+            // opérateur ré-enregistre l'`action_config` lu sur une ligne morte,
+            // donc non littéral par construction. La propriété que cette garde
+            // protège (tout trigger enregistré a un bras) y est tenue à
+            // l'exécution par `is_routable_trigger`, dont l'inventaire est
+            // lui-même gardé égal au `match` (D-1). L'exception ne vaut que si
+            // ce test PRÉCÈDE l'appel dans le corps de `rearm_recurring_task` ;
+            // toute autre forme retombe dans la halte ci-dessous.
+            if string_literal_content(&args[3]).is_none()
+                && operator_rearm_site_is_routability_gated(&rel, src, idx)
+            {
+                continue;
+            }
 
             let literal = string_literal_content(&args[3]).unwrap_or_else(|| {
                 panic!(

@@ -146,6 +146,12 @@ impl Database {
     /// label inside the window meets a fully armed veto. The lift buys one
     /// restart, not immunity.
     ///
+    /// **mika#2446 — operator lift.** Rows carrying
+    /// [`RECURRING_OPERATOR_REARM_PATH`] — written by
+    /// [`Database::mark_recurring_operator_rearm`] when an operator runs
+    /// `mika tasks rearm <label>` — are skipped too. An act, not an exemption:
+    /// it absolves only the rows that existed when it was taken.
+    ///
     /// Non-goal here: fixing the *underlying* dispatch failure for Mika's
     /// specific `curator_review` (Problem A in the ticket). Root-claude's
     /// diagnosis notes PR#1726 (RouteFuture/dashmap wedge) likely already
@@ -187,6 +193,8 @@ impl Database {
                    AND NOT (?5 = 0
                             AND json_valid(metadata)
                             AND COALESCE(json_extract(metadata, ?6), 0) = 1)
+                   AND NOT (json_valid(metadata)
+                            AND COALESCE(json_extract(metadata, ?7), 0) = 1)
                  ORDER BY updated_at DESC LIMIT 1",
                 params![
                     task.agent_id,
@@ -194,7 +202,8 @@ impl Database {
                     RECURRING_ZOMBIE_GRACE_SQL,
                     RECURRING_CONFIG_CANCEL_REVERTED_PATH,
                     i64::from(lift_already_spent),
-                    RECURRING_UNKNOWN_TRIGGER_PATH
+                    RECURRING_UNKNOWN_TRIGGER_PATH,
+                    RECURRING_OPERATOR_REARM_PATH
                 ],
                 |r| {
                     Ok((
@@ -399,6 +408,74 @@ impl Database {
                      ?2, 1)
              WHERE id = ?1 AND trigger_type = 'recurring'",
             params![task_id, RECURRING_UNKNOWN_TRIGGER_PATH],
+        )?;
+        Ok(n)
+    }
+
+    /// mika#2446 — the most recent dead recurring row of `(agent_id, label)`,
+    /// the one `mika tasks rearm` resurrects. `None` when the label never had a
+    /// recurring row in a veto-arming state.
+    ///
+    /// No grace-window filter: a death older than the window no longer arms the
+    /// veto, but it still carries the `cron_expr` and `action_config` a rearm
+    /// re-registers — the operator must never retype a cron.
+    pub fn find_recurring_rearm_target(
+        &self,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<Option<RecurringRearmTarget>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, label, status, cron_expr, action_type, action_config, updated_at
+                 FROM tasks
+                 WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+                   AND trigger_type = 'recurring'
+                   AND status IN ('failed', 'cancelled', 'expired')
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![agent_id, label],
+                |r| {
+                    Ok(RecurringRearmTarget {
+                        task_id: r.get(0)?,
+                        label: r.get(1)?,
+                        status: r.get(2)?,
+                        cron_expr: r.get(3)?,
+                        action_type: r.get(4)?,
+                        action_config: r.get(5)?,
+                        updated_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// mika#2446 — stamp [`RECURRING_OPERATOR_REARM_PATH`] on every dead
+    /// recurring row of `(agent_id, label)`. Returns the number of rows marked.
+    ///
+    /// **Every** dead row, not only the latest: the guard picks the most recent
+    /// *unexempted* death inside the window, so absolving the latest alone would
+    /// surface the one before it and the rearm would be refused by its own
+    /// history. Rows dying *after* this call carry no marker and arm the veto
+    /// normally — mika#1742 stays armed for every other death.
+    ///
+    /// Mirrors [`Database::revert_config_cancel_recurring_task`]: the status is
+    /// not rewritten and `updated_at` is not touched, so the audit trail keeps
+    /// the real date of each death and the marker ages out with its row.
+    /// Writes the integer `1` — see [`Database::mark_recurring_unknown_trigger`]
+    /// for why a string would be invisible to the guard.
+    pub fn mark_recurring_operator_rearm(&self, agent_id: &str, label: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET metadata = json_set(
+                     CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                     ?3, 1)
+             WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+               AND trigger_type = 'recurring'
+               AND status IN ('failed', 'cancelled', 'expired')
+               AND NOT (json_valid(metadata)
+                        AND COALESCE(json_extract(metadata, ?3), 0) = 1)",
+            params![agent_id, label, RECURRING_OPERATOR_REARM_PATH],
         )?;
         Ok(n)
     }

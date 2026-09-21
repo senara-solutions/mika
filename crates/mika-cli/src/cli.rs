@@ -892,6 +892,17 @@ pub enum TaskCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Re-arm a dead recurring task without waiting out the 24 h zombie-veto
+    /// window and without editing the database (mika#2446).
+    ///
+    /// Refuses when the label has no dead row (a rearm never creates a
+    /// recurrence), when it is already armed, and when its trigger is not
+    /// routable by this binary. The act is recorded in `audit_events`
+    /// (`tool_name = 'recurring_operator_rearm'`).
+    Rearm {
+        /// Recurring task label (e.g. `worktree_reap`)
+        label: String,
+    },
     /// Force-promote the next pending deferred dispatch wrapper for a class.
     /// Fails if the per-class dispatch slot is occupied, unless --override is set.
     PromoteDeferred {

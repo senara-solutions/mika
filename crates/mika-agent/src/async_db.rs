@@ -6,10 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
-    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRegistryRow,
-    SearchResult, ServedContent, Session, SessionMessage, SessionWithStats, SkillOverride, Task,
-    TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters,
-    TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRearmTarget,
+    RecurringRegistryRow, SearchResult, ServedContent, Session, SessionMessage, SessionWithStats,
+    SkillOverride, Task, TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow,
+    TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
@@ -396,6 +396,28 @@ impl AsyncDatabase {
     pub async fn mark_recurring_unknown_trigger(&self, task_id: &str) -> Result<usize> {
         let t = task_id.to_owned();
         self.with_db(move |db| db.mark_recurring_unknown_trigger(&t))
+            .await
+    }
+
+    /// mika#2446 — the most recent dead recurring row of `label`, the one
+    /// `mika tasks rearm` resurrects. See
+    /// [`Database::find_recurring_rearm_target`].
+    pub async fn find_recurring_rearm_target(
+        &self,
+        label: &str,
+    ) -> Result<Option<RecurringRearmTarget>> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.find_recurring_rearm_target(&a, &l))
+            .await
+    }
+
+    /// mika#2446 — stamp the operator lift on every dead recurring row of
+    /// `label`. See [`Database::mark_recurring_operator_rearm`].
+    pub async fn mark_recurring_operator_rearm(&self, label: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.mark_recurring_operator_rearm(&a, &l))
             .await
     }
 
