@@ -42,7 +42,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `scripts/` — Utility scripts (sync-agent-docs.sh for crates.io publish prep)
 - `Makefile` — Development workflow targets: `make build`, `make deploy` (dashboard+build+install+restart), `make test`, `make lint`, `make fmt`, `make check`
 - `todos/` — Code review findings (tracked as markdown files)
-- `.claude/commands/` — Claude Code slash commands (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues)
+- `.claude/commands/` — Claude Code slash commands. **This repo tracks exactly four** (`/mika` — full dev workflow, `/mika-doc-audit` — standalone documentation audit, `/mika-issue` — create a single GitHub issue, `/mika-issues` — batch-create GitHub issues). The orchestration commands (`/mika-groom-ticket`, `/mika-groom-plan-only`, `/mika-groom-milestone`, `/mika-revise-plan`, …) live in `mika-platform` — removed from here deliberately by `b831cbd5` (2026-05-26) — and are seeded into each dispatch worktree by `_seed_worktree_slash_commands` (mika#1415), which also hides them from `git status`. **So a ticket opened on `senara-solutions/mika` cannot edit them, and their absence from `git ls-files .claude/commands/` while they sit on disk is the nominal state, never evidence of a deletion** (misread that way once — mika-qa on PR#1994 — then re-established from scratch twice more, by mika#2306 and mika#2001). The one command that settles it: `git log --oneline --all -- .claude/commands/`. Full reasoning: `docs/solutions/architecture-patterns/seed-scaffold-into-tracked-worktree-dir-via-git-exclude.md` § Effet de lecture.
 
 ## Versioning
 
