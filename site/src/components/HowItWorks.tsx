@@ -53,7 +53,7 @@ export function HowItWorks() {
           className="absolute top-8 left-[16.67%] right-[16.67%] hidden h-px md:block"
           style={{
             background:
-              "linear-gradient(90deg, transparent, rgba(124,106,247,0.25), transparent)",
+              "linear-gradient(90deg, transparent, color-mix(in srgb, var(--color-accent) 25%, transparent), transparent)",
           }}
         />
 

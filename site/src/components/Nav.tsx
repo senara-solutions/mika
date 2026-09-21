@@ -33,7 +33,7 @@ export function Nav() {
 
         <a
           href={GETTING_STARTED_URL}
-          className="rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-light hover:shadow-[0_0_24px_rgba(124,106,247,0.3)]"
+          className="rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-light hover:shadow-[0_0_24px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
         >
           Get Started
         </a>
