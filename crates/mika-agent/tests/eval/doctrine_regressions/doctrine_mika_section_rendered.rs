@@ -80,6 +80,7 @@ fn make_ctx<'a>(identity: &'a Identity, persona: PersonaProfile) -> PromptContex
         // Cloud, because that is what the measured tenant was.
         deployment: Deployment::Cloud,
         persona_profile: persona,
+        tenant_language: None,
     }
 }
 
@@ -294,6 +295,7 @@ fn test_ac1_silent_prompt_carries_the_doctrine_section() {
         runtime_model: "test-model",
         deployment: Deployment::Cloud,
         persona_profile: PersonaProfile::Family,
+        tenant_language: None,
     };
 
     let out = prompt::build_silent_prompt(&ctx);

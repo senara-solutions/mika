@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::io::Read;
 use uuid::Uuid;
 
 use crate::cli::OutputFormat;
@@ -265,17 +264,16 @@ pub async fn run(
             tracing::warn!(error = %e, "failed to create session");
         }
     }
-    // Read message from arg, or from stdin if "-"
-    let user_message = if message == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        message.to_string()
-    };
+    // mika#1982: `message` arrives already resolved — the argument, the "-"
+    // sentinel, or the piped input, decided once in `mika_cli::ask_message`.
+    // The read that used to live here is gone; keeping a second one would be
+    // the divergence that module exists to close.
+    let user_message = message.to_string();
 
+    // Kept as defence in depth: this function is `pub`, so it can be reached by
+    // a caller that did not go through the resolver.
     if user_message.is_empty() {
-        anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
+        anyhow::bail!("Empty message. Provide a message argument or pipe one in.");
     }
 
     // --task-complete path: validate and complete the callback task, then exit.
@@ -754,15 +752,11 @@ pub async fn run_team_ask(
     use mika_agent::teams::types::TeamEvent;
     use mika_common::config::Settings;
 
-    // Read message from stdin if "-"
-    let goal = if message == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        message.to_string()
-    };
+    // mika#1982: same as the local path above — the goal arrives resolved, and
+    // the second copy of the sentinel read that used to live here is gone.
+    let goal = message.to_string();
 
+    // Defence in depth: this function is `pub`.
     if goal.is_empty() {
         anyhow::bail!("Empty message. Provide a goal for the team.");
     }
