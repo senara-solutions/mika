@@ -173,6 +173,11 @@ mod eval {
     // et une mort par trigger inconnu ne gèle plus la récurrence 24 h.
     mod test_recurring_trigger_wiring_2337;
 
+    // mika#2456 — un agent désactivé ne tire aucune récurrente : le filet au tir
+    // refuse avant tout appel LLM, sans muter la row, et laisse intact le chemin
+    // non récurrent.
+    mod test_agent_disabled_recurring_gate_2456;
+
     // La porte de mika#2277 : le prédicat de kill est une conjonction sur les
     // trois surfaces du pilote. Contrôle positif + N1..N4, même suite.
     mod test_reaper_liveness_all_surfaces_2277;

@@ -17,7 +17,9 @@ pub use types::{action_type, task_status, trigger_type};
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 use chrono::Timelike;
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
 /// Prune completed/failed/cancelled/expired tasks older than 30 days at startup
@@ -28,6 +30,65 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
     if let Err(e) = db.prune_completed_tasks(THIRTY_DAYS_SECS).await {
         warn!("Failed to prune completed tasks: {}", e);
     }
+}
+
+/// Structured log event naming the resolved state of the agent-level activity
+/// gate and its provenance (mika#2456).
+///
+/// Answers *"is this agent disabled, and through which door?"* without reading
+/// the disk. Same shape and same reason as `llm_budget_resolved` (mika#2293) and
+/// `tenant_language_resolved` (mika#2247).
+pub const AGENT_GATE_RESOLVED_EVENT: &str = "agent_recurring_gate_resolved";
+
+/// Structured log event for a registration the gate refused (mika#2456).
+///
+/// **Expected regime: non-empty on the first startup after the knob is posted**
+/// (one line per recurrence cancelled), then a handful per startup. Without this
+/// line a gate that bites reads exactly like an inert one — the class mika#2205
+/// had to close.
+pub const REGISTRATION_REFUSED_EVENT: &str = "recurring_registration_refused_agent_disabled";
+
+/// When each `(agent, enabled, source)` triple was last announced by this
+/// process. A repetition is silent; a **change** is re-emitted.
+static GATE_RESOLVED_SEEN: OnceLock<Mutex<HashSet<(String, bool, &'static str)>>> = OnceLock::new();
+
+/// Whether this agent may register and fire recurring automatic turns, plus the
+/// provenance of that answer (mika#2456).
+///
+/// Sits next to [`heartbeat_enabled_for_agent`] because it is the same kind of
+/// question one level up: that one gates a single feature, this one gates the
+/// agent. The two **compose by conjunction** (§ 3.4) — `[heartbeat] enabled =
+/// false` remains in force and is neither removed nor deprecated.
+pub async fn agent_recurring_tasks_enabled(home_dir: &Path) -> (bool, crate::prompt::GateSource) {
+    crate::prompt::load_identity_async(home_dir)
+        .await
+        .recurring_tasks_enabled()
+}
+
+/// Emit [`AGENT_GATE_RESOLVED_EVENT`] once per resolved state per agent.
+///
+/// Deduplicated rather than per-call: this runs nine times per startup per
+/// agent, and nine identical lines would be the churn mika#2131 bounds. A
+/// **change** of resolved state is re-emitted, which is what makes "the operator
+/// posted the knob" readable on one line.
+fn announce_gate_state(agent_id: &str, enabled: bool, source: crate::prompt::GateSource) {
+    let key = (agent_id.to_string(), enabled, source.as_str());
+    {
+        let mut seen = GATE_RESOLVED_SEEN
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !seen.insert(key) {
+            return;
+        }
+    }
+    info!(
+        event = AGENT_GATE_RESOLVED_EVENT,
+        agent_id,
+        enabled,
+        source = source.as_str(),
+        "agent-level recurring-task gate resolved"
+    );
 }
 
 /// Register a recurring task in the DB if one with the same label doesn't already exist.
@@ -43,12 +104,65 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
 /// reverts it before re-registering. Terminal failures (`failed` / `expired`)
 /// keep blocking through the mika#1742 refuse-to-zombie guard — only the
 /// deliberate `cancelled` state is cleared here.
+///
+/// # The agent-level gate lives HERE, not at the callers (mika#2456)
+///
+/// The reflex is to wrap the nine registration sites in an `if agent_enabled`.
+/// Two measurements refuse it.
+///
+/// **(a) This function resurrects what such a guard would have cancelled.** The
+/// `revert_config_cancel_recurring_task` call below exists to lift the mika#1742
+/// veto on a row a knob cancelled (mika#2271). So a single unguarded caller —
+/// the CLI site in `chat.rs`, or any future one — **reopens** the row the boot
+/// just cancelled. A guard spread over N sites, one of which lifts the others'
+/// veto, is not a guard; it is a race.
+///
+/// **(b) Nine sites, and nothing reddens on the tenth.** A site added without
+/// the guard makes no decision wrong: it makes the gate inert, with every test
+/// green. That is the exact shape mika#2205 had to close.
+///
+/// So `home_dir` is a **parameter, never derived**: the nine callers already
+/// hold one (`agent_state.home_dir`, `ctx.home_dir`), and a caller that forgets
+/// it does not compile. The compiler, not a reviewer, is what forces a future
+/// site to take the decision — the `dispatch_substrate_diagnostic` motif, and
+/// `mika2334_every_scan_variant_is_covered`'s.
+///
+/// When the agent is disabled this function does **not** call the revert, does
+/// **not** create the row, and **cancels** any existing one — which is what
+/// makes the ticket's negative test (*"aucune tâche récurrente
+/// `recurring_active`"*) true.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
+    home_dir: &Path,
     label: &str,
     cron_expr: &str,
     action_config: &str,
 ) {
+    let (enabled, source) = agent_recurring_tasks_enabled(home_dir).await;
+    announce_gate_state(&db.agent_id, enabled, source);
+    if !enabled {
+        // Deliberately BEFORE `revert_config_cancel_recurring_task`: lifting the
+        // veto and then cancelling again would leave the row's history saying
+        // the opposite of what happened, and would make a concurrent caller's
+        // registration land in the window between the two writes.
+        let cancelled_rows = match db.cancel_recurring_task_by_label(label).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(label, error = %e, "failed to cancel recurring task for disabled agent");
+                0
+            }
+        };
+        info!(
+            event = REGISTRATION_REFUSED_EVENT,
+            agent_id = %db.agent_id,
+            label,
+            cancelled_rows,
+            "agent is disabled (identity.toml `enabled = false`) — recurring task \
+             not registered"
+        );
+        return;
+    }
+
     // mika#2271: knob-off cancelled this label; the caller now says it must run.
     // Clear the config-cancel veto so the mika#1742 guard doesn't refuse the
     // re-registration below.
@@ -185,6 +299,30 @@ mod tests {
         AsyncDatabase::new(Database::open_in_memory().unwrap())
     }
 
+    /// An agent home whose `identity.toml` carries exactly `body`.
+    ///
+    /// The `TempDir` is returned so the caller keeps it alive: dropping it
+    /// deletes the directory, and an absent `identity.toml` resolves through
+    /// `fail_closed_identity()` — whose `enabled` is `None`, hence `true`. A
+    /// test that let the dir drop would therefore silently measure the enabled
+    /// path while believing it measured the disabled one.
+    fn agent_home(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("identity.toml"), body).unwrap();
+        dir
+    }
+
+    /// An identity that says nothing about `enabled` (the shape every deployed
+    /// agent carries today).
+    fn enabled_home() -> tempfile::TempDir {
+        agent_home("name = \"Mika\"\nemoji = \"✦\"\n")
+    }
+
+    /// An identity carrying the knob this ticket creates.
+    fn disabled_home() -> tempfile::TempDir {
+        agent_home("name = \"Mika\"\nemoji = \"✦\"\nenabled = false\n")
+    }
+
     async fn statuses_for(db: &AsyncDatabase, label: &str) -> Vec<String> {
         db.get_tasks_by_status(vec![
             "recurring_active".to_string(),
@@ -215,9 +353,10 @@ mod tests {
     #[tokio::test]
     async fn knob_off_then_on_reregisters_the_feeder() {
         let db = test_async_db();
+        let home = enabled_home();
 
         // Boot 1 — knob absent : le feeder s'inscrit.
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
         assert_eq!(
             statuses_for(&db, FEEDER_LABEL).await,
             vec!["recurring_active".to_string()],
@@ -235,7 +374,7 @@ mod tests {
         );
 
         // Boot 3 — knob retiré : le feeder doit revenir.
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let statuses = statuses_for(&db, FEEDER_LABEL).await;
         assert!(
@@ -251,7 +390,8 @@ mod tests {
     #[tokio::test]
     async fn recent_failed_still_blocks_reregistration() {
         let db = test_async_db();
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        let home = enabled_home();
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let label = FEEDER_LABEL.to_string();
         db.with_db(move |d| {
@@ -266,7 +406,7 @@ mod tests {
         .await
         .unwrap();
 
-        ensure_recurring_task(&db, FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
+        ensure_recurring_task(&db, home.path(), FEEDER_LABEL, FEEDER_CRON, FEEDER_CONFIG).await;
 
         let statuses = statuses_for(&db, FEEDER_LABEL).await;
         assert_eq!(
@@ -274,6 +414,144 @@ mod tests {
             vec!["failed".to_string()],
             "un échec terminal récent doit toujours bloquer la ré-inscription \
              (mika#1742) — statuts observés : {statuses:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2456 — la porte `enabled` niveau agent
+    // ---------------------------------------------------------------------
+
+    /// **V1 — le test négatif littéral du ticket.** `enabled = false` :
+    /// `ensure_recurring_task` ne crée rien, et la row préexistante devient
+    /// `cancelled`.
+    #[tokio::test]
+    async fn mika2456_v1_disabled_agent_registers_nothing_and_cancels_the_existing_row() {
+        let db = test_async_db();
+
+        // Une row née avant que la clé soit posée.
+        let enabled = enabled_home();
+        ensure_recurring_task(&db, enabled.path(), "heartbeat", "0 0 * * * *", "{}").await;
+        assert_eq!(
+            statuses_for(&db, "heartbeat").await,
+            vec!["recurring_active".to_string()]
+        );
+
+        // L'opérateur pose `enabled = false`, puis on redémarre.
+        let disabled = disabled_home();
+        ensure_recurring_task(&db, disabled.path(), "heartbeat", "0 0 * * * *", "{}").await;
+
+        assert_eq!(
+            statuses_for(&db, "heartbeat").await,
+            vec!["cancelled".to_string()],
+            "un agent désactivé ne doit porter AUCUNE récurrente active"
+        );
+    }
+
+    /// **V2 — contrôle négatif, porteur.** `enabled = true` et clé **absente**
+    /// créent la row normalement.
+    ///
+    /// Sans lui, V1 ne distingue pas « la garde mord » de « la fonction est
+    /// cassée ».
+    #[tokio::test]
+    async fn mika2456_v2_enabled_and_absent_both_register_normally() {
+        for (body, what) in [
+            ("name = \"Mika\"\n", "clé absente"),
+            ("name = \"Mika\"\nenabled = true\n", "enabled = true"),
+        ] {
+            let db = test_async_db();
+            let home = agent_home(body);
+            ensure_recurring_task(&db, home.path(), "heartbeat", "0 0 * * * *", "{}").await;
+            assert_eq!(
+                statuses_for(&db, "heartbeat").await,
+                vec!["recurring_active".to_string()],
+                "{what} : la récurrente doit être inscrite"
+            );
+        }
+    }
+
+    /// **V3 — anti-résurrection, et le cœur du § 2.1(a).**
+    ///
+    /// Un second appel sur un agent désactivé laisse la row `cancelled` :
+    /// `revert_config_cancel_recurring_task` n'a PAS été appelé. C'est le
+    /// défaut mika#2271 retourné — la fonction qui ressuscite est celle-là même
+    /// qu'on garde, ce qui est la raison pour laquelle la garde y vit plutôt
+    /// que chez ses neuf appelants.
+    #[tokio::test]
+    async fn mika2456_v3_a_disabled_agent_never_resurrects_a_cancelled_row() {
+        let db = test_async_db();
+        let disabled = disabled_home();
+
+        ensure_recurring_task(&db, disabled.path(), "heartbeat", "0 0 * * * *", "{}").await;
+        ensure_recurring_task(&db, disabled.path(), "heartbeat", "0 0 * * * *", "{}").await;
+
+        let statuses = statuses_for(&db, "heartbeat").await;
+        assert!(
+            statuses.iter().all(|s| s == "cancelled") && !statuses.is_empty()
+                || statuses.is_empty(),
+            "un agent désactivé ne doit jamais ressusciter une row annulée — \
+             statuts observés : {statuses:?}"
+        );
+        assert!(
+            !statuses.iter().any(|s| s == "recurring_active"),
+            "aucune row ne doit être `recurring_active` — {statuses:?}"
+        );
+    }
+
+    /// **V6 — conjonction (§ 3.4).** `enabled = true` + `[heartbeat] enabled =
+    /// false` : le heartbeat reste refusé par son knob par-feature, que ce
+    /// ticket ne retire ni ne déprécie.
+    #[tokio::test]
+    async fn mika2456_v6_the_per_feature_knob_still_holds_under_an_enabled_agent() {
+        let home = agent_home("name = \"Mika\"\nenabled = true\n\n[heartbeat]\nenabled = false\n");
+        assert!(
+            !heartbeat_enabled_for_agent(home.path()).await,
+            "`[heartbeat] enabled = false` doit rester en vigueur"
+        );
+        let (agent_enabled, source) = agent_recurring_tasks_enabled(home.path()).await;
+        assert!(agent_enabled, "l'agent lui-même est actif");
+        assert_eq!(source, crate::prompt::GateSource::Identity);
+    }
+
+    /// **V7 — fail-closed (§ 3.3).** `identity.toml` absent ⇒ `enabled` résolu
+    /// à `true`, et les récurrentes sont enregistrées.
+    ///
+    /// Élargir la sévérité du fail-closed dans un correctif de coût ferait
+    /// qu'une erreur I/O transitoire couperait les messages proactifs d'un
+    /// tenant famille. Question nommée, renvoyée à son ticket.
+    #[tokio::test]
+    async fn mika2456_v7_a_fail_closed_identity_keeps_the_agent_enabled() {
+        let db = test_async_db();
+        let empty = tempfile::tempdir().unwrap(); // pas d'identity.toml
+
+        let (enabled, source) = agent_recurring_tasks_enabled(empty.path()).await;
+        assert!(enabled, "le chemin fail-closed garde `enabled = true`");
+        assert_eq!(
+            source,
+            crate::prompt::GateSource::Default,
+            "aucun fichier n'a été lu : la provenance honnête est `default`"
+        );
+
+        ensure_recurring_task(&db, empty.path(), "heartbeat", "0 0 * * * *", "{}").await;
+        assert_eq!(
+            statuses_for(&db, "heartbeat").await,
+            vec!["recurring_active".to_string()]
+        );
+    }
+
+    /// La provenance sépare les deux remèdes de la sonde (AC6) : `identity`
+    /// ⇒ la clé est en vigueur ; `default` ⇒ elle n'a pas atterri.
+    #[tokio::test]
+    async fn mika2456_provenance_distinguishes_a_posed_key_from_an_absent_one() {
+        let posed = agent_home("name = \"Mika\"\nenabled = false\n");
+        assert_eq!(
+            agent_recurring_tasks_enabled(posed.path()).await,
+            (false, crate::prompt::GateSource::Identity)
+        );
+
+        let absent = agent_home("name = \"Mika\"\n");
+        assert_eq!(
+            agent_recurring_tasks_enabled(absent.path()).await,
+            (true, crate::prompt::GateSource::Default)
         );
     }
 }

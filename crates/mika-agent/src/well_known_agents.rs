@@ -3540,6 +3540,31 @@ mod tests {
         );
     }
 
+    /// **V8 (mika#2456) — `enabled` n'est PAS code-owned (R-7).**
+    ///
+    /// La clé racine `enabled` est une décision **d'opérateur**. L'ajouter à
+    /// `CODE_OWNED_IDENTITY_SECTIONS` ferait ré-écrire le knob par
+    /// `reconcile_well_known_identity` au démarrage suivant — le pire mode de
+    /// panne pour un interrupteur, et précisément l'argument que mika#2329 a dû
+    /// écrire pour rejeter un toggle `identity.toml` sur son STOP à chaud. Ici
+    /// le risque est **levé** par l'absence de réconciliation, pas contourné :
+    /// ce test est ce qui garde l'absence.
+    ///
+    /// Le préfixe est testé autant que l'égalité : un futur `enabled.something`
+    /// serait un enfant de la même clé et la rendrait code-owned par la bande.
+    #[test]
+    fn mika2456_v8_the_agent_enabled_knob_is_not_code_owned() {
+        for path in CODE_OWNED_IDENTITY_SECTIONS {
+            assert!(
+                *path != "enabled" && !path.starts_with("enabled."),
+                "`enabled` (mika#2456) doit rester operator-owned : le rendre \
+                 code-owned le ferait ré-écrire au démarrage suivant, donc un \
+                 agent désactivé se réactiverait tout seul. Entrée fautive : \
+                 {path}"
+            );
+        }
+    }
+
     #[test]
     fn test_code_owned_sections_have_reconciler_coverage() {
         // For every dotted path in CODE_OWNED_IDENTITY_SECTIONS, at least one

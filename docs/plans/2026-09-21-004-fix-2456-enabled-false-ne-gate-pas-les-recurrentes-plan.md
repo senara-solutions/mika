@@ -54,6 +54,33 @@ Le coût mesuré est réel : un tour heartbeat de mika-test de **59 s** finissan
 `reasoning budget exhausted`, zéro texte visible, ~5,18 $/22 h sur le tenant
 cloud.
 
+### R4 — Ce que R1 et R2 exigent du corps du ticket, et qui n'est pas au pilote
+
+R1 et R2 réfutent trois affirmations écrites : le corps pose que « la porte
+`enabled` ne couvre que le chemin interactif », le commentaire 2 que ce knob est
+« lu par le chemin **interactif** uniquement », et le corps que l'`identity.toml`
+de mika-test porte `enabled = false` racine. La convention maison (mika#2169,
+mika#2158 ; précédent d'application mika#2170 rev 2) veut que lorsque la lecture
+du code déplace le diagnostic, **le corps soit rectifié par un encadré daté** et
+la rectification annoncée par un commentaire d'avis d'édition — la mesure
+d'origine étant conservée telle quelle, jamais réécrite.
+
+Le geste appartient à la **Phase 4 du grooming**, pas au pilote : il édite le
+corps de mika#2456 et poste un commentaire, deux écritures GitHub qui sont hors
+du contrat content-only d'un pilote d'implémentation. Il est inscrit au DoD et
+porté par **AC8** pour qu'il ne se perde pas entre les deux.
+
+Contenu exigé de l'encadré :
+
+1. **La porte `enabled` niveau agent n'existe pas** — ni sur le chemin
+   interactif, ni ailleurs. `prompt.rs::Identity` n'a pas de champ racine
+   `enabled` (R1) ; il n'y a rien à *étendre*, il y a une clé à *créer*.
+2. **`MIKA_TEST_IDENTITY` porte `[kg] enabled = false` et `[skills]
+   nudge_enabled = false`** — deux sous-clés de sections sans rapport avec
+   l'activité de l'agent, et aucune clé racine (R2).
+3. Ce qui **reste entier** du ticket : le symptôme, le tableau des récurrentes du
+   commentaire 2, et le coût mesuré (R3).
+
 ---
 
 ## 2. La décision centrale : deux moitiés, et la seconde n'est pas une redondance
@@ -115,6 +142,42 @@ avant le déploiement, row ressuscitée par un chemin non encore inventorié, ou
 `enabled` basculé à `false` pendant que le moteur tourne (la garde 2.2 ne
 s'exécute qu'au boot et au provisionnement). Le filet borne la fuite de coût
 **sans attendre un redémarrage**, ce que la garde seule ne fait pas.
+
+### 2.4 Le filet refuse sans muter, et la row reste `recurring_active`
+
+Le refus **ne touche pas la row** : elle reste `recurring_active`, son
+`next_fire_at` est recalculé par le chemin nominal, et la cadence suivante est
+re-refusée à l'identique. Ce comportement de re-tentative est une décision, pas
+un oubli, et il porte trois conséquences qu'il faut écrire ensemble.
+
+**(a) Pourquoi ne pas annuler la row au tir.** Le réflexe est de faire annuler
+par le filet ce que la garde 2.2 aurait annulé. Refusé pour deux raisons. La
+première est que le filet **effacerait sa propre preuve** : sa raison d'être est
+de nommer une row admise sans passer par la garde (§ 5), donc de rendre
+comptable une population ; une annulation au tir supprimerait la row, le chemin
+d'enregistrement fautif en recréerait une au tour suivant, et on compterait des
+événements sans jamais pouvoir dire combien de rows sont concernées. Précédent
+exact : `phantom_sweep_spared` (mika#2156), où une row épargnée est
+re-sélectionnée et re-épargnée à chaque passe, et où « `count: 0` avec
+`spared_count > 0` est la forme saine, pas une anomalie ». La seconde est que
+`dispatch_run_skill` deviendrait une **seconde autorité** sur le cycle de vie des
+récurrentes, à côté de `ensure_recurring_task` — exactement la dispersion que
+le § 2.2 vient de refermer.
+
+**(b) La fuite de coût est bornée quand même, et « borné » est littéral.** Le
+refus est posé **avant tout appel LLM et avant toute prise de `agent_lock`**
+(R-4). Ce qui est re-joué à chaque cadence coûte une comparaison et, au plus, une
+ligne de journal — zéro dollar, zéro seconde d'agent. C'est bien la fuite
+mesurée (~5,18 $/22 h) qui s'arrête sans attendre un redémarrage ; ce qui
+continue est une décision, pas une dépense.
+
+**(c) D'où la déduplication, qui est ce qui rend « zéro ligne » lisible.** Sans
+elle, une row heartbeat horaire écrirait 24 WARN par jour et la ligne SQL une
+row par tir : un état stable se lirait comme un trafic. Le WARN et la ligne
+d'audit sont donc **dédupliqués sur la même fenêtre de 24 h par `(agent_id,
+label)`** — site et mécanisme en § 5. « Régime attendu : zéro ligne » se lit
+alors sur la bonne granularité : zéro **population**, une ligne par row fautive
+et par jour, pas une par cadence.
 
 **Régime attendu du filet : zéro ligne.** Toute occurrence nomme une row admise
 sans passer par la garde, donc un chemin d'enregistrement à établir — c'est un
@@ -229,13 +292,31 @@ Le chemin interactif reste ouvert : mika-test est un **banc d'essai**, et un
   "recurring"` d'un agent désactivé, avant tout appel LLM et avant toute prise
   de `agent_lock`.
 - **R-5** — Le chemin interactif, les reminders, les callbacks et les tours
-  `run_skill` non récurrents sont **inchangés**.
+  `run_skill` non récurrents sont **inchangés** — aucune lecture d'identité,
+  aucune écriture d'audit, aucune branche ajoutée sur leur trajet. La portée de
+  R-5 est le **chemin nominal** : la branche de refus du filet (§ 2.3), qui par
+  construction ne s'atteint que sur `trigger_type == "recurring"` d'un agent
+  désactivé, écrit son WARN et sa ligne d'audit (R-8). Un tour qui s'exécute
+  n'écrit rien de nouveau ; c'est ce que V5 mesure.
 - **R-6** — Aucun agent ne reçoit `enabled = false` dans ce travail. Le ticket
   le dit : *« Décision runtime = opérateur. »*
 - **R-7** — `enabled` n'entre pas dans `CODE_OWNED_IDENTITY_SECTIONS`.
-- **R-8** — Observabilité, § 5.
-- **R-9** — Documentation : `docs/configuration.md` § identity.toml + l'entrée
+- **R-8** — Observabilité, § 5. En particulier, la ligne `audit_events` a **un
+  seul émetteur nommé** : `task_engine/dispatcher.rs::dispatch_run_skill`, sur
+  sa branche de refus et nulle part ailleurs. `tool_name = 'agent_recurring_gate'`,
+  `target_key = '<agent_id>@<label>'`. Le refus à l'enregistrement (§ 2.2)
+  **n'écrit pas** de ligne d'audit — il est borné par la cadence des démarrages
+  et son INFO suffit.
+- **R-9** — Le WARN `recurring_fire_refused_agent_disabled` et la ligne d'audit
+  R-8 partagent **un seul prédicat de déduplication**, par `(agent_id, label)`
+  sur 24 h glissantes. Deux fenêtres distinctes rendraient les deux surfaces non
+  comparables entre elles, ce qui est précisément ce qu'on demande à un opérateur
+  de faire au § 5.
+- **R-10** — Documentation : `docs/configuration.md` § identity.toml + l'entrée
   correspondante du CLAUDE.md racine.
+- **R-11** — Grooming Phase 4 (§ R4) : corps de mika#2456 rectifié par encadré
+  daté + commentaire d'avis d'édition. **Geste de grooming, hors du contrat du
+  pilote.**
 
 ---
 
@@ -259,17 +340,51 @@ Trois événements dans `$MIKA_SPIRIT_LOG_FILE`, plus une ligne d'audit.
   une garde qui mord se lit exactement comme une garde inerte (mika#2205).
 
 - **`recurring_fire_refused_agent_disabled`** (WARN — `agent_id`, `task_id`,
-  `label`) — le filet 2.3 a tiré. **Régime attendu : zéro ligne** hors de la
-  première fenêtre post-déploiement (où les rows nées avant la garde sont encore
-  actives). Toute occurrence durable nomme un chemin d'enregistrement qui échappe
-  à `ensure_recurring_task` : **établir ce chemin, ne pas élargir le filet.**
+  `label`) — le filet 2.3 a tiré. Émis par
+  `task_engine/dispatcher.rs::dispatch_run_skill`, sur sa branche de refus,
+  **dédupliqué par `(agent_id, label)` sur 24 h** (§ 5.1). Sans cette
+  déduplication une seule row horaire écrirait 24 lignes/jour et noierait le
+  signal que l'événement existe pour lever (§ 2.4(c)). **Régime attendu : zéro
+  ligne** hors de la première fenêtre post-déploiement (où les rows nées avant la
+  garde sont encore actives). Toute occurrence durable nomme un chemin
+  d'enregistrement qui échappe à `ensure_recurring_task` : **établir ce chemin,
+  ne pas élargir le filet.**
 
 - **SQL** — `SELECT target_key, count(*) FROM audit_events WHERE tool_name =
-  'agent_recurring_gate' GROUP BY 1;`. Une ligne par refus **au tir** uniquement
-  (le refus à l'enregistrement est borné par la cadence des démarrages ; le tir
-  ne l'est pas). Dédupliquée sur 24 h par `(agent, label)` — doctrine mika#2131 :
-  l'information durable est « cet agent est gaté », pas « il l'était encore à
-  14 h 32 ».
+  'agent_recurring_gate' GROUP BY 1;`, où `target_key = '<agent_id>@<label>'`.
+  **Émetteur unique : `dispatch_run_skill`, au refus du filet** (R-8) — donc une
+  ligne par refus **au tir** et jamais par refus à l'enregistrement, ce dernier
+  étant borné par la cadence des démarrages quand le tir ne l'est pas. Cette
+  unicité d'écrivain est ce qui rend la requête lisible : son résultat est
+  exactement la population des rows qui échappent à la garde, et non un mélange
+  de deux mécanismes. Elle est tenue par V10.
+
+  Le séparateur `@` est choisi comme dans `issue:2360@blocked` (mika#2361) :
+  il rend un `LIKE 'mika-test@%'` sûr là où une concaténation nue ferait matcher
+  un préfixe d'agent sur un autre — le piège `#234` / `#2343` de mika#2347.
+
+### 5.1 Le site de déduplication, et pourquoi il est dit
+
+Un `OnceLock<Mutex<HashMap<(String, String), Instant>>>` privé de
+`task_engine/dispatcher.rs`, consulté par un `recurring_gate_audit_is_due(key,
+now)` et marqué par un `mark_recurring_gate_audited(key, now)` — décalque
+littéral de `EXCLUSION_AUDIT_SEEN` / `exclusion_audit_is_due` /
+`mark_exclusion_audited` (`auto_pull.rs`, mika#2131), avec ses quatre propriétés
+reprises telles quelles :
+
+1. **Consulter n'est pas marquer.** La marque n'est posée qu'**après** une
+   écriture réussie : un échec transitoire de `log_audit_event` coûte un réessai
+   à la cadence suivante, jamais la ligne de cette row pour la vie du process.
+2. **Le WARN et l'audit partagent le prédicat** (R-9), donc les deux surfaces se
+   soustraient.
+3. **Fail-open sur mutex empoisonné** (`into_inner`) : le seul état détenu est
+   « déjà écrit », et réécrire une ligne d'audit vaut mieux qu'en perdre une.
+4. **L'état est en mémoire et perdu au redémarrage, à dessein** : un process neuf
+   re-photographie l'état qu'il trouve. Même contrat que `auto_pull_stop_armed`
+   (mika#2329) et que le jeu mika#2131 lui-même.
+
+Un cap sur la taille de la map, repris du même précédent, borne la croissance
+pathologique (WARN + purge).
 
 ---
 
@@ -288,10 +403,17 @@ Trois événements dans `$MIKA_SPIRIT_LOG_FILE`, plus une ligne d'audit.
 4. **`crates/mika-cli/src/commands/chat.rs`** — deux sites : `&ctx.home_dir`.
 5. **`crates/mika-agent/src/task_engine/dispatcher.rs`** — filet en tête de
    `dispatch_run_skill`, conditionné à `task.trigger_type == "recurring"`, avant
-   le `match trigger_name` et avant toute acquisition de `agent_lock`.
+   le `match trigger_name` et avant toute acquisition de `agent_lock`. Le filet
+   lit `self.home_dir` (per-agent, déjà porté par `TaskDispatcher`) — aucun
+   paramètre ajouté, aucune relecture d'environnement. Il **ne mute pas la row**
+   (§ 2.4) et sort en `Ok(())`. Dans le même fichier : les deux fonctions de
+   déduplication et leur `static` privé (§ 5.1), le WARN et l'écriture
+   `log_audit_event`, dans cet ordre — la marque après l'écriture.
 6. **Documentation** — `docs/configuration.md` § identity.toml (tableau des
    champs + les trois états + la conjonction § 3.4 + la portée § 3.5) ;
    `CLAUDE.md` racine, entrée voisine de `MIKA_AGENT_TIER`.
+7. **Grooming Phase 4 (R-11)** — hors du périmètre du pilote : encadré daté sur
+   le corps de mika#2456 + commentaire d'avis d'édition (§ R4).
 
 ---
 
@@ -310,6 +432,18 @@ Trois événements dans `$MIKA_SPIRIT_LOG_FILE`, plus une ligne d'audit.
   mika#2271 retourné, et le cœur de § 2.1(a).*
 - **V4** — Filet : row `recurring_active` d'un agent désactivé, tâche due →
   `dispatch_run_skill` refuse, aucun appel LLM, `agent_lock` non pris.
+- **V4b** — **État résiduel, et c'est la moitié qui manque à V4 seul** : après ce
+  refus, la row est relue et **reste `recurring_active`** — ni `cancelled`, ni
+  `failed`, aucun champ muté hors du `next_fire_at` que le chemin nominal
+  recalcule. Une seconde échéance est ensuite jouée et **re-refusée à
+  l'identique**. Sans cette assertion, § 2.4 serait une intention non tenue et
+  rien ne distinguerait « le filet refuse » de « le filet annule en silence » —
+  deux comportements dont seul le premier rend la population comptable.
+- **V4c** — Déduplication (R-9, § 5.1) : deux refus consécutifs sur la même
+  `(agent_id, label)` à moins de 24 h d'intervalle produisent **une seule** ligne
+  `audit_events` ; un troisième au-delà de la fenêtre en produit une seconde. Le
+  contrôle négatif est porteur : sans lui, le test ne distingue pas « dédupliqué »
+  de « écrit une seule fois puis jamais plus ».
 - **V5** — Non-régression : un `run_skill` **non** récurrent d'un agent désactivé
   s'exécute (R-5).
 - **V6** — Conjonction : `enabled = true` + `[heartbeat] enabled = false` → le
@@ -317,10 +451,23 @@ Trois événements dans `$MIKA_SPIRIT_LOG_FILE`, plus une ligne d'audit.
 - **V7** — Fail-closed : `identity.toml` absent → `enabled` résolu à `true`,
   les récurrentes sont enregistrées (§ 3.3).
 
-### Test structurel
+### Tests structurels
 
 - **V8** — `CODE_OWNED_IDENTITY_SECTIONS` ne contient pas `enabled` (R-7). Un
   ajout futur ferait ré-écrire le knob de l'opérateur au démarrage suivant.
+- **V9** — Non-régression R-5 sur l'audit : un tour `run_skill` **non** récurrent
+  d'un agent désactivé n'écrit **aucune** ligne `agent_recurring_gate`. C'est la
+  moitié mesurable de la clause R-5 étendue ; V5 atteste que le tour s'exécute,
+  V9 qu'il n'écrit rien au passage.
+- **V10** — **SOLE WRITER** : un scan de source atteste que la chaîne
+  `agent_recurring_gate` n'apparaît comme `tool_name` d'un `log_audit_event`
+  qu'à un seul site, dans `dispatch_run_skill`. Allowlist **livrée vide** ;
+  quand le scan tire, on retire le second site, on ne l'allowliste pas. Sans ce
+  test, un deuxième émetteur — typiquement la garde 2.2 à qui l'on voudrait « la
+  même ligne » — mélangerait deux populations dans la requête du § 5 sans rendre
+  aucune décision fausse, donc sans rien faire rougir. Motif : les paires
+  `phantom_aged_out` / `phantom_sweep_spared` (mika#2156) et
+  `qa_deadline_verdict` / `qa_callback_verdict` (mika#2368).
 
 L'exhaustivité des appelants **n'a pas de test** : elle est portée par le
 compilateur (§ 2.2), ce qui est plus fort qu'un scan de source.
@@ -392,12 +539,19 @@ clé posée), `agent_recurring_gate_resolved` rend `{enabled: true, source:
 - [ ] `Identity.enabled` livré avec son défaut `true` et son doc-comment.
 - [ ] `ensure_recurring_task` garde + annule + ne ressuscite pas ; signature
       étendue ; neuf appelants migrés.
-- [ ] Filet `dispatch_run_skill` sur `trigger_type == "recurring"`.
-- [ ] Les trois événements et la ligne d'audit du § 5.
-- [ ] V1 à V8 verts ; `cargo test`, `cargo clippy`, `cargo fmt` propres.
+- [ ] Filet `dispatch_run_skill` sur `trigger_type == "recurring"`, **sans
+      mutation de la row** (§ 2.4).
+- [ ] Les trois événements et la ligne d'audit du § 5, avec leur émetteur unique
+      et leur déduplication partagée (R-8, R-9, § 5.1).
+- [ ] V1 à V10 verts ; `cargo test`, `cargo clippy`, `cargo fmt` propres.
 - [ ] `docs/configuration.md` et `CLAUDE.md` racine à jour ; `docs-sync` vert.
 - [ ] Aucun `identity.toml` d'agent modifié ; `CODE_OWNED_IDENTITY_SECTIONS`
       inchangée.
+- [ ] **Grooming Phase 4 (R-11, § R4)** — corps de mika#2456 rectifié par
+      encadré daté (la porte `enabled` n'existe pas ; mika-test porte `[kg]
+      enabled` et `[skills] nudge_enabled`, pas de clé racine) + commentaire
+      d'avis d'édition. **Geste de grooming, pas du pilote** ; la mesure
+      d'origine est conservée telle quelle.
 
 ---
 
@@ -423,3 +577,50 @@ section `## Acceptance criteria`).
   disque, avec sa provenance (`identity` / `default`).
 - **AC7** — Aucun agent existant ne change de comportement au déploiement :
   aucune identité n'est modifiée et l'absence de la clé vaut `true`.
+- **AC8** — Le corps de mika#2456 porte un encadré daté rectifiant les trois
+  affirmations réfutées par R1 et R2, et un commentaire d'avis d'édition annonce
+  la rectification. La mesure d'origine (symptôme, tableau, coût) est conservée
+  telle quelle. **Geste de grooming Phase 4, hors du contrat du pilote** (R-11).
+- **AC9** — Après un refus du filet, la row concernée reste `recurring_active` et
+  la cadence suivante est re-refusée : le filet borne la dépense sans prendre
+  autorité sur le cycle de vie des récurrentes (§ 2.4, V4b).
+- **AC10** — La requête `tool_name = 'agent_recurring_gate'` du § 5 rend la
+  population des rows qui échappent à la garde, et rien d'autre : un émetteur
+  unique nommé (R-8, V10) et une déduplication par `(agent, label)` sur 24 h
+  partagée avec le WARN (R-9, V4c).
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-21)** — adressé les trois findings de la première passe
+  architecte :
+  - **F1 (BLOCKING)** — ajouté le § 1/R4 *« Ce que R1 et R2 exigent du corps du
+    ticket, et qui n'est pas au pilote »* : contenu exigé de l'encadré daté, et
+    la raison pour laquelle le geste relève de la Phase 4 du grooming et non du
+    pilote. Inscrit au DoD (dernier item), aux Requirements (**R-11**) et aux AC
+    (**AC8**), en reprenant le précédent d'application mika#2170 rev 2 (U8) et
+    la convention mika#2169 / mika#2158, citations préservées.
+  - **F2 (sharpening)** — ajouté le § 2.4 *« Le filet refuse sans muter, et la
+    row reste `recurring_active` »*, qui tranche explicitement le comportement de
+    re-tentative, refuse l'annulation au tir avec sa raison (le filet effacerait
+    sa propre preuve — précédent `phantom_sweep_spared`, mika#2156 — et
+    deviendrait une seconde autorité sur le cycle de vie), et montre que « borner
+    la fuite de coût sans attendre un redémarrage » (§ 2.3) reste littéralement
+    vrai puisque le refus précède tout appel LLM. Ajouté **V4b** (état résiduel +
+    seconde échéance re-refusée) et **AC9**. La tension relevée entre ce
+    comportement et le « régime attendu : zéro ligne » du § 5 est levée par la
+    déduplication, désormais spécifiée — § 2.4(c) dit sur quelle granularité le
+    « zéro » se lit.
+  - **F3 (BLOCKING)** — nommé l'émetteur, le moment et la déduplication de la
+    ligne d'audit : **R-8** (site `dispatcher.rs::dispatch_run_skill`, sur la
+    branche de refus uniquement, `target_key = '<agent_id>@<label>'`, et le refus
+    à l'enregistrement n'écrit pas), **R-9** (prédicat de déduplication unique
+    partagé par le WARN et l'audit), et le nouveau **§ 5.1** qui donne le site
+    (`OnceLock<Mutex<HashMap<…, Instant>>>` privé du module) en décalquant
+    `EXCLUSION_AUDIT_SEEN` de mika#2131 avec ses quatre propriétés. La
+    contradiction avec **R-5** est levée en bornant explicitement sa portée au
+    *chemin nominal* — un tour qui s'exécute n'écrit rien de nouveau — et cette
+    moitié est rendue mesurable par **V9**. Ajouté **V10** (SOLE WRITER,
+    allowlist vide) et **AC10**.
+  - Aucune AC n'a été affaiblie ; trois ont été ajoutées.

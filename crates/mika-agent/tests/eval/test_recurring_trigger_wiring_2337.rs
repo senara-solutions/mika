@@ -211,20 +211,21 @@ fn registered_triggers() -> BTreeMap<String, String> {
                 .unwrap_or_else(|| panic!("{rel}: appel à ensure_recurring_task non refermé"));
             assert_eq!(
                 args.len(),
-                4,
-                "{rel}: ensure_recurring_task prend 4 arguments ; la garde lit le \
-                 4e (`action_config`). Si la signature a changé, c'est ici qu'il \
+                5,
+                "{rel}: ensure_recurring_task prend 5 arguments depuis mika#2456 \
+                 (`db, home_dir, label, cron, action_config`) ; la garde lit le \
+                 5e (`action_config`). Si la signature a changé, c'est ici qu'il \
                  faut la suivre — pas dans une exemption."
             );
 
-            let literal = string_literal_content(&args[3]).unwrap_or_else(|| {
+            let literal = string_literal_content(&args[4]).unwrap_or_else(|| {
                 panic!(
                     "{rel}: l'`action_config` de cet enregistrement n'est pas un \
                      littéral ({}), donc la garde ne peut pas lire le trigger qu'il \
                      déclare. Halte : une récurrence dont le destinataire est \
                      illisible est exactement l'incident mika#2337, et sa résolution \
                      est une décision de périmètre, pas un geste de poseur.",
-                    args[3]
+                    args[4]
                 )
             });
 
@@ -381,6 +382,10 @@ fn test_db() -> AsyncDatabase {
 /// La sonde s'arrête donc à la **résolution**, ce qui est exactement sa portée —
 /// l'exécution du scan appelle le réseau et n'a pas sa place dans un test
 /// hermétique.
+/// Home d'agent qui n'existe pas : la résolution d'identité y est fail-closed,
+/// donc `enabled` vaut `true` et la porte mika#2456 laisse passer.
+const ABSENT_AGENT_HOME: &str = "/tmp/mika-test-agent-home-absent-2337";
+
 fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let mut settings = mika_common::config::Settings::load(tmp.path()).expect("load settings");
@@ -395,7 +400,11 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
         tools: Arc::new(default_tools()),
         skills: Arc::new(SkillRegistry::empty()),
         message_sender: Some(Arc::new(NoopSender)),
-        home_dir: PathBuf::from("/tmp"),
+        // mika#2456 — un home d'agent **inexistant** plutôt que `/tmp`, qui est
+        // un vrai répertoire où un `identity.toml` égaré désactiverait l'agent
+        // et ferait taire la sonde sans rien casser. Absent ⇒ identité
+        // fail-closed ⇒ `enabled` résolu à `true` ⇒ chemin nominal.
+        home_dir: PathBuf::from(ABSENT_AGENT_HOME),
         // mika#2329 — home global inexistant : aucun STOP n'y est armé, chemin nominal.
         global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
         embedding_client: None,
@@ -434,7 +443,14 @@ async fn fire_recurring(
     action_config: &str,
     settled: impl Fn(&mika_agent::db::Task) -> bool,
 ) -> String {
-    mika_agent::task_engine::ensure_recurring_task(db, label, "* * * * * *", action_config).await;
+    mika_agent::task_engine::ensure_recurring_task(
+        db,
+        std::path::Path::new(ABSENT_AGENT_HOME),
+        label,
+        "* * * * * *",
+        action_config,
+    )
+    .await;
 
     let id = db
         .get_tasks_by_status(vec!["recurring_active".to_string()])

@@ -1616,6 +1616,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         if task_engine::heartbeat_enabled_for_agent(&agent_state.home_dir).await {
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "heartbeat",
                 HEARTBEAT_CRON,
                 r#"{"trigger":"heartbeat"}"#,
@@ -1628,6 +1629,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         {
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "reflection",
                 &cron,
                 r#"{"trigger":"reflection"}"#,
@@ -1651,6 +1653,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "auto_pull_groomed",
                     AUTO_PULL_CRON,
                     r#"{"trigger":"auto_pull_groomed"}"#,
@@ -1673,6 +1676,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "wip_rescue",
                     WIP_RESCUE_CRON,
                     r#"{"trigger":"wip_rescue"}"#,
@@ -1707,6 +1711,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "qa_review_reconcile",
                     QA_REVIEW_RECONCILE_CRON,
                     r#"{"trigger":"qa_review_reconcile"}"#,
@@ -1740,6 +1745,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "worktree_reap",
                     WORKTREE_REAP_CRON,
                     r#"{"trigger":"worktree_reap"}"#,
@@ -1759,6 +1765,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 .unwrap_or_else(|| CURATOR_REVIEW_CRON.to_string());
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "curator_review",
                 &curator_cron,
                 r#"{"trigger":"curator_review"}"#,

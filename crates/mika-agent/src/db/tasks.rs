@@ -404,14 +404,21 @@ impl Database {
     }
 
     /// Cancel a recurring task by label (e.g. when reflection is disabled in identity.toml).
-    pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<()> {
-        self.conn.execute(
+    /// Returns how many rows were actually cancelled (mika#2456).
+    ///
+    /// `execute` already computed the count; returning it lets
+    /// `ensure_recurring_task`'s refusal line say *how many* recurrences the
+    /// agent-level gate took down rather than merely that it ran. The
+    /// pre-mika#2456 signature returned `()`, so every existing caller — all of
+    /// them `if let Err(e) = …` — is unaffected.
+    pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<usize> {
+        let cancelled = self.conn.execute(
             "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE agent_id = ?1 AND label = ?2 AND trigger_type = 'recurring'
                AND status NOT IN ('completed','failed','cancelled','expired')",
             params![agent_id, label],
         )?;
-        Ok(())
+        Ok(cancelled)
     }
 
     /// Cancel active recurring tasks for agents no longer on disk (mika#1436).

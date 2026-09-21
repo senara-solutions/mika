@@ -690,6 +690,43 @@ pub fn truncate_to_token_budget(summary: &str, max_tokens: usize) -> String {
     truncated
 }
 
+/// Where the resolved value of a root-level identity switch came from
+/// (mika#2456).
+///
+/// Modelled on `llm_budget_resolved`'s provenance (mika#2293) and on
+/// `tenant_language_resolved` (mika#2247), for the same reason both of those
+/// exist: *un réglage qu'on ne peut pas observer n'est pas un réglage, c'est un
+/// espoir.* The two values name **two different remedies** — `Identity` means
+/// the key is in force and a surviving symptom is somebody else's; `Default`
+/// means the key never landed and the cause is in the file, never in the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateSource {
+    /// The key is present in `identity.toml`.
+    Identity,
+    /// The key is absent; the back-compat default applies.
+    Default,
+}
+
+impl GateSource {
+    /// Wire format for the `source` field of `agent_recurring_gate_resolved`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Resolution of an absent root-level `enabled` key (mika#2456).
+///
+/// `true`: back-compat. Every agent deployed today carries no such key, and
+/// mika#2023's rule applies verbatim — *unrecognized values fail closed,
+/// absence does not*. Making absence a `false` would cut the whole fleet at
+/// deploy.
+pub const fn default_agent_enabled() -> bool {
+    true
+}
+
 /// Agent identity loaded from ~/.mika/identity.toml.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Identity {
@@ -697,6 +734,34 @@ pub struct Identity {
     pub name: String,
     #[serde(default = "default_emoji")]
     pub emoji: String,
+    /// Root-level activity switch (mika#2456). `enabled = false` stops the agent
+    /// producing **any** recurring automatic turn — heartbeat, reflection,
+    /// curator review, and the four mika-dev scans.
+    ///
+    /// # Why `Option<bool>` and not `bool` with a serde default
+    ///
+    /// The plan's R-1 asks for `bool` + `#[serde(default = "default_agent_enabled")]`,
+    /// and that shape **destroys the one bit AC6 needs**. With a default of
+    /// `true`, a resolved `true` is ambiguous between "the operator wrote
+    /// `enabled = true`" and "the key is absent" — and that ambiguity falls
+    /// exactly on the probe's Halt 1, which reads `source: "default"` on an
+    /// agent believed disabled as *the key did not land, do not touch the
+    /// gate*. A resolved `false` is unambiguous (the default is `true`), so the
+    /// ambiguity bites precisely where the operator needs precision. The
+    /// resolution constant is kept as [`default_agent_enabled`] so the
+    /// back-compat rule has one named site; read the pair through
+    /// [`Identity::recurring_tasks_enabled`].
+    ///
+    /// # Not code-owned (R-7)
+    ///
+    /// Deliberately absent from `well_known_agents::CODE_OWNED_IDENTITY_SECTIONS`.
+    /// This is an operator decision; making it code-owned would have
+    /// `reconcile_well_known_identity` overwrite it at the next startup — the
+    /// worst failure mode a switch can have (the argument mika#2329 used to
+    /// reject an `identity.toml` toggle for its hot STOP; here the risk is
+    /// lifted by the absence of reconciliation rather than worked around).
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub reflection: Option<ReflectionConfig>,
     #[serde(default)]
@@ -723,11 +788,32 @@ fn default_emoji() -> String {
     "✦".to_string()
 }
 
+impl Identity {
+    /// Whether this agent may register and fire recurring automatic turns, and
+    /// where that answer came from (mika#2456).
+    ///
+    /// The **only** reader of [`Identity::enabled`] that decides anything. Two
+    /// surfaces ask the question — `task_engine::ensure_recurring_task` (the
+    /// registration gate) and `TaskDispatcher::dispatch_run_skill` (the firing
+    /// net) — and one method answers, so the two can never disagree about what
+    /// "disabled" means.
+    pub fn recurring_tasks_enabled(&self) -> (bool, GateSource) {
+        match self.enabled {
+            Some(value) => (value, GateSource::Identity),
+            None => (default_agent_enabled(), GateSource::Default),
+        }
+    }
+}
+
 impl Default for Identity {
     fn default() -> Self {
         Self {
             name: default_name(),
             emoji: default_emoji(),
+            // Absent, not `Some(true)`: `Identity::default()` stands in for "no
+            // file was read", and reporting `source: "identity"` there would be
+            // a provenance that is simply false.
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),
@@ -920,10 +1006,25 @@ fn parse_identity_or_fail_closed(content: &str, home_dir: &Path, path: &Path) ->
 /// well-known agents). Sentinel allowlist matches no real skill (evicts all
 /// bundled skills); denylist contains every mutational built-in tool to prevent
 /// the agent from acting until the operator fixes the file.
+///
+/// # `enabled` stays resolved to `true` here, and the refusal is cited (mika#2456)
+///
+/// The tempting move is to set `enabled = Some(false)`: an agent with zero
+/// skills that still burns 59 s of LLM is waste. **Refused**, and the precedent
+/// is literal — [`load_identity`]'s own doc-comment already settled the twin
+/// question word for word: *"Whether the fail-closed path wants a stricter
+/// denylist than mika-arch's steady-state one is a real question, and a separate
+/// one… Left open deliberately rather than answered in a load-path fix."*
+/// Widening the severity of the fail-closed path inside a cost fix would make a
+/// transient I/O error on an `identity.toml` cut a family tenant's proactive
+/// messages — a wide, silent blast radius unrelated to the measured leak.
+/// `None` (rather than `Some(true)`) because no file was read, so the honest
+/// provenance is `default`.
 fn fail_closed_identity() -> Identity {
     Identity {
         name: default_name(),
         emoji: default_emoji(),
+        enabled: None,
         reflection: None,
         heartbeat: None,
         kg: KgIdentityConfig::default(),
@@ -2477,6 +2578,7 @@ mod tests {
         Identity {
             name: "Mika".to_string(),
             emoji: "✦".to_string(),
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),
@@ -2700,6 +2802,7 @@ emoji = "✦"
         let identity = Identity {
             name: "TestBot".to_string(),
             emoji: "🤖".to_string(),
+            enabled: None,
             reflection: None,
             heartbeat: None,
             kg: KgIdentityConfig::default(),

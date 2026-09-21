@@ -399,7 +399,8 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
+    /// Returns the number of rows cancelled (mika#2456 — see the sync sibling).
+    pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<usize> {
         // mika#1758 note: this method cancels 0..N recurring rows keyed by
         // (agent_id, label) without returning the affected task ids. Emitting
         // per-row `TaskCancelled` frames would require an extra pre-fetch
