@@ -625,6 +625,14 @@ fn mika2360_zombie_veto_flag_matches_registration_refusal() {
             }),
             false,
         ),
+        (
+            "failed inside the window, lifted by the operator (mika#2446)",
+            Box::new(|db| {
+                kill_recurring(db, "lbl", "-1 hour", false);
+                assert_eq!(db.mark_recurring_operator_rearm("mika", "lbl").unwrap(), 1);
+            }),
+            false,
+        ),
     ];
 
     for (name, prepare, expected_veto) in cases {
@@ -829,4 +837,148 @@ fn test_cancelled_recurring_task_allows_re_creation() {
     let t2 = db.get_task(&id2, "mika").unwrap().unwrap();
     assert_eq!(t2.status, "pending");
     assert_eq!(t2.label, "heartbeat");
+}
+
+// ── mika#2446 — la levée opérateur (`mika tasks rearm`) ──────────────────
+//
+// Jumeaux des tests mika#2337 : le premier dit ce que l'acte achète, les
+// suivants ce qu'il ne touche pas. Pris isolément, le premier passerait sur
+// un désarmement général de mika#1742.
+
+/// AC6 — le marqueur opérateur lève le veto pour son label : une mort de
+/// cause quelconque, dans la fenêtre, ne bloque plus la ré-inscription.
+#[test]
+fn mika2446_operator_rearm_lifts_the_veto_for_its_label() {
+    let db = db();
+    kill_recurring(&db, "worktree_reap", "-1 hour", false);
+
+    assert!(
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "worktree_reap"))
+            .unwrap()
+            .is_none(),
+        "précondition : sans l'acte, le veto mika#1742 est armé"
+    );
+
+    assert_eq!(
+        db.mark_recurring_operator_rearm("mika", "worktree_reap")
+            .unwrap(),
+        1
+    );
+    assert!(
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "worktree_reap"))
+            .unwrap()
+            .is_some(),
+        "une ligne morte levée par l'opérateur ne doit plus bloquer la ré-inscription"
+    );
+}
+
+/// AC8 — la levée est per-label : un autre label mort dans la même fenêtre
+/// garde son veto armé.
+#[test]
+fn mika2446_operator_rearm_is_scoped_to_its_label() {
+    let db = db();
+    kill_recurring(&db, "worktree_reap", "-1 hour", false);
+    kill_recurring(&db, "curator_review", "-1 hour", false);
+
+    db.mark_recurring_operator_rearm("mika", "worktree_reap")
+        .unwrap();
+
+    assert!(
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "curator_review"))
+            .unwrap()
+            .is_none(),
+        "la levée d'un label ne doit rien lever ailleurs — mika#1742 reste armé"
+    );
+}
+
+/// AC8 — la levée absout les morts qui existaient au moment de l'acte,
+/// jamais une mort postérieure : la ligne ré-inscrite qui meurt à son tour
+/// retrouve un veto armé.
+#[test]
+fn mika2446_a_death_after_the_rearm_still_arms_the_veto() {
+    let db = db();
+    kill_recurring(&db, "worktree_reap", "-2 hours", false);
+    db.mark_recurring_operator_rearm("mika", "worktree_reap")
+        .unwrap();
+    let revived = db
+        .create_recurring_task_if_absent(zombie_recurring_task("mika", "worktree_reap"))
+        .unwrap()
+        .expect("la levée doit laisser passer la ré-inscription");
+
+    db.conn
+        .execute(
+            "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE id = ?1",
+            params![revived],
+        )
+        .unwrap();
+
+    assert!(
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "worktree_reap"))
+            .unwrap()
+            .is_none(),
+        "le ré-armement est un acte, pas une immunité : la mort suivante arme le veto"
+    );
+}
+
+/// La levée doit couvrir TOUTES les morts du label : la garde prend la plus
+/// récente non exemptée, donc n'absoudre que la dernière exposerait celle
+/// d'avant et l'acte serait refusé par son propre historique.
+#[test]
+fn mika2446_operator_rearm_covers_every_dead_row_of_the_label() {
+    let db = db();
+    let older = kill_recurring(&db, "worktree_reap", "-3 hours", false);
+    // Seconde mort : on contourne la garde pour poser une seconde ligne.
+    db.conn
+        .execute(
+            "UPDATE tasks SET metadata = json_set(COALESCE(metadata, '{}'), '$.config_cancel_reverted', 1)
+                 WHERE id = ?1",
+            params![older],
+        )
+        .unwrap();
+    let newer = kill_recurring(&db, "worktree_reap", "-1 hour", false);
+    db.conn
+        .execute(
+            "UPDATE tasks SET metadata = json_remove(metadata, '$.config_cancel_reverted')
+                 WHERE id = ?1",
+            params![older],
+        )
+        .unwrap();
+    assert_ne!(older, newer);
+
+    assert_eq!(
+        db.mark_recurring_operator_rearm("mika", "worktree_reap")
+            .unwrap(),
+        2,
+        "les deux lignes mortes doivent porter le marqueur"
+    );
+    assert!(
+        db.create_recurring_task_if_absent(zombie_recurring_task("mika", "worktree_reap"))
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// La cible est la mort la plus récente, et la recherche est insensible à la
+/// casse comme la garde — mais rend l'orthographe stockée.
+#[test]
+fn mika2446_rearm_target_is_the_latest_dead_row() {
+    let db = db();
+    assert!(
+        db.find_recurring_rearm_target("mika", "worktree_reap")
+            .unwrap()
+            .is_none(),
+        "aucune ligne morte → aucune cible (jamais de création ex nihilo)"
+    );
+    let id = kill_recurring(&db, "worktree_reap", "-1 hour", false);
+
+    let target = db
+        .find_recurring_rearm_target("mika", "WORKTREE_REAP")
+        .unwrap()
+        .expect("la ligne morte doit être trouvée");
+    assert_eq!(target.task_id, id);
+    assert_eq!(target.label, "worktree_reap");
+    assert_eq!(target.status, "failed");
+    assert_eq!(target.cron_expr.as_deref(), Some("0 0 * * * *"));
 }

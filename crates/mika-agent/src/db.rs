@@ -106,6 +106,24 @@ pub const RECURRING_UNKNOWN_TRIGGER_PATH: &str = "$.unknown_trigger_death";
 /// closed. The lift buys **one** restart, not immunity.
 pub const RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH: &str = "$.unknown_trigger_lift_consumed";
 
+/// mika#2446: JSON path of the marker an **operator** writes on a dead
+/// recurring row through `mika tasks rearm <label>` — the explicit, traced
+/// counterpart of the automatic exemptions above.
+///
+/// A row carrying this marker is invisible to the mika#1742 refuse-to-zombie
+/// guard, exactly like [`RECURRING_CONFIG_CANCEL_REVERTED_PATH`]. The lift is
+/// **per-row**: it absolves the deaths that existed when the operator acted,
+/// never a later one — a fresh death is a fresh row without the marker and
+/// meets a fully armed veto. The terminal status is not rewritten (the death
+/// stays a dated fact) and `updated_at` is not touched, so the marker ages out
+/// of the grace window together with the row and leaves no debt.
+///
+/// Load-bearing: bound as a parameter by
+/// [`Database::mark_recurring_operator_rearm`] (writer),
+/// [`Database::create_recurring_task_if_absent`] (the guard) and
+/// [`Database::list_recurring_registry`] (its `zombie_veto_active` mirror).
+pub const RECURRING_OPERATOR_REARM_PATH: &str = "$.operator_rearm";
+
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
 const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
@@ -539,6 +557,24 @@ pub enum TeamRunIdFilter {
     NotNull,
     /// team_run_id = specific value
     Specific(String),
+}
+
+/// mika#2446 — the dead recurring row `mika tasks rearm <label>` resurrects.
+///
+/// Carries what re-registration needs (`cron_expr`, `action_config`) read off
+/// the dead row itself, so the operator never retypes a cron, plus the fields
+/// that name the death being absolved.
+#[derive(Debug, Clone)]
+pub struct RecurringRearmTarget {
+    pub task_id: String,
+    /// The label as stored — the lookup is `COLLATE NOCASE`, re-registration
+    /// must use the stored spelling.
+    pub label: String,
+    pub status: String,
+    pub cron_expr: Option<String>,
+    pub action_type: String,
+    pub action_config: String,
+    pub updated_at: String,
 }
 
 /// mika#2360 — closed projection of the recurring-task registry.
@@ -5571,7 +5607,9 @@ impl Database {
                             )
                             AND json_valid(t.metadata)
                             AND COALESCE(json_extract(t.metadata, ?5), 0) = 1
-                        ),
+                        )
+                        AND NOT (json_valid(t.metadata)
+                                 AND COALESCE(json_extract(t.metadata, ?8), 0) = 1),
                         0
                     ) AS zombie_veto_active
              FROM tasks t
@@ -5590,6 +5628,7 @@ impl Database {
                     RECURRING_UNKNOWN_TRIGGER_PATH,
                     limit as i64,
                     offset as i64,
+                    RECURRING_OPERATOR_REARM_PATH,
                 ],
                 |r| {
                     Ok(RecurringRegistryRow {

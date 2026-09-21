@@ -93,6 +93,9 @@ async fn run_handler_with(
 ) -> VerdictAction {
     let sender: Arc<dyn MessageSender> = Arc::new(NoopSender);
     let skills = SkillRegistry::empty();
+    // mika#2049 — a real home carrying no egress-down stamp, so gate 2d reads
+    // "the relay serves" and every gate under test is reached as before.
+    let home = tempfile::tempdir().expect("temp home");
     try_handle_ready_label_dispatch_with_fetcher(
         text,
         db,
@@ -101,6 +104,7 @@ async fn run_handler_with(
         SESSION,
         TRACE,
         &skills,
+        home.path(),
         move |_owner_repo, _number, _token| async move {
             fetch.map(|labels| (GROOMED_BODY.to_string(), labels))
         },

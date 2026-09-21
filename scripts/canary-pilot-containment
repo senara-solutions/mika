@@ -44,6 +44,15 @@
 #                                                   # start the egress relay
 #                                                     daemon if not running, exit
 #                                                     0 (idempotent)
+#   ./scripts/canary-pilot-containment --restart-relay
+#                                                   # kill a wedged relay, then
+#                                                     bring a fresh one up
+#                                                     (mika#2049). Use this when
+#                                                     the socket answers but
+#                                                     nothing works;
+#                                                     --ensure-relay cannot see
+#                                                     that state. Runbook:
+#                                                     docs/operator/pilot-egress-relay.md
 
 set -euo pipefail
 
@@ -92,6 +101,65 @@ if [ "${1:-}" = "--ensure-relay" ]; then
         exit 0
     fi
     echo "relay: FAILED to start (see stderr above)" >&2
+    exit 1
+fi
+
+# --restart-relay mode (mika#2049): kill a wedged proxy, then bring a fresh one
+# up. This is the operator gesture the fail-closed posture owes: since a dead
+# relay now REFUSES every dispatch instead of degrading it, "restart the relay"
+# has to be a command rather than a piece of folklore.
+#
+# WHAT THIS COVERS AND WHAT IT DOES NOT, and the distinction matters at 3am:
+#
+#   * Simple death (proxy gone, socket orphaned) is already covered by
+#     --ensure-relay: mika-pilot-egress-proxy unlinks an orphaned socket before
+#     bind() and handles SIGTERM to unlink on the way out, so a plain relaunch
+#     works. That is measured, and it is what makes the fail-closed posture
+#     non-trapping on that cause.
+#   * WEDGED relay (the socket still accepts connect() but the proxy no longer
+#     serves) is the case --ensure-relay cannot see: the liveness probe is a
+#     connect(), so a wedged proxy reads as "alive" and the launcher says so.
+#     This mode exists for exactly that state — it does not DETECT it (see
+#     mika#2049 § out of scope: detecting it needs an end-to-end application
+#     probe on the critical path of every dispatch, whose cost and false-positive
+#     rate are unmeasured), it gives it a gesture.
+#
+# So: use --ensure-relay when the relay is down, --restart-relay when it answers
+# but nothing works.
+if [ "${1:-}" = "--restart-relay" ]; then
+    echo "canary: restarting the pilot egress relay (mika#2049)" >&2
+
+    # Kill by socket identity, not by name: `pkill -f mika-pilot-egress-proxy`
+    # would also match an operator's editor, a grep, or this very script's
+    # command line. `fuser` names the processes actually holding the socket.
+    if [ -S "$_PILOT_EGRESS_SOCK" ]; then
+        if command -v fuser >/dev/null 2>&1; then
+            # -k sends TERM to the holders; failure is not fatal — the proxy may
+            # already be gone, leaving only the orphaned path.
+            fuser -k "$_PILOT_EGRESS_SOCK" 2>/dev/null || true
+            # Give the TERM handler its chance to unlink before we do it by hand.
+            sleep 1
+        else
+            echo "canary: fuser not installed — cannot signal the socket holder; \
+removing the socket path and relaunching (a wedged proxy may survive)" >&2
+        fi
+    fi
+
+    # Unlink whatever is left. The proxy unlinks an orphaned socket itself before
+    # bind(), so this is belt-and-braces for the case where the holder ignored
+    # TERM and the path outlived it.
+    rm -f "$_PILOT_EGRESS_SOCK" 2>/dev/null || true
+
+    if _ensure_pilot_egress_proxy; then
+        echo "relay: up ($_PILOT_EGRESS_SOCK)"
+        echo "canary: the next dispatch will clear the egress-down stamp and \
+announce the resumption (mika#2049). No gesture is owed on any ticket." >&2
+        exit 0
+    fi
+    echo "relay: FAILED to restart — read \
+${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log (or \
+/tmp/mika-pilot-egress-proxy.log) for why, then see \
+docs/operator/pilot-egress-relay.md" >&2
     exit 1
 fi
 
