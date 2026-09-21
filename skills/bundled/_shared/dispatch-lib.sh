@@ -3431,9 +3431,13 @@ ${_outcome_line}"
 # stall_detected, empty_response, idle_timeout — the hint is `investigate`.
 #
 # The `*)` arm is the whole point (R-4): a subtype added upstream is classed
-# `unknown`, hinted `investigate`, AND named once on stderr — which lands in
-# the persisted `.stderr` and in the callback's 10 KB tail — the first time it
-# is seen, instead of silently joining the `Halt:` prose.
+# `unknown`, hinted `investigate`, and the CALLER (`_classify_terminated_session`)
+# writes the `halt_family.unknown` line into the two sinks that actually
+# persist. Not from here, and not with a bare `>&2`: this function runs inside
+# `dispatch_claude_pilot`, whose fd 2 is `/dev/null` from the moment
+# `exec 9>>"$TRACE_FILE" 2>/dev/null` runs (mika#903), and outside the one
+# `2>"$STDERR_FILE"` redirection that covers the pilot command alone — the
+# Signal M class the root CLAUDE.md documents, found by the mika#2149 review.
 _halt_family() {
     local subtype="${1:-}"
     case "$subtype" in
@@ -3460,10 +3464,6 @@ _halt_family() {
         transport_message_too_large)
             printf '%s\n' "transport|investigate|one NDJSON message exceeded max_buffer_size" ;;                                                                         # cpp#187
         *)
-            # An EMPTY subtype is "cause not recorded" (no JSON subtype, no
-            # [guardrail] line) — already said on the Halt: line, and not an
-            # upstream drift. Only a non-empty stranger is worth the grep hit.
-            [ -n "$subtype" ] && echo "dispatch-lib: halt_family.unknown subtype=${subtype}" >&2
             printf '%s\n' "unknown|investigate|subtype outside the downstream table; see _halt_family in dispatch-lib.sh and GuardrailAbortReason in claude-pilot" ;;
     esac
 }
@@ -3513,7 +3513,7 @@ _classify_terminated_session() {
             # is never classed `unknown` for having arrived by the other
             # channel. The ANSI strip above already ran; ui.py:113 writes
             # `[guardrail] <name>: <detail>`.
-            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z_]*\):.*/\1/p')
+            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
         else
             cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
         fi
@@ -3527,6 +3527,17 @@ _classify_terminated_session() {
     halt_family=${halt_row%%|*}
     halt_hint=${halt_row#*|}; halt_hint=${halt_hint%%|*}
     halt_meaning=${halt_row##*|}
+    # R-4, the drift line — written where it persists (mika#2149 review, #1).
+    # `$STDERR_FILE` is still on disk here and the callback's 10 KB tail is
+    # built from it a few lines after this function returns; `$PERSISTENT_STDERR`
+    # was already written once, so append — the mika#2165 shape at
+    # `pilot_log_guard.missing`. An EMPTY subtype is "cause not recorded",
+    # already said on the Halt: line and not an upstream drift, so it stays
+    # silent: only a non-empty stranger is worth the grep hit.
+    if [ "$halt_family" = "unknown" ] && [ -n "$halt_subtype" ]; then
+        printf 'dispatch-lib: halt_family.unknown subtype=%s\n' "$halt_subtype" \
+            | tee -a "${STDERR_FILE:-/dev/null}" "${PERSISTENT_STDERR:-/dev/null}" >&2 2>/dev/null || true
+    fi
     halt_lines="Halt class: ${halt_family} — ${halt_meaning}
 Retry hint: ${halt_hint} — $(_halt_hint_meaning "$halt_hint")"
 

@@ -4305,7 +4305,10 @@ _t6_locate_types_py() {
     # <meta>/mika and <meta>/.claude/worktrees/<slug>/mika both have
     # claude-pilot/ one or three levels above the repo root.
     local top c
-    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    # From the script's own repo, never the caller's cwd (mika#2149 review, #6):
+    # launched from the meta-repo root, a bare rev-parse resolved the wrong
+    # toplevel and the guard SKIPped on the very host it exists to protect.
+    top=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) || return 0
     for c in "$top/../claude-pilot/src/claude_pilot/types.py" \
              "$top/../../../../claude-pilot/src/claude_pilot/types.py"; do
         if [ -r "$c" ]; then
@@ -4324,8 +4327,12 @@ _t6_drift_guard() {
         SKIPPED=$((SKIPPED + 1))
         return 0
     fi
-    # The `guardrail: Literal[ ... ]` block, one quoted value per line.
-    values=$(sed -n '/guardrail: Literal\[/,/\]/p' "$types_py" | grep -o '"[a-z_]*"' | tr -d '"' || true)
+    # The `guardrail: Literal[ ... ]` block, EVERY quoted token — then fail
+    # closed on any token outside the shape a subtype can have (mika#2149
+    # review, #3): a charset filter in the extraction excluded a digit-bearing
+    # name instead of failing on it, so the guard counted it out and stayed
+    # green. The shape mirrors the runtime scrape in dispatch-lib.sh.
+    values=$(sed -n '/guardrail: Literal\[/,/\]/p' "$types_py" | grep -o '"[^"]*"' | tr -d '"' || true)
     n=$(printf '%s\n' "$values" | grep -c . || true)
     echo "DRIFT-GUARD: armed against $types_py ($n values)"
     if [ "$n" -eq 0 ]; then
@@ -4334,7 +4341,16 @@ _t6_drift_guard() {
         return 0
     fi
     for v in $values; do
+        if ! printf '%s\n' "$v" | grep -Eq '^[a-z][a-z0-9_]*$'; then
+            FAIL=$((FAIL + 1))
+            echo "  ✗ T6: upstream token '$v' is outside the subtype shape [a-z][a-z0-9_]* — widen the runtime scrape and this guard together"
+            continue
+        fi
         family=$( ( source "$DISPATCH_LIB" 2>/dev/null || true; _halt_family "$v" 2>/dev/null | cut -d'|' -f1 ) )
+        # Positive control first: an empty family (function renamed, source
+        # aborted in the subshell) must not pass the drift check vacuously.
+        assert_eq "T6 drift: upstream value '$v' resolved to a non-empty family" \
+            "yes" "$([ -n "$family" ] && echo yes || echo no)"
         assert_not_contains "T6 drift: upstream value '$v' has a downstream family (got: $family)" \
             "unknown" "$family"
     done
@@ -4347,6 +4363,90 @@ T6_MARKER_COUNT=$(grep -c '^DRIFT-GUARD: ' "$T6_CAPTURE" || true)
 assert_eq "T6-arm: exactly one DRIFT-GUARD marker was emitted on stdout" \
     "1" "$T6_MARKER_COUNT"
 rm -f "$T6_CAPTURE"
+
+# T6 fixtures — the guard's own branches, driven in a subshell so its
+# counters do not leak into this run's (mika#2149 review, #3 and testing gaps).
+# Each fixture is a minimal types.py; the guard's stdout is the assertion
+# surface, and its FAIL count is printed last so the fail-closed direction is
+# pinned by number, not by prose.
+_t6_fixture_probe() {
+    local body="$1" fx
+    fx=$(mktemp)
+    printf '%s\n' "$body" > "$fx"
+    (
+        PASS=0; FAIL=0; SKIPPED=0
+        CLAUDE_PILOT_TYPES="$fx" _t6_drift_guard
+        echo "FAIL=$FAIL SKIPPED=$SKIPPED"
+    )
+    rm -f "$fx"
+}
+# (a) a digit-bearing name is iterated, not silently dropped: it reaches the
+#     table and comes back unknown, and the guard names it.
+T6_FX_DIGIT=$(_t6_fixture_probe '    guardrail: Literal[
+        "idle_timeout",
+        "http_529",
+    ]')
+assert_contains "T6 fixture: a digit-bearing upstream value is counted" \
+    "(2 values)" "$T6_FX_DIGIT"
+assert_contains "T6 fixture: a digit-bearing unknown value is named red" \
+    "✗ T6 drift: upstream value 'http_529' has a downstream family (got: unknown)" "$T6_FX_DIGIT"
+assert_contains "T6 fixture: exactly one red for the one unknown value" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_DIGIT"
+# (b) a token outside the subtype shape fails closed, by name.
+T6_FX_SHAPE=$(_t6_fixture_probe '    guardrail: Literal[
+        "idle_timeout",
+        "Bad-Token",
+    ]')
+assert_contains "T6 fixture: an out-of-shape token is refused by name" \
+    "upstream token 'Bad-Token' is outside the subtype shape" "$T6_FX_SHAPE"
+assert_contains "T6 fixture: the refusal counts as a FAIL" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_SHAPE"
+# (c) a matched-but-empty Literal block is a red, not a vacuous green.
+T6_FX_EMPTY=$(_t6_fixture_probe '    guardrail: Literal[
+    ]')
+assert_contains "T6 fixture: an empty Literal block is named" \
+    "the Literal block was found empty" "$T6_FX_EMPTY"
+assert_contains "T6 fixture: an empty Literal block is a FAIL" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_EMPTY"
+# (d) the SKIP branch, in-file: marker + SKIPPED, zero content assertions.
+T6_FX_SKIP=$( ( PASS=0; FAIL=0; SKIPPED=0; CLAUDE_PILOT_TYPES=/nonexistent _t6_drift_guard; echo "FAIL=$FAIL SKIPPED=$SKIPPED PASS=$PASS" ) )
+assert_contains "T6 fixture: unreachable types.py emits the SKIP marker" \
+    "DRIFT-GUARD: SKIP" "$T6_FX_SKIP"
+assert_contains "T6 fixture: unreachable types.py counts SKIPPED and asserts nothing" \
+    "FAIL=0 SKIPPED=1 PASS=0" "$T6_FX_SKIP"
+
+# T2-sink — the drift line through the PRODUCTION channel (mika#2149 review,
+# #1). The probe mirrors dispatch_claude_pilot: fd 2 is /dev/null (the
+# `exec 9>>"$TRACE_FILE" 2>/dev/null` at its top), and the two sinks are the
+# files the callback tail and the persisted .stderr are built from. A bare
+# `>&2` passes the earlier T2 (which merges fd 2 in the probe) and lands
+# nowhere here — that is the defect this probe exists to keep closed.
+_classify_sink_probe() {
+    local subtype="$1" tmp
+    tmp=$(mktemp -d)
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        exec 2>/dev/null
+        STATUS="terminated"; TURNS=2; DURATION=1; SESSION_ID=s; LOG_ID="probe-sink"
+        PILOT_LOG_DIR="$tmp"
+        STDERR_FILE="$tmp/stderr.tmp"; : > "$STDERR_FILE"
+        PERSISTENT_STDERR="$tmp/probe-sink.stderr"; : > "$PERSISTENT_STDERR"
+        SUBTYPE="$subtype"; TERMINATION_REASON="x"; API_ERROR_STATUS=""
+        _classify_terminated_session >/dev/null
+        printf 'tail:%s\n' "$(cat "$STDERR_FILE")"
+        printf 'persisted:%s\n' "$(cat "$PERSISTENT_STDERR")"
+    )
+    rm -rf "$tmp"
+}
+T2_SINK=$(_classify_sink_probe foo_bar) || T2_SINK=""
+assert_contains "T2-sink: the drift line reaches the callback-tail source (STDERR_FILE)" \
+    "tail:dispatch-lib: halt_family.unknown subtype=foo_bar" "$T2_SINK"
+assert_contains "T2-sink: the drift line reaches the persisted .stderr" \
+    "persisted:dispatch-lib: halt_family.unknown subtype=foo_bar" "$T2_SINK"
+T2_SINK_KNOWN=$(_classify_sink_probe idle_timeout) || T2_SINK_KNOWN=""
+assert_not_contains "T2-sink (negative control): a known subtype writes nothing to either sink" \
+    "halt_family.unknown" "$T2_SINK_KNOWN"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \

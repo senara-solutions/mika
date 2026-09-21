@@ -264,11 +264,21 @@ c'est lui qu'il dispatche). En CI, il saute et le dit — par le même marqueur.
 ### D-1 — `halt_family.unknown` (C-1, Phase 1)
 
 **Tire quand** : un `status: terminated` porte un subtype absent de la table.
-**Fait** : `echo "dispatch-lib: halt_family.unknown subtype=<x>" >&2` — atterrit
-dans `$STDERR_FILE` (donc dans le tail de 10 Ko du callback) et dans le
-`.stderr` persisté. Classe `unknown`, indice `investigate`. **Ne change rien**
-au routage ni au retry. **Contrôle négatif** : un subtype connu n'émet pas la
-ligne (T2).
+**Fait** : `_classify_terminated_session` écrit
+`dispatch-lib: halt_family.unknown subtype=<x>` par `tee -a` dans
+`$STDERR_FILE` (encore sur disque à cet instant ; le tail de 10 Ko du callback
+en est construit juste après) **et** dans `$PERSISTENT_STDERR` (le `.stderr`
+persisté, déjà écrit une fois — d'où l'append), plus fd 2. **Jamais par un
+`>&2` nu depuis `_halt_family`** : v1 de ce plan le prescrivait, et la revue
+(constat #1, quatre relecteurs) a mesuré qu'un `>&2` nu depuis ce site tombe
+dans `/dev/null` — `dispatch_claude_pilot` ouvre par `exec 9>>"$TRACE_FILE"
+2>/dev/null` (mika#903), et la seule redirection `2>"$STDERR_FILE"` couvre la
+commande pilote seule (classe Signal M du CLAUDE.md racine). Classe `unknown`,
+indice `investigate`. **Ne change rien** au routage ni au retry. **Contrôles
+négatifs** : un subtype connu n'émet pas la ligne (T2) ; un subtype vide
+(« cause not recorded ») non plus. **Sonde du canal réel** : T2-sink rejoue le
+`exec 2>/dev/null` du dispatcher et lit les deux fichiers — un `>&2` nu y est
+rouge alors que T2 reste vert.
 
 ### D-2 — Garde de dérive (C-5, Phase 3)
 
@@ -423,3 +433,15 @@ avant tout push (les sondes sont le vert). Une seule PR.
   `agent.py:54` (`SDK_TERMINATION_SUBTYPES`), `agent.py:906`
   (`transport_message_too_large` → `status: terminated`), `ui.py:113` (format
   ANSI de la ligne `[guardrail]`). Aucune dérive ; aucun changement de contenu.
+- 2026-09-21 — v4 : revue multi-agents (`/ce:review`, 8 lentilles, verdict
+  « Ready with fixes »). #1 (P1, confiance 100, 4 relecteurs) : le `>&2` nu de
+  D-1 v1 tombait dans `/dev/null` — D-1 réécrit, émission déplacée dans
+  `_classify_terminated_session` via `tee -a` dans les deux puits, sonde
+  T2-sink. #6 (P3) : `_t6_locate_types_py` ancré sur `$SCRIPT_DIR`, plus sur
+  le cwd. #3 (P2) : extraction T6 fail-closed sur toute forme hors
+  `[a-z][a-z0-9_]*`, scrape runtime élargi, sondes fixtures (chiffre, forme
+  invalide, bloc vide, SKIP en fichier) et contrôle positif sur la famille.
+  #5 rejeté par le validateur. Résiduels consignés pour un suivi :
+  `grep -m1` sur la ligne `[guardrail]` (prendre la dernière), couverture T6
+  limitée au `Literal` (pas `SDK_TERMINATION_SUBTYPES`), CI en SKIP par
+  conception (C-5).

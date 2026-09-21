@@ -35,11 +35,25 @@ est de **remplacer l'énumération en prose par une table exécutée** :
 1. `_halt_family <subtype>` est un `case` — une ligne par valeur, la branche
    `*)` en dernier. La table *est* l'énumération aval ; le commentaire de tête
    ne liste plus rien, il pointe vers `types.py` (amont) et vers la table.
-2. La branche `*)` **dit** ce qu'elle ne connaît pas :
-   `dispatch-lib: halt_family.unknown subtype=<x>` sur stderr — donc dans le
-   `.stderr` persisté et dans la queue de 10 Ko du callback. La prochaine
-   valeur ajoutée en amont laisse une trace à sa **première** occurrence, au
-   lieu de rejoindre silencieusement la prose.
+2. La branche `*)` classe `unknown`, et **l'appelant dit** ce qu'il ne
+   connaît pas : `_classify_terminated_session` écrit
+   `dispatch-lib: halt_family.unknown subtype=<x>` par `tee -a` dans
+   `$STDERR_FILE` (source de la queue de 10 Ko du callback) et dans le
+   `.stderr` persisté. La prochaine valeur ajoutée en amont laisse une trace à
+   sa **première** occurrence, au lieu de rejoindre silencieusement la prose.
+
+   **Le puits est le point qui a rougi en revue, et il mérite sa ligne.** La
+   première version émettait depuis `_halt_family` par un `>&2` nu — et la
+   revue a mesuré qu'il ne tombait *nulle part* : `dispatch_claude_pilot`
+   ouvre par `exec 9>>"$TRACE_FILE" 2>/dev/null` (mika#903), donc son fd 2
+   est `/dev/null`, et la seule redirection `2>"$STDERR_FILE"` du fichier
+   couvre la commande pilote seule. C'est la classe **Signal M** que le
+   CLAUDE.md racine documente sur ce même fichier, retrouvée « une ligne à
+   côté ». La règle : un diagnostic de dispatch-lib s'écrit dans le fichier
+   qu'on grep, jamais sur un fd 2 dont on suppose la destination — et la
+   sonde qui le tient (T2-sink) rejoue le `exec 2>/dev/null` du dispatcher et
+   lit les deux fichiers, là où la sonde naïve (fusion `2>&1` dans le
+   harnais) reste verte sur un `>&2` nu.
 3. Un test lit le `Literal` amont et exige une famille ≠ `unknown` pour
    chaque valeur (`test-dispatch-lib.sh`, T6). C'est ce test, pas le
    commentaire, qui rougit le jour où cpp ajoute un motif.
