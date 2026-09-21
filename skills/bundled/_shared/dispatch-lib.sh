@@ -3012,15 +3012,25 @@ _run_claude_pilot() {
     SESSION_ID=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null)
     TURNS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.turns // empty' 2>/dev/null)
     # mika#1772: `status: terminated` covers TWO populations, and they need
-    # different handling. claude-pilot sets it both for a guardrail abort
-    # (subtype is one of stall_detected / empty_response / idle_timeout,
-    # claude-pilot/src/claude_pilot/types.py:154) and for an SDK limit
-    # (SDK_TERMINATION_SUBTYPES = {error_max_turns, error_max_budget_usd},
-    # agent.py:43). The first kills a session that has usually done nothing;
-    # the second kills one that has often done a great deal. Reading the
-    # subtype is how this file tells them apart instead of guessing.
+    # different handling. claude-pilot sets it both for a guardrail abort and
+    # for an SDK limit. The first kills a session that has usually done
+    # nothing; the second kills one that has often done a great deal. Reading
+    # the subtype is how this file tells them apart instead of guessing.
+    #
+    # mika#2149: the subtype vocabulary is NOT enumerated here. It is owned
+    # upstream by `GuardrailAbortReason.guardrail`
+    # (claude-pilot/src/claude_pilot/types.py) plus `SDK_TERMINATION_SUBTYPES`
+    # and the cpp#187 transport halt in agent.py; downstream it is the `case`
+    # table in `_halt_family` below, whose `*)` arm says out loud when a value
+    # it does not know arrives. A prose list here went stale by five values in
+    # eighteen days (cpp#119, #145, #168, #185, #187) because nothing read it.
     SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
     TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
+    # cpp#54 promised this field to "mika-dev dispatch-lib" as its consumer and
+    # nothing here ever read it (mika#2149 P4). It is a qualifier on the
+    # `Halt:` line, never a second classification axis: cpp#119 sets it only on
+    # a `rate_limited` abort, and it is absent (`exclude_none`) otherwise.
+    API_ERROR_STATUS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.api_error_status // empty' 2>/dev/null)
     COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
     DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
 
@@ -3400,16 +3410,88 @@ ${_outcome_line}"
 #
 # Reads STATUS, SUBTYPE, TERMINATION_REASON, SESSION_ID, TURNS, DURATION,
 # PRE_RUN_HEAD, POST_RUN_HEAD, LOG_ID, STDERR_FILE. Prints the callback body.
+# mika#2149 (C-1): one halt motif -> `<family>|<hint>|<meaning>` on stdout.
+#
+# This `case` IS the downstream enumeration of claude-pilot's halt vocabulary —
+# the upstream one is `GuardrailAbortReason.guardrail` in
+# claude-pilot/src/claude_pilot/types.py, plus `SDK_TERMINATION_SUBTYPES` and
+# the cpp#187 transport halt in agent.py. test-dispatch-lib.sh's drift guard
+# reads that Literal and refuses any value this table would class `unknown`.
+#
+# The three hints are annotations, not decisions — nothing reads them to
+# decide a retry yet (out of scope, see the ticket):
+#   transient     — the cause is OUTSIDE the session (quota, model mute
+#                   upstream); a re-run has a fair chance of not seeing it again.
+#   deterministic — the cause is IN what the session did; a re-run from the
+#                   same state reproduces it, and what matters is what it left.
+#   investigate   — a re-run teaches nothing until the cause has been read.
+#                   Neither a promise nor a ban: a pointer to the log.
+# Each hint is written to the height of what the upstream comment asserts
+# (source cited per row) and no further; where upstream does not rule —
+# stall_detected, empty_response, idle_timeout — the hint is `investigate`.
+#
+# The `*)` arm is the whole point (R-4): a subtype added upstream is classed
+# `unknown`, hinted `investigate`, AND named once on stderr — which lands in
+# the persisted `.stderr` and in the callback's 10 KB tail — the first time it
+# is seen, instead of silently joining the `Halt:` prose.
+_halt_family() {
+    local subtype="${1:-}"
+    case "$subtype" in
+        rate_limited)
+            printf '%s\n' "quota_throttled|transient|the API refused (429) and the SDK exhausted its backoff; the session did nothing wrong" ;;                       # cpp#119, cpp#133
+        awaiting_model)
+            printf '%s\n' "model_never_resumed|transient|the model never returned the first token of the next turn; the session was waiting, not looping" ;;             # cpp#145
+        awaiting_tool)
+            printf '%s\n' "tool_never_returned|investigate|a tool never returned its result; re-running without reading which one replays it" ;;                       # cpp#145
+        idle_timeout)
+            printf '%s\n' "session_silent|investigate|real silence with nobody outstanding; the cause is in the log, not in a re-run" ;;                                # cpp#54, refined cpp#145
+        stall_detected)
+            printf '%s\n' "model_unproductive|investigate|N turns without a tool call; the starting state leads the model nowhere" ;;                                   # cpp#54
+        empty_response)
+            printf '%s\n' "model_unproductive|investigate|N consecutive empty responses" ;;                                                                              # cpp#54
+        watchdog_error)
+            printf '%s\n' "pilot_bug|investigate|the watchdog itself raised; a claude-pilot defect, not a session one" ;;                                               # cpp#168
+        prompt_cache_dead)
+            printf '%s\n' "substrate|investigate|the prompt cache is no longer read; check the relay (mika#2313/#2316) before any re-run" ;;                              # cpp#185 D1
+        error_max_turns)
+            printf '%s\n' "budget_exhausted|deterministic|SDK turn limit reached; work was produced and the recovery chain carries it" ;;                              # agent.py SDK_TERMINATION_SUBTYPES
+        error_max_budget_usd)
+            printf '%s\n' "budget_exhausted|deterministic|SDK dollar limit reached; work was produced and the recovery chain carries it" ;;                            # agent.py SDK_TERMINATION_SUBTYPES
+        transport_message_too_large)
+            printf '%s\n' "transport|investigate|one NDJSON message exceeded max_buffer_size" ;;                                                                         # cpp#187
+        *)
+            # An EMPTY subtype is "cause not recorded" (no JSON subtype, no
+            # [guardrail] line) — already said on the Halt: line, and not an
+            # upstream drift. Only a non-empty stranger is worth the grep hit.
+            [ -n "$subtype" ] && echo "dispatch-lib: halt_family.unknown subtype=${subtype}" >&2
+            printf '%s\n' "unknown|investigate|subtype outside the downstream table; see _halt_family in dispatch-lib.sh and GuardrailAbortReason in claude-pilot" ;;
+    esac
+}
+
+# The three hints' one-line definitions, rendered after the family so the
+# operator reading the callback does not have to open this file.
+_halt_hint_meaning() {
+    case "${1:-}" in
+        transient)     printf '%s' "the cause is outside the session; a re-run has a fair chance of not seeing it again" ;;
+        deterministic) printf '%s' "the cause is in what the session did; a re-run from the same state reproduces it — what it left behind is what counts" ;;
+        *)             printf '%s' "a re-run teaches nothing until the cause has been read; neither a promise nor a ban" ;;
+    esac
+}
+
 _classify_terminated_session() {
     local mode="${1:-full}"
     local cause guardrail="" stderr_path _candidate
+    local halt_subtype="" halt_row halt_family halt_hint halt_meaning halt_lines
 
     # The halt cause comes from the structured result first. claude-pilot puts
     # the guardrail name in `.subtype` and its detail in `.termination_reason`
     # (agent.py:155-162), which is more reliable than scraping stderr and is the
     # only signal that distinguishes a guardrail abort from an SDK limit.
     if [ -n "${SUBTYPE:-}" ]; then
-        cause="Halt: ${SUBTYPE}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
+        # mika#2149 (C-3): `api_error_status` is a qualifier, inserted only when
+        # the result carried it.
+        cause="Halt: ${SUBTYPE}${API_ERROR_STATUS:+ (HTTP ${API_ERROR_STATUS})}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
+        halt_subtype="$SUBTYPE"
     else
         # Fallback for a result without a subtype: scrape the `[guardrail]` line.
         # Prefer the stderr still in hand; the persisted copy may not exist yet
@@ -3427,10 +3509,26 @@ _classify_terminated_session() {
         done
         if [ -n "$guardrail" ]; then
             cause="Halt: ${guardrail}"
+            # mika#2149 (C-4): the scraped line feeds the same table, so a halt
+            # is never classed `unknown` for having arrived by the other
+            # channel. The ANSI strip above already ran; ui.py:113 writes
+            # `[guardrail] <name>: <detail>`.
+            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z_]*\):.*/\1/p')
         else
             cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
         fi
     fi
+
+    # mika#2149 (C-2): two stable prefixes after `Halt:`, in both modes — same
+    # contract as `Outcome:` and `RECOVERY_PENDING:` (one line, one prefix,
+    # `grep -m1` suffices). An empty halt_subtype (no JSON subtype, no
+    # [guardrail] line) goes through the `*)` arm and is said as such.
+    halt_row=$(_halt_family "$halt_subtype")
+    halt_family=${halt_row%%|*}
+    halt_hint=${halt_row#*|}; halt_hint=${halt_hint%%|*}
+    halt_meaning=${halt_row##*|}
+    halt_lines="Halt class: ${halt_family} — ${halt_meaning}
+Retry hint: ${halt_hint} — $(_halt_hint_meaning "$halt_hint")"
 
     if [ "$mode" = "banner" ]; then
         printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind. Everything below was produced by an incomplete session — treat it as unvalidated.
@@ -3439,6 +3537,7 @@ Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
 Duration: ${DURATION:-unknown}ms
 ${cause}
+${halt_lines}
 Commits: ${PRE_RUN_HEAD:-unknown}..${POST_RUN_HEAD:-unknown}"
         return 0
     fi
@@ -3449,6 +3548,7 @@ Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
 Duration: ${DURATION:-unknown}ms
 ${cause}
+${halt_lines}
 
 HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
 

@@ -4266,6 +4266,9 @@ assert_contains "T4 (negative control): no [guardrail] line -> unknown" \
     "Halt class: unknown" "$T4_NONE"
 assert_contains "T4 (negative control): 'cause not recorded' is preserved" \
     "cause not recorded" "$T4_NONE"
+T4_NONE_ERR=$(_classify_probe 'no guardrail line here' 2 '' '' 'full' '' stderr) || T4_NONE_ERR=""
+assert_not_contains "T4 (negative control): an unrecorded cause is not reported as upstream drift" \
+    "halt_family.unknown" "$T4_NONE_ERR"
 
 # T5 — banner mode carries both lines too.
 T5_OUT=$(_classify_probe '' 12 'awaiting_tool' 'tool-wait ceiling exceeded' 'banner') || T5_OUT=""
