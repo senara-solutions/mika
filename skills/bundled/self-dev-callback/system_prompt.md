@@ -54,25 +54,17 @@ Permitted post-callback actions are described prosaically in the success/failure
 - `STATUS=CANCELLED_BY_SIGNAL`: dispatch was terminated by signal (potentially operator-initiated cancel without the pre-write path, or external signal). Treat as operator-cancel for retry-decision purposes (do NOT retry). Call `update_task_status(task_id, "cancelled")` with metadata `{"cancelled_reason": "signal_cancel"}`. Call `send_message`: "Dispatch terminated by signal — not retrying. Issue status unchanged." Proceed to Step 6.
 - Anything else (no `STATUS=CANCELLED_` prefix): fall through to existing classification paths below.
 
-**Containment-refusal discriminator (mika#2049 — MANDATORY, alongside the cancel discriminator above and for the same reason: both run BEFORE pipeline result classification):**
+**Containment-refusal discriminator (mika#2049 — MANDATORY, BEFORE pipeline result classification):**
 
-> **Predicate — `contains`, NEVER `starts with`.** If the callback `RESULT` **contains** the literal `CONTAINMENT REFUSAL (exit 78)`.
+> **Predicate:** `RESULT` **contains** the literal `CONTAINMENT REFUSAL (exit 78)`. Use `contains`, NEVER `starts with`: this `RESULT` begins with `Log path: …`.
 >
-> The cancel discriminator above is a `starts with`; this one cannot be. The `RESULT` of a containment refusal begins with `Log path: …`, so a `starts with` copied by analogy would never match and would ship an inert guard.
+> **Why:** it has no failure marker and a non-empty result, so without this branch it falls into `On success` and announces a PR that does not exist. No pilot ran; in a relay outage every dispatch lands here.
 >
-> **Why this branch has to exist at all.** Without it the refusal falls, literally, into `On success` below — it carries no `PIPELINE FAILURE:` prefix, no `FAILED`, no `STATUS=CANCELLED_` prefix, no `error_max_turns`, and its `result` is non-empty (so the secondary pipeline trigger, which requires a NULL/empty result, does not fire either). The first instruction of `On success` is to go find the PR URL, and its nominal outcome is to notify "claude-pilot completed" and leave the task `in_progress` "awaiting QA review". **No pilot ever started and there is no PR** — that is the `assert_grounded` / milestone-close-claim class, produced by the substrate rather than by model drift.
->
-> This hole predates mika#2049 (it came in with mika#2141) and never cost anything, because a gitdir refusal is rare. The egress fail-closed does not create the hole — it makes it **the nominal path during a relay outage**, when every dispatch traverses it. A dormant defect put on the critical path belongs to the batch that puts it there.
->
-> **Conduct:**
->
-> 1. **Do NOT retry.** An immediate retry hits a relay that is still dead and burns `pipeline_retry_count` on a cause that is not its own.
-> 2. **Do NOT touch any label.** Not `ready`, not `blocked`, not `operator-review`. Resumption is `auto_pull`'s job and it needs the ticket exactly as it is; removing `ready` here would strand the ticket the other way round.
-> 3. Call `update_task_status(task_id, "failed")` with metadata `{"containment_refusal": true, "refusal_reason": "<the cause line from the RESULT>"}`. The reason string MUST be distinct from `operator_cancel` and from `signal_cancel`: a containment refusal is neither, and the three populations have to stay countable apart (doctrine mika#2131 — and mika#2249 had to pre-write its own discriminator for exactly this reason, so its disposition would not be absorbed into a `CANCELLED_BY_*` branch that reads "do not retry" where the truth is "the engine disposed of it").
-> 4. Call `send_message` relaying the refusal text **verbatim**. It already names the cause and the remedy (mika#2049 R2) — paraphrasing it is how the operator ends up repairing the wrong organ.
-> 5. Proceed to Step 6.
->
-> **Do NOT** announce a PR, a completion, or "awaiting QA review". No pilot ran.
+> 1. **Do NOT retry** (relay still down; would burn `pipeline_retry_count`).
+> 2. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`): `auto_pull` resumes the ticket as-is.
+> 3. `update_task_status(task_id, "failed")` with metadata `{"containment_refusal": true, "refusal_reason": "<cause line from RESULT>"}` — distinct from `operator_cancel`/`signal_cancel`, countable apart (mika#2131).
+> 4. `send_message` with the refusal text **verbatim** (names cause + remedy).
+> 5. Proceed to Step 6. Never announce a PR, completion, or "awaiting QA review".
 
 **Pipeline result classification (MANDATORY — before generic failure handling):**
 
