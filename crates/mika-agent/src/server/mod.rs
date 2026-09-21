@@ -793,6 +793,12 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // provider outage and is not one.
     budget_guard::assert_llm_budgets_valid(global_home)?;
 
+    // mika#2455 — say, once at startup, that the CI↔verdict gate is disarmed.
+    // Silent when armed: a line per boot on a healthy fleet is the churn the
+    // mika#2131 doctrine bounds, while the silence of a *disarmed* gate reads
+    // exactly like the silence of a healthy one (mika#2205).
+    crate::evidence::guards::log_qa_ci_coherence_gate_state();
+
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
         warn!(

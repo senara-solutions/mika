@@ -2298,6 +2298,233 @@ fn parse_run_gh_argv(input: &str) -> Option<Vec<String>> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// mika#2455 — un `pass` ne peut pas affirmer ce qu'un check requis rouge contredit
+// ---------------------------------------------------------------------------
+//
+// Troisième membre de la famille pre-subprocess, après mika#1646
+// (`validate_destructive_action_grounding`) et mika#2237 ci-dessus : même
+// raison d'être à cet endroit — le défaut est l'*appel*, et une garde EndTurn
+// arriverait quand la revue est déjà sur GitHub.
+//
+// Défaut mesuré, n=2 le même jour (2026-09-21). PR #2439 (tête `73ec3e3e`) :
+// `SIGPIPE grep-q Lint` et `Check` rouges, verdict mika-qa `pass` / APPROVED.
+// PR #2461 (tête `1302b0d0`) : `Check` rouge sur un test unitaire mika-cli,
+// verdict `pass` / APPROVED. Deux surfaces d'échec différentes, même angle mort.
+//
+// Quatre points que l'implémentation évidente rate, dans l'ordre où ils
+// décident :
+//
+// 1. **Le risque nommé par le ticket — « faire merger du code rouge » — est
+//    déjà fermé.** Un verdict `pass` route vers `pr_merge_with_gate`, qui lit
+//    `gh pr checks --required` et refuse sur tout bucket `fail`/`cancel`
+//    (mika#485/#490). C'est un `Tool` de `default_tools()`, donc non
+//    désactivable par agent. Ce qui reste ouvert n'est pas une porte de merge
+//    mais un **signal faux** : `pass`/APPROVED affirme ce que la CI contredit,
+//    et trompe l'humain qui lit la PR. Cette garde ferme le signal ; elle
+//    n'ajoute aucune garantie de merge et il ne faut pas en attendre une.
+//
+// 2. **La garde porte sur le VERDICT, jamais sur le flag — et c'est la
+//    décision centrale.** Un gate qui refuserait `--approve` sur CI rouge
+//    produirait, sur un corps `pass` : `--approve` refusé ici, `--comment`
+//    refusé par mika#2237 (aucune tentative recevable), donc **aucune revue
+//    postable** — le tour boucle et meurt, ce que la documentation de mika#2237
+//    nomme déjà comme son propre mode de panne. Porter sur le verdict laisse
+//    une sortie toujours atteignable : réécrire le corps en `block[ci]` ou
+//    `hold[review]` et poster en `--comment`.
+//
+// 3. **Le refus ne prescrit PAS `block[ci]`.** Ce token n'est pas un label
+//    inerte : `verdict_handler::handle_block_ci` dispatche un claude-pilot
+//    CI-fix borné à trois tentatives. La garde n'a aucun moyen de savoir si la
+//    CI rouge est réparable par un pilote — un lint l'est, une infra cassée ou
+//    un flake ne l'est pas — donc elle nomme **les deux** sorties et laisse le
+//    modèle choisir. Même arbitrage que `hold[review]` plutôt que `block[ac]`
+//    en Step 1.5 de qa-review (mika#2157).
+//
+// 4. **Le modèle ne voit toujours pas la CI.** `qa_pr_view` retire les champs
+//    CI *à la source* (décision datée : la capacité est retirée, pas
+//    seulement interdite), et `QA_REVIEW_GH_ALLOWED` borne le périmètre `gh` de
+//    qa-review. Rien de cela ne bouge : c'est le moteur qui lit, et le modèle
+//    n'en reçoit que le corps du refus. C'est aussi pourquoi le correctif ne
+//    peut pas être une phrase de prompt — une règle qu'un modèle ne peut pas
+//    appliquer faute de signal, en plus de la classe que
+//    `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
+//    interdit.
+//
+// Fail-OPEN sur tout signal illisible, l'inverse de mika#1646, et l'asymétrie
+// se calcule : un faux négatif laisse subsister le signal trompeur — le défaut
+// d'origine, déjà le régime actuel, et le merge reste fermé par le point 1 ;
+// un faux positif oblige à réécrire la revue et, si le modèle s'obstine, tue le
+// tour sans revue, c'est-à-dire le mode de panne du point 2.
+
+/// Audit-event `tool_name` pour chaque décision du gate CI↔verdict (R9/AC8).
+///
+/// Même convention que [`PR_REVIEW_FLAG_AUDIT_TOOL`] et
+/// [`DESTRUCTIVE_ACTION_AUDIT_TOOL`] : `audit_events` n'a pas de colonne
+/// `event_type`, `tool_name` est du TEXT libre, aucune migration.
+pub const QA_CI_COHERENCE_AUDIT_TOOL: &str = "qa_ci_coherence_guard";
+
+/// Variable de désarmement du gate (R7/AC7).
+pub const QA_CI_COHERENCE_GATE_ENV: &str = "MIKA_QA_CI_COHERENCE_GATE";
+
+/// Plafond de temps sur la lecture CI du gate (U1).
+///
+/// `run_gh_subprocess` — le chemin qu'emprunte `run_gh_checks` — **ne porte
+/// aucun plafond propre** : il `spawn` puis `wait()` sans borne. Ce plafond est
+/// donc le seul, et il n'en empile pas un second. 10 s, très en deçà du
+/// `timeout_secs = 30` que `qa-review` déclare pour ses propres outils, parce
+/// que le dépassement ici n'est pas une erreur mais une **abstention** : mieux
+/// vaut laisser passer tôt que consommer le tiers de l'enveloppe de l'outil sur
+/// une lecture qui, de toute façon, ne refusera rien.
+pub const QA_CI_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Ce que la garde conclut **d'une liste de checks qu'elle a pu lire**.
+///
+/// **L'abstention n'est délibérément pas un variant d'ici.** Le plan de
+/// mika#2455 en prévoyait un ; la lecture du code le refuse, et l'écart vaut
+/// d'être écrit : les six causes d'abstention — pas de cible, pas de dépôt, pas
+/// de jeton, `gh` en échec, timeout, sortie illisible — sont toutes des états
+/// dans lesquels **il n'existe aucune liste de checks à classer**. Un variant
+/// que la fonction ne peut pas construire serait une promesse que l'enum ne
+/// tient pas, et un bras mort dans le `match` de l'appelant. L'abstention est
+/// une décision du gate, en amont ; ses causes vivent dans [`CiAbstention`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CiCoherenceOutcome {
+    /// Au moins un check requis est en bucket `fail`/`cancel`. Porte leurs noms
+    /// pour que le corps du refus soit auto-suffisant (R2/AC4).
+    Refused { failing: Vec<String> },
+    /// Tous les checks requis ont conclu au vert (ou il n'y en a aucun).
+    AllowedGreen,
+    /// Au moins un check requis est encore `pending`, aucun n'est rouge (R6).
+    AllowedPending,
+}
+
+/// Les causes d'abstention du gate, écrites une seule fois.
+///
+/// **Format de fil** : ces chaînes sont lues par `jq` sur le champ `reason` de
+/// `qa_ci_coherence_abstained` et par `GROUP BY` sur `audit_events`. Deux
+/// orthographes d'une même cause couperaient une population en deux sans le
+/// dire (doctrine mika#2131). Épinglées par
+/// `mika2455_abstention_reasons_are_a_wire_format`.
+///
+/// `NO_PR_TARGET` n'était pas dans la liste du plan (qui en nommait cinq) : le
+/// plan décrivait bien la branche — « `pr_review_target(args)` absent →
+/// abstention » — sans lui donner de nom de fil. L'ajout est un enrichissement
+/// nommé, jamais un affaiblissement.
+pub struct CiAbstention;
+
+impl CiAbstention {
+    /// L'argv ne nomme pas de PR, ou la nomme sous une forme qui n'est pas un
+    /// numéro. Le gate ne devine pas une cible.
+    pub const NO_PR_TARGET: &'static str = "no_pr_target";
+    /// Aucun `--repo` : le gate ne devine pas le dépôt.
+    pub const NO_REPO: &'static str = "no_repo";
+    /// Aucun jeton GitHub résolu sur ce chemin.
+    pub const NO_TOKEN: &'static str = "no_token";
+    /// `gh` a échoué (non-zéro, absent, réseau).
+    pub const GH_FAILED: &'static str = "gh_failed";
+    /// La lecture a dépassé [`QA_CI_READ_TIMEOUT_SECS`].
+    pub const GH_TIMEOUT: &'static str = "gh_timeout";
+    /// `gh` a répondu, mais sa sortie n'est pas du JSON exploitable.
+    pub const UNPARSEABLE: &'static str = "unparseable";
+}
+
+/// Classe l'état CI **sans réimplémenter la notion de « check requis »** (D6/R10).
+///
+/// La délégation à [`classify_checks`] n'est pas une économie de lignes : c'est
+/// la condition pour que les deux extrémités du même contrat — le gate qui
+/// refuse un `pass` et le gate de merge qui refuse le merge — ne puissent pas
+/// diverger sur ce qui bloque. Une seconde définition de « requis » est la
+/// classe que `grooming_marker` (mika#2158) a dû fermer après des mois de
+/// divergence silencieuse.
+///
+/// Seule l'extraction des noms rouges est ajoutée, pour R2.
+///
+/// [`classify_checks`]: crate::tools::pr_merge_with_gate::classify_checks
+pub(crate) fn classify_ci_coherence(
+    checks: &[crate::tools::pr_merge_with_gate::GhCheck],
+) -> CiCoherenceOutcome {
+    use crate::tools::pr_merge_with_gate::{CheckClassification, classify_checks};
+
+    match classify_checks(checks) {
+        CheckClassification::HasFailures => CiCoherenceOutcome::Refused {
+            failing: checks
+                .iter()
+                .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
+                .map(|c| c.name.clone())
+                .collect(),
+        },
+        CheckClassification::HasPending => CiCoherenceOutcome::AllowedPending,
+        CheckClassification::AllPassed => CiCoherenceOutcome::AllowedGreen,
+    }
+}
+
+/// Le gate est-il armé ? (R7/U3)
+///
+/// **La polarité est celle de `MIKA_TELEGRAM_HTML_RENDER` (mika#2291), pas
+/// celle de ses voisins de ce fichier.** Armé par défaut : rend `true` sur
+/// `None`, sur vide **et sur toute valeur non reconnue** ; rend `false` sur le
+/// seul `0` / `false` / `off` / `no` explicite (insensible à la casse, espaces
+/// tolérés). Un désarmement par coquille sur un gate de sûreté serait la panne
+/// silencieuse que tout ce travail ferme, et la valeur fautive est nommée
+/// **entre guillemets** — sans les guillemets un espace parasite est invisible
+/// (mika#2220).
+pub fn qa_ci_coherence_gate_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            // La valeur **trimée d'origine**, jamais la version en minuscules :
+            // citer la valeur existe pour préserver la fidélité du diagnostic
+            // (mika#2220), et plier sa casse jette une partie de ce que
+            // l'opérateur a réellement tapé.
+            tracing::warn!(
+                event = "qa_ci_coherence_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2455: MIKA_QA_CI_COHERENCE_GATE porte une valeur non reconnue — le gate \
+                 reste ARMÉ (le défaut). Utiliser 0/false/off/no pour le désarmer."
+            );
+            true
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache (R7).
+///
+/// Lue une fois : poser ou retirer la variable sur un process déjà démarré n'a
+/// aucun effet, par construction — même contrat que `MIKA_AGENT_TIER` et
+/// `MIKA_DEPLOYMENT`.
+pub fn qa_ci_coherence_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        qa_ci_coherence_gate_is_enabled(std::env::var(QA_CI_COHERENCE_GATE_ENV).ok().as_deref())
+    })
+}
+
+/// Dit au démarrage que le gate est désarmé — et ne dit rien s'il est armé.
+///
+/// Appelée depuis `run_server`. Le silence d'un gate désarmé se lit exactement
+/// comme le silence d'un gate sain (mika#2205) ; c'est la seule raison d'être
+/// de cette fonction, et c'est pourquoi elle est muette dans le cas nominal
+/// (une ligne par démarrage sur un parc sain serait du bruit, doctrine
+/// mika#2131).
+pub fn log_qa_ci_coherence_gate_state() {
+    if !qa_ci_coherence_gate_enabled() {
+        tracing::info!(
+            event = "qa_ci_coherence_gate_disabled",
+            env = QA_CI_COHERENCE_GATE_ENV,
+            "mika#2455: le gate de cohérence CI↔verdict est DÉSARMÉ — un verdict `pass` peut être \
+             posté sur une PR dont un check requis est rouge"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4747,6 +4974,185 @@ mod tests {
                 ("run_gh", other.as_str(), false),
             ];
             assert!(!approve_attempt_failed_in_turn(calls.into_iter(), "2236"));
+        }
+    }
+
+    // -- mika#2455 — un `pass` contredit par un check requis rouge --
+
+    mod mika2455 {
+        use super::super::*;
+        use crate::tools::pr_merge_with_gate::GhCheck;
+
+        fn check(name: &str, bucket: &str) -> GhCheck {
+            GhCheck {
+                name: name.to_string(),
+                state: bucket.to_uppercase(),
+                bucket: bucket.to_string(),
+                link: None,
+            }
+        }
+
+        /// Le cas mesuré sur #2439 : deux checks requis rouges, dont
+        /// `SIGPIPE grep-q Lint`. Le refus doit **nommer** les checks, sans
+        /// quoi R2 n'est pas tenue et la réécriture du verdict est aveugle.
+        #[test]
+        fn a_failing_required_check_refuses_and_names_it() {
+            let checks = [
+                check("SIGPIPE grep-q Lint", "fail"),
+                check("Check", "fail"),
+                check("docker-build", "pass"),
+            ];
+            let CiCoherenceOutcome::Refused { failing } = classify_ci_coherence(&checks) else {
+                panic!("attendu Refused");
+            };
+            assert_eq!(failing, vec!["SIGPIPE grep-q Lint", "Check"]);
+        }
+
+        /// `cancel` est du même côté que `fail`, parce que `classify_checks`
+        /// le range là : un check annulé n'a pas conclu au vert, et les deux
+        /// extrémités du contrat doivent lire la même chose (D6).
+        #[test]
+        fn a_cancelled_required_check_refuses_too() {
+            let checks = [check("Check", "cancel")];
+            let CiCoherenceOutcome::Refused { failing } = classify_ci_coherence(&checks) else {
+                panic!("attendu Refused");
+            };
+            assert_eq!(failing, vec!["Check"]);
+        }
+
+        /// R6/AC3 — la population `pending` est **hors** de ce que ce gate
+        /// ferme. `pull_request.opened` route vers mika-qa sans aucun terme CI,
+        /// donc une revue qui part avant la conclusion de la CI est le cas
+        /// nominal : refuser ici refuserait le nominal.
+        #[test]
+        fn a_pending_required_check_refuses_nothing() {
+            let checks = [check("Check", "pending"), check("docker-build", "pass")];
+            assert_eq!(
+                classify_ci_coherence(&checks),
+                CiCoherenceOutcome::AllowedPending
+            );
+        }
+
+        /// Un rouge l'emporte sur un pending : la conjonction est « au moins un
+        /// rouge », pas « tous ont conclu ».
+        #[test]
+        fn a_red_check_wins_over_a_pending_one() {
+            let checks = [check("Check", "pending"), check("Lint", "fail")];
+            assert!(matches!(
+                classify_ci_coherence(&checks),
+                CiCoherenceOutcome::Refused { .. }
+            ));
+        }
+
+        /// Aucun check requis ⇒ vert, aligné sur le « empty → treat as
+        /// all-pass » que `classify_checks` porte déjà. Un dépôt sans check
+        /// requis ne doit pas voir ses revues refusées.
+        #[test]
+        fn no_required_check_at_all_is_green() {
+            assert_eq!(classify_ci_coherence(&[]), CiCoherenceOutcome::AllowedGreen);
+        }
+
+        #[test]
+        fn every_required_check_green_is_green() {
+            let checks = [
+                check("Check", "pass"),
+                check("docker-build", "pass"),
+                check("skipped-one", "skipping"),
+            ];
+            assert_eq!(
+                classify_ci_coherence(&checks),
+                CiCoherenceOutcome::AllowedGreen
+            );
+        }
+
+        // -- Kill-switch (R7/U3) --
+
+        /// La polarité est celle de mika#2291 et **l'inverse** de la plupart
+        /// des drapeaux de ce dépôt : absent, vide et non reconnu restent
+        /// ARMÉS. Un corps copié d'un voisin donnerait un gate désarmé par
+        /// défaut, exactement l'inverse de la décision.
+        #[test]
+        fn the_gate_is_armed_by_default_and_a_typo_does_not_disarm_it() {
+            assert!(qa_ci_coherence_gate_is_enabled(None));
+            assert!(qa_ci_coherence_gate_is_enabled(Some("")));
+            assert!(qa_ci_coherence_gate_is_enabled(Some("   ")));
+            assert!(qa_ci_coherence_gate_is_enabled(Some("zorglub")));
+            // La coquille la plus plausible sur un drapeau que l'on croit
+            // booléen : un espace parasite autour d'un `0` reste un `0`, mais
+            // `flase` reste armé.
+            assert!(qa_ci_coherence_gate_is_enabled(Some("flase")));
+        }
+
+        #[test]
+        fn only_an_explicit_negative_disarms_the_gate() {
+            for raw in ["0", "false", "off", "no", "FALSE", " Off ", "NO"] {
+                assert!(
+                    !qa_ci_coherence_gate_is_enabled(Some(raw)),
+                    "{raw:?} devrait désarmer"
+                );
+            }
+            for raw in ["1", "true", "on", "yes", "TRUE", " On "] {
+                assert!(
+                    qa_ci_coherence_gate_is_enabled(Some(raw)),
+                    "{raw:?} devrait laisser armé"
+                );
+            }
+        }
+
+        // -- Formats de fil --
+
+        /// Ces six chaînes atterrissent dans `audit_events.after_value` et dans
+        /// le champ `reason` du journal, où l'opérateur en fait des `GROUP BY`.
+        /// Les renommer est une rupture à **dater** dans `CLAUDE.md`, jamais une
+        /// mise à jour de test en silence.
+        #[test]
+        fn mika2455_abstention_reasons_are_a_wire_format() {
+            assert_eq!(CiAbstention::NO_PR_TARGET, "no_pr_target");
+            assert_eq!(CiAbstention::NO_REPO, "no_repo");
+            assert_eq!(CiAbstention::NO_TOKEN, "no_token");
+            assert_eq!(CiAbstention::GH_FAILED, "gh_failed");
+            assert_eq!(CiAbstention::GH_TIMEOUT, "gh_timeout");
+            assert_eq!(CiAbstention::UNPARSEABLE, "unparseable");
+        }
+
+        #[test]
+        fn mika2455_the_audit_tool_name_is_a_wire_format() {
+            assert_eq!(QA_CI_COHERENCE_AUDIT_TOOL, "qa_ci_coherence_guard");
+            assert_eq!(QA_CI_COHERENCE_GATE_ENV, "MIKA_QA_CI_COHERENCE_GATE");
+        }
+
+        /// Le discriminant entre `gh_failed` et `unparseable` repose sur un
+        /// préfixe partagé entre le producteur (`parse_gh_checks`) et le
+        /// lecteur (le gate). Un littéral tapé deux fois serait la comparaison
+        /// de sous-chaîne sur un message rendu que mika#2179 interdit ; ce test
+        /// est ce qui rend le partage vérifiable.
+        #[test]
+        fn mika2455_the_parse_error_prefix_is_a_wire_format() {
+            use crate::tools::pr_merge_with_gate::{GH_CHECKS_PARSE_ERROR_PREFIX, parse_gh_checks};
+            let err = parse_gh_checks("{ ceci n'est pas une liste }").unwrap_err();
+            assert!(
+                err.starts_with(GH_CHECKS_PARSE_ERROR_PREFIX),
+                "le préfixe partagé doit préfixer l'erreur réelle, obtenu: {err}"
+            );
+            // Contrôle négatif : une sortie vide n'est pas une erreur de parse,
+            // c'est « aucun check requis » — la sémantique préexistante.
+            assert_eq!(parse_gh_checks("").unwrap().len(), 0);
+            assert_eq!(parse_gh_checks("  []  ").unwrap().len(), 0);
+        }
+
+        /// Le plafond de lecture est très en deçà du budget d'outil que
+        /// `qa-review` déclare : le dépassement est une **abstention**, pas une
+        /// erreur, donc il ne doit pas consommer l'enveloppe de l'outil.
+        #[test]
+        fn the_read_timeout_stays_well_under_the_tool_budget() {
+            assert!(
+                QA_CI_READ_TIMEOUT_SECS < 30,
+                "le plafond de lecture doit rester sous le timeout_secs de qa-review"
+            );
+            assert!(
+                QA_CI_READ_TIMEOUT_SECS >= 5,
+                "assez pour un aller-retour gh"
+            );
         }
     }
 }

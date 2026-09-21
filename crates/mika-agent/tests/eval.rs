@@ -146,6 +146,11 @@ mod eval {
     // vivant, harness multi-agents pour l'attribution.
     mod test_pr_review_idempotency;
 
+    // mika#2455 — un `pass` ne peut plus affirmer ce qu'un check requis rouge
+    // contredit : les deux têtes mesurées, l'issue laissée ouverte sous
+    // mika#2237, et les six abstentions nommées.
+    mod test_qa_ci_coherence_2455;
+
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
     mod test_qa_review_reconcile_2334;
