@@ -4341,7 +4341,7 @@ _t6_drift_guard() {
         return 0
     fi
     for v in $values; do
-        if ! printf '%s\n' "$v" | grep -Eq '^[a-z][a-z0-9_]*$'; then
+        if ! grep -Eq -- '^[a-z][a-z0-9_]*$' <<<"$v"; then
             FAIL=$((FAIL + 1))
             echo "  ✗ T6: upstream token '$v' is outside the subtype shape [a-z][a-z0-9_]* — widen the runtime scrape and this guard together"
             continue
