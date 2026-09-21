@@ -36,6 +36,16 @@ fn fixture(name: &str) -> StalenessMeasurement {
 /// Measured 2026-09-01: 180 behind, 2 ahead, and a real `git rebase origin/main`
 /// conflicts on `agent_loop/mod.rs` and `evidence/guards.rs` — the same two
 /// files the issue reported on 2026-08-31.
+///
+/// **Second role, mika#2170 AC5 — negative control of the slug split.** This
+/// branch carries four `crates/**` files *and* its plan, so it is the nominal
+/// grooming-branch-with-work case, and it must keep
+/// `salvage_work_on_stale_branch`. The split exists to separate it from a branch
+/// that carries no plan at all; if this assertion ever flips to
+/// `stale_branch_without_plan`, the discriminant is inverted or the prefix
+/// stopped matching, and the new slug is eating the nominal traffic (halt 3 of
+/// the mika#2170 verification contract). **Do not "harmonise" the assertion
+/// below to the new variant** — it is the control, not a stale expectation.
 #[test]
 fn auto_pull_replay_1680_is_refused_by_name() {
     let m = fixture("1680-diverged-180-behind-2-ahead.json");
@@ -147,6 +157,17 @@ fn auto_pull_replay_1959_refusal_is_the_threshold_and_nothing_else() {
 /// promoted" — is not lost: it moves to the #2118/#2120 replays below, on
 /// branches that are actually grooming branches, which is the population this
 /// gate exists to judge.
+///
+/// **mika#2170 — the date stands, the conclusion changes support.** The
+/// measurement above is unchanged and the verdict is unchanged: this branch was
+/// refused before and is refused now. What moved is that the refusal is no
+/// longer *indistinguishable* from the nominal one. It carries its own slug, so
+/// the population mika#2170 was created to watch is countable in one `GROUP BY`
+/// instead of living in an open ticket — and its original wake condition, which
+/// named a field that can never hold what it was looking for, is replaced by
+/// that slug plus `plan_files_count`. The remaining policy question (widen the
+/// prefix? filter Phase 2?) is unchanged and still reserved: it is now decidable
+/// on a count rather than on an argument.
 #[test]
 fn auto_pull_replay_2048_no_plan_file_is_refused_and_the_prefix_is_the_sole_cause() {
     let m = fixture("2048-diverged-17-behind-1-ahead.json");
@@ -165,12 +186,22 @@ fn auto_pull_replay_2048_no_plan_file_is_refused_and_the_prefix_is_the_sole_caus
         "and while the old predicate would promote too"
     );
 
+    // And that not one of the three paths is a plan — the fact the mika#2170
+    // slug asserts. Frozen here rather than inferred from the verdict, so the
+    // fixture cannot drift into carrying a plan without this test saying so.
+    assert!(
+        s.changed_files
+            .as_ref()
+            .expect("fixture carries a file list")
+            .iter()
+            .all(|f| !f.starts_with("docs/plans/")),
+        "this test is only meaningful while the branch carries no plan at all"
+    );
+
     match classify_promotion(&m, Some("ci/2048-re-enable-release-please"), THRESHOLD) {
-        PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
-            non_plan_files, ..
-        }) => {
+        PromotionGate::Refuse(RefusalReason::StaleBranchWithoutPlan { changed_files, .. }) => {
             assert_eq!(
-                non_plan_files,
+                changed_files,
                 vec![
                     ".github/workflows/release-pr.yml".to_string(),
                     "release-please-config.json".to_string(),
@@ -178,7 +209,7 @@ fn auto_pull_replay_2048_no_plan_file_is_refused_and_the_prefix_is_the_sole_caus
                 ]
             );
         }
-        other => panic!("expected a named salvage refusal, got {other:?}"),
+        other => panic!("expected a named plan-less refusal, got {other:?}"),
     }
 }
 
@@ -249,6 +280,18 @@ fn auto_pull_replay_2118_and_2120_multi_pass_grooming_promotes() {
 /// boundary case where the prefix is the sole cause of a refusal that would
 /// otherwise have promoted, this assertion fails and the prefix question reopens
 /// instead of answering itself in silence.
+///
+/// **Second role, mika#2170 AC5 — negative control of the slug split, and this
+/// one is a trap.** Read alone, the paragraph above ("literally true,
+/// semantically arguable") invites exactly the wrong conclusion: that
+/// `stale_branch_without_plan` would be the fairer verdict here. It would not.
+/// This branch **carries** `docs/plans/2026-07-06-001-feat-1727-…-plan.md`
+/// alongside its stray document, so it is a grooming branch and keeps
+/// `salvage_work_on_stale_branch`. The mika#2170 slug asserts a different fact —
+/// *no plan file at all* — which is false of this branch. The two roles coexist
+/// on this test; neither of the two assertions already here is removed, and the
+/// third below pins the premise the split rests on. **Do not "harmonise" this to
+/// the new variant.**
 #[test]
 fn auto_pull_replay_1727_is_the_measured_boundary_case() {
     let m = fixture("1727-diverged-190-behind-3-ahead.json");
@@ -259,6 +302,18 @@ fn auto_pull_replay_1727_is_the_measured_boundary_case() {
         s.behind_by > THRESHOLD,
         "#1727's refusal must stay overdetermined by distance ({} behind)",
         s.behind_by
+    );
+    // mika#2170: the premise of the negative control, frozen rather than
+    // assumed. Strip the plan file from this fixture and the verdict legitimately
+    // becomes the new slug — so the day it disappears, this fails here, where the
+    // reason is written, instead of failing below as a puzzling slug mismatch.
+    assert!(
+        s.changed_files
+            .as_ref()
+            .expect("fixture carries a file list")
+            .iter()
+            .any(|f| f.starts_with("docs/plans/")),
+        "#1727 is the negative control only while it genuinely carries a plan"
     );
 
     match classify_promotion(
@@ -278,6 +333,91 @@ fn auto_pull_replay_1727_is_the_measured_boundary_case() {
             );
         }
         other => panic!("expected a named salvage refusal, got {other:?}"),
+    }
+}
+
+/// **mika#2170 AC3 / R5 — the whole frozen corpus, and the property that must
+/// not move: no promotion becomes a refusal, and no refusal becomes a
+/// promotion.**
+///
+/// The other replays in this file each assert one branch's verdict in detail.
+/// This one asserts the *partition* over all seven, because that is the claim
+/// mika#2170 makes about itself: it splits a slug and rewrites a diagnostic, and
+/// it changes not one decision. A per-branch assertion cannot say that — only
+/// the set can, and only if it is exhaustive.
+///
+/// **Exhaustiveness is checked, not trusted.** The table is compared against the
+/// fixture directory, so a fixture added without a line here fails the test
+/// instead of silently escaping the invariant.
+///
+/// Note what is deliberately *not* asserted: the refusal slugs. Those are the
+/// half mika#2170 does change, and they are pinned one by one in the replays
+/// above, where each carries the reasoning for its own verdict.
+#[test]
+fn mika2170_no_frozen_verdict_flips_between_promote_and_refuse() {
+    // (fixture, branch, promoted?) — frozen 2026-09-21, unchanged by mika#2170.
+    let corpus: &[(&str, &str, bool)] = &[
+        (
+            "1680-diverged-180-behind-2-ahead.json",
+            "fix/1680/mika-dev-tui-broken-glyph-rendering-in",
+            false,
+        ),
+        (
+            "1727-diverged-190-behind-3-ahead.json",
+            "feat/1727/tui-tui-as-thin-http-client-of-mika",
+            false,
+        ),
+        (
+            "1959-diverged-75-behind-1-ahead.json",
+            "feat/1959/mcp-manifest-data-grade-field-l4-forward",
+            false,
+        ),
+        (
+            "2048-diverged-17-behind-1-ahead.json",
+            "ci/2048-re-enable-release-please",
+            false,
+        ),
+        (
+            "2118-diverged-13-behind-3-ahead.json",
+            "fix/2118/skills-cloud-sur-un-tenant-cloud-google",
+            true,
+        ),
+        (
+            "2120-diverged-13-behind-2-ahead.json",
+            "fix/2120/auto-pull-is-groomed-exige-docs-plans",
+            true,
+        ),
+        (
+            "2123-ahead-0-behind-1-ahead.json",
+            "fix/2123/dispatch-lib-le-rebase-est-tent-au",
+            true,
+        ),
+    ];
+
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/auto_pull_compare/"
+    );
+    let on_disk = std::fs::read_dir(dir)
+        .expect("fixture directory must be readable")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|n| n.ends_with(".json"))
+        .count();
+    assert_eq!(
+        on_disk,
+        corpus.len(),
+        "a fixture was added or removed without updating this table — the R5 \
+         invariant is only worth anything while it covers every frozen branch"
+    );
+
+    for (name, branch, expected_promote) in corpus {
+        let decision = classify_promotion(&fixture(name), Some(branch), THRESHOLD);
+        let promoted = matches!(decision, PromotionGate::Promote { .. });
+        assert_eq!(
+            promoted, *expected_promote,
+            "{name}: mika#2170 moves no decision, yet this verdict flipped \
+             (got {decision:?})"
+        );
     }
 }
 

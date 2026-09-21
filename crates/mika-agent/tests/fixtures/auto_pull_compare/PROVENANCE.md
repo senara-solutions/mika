@@ -55,6 +55,16 @@ Phase 1 filter on `is_groomed`, which requires a plan callout; Phase 2 could,
 but zero of the 18 open tickets with a branch callout on 2026-09-04 point at a
 plan-less branch; and #2048 itself is closed with no grooming callout).
 
+Since **mika#2170** it is also the one body of the `stale_branch_without_plan`
+population. Its verdict is unchanged — refused before, refused now — but it no
+longer shares a slug with `#1680` / `#1727`, which carry a plan alongside their
+code and keep `salvage_work_on_stale_branch`. Those two are the negative
+controls of that split, and each says so in its own test; **do not harmonise
+them to the new variant**. The measurement above is not superseded: it stands,
+and the count it produced now lives in the audit trail
+(`reason = 'stale_branch_without_plan'`, plus `plan_files_count` on every
+decision) rather than in an open ticket.
+
 **`#2118` / `#2120`** are the two bodies mika#2140 was filed on: three and two
 grooming commits, nothing but their own plan file, both labelled `operator-gated`
 by the old `ahead_by > 1` predicate and held out of the `ready` pool for days.

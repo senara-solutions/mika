@@ -297,7 +297,8 @@ plus — il n'y a plus de condition d'attente à consigner.
 **Dans le périmètre :** `staleness_audit_json` (un champ additif), `RefusalReason`
 (un variant + ses quatre `match`), `classify_promotion` (l'aiguillage entre les
 deux variants, à décision constante), le commentaire du site d'appel Phase 2, les
-tests, et une addition courte à `CLAUDE.md`.
+tests, une addition courte à `CLAUDE.md`, et **la rectification du corps de
+mika#2170** (U8 — geste de grooming en Phase 4, pas du pilote).
 
 **Hors périmètre, nommé :**
 
@@ -383,15 +384,70 @@ assertion sur `non_plan_files` reste, et son doc-comment est mis à jour (il
 affirme aujourd'hui que la population vivante est vide « au 2026-09-04 » — la
 date reste, la conclusion change de support).
 
-Le test `auto_pull_replay_1680_is_refused_by_name` devient le **contrôle négatif
-nommé** de la scission ; son commentaire doit le dire, sinon un futur lecteur le
-lira comme une simple assertion de slug et l'« harmonisera ».
+**Les deux** tests de contrôle négatif — `auto_pull_replay_1680_is_refused_by_name`
+(`:40`) et `auto_pull_replay_1727_is_the_measured_boundary_case` (`:253`) —
+deviennent les **contrôles négatifs nommés** de la scission, et **chacun porte le
+commentaire qui le dit**. Pas seulement le premier nommé : un contrôle dont le rôle
+n'est pas écrit se lit comme une simple assertion de slug, et c'est celui-là qu'un
+futur lecteur « harmonisera » vers le nouveau variant — rouvrant en silence ce que
+la scission ferme. La protection vaut pour chaque contrôle, pas pour le seul premier
+nommé (mika#2120 AC2 ; discipline de frontière — chaque contrôle porte son rôle).
+
+Le cas de `1727` demande une **extension**, pas une réécriture, et c'est ce qui rend
+l'omission dangereuse : son commentaire porte déjà un rôle — contrôle **positif** de
+la question du préfixe (mika#2140), avec l'assertion auto-nettoyante sur
+`behind_by > THRESHOLD` — et ce rôle-là dit « le préfixe classe ce doc comme
+non-grooming : littéralement vrai, sémantiquement discutable ». Lue seule, cette
+phrase invite précisément à croire que `stale_branch_without_plan` serait plus juste
+ici. Elle ne l'est pas : la branche **porte** un plan, et c'est ce que le
+commentaire étendu doit poser. Les deux rôles coexistent sur le même test ; aucune
+des deux assertions existantes n'est retirée.
 
 ### U7 — `CLAUDE.md`
 
 Addition **courte** à la section auto-pull existante : les deux slugs, la règle
 de lecture de part et d'autre du déploiement (D3), la requête de comptage et sa
 halte (cf. Verification Contract).
+
+### U8 — rectification du corps de mika#2170 (**geste de grooming en Phase 4, pas du pilote**)
+
+Trois affirmations du corps sont réfutées par ce plan, et le corps reste tel quel :
+
+| affirmation du corps | statut | où |
+|---|---|---|
+| la condition de réveil (« … dont la liste `non_plan_files` ne contient aucun frère sous `docs/plans/` ») | **invérifiable telle qu'écrite** — trivialement vraie pour tout refus salvage, `non_plan_files` ne pouvant par construction contenir le frère qu'elle cherche | F2 |
+| « Les deux résolutions possibles, à trancher au réveil » (filtrer `is_groomed` ; élargir `PLAN_PATH_PREFIX`) | **réfutées**, chacune par une raison distincte — la première supprime le filet de l'état d'entrée nominal et désavoue une décision opérateur, la seconde trahit la raison de la règle salvage et heurte l'interdiction de mika#2123 KTD2b | F3/F4, F5 |
+| « Il ne se ferme pas : la classe reste réelle, seule sa population est vide » | **renversé** — la classe change de support, du ticket vers l'instrument | D7 |
+
+Sans rectification, le prochain lecteur du ticket lit une spécification réfutée
+présentée comme vivante — et il la lit **avant** la fermeture, la fenêtre s'ouvrant
+au grooming et non au merge.
+
+Forme, selon la convention maison (mika#2169, mika#2158, appliquée sur mika#2162),
+**l'original conservé, jamais réécrit** :
+
+- un **encadré daté en tête de corps** nommant les trois lignes du tableau
+  ci-dessus — pour chacune : ce qui est remplacé ou réfuté, sa raison en une
+  phrase, et le renvoi à ce plan ;
+- un **commentaire d'avis d'édition** posté sur le ticket, pour que la
+  modification du corps soit datée et attribuée dans la timeline plutôt que
+  silencieuse.
+
+**Une trace rectifiée dit ce qui était vrai au moment où elle a été écrite** :
+c'est exactement le raisonnement que D3 applique aux lignes d'audit déjà posées,
+et un corps de ticket est une trace de spécification au même titre (mika#2361,
+précédent de scission de format de fil que ce plan invoque déjà).
+
+**Pourquoi ce n'est pas le travail du pilote.** D7 fait dépendre la fermeture du
+ticket de la ratification opérateur d'un changement de support : c'est une décision
+de grooming, prise avec le plan sous les yeux, pas un effet de bord d'un patch. Le
+pilote ne touche pas au corps du ticket — seul le groomer écrit U8, en Phase 4.
+
+**Réserve déclarée, non prétendue :** `gh` n'est pas authentifié dans ce worktree
+de grooming, donc la forme byte-exacte de l'encadré de mika#2162 n'a pas été relue
+ici. Ce qui est prescrit est la **convention** (encadré daté en tête + commentaire
+d'avis d'édition, original conservé) ; si mika#2162 porte une forme plus précise,
+c'est elle qui fait foi.
 
 ---
 
@@ -458,9 +514,16 @@ pilote d'implémentation, pas dans ce worktree (Scope Boundaries).
 - L'aiguillage est à décision constante, et un test le pose sur les 7 fixtures.
 - Le message ne dit plus « partiel » sur cette population et porte la butée F7.
 - Le commentaire du site Phase 2 porte la réponse (F2–F5), pas la question.
-- Les deux contrôles négatifs (`1680`, `1727`) gardent l'ancien slug.
+- Les deux contrôles négatifs (`1680`, `1727`) gardent l'ancien slug, et **chacun
+  des deux tests porte le commentaire qui le nomme contrôle négatif de la
+  scission** (celui de `1727` étendu, son rôle mika#2140 conservé).
 - `CLAUDE.md` porte les deux slugs, la règle de lecture datée, la requête et ses
   haltes.
+- **Le corps de mika#2170 est rectifié** : encadré daté en tête nommant les trois
+  réfutations (condition de réveil remplacée ; deux résolutions écartées avec leur
+  raison ; support de visibilité déplacé du ticket vers l'instrument), plus un
+  commentaire d'avis d'édition posté sur le ticket, l'original conservé. **Geste de
+  grooming en Phase 4 (U8) — pas du pilote d'implémentation.**
 - `cargo test`, `cargo clippy`, `cargo fmt` verts.
 - Aucune fixture modifiée ; `PLAN_PATH_PREFIX` et `is_groomed` inchangés.
 
@@ -484,7 +547,11 @@ ci-dessous sont dérivés des Requirements et du Verification Contract.
   `stale_branch_without_plan` et son message ne qualifie pas le travail de
   « partiel ».
 - **AC5.** Sur les fixtures `1680` et `1727` (plan présent), le refus **garde**
-  `salvage_work_on_stale_branch` — contrôles négatifs explicites.
+  `salvage_work_on_stale_branch`, et **chacun des deux tests porte le commentaire
+  qui le nomme contrôle négatif de la scission** — la protection vaut pour chaque
+  contrôle, pas pour le seul premier nommé (mika#2120 AC2). Celui de `1727` est
+  étendu : son rôle de contrôle positif du préfixe (mika#2140) et ses deux
+  assertions existantes sont conservés.
 - **AC6.** Le remède servi à la population sans plan ne prescrit aucune gestuelle
   inerte, et dit explicitement que groomer le ticket ne lèvera pas le refus.
 - **AC7.** Une liste `files` possiblement tronquée (≥ 300) ne produit **jamais**
@@ -496,6 +563,13 @@ ci-dessous sont dérivés des Requirements et du Verification Contract.
   filtre n'est ajouté en Phase 2.
 - **AC10.** Le commentaire du site d'appel Phase 2 énonce la dissymétrie comme
   correcte et nomme les deux résolutions écartées avec leur raison.
+- **AC11.** Le corps de mika#2170 porte un **encadré daté** nommant les trois
+  rectifications — condition de réveil remplacée et pourquoi ; deux résolutions
+  réfutées et pourquoi ; support de visibilité déplacé du ticket vers l'instrument
+  — et un **commentaire d'avis d'édition** est posté sur le ticket. L'original est
+  conservé, jamais réécrit. Sans cela, la trace de la réfutation ne vit que dans un
+  fichier de plan et le prochain lecteur du ticket prend une spécification réfutée
+  pour la spécification en vigueur.
 
 ---
 
@@ -568,7 +642,14 @@ reviendrait à surveiller une décision, ce que la maison ne fait pas.
 - mika#2123 — la porte de promotion, KTD2b (ne pas prédire le conflit)
 - mika#2020 — `ready` non groomé est l'état d'entrée nominal du pipeline
 - mika#996 — auto-groom on dispatch, qui rend le secours d'un non-groomé productif
-- mika#2361 — précédent de scission de format de fil, datée et non rétroactive
+- mika#2361 — précédent de scission de format de fil, datée et non rétroactive ;
+  une trace rectifiée dit ce qui était vrai au moment de l'écriture (D3, U8)
+- mika#2169, mika#2158 — convention maison de rectification d'un corps de ticket
+  réfuté par son grooming ; appliquée sur mika#2162 (DoD : encadré daté en tête +
+  commentaire d'avis d'édition, original conservé). Voir U8.
+- mika#2120 AC2 — rendre une garde plus permissive ne doit pas rouvrir ce qu'elle
+  ferme ; la protection vaut pour **chaque** contrôle négatif, pas pour le seul
+  premier nommé (U6, AC5)
 - mika#2131 — la valeur qu'un opérateur agrège est posée, pas dérivée
 - mika#2277 — un signal qu'on ne peut pas lire n'est jamais un terme satisfait
 - mika#2272 — la condition de flip insatisfiable (classe miroir de F2)
@@ -585,3 +666,32 @@ reviendrait à surveiller une décision, ce que la maison ne fait pas.
   le frère qu'elle cherche. Le travail livré répare l'instrument et le
   diagnostic, sans prendre aucune des deux décisions de politique que mika#2140
   réserve à un cas réel.
+
+- **rev 2 (2026-09-21)** — révision sur findings de première passe architecte
+  (`.iterate/findings-1.md`, `Disposition: ITERATE`). Les deux findings sont
+  adressés ; aucun ne reste ouvert.
+  - **F1 (bloquant)** — le plan réfutait le ticket sans prescrire la rectification
+    de son corps. Ajout de l'unité **U8** (encadré daté en tête + commentaire
+    d'avis d'édition, original conservé, rédigé par le groomer en Phase 4 et non
+    par le pilote), avec le tableau des trois affirmations réfutées — condition de
+    réveil (F2), deux résolutions à trancher (F3/F4, F5), support de visibilité
+    (D7 contre « Il ne se ferme pas »). Répercuté sur le **DoD** (c'est
+    l'exigence que le finding demandait explicitement d'y inscrire), sur
+    **AC11**, et sur les Scope Boundaries. Citations conservées : convention
+    maison mika#2169/#2158 appliquée sur mika#2162 ; cohérence avec mika#2361 (D3),
+    dont le raisonnement — une trace rectifiée dit ce qui était vrai au moment de
+    l'écriture — s'applique au corps d'un ticket comme aux lignes d'audit. Réserve
+    déclarée dans U8 : `gh` n'étant pas authentifié dans ce worktree, c'est la
+    convention qui est prescrite, non une forme relue sur mika#2162.
+  - **F2 (affûtage)** — U6 n'exigeait le commentaire de rôle que sur `1680`. Les
+    **deux** contrôles négatifs le portent désormais, et AC5 comme le DoD le
+    posent. Précision ajoutée en chemin : le test `1727` **existe déjà**
+    (`auto_pull_replay_1727_is_the_measured_boundary_case`, `:253`) et porte un
+    commentaire de rôle — mais pour un **autre** rôle, contrôle positif de la
+    question du préfixe (mika#2140). Son rôle actuel dit littéralement que le
+    préfixe classe son doc comme non-grooming, « sémantiquement discutable » :
+    lue seule, cette phrase invite à croire que `stale_branch_without_plan` serait
+    plus juste là, alors que la branche porte un plan. Le commentaire est donc
+    **étendu**, pas remplacé, et ses deux assertions existantes sont conservées —
+    ce qui rend l'omission signalée par F2 plus coûteuse qu'un simple oubli de
+    symétrie. Citation conservée : mika#2120 AC2.
