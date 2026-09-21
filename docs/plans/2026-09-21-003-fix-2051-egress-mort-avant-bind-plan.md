@@ -266,16 +266,27 @@ dans le `pid=` du `.begin` du journal du proxy.
 `skills/bundled/_shared/dispatch-lib.sh`, `_ensure_pilot_egress_proxy` :
 
 - capturer `local proxy_pid=$!` **immédiatement** après le `nohup … &` /
-  `disown` ;
+  `disown` (lignes 512-514) ;
 - ligne 531 (`pilot_egress_guard.unreachable`) : ajouter `(pid <proxy_pid>)` ;
 - ligne 534 (succès) : lire `$proxy_pid` au lieu de `$!` — même valeur
   aujourd'hui (vérifié : aucun arrière-plan ne s'interpose), mais la lecture ne
   dépend plus d'un invariant à distance.
 
+**Le point d'insertion est contraint, et c'est lui qui protège les greps.** Le
+pid s'insère **avant** le tiret cadratin, entre `within 3s` et
+`— falling back to fs-only` :
+
+```
+dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind <sock> within 3s (pid <proxy_pid>) — falling back to fs-only
+```
+
 Le texte existant n'est pas réécrit : le token `pilot_egress_guard.unreachable`
 et la sous-chaîne `falling back to fs-only` sont **tous deux** des prédicats
-publiés du Signal S, et la ligne reste ancrée à `^dispatch-lib: `. Le pid
-s'ajoute ; rien ne bouge de ce sur quoi les greps mordent.
+publiés du Signal S, et la ligne reste ancrée à `^dispatch-lib: `. Insérer le
+pid **après** le tiret couperait la sous-chaîne publiée en deux et rendrait
+muet le prédicat qui couvre *toute* la population de repli — c'est-à-dire qu'on
+casserait l'instrument du Signal S en croyant l'améliorer. Le pid s'ajoute en
+amont du tiret ; rien ne bouge de ce sur quoi les greps mordent (V7).
 
 ### U3 — L'artefact durable et la procédure de mesure (R3, R4)
 
@@ -424,8 +435,11 @@ prudence »).
 
 - `ed8d0e2b` — PR #2086, *fix(egress): name a pre-bind proxy death instead of
   dying silent (mika#2051)*, 2026-08-30 : la moitié code, déjà livrée.
-- `scripts/mika-pilot-egress-proxy:1242-1290` — fenêtre pré-bind instrumentée
-  (`.begin`, handlers précoces, seam de test).
+- `scripts/mika-pilot-egress-proxy:1242-1292` — fenêtre pré-bind instrumentée :
+  handler précoce `:1269`, `.begin` `:1284`, seam de test `:1292` ; le
+  `host-unix listening on` qui clôt la fenêtre est `:1325`.
+- `scripts/mika-pilot-egress-proxy:1299-1306` — le déliement de socket éventée
+  que le ticket a déjà réfuté comme cause (`stat.S_ISSOCK` puis `unlink`).
 - `scripts/test-pilot-egress-proxy-status.py:1450`, `:1467` — les deux tests de
   régression de #2086.
 - `skills/bundled/_shared/dispatch-lib.sh:491-536` — `_ensure_pilot_egress_proxy`,
@@ -450,3 +464,18 @@ prudence »).
   signatures, `pilot_egress_startup` absent de tout markdown) et la jointure
   pid absente du chemin d'échec du lanceur. La cause reste hors dépôt et non
   affirmée.
+- **v2 (2026-09-21)** — Re-groom. Les sept assertions portantes de v1 ont été
+  re-confrontées à `HEAD` (`3b177df3`) et tiennent toutes : `ed8d0e2b` ancêtre
+  et titre exact ; `pilot_egress_startup` à **zéro** dans `CLAUDE.md` et présent
+  dans **un seul** markdown — ce plan — ce qui **confirme par la mesure** le
+  choix d'ancrer V1/AC1 sur `CLAUDE.md` plutôt que sur `*.md` ; asymétrie pid
+  aux lignes 531/534 ; aucun arrière-plan entre `nohup` (512) et la garde, donc
+  `$!` tient toujours ; `make test-dispatch-lib` présent (`Makefile:158`) ; les
+  deux tests de #2086 présents (`:1450`, `:1467`). **Aucune décision, aucune AC,
+  aucun périmètre n'a changé.** Trois resserrages de précision seulement :
+  (a) U2 nomme désormais le **point d'insertion** du pid — avant le tiret
+  cadratin — parce que l'insérer après couperait la sous-chaîne publiée
+  `falling back to fs-only` et casserait le prédicat qui couvre toute la
+  population de repli ; (b) les références au proxy passent d'une plage
+  approximative à des lignes vérifiées (1269 / 1284 / 1292 / 1325, plus le
+  déliement 1299-1306) ; (c) cette entrée.
