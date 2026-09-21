@@ -5158,7 +5158,10 @@ mod tests {
                 );
             }
             const {
-                assert!(QA_CI_READ_TIMEOUT_SECS >= 5, "assez pour un aller-retour gh");
+                assert!(
+                    QA_CI_READ_TIMEOUT_SECS >= 5,
+                    "assez pour un aller-retour gh"
+                );
             }
         }
     }
