@@ -507,22 +507,22 @@ jour : vérifier par `diff` que le dispatch-lib.sh **résolu en production** por
 
 Reprises du ticket, avec le lieu du plan qui les tient.
 
-- **AC1** — Quand dispatch-lib prend un ticket, `dispatch:loop` est posée sur l'issue
+- [ ] **AC1** — Quand dispatch-lib prend un ticket, `dispatch:loop` est posée sur l'issue
   avant tout travail sur la branche. **Tenu par** C-3 (site avant `git fetch origin
   main` et toute mutation de worktree), épinglé par le test d'ordre (C-5, D-1).
   **Vérifiable** par la sonde post-déploiement : `labeled dispatch:loop` horodaté avant
   le premier commit de la branche.
-- **AC2** — Pose idempotente et non fatale. **Tenu par** C-1 (branche `already_owned`,
+- [ ] **AC2** — Pose idempotente et non fatale. **Tenu par** C-1 (branche `already_owned`,
   aucune écriture ; `|| true` au site ; pas de repli `label create`), T2/T3/T8/T9.
   `OwnedByCurrentSeat` reste un cas de passage côté moteur — inchangé, et c'est ce qui
   rend la course de C-4 bénigne.
-- **AC3** — La pose ne contourne pas la garde : classifier puis estampiller. **Tenu
+- [ ] **AC3** — La pose ne contourne pas la garde : classifier puis estampiller. **Tenu
   par** C-2/C-1 (lecture du **même** snapshot que le moteur ; toute étiquette
   `dispatch:*` étrangère → aucune écriture) et par les tests négatifs T4–T7, qui posent
   `dispatch:ssc`/`dispatch:mpc` et affirment qu'aucun `--add-label dispatch:loop`
   n'apparaît dans l'argv de `gh`. Le refus du dispatch lui-même reste au moteur —
   décision écrite en C-2, avec la condition de réveil d'un éventuel refus miroir.
-- **AC4** — Le retrait est décidé et documenté. **Décision : retrait à la sortie, sur
+- [ ] **AC4** — Le retrait est décidé et documenté. **Décision : retrait à la sortie, sur
   tous les chemins, inconditionnel** (C-4), avec le tableau des deux durées de vie, le
   résidu accepté (dispatch tué sans trap → guéri au dispatch suivant) et la sonde qui
   tranche un résidu (`tasks` dans `mika.db`). La garde continue de laisser passer
