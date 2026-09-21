@@ -292,12 +292,27 @@ sites (sinon il est vert parce qu'il ne regarde rien — classe mika#2205).
 ### U3 — La sonde de saleté (R3, R6, D2, D3, D4)
 
 `crates/mika-agent/src/worktree_reaper.rs`. Dans la boucle par checkout de
-`reap_terminal_worktrees`, avant le screening : `git status --porcelain` borné
-en temps, fail-open. Fonction **pure** séparée pour la décision
+`reap_terminal_worktrees` (1065) : `git status --porcelain` borné en temps,
+fail-open. Fonction **pure** séparée pour la décision
 (propre / sale+liste / illisible), testable sans git. Émission dédupliquée par
 `(checkout, empreinte)` sur 24 h via `audit_events`, sur le modèle de
 l'exclusion mika#2131. Chemins plafonnés (20, comme `DIRTY_FILES` en 3486) et
 **jamais** de contenu de fichier.
+
+**L'ordre dans la boucle est porteur, et le placer au mauvais endroit produit un
+défaut plutôt qu'un signal.** La sonde va **après** la garde
+`repo_dir.join(".git").exists()` qui émet `worktree_reap_no_checkout`, et avant
+le `git worktree list`. Placée en tête de boucle — le réflexe — elle sonderait un
+chemin sans dépôt : en production conteneurisée, où les worktrees ne vivent pas
+sur le système de fichiers de l'agent, chaque checkout configuré produirait un
+`git status` en échec, donc une émission « illisible » **à chaque tick et pour
+toujours**. Ce serait le bruit permanent que R6 et D5 existent pour éviter, sous
+un nom qui promet une mesure. La garde existante répond déjà à cette population,
+et la sonde doit hériter de sa réponse plutôt que la contredire.
+
+Ce placement a un corollaire à écrire dans le test : « pas de checkout à ce
+chemin » et « `git status` illisible sur un checkout réel » sont **deux** états
+distincts, et seul le second est un signal de R3.
 
 ### U4 — Les deux signaux de containment + le contrôle positif (R4, D6)
 
@@ -331,6 +346,11 @@ ancrage**.
 3. **U3, fonction pure** : propre → aucune émission ; sale → une émission portant
    le compte et les chemins ; illisible → hors population + signal nommé, jamais
    « propre ».
+3b. **U3, placement** : un `repo_dir` **sans `.git`** produit
+   `worktree_reap_no_checkout` et **aucune** émission de saleté — contrôle
+   négatif qui vaut pour toute la production conteneurisée. Un checkout réel dont
+   le `git status` échoue produit, lui, le signal « illisible ». Les deux états
+   ne partagent pas de nom.
 4. **U3, déduplication** : deux ticks consécutifs sur la même liste → **une**
    ligne ; liste changée → deux lignes ; > 24 h → ré-écriture.
 5. **U3, non-blocage** : un checkout sale ne change ni le verdict de fauche ni le
