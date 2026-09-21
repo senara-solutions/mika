@@ -130,6 +130,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
 	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
@@ -175,6 +176,9 @@ test-rescue-pipeline-verified: ## Verify the `rescue-pipeline-verified` marker i
 test-pr-origin: ## Run the PR-origin marker + report suites (mika#2026)
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash scripts/test-pr-origin-report.sh
+
+test-stamp-issue-seat: ## Verify dispatch-lib claims the issue with dispatch:loop and releases it on exit (mika#2155)
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
 
 test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
