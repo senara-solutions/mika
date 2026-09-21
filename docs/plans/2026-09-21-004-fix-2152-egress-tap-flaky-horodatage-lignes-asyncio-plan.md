@@ -285,6 +285,13 @@ async def test_connect_then_close_stays_silent_under_slow_callback_noise(self) -
         buffer = io.StringIO()
         with contextlib.redirect_stderr(buffer):
             await proxy.handle_host_client(_reader_of(), self._Writer(fail_drain=True))
+            # Yield once INSIDE the redirect (doc-review, 2026-09-21): since 3.12
+            # `asyncio.wait_for` awaits inline instead of wrapping a Task, so on
+            # an EOF reader the handler never suspends and the task step — where
+            # asyncio writes the slow-callback line — would otherwise end AFTER
+            # this block, on the real stderr. On 3.10 (CI) the extra yield is
+            # harmless: `wait_for` already suspended the step inside the block.
+            await asyncio.sleep(0)
         raw = buffer.getvalue()
     finally:
         loop.slow_callback_duration = before
@@ -298,6 +305,20 @@ async def test_connect_then_close_stays_silent_under_slow_callback_noise(self) -
 Note d'implémentation : le loop est par test dans `IsolatedAsyncioTestCase`, donc la
 restauration dans `finally` est de l'hygiène, pas une nécessité — mais elle évite
 que le bruit contamine les assertions de teardown si un jour le loop est partagé.
+
+Seconde note, et elle est portante : **sans le `await asyncio.sleep(0)` à
+l'intérieur du bloc, ce test échoue sur son contrôle positif** (`raw == ''`) sur
+3.12, 3.13 et 3.14 — vérifié sur le proxy du worktree, 2026-09-21 — et non sur
+`not timestamped`. Depuis 3.12 `asyncio.wait_for` attend la coroutine en ligne au
+lieu de l'envelopper dans une `Task` ; avec `_reader_of()` (EOF pré-alimenté) et un
+`drain` qui lève de façon synchrone, `handle_host_client` se termine sans jamais
+céder la boucle, donc le pas de la tâche de test — le moment où asyncio écrit la
+ligne de rappel lent — se clôt **après** le `with`, sur le vrai stderr. Sur le
+3.10 de la CI, `wait_for` crée une `Task` et suspend le pas dans le bloc, ce qui
+explique que la ligne y soit tombée dans le tampon « par accident ». Le yield
+force la fin du pas pendant la redirection ; vérifié : le tampon contient alors
+exactement une ligne `Executing <Task pending name='Task-2' …> took 0.000 seconds`,
+reconnue par `_FOREIGN_LINE_RES`.
 
 ### Lecture de l'AC4 — un frère, pas le test nommé (encadré, 2026-09-21)
 
@@ -369,7 +390,11 @@ toute ligne passe par lui.
    **sans toucher `_strip_ts`**.
 2. `python3 -B scripts/test-pilot-egress-proxy-status.py` → les deux rougissent avec
    `log line is not timestamped: "Executing <…`. Coller la sortie dans le corps de la
-   PR : c'est la preuve « avant le correctif le test rougit » d'AC1.
+   PR : c'est la preuve « avant le correctif le test rougit » d'AC1. **Si le test
+   par mécanisme rougit sur `expected asyncio's slow-callback line in stderr` au
+   lieu de `not timestamped`, c'est que le `await asyncio.sleep(0)` manque dans le
+   bloc `redirect_stderr`** (voir la seconde note sous C-3) — le bruit est parti
+   sur le vrai stderr, pas dans le tampon, et le rouge n'est pas celui attendu.
 3. Commit : `test(egress-proxy): rouge-avant — le bruit asyncio fait rougir le helper (mika#2152)`.
 
 ### Phase 2 — Le classement (C-1, C-2, C-4 ; R-1 à R-4)
@@ -454,6 +479,11 @@ exécuter dans le même passage et à coller dans la PR.
 
 - 2026-09-21 — v1, /ce:plan par l'orchestrateur ; mécanisme reproduit en local
   (3.14) et corrélé au run CI (3.10) ; inventaire des préfixes relevé sur la source.
+- 2026-09-21 — `/ce:doc-review` (pipeline `/mika`, feasibility-reviewer, ancre 100) :
+  le test par mécanisme de C-3 échouait sur son contrôle positif sur 3.12+ (le pas
+  de tâche se clôt après le `redirect_stderr`) ; ajout du `await asyncio.sleep(0)`
+  dans le bloc, note d'implémentation et halte en Phase 1 étape 2. Aucune décision
+  de l'architecte touchée.
 - 2026-09-21 — mika-arch première passe : `Disposition: READY` (session
   `f0c95896-c380-4519-9c3a-caf324eef5e3`). Affûtages appliqués au commit : S1
   (encadré « lecture de l'AC4 »), S2 (`_OBSERVED_HANDLE_LINE` figée). Les cinq
