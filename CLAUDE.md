@@ -85,6 +85,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
 - `mika agents reprovision <name> [--tier <t>] [--identity-only] [--dry-run] [--yes]` — Re-apply an existing agent's authoritative `identity.toml` **and** `soul.md` (mika#2230). Both, because a tier has two axes since mika#2023 and the mika#1962 guard reads either. Differential, backs up what it overwrites in `0600`, refuses a template whose `[skills].allowlist` is absent or empty, and touches neither `config.toml` nor the DB. Runbook: `docs/operator/agent-identity-reprovision.md` § 7.
+- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
 - `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@samidarko/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
@@ -1009,6 +1010,54 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   latence du 11/09 était le symptôme) et passera par le `config.toml` per-agent, pas
   par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
   pourquoi.
+
+**La ligne existait, la question restait sans surface (mika#2457).**
+`llm_budget_resolved` répondait déjà — une fois par agent et par couple résolu,
+dédupliquée, dans ~19 Go de journal. L'opérateur qui veut *poser* la question n'avait
+rien. C'est ce trou qui a laissé le `240/900` du 06/09 échouer en silence jusqu'au
+11/09, et qui a avalé mika#2457 : **trois** plafonds ont été affirmés pour le même
+agent — **240** (le dépôt), **420** (mika#2342), **300** (mika#2457) — et **aucun**
+n'avait jamais été établi par lecture d'instrument.
+
+```bash
+mika agents budget --agent mika-arch                     # ce sous quoi l'agent TOURNE, daté
+stat -c '%y  %n' ~/.mika/agents/mika-arch/config.toml    # ce que le disque PORTE, daté
+```
+
+- **Spirit atteste, le CLI rend — jamais l'inverse.** `AgentState.budget_record` est
+  figé à l'`init_agent` (contrat *not hot-swappable*, comme `tier` et `deployment`) et
+  `GET /api/v1/agents/{id}/budget` le sert tel quel. Ni la route ni le CLI ne relisent
+  le disque : recalculer lirait le `process_env` du **process lecteur**, donc
+  rapporterait un réglage qui n'est pas en vigueur avec l'autorité d'une mesure — le
+  défaut mika#2304 d'un champ à côté. Serveur injoignable ou 404 ⇒ *« non attesté »*,
+  **aucune valeur locale affichée**.
+- **Le gel est la propriété, et la datation est ce qui le rend lisible.** Le record
+  répond « sous quoi cet agent tourne », jamais « que porte le disque maintenant ».
+  Les deux coïncident sauf si quelqu'un a édité le `config.toml` depuis le démarrage —
+  c'est-à-dire précisément la dérive hors dépôt que mika#2328 a mesurée. D'où les deux
+  dates : `resolved_at` **postérieur** au mtime ⇒ la sonde tranche sans réserve ;
+  `resolved_at` **antérieur** ⇒ le record reste vrai de ce qui **tourne** (donc décisif
+  pour diagnostiquer un tour coupé) mais ne dit rien du disque, dont la valeur
+  n'entrera en service qu'au prochain redémarrage.
+- **Table de lecture.** `model` ≠ celui du dépôt ⇒ dérive hors dépôt **confirmée et
+  mesurée** : noter la valeur, sa provenance et `resolved_at` **avant** de toucher au
+  disque ; le préalable est un ticket de réconciliation modèle + calibration
+  (mika#1190), pas une baisse de `max_tokens`. `http_source = process_env` ⇒ une
+  variable de service écrase le `config.toml` : le remède est de la **retirer de
+  l'environnement du service**, ce qui referme aussi la question ouverte de mika#2342.
+  `http_source = agent_config` à la valeur attendue ⇒ le réglage est en vigueur et la
+  cause est ailleurs — **ne pas conclure sur `max_tokens`**. `max_tokens_source =
+  default` ⇒ provisionnement gelé, geste de provisionnement et non de code.
+- **Halte — aucune ligne, agent inconnu.** Le binaire servi est antérieur au correctif
+  (classe mika#2340) ou l'agent n'est pas servi par ce process. Établir le déploiement
+  **avant** toute conclusion sur les valeurs.
+- **Ce que ce travail n'achète PAS.** Aucune valeur de réglage ne bouge : plafond,
+  enveloppe, `llm_max_tokens` et modèle sont inchangés, et les deux tests qui figent la
+  géométrie de mika-arch (`test_mika_arch_config_toml_is_valid_toml`,
+  `mika2280_the_three_shipped_geometries_and_their_verdict`) passent sans modification.
+  Ce livrable **mesure** la dérive code↔runtime ; il ne la refuse pas — la garde est le
+  suivi que mika#2328 s'est écrit. Et aucun mécanisme de repli modèle n'est introduit :
+  voir *Hors périmètre* du plan mika#2457 pour ses trois préconditions.
 
 `mika ask --model` atteint enfin l'exécutant, et `--verbose` cesse de répondre à sa place (mika#2304) :
 - **Le défaut, et il est plus large que le ticket ne le dit.** Le ticket vise

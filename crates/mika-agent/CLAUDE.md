@@ -101,6 +101,28 @@ budget, not what a skill overrides for one turn. Reader lives in
 `mika_common::llm::budget_provenance` (see `mika-common/CLAUDE.md` for why the
 cascade is rebuilt rather than recorded, and why its inverted order is pinned).
 
+*The pair is now readable on demand, and the freeze is the property (mika#2457).*
+`AgentState.budget_record` holds the `ResolvedBudgetRecord` this agent was
+initialized under — resolved **once** at `init_agent`, from the same call that
+emits `llm_budget_resolved`, and never recalculated. Same *not hot-swappable*
+contract as `tier` (mika#1962) and `deployment` (mika#2290), for the same reason:
+it reports the state the agent **runs under**, not what the disk carries now.
+`GET /api/v1/agents/{id}/budget` (dashboard-or-internal auth, like its
+`/sessions` and `/audit` neighbours) serves it verbatim, `resolved_at` included.
+
+**It does not re-read the disk, and that refusal is the design.** Recomputing at
+request time would walk the cascade in *this* process and could name a setting
+that is not in force — mika#2304's defect one field over. It is also what keeps
+the route and the disk **two distinct facts**, whose difference *is* the drift
+measurement mika#2457 asks for: the operator compares `resolved_at` against the
+`config.toml` mtime, and a route that refreshed itself would erase the
+comparison. A **404** means "this server has not resolved that agent", never a
+default — the lookup reads the resolved-agent map rather than `resolve_agent`,
+which would lazily construct an agent (DB, skills, task engine, KG) as a side
+effect of a read-only GET. `mika agents budget` renders that 404 as *"not
+attested"* and prints **no** locally computed value; the CLI-side structural
+guard is in `crates/mika-cli/CLAUDE.md`.
+
 *A half-configured pair now fails at boot.* `server::budget_guard::assert_llm_budgets_valid`
 runs in `run_server` after `provision_well_known_agents` (which writes the
 `config.toml` carrying the pair) and before any agent is initialized, over the same
