@@ -239,8 +239,12 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
-    /// The message to send (use "-" to read from stdin)
-    pub message: String,
+    /// The message to send. Three doors, and they resolve in this order
+    /// (mika#1982): the argument wins when present; the "-" sentinel always
+    /// reads the standard input, terminal or not; and an absent argument reads
+    /// the standard input when it is not a terminal. Absent on a terminal is a
+    /// usage error, never a silent wait.
+    pub message: Option<String>,
     /// Correlate this message with a task for observability. Without --task-complete,
     /// only records the task-id in session/trace metadata. With --task-complete, marks
     /// the callback task as completed.

@@ -4,5 +4,6 @@
 //! exposes only the pieces that need to be reachable from integration tests
 //! under `tests/`. Keep it minimal — most code stays binary-private.
 
+pub mod ask_message;
 pub mod remote_ask;
 pub mod supervision;
