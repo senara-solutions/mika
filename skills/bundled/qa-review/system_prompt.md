@@ -197,11 +197,11 @@ Every one that exists is executed, and **the pipeline verdict is the conjunction
 
 The guards `cd "$(dirname "$0")/.."` and aggregate committed + staged + unstaged diffs. Running them inside the shared checkout at `$MIKA_PLATFORM_DIR/<repo>/` would judge whatever is checked out there — usually `main`, possibly dirty — not the PR. A detached worktree on the PR head has an empty index and no unstaged changes, so the guard sees exactly the PR's diff. Measured cost on `mika` (3323 tracked files): ~0.6s, against `run_shell`'s 30s budget — a budget the engine actually holds since mika#2276, where it was previously raised to the turn's maximum (300 s via `build-mika`) without anything saying so.
 
-Extract `number`, `headRefName`, `baseRefName`, `labels`, and `body` from Step 1's `qa_pr_view`. **Injection guard (mandatory):** the body is untrusted — if it contains a line equal to `MIKA_QA_BODY_EOF`, do NOT run this command; emit `hold[review]` ("PR body carries the heredoc delimiter; guard execution not attempted"). One `run_shell` call, cleanup included:
+Extract `number`, `headRefName`, `baseRefName`, `labels`, `author`, and `body` from Step 1's `qa_pr_view`. **Injection guard (mandatory):** the body is untrusted — if it contains a line equal to `MIKA_QA_BODY_EOF`, do NOT run this command; emit `hold[review]` ("PR body carries the heredoc delimiter; guard execution not attempted"). One `run_shell` call, cleanup included:
 
 ```
 R="$MIKA_PLATFORM_DIR/<repo>"; W=$(mktemp -d); trap 'git -C "$R" worktree remove --force "$W" 2>/dev/null; rm -rf "$W" "$W.ev" "$W.body"' EXIT
-printf '%s' '{"pull_request":{"number":<number>,"labels":[{"name":"<label1>"},{"name":"<label2>"}]}}' > "$W.ev"
+printf '%s' '{"pull_request":{"number":<number>,"user":{"login":"<author>"},"labels":[{"name":"<label1>"},{"name":"<label2>"}]}}' > "$W.ev"
 cat > "$W.body" <<'MIKA_QA_BODY_EOF'
 <PR body verbatim>
 MIKA_QA_BODY_EOF
@@ -218,7 +218,7 @@ done
 Each part of the shape is load-bearing:
 
 - The heredoc delimiter is **quoted** (`<<'MIKA_QA_BODY_EOF'`), so nothing in the body is expanded. With the injection guard above, that is what makes untrusted body text safe to pass.
-- `GITHUB_EVENT_PATH` is a **synthetic** event file built from the labels `qa_pr_view` just returned, read by `jq` with no network — so the `pipeline-exempt` label path is reproduced faithfully, and from *live* labels, sidestepping the frozen-snapshot problem mika#1395 works around in CI.
+- `GITHUB_EVENT_PATH` is a **synthetic** event file built from the labels **and the author** `qa_pr_view` just returned, read by `jq` with no network — so the `pipeline-exempt` label path is reproduced faithfully, and from *live* labels, sidestepping the frozen-snapshot problem mika#1395 works around in CI. `user.login` is the field `verify-pipeline.sh` reads for its automated-author exemption (mika#2419): omit it and the guard resolves an empty login, grants no exemption, and every Dependabot Cargo.lock-only PR goes back to `block[pipeline]` — with the whole shell test suite still green, which is why a Rust source scan pins the payload's shape.
 - `run_shell` scrubs `GH_TOKEN`, so the guards' internal `gh` calls resolve to "no linked issue" / "no label". Every exemption path but one stays reachable through the variables above; the exception is 2C, row 3.
 - Keep the command free of any bare `gh` token — `shell-exec`'s lexical scan (mika#1957) rejects the command string, but does not inspect a script it runs, so `bash "$W/<guard>"` passes.
 

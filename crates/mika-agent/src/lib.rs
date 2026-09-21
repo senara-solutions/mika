@@ -11,6 +11,7 @@ pub mod auto_pull;
 pub mod auto_pull_stop;
 pub mod bundled_skills;
 pub mod calibration;
+pub mod canonical_tokens;
 pub mod compaction;
 pub mod config_keys;
 pub mod db;

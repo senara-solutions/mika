@@ -111,7 +111,7 @@ export function Teams() {
           },
         ].map((item, i) => (
           <FadeIn key={item.title} delay={i * 80}>
-            <div className="group h-full rounded-2xl border border-white/[0.05] bg-bg-card p-6 transition-all duration-300 hover:border-accent/40 hover:shadow-[0_0_30px_rgba(124,106,247,0.08)]">
+            <div className="group h-full rounded-2xl border border-white/[0.05] bg-bg-card p-6 transition-all duration-300 hover:border-accent/40 hover:shadow-[0_0_30px_color-mix(in_srgb,var(--color-accent)_8%,transparent)]">
               <item.icon className="mb-4 h-5 w-5 text-accent" strokeWidth={2} />
               <h4 className="text-sm font-bold text-white">{item.title}</h4>
               <p className="mt-1.5 text-xs leading-relaxed text-muted/60">

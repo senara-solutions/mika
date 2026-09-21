@@ -18,3 +18,37 @@ jobs:
         run: bash scripts/check-pr-body-consistency.sh "${{ github.event.pull_request.number }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Canonical machine tokens in the PR body (mika#2201, surface S2).
+      #
+      # LANDS UNARMED (`continue-on-error: true`), and the condition to arm it
+      # is written rather than remembered.
+      #
+      # mika#2201 § D3 makes the arming of this surface conditional on V5c — the
+      # lint measured clean over the open PRs plus the last 50 merged. That
+      # measurement was NOT POSSIBLE at delivery: `gh` is unauthenticated inside
+      # the dispatch sandbox, so the sample could not be fetched. The plan
+      # provides for a red sample, not for an unmeasurable one, and the safe
+      # reading of both is the same: DO NOT ARM WHAT YOU HAVE NOT MEASURED. S1
+      # is finite, versioned and reviewed, so an accusation there is a file to
+      # fix in the same commit; S2 is a flow whose measurable sample is a past
+      # nobody can rewrite, and blocking in-flight work for a form nobody asked
+      # it to use is exactly the § R4 failure.
+      #
+      # This is NOT a reduction of AC1: it is ratified on S2 as a blocking gate,
+      # and the disposition bears on the deployment WINDOW, not on the target.
+      #
+      # TO ARM: run
+      #   gh pr list --repo senara-solutions/mika --state all --limit 50 \
+      #     --json number,body --jq '.[].body' > /tmp/sample.md
+      #   bash scripts/check-canonical-tokens.sh --body /tmp/sample.md
+      # and, if it is clean, delete the `continue-on-error` line below. One
+      # line, no redeploy. If it is not clean, fix the named PRs first.
+      - name: Canonical machine tokens in the PR body (mika#2201, unarmed)
+        continue-on-error: true
+        run: |
+          gh pr view "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --json body --jq .body > /tmp/pr-body.md
+          bash scripts/check-canonical-tokens.sh --body /tmp/pr-body.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
