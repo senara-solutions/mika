@@ -43,6 +43,9 @@ DISPATCH_LIB="$SCRIPT_DIR/dispatch-lib.sh"
 
 PASS=0
 FAIL=0
+# mika#2149: a third column, so a guard that could not arm is never read as a
+# bare green. Incremented only by a probe that says SKIP out loud.
+SKIPPED=0
 
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
@@ -4116,13 +4119,18 @@ assert_contains "U3b: the re-dispatch note names the plan it found" \
 
 # --- mika#1772 review round: the two populations of `terminated` -----------
 #
-# `status: terminated` is set both by a guardrail abort (subtype in
-# stall_detected|empty_response|idle_timeout) and by an SDK limit
-# (error_max_turns|error_max_budget_usd). The first usually kills a session that
-# did nothing; the second often kills one that did a great deal. Treating them
-# alike would skip the mika#1282 dirty-worktree rescue for the second and tell
-# the operator "nothing was written" about a branch carrying commits — the exact
-# defect class this ticket closes, reintroduced by its own fix.
+# `status: terminated` is set both by a guardrail abort and by an SDK limit.
+# The first usually kills a session that did nothing; the second often kills
+# one that did a great deal. Treating them alike would skip the mika#1282
+# dirty-worktree rescue for the second and tell the operator "nothing was
+# written" about a branch carrying commits — the exact defect class this ticket
+# closes, reintroduced by its own fix.
+#
+# The subtype vocabulary is deliberately NOT listed here (mika#2149): upstream
+# it is `GuardrailAbortReason.guardrail` in claude-pilot's types.py plus
+# `SDK_TERMINATION_SUBTYPES` in agent.py; downstream it is `_halt_family` in
+# dispatch-lib.sh. The drift guard further down reads the former and checks the
+# latter — a comment nobody executes went stale by five values in eighteen days.
 
 echo ""
 echo "Test: terminated sessions that left work behind (mika#1772 review)"
@@ -4276,6 +4284,69 @@ assert_contains "T5: banner mode carries Halt class:" \
     "Halt class: tool_never_returned" "$T5_OUT"
 assert_contains "T5: banner mode carries Retry hint:" \
     "Retry hint: investigate" "$T5_OUT"
+
+# T6 — the drift guard (C-5): read the upstream Literal, demand a family for
+# every value. Runs on the dispatch host, where claude-pilot is always present
+# (it is what this file dispatches). Elsewhere it SKIPs and says so.
+#
+# T6-arm (F1, first architect pass): a SKIP buried in thousands of output lines
+# is indistinguishable from a green to the eye that reads the last line. So the
+# block emits EXACTLY ONE `DRIFT-GUARD:` marker on stdout, and a companion
+# assertion reads that stdout back — a bare green with no marker is a red. The
+# block runs in the current shell (so PASS/FAIL/SKIPPED survive) with its stdout
+# duplicated into a capture file by process substitution.
+_t6_locate_types_py() {
+    # An explicit variable is authoritative — including when it points nowhere,
+    # which is how T6-arm control (a) forces the SKIP branch.
+    if [ -n "${CLAUDE_PILOT_TYPES:-}" ]; then
+        [ -r "$CLAUDE_PILOT_TYPES" ] && printf '%s\n' "$CLAUDE_PILOT_TYPES"
+        return 0
+    fi
+    # <meta>/mika and <meta>/.claude/worktrees/<slug>/mika both have
+    # claude-pilot/ one or three levels above the repo root.
+    local top c
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    for c in "$top/../claude-pilot/src/claude_pilot/types.py" \
+             "$top/../../../../claude-pilot/src/claude_pilot/types.py"; do
+        if [ -r "$c" ]; then
+            (cd "$(dirname "$c")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$c")")
+            return 0
+        fi
+    done
+    return 0
+}
+
+_t6_drift_guard() {
+    local types_py values n v family
+    types_py=$(_t6_locate_types_py)
+    if [ -z "$types_py" ]; then
+        echo "DRIFT-GUARD: SKIP — types.py unreachable (set CLAUDE_PILOT_TYPES)"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    # The `guardrail: Literal[ ... ]` block, one quoted value per line.
+    values=$(sed -n '/guardrail: Literal\[/,/\]/p' "$types_py" | grep -o '"[a-z_]*"' | tr -d '"' || true)
+    n=$(printf '%s\n' "$values" | grep -c . || true)
+    echo "DRIFT-GUARD: armed against $types_py ($n values)"
+    if [ "$n" -eq 0 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  ✗ T6: the Literal block was found empty — the sed anchor no longer matches types.py"
+        return 0
+    fi
+    for v in $values; do
+        family=$( ( source "$DISPATCH_LIB" 2>/dev/null || true; _halt_family "$v" 2>/dev/null | cut -d'|' -f1 ) )
+        assert_not_contains "T6 drift: upstream value '$v' has a downstream family (got: $family)" \
+            "unknown" "$family"
+    done
+}
+
+T6_CAPTURE=$(mktemp)
+_t6_drift_guard > >(tee "$T6_CAPTURE")
+wait $! 2>/dev/null || true
+T6_MARKER_COUNT=$(grep -c '^DRIFT-GUARD: ' "$T6_CAPTURE" || true)
+assert_eq "T6-arm: exactly one DRIFT-GUARD marker was emitted on stdout" \
+    "1" "$T6_MARKER_COUNT"
+rm -f "$T6_CAPTURE"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \
@@ -7019,7 +7090,7 @@ assert_not_contains "T11 (b): et rien n'est journalisé" \
 
 echo ""
 echo "========================================"
-echo "Results: $PASS passed, $FAIL failed"
+echo "Results: $PASS passed, $FAIL failed, SKIPPED: $SKIPPED"
 echo "========================================"
 
 if [ "$FAIL" -gt 0 ]; then
