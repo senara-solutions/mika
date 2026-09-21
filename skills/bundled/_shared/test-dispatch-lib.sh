@@ -3917,8 +3917,13 @@ assert_not_contains "U1: missing issue plan does not blame architect convergence
 # KTD5: dispatch_claude_pilot and _run_claude_pilot need a real pilot and CLI,
 # so the classification lives in its own callable function the harness can run
 # with an injected environment — the same shape as _find_issue_plan's probes.
+# mika#2149: a sixth argument carries `.api_error_status` (cpp#54), and a
+# seventh selects which stream the probe returns — `stdout` (default) or
+# `stderr`, because the halt_family.unknown line (R-4) lives on stderr and the
+# 2>/dev/null here used to make that stream unobservable.
 _classify_probe() {
     local guardrail_line="$1" turns="${2:-2}" subtype="${3:-}" reason="${4:-}" mode="${5:-full}"
+    local api_error_status="${6:-}" stream="${7:-stdout}"
     local tmp log_id
     tmp=$(mktemp -d)
     log_id="probe-1772"
@@ -3937,7 +3942,12 @@ _classify_probe() {
         STDERR_FILE=""
         SUBTYPE="$subtype"
         TERMINATION_REASON="$reason"
-        _classify_terminated_session "$mode" 2>/dev/null
+        API_ERROR_STATUS="$api_error_status"
+        if [ "$stream" = "stderr" ]; then
+            _classify_terminated_session "$mode" 2>&1 >/dev/null
+        else
+            _classify_terminated_session "$mode" 2>/dev/null
+        fi
     )
     rm -rf "$tmp"
 }
@@ -4181,6 +4191,88 @@ assert_contains "full mode states the measurement behind its claim" \
 CLASSIFY_NO_CAUSE=$(_classify_probe '' 2 '' '' 'full') || CLASSIFY_NO_CAUSE=""
 assert_contains "an unrecorded cause is reported as unrecorded" \
     "cause not recorded" "$CLASSIFY_NO_CAUSE"
+
+# --- mika#2149: every halt motif gets a family and a retry hint downstream ---
+#
+# The subtype vocabulary is owned upstream by `GuardrailAbortReason.guardrail`
+# (claude-pilot/src/claude_pilot/types.py) plus `SDK_TERMINATION_SUBTYPES` and
+# the cpp#187 transport halt in agent.py. Downstream, `_halt_family` in
+# dispatch-lib.sh is the ONLY place that enumerates it — a `case` with a `*)`
+# arm, so a value added upstream lands on stderr as `halt_family.unknown` the
+# first time it is seen instead of silently joining the prose. This comment
+# deliberately lists no value: the two tables are the source of truth, and T6
+# below checks them against each other.
+
+echo ""
+echo "Test: halt motifs are classified downstream (mika#2149)"
+echo "--------------------------------------------------------"
+
+# T1 — table-driven: one row per known subtype, both lines present.
+while IFS='|' read -r subtype family hint; do
+    T1_OUT=$(_classify_probe '' 2 "$subtype" 'x' 'full') || T1_OUT=""
+    assert_contains "T1: $subtype -> Halt class: $family" \
+        "Halt class: $family" "$T1_OUT"
+    assert_contains "T1: $subtype -> Retry hint: $hint" \
+        "Retry hint: $hint" "$T1_OUT"
+done <<'T1_TABLE'
+rate_limited|quota_throttled|transient
+awaiting_model|model_never_resumed|transient
+awaiting_tool|tool_never_returned|investigate
+idle_timeout|session_silent|investigate
+stall_detected|model_unproductive|investigate
+empty_response|model_unproductive|investigate
+watchdog_error|pilot_bug|investigate
+prompt_cache_dead|substrate|investigate
+error_max_turns|budget_exhausted|deterministic
+error_max_budget_usd|budget_exhausted|deterministic
+transport_message_too_large|transport|investigate
+T1_TABLE
+
+# T2 — a subtype outside the table is classed unknown/investigate AND said on
+# stderr; a known one is not (negative control, same call shape).
+T2_OUT=$(_classify_probe '' 2 'foo_bar' 'x' 'full') || T2_OUT=""
+assert_contains "T2: unknown subtype -> Halt class: unknown" \
+    "Halt class: unknown" "$T2_OUT"
+assert_contains "T2: unknown subtype -> Retry hint: investigate" \
+    "Retry hint: investigate" "$T2_OUT"
+T2_ERR=$(_classify_probe '' 2 'foo_bar' 'x' 'full' '' stderr) || T2_ERR=""
+assert_contains "T2: unknown subtype is named on stderr" \
+    "halt_family.unknown subtype=foo_bar" "$T2_ERR"
+T2_ERR_KNOWN=$(_classify_probe '' 2 'idle_timeout' 'x' 'full' '' stderr) || T2_ERR_KNOWN=""
+assert_not_contains "T2 (negative control): a known subtype is silent on stderr" \
+    "halt_family.unknown" "$T2_ERR_KNOWN"
+
+# T3 — api_error_status (cpp#54) is a qualifier on the Halt: line, present
+# only when the JSON carried it.
+T3_OUT=$(_classify_probe '' 2 'rate_limited' 'backoff exhausted' 'full' '429') || T3_OUT=""
+assert_contains "T3: api_error_status renders as (HTTP n) on the Halt: line" \
+    "Halt: rate_limited (HTTP 429)" "$T3_OUT"
+T3_NONE=$(_classify_probe '' 2 'rate_limited' 'backoff exhausted' 'full' '') || T3_NONE=""
+assert_not_contains "T3 (negative control): no status -> no (HTTP" \
+    "(HTTP" "$T3_NONE"
+assert_contains "T3 (negative control): the Halt: line is otherwise intact" \
+    "Halt: rate_limited — backoff exhausted" "$T3_NONE"
+
+# T4 — fallback path: no subtype on the JSON, the `[guardrail]` line in stderr
+# (ANSI-coloured, as ui.py:113 writes it) feeds the same table.
+T4_LINE=$(printf '\033[38;5;208m[guardrail]\033[0m \033[1mawaiting_model\033[0m: model-wait ceiling 900s exceeded')
+T4_OUT=$(_classify_probe "$T4_LINE" 2 '' '' 'full') || T4_OUT=""
+assert_contains "T4: a stderr-only halt is classified like a JSON one" \
+    "Halt class: model_never_resumed" "$T4_OUT"
+assert_contains "T4: the Halt: line keeps the scraped text" \
+    "Halt: [guardrail] awaiting_model:" "$T4_OUT"
+T4_NONE=$(_classify_probe 'no guardrail line here' 2 '' '' 'full') || T4_NONE=""
+assert_contains "T4 (negative control): no [guardrail] line -> unknown" \
+    "Halt class: unknown" "$T4_NONE"
+assert_contains "T4 (negative control): 'cause not recorded' is preserved" \
+    "cause not recorded" "$T4_NONE"
+
+# T5 — banner mode carries both lines too.
+T5_OUT=$(_classify_probe '' 12 'awaiting_tool' 'tool-wait ceiling exceeded' 'banner') || T5_OUT=""
+assert_contains "T5: banner mode carries Halt class:" \
+    "Halt class: tool_never_returned" "$T5_OUT"
+assert_contains "T5: banner mode carries Retry hint:" \
+    "Retry hint: investigate" "$T5_OUT"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \
