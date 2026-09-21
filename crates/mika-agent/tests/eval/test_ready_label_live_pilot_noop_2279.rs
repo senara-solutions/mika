@@ -223,6 +223,9 @@ async fn task_count(db: &AsyncDatabase) -> usize {
 async fn run_handler(db: &AsyncDatabase) -> VerdictAction {
     let sender: Arc<dyn MessageSender> = Arc::new(NoopSender);
     let skills = SkillRegistry::empty();
+    // mika#2049 — a real home carrying no egress-down stamp, so gate 2d reads
+    // "the relay serves" and gate 2c (the one under test) is reached.
+    let home = tempfile::tempdir().expect("temp home");
     try_handle_ready_label_dispatch_with_fetcher(
         READY_EVENT,
         db,
@@ -231,6 +234,7 @@ async fn run_handler(db: &AsyncDatabase) -> VerdictAction {
         SESSION,
         TRACE,
         &skills,
+        home.path(),
         move |_owner_repo, _number, _token| async move {
             Ok((GROOMED_BODY.to_string(), vec!["ready".to_string()]))
         },

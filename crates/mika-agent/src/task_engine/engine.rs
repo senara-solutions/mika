@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -203,6 +204,54 @@ const PROMOTED_WRAPPER_LIVENESS_ENV: &str = "MIKA_PROMOTED_WRAPPER_LIVENESS_SECS
 /// `parent.created_at <` comparison where NULL merely selects nothing.
 const PROMOTED_WRAPPER_LIVENESS_MAX_SECS: i64 = 30 * 24 * 3600;
 
+/// Window (seconds) within which an activity row on a deferred wrapper's session
+/// proves the turn is working (mika#2184).
+///
+/// This is the **direct** measure that succeeds mika#2181's proxy window, and
+/// the two coexist deliberately: the proxy filters first, in SQL (R4), and this
+/// one filters afterwards, in the application, where it can log what it saw
+/// (D1/R2).
+///
+/// 600 s = 2× the default per-agent turn envelope (`AGENT_TOTAL_TIMEOUT`, 300 s,
+/// mika#2189). A turn that is working writes one `llm_calls` row per call, and
+/// two consecutive calls are separated by at most the per-call plafond (120 s by
+/// default) plus processing — so 600 s covers a whole turn **and** the interval
+/// to the next, with a factor of 2 of margin. Neighbouring landmark: mika#1652
+/// uses 300 s for team runs; being deliberately twice as generous is the right
+/// direction here, because the expensive error is killing a live turn.
+const STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS: i64 = 600;
+
+/// Env var overriding [`STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS`].
+const STUCK_PENDING_ACTIVITY_WINDOW_ENV: &str = "MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS";
+
+/// Upper clamp on the activity window (30 days), and it is **not** the same
+/// mechanism as [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`].
+///
+/// That sibling clamps a value that reaches a SQLite `strftime` modifier, where
+/// an out-of-range setting silently reverts the fix. This threshold never enters
+/// the SQL at all (mika#2184 D1), so no NULL can be produced. The clamp is here
+/// for the coherence of the knob: an absurd setting would spare every parent for
+/// ever, which is exactly what [`WrapperActivity::NotRecorded`] already refuses
+/// on the other axis — better that the knob refuse it too, and say so.
+const STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Log event **and** audit `tool_name` for a parent spared by the direct
+/// activity measure (mika#2184, U4/D6).
+///
+/// SOLE WRITER: `TaskEngine::record_activity_spare`.
+///
+/// **Deliberately distinct from `stuck_pending_sheltered_by_promoted_wrapper`**,
+/// and the letter of AC4 is rectified here rather than followed (D6). That name
+/// *carries its own cause*; routing a spare that has nothing to do with a
+/// promoted wrapper through it would make the name false, and would split in two
+/// the population mika#2181's probe counts to measure whether its debt is being
+/// retired. The house has an established way to keep two populations countable
+/// apart, used three times: `phantom_aged_out` / `phantom_sweep_spared`
+/// (mika#2156), `qa_deadline_verdict` / `qa_callback_verdict` (mika#2368),
+/// `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). AC4's *intent* —
+/// the two causes are distinguishable — is held; its letter is corrected.
+const STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT: &str = "stuck_pending_sheltered_by_activity";
+
 /// Env var overriding the promotion-starvation indicator threshold (mika#2169,
 /// L2b).
 const DEFERRED_PROMOTION_STALE_ENV: &str = "MIKA_DEFERRED_PROMOTION_STALE_SECS";
@@ -395,6 +444,83 @@ impl LivenessSignal {
     }
 }
 
+/// What the activity rows of a parent's deferred wrappers say about the turn
+/// consuming them (mika#2184, D3).
+///
+/// Sibling of [`LivenessSignal`], one file apart and one lesson further on. That
+/// enum has three states because *"I could not read this surface"* differs from
+/// *"this surface is silent"*. This one has **four**, because the unreadable case
+/// splits again — and the split is not descriptive, it **decides**:
+///
+/// | state | disposition | why |
+/// |---|---|---|
+/// | [`Active`](Self::Active) | **spare** | R1 — the turn is demonstrably working |
+/// | [`NotYetObservable`](Self::NotYetObservable) | **spare** | the ignorance is **bounded**: it extinguishes itself as soon as uptime exceeds the window |
+/// | [`Silent`](Self::Silent) | reap | R5 — today's behaviour, bit for bit |
+/// | [`NotRecorded`](Self::NotRecorded) | reap + WARN | the ignorance is **permanent**: sparing here would restore the corpse-shield mika#2181 had to bound |
+///
+/// *What cannot extinguish itself cannot spare.* That is the rule the four
+/// states encode, and it is why `NotYetObservable` and `NotRecorded` are two
+/// variants rather than one `Unobservable { reason }`: **a reason that decides is
+/// not a reason, it is a state.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperActivity {
+    /// At least one activity row inside the window — the turn is working.
+    Active { last_seen_secs: i64 },
+    /// Telemetry armed, the window fully lived through, zero rows.
+    Silent,
+    /// The process has not lived through the window: we could not observe.
+    NotYetObservable { uptime_secs: i64 },
+    /// Both `store_llm_calls` and `store_tool_calls` are disarmed.
+    NotRecorded,
+}
+
+/// Classify a measured activity age against the window (mika#2184, D3).
+///
+/// A pure function with a complete signature: **no global state is read inside**
+/// (the 5d/mika#2290 and mika#2277 pattern — the parameter rather than the
+/// caller-side `if`, so the rule carries its own test). In particular
+/// `engine_uptime_secs` is *passed*, never read from `TaskEngine`, because tests
+/// build a fresh engine and would otherwise see a zero uptime and spare
+/// everything — T5 would be green for the wrong reason.
+///
+/// `telemetry_armed` is a setting that is **read**, never inferred from an
+/// absence of rows. Telling "telemetry is off" from "the agent did nothing" is
+/// impossible by observation, and that is precisely the confusion mika#2277
+/// condemns.
+///
+/// The window bound is **inclusive** (`age <= window` is `Active`), matching
+/// [`LivenessSignal::from_age`].
+fn classify_wrapper_activity(
+    last_activity_age_secs: Option<i64>,
+    window_secs: i64,
+    engine_uptime_secs: i64,
+    telemetry_armed: bool,
+) -> WrapperActivity {
+    if let Some(age) = last_activity_age_secs
+        && age <= window_secs
+    {
+        return WrapperActivity::Active {
+            last_seen_secs: age,
+        };
+    }
+
+    // Order matters below, and it is the order of *permanence*. A disarmed
+    // telemetry makes the silence uninformative for ever; a young process makes
+    // it uninformative for a bounded time. Reporting the permanent cause first
+    // is what stops an operator reading "the process just started" on a fleet
+    // that has simply stopped recording.
+    if !telemetry_armed {
+        return WrapperActivity::NotRecorded;
+    }
+    if engine_uptime_secs < window_secs {
+        return WrapperActivity::NotYetObservable {
+            uptime_secs: engine_uptime_secs,
+        };
+    }
+    WrapperActivity::Silent
+}
+
 /// The three idle ages a disposition rests on (mika#2277 AC5).
 ///
 /// Carried into the `warn!` and the audit row together. Reporting the worktree
@@ -461,6 +587,24 @@ pub struct TaskEngine {
     /// tick; read by [`super::liveness::spawn_engine_wedge_watchdog`]
     /// on its own cadence to detect wedged tick loops.
     heartbeat: EngineHeartbeat,
+    /// When this engine was constructed (mika#2184, U3).
+    ///
+    /// Read only to feed [`classify_wrapper_activity`]'s `engine_uptime_secs`
+    /// parameter. A process whose uptime is shorter than the activity window
+    /// **could not have observed** that window, so zero activity rows there is
+    /// not a silence — it is an unavailability, and the parent is spared
+    /// ([`WrapperActivity::NotYetObservable`]). That covers cause C of the
+    /// mika#2184 analysis: a wrapper delayed by a service restart is a *healthy*
+    /// wrapper, which is exactly the one that must not be killed.
+    started_at: std::time::Instant,
+    /// Whether `stuck_pending_activity_not_recorded` has already been warned
+    /// about in this process (mika#2184, U4).
+    ///
+    /// The reaper passes every `DB_SCAN_INTERVAL_TICKS`. Without this, a fleet
+    /// running with both telemetry settings disarmed would emit one WARN per
+    /// minute for ever. Once per process is enough: the condition is a setting,
+    /// not an event.
+    activity_not_recorded_warned: AtomicBool,
 }
 
 impl TaskEngine {
@@ -475,6 +619,8 @@ impl TaskEngine {
             reenqueue_rx: rx,
             tick_count: 0,
             heartbeat: EngineHeartbeat::new(),
+            started_at: std::time::Instant::now(),
+            activity_not_recorded_warned: AtomicBool::new(false),
         }
     }
 
@@ -484,6 +630,28 @@ impl TaskEngine {
     /// [`super::liveness::spawn_engine_wedge_watchdog`].
     pub fn heartbeat(&self) -> EngineHeartbeat {
         self.heartbeat.clone()
+    }
+
+    /// Backdate the engine's construction instant (mika#2184, tests only).
+    ///
+    /// A freshly built engine has an uptime of zero, so
+    /// [`classify_wrapper_activity`] answers
+    /// [`WrapperActivity::NotYetObservable`] and the stuck-pending reaper spares
+    /// **everything**. That is correct in production — a process that has just
+    /// started could not have observed the window — and it is exactly what makes
+    /// a reaper test green for the wrong reason.
+    ///
+    /// So every test that drives the reaper and expects it to *act* declares
+    /// that precondition out loud, rather than inheriting it from the fact that
+    /// `Instant::now()` happens to be old enough. There is no production caller
+    /// and there must not be one: a process cannot honestly claim to have
+    /// observed a window it did not live through.
+    #[cfg(test)]
+    fn with_started_at_secs_ago(mut self, secs: u64) -> Self {
+        self.started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("the test clock is not close enough to the epoch for this to underflow");
+        self
     }
 
     /// Called at startup.
@@ -1072,8 +1240,102 @@ impl TaskEngine {
             "issues are `ready` with a pending task nothing represents any more"
         );
 
+        let activity_window_seconds = stuck_pending_activity_window_secs();
+        // mika#2184 D3 — a setting that is READ, never inferred from an absence
+        // of rows. Both disarmed means no activity row will ever exist, so a
+        // silence there says nothing about the turn.
+        let telemetry_armed =
+            self.dispatcher.settings.store_llm_calls || self.dispatcher.settings.store_tool_calls;
+        let engine_uptime_seconds = self.started_at.elapsed().as_secs() as i64;
+
         for candidate in candidates {
             let system_session = format!("system-{}", self.db.agent_id());
+
+            // mika#2184 R1 — the direct measure, ahead of everything the repair
+            // ladder costs. A spared parent pays neither the wrapper inventory
+            // nor the `action_config` reconstruction below.
+            //
+            // A failed read is NOT a silence: it falls through to the proxy
+            // window's verdict, i.e. today's behaviour. Refusing to reap on an
+            // unreadable database would hand any DB hiccup a permanent veto over
+            // the reaper.
+            let activity_age = match self
+                .db
+                .find_deferred_wrapper_activity_age_secs(&candidate.id)
+                .await
+            {
+                Ok(age) => age,
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to read wrapper activity"
+                    );
+                    None
+                }
+            };
+
+            // Exhaustive `match`, no `_ =>` arm (the `hosting_ground_truth_line`
+            // pattern, mika#2290): a fifth state must be forced to decide its own
+            // disposition rather than inherit a fall-through that reaps.
+            match classify_wrapper_activity(
+                activity_age,
+                activity_window_seconds,
+                engine_uptime_seconds,
+                telemetry_armed,
+            ) {
+                WrapperActivity::Active { last_seen_secs } => {
+                    self.record_activity_spare(
+                        &system_session,
+                        &candidate,
+                        "active",
+                        Some(last_seen_secs),
+                        activity_window_seconds,
+                    )
+                    .await;
+                    continue;
+                }
+                WrapperActivity::NotYetObservable { uptime_secs } => {
+                    self.record_activity_spare(
+                        &system_session,
+                        &candidate,
+                        "not_yet_observable",
+                        None,
+                        activity_window_seconds,
+                    )
+                    .await;
+                    debug!(
+                        task_id = %candidate.id,
+                        uptime_secs,
+                        activity_window_seconds,
+                        "stuck-pending reaper: engine has not lived through the activity window"
+                    );
+                    continue;
+                }
+                WrapperActivity::NotRecorded => {
+                    // Once per process: the condition is a setting, not an event.
+                    if !self
+                        .activity_not_recorded_warned
+                        .swap(true, Ordering::SeqCst)
+                    {
+                        warn!(
+                            event = "stuck_pending_activity_not_recorded",
+                            store_llm_calls = self.dispatcher.settings.store_llm_calls,
+                            store_tool_calls = self.dispatcher.settings.store_tool_calls,
+                            agent_id = %self.db.agent_id(),
+                            "stuck-pending reaper is running WITHOUT its direct activity measure: \
+                             MIKA_STORE_LLM_CALLS and MIKA_STORE_TOOL_CALLS are both disabled, so \
+                             no activity row can exist and mika#2184's spare is inert"
+                        );
+                    }
+                    // Fall through and reap. The ignorance is PERMANENT here —
+                    // sparing on it would restore the corpse-shield mika#2181 had
+                    // to bound. What cannot extinguish itself cannot spare.
+                }
+                WrapperActivity::Silent => {
+                    // R5 — today's behaviour, bit for bit.
+                }
+            }
 
             // AC4 (mika#2181) — read the inventory ONCE, before the decision, so
             // both terminal events carry the statuses that produced the verdict.
@@ -1275,6 +1537,75 @@ impl TaskEngine {
                     );
                 }
             }
+        }
+    }
+
+    /// Record that the direct activity measure withheld a stuck-pending expiry
+    /// (mika#2184, U4/R2).
+    ///
+    /// Writes both surfaces, for the reason `record_phantom_spare` states one
+    /// screen above: the `info!` line is what an operator greps while watching a
+    /// dispatch, the `audit_events` row is what survives log rotation.
+    ///
+    /// SOLE WRITER of [`STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT`] — and that
+    /// name is deliberately **not**
+    /// `stuck_pending_sheltered_by_promoted_wrapper`, so the two spare causes
+    /// stay countable apart (R3/D6). `find_parents_sheltered_by_promoted_wrapper`
+    /// is untouched.
+    ///
+    /// `before_value` and `after_value` are both `"pending"`: the point of the
+    /// row is that nothing moved.
+    ///
+    /// The audit write is fire-and-forget. Losing the row costs visibility, never
+    /// the spare — the same discipline as `record_phantom_spare`.
+    async fn record_activity_spare(
+        &self,
+        system_session: &str,
+        candidate: &crate::db::OrphanedPendingTask,
+        cause: &str,
+        last_activity_secs: Option<i64>,
+        activity_window_secs: i64,
+    ) {
+        info!(
+            event = STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+            task_id = %candidate.id,
+            issue = %candidate.reference_url,
+            age_seconds = candidate.age_seconds,
+            last_activity_secs,
+            activity_window_secs,
+            cause,
+            "stuck-pending reaper: parent spared — its deferred turn is demonstrably active"
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+                &format!("task:{}", candidate.id),
+                Some("pending"),
+                Some("pending"),
+                Some(&format!(
+                    "issue:{} age_seconds:{} cause:{} last_activity_secs:{} window:{}",
+                    candidate.reference_url,
+                    candidate.age_seconds,
+                    cause,
+                    last_activity_secs
+                        .map(|s| s.to_string())
+                        // `null`, never `0` (mika#2331): on the
+                        // `not_yet_observable` branch no activity was measured,
+                        // and a zero would read as "measured, one second ago".
+                        .unwrap_or_else(|| "null".to_string()),
+                    activity_window_secs
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(
+                task_id = %candidate.id,
+                error = %e,
+                "failed to write stuck_pending_sheltered_by_activity audit event (parent was still spared)"
+            );
         }
     }
 
@@ -4502,6 +4833,38 @@ pub fn promoted_wrapper_liveness_secs() -> i64 {
     parse_promoted_wrapper_liveness(std::env::var(PROMOTED_WRAPPER_LIVENESS_ENV).ok().as_deref())
 }
 
+/// Pure parse of the direct-activity window (mika#2184, D4). House three-tier
+/// shape — absent or empty → default; unparseable, zero, negative, or beyond
+/// [`STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS`] → default with a WARN **naming the
+/// offending value between quotes**, so a stray space is visible.
+fn parse_stuck_pending_activity_window(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    event = "stuck_pending_activity_window_invalid",
+                    env = STUCK_PENDING_ACTIVITY_WINDOW_ENV,
+                    value = %v,
+                    default = STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+                    "invalid stuck-pending activity window value; falling back to default"
+                );
+                STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+            }
+        },
+        _ => STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the direct-activity window (mika#2184).
+fn stuck_pending_activity_window_secs() -> i64 {
+    parse_stuck_pending_activity_window(
+        std::env::var(STUCK_PENDING_ACTIVITY_WINDOW_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Pure parse of the settler grace window (mika#2405, U3). House three-tier
 /// shape — absent or empty → default; unparseable, zero, or negative → default
 /// with a WARN — plus the upper clamp
@@ -4639,9 +5002,40 @@ mod tests {
         }
     }
 
+    /// An engine that has **lived through** the mika#2184 activity window.
+    ///
+    /// Every stuck-pending reaper test that expects an action needs this. A
+    /// freshly built engine has zero uptime, so `classify_wrapper_activity`
+    /// answers [`WrapperActivity::NotYetObservable`] and the reaper spares
+    /// everything — correctly, and for a reason that has nothing to do with what
+    /// those tests are asserting.
+    ///
+    /// The nominal production regime is a process that has been up for hours; a
+    /// just-restarted one is the exception, and
+    /// `mika2184_a_young_process_spares_and_the_ignorance_extinguishes_itself`
+    /// models it explicitly rather than leaving it to `Instant::now()`.
+    fn observing_engine(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> TaskEngine {
+        TaskEngine::new(db, dispatcher).with_started_at_secs_ago(24 * 3600)
+    }
+
     fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+        test_dispatcher_with(db, |_| {})
+    }
+
+    /// `test_dispatcher`, with a hook on the resolved [`Settings`] (mika#2184).
+    ///
+    /// The one setting mika#2184 reads — `store_llm_calls || store_tool_calls` —
+    /// is a *setting*, never inferred from an absence of rows, so the test for
+    /// [`WrapperActivity::NotRecorded`] has to be able to turn it off. A shared
+    /// hook rather than a second literal copy of the struct: two dispatchers
+    /// maintained apart would drift, and the drift would be silent.
+    fn test_dispatcher_with(
+        db: AsyncDatabase,
+        tweak: impl FnOnce(&mut mika_common::config::Settings),
+    ) -> Arc<TaskDispatcher> {
         let tmp = tempfile::tempdir().unwrap();
-        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        let mut settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        tweak(&mut settings);
         Arc::new(TaskDispatcher {
             db,
             tier: mika_common::home::AgentTier::Default,
@@ -5559,7 +5953,7 @@ mod tests {
     async fn test_stuck_pending_reaper_rearms_before_expiring() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
 
@@ -5591,7 +5985,7 @@ mod tests {
     async fn test_stuck_pending_reaper_repairs_into_the_parents_own_class() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2026, 3600).await;
         db.update_task_dispatch_class(&parent_id, "groom")
@@ -6559,7 +6953,7 @@ mod tests {
     async fn test_stuck_pending_reaper_expires_once_budget_is_spent() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
         for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
@@ -6614,7 +7008,7 @@ mod tests {
     async fn test_stuck_pending_reaper_cancels_surviving_wrappers_on_expiry() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
         for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
@@ -6669,7 +7063,7 @@ mod tests {
     async fn test_stuck_pending_reaper_spares_task_queued_behind_busy_slot() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
         let wrapper = NewTask {
@@ -6711,7 +7105,7 @@ mod tests {
     async fn test_stuck_pending_reaper_spares_task_inside_the_grace_window() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2013, 600).await;
 
@@ -6805,7 +7199,7 @@ mod tests {
     async fn test_reaper_leaves_parent_alone_when_wrapper_was_just_promoted() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
         // Promote through the REAL code path rather than hand-writing
@@ -6848,7 +7242,7 @@ mod tests {
     async fn test_reaper_repairs_when_promoted_wrapper_is_stale() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
         seed_wrapper_with_status(&db, &parent_id, "completed", Some(3000)).await;
@@ -6883,7 +7277,7 @@ mod tests {
     async fn test_reaper_counts_parents_it_sheltered() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let sheltered = seed_pending_issue_parent(&db, 2158, 11_455).await;
         seed_wrapper_with_status(&db, &sheltered, "completed", Some(0)).await;
@@ -6917,7 +7311,7 @@ mod tests {
     async fn test_stuck_pending_rearm_audit_names_the_wrappers_seen() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
         // Two distinct statuses, neither live: the parent IS orphaned, and the
@@ -6941,7 +7335,7 @@ mod tests {
     async fn test_stuck_pending_rearm_audit_renders_wrappers_none() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
 
@@ -6962,7 +7356,7 @@ mod tests {
     async fn test_stuck_pending_expiry_audit_names_the_wrappers_seen() {
         let db = test_db();
         let dispatcher = test_dispatcher(db.clone());
-        let engine = TaskEngine::new(db.clone(), dispatcher);
+        let engine = observing_engine(db.clone(), dispatcher);
 
         let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
         let spent = seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
@@ -6978,6 +7372,498 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert!(details[0].contains(&spent[..8]), "got: {}", details[0]);
         assert!(details[0].contains("delivered@"), "got: {}", details[0]);
+    }
+
+    // -- mika#2184 : la vivacité d'un tour différé se mesure sur son activité --
+
+    /// Attache au wrapper une session portant une ligne d'activité datée.
+    ///
+    /// Reproduit la trajectoire de production : `dispatch_resume_agent` ouvre sa
+    /// session via `create_session_with_parent(…, task_id = Some(&task.id))` où
+    /// `task.id` est **le wrapper**, puis le tour écrit ses `llm_calls` /
+    /// `tool_calls` sur cette session.
+    async fn seed_wrapper_activity(
+        db: &AsyncDatabase,
+        wrapper_id: &str,
+        session_id: &str,
+        age_secs: i64,
+        channel: ActivityChannel,
+    ) {
+        let w = wrapper_id.to_string();
+        let s = session_id.to_string();
+        db.with_db(move |d| {
+            d.create_session_with_parent(&s, "mika", "system", None, None, Some(&w))?;
+            let row_id = format!("row-{s}");
+            match channel {
+                ActivityChannel::Llm => d.save_llm_call(
+                    &row_id,
+                    "mika",
+                    &s,
+                    None,
+                    "mock",
+                    "mock-model",
+                    1,
+                    1,
+                    None,
+                    None,
+                    10,
+                    None,
+                    "success",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+                ActivityChannel::Tool => d.save_tool_call(
+                    &row_id,
+                    "mika",
+                    &s,
+                    None,
+                    None,
+                    0,
+                    "run_shell",
+                    "builtin",
+                    None,
+                    Some("{}"),
+                    Some("ok"),
+                    true,
+                    false,
+                    10,
+                    None,
+                )?,
+            }
+            let table = match channel {
+                ActivityChannel::Llm => "llm_calls",
+                ActivityChannel::Tool => "tool_calls",
+            };
+            d.conn.execute(
+                &format!(
+                    "UPDATE {table} SET created_at =
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1"
+                ),
+                rusqlite::params![row_id, format!("-{age_secs} seconds")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActivityChannel {
+        Llm,
+        Tool,
+    }
+
+    /// Les deux bornes de promotion **mesurées** sur les 8 cas résiduels du
+    /// corps de mika#2184 : 2820 s et 4996 s après promotion, tous deux hors de
+    /// portée de `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS` (2700 s) et de toute
+    /// valeur compatible avec un faucheur utile.
+    const MEASURED_RESIDUAL_PROMOTION_AGES_SECS: [i64; 2] = [2820, 4996];
+
+    /// T2 / **AC2** — rejeu anti-vacuité sur la géométrie des 8 cas résiduels.
+    ///
+    /// Sur `main`, la parente est expirée : le wrapper promu il y a 2820 s (puis
+    /// 4996 s) est hors de la fenêtre-proxy de mika#2181, donc
+    /// `find_orphaned_pending_issue_tasks` la rend candidate, le budget de
+    /// réparation est épuisé, et elle passe `failed`. Avec la mesure directe,
+    /// elle survit — la session de son wrapper porte une ligne `llm_calls` à
+    /// −60 s, c'est-à-dire que le tour **travaille**.
+    ///
+    /// **Ce que ce test n'établit pas, et le dire ici est la moitié honnête
+    /// d'AC2 :** que les 8 cas mesurés en production portaient effectivement de
+    /// l'activité. Rien dans le corps du ticket ne l'établit, et la
+    /// caractérisation n'est pas exécutable depuis le bac à sable de dispatch
+    /// (`~/.mika/data/mika.db` n'existe pas dans le bwrap du pilote). Ce test
+    /// rejoue la **géométrie** ; la sonde 1 du plan rejoue la population, avec
+    /// sa halte. Un test vert sur une fixture dont on n'a pas établi qu'elle
+    /// décrit les 8 cas serait le « rouge vacuux » que le doc de mika#2181
+    /// condamne.
+    #[tokio::test]
+    async fn mika2184_a_parent_whose_deferred_turn_is_working_survives() {
+        for (i, promoted_age) in MEASURED_RESIDUAL_PROMOTION_AGES_SECS.iter().enumerate() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let engine = observing_engine(db.clone(), dispatcher);
+
+            let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+            let wrapper_id =
+                seed_wrapper_with_status(&db, &parent_id, "completed", Some(*promoted_age)).await;
+            seed_wrapper_activity(
+                &db,
+                &wrapper_id,
+                &format!("deferred-dispatch-{i}"),
+                60,
+                ActivityChannel::Llm,
+            )
+            .await;
+            // Budget spent: without the direct measure, the ONLY outcome left is
+            // expiry. That is what makes the test non-vacuous.
+            for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+                db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+            }
+
+            engine.reap_orphaned_pending_issue_tasks().await;
+
+            let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "pending",
+                "a parent whose deferred turn wrote an llm_calls row 60 s ago must survive \
+                 (promotion age {promoted_age} s, past every value of the proxy window)"
+            );
+
+            // R3/D6 — the spare is attributable, and to the RIGHT cause. The
+            // proxy window cannot have produced it (the promotion is past it),
+            // so a spare recorded under the mika#2181 name here would mean the
+            // two causes have been merged.
+            let details =
+                reaper_audit_details(&db, STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT, &parent_id)
+                    .await;
+            assert_eq!(
+                details.len(),
+                1,
+                "the spare must be attributable to the direct measure, not to the proxy window"
+            );
+            assert!(details[0].contains("cause:active"), "got: {}", details[0]);
+            assert!(
+                details[0].contains("last_activity_secs:"),
+                "the age must be NAMED — mika#2277 paid dearly for a spare whose age could \
+                 not be read: {}",
+                details[0]
+            );
+        }
+    }
+
+    /// T3 — même forme, activité portée par `tool_calls` seul.
+    ///
+    /// Un tour peut enchaîner plusieurs outils entre deux appels LLM. Ne lire
+    /// que `llm_calls` ferait passer ce tour-là pour mort.
+    #[tokio::test]
+    async fn mika2184_activity_on_tool_calls_alone_also_spares() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        let wrapper_id = seed_wrapper_with_status(&db, &parent_id, "completed", Some(4996)).await;
+        seed_wrapper_activity(
+            &db,
+            &wrapper_id,
+            "deferred-dispatch-tool",
+            60,
+            ActivityChannel::Tool,
+        )
+        .await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "the measure must not depend on a single channel"
+        );
+    }
+
+    /// T4 — contrôle négatif de cible : l'activité d'une **autre** parente
+    /// n'épargne pas la candidate.
+    ///
+    /// Sans lui, « la jointure discrimine » et « la jointure épargne tout le
+    /// monde » produisent exactement le même vert. Le test assert les **deux**
+    /// sens : la candidate expire, et la parente qui porte l'activité survit —
+    /// un prédicat cassé dans l'autre direction (qui n'épargne jamais personne)
+    /// rougit sur la seconde assertion.
+    #[tokio::test]
+    async fn mika2184_activity_of_another_parent_does_not_spare_the_candidate() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let candidate = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &candidate, "completed", Some(4996)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&candidate).await.unwrap();
+        }
+
+        let other = seed_pending_issue_parent(&db, 9999, 11_455).await;
+        let other_wrapper = seed_wrapper_with_status(&db, &other, "completed", Some(4996)).await;
+        seed_wrapper_activity(
+            &db,
+            &other_wrapper,
+            "deferred-dispatch-other",
+            60,
+            ActivityChannel::Llm,
+        )
+        .await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&other).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&candidate).await.unwrap().unwrap().status,
+            "failed",
+            "the candidate has no activity of its own and must still be expired"
+        );
+        assert_eq!(
+            db.get_task(&other).await.unwrap().unwrap().status,
+            "pending",
+            "the parent that DOES carry activity survives — this is what makes the \
+             negative control non-vacuous"
+        );
+    }
+
+    /// T5 / **AC3** — non-régression : une parente dont le tour est réellement
+    /// mort est toujours ré-armée puis expirée.
+    ///
+    /// Aucune activité, télémétrie armée, moteur ayant vécu la fenêtre : la
+    /// classification est `Silent`, et le comportement est celui d'aujourd'hui,
+    /// bit pour bit (R5).
+    #[tokio::test]
+    async fn mika2184_a_genuinely_dead_turn_is_still_rearmed_then_expired() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+
+        // Rung 2: repair first.
+        engine.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "repair must come before expiry"
+        );
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+
+        // Rung 3: budget spent -> expiry.
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+        db.cancel_deferred_wrappers_of_parent(&parent_id)
+            .await
+            .unwrap();
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "a turn with no activity at all is still expired once the budget is spent"
+        );
+    }
+
+    /// T7 — **cause C** (redémarrage) : `NotYetObservable` épargne, **et
+    /// s'éteint**.
+    ///
+    /// Les deux moitiés comptent. Épargner sans s'éteindre serait la même dette
+    /// que la fenêtre-proxy qu'on remplace — une ignorance permanente déguisée
+    /// en prudence. Le test rejoue la **même entrée** sous deux uptimes et exige
+    /// deux verdicts opposés.
+    #[tokio::test]
+    async fn mika2184_a_young_process_spares_and_the_ignorance_extinguishes_itself() {
+        // Uptime 120 s < window 600 s: the process could not have observed.
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let young = TaskEngine::new(db.clone(), dispatcher).with_started_at_secs_ago(120);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        young.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "a process that has not lived through the window has not observed a silence"
+        );
+
+        // Same input, an engine that HAS lived through it.
+        let dispatcher = test_dispatcher(db.clone());
+        let observing = observing_engine(db.clone(), dispatcher);
+        observing.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "the ignorance must extinguish itself — otherwise it is a permanent shield"
+        );
+    }
+
+    /// T8 — `NotRecorded` **fauche**.
+    ///
+    /// Télémétrie désarmée des deux côtés : aucune ligne d'activité ne peut
+    /// exister, donc le silence ne dit rien. Épargner ici restaurerait le
+    /// cadavre-bouclier que mika#2181 a dû borner — *ce qui ne peut pas
+    /// s'éteindre tout seul ne peut pas épargner.*
+    #[tokio::test]
+    async fn mika2184_disarmed_telemetry_reaps_rather_than_spares() {
+        let db = test_db();
+        let dispatcher = test_dispatcher_with(db.clone(), |s| {
+            s.store_llm_calls = false;
+            s.store_tool_calls = false;
+        });
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "a permanent inability to observe must not disarm the reaper"
+        );
+    }
+
+    /// T9 — **les trois fenêtres ne sont pas interchangeables** (angle mort nommé
+    /// par le doc de mika#2181).
+    ///
+    /// `grace_seconds`, `promoted_liveness_seconds` et `activity_window_secs`
+    /// sont trois `i64` de même type, et les deux premiers partagent le **même
+    /// défaut** (2700). Rien dans le compilateur ne distingue une transposition.
+    ///
+    /// **Ce test ne mute PAS l'environnement du process, et ce n'est pas un
+    /// détail de confort.** Une première version posait les trois variables
+    /// globalement ; or les trois getters sont lus par *chaque* test faucheur, et
+    /// ceux-ci tournent en parallèle dans le même binaire — le test aurait
+    /// fabriqué exactement la flakiness qu'il prétend prévenir. La propriété se
+    /// teste donc là où elle vit : sur les paramètres, que D3 a précisément
+    /// sortis de la SQL pour ça.
+    ///
+    /// Deux moitiés, et la seconde est celle qu'un test de comportement ne peut
+    /// pas voir : les trois boutons doivent être **trois** noms distincts. Deux
+    /// constantes qui se rejoignent feraient d'un réglage de l'une un réglage
+    /// silencieux de l'autre.
+    #[test]
+    fn mika2184_the_three_windows_are_not_interchangeable() {
+        // Half 1 — transposing the two adjacent `i64` of the pure function
+        // changes the verdict. Telemetry armed, no activity, window 600,
+        // uptime 120: the process has not lived through the window.
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 120, true),
+            WrapperActivity::NotYetObservable { uptime_secs: 120 }
+        );
+        // Transposed — uptime 600 >= window 120 — and the verdict flips from
+        // spare to reap. An argument inversion cannot pass unnoticed.
+        assert_eq!(
+            classify_wrapper_activity(None, 120, 600, true),
+            WrapperActivity::Silent
+        );
+
+        // Half 2 — three distinct knobs. `STUCK_PENDING_REAPER_GRACE_ENV` and
+        // `PROMOTED_WRAPPER_LIVENESS_ENV` already share a default value; if they
+        // also shared a name, setting one would silently set the other.
+        let names = [
+            STUCK_PENDING_REAPER_GRACE_ENV,
+            PROMOTED_WRAPPER_LIVENESS_ENV,
+            STUCK_PENDING_ACTIVITY_WINDOW_ENV,
+        ];
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let before = sorted.len();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            before,
+            "the three windows must be settable independently; found duplicates in {names:?}"
+        );
+    }
+
+    /// T6 — table complète de `classify_wrapper_activity`, bornes comprises.
+    #[test]
+    fn mika2184_classify_wrapper_activity_table() {
+        assert_eq!(
+            classify_wrapper_activity(Some(60), 600, 10_000, true),
+            WrapperActivity::Active { last_seen_secs: 60 }
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10_000, true),
+            WrapperActivity::Silent
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 120, true),
+            WrapperActivity::NotYetObservable { uptime_secs: 120 }
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10_000, false),
+            WrapperActivity::NotRecorded
+        );
+        // Upper bound: 700 > 600 is silent...
+        assert_eq!(
+            classify_wrapper_activity(Some(700), 600, 10_000, true),
+            WrapperActivity::Silent
+        );
+        // ...and the bound itself is INCLUSIVE, matching `LivenessSignal::from_age`.
+        assert_eq!(
+            classify_wrapper_activity(Some(600), 600, 10_000, true),
+            WrapperActivity::Active {
+                last_seen_secs: 600
+            }
+        );
+        // An age inside the window wins over EVERY unobservability: there is
+        // nothing to be unable to observe once the evidence is in hand.
+        assert_eq!(
+            classify_wrapper_activity(Some(60), 600, 10, false),
+            WrapperActivity::Active { last_seen_secs: 60 }
+        );
+        // Permanence before transience: a disarmed telemetry is reported ahead
+        // of a young process, because an operator reading "the process just
+        // started" on a fleet that stopped recording would chase the wrong fix.
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10, false),
+            WrapperActivity::NotRecorded
+        );
+    }
+
+    /// T12 — les trois paliers du bouton, plus le plafond.
+    #[test]
+    fn mika2184_parse_stuck_pending_activity_window() {
+        assert_eq!(
+            parse_stuck_pending_activity_window(None),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some("  ")),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(parse_stuck_pending_activity_window(Some("900")), 900);
+        assert_eq!(parse_stuck_pending_activity_window(Some(" 900 ")), 900);
+        for bad in ["0", "-1", "abc"] {
+            assert_eq!(
+                parse_stuck_pending_activity_window(Some(bad)),
+                STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+                "{bad} must fall back to the default"
+            );
+        }
+        // Beyond the clamp: a knob whose extreme setting would spare every
+        // parent for ever must refuse it, and say so.
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some(
+                &(STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS + 1).to_string()
+            )),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some(
+                &STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS.to_string()
+            )),
+            STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS,
+            "the clamp itself is a legal value"
+        );
+        assert_eq!(STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS, 600);
     }
 
     #[test]
@@ -7246,6 +8132,199 @@ mod tests {
             writers[0].ends_with("engine.rs"),
             "{DISPATCH_PARENT_SETTLED_EVENT} must be written in this module, not in {:?}",
             writers[0]
+        );
+    }
+
+    /// T10 (mika#2184, R3/D6) — the two spare causes have **two names**, and
+    /// each has exactly one production writer.
+    ///
+    /// This is the half AC4's letter asked for as a `cause` field on a single
+    /// event, and that reading is rectified here (D6): the mika#2181 name
+    /// *carries its own cause*, so routing an unrelated spare through it would
+    /// make the name false and would split in two the population mika#2181's own
+    /// probe counts to measure whether its debt is being retired. Two names, two
+    /// counts, and an operator can subtract them.
+    ///
+    /// A behavioural test cannot see this class: a second writer would make no
+    /// decision wrong, it would only make the two populations uncountable apart
+    /// — with every assertion still green.
+    #[test]
+    fn mika2184_the_two_spare_causes_have_one_writer_each() {
+        for name in [
+            STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+            "stuck_pending_sheltered_by_promoted_wrapper",
+        ] {
+            let writers = production_sites_quoting(name);
+            assert_eq!(
+                writers.len(),
+                1,
+                "`{name}` must have exactly one production writer, so the two spare \
+                 causes stay countable apart; found: {writers:?}"
+            );
+            assert!(
+                writers[0].ends_with("engine.rs"),
+                "`{name}` must be written in this module, not in {:?}",
+                writers[0]
+            );
+        }
+    }
+
+    /// Production files quoting `needle` as a string literal, excluding test
+    /// code and comment lines. Shared by the two mika#2184 scans below.
+    fn production_sites_quoting(needle: &str) -> Vec<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for (path, production) in production_sources(&root) {
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&format!("\"{needle}\"")) {
+                    out.push(path.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every production `.rs` under `root`, as `(path, production-half)`.
+    ///
+    /// mika#2321: an extracted test module carries no `#[cfg(test)]` literal, so
+    /// truncation alone would scan it whole as production. Classify by path
+    /// first, then truncate.
+    fn production_sources(root: &std::path::Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                if crate::source_scan::is_test_source_path(&path) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = match text.find("\n#[cfg(test)]") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                out.push((path.to_string_lossy().to_string(), production));
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    /// T11 / **U5** (mika#2184, R7/D7) — the question *"does this wrapper show
+    /// activity?"* has exactly one reader.
+    ///
+    /// This is the `grooming_marker` lesson (mika#2158): a copied predicate is a
+    /// predicate that will diverge, and it cost months of silent disagreement
+    /// between two regexes one of which carried a comment saying it mirrored the
+    /// other. This very file has already paid it a second time, with
+    /// `has_pending_deferred_wrapper_child`.
+    ///
+    /// **Allowlist shipped empty, and it is not a slot to fill:** when this
+    /// fires, the resolution is to remove the second site, never to exempt it.
+    ///
+    /// The needle is a **conjunction of three terms**, and each one was put
+    /// there by a measured false positive rather than by caution:
+    ///
+    /// 1. a `JOIN sessions` — `find_stuck_team_runs` (mika#1652) reads the same
+    ///    two activity tables and joins them by
+    ///    `session_id LIKE 'team-' || r.id || '%'`, touching `sessions` not at
+    ///    all. A scan that accused the neighbour is a scan somebody disarms.
+    /// 2. whose ON clause carries `.task_id =` — the direction that starts from
+    ///    a task row and reaches its session.
+    /// 3. and which is followed by a `JOIN llm_calls` / `JOIN tool_calls` — this
+    ///    is what separates it from `get_task_health_summary`'s Signal A
+    ///    (`db/tasks.rs`), which traverses the chain in the **other** direction
+    ///    (`tool_calls → sessions → tasks`) to answer *"which task does this
+    ///    failing tool call belong to?"*. Terms 1 and 2 alone accuse it, and it
+    ///    is not a reader of this question.
+    ///
+    /// Counted **per file**, not per occurrence: one query legitimately carries
+    /// two branches (the `UNION ALL` over the two activity tables), and a scan
+    /// that called that two readers would have to be softened on its first run.
+    ///
+    /// **Named limit:** a second reader written with different aliases, or
+    /// reconstructing the join in Rust rather than in SQL, escapes it. The scan
+    /// bounds the realistic regression — a copy-paste of this query — and says
+    /// so rather than claiming completeness.
+    #[test]
+    fn mika2184_wrapper_activity_has_a_single_reader() {
+        /// Byte offsets in `text` of a task→session→activity join: the shape of
+        /// this question, and only it.
+        fn join_sites(text: &str) -> Vec<usize> {
+            text.match_indices("JOIN sessions")
+                .filter(|(at, _)| {
+                    let tail = &text[*at..text.len().min(at + 400)];
+                    tail.contains(".task_id =")
+                        && (tail.contains("JOIN llm_calls") || tail.contains("JOIN tool_calls"))
+                })
+                .map(|(at, _)| at)
+                .collect()
+        }
+
+        // Good-faith controls FIRST: a matcher that matched nothing would make
+        // the real assertion below vacuously green.
+        let duplicated = "JOIN sessions s ON s.task_id = w.id JOIN llm_calls lc \
+                          ON lc.session_id = s.id ;; JOIN sessions s2 ON s2.task_id = x.id \
+                          JOIN tool_calls tc ON tc.session_id = s2.id";
+        assert_eq!(
+            join_sites(duplicated).len(),
+            2,
+            "the matcher must see a duplicated join — otherwise the scan below proves nothing"
+        );
+        // It must NOT accuse the mika#1652 neighbour (term 1)...
+        assert!(
+            join_sites("JOIN llm_calls lc ON lc.session_id LIKE 'team-' || r.id || '%'").is_empty(),
+            "the scan must not accuse find_stuck_team_runs"
+        );
+        // ...nor Signal A of `get_task_health_summary`, which walks the same
+        // three tables in the opposite direction (term 3).
+        assert!(
+            join_sites(
+                "FROM tool_calls tc LEFT JOIN sessions s ON tc.session_id = s.id \
+                 LEFT JOIN tasks t ON s.task_id = t.id AND t.status = 'in_progress'"
+            )
+            .is_empty(),
+            "the scan must not accuse the tool_call→session→task traversal — a scan that \
+             reddens on a healthy neighbour is a scan somebody disarms"
+        );
+
+        const ALLOWED: &[&str] = &[];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut readers: Vec<String> = Vec::new();
+        for (path, production) in production_sources(&root) {
+            if ALLOWED.iter().any(|a| path.ends_with(a)) {
+                continue;
+            }
+            if !join_sites(&production).is_empty() {
+                readers.push(path.clone());
+            }
+        }
+
+        assert_eq!(
+            readers.len(),
+            1,
+            "the wrapper-activity join must have exactly ONE production reader \
+             (`Database::find_deferred_wrapper_activity_age_secs`). When this fires, \
+             remove the second site — do not allowlist it. Found: {readers:?}"
+        );
+        assert!(
+            readers[0].ends_with("tasks.rs"),
+            "the single reader must be the one in db/tasks.rs, not {:?}",
+            readers[0]
         );
     }
 

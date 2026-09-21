@@ -1236,6 +1236,19 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Age of the most recent activity row on the sessions of this parent's
+    /// deferred wrappers (mika#2184, U1).
+    /// See [`Database::find_deferred_wrapper_activity_age_secs`].
+    pub async fn find_deferred_wrapper_activity_age_secs(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<i64>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.find_deferred_wrapper_activity_age_secs(&a, &p))
+            .await
+    }
+
     /// Find `pending` self_dev issue parents that no callback child represents
     /// any more (mika#2045). See [`Database::find_orphaned_pending_issue_tasks`].
     pub async fn find_orphaned_pending_issue_tasks(

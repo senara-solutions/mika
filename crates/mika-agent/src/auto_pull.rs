@@ -1264,6 +1264,33 @@ const FILTER_READY_PARKED: &str = "ready_parked";
 /// That is the whole of mika#2361: the gesture the operator makes is not the
 /// gesture that re-enters, and until this name existed nothing said so.
 const FILTER_ABANDONED_OPERATOR_HELD: &str = "abandoned_operator_held";
+/// The host egress relay is down, so no dispatch can leave contained and every
+/// re-drive would be spent on a refusal (mika#2049).
+///
+/// # Why this filter exists at all, since it protects nothing
+///
+/// The protection is the shell guard in `dispatch-lib`, which refuses the launch
+/// on a **fresh probe** and reads no persistent state. This filter buys the
+/// operator's own acceptance criterion: *« proxy relancé ⇒ le dispatch reprend
+/// sans intervention sur les tickets »*. Without it, a refused dispatch leaves
+/// the ticket `ready`, Phase 2 re-drives it every ~15 min, and at
+/// `MIKA_AUTO_PULL_MAX_REDRIVES` (default 3) the ticket is **abandoned** —
+/// `operator-review` posted, `ready` removed, a comment written (mika#2020). A
+/// relay outage of about an hour would park every `ready` ticket behind an
+/// operator label, and resuming would cost one gesture per ticket.
+///
+/// # `Skip`, never `SkipAndResetBudget`
+///
+/// Waiting for a relay is right; calling the wait a success is what made the
+/// mika#2020 budget unreachable — measured at 31 re-drives against a counter
+/// reading 1 (mika#2158). Same sentence, same reason, third occurrence.
+///
+/// The name is shared **verbatim** with the `ready_label_outcome` gate of
+/// mika#2323: same cause, two distinct audit surfaces that an operator
+/// aggregates separately. A divergent spelling would cut one outage's
+/// population in two, which is the error both wire-format scans exist to make
+/// impossible.
+const FILTER_EGRESS_DOWN: &str = "egress_relay_down";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -1577,6 +1604,12 @@ struct StuckReadyFacts {
     redrive_count: i64,
     /// `redrive_abandoned_at` is set — this ticket was handed to the operator.
     abandoned: bool,
+    /// The host egress relay is down (mika#2049). **Global to the tick, not
+    /// per-ticket** — it is resolved once by the caller and copied onto every
+    /// ticket's facts, because the decision function is where the reason gets a
+    /// name and a ledger row. Resolving it per ticket would read the same file a
+    /// hundred times per tick to answer the same question.
+    egress_relay_down: bool,
 }
 
 /// What Phase 2 should do with one `ready` ticket (mika#2020).
@@ -1746,6 +1779,26 @@ fn classify_stuck_ready(
     if facts.live_pilot {
         return StuckReadyVerdict::Skip {
             reason: FILTER_LIVE_PILOT,
+        };
+    }
+
+    // mika#2049 — the egress relay is down, so no dispatch can leave contained.
+    //
+    // Placed AFTER the three "a dispatch is already running" branches and
+    // BEFORE everything that mutates a ticket's state. The three above name a
+    // more precise cause and change nothing; from here on, every branch either
+    // clears a budget (`ReEntry`), spends one (`Eligible`) or parks the ticket
+    // (`Abandon`) — and during an outage none of those should happen at all.
+    //
+    // Blocking `ReEntry` for the duration of the outage costs one extra tick
+    // after the relay returns. Letting it through would clear the budget and
+    // make the ticket `Eligible` on the next tick, which is the re-drive this
+    // branch exists to withhold.
+    //
+    // `Skip`, never `SkipAndResetBudget` — see [`FILTER_EGRESS_DOWN`].
+    if facts.egress_relay_down {
+        return StuckReadyVerdict::Skip {
+            reason: FILTER_EGRESS_DOWN,
         };
     }
 
@@ -2982,12 +3035,21 @@ async fn record_ready_refusal(
 /// sert **uniquement** aux écritures de label, parce que le PAT résolu du spirit
 /// authentifie sans porter `issues: write` — 34 `--add-label` refusés le
 /// 2026-09-07, sur trois chemins de ce module.
+///
+/// # `egress_relay_down` (mika#2049)
+///
+/// Resolved **once per tick by the caller**, which is the only place holding the
+/// global home the shell guard writes its stamp under (same trajectory as
+/// mika#2329's hot STOP). Passed in rather than read here so this function keeps
+/// doing no filesystem work of its own, and so a test can drive both states
+/// without touching the disk.
 pub async fn auto_pull_groomed_ticket(
     db: &AsyncDatabase,
     github_token: &str,
     label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
+    egress_relay_down: bool,
 ) -> Option<u64> {
     // Fetch open issues once (F4: client-side filter for the `ready` label).
     let issues = match gh_list_open_issues(github_token).await {
@@ -3060,6 +3122,7 @@ pub async fn auto_pull_groomed_ticket(
         trace_id,
         session_id,
         &mut ledger,
+        egress_relay_down,
     )
     .await;
     debug!(
@@ -3518,6 +3581,7 @@ async fn phase2_reconcile_stuck_ready(
     trace_id: &str,
     session_id: &str,
     ledger: &mut ExclusionLedger,
+    egress_relay_down: bool,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
     let redrive_budget = max_redrives();
@@ -3667,6 +3731,7 @@ async fn phase2_reconcile_stuck_ready(
             circuit_broken,
             redrive_count,
             abandoned,
+            egress_relay_down,
         };
 
         let verdict = classify_stuck_ready(issue, &facts, redrive_budget);
@@ -5674,6 +5739,7 @@ This ticket has been GROOMED and is ready.
             circuit_broken: false,
             redrive_count,
             abandoned: false,
+            egress_relay_down: false,
         }
     }
 
@@ -6562,6 +6628,9 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
         )
         .await;
 
@@ -6626,6 +6695,9 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
         )
         .await;
 
@@ -7018,6 +7090,18 @@ This ticket has been GROOMED and is ready.
         assert_eq!(FILTER_PROBE_ERROR, "state_probe_failed");
         assert_eq!(FILTER_SEAT_REFUSED, "seat_refused");
         assert_eq!(FILTER_READY_PARKED, "ready_parked");
+        assert_eq!(FILTER_ABANDONED_OPERATOR_HELD, "abandoned_operator_held");
+        // mika#2049 — the SAME value as `ReadyLabelGate::EgressRelayDown`'s wire
+        // name, deliberately: one cause, two audit surfaces an operator
+        // aggregates separately. A divergent spelling would cut one outage's
+        // population in two, which is the error both scans exist to prevent.
+        assert_eq!(FILTER_EGRESS_DOWN, "egress_relay_down");
+        assert_eq!(
+            FILTER_EGRESS_DOWN,
+            crate::server::ready_label_handler::ReadyLabelGate::EgressRelayDown.wire_name(),
+            "mika#2049 — the two surfaces must name the same outage identically; \
+             pinning each side alone would let them drift apart in silence"
+        );
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
         // mika#2361 — the audit `tool_name`s are wire format too: an operator
         // greps them by hand, so a rename silently empties their query.
@@ -7254,6 +7338,9 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
         )
         .await;
 
@@ -7282,5 +7369,166 @@ This ticket has been GROOMED and is ready.
             "attendre un pilote ne dépense pas le budget de re-drive"
         );
         assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
+    }
+
+    // ── mika#2049 : la garde B (relais d'egress mort) ──
+
+    /// §5.1 assertion 6 — le **verdict**. `Skip`, jamais `SkipAndResetBudget`.
+    ///
+    /// Attendre un relais est juste ; appeler l'attente un succès est ce qui a
+    /// rendu le budget de mika#2020 inatteignable — mesuré à 31 re-drives contre
+    /// un compteur affichant 1 (mika#2158). Troisième occurrence de la même
+    /// phrase, et c'est pour ça qu'elle est asserte plutôt que commentée.
+    #[test]
+    fn mika2049_le_relais_mort_rend_skip_et_ne_remet_pas_le_budget_a_zero() {
+        let issue = make_issue(1, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(2);
+        f.egress_relay_down = true;
+
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_EGRESS_DOWN
+            },
+            "un relais mort doit SAUTER le ticket sous son propre nom"
+        );
+
+        // Contrôle négatif : c'est bien le drapeau qui décide. Sans lui, le même
+        // ticket est éligible — donc l'assertion ci-dessus ne peut pas passer
+        // sur une constante.
+        let mut clean = facts(2);
+        clean.egress_relay_down = false;
+        assert_eq!(
+            classify_stuck_ready(&issue, &clean, 3),
+            StuckReadyVerdict::Eligible,
+            "sans panne, le ticket reste éligible — sinon l'assertion précédente \
+             ne prouverait rien sur le drapeau"
+        );
+    }
+
+    /// §5.1 assertion 6 (suite) — le **tick**, et ce qu'il ne touche pas.
+    ///
+    /// L'assertion pure ci-dessus dit le verdict ; celle-ci dit que la boucle
+    /// l'applique, nomme l'exclusion sous son propre nom, et **ne dépense pas**
+    /// le budget de re-drive — qui est tout l'objet de la garde (R5).
+    #[tokio::test]
+    async fn mika2049_un_tick_sous_panne_ne_parque_ni_ne_depense() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2049u64;
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            true, // le relais est mort
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "aucun re-drive pendant une panne de relais");
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_EGRESS_DOWN)),
+            "l'exclusion doit être comptable sous son propre nom : c'est la \
+             requête qui répond « combien de tickets la panne a-t-elle épargnés ? » \
+             ; ledger = {:?}",
+            ledger.entries
+        );
+
+        let (redrives, abandoned) = db
+            .get_auto_pull_redrive_state(DEFAULT_REPO, n)
+            .await
+            .expect("read redrive state");
+        assert_eq!(
+            redrives, 0,
+            "attendre un relais ne dépense pas le budget — sans quoi une panne \
+             d'une heure parquerait chaque ticket derrière `operator-review`"
+        );
+        assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
+
+        // Contrôle négatif : relais servant, même ticket. L'exclusion
+        // `egress_relay_down` ne doit PAS apparaître — sans quoi cette suite
+        // serait satisfaite par une garde qui refuse tout le monde.
+        let mut ledger_up = ExclusionLedger::default();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger_up,
+            false,
+        )
+        .await;
+        assert!(
+            !ledger_up
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_EGRESS_DOWN),
+            "sans panne, aucune exclusion d'egress ; ledger = {:?}",
+            ledger_up.entries
+        );
+    }
+
+    /// §5.1 assertion 7 — **l'invariant qui rend la garde B atteignable**.
+    ///
+    /// Le TTL du marqueur doit rester strictement supérieur au seuil de
+    /// stuck-ready. Une rédaction antérieure du plan posait 600 s « soit un tick
+    /// d'`auto_pull` », en raisonnant sur la cadence du tick ; le nombre qui
+    /// gouverne est le **seuil d'âge du label**, 900 s. À `TTL = 600 < 900`, le
+    /// marqueur est périmé **à chaque fois que Phase 2 le regarde**, la garde
+    /// n'est jamais consultée avec un marqueur frais, et une panne d'une heure
+    /// parque chaque ticket — exactement le résultat que la garde existe pour
+    /// éviter, avec une suite de tests verte.
+    ///
+    /// C'est la classe mika#2362 : deux nombres corrects l'un sans l'autre,
+    /// dont la relation n'était écrite nulle part.
+    #[test]
+    fn mika2049_le_ttl_du_marqueur_depasse_le_seuil_de_stuck_ready() {
+        let ttl = crate::pilot_egress_stamp::DOWN_TTL_DEFAULT_SECS;
+        let seuil = STUCK_READY_THRESHOLD_DEFAULT_SECS;
+
+        assert!(
+            ttl > seuil,
+            "mika#2049 — le TTL du marqueur d'egress ({ttl} s) doit dépasser le \
+             seuil de stuck-ready ({seuil} s), sinon le marqueur est périmé à \
+             chaque regard de Phase 2 et la garde B ne mord JAMAIS. Ne baissez \
+             pas l'un sans refaire cette arithmétique : le symptôme (des tickets \
+             parqués pendant une panne de relais) ne ressemble en rien à sa cause."
+        );
+
+        // Contrôle négatif de la correction elle-même : à 600 s — la valeur
+        // qu'une rédaction antérieure du plan proposait — la relation est FAUSSE.
+        // Sans cette ligne, l'assertion ci-dessus passerait aussi sur un TTL mal
+        // dimensionné si quelqu'un baissait le seuil en même temps.
+        assert!(
+            600 <= seuil,
+            "le contrôle négatif suppose un seuil >= 600 s ; s'il a bougé, \
+             refaites le tableau de `DOWN_TTL_DEFAULT_SECS`"
+        );
+
+        // Et la marge est écrite, pas seulement la stricte supériorité : le
+        // défaut est à deux fois le seuil.
+        assert!(
+            ttl >= 2 * seuil,
+            "le défaut vise deux fois le seuil ({} s attendus au moins, {ttl} s posés)",
+            2 * seuil
+        );
     }
 }

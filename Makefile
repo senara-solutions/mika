@@ -137,6 +137,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh

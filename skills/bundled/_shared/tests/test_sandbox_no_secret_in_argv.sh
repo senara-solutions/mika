@@ -83,14 +83,24 @@ assert_true() {
 # write to /var/log. The stub return code selects Phase 2a vs Phase 2b.
 
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2039-XXXXXX")
-trap 'rm -rf "$TMPROOT"' EXIT
+# mika#2049 — the fabricated relay's listener dies with the temp tree.
+trap 'if declare -F stop_fake_egress_relay >/dev/null 2>&1; then stop_fake_egress_relay; fi; rm -rf "$TMPROOT"' EXIT
 
 CAPTURE="$TMPROOT/bwrap-argv"
 export HOME="$TMPROOT/home"
 WORKTREE_DIR="$TMPROOT/worktree"
 mkdir -p "$HOME" "$WORKTREE_DIR"
 
-MOCK_EGRESS_RC=1   # 1 → Phase 2a (fs cut only); 0 → Phase 2b (full)
+# mika#2049 — the default FLIPPED, and the meaning of `1` changed with it.
+#
+# Before: `1` → Phase 2a (fs cut only, network open), the suite's default shape.
+# Now:    `1` → the relay is unavailable → `_run_pilot_sandboxed` REFUSES (78)
+#              and never reaches bwrap. There is no Phase 2a any more.
+#
+# So the default is `0` (relay serving, full Phase 2b), which is the only shape
+# a dispatch can now take, and `1` is used exactly once below — to assert the
+# refusal itself.
+MOCK_EGRESS_RC=0
 MOCK_BWRAP_RC=0
 
 # mika#2056: the production _PILOT_SANDBOX_SECRET_ALLOWLIST is now empty (no
@@ -103,7 +113,22 @@ bwrap() {
     printf '%s\0' "$@" > "$CAPTURE"
     return "$MOCK_BWRAP_RC"
 }
-_ensure_pilot_egress_proxy() { return "$MOCK_EGRESS_RC"; }
+# mika#2049 — the fabricated relay supplies the artefacts Phase 2b binds (a real
+# unix socket and a real proxy file); bwrap refuses a `--bind` whose source does
+# not exist, so without them the real-bwrap section below would fail for a
+# reason unrelated to this suite.
+# shellcheck source=skills/bundled/_shared/tests/lib-fake-egress-relay.sh
+source "$SCRIPT_DIR/lib-fake-egress-relay.sh"
+stub_serving_egress_relay "$TMPROOT"
+
+# …but this suite drives availability itself, so the helper's hard `return 0` is
+# replaced by one that honours MOCK_EGRESS_RC. The artefacts and the stamp
+# no-ops it installed are kept.
+_ensure_pilot_egress_proxy() {
+    _PILOT_EGRESS_ABORT=""
+    [ "$MOCK_EGRESS_RC" -eq 0 ] || _PILOT_EGRESS_ABORT="egress_bind_timeout"
+    return "$MOCK_EGRESS_RC"
+}
 _ensure_pilot_helper() { return 1; }
 
 # Read the captured argv back as a bash array.
@@ -203,21 +228,40 @@ run_sandboxed() {
 }
 
 # ============================================================================
-# Test 1: Phase 2a — no credential value in the bwrap argv
+# Test 1: egress unavailable — the launch is REFUSED, so there is no argv at all
 # ============================================================================
+# This scenario used to be "Phase 2a (fs cut only) — argv carries no
+# credential". Phase 2a no longer exists (mika#2049 made the posture
+# fail-closed), so the shape it asserted on can no longer be built. The
+# scenario is CONVERTED rather than deleted, and the converted form is strictly
+# stronger: "no bwrap argv at all" implies "no credential in the bwrap argv".
+#
+# It is also the assertion this suite owes the fail-closed posture — the argv
+# channel is the one mika#2039 guards, and the surest way for a secret not to
+# reach it is for no process to be launched.
 echo ""
-echo "Test: Phase 2a (fs cut only) — argv carries no credential"
-echo "----------------------------------------------------------"
+echo "Test: egress unavailable — the launch is refused, no argv is built"
+echo "-------------------------------------------------------------------"
 
+: > "$CAPTURE"   # a stale capture from an earlier run would make this vacuous
 MOCK_EGRESS_RC=1
-run_sandboxed /bin/true >/dev/null
+# Called directly rather than through `run_sandboxed`, which wraps it in a
+# command substitution: `$( … )` is a subshell, so `$_PILOT_SANDBOX_REFUSAL`
+# would never come back and the reason assertion below could only ever read an
+# empty string. The variable is deliberately non-`local` in dispatch-lib for
+# exactly this reason — the caller is where the operator-facing text is built.
+_PILOT_SANDBOX_REFUSAL=""
+rc=0
+MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed /bin/true >/dev/null 2>&1 || rc=$?
 
-rc=1; captured_has_credential && rc=0
-assert_eq "2a: argv contains no credential-shaped value" "1" "$rc"
+assert_eq "refusal: _run_pilot_sandboxed returns 78 (containment refusal)" "78" "$rc"
+assert_eq "refusal: bwrap was never invoked, so no argv exists to leak" \
+    "0" "$(wc -c < "$CAPTURE" | tr -d ' ')"
+rc=1
+case "$_PILOT_SANDBOX_REFUSAL" in *"egress relay is not serving"*) rc=0 ;; esac
+assert_true "refusal: the reason names the relay, not the worktree" "$rc"
 
-rc=1; [ "$(arg_index '--ro-bind-data')" != "-1" ] && rc=0
-assert_true "2a: argv carries --ro-bind-data (secret channel present)" "$rc"
-assert_setenv_channel_closed "2a: no unaudited name travels by --setenv"
+MOCK_EGRESS_RC=0
 
 # ============================================================================
 # Test 2: Phase 2b — no credential value in the bwrap argv
@@ -252,7 +296,10 @@ run_sandboxed /bin/true >/dev/null
 assert_setenv_channel_closed "2b: an unknown-vendor secret cannot ride --setenv"
 unset NPM_TOKEN ATLASSIAN_API_TOKEN
 
-MOCK_EGRESS_RC=1
+# mika#2049 — was `=1` (back to the Phase 2a default). Phase 2a is gone, and
+# leaving `1` here would make every test below this line a refusal with no argv
+# to inspect: nine scenarios silently asserting on a stale capture.
+MOCK_EGRESS_RC=0
 
 # ============================================================================
 # Test 3: --perms 0600 immediately precedes --ro-bind-data
@@ -323,7 +370,18 @@ assert_eq "trace file contains no credential-shaped value" "1" "$rc"
 # `NAME=value`, so a `+ GH_TOKEN=...` line would be scrubbed on the way to the
 # callback — but `++ printf %s <value>` from an untraced-suppressed process
 # substitution would not be, and that is what reaches the caller.
-rc=1; grep -qE '\+\+ printf' "$TRACE" && rc=0
+#
+# mika#2049 — with Phase 2b now the default, the traced call also re-quotes the
+# PAYLOAD argv (`quoted_argv=$(printf ' %q' "$@")`), which traces as
+# `++ printf ' %q' /bin/true`. That line carries the payload, never a secret
+# (the argv channel is audited above), so it alone is excluded — exactly, so
+# any other expanded printf still fails the assertion.
+# Here-string, not a pipe (mika#2055/#2432: `producer | grep -q` SIGPIPEs).
+# The `-n` guard matters: an empty here-string is one empty line, which
+# `grep -v` would count as an offending printf.
+_printf_lines=$(grep -E -- '\+\+ printf' "$TRACE" || true)
+rc=1
+[ -n "$_printf_lines" ] && grep -vqxF -- "++ printf ' %q' /bin/true" <<<"$_printf_lines" && rc=0
 assert_eq "trace carries no expanded process-substitution printf" "1" "$rc"
 
 rc=1; grep -q 'sentinel-after-sandbox-call' "$TRACE" && rc=0
@@ -525,7 +583,8 @@ else
             /bin/sh -c 'printf %s "${MIKA_TEST_SECRET:-<absent>}"' 2>/dev/null)
         assert_eq "Phase 2b: sandbox sees a listed secret via the file channel" \
             "$FAKE_TOKEN" "$got_2b"
-        MOCK_EGRESS_RC=1
+        # mika#2049 — stays at 0; `1` would refuse, not degrade.
+        MOCK_EGRESS_RC=0
     else
         echo "  ⊘ Phase 2b real-bwrap run skipped — egress proxy not running"
         echo "    (argv-level Phase 2b coverage above still applies)"

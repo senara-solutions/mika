@@ -2623,6 +2623,93 @@ impl Database {
         Ok(rows)
     }
 
+    /// Age, in seconds, of the most recent activity row on the sessions attached
+    /// to this parent's deferred wrappers — `None` when there is none
+    /// (mika#2184, U1).
+    ///
+    /// **The direct liveness measure the proxy window could not be.** mika#2181
+    /// shelters a promoted wrapper while its `completed_at` is younger than
+    /// `promoted_wrapper_liveness_secs()`. That is a proxy on the *promotion*
+    /// instant, and it leaves a measured residue: over 30 days, 139 of 799
+    /// delivered wrappers (17 %) delivered past 2700 s, 81 of their parents were
+    /// expired `stuck_pending_no_deferred_wrapper`, and 8 of those were expired
+    /// 2820–4996 s after promotion — out of reach of *any* value of that
+    /// constant compatible with a useful reaper. Widening the window buys
+    /// coverage by blinding the reaper for longer; this reads whether the turn is
+    /// actually working.
+    ///
+    /// **The join is by equality, not by prefix.** The turn that consumes a
+    /// promoted wrapper is a `SilentTrigger::DeferredDispatch`, dispatched by
+    /// `dispatch_resume_agent`, which opens its session through
+    /// `create_session_with_parent(&session_id, …, task_id = Some(&task.id))` —
+    /// where `task.id` is **the wrapper**. So:
+    ///
+    /// ```text
+    /// parent P → wrappers W (trigger_type='callback', parent_task_id = P.id,
+    ///                        label = DEFERRED_DISPATCH_LABEL)
+    ///          → sessions S (sessions.task_id = W.id)
+    ///          → llm_calls / tool_calls (session_id = S.id)
+    /// ```
+    ///
+    /// That is stricter than the shape mika#1652 uses for team runs, which has
+    /// to fall back on `session_id LIKE 'team-' || r.id || '%'`. The `task_id`
+    /// column has existed since v19 and is written there — no migration, no
+    /// column.
+    ///
+    /// **It returns an age, never a boolean** (mika#2184 D2), for three reasons
+    /// in order of weight: the threshold leaves the SQL and becomes a parameter
+    /// of a pure function, testable at its boundaries without a database; the
+    /// log line can then *name* the age, which mika#2277 paid dearly for not
+    /// doing (two false positives read "nominal" on first inspection because a
+    /// single age was reported on a disposition crossing three); and `None` is
+    /// never `0` (mika#2331) — no activity is not activity of age zero.
+    ///
+    /// A **negative** age (clock skew, a row stamped in the future) is clamped to
+    /// `0`: it means "very recent", never "very old". Fail-safe towards sparing,
+    /// which is the direction of this ticket's asymmetry — a parent killed in
+    /// error loses hours of work, a parent spared in error costs one more tick.
+    ///
+    /// SOLE READER of the question *"does this wrapper show activity?"*
+    /// (mika#2184 R7/D7), pinned by
+    /// `mika2184_wrapper_activity_has_a_single_reader`. Deliberately **not**
+    /// unified with `find_stuck_team_runs`: disjoint populations, different
+    /// joins, and an abstraction drawn over two points whose joins differ is the
+    /// wrong abstraction.
+    pub fn find_deferred_wrapper_activity_age_secs(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<Option<i64>> {
+        let age: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(age) FROM (
+                   SELECT CAST(strftime('%s','now') - strftime('%s', lc.created_at) AS INTEGER) AS age
+                     FROM tasks w
+                     JOIN sessions s ON s.task_id = w.id
+                     JOIN llm_calls lc ON lc.session_id = s.id
+                    WHERE w.agent_id = ?1 AND w.parent_task_id = ?2
+                      AND w.trigger_type = 'callback' AND w.label = ?3
+                   UNION ALL
+                   SELECT CAST(strftime('%s','now') - strftime('%s', tc.created_at) AS INTEGER)
+                     FROM tasks w
+                     JOIN sessions s ON s.task_id = w.id
+                     JOIN tool_calls tc ON tc.session_id = s.id
+                    WHERE w.agent_id = ?1 AND w.parent_task_id = ?2
+                      AND w.trigger_type = 'callback' AND w.label = ?3
+                 )",
+                params![
+                    agent_id,
+                    parent_task_id,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(age.map(|a| a.max(0)))
+    }
+
     /// Find `blocked` self_dev issue parents refused on a busy dispatch slot,
     /// older than `grace_seconds` and with nothing left representing them
     /// (mika#2169, L3b).

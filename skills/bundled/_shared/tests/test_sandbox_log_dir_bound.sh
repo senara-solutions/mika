@@ -85,7 +85,8 @@ if ! command -v bwrap >/dev/null 2>&1; then
 fi
 
 TMPROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2165-XXXXXX")
-trap 'rm -rf "$TMPROOT"' EXIT
+# mika#2049 — the fabricated relay's listener dies with the temp tree.
+trap 'if declare -F stop_fake_egress_relay >/dev/null 2>&1; then stop_fake_egress_relay; fi; rm -rf "$TMPROOT"' EXIT
 
 # The redirected log dir. Set here for readability, not out of necessity —
 # see the note above; the assertion below is what holds that claim.
@@ -104,10 +105,15 @@ mkdir -p "$HOME" "$HOME/.mika/data/pilot-transcripts"
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
 
-# No real egress proxy / mitmproxy for a test. This exercises the Phase 2a
-# fallback bwrap construction — the degraded path, which must carry the log
-# bind too. Wiring only the Phase 2b branch is the named risk of this ticket.
-_ensure_pilot_egress_proxy() { return 1; }
+# mika#2049 — a SERVING relay, fabricated. This used to stub the launcher to
+# `return 1` to exercise the Phase 2a fallback (fs cut, network open), and the
+# comment here named "wiring only the Phase 2b branch" as this ticket's risk.
+# The posture is now fail-closed and Phase 2a is gone, so 2b is the ONLY shape
+# — the risk has inverted, and the log bind must be proven under it. The
+# mika#2165 invariant is unchanged; only the preparation moved.
+# shellcheck source=skills/bundled/_shared/tests/lib-fake-egress-relay.sh
+source "$SCRIPT_DIR/lib-fake-egress-relay.sh"
+stub_serving_egress_relay "$TMPROOT"
 _ensure_pilot_helper() { return 1; }
 _PILOT_SANDBOX_SECRET_ALLOWLIST=()
 

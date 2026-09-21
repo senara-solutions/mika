@@ -1755,12 +1755,40 @@ impl TaskDispatcher {
             "auto_pull: running groomed ticket selection"
         );
 
+        // mika#2049 — is the host egress relay down? Resolved ONCE per tick,
+        // here, because this is the type that holds the global home the shell
+        // guard stamps under (same trajectory as mika#2329's hot STOP, and the
+        // reason `auto_pull` takes this as a parameter rather than reading it).
+        //
+        // Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+        // "serving". That cannot open the network — the protection is the shell
+        // guard, which probes the socket on every dispatch and reads no stamp.
+        // The worst a false "serving" buys is one refused dispatch.
+        let egress_verdict = crate::pilot_egress_stamp::relay_verdict(
+            &self.global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        );
+        if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } = &egress_verdict {
+            // One line per tick, not per ticket: the per-ticket record is the
+            // exclusion ledger's `egress_relay_down` rows (mika#2131 doctrine —
+            // detail in `audit_events`, shape in one INFO line).
+            info!(
+                event = "auto_pull_egress_relay_down",
+                motif = %motif,
+                age_secs,
+                trace_id = %trace_id,
+                "auto_pull: host egress relay is down — tickets are skipped, not \
+                 re-driven, so none is parked by the outage (mika#2049)"
+            );
+        }
+
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
             &label_auth,
             &trace_id,
             &session_id,
+            egress_verdict.is_down(),
         )
         .await;
 
