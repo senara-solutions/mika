@@ -136,7 +136,7 @@ dépôt — même dérive que le `glm-5.3` de mika-qa mesuré par mika#2328.
 
 - **Aucun mécanisme de repli modèle n'existe.** `grep -rn "model_fallback|fallback_model|secondary_model|on_cap_exhausted"` sur `crates/` rend un seul résultat, dans un test de coût KG sans rapport. C'est une brique entière, pas un réglage.
 - **Elle viole mika#1190 par construction.** *« Never swap an agent's base model … without a passing `make calibrate-<role>` run. »* Un repli **automatique** est un swap de modèle sur un chemin que personne ne voit, au moment le plus défavorable.
-- **DeepSeek n'a aucune calibration mika-arch. Ni kimi.** `docs/eval/calibration/` contient `mika-dev-1221`, `mika-dev-1633`, `mika-orchestrator-1641`, `mika-qa-1632`, `mika-qa-2328`, `2264` — et **rien pour mika-arch**, alors que la suite (`calibration/roles/mika_arch.rs`) et ses fixtures existent. Il n'existe donc **aucune baseline** contre laquelle mesurer quoi que ce soit sur cet agent.
+- **DeepSeek n'a aucune calibration mika-arch. Ni kimi.** `docs/eval/calibration/` contient exactement six entrées — `2264`, `mika-dev-1221`, `mika-dev-1633`, `mika-orchestrator-1641`, `mika-qa-1632`, `mika-qa-2328` — et **rien pour mika-arch**, alors que la suite `crates/mika-agent/src/calibration/roles/mika_arch.rs` et ses fixtures existent. Plus net encore : le `CLAUDE.md` racine désigne `docs/eval/calibration/baselines/` comme le lieu des baselines (« Baselines live at `docs/eval/calibration/baselines/` ») et **ce répertoire n'existe pas dans l'arbre**. Il n'existe donc aucune baseline contre laquelle mesurer quoi que ce soit sur cet agent — ni pour k2.5, ni pour un modèle de repli. Le pilote n'a pas à le redécouvrir : les deux chemins sont nommés ici.
 - **Le ticket la conditionne lui-même** : « Après la mesure ». Elle n'est pas à livrer ici.
 
 Le chemin correct, quand la mesure du § 6 l'aura justifiée : un ticket propre
@@ -174,7 +174,10 @@ un autre) et la leçon mika#2270 (le serveur tenait la réponse et la jetait).
 changer un champ ni une valeur :
 
 ```rust
-pub struct ResolvedBudgetRecord { /* les champs de l'événement, tels quels */ }
+pub struct ResolvedBudgetRecord {
+    /* les champs de l'événement, tels quels */
+    pub resolved_at: String, // RFC 3339 UTC — l'instant de la résolution (F3)
+}
 pub fn resolve_llm_budget_record(agent_id, global_home, agent_home) -> ResolvedBudgetRecord;
 pub fn log_llm_budget_resolved(...)  // appelle le premier, garde la dédup et le WARN mika#2362
 ```
@@ -182,6 +185,20 @@ pub fn log_llm_budget_resolved(...)  // appelle le premier, garde la dédup et l
 Refactor **pur** : mêmes champs, même dédup, même `llm_budget_retry_unreachable`,
 même ligne INFO. Un second résolveur serait un résolveur libre de diverger du
 premier — la classe que `grooming_marker` (mika#2158) a dû fermer une fois.
+
+**`log_llm_budget_resolved` a deux appelants, pas un**, et le refactor doit les
+garder tous deux verts : `crates/mika-agent/src/server/mod.rs:476` (`init_agent`)
+et `crates/mika-agent/src/teams/engine.rs:222` (run d'équipe). Seul le premier
+prend le chemin U2 — un run d'équipe ne construit pas d'`AgentState` et continue
+d'appeler la fonction de journal telle quelle. Le chemin per-skill
+(`agent_loop`'s `make_provider_for`) reste hors périmètre et n'émet rien, comme
+les commentaires des deux sites le déclarent déjà.
+
+`resolved_at` est le **seul** champ ajouté, et c'est un fait sur le record, pas
+un second avis sur le budget (F3) : il date la résolution, il ne la refait pas.
+Il n'entre **pas** dans la signature de déduplication — deux résolutions
+identiques à deux instants différents doivent rester une seule ligne, sans quoi
+la dédup de mika#2293 serait annulée par le champ censé la documenter.
 
 ### U2 — `AgentState` garde ce que son `init_agent` a résolu
 
@@ -193,14 +210,27 @@ recalculé** — même contrat *not hot-swappable* que `AgentState.tier` (mika#1
 `AgentState.deployment` (mika#2290), et pour la même raison : c'est l'état sous
 lequel cet agent **tourne**, pas celui que le disque porte maintenant.
 
+**Le gel est la propriété voulue, et il a un coût qu'il faut rendre lisible
+plutôt que taire (F3).** Un record figé au boot répond à *« sous quoi cet agent
+tourne-t-il »* et **jamais** à *« que porte le disque en ce moment »*. Les deux
+questions se confondent tant que rien ne date la réponse : un opérateur lisant
+`model = moonshotai/kimi-k2.5` ne peut pas distinguer « k3 est absent du disque »
+de « le disque a changé depuis le boot ». D'où `resolved_at`, posé au même
+instant que le record et rendu partout où le record l'est. Il ne lève pas
+l'ambiguïté tout seul — il la rend **décidable** : la conduite de lecture est
+écrite au § 6.
+
 ### U3 — Une route read-only
 
 `GET /api/v1/agents/{name}/budget`, auth dashboard-ou-interne comme ses voisines
 (`/api/v1/agents/{name}/sessions`, `/api/v1/agents/{name}/audit` existent déjà —
-le motif est en place). Rend le record de l'`AgentState`, tel quel. **404 si
-l'agent n'est pas résolu** — et surtout : ne recalcule rien, ne relit pas le
-disque. Un agent non servi n'a pas de budget « en vigueur » à rapporter, et en
-inventer un serait le faux vert que U1/U2 existent pour empêcher.
+le motif est en place). Rend le record de l'`AgentState`, tel quel, `resolved_at`
+compris. **404 si l'agent n'est pas résolu** — et surtout : ne recalcule rien, ne
+relit pas le disque. Un agent non servi n'a pas de budget « en vigueur » à
+rapporter, et en inventer un serait le faux vert que U1/U2 existent pour
+empêcher. Le refus de relire le disque n'est pas une économie : c'est ce qui rend
+la route et le disque **deux faits distincts**, dont la différence *est* la
+mesure de dérive que #2457 attend (§ 6).
 
 ### U4 — `mika agents budget [--agent <name>]`
 
@@ -209,7 +239,7 @@ Nouvelle variante de `AgentsCommand` (`crates/mika-cli/src/cli.rs:389`, à côt�
 Sortie texte, une ligne par fait, chacune avec sa provenance :
 
 ```
-mika-arch
+mika-arch                        (résolu le 2026-09-21T06:12:44Z)
   provider   openrouter          (agent_config)
   model      moonshotai/kimi-k2.5 (agent_config, clé: openrouter_model)
   plafond    240 s               (agent_config)
@@ -219,10 +249,34 @@ mika-arch
   tentatives 3 nominales / 3 atteignables
 ```
 
+La première ligne porte `resolved_at` (F3) : la sortie dit **quand** elle a été
+vraie, jamais seulement ce qu'elle vaut.
+
 **Si spirit ne répond pas, ou répond 404, le CLI ne calcule PAS de repli local.**
 Il dit *« ce serveur n'a rien attesté »* — population que mika#2304 a dû nommer
 pour exactement cette raison, et dont l'ambiguïté (binaire antérieur au correctif
 vs agent non servi) est préférable à une valeur fausse.
+
+**Le sixième mot de provenance existe déjà ; U4 ne l'invente pas (F2).**
+`MODEL_SOURCE_UNKNOWN_PROVIDER = "unknown_provider"` est déclaré à
+`crates/mika-common/src/llm/budget_provenance.rs:164`, produit par
+`ModelProvenance::model_source_name` (`:346`) quand une porte de la cascade porte
+un `llm_provider` que le lecteur ne sait pas parser, et **déjà épinglé** par deux
+tests en place : `mika2293_source_names_are_a_wire_format` (`:1288`, format de
+fil) et `mika2328_an_unreadable_provider_is_never_reported_as_a_default_model`
+(`:1498`, qui asserte en plus que `Settings::load_for_agent` refuse ce fichier,
+donc que l'état est inatteignable en production). Le doc-comment du site énonce
+la raison : rapporter `default` affirmerait « aucune porte ne portait le
+modèle », ce qui est inconnu et possiblement faux.
+
+**Conséquence de périmètre, dite explicitement :** ce plan **n'introduit aucun
+nouveau comportement de refus** dans `BudgetProvenance` / `ModelProvenance`. La
+ligne U4 du § 5 est donc une **non-régression** — elle atteste que le passage par
+le record et par la route ne perd pas cette provenance en chemin — et non une
+garde nouvelle. Sur ce croisement, `effective_model()` rend `None` (`:334`) : la
+sortie texte doit rendre `model  (non résolu — provider illisible : "<brut>")`
+plutôt qu'une chaîne vide, et `provider_name()` (`:356`) fournit déjà le brut qui
+a échoué à parser.
 
 ### Ce que ce livrable n'est PAS
 
@@ -241,13 +295,76 @@ vs agent non servi) est préférable à une valeur fausse.
 | U2 | Le record servi est celui de l'init : muter le `config.toml` après démarrage **ne change pas** ce que la route rend | un recalcul par requête (le faux vert mika#2304) |
 | U3 | Agent servi → 200 + record ; agent inconnu → **404**, jamais un record calculé | un repli qui invente une provenance |
 | U4 | Spirit injoignable ou 404 → *« non attesté »*, **aucune** valeur locale affichée | un `BudgetProvenance::resolve` appelé dans le process CLI |
-| U4 | Un `provider` dont le modèle est illisible rend `unknown_provider`, pas `default` | la fausse provenance que `budget_provenance.rs` refuse déjà |
+| U4 (non-régression) | Un `provider` illisible rend `unknown_provider` **à travers le record et la route**, pas `default` — comportement en place (`budget_provenance.rs:164` / `:346`), déjà épinglé par `mika2328_an_unreadable_provider_is_never_reported_as_a_default_model` (`:1498`) | une provenance perdue en traversant le record |
+| U2/U3/U4 | Le record rend `resolved_at`, et le CLI l'affiche sur toute sortie attestée | une mesure non datable (F3) |
+| U1 | `teams::engine` (`engine.rs:222`), second appelant, reste vert et continue d'émettre la même ligne | un refactor qui n'adapte que `server/mod.rs` |
 | Non-régression | `test_mika_arch_config_toml_is_valid_toml` et `mika2280_the_three_shipped_geometries_and_their_verdict` **verts sans modification** | toute valeur touchée |
 
 Le contrôle négatif d'U4 est celui qui porte : sans lui, « le CLI lit le serveur »
 et « le CLI calcule localement » produisent exactement la même sortie sur un poste
 où les deux processus partagent l'environnement — c'est-à-dire sur le poste de
 développement où le test serait écrit.
+
+---
+
+## Fire-Disposition
+
+Option retenue : **(a) named allowlist exception, allowlist livrée VIDE** — pour
+le seul détecteur de ce plan qui ait une population pré-existante. Les autres
+n'en ont aucune, et cette asymétrie est le cœur de la réponse, donc elle est
+écrite détecteur par détecteur plutôt que globalement.
+
+**Deux familles, et une seule a un sujet.**
+
+| Détecteur | Population « données existantes » | Disposition |
+|---|---|---|
+| U1 équivalence (quatre positions de cascade) + contrôle négatif dédup/WARN | **aucune** — hermétique : le test construit ses propres `global_home`/`agent_home` en `tempdir`, sur le gabarit de `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position` | N/A |
+| U2 fraîcheur (muter le `config.toml` post-boot ne change pas le record) | **aucune** — hermétique : le test provisionne, initialise, mute, asserte | N/A |
+| U3 200/404 | **aucune** — hermétique | N/A |
+| U4 contrôle négatif *« non attesté »* | **aucune** — hermétique (serveur simulé injoignable / 404) | N/A |
+| Non-régressions de valeur (`test_mika_arch_config_toml_is_valid_toml`, `mika2280_…`) | tests **déjà verts** à HEAD, non modifiés | N/A |
+| **Scan structurel** : le record a **un** site de construction, et `mika-cli` ne résout **aucun** budget localement | **le code source présent** — sujet réel | **(a), allowlist vide** |
+
+**Le scan structurel, et pourquoi il est nécessaire.** Le contrôle négatif d'U4
+est comportemental : il atteste que *cette* sortie vient du serveur. Il ne peut
+pas voir un second lecteur ajouté six mois plus tard sur un autre chemin du CLI —
+la régression ne rendrait aucune décision fausse, elle rendrait la garantie
+inopérante en silence, et toutes les assertions comportementales resteraient
+vertes. C'est la classe que `mika1883_run_usage_accumulates_only_via_the_one_helper`
+et `mika2205_periodic_scans_do_not_read_the_pat_field_directly` ont dû fermer par
+un scan de source, pour exactement ce motif.
+
+**Population pré-existante, mesurée à HEAD (`93931d40`) :**
+
+- `grep -rn "BudgetProvenance\|budget_provenance\|effective_budget\|http_timeout_secs()" crates/mika-cli/` ⇒ **0 ligne**. Le CLI ne résout aucun budget aujourd'hui : l'allowlist du scan part vide et doit le rester.
+- `log_llm_budget_resolved` a **deux** sites d'appel en production (`server/mod.rs:476`, `teams/engine.rs:222`) et **un** site de définition. Après U1, `resolve_llm_budget_record` devient l'unique constructeur ; le scan compte les constructeurs, pas les appelants.
+
+**Zéro violation existante ⇒ aucune exception à nommer, donc aucun tracker de
+suivi ni assertion auto-nettoyante à écrire** — les sous-conditions (1)(2)(3) de
+l'option (a) portent sur les entrées de l'allowlist, et il n'y en a pas. C'est
+le cas sain de l'option (a), pas son contournement : un plan qui aurait trouvé
+des violations devrait les nommer une par une.
+
+**Conduite quand le scan tire : on retire le second lecteur, on n'allowliste
+pas.** Écrit dans le doc-comment du test, comme `mika2323_no_gate_predicate_reads_the_actor`
+et le scan de mika#2201 l'écrivent déjà chacun pour le leur. Une allowlist qui
+cesse d'être vide sur ce scan **est** le faux vert mika#2304 réintroduit : le
+CLI afficherait une valeur locale avec l'autorité d'une attestation.
+
+**Le cas concret soulevé par la revue, et sa réponse directe.** *« Au premier
+boot après déploiement, si l'`AgentState` d'un agent déjà provisionné porte un
+record qui diverge du `config.toml` sur disque, U2 passe — mais sur une donnée
+déjà fausse. »* Deux moitiés :
+
+1. **U2 ne lit jamais cet état.** Il est hermétique (tableau ci-dessus) : il
+   construit son propre home, donc aucune donnée de production n'entre dans son
+   verdict. Il n'y a pas de population à exempter.
+2. **La divergence décrite n'est pas une violation à supprimer, c'est le
+   livrable.** Ce qui lit l'état de production est la **route**, et une route
+   n'est pas un détecteur : elle rapporte, et rapporter cette divergence est
+   précisément ce que #2457 attend. Il n'y a donc rien à allowlister — il y a une
+   **datation** à fournir pour que l'opérateur sache de quand date ce qu'il lit.
+   C'est `resolved_at` (U1/U2/U3/U4) et la table de lecture du § 6.
 
 ---
 
@@ -259,11 +376,46 @@ Après déploiement, sur le vrai serveur :
 mika agents budget --agent mika-arch
 ```
 
-Elle tranche A1–A4 en une commande. Table de lecture :
+Elle tranche A1–A4 en une commande — **à l'instant qu'elle affiche**, et cette
+restriction n'est pas une précaution de style.
+
+### Ce que la sonde mesure, et ce qu'elle ne mesure pas (F3)
+
+Le record est figé à l'`init_agent` (U2, contrat *not hot-swappable* mika#1962) :
+il rapporte **l'état sous lequel l'agent tourne**, daté par `resolved_at`. Il ne
+rapporte pas l'état du disque à l'instant de la lecture. Les deux coïncident sauf
+si quelqu'un a édité le `config.toml` depuis le boot — c'est-à-dire précisément
+dans la branche « provisionnement gelé » que le § R4 juge la plus probable, où
+une édition hors dépôt est le mécanisme même de la dérive soupçonnée.
+
+**La lecture est donc en deux temps, et le second n'est facultatif que si les
+dates le permettent :**
+
+```bash
+mika agents budget --agent mika-arch              # ce sous quoi l'agent TOURNE, daté
+stat -c '%y  %n' ~/.mika/agents/mika-arch/config.toml   # ce que le disque PORTE, daté
+```
+
+| `resolved_at` vs mtime du `config.toml` | Ce qui est établi |
+|---|---|
+| `resolved_at` **postérieur** au mtime | Le record reflète le disque courant : la sonde tranche A1–A4 **sans réserve** |
+| `resolved_at` **antérieur** au mtime | Le disque a bougé depuis le boot. Le record reste vrai de ce qui **tourne** — donc toujours décisif pour diagnostiquer un tour coupé — mais il ne dit **rien** de ce que le disque porte. Lire le fichier avant toute conclusion sur la dérive, et se rappeler que la valeur du disque **n'entrera en service qu'au prochain redémarrage** : c'est le contrat, pas un défaut |
+
+Écrire `model = moonshotai/kimi-k2.5` sans cette datation laissait l'opérateur
+incapable de distinguer « k3 est absent du disque » de « le record est
+antérieur à l'arrivée de k3 ». Les deux dates rendent la distinction décidable
+par construction, ce qui est ce qu'on demande à un livrable d'observation
+(review-guide § Orthogonality : il rapporte l'état qu'il mesure, pas un état
+postulé).
+
+### Table de lecture
+
+Chaque ligne se lit **sous la réserve de datation ci-dessus**.
 
 | Observation | Lecture | Conduite |
 |---|---|---|
-| `model` ≠ `moonshotai/kimi-k2.5` | **la dérive hors dépôt est confirmée et mesurée** — k3 vit sur disque | **Halte 1.** Noter la valeur, sa provenance et la date **avant** de toucher au disque. Toute édition de `MIKA_ARCH_CONFIG` démote le modèle : le préalable est un ticket de réconciliation modèle + calibration (mika#1190), pas une baisse de `max_tokens` |
+| `model` ≠ `moonshotai/kimi-k2.5` | **une dérive hors dépôt est confirmée et mesurée** : à `resolved_at`, ce modèle-là était en service — donc il vit (ou vivait) sur disque, hors du dépôt | **Halte 1.** Noter la valeur, sa provenance **et `resolved_at`** avant de toucher au disque, puis lire le `config.toml` et son mtime pour savoir si le disque porte encore cette valeur. Toute édition de `MIKA_ARCH_CONFIG` démote le modèle : le préalable est un ticket de réconciliation modèle + calibration (mika#1190), pas une baisse de `max_tokens` |
+| `model = moonshotai/kimi-k2.5` **et** mtime du `config.toml` postérieur à `resolved_at` | **Indéterminé sur la dérive présente**, décisif sur la dérive au boot | Ne **pas** conclure « k3 est absent ». Lire le `config.toml` : s'il porte k3, la dérive existe et n'est pas encore en service — c'est un redémarrage qui la mettra en vigueur, et c'est le moment de décider si on le veut |
 | `plafond` ≠ 240 avec `http_source = process_env` | une variable de service écrase le `config.toml` | Le remède est de **retirer la variable de l'environnement du service**, pas de toucher une constante. Referme aussi la question ouverte de mika#2342 |
 | `plafond = 240`, `http_source = agent_config` | le réglage est bien en vigueur | Alors A2 et A4 du ticket sont faux, et les coupures à 300 s viennent d'ailleurs — **ne pas conclure sur `max_tokens`** |
 | `max_tokens_source = default` | le `config.toml` n'a pas été lu ou ne porte pas la clé | Provisionnement gelé : l'Étape 1 aurait été **inerte**. Geste de provisionnement, pas de code |
@@ -303,19 +455,23 @@ d'objet. C'est un résultat, pas un échec.
 
 1. **AC1 — Rectification livrée.** Le corps de PR et le § 1 de ce plan énoncent les cinq divergences A1–A5 avec leur référence de fichier et de ligne, et établissent que `11250 = 300 × 3/4 × 50` est `reachable_output_tokens` à 300 s, non une mesure de tokens produits.
 2. **AC2 — Aucune valeur de réglage ne bouge.** `MIKA_ARCH_CONFIG` est inchangé : `openrouter_model`, `llm_max_tokens`, `llm_http_timeout_secs`, `agent_total_timeout_secs` conservent leurs valeurs. `test_mika_arch_config_toml_is_valid_toml` et `mika2280_the_three_shipped_geometries_and_their_verdict` passent **sans modification**.
-3. **AC3 — Un seul site de résolution.** `resolve_llm_budget_record` est l'unique constructeur du record ; `log_llm_budget_resolved` l'appelle. La ligne `llm_budget_resolved`, sa déduplication et le WARN `llm_budget_retry_unreachable` sont inchangés à champ constant.
-4. **AC4 — Le record est celui de l'init.** `AgentState` porte le record résolu à `init_agent` ; muter le `config.toml` d'un agent servi ne change pas ce que la route rend, jusqu'au redémarrage.
+3. **AC3 — Un seul site de résolution.** `resolve_llm_budget_record` est l'unique constructeur du record ; `log_llm_budget_resolved` l'appelle. La ligne `llm_budget_resolved`, sa déduplication et le WARN `llm_budget_retry_unreachable` sont inchangés à champ constant, et **les deux appelants** (`server/mod.rs:476`, `teams/engine.rs:222`) restent verts. `resolved_at` n'entre pas dans la signature de déduplication.
+4. **AC4 — Le record est celui de l'init, et il est daté.** `AgentState` porte le record résolu à `init_agent` ; muter le `config.toml` d'un agent servi ne change pas ce que la route rend, jusqu'au redémarrage. Le record porte `resolved_at` (RFC 3339 UTC), rendu par la route et par le CLI sur toute sortie attestée.
 5. **AC5 — La route atteste ou se tait.** `GET /api/v1/agents/{name}/budget` rend 200 + le record pour un agent servi, 404 pour tout autre. Elle ne relit pas le disque et ne calcule aucun repli.
-6. **AC6 — Le CLI n'invente rien.** `mika agents budget` rend le record du serveur, avec la provenance de chaque champ. Serveur injoignable ou 404 ⇒ *« non attesté »* ; aucune valeur résolue localement n'est jamais affichée. Un test de contrôle négatif l'atteste.
+6. **AC6 — Le CLI n'invente rien.** `mika agents budget` rend le record du serveur, avec la provenance de chaque champ. Serveur injoignable ou 404 ⇒ *« non attesté »* ; aucune valeur résolue localement n'est jamais affichée. Un contrôle négatif comportemental **et** un scan structurel (aucune résolution de budget dans `mika-cli`, allowlist vide) l'attestent.
+6bis. **AC6bis — Aucun comportement de refus nouveau.** `BudgetProvenance` / `ModelProvenance` sont inchangés : `unknown_provider` (`budget_provenance.rs:164`/`:346`) est un comportement en place, et la ligne U4 correspondante du § 5 est une non-régression attestant qu'il survit au passage par le record et par la route.
 7. **AC7 — L'Étape 2 n'est pas livrée, et son chemin est écrit.** Aucun mécanisme de repli modèle n'est introduit. Le § 3 énonce ses trois préconditions (baseline mika-arch absente, calibration du modèle de repli, mika#1190) et la PR ouvre le ticket de suivi correspondant.
-8. **AC8 — La sonde est exécutable.** Le § 6 fournit la commande qui tranche A1–A4 et ses quatre haltes, chacune nommant une conduite distincte.
+8. **AC8 — La sonde est exécutable, et sa portée est écrite.** Le § 6 fournit la commande qui tranche A1–A4, ses quatre haltes nommant chacune une conduite distincte, **et** la règle de datation (`resolved_at` vs mtime du `config.toml`) qui dit quand la sonde tranche sans réserve et quand elle ne tranche que sur l'état au boot.
+9. **AC9 — Fire-Disposition renseignée.** La section `## Fire-Disposition` nomme l'option retenue pour chaque détecteur livré : N/A pour les détecteurs hermétiques (population de données existantes vide par construction), **(a) named allowlist exception avec allowlist vide** pour le scan structurel, dont la population pré-existante est mesurée à zéro à HEAD et dont la conduite au déclenchement (retirer le second lecteur, ne pas allowlister) est écrite dans son doc-comment.
 
 ## Definition of Done
 
-- [ ] `resolve_llm_budget_record` extrait, `log_llm_budget_resolved` délégué, champs et dédup inchangés
+- [ ] `resolve_llm_budget_record` extrait, `log_llm_budget_resolved` délégué, champs et dédup inchangés ; `teams/engine.rs:222` vérifié vert
+- [ ] `resolved_at` porté par le record, hors signature de déduplication
 - [ ] `AgentState` porte le record ; `server/mod.rs:476` adapté
 - [ ] `GET /api/v1/agents/{name}/budget` livrée avec ses deux cas (200 / 404)
-- [ ] `mika agents budget [--agent] [--format json]` livrée, avec la branche *non attesté*
+- [ ] `mika agents budget [--agent] [--format json]` livrée, avec la branche *non attesté*, la ligne `resolved_at` et le rendu du croisement `unknown_provider`
+- [ ] Scan structurel livré (constructeur unique du record + aucune résolution de budget dans `mika-cli`), **allowlist vide**, conduite au déclenchement écrite dans son doc-comment
 - [ ] Tests du § 5 verts, **contrôle négatif d'U4 vérifié rouge** avant d'être vert
 - [ ] `cargo test`, `cargo clippy`, `cargo fmt` propres
 - [ ] `crates/mika-agent/CLAUDE.md` : la route et le champ d'`AgentState` documentés à côté de la section *Observability + boot guard (mika#2293)*
@@ -332,3 +488,9 @@ d'objet. C'est un résultat, pas un échec.
 - **La réduction du prompt arch** — suivi explicitement nommé par mika#2189, conditionné à la mesure `request_bytes` de la Halte 3.
 - **La cause fournisseur des coupures** — ce travail rend le réglage lisible ; il ne rend pas le modèle plus rapide.
 - **Un second retry `_arch_ask`** — mika#2278 a livré le premier et écrit pourquoi le budget est de un.
+- **Tout nouveau comportement de refus dans `BudgetProvenance` / `ModelProvenance`** — `unknown_provider` existe déjà et n'est pas retouché (AC6bis).
+- **Une route ou une commande qui relirait le disque pour « rafraîchir » le record** — ce serait annuler U2. La fraîcheur se lit par datation (§ 6), jamais par recalcul.
+
+## Revision history
+
+- rev 2 (2026-09-21) : adressé **F1** en ajoutant une section `## Fire-Disposition` qui statue détecteur par détecteur — N/A pour les quatre détecteurs hermétiques (population de données existantes vide par construction, gabarit `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`), option **(a) allowlist vide** pour le scan structurel dont la population pré-existante est **mesurée** à zéro à HEAD (`grep` sur `crates/mika-cli/` ⇒ 0 ligne), avec la conduite au déclenchement écrite (« on retire le second lecteur, on n'allowliste pas ») ; le cas concret soulevé par la revue y reçoit sa réponse en deux moitiés (U2 est hermétique et ne lit pas cet état ; la route n'est pas un détecteur, et la divergence qu'elle rapporte *est* le livrable). Adressé **F2** en ancrant `unknown_provider` à `crates/mika-common/src/llm/budget_provenance.rs:164` (constante), `:346` (`model_source_name`), `:1288` et `:1498` (tests en place) : le comportement **existe**, la ligne U4 du § 5 est requalifiée en **non-régression**, un AC6bis déclare qu'aucun refus nouveau n'est introduit, et le rendu du croisement (`effective_model()` ⇒ `None`, `:334`) est spécifié. Adressé **F3** en choisissant la branche (b) *et* (a) : le record porte `resolved_at` (hors signature de dédup), la route et le CLI le rendent, et le § 6 gagne une règle de datation explicite (`resolved_at` vs mtime du `config.toml`) plus une ligne de table pour le cas « record antérieur à l'édition du disque » — la sonde dit désormais de quand date ce qu'elle affirme au lieu de le postuler. Sharpening non bloquant intégré : `docs/eval/calibration/baselines/`, nommé par le `CLAUDE.md` racine comme le lieu des baselines, **n'existe pas dans l'arbre**. Corrigé au passage un manque trouvé en chemin : `log_llm_budget_resolved` a **deux** appelants (`server/mod.rs:476`, `teams/engine.rs:222`) et le plan n'en nommait qu'un.
