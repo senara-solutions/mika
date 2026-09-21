@@ -44,8 +44,21 @@ impl Tool for SendMessageTool {
             return Ok(ToolOutput::error("'text' is required."));
         }
 
-        // Strip any internal metadata tags the LLM may have echoed
-        let cleaned = mika_common::llm::strip_internal_tags(text);
+        // Strip any internal metadata tags the LLM may have echoed, then
+        // normalise the typography for the tenant's register (mika#2247 AC1).
+        //
+        // The order is not free, and neither is the position. Normalising
+        // **before** `cleaned` is captured is obligatory: the mika#2136
+        // `DeliveryVerdict` carries `cleaned` and its predicate compares texts
+        // by equality, so two inconsistent normalisations would make a repair
+        // unrecognisable and send an "it was not received" line to a user who
+        // received it — the trap that type's doc comment names word for word.
+        // Every exit below therefore sees one and the same text: the one that
+        // is measured, persisted and delivered.
+        let cleaned = mika_common::text::normalize_typography_for_persona(
+            mika_common::llm::strip_internal_tags(text),
+            ctx.tier.persona_profile(),
+        );
         if cleaned.is_empty() {
             return Ok(ToolOutput::success("Message was empty after processing."));
         }

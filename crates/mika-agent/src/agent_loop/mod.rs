@@ -22,10 +22,12 @@ use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
-    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    RESPONSE_LANGUAGE_DRIFT_LABEL, TIME_OF_DAY_GREETING_LABEL, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
+    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
+    asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
+    detect_response_language_drift, detect_time_of_day_greeting_mismatch,
     detect_unactioned_frequency_promise, detect_unverified_callback_state_claim,
     equivalence_claim_satisfied, undelivered_send_correction, undelivered_sends,
 };
@@ -462,6 +464,11 @@ struct AgentContext {
     identity: prompt::Identity,
     core_memory: Vec<crate::db::CoreMemoryEntry>,
     timezone: Option<String>,
+    /// The tenant's declared thread language (mika#2247 AC2). Read from
+    /// `customer_config` beside `timezone` — one line, at the site that already
+    /// reads its exact neighbour. `None` is the third state: nothing is posed in
+    /// `## Runtime` and the drift guard does not arm.
+    language: Option<crate::config_keys::TenantLanguage>,
     /// Active `stop_topic_*` preferences (mika#1813). Loaded fail-open — a query
     /// error here must not block the turn; the `<stopped-topics>` block simply
     /// stays empty.
@@ -475,6 +482,22 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
     let identity = prompt::load_identity_async(home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
+    // mika#2247 AC2 — the language axis rides the trajectory `timezone` already
+    // traces: same table, same call site, same struct. That is the whole reason
+    // `customer_config` was chosen over a process variable (see
+    // `config_keys::TENANT_LANGUAGE_KEY` for the four measurements).
+    //
+    // Fail-open like every other read here: a DB error resolves to the third
+    // state (nothing posed, nothing guarded), which is today's behaviour, rather
+    // than failing the turn over a register setting.
+    let language_raw = db
+        .get_customer_config(crate::config_keys::TENANT_LANGUAGE_KEY)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, event = "tenant_language_load_failed", "tenant language read failed");
+            None
+        });
+    let language = report_resolved_tenant_language(db.agent_id(), language_raw.as_deref());
     // mika#1813: load stop-signal preferences for injection into every turn.
     //
     // Fail-open by design (per AgentContext::stopped_topics doc). Log the error
@@ -499,8 +522,65 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
         identity,
         core_memory,
         timezone,
+        language,
         stopped_topics,
     })
+}
+
+/// Last `tenant_language_resolved` couple this process announced, per agent.
+///
+/// Deduplication, not gating: an identical repetition is silent, a **change** is
+/// re-emitted — which is what makes "the user asked for English mid-thread"
+/// readable on one line. Keyed by agent because one `mika-spirit` serves them
+/// all from this one free function.
+static TENANT_LANGUAGE_REPORTED: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, crate::config_keys::ResolvedTenantLanguage>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Resolve the tenant language and announce the resolved couple once (mika#2247).
+///
+/// **The event is the half the first pass of the plan nearly missed.** mika#2358
+/// ships *two* surfaces for a key of this shape — the "unreadable value" WARN
+/// *and* the provenance INFO — and they answer different questions: « did
+/// somebody write an out-of-domain value? » against « which language is actually
+/// in force for this tenant? ». It is the second that separates the two causes
+/// of a surviving symptom, and its doc-comment quotes mika#2293 word for word on
+/// why: *a setting one cannot observe is not a setting, it is a hope.*
+///
+/// Ungated by any telemetry switch, for that constant's reason: this is a
+/// **configuration** event, and it has to stay readable precisely when call
+/// telemetry was cut to reduce noise.
+fn report_resolved_tenant_language(
+    agent_id: &str,
+    raw: Option<&str>,
+) -> Option<crate::config_keys::TenantLanguage> {
+    let resolved = crate::config_keys::resolve_tenant_language(raw);
+
+    let changed = match TENANT_LANGUAGE_REPORTED.lock() {
+        Ok(mut last) => match last.get(agent_id) {
+            Some(previous) if *previous == resolved => false,
+            _ => {
+                last.insert(agent_id.to_string(), resolved);
+                true
+            }
+        },
+        // A poisoned mutex must not silence the announcement: reporting the same
+        // couple twice is noise, never reporting it is a blind spot (mika#2358).
+        Err(_) => true,
+    };
+
+    if changed {
+        info!(
+            target: "mika::otel",
+            agent_id = %agent_id,
+            language = resolved.language_label(),
+            source = resolved.source.as_str(),
+            event = "tenant_language_resolved",
+            "tenant thread language resolved"
+        );
+    }
+
+    resolved.language
 }
 
 /// Parameterizes behavioral differences between the three agent loop variants.
@@ -607,6 +687,11 @@ async fn attempt_continuation_turn(
     trace_id: &str,
     store_llm_calls: bool,
     prompt_variant: Option<&str>,
+    // mika#2247 AC1 — the persona register of the tenant this summary is for.
+    // The continuation turn is the third output site: it produces user-facing
+    // text that no other path normalises, so leaving it out would make AC1 hold
+    // "except when the turn ran out of tool steps".
+    persona: mika_common::home::PersonaProfile,
 ) -> ContinuationResult {
     // `label` (may be an operational trigger name like "heartbeat"/"callback")
     // is preserved for the existing warn! diagnostics. `mode_label` is the
@@ -667,7 +752,13 @@ async fn attempt_continuation_turn(
 
     match continuation {
         Ok(Ok(resp)) => {
-            let t = mika_common::llm::strip_internal_tags(&resp.text());
+            // mika#2247 AC1 — same order as the two sibling sites: normalise
+            // immediately after the tag strip, so the summary that is returned,
+            // persisted and delivered is one and the same text.
+            let t = mika_common::text::normalize_typography_for_persona(
+                mika_common::llm::strip_internal_tags(&resp.text()),
+                persona,
+            );
             let stop = format!("{:?}", resp.stop_reason);
             let usage = resp.usage;
             // Always call — `save_continuation_llm_call` emits the ungated
@@ -1047,6 +1138,27 @@ async fn run_loop(
     // (build-callback message AND `qa-review` loaded) and therefore cannot be
     // an `INTENT_GUARDS` entry (`fn(&str) -> bool` sees the message alone).
     loaded_skill_names: &[String],
+    // mika#2247 AC2 — the tenant's declared thread language, resolved from
+    // `customer_config` in `load_agent_context` and threaded here for the
+    // `response_language_drift` guard (5f). `None` is the third state: no
+    // declaration, no ground truth, no guard — today's behaviour for every
+    // agent that declares nothing, which is every engineering agent.
+    //
+    // A parameter on the model of `loaded_skill_names` rather than a field on
+    // `ToolContext`: this is a *turn* fact read by one guard, not a capability
+    // the tools need.
+    tenant_language: Option<crate::config_keys::TenantLanguage>,
+    // mika#2247 AC3 — the part of the day at the tenant's local time, computed
+    // once per turn by `prompt::resolve_local_part_of_day` from the same instant
+    // and the same timezone the `## Current Time` section renders. `None` when no
+    // usable timezone is declared, which is what makes the greeting guard (5g)
+    // fail open: with no local hour there is nothing for a greeting to
+    // contradict.
+    //
+    // Threaded rather than recomputed here so the prompt and the guard can never
+    // disagree about what "evening" means — a second parse would be free to
+    // refuse the very greeting the prompt asked for.
+    local_part_of_day: Option<&str>,
     // mika#2368 — out-param : posé quand le tour sort sur un EndTurn accepté
     // alors qu'un verdict était dû, que le budget de re-prompt de la garde
     // `qa_build_callback_verdict` est épuisé et qu'aucune revue n'a été postée.
@@ -1580,7 +1692,19 @@ async fn run_loop(
 
                 // `mut`: the mika#2037 review-anchor guard withholds an unattested
                 // disposition from the final text rather than accepting it (fail-closed).
-                let mut text = mika_common::llm::strip_internal_tags(&response.text());
+                //
+                // mika#2247 AC1 — the typographic normalisation is applied here,
+                // immediately after `strip_internal_tags` and **before** the
+                // guards, so a single text reaches everything downstream: the
+                // guards that read it, the persistence, and the delivery. Doing
+                // it later (in `server::handlers`, the mika#2136 site) would let
+                // the database and the delivered message diverge, and the
+                // compaction summary would then re-teach the em-dash on the very
+                // next turn.
+                let mut text = mika_common::text::normalize_typography_for_persona(
+                    mika_common::llm::strip_internal_tags(&response.text()),
+                    tool_ctx.tier.persona_profile(),
+                );
 
                 // mika#2296 — a turn that ended on MaxTokens with nothing visible
                 // to show for it names itself, and names its remedy. See
@@ -2455,6 +2579,202 @@ async fn run_loop(
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise_uncorrected",
                             "Unactioned frequency-promise guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5f. Response language-drift guard (mika#2247 AC2) — refuse
+                    // a turn answering in a language other than the one this
+                    // tenant declared.
+                    //
+                    // **The measured defect.** The 2026-09-06 thread on the
+                    // general-public tenant flipped EN↔FR inside one
+                    // conversation: « So — who are you… », « All good », then
+                    // « Bonjour ! Je suis Mika… ». The persona already
+                    // prescribes French twice, once in bold, and that is exactly
+                    // why a third sentence would not have helped: the class
+                    // `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
+                    // bounds. What was missing was a **declared** axis (U1, the
+                    // `language` key) and a structural half that refuses a
+                    // drifted turn — this one.
+                    //
+                    // Applies uniformly across modes: a heartbeat that opens in
+                    // the wrong language is exactly as wrong, and it is the turn
+                    // that *starts* the exchange. Not skipped by
+                    // `skip_remaining_guards` (#1178) — a posted PR review does
+                    // not license answering in the wrong language, the same
+                    // literal reason as 5c/5d/5e.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(RESPONSE_LANGUAGE_DRIFT_LABEL)
+                        && let Some(drift) = detect_response_language_drift(&text, tenant_language)
+                    {
+                        intent_guard_retries.insert(RESPONSE_LANGUAGE_DRIFT_LABEL);
+                        let corr_id =
+                            format!("{}:{}:response_language_drift", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "response_language_drift",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            expected_language = %drift.expected,
+                            detected_language = %drift.detected,
+                            detected_hits = drift.detected_hits,
+                            expected_hits = drift.expected_hits,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.response_language_drift",
+                            "Response language-drift guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] This conversation's language is `{expected}`, \
+                             declared for this tenant, and your response is in \
+                             `{detected}`. A thread holds one language: an incoming \
+                             message written in another language does not change it.\n\n\
+                             Rewrite your response in `{expected}` now. Keep the \
+                             substance exactly as it is; change only the language.\n\n\
+                             If the person explicitly asked you to switch, do not just \
+                             switch: call `set_config` with `{key}` = `{detected}` \
+                             first, then answer in the new language.",
+                            expected = drift.expected,
+                            detected = drift.detected,
+                            key = crate::config_keys::TENANT_LANGUAGE_KEY,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2247 — the residue of 5f's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d's and 5e's: the budget
+                    // is spent, the answer goes out drifted, and without this
+                    // event that population would be indistinguishable from a
+                    // healthy turn. It is **not** a second correction — the
+                    // family grants one re-prompt — it is what turns AC2 from a
+                    // claim into a measurement: `guard.response_language_drift`
+                    // counts the turns caught, this one counts the turns the
+                    // guard did not close. Expected regime: zero.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(RESPONSE_LANGUAGE_DRIFT_LABEL)
+                        && let Some(drift) = detect_response_language_drift(&text, tenant_language)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            expected_language = %drift.expected,
+                            detected_language = %drift.detected,
+                            label = mode.label(),
+                            event = "guard.response_language_drift_uncorrected",
+                            "Response language-drift guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5g. Time-of-day greeting guard (mika#2247 AC3) — refuse a
+                    // greeting that names a part of the day the tenant is not in.
+                    //
+                    // **The measured defect** is a « belle journée » sent in the
+                    // evening. Its cause was not a missing instruction but a
+                    // missing *fact*: the prompt posed UTC and left two untooled
+                    // inferences to the model. The intent half (U7) now computes
+                    // and poses the local hour, so this guard is a **net**, not
+                    // the mechanism — which is why its lexicon is a closed, narrow
+                    // list where 5f's is a measurement.
+                    //
+                    // Fail-open on an unknown hour: with no local time there is
+                    // nothing for a greeting to contradict, and the prompt has
+                    // already forbidden a time-stamped greeting on that path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(TIME_OF_DAY_GREETING_LABEL)
+                        && let Some(mismatch) =
+                            detect_time_of_day_greeting_mismatch(&text, local_part_of_day)
+                    {
+                        intent_guard_retries.insert(TIME_OF_DAY_GREETING_LABEL);
+                        let corr_id = format!(
+                            "{}:{}:time_of_day_greeting_mismatch",
+                            tool_ctx.trace_id, step
+                        );
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "time_of_day_greeting_mismatch",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            greeting = %mismatch.greeting,
+                            implied_part = %mismatch.implied,
+                            actual_part = %mismatch.actual,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.time_of_day_greeting_mismatch",
+                            "Time-of-day greeting guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] Your response greets the person with \
+                             `{greeting}`, which names the {implied}. It is currently \
+                             the {actual} where they are — the `Local time` line of \
+                             your `## Current Time` section is the ground truth, and \
+                             it is computed, not inferred.\n\n\
+                             Rewrite your response with a greeting that matches the \
+                             {actual}, or with one that names no part of the day at \
+                             all. Keep everything else as it is.",
+                            greeting = mismatch.greeting,
+                            implied = mismatch.implied,
+                            actual = mismatch.actual,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2247 — the residue of 5g's single-retry budget, named.
+                    // Same gesture and same reason as 5d/5e/5f above.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(TIME_OF_DAY_GREETING_LABEL)
+                        && let Some(mismatch) =
+                            detect_time_of_day_greeting_mismatch(&text, local_part_of_day)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            greeting = %mismatch.greeting,
+                            implied_part = %mismatch.implied,
+                            actual_part = %mismatch.actual,
+                            label = mode.label(),
+                            event = "guard.time_of_day_greeting_mismatch_uncorrected",
+                            "Time-of-day greeting guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
                     }
@@ -4333,12 +4653,17 @@ async fn run_agent_inner(
     // drift on the "which model am I?" answer.
     let runtime_provider = llm.provider_name();
     let runtime_model = llm.model_name();
+    // mika#2247 AC3 — one instant and one timezone read, shared by the prompt
+    // section and by the greeting guard. Computing the guard's side separately
+    // would let the two disagree about what "evening" means.
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         is_onboarding: params.is_onboarding,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         global_home_dir: params.global_home_dir,
         channel_type: Some(params.channel_type),
@@ -4356,6 +4681,9 @@ async fn run_agent_inner(
         // mika#2290 — the register of the hosting line follows the persona axis
         // of the cached tier, never the hosting axis and never the locale.
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — `None` renders no line at all, which is today's
+        // behaviour for every agent that declares nothing.
+        tenant_language: ctx.language,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -4889,6 +5217,8 @@ async fn run_agent_inner(
         &enabled_tool_names,
         is_verdict_producer,
         &loaded_skill_names,
+        ctx.language,      // mika#2247: `None` = undeclared = nothing guarded
+        local_part_of_day, // mika#2247 AC3: `None` = unknown hour = guard fails open
         // mika#2368 : un callback de build est toujours un tour silencieux, donc
         // ce mode n'a pas de population pour le filet.
         None,
@@ -4985,6 +5315,7 @@ async fn run_agent_inner(
                 trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -5575,13 +5906,17 @@ async fn run_silent_inner(
     // uniform across conversation and silent paths.
     let silent_runtime_provider = llm.provider_name();
     let silent_runtime_model = llm.model_name();
+    // mika#2247 AC3 — see the conversation path: one instant, one read, two
+    // consumers. A proactive turn is the one that greets unprompted (R3b).
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         pending_commitments: &pending_commitments,
         trigger_context: &trigger_context,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
@@ -5595,6 +5930,9 @@ async fn run_silent_inner(
         runtime_model: silent_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — a proactive turn opens the exchange, so it is the one
+        // that most needs to know which language to open it in (R3b).
+        tenant_language: ctx.language,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -5960,6 +6298,8 @@ async fn run_silent_inner(
         &enabled_tool_names,
         false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
         &loaded_skill_names, // mika#2355: callback_safe_skills() — where qa-review is or isn't
+        ctx.language, // mika#2247: a proactive turn opens the exchange (R3b)
+        local_part_of_day, // mika#2247 AC3
         Some(&qa_verdict_unmet), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
@@ -6032,6 +6372,7 @@ async fn run_silent_inner(
                 &trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -6259,12 +6600,15 @@ async fn run_team_agent_inner_impl(
     // share the same Self-Identity Discipline contract as conversation-mode.
     let team_runtime_provider = llm.provider_name();
     let team_runtime_model = llm.model_name();
+    // mika#2247 AC3 — same single read as the two sibling paths.
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         is_onboarding: false,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
@@ -6278,6 +6622,10 @@ async fn run_team_agent_inner_impl(
         runtime_model: team_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — the team child reads its OWN agent's declaration, the
+        // same rule mika#1926 settled for `stopped_topics`: `ctx` here is the
+        // child's context, not the orchestrator's.
+        tenant_language: ctx.language,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -6525,6 +6873,8 @@ async fn run_team_agent_inner_impl(
         &enabled_tool_names,
         has_verdict_producer_skill(params.skills.skills()),
         &skill_names_of(&matched_entries), // mika#2355
+        ctx.language,                      // mika#2247: the child agent's own declaration
+        local_part_of_day,                 // mika#2247 AC3
         None,                              // mika#2368 : pas de callback de build en mode équipe
         store_llm,
         store_tools,
@@ -6617,6 +6967,7 @@ async fn run_team_agent_inner_impl(
                 &trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -9343,6 +9694,161 @@ mod tests {
             "        // llm.send_message_with_deadline(request, None) is wrapped below\n";
         assert!(
             unwrapped_deadline_call_sites(commented).is_empty(),
+            "prose naming the call must not be a violation, or the guard forbids documenting itself"
+        );
+    }
+
+    // ===========================================================================
+    // mika#2247 — every user-facing output site normalises its typography
+    // ===========================================================================
+
+    /// How many lines above the tag-strip the normaliser may sit.
+    ///
+    /// Two covers the single-line form and the three-line composition all three
+    /// real sites use. Deliberately *not* wider, for the sibling guard's reason:
+    /// a normaliser five lines up is more likely to belong to something else,
+    /// and a gate that accepts an unrelated wrapper passes the regression it
+    /// exists to catch.
+    const TYPOGRAPHY_GUARD_LOOKBACK_LINES: usize = 2;
+
+    /// The detector behind
+    /// [`mika2247_every_output_site_normalises_its_typography`], split out so
+    /// the guard can be exercised on a fabricated string rather than by
+    /// breaking the real source.
+    ///
+    /// Lexical, and says so: it finds the tag-strip call and then looks for the
+    /// normaliser within the preceding [`TYPOGRAPHY_GUARD_LOOKBACK_LINES`]. It
+    /// cannot parse Rust. That is acceptable for what it defends — not a subtle
+    /// behaviour, but a **new output site** added without the normalisation,
+    /// which is what a hurried feature does.
+    fn unnormalised_output_sites(label: &str, src: &str) -> Vec<String> {
+        // Both tokens in halves: this function lives inside the crate the guard
+        // scans, so writing either one whole would make the gate its own first
+        // offender (the `mika2342_*` motif above).
+        let strip_token = concat!("strip_internal_", "tags(");
+        let normalise_token = concat!("normalize_typography_", "for_persona(");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // Prose naming the call is how this ticket explains itself; scanning
+            // it would make the explanation the violation.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !line.contains(strip_token) {
+                continue;
+            }
+            let from = i.saturating_sub(TYPOGRAPHY_GUARD_LOOKBACK_LINES);
+            if !lines[from..=i].iter().any(|l| l.contains(normalise_token)) {
+                offenders.push(format!("{label}:{}: {trimmed}", i + 1));
+            }
+        }
+
+        offenders
+    }
+
+    /// Every production site of this crate that produces user-facing text must
+    /// compose the tag strip with the mika#2247 normaliser.
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// A fourth output site added without the normalisation breaks **no
+    /// assertion**. Every existing test stays green; the only change is that one
+    /// path starts emitting em-dashes to a family tenant again. A regression
+    /// that makes nothing false, only something un-normalised on one path, is
+    /// the class this house guards by scanning source
+    /// (`mika2342_every_llm_call_is_wrapped_in_a_timeout` two blocks up,
+    /// `grooming_marker::no_grooming_regex_outside_this_module`).
+    ///
+    /// # Scope, and what a fourth site means
+    ///
+    /// The whole `mika-agent` crate, production half only. The inventory is
+    /// closed at **three** sites — the EndTurn extraction, the continuation
+    /// turn, and the `send_message` tool — and there is **no allowlist**: an
+    /// allowlist born empty is just a place to put the next violation instead
+    /// of normalising it. A fourth site means either the inventory was wrong or
+    /// an output path was added: **halt and surface**, do not adjust the guard.
+    ///
+    /// `mika-common`'s own `serialize_response_text` is deliberately outside the
+    /// perimeter: it feeds `llm_calls.response_text`, an observability sink, not
+    /// a user channel.
+    #[test]
+    fn mika2247_every_output_site_normalises_its_typography() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        let mut sites = 0usize;
+        scanner.for_each(|path, production| {
+            let label = path
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            sites += production
+                .lines()
+                .filter(|l| {
+                    !l.trim_start().starts_with("//")
+                        && l.contains(concat!("strip_internal_", "tags("))
+                })
+                .count();
+            offenders.extend(unnormalised_output_sites(&label, production));
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2247: {} output site(s) strip internal tags without normalising the \
+             typography.\n{}\n\n\
+             WHY THIS MATTERS: the family persona prescribes simple ASCII punctuation, and \
+             glm-5.2 emits em-dashes by style. An un-normalised site re-opens AC1 on that path \
+             alone, silently — no test goes red, the tenant simply reads « … connaître — tu me \
+             parles » again.\n\
+             FIX: compose as the three existing sites do —\n  \
+             mika_common::text::normalize_typography_for_persona(\n    \
+             mika_common::llm::strip_internal_tags(…),\n    <persona>,\n  )\n\
+             and normalise BEFORE the text is captured, persisted or measured, so the database, \
+             the guards and the delivered message never diverge (mika#2136).",
+            offenders.len(),
+            offenders.join("\n")
+        );
+
+        assert_eq!(
+            sites, 3,
+            "mika#2247: the inventory is closed at three output sites (EndTurn extraction, \
+             continuation turn, `send_message`). Found {sites}. A fourth site is halt-and-surface, \
+             not an allowlist entry — decide whether it produces user-facing text, normalise it if \
+             it does, and update this count with its reason."
+        );
+    }
+
+    /// The guard's positive control: it must actually fire on a bare call.
+    ///
+    /// Written against a fabricated snippet rather than by editing the real
+    /// source — a guard verified only by its own green is a guard verified by
+    /// nothing.
+    #[test]
+    fn mika2247_typography_guard_fires_on_an_unnormalised_site() {
+        let bare = "        let cleaned = mika_common::llm::strip_internal_tags(text);\n";
+        assert_eq!(
+            unnormalised_output_sites("fixture.rs", bare).len(),
+            1,
+            "the guard must flag a bare tag strip — it is the exact shape mika#2247 replaced"
+        );
+
+        let composed = "        let cleaned = mika_common::text::normalize_typography_for_persona(\n\
+                        \x20           mika_common::llm::strip_internal_tags(text),\n\
+                        \x20           ctx.tier.persona_profile(),\n\
+                        \x20       );\n";
+        assert!(
+            unnormalised_output_sites("fixture.rs", composed).is_empty(),
+            "the guard must accept the composed shape, or it would forbid the fix"
+        );
+
+        let commented = "        // strip_internal_tags(text) is normalised just below\n";
+        assert!(
+            unnormalised_output_sites("fixture.rs", commented).is_empty(),
             "prose naming the call must not be a violation, or the guard forbids documenting itself"
         );
     }
