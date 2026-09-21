@@ -1759,6 +1759,68 @@ _scrub_env() {
     unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 }
 
+# ---------------------------------------------------------------------------
+# mika#1943 — un chemin qu'on ne peut pas PROUVER worktree n'est pas supprimé
+# ---------------------------------------------------------------------------
+#
+# L'incident du 28/07 : un nettoyage automatisé a emporté `/data/workspace/bbytaa`,
+# un répertoire qui n'était protégé par aucune liste — il était protégé par les
+# instantanés btrbk qui l'encadraient. Le ticket prescrivait une **denylist**
+# (`^/data/workspace/[^/]+/?$` refusé). Ce qui est livré ici est l'inverse, et
+# strictement plus fort : une **allowlist positive**, alignée terme pour terme sur
+# `worktree_reaper::is_managed_worktree_path` (mika#2420, `crates/mika-agent/src/`).
+#
+# Trois raisons, dont la troisième décide :
+#
+#   1. Une denylist est fausse le jour où un répertoire précieux n'y figure pas —
+#      c'est-à-dire le jour où elle servirait. `/data/workspace/bbytaa` n'aurait
+#      été dans aucune liste écrite avant lui.
+#   2. Deux sémantiques opposées pour une même question dans un même dépôt est la
+#      divergence programmée que `grooming_marker` (mika#2158) a dû fermer une
+#      fois : deux prédicats répondant différemment à « ce chemin est-il
+#      supprimable ». Le reaper décide par allowlist ; cette garde aussi.
+#   3. `/data/workspace/` est le disque de cette machine, pas une propriété du
+#      système. Coder ce préfixe en dur ne protégerait que gentux et serait muet
+#      partout ailleurs — un garde-fou qui *paraît* poser une règle générale.
+#      `/.claude/worktrees/` est, lui, une propriété structurelle du layout.
+#
+# L'asymétrie qui décide du fail-safe, écrite avant le reste : un faux négatif
+# laisse un worktree résiduel sur le disque — le reaper mika#2420 le ramasse au
+# tick suivant, ou l'opérateur ; coût borné, quelques Go, temporaire. Un faux
+# positif supprime un répertoire qui n'est pas un worktree : irréversible, et
+# c'est l'incident du 28/07. **Donc tout terme illisible conserve**, exactement
+# comme le reaper, délibérément, pour que les deux gardes ne puissent pas se
+# contredire.
+#
+# Une fonction, et pas une garde recopiée à chaque site : il y a cinq sites
+# destructifs dans ce fichier, donc cinq occasions de diverger.
+#
+# Les marqueurs `# mika1943:T<n>` en fin de ligne ne sont pas décoratifs : la
+# suite de tests neutralise **un** terme à la fois par `sed` et vérifie que le
+# refus correspondant disparaît. Renommer un marqueur ou fusionner deux termes
+# fait rougir `MUTATION_ABSENTE` plutôt que de désarmer la vérification en
+# silence. Une conjonction ne se teste pas en désarmant tous ses termes ensemble
+# (leçon mika#2277).
+_MIKA_MANAGED_WORKTREE_SEGMENT='/.claude/worktrees/'
+
+# Émetteur du refus. Séparé de la décision : celle-ci a un lecteur unique, mais
+# dire le refus n'est pas décider. Sans cette ligne, un refus se lirait
+# exactement comme une absence de travail (classe mika#2205).
+_refuse_unsafe_removal() {
+    echo "dispatch_lib_unsafe_removal_refused: site=$1 term=$3 path='$2' (mika#1943)" >&2
+}
+
+# Args: $1 = chemin candidat, $2 = nom du site appelant (pour le diagnostic).
+# Rend 0 si le chemin est un worktree géré supprimable, non-zéro sinon.
+_assert_removable_worktree_path() {
+    local path="${1-}" site="${2:-unknown}"
+    case "$path" in "") _refuse_unsafe_removal "$site" "$path" empty; return 1 ;; esac                                            # mika1943:T1
+    case "$path" in /*) : ;; *) _refuse_unsafe_removal "$site" "$path" not_absolute; return 1 ;; esac                             # mika1943:T2
+    case "$path" in */../*|*/..) _refuse_unsafe_removal "$site" "$path" parent_dir_component; return 1 ;; esac                    # mika1943:T3
+    case "$path" in *"$_MIKA_MANAGED_WORKTREE_SEGMENT"*) : ;; *) _refuse_unsafe_removal "$site" "$path" outside_managed_root; return 1 ;; esac  # mika1943:T4
+    return 0
+}
+
 # mika#1414: Pre-rebase worktree cleanup for the resume path.
 #
 # On a resume dispatch _set_up_worktree() reuses an existing worktree, then
@@ -1823,7 +1885,13 @@ _clean_worktree_for_rebase() {
     # duplicated patterns. They can drift; when you add a path here, add it to
     # the classifier too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
-    rm -rf "$wt/.iterate" 2>/dev/null || true
+    # mika#1943: `$wt` a déjà prouvé qu'il est un dépôt git (garde en tête de
+    # fonction), jamais qu'il est un worktree GÉRÉ — et c'est la seconde moitié
+    # qui manquait. Sur refus on saute ce reset chirurgical : le tier 3
+    # ci-dessous (stash + reset) ramasse le résidu, donc le coût est borné.
+    if _assert_removable_worktree_path "$wt" clean_worktree_for_rebase; then
+        rm -rf "$wt/.iterate" 2>/dev/null || true
+    fi
     git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
     git -C "$wt" checkout HEAD -- .claude/commands/ 2>/dev/null || true
 
@@ -2157,6 +2225,56 @@ et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\`
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
 
+# mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
+# de grooming.
+#
+# Le défaut qu'elle ferme : `/ce:plan` est un plugin tiers
+# (`compound-engineering`) qui n'a aucune connaissance de mika#1574, donc un plan
+# neuf livrant un détecteur arrive devant mika-arch sans la section que son
+# Fire-Disposition Gate exige. L'architecte rend alors ITERATE — à juste titre —
+# et l'unique itération de `_iterate_groom_loop` est dépensée sur un motif
+# purement formel, évitable en amont. Au second passage le gate est sans recours
+# (« No ITERATE exists at second pass per the two-pass limit »), donc le ticket
+# ESCALATE et la boucle ne dispatche jamais l'implémentation.
+#
+# C'est exactement la configuration que le Acceptance-Criteria Gate décrit déjà
+# mot pour mot pour sa section sœur : « Grooming is the surface we control
+# between the third-party producer and our validator. » `## Acceptance criteria`
+# a reçu ce traitement (mika#1600/#1627) ; `## Fire-Disposition` ne l'avait
+# jamais reçu.
+#
+# La règle vit ICI et non dans `.claude/commands/mika-groom-plan-only.md` pour la
+# même raison que `_PR_BODY_CONTAINMENT_RULE` ci-dessus : les trois commandes de
+# groom vivent dans `senara-solutions/mika-platform` et sont semées dans le
+# worktree par `_seed_worktree_slash_commands` (mika#1415), donc un ticket ouvert
+# sur `senara-solutions/mika` ne peut pas les éditer. Ce PROMPT est le seul canal
+# que ce dépôt contrôle. La moitié commandes est nommée en suivi, pas simulée.
+#
+# Ce n'est pas le prompt-enforcement que
+# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` condamne :
+# la leçon de mika#2120 porte sur une consigne qui dépend qu'un opérateur pense à
+# la taper. Une constante injectée par le substrat à chaque dispatch ne dépend
+# d'aucune mémoire — et la moitié structurelle est livrée à côté (le rattrapage
+# de `_launch_revise_pilot`), ce que cette doctrine prescrit justement.
+#
+# Elle cite mika#1574 par référence et nomme ses trois options ; elle ne
+# reformule pas la doctrine, pour que les deux ne puissent pas diverger.
+_FIRE_DISPOSITION_RULE="RÈGLE DE GROOMING (mika#2306) — un plan qui livre un détecteur porte \`## Fire-Disposition\`.
+Détecteur = tout livrable dont la fonction primaire est de signaler une violation : test,
+assertion, règle de lint, garde CI, validateur de schéma, scan structurel, garde EndTurn —
+tout code dont le chemin de succès est « aucune violation trouvée ».
+Si le plan en livre au moins un, il DOIT porter une section \`## Fire-Disposition\` nommant
+l'une des trois options canoniques de mika#1574, avec son détail d'implémentation :
+(a) exception nommée en allowlist (défaut) — chaque violation existante reçoit une entrée
+    grep-visible qui nomme la donnée précise, référence un ticket de suivi, et porte une
+    assertion auto-nettoyante qui rougit quand l'exception devient stale ;
+(b) livrer désarmé — le détecteur atterrit avec \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent,
+    plus un suivi tracké pour l'armer ;
+(c) halte-et-remontée — l'implémentation s'arrête et remonte à l'opérateur pour cadrage.
+Si le plan ne livre AUCUN détecteur, la section n'est pas requise (gate N/A) : ne l'invente pas.
+Sans elle, mika-arch rend ITERATE en première passe et ESCALATE en seconde — et la seconde
+passe est sans recours."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -2446,7 +2564,26 @@ _set_up_worktree() {
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
 
         # Worktree path is centralized in mika-platform/scripts/derive-worktree-path
-        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
+        #
+        # mika#1943 — la racine. Le code de sortie n'était pas vérifié, et ce
+        # fichier n'a ni `set -e` ni `set -u` : un script absent (il vit dans
+        # mika-platform, un AUTRE dépôt, donc son absence n'est pas une
+        # hypothèse d'école) ou en échec rendait une chaîne vide qui se
+        # propageait en silence jusqu'à la comparaison d'égalité ci-dessous —
+        # laquelle ÉLIT une cible de suppression — puis jusqu'aux deux
+        # `worktree remove --force`.
+        #
+        # Le `|| WORKTREE_DIR=""` efface délibérément toute sortie produite par
+        # un appel qui a échoué : un script qui sort non-zéro en ayant tout de
+        # même imprimé quelque chose n'a rien prouvé, et c'est le sens sûr.
+        # Abandonner le dispatch est le bon arbitrage — il n'y a rien à faire
+        # sans worktree, et `return 1` est déjà la sortie d'échec de cette
+        # fonction (cf. `worktree_setup_failed` plus bas).
+        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO") || WORKTREE_DIR=""
+        if [ -z "$WORKTREE_DIR" ]; then
+            echo "[dispatch-lib] worktree_path_derivation_failed: branch=$BRANCH repo=$REPO script=$PLATFORM_DIR/scripts/derive-worktree-path — aborting rather than propagating an empty path to a removal site (mika#1943)" >&2
+            return 1
+        fi
 
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
@@ -2458,7 +2595,13 @@ _set_up_worktree() {
         local existing_wt
         existing_wt=$(git -C "$SUB_REPO_DIR" worktree list --porcelain 2>/dev/null \
             | awk -v b="refs/heads/$BRANCH" '/^worktree / {wt = substr($0, 10)} $0 == "branch " b {print wt; exit}')
-        if [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
+        # mika#1943: `$WORKTREE_DIR` en tête, et non vide. C'est la comparaison
+        # qui ÉLIT la cible du `worktree remove --force` ci-dessous : avec un
+        # côté vide, TOUT worktree existant devient « non canonique ». La racine
+        # ci-dessus rend le cas inatteignable ; on pose quand même le terme,
+        # parce qu'une garde qui dépend d'un seul point de contrôle en amont
+        # n'est pas une garde.
+        if [ -n "$WORKTREE_DIR" ] && [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
             echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
             if [ -d "$existing_wt" ]; then
                 local dirty_state
@@ -2475,14 +2618,28 @@ _set_up_worktree() {
                     fi
                 fi
             fi
-            git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            # mika#1943: le relic vient du registre git, donc `git worktree
+            # remove` le refuserait s'il n'en était pas un — mais c'est git qui
+            # protège, pas dispatch-lib, et un registre porte ce qu'on y a mis.
+            # Sur refus on ne supprime pas : le `worktree add` plus bas échouera
+            # alors bruyamment (`worktree_setup_failed`), ce qui est le bon sens
+            # de l'asymétrie — un worktree résiduel contre une suppression
+            # irréversible.
+            if _assert_removable_worktree_path "$existing_wt" set_up_worktree_relic; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            fi
         fi
 
         # Reuse existing worktree if valid
         if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            # mika#1943: nettoyage d'une entrée de registre périmée avant le
+            # `worktree add`. Sur refus on saute la suppression et on laisse le
+            # `add` décider : s'il échoue, il le dit (`worktree_setup_failed`).
+            if _assert_removable_worktree_path "$WORKTREE_DIR" set_up_worktree_stale; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
             # mika#1311: when origin/$BRANCH already exists from a prior
             # successful dispatch, base the worktree on it (preserves prior
             # history) rather than creating a fresh local branch from
@@ -2695,6 +2852,23 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
+        # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
+        #
+        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
+        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
+        # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
+        # donc à écrire explicitement, jamais à hériter du voisin : la copier
+        # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
+        #
+        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
+        # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
+        if [ "$SKILL" = "dev-groom" ]; then
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
+        fi
+
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
         # Save pre-run remote HEAD for pilot push guard (mika#1318).
@@ -2720,9 +2894,17 @@ _handle_dry_run() {
                 --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
                 --arg entry_command "$ENTRY_COMMAND" \
                 '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt, entry_command:$entry_command}'
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
-            rmdir "$PARENT_DIR" 2>/dev/null || true
+            # mika#1943: cinquième site destructif, absent de la table du plan et
+            # trouvé à la lecture. L'invariant du Product Contract porte sur
+            # *tout* site de suppression, pas sur la liste énumérée.
+            if _assert_removable_worktree_path "$WORKTREE_DIR" handle_dry_run; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
+            # `rmdir` n'est pas gardé, et c'est mesuré plutôt que négligé : il ne
+            # retire qu'un répertoire VIDE, donc il ne peut emporter aucun
+            # contenu — la classe de l'incident du 28/07 lui est inatteignable.
+            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo) || PARENT_DIR=""
+            [ -n "$PARENT_DIR" ] && rmdir "$PARENT_DIR" 2>/dev/null || true
         else
             jq -n --arg prompt "$PROMPT" \
                 '{dry_run:true, repo:null, issue:null, branch:null, worktree_dir:null, prompt:$prompt}'
@@ -5437,9 +5619,17 @@ _launch_revise_pilot() {
     # detect revision via sha256 of the plan file before-and-after. Identical
     # content = "no revision happened" = caller falls through.
     #
-    # Args: $1 = absolute path to findings file
+    # Args: $1 = absolute path to findings file — le findings-file de PREMIÈRE
+    #            passe (`$WORKTREE_DIR/.iterate/findings-1.md`, écrit par
+    #            `_iterate_groom_loop` depuis la sortie architecte). C'est la
+    #            source UNIQUE du premier terme du prédicat mika#2306 ci-dessous.
     # Returns: 0 if plan content changed, 1 otherwise (missing args, no plan
     #          found, pilot failed to revise).
+
+    # mika#2306 — compteur de garde du rattrapage Fire-Disposition, remis à zéro
+    # à CHAQUE entrée. Global à dessein (pas de `local`) : la terminaison doit
+    # être lisible sans dérouler le flot de contrôle, et le test T10 la lit.
+    _FD_REVISE_RETRIED=0
 
     local findings_file="$1"
     [ -r "$findings_file" ] || {
@@ -5482,11 +5672,137 @@ _launch_revise_pilot() {
 
     if [ "$pre_hash" != "$post_hash" ]; then
         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
+        _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
         return 0
     else
         echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
         return 1
     fi
+}
+
+# mika#2306 — le rattrapage Fire-Disposition, greffé sur la branche `sha256`
+# RÉUSSIE de `_launch_revise_pilot`.
+#
+# Le défaut qu'il ferme : le critère de convergence du revise est « le contenu a
+# changé », jamais « le finding a été traité ». Un revise qui corrige une virgule
+# sans ajouter la section réclamée est, pour la boucle, indistinguable d'un
+# revise réussi ; elle enchaîne sur le second passage, qui ESCALATE, et l'unique
+# itération a été dépensée pour rien.
+#
+# Le prédicat est une CONJONCTION DE DEUX `grep`, jamais un jugement :
+#   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
+#      contient la chaîne `Fire-Disposition` (le vocabulaire imposé par son
+#      propre gate) ;
+#   2. la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
+#
+# La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
+# `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
+# findings ciblé que cette fonction écrit elle-même (`findings-1-fd.md`) est
+# INTERDIT comme source : il contient nécessairement la chaîne `Fire-Disposition`
+# puisque c'est son objet, donc un prédicat qui le relirait serait vrai par
+# construction — la garde relancerait même quand l'architecte n'a rien demandé,
+# et le test de relance-unique resterait vert sur une garde qui ne regarde plus
+# la sortie architecte. Le compteur casserait la boucle infinie ; il ne rendrait
+# pas le défaut visible. Même raison pour l'absence de récursion sur
+# `_launch_revise_pilot` : elle ferait de `findings-1-fd.md` le `$1` du second
+# tour, c'est-à-dire exactement la confusion de source interdite.
+#
+# Si l'un des deux termes est faux, RIEN ne se passe : comportement d'avant le
+# correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a
+# fait son travail ne paie rien. Un findings-file illisible sort le dispatch de
+# la population plutôt que de l'y faire entrer.
+#
+# Le BUDGET ARCHITECTE est inchangé : aucun appel `_arch_ask` sur ce chemin. Ce
+# qui est élargi est le budget du *revise*, qui n'est le contrat de personne —
+# et d'une seule tentative. Cette fonction ne REFUSE jamais rien : elle réessaie,
+# puis laisse passer en journalisant. Un échec dur ici aurait déplacé l'ESCALATE
+# d'une porte au lieu de le lever.
+#
+# Args: $1 = findings-file de première passe (source du terme 1)
+#       $2 = chemin du plan révisé (sujet du terme 2)
+# Returns: toujours 0 — l'appelant a déjà décidé que le plan a changé.
+_fd_retry_if_section_still_missing() {
+    local first_pass_findings="$1" plan_path="$2"
+
+    # Budget : une seule relance par invocation de `_launch_revise_pilot`.
+    [ "${_FD_REVISE_RETRIED:-0}" -eq 0 ] || return 0
+    # Fail-safe : une information illisible SORT de la population.
+    [ -r "$first_pass_findings" ] || return 0
+    [ -r "$plan_path" ] || return 0
+
+    # Terme 1 — l'architecte a réclamé la section.
+    grep -qF -- 'Fire-Disposition' "$first_pass_findings" 2>/dev/null || return 0
+    # Terme 2 — le plan révisé ne la porte toujours pas.
+    ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0
+
+    # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
+    _FD_REVISE_RETRIED=1
+
+    local fd_findings_file="${first_pass_findings%/*}/findings-1-fd.md"
+    printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2306), pas par l'architecte.
+
+F-FD [BLOQUANT] — la section \`## Fire-Disposition\` que la première passe
+architecte a réclamée est TOUJOURS ABSENTE du plan révisé.
+
+Le plan a bien été modifié, mais le finding n'a pas été traité. En l'état il part
+au second passage architecte, où le Fire-Disposition Gate est SANS RECOURS
+(« No ITERATE exists at second pass per the two-pass limit ») : le verdict sera
+ESCALATE et le ticket ne sera jamais implémenté.
+
+Action demandée, et elle seule : ajouter au plan une section \`## Fire-Disposition\`
+nommant l'une des trois options canoniques de mika#1574, avec son détail
+d'implémentation —
+  (a) exception nommée en allowlist (défaut) : chaque violation existante reçoit
+      une entrée grep-visible qui nomme la donnée précise, référence un ticket de
+      suivi, et porte une assertion auto-nettoyante ;
+  (b) livrer désarmé : \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent, plus un suivi
+      tracké pour l'armer ;
+  (c) halte-et-remontée : l'implémentation s'arrête et remonte à l'opérateur.
+
+Si — et seulement si — le plan ne livre réellement AUCUN détecteur (test,
+assertion, lint, garde CI, validateur, scan structurel, garde EndTurn), dis-le
+explicitement dans la section plutôt que d'inventer une disposition : le gate est
+alors N/A et cette phrase est ce qui le rend lisible.
+
+Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
+        echo "WARN: fire_disposition_retry_findings_unwritable: cannot write $fd_findings_file — skipping retry" >&2
+        return 0
+    }
+
+    echo "fire_disposition_revise_retried: ${REPO:-?}#${ISSUE_NUM:-?} — section absente du plan révisé alors que les findings de première passe la réclamaient ; relance unique du pilote de revise avec $(basename "$fd_findings_file")" >&2
+
+    local fd_log_id="${LOG_ID:-unknown}-revise-fd-$(date +%s)"
+    local fd_stdout; fd_stdout=$(mktemp /tmp/revise-fd-stdout-XXXXXX)
+    local fd_stderr; fd_stderr=$(mktemp /tmp/revise-fd-stderr-XXXXXX)
+
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+        --command "/mika-revise-plan" $CWD_ARGS \
+        -- "@${fd_findings_file}" \
+        >"$fd_stdout" 2>"$fd_stderr"
+    set -e
+    rm -f "$fd_stdout" "$fd_stderr"
+
+    # La section est re-testée POUR JOURNALISER, jamais pour reboucler : le
+    # compteur est déjà armé, donc aucun chemin ne réarme le lancement. C'est ce
+    # qui réconcilie « une seule relance » et « l'événement doit savoir si la
+    # section manque encore » — le prédicat est évalué deux fois, il n'autorise
+    # l'action qu'une.
+    #
+    # Les deux événements sont de l'OBSERVABILITÉ PURE : consommés par
+    # l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche
+    # de ce fichier, sans effet sur le flot de la boucle. Régime attendu :
+    # `fire_disposition_revise_retried` rare, `fire_disposition_still_missing_after_retry`
+    # à zéro. Une occurrence soutenue du second dit que le pilote de revise ne
+    # sait pas écrire la section — donc que le correctif est côté
+    # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
+    if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then
+        echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
+    fi
+
+    return 0
 }
 
 _cleanup_iterate_findings() {
@@ -5498,6 +5814,10 @@ _cleanup_iterate_findings() {
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
     local findings_dir="$WORKTREE_DIR/.iterate"
     [ -d "$findings_dir" ] || return 0
+    # mika#1943: le `[ -d ]` ci-dessus prouve que le chemin existe, jamais qu'il
+    # est à nous. Sur refus on conserve — les findings sont de toute façon un
+    # artefact forensique dont la préservation est le défaut sur ESCALATE.
+    _assert_removable_worktree_path "$findings_dir" cleanup_iterate_findings || return 0
     rm -rf "$findings_dir" 2>/dev/null || true
     echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
 }

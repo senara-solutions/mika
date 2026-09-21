@@ -32,6 +32,44 @@ pub trait GhRunner: Send + Sync {
     async fn run(&self, args: &[&str]) -> Result<String>;
 }
 
+/// mika#1975 (AC3, plan D5) — a failed `gh` invocation, **typed**.
+///
+/// **Why the two halves travel apart.** The classifier in `spawn.rs`
+/// (`classify_cycle_error`) used to run over the *rendered* error string, which
+/// carried the command line as well as the stderr. That line holds numbers an
+/// operator chooses — `/repos/{owner}/{repo}/milestones/{N}`, `--milestone {N}`,
+/// `--search milestone:{N}` — so with
+/// `MIKA_MANAGER_TARGET_MILESTONE=owner/repo#403` **every** failure of that call
+/// (a 500, a DNS error whose wording matches no `Network` pattern, a JSON parse
+/// failure) classified as `Forbidden`, reached `is_auth_failure`, and fired the
+/// 30-minute auth alarm with the wrong class and the wrong hint. Keeping `args`
+/// and `stderr` in separate fields lets the classifier read the half that
+/// carries the signal and ignore the half it wrote itself.
+///
+/// **House precedent:** `DeliveryError` + `downcast_ref::<DeliveryError>()`
+/// (`cadence.rs`), and the mika#2179 rule — *error classes come from the
+/// variant, never from a substring match on the rendered message*.
+///
+/// **`Display` is byte-identical to the legacy `anyhow!` format on purpose.**
+/// Everything downstream still reads the rendered string: the
+/// `manager_gh_auth_check_failed` log's `stderr_head` (which must keep naming
+/// *which* call failed — see `spawn.rs`'s `raw` comment), the
+/// `manager_cycle_error` `error` field, and the existing test corpus. The
+/// tightening is on **what is classified**, never on what is logged.
+/// `mika1975_the_gh_command_error_display_is_byte_identical` pins it.
+///
+/// `pub(crate)`: it travels boxed inside an `anyhow::Error`, so no public
+/// signature exposes it. Widening it later is additive.
+#[derive(Debug, thiserror::Error)]
+#[error("gh {args} failed: {stderr}")]
+pub(crate) struct GhCommandError {
+    /// The `gh` argument vector, space-joined — **operator-chosen digits live
+    /// here**, which is exactly why the classifier must not read it.
+    pub(crate) args: String,
+    /// What `gh` wrote to stderr — the only half that carries a status signal.
+    pub(crate) stderr: String,
+}
+
 /// Production runner — spawns `gh` via `tokio::process::Command`.
 pub struct ProcessGhRunner {
     token: Option<String>,
@@ -59,7 +97,15 @@ impl GhRunner for ProcessGhRunner {
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("gh {} failed: {}", args.join(" "), stderr));
+            // mika#1975 D5 — typed, not formatted. Going back to
+            // `anyhow!("gh {} failed: {}", …)` here would break no test (the
+            // classifier's string fallback keeps the suite green) while
+            // silently putting the command line back into the classified text.
+            // `mika1975_the_gh_runner_error_stays_typed` is what refuses it.
+            return Err(anyhow::Error::new(GhCommandError {
+                args: args.join(" "),
+                stderr: stderr.into_owned(),
+            }));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
@@ -675,6 +721,113 @@ mod tests {
             .expect("closed sub-issue present in enumeration");
         assert_eq!(closed.state, IssueState::Closed);
         assert_eq!(closed.pr_number, Some(1929));
+    }
+
+    /// mika#1975 D5/D8 — the typed error renders **exactly** the legacy
+    /// `anyhow!("gh {} failed: {}", args.join(" "), stderr)` string.
+    ///
+    /// Necessary because the tightening is on what is *classified*, never on
+    /// what is *logged*: `verify_gh_auth`'s `stderr_head`, the
+    /// `manager_cycle_error` `error` field and the frozen D7 corpus all read
+    /// this rendering. A `Display` drifted by one space would amputate the
+    /// operator's log without failing any behavioural assertion.
+    #[test]
+    fn mika1975_the_gh_command_error_display_is_byte_identical() {
+        let args = ["api", "/repos/senara-solutions/mika/milestones/403"];
+        let stderr = "HTTP 500: Internal Server Error";
+
+        let legacy = format!("gh {} failed: {}", args.join(" "), stderr);
+        let typed = GhCommandError {
+            args: args.join(" "),
+            stderr: stderr.to_string(),
+        };
+
+        assert_eq!(
+            format!("{typed}"),
+            legacy,
+            "the typed error must render the legacy string byte for byte"
+        );
+        // And through `anyhow`, which is how every downstream reader sees it.
+        let boxed = anyhow::Error::new(GhCommandError {
+            args: args.join(" "),
+            stderr: stderr.to_string(),
+        });
+        assert_eq!(format!("{boxed}"), legacy);
+    }
+
+    /// mika#1975 D8 — structural guard: `ProcessGhRunner::run` must not go back
+    /// to formatting its error.
+    ///
+    /// **Why a source scan and not a behavioural test.** Reverting to
+    /// `anyhow!("gh {} failed: {}", …)` breaks **nothing**: the classifier's
+    /// documented string fallback (D5) keeps every assertion green while the
+    /// command line quietly re-enters the classified text and re-widens the
+    /// search space. The regression makes no decision *wrong*; it makes the
+    /// tightening *absent*. That class is invisible to assertions on behaviour.
+    ///
+    /// The allowlist ships **empty** and stays empty: there is nothing to
+    /// exempt, so there is no slot in which to drop the next lapse (doctrine
+    /// mika#2323). When this fires, remove the site — do not allowlist it.
+    #[test]
+    fn mika1975_the_gh_runner_error_stays_typed() {
+        const FORBIDDEN_NEEDLE: &str = r#"anyhow!("gh "#;
+        /// Deliberately empty — see the test's doc comment.
+        const ALLOWED_LEGACY_SITES: &[&str] = &[];
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("milestone_manager")
+            .join("reader.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+        // Scan the production half only. This very test carries the needle as
+        // a literal (and so does its anti-vacuity control below), so a whole-
+        // file scan would flag the guard itself. `reader.rs` keeps its test
+        // modules inline, so truncating at the first `#[cfg(test)]` excludes
+        // every one of them.
+        let cut = source.find("#[cfg(test)]").expect(
+            "reader.rs must keep an inline test module for this truncation to mean anything",
+        );
+        let production = &source[..cut]; // safe-byte-slice: `find` returns a char boundary
+
+        let offenders: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            // Prose that *describes* the forbidden shape is not a site. Only a
+            // `//`-comment prefix is excluded; a real call sits at code level.
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| line.contains(FORBIDDEN_NEEDLE))
+            .filter(|(_, line)| !ALLOWED_LEGACY_SITES.iter().any(|a| line.contains(a)))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "mika#1975 D5 regressed: `gh` failures must be `GhCommandError`, not a \
+             formatted string — the command line would re-enter the text \
+             `classify_cycle_error` reads. Offending sites:\n{}",
+            offenders
+                .iter()
+                .map(|(n, l)| format!("  reader.rs:{n}: {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // Anti-vacuity, two halves. (a) the scanned region is the one that
+        // holds the runner — a truncation that cut too early would make this
+        // guard pass on an empty string for ever.
+        assert!(
+            production.contains("impl GhRunner for ProcessGhRunner"),
+            "the scanned region no longer contains the runner this guard protects"
+        );
+        // (b) the needle is the shape a regression would actually write.
+        let regression =
+            r#"            return Err(anyhow!("gh {} failed: {}", args.join(" "), stderr));"#;
+        assert!(
+            regression.contains(FORBIDDEN_NEEDLE),
+            "the needle no longer matches the shape it exists to refuse"
+        );
     }
 
     #[test]
