@@ -1127,6 +1127,49 @@ class TimestampTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# mika#2152 — `_strip_ts` must assert the timestamp on the PROXY's lines only.
+#
+# The stderr the tests capture is shared: `IsolatedAsyncioTestCase` runs its
+# loop in debug mode, asyncio's slow-callback warning goes to the handlerless
+# `asyncio` logger, `logging.lastResort` resolves `sys.stderr` at emission
+# time, and `redirect_stderr` swallows it into the same buffer as the proxy.
+# ---------------------------------------------------------------------------
+
+# Verbatim from run 33715931630 (2026-09-03T04:40Z, Python 3.10): the line that
+# made a healthy PR red. Kept whole so the regression test reads the real thing.
+_RUN_33715931630_LINE = (
+    "Executing <Task pending name='Task-1' "
+    "coro=<IsolatedAsyncioTestCase._asyncioLoopRunner() running at "
+    "/usr/lib/python3.10/unittest/async_case.py:101> wait_for=<Future pending "
+    "cb=[Task.task_wakeup()] created at /usr/lib/python3.10/asyncio/base_events.py:429> "
+    "created at /usr/lib/python3.10/unittest/async_case.py:117> took 0.191 seconds"
+)
+
+# The second shape asyncio's debug loop emits, observed locally (3.14) with
+# `slow_callback_duration = 0.0` on 2026-09-21: a Handle, not a Task. Frozen
+# next to the run's line so the `<Handle …>` coverage reads a real sample,
+# not a free-hand string (architect S2, first pass).
+_OBSERVED_HANDLE_LINE = (
+    "Executing <Handle _run_until_complete_cb(<Task finishe...unners.py:110>) at "
+    "/usr/lib/python3.14/asyncio/base_events.py:181 created at "
+    "/usr/lib/python3.14/asyncio/events.py:94> took 0.000 seconds"
+)
+
+
+class ForeignLineFilterTests(unittest.TestCase):
+    """The helper in isolation: the real run's line, the proxy's own lines, and
+    the two refusals (AC2 bare proxy line, AC3 unknown prefix / unclassified)."""
+
+    def test_the_real_asyncio_line_is_skipped_and_proxy_lines_survive(self) -> None:
+        # AC1 + AC4: the run's exact line is in the buffer next to a real proxy
+        # line — the noise is dropped, the proxy line is returned, stamp removed.
+        stripped = _strip_ts(
+            self, [_RUN_33715931630_LINE, "2026-09-03T04:40:00.000Z [egress] ALLOW 127.0.0.1:0"]
+        )
+        self.assertEqual(stripped, ["[egress] ALLOW 127.0.0.1:0"])
+
+
+# ---------------------------------------------------------------------------
 # mitmproxy addon (the CONNECT path)
 #
 # The addon imports `mitmproxy`, which is a pilot-host dependency and is not
@@ -1585,6 +1628,34 @@ class ReadinessProbeVsErrorTests(unittest.IsolatedAsyncioTestCase):
         # Silenced, but not swallowed: it is counted, so the fix is not merely
         # taping over the log. (Anti-vacuity, counter half.)
         self.assertEqual(proxy._readiness_probe_count, before + 1)
+
+    async def test_connect_then_close_stays_silent_under_slow_callback_noise(self) -> None:
+        # mika#2152: the CI failure reproduced by its cause, not by injection.
+        # A threshold of 0 makes asyncio's debug loop flag EVERY callback as
+        # slow, so the warning lands in the redirected stderr deterministically —
+        # on a loaded runner it took 0.191s to get there by accident.
+        loop = asyncio.get_running_loop()
+        before = loop.slow_callback_duration
+        loop.slow_callback_duration = 0.0
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stderr(buffer):
+                await proxy.handle_host_client(_reader_of(), self._Writer(fail_drain=True))
+                # Yield once INSIDE the redirect: since 3.12 `asyncio.wait_for`
+                # awaits inline instead of wrapping a Task, so on an EOF reader
+                # the handler never suspends and the task step — where asyncio
+                # writes the slow-callback line — would otherwise end AFTER this
+                # block, on the real stderr. On 3.10 (CI) the extra yield is
+                # harmless: `wait_for` already suspended the step in the block.
+                await asyncio.sleep(0)
+            raw = buffer.getvalue()
+        finally:
+            loop.slow_callback_duration = before
+        # Positive control: the noise WAS there. Without this the test is vacuous.
+        self.assertIn("Executing <", raw, "expected asyncio's slow-callback line in stderr")
+        self.assertFalse(_TS_PREFIX_RE.match(raw.splitlines()[0]), "the noise is not stamped")
+        # And the helper reads through it: the probe is still silent.
+        self.assertEqual(_strip_ts(self, raw.splitlines()), [])
 
     async def test_malformed_connect_still_emits_one_error(self) -> None:
         # A peer that DID speak — a malformed CONNECT line — then dropped. A
