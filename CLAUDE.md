@@ -1572,6 +1572,123 @@ Optional (terminal-worktree reaper — mika#2420):
 - **Named residual risk.** When `refs/remotes/origin/<branch>` is **absent**, T7 reads `Clean` rather than `Unreadable`: this term is only reached for a worktree whose PR is terminal, hence whose branch *was* pushed, so the ref's absence means the remote deleted it after the PR closed. Reading it as unreadable would keep nearly the whole targeted population, i.e. make the scan inert exactly where it must serve (class mika#2205). The cost, stated: a PR **closed without merging** whose remote branch was deleted will see its commits go with the worktree — they remain reachable in the PR's history on GitHub, and the dirty half still protects **uncommitted** work.
 - **Out of scope, deliberately:** layers A and B of #1694 (`worktrees-audit` / `worktrees-clean`, in the mika-platform repo) are unchanged and remain the manual gesture; remote branches; the `target/` of open PRs (HALT 2); and reopening #1694 itself, which is an orchestrator gesture the PR body signals rather than performs.
 
+### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
+
+**Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
+qui voit rougir `canonical-tokens-lint`, ou qui se demande s'il peut écrire un
+callout en français, cherche dans ce voisinage.
+
+- **La règle, et ce qu'elle n'est PAS.** Le bearing Prime dit : prose des tickets
+  en français, jetons machine en anglais canonique exact. Confrontée au code qui
+  matche — la borne de fermeture de Prime elle-même — la lecture naïve de cette
+  règle **accuse deux formes que le dépôt lit délibérément bien** :
+  « seconde passe » (`grooming_marker.rs::LATER_PASS_RE` est bilingue **par
+  décision écrite** depuis mika#2158) et les paraphrases de
+  `_parse_disposition`. La règle en vigueur est donc :
+
+  > **Une forme qu'un lecteur strict ne voit pas est refusée ; une forme qu'un
+  > lecteur tolérant voit est admise.**
+
+  Le discriminant est la **tolérance du lecteur**, jamais la langue du jeton.
+- **`scripts/canonical-tokens.tsv` — un fichier, quatre colonnes, deux lecteurs**
+  (le lint shell et le scan Rust). `classe` décide si le lint accuse (`B`) ou se
+  tait (`A`) ; `site de match` au format `chemin::symbole` (**jamais un numéro de
+  ligne**, qui pourrit en silence) est ce qui rend la liste *confrontable* ;
+  `tolérance` est la colonne que l'intuition omet et celle qui empêche la
+  ré-accusation de « seconde passe ». **Format de fil** : `exact:line-anchored`,
+  `exact:word-boundary`, `exact:prefix`, `exact:literal`, `ci:line-anchored`,
+  `ci+emphasis:…`, `paraphrase`, `ci+fr:…`. Un jeton dont la tolérance porte `ci`
+  ne peut pas être accusé de casse.
+- **Le relevé est PRODUIT, jamais tenu à la main.**
+  `scripts/canonical-tokens-survey.sh` (`--tsv`, `--check`). La première version
+  du plan présentait son inventaire comme « relevé sur l'arbre » sans livrer le
+  geste qui le produit, et la révision l'a démontré sur elle-même : le relevé
+  était exact ligne à ligne et **incomplet**, ratant
+  `dispatch-lib.sh::_extract_plan_path`, le lecteur le plus strict du callout
+  `Plan`. Le survey livré en trouve **74**, dont une douzaine que le plan ne
+  listait pas.
+- **Deux gardes, deux directions, et aucune n'est la copie de l'autre.**
+  `--check` part de la **forme de lecture** (`Regex::new`, `starts_with`,
+  `strip_prefix`, `match_indices`, `grep`, `sed -n`, une constante nommée
+  `*_MARKER|_PREFIX|_KEY|_LINE`) ; `canonical_tokens::tests::mika2201_every_match_site_is_declared`
+  part du **jeton**, ce qui lui fait voir un lecteur par `contains` que le survey
+  ne voit pas — c'est ainsi que `executor.rs::check_grooming_markers` a été
+  trouvé. La direction « périmée » est tenue par
+  `…::mika2201_every_declared_symbol_still_exists`, qui pose la question
+  directement au lieu de l'inférer d'une coïncidence avec un survey.
+  **`contains` est hors du survey par mesure** : l'y admettre ajoute quatorze
+  lignes fausses pour deux vraies.
+- **Cinq règles, toutes négatives.** Aucune ne dit « ce texte doit contenir X » :
+  un lint qui exige une forme sur un corps libre accuse toute prose. L1
+  sous-chaîne ambiguë **dans une ligne de callout** (`ESCALATE-divergence`) ; L2
+  casse d'un token de verdict, **sauf tolérance `ci`** ; L3 clé de callout
+  quasi-variante (espace typographique FR, casse, traduction listée) — **et pas**
+  « toute clé hors des trois canoniques », le flux milestone écrivant
+  légitimement `Sub-issues:` / `Sequencing record:` / `Coordination branch:` ;
+  L4 espace avant les deux-points d'une étiquette de protocole ; L5 label écrit
+  en **instruction** (`--add-label` / `--remove-label`) et non déclaré.
+- **Un jeton cité entre backticks ou dans un bloc clôturé est une mention, jamais
+  une instruction** — mesuré sur le plan de ce ticket même, dont le § M4 décrit
+  la règle L4 en citant les formes fautives et faisait rougir le lint. Même geste
+  et même raison qu'`auto_pull::is_groomed` (mika#2120), même classe que le faux
+  positif du Signal S (mika#2050). Ne s'applique **pas** à L5 : dans un
+  prescripteur markdown, une instruction `gh` vit nécessairement dans un bloc.
+- **Trois surfaces, trois statuts, et l'une n'est pas un gate.** S1 les
+  prescripteurs du dépôt — **gate CI bloquant** (`canonical-tokens-lint`), le
+  levier structurel : un prompt qui prescrit une forme fausse la reproduit sur
+  *tous* les tickets qu'il produit. S2 les corps de PR — **livré désarmé**
+  (`continue-on-error`), voir la halte ci-dessous. S3 les corps de tickets —
+  **annotation non bloquante** (`issue-token-annotate.yml`), parce que GitHub
+  n'offre **aucun** gate sur une issue ; prétendre en livrer un annoncerait une
+  protection qui n'existe pas. S3 est borné à son époque (`opened`/`edited`) : le
+  bearing interdit la migration rétroactive de la prose.
+- **« On déclare, on n'allowliste pas. »** Quand le scan d'exhaustivité tire, la
+  résolution est **une ligne de TSV** — jamais une exemption. Son allowlist est
+  livrée vide et un test refuse qu'elle cesse de l'être. Le fichier
+  `scripts/canonical-tokens-exceptions.tsv` existe pour le **lint** (une
+  accusation sur un texte préexistant), quatre champs obligatoires, **livré
+  vide**, et porte son **assertion auto-nettoyante** : une exception dont le
+  fichier ne contient plus le jeton fait rougir — le jour de la réparation, pas
+  des mois après.
+- **Ce que ce travail a trouvé en se construisant.**
+  `needs-multi-agent-review`, écrit par `_finalize_pr_gate` (`dispatch-lib.sh`)
+  en `--add-label … || true`, n'était **déclaré nulle part**. Cinquième
+  occurrence de la classe
+  `un-label-denforcement-non-declare-echoue-en-silence` : `delete-other-labels:
+  true` l'aurait supprimé du dépôt et de chaque PR le portant, sans événement ni
+  journal, pendant que son écriture échouait en silence des deux côtés. **Réparé
+  dans le même commit** en le déclarant, comme mika#2199 l'a fait pour
+  `human-review-required`.
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal.
+  Le lint est un gate : son signal est son propre rouge, et **son silence sur S3
+  ne prouve rien** — une annotation que personne ne lit est un silence avec une
+  ligne de plus. La seule mesure est le taux d'accusation sur S1+S2, **régime
+  attendu zéro**. Une accusation soutenue sur un prescripteur signifie que ce
+  prescripteur prescrit une forme fausse depuis un moment : c'est un résultat,
+  pas une panne du lint.
+- **Halte 1 — armer S2.** Le gate S2 est livré **désarmé** parce que sa mesure de
+  pré-vol (V5c : le lint propre sur les PR ouvertes + les 50 dernières mergées)
+  **n'était pas exécutable** au moment de la livraison, `gh` n'étant pas
+  authentifié dans le bac à sable de dispatch. Le plan prévoyait le cas « rouge »,
+  pas le cas « non mesurable » ; la lecture sûre est la même — **ne pas armer ce
+  qu'on n'a pas mesuré**. La condition d'armement et le geste (retirer une ligne
+  `continue-on-error`) sont écrits dans `pr-body-validation.yml`, donc ce n'est
+  pas un désarmement permanent qu'on aurait oublié d'armer. **Ce n'est pas une
+  réduction d'AC1** : AC1 est ratifiée sur S2 comme gate bloquant, la disposition
+  porte sur la *fenêtre de déploiement*.
+- **Halte 2 — accusation soutenue sur les corps de PR sans qu'aucun prescripteur
+  ne rougisse.** La forme fautive naît alors du pilote et non du prompt :
+  **ne pas élargir le lint**, établir quel chemin l'écrit.
+- **Halte 3 — le lint rougit sur une forme que la machine lit.** C'est la
+  régression que la fixture `seconde-passe.md` existe pour dire (elle doit rester
+  **verte**). Le remède est la colonne `tolérance` du TSV, jamais une exception.
+- **Hors périmètre, délibérément.** La classe A (six lecteurs mesurément
+  tolérants) ; la migration rétroactive des corps existants ; resserrer
+  `VERDICT_TOKEN_RE`, écarté par mika#2188 avec sa raison ; et **`post-launch`**,
+  employé par le commentaire opérateur de ce ticket et déclaré nulle part — réel,
+  adjacent, mais ce n'est pas un label d'enforcement (sa perte coûte un parking,
+  pas une garde) : **ticket de suivi**.
+
 ### Une consigne de fréquence a un site d'inscription (mika#2358)
 
 **Ce ne sont pas des variables d'environnement mais des clés `customer_config`**,
