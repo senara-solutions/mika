@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "timestamp": "2026-09-22T14:36:16.654045475+00:00",
+  "providers": {
+    "mika-arch": {
+      "model": "openrouter/moonshotai/kimi-k3",
+      "scenarios": {
+        "citation_discipline": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 391,
+          "output_tokens": 930,
+          "latency_ms": 49332
+        },
+        "disposition_keyword_discipline": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 455,
+          "output_tokens": 2156,
+          "latency_ms": 120813
+        },
+        "fire_disposition_gate": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 4235,
+          "output_tokens": 6222,
+          "latency_ms": 227607
+        },
+        "groom_milestone": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 507,
+          "output_tokens": 6210,
+          "latency_ms": 196247
+        },
+        "groom_ticket_basic": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 454,
+          "output_tokens": 2308,
+          "latency_ms": 76872
+        },
+        "groomed_no_tbds_passes": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 4169,
+          "output_tokens": 8192,
+          "latency_ms": 294549
+        },
+        "groomed_with_placeholder_path_rejected": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 4108,
+          "output_tokens": 7856,
+          "latency_ms": 54068
+        },
+        "groomed_with_tbd_rejected": {
+          "outcome": "fail",
+          "error_class": "rate_limit",
+          "input_tokens": 4096,
+          "output_tokens": 8192,
+          "latency_ms": 49577
+        },
+        "required_finding_list": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 385,
+          "output_tokens": 1984,
+          "latency_ms": 68508
+        },
+        "review_anchor_attestation": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 925,
+          "output_tokens": 2346,
+          "latency_ms": 120901
+        }
+      }
+    }
+  }
+}
