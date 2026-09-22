@@ -2249,7 +2249,12 @@ mod tests {
         fs::create_dir_all(home.join("agents")).unwrap();
 
         // Create mika-dev with custom soul
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let dev_home = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(dev_home.join("soul.md"), "custom soul content").unwrap();
 
@@ -2270,7 +2275,12 @@ mod tests {
         fs::create_dir_all(home.join("agents")).unwrap();
 
         // Only mika-dev exists
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         assert!(!mika_common::agent::agent_exists(home, "mika-qa"));
 
         provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
@@ -3206,8 +3216,31 @@ mod tests {
 
     /// Pre-seed an agent on disk with a custom identity.toml content,
     /// bypassing the spec-driven provisioner.
+    ///
+    /// **The tier is posed here, and that covers twelve callers at once
+    /// (mika#2471).** Every one of them is a bare `#[test]` running in the same
+    /// binary as `server::mod`'s and `server::tier_guard`'s
+    /// `MIKA_AGENT_TIER=family` setters, and `#[serial]` only sequences its own
+    /// bearers — so a `bootstrap_agent()` here would read whichever tier the
+    /// scheduler happened to leave in the process environment. The content this
+    /// helper writes overwrites `identity.toml` immediately afterwards, so
+    /// `Default` is the tier these tests already assume.
+    ///
+    /// **This site is the one mika#2073's guard structurally cannot see**: it
+    /// carries no test attribute, so the walker never enters its body — it was
+    /// not among the five offenders the widened scan reported, and the green that
+    /// follows the conversion says nothing about it either. What attests it is
+    /// `cargo test -p mika-agent --lib` (which exercises the twelve callers) and
+    /// the diff, not a detector. The limit is the "helper-wrapped" one already
+    /// documented in `crates/mika-common/CLAUDE.md`; this closes its only known
+    /// real case by hand without claiming to lift it.
     fn pre_seed_identity(home: &Path, agent_name: &str, content: &str) {
-        mika_common::home::bootstrap_agent(home, agent_name).unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            agent_name,
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, agent_name);
         fs::write(agent_dir.join("identity.toml"), content).unwrap();
     }
@@ -3657,7 +3690,12 @@ mod tests {
         let home = tmp.path();
 
         // Pre-seed mika-dev with an old config (no openrouter).
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
         fs::write(agent_dir.join("config.toml"), "log_level = \"info\"\n").unwrap();
@@ -3678,7 +3716,12 @@ mod tests {
         let home = tmp.path();
 
         // Pre-seed with the correct config.
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
         fs::write(agent_dir.join("config.toml"), MIKA_DEV_CONFIG).unwrap();
@@ -3702,7 +3745,12 @@ mod tests {
         // Pre-seed mika-test (which has config_toml: None) with a custom config.
         // mika-qa moved to Some(MIKA_QA_CONFIG) in mika#1670, so mika-test is now
         // the well-known agent exemplifying the None-config skip path.
-        mika_common::home::bootstrap_agent(home, "mika-test").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-test",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-test");
         fs::write(agent_dir.join("identity.toml"), MIKA_TEST_IDENTITY).unwrap();
         let custom = "log_level = \"debug\"\n";

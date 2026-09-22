@@ -2337,12 +2337,22 @@ mod tests {
         .any(|name| calls(line, name))
     }
 
+    #[derive(Default)]
     struct TierScan {
         offenders: Vec<String>,
         tests_seen: usize,
         /// Test items whose body did not close where the source says it closes.
         /// **Not a diagnostic — a failure.** See the guard.
         desyncs: Vec<String>,
+    }
+
+    impl TierScan {
+        /// Fold one file's scan into the workspace total (mika#2471).
+        fn absorb(&mut self, other: TierScan) {
+            self.offenders.extend(other.offenders);
+            self.desyncs.extend(other.desyncs);
+            self.tests_seen += other.tests_seen;
+        }
     }
 
     /// Brace movement contributed by a line, ignoring comments and string, raw
@@ -2386,7 +2396,13 @@ mod tests {
     /// Runs over the raw file on purpose: `source_guard::ProductionScanner`
     /// *masks* `cfg(test)` regions, which is the exact inverse of what is needed
     /// here — the target of this scan **is** the test block.
-    fn scan_bare_tests_reading_the_tier(source: &str) -> TierScan {
+    ///
+    /// `label` is what each reported line is attributed to — the path relative
+    /// to `crates/` (`mika-agent/src/well_known_agents.rs`) for a real file,
+    /// `"fabricated.rs"` for the good-faith control. It is a **parameter** since
+    /// mika#2471: the literal `home.rs` was hard-coded here, so widening the
+    /// scan to the workspace would have attributed every offender to this file.
+    fn scan_bare_tests_reading_the_tier(label: &str, source: &str) -> TierScan {
         let lines: Vec<&str> = source.lines().collect();
         let mut offenders = Vec::new();
         let mut desyncs = Vec::new();
@@ -2451,14 +2467,16 @@ mod tests {
             match closed_at {
                 Some(n) if lines[n] == format!("{indent}}}") => {}
                 Some(n) => desyncs.push(format!(
-                    "  line {} in `{}` — body closed on {:?}, expected {:?}",
+                    "  {}:{} in `{}` — body closed on {:?}, expected {:?}",
+                    label,
                     n + 1,
                     signature,
                     lines[n],
                     format!("{indent}}}")
                 )),
                 None => desyncs.push(format!(
-                    "  line {} in `{}` — body never closed before end of file",
+                    "  {}:{} in `{}` — body never closed before end of file",
+                    label,
                     signature_at + 1,
                     signature
                 )),
@@ -2470,7 +2488,8 @@ mod tests {
             for (n, line) in body {
                 if reads_the_tier_from_the_environment(line) {
                     offenders.push(format!(
-                        "  home.rs:{} in `{}` — {}",
+                        "  {}:{} in `{}` — {}",
+                        label,
                         n + 1,
                         signature,
                         line.trim()
@@ -2501,32 +2520,90 @@ mod tests {
     /// hundred runs passes in CI. Hence a source scan (same reasoning as
     /// mika#2131).
     ///
-    /// **Scope: this file only.** AC2 of mika#2073 says "audit of the same file",
-    /// and six sibling sites in `mika-agent/src/well_known_agents.rs` carry the
-    /// same armed mine without the mandate to convert them — a workspace-wide
-    /// scan would be red on them, i.e. undeliverable. The follow-up, mika#2471,
-    /// widens the scan and converts those six at the same commit, in that order.
+    /// **Scope: every `.rs` file under `crates/`** since mika#2471 — `tests/`
+    /// and `src/bin/` included. It was bounded to this file until then, matching
+    /// mika#2073's AC2 ("audit of the same file") while six sibling sites in
+    /// `mika-agent/src/well_known_agents.rs` carried the same armed mine without
+    /// the mandate to convert them. mika#2471 converted those six and widened the
+    /// scan at the same commit, in that order — widened first, it would have been
+    /// red on sites nobody was allowed to touch, i.e. undeliverable.
+    ///
+    /// Integration tests (`crates/*/tests/`) compile into their own binaries, so
+    /// a bare `#[test]` there races no setter of `src/`. They are scanned anyway:
+    /// the ticket says "workspace", the correction (`_with_tier`) costs nothing
+    /// and makes the test honest about the tier it assumes, and a per-directory
+    /// exclusion is an allowlist under another name. Today zero site falls there.
+    ///
+    /// What still escapes it: it reads text, not an AST — an alias
+    /// (`use home::bootstrap_agent as b;`), a call whose name and `(` sit on
+    /// different lines (which rustfmt does not emit, but nothing forbids), or a
+    /// **helper** with no test attribute. `well_known_agents.rs`'s
+    /// `pre_seed_identity` is that last shape and is the one real case: mika#2471
+    /// converted it by hand, at the same gesture, without claiming to lift the
+    /// limit.
     ///
     /// **Disposition: halt-and-surface. The allowlist is empty and there is no
     /// constant to add one to** — see the plan's Fire-Disposition section.
     #[test]
     fn mika2073_no_bare_test_reads_the_tier_from_the_environment() {
-        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.rs");
-        let source = std::fs::read_to_string(&this_file)
-            .expect("the guard must be able to read its own file");
+        use std::collections::BTreeMap;
 
-        let scan = scan_bare_tests_reading_the_tier(&source);
+        // Canonicalized once, before the walk: `rust_sources_under` builds its
+        // paths from this root, so a `..` left unresolved would make every
+        // `strip_prefix` below miss and degrade the label into an absolute path
+        // — readable, but unstable across machines and fatal to the anchors.
+        let crates_root = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
+            .expect("the guard must be able to resolve the crates/ root");
+        let files = crate::source_guard::rust_sources_under(&crates_root);
+
+        let mut per_file: BTreeMap<String, usize> = BTreeMap::new();
+        let mut scan = TierScan::default();
+        for path in &files {
+            let label = path
+                .strip_prefix(&crates_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                panic!("the guard must be able to read {}: {e}", path.display())
+            });
+            let file_scan = scan_bare_tests_reading_the_tier(&label, &source);
+            per_file.insert(label, file_scan.tests_seen);
+            scan.absorb(file_scan);
+        }
 
         // A scan that silently read nothing is indistinguishable from a clean
-        // tree (class mika#2205). On a single file a drifted path surfaces here
-        // first.
+        // tree (class mika#2205). On a workspace walk the item count alone no
+        // longer says that — a root drifted to `crates/mika-agent` would still
+        // show thousands of items — so the two files this guard's history is
+        // made of are named, each with its own floor, and a global floor sits
+        // behind them as a second line.
+        for (anchor, floor) in [
+            ("mika-common/src/home.rs", 40usize),
+            ("mika-agent/src/well_known_agents.rs", 40usize),
+        ] {
+            let seen = per_file.get(anchor).copied();
+            let sample: Vec<&str> = per_file.keys().take(5).map(String::as_str).collect();
+            assert!(
+                seen.is_some_and(|n| n >= floor),
+                "the guard saw {} test items in `{anchor}` (floor {floor}) while walking {} — \
+                 it is not reading what it thinks it is. Walk root: {}. First paths seen: {sample:?}. \
+                 FIX: repair the root, or — if the file was renamed or split — update this anchor \
+                 to the file that now carries those tests. NOT a fix: lowering the floor or \
+                 dropping the anchor; a walk that does not reach these two attests nothing.",
+                seen.map_or("no".to_string(), |n| n.to_string()),
+                files.len(),
+                crates_root.display()
+            );
+        }
         assert!(
-            scan.tests_seen >= 40,
-            "the guard saw only {} test items in {} — it is not reading the file \
-             it thinks it is. Its green means nothing until this number is \
-             plausible.",
+            files.len() >= 400 && scan.tests_seen >= 4000,
+            "the guard walked {} file(s) for {} test items under {} — far under the workspace \
+             it is meant to cover, so the root is pointing at a subtree. Its green means \
+             nothing until these numbers are plausible.",
+            files.len(),
             scan.tests_seen,
-            this_file.display()
+            crates_root.display()
         );
 
         // The item count cannot see the *other* way this walk fails: a body that
@@ -2553,8 +2630,11 @@ mod tests {
              in parallel with the serial tests that set and unset that variable, so \
              this test can read `family` on a run where it asserted the default \
              persona — intermittently, on a PR that touched none of this code.\n\
-             FIX: call the `_with_tier` variant and pass the tier the test assumes \
-             (`bootstrap_with_tier(&home, AgentTier::Default)`).\n\
+             FIX: call the `_with_tier` variant and pass the tier the test assumes — \
+             `bootstrap_with_tier(&home, AgentTier::Default)`, \
+             `bootstrap_agent_with_tier(home, name, AgentTier::Default)`, or \
+             `bootstrap_fresh_install_with_tier(home, AgentTier::Default)`, \
+             whichever the offending line above calls.\n\
              NOT a fix: adding `#[serial]` (it serializes the whole suite for a \
              defect that has a structural correction, and AC1 rules it out). \
              NOT a fix: adding an allowlist entry — there is no allowlist, and \
@@ -2568,13 +2648,17 @@ mod tests {
     /// green is verified by nothing. Written against **fabricated** lines and a
     /// fabricated source, never by editing real source.
     ///
-    /// Three of the shapes below do not occur in the file actually scanned
-    /// (`home.rs` has zero tokio tests, no keyed `#[serial(…)]`, and no
-    /// `#[serial_test::serial]` in attribute position — only the `use` at the
-    /// head of this module). This control is therefore their **sole**
-    /// attestation, which is exactly why it cannot be trimmed. The same holds
-    /// for the desync self-check's two failure arms, which a well-formed file
-    /// never reaches.
+    /// **One** of the shapes below does not occur anywhere the guard actually
+    /// walks: the keyed `#[serial(…)]`, whose only four occurrences in the tree
+    /// are in this control's own fabricated source. This control is therefore
+    /// its **sole** attestation, which is exactly why it cannot be trimmed. The
+    /// two others used to be in that case and no longer are — since mika#2471
+    /// widened the scan to `crates/`, `#[tokio::test…]` (~2 000 items) and
+    /// `#[serial_test::serial]` in attribute position (~32, including the two
+    /// `MIKA_AGENT_TIER` setters of `mika-agent`) are traversed on real,
+    /// rustfmt-formatted source on every run. The same sole-attestation status
+    /// still holds for the desync self-check's two failure arms, which a
+    /// well-formed file never reaches.
     #[test]
     fn mika2073_the_guard_fires_on_a_relapse() {
         // The forbidden call tokens are recomposed with `concat!` rather than
@@ -2728,7 +2812,7 @@ still inside the literal"#;
 }}
 "##
         );
-        let scan = scan_bare_tests_reading_the_tier(&fabricated);
+        let scan = scan_bare_tests_reading_the_tier("fabricated.rs", &fabricated);
         assert!(
             scan.desyncs.is_empty(),
             "the walk must stay in sync on the fabricated source:\n{}",
@@ -2794,7 +2878,7 @@ mod tests {
     fn a_test_that_never_closes() {
         let _ = 1;
 "#;
-        let scan = scan_bare_tests_reading_the_tier(desynced);
+        let scan = scan_bare_tests_reading_the_tier("fabricated.rs", desynced);
         assert_eq!(
             scan.desyncs.len(),
             2,
