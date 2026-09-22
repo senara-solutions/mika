@@ -167,6 +167,48 @@ path_is_within() {
 }
 
 # ---------------------------------------------------------------------------
+# Redirections — jamais des arguments du verbe (mika#2449, QA block[ac] AC6).
+#
+# `git merge --ff-only origin/main 2>&1` portait `2>&1` dans les arguments du
+# verbe, et le bras pull|merge le lisait comme une REF hors allow-list → refus
+# de trois synchronisations légitimes de mika-dev. Une redirection n'est pas
+# un argument de git : elle est retirée AVANT tout prédicat. Un opérateur nu
+# (`2>`, `>`, `<`, `>>`) consomme aussi le jeton suivant, sa cible.
+# ---------------------------------------------------------------------------
+token_is_redirection() {
+	case $1 in
+	[0-9]'>' | [0-9]'>>' | '>' | '>>' | '<' | '<<' | '<<<' | '&>' | '&>>' ) return 0 ;;
+	[0-9]'>'* | [0-9]'<'* | '>'* | '<'* | '&>'*) return 0 ;;
+	esac
+	return 1
+}
+
+# Opérateur SANS cible attachée : le jeton suivant est la cible.
+token_is_bare_redirection() {
+	case $1 in
+	[0-9]'>' | [0-9]'>>' | '>' | '>>' | '<' | '<<' | '<<<' | '&>' | '&>>' | [0-9]'<') return 0 ;;
+	esac
+	return 1
+}
+
+# strip_redirections <args…> → imprime les arguments restants, un par ligne.
+strip_redirections() {
+	local skip_next=0 tok
+	for tok in "$@"; do
+		if [ "$skip_next" = 1 ]; then
+			skip_next=0
+			continue
+		fi
+		if token_is_bare_redirection "$tok"; then
+			skip_next=1
+			continue
+		fi
+		token_is_redirection "$tok" && continue
+		printf '%s\n' "$tok"
+	done
+}
+
+# ---------------------------------------------------------------------------
 # ALLOW-LIST DE LECTURE, PAS DENY-LIST DE MUTATION — et c'est la mesure qui
 # tranche. Une deny-list bâtie sur les mécanismes que le ticket nomme
 # (`checkout`, `reset`) aurait manqué l'occurrence 3 (`git add`) et
@@ -683,6 +725,17 @@ decide_command() {
 
 		# `git --version`, `git` nu : aucun verbe, rien à muter.
 		[ -n "$verb" ] || continue
+
+		# Les redirections sortent des arguments du verbe (voir
+		# strip_redirections) — pour les DEUX modes, avant tout prédicat.
+		if [ "${#verb_args[@]}" -gt 0 ]; then
+			local -a clean_args=()
+			local ca
+			while IFS= read -r ca; do
+				clean_args+=("$ca")
+			done < <(strip_redirections "${verb_args[@]}")
+			verb_args=("${clean_args[@]+"${clean_args[@]}"}")
+		fi
 
 		# Le cwd du segment, après un éventuel `-C`.
 		local base=$sim_cwd
