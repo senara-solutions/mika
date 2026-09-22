@@ -62,6 +62,12 @@ décisions portent la forme (plan `docs/plans/2026-09-22-001-fix-2470-…`) :
    en `pilot_in_flight`, refus nominal. Le churn reste parce qu'il remet l'âge
    du label à zéro : c'est le throttle qui espace les re-drives d'un ticket
    dont le pilote meurt vite (mika#1824 D3, budget mika#2020 inchangé).
+   **Rectifié en troisième passe (mika-arch, Option A) :** la marge est
+   temporelle, pas un invariant (9i est un `tokio::spawn`) ; et quand l'appel
+   direct n'a pas dispatché mais que le moteur tient déjà le ticket (parente
+   `pending` laissée par 9d/9a/9b), le churn est sauté — ses deux rôles sont
+   sans objet et son `labeled` ne produirait qu'une collision à l'étape 7 et un
+   tour LLM `Passthrough`. Ligne d'audit : `churn=skipped_in_flight`.
 
 Une ligne d'audit côté `auto_pull` dit ce qu'`auto_pull` a obtenu, jointurable
 au `ready_label_outcome` du handler par `trace_id` :

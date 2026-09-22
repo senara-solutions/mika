@@ -174,6 +174,30 @@ pas déplacer cette cadence. Il coûte, quand le canal est vivant, une ligne
 `ready_label_pilot_in_flight` par sauvetage — le prix d'un déclencheur
 redondant, et il est déjà nommé nominal.
 
+> **Rectification (2026-09-22, troisième passe mika-arch, session `2cee847f`,
+> Verdict: GROOMED — Option A).** La prémisse de sûreté ci-dessus — « le pgid
+> est écrit depuis plusieurs secondes » — est **fausse** : l'étape 9i est un
+> `tokio::spawn` (`skills/executor.rs`), le pgid est écrit par la tâche
+> détachée *après* le retour du handler ; dispatcher d'abord est une **marge
+> temporelle** (millisecondes de spawn contre secondes de trajet), pas un
+> invariant d'ordre — mesurée par S2, pas durcie ici (A4). Et sur une issue
+> non-`Dispatched` qui laisse une parente `pending` (9d slot occupé → différé ;
+> 9a/9b), le `labeled` du churn ne rencontre pas `pilot_in_flight` mais une
+> collision à l'étape 7 → `task_create_failed` → `Passthrough` → un tour LLM
+> dépensé sur un ticket que le moteur tient déjà, déterministe pour les
+> sauvetages 2..5 d'un tick (revue `/ce:review`, constats #1 et #3). **Nouvelle
+> forme de D3 : « dispatch direct d'abord, puis churn — sauf quand le moteur
+> tient déjà le ticket. »** Prédicat pur `churn_is_moot(action, engine_holds)`
+> = `!Dispatched && has_active_self_dev_task_for_issue(url)` ; quand il est
+> vrai : ligne d'audit écrite avec `churn=skipped_in_flight`, exclusion
+> `FILTER_IN_FLIGHT` au ledger, `continue` avant `rescued += 1`, **aucun point
+> de budget re-drive dépensé** (le ticket est dans la file du moteur, le filtre
+> 4a l'exclut au tick suivant). Sur `Dispatched`, le churn garde ses deux
+> rôles. Erreur de sonde → churn comme avant (fail-open vers l'ancienne forme).
+> Option B (churn inconditionnel + S2 nommée) rejetée par l'architecte : « on
+> ne budgète pas un gaspillage certain, on le supprime » (A2). Tests : T7 étendu
+> (garde entre dispatch et `gh_remove_label`), T8 (prédicat terme par terme).
+
 ### D4 — Un texte de marqueur synthétisé, et sa forme est celle de la gateway
 
 Le handler ne lit du texte que le préfixe `READY_LABEL_DISPATCH_MARKER` +
@@ -382,6 +406,11 @@ T1, T6, T7 inchangés.
 - [ ] Le commentaire « Option A — reuse the webhook pipeline » n'existe plus
       dans `auto_pull.rs`.
 - [ ] Sonde S1 écrite dans le corps de la PR avec sa requête et sa halte.
+- [ ] **(mika-arch troisième passe, Option A)** encadré daté § D3 présent ;
+      S2 aligné sur `FILTER_IN_FLIGHT` comme état nominal d'un sauvetage
+      différé ; la ligne d'audit porte `churn={churned|skipped_in_flight}` ;
+      AC1–AC4 inchangés (le succès primaire reste
+      `stuck_ready_direct_dispatch after_value=dispatched`).
 - [ ] Suivi (fusion de la copie `dispatcher.rs:3861`) ouvert ou nommé dans la PR.
 - [x] **(mika-arch F1)** Encadré de rectification daté dans le corps de
       mika#2470 sous § Attendu **et** commentaire d'avis d'édition posté
@@ -491,13 +520,17 @@ puis un `ready_label_pilot_in_flight` (session webhook). **Halte :** deux
 s'est fermée moins vite que prévu ; **mesurer** l'écart entre `created_at` des
 deux avant d'ouvrir quoi que ce soit.
 
-**Branche non-`Dispatched` (revue de code, constat #3) :** quand la ligne
-`stuck_ready_direct_dispatch` d'un ticket dit `handled` avec une parente
-`pending` (slot occupé → différé), le `labeled` du churn revient en
-`ready_label_outcome gate=task_create_failed` (session webhook) puis un tour
-LLM `Passthrough` — **attendu, pas une anomalie**, tant que la ratification
-de la troisième passe mika-arch (gating du churn, option A/B) n'a pas atterri.
-Ne pas lire ce `task_create_failed` comme un défaut du filet.
+**Branche non-`Dispatched` (Option A, ratifiée) :** quand la ligne
+`stuck_ready_direct_dispatch` d'un ticket dit `handled` avec
+`churn=skipped_in_flight` (slot occupé → différé, parente `pending`), l'état
+**nominal** est : aucun `unlabeled`/`labeled` sur le ticket dans ce tick, une
+ligne `stuck_ready_churn_skipped_in_flight` (INFO) et l'exclusion
+`in_flight_self_dev` au ledger. **Halte :** un `ready_label_outcome
+gate=task_create_failed` (session webhook) qui suit une ligne `handled` du
+même tick → le churn a tourné alors que le moteur tenait le ticket ; lire le
+`churn=` de la ligne d'audit avant d'ouvrir quoi que ce soit. Un `pending`
+qui stagne au-delà de la promotion différée est l'anomalie que S2 remonte —
+pas un bruit à budgéter.
 
 ### S3 — Le budget ne s'est pas déplacé (R7)
 
@@ -570,6 +603,10 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
   → ROUTÉ à mika-arch en choix forcé (option A : sauter le churn quand le
   moteur tient déjà le ticket ; option B : churn inconditionnel + S2 nommée),
   session `2cee847f`, non construit avant ratification.
+- 2026-09-22 — v6, troisième passe mika-arch (session `2cee847f`, **Verdict:
+  GROOMED — Option A**) : churn gaté sur `churn_is_moot` ; encadré daté § D3 ;
+  S2 réécrite (nominal = `skipped_in_flight` + `in_flight_self_dev`) ; case
+  DoD ajoutée ; T7 étendu, T8 ajouté. Marge temporelle de (a) laissée à S2 (A4).
 - 2026-09-22 — v1, /ce:plan par orchestrator-CC, avant première passe mika-arch.
 - 2026-09-22 — v3, seconde passe mika-arch : **Verdict: GROOMED** (même session,
   kimi-k3). F1/F2/F3 RESOLVED, aucun constat nouveau. Précision non bloquante

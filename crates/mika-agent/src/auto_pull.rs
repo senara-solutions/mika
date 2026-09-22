@@ -3618,6 +3618,23 @@ fn direct_dispatch_action_label(action: &VerdictAction) -> &'static str {
     }
 }
 
+/// mika#2470 (third-pass mika-arch, Option A) — is the remove→add churn moot
+/// for this rescue?
+///
+/// The churn has two roles: reset the label age (the mika#1824 D3 throttle)
+/// and act as a redundant trigger. Both are pointless when the direct call did
+/// **not** dispatch and yet the engine already holds the ticket — a `pending`
+/// parent left by 9d (slot taken → deferred wrapper) or 9a/9b (tool missing):
+/// filter 4a excludes such a ticket next tick, so the age reset throttles
+/// nothing, and the churn's `labeled` can only collide at the handler's step 7
+/// (`task_create_failed` → `Passthrough` → one LLM turn spent on a ticket the
+/// engine has already queued). On `Dispatched` the churn keeps both roles.
+///
+/// Pure so it can be pinned without the network the rescue loop needs.
+fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
+    !matches!(action, VerdictAction::Dispatched { .. }) && engine_holds_ticket
+}
+
 /// mika#2470 — dispatch a rescued ticket by a **direct, in-process** call of the
 /// ready-label handler. The webhook channel may be dead: nothing here depends
 /// on it.
@@ -4076,6 +4093,34 @@ async fn phase2_reconcile_stuck_ready(
             VerdictAction::Dispatched { task_id, .. } => task_id.as_str(),
             _ => "none",
         };
+        // Option A (third-pass mika-arch on the groom session): when the direct
+        // call did not dispatch but the engine now holds the ticket (a
+        // `pending`/`in_progress` parent left by 9a/9b/9d), the churn is moot —
+        // see [`churn_is_moot`]. A probe error reads as "not held", so the churn
+        // runs as it did before Option A: here a skipped churn would be the
+        // costlier silence.
+        let engine_holds_ticket = if matches!(action, VerdictAction::Dispatched { .. }) {
+            false
+        } else {
+            let issue_url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+            match db.has_active_self_dev_task_for_issue(&issue_url).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        issue = n,
+                        "auto_pull: post-dispatch in-flight probe failed; churning as before"
+                    );
+                    false
+                }
+            }
+        };
+        let churn_moot = churn_is_moot(&action, engine_holds_ticket);
+        let churn = if churn_moot {
+            "skipped_in_flight"
+        } else {
+            "churned"
+        };
         if let Err(e) = db
             .log_audit_event(
                 session_id,
@@ -4084,7 +4129,7 @@ async fn phase2_reconcile_stuck_ready(
                 None,
                 Some(action_label),
                 Some(&format!(
-                    "issue={n} action={action_label} task_id={task_id}"
+                    "issue={n} action={action_label} task_id={task_id} churn={churn}"
                 )),
                 Some(trace_id),
             )
@@ -4095,6 +4140,19 @@ async fn phase2_reconcile_stuck_ready(
                 issue = n,
                 "auto_pull: failed to write stuck_ready_direct_dispatch audit event"
             );
+        }
+        if churn_moot {
+            // The engine already queued this ticket: no age to reset, nothing
+            // for a redundant trigger to do but collide. Counted as an attempt,
+            // never as a rescue, and no re-drive budget point is spent — the
+            // ticket sits in the engine's deferred queue, not in the loop's.
+            info!(
+                issue = n,
+                direct_dispatch = action_label,
+                "stuck_ready_churn_skipped_in_flight"
+            );
+            ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_IN_FLIGHT);
+            continue;
         }
 
         if let Err(e) = gh_remove_label(label_auth, n, "ready").await {
@@ -5667,6 +5725,47 @@ This ticket has been GROOMED and is ready.
             !body.contains("rescued >= MAX_STUCK_RESCUE_PER_TICK"),
             "the cap must not be re-keyed on churn successes"
         );
+
+        // Option A (third-pass mika-arch): the churn is guarded by
+        // `churn_is_moot` between the dispatch and the label removal.
+        let guard = body
+            .find("if churn_moot {")
+            .expect("the churn must be guarded by churn_is_moot (mika#2470 Option A)");
+        assert!(
+            dispatch < guard && guard < churn,
+            "mika#2470 Option A VIOLATED: the churn_is_moot guard must sit between \
+             the direct dispatch and gh_remove_label"
+        );
+    }
+
+    /// T8 — Option A's predicate, pure (third-pass mika-arch): the churn is
+    /// moot only when the direct call did **not** dispatch **and** the engine
+    /// holds the ticket. Term by term, so neutralising either does not pass.
+    #[test]
+    fn mika2470_churn_is_moot_only_when_not_dispatched_and_held() {
+        let dispatched = VerdictAction::Dispatched {
+            pre_digest: String::new(),
+            task_id: "t".to_string(),
+        };
+        let handled = VerdictAction::Handled {
+            pre_digest: String::new(),
+        };
+        let passthrough = VerdictAction::Passthrough { enrichment: None };
+
+        // The moot case: deferred at 9d (Handled) or 9a/9b, parent pending.
+        assert!(churn_is_moot(&handled, true));
+        assert!(churn_is_moot(&passthrough, true));
+        // Contrôles négatifs, terme par terme.
+        assert!(
+            !churn_is_moot(&dispatched, true),
+            "Dispatched keeps the churn"
+        );
+        assert!(!churn_is_moot(&dispatched, false));
+        assert!(
+            !churn_is_moot(&handled, false),
+            "a refusal that left no task (2b–4c) still churns: age reset applies"
+        );
+        assert!(!churn_is_moot(&passthrough, false));
     }
 
     const GROOMED_BODY: &str = r#"> - **Branch:** `feat/123/x`
