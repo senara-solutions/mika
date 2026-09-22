@@ -1019,9 +1019,13 @@ author for GitHub to read in the ADR-008 sense and no
 `resolve_periodic_scan_label_token`. `PeriodicScan` gained a variant, so
 `mika2334_every_scan_variant_is_covered` fails to compile until the guards enumerate it.
 
-**SOLE WRITER** of the `worktree_reaped` audit `tool_name`, pinned by a source scan —
-that is what makes `SELECT … WHERE tool_name = 'worktree_reaped'` the exact list of
-worktrees the loop removed, i.e. the ticket's guard-rail 3. Refusals are written under
+**SOLE WRITER** of both audit `tool_name`s — `worktree_reaped` (`armed`, an effective
+removal) and `worktree_reap_would_dispose` (`observe`, the population that *would* be
+removed — mika#2469) — pinned by the same two-needle source scan. That is what makes
+`SELECT … WHERE tool_name = 'worktree_reaped'` the exact list of worktrees the loop
+removed, i.e. the ticket's guard-rail 3: since mika#2469 the name is reserved to the
+removal, and `outcome_for(disposition)` is the one site the log event and the audit
+`tool_name` both read, so the two surfaces cannot diverge. Refusals are written under
 `worktree_reap_skipped`, keyed `worktree:<path>@<motif>` and **deduplicated on 24 h**
 (mika#2131): a dirty worktree of a merged PR would otherwise write a row every ten
 minutes, and a motif *change* rewrites because it is a state change.

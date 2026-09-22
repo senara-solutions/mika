@@ -74,7 +74,7 @@
 //! | levier | effet | quand |
 //! |---|---|---|
 //! | `MIKA_WORKTREE_REAP=0` | **annule la row récurrente** | au démarrage, désactivation durable |
-//! | `MIKA_WORKTREE_REAP_DISPOSITION=observe` | le scan mesure et journalise, **ne supprime rien** | validation d'une nouvelle machine |
+//! | `MIKA_WORKTREE_REAP_DISPOSITION=observe` | le scan mesure et journalise, **ne supprime rien** — écrit `worktree_reap_would_dispose`, jamais `worktree_reaped` (mika#2469) | validation d'une nouvelle machine |
 //! | le fichier sentinelle de [`crate::auto_pull_stop::WORKTREE_REAP_SCAN`] | court-circuite le tick | **pendant un incident, à chaud** |
 //!
 //! Le troisième est lu par [`crate::auto_pull_stop`], déjà paramétré par nom de
@@ -279,7 +279,8 @@ const DEFAULT_REPO_DIR: &str = "/data/workspace/mika-platform/mika";
 /// Le scan supprime-t-il, ou se contente-t-il de mesurer ?
 ///
 /// Patron de mika#2249 : *la détection est inconditionnelle, seule la
-/// disposition est gardée*. En observation, les lignes d'audit sont écrites avec
+/// disposition est gardée*. En observation, les lignes d'audit sont écrites sous
+/// [`WOULD_DISPOSE_TOOL`] (jamais [`REAPED_TOOL`], mika#2469) avec
 /// `disposition: "observe"`, ce qui donne à l'opérateur la population exacte qui
 /// *serait* supprimée, avant de l'armer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
