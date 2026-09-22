@@ -10,8 +10,9 @@ doctrine du lint par propriété), mika#2201 (« on déclare, on n'allowliste pa
 
 ## 1. Ce que la lecture du code déplace dans le ticket
 
-C'est le premier livrable : **quatre mesures** changent la sévérité, le périmètre
-et l'ordre des deux moitiés. Prises à HEAD `2b5456cc`.
+C'est le premier livrable : **cinq mesures** changent la sévérité, le périmètre,
+l'ordre des deux moitiés — et, pour la dernière, la viabilité même du garde.
+Prises à HEAD `367be118`.
 
 ### M1 — la prémisse « latent » est fausse, et elle l'est pour la moitié du périmètre
 
@@ -98,24 +99,79 @@ assertions restent vertes. La partie B du ticket n'est pas de l'hygiène qui sui
 la partie A — c'est le seul livrable qui empêche la partie A de se défaire au
 prochain déplacement de chemin.
 
+### M5 — la troncature évidente rend le garde inerte sur 87 % de sa cible, et l'arbre porte déjà la réfutation écrite
+
+Un garde qui scanne ce périmètre **doit** écarter les régions de test : les tests
+assertent précisément sur ces tokens (`FORBIDDEN_FAMILY_TIER_TOKENS`,
+`builtin_handlers.rs:4585-4586`, contient littéralement `MIKA_BRAVE_API_KEY` et
+`config.toml`). C'est la différence avec le garde modèle, qui scanne `crates/`
+entier parce qu'une panique UTF-8 est un défaut dans un test aussi.
+
+L'écriture évidente de cette troncature — couper à la première occurrence de
+`#[cfg(test)]` — **est fausse sur le fichier principal du périmètre**, et
+d'une manière qui ne se voit pas :
+
+- `builtin_handlers.rs:601-603` porte une paire `#[cfg(not(test))]` /
+  `#[cfg(test)]` sur `PROGRESS_TICKER_INTERVAL` ;
+- le module de test réel commence à `:4493`.
+
+Couper à la première occurrence laisse donc **3 891 lignes de code de production
+hors scan** — `run_gh`, `run_gws`, les six `cmd.env("GH_TOKEN", …)`, le
+diagnostic GWS — pendant que le garde sort `0` et se lit comme « périmètre
+propre ». Seul `map_substrate_error` (`:356`) resterait couvert, par accident de
+position.
+
+**Le dépôt a déjà rencontré cette trappe et l'a écrite.**
+`mika2118_probe_runs_only_on_auth_error` (`:6643`) porte, mot pour mot :
+
+> *Split on the test MODULE, not on the first `#[cfg(test)]`: this file carries a
+> `#[cfg(test)]` / `#[cfg(not(test))]` pair on `PROGRESS_TICKER_INTERVAL` around
+> line 590, so the naive split truncates production at that point and the scan
+> reads an empty set — **green for the wrong reason**.*
+
+Et il porte le remède complet, à reprendre tel quel : le split sur
+`"\n#[cfg(test)]\nmod tests {"`, **plus une assertion de bonne foi** sur la
+tranche obtenue (`production.contains("async fn run_gws(")`) — sans quoi un
+déplacement futur du marqueur rendrait le scan vide en silence, ce qui est le
+défaut d'un cran plus haut.
+
+Cette mesure est la raison pour laquelle §3.4 impose un **contrôle négatif de
+troncature** : un littéral fuyant posé *après* la ligne 602 doit faire rougir le
+garde. C'est le seul cas du harnais dont l'échec signifie « le garde ne regarde
+pas où il croit regarder » plutôt que « une règle est trop étroite ».
+
 ---
 
 ## 2. Inventaire de la population (partie A)
 
 Périmètre déclaré : `crates/mika-agent/src/skills/builtin_handlers.rs` et
-`crates/mika-agent/src/tools/*.rs`, **code de production seulement** (troncature
-à la première occurrence de `#[cfg(test)]`, l'idiome du dépôt).
+`crates/mika-agent/src/tools/*.rs`, **code de production seulement** — troncature
+sur le **module** de test, jamais sur la première occurrence de `#[cfg(test)]`
+(M5 ; l'écriture évidente rend le scan vide sur ce fichier précis).
 
 ### 2.1 — Violations à convertir
+
+Neuf sites, **et trois d'entre eux ne sont pas dans la liste du ticket** : les
+candidats qu'il nomme sont aux trois quarts déjà traités (M2), pendant que la
+population réelle contient des sites qu'il ne mentionne pas.
 
 | site | ce que le LLM lit aujourd'hui | atteignable famille ? |
 |---|---|---|
 | `builtin_handlers.rs:307` + `map_substrate_error` `(404, …)` | « Ask the operator to set `MIKA_SEARCH_UPSTREAM` on mika-gateway (and the matching upstream key, e.g. `MIKA_BRAVE_API_KEY`…) » | **oui** — skill `web-search` |
 | idem, `(502, "unauthorized")` | « Ask the operator to rotate `MIKA_BRAVE_API_KEY` on mika-gateway. » | **oui** |
 | `pr_merge_with_gate.rs:164-167` | « GitHub token required for `pr_merge_with_gate`. Set `MIKA_GITHUB_TOKEN` or configure a GitHub App. » | **oui** — builtin tool, cf. M1 |
-| `pr_merge_with_gate.rs:1568 classify_credential_scope_error` | « install the mika GitHub App on `{repo}` with Contents + Pull requests write permission, or grant the configured PAT the `repo` scope » | **oui** — sérialisé dans le JSON `MergeGateResult` servi en `content` |
+| `pr_merge_with_gate.rs:1572 classify_credential_scope_error` | « install the mika GitHub App on `{repo}` with Contents + Pull requests write permission, or grant the configured PAT the `repo` scope » | **oui** — sérialisé dans le JSON `MergeGateResult` servi en `content` |
+| **`pr_merge_with_gate.rs:1303-1311`** — branche `BehindMainRemediation::Failed \| Contradiction` | « the fix is to install the mika GitHub App on it with Contents + Pull requests write permission, or to grant the configured PAT the `repo` scope » | **oui** — **absent de l'inventaire du ticket ; même texte que `:1572`, autre fonction** |
+| **`send_message.rs:186-187`** | « No outbound sender configured — message was NOT delivered. **To enable Telegram delivery, set `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`.** » | **oui** — builtin, cf. §2.4 pour la contrainte mika#2136 |
+| **`builtin_handlers.rs:2812-2816`** — garde d'action destructive (mika#1646) | « If tool-call persistence is disabled (`MIKA_STORE_TOOL_CALLS=false`), this gate cannot observe your read… Surface to the operator rather than retrying. » | **oui** — chaîne `extra` concaténée au refus servi au modèle |
 | `resolve_issue_order.rs:219` | `"warning": "No GitHub token configured — returning issues in input order…"` | **oui** — builtin tool |
 | `check_task.rs:273` / `:294` | « GitHub PR status: not available (no token configured) » | **oui** — `check_task` est un builtin |
+
+**Trois constructeurs distincts dans cette seule table** — `ToolOutput::error`,
+`ToolOutput::success` (`resolve_issue_order`) et `ToolOutput::delivery`
+(`send_message`). C'est la confirmation empirique de la décision de §3.3 : une
+règle ancrée sur `ToolOutput::error(` — la lettre de l'AC — ne verrait que la
+moitié de sa propre population.
 
 ### 2.2 — Déjà conformes, à ne pas toucher
 
@@ -126,25 +182,45 @@ passent par `substrate_unavailable` + `dispatch_substrate_diagnostic`.
 ### 2.3 — Hors population, et il faut le dire plutôt que le découvrir
 
 Des littéraux portent un token substrat **sans jamais atteindre le LLM** :
-`cmd.env("GH_TOKEN", token)` (`:1817`, `:2554`, `:3277`, `pr_merge_with_gate.rs:1359`),
-`GWS_BLOCKED_FLAGS` (`:3402`), les clés de `set_config`, et — cas central — le
-**second argument** de `substrate_unavailable`, dont nommer la surface opérateur
-est la raison d'être (`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC:3926` nomme
-`XDG_CONFIG_HOME`, correctement).
+`cmd.env("GH_TOKEN", token)` (`:1817`, `:2554`, `:3277`,
+`pr_merge_with_gate.rs:1359`), la liste de scrub `:3283`, `GWS_BLOCKED_FLAGS`
+(`:3402`), les clés de `set_config`, le `tracing::warn!` du garde de flag de
+revue (`:3025`, qui nomme `MIKA_STORE_TOOL_CALLS` **au journal**, pas au modèle
+— à distinguer de son voisin `:2813`, qui est servi et figure donc en §2.1), et
+— cas central — le **second argument** de `substrate_unavailable`, dont nommer la
+surface opérateur est la raison d'être (`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC:3929`
+nomme `XDG_CONFIG_HOME`, correctement ; idem les quatre diagnostics déjà
+conformes de §2.2, `:227`, `:240`, `:449`, `:463`).
 
 **Un lint qui accuserait le diagnostic accuserait le mécanisme qu'il promeut.**
 Ce cas décide la forme de l'annotation en §3.3.
 
-### 2.4 — Deux jugements à poser à l'implémentation, non tranchés ici
+**Volume mesuré, plutôt que prescrit.** Le motif de la règle 2 appliqué au
+périmètre de production, **lignes de commentaire exclues** (§3.3), rend
+**≈ 21 sites** : 9 conversions (§2.1) et ≈ 12 annotations. Sous la halte de §4,
+mais de peu — et uniquement grâce à l'exclusion des commentaires, sans laquelle
+le chiffre double. La mesure est à refaire au premier run du garde ; c'est son
+résultat, pas celui-ci, qui décide.
 
-- `send_message.rs:186` « No outbound sender configured — message was NOT
-  delivered. » : nomme un état du substrat mais **aucune variable, aucun chemin,
-  aucune instruction opérateur**, et le tour a besoin du fait pour ne pas
-  prétendre avoir livré (mika#2136). Position par défaut : **hors population**,
-  annoté.
-- `get_documentation` « Run the `mika` CLI once to generate it. » : instruction
-  opérateur sans token. Position par défaut : **hors population**, annoté.
-  Trancher l'inverse est admissible ; le trancher **en silence** ne l'est pas.
+### 2.4 — Un jugement à poser, et un site qui n'en est plus un
+
+- **`send_message.rs:186-187` n'est pas un jugement ouvert : c'est une fuite**,
+  et elle passe en §2.1. La lecture qui la classait « hors population » ne portait
+  que sur la première phrase ; la seconde dit « To enable Telegram delivery, set
+  `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN` » — deux variables et une
+  instruction opérateur.
+  **Contrainte de conversion, et elle est stricte.** Le `content` doit conserver
+  le fait de non-livraison : le tour en a besoin pour ne pas prétendre avoir
+  livré (mika#2136), et `DeliveryOutcome::NoSender` ainsi que le `cleaned` capturé
+  ne bougent pas — le `DeliveryVerdict` compare des textes par égalité. Seule la
+  seconde phrase part au diagnostic. C'est le seul site du périmètre où le repli
+  neutre a une obligation **positive** de contenu.
+- `get_documentation` (`builtin_handlers.rs:166`) « Run the `mika` CLI once to
+  generate it. » : instruction opérateur **sans aucun token**, donc le motif de
+  la règle 2 ne l'accuse pas et aucune annotation n'a de prise sur lui. Le
+  trancher est un jugement de doctrine sans effet sur le garde. Position par
+  défaut : **hors population**. Trancher l'inverse est admissible ; le trancher
+  **en silence** ne l'est pas.
 
 ---
 
@@ -181,14 +257,18 @@ Le lint de couplage du ticket devient alors une règle de site unique — plus
 simple, plus forte, et dans l'idiome maison (`grooming_marker` mika#2158,
 `sink_dir` mika#2267, `auto_pull_stop` mika#2329).
 
-### 3.2 — U2 : conversion des six sites de §2.1
+### 3.2 — U2 : conversion des neuf sites de §2.1
 
 Forme, pour chacun : le `content` devient un repli neutre — *aucun nom de
 service, aucune variable, aucun chemin, aucune URL, aucune instruction
 opérateur* — et le texte actuel devient le diagnostic, **intégralement** : il ne
 perd rien, il change de canal.
 
-Deux points de conception :
+**Une exception à cette forme, et une seule** : `send_message` (§2.4), dont le
+repli a une obligation *positive* — conserver le fait de non-livraison. Partout
+ailleurs le repli dit que la capacité est indisponible et rien de plus.
+
+Quatre points de conception :
 
 - **`map_substrate_error` rend une `String` et n'a pas de `ctx`.** Sa signature
   devient `fn substrate_error_message(status, label) -> (String, String)`
@@ -200,6 +280,18 @@ Deux points de conception :
   reste, son `detail` devient le repli neutre, et l'actuel part au diagnostic.
   La variante et son nom de fil ne bougent pas : mika#1616 les a posés pour que
   le modèle puisse brancher, et rien ici n'est un changement de taxonomie.
+- **`pr_merge_with_gate:1303-1311` n'a pas de `ctx` non plus** — c'est une
+  fonction de remédiation qui compose une `String` rendue plus haut. Même
+  traitement que `map_substrate_error` : elle rend le couple, l'appelant route.
+  Son texte est le jumeau de celui de `:1572` et le rester est souhaitable ;
+  les deux gagnent à partager une constante nommée (§3.3 décision 3).
+- **`builtin_handlers.rs:2812-2816` est un garde, pas un handler de substrat.**
+  Son `extra` explique au modèle pourquoi un refus est irréparable, et la
+  variable n'est là que pour lui dire « remonte à l'opérateur ». Le repli neutre
+  doit conserver cette conduite — *ce refus ne peut pas être levé en réessayant,
+  remonte-le* — et céder au diagnostic la seule cause technique. Ne pas le
+  convertir en « capacité indisponible » : il n'y a pas de capacité absente, il
+  y a une garde qui ne peut pas conclure.
 
 Registre du repli : **opérateur par défaut** (`Deployment`/`PersonaProfile` ne
 sont pas des entrées ici). Deux registres à la mika#2290 seraient une extension
@@ -244,6 +336,37 @@ Un seul préfixe fusionnerait « c'est protégé par le mécanisme » et « ce n
 pas dans le sujet », et rendrait la première population incomptable le jour où
 elle mérite un audit.
 
+**Trois décisions de mécanique que la doctrine seule ne donne pas.** Chacune est
+la différence entre un garde qui mord et un garde décoratif.
+
+1. **La troncature porte sur le module de test, jamais sur le premier
+   `#[cfg(test)]`** (M5). Split sur `"\n#[cfg(test)]\nmod tests {"`, **plus une
+   assertion de bonne foi** sur la tranche obtenue — le garde vérifie qu'elle
+   contient encore un marqueur de production connu (`async fn run_gws(`) et
+   **échoue bruyamment** si le marqueur a bougé. Un scan qui ne trouve plus sa
+   cible doit rougir, jamais sortir vert sur l'ensemble vide. Reprise mot pour
+   mot du motif déjà posé par `mika2118_probe_runs_only_on_auth_error`.
+
+2. **Les lignes de commentaire sont exclues du scan** (premier caractère non
+   blanc `//`, ce qui couvre `///` et `//!`). Sans cette exclusion le garde
+   accuse des dizaines de doc-comments — citer une variable d'environnement dans
+   la documentation est le style maison, et le `CLAUDE.md` en est fait. Coût
+   nommé : **nul sur le sujet**, un commentaire n'atteignant jamais le `content`
+   servi au LLM. C'est cette exclusion, et elle seule, qui maintient le volume
+   d'annotations sous la halte de §4 (§2.3).
+
+3. **L'annotation porte sur une fenêtre, pas sur une ligne — et c'est une
+   contrainte du langage, pas un confort.** Les littéraux fautifs sont des
+   `format!` multi-lignes dont les lignes de continuation se terminent par `\`
+   (`pr_merge_with_gate.rs:1309`, `builtin_handlers.rs:367-369`) : **y écrire un
+   `//` mettrait le commentaire à l'intérieur de la chaîne**. Une annotation
+   exempte donc les lignes suivantes jusqu'à une borne courte (≈ 12), et cette
+   borne est testée **dans les deux sens** par le harnais — une annotation qui
+   couvrirait un littéral trente lignes plus bas serait un trou silencieux dans
+   le garde. Le gabarit à privilégier reste celui de
+   `GWS_CREDENTIALS_ABSENT_DIAGNOSTIC` : hisser le texte en constante nommée et
+   annoter sa déclaration, ce qui rend la fenêtre courte par construction.
+
 **Bornes, dites plutôt que découvertes.** Le garde couvre
 `builtin_handlers.rs` + `tools/*.rs`. Il **ne couvre pas** `mika-gateway`,
 `mika-cli`, ni les `skills/bundled/**` — trois périmètres où un nom de variable
@@ -254,11 +377,24 @@ d'annotations ; ce n'est pas ce ticket.
 
 `scripts/test-check-substrate-leak.sh`, sur le modèle de
 `test-check-byte-slices.sh` : *« Delete the thing the test protects; confirm the
-test goes red. »* Un cas par règle, l'annotation dans les deux sens, et —
-obligatoire — **un contrôle négatif portant le littéral exact de M3**
-(`rotate MIKA_BRAVE_API_KEY on mika-gateway` posé dans une fonction séparée du
-constructeur). Si ce cas passe au vert, le garde ne couvre pas le défaut qui
-l'a fait naître, quelles que soient les autres règles.
+test goes red. »* Un cas par règle, plus **quatre contrôles négatifs
+obligatoires** — ce sont eux le livrable, les cas positifs ne prouvant que la
+syntaxe :
+
+- **N1 — le littéral exact de M3** (`rotate MIKA_BRAVE_API_KEY on mika-gateway`)
+  posé dans une fonction **séparée** du constructeur. S'il passe au vert, le
+  garde ne couvre pas le défaut qui l'a fait naître, quelles que soient les
+  autres règles.
+- **N2 — troncature (M5).** Un littéral fuyant posé **après** une paire
+  `#[cfg(not(test))]` / `#[cfg(test)]` placée en tête de fixture doit rougir.
+  C'est le seul cas dont l'échec signifie « le garde ne regarde pas où il croit
+  regarder » plutôt que « une règle est trop étroite ». Doublé de son miroir :
+  un littéral posé **dans** `mod tests` ne doit **pas** rougir.
+- **N3 — marqueur déplacé.** Une fixture sans `mod tests {` doit faire échouer le
+  garde **bruyamment**, jamais sortir 0 sur l'ensemble vide.
+- **N4 — portée de l'annotation.** Une annotation doit exempter la continuation
+  de chaîne qui la suit, et **ne pas** exempter un littéral situé au-delà de la
+  borne. Sans le second sens, la fenêtre est un trou qu'aucun test ne mesure.
 
 Job `substrate-leak-lint` dans `.github/workflows/ci.yml`, calqué sur
 `byte-slice-lint` (`ci.yml:177-187`) : deux étapes, le garde puis son harnais,
@@ -317,10 +453,14 @@ Deux mécanismes distincts, et la distinction est la moitié qui compte :
    aucune ne porte de ticket de suivi, et une assertion auto-nettoyante n'aurait
    rien à nettoyer.
 
-**Halte d'implémentation.** Si la mesure du volume d'annotations dépasse **25
-sites** sur le périmètre, ne pas annoter en masse : le motif est trop large, et
-un garde dont le coût d'entrée est cinquante annotations est un garde qu'on
-désarme. Resserrer le motif, re-mesurer, et écrire la mesure dans le script.
+**Halte d'implémentation.** Le volume est **mesuré à ≈ 21 sites** (§2.3), dont
+≈ 12 annotations — sous la borne, mais de peu, et seulement grâce à l'exclusion
+des lignes de commentaire (§3.3 décision 2). Si le premier run réel dépasse
+**25 sites**, ne pas annoter en masse : le motif est trop large, et un garde dont
+le coût d'entrée est cinquante annotations est un garde qu'on désarme. Resserrer
+le motif, re-mesurer, écrire la mesure dans le script. **Et si le premier run en
+rend beaucoup moins que 21, ne pas s'en réjouir : vérifier d'abord la troncature
+(M5), dont l'échec se présente exactement comme un périmètre propre.**
 
 **Si une violation de §2.1 se révèle non convertible** (contrainte non vue à la
 lecture), elle passe alors en (a) plein : entrée grep-visible nommant le site,
@@ -355,8 +495,11 @@ divergence est déclarée ici plutôt que découverte en revue :**
 - *« Rejects `ToolOutput::error(...)` calls with substrate-token strings »* — la
   règle 2 porte sur le **littéral**, pas sur le constructeur, ce qui couvre
   strictement plus : le défaut M3 (littéral dans une fonction séparée) et les
-  `ToolOutput::success` porteurs. Une règle ancrée sur `ToolOutput::error` ne
-  voit ni l'un ni l'autre. Justification complète en §3.3.
+  porteurs qui ne sont pas des `error`. **Ce n'est pas une précaution théorique :
+  l'inventaire de §2.1 compte trois constructeurs** — `error`, `success`
+  (`resolve_issue_order:219`) et `delivery` (`send_message:186`). Une règle
+  ancrée sur `ToolOutput::error(` raterait un tiers de sa propre population, et
+  le défaut fondateur avec. Justification complète en §3.3.
 - *« Rejects `substrate_unavailable(...)` calls without a same-function
   sibling »* — U1 rend le découplage inexprimable et la règle 1 tient le site
   unique. La classe est supprimée, pas détectée. Justification en §3.1.
@@ -378,12 +521,16 @@ divergence est déclarée ici plutôt que découverte en revue :**
   indistinguable de « le garde bloque tout ».
 - **V3 — `pr_merge_with_gate` sans token, tier `Family` :** `content` (JSON
   sérialisé compris) ne contient ni `MIKA_GITHUB_TOKEN` ni « GitHub App » ;
-  `audit_events` porte la ligne. Idem pour `resolve_issue_order` et `check_task`.
-- **V4 — le garde mord.** `bash scripts/test-check-substrate-leak.sh` passe, y
-  compris son contrôle négatif portant le littéral M3 dans une fonction séparée
-  du constructeur.
-- **V5 — l'arbre balayé est propre.** `bash scripts/check-substrate-leak.sh`
-  sort 0 sur `crates/mika-agent/src`.
+  `audit_events` porte la ligne. Idem pour `resolve_issue_order`, `check_task`,
+  et pour `send_message` — dont le `content` doit **conserver** le fait de
+  non-livraison tout en perdant les deux variables (§2.4).
+- **V4 — le garde mord.** `bash scripts/test-check-substrate-leak.sh` passe, ses
+  quatre contrôles négatifs N1–N4 compris (§3.4).
+- **V5 — l'arbre balayé est propre, et le garde regarde où il croit regarder.**
+  `bash scripts/check-substrate-leak.sh` sort 0 sur `crates/mika-agent/src`
+  — **et** ce zéro est qualifié : l'assertion de bonne foi passe, et retirer une
+  seule annotation d'un site de §2.3 fait rougir le garde. Un `0` non qualifié
+  est exactement ce que produirait la troncature naïve de M5.
 - **V6 —** `cargo test -p mika-agent`, `cargo clippy`, `cargo fmt --check`.
 
 **Sonde post-déploiement, et sa halte.** Sur 7 jours :
@@ -400,8 +547,11 @@ antérieur — classe mika#2340), et c'est le chemin qu'il faut établir d'abord
 
 ## 7. Definition of Done
 
-- U1 à U6 livrés ; les six sites de §2.1 convertis ; l'allowlist du garde vide.
+- U1 à U6 livrés ; les **neuf** sites de §2.1 convertis ; l'allowlist du garde
+  vide.
 - V1 à V6 verts ; le job `substrate-leak-lint` présent et passant en CI.
+- La troncature du garde porte sur le module de test et **échoue bruyamment**
+  quand son marqueur bouge (M5) — vérifié par N2 et N3.
 - `docs/skills.md` ne promet plus, il nomme.
 - Le corps de PR déclare les deux divergences de §5 et le changement de contrat
   de §3.5 (le texte opérateur reste lisible sur tier `Default`, après le repli
