@@ -295,7 +295,7 @@ pub fn classify_main_checkout(status_porcelain: Option<&str>) -> MainCheckoutSta
         format!("{:016x}", h.finish())
     };
     let truncated = file_count > MAIN_CHECKOUT_DIRTY_MAX_PATHS;
-    lines.truncate(MAIN_CHECKOUT_DIRTY_MAX_PATHS);
+    lines.truncate(MAIN_CHECKOUT_DIRTY_MAX_PATHS); // safe-byte-slice: Vec<String> element count, not a byte offset into a str
     MainCheckoutState::Dirty {
         file_count,
         files: lines,
