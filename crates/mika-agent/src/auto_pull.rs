@@ -3975,24 +3975,41 @@ async fn phase2_reconcile_stuck_ready(
     // two reasons: it resets the label-age timestamp, so a rescued ticket whose
     // pilot dies quickly self-throttles for a full threshold window (mika#1824
     // D3, the re-drive budget of mika#2020 keeps its cadence), and it is a
-    // redundant trigger on a live channel — where its `labeled` arrives after
-    // the pgid is written and gate 2c refuses it as `pilot_in_flight`, the
-    // nominal composition of the feeder and the webhook path.
+    // redundant trigger on a live channel.
     //
-    // Dispatching first is what makes that composition safe: the only
-    // dangerous window is a webhook `labeled` handled between the handler's
-    // step 7 (parent pre-created) and 9i (pgid recorded), where gate 2c sees no
-    // live pilot yet and step 6b would kill the newborn (mika#2335). With the
-    // churn after the dispatch, its `labeled` cannot arrive before two `gh`
-    // round trips plus the GitHub → gateway → agent hop.
+    // What the churn's `labeled` meets at the handler depends on what the
+    // direct call returned, and dispatching first is a **timing margin**, not
+    // an ordering invariant. On `Dispatched`, step 9i is a `tokio::spawn`
+    // (`skills/executor.rs`): the pgid is written by the detached task *after*
+    // the handler returns, so gate 2c can only refuse the churn's `labeled` as
+    // `pilot_in_flight` once that write has landed — normally milliseconds,
+    // against two `gh` round trips plus the GitHub → gateway → agent hop. A
+    // `labeled` that beats the write lands in the step 7 → 9i window where 2c
+    // sees no pilot and 6b would kill the newborn (mika#2335); probe S2 (two
+    // `gate=dispatched` within a minute) is what measures that margin. On a
+    // non-`Dispatched` outcome that left a `pending` parent behind (9d slot
+    // taken → deferred wrapper; 9a/9b tool missing), the churn's `labeled`
+    // passes 2c (no pgid) and 6b (pending is not superseded), collides at step
+    // 7 on the active-URL index and returns `Passthrough` — one LLM turn spent
+    // on a ticket the engine already holds. No second pilot, no kill (R3
+    // strictly holds); the cost is that turn, named in probe S2.
     //
-    // Capped at MAX_STUCK_RESCUE_PER_TICK; overflow waits for the next tick.
+    // Capped at MAX_STUCK_RESCUE_PER_TICK **attempts** — counted before the
+    // direct call, not on churn success: a `gh_remove_label` failure
+    // `continue`s below without touching `rescued`, and every attempt now runs
+    // the handler's full readiness chain (real GitHub calls, a spawn or a
+    // deferred wrapper), so a sustained label-write failure (the mika#2228 PAT
+    // class) must not turn the cap into "every candidate, every tick".
+    // Overflow waits for the next tick.
     let mut rescued = 0usize;
+    let mut attempted = 0usize;
     for &n in &selected {
-        if rescued >= MAX_STUCK_RESCUE_PER_TICK {
+        if attempted >= MAX_STUCK_RESCUE_PER_TICK {
             warn!(
                 cap = MAX_STUCK_RESCUE_PER_TICK,
-                deferred = selected.len() - rescued,
+                attempted,
+                rescued,
+                deferred = selected.len() - attempted,
                 "auto_pull: phase 2 rescue cap reached; deferring rest to next tick"
             );
             break;
@@ -4050,6 +4067,7 @@ async fn phase2_reconcile_stuck_ready(
         // line names the gate that decided; this line says what auto_pull got
         // back, under the tick's trace_id, so `SELECT after_value, count(*) …
         // GROUP BY 1` answers "how many rescues actually dispatched" (D5).
+        attempted += 1;
         let action =
             dispatch_rescued_ticket_in_process(db, ctx, issue, github_token, trace_id, session_id)
                 .await;
@@ -5627,6 +5645,27 @@ This ticket has been GROOMED and is ready.
             "mika#2470 D3 VIOLATED: the in-process dispatch must precede the \
              remove→add churn, or a live-channel `labeled` can land inside the \
              step 7 → 9i window and kill the newborn pilot (mika#2335)"
+        );
+
+        // The per-tick cap bounds **attempts**, counted before the direct call
+        // (review finding #2 on mika#2470): the cap check reads `attempted`
+        // and the increment sits before the dispatch, so a run of
+        // `gh_remove_label` failures cannot turn the cap into "every candidate".
+        let cap_check = body
+            .find("attempted >= MAX_STUCK_RESCUE_PER_TICK")
+            .expect("the rescue cap must count attempts, not churn successes");
+        let attempt_increment = body
+            .find("attempted += 1;")
+            .expect("each direct-dispatch attempt must be counted");
+        assert!(
+            cap_check < attempt_increment && attempt_increment < dispatch,
+            "mika#2470 cap VIOLATED: `attempted` must be checked at the top of \
+             the loop and incremented before dispatch_rescued_ticket_in_process, \
+             or a sustained label-write failure dispatches every candidate per tick"
+        );
+        assert!(
+            !body.contains("rescued >= MAX_STUCK_RESCUE_PER_TICK"),
+            "the cap must not be re-keyed on churn successes"
         );
     }
 

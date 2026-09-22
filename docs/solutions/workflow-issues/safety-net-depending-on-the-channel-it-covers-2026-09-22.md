@@ -113,3 +113,8 @@ il rougit si un diff futur remet le churn avant le dispatch.
 - `docs/solutions/workflow-issues/ready-label-dispatch-handler-regression-2026-04-27.md`
   — la première occurrence de « le label disparaît et rien ne part », côté
   prompt ; celle-ci est la même classe côté filet.
+- `docs/solutions/best-practices/a-rescue-mechanism-must-know-how-to-give-up-out-loud-2026-08-30.md`
+  (mika#1901) — le budget re-drive de cette même boucle ; il reste incrémenté
+  sur le churn réussi, pas sur `Dispatched`.
+- `docs/solutions/dev-loop/two-predicates-for-one-concept-livelock-2026-09-03.md`
+  (mika#2158) — le précédent de D1 : appeler, ne pas dupliquer.

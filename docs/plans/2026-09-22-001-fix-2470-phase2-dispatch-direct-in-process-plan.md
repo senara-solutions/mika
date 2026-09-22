@@ -491,6 +491,14 @@ puis un `ready_label_pilot_in_flight` (session webhook). **Halte :** deux
 s'est fermée moins vite que prévu ; **mesurer** l'écart entre `created_at` des
 deux avant d'ouvrir quoi que ce soit.
 
+**Branche non-`Dispatched` (revue de code, constat #3) :** quand la ligne
+`stuck_ready_direct_dispatch` d'un ticket dit `handled` avec une parente
+`pending` (slot occupé → différé), le `labeled` du churn revient en
+`ready_label_outcome gate=task_create_failed` (session webhook) puis un tour
+LLM `Passthrough` — **attendu, pas une anomalie**, tant que la ratification
+de la troisième passe mika-arch (gating du churn, option A/B) n'a pas atterri.
+Ne pas lire ce `task_create_failed` comme un défaut du filet.
+
 ### S3 — Le budget ne s'est pas déplacé (R7)
 
 Sur 48 h : `select issue_number, redrive_count from auto_pull_stats where
@@ -551,6 +559,17 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
   lignes réalignées ; D5/S1 corrigés `detail` → `reasoning` (seule colonne
   d'`audit_events` qui existe) ; mutation « fetcher retiré » précisée (T2+T3+T4
   rouges, T5 vert — T3/T4 passent aussi par l'étape 4 `fetch_issue`).
+- 2026-09-22 — v5, après `/ce:review` (7 relecteurs, « Ready with fixes », 3×P2) :
+  **#2** appliqué — le plafond `MAX_STUCK_RESCUE_PER_TICK` compte les
+  **tentatives** de dispatch (avant l'appel direct), plus les churns réussis ;
+  T7 étendu pour l'épingler. **#1/#3 (partie doc)** appliqué — le commentaire
+  de la boucle et le `CLAUDE.md` du crate disent « marge temporelle » (9i est
+  un `tokio::spawn`, le pgid est écrit après le retour du handler) et nomment
+  la branche non-`Dispatched` (`task_create_failed` → `Passthrough`). **#3/#1
+  (gating du churn sur l'issue de l'appel direct)** : modifie le dessin de D3
+  → ROUTÉ à mika-arch en choix forcé (option A : sauter le churn quand le
+  moteur tient déjà le ticket ; option B : churn inconditionnel + S2 nommée),
+  session `2cee847f`, non construit avant ratification.
 - 2026-09-22 — v1, /ce:plan par orchestrator-CC, avant première passe mika-arch.
 - 2026-09-22 — v3, seconde passe mika-arch : **Verdict: GROOMED** (même session,
   kimi-k3). F1/F2/F3 RESOLVED, aucun constat nouveau. Précision non bloquante
