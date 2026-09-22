@@ -69,11 +69,16 @@ toutes lettres : *« Nothing here prevents it — this is an instrument, not a
 guard. »* mika#2457 a livré la mesure (le record, daté) et a nommé la garde
 comme hors périmètre ; ce plan est cette garde.
 
-Le second mécanisme, nommé par le ticket : une édition du `config.toml`
-**après** le boot n'entre en service qu'au redémarrage
+Le second mécanisme est nommé par le corps du ticket dans sa définition même
+du défaut — *« le modèle effectif au runtime peut diverger du modèle attendu par
+le code (config figée au boot, **flip non rechargé à chaud** — cf.
+`feedback_agent_config_flip_needs_restart`) »* — et c'est cette parenthèse qui
+fait autorité pour D2 (R8–R9) : une édition du `config.toml` **après** le boot
+n'entre en service qu'au redémarrage
 (`feedback_agent_config_flip_needs_restart_read_model_in_turn_usage`). Le siège
 TUI affiche le disque ; `turn_usage.model` affiche le process ; rien ne signale
-l'écart entre les deux tant qu'un humain ne les compare pas.
+l'écart entre les deux tant qu'un humain ne les compare pas. Une garde qui ne
+verrait que D1 laisserait cette moitié de la classe silencieuse.
 
 ### Requirements
 
@@ -498,7 +503,7 @@ Zéro ligne D1 après restart ⇒ binaire antérieur au correctif (classe mika#2
 | Tests unitaires U1–U5 | aucune — hermétiques (tempdir, env nettoyé, états construits) | N/A |
 | Scan structurel U4 (un seul appel à `detect_config_change`) | **zéro** appel à HEAD `367be118` | **(a)** allowlist **vide** ; conduite au déclenchement écrite dans le doc-comment : retirer le second site, ne pas allowlister |
 | Scan mika#2457 (constructeur unique du record) | inchangé, allowlist vide | (a), rien à ajouter — U2 **appelle** le constructeur, il n'en crée pas |
-| **D1 / D2 en production** | **les trois agents de ce poste** : mika-arch et mika-qa en dérive, mika-dev en phase ; `MIKA_DISABLE_AGENT_PROVISIONING=1` | **Aucune exception.** Ces détecteurs ne font pas échouer un test ni un boot (KTD1) : ils rapportent, et rapporter cette population **est le livrable** — la même raison pour laquelle mika#2457 a refusé d'allowlister la divergence que sa route rend. Une allowlist ici serait la garde muette que mika#2328 a mesurée |
+| **D1 / D2 en production** | **les trois agents de ce poste** : mika-arch et mika-qa en dérive, mika-dev en phase ; `MIKA_DISABLE_AGENT_PROVISIONING=1` | **(a) Named allowlist exception — zéro entrée.** Ces détecteurs ne font pas échouer un test ni un boot (KTD1) : ils rapportent, et rapporter cette population **est le livrable** — la même raison pour laquelle mika#2457 a refusé d'allowlister la divergence que sa route rend. Une entrée d'allowlist ici serait la garde muette que mika#2328 a mesurée ; conduite au déclenchement : lire, ne pas filtrer (paragraphe ci-dessous) |
 
 **Conduite quand D1 tire à chaque boot sur les trois agents** : ce n'est pas
 du bruit à museler, c'est l'état de ce poste, lisible. La résolution appartient
