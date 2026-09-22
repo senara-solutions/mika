@@ -82,8 +82,10 @@ la Phase 2 tend au parkeur la timeline déjà lue pour l'âge.
 
 - **R1** — Un ticket que la Phase 2 décide de sauver est dispatché **par appel
   direct, in-process**, du handler ready-label — sans qu'aucun webhook n'ait à
-  revenir. Preuve : une ligne `tasks` (parente `self_dev`, `reference_url` de
-  l'issue) existe à la fin du tick, canal entrant mort ou vivant.
+  revenir. Preuve primaire : l'audit `stuck_ready_direct_dispatch
+  after_value=dispatched` (D5) ; conséquence topologique : une ligne `tasks`
+  (parente `self_dev`, `reference_url` de l'issue) existe à la fin du tick,
+  canal entrant mort ou vivant.
 - **R2** — Les quinze portes du handler s'appliquent au dispatch direct
   **inchangées** : pas de chemin « auto_pull » qui contourne live-pilot, siège,
   held, egress ou le slot par classe.
@@ -375,6 +377,16 @@ seul. Retirer le fetcher injecté (passer `fetch_issue_body_and_labels_via_gh`)
       dans `auto_pull.rs`.
 - [ ] Sonde S1 écrite dans le corps de la PR avec sa requête et sa halte.
 - [ ] Suivi (fusion de la copie `dispatcher.rs:3861`) ouvert ou nommé dans la PR.
+- [x] **(mika-arch F1)** Encadré de rectification daté dans le corps de
+      mika#2470 sous § Attendu **et** commentaire d'avis d'édition posté
+      (`issuecomment-5770350678`, 2026-09-22) — fait au groom, avant la seconde
+      passe.
+- [ ] **(mika-arch F2)** Callout canonique `> - **Branch:** fix/2470/p1-substrat-le-filet-auto-pull-phase-2`
+      (+ `**Plan:**`, `**Grooming history:**`) présent en tête du corps de mika#2470 **avant**
+      que le `ready` déjà posé puisse être consommé par un dispatcher — écrit
+      par `/mika-groom-ticket` Phase 5 étape 19 ; à vérifier par
+      `gh issue view 2470 --json body -q .body | grep -cF '**Branch:**'` ≥ 1.
+      Séquencement mika#844 : le callout précède le dispatch.
 
 ---
 
@@ -390,24 +402,37 @@ Le corps de mika#2470 n'a pas de section « Acceptance Criteria » ; son
 > (pour l'âge/idempotence), mais elle ne doit pas être le seul mécanisme de
 > déclenchement.
 
-- **AC1** — « dispatcher par appel DIRECT du handler in-process » : un ticket
-  sauvé produit une parente `self_dev` + (slot libre) un enfant callback avec
-  pgid, **sans webhook**. ← U2/U3, T2, S1.
+- **AC1** — « dispatcher par appel DIRECT du handler in-process » : pour un
+  ticket sauvé, **le succès primaire est la ligne d'audit**
+  `stuck_ready_direct_dispatch after_value=dispatched` (D5), jointurable par
+  `trace_id` à `ready_label_outcome gate=dispatched` — écrite **sans qu'aucun
+  webhook n'ait à revenir**. La parente `self_dev` (et, slot libre, l'enfant
+  callback avec pgid) en est la **conséquence topologique attendue**, pas le
+  porteur du succès : c'est ce que T2 observe jusqu'à l'étape 7, et ce que S1
+  compte en second. ← U2/U3, D5, T2, S1.
 - **AC2** — « l'équivalent de ce que `ready_label_handler` fait » : ce n'est
   pas un équivalent, c'est **le même code** — décision groom/dispatch, portes,
   slot et différé compris. ← D1, T3, T4, T5.
 - **AC3** — « la ré-écriture du label peut rester (pour l'âge/idempotence) » :
   le churn est conservé, après le dispatch, rôle documenté. ← D3, U3, T7.
 - **AC4** — « ne doit pas être le seul mécanisme de déclenchement » : sur canal
-  mort, S1 montre des `tasks` créées après `stuck_ready_reconciled` ; sur canal
-  vivant, S2 montre un seul dispatch et un `ready_label_pilot_in_flight`. ←
-  S1, S2.
+  mort, S1 montre un `stuck_ready_direct_dispatch after_value=dispatched` posé
+  dans le même tick (`trace_id`) qu'un `stuck_ready_reconciled` — et, en
+  conséquence, des `tasks` créées après lui ; sur canal vivant, S2 montre un
+  seul `ready_label_outcome gate=dispatched` (session `auto-pull-…`) suivi d'un
+  `ready_label_pilot_in_flight` (session webhook). ← S1, S2.
 
 **Rectification portée, et assumée :** le ticket dit « créer la tâche de
 groom/dispatch ». Le handler crée **deux** lignes (parente + enfant callback)
 et spawne — c'est la topologie d'un dispatch (`live_pilot.rs`, doc de module,
 tableau des deux rows). Le plan tient l'intention (une tâche existe, un pilote
 part), pas la lettre (« la » tâche).
+
+**Trace d'audit de la rectification (mika-arch F1, première passe) :** encadré
+daté « Rectification (2026-09-22, …) » ajouté au corps de mika#2470 sous
+§ Attendu (`gh issue edit`, 2026-09-22) ; commentaire d'avis d'édition posté
+(`mika#2470#issuecomment-5770350678`). Forme issue-as-versioned-contract :
+édition du corps + avis d'édition + annotation de clôture ici.
 
 ---
 
@@ -436,7 +461,8 @@ select count(*) from tasks
    and created_at >= '<ts du reconciled>';
 ```
 
-**Attendu :** `after_value = dispatched` **et** `count ≥ 1`. **Halte :**
+**Attendu :** `after_value = dispatched` (succès primaire, AC1) **puis**
+`count ≥ 1` (conséquence topologique). **Halte :**
 `after_value ∈ {handled, passthrough}` → joindre `ready_label_outcome` sur
 `trace_id`, lire la porte, ne **pas** conclure « réparé » avant d'avoir vu un
 `dispatched` (mémoire : *déployé ≠ efficace — voir le mécanisme faucher du
@@ -508,3 +534,12 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
 ## Revision history
 
 - 2026-09-22 — v1, /ce:plan par orchestrator-CC, avant première passe mika-arch.
+- 2026-09-22 — v2, après première passe mika-arch (ITERATE, session
+  `2cee847f-41fa-4a32-bffc-6cd9cc9b71fe`, kimi-k3) :
+  **F1** rectification tracée (encadré daté dans le corps + avis d'édition
+  `issuecomment-5770350678` + annotation § AC + case DoD) ;
+  **F2** case DoD « callout Branch/Plan/Grooming-history dans le corps avant
+  consommation du `ready` posé » ;
+  **F3** AC1/AC4 réécrits : succès primaire = `stuck_ready_direct_dispatch
+  after_value=dispatched` jointuré à `ready_label_outcome` par `trace_id` ; la
+  parente `self_dev` est la conséquence topologique ; S1 aligné.
