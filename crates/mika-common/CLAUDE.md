@@ -83,6 +83,71 @@ What the record closes is not a missing fact but an unreachable one. `llm_budget
 
 **The cascade is rebuilt, not recorded, and its order is inverted.** Making `load_for_agent` carry provenance would mean instrumenting config-rs for every key to serve two, on the load path of every agent and every binary. So this module redoes the resolution for these two keys only, reproducing the real order — `.env` per-agent > process env > per-agent `config.toml` > global `config.toml` > constant (mika#2218). A reconstruction assuming the usual file-below-env order would report a **false** provenance, which is strictly worse than none: it answers the one question the module exists to settle, with authority, and wrongly. `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position` pins the duplication by asserting the reconstructed value equals the merged one on all four positions — the day `config.rs` changes that order, it goes red instead of letting the provenance drift. Two further properties are load-bearing: a value living in the process environment is **never** reported `default` (`Settings::effective_llm_http_timeout_secs` falls back to `llm::http_timeout_secs()`, a second out-of-cascade read of the same variable — this reader consults the environment itself, so the two worlds stay separate), and `resolve` **never panics**, which is what lets `mika-agent`'s boot guard read a below-floor value and name the agent instead of aborting the process.
 
+**The guard mika#2328 said was missing (mika#2473).** The record above *measures*
+code↔runtime drift; it refuses nothing, and mika#2457 named the guard as its own
+follow-up. This is it, and it refuses nothing either — `declared_model` reads what
+a well-known agent's `config_toml` constant declares, `ModelDriftCheck::compare`
+compares it **purely** to the record, and `emit_model_drift` is the single emission
+site: WARN `well_known_model_drift` on a divergence, INFO `well_known_model_in_sync`
+in phase, and **nothing at all** for an agent that declares no model. That third
+arm is what separates *the guard is silent* from *the guard did not run* — the
+distinction the whole of mika#2205 exists to keep.
+
+The declared side is read **by the same key derivation as the resolved side**
+(`model_config_key`), never by a second table, for the reason this module already
+gives about its own reconstruction: a second reader is free to diverge, silently,
+with every assertion still green. It also trims `llm_provider` before parsing,
+exactly as `ModelProvenance::from_layers` does — a constant written one day with a
+stray space would otherwise be readable on one side and `unknown_provider` on the
+other, and the guard would cry drift on a correct configuration.
+
+Both comparing arms also carry `declared_model_is_provider_default` onto the line.
+The flag was computed by `declared_model` and read by nobody, which is how an
+unimplemented guarantee gets documented; on the event it is actionable —
+reconciling the constant means **writing** a model key when nothing declared one
+and **editing** one when something did, and on the in-sync arm it warns that the
+agreement rests on a provider default the provider can move without any file
+changing.
+
+`config_freshness.rs` is the second half, and it watches the file rather than the
+content: `note_config_at_boot` records the `config.toml` mtime where the record is
+resolved, `detect_config_change` compares it once per turn — one `stat`, one
+re-resolution per distinct mtime — and `report_config_change` says whether a
+restart is required.
+
+**`restart_required` answers "a value in service differs from the value on disk"**,
+which is narrower than "the record differs". The record also carries `*_source` and
+`*_raw` provenance, so a setting moved between cascade doors **at the same value**
+used to raise the loud arm and tell an operator to restart for a change a restart
+would not apply; the comparison therefore clears dating *and* provenance on both
+clones. And `restart_required = false` still does not mean nothing moved: the
+record carries no base URL and no `log_level`, so an edit to those lands in the
+benign arm and the message says so rather than claiming no effective field changed.
+
+**Nothing on this path panics, refuses, or shouts every turn** (KTD1 + mika#2131).
+The mtime is formatted by `format_config_mtime`, a fallible conversion with the
+named fallback `CONFIG_MTIME_UNREPRESENTABLE` — `DateTime::<Utc>::from(SystemTime)`
+ends in an `.unwrap()` and a filesystem stores instants outside chrono's range, so
+the first cut of this module could panic on a turn, and it wrote `reported` *before*
+converting, marking the drift reported and losing it for good. The global
+`BOOT_NOTES` mutex is taken twice and briefly, and **never across the `stat` or the
+re-resolution**: it is shared by every agent, so one slow `config.toml` would
+serialise every other agent's turn on the path every turn takes (the same
+drop-then-relock discipline `emit_llm_budget_resolved` uses on `LAST_EMITTED`).
+Releasing it opens a race between two turns of one agent, closed by re-checking
+`Reported::covers` under the second acquisition.
+
+An unreadable `stat` takes the turn **out** of the population and says so under its
+own name, `agent_config_mtime_unreadable` — **once on the onset and once on the
+recovery**, never once per turn: the readable path was deduplicated and this one
+consulted no state, so a deleted `config.toml` produced one WARN per turn for ever
+on an arm whose expected regime is zero. That bound lives in its own set and
+deliberately **not** in `BootNote::reported`, which carries the population
+semantics: the reading is never folded into the already-reported sentinel, and the
+type makes that collision unwritable (`reported` is an enum whose `covers()` takes
+a `SystemTime`, not an `Option`). Same rule, same reason, as mika#2277's unreadable
+liveness signal and mika#2328's `unknown_provider`.
+
 ## Typed Errors
 
 - `ClaudeApiError` enum with HTTP status-code retry (429/500/529); `BillingError` variant for non-retriable Anthropic HTTP 400 billing rejections (detected via `error.type == "invalid_request_error"` + message prefix, logs at `error!`, surfaces billing URL in error chain); `BodyRead` variant (mika#2331) for a body cut mid-stream

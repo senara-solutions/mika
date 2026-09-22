@@ -85,7 +85,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
 - `mika agents reprovision <name> [--tier <t>] [--identity-only] [--dry-run] [--yes]` — Re-apply an existing agent's authoritative `identity.toml` **and** `soul.md` (mika#2230). Both, because a tier has two axes since mika#2023 and the mika#1962 guard reads either. Differential, backs up what it overwrites in `0600`, refuses a template whose `[skills].allowlist` is absent or empty, and touches neither `config.toml` nor the DB. Runbook: `docs/operator/agent-identity-reprovision.md` § 7.
-- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
+- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. Depuis mika#2473 elle porte aussi une ligne `code` : ce que le **dépôt** déclare pour cet agent, et si le runtime en sert un autre. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
 - `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@samidarko/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
@@ -1071,6 +1071,58 @@ stat -c '%y  %n' ~/.mika/agents/mika-arch/config.toml    # ce que le disque PORT
   Ce livrable **mesure** la dérive code↔runtime ; il ne la refuse pas — la garde est le
   suivi que mika#2328 s'est écrit. Et aucun mécanisme de repli modèle n'est introduit :
   voir *Hors périmètre* du plan mika#2457 pour ses trois préconditions.
+
+**La garde annoncée ci-dessus est livrée, et elle ne refuse toujours rien (mika#2473).**
+Deux détecteurs, deux questions différentes, et aucun des deux ne couche la flotte.
+
+- **D1, au boot : ce que le dépôt déclare vs ce que la cascade a résolu.** À chaque
+  `init_agent`, spirit compare le couple `(provider, modèle)` de la constante
+  `config_toml` de l'agent bien connu à celui du record mika#2457, et émet **une**
+  ligne par agent et par init : `well_known_model_drift` (WARN) sur divergence,
+  `well_known_model_in_sync` (INFO) en phase, **rien** pour un agent qui ne déclare
+  aucun modèle. Ce troisième bras est ce qui sépare « la garde s'est tue » de « la
+  garde n'a pas tourné ». Le résultat est **gelé** sur `AgentState` et servi en
+  sibling du record sur `GET /api/v1/agents/{id}/budget`.
+- **D2, au tour : ce que le process sert vs ce que le disque porte maintenant.** Un
+  `stat` du `config.toml` par tour, une re-résolution par mtime distinct, et
+  `agent_config_changed_since_boot` — WARN avec `restart_required = true` quand un
+  champ du record a bougé, INFO sinon. **`restart_required = false` ne veut pas dire
+  « rien n'a changé »** : le record ne porte ni `openrouter_base_url`, ni `zai_base_url`,
+  ni `log_level`, donc une édition de ces clés y tombe, et le message le dit plutôt que
+  d'affirmer qu'aucun champ effectif n'a bougé. Un `stat` illisible **sort le tour de
+  la population** et le dit sous son propre nom, `agent_config_mtime_unreadable`.
+
+```bash
+# D1 — une ligne par agent bien connu, avant tout tour
+grep -E 'well_known_model_(drift|in_sync)' "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{agent_id, declared_model, runtime_model, runtime_model_source}'
+mika agents budget --agent mika-arch    # la ligne `code … — DÉRIVE …` est rendue
+
+# D2 — les deux contrôles, dans l'ordre
+touch ~/.mika/agents/mika-arch/config.toml && mika ask --agent mika-arch "ping"
+grep agent_config_changed_since_boot "$MIKA_SPIRIT_LOG_FILE" | tail -1 | jq .restart_required
+```
+
+**Attendu sur ce poste au 2026-09-22, et c'est une mesure, pas une prédiction :**
+mika-arch en **dérive** (`kimi-k2.5` au dépôt, `kimi-k3` sur disque depuis le 18/09),
+mika-qa en **dérive** (`zai/glm-5.2` au dépôt, `openrouter/z-ai/glm-5.2` depuis le
+19/09), mika-dev **en phase**. Le `touch` doit rendre `restart_required: false` ; une
+édition réelle du modèle, `true`.
+
+**Halte 1 — zéro ligne D1 après un restart.** Le binaire servi est antérieur au
+correctif (classe mika#2340) : établir le déploiement **avant** toute conclusion sur
+la dérive. Une garde qu'on n'a pas déployée se lit exactement comme une flotte saine.
+**Halte 2 — D1 tire sur les trois agents à chaque boot.** Ce n'est pas du bruit à
+museler : c'est l'état de ce poste, rendu lisible, et `MIKA_DISABLE_AGENT_PROVISIONING=1`
+est ce qui le gèle là. La résolution appartient à la réconciliation modèle +
+calibration (mika#1190), jamais à un filtre ni à un `#[ignore]`.
+**Halte 3 — la dérive persiste après une correction du `config.toml` sans redémarrage.**
+C'est le contrat, pas un défaut : le record est figé au boot, et D2 est précisément ce
+qui rend cet écart décidable au lieu de le laisser deviner.
+
+**Le côté déclaré est celui du BINAIRE servi**, pas du checkout : un `mika-spirit` en
+retard sur `main` déclare la constante d'hier et rapportera une dérive qui n'existe
+que dans son propre passé (`feedback_binary_staleness_vs_main`).
 
 `mika ask --model` atteint enfin l'exécutant, et `--verbose` cesse de répondre à sa place (mika#2304) :
 - **Le défaut, et il est plus large que le ticket ne le dit.** Le ticket vise

@@ -117,7 +117,18 @@ async fn budget(name: &str, format: &OutputFormat, out: &mut impl Write) -> Resu
             .json::<serde_json::Value>()
             .await
             .ok()
-            .and_then(|v| serde_json::from_value::<BudgetRecord>(v["budget"].clone()).ok())
+            .and_then(|v| {
+                let mut record =
+                    serde_json::from_value::<BudgetRecord>(v["budget"].clone()).ok()?;
+                // The drift is a **sibling** of the record, not a field of it
+                // (KTD3), and it is read tolerantly: absent (a spirit predating
+                // mika#2473) or unreadable (a shape this mirror does not know)
+                // both give `None`, which renders as its own sentence rather
+                // than failing the whole attestation over a second opinion.
+                record.model_drift =
+                    serde_json::from_value::<ModelDrift>(v["model_drift"].clone()).ok();
+                Some(record)
+            })
             .ok_or(UnattestedCause::Malformed),
     };
 
@@ -159,7 +170,73 @@ struct BudgetRecord {
     model_source: String,
     model_config_key: String,
     resolved_at: String,
+    /// The mika#2473 sibling, carried on the record so one value feeds all
+    /// three renders. `None` is *"this server did not evaluate it"* — never
+    /// *"in phase"*; see [`render_drift_line`].
+    #[serde(default)]
+    model_drift: Option<ModelDrift>,
 }
+
+/// The code↔runtime drift as mika-spirit establishes it at `init_agent`
+/// (mika#2473).
+///
+/// A local mirror of `mika_common::llm::ModelDriftCheck` rather than an import,
+/// for the reason [`BudgetRecord`] gives above: this CLI may be talking to a
+/// spirit of another version, so neither an unknown field nor an unknown
+/// `status` word may fail the render. Hence `status: String` rather than an
+/// enum, and every arm-specific field an `Option` — the wire form is
+/// internally tagged, and each arm carries only what it honestly knows.
+///
+/// `runtime_provider_source` is the one field of the wire's `drift` arm still
+/// deliberately unmirrored: this surface prints no provider *door*, and a mirror
+/// field nobody reads is a second place for the two shapes to diverge.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ModelDrift {
+    /// `in_sync` / `drift` / `not_applicable` — or a word a newer spirit knows
+    /// and this binary does not.
+    status: String,
+    /// The provider `well_known_agents.rs` selects. Absent on `not_applicable`.
+    declared_provider: Option<String>,
+    /// The model `well_known_agents.rs` declares. Absent on `not_applicable`.
+    declared_model: Option<String>,
+    /// The provider in force. Present on `drift` only.
+    runtime_provider: Option<String>,
+    /// The model actually served. Present on `drift` only.
+    runtime_model: Option<String>,
+    /// The door that model came through. Present on `drift` only — and
+    /// **absent on `in_sync` by design**: on that arm the runtime values equal
+    /// the declared ones and the emitter has no honest source for a door, so
+    /// the enum does not carry one.
+    runtime_model_source: Option<String>,
+    /// The `config.toml` key an operator would edit to resolve the drift
+    /// (`zai_model`, `openrouter_model`, …). Present on `drift` only.
+    ///
+    /// Mirrored since mika#2473 P2 #6. It exists on the wire and reached
+    /// neither the text render nor this struct, so it reached neither JSON nor
+    /// YAML — and it is the one field that says *what to edit*, which is the
+    /// actionable half of a drift line.
+    ///
+    /// `Some("")` is a state and not an absence: the emitter empties it exactly
+    /// when the runtime provider is unreadable, because there is then no model
+    /// key to name. [`render_drift_line`] suppresses the clause on both, for
+    /// the same reason — naming a plausible key there would be a false
+    /// provenance.
+    model_config_key: Option<String>,
+}
+
+/// What a `drift` field a newer spirit did not send is rendered as.
+///
+/// Version skew inside an arm: printing an empty string there would read as
+/// "no model", which is not what is known.
+const DRIFT_FIELD_ABSENT: &str = "(non transmis)";
+
+/// What the drift line prints when the runtime model is the empty string.
+///
+/// Distinct from [`DRIFT_FIELD_ABSENT`], which means "this server did not
+/// send the field". An empty model is a field the server DID send, carrying
+/// the `unknown_provider` shape: the provider line was unreadable, so no
+/// model could be resolved. Two different facts, two different sentences.
+const DRIFT_MODEL_UNRESOLVED: &str = "(non résolu — provider illisible)";
 
 /// mika#2328's sixth provenance word: a door carried an `llm_provider` the
 /// reader cannot parse, so the model key's *name* is unknown.
@@ -196,6 +273,7 @@ fn render_budget_text(record: &BudgetRecord, out: &mut impl Write) -> Result<()>
             record.model, record.model_source, record.model_config_key
         )?;
     }
+    render_drift_line(record.model_drift.as_ref(), out)?;
     writeln!(
         out,
         "  plafond    {:<20} ({})",
@@ -229,6 +307,122 @@ fn render_budget_text(record: &BudgetRecord, out: &mut impl Write) -> Result<()>
             "  ⚠ dernière tentative nominale inatteignable (mika#2362)"
         }
     )?;
+    Ok(())
+}
+
+/// The mika#2473 `code` line: what the repo declares, and whether the runtime
+/// serves it — read directly under the `model` line it qualifies.
+///
+/// # The absent key is a state, not an `in_sync`
+///
+/// A spirit predating mika#2473 answers `{budget}` with no `model_drift`. A
+/// render that folded that silence into « en phase » would attest a
+/// comparison nobody ran — mika#2457's *not attested* population, one field
+/// over — so it gets its own sentence, and so does a `status` word this binary
+/// does not know.
+///
+/// # `in_sync` promises no door
+///
+/// The `InSync` arm of `ModelDriftCheck` carries only the declared pair: there
+/// the runtime values equal the declared ones by definition and the emitter has
+/// no honest source for the `*_source` fields. This line therefore names no
+/// provenance on that arm — inventing one would be the false provenance
+/// `budget_provenance.rs` refuses in so many words.
+fn render_drift_line(drift: Option<&ModelDrift>, out: &mut impl Write) -> Result<()> {
+    let Some(drift) = drift else {
+        return Ok(writeln!(
+            out,
+            "  code       (dérive non évaluée par ce serveur — binaire antérieur à mika#2473)"
+        )?);
+    };
+    let declared = || {
+        drift
+            .declared_model
+            .as_deref()
+            .unwrap_or(DRIFT_FIELD_ABSENT)
+            .to_string()
+    };
+    match drift.status.as_str() {
+        "not_applicable" => writeln!(
+            out,
+            "  code       (aucun modèle déclaré par le code pour cet agent)"
+        )?,
+        "in_sync" => writeln!(
+            out,
+            "  code       {:<20} (well_known_agents.rs) — en phase",
+            declared()
+        )?,
+        "drift" => {
+            // The provider is named only when it MOVED. `compare` returns
+            // `Drift` as soon as the provider OR the model differs, so a
+            // provider-only drift used to print « DÉRIVE : le runtime sert
+            // <la même chaîne de modèle> » — a contradiction with no visible
+            // cause. Reachable, not theoretical: mika-qa on this workstation is
+            // in provider drift (`zai` → `openrouter`) at the same model string.
+            // On a model-only drift the clause is omitted rather than printed
+            // with two identical values, which would read as a second change.
+            let providers_moved = match (
+                drift.declared_provider.as_deref(),
+                drift.runtime_provider.as_deref(),
+            ) {
+                (Some(declared), Some(runtime)) => declared != runtime,
+                // A newer spirit that sent one side and not the other: say the
+                // little that is known rather than assert agreement.
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            let provider_clause = if providers_moved {
+                format!(
+                    ", fournisseur {} → {}",
+                    drift
+                        .declared_provider
+                        .as_deref()
+                        .unwrap_or(DRIFT_FIELD_ABSENT),
+                    drift
+                        .runtime_provider
+                        .as_deref()
+                        .unwrap_or(DRIFT_FIELD_ABSENT)
+                )
+            } else {
+                String::new()
+            };
+            // Suppressed on an empty key — the documented `unknown_provider`
+            // shape, where there is no model key and naming one would be a
+            // false provenance. `runtime_model_source` already says which line
+            // to look at there.
+            let key_clause = match drift.model_config_key.as_deref() {
+                Some(key) if !key.is_empty() => format!(", clé: {key}"),
+                _ => String::new(),
+            };
+            // An EMPTY runtime model is the `unknown_provider` shape, not an
+            // absent field: the record carries `model: ""` when the provider
+            // itself could not be read. `unwrap_or` only fires on `None`, so
+            // without this the line renders "le runtime sert  (unknown_provider)"
+            // with a hole where the model should be. The `model` line just above
+            // already says this properly; this says it the same way.
+            let runtime_model = match drift.runtime_model.as_deref() {
+                None => DRIFT_FIELD_ABSENT,
+                Some("") => DRIFT_MODEL_UNRESOLVED,
+                Some(model) => model,
+            };
+            writeln!(
+                out,
+                "  code       {:<20} (well_known_agents.rs) — DÉRIVE : le runtime sert {} ({}{}{})",
+                declared(),
+                runtime_model,
+                drift
+                    .runtime_model_source
+                    .as_deref()
+                    .unwrap_or(DRIFT_FIELD_ABSENT),
+                provider_clause,
+                key_clause
+            )?
+        }
+        other => writeln!(
+            out,
+            "  code       (état de dérive « {other} » inconnu de ce CLI — spirit plus récent que ce binaire)"
+        )?,
+    }
     Ok(())
 }
 
@@ -1309,6 +1503,10 @@ mod budget_tests {
             model_source: "agent_config".to_string(),
             model_config_key: "openrouter_model".to_string(),
             resolved_at: "2026-09-21T06:12:44Z".to_string(),
+            // The mika#2473 default is the honest one: a sample says nothing
+            // about the drift until a test sets it, and "nothing said" renders
+            // as *non évaluée*, never as *en phase*.
+            model_drift: None,
         }
     }
 
@@ -1629,6 +1827,465 @@ mod budget_tests {
             files.iter().any(|p| p.ends_with("commands/agents.rs")),
             "le scan doit voir le fichier qui porte la commande"
         );
+    }
+
+    /// The `code` line of a render — the mika#2473 surface, isolated.
+    fn code_line(text: &str) -> String {
+        text.lines()
+            .find(|l| l.trim_start().starts_with("code "))
+            .unwrap_or_else(|| panic!("aucune ligne `code` dans :\n{text}"))
+            .to_string()
+    }
+
+    fn drift_of(status: &str) -> ModelDrift {
+        ModelDrift {
+            status: status.to_string(),
+            declared_provider: Some("openrouter".to_string()),
+            declared_model: Some("moonshotai/kimi-k2.5".to_string()),
+            runtime_provider: None,
+            runtime_model: None,
+            runtime_model_source: None,
+            model_config_key: None,
+        }
+    }
+
+    /// mika#2473 U5 — the render carries the four states the guard can be in,
+    /// and the fourth is never folded into the second.
+    ///
+    /// The state this test exists for is the **absent key**: a spirit predating
+    /// mika#2473 answers `{budget}` with no `model_drift`, and rendering that
+    /// silence as *en phase* would attest a comparison nobody ran — mika#2457's
+    /// *not attested* population, one field over. Hence the negative control at
+    /// the end: the words *en phase* may appear on the `in_sync` render and
+    /// nowhere else, which is the only assertion that makes the four states
+    /// distinguishable rather than merely present.
+    #[test]
+    fn mika2473_the_render_carries_the_four_drift_states() {
+        // 1. `drift` — the declared model, the one actually served, AND the
+        //    door it came through. `process_env` rather than `agent_config` on
+        //    purpose: the sample already says `agent_config` five times, so
+        //    asserting that word would pass on a render that dropped the door.
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k3".to_string()),
+            runtime_model_source: Some("process_env".to_string()),
+            ..drift_of("drift")
+        });
+        let drift = render(&record);
+        let line = code_line(&drift);
+        assert!(
+            line.contains("moonshotai/kimi-k2.5"),
+            "le modèle déclaré par le dépôt doit être nommé : {line}"
+        );
+        assert!(
+            line.contains("moonshotai/kimi-k3"),
+            "le modèle réellement servi doit être nommé : {line}"
+        );
+        assert!(
+            line.contains("process_env"),
+            "la porte par laquelle le runtime a pris son modèle est la moitié \
+             actionnable : {line}"
+        );
+
+        // The `code` line reads under the `model` line it qualifies.
+        let order: Vec<&str> = drift
+            .lines()
+            .filter(|l| l.trim_start().starts_with("model ") || l.trim_start().starts_with("code "))
+            .collect();
+        assert_eq!(
+            order.len(),
+            2,
+            "une ligne `model` et une ligne `code`, pas plus : {drift}"
+        );
+        assert!(
+            order[0].trim_start().starts_with("model "),
+            "la ligne `code` suit la ligne `model` : {drift}"
+        );
+
+        // 2. `in_sync` — and no door promised, because the arm carries none.
+        let mut record = sample();
+        record.model_drift = Some(drift_of("in_sync"));
+        let in_sync = render(&record);
+        let line = code_line(&in_sync);
+        assert!(
+            line.contains("en phase") && line.contains("moonshotai/kimi-k2.5"),
+            "en phase, avec le modèle que le dépôt déclare : {line}"
+        );
+
+        // 3. `not_applicable` — nothing declared, so nothing to be out of phase
+        //    with. A distinct sentence, never a silent `in_sync`.
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            declared_provider: None,
+            declared_model: None,
+            ..drift_of("not_applicable")
+        });
+        let not_applicable = render(&record);
+        assert!(
+            code_line(&not_applicable).contains("aucun modèle déclaré"),
+            "un agent sans constante le dit : {not_applicable}"
+        );
+
+        // 4. Key absent — a spirit older than this fix. It did not evaluate;
+        //    it did not find agreement.
+        let mut record = sample();
+        record.model_drift = None;
+        let unevaluated = render(&record);
+        let line = code_line(&unevaluated);
+        assert!(
+            line.contains("non évaluée"),
+            "une clé absente est une garde qui n'a pas tourné : {line}"
+        );
+        assert!(
+            !line.contains("aucun modèle déclaré"),
+            "« pas évalué » et « rien de déclaré » sont deux états : {line}"
+        );
+
+        // NEGATIVE CONTROL — the whole point of the four states. If *en phase*
+        // can be printed about a runtime nobody compared, the other three
+        // renders are decoration.
+        for (etat, texte) in [
+            ("drift", &drift),
+            ("not_applicable", &not_applicable),
+            ("clé absente", &unevaluated),
+        ] {
+            assert!(
+                !texte.contains("en phase"),
+                "« en phase » n'appartient qu'à in_sync — il est apparu sur \
+                 l'état {etat} :\n{texte}"
+            );
+        }
+    }
+
+    /// **mika#2473 P2 #6** — une dérive de PROVIDER seul est lisible, et la
+    /// clé à éditer est nommée.
+    ///
+    /// `ModelDriftCheck::compare` rend `Drift` dès que le **provider** diffère,
+    /// modèle identique compris : `InSync` exige l'égalité des deux. Or le
+    /// rendu ne montrait aucun provider, donc cette dérive-là s'affichait
+    /// « DÉRIVE : le runtime sert <la même chaîne de modèle> » — une
+    /// contradiction sans cause visible. Ce n'est pas théorique : mika-qa, sur
+    /// ce poste, est en dérive de provider seul (`zai` → `openrouter`) avec
+    /// `glm-5.2` des deux côtés.
+    ///
+    /// Le second terme est `model_config_key` : la clé qu'un opérateur
+    /// éditerait. Elle existe sur le fil depuis la livraison et n'atteignait ni
+    /// le texte ni le miroir, donc ni JSON ni YAML.
+    #[test]
+    fn mika2473_a_provider_only_drift_names_the_provider_and_the_key() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            // Même modèle des deux côtés : seule la porte fournisseur a bougé.
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k2.5".to_string()),
+            runtime_model_source: Some("agent_config".to_string()),
+            model_config_key: Some("openrouter_model".to_string()),
+            declared_provider: Some("zai".to_string()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+
+        assert!(
+            line.contains("zai"),
+            "le provider DÉCLARÉ doit être nommé, sinon la dérive n'a pas de \
+             cause visible : {line}"
+        );
+        assert!(
+            line.contains("openrouter"),
+            "et le provider EN VIGUEUR aussi : {line}"
+        );
+        assert!(
+            line.contains("openrouter_model"),
+            "la clé qu'un opérateur éditerait est la moitié actionnable : {line}"
+        );
+        assert!(
+            !line.contains("en phase"),
+            "contrôle négatif : une dérive de provider reste une dérive : {line}"
+        );
+
+        // Contrôle négatif du provider : quand les deux providers coïncident,
+        // la ligne ne se met pas à annoncer un changement de fournisseur.
+        let mut same_provider = sample();
+        same_provider.model_drift = Some(ModelDrift {
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k3".to_string()),
+            runtime_model_source: Some("process_env".to_string()),
+            model_config_key: Some("openrouter_model".to_string()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&same_provider));
+        assert!(
+            !line.contains("fournisseur"),
+            "un modèle qui bouge sous le même provider ne doit pas annoncer un \
+             changement de fournisseur : {line}"
+        );
+        assert!(
+            line.contains("openrouter_model"),
+            "mais la clé reste nommée : {line}"
+        );
+    }
+
+    /// **mika#2473 P2 #6** — une clé vide n'est pas nommée.
+    ///
+    /// `model_config_key` est vide **exactement** quand le provider en vigueur
+    /// est illisible (forme `unknown_provider`) : il n'y a alors aucune clé
+    /// modèle à nommer, et en nommer une plausible serait une fausse
+    /// provenance — ce que `budget_provenance.rs` refuse en toutes lettres.
+    #[test]
+    fn mika2473_an_empty_config_key_is_not_named() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("un fournisseur illisible".to_string()),
+            runtime_model: Some(String::new()),
+            runtime_model_source: Some(MODEL_SOURCE_UNKNOWN_PROVIDER.to_string()),
+            model_config_key: Some(String::new()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+        assert!(
+            line.contains(MODEL_SOURCE_UNKNOWN_PROVIDER),
+            "le mot qui dit quelle ligne regarder est déjà là : {line}"
+        );
+        assert!(
+            !line.contains("clé:") && !line.contains("clé "),
+            "aucune clé n'est nommée quand il n'y en a pas : {line}"
+        );
+    }
+
+    /// **mika#2473 revue de code** — un modèle vide est DIT, jamais laissé en trou.
+    ///
+    /// La forme `unknown_provider` fait porter au record un `model` **vide** : le
+    /// provider était illisible, donc aucun modèle n'a pu être résolu. C'est un
+    /// champ que le serveur a bel et bien envoyé, à la différence d'un champ
+    /// absent — et `unwrap_or` ne se déclenche que sur `None`. Sans discriminant,
+    /// la ligne rendait « le runtime sert  (unknown_provider) », avec un blanc à
+    /// l'endroit exact où l'opérateur cherche la cause. La ligne `model` juste
+    /// au-dessus dit déjà ce cas correctement ; celle-ci le dit pareil.
+    ///
+    /// Contrôle négatif inclus : le mot réservé à un champ **absent** ne doit pas
+    /// apparaître ici, sans quoi les deux faits redeviendraient une seule phrase.
+    #[test]
+    fn mika2473_an_empty_runtime_model_is_named_not_left_blank() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("un fournisseur illisible".to_string()),
+            runtime_model: Some(String::new()),
+            runtime_model_source: Some(MODEL_SOURCE_UNKNOWN_PROVIDER.to_string()),
+            model_config_key: Some(String::new()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+        assert!(
+            line.contains(DRIFT_MODEL_UNRESOLVED),
+            "un modèle vide est nommé, pas laissé en blanc : {line}"
+        );
+        assert!(
+            !line.contains(DRIFT_FIELD_ABSENT),
+            "« non transmis » dit un champ ABSENT — le serveur a envoyé celui-ci, vide : {line}"
+        );
+        assert!(
+            !line.contains("sert  ("),
+            "le trou que ce test existe pour fermer : {line}"
+        );
+    }
+
+    /// **mika#2473 P2 #6** — la clé survit au trajet JSON et YAML.
+    ///
+    /// Le miroir est un miroir pour tolérer un spirit d'une autre version : un
+    /// champ ajouté au rendu texte mais pas au miroir n'atteindrait ni JSON ni
+    /// YAML, et les scripts qui branchent dessus liraient `null` sur un serveur
+    /// qui l'a pourtant servi.
+    #[test]
+    fn mika2473_the_config_key_survives_the_json_round_trip() {
+        let wire = serde_json::json!({
+            "status": "drift",
+            "declared_provider": "zai",
+            "declared_model": "glm-5.2",
+            "runtime_provider": "openrouter",
+            "runtime_model": "glm-5.2",
+            "runtime_model_source": "agent_config",
+            "runtime_provider_source": "agent_config",
+            "model_config_key": "openrouter_model",
+        });
+        let mirrored: ModelDrift =
+            serde_json::from_value(wire).expect("le miroir lit la forme du fil");
+        assert_eq!(
+            mirrored.model_config_key.as_deref(),
+            Some("openrouter_model"),
+            "la clé doit traverser la désérialisation du miroir"
+        );
+
+        let mut record = sample();
+        record.model_drift = Some(mirrored);
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            json["model_drift"]["model_config_key"], "openrouter_model",
+            "et ressortir en JSON : {json}"
+        );
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        let back: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            back["model_drift"]["model_config_key"], "openrouter_model",
+            "et en YAML — deux sérialiseurs sur une valeur : {yaml}"
+        );
+    }
+
+    /// mika#2473 U5 — a status word this CLI does not know is not *en phase*
+    /// either.
+    ///
+    /// The mirror below is a mirror precisely so a newer spirit can serve a
+    /// fifth arm without breaking this render (the reason `BudgetRecord` is one
+    /// too). A `match` whose catch-all fell through to the `in_sync` sentence
+    /// would turn that tolerance into the false green this unit exists to
+    /// close.
+    #[test]
+    fn mika2473_an_unknown_status_is_not_rendered_in_sync() {
+        let mut record = sample();
+        record.model_drift = Some(drift_of("recalibrating"));
+        let text = render(&record);
+        assert!(
+            !text.contains("en phase"),
+            "un mot inconnu n'est pas une mise en phase : {text}"
+        );
+        assert!(
+            code_line(&text).contains("recalibrating"),
+            "le mot reçu est dit, pour que l'opérateur sache quoi chercher : {text}"
+        );
+    }
+
+    /// mika#2473 U5 — the structured formats carry the sibling, not only the
+    /// text one.
+    ///
+    /// R7 names JSON **and** YAML; both are asserted here because they are two
+    /// serializers over one value, and a field reaching one and missing the
+    /// other is the shape `render_unattested` already keeps one payload to
+    /// avoid.
+    #[test]
+    fn mika2473_json_output_carries_model_drift() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k3".to_string()),
+            runtime_model_source: Some("process_env".to_string()),
+            ..drift_of("drift")
+        });
+
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["model_drift"]["status"], "drift", "{json}");
+        assert_eq!(json["model_drift"]["runtime_model"], "moonshotai/kimi-k3");
+        assert_eq!(json["model_drift"]["runtime_model_source"], "process_env");
+
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        let back: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back["model_drift"]["status"], "drift", "{yaml}");
+    }
+
+    /// mika#2473 U5 — the key is read off the **response**, tolerantly, and a
+    /// spirit that does not serve it is not rendered *en phase*.
+    ///
+    /// The two renders above start from a record built in the test. This one
+    /// starts from the wire, because the tolerance R7 asks for lives in
+    /// `budget()`'s read and nowhere else: `model_drift` is a sibling of
+    /// `budget`, not a field of it, so a reader that deserialized only
+    /// `v["budget"]` would produce `None` for **every** spirit — including the
+    /// ones that answer correctly — and the four states would collapse to one
+    /// that happens to be honest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2473_the_drift_is_read_off_the_response_beside_the_budget() {
+        use axum::{Router, routing::get};
+
+        let mut budget_json = serde_json::to_value(sample()).unwrap();
+        budget_json
+            .as_object_mut()
+            .unwrap()
+            .remove("model_drift")
+            .expect("le record d'échantillon porte le champ");
+
+        let served = budget_json.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/agents/moderne/budget",
+                get(move || {
+                    let body = serde_json::json!({
+                        "budget": served,
+                        "model_drift": {
+                            "status": "drift",
+                            "declared_provider": "openrouter",
+                            "declared_model": "moonshotai/kimi-k2.5",
+                            "runtime_provider": "openrouter",
+                            "runtime_model": "moonshotai/kimi-k3",
+                            "runtime_model_source": "process_env",
+                            "runtime_provider_source": "agent_config",
+                            "model_config_key": "openrouter_model",
+                        },
+                    });
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                // A spirit predating mika#2473: the budget, and no sibling.
+                "/api/v1/agents/ancien/budget",
+                get(move || {
+                    let body = serde_json::json!({ "budget": budget_json });
+                    async move { axum::Json(body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Safety: test-only env vars, serialized by `#[serial]`.
+        unsafe {
+            std::env::set_var("MIKA_SPIRIT_URL", format!("http://{addr}"));
+            std::env::set_var("MIKA_INTERNAL_TOKEN", "ab".repeat(32));
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        budget("moderne", &OutputFormat::Text, &mut out)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("moonshotai/kimi-k3") && text.contains("process_env"),
+            "la dérive servie à côté du record doit être rendue : {text}"
+        );
+        assert!(
+            !text.contains("en phase"),
+            "un runtime qui sert autre chose n'est pas en phase : {text}"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        budget("moderne", &OutputFormat::Json, &mut out)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["model_drift"]["status"], "drift", "{json}");
+
+        let mut out: Vec<u8> = Vec::new();
+        budget("ancien", &OutputFormat::Text, &mut out)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("non évaluée"),
+            "un spirit qui ne sert pas la clé n'a rien évalué : {text}"
+        );
+        assert!(
+            !text.contains("en phase"),
+            "et ne doit surtout pas passer pour « en phase » : {text}"
+        );
+
+        server.abort();
+        unsafe {
+            std::env::remove_var("MIKA_SPIRIT_URL");
+            std::env::remove_var("MIKA_INTERNAL_TOKEN");
+        }
     }
 }
 
