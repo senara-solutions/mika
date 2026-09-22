@@ -15,9 +15,12 @@
 //! So: one `stat` per turn, and **one** re-resolution per distinct mtime. The
 //! finding names both sides — what the disk says now, what the process serves —
 //! and says whether a restart would change anything. It never refuses a turn
-//! (KTD1), and it never hot-reloads: a detector that swapped the note for the
-//! disk's record would make the process report a value it has never loaded,
-//! which is mika#2304's defect one field over.
+//! (KTD1) — and *nothing on this path may panic either*, which is why the
+//! mtime is formatted by a fallible conversion with a named fallback rather
+//! than by `DateTime::<Utc>::from(SystemTime)`, whose `.unwrap()` dies on an
+//! instant a filesystem will happily store. It never hot-reloads: a detector
+//! that swapped the note for the disk's record would make the process report a
+//! value it has never loaded, which is mika#2304's defect one field over.
 //!
 //! # Why the mtime and not the content (KTD4)
 //!
@@ -27,7 +30,17 @@
 //! The cost of the false positive — a `touch` with no edit — is one INFO line
 //! saying exactly that, which is cheaper than the read it avoids.
 //!
-//! # `restart_required = false` is not "nothing changed"
+//! # `restart_required` answers "a value in service differs"
+//!
+//! Narrower than "the record differs", and the narrowing is the point.
+//! [`ResolvedBudgetRecord`] also carries `*_source` and `*_raw` — the cascade
+//! door a value came through and the string as written — and neither is a value
+//! the process serves. Comparing the whole record made a setting moved from the
+//! agent's `config.toml` to the global one **at the same value** raise the loud
+//! arm and tell an operator to restart for a change a restart would not apply.
+//! [`clear_dating_and_provenance`] neutralises them alongside `resolved_at`.
+//!
+//! # `restart_required = false` is still not "nothing changed"
 //!
 //! [`ResolvedBudgetRecord`] carries the budget and the model. It does **not**
 //! carry `openrouter_base_url`, `zai_base_url` or `log_level` — and an edit to
@@ -36,9 +49,19 @@
 //! *"no field of the budget/model record moved — another field of the file may
 //! still require a restart"*, never *"nothing effective moved"*: the second
 //! wording would leave an operator on the old endpoint while telling them all
-//! is well.
+//! is well. A door-only move lands there too, and that sentence is exactly true
+//! of it.
+//!
+//! # The unreadable `stat` is said twice, not every turn
+//!
+//! Its arm consulted no state and wrote none, so a `config.toml` deleted under a
+//! running spirit produced one WARN **per turn, for ever** — on the arm whose
+//! expected regime is zero, which is the churn mika#2131 bounds. It is now
+//! bounded to the onset and the recovery (see [`report_unreadable_stat`]), and
+//! the bound lives in its own set rather than in [`BootNote::reported`], which
+//! carries the population semantics and must stay exactly as documented.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
@@ -161,6 +184,11 @@ pub struct ConfigChangedSinceBoot {
     /// The file's new mtime — RFC 3339 UTC, the format
     /// [`ResolvedBudgetRecord::resolved_at`] uses, so the two are comparable by
     /// eye in a log.
+    ///
+    /// [`CONFIG_MTIME_UNREPRESENTABLE`] when the instant the filesystem returned
+    /// is outside chrono's range. The reading is **named**, never invented and
+    /// never fatal: this field is built by [`format_config_mtime`], which cannot
+    /// panic (KTD1), and the rest of the finding stands.
     pub config_mtime: String,
     /// The provider the file declares **now**.
     pub provider_on_disk: String,
@@ -191,79 +219,121 @@ pub struct ConfigChangedSinceBoot {
 ///    distinct mtime, not one per turn);
 /// 4. **the `stat` failed.** That takes the turn *out of the population*: it is
 ///    not a satisfied term. The reading is announced under its own name,
-///    `agent_config_mtime_unreadable` (expected regime: zero), and
-///    [`BootNote::reported`] is left **intact** — so the moment the file is
-///    readable again, the change is reported normally. See [`Reported`] for why
-///    the types make this the only possible reading.
+///    `agent_config_mtime_unreadable` (expected regime: zero) — **once on the
+///    onset and once on the recovery**, never once per turn (see
+///    [`report_unreadable_stat`]) — and [`BootNote::reported`] is left
+///    **intact**, so the moment the file is readable again, the change is
+///    reported normally. See [`Reported`] for why the types make this the only
+///    possible reading.
 ///
 /// Otherwise the cascade is re-resolved **from disk** through
 /// [`resolve_llm_budget_record`] — the single constructor of the record
 /// (mika#2457), called and not duplicated — and compared to the boot record
-/// with `resolved_at` cleared on both sides: that field dates the resolution,
-/// so leaving it in would make every comparison differ and every edit look like
-/// a restart-requiring one.
+/// with its dating and provenance cleared on both sides (see
+/// [`clear_dating_and_provenance`]): `resolved_at` dates the resolution, and the
+/// `*_source` / `*_raw` fields say through which cascade door a value came.
+/// None of them is a value the process serves, so leaving them in would make a
+/// setting moved between doors **at the same value** read as a restart-requiring
+/// change.
+///
+/// # What holds the lock, and for how long
+///
+/// [`BOOT_NOTES`] is shared by every agent this process serves. The guard is
+/// taken twice, briefly: once to clone what this turn needs, once to record the
+/// report — and **never across the `stat` or the re-resolution**, which are
+/// blocking filesystem I/O. The gap between the two acquisitions is a real race,
+/// closed by re-checking [`Reported::covers`] under the second one: a turn that
+/// loses it returns `None`, because the turn that won is reporting the same edit.
 ///
 /// The boot note's record is **not** replaced. The process keeps serving what
 /// it loaded; this function says so, it does not change it.
 pub fn detect_config_change(agent_id: &str) -> Option<ConfigChangedSinceBoot> {
-    let mut notes = boot_notes()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let note = notes.get(agent_id)?;
+    // Everything this turn needs from the note, taken in one short critical
+    // section. The guard is then DROPPED — `BOOT_NOTES` is shared by every
+    // agent this process serves, and the two operations below are blocking
+    // filesystem I/O: one `stat`, then `resolve_llm_budget_record`, which walks
+    // the cascade with up to three more synchronous reads. Holding a global
+    // mutex across them makes one slow or hanging `config.toml` serialise every
+    // other agent's turn, with no timeout, on the path every turn takes. The
+    // unreadable-`stat` arm below already dropped before its WARN; this extends
+    // the same discipline to the whole body, and mirrors the drop-then-relock
+    // `emit_llm_budget_resolved` uses on its own `LAST_EMITTED` map.
+    let (boot_mtime, global_home, agent_home, in_service, reported) = {
+        let notes = boot_notes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let note = notes.get(agent_id)?;
+        (
+            note.mtime,
+            note.global_home.clone(),
+            note.agent_home.clone(),
+            note.record.clone(),
+            note.reported,
+        )
+    };
 
-    let path = note.agent_home.join(AGENT_CONFIG_FILE);
+    let path = agent_home.join(AGENT_CONFIG_FILE);
     let current = match std::fs::metadata(&path).and_then(|meta| meta.modified()) {
         Ok(mtime) => mtime,
         Err(err) => {
-            drop(notes);
-            tracing::warn!(
-                event = "agent_config_mtime_unreadable",
-                agent_id,
-                path = %path.display(),
-                error = %err,
-                "this agent's config.toml could not be stat'ed, so freshness cannot be \
-                 decided for this turn: the turn leaves the population rather than being \
-                 counted as unchanged, and nothing is refused. Expected regime is zero of \
-                 these lines — one means the file was removed, renamed or made unreadable \
-                 under a running spirit (mika#2473)"
-            );
+            report_unreadable_stat(agent_id, &path, &err);
             return None;
         }
     };
 
-    if note.mtime == Some(current) || note.reported.covers(current) {
+    if boot_mtime == Some(current) || reported.covers(current) {
+        forget_unreadable_stat(agent_id);
         return None;
     }
-
-    let global_home = note.global_home.clone();
-    let agent_home = note.agent_home.clone();
-    let in_service = note.record.clone();
 
     let on_disk = resolve_llm_budget_record(agent_id, &global_home, &agent_home);
 
     // `resolved_at` dates the record, it is not part of it (mika#2457). Cleared
     // on both sides so the comparison is about the configuration and not about
-    // the clock.
+    // the clock. The provenance and raw fields go with it: they say through
+    // WHICH DOOR a value came, not what is in service, so moving a setting
+    // between cascade doors at the same value would otherwise raise
+    // `restart_required` and WARN that a restart is needed — a false alarm on
+    // the loud arm, about a change that moves nothing a restart would apply.
+    // The INFO arm's wording already covers a door-only move: it says no field
+    // of the budget/model record moved, which is exactly true.
     let restart_required = {
         let mut a = in_service.clone();
         let mut b = on_disk.clone();
-        a.resolved_at.clear();
-        b.resolved_at.clear();
+        clear_dating_and_provenance(&mut a);
+        clear_dating_and_provenance(&mut b);
         a != b
     };
     let budget_changed = in_service.http_timeout_secs != on_disk.http_timeout_secs
         || in_service.agent_total_timeout_secs != on_disk.agent_total_timeout_secs
         || in_service.llm_max_tokens != on_disk.llm_max_tokens;
 
-    if let Some(note) = notes.get_mut(agent_id) {
+    // Built BEFORE the `reported` write, and by a conversion that cannot fail.
+    // `DateTime::<Utc>::from(SystemTime)` ends in an `.unwrap()` and panics on
+    // an instant outside chrono's range — on the path every turn takes, and
+    // after the write, so the drift was marked reported and lost for good.
+    let config_mtime = format_config_mtime(current);
+
+    // Re-acquire only to record the report. The released lock opened a window
+    // where two concurrent turns for the same agent could both reach here with
+    // the same unreported mtime; re-checking `covers` under THIS acquisition is
+    // what keeps R9's at-most-once-per-distinct-mtime true. Losing the race is
+    // not a failure — the other turn is reporting the very same edit.
+    {
+        let mut notes = boot_notes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let note = notes.get_mut(agent_id)?;
+        if note.reported.covers(current) {
+            return None;
+        }
         note.reported = Reported::At(current);
     }
+    forget_unreadable_stat(agent_id);
 
     Some(ConfigChangedSinceBoot {
         agent_id: agent_id.to_string(),
-        config_mtime: chrono::DateTime::<chrono::Utc>::from(current)
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string(),
+        config_mtime,
         provider_on_disk: on_disk.provider,
         model_on_disk: on_disk.model,
         provider_in_service: in_service.provider,
@@ -271,6 +341,132 @@ pub fn detect_config_change(agent_id: &str) -> Option<ConfigChangedSinceBoot> {
         budget_changed,
         restart_required,
     })
+}
+
+/// Clear what dates a record and what says which door it came through, leaving
+/// only what is *in service* (mika#2473).
+///
+/// `resolved_at` dates the resolution; the `*_source` and `*_raw` fields carry
+/// the cascade door and the string as written. None of the three is a value the
+/// process serves, so a difference in any of them is not a reason to tell an
+/// operator that a restart would change what is running.
+fn clear_dating_and_provenance(record: &mut ResolvedBudgetRecord) {
+    record.resolved_at.clear();
+    record.http_source.clear();
+    record.total_source.clear();
+    record.max_tokens_source.clear();
+    record.provider_source.clear();
+    record.model_source.clear();
+    record.http_raw.clear();
+    record.total_raw.clear();
+    record.max_tokens_raw.clear();
+}
+
+/// What [`ConfigChangedSinceBoot::config_mtime`] carries when the instant the
+/// filesystem returned is outside chrono's representable range.
+///
+/// Named rather than fabricated or silently dropped, the same posture the
+/// unreadable-`stat` arm takes one branch away: the reading is announced under
+/// its own words. A plausible-looking date would be a false fact carried by the
+/// one field an operator compares by eye against `resolved_at`.
+pub const CONFIG_MTIME_UNREPRESENTABLE: &str = "(mtime hors de portée — non représentable)";
+
+/// The RFC 3339 form of a file's mtime — **never a panic** (KTD1).
+///
+/// `From<SystemTime> for DateTime<Utc>` ends in `Utc.timestamp_opt(..).unwrap()`
+/// and dies on anything outside roughly ±262 000 years. A filesystem will
+/// happily store such an instant (`utimensat` takes a 64-bit seconds field), so
+/// this is reachable on a real disk — and it runs on every turn.
+fn format_config_mtime(mtime: SystemTime) -> String {
+    let (secs, nanos) = match mtime.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()).ok(), after.subsec_nanos()),
+        Err(before) => {
+            // Before the epoch: chrono counts seconds backwards and nanoseconds
+            // forwards, so a sub-second part borrows one second.
+            let d = before.duration();
+            match (i64::try_from(d.as_secs()), d.subsec_nanos()) {
+                (Ok(s), 0) => (s.checked_neg(), 0),
+                (Ok(s), n) => (
+                    s.checked_neg().and_then(|s| s.checked_sub(1)),
+                    1_000_000_000 - n,
+                ),
+                (Err(_), _) => (None, 0),
+            }
+        }
+    };
+
+    secs.and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, nanos))
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| CONFIG_MTIME_UNREPRESENTABLE.to_string())
+}
+
+/// Agents whose `config.toml` was unreadable the last time this process looked.
+///
+/// # Why the unreadable arm needs state at all
+///
+/// The readable path is deduplicated by [`BootNote::reported`]: one edit, one
+/// line. The unreadable one consulted nothing and wrote nothing, so a
+/// `config.toml` deleted or made unreadable under a running spirit produced one
+/// WARN **per turn, for ever** — exactly the log churn mika#2131 bounds, and on
+/// the arm whose expected regime is zero.
+///
+/// So the emission is bounded to the two crossings that carry information: the
+/// onset (readable → unreadable) and the recovery (unreadable → readable).
+/// Kept apart from [`BootNote::reported`] **on purpose**: that field carries the
+/// population semantics — an unreadable `stat` leaves the population and must
+/// not mark the drift reported — and folding the two would restore the silent
+/// blindness [`Reported`] exists to make unwritable.
+static UNREADABLE_STAT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn unreadable_stat() -> &'static Mutex<HashSet<String>> {
+    UNREADABLE_STAT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Say the unreadable reading once — on its onset, and again when it recovers.
+fn report_unreadable_stat(agent_id: &str, path: &Path, err: &std::io::Error) {
+    let first = {
+        let mut seen = unreadable_stat()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seen.insert(agent_id.to_string())
+    };
+    if !first {
+        return;
+    }
+    tracing::warn!(
+        event = "agent_config_mtime_unreadable",
+        agent_id,
+        path = %path.display(),
+        error = %err,
+        recovered = false,
+        "this agent's config.toml could not be stat'ed, so freshness cannot be \
+         decided for this turn: the turn leaves the population rather than being \
+         counted as unchanged, and nothing is refused. Expected regime is zero of \
+         these lines — one means the file was removed, renamed or made unreadable \
+         under a running spirit. Said once on the onset and once on the recovery, \
+         never once per turn (mika#2473, mika#2131)"
+    );
+}
+
+/// The mirror crossing: the file is readable again, so the onset above is over.
+fn forget_unreadable_stat(agent_id: &str) {
+    let was_unreadable = {
+        let mut seen = unreadable_stat()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seen.remove(agent_id)
+    };
+    if !was_unreadable {
+        return;
+    }
+    tracing::warn!(
+        event = "agent_config_mtime_unreadable",
+        agent_id,
+        recovered = true,
+        "this agent's config.toml can be stat'ed again: the turns are back in the \
+         freshness population. Both ends of the outage are said, because an onset \
+         with no recovery reads as an outage that never ended (mika#2473)"
+    );
 }
 
 /// Say the finding once — WARN when the values in service are stale, INFO when
@@ -337,6 +533,13 @@ pub fn report_config_change(finding: &ConfigChangedSinceBoot) {
 #[cfg(any(test, feature = "test-utils"))]
 pub fn reset_notes_for_test() {
     boot_notes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    // The unreadable-stat crossing set is process state of the same kind, and a
+    // test that started with a stale entry would see the onset WARN swallowed as
+    // a repetition — a green test measuring nothing.
+    unreadable_stat()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
@@ -656,6 +859,259 @@ mod tests {
             detect_config_change("mika-arch").is_some(),
             "contrôle négatif : la lecture manquée n'a pas empoisonné la note — \
              `reported` est resté intact, donc le fichier revenu est rapporté"
+        );
+
+        clean_budget_env();
+    }
+
+    /// Force the agent's `config.toml` to an mtime chrono cannot represent, and
+    /// give back the instant the filesystem actually kept.
+    ///
+    /// `1 << 50` seconds after the epoch is roughly the year 35 000 000 — well
+    /// past chrono's ceiling (year 262 143) and well inside what a Linux
+    /// filesystem accepts, which is the whole point: the pair is reachable on a
+    /// real disk, so the panic it used to produce was reachable on a real turn.
+    fn force_unrepresentable_mtime(agent_home: &std::path::Path) -> SystemTime {
+        let path = agent_home.join("config.toml");
+        std::fs::write(&path, AT_BOOT).unwrap();
+        let forced = SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 50);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(forced)
+            .unwrap();
+        std::fs::metadata(&path).unwrap().modified().unwrap()
+    }
+
+    /// mika#2473 KTD1 — **un mtime hors de portée ne fait PAS paniquer le tour.**
+    ///
+    /// `DateTime::<Utc>::from(SystemTime)` se termine par un `.unwrap()` : sur un
+    /// instant hors de la plage représentable par chrono il panique. Ce chemin
+    /// tourne à **chaque tour**, et la panique cassait le contrat KTD1 — la
+    /// garde rapporte, elle ne refuse jamais.
+    ///
+    /// Le second terme est celui qui coûte le plus cher : avant le correctif,
+    /// `note.reported = Reported::At(current)` était écrit **avant** la
+    /// conversion, donc la panique laissait la dérive marquée comme rapportée et
+    /// la perdait définitivement. Ici, le rapport doit survivre à la lecture
+    /// impossible — la date est nommée, le reste du constat est intact.
+    #[test]
+    #[serial]
+    fn mika2473_an_unrepresentable_mtime_is_named_and_never_panics() {
+        clean_budget_env();
+        reset_notes_for_test();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(agent.join("config.toml"), AT_BOOT).unwrap();
+
+        let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+        note_config_at_boot("mika-arch", &global, &agent, &record);
+
+        let forced = force_unrepresentable_mtime(&agent);
+        assert!(
+            chrono::DateTime::<chrono::Utc>::from_timestamp(
+                forced
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64,
+                0,
+            )
+            .is_none(),
+            "la fixture doit être hors de portée de chrono, sinon elle ne mesure rien"
+        );
+
+        let finding = detect_config_change("mika-arch")
+            .expect("un mtime illisible par chrono reste un changement : le tour est rapporté");
+        assert_eq!(
+            finding.config_mtime, CONFIG_MTIME_UNREPRESENTABLE,
+            "la lecture impossible est NOMMÉE, jamais inventée ni tue"
+        );
+        assert_eq!(finding.agent_id, "mika-arch");
+        assert_eq!(finding.model_on_disk, finding.model_in_service);
+
+        clean_budget_env();
+    }
+
+    /// mika#2473 R9 — **deux tours concurrents sur le même agent : un seul
+    /// rapporte.**
+    ///
+    /// Le verrou global n'est plus tenu pendant le `stat` ni pendant la
+    /// re-résolution (P1 #2), ce qui ouvre une course : deux tours peuvent lire
+    /// le même mtime non rapporté, chacun croire l'avoir gagné, et l'édition
+    /// serait rapportée deux fois. La seconde acquisition re-teste
+    /// `reported.covers(current)` et c'est ce test-là qui l'atteste.
+    ///
+    /// Mesuré rouge en retirant cette re-vérification : deux `Some`.
+    #[test]
+    #[serial]
+    fn mika2473_two_concurrent_turns_report_once() {
+        clean_budget_env();
+        reset_notes_for_test();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(agent.join("config.toml"), AT_BOOT).unwrap();
+
+        let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+        note_config_at_boot("mika-arch", &global, &agent, &record);
+        rewrite_with_distinct_mtime(
+            &agent,
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k3\"\nllm_max_tokens = 8192\n",
+        );
+
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let gate = std::sync::Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    detect_config_change("mika-arch").is_some()
+                })
+            })
+            .collect();
+
+        let reported = handles
+            .into_iter()
+            .filter(|_| true)
+            .map(|h| h.join().unwrap())
+            .filter(|reported| *reported)
+            .count();
+        assert_eq!(
+            reported, 1,
+            "une re-résolution par mtime distinct (R9), même quand le verrou est \
+             relâché pendant le stat et la re-résolution"
+        );
+
+        clean_budget_env();
+    }
+
+    /// mika#2473 / mika#2131 — **un `stat` illisible se dit une fois, pas une
+    /// fois par tour**, et sa guérison se dit aussi.
+    ///
+    /// Le chemin lisible est dédupliqué par `reported` ; l'illisible ne
+    /// consultait ni n'écrivait aucun état, donc un `config.toml` supprimé sous
+    /// un spirit vivant produisait un WARN **par tour, indéfiniment** — le churn
+    /// que la doctrine de la maison borne, et sur le bras dont le régime attendu
+    /// est zéro. Les deux traversées portent de l'information : l'apparition et
+    /// le retour. Les répétitions au milieu n'en portent aucune.
+    ///
+    /// `reported` n'est **pas** touché : la sémantique de population (« un stat
+    /// illisible sort le tour de la population ») est inchangée, et le test
+    /// voisin `…_an_unreadable_stat_leaves_the_population_and_never_reports`
+    /// l'atteste encore.
+    #[test]
+    #[serial]
+    fn mika2473_a_repeated_unreadable_stat_is_said_once_and_its_recovery_too() {
+        clean_budget_env();
+        reset_notes_for_test();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(agent.join("config.toml"), AT_BOOT).unwrap();
+
+        let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+        note_config_at_boot("mika-arch", &global, &agent, &record);
+
+        let (_guard, seen) = capture_event_names();
+        std::fs::remove_file(agent.join("config.toml")).unwrap();
+        for _ in 0..5 {
+            assert!(detect_config_change("mika-arch").is_none());
+        }
+        assert_eq!(
+            unreadable_lines(&seen),
+            1,
+            "cinq tours sur un fichier illisible : UNE ligne, pas cinq — \
+             sinon le régime attendu zéro devient illisible : {:?}",
+            seen.lock().unwrap()
+        );
+
+        rewrite_with_distinct_mtime(&agent, AT_BOOT);
+        assert!(
+            detect_config_change("mika-arch").is_some(),
+            "contrôle négatif : `reported` est resté intact, le fichier revenu \
+             est rapporté normalement"
+        );
+        assert_eq!(
+            unreadable_lines(&seen),
+            2,
+            "et le retour est dit une fois : une apparition sans guérison se lit \
+             comme une panne qui n'a jamais cessé : {:?}",
+            seen.lock().unwrap()
+        );
+
+        for _ in 0..3 {
+            let _ = detect_config_change("mika-arch");
+        }
+        assert_eq!(
+            unreadable_lines(&seen),
+            2,
+            "et les tours sains qui suivent ne redisent rien"
+        );
+
+        clean_budget_env();
+    }
+
+    /// Combien de lignes `agent_config_mtime_unreadable` la capture a vues.
+    fn unreadable_lines(seen: &EventSink) -> usize {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name)| name == "agent_config_mtime_unreadable")
+            .count()
+    }
+
+    /// mika#2473 — **déplacer un réglage d'une porte à l'autre à valeur égale
+    /// n'exige aucun redémarrage.**
+    ///
+    /// `ResolvedBudgetRecord` porte ses champs `*_source` et `*_raw` : la porte
+    /// de la cascade et la chaîne telle qu'écrite. Aucun des deux n'est une
+    /// valeur que le process sert. Comparer les records sans les effacer faisait
+    /// donc lever `restart_required` — et WARN qu'un redémarrage est requis —
+    /// sur un `llm_max_tokens` passé du `config.toml` de l'agent à celui du
+    /// global **à la même valeur** : une fausse alerte sur le bras bruyant, à
+    /// propos d'un changement qu'un redémarrage ne changerait pas.
+    ///
+    /// Le bras INFO dit exactement le vrai dans ce cas : aucun champ du record
+    /// budget/modèle n'a bougé, un autre champ du fichier peut néanmoins exiger
+    /// un redémarrage.
+    #[test]
+    #[serial]
+    fn mika2473_a_door_only_move_at_the_same_value_needs_no_restart() {
+        clean_budget_env();
+        reset_notes_for_test();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(agent.join("config.toml"), AT_BOOT).unwrap();
+
+        let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+        assert_eq!(
+            record.max_tokens_source, "agent_config",
+            "précondition : la valeur entre par la porte de l'agent"
+        );
+        note_config_at_boot("mika-arch", &global, &agent, &record);
+
+        // Même valeur, autre porte : retirée du config.toml de l'agent, posée
+        // dans le global.
+        std::fs::write(global.join("config.toml"), "llm_max_tokens = 8192\n").unwrap();
+        rewrite_with_distinct_mtime(
+            &agent,
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k2.5\"\n",
+        );
+
+        let on_disk = resolve_llm_budget_record("mika-arch", &global, &agent);
+        assert_eq!(
+            on_disk.max_tokens_source, "global_config",
+            "précondition : la porte a bien changé"
+        );
+        assert_eq!(
+            on_disk.llm_max_tokens, record.llm_max_tokens,
+            "précondition : la valeur EN SERVICE, elle, n'a pas bougé"
+        );
+
+        let finding = detect_config_change("mika-arch")
+            .expect("le mtime a bougé : le déplacement est bien rapporté");
+        assert!(
+            !finding.restart_required,
+            "aucune valeur en service ne diffère : le bras bruyant doit se taire"
+        );
+        assert!(
+            !finding.budget_changed,
+            "et le budget n'a pas bougé non plus"
         );
 
         clean_budget_env();

@@ -439,6 +439,68 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Establish, for one agent at boot, whether the runtime serves the model the
+/// repo declares — and leave behind the note the per-turn detector reads
+/// (mika#2473 D1 + D2).
+///
+/// # Why this is a function and not four lines inside `init_agent`
+///
+/// Because the **sequence** is what can be wrong, and nothing else here can see
+/// it. `find_well_known_agent` → `config_toml` → `declared_model` → `compare` →
+/// `emit_model_drift` → `note_config_at_boot` was only ever exercised through
+/// its constituent primitives, each of which has its own green test. Swap
+/// `global_home` and `agent_home` at the `note_config_at_boot` call, drop the
+/// emission, or compare against a record resolved for another agent, and the
+/// crate still compiles and every one of those tests still passes — while the
+/// boot note points at the wrong `config.toml` and D2 watches a file nobody
+/// edits. Extracted, the assembly has a return value and a caller-visible
+/// effect, so a test can assert both (`mika2473_the_boot_assembly_returns_the_check_and_takes_the_note`).
+///
+/// # What each step is for
+///
+/// The record says what the RUNTIME serves; the constant in
+/// `well_known_agents.rs` says what the REPO declares. Until mika#2473 nothing
+/// compared the two, and the cost of that silence is measured: mika-qa ran
+/// glm-5.3 for weeks while the repo said glm-5.2, and the divergence surfaced as
+/// a lost verdict on PR #2327 rather than as a line anyone could grep.
+///
+/// The declared side is read by the SAME key derivation as the resolved one
+/// (`mika_common::llm::declared_model`, KTD6) — a second parser would be free to
+/// diverge and report a *false* drift on a correct configuration, which is
+/// strictly worse than none. The comparison is pure, and the emission is
+/// `emit_model_drift`'s alone: the event's field names are a log format an
+/// operator greps, and a format written at the call site is a format that
+/// acquires a second spelling.
+///
+/// The boot note (D2) is taken HERE, where the record was just resolved, and not
+/// at the first turn: a first turn can already be posterior to an edit, and a
+/// note taken then would call the edited file the boot state. Without this call
+/// `detect_config_change` is inert by construction (it keys on `agent_id` and
+/// answers `None` when this process holds no note), which is what exempts an
+/// agent this process never initialised — not the kind of turn.
+///
+/// # Reports, never refuses (KTD1)
+///
+/// No `?`, no `bail!`, no panic, and the return type is not a `Result`. The
+/// drift on this fleet is a sequence of dated operator decisions, and refusing
+/// to boot on a *valid* configuration is the failure mode this guard exists to
+/// avoid becoming. `budget_guard` stays the only thing that refuses, and only on
+/// an *invalid* pair.
+fn establish_model_drift(
+    agent_name: &str,
+    global_home: &std::path::Path,
+    agent_home: &std::path::Path,
+    budget_record: &mika_common::llm::ResolvedBudgetRecord,
+) -> mika_common::llm::ModelDriftCheck {
+    let declared = crate::well_known_agents::find_well_known_agent(agent_name)
+        .and_then(|spec| spec.config_toml)
+        .and_then(mika_common::llm::declared_model);
+    let model_drift = mika_common::llm::ModelDriftCheck::compare(declared.as_ref(), budget_record);
+    mika_common::llm::emit_model_drift(agent_name, &model_drift);
+    mika_common::llm::note_config_at_boot(agent_name, global_home, agent_home, budget_record);
+    model_drift
+}
+
 /// Initialize a single agent and return its AgentState with a running TaskEngine.
 ///
 /// Uses the shared container database at `{global_home}/data/mika.db`.
@@ -487,39 +549,10 @@ async fn init_agent(
         mika_common::llm::resolve_llm_budget_record(agent_name, global_home, agent_home);
     mika_common::llm::emit_llm_budget_resolved(&budget_record);
 
-    // mika#2473 D1 — the record above says what the RUNTIME serves; the constant
-    // in `well_known_agents.rs` says what the REPO declares. Until now nothing
-    // compared the two, and the cost of that silence is measured: mika-qa ran
-    // glm-5.3 for weeks while the repo said glm-5.2, and the divergence surfaced
-    // as a lost verdict on PR #2327 rather than as a line anyone could grep.
-    //
-    // The declared side is read by the SAME key derivation as the resolved one
-    // (`mika_common::llm::declared_model`, KTD6) — a second parser would be free
-    // to diverge and report a *false* drift on a correct configuration, which is
-    // strictly worse than none. The comparison is pure, and the emission is
-    // `emit_model_drift`'s alone: the event's field names are a log format an
-    // operator greps, and a format written at the call site is a format that
-    // acquires a second spelling.
-    //
-    // **Nothing here can refuse (KTD1).** No `?`, no `bail!`, no panic — the
-    // drift on this fleet is a sequence of dated operator decisions, and
-    // refusing to boot on a *valid* configuration is the failure mode this guard
-    // exists to avoid becoming. `budget_guard` stays the only thing that refuses,
-    // and only on an *invalid* pair.
-    let declared = crate::well_known_agents::find_well_known_agent(agent_name)
-        .and_then(|spec| spec.config_toml)
-        .and_then(mika_common::llm::declared_model);
-    let model_drift = mika_common::llm::ModelDriftCheck::compare(declared.as_ref(), &budget_record);
-    mika_common::llm::emit_model_drift(agent_name, &model_drift);
-
-    // mika#2473 D2 — the note the per-turn detector reads. Taken HERE, where the
-    // record was just resolved, and not at the first turn: a first turn can
-    // already be posterior to an edit, and a note taken then would call the
-    // edited file the boot state. Without this call `detect_config_change` is
-    // inert by construction (it keys on `agent_id` and answers `None` when this
-    // process holds no note), which is what exempts an agent this process never
-    // initialised — not the kind of turn.
-    mika_common::llm::note_config_at_boot(agent_name, global_home, agent_home, &budget_record);
+    // mika#2473 D1 + D2, assembled in one place so the assembly can be tested as
+    // one thing. See `establish_model_drift` for what the sequence is and why
+    // each step sits where it does.
+    let model_drift = establish_model_drift(agent_name, global_home, agent_home, &budget_record);
     let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
@@ -4670,6 +4703,153 @@ mod tests {
         );
     }
 
+    /// **mika#2473 P2 #8** — l'assemblage D1+D2 de `init_agent`, exercé PAR
+    /// l'assemblage et non par ses primitives.
+    ///
+    /// Les six pas — `find_well_known_agent` → `config_toml` → `declared_model`
+    /// → `compare` → `emit_model_drift` → `note_config_at_boot` — avaient chacun
+    /// leur test vert, et la séquence n'en avait aucun. Intervertir
+    /// `global_home` et `agent_home`, ou laisser tomber la note, compile et
+    /// laisse tous ces tests verts pendant que D2 surveille un fichier que
+    /// personne n'édite.
+    ///
+    /// Deux termes, et le second est celui qui manquait : le verdict rendu, et
+    /// **la note réellement prise sous la bonne clé**. `noted_record_for_test`
+    /// lit la carte process-globale par `agent_id` : elle rend `Some` seulement
+    /// si l'assemblage a bien noté *cet* agent, avec *ce* record.
+    ///
+    /// Contrôle négatif porté par la seconde moitié : un agent qui ne déclare
+    /// aucun modèle rend `NotApplicable` — et prend **quand même** sa note, ce
+    /// qui est la propriété qu'un `return` prématuré dans l'assemblage
+    /// casserait sans faire rougir quoi que ce soit d'autre.
+    #[test]
+    #[serial_test::serial]
+    fn mika2473_the_boot_assembly_returns_the_check_and_takes_the_note() {
+        use mika_common::llm::config_freshness::{noted_record_for_test, reset_notes_for_test};
+        use mika_common::llm::{
+            ModelDriftCheck, clean_budget_env, declared_model, resolve_llm_budget_record,
+        };
+
+        clean_budget_env();
+        reset_notes_for_test();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        // kg_docs_roots populated because mika-arch's identity rendering
+        // requires absolute corpus paths; the paths need not exist.
+        let mut provisioning_settings = Settings::test_defaults();
+        provisioning_settings.kg_docs_roots = Some(vec![
+            std::path::PathBuf::from("/tmp/test-kg-corpus-a"),
+            std::path::PathBuf::from("/tmp/test-kg-corpus-b"),
+        ]);
+        crate::well_known_agents::provision_well_known_agents(home, &provisioning_settings, false);
+
+        // A real spec, chosen because it declares a model — the arm the guard
+        // exists for. A spec that declares none is exercised below.
+        let spec = crate::well_known_agents::find_well_known_agent("mika-arch")
+            .expect("mika-arch est un agent bien connu");
+        let declared = declared_model(spec.config_toml.expect("mika-arch déclare un config.toml"))
+            .expect("et ce config.toml déclare un couple lisible");
+        let agent_home = mika_common::agent::agent_dir(home, spec.name);
+        let record = resolve_llm_budget_record(spec.name, home, &agent_home);
+
+        assert_eq!(
+            noted_record_for_test(spec.name),
+            None,
+            "précondition : aucune note avant l'assemblage, sinon le terme final \
+             mesurerait une note d'un autre test"
+        );
+
+        let check = establish_model_drift(spec.name, home, &agent_home, &record);
+        assert_eq!(
+            check,
+            ModelDriftCheck::InSync {
+                declared_provider: declared.provider.config_prefix().to_string(),
+                declared_model: declared.model.clone(),
+                declared_model_is_provider_default: declared.model_is_provider_default,
+            },
+            "un agent fraîchement provisionné tourne sous ce que sa constante déclare"
+        );
+        assert_eq!(
+            noted_record_for_test(spec.name).as_ref(),
+            Some(&record),
+            "et la note D2 est prise, sous la clé `agent_id` et avec CE record — \
+             sans quoi `detect_config_change` reste inerte pour cet agent"
+        );
+
+        // Le disque bouge après le boot : c'est la dérive hors dépôt mesurée le
+        // 2026-09-15, et l'assemblage doit la rendre, pas seulement la primitive.
+        const IMPOSTEUR: &str = "un-modele-que-personne-ne-declare";
+        let config_path = agent_home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "llm_provider = \"{}\"\n{} = \"{IMPOSTEUR}\"\n",
+                record.provider, record.model_config_key
+            ),
+        )
+        .unwrap();
+        // mtime forcé : une réécriture dans la granularité du système de
+        // fichiers peut retomber sur l'instant que la note porte, et D2 dirait
+        // « rien n'a bougé » d'un fichier qui a bougé — vert, et ne mesurant rien.
+        std::fs::File::options()
+            .write(true)
+            .open(&config_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+
+        // **Le terme qui attrape l'interversion `global_home` / `agent_home`.**
+        // La note porte les deux chemins, et `noted_record_for_test` n'en montre
+        // aucun : intervertis, l'assemblage compile, le record noté est le même,
+        // et D2 surveille le `config.toml` GLOBAL pendant que l'agent édite le
+        // sien. Seule une détection réelle sur le fichier de l'agent le dit.
+        let finding = mika_common::llm::detect_config_change(spec.name).expect(
+            "D2 doit voir l'édition du config.toml DE CET AGENT : une note prise \
+             avec les homes intervertis surveille l'autre fichier et se tait",
+        );
+        assert_eq!(
+            finding.model_on_disk, IMPOSTEUR,
+            "et elle doit nommer ce que le disque porte maintenant"
+        );
+
+        let drifted = resolve_llm_budget_record(spec.name, home, &agent_home);
+        match establish_model_drift(spec.name, home, &agent_home, &drifted) {
+            ModelDriftCheck::Drift { runtime_model, .. } => {
+                assert_eq!(runtime_model, IMPOSTEUR)
+            }
+            other => panic!("une édition du modèle est une dérive, et rend {other:?}"),
+        }
+
+        // L'agent sans constante : `NotApplicable`, ET la note prise quand même.
+        let orphan_home = home.join("agents").join("un-agent-sans-constante");
+        std::fs::create_dir_all(&orphan_home).unwrap();
+        std::fs::write(orphan_home.join("config.toml"), "llm_max_tokens = 4096\n").unwrap();
+        let orphan_record =
+            resolve_llm_budget_record("un-agent-sans-constante", home, &orphan_home);
+        assert_eq!(
+            establish_model_drift(
+                "un-agent-sans-constante",
+                home,
+                &orphan_home,
+                &orphan_record
+            ),
+            ModelDriftCheck::NotApplicable,
+            "rien n'a été déclaré, donc rien n'a été comparé — et le dire est \
+             autre chose que dire « en phase »"
+        );
+        assert_eq!(
+            noted_record_for_test("un-agent-sans-constante").as_ref(),
+            Some(&orphan_record),
+            "mais D2 surveille cet agent comme les autres : un `return` anticipé \
+             sur le bras `NotApplicable` le rendrait aveugle en silence"
+        );
+
+        reset_notes_for_test();
+        clean_budget_env();
+    }
+
     /// mika#2473 U3 / R6, AC4 — la route rend le sibling `model_drift` à côté du
     /// record, et le gèle comme elle gèle le record.
     ///
@@ -4712,6 +4892,7 @@ mod tests {
             runtime_model_source: "agent_config".to_string(),
             runtime_provider_source: "agent_config".to_string(),
             model_config_key: "openrouter_model".to_string(),
+            declared_model_is_provider_default: false,
         };
 
         let tmp = tempfile::tempdir().unwrap();

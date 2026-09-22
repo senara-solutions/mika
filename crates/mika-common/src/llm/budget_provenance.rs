@@ -967,6 +967,15 @@ pub struct DeclaredModel {
     /// "the repo declares nothing and `glm-5.2` is what z.ai defaults to" are
     /// two different facts, and reconciling a drift (mika#2472) means knowing
     /// which one is on the table.
+    ///
+    /// **It has a reader.** Computed and never read would make it a guarantee
+    /// nobody implemented, so [`ModelDriftCheck::compare`] carries it onto both
+    /// its comparing arms and [`emit_model_drift`] puts it on the line as
+    /// `declared_model_is_provider_default`. That is where it is actionable: an
+    /// operator reading a drift learns whether reconciling the constant means
+    /// **writing** a model key (nothing declared one) or **editing** one
+    /// (something did) — and, on the in-sync arm, that the agreement rests on a
+    /// provider default a provider is free to move under them.
     pub model_is_provider_default: bool,
 }
 
@@ -1050,6 +1059,10 @@ pub enum ModelDriftCheck {
         declared_provider: String,
         /// The model the constant declares.
         declared_model: String,
+        /// Whether the declared model came from the provider's default rather
+        /// than from an explicit key. See [`DeclaredModel::model_is_provider_default`].
+        #[serde(default)]
+        declared_model_is_provider_default: bool,
     },
     /// The runtime serves something else — reported with the door it came
     /// through, never with a refusal (KTD1).
@@ -1073,6 +1086,14 @@ pub enum ModelDriftCheck {
         /// already says which line to look at. Naming a plausible key there
         /// would be a false provenance.
         model_config_key: String,
+        /// Whether the declared model came from the provider's default rather
+        /// than from an explicit key. See [`DeclaredModel::model_is_provider_default`].
+        ///
+        /// It changes the *repairing gesture*: reconciling the constant means
+        /// **writing** a model key when nothing declared one, and **editing**
+        /// one when something did.
+        #[serde(default)]
+        declared_model_is_provider_default: bool,
     },
 }
 
@@ -1095,6 +1116,7 @@ impl ModelDriftCheck {
             return Self::InSync {
                 declared_provider,
                 declared_model: declared.model.clone(),
+                declared_model_is_provider_default: declared.model_is_provider_default,
             };
         }
 
@@ -1106,6 +1128,7 @@ impl ModelDriftCheck {
             runtime_model_source: record.model_source.clone(),
             runtime_provider_source: record.provider_source.clone(),
             model_config_key: record.model_config_key.clone(),
+            declared_model_is_provider_default: declared.model_is_provider_default,
         }
     }
 }
@@ -1146,6 +1169,7 @@ pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck) {
         ModelDriftCheck::InSync {
             declared_provider,
             declared_model,
+            declared_model_is_provider_default,
         } => {
             // Emitted on purpose, at INFO. Without it, "no WARN" is
             // indistinguishable from "the guard did not run" — the exact
@@ -1156,6 +1180,7 @@ pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck) {
                 agent_id,
                 declared_provider,
                 declared_model,
+                declared_model_is_provider_default,
                 declared_by = DECLARED_BY,
                 "this agent runs the model its constant declares (mika#2473)"
             );
@@ -1168,6 +1193,7 @@ pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck) {
             runtime_model_source,
             runtime_provider_source,
             model_config_key,
+            declared_model_is_provider_default,
         } => {
             tracing::warn!(
                 event = "well_known_model_drift",
@@ -1179,6 +1205,7 @@ pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck) {
                 runtime_model_source,
                 runtime_provider_source,
                 model_config_key,
+                declared_model_is_provider_default,
                 declared_by = DECLARED_BY,
                 "this agent does NOT run the model the repo declares for it: the runtime \
                  value came through the door named by `runtime_model_source`, and the \
@@ -2477,6 +2504,9 @@ mod tests {
             ModelDriftCheck::InSync {
                 declared_provider: "openrouter".to_string(),
                 declared_model: "moonshotai/kimi-k2.5".to_string(),
+                // La constante écrit la clé modèle : ce n'est pas un défaut de
+                // fournisseur, et le drapeau le porte jusqu'à la ligne.
+                declared_model_is_provider_default: false,
             },
             "constante et disque identiques : en phase"
         );
@@ -2601,6 +2631,7 @@ mod tests {
             &ModelDriftCheck::InSync {
                 declared_provider: "zai".to_string(),
                 declared_model: "glm-5.2".to_string(),
+                declared_model_is_provider_default: true,
             },
         );
         {
@@ -2621,6 +2652,19 @@ mod tests {
                 in_sync.fields.get("declared_by").map(String::as_str),
                 Some(DECLARED_BY)
             );
+            // mika#2473 P3 #9 — le drapeau atteint la ligne. Sur ce bras il dit
+            // que l'accord repose sur un défaut de fournisseur, que le
+            // fournisseur peut déplacer sous nos pieds sans qu'aucun fichier ne
+            // change.
+            assert_eq!(
+                in_sync
+                    .fields
+                    .get("declared_model_is_provider_default")
+                    .map(String::as_str),
+                Some("true"),
+                "un drapeau calculé et jamais lu se lit comme une garantie que \
+                 personne n'a implémentée"
+            );
         }
 
         emit_model_drift(
@@ -2633,6 +2677,7 @@ mod tests {
                 runtime_model_source: "agent_config".to_string(),
                 runtime_provider_source: "agent_config".to_string(),
                 model_config_key: "openrouter_model".to_string(),
+                declared_model_is_provider_default: false,
             },
         );
         let events = seen.lock().unwrap();
@@ -2653,6 +2698,9 @@ mod tests {
             ("runtime_model_source", "agent_config"),
             ("runtime_provider_source", "agent_config"),
             ("model_config_key", "openrouter_model"),
+            // mika#2473 P3 #9 — et sur le bras bruyant il dit quel geste répare :
+            // `false` = une clé existe et s'édite ; `true` = il faut en écrire une.
+            ("declared_model_is_provider_default", "false"),
             ("declared_by", "well_known_agents.rs"),
         ] {
             assert_eq!(

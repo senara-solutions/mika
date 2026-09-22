@@ -187,9 +187,9 @@ struct BudgetRecord {
 /// enum, and every arm-specific field an `Option` — the wire form is
 /// internally tagged, and each arm carries only what it honestly knows.
 ///
-/// `runtime_provider_source` and `model_config_key` exist on the wire's `drift`
-/// arm and are deliberately not mirrored: this surface prints neither, and a
-/// mirror field nobody reads is a second place for the two shapes to diverge.
+/// `runtime_provider_source` is the one field of the wire's `drift` arm still
+/// deliberately unmirrored: this surface prints no provider *door*, and a mirror
+/// field nobody reads is a second place for the two shapes to diverge.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ModelDrift {
     /// `in_sync` / `drift` / `not_applicable` — or a word a newer spirit knows
@@ -208,6 +208,20 @@ struct ModelDrift {
     /// the declared ones and the emitter has no honest source for a door, so
     /// the enum does not carry one.
     runtime_model_source: Option<String>,
+    /// The `config.toml` key an operator would edit to resolve the drift
+    /// (`zai_model`, `openrouter_model`, …). Present on `drift` only.
+    ///
+    /// Mirrored since mika#2473 P2 #6. It exists on the wire and reached
+    /// neither the text render nor this struct, so it reached neither JSON nor
+    /// YAML — and it is the one field that says *what to edit*, which is the
+    /// actionable half of a drift line.
+    ///
+    /// `Some("")` is a state and not an absence: the emitter empties it exactly
+    /// when the runtime provider is unreadable, because there is then no model
+    /// key to name. [`render_drift_line`] suppresses the clause on both, for
+    /// the same reason — naming a plausible key there would be a false
+    /// provenance.
+    model_config_key: Option<String>,
 }
 
 /// What a `drift` field a newer spirit did not send is rendered as.
@@ -215,6 +229,14 @@ struct ModelDrift {
 /// Version skew inside an arm: printing an empty string there would read as
 /// "no model", which is not what is known.
 const DRIFT_FIELD_ABSENT: &str = "(non transmis)";
+
+/// What the drift line prints when the runtime model is the empty string.
+///
+/// Distinct from [`DRIFT_FIELD_ABSENT`], which means "this server did not
+/// send the field". An empty model is a field the server DID send, carrying
+/// the `unknown_provider` shape: the provider line was unreadable, so no
+/// model could be resolved. Two different facts, two different sentences.
+const DRIFT_MODEL_UNRESOLVED: &str = "(non résolu — provider illisible)";
 
 /// mika#2328's sixth provenance word: a door carried an `llm_provider` the
 /// reader cannot parse, so the model key's *name* is unknown.
@@ -330,16 +352,72 @@ fn render_drift_line(drift: Option<&ModelDrift>, out: &mut impl Write) -> Result
             "  code       {:<20} (well_known_agents.rs) — en phase",
             declared()
         )?,
-        "drift" => writeln!(
-            out,
-            "  code       {:<20} (well_known_agents.rs) — DÉRIVE : le runtime sert {} ({})",
-            declared(),
-            drift.runtime_model.as_deref().unwrap_or(DRIFT_FIELD_ABSENT),
-            drift
-                .runtime_model_source
-                .as_deref()
-                .unwrap_or(DRIFT_FIELD_ABSENT)
-        )?,
+        "drift" => {
+            // The provider is named only when it MOVED. `compare` returns
+            // `Drift` as soon as the provider OR the model differs, so a
+            // provider-only drift used to print « DÉRIVE : le runtime sert
+            // <la même chaîne de modèle> » — a contradiction with no visible
+            // cause. Reachable, not theoretical: mika-qa on this workstation is
+            // in provider drift (`zai` → `openrouter`) at the same model string.
+            // On a model-only drift the clause is omitted rather than printed
+            // with two identical values, which would read as a second change.
+            let providers_moved = match (
+                drift.declared_provider.as_deref(),
+                drift.runtime_provider.as_deref(),
+            ) {
+                (Some(declared), Some(runtime)) => declared != runtime,
+                // A newer spirit that sent one side and not the other: say the
+                // little that is known rather than assert agreement.
+                (Some(_), None) | (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            let provider_clause = if providers_moved {
+                format!(
+                    ", fournisseur {} → {}",
+                    drift
+                        .declared_provider
+                        .as_deref()
+                        .unwrap_or(DRIFT_FIELD_ABSENT),
+                    drift
+                        .runtime_provider
+                        .as_deref()
+                        .unwrap_or(DRIFT_FIELD_ABSENT)
+                )
+            } else {
+                String::new()
+            };
+            // Suppressed on an empty key — the documented `unknown_provider`
+            // shape, where there is no model key and naming one would be a
+            // false provenance. `runtime_model_source` already says which line
+            // to look at there.
+            let key_clause = match drift.model_config_key.as_deref() {
+                Some(key) if !key.is_empty() => format!(", clé: {key}"),
+                _ => String::new(),
+            };
+            // An EMPTY runtime model is the `unknown_provider` shape, not an
+            // absent field: the record carries `model: ""` when the provider
+            // itself could not be read. `unwrap_or` only fires on `None`, so
+            // without this the line renders "le runtime sert  (unknown_provider)"
+            // with a hole where the model should be. The `model` line just above
+            // already says this properly; this says it the same way.
+            let runtime_model = match drift.runtime_model.as_deref() {
+                None => DRIFT_FIELD_ABSENT,
+                Some("") => DRIFT_MODEL_UNRESOLVED,
+                Some(model) => model,
+            };
+            writeln!(
+                out,
+                "  code       {:<20} (well_known_agents.rs) — DÉRIVE : le runtime sert {} ({}{}{})",
+                declared(),
+                runtime_model,
+                drift
+                    .runtime_model_source
+                    .as_deref()
+                    .unwrap_or(DRIFT_FIELD_ABSENT),
+                provider_clause,
+                key_clause
+            )?
+        }
         other => writeln!(
             out,
             "  code       (état de dérive « {other} » inconnu de ce CLI — spirit plus récent que ce binaire)"
@@ -1767,6 +1845,7 @@ mod budget_tests {
             runtime_provider: None,
             runtime_model: None,
             runtime_model_source: None,
+            model_config_key: None,
         }
     }
 
@@ -1877,6 +1956,179 @@ mod budget_tests {
                  l'état {etat} :\n{texte}"
             );
         }
+    }
+
+    /// **mika#2473 P2 #6** — une dérive de PROVIDER seul est lisible, et la
+    /// clé à éditer est nommée.
+    ///
+    /// `ModelDriftCheck::compare` rend `Drift` dès que le **provider** diffère,
+    /// modèle identique compris : `InSync` exige l'égalité des deux. Or le
+    /// rendu ne montrait aucun provider, donc cette dérive-là s'affichait
+    /// « DÉRIVE : le runtime sert <la même chaîne de modèle> » — une
+    /// contradiction sans cause visible. Ce n'est pas théorique : mika-qa, sur
+    /// ce poste, est en dérive de provider seul (`zai` → `openrouter`) avec
+    /// `glm-5.2` des deux côtés.
+    ///
+    /// Le second terme est `model_config_key` : la clé qu'un opérateur
+    /// éditerait. Elle existe sur le fil depuis la livraison et n'atteignait ni
+    /// le texte ni le miroir, donc ni JSON ni YAML.
+    #[test]
+    fn mika2473_a_provider_only_drift_names_the_provider_and_the_key() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            // Même modèle des deux côtés : seule la porte fournisseur a bougé.
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k2.5".to_string()),
+            runtime_model_source: Some("agent_config".to_string()),
+            model_config_key: Some("openrouter_model".to_string()),
+            declared_provider: Some("zai".to_string()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+
+        assert!(
+            line.contains("zai"),
+            "le provider DÉCLARÉ doit être nommé, sinon la dérive n'a pas de \
+             cause visible : {line}"
+        );
+        assert!(
+            line.contains("openrouter"),
+            "et le provider EN VIGUEUR aussi : {line}"
+        );
+        assert!(
+            line.contains("openrouter_model"),
+            "la clé qu'un opérateur éditerait est la moitié actionnable : {line}"
+        );
+        assert!(
+            !line.contains("en phase"),
+            "contrôle négatif : une dérive de provider reste une dérive : {line}"
+        );
+
+        // Contrôle négatif du provider : quand les deux providers coïncident,
+        // la ligne ne se met pas à annoncer un changement de fournisseur.
+        let mut same_provider = sample();
+        same_provider.model_drift = Some(ModelDrift {
+            runtime_provider: Some("openrouter".to_string()),
+            runtime_model: Some("moonshotai/kimi-k3".to_string()),
+            runtime_model_source: Some("process_env".to_string()),
+            model_config_key: Some("openrouter_model".to_string()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&same_provider));
+        assert!(
+            !line.contains("fournisseur"),
+            "un modèle qui bouge sous le même provider ne doit pas annoncer un \
+             changement de fournisseur : {line}"
+        );
+        assert!(
+            line.contains("openrouter_model"),
+            "mais la clé reste nommée : {line}"
+        );
+    }
+
+    /// **mika#2473 P2 #6** — une clé vide n'est pas nommée.
+    ///
+    /// `model_config_key` est vide **exactement** quand le provider en vigueur
+    /// est illisible (forme `unknown_provider`) : il n'y a alors aucune clé
+    /// modèle à nommer, et en nommer une plausible serait une fausse
+    /// provenance — ce que `budget_provenance.rs` refuse en toutes lettres.
+    #[test]
+    fn mika2473_an_empty_config_key_is_not_named() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("un fournisseur illisible".to_string()),
+            runtime_model: Some(String::new()),
+            runtime_model_source: Some(MODEL_SOURCE_UNKNOWN_PROVIDER.to_string()),
+            model_config_key: Some(String::new()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+        assert!(
+            line.contains(MODEL_SOURCE_UNKNOWN_PROVIDER),
+            "le mot qui dit quelle ligne regarder est déjà là : {line}"
+        );
+        assert!(
+            !line.contains("clé:") && !line.contains("clé "),
+            "aucune clé n'est nommée quand il n'y en a pas : {line}"
+        );
+    }
+
+    /// **mika#2473 revue de code** — un modèle vide est DIT, jamais laissé en trou.
+    ///
+    /// La forme `unknown_provider` fait porter au record un `model` **vide** : le
+    /// provider était illisible, donc aucun modèle n'a pu être résolu. C'est un
+    /// champ que le serveur a bel et bien envoyé, à la différence d'un champ
+    /// absent — et `unwrap_or` ne se déclenche que sur `None`. Sans discriminant,
+    /// la ligne rendait « le runtime sert  (unknown_provider) », avec un blanc à
+    /// l'endroit exact où l'opérateur cherche la cause. La ligne `model` juste
+    /// au-dessus dit déjà ce cas correctement ; celle-ci le dit pareil.
+    ///
+    /// Contrôle négatif inclus : le mot réservé à un champ **absent** ne doit pas
+    /// apparaître ici, sans quoi les deux faits redeviendraient une seule phrase.
+    #[test]
+    fn mika2473_an_empty_runtime_model_is_named_not_left_blank() {
+        let mut record = sample();
+        record.model_drift = Some(ModelDrift {
+            runtime_provider: Some("un fournisseur illisible".to_string()),
+            runtime_model: Some(String::new()),
+            runtime_model_source: Some(MODEL_SOURCE_UNKNOWN_PROVIDER.to_string()),
+            model_config_key: Some(String::new()),
+            ..drift_of("drift")
+        });
+        let line = code_line(&render(&record));
+        assert!(
+            line.contains(DRIFT_MODEL_UNRESOLVED),
+            "un modèle vide est nommé, pas laissé en blanc : {line}"
+        );
+        assert!(
+            !line.contains(DRIFT_FIELD_ABSENT),
+            "« non transmis » dit un champ ABSENT — le serveur a envoyé celui-ci, vide : {line}"
+        );
+        assert!(
+            !line.contains("sert  ("),
+            "le trou que ce test existe pour fermer : {line}"
+        );
+    }
+
+    /// **mika#2473 P2 #6** — la clé survit au trajet JSON et YAML.
+    ///
+    /// Le miroir est un miroir pour tolérer un spirit d'une autre version : un
+    /// champ ajouté au rendu texte mais pas au miroir n'atteindrait ni JSON ni
+    /// YAML, et les scripts qui branchent dessus liraient `null` sur un serveur
+    /// qui l'a pourtant servi.
+    #[test]
+    fn mika2473_the_config_key_survives_the_json_round_trip() {
+        let wire = serde_json::json!({
+            "status": "drift",
+            "declared_provider": "zai",
+            "declared_model": "glm-5.2",
+            "runtime_provider": "openrouter",
+            "runtime_model": "glm-5.2",
+            "runtime_model_source": "agent_config",
+            "runtime_provider_source": "agent_config",
+            "model_config_key": "openrouter_model",
+        });
+        let mirrored: ModelDrift =
+            serde_json::from_value(wire).expect("le miroir lit la forme du fil");
+        assert_eq!(
+            mirrored.model_config_key.as_deref(),
+            Some("openrouter_model"),
+            "la clé doit traverser la désérialisation du miroir"
+        );
+
+        let mut record = sample();
+        record.model_drift = Some(mirrored);
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            json["model_drift"]["model_config_key"], "openrouter_model",
+            "et ressortir en JSON : {json}"
+        );
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        let back: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            back["model_drift"]["model_config_key"], "openrouter_model",
+            "et en YAML — deux sérialiseurs sur une valeur : {yaml}"
+        );
     }
 
     /// mika#2473 U5 — a status word this CLI does not know is not *en phase*

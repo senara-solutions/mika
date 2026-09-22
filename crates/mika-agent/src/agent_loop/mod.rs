@@ -15645,14 +15645,42 @@ mod tests {
         );
     }
 
-    /// The enclosing `fn` of each `detect_config_change(` call site in a Rust
-    /// source, as `(1-based line, enclosing fn, trimmed text)`.
+    /// One `detect_config_change(` call site, with everything the AC7 assertion
+    /// needs to name it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Mika2473Site {
+        /// Path relative to the crate's `src/`, e.g. `agent_loop/mod.rs`.
+        file: String,
+        /// 1-based line inside that file.
+        line: usize,
+        /// The `fn` the call sits in.
+        enclosing: String,
+        /// The trimmed source line, so a failure reads without opening the file.
+        text: String,
+    }
+
+    impl std::fmt::Display for Mika2473Site {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self {
+                file,
+                line,
+                enclosing,
+                text,
+            } = self;
+            write!(f, "{file}:{line} (in `{enclosing}`): {text}")
+        }
+    }
+
+    /// Every `detect_config_change(` call site in one Rust source, tagged with
+    /// the file it was found in.
     ///
     /// **Prose is not a call site.** A line whose content starts with `//`
     /// *names* the primitive without calling it; flagging those would make the
     /// only way to keep the guard green to stop naming the contract in comments,
     /// which is how a structural guard gets disarmed by the people it serves.
-    fn mika2473_freshness_check_sites(src: &str) -> Vec<(usize, String, String)> {
+    /// `server/mod.rs` names it in exactly that way, one line above
+    /// `note_config_at_boot`.
+    fn mika2473_freshness_check_sites(file: &str, src: &str) -> Vec<Mika2473Site> {
         let mut enclosing = String::from("<no enclosing fn>");
         let mut sites = Vec::new();
         for (i, line) in src.lines().enumerate() {
@@ -15664,7 +15692,12 @@ mod tests {
                 continue;
             }
             if text.contains("detect_config_change(") {
-                sites.push((i + 1, enclosing.clone(), text.to_string()));
+                sites.push(Mika2473Site {
+                    file: file.to_string(),
+                    line: i + 1,
+                    enclosing: enclosing.clone(),
+                    text: text.to_string(),
+                });
             }
         }
         sites
@@ -15691,36 +15724,52 @@ mod tests {
     }
 
     /// **AC7 (mika#2473)** — the config-freshness check has exactly one call
-    /// site, and that site is the funnel.
+    /// site **in the whole crate**, and that site is the funnel.
     ///
     /// `load_agent_context` is the single entry point of the three loops —
     /// conversation (`run_agent`), silent, and team (`run_team_agent_inner_impl`)
     /// — so one call there evaluates every turn that runs on this process
-    /// (KTD5). A second call, added inside one loop body by an author who did
-    /// not know the funnel existed, costs a second `stat` per turn and — the
-    /// real damage — splits the "one report per distinct mtime" contract
-    /// (R9/KTD4) across two callers of a dedup map keyed by `agent_id`, not by
-    /// call site: whichever site ran first would silence the other, and which
-    /// one that is would depend on the loop.
+    /// (KTD5). A second call, added by an author who did not know the funnel
+    /// existed, costs a second `stat` per turn and — the real damage — splits
+    /// the "one report per distinct mtime" contract (R9/KTD4) across two callers
+    /// of a dedup map keyed by `agent_id`, not by call site: whichever site ran
+    /// first would silence the other, and which one that is would depend on the
+    /// loop.
     ///
-    /// Shipped with **no allowlist**, and the pre-existing population at HEAD
-    /// was **zero** — so the first entry anyone would want to add here is
-    /// exactly the second site this scan exists to refuse. Conduct when it
-    /// fires: **remove the second call site**, never allowlist it. The same
-    /// rule `mika1883_run_usage_accumulates_only_via_the_one_helper` states for
-    /// its own empty list, one module over.
+    /// # Why the whole crate and not `agent_loop/mod.rs`
+    ///
+    /// Because the damage does not care which file the second site lives in, and
+    /// a scan of one file is *most* blind exactly where a stranger to this
+    /// contract would write: `server/`, `teams/`, `task_engine/`. A guard that
+    /// green-lights the case it exists to refuse is worse than none — it reads
+    /// as coverage. The one-file form shipped that way and its companion control
+    /// only ever injected a second site into the *same* file, which is the case
+    /// the scan did cover.
+    ///
+    /// Shipped with **no allowlist**, and the population at HEAD is **one**. So
+    /// the first entry anyone would want to add here is exactly the second site
+    /// this scan exists to refuse. Conduct when it fires: **remove the second
+    /// call site**, never allowlist it. The same rule
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` states for its
+    /// own empty list, one module over.
     #[test]
     fn mika2473_the_freshness_check_sits_in_the_one_funnel() {
         let scanner =
             mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
-        let sites = mika2473_freshness_check_sites(&production);
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<Mika2473Site> = Vec::new();
+        scanner.for_each(|path, production| {
+            let label = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            sites.extend(mika2473_freshness_check_sites(&label, production));
+        });
 
         let rendered = sites
             .iter()
-            .map(|(line, enclosing, text)| {
-                format!("agent_loop/mod.rs:{line} (in `{enclosing}`): {text}")
-            })
+            .map(Mika2473Site::to_string)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -15728,45 +15777,77 @@ mod tests {
             sites.len(),
             1,
             "mika#2473 AC7 — `detect_config_change` must be called exactly once \
-             in `agent_loop/mod.rs`. Remove the extra call site; do not \
-             allowlist it — two sites share one dedup key and silence each \
-             other:\n{rendered}"
+             in this crate. Remove the extra call site; do not allowlist it — two \
+             sites share one dedup key and silence each other:\n{rendered}"
         );
         assert_eq!(
-            sites[0].1, "load_agent_context",
+            sites[0].enclosing, "load_agent_context",
             "mika#2473 KTD5 — the one call must sit in `load_agent_context`, the \
              funnel of the three loops. A guard in a single loop is blind to the \
              other two:\n{rendered}"
+        );
+        assert_eq!(
+            sites[0].file,
+            std::path::Path::new("agent_loop")
+                .join("mod.rs")
+                .display()
+                .to_string(),
+            "mika#2473 KTD5 — and `load_agent_context` lives in `agent_loop/mod.rs`. \
+             A same-named fn elsewhere is not the funnel:\n{rendered}"
         );
     }
 
     /// Good-faith control for the scan above: it catches the shape it claims to,
     /// rather than being a predicate that matches nothing.
+    ///
+    /// The second site is injected into a **different file**, which is the case
+    /// the one-file form of this guard could not see: it is the whole reason the
+    /// scan became a crate walk.
     #[test]
     fn mika2473_the_funnel_scan_catches_a_second_site() {
         let funnel = "async fn load_agent_context(db: &AsyncDatabase) -> Result<AgentContext> {\n    \
              if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {}\n}\n";
-        let one = mika2473_freshness_check_sites(funnel);
+        let one = mika2473_freshness_check_sites("agent_loop/mod.rs", funnel);
         assert_eq!(one.len(), 1, "the legal shape is one site");
         assert_eq!(
-            one[0].1, "load_agent_context",
+            one[0].enclosing, "load_agent_context",
             "and it is attributed to the funnel"
         );
+        assert_eq!(one[0].file, "agent_loop/mod.rs", "and to its file");
 
-        let two = format!(
+        let same_file = format!(
             "{funnel}\nasync fn run_team_agent_inner_impl() {{\n    \
              let _ = mika_common::llm::detect_config_change(\"mika-arch\");\n}}\n"
         );
-        let both = mika2473_freshness_check_sites(&two);
-        assert_eq!(both.len(), 2, "a second call site must be caught");
+        let both = mika2473_freshness_check_sites("agent_loop/mod.rs", &same_file);
         assert_eq!(
-            both[1].1, "run_team_agent_inner_impl",
+            both.len(),
+            2,
+            "a second call site in the same file is caught"
+        );
+        assert_eq!(
+            both[1].enclosing, "run_team_agent_inner_impl",
             "and named by the fn that added it"
         );
 
+        // The case the one-file scan was blind to: a stranger to this contract
+        // writes the second call where the turn passes through *their* module.
+        let elsewhere = "pub async fn init_agent(agent_name: &str) {\n    \
+             let _ = mika_common::llm::detect_config_change(agent_name);\n}\n";
+        let mut across = one.clone();
+        across.extend(mika2473_freshness_check_sites("server/mod.rs", elsewhere));
+        assert_eq!(
+            across.len(),
+            2,
+            "a second call site in ANOTHER file must be caught — this is the \
+             population the crate walk exists for"
+        );
+        assert_eq!(across[1].file, "server/mod.rs", "and named by its file");
+        assert_eq!(across[1].enclosing, "init_agent");
+
         let prose = "/// The funnel calls `detect_config_change(` once.\nfn f() {}\n";
         assert!(
-            mika2473_freshness_check_sites(prose).is_empty(),
+            mika2473_freshness_check_sites("server/mod.rs", prose).is_empty(),
             "naming the primitive in a comment is not calling it — flagging \
              prose is how this guard would get disarmed"
         );

@@ -137,9 +137,15 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   pas encore été rapporté, spirit re-résout le record **depuis le disque** (sans
   toucher `AgentState.budget_record`), le compare au record du boot hors
   `resolved_at`, et émet une fois par mtime : WARN
-  `agent_config_changed_since_boot` avec `restart_required = true` **ssi un
-  champ du record budget/modèle de mika#2457 diffère**, INFO avec
-  `restart_required = false` sinon. Le bras `false` n'est **pas** « rien n'a
+  `agent_config_changed_since_boot` avec `restart_required = true` **ssi une
+  valeur EN SERVICE diffère de celle du disque**, INFO avec
+  `restart_required = false` sinon. « Valeur », et non « champ du record » : le
+  record porte aussi ses champs de provenance (`*_source`, `*_raw`), et déplacer
+  un réglage d'une porte de la cascade à une autre **à valeur identique** ne rend
+  rien obsolète. Comparer le record entier ferait crier au redémarrage sur un
+  déménagement — un faux positif sur le bras bruyant, qui est celui qu'un
+  opérateur croit. La comparaison neutralise donc `resolved_at` **et** la
+  provenance (revue de code mika#2473). Le bras `false` n'est **pas** « rien n'a
   changé » : `ResolvedBudgetRecord` ne porte ni `openrouter_base_url`, ni
   `zai_base_url`, ni `log_level`, donc une édition de ces clés — un geste réel
   sur ces agents, et qui change l'endpoint servi — y tombe. Le message dit donc

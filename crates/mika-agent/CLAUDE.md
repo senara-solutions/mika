@@ -131,19 +131,72 @@ signature untouched — the scan that refuses a second constructor stays green w
 an empty allowlist. `init_agent` compares what `well_known_agents.rs` declares for
 this agent against what the cascade resolved, emits `well_known_model_drift` (WARN)
 or `well_known_model_in_sync` (INFO) once, and takes the boot note D2 needs. **No
-new error path**: nothing here refuses a boot. The three agents of a dev
-workstation are in measured drift today (mika-arch `kimi-k2.5`→`kimi-k3`, mika-qa
-`zai`→`openrouter`), and reporting them *is* the deliverable — muting that
+new error path**: nothing here refuses a boot. **Two** of the three agents on a
+dev workstation are in measured drift today (mika-arch `kimi-k2.5`→`kimi-k3`,
+mika-qa `zai`→`openrouter`); the third, mika-dev, is in phase — and reporting all
+three, whichever the verdict, *is* the deliverable — muting that
 population with an allowlist would rebuild the silent guard mika#2328 measured.
 
 *And once per turn, whether the disk moved under the process.* The per-turn half
 sits at the head of `load_agent_context` — the **single funnel** of all three
 loops, team runs included, which is why `mika2473_the_freshness_check_sits_in_the_one_funnel`
 is a source scan asserting exactly one call site and shipping no allowlist: two
-sites would share one dedup key and silence each other. Its companion control
-(`…_catches_a_second_site`) keeps that scan from going vacuous. A turn whose agent
-this process never initialized finds no boot note and triggers nothing — that, and
-not "team runs", is the exempt population.
+sites would share one dedup key and silence each other. **That scan walks the
+whole crate**, not `agent_loop/mod.rs` alone: it shipped reading one file, which
+left it green on a second call site in `server/`, `teams/` or `task_engine/` —
+i.e. blind exactly where a stranger to this contract would write, and reading as
+coverage while covering nothing (measured: a `detect_config_change` planted in
+`init_agent` kept the one-file form green). Its companion control
+(`…_catches_a_second_site`) keeps the scan from going vacuous and now injects its
+second site in a **different** file. A turn whose agent this process never
+initialized finds no boot note and triggers nothing — that, and not "team runs",
+is the exempt population.
+
+*Nothing on that per-turn path may panic, refuse, or shout every turn.* Three
+properties the review of mika#2473 had to close, all in
+`mika-common::llm::config_freshness`. (a) The mtime is formatted by a **fallible**
+conversion with a named fallback (`CONFIG_MTIME_UNREPRESENTABLE`);
+`DateTime::<Utc>::from(SystemTime)` ends in an `.unwrap()` and a filesystem will
+store an instant outside chrono's range, so the shipped form could panic on a
+turn — and it wrote `reported` *before* converting, which marked the drift
+reported and lost it for good. (b) The global `BOOT_NOTES` mutex is **not held
+across the `stat` nor across `resolve_llm_budget_record`** (itself up to three
+more synchronous reads): it is shared by every agent, so one slow `config.toml`
+serialised every other agent's turn. Releasing it opens a race, closed by
+re-checking `Reported::covers` under the second acquisition, so R9's
+at-most-once-per-distinct-mtime still holds. (c) `agent_config_mtime_unreadable`
+is emitted on the **onset and on the recovery**, not once per turn — the readable
+path was deduplicated and this one was not, so a `config.toml` made unreadable
+produced one WARN per turn for ever on an arm whose expected regime is zero
+(mika#2131). The population semantics are untouched: an unreadable `stat` still
+leaves the population and still leaves `BootNote::reported` intact.
+
+*`restart_required` answers "a value in service differs", not "the record
+differs".* `ResolvedBudgetRecord` carries `*_source` and `*_raw` provenance, so
+moving a setting between cascade doors **at the same value** used to raise the
+loud arm and WARN that a restart was needed — a false alarm about a change a
+restart would not apply. The comparison now clears dating *and* provenance on
+both clones, and a door-only move lands on the INFO arm, whose wording already
+says exactly that.
+
+*The D1 assembly is a function, so it can be tested as one.*
+`server::establish_model_drift(agent, global_home, agent_home, &record)` carries
+`find_well_known_agent → config_toml → declared_model → compare →
+emit_model_drift → note_config_at_boot` and returns the check. Inline, the
+sequence was only ever exercised through its primitives: swapping
+`global_home`/`agent_home` at the note, or dropping a step, compiled and passed
+every test while D2 watched a file nobody edits.
+`mika2473_the_boot_assembly_returns_the_check_and_takes_the_note` asserts the
+verdict, the note under the right key, **and** that D2 then sees an edit to *that
+agent's* `config.toml` — the only term that catches the swap.
+
+*The D1 line says whether the declared model was written or defaulted.*
+`declared_model_is_provider_default` rides both comparing arms of
+`ModelDriftCheck` onto `well_known_model_drift` / `well_known_model_in_sync`. It
+was computed and never read; on the line it is actionable — reconciling the
+constant means **writing** a model key when nothing declared one and **editing**
+one when something did, and on the in-sync arm it says the agreement rests on a
+provider default the provider can move without any file changing.
 
 *A half-configured pair now fails at boot.* `server::budget_guard::assert_llm_budgets_valid`
 runs in `run_server` after `provision_well_known_agents` (which writes the
