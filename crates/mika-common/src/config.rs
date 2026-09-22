@@ -434,6 +434,25 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Claude thinking level (low/medium/high/off)",
     },
+    // mika#2425 — the per-tenant half of `[context.history]`. The identity
+    // declares a role's floor; these two may only NARROW it, never widen it.
+    // Deliberately absent from `mika_agent::config_keys::SETTABLE_CONFIG_KEYS`:
+    // that constant IS the `set_config` tool surface, so the omission is the
+    // whole of the refusal (mika#2425 refus 2).
+    ConfigKeyInfo {
+        key: "context_history_scope",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Per-tenant conversation-window scope: agent (neutral, the default) or session. Can only narrow what identity.toml [context.history] declares.",
+    },
+    ConfigKeyInfo {
+        key: "context_history_max_tokens",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Per-tenant conversation-window token ceiling: none (neutral, the default) or an integer >= 500. The narrower of this and identity.toml wins.",
+    },
     // -- Knowledge Graph --
     ConfigKeyInfo {
         key: "kg_docs_root",

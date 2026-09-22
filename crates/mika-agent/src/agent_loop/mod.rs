@@ -51,6 +51,7 @@ use mika_common::llm::ProviderKind;
 
 /// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
 /// prompt-injection helpers. Co-located with the loop that reads them.
+pub mod context_history;
 pub mod review_anchor;
 pub mod skill_nudge;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
@@ -469,6 +470,18 @@ struct AgentContext {
     /// reads its exact neighbour. `None` is the third state: nothing is posed in
     /// `## Runtime` and the drift guard does not arm.
     language: Option<crate::config_keys::TenantLanguage>,
+    /// Raw per-tenant conversation-window narrowing (mika#2425), carried
+    /// **unparsed** to the decision site.
+    ///
+    /// The values travel raw on purpose: the resolver and the consumer must not
+    /// be separated by a function boundary, or the resolved pair becomes a
+    /// second thing somebody can compute differently. Read fail-open like every
+    /// other `customer_config` read here — a DB error resolves to "no narrowing
+    /// posed", which is today's behaviour, rather than failing a turn over a
+    /// window setting.
+    db_history_scope: Option<String>,
+    /// Same, for the token ceiling. See [`Self::db_history_scope`].
+    db_history_max_tokens: Option<String>,
     /// Active `stop_topic_*` preferences (mika#1813). Loaded fail-open — a query
     /// error here must not block the turn; the `<stopped-topics>` block simply
     /// stays empty.
@@ -504,14 +517,35 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
     // Fail-open like every other read here: a DB error resolves to the third
     // state (nothing posed, nothing guarded), which is today's behaviour, rather
     // than failing the turn over a register setting.
-    let language_raw = db
-        .get_customer_config(crate::config_keys::TENANT_LANGUAGE_KEY)
-        .await
-        .unwrap_or_else(|e| {
-            warn!(error = %e, event = "tenant_language_load_failed", "tenant language read failed");
-            None
-        });
+    let language_raw = read_optional_customer_config(
+        db,
+        crate::config_keys::TENANT_LANGUAGE_KEY,
+        "tenant_language_load_failed",
+    )
+    .await;
     let language = report_resolved_tenant_language(db.agent_id(), language_raw.as_deref());
+    // mika#2425 — the per-tenant half of `[context.history]`, riding the exact
+    // trajectory `timezone` and `language` already trace: same table, same call
+    // site, same struct. That neighbourhood is the whole reason `customer_config`
+    // was chosen over an `identity.toml` writer (see
+    // `config_keys::CONTEXT_HISTORY_SCOPE_KEY` for the three measurements).
+    //
+    // Fail-open, and note the asymmetry with the `timezone` line above, which
+    // uses `?`: a window setting that cannot be read must cost the turn nothing.
+    // The resolver then applies what identity.toml declares, exactly as if no
+    // key were posed.
+    let db_history_scope = read_optional_customer_config(
+        db,
+        crate::config_keys::CONTEXT_HISTORY_SCOPE_KEY,
+        "context_history_scope_load_failed",
+    )
+    .await;
+    let db_history_max_tokens = read_optional_customer_config(
+        db,
+        crate::config_keys::CONTEXT_HISTORY_MAX_TOKENS_KEY,
+        "context_history_max_tokens_load_failed",
+    )
+    .await;
     // mika#1813: load stop-signal preferences for injection into every turn.
     //
     // Fail-open by design (per AgentContext::stopped_topics doc). Log the error
@@ -537,7 +571,32 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
         core_memory,
         timezone,
         language,
+        db_history_scope,
+        db_history_max_tokens,
         stopped_topics,
+    })
+}
+
+/// Read one `customer_config` key, fail-open, naming the failure under `event`.
+///
+/// A distinct event name per key rather than a shared one, for the reason
+/// mika#2205 had to write down about `auto_pull_no_token` / `wip_rescue_no_token`:
+/// two populations under one name are not subtractable, and the grep that
+/// answers "is this setting being read at all?" must name the setting.
+///
+/// **`timezone` deliberately does not go through here.** That read uses `?` and
+/// fails the turn; the three that use this helper resolve to "nothing posed",
+/// which is the pre-existing behaviour for each of them. The asymmetry is the
+/// contract, not an oversight — converting `timezone` would change when a turn
+/// dies.
+async fn read_optional_customer_config(
+    db: &AsyncDatabase,
+    key: &str,
+    event: &'static str,
+) -> Option<String> {
+    db.get_customer_config(key).await.unwrap_or_else(|e| {
+        warn!(error = %e, key = %key, event = event, "customer_config read failed");
+        None
     })
 }
 
@@ -4893,17 +4952,34 @@ async fn run_agent_inner(
     let image_disposition = crate::image_disposition::decide(params.user_images, effective_llm);
     record_withheld_images(db, session_id, trace_id, scope_task_id, &image_disposition).await;
 
-    let history_config = &ctx.identity.context.history;
+    // mika#2425 — the identity declares a ROLE FLOOR; `customer_config` may
+    // narrow it per tenant and never widen it. This is the single production
+    // reader of `identity.context.history`, held by
+    // `mika2425_identity_context_history_has_a_single_reader`: a second one
+    // would apply the floor without the narrowing, silently, with every
+    // behavioural assertion still green.
+    let resolved_history = context_history::resolve(
+        &ctx.identity.context.history,
+        ctx.db_history_scope.as_deref(),
+        ctx.db_history_max_tokens.as_deref(),
+        context_history::SessionMinting::of(&ctx.identity),
+    );
+    context_history::report_resolved(&db.agent_id, &resolved_history);
+
     // mika#1951, read site 2 of 2. The caller may narrow this turn's scope to its
     // own session; it may never widen it. The branch only ever *replaces* a
     // declared scope with the narrower one, so an agent already declaring
     // `session` (mika-arch) cannot be pushed back to `agent` from the network
     // whatever a caller sends. That asymmetry is why the wire key is a bool: the
     // widening request has no spelling.
+    //
+    // mika#2425 composes upstream and in the SAME direction: the caller narrows
+    // what the cascade already resolved, so the two asymmetries never have to be
+    // arbitrated against each other.
     let effective_scope = if params.session_isolated {
         prompt::HistoryScope::Session
     } else {
-        history_config.scope
+        resolved_history.scope
     };
     let scoped_session_id = match effective_scope {
         prompt::HistoryScope::Session => Some(session_id),
@@ -4912,7 +4988,11 @@ async fn run_agent_inner(
     let mut history = db
         .rebuild_context(scoped_session_id, scope_task_id, 20)
         .await?;
-    let truncation = match history_config.max_tokens {
+    // mika#2425 — the RESOLVED ceiling, not the declared one. Reading
+    // `ctx.identity.context.history.max_tokens` here would apply the role's floor
+    // and drop the tenant's narrowing on this axis alone, which is the half-wired
+    // shape `mika2425_identity_context_history_has_a_single_reader` refuses.
+    let truncation = match resolved_history.max_tokens {
         Some(max_tokens) => truncate_history_to_token_budget(&mut history, max_tokens),
         None => HistoryTruncation::default(),
     };
@@ -15861,11 +15941,24 @@ mod tests {
     /// `grooming_marker` had to engrave once (mika#2158: a copied regex whose own
     /// comment said "Mirrors …" and then missed two widenings).
     ///
-    /// Exactly **two** sites are expected, both in `agent_loop/mod.rs`: the
-    /// decision (`scoped_session_id`) and the rendering (`history_scope_label`).
-    /// A third is halt-and-surface, not an allowlist entry — whether it is a
-    /// legitimate rendering or a second decision is a question this guard cannot
-    /// answer for you.
+    /// Exactly **three** sites are expected, all under `agent_loop/`: the
+    /// cascade (`context_history::resolve`, mika#2425), the decision
+    /// (`scoped_session_id`) and the rendering (`history_scope_label`). A fourth
+    /// is halt-and-surface, not an allowlist entry — whether it is a legitimate
+    /// rendering or a second decision is a question this guard cannot answer for
+    /// you.
+    ///
+    /// **mika#2425 amended this guard rather than excepting itself from it**, and
+    /// the difference matters. What the guard protects is written in its own
+    /// message: *two answers to "which rows may this window draw from?" can drift
+    /// apart without breaking anything visible.* `context_history::resolve` is
+    /// not a second answer — it **produces** the single answer `scoped_session_id`
+    /// consumes, and `mika2425_identity_context_history_has_a_single_reader`
+    /// guarantees that consumer reads nothing else. Two grep-visible gestures:
+    /// the count goes `2 → 3` and names the third site, and the path constraint
+    /// relaxes from `agent_loop/mod.rs` to `agent_loop/` — the invariant as
+    /// written is *the readers live in the loop*, and the resolver is in the loop.
+    /// The constraint is not relaxed beyond that directory.
     ///
     /// **The production half is read by [`mika_common::source_guard`]
     /// (mika#2398).** Truncating at the first `#[cfg(test)]`, as this guard did,
@@ -15888,21 +15981,24 @@ mod tests {
 
         assert_eq!(
             sites.len(),
-            2,
-            "mika#2305 — expected exactly two readers of `HistoryScope` outside \
-             deserialization: the decision in `run_agent` (`scoped_session_id`) and \
-             the rendering in `history_scope_label`. Found {}:\n{}\n\nIf you added \
-             a second *decision*, route it through `scoped_session_id` instead — \
-             two answers to \"which rows may this window draw from?\" can drift \
-             apart without breaking anything visible.",
+            3,
+            "mika#2305 (count amended by mika#2425) — expected exactly three readers of \
+             `HistoryScope` outside deserialization: the cascade in \
+             `context_history::resolve`, the decision in `run_agent` \
+             (`scoped_session_id`) and the rendering in `history_scope_label`. \
+             Found {}:\n{}\n\nIf you added a second *decision*, route it through \
+             `scoped_session_id` instead — two answers to \"which rows may this window \
+             draw from?\" can drift apart without breaking anything visible. If a \
+             rustfmt reflow split the resolver's `match` into two sites, put its arms \
+             back on one line each rather than raising this number.",
             sites.len(),
             sites.join("\n")
         );
         assert!(
-            sites.iter().all(
-                |s| s.starts_with("agent_loop/mod.rs:") || s.starts_with("agent_loop\\mod.rs:")
-            ),
-            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/mod.rs`:\n{}",
+            sites
+                .iter()
+                .all(|s| s.starts_with("agent_loop/") || s.starts_with("agent_loop\\")),
+            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/`:\n{}",
             sites.join("\n")
         );
     }
@@ -15978,6 +16074,193 @@ fn prod(scope: HistoryScope) -> usize {
             1,
             "a decisional match AFTER a module-level test helper must still be seen — \
              the truncating rule this guard used to apply would have missed it"
+        );
+    }
+
+    // -- mika#2425: the declared floor has ONE reader -----------------------
+
+    /// Production sites exempted from [`mika2425_identity_context_history_has_a_single_reader`].
+    ///
+    /// **Shipped empty, and the resolution when the scan fires is to REMOVE the
+    /// second reader, never to add an entry here.** Same contract as
+    /// `ACTOR_READING_PREDICATES_ALLOWED` (mika#2323) and the empty allowlist of
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` — a list born
+    /// empty is a slot for the next lapse, so its emptiness is itself asserted.
+    ///
+    /// If an exception is ever genuinely warranted, the entry must name its
+    /// follow-up ticket (`mika#NNNN`), which the self-cleaning assertion below
+    /// enforces.
+    const CONTEXT_HISTORY_READERS_ALLOWED: &[&str] = &[];
+
+    /// Production lines reading the declared `[context.history]` block off an
+    /// identity, as `(1-based line, trimmed text)`.
+    ///
+    /// The needle is the **dotted field path** (`.context.history`), not the
+    /// TOML section header `[context.history]`: the second names the block in a
+    /// doc comment, a template literal or a `CODE_OWNED_IDENTITY_SECTIONS`
+    /// entry without reading it, and sweeping those in would make the guard
+    /// unusable on the very files that legitimately describe the section.
+    ///
+    /// A **comment line is not a reader**, and that exclusion is load-bearing
+    /// rather than cosmetic. This guard's own decision site carries three
+    /// paragraphs naming the field to say why it must be read exactly once, and
+    /// an unanchored predicate accused them — the same shape as the mika#2050
+    /// Signal S false positive, where a grep matched prose a pilot had written
+    /// *about* the signal. Anchoring on comments is what keeps the guard
+    /// readable enough to be trusted; an in-line trailing comment does not
+    /// exempt the code preceding it, since the line no longer *starts* with the
+    /// marker.
+    ///
+    /// Two further exclusions compose, in this order and for the reasons
+    /// [`scope_reader_sites`] states: a file whose **path** is test code has no
+    /// production half (mika#2321); anywhere else the test regions are masked
+    /// (mika#2398), which keeps the file's own line numbers.
+    fn identity_history_reader_sites(path: &std::path::Path, src: &str) -> Vec<(usize, String)> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        mika_common::source_guard::mask_test_regions(src)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, line)| {
+                line.contains(".context.history")
+                    && !line.starts_with("//")
+                    && !line.starts_with('*')
+            })
+            .collect()
+    }
+
+    /// **D3** — the identity's declared window has exactly one production reader.
+    ///
+    /// The whole mika#2425 cascade rests on that number being one: the declared
+    /// value is a **floor** that the `customer_config` half may only narrow, and
+    /// a second site reading `identity.context.history` directly would apply the
+    /// floor without the narrowing — silently, with every behavioural assertion
+    /// still green, because both answers are individually plausible. That is the
+    /// class `grooming_marker` had to close once (mika#2158), where promotion
+    /// and dispatch routing answered the same question differently for months.
+    #[test]
+    fn mika2425_identity_context_history_has_a_single_reader() {
+        assert!(
+            CONTEXT_HISTORY_READERS_ALLOWED
+                .iter()
+                .all(|entry| entry.contains("mika#")),
+            "mika#2425 — every entry of CONTEXT_HISTORY_READERS_ALLOWED must name the \
+             follow-up ticket that will remove it. An exemption nobody owns is how a \
+             guard stops guarding. Current list: {CONTEXT_HISTORY_READERS_ALLOWED:?}"
+        );
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if CONTEXT_HISTORY_READERS_ALLOWED
+                .iter()
+                .any(|allowed| rel.contains(allowed))
+            {
+                return;
+            }
+            for (line, text) in identity_history_reader_sites(path, production) {
+                sites.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#2425 — expected exactly ONE production reader of the identity's \
+             `[context.history]`: the site that feeds `context_history::resolve`. \
+             Found {}:\n{}\n\nIf you added a second one, route it through the resolver \
+             instead of allowlisting it — a site reading the declared value directly \
+             applies the role's floor WITHOUT the per-tenant narrowing, and nothing \
+             visible breaks.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites[0].starts_with("agent_loop/mod.rs:")
+                || sites[0].starts_with("agent_loop\\mod.rs:"),
+            "mika#2425 — the one reader must be the decision site in `agent_loop/mod.rs`, \
+             where the resolved scope is consumed:\n{}",
+            sites[0]
+        );
+    }
+
+    /// **D3b — good-faith control for D3.**
+    ///
+    /// D3 could be green because it looks at nothing, which is the exact failure
+    /// mode D3 exists to make visible. So the predicate is shown to redden on a
+    /// reader added elsewhere, and to stay silent on the four shapes that name
+    /// the block without reading it.
+    #[test]
+    fn mika2425_the_reader_scan_reddens_on_a_second_reader() {
+        let prod = std::path::Path::new("src/somewhere.rs");
+
+        let offending = "fn elsewhere(identity: &Identity) -> HistoryScope {\n    \
+             identity.context.history.scope\n}\n";
+        assert_eq!(
+            identity_history_reader_sites(prod, offending).len(),
+            1,
+            "the scan must see a reader added outside the decision site"
+        );
+
+        // 1. The TOML section header in a doc comment or a template literal.
+        let header = "/// `[context.history]` bounds the window.\n\
+             const IDENTITY: &str = \"[context.history]\\nscope = \\\"session\\\"\\n\";\n";
+        assert!(
+            identity_history_reader_sites(prod, header).is_empty(),
+            "naming the TOML section is not reading the field"
+        );
+
+        // 2. The section path as data (CODE_OWNED_IDENTITY_SECTIONS).
+        let as_data = "const CODE_OWNED: &[&str] = &[\"context.history\", \"context.summary\"];\n";
+        assert!(
+            identity_history_reader_sites(prod, as_data).is_empty(),
+            "the section path as a string datum is not a field read"
+        );
+
+        // 3. A read inside a masked test region.
+        let in_tests = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
+             assert_eq!(identity.context.history.scope, HistoryScope::Agent);\n}\n";
+        assert!(
+            identity_history_reader_sites(prod, in_tests).is_empty(),
+            "a test region is masked before scanning"
+        );
+
+        // 4. A file whose path is test code has no production half at all.
+        let test_path = std::path::Path::new("src/db/tests/harnais.rs");
+        assert!(
+            identity_history_reader_sites(test_path, offending).is_empty(),
+            "mika#2321 — a file under `tests/` is test code whatever its contents"
+        );
+
+        // 5. Prose ABOUT the field — the shape that accused this guard's own
+        // decision site, and the mika#2050 Signal S class. A comment cannot read.
+        let prose = "\
+// This is the single production reader of `identity.context.history`.
+/// Reading `ctx.identity.context.history.max_tokens` here would drop the narrowing.
+ * `identity.context.history` is the role floor.
+";
+        assert!(
+            identity_history_reader_sites(prod, prose).is_empty(),
+            "prose naming the field is not a read — an unanchored predicate accuses \
+             the very comments that explain why the field has one reader"
+        );
+
+        // …but a trailing comment does not exempt the code before it.
+        let trailing = "    let h = &ctx.identity.context.history; // the role floor\n";
+        assert_eq!(
+            identity_history_reader_sites(prod, trailing).len(),
+            1,
+            "only a line that STARTS with a comment marker is prose"
         );
     }
 
