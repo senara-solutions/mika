@@ -117,10 +117,13 @@ emploie `armed` partout.
 - R7. Aucune valeur de réglage, aucun terme du prédicat T1–T7, aucun compteur
   du tick (`disposed`/`failed`/`refused`), aucune migration ne change. Le
   chemin `armed` produit **exactement** les mêmes lignes qu'aujourd'hui.
-- R8. Les deux documents contractuels sont mis en accord : le doc de module de
-  `worktree_reaper.rs` (§ « Trois leviers » et commentaire de `REAPED_TOOL`) et
+- R8. Les **trois** documents contractuels sont mis en accord : le doc de module de
+  `worktree_reaper.rs` (§ « Trois leviers » et commentaire de `REAPED_TOOL`),
   `CLAUDE.md` § reaper (lignes du levier `MIKA_WORKTREE_REAP_DISPOSITION`, des
-  surfaces opérateur, et de la sonde post-déploiement « commencer en observe »).
+  surfaces opérateur, et de la sonde post-déploiement « commencer en observe »),
+  et `crates/mika-agent/CLAUDE.md` § reaper (paragraphe « SOLE WRITER of the
+  `worktree_reaped` audit `tool_name` », `:1022-1023`, qui porte la même
+  affirmation que le commentaire de `REAPED_TOOL` — revue doc 2026-09-22).
 
 ---
 
@@ -215,7 +218,7 @@ la requête « population observée » inexacte en silence.
 ## Scope Boundaries
 
 **Dans le périmètre :** le triplet (event, tool_name, message) par disposition ;
-sa source unique ; le garde structurel ; les deux docs contractuels.
+sa source unique ; le garde structurel ; les trois docs contractuels (R8).
 
 **Hors périmètre, nommé :**
 
@@ -269,6 +272,12 @@ Dans `mod tests` de `worktree_reaper.rs`.
 
 ### U4 — Documentation (R8)
 
+`crates/mika-agent/CLAUDE.md` § reaper (mika#2420), paragraphe « **SOLE WRITER** of
+the `worktree_reaped` audit `tool_name` » : étendre à *SOLE WRITER des deux noms —
+`worktree_reaped` (`armed`, retrait effectif) et `worktree_reap_would_dispose`
+(`observe`, la population qui serait retirée — mika#2469) — épinglés par le même
+scan de source*.
+
 `CLAUDE.md` § reaper (mika#2420) :
 
 - Levier `MIKA_WORKTREE_REAP_DISPOSITION` : *« writing its audit rows with
@@ -319,7 +328,9 @@ cargo clippy -p mika-agent --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Tests, tous dans `worktree_reaper::tests`, préfixe `mika2469_` :
+Tests, tous dans `worktree_reaper::tests`, préfixe `mika2469_`. **Les T1–T5
+ci-dessous numérotent les tests de ce contrat, pas les sept termes du prédicat
+(`T1–T7` de R7 et du § Scope) ; en cas de doute, le nom de fonction fait foi.**
 
 - **T1 — `mika2469_en_observe_laudit_ne_revendique_pas_un_retrait`** (R2/R3 ;
   **rouge sur `main`**). `record_reaped(…, Disposition::Observe, …)` sur une DB
@@ -368,12 +379,15 @@ dans ce crate hors `memory/`) ; c'est D2 qui le couvre : le message que
       daté existe sur le ticket (F1 arch pass 1). Vérifiable :
       `gh issue view 2469 --repo senara-solutions/mika --json body -q .body | grep -c 'Rectification 2026-09-22'` ≥ 1.
 - [ ] `grep -n '"worktree_reap: worktree de PR terminale retiré"' crates/` rend
-      **un seul** site (la constante `REAPED_MESSAGE`).
-- [ ] Aucune valeur de réglage, aucun terme T1–T7, aucun compteur du tick,
-      aucune migration modifiés ; `schema_version` inchangée.
-- [ ] `CLAUDE.md` § reaper et le doc de module disent la même chose que le code
-      (R8) ; la requête opérateur « retraits » est exacte dans les deux
-      dispositions.
+      **exactement deux** sites, tous deux dans `worktree_reaper.rs` : la constante
+      `REAPED_MESSAGE` et le pin à l'octet près de T2 (revue doc 2026-09-22 :
+      « un seul site » contredisait T2/F3, qui exige le littéral dans le test) ;
+      aucun littéral ne subsiste dans le corps de `reap_terminal_worktrees`.
+- [ ] Aucune valeur de réglage, aucun **terme du prédicat** T1–T7, aucun compteur
+      du tick, aucune migration modifiés ; `schema_version` inchangée.
+- [ ] `CLAUDE.md` § reaper, `crates/mika-agent/CLAUDE.md` § reaper et le doc de
+      module disent la même chose que le code (R8) ; la requête opérateur
+      « retraits » est exacte dans les deux dispositions.
 - [ ] Sonde post-merge (une seule, bornée) : un tick en
       `MIKA_WORKTREE_REAP_DISPOSITION=observe` sur la station, s'il existe au
       moins un candidat, produit `event=worktree_reap_would_dispose` et une ligne
