@@ -1475,6 +1475,155 @@ Aucun filtre acteur n'existe ; ce qui manquait, c'est de savoir quelle porte a r
 - **Surfaces opérateur.** SQL — `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'ready_label_outcome' GROUP BY 1 ORDER BY 2 DESC;` donne la distribution des portes, la mesure que le ticket demandait et qui n'existait pas ; `SELECT * FROM audit_events WHERE tool_name = 'ready_label_outcome' AND target_key = 'senara-solutions/mika#2323' ORDER BY created_at DESC;` répond directement à « pourquoi ce ticket n'a-t-il pas dispatché ? », en une requête plutôt qu'en un grep sur dix-neuf gigaoctets. Journal — `grep ready_label_received $MIKA_SPIRIT_LOG_FILE | jq -c '{repo, num, actor}'` (une ligne par `labeled ready` réellement reçu) et `grep ready_label_outcome …` (sa porte).
 - **Sonde post-déploiement, 48 h, avec ses deux haltes.** *Halte 1 — l'instrument ne voit rien.* Un `labeled ready` humain posé, confirmé par la timeline GitHub, et **aucune** ligne `ready_label_received` : ne pas élargir le handler. L'événement n'atteint pas l'agent ; la cause est dans le chemin de livraison (file bornée, 429, circuit breaker, DLQ) et c'est **ce chemin** qu'il faut instrumenter, pas ce prédicat. *Halte 2 — une porte domine.* Si une valeur de `gate` concentre les refus (typiquement `operator_held` ou `pilot_in_flight`), le défaut n'est pas dans le handler : la porte a raison et un producteur en amont repose le label. C'est ce producteur qu'il faut traiter, et il a son propre ticket.
 
+Un dé-groomage est un fait estampillé par son producteur (mika#2242) :
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` sans comprendre
+pourquoi cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-09-08.** Fermer une PR **umbrella** qui déclare
+  `Closes #<sous-ticket>` **dé-groome** ses sous-tickets : le plan et le marqueur
+  `GROOMED` vivent sur la **branche de l'umbrella**, jamais sur le corps de
+  l'issue du sous-ticket, et le routage groom-vs-impl lit ce corps. #2131 a
+  conservé `ready` sans aucun callout ; chaque dispatch a re-routé vers `groom`.
+  Résolu à la main, en re-groomant #2131 standalone avec le plan récupéré sur la
+  branche morte de la PR #2226.
+- **Ce que la lecture du code déplace dans le ticket.** *(a)* L'option 2 du
+  ticket — « le sélecteur détecte que ce ticket était closingIssue d'une umbrella
+  fermée » — **n'est pas implémentable depuis le sous-ticket** : le nom canonique
+  d'un plan d'umbrella ne porte aucun numéro de sous-ticket (le créneau `<issue>`
+  contient le mot `umbrella`), donc ni `_find_issue_plan` ni un `git log --all`
+  ne le retrouvent ; et GitHub n'expose pas la direction issue → PR fermantes
+  (l'inverse, `PullRequest.closingIssuesReferences`, existe seul). **Le lien
+  n'est lisible qu'à un instant : la fermeture de la PR.** *(b)* La boucle
+  « indéfiniment » du ticket est **déjà bornée** depuis mika#2020 (trois
+  re-drives puis abandon) et mika#2279 (porte 2c). Ce qui restait ouvert est
+  double et se ferme par le même couple : rien ne nommait la cause, et le travail
+  revu — un plan plus deux passes architecte — était jeté.
+- **Un enregistrement, pas une action.** `pull_request.closed` est un **événement
+  unique non rejouable**, perdable aux quatre endroits que la maison a mesurés
+  (file bornée mika#1870 → 429 → disjoncteur → DLQ `dead`). C'est la classe dont
+  la couche C de #1694 est morte. On n'y accroche donc pas une action : on y
+  écrit un **fait durable** que des lecteurs ultérieurs consultent.
+- **Deux noms, deux populations, chacun à écrivain unique**, et c'est ce qui rend
+  les sondes lisibles. `closing_pr_closed_unmerged` (producteur) compte **toute**
+  fermeture sans merge × ref fermante, y compris les anodines — une PR de
+  brouillon fermée, une PR remplacée. `ready_label_degroomed` (lecteur) compte le
+  sous-ensemble qui a **effectivement** reflué en `groom` en portant le marqueur,
+  c'est-à-dire le défaut. **Le compte du producteur doit dominer largement celui
+  du lecteur** : c'est le régime sain, et il n'est soustractible que tant que
+  chaque nom a un seul écrivain (scan
+  `canonical_tokens::tests::mika2242_the_two_audit_names_have_a_single_writer`,
+  allowlist livrée vide). Cinquième emploi du motif après
+  `phantom_aged_out`/`phantom_sweep_spared` (mika#2156).
+- **Le routage ne change pas, et c'est un refus raisonné.** Un ticket dé-groomé
+  continue de partir en `groom`, même `dispatch_class`, même `ReadyLabelGate`.
+  Halter serait la lettre de l'option 2, et c'est refusé sur deux mesures : la
+  boucle n'est plus le mal à éviter (mika#2020), et **re-groomer un ticket
+  dé-groomé est un travail correct** — le plan est inatteignable depuis l'issue,
+  et un groom qui aboutit rétablit précisément les callouts qui manquent. C'est
+  d'ailleurs le remède que l'opérateur a appliqué à la main. *Un filet, pas un
+  chemin* (mika#2334).
+- **Fail-open sur toute lecture.** Registre illisible, marqueur absent,
+  `reasoning` inexploitable : le routage est identique à aujourd'hui. Le seul
+  effet possible d'une défaillance est de **perdre une explication**, jamais d'en
+  fabriquer une fausse. La granularité est porteuse : la décision du lecteur ne
+  tient qu'à la **présence** de la ligne, la branche est un enrichissement — un
+  `reasoning` illisible rend donc « dé-groomé par pr#N, branche inconnue »,
+  jamais un silence.
+- **Fenêtre de 90 jours, dérivée et non réécrite.** Le lecteur interroge sur
+  `evidence::audit::AUDIT_RETENTION_DAYS`, la constante que
+  `compact_old_audit_events` consomme : deux littéraux laisseraient la fenêtre
+  survivre aux lignes qu'elle lit, c'est-à-dire une recherche qui cesse de
+  trouver **en silence**. Coût nommé : un ticket délié il y a plus de 90 jours
+  perd son attribution et se relit comme « simplement non groomé » — le
+  comportement d'avant ce correctif.
+- **Portée agent : une condition de fonctionnement.** `audit_events` est scopé
+  par `agent_id`, donc producteur et lecteur doivent tourner sur le même agent.
+  Ils le font : `route_event` rend `mika-dev` pour `pull_request.closed` **et**
+  pour `issues.labeled`. Écrit au site d'émission parce que si ça cessait d'être
+  vrai, le marqueur deviendrait invisible **sans qu'aucun test ne rougisse**.
+  Limite corollaire : la résolution de siège (mika#2084) pourrait router les deux
+  événements d'un dépôt vers des sièges distincts — le lecteur retomberait alors
+  sur le comportement d'aujourd'hui, fail-open, jamais une attribution fausse.
+
+### SQL
+
+```sql
+-- « Pourquoi ce ticket n'est-il plus groomé, et où est son plan ? »
+SELECT created_at, after_value, reasoning FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged'
+   AND target_key = 'issue:senara-solutions/mika#2131';
+
+-- Quelle umbrella a délié quoi (population du producteur)
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le défaut réellement vécu (population du lecteur) — doit être TRÈS inférieure
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_degroomed' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `closing_pr_closed_unmerged` | INFO | **non vide, faible** | une fermeture sans merge a délié un ticket de sa PR fermante. Fréquent et souvent anodin. |
+| `ready_label_degroomed` | INFO | **proche de zéro** | chaque ligne est du grooming revu qu'on est en train de re-payer. |
+| `closing_pr_body_truncated_no_refs` | WARN | **inconnu, à mesurer** | l'angle mort de troncature. Non vide ⇒ des fermetures unmerged passent sous le radar du producteur. |
+| `ready_label_degroom_ledger_unreadable` | WARN | **vide** | toute occurrence est une attribution perdue (jamais fausse). |
+| `closing_pr_marker_write_failed` | WARN | **vide** | le marqueur n'a pas été écrit ; le nettoyage de rows, lui, a bien eu lieu. |
+
+- **L'angle mort, nommé et NON corrigé.** `format_event_text` tronque le corps de
+  PR à 2 000 caractères et `parse_closing_issue_refs` lit **ce corps tronqué** :
+  les lignes `Closes #N` d'une umbrella — corps typiquement long — peuvent tomber
+  au-delà. Le producteur serait alors **silencieusement inerte pour exactement la
+  population qu'il vise**, et un détecteur inerte se lit comme un détecteur sain
+  (mika#2205). D'où `closing_pr_body_truncated_no_refs`. Le fermer demanderait
+  d'aller chercher le corps complet en GraphQL, dans un handler qui ne fait
+  **aucune** lecture réseau et sur **toute** fermeture de PR — donc de changer la
+  population du nettoyage de rows existant. **Ticket de suivi, précondition : que
+  cette ligne soit non vide.**
+
+### Sondes, et leurs haltes
+
+1. **Contrôle positif du producteur (7 jours).** `closing_pr_closed_unmerged`
+   non vide. **Halte 1 —** vide alors que des PR ont été fermées sans merge :
+   **ne pas élargir le prédicat**, lire d'abord
+   `closing_pr_body_truncated_no_refs`. Si *elle* est non vide, le producteur est
+   inerte par troncature et le remède est son suivi. Si les deux sont vides,
+   établir le déploiement (classe mika#2340) avant toute conclusion — *une ligne
+   absente ne prouve rien tant qu'on n'a pas établi que le binaire qui tourne
+   sait l'écrire*.
+2. **Attribution du lecteur (30 jours).** `ready_label_degroomed` doit rester
+   proche de zéro. **Halte 2 —** si ce compte porte du trafic nominal, ce n'est
+   pas le lecteur qui est trop large : des tickets dé-groomés sont dispatchés en
+   série, et c'est la **décision de refus** ci-dessus qu'il faut rouvrir (copier
+   le plan vers chaque sous-ticket à la décomposition) — avec ce compte comme
+   précondition.
+3. **Le défaut fondateur n'est PAS rattrapé.** Le marqueur de #2131 n'existe pas
+   et n'existera pas : la PR #2226 a été fermée avant ce correctif, et **rien ici
+   ne rétro-remplit le registre** — fabriquer une ligne d'audit datée d'un
+   événement qu'on n'a pas observé serait l'inverse de tout ce que ce travail
+   défend. La sonde est la **prochaine** occurrence.
+4. **Contrôle négatif de bruit (7 jours).** Aucun `ready_label_degroomed` sur un
+   ticket portant ses trois callouts. **Halte 3 —** une occurrence signifie que
+   le lecteur est atteint sur le chemin `implement`, donc mal placé : le
+   corriger, ne pas filtrer en aval.
+
+**Ce que ce travail n'achète pas.** Il ne réutilise aucun plan automatiquement :
+il rend le plan **désignable** (un numéro de PR, une branche) là où il fallait
+une archéologie. Il ne rétro-remplit rien. Et `ready_label_degroomed` ne peut pas
+voir un ticket dont personne ne repose le label : *une attribution que personne
+ne déclenche reste un silence*.
+
+**Hors périmètre, délibérément :** la copie du plan aux sous-tickets à la
+décomposition (refus raisonné ci-dessus, **suivi** conditionné à la sonde 2) ;
+l'angle mort de troncature (**suivi** conditionné à la sonde 1) ; le halt au
+routage ; la réutilisation automatique du plan par le pilote de groom ;
+`claude-pilot#166`, qui vit dans un autre dépôt ; et le rétro-remplissage du
+registre.
+
 Optional (authentification des deux scans périodiques — mika#2205):
 - **`auto_pull` et `wip_rescue` résolvent PAT-first / App-fallback, plus PAT-seul.** Les deux gardes de `task_engine/dispatcher.rs` lisaient `self.github_token` — le PAT seul, peuplé depuis `Settings::agent_github_token()` — alors que le dispatcher détenait déjà `settings` et `github_app`, et que le convertisseur canonique `Settings::resolve_github_token` existait à côté. Le 2026-09-05 le PAT a disparu de l'environnement du spirit à ~16:20 et **les deux scans sont morts à la même seconde** (`auto_pull: running groomed ticket selection` dernier `16:20:00.320868Z`, `wip_rescue: running auto-resume scan` dernier `16:20:00.320882Z`), alors que le chemin App était sain (`manager_token_refreshed` jusqu'à 23:17Z, zéro `gh_app_token_exchange_failed`). Précédent identique et non généralisé : mika#2013 sur le cycle mika-manager.
 - **Identité (ADR-008).** Le repli App est acceptable **ici** parce qu'aucune opération de ces deux scans n'est de celles dont GitHub lit l'auteur : `auto_pull` bascule le label `ready` et lit ; `wip_rescue` rebase, pousse sur une branche de brouillon, `gh pr ready`, commente. Les chemins qui **exigent** l'identité machine (revue/merge de PR, où `mika-qa` approuvant une PR `mika-dev` sous l'identité App partagée est refusé par GitHub) ne passent pas par là et ne sont pas touchés — y compris le troisième site PAT-seul du même fichier, l'auto-fire post-grooming, laissé hors périmètre à dessein.

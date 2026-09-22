@@ -322,6 +322,168 @@ async fn emit_ready_label_outcome(
     }
 }
 
+/// `audit_events.tool_name` of the mika#2242 dé-groomage attribution.
+///
+/// # SOLE WRITER, and deliberately NOT the producer's name
+///
+/// Two names because the two populations genuinely differ. The producer
+/// (`closing_pr_closed_unmerged`) counts *every* unmerged close × closing ref,
+/// including the harmless ones — a draft PR closed, a PR superseded. This one
+/// counts the sub-set that **actually** fell back to `groom` while carrying the
+/// marker: the defect. The producer's count must dominate this one by a wide
+/// margin; that is the healthy regime, and it is subtractible only while each
+/// name has one writer. Fifth use of the motif after `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156).
+pub const READY_LABEL_DEGROOMED_TOOL: &str = "ready_label_degroomed";
+
+/// What the reader could recover from the producer's row.
+///
+/// The granularity of the fail-soft is load-bearing: the reader's **decision**
+/// rests on the row's *presence* alone, and `head_branch` is an enrichment. An
+/// unusable `reasoning` therefore yields "dé-groomé by pr#N, branch unknown",
+/// never a silence — losing the pointer is a smaller loss than losing the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DegroomMarker {
+    /// The producer's `after_value`, re-emitted verbatim so both halves
+    /// `GROUP BY` the same shape. `None` only if the column was NULL, which the
+    /// producer never writes.
+    pub pr_ref: Option<String>,
+    /// The branch carrying the plan the sub-ticket was groomed under.
+    pub head_branch: Option<String>,
+}
+
+/// Unfold the producer's `clé=valeur` record. Pure — testable without a DB.
+///
+/// Tolerant by construction: an absent, empty or unparseable `reasoning` costs
+/// the branch and nothing else. `head_branch` is read as the token up to the
+/// next space, which is what the producer writes and what a branch name can be.
+pub(crate) fn parse_degroom_marker(
+    after_value: Option<&str>,
+    reasoning: Option<&str>,
+) -> DegroomMarker {
+    let head_branch = reasoning
+        .and_then(|r| r.split_once("head_branch="))
+        .map(|(_, tail)| tail.split_whitespace().next().unwrap_or_default())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+
+    DegroomMarker {
+        pr_ref: after_value.filter(|v| !v.is_empty()).map(str::to_string),
+        head_branch,
+    }
+}
+
+/// Lower bound of the marker lookup: the ledger's own retention.
+///
+/// Derived from [`crate::evidence::audit::AUDIT_RETENTION_DAYS`] rather than
+/// written here, so the window cannot outlive the rows it reads. Named cost: a
+/// ticket untied longer ago than that loses its attribution and reads as "simply
+/// not groomed" — i.e. the pre-mika#2242 behaviour. Fail-open, safe direction.
+fn degroom_marker_lookup_since() -> String {
+    crate::timestamp::now_minus(chrono::Duration::days(
+        crate::evidence::audit::AUDIT_RETENTION_DAYS as i64,
+    ))
+}
+
+/// Name the dé-groomage when the routing falls back to `groom` and the producer
+/// left a marker on this ticket (mika#2242 R3).
+///
+/// # Fail-open on every read (R5)
+///
+/// An unreadable ledger, an absent marker, an unusable `reasoning`: the routing
+/// is identical to today's. The only thing a failure of this path can cost is an
+/// **explanation** — never a fabricated one, and never a changed decision.
+///
+/// # Agent scope is a condition of operation, not a detail
+///
+/// `audit_events` is scoped by `agent_id`, so producer and reader must run on
+/// the same agent. They do: `route_event` returns `mika-dev` for
+/// `pull_request.closed` **and** for `issues.labeled`. Written here because if
+/// that ceased to be true the marker would become invisible **without any test
+/// going red** — same reason `ci_success_handler` carries its own scope note.
+/// Corollary, named: seat resolution (mika#2084) could route a repo's events to
+/// a distinct `dispatch:<seat>`; split across seats, the reader falls back to
+/// today's behaviour — fail-open, never a false attribution.
+async fn note_degroomed_ticket(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    location: &ReadyLabelLocation,
+    missing_markers: &[&'static str],
+) {
+    let owner_repo = location.owner_repo();
+    let target_key =
+        crate::server::upstream_close_handler::degroom_marker_key(&owner_repo, location.number);
+
+    let row = match db
+        .latest_audit_event_for_target(
+            crate::server::upstream_close_handler::CLOSING_PR_CLOSED_UNMERGED_TOOL,
+            &target_key,
+            &degroom_marker_lookup_since(),
+        )
+        .await
+    {
+        // The nominal first grooming: no marker, nothing to say.
+        Ok(None) => return,
+        Ok(Some(row)) => row,
+        Err(e) => {
+            warn!(
+                event = "ready_label_degroom_ledger_unreadable",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: dé-groomage ledger unreadable — routing \
+                 unchanged, attribution lost (mika#2242)"
+            );
+            return;
+        }
+    };
+
+    let (after_value, reasoning, recorded_at) = row;
+    let marker = parse_degroom_marker(after_value.as_deref(), reasoning.as_deref());
+    let pr_ref = marker.pr_ref.unwrap_or_else(|| "pr#unknown".to_string());
+    let head_branch = marker
+        .head_branch
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let missing = missing_markers.join(",");
+
+    info!(
+        event = "ready_label_degroomed",
+        repo = %owner_repo,
+        num = location.number,
+        pr = %pr_ref,
+        head_branch = %head_branch,
+        missing_markers = %missing,
+        recorded_at = %recorded_at,
+        trace_id,
+        "ready_label_handler: ticket routed to `groom` because a closing PR was \
+         closed without merging — its plan lives on that PR's branch (mika#2242)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            READY_LABEL_DEGROOMED_TOOL,
+            &target_key,
+            None,
+            Some(&pr_ref),
+            Some(&format!(
+                "head_branch={head_branch} missing_markers={missing} recorded_at={recorded_at}"
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "ready_label_audit_log_failed",
+            repo = %owner_repo,
+            num = location.number,
+            error = %e,
+            "ready_label_handler: failed to write dé-groomage audit event (non-fatal)"
+        );
+    }
+}
+
 /// Attempt to handle a `[GitHub] Issue labeled ready on …` webhook structurally
 /// before the LLM turn.
 ///
@@ -913,6 +1075,28 @@ where
     //    sites would re-introduce the bug class this handler closes.
     let missing_markers = crate::skills::executor::check_grooming_markers(&body);
     let is_groomed = missing_markers.is_empty();
+
+    // 5b. mika#2242 — name the CAUSE when the routing falls back to `groom`.
+    //
+    //     THIS BLOCK DECIDES NOTHING. It runs after the predicate and before the
+    //     choice below, reads no value the choice reads, and returns no verdict:
+    //     a dé-groomed ticket keeps going to `groom`, with the same
+    //     `target_skill`, the same `dispatch_class` and the same `ReadyLabelGate`
+    //     as before this ticket existed (R4, AC5).
+    //
+    //     Re-grooming a dé-groomed ticket is CORRECT work, not an error: the
+    //     umbrella's plan is unreachable from the sub-ticket, and a groom that
+    //     succeeds restores exactly the callouts that are missing — which is the
+    //     remedy the operator applied by hand on #2131. Halting here would trade
+    //     autonomy for an attribution obtainable without it. *A net, not a path*
+    //     (mika#2334).
+    //
+    //     Silent on the nominal path (`is_groomed`) and silent on a first
+    //     grooming (no marker): an observability that records everyone
+    //     distinguishes no one (mika#2131 AC7).
+    if !is_groomed {
+        note_degroomed_ticket(db, session_id, trace_id, location, &missing_markers).await;
+    }
 
     // 6. Target tool + skill + dispatch class. dev-groom for ungroomed, dev-pilot
     //    for groomed. This mirrors the auto-groom-on-dispatch behavior (mika#996)
@@ -1658,6 +1842,75 @@ fn task_age_secs(created_at: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------
+    // mika#2242 — le dépliage du marqueur de dé-groomage, en fonction pure.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mika2242_a_complete_record_yields_both_halves() {
+        let marker = parse_degroom_marker(
+            Some("pr#2226"),
+            Some(
+                "pr_url=https://github.com/senara-solutions/mika/pull/2226 \
+                 head_branch=fix/umbrella-auto-pull-exclusion-observability merged=false",
+            ),
+        );
+        assert_eq!(marker.pr_ref.as_deref(), Some("pr#2226"));
+        assert_eq!(
+            marker.head_branch.as_deref(),
+            Some("fix/umbrella-auto-pull-exclusion-observability")
+        );
+    }
+
+    /// **La granularité du fail-soft, et c'est elle qui est porteuse.** La
+    /// *décision* du lecteur ne tient qu'à la présence de la ligne ; la branche
+    /// est un enrichissement. Un `reasoning` absent ou inexploitable doit donc
+    /// rendre « dé-groomé par pr#N, branche inconnue », jamais un silence.
+    #[test]
+    fn mika2242_an_unusable_reasoning_costs_the_branch_and_nothing_else() {
+        for reasoning in [None, Some(""), Some("merged=false"), Some("head_branch=")] {
+            let marker = parse_degroom_marker(Some("pr#2226"), reasoning);
+            assert_eq!(
+                marker.pr_ref.as_deref(),
+                Some("pr#2226"),
+                "le fait doit survivre à un reasoning {reasoning:?}"
+            );
+            assert_eq!(
+                marker.head_branch, None,
+                "une branche illisible est `None`, jamais une chaîne vide"
+            );
+        }
+    }
+
+    /// La colonne `after_value` est nullable ; une NULL ne doit pas se lire
+    /// comme une valeur vide (« `null` n'est jamais `0` », mika#2331).
+    #[test]
+    fn mika2242_an_absent_after_value_is_none_not_empty() {
+        assert_eq!(parse_degroom_marker(None, None).pr_ref, None);
+        assert_eq!(parse_degroom_marker(Some(""), None).pr_ref, None);
+    }
+
+    /// La fenêtre de lecture est **dérivée** de la rétention du registre, jamais
+    /// réécrite. Si les deux divergeaient, le lecteur interrogerait des lignes
+    /// que le purgeur a effacées — une recherche qui cesse de trouver en
+    /// silence, et qui se lit exactement comme un ticket jamais dé-groomé.
+    #[test]
+    fn mika2242_the_lookup_window_is_derived_from_the_ledger_retention() {
+        let since = degroom_marker_lookup_since();
+        let expected = crate::timestamp::now_minus(chrono::Duration::days(
+            crate::evidence::audit::AUDIT_RETENTION_DAYS as i64,
+        ));
+        // Même seconde, ou la précédente si l'horloge a tourné entre les deux.
+        assert!(
+            since <= expected,
+            "fenêtre {since} incohérente avec la rétention {expected}"
+        );
+        assert!(
+            since < crate::timestamp::now(),
+            "la fenêtre est dans le passé"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // mika#2323 — gate vocabulary, actor readability, and the invariant that
