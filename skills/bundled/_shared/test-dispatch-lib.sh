@@ -4852,7 +4852,9 @@ assert_eq "fake-proxy output never reaches the operational proxy log" \
 # it the fake proxy's traceback lands in the operational log, the very file this
 # ticket exists to make legible, and the assertion at the end of the block above
 # is what catches that regression.
+# _egress_guard_line [bin_state]   bin_state: dies (default) | missing
 _egress_guard_line() {
+    local bin_state="${1:-dies}"
     local tmp sock bin logdir out
     tmp=$(mktemp -d)
     sock="$tmp/mika-pilot-egress.sock"
@@ -4866,6 +4868,7 @@ echo "fake-proxy: dying before bind (mika#2041 test fixture)" >&2
 exit 1
 FAKE_PROXY
     chmod +x "$bin"
+    [ "$bin_state" = "missing" ] && rm -f "$bin"
 
     # The orphan shape: bind then close without unlink. `[ -S ]` is satisfied,
     # nothing listens -- the population mika#2041 measured.
@@ -4908,6 +4911,37 @@ assert_eq "mika#2051: the unreachable refusal names the pid it launched" \
 assert_eq "mika#2051: the refusal keeps its anchor and contiguous token" \
     "yes" \
     "$(grep -qE '^dispatch-lib: pilot_egress_guard\.unreachable ' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The Signal S predicate (CLAUDE.md) stops at the token FAMILY, `pilot_egress_guard.`,
+# precisely so it covers both causes -- mika#2050's lesson being that an operator
+# who takes `unreachable` for THE predicate reads a nominal regime on a fleet
+# whose proxy binary was never deployed. A predicate published over two tokens
+# needs both to be witnessed, or half of it is an assumption.
+_EGRESS_BINARY_MISSING_LINE=$(_egress_guard_line missing)
+
+assert_eq "mika#2051: the Signal S family predicate bites on unreachable" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+assert_eq "mika#2051: the Signal S family predicate bites on binary_missing" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.binary_missing ' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# binary_missing launched NO proxy, so it has no pid to name. Stamping one would
+# be a false statement, and this is the negative control that keeps the pid from
+# being spread to the line where it would be a lie.
+assert_eq "mika#2051: binary_missing names no pid, because it launched none" \
+    "no" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# R8 again, and it must be HERE rather than only above: the sister function
+# launches its own fake proxy, so the earlier assertion -- which runs before
+# these calls -- cannot witness it. A log override that regressed only in
+# `_egress_guard_line` would leave the first check green while this suite wrote
+# fake-proxy tracebacks into the operational log, i.e. destroyed the very
+# evidence surface mika#2051 exists to make legible.
+assert_eq "mika#2051: the sister function does not reach the operational proxy log either" \
+    "0" "$(_egress_log_fixture_hits)"
 
 # ============================================================================
 # Dispatchable-repo allowlist: shell defense in depth (mika#2062)
