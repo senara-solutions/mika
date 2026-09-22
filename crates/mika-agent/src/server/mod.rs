@@ -694,8 +694,13 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
         warn!(error = %e, "failed to prune old reflection runs");
     }
 
-    // Compact old memory events into monthly summaries
-    match db.compact_old_audit_events(90).await {
+    // Compact old memory events into monthly summaries. The retention is a named
+    // constant because mika#2242's reader derives its lookup window from it —
+    // two literals would let the window outlive the ledger in silence.
+    match db
+        .compact_old_audit_events(crate::evidence::audit::AUDIT_RETENTION_DAYS)
+        .await
+    {
         Ok(deleted) if deleted > 0 => {
             info!(deleted, "compacted old audit events");
             if let Err(e) = db.vacuum().await {

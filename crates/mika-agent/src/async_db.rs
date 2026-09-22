@@ -763,6 +763,23 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Most recent audit row for (tool_name, target_key) newer than `since`:
+    /// `(after_value, reasoning, created_at)`. Used by mika#2242's reader, which
+    /// needs *which* row rather than how many.
+    pub async fn latest_audit_event_for_target(
+        &self,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestAuditEventProjection>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let tk = target_key.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.latest_audit_event_for_target(&a, &tn, &tk, &sn))
+            .await
+    }
+
     pub async fn find_active_task_by_ref_url(&self, reference_url: &str) -> Result<Option<Task>> {
         let a = self.agent_id.clone();
         let url = reference_url.to_owned();
