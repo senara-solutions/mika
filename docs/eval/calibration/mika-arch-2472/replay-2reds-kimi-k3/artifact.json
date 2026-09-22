@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "timestamp": "2026-09-22T15:42:34.316427557+00:00",
+  "providers": {
+    "mika-arch": {
+      "model": "openrouter/moonshotai/kimi-k3",
+      "scenarios": {
+        "groomed_no_tbds_passes": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": 4172,
+          "output_tokens": 8192,
+          "latency_ms": 68364
+        },
+        "groomed_with_tbd_rejected": {
+          "outcome": "fail",
+          "error_class": "rate_limit",
+          "input_tokens": 4096,
+          "output_tokens": 6929,
+          "latency_ms": 81128
+        }
+      }
+    }
+  }
+}
