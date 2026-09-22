@@ -1555,10 +1555,17 @@ fn groom_provenance_verdict(
                           callback carrying 'Outcome: PLAN_GROOMED' exists under a \
                           task for this issue — markers may be pre-stamped by hand, \
                           or the proof aged past the 30-day task retention",
+            // mika#2484 — une phrase de ce champ est devenue FAUSSE par l'effet
+            // de ce ticket, et la laisser serait livrer la régression que
+            // mika#2287 a nommée : un texte de remède qui prescrit une route
+            // morte. Elle disait « Re-applying the `ready` label does NOT help
+            // … the handler dispatches dev-pilot and lands here again » — c'est
+            // exactement ce que le routage corrigé ne fait plus. Seule cette
+            // phrase change ; le reste du payload est inchangé à l'octet près.
             "recovery": "Groom through the autonomous loop: dispatch dev-groom via \
                          'mika ask --agent mika-dev \"groom <typed-ref>\"'. Re-applying \
-                         the `ready` label does NOT help while the markers are present \
-                         — the handler dispatches dev-pilot and lands here again. If the \
+                         the `ready` label also works since mika#2484 — markers without \
+                         proof now route to dev-groom, not dev-pilot. Either way, if the \
                          plan already resolves on the dispatch branch (hand-groomed \
                          ticket), dev-groom answers `already_groomed` and mints no proof \
                          — remove the plan from the branch first so a fresh loop groom \
@@ -1590,12 +1597,119 @@ fn groom_provenance_verdict(
     }
 }
 
+/// Le jeton de refus de la garde d'intention de grooming (mika#2484 U4).
+///
+/// # FORMAT DE FIL
+///
+/// Il atterrit dans `tasks.result` et un opérateur le `grep` — c'est la sonde
+/// S2 du plan. Une constante nommée plutôt qu'un littéral au site de refus,
+/// pour la même raison que `ReadyLabelGate::wire_name` : deux orthographes d'un
+/// même refus couperaient une population en deux sans le dire.
+pub(crate) const GROOMING_INTENT_MISMATCH_ERROR: &str = "dispatch_grooming_intent_mismatch";
+
+/// Est-ce qu'un `dev-pilot` peut partir sur ce ticket ? (mika#2484 D1)
+///
+/// Quatre bras, et **pas un booléen**. Trois causes distinctes mènent au même
+/// outil (`dev-groom`), et elles appellent trois lectures opérateur
+/// différentes : « ce ticket n'a jamais été groomé » (le cas nominal d'un
+/// premier grooming), « il a été groomé hors du moteur » (le défaut que
+/// mika#2484 ferme), « la base ne répond pas » (une panne). Les fondre dans un
+/// `bool` rendrait la population de mika#2484 **incomptable** — exactement le
+/// motif de `below_threshold` / `no_ready_label_event` (mika#2131) et de
+/// `in_flight_self_dev` / `live_pilot_orphaned_parent` (mika#2279).
+///
+/// Les deux sites de consommation (le traducteur [`evaluate_grooming_gate`] et
+/// le routage de `server::ready_label_handler`) font un `match` **exhaustif
+/// sans bras `_ =>`** : le compilateur force un cinquième état à décider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroomedState {
+    /// Callouts présents ET preuve en base. Un `dev-pilot` peut partir.
+    Groomed,
+    /// Un ou plusieurs callouts manquent. Le cas nominal d'un premier grooming.
+    MarkersMissing(Vec<&'static str>),
+    /// Callouts présents, aucune preuve. Grooming hors moteur (spawn
+    /// orchestrateur, geste manuel), ou preuve purgée par la rétention de
+    /// 30 jours (`prune_completed_tasks`).
+    MarkersWithoutProof,
+    /// La preuve n'a pas pu être lue. Porte le message d'erreur pour que le
+    /// traducteur reproduise le JSON `dispatch_check_failed` à l'octet près.
+    ProofUnreadable(String),
+}
+
+/// Le lecteur **unique** de la preuve de grooming (mika#2484 R2).
+///
+/// # Pourquoi cette fonction existe
+///
+/// `ready_label_handler` décidait le routage (`dev-pilot` vs `dev-groom`) sur
+/// `check_grooming_markers` seul, pendant que `validate_dispatch_readiness`
+/// refusait quatre étapes plus loin sur forme **et** preuve. Le handler
+/// choisissait donc `dev-pilot` puis refusait le `dev-pilot` qu'il venait de
+/// choisir — `dispatch_grooming_not_verified` — et le ticket restait `ready`,
+/// re-promu, re-refusé. C'est mot pour mot la classe que mika#2158 a dû fermer
+/// un cran plus haut (« promotion et routage du dispatch répondaient
+/// différemment à la même question »).
+///
+/// Depuis mika#2470 la Phase 2 d'`auto_pull` dispatche in-process en appelant
+/// `try_handle_ready_label_dispatch`, donc **un seul site réparé couvre le
+/// webhook et le filet de sauvetage**.
+///
+/// # `check_grooming_markers` n'est pas touchée, et c'est structurel (D2)
+///
+/// `grooming_marker.rs` porte un test de parité : `auto_pull::is_groomed` et
+/// `check_grooming_markers(..).is_empty()` doivent rendre le **même** verdict
+/// sur un corpus partagé. Y intégrer la preuve casserait ce test — et à
+/// raison : `is_groomed` répond de la **forme** du callout, question à laquelle
+/// la base n'a rien à dire, et que le feeder pose légitimement sans elle. Deux
+/// questions, deux noms : `check_grooming_markers` = « la forme est-elle
+/// là ? », `groomed_state` = « un dev-pilot peut-il partir ? ». La seconde
+/// appelle la première ; l'inverse serait une régression de mika#2120.
+///
+/// # Pas de `task_id` dans la signature
+///
+/// Le routage de l'étape 5 tourne **avant** la pré-création de la parente
+/// (étape 7), et le `task_id` n'est employé par la porte que pour remplir son
+/// JSON de refus. C'est le traducteur qui l'ajoute.
+pub(crate) async fn groomed_state(
+    db: &AsyncDatabase,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    issue_body: &str,
+) -> GroomedState {
+    let missing = check_grooming_markers(issue_body);
+    if !missing.is_empty() {
+        return GroomedState::MarkersMissing(missing);
+    }
+
+    // Grooming provenance cross-check (#1620, mika#2287):
+    // markers are present but may have been pre-stamped by
+    // hand. Proof = a completed groom CALLBACK row carrying
+    // `Outcome: PLAN_GROOMED` under a parent for this issue
+    // (bare URL or legacy `?phase=groom`). The parent row is
+    // not proof — the engine flips it groom→implement
+    // (mika#1614) before it is terminal. Read-only.
+    let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
+    match db.has_completed_groom_for_issue(&issue_url).await {
+        Ok(true) => GroomedState::Groomed,
+        Ok(false) => GroomedState::MarkersWithoutProof,
+        Err(e) => GroomedState::ProofUnreadable(e.to_string()),
+    }
+}
+
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
 ///
 /// This is the segment of `validate_dispatch_readiness` that follows
 /// `fetch_issue_body`: markers check → rejection `dispatch_no_grooming_marker`
 /// if any is missing, otherwise issue-URL construction →
 /// `has_completed_groom_for_issue` → [`groom_provenance_verdict`].
+///
+/// # Traductrice depuis mika#2484
+///
+/// Le corps est désormais un `match` exhaustif sur [`groomed_state`], qui rend
+/// les **mêmes** quatre sorties qu'avant : les JSON sont déplacés, jamais
+/// réécrits (R3). Aucun appelant ne change, aucune formulation ne bouge, et les
+/// trois tests `test_groom_provenance_verdict_*` restent verts sans
+/// modification — si l'un d'eux doit changer, R3 est violée.
 ///
 /// **Extracted so the gate can be exercised end-to-end without a network.**
 /// `fetch_issue_body` (`github_graphql.rs`) writes `https://api.github.com/...`
@@ -1621,10 +1735,11 @@ pub(crate) async fn evaluate_grooming_gate(
     number: u64,
     issue_body: &str,
 ) -> Result<(), serde_json::Value> {
-    let missing = check_grooming_markers(issue_body);
-
-    if !missing.is_empty() {
-        return Err(serde_json::json!({
+    // `match` exhaustif, aucun bras `_ =>` : un cinquième état de
+    // `GroomedState` doit être décidé ici par le compilateur, jamais absorbé
+    // par un joker (mika#2484 D1).
+    match groomed_state(db, owner, repo, number, issue_body).await {
+        GroomedState::MarkersMissing(missing) => Err(serde_json::json!({
             "error": "dispatch_no_grooming_marker",
             "task_id": task_id,
             "issue": format!("{}/{}#{}", owner, repo, number),
@@ -1642,25 +1757,19 @@ pub(crate) async fn evaluate_grooming_gate(
                  gate ensures architect-reviewed plans are committed before \
                  implementation begins (mika#907, mika#919)."
             )
-        }));
+        })),
+        // Les trois bras suivants sont la traduction littérale des trois
+        // entrées de `groom_provenance_verdict`, dont la signature et les
+        // formulations sont inchangées — fail-closed sur le cas dégradé, comme
+        // avant mika#2484.
+        GroomedState::Groomed => groom_provenance_verdict(Ok(true), task_id, owner, repo, number),
+        GroomedState::MarkersWithoutProof => {
+            groom_provenance_verdict(Ok(false), task_id, owner, repo, number)
+        }
+        GroomedState::ProofUnreadable(e) => {
+            groom_provenance_verdict(Err(anyhow::anyhow!(e)), task_id, owner, repo, number)
+        }
     }
-
-    // Grooming provenance cross-check (#1620, mika#2287):
-    // markers are present but may have been pre-stamped by
-    // hand. Proof = a completed groom CALLBACK row carrying
-    // `Outcome: PLAN_GROOMED` under a parent for this issue
-    // (bare URL or legacy `?phase=groom`). The parent row is
-    // not proof — the engine flips it groom→implement
-    // (mika#1614) before it is terminal. Read-only,
-    // fail-closed on every degraded case of the cross-check.
-    let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
-    groom_provenance_verdict(
-        db.has_completed_groom_for_issue(&issue_url).await,
-        task_id,
-        owner,
-        repo,
-        number,
-    )
 }
 
 async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_json: &str) {
@@ -1760,6 +1869,54 @@ pub(crate) async fn validate_dispatch_readiness(
                        may dispatch claude-pilot. All other webhook events must use \
                        Webhook Fallthrough: acknowledge without dispatching \
                        (mika#841 positive-consent contract, mika#933)."
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // mika#2484 — Tool-boundary gate for an explicit grooming intent.
+    //
+    // Pure string handling on `originating_message` and on the tool input, no
+    // DB access, so it sits with the other two message guards ahead of the task
+    // fetch. L'ordre entre gardes pures est libre ; celui-ci groupe les deux
+    // lectures d'`originating_message`.
+    //
+    // Pre-subprocess et non post-hoc, pour la raison que mika#1646 a déjà dû
+    // écrire : `run_claude_pilot` spawne un processus et crée un worktree, donc
+    // une garde qui ne tire qu'après l'exécution de l'outil *constate* la
+    // violation sans l'empêcher. Ici la violation est un **contournement de la
+    // porte de preuve** — une implémentation sur un grooming que le moteur n'a
+    // jamais vérifié — donc la constater ne sert à rien.
+    //
+    // Ne mord que sur `dev-pilot` : un `run_claude_pilot_groom` sous intention
+    // de grooming est le chemin nominal.
+    //
+    // Le refus porte sur le TOUR ENTIER, pas seulement sur le ticket nommé, et
+    // c'est un arbitrage explicite : dériver le numéro d'issue du message pour
+    // ne refuser que lui ajouterait un second parseur là où le seul cas
+    // légitime — la chaîne dev-groom → dev-pilot — ne passe pas par ce chemin
+    // (son `originating_message` est absent, c'est un tour de callback). Un
+    // tour ouvert par « groom X » qui dispatche un implement sur Y est déjà un
+    // dérapage.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_grooming_intent_message(msg)
+        && tool_input.and_then(extract_skill_from_input) == Some("dev-pilot")
+    {
+        let rejection = serde_json::json!({
+            "error": GROOMING_INTENT_MISMATCH_ERROR,
+            "task_id": task_id,
+            "reason": "This turn was opened by an explicit grooming request \
+                       (the message begins with `groom `), so it may not dispatch \
+                       `run_claude_pilot` / `dev-pilot`. A ticket whose body carries \
+                       the grooming callouts may still be ungroomed as far as the \
+                       engine is concerned: the callouts are a shape, the proof is a \
+                       completed groom callback carrying `Outcome: PLAN_GROOMED`. \
+                       Implementing here would bypass the provenance gate (mika#1620, \
+                       mika#2484).",
+            "recovery": "Call `run_claude_pilot_groom` with `skill: \"dev-groom\"` and \
+                         the same `task_id` and `prompt`. That is the tool this turn \
+                         was asked for; it is available and this refusal does not \
+                         block it."
         });
         record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
         return Err(rejection.to_string());
@@ -9262,6 +9419,198 @@ Harness ticket.
             );
             assert_eq!(rejection["task_id"], "task-2310");
             assert_eq!(rejection["issue"], "senara-solutions/mika#123");
+        }
+
+        /// **Test 5 / AC3 — les quatre verdicts de la porte sont inchangés.**
+        ///
+        /// mika#2484 déplace une décision ; il n'en change aucune formulation
+        /// (R3). Les trois `test_groom_provenance_verdict_*` au-dessus restent
+        /// verts sans modification — ce test-ci couvre la moitié qu'ils ne
+        /// voient pas : que la **traductrice** rend bien ces quatre sorties
+        /// après être passée par `groomed_state`.
+        #[tokio::test]
+        async fn mika2484_les_quatre_verdicts_de_la_porte_sont_inchanges() {
+            // (1) `Ok` — callouts + preuve.
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let ok_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+            assert!(
+                evaluate_grooming_gate(&ok_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .is_ok()
+            );
+
+            // (2) `dispatch_no_grooming_marker` — aucun callout.
+            let empty_db = AsyncDatabase::new_with_agent(db(), "mika");
+            let missing =
+                evaluate_grooming_gate(&empty_db, "t", OWNER, REPO, NUMBER, "aucun callout")
+                    .await
+                    .expect_err("un corps sans callout refuse");
+            assert_eq!(missing["error"], "dispatch_no_grooming_marker");
+            assert!(
+                missing["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("'> - **Branch:**', 'docs/plans/'"),
+                "la formulation du prédicat est déplacée, jamais réécrite : {missing}"
+            );
+            assert!(
+                missing["missing_signals"]
+                    .as_array()
+                    .expect("missing_signals est un tableau")
+                    .len()
+                    == 3,
+                "les trois signaux manquants sont nommés : {missing}"
+            );
+
+            // (3) `dispatch_grooming_not_verified` — callouts, pas de preuve.
+            let no_proof =
+                evaluate_grooming_gate(&empty_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .expect_err("callouts sans preuve refusent");
+            assert_eq!(no_proof["error"], "dispatch_grooming_not_verified");
+            let recovery = no_proof["recovery"].as_str().expect("recovery présent");
+            assert!(
+                recovery.contains("already_groomed"),
+                "le champ `recovery` est déplacé à l'identique : {no_proof}"
+            );
+            // La seule phrase de ce payload que mika#2484 change, et elle
+            // change parce que ce ticket la rend fausse : la laisser serait
+            // prescrire une route morte, la régression que mika#2287 a nommée.
+            assert!(
+                !recovery.contains("does NOT help"),
+                "le `recovery` prescrit encore que re-poser `ready` ne sert à \
+                 rien — c'est ce que le routage corrigé a cessé d'être vrai : \
+                 {recovery}"
+            );
+            assert!(
+                recovery.contains("route to dev-groom, not dev-pilot"),
+                "le `recovery` doit nommer la route qui marche : {recovery}"
+            );
+
+            // (4) `dispatch_check_failed` — base injoignable, FAIL-CLOSED.
+            let dead_db = AsyncDatabase::new_with_agent(db(), "mika");
+            dead_db.shutdown();
+            let unreadable =
+                evaluate_grooming_gate(&dead_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .expect_err("une base injoignable refuse, jamais n'autorise");
+            assert_eq!(unreadable["error"], "dispatch_check_failed");
+            assert!(
+                unreadable["reason"]
+                    .as_str()
+                    .expect("reason présent")
+                    .contains("shut down"),
+                "le message d'erreur original traverse `ProofUnreadable` sans être \
+                 réécrit — c'est ce qui rend le JSON identique à l'octet près : {unreadable}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2484 — une intention de grooming ne peut pas dispatcher un implement
+    // -----------------------------------------------------------------------
+
+    mod mika2484_intention {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::db;
+
+        fn dispatch_input(skill: &str) -> serde_json::Value {
+            serde_json::json!({
+                "skill": skill,
+                "prompt": "mika#2471",
+                "task_id": "t-2484",
+            })
+        }
+
+        /// **Test 6 / AC4 — le rouge du défaut 2.**
+        ///
+        /// `mika ask --agent mika-dev "groom mika issue#2471"` sur un ticket
+        /// callouté a produit un callback **implement** qui a ouvert une PR :
+        /// une implémentation sur un grooming que le chemin moteur n'a jamais
+        /// vérifié. La garde refuse avant tout fetch de tâche, donc la base n'a
+        /// même pas besoin de porter la tâche.
+        #[tokio::test]
+        async fn mika2484_une_intention_de_grooming_refuse_un_dev_pilot() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let rejection = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-pilot")),
+                Some("groom mika issue#2471"),
+            )
+            .await
+            .expect_err("une intention de grooming ne peut pas dispatcher un implement");
+
+            assert!(
+                rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "le jeton de refus est un format de fil que l'opérateur grep : {rejection}"
+            );
+            assert!(
+                rejection.contains("run_claude_pilot_groom"),
+                "le refus nomme l'outil correct et est actionnable dans le même \
+                 tour (R7) : {rejection}"
+            );
+        }
+
+        /// **Test 7 — et il laisse passer le chemin nominal.**
+        ///
+        /// Sans ce contrôle, une garde qui refuserait *tout* sous intention de
+        /// grooming passerait le test 6 en supprimant le grooming lui-même.
+        /// L'erreur attendue ici est `task_not_found` : la garde a laissé
+        /// passer et le refus vient du fetch de tâche, quatre étapes plus loin.
+        #[tokio::test]
+        async fn mika2484_la_meme_intention_laisse_passer_un_dev_groom() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-groom")),
+                Some("groom mika issue#2471"),
+            )
+            .await;
+
+            let rejection = outcome.expect_err("la tâche n'existe pas dans cette base");
+            assert!(
+                !rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "un `run_claude_pilot_groom` sous intention de grooming EST le \
+                 chemin nominal : {rejection}"
+            );
+            assert!(
+                rejection.contains("task_not_found"),
+                "le refus doit venir du fetch de tâche, donc d'APRÈS la garde : \
+                 {rejection}"
+            );
+        }
+
+        /// Le contrôle négatif du mot, au niveau de la garde branchée — et non
+        /// plus seulement du prédicat. Une demande de *rapport* de grooming ne
+        /// doit pas refuser un dispatch.
+        #[tokio::test]
+        async fn mika2484_grooming_report_ne_refuse_pas_un_dev_pilot() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let rejection = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-pilot")),
+                Some("grooming report for mika#2471, then implement it"),
+            )
+            .await
+            .expect_err("la tâche n'existe pas dans cette base");
+
+            assert!(
+                !rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "« grooming report » n'est pas une intention de grooming : {rejection}"
+            );
         }
     }
 
