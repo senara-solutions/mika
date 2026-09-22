@@ -40,6 +40,10 @@ The two containment postures the pilot sandbox runs in. **Phase 2b** is the full
 
 The distinction is load-bearing beyond confinement strength: the attestation that unlocks the session's wider execution tier is set only under Phase 2b, so a degraded launch keeps the narrower tier rather than silently widening.
 
+### Label churn
+
+The remove→add cycle of the `ready` label that `auto_pull` Phase 2 performs on a stuck-ready ticket. It has two roles and one non-role: it resets the label's age so a rescued ticket whose pilot dies quickly self-throttles for a full threshold window (the mika#1824 D3 throttle), and it is a redundant trigger on a live webhook channel; since mika#2470 it is **never the trigger** — the rescue is dispatched by a direct in-process call of the ready-label handler first, and the churn is skipped altogether when that call did not dispatch but the engine already holds the ticket (`churn_is_moot`). Dispatch-before-churn is a timing margin, not an ordering invariant: the pilot's pgid is written by a spawned task after the handler returns.
+
 ### Containment canary
 
 A one-command reproducer that spawns a real sandbox through the same code path a dispatch uses, then asserts both directions: that credentials and host state are unreachable from inside, and that the tools the session legitimately needs still work. It exists because a containment claim read from source is not a containment result — the author is not their own control — so it also offers an interactive mode an external reviewer can enter the sandbox through and probe by hand.
