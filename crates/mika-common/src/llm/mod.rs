@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod budget;
 pub mod budget_provenance;
+pub mod config_freshness;
 pub mod error;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
@@ -24,10 +25,16 @@ pub use budget::{
     AGENT_TOTAL_TIMEOUT_ENV_VAR, DEFAULT_AGENT_TOTAL_TIMEOUT_SECS, LlmBudgetError,
     LlmTimeoutBudget, MIN_AGENT_TOTAL_TIMEOUT_SECS,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use budget_provenance::clean_budget_env;
 pub use budget_provenance::{
-    BudgetProvenance, BudgetSource, MODEL_SOURCE_UNKNOWN_PROVIDER, ModelProvenance,
-    ResolvedBudgetRecord, ResolvedBudgetValue, ResolvedTextValue, emit_llm_budget_resolved,
-    log_llm_budget_resolved, resolve_llm_budget_record,
+    BudgetProvenance, BudgetSource, DECLARED_BY, DeclaredModel, MODEL_SOURCE_UNKNOWN_PROVIDER,
+    ModelDriftCheck, ModelProvenance, ResolvedBudgetRecord, ResolvedBudgetValue, ResolvedTextValue,
+    declared_model, emit_llm_budget_resolved, emit_model_drift, log_llm_budget_resolved,
+    resolve_llm_budget_record,
+};
+pub use config_freshness::{
+    ConfigChangedSinceBoot, detect_config_change, note_config_at_boot, report_config_change,
 };
 pub use error::LlmError;
 pub use model_override::{

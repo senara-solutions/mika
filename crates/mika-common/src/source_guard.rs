@@ -1644,13 +1644,14 @@ pub fn before() {}
         }
     }
 
-    /// Every `pub fn` this module hides on the real tree, measured 2026-09-19.
+    /// Every `pub fn` this module hides on the real tree, measured 2026-09-19,
+    /// extended 2026-09-22 (mika#2473).
     ///
     /// **This is a census, not an allowlist**, and the difference is the whole
-    /// point of freezing it. These eight are not *exempted* from the control
-    /// below — they pass it, because each sits under an indented `cfg(test)`
-    /// attribute inside a production item and is excluded **structurally**, by
-    /// the boundary rule itself. Writing them as exemptions would create a dead
+    /// point of freezing it. These eleven are not *exempted* from the control
+    /// below — they pass it, because each sits under a `cfg(test)`-mentioning
+    /// attribute and is excluded **structurally**, by the boundary rule
+    /// itself. Writing them as exemptions would create a dead
     /// dispensation nothing later cleans up; writing them as a census makes a
     /// future widening of the rule visible the moment it happens.
     const MASKED_PUB_FN_CENSUS: &[(&str, &str)] = &[
@@ -1665,12 +1666,32 @@ pub fn before() {}
         ("mika-common/src/github_app.rs", "new"),
         ("mika-common/src/github_app.rs", "seed_test_token"),
         ("mika-common/src/github_app.rs", "new_with_test_token"),
+        // mika#2473, case (a) of the message below: three test helpers under
+        // `#[cfg(any(test, feature = "test-utils"))]`, which mentions `test`
+        // positively and therefore opens a masked region exactly as
+        // `#[cfg(test)]` does. They are `pub` because a *second* crate's tests
+        // need them — `clean_budget_env` owns the single `MIKA_{PREFIX}_MODEL`
+        // list a re-derivation would silently get wrong, and the two
+        // `config_freshness` helpers reach process-global boot notes whose key
+        // a second implementation would be free to spell differently.
+        (
+            "mika-common/src/llm/budget_provenance.rs",
+            "clean_budget_env",
+        ),
+        (
+            "mika-common/src/llm/config_freshness.rs",
+            "reset_notes_for_test",
+        ),
+        (
+            "mika-common/src/llm/config_freshness.rs",
+            "noted_record_for_test",
+        ),
     ];
 
     /// **The good-faith control, on the dangerous axis.**
     ///
     /// Applied to a real tree, the `pub fn` this module hides must be exactly
-    /// the eight test helpers of [`MASKED_PUB_FN_CENSUS`] — no more.
+    /// the eleven test helpers of [`MASKED_PUB_FN_CENSUS`] — no more.
     ///
     /// **What this is, stated rather than overclaimed.** It is a frozen census,
     /// not a proof: no mechanical predicate can tell a swallowed production

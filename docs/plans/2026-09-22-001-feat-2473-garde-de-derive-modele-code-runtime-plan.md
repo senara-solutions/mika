@@ -103,9 +103,17 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   `runtime_provider`, `runtime_model`, `runtime_model_source`,
   `runtime_provider_source`, `model_config_key`, et
   `declared_by = "well_known_agents.rs"`. En phase, un INFO
-  `well_known_model_in_sync` aux mêmes champs — pour qu'une absence de WARN soit
-  distinguable d'une garde qui n'a pas tourné. Un agent sans constante n'émet
-  rien.
+  `well_known_model_in_sync` — pour qu'une absence de WARN soit distinguable
+  d'une garde qui n'a pas tourné. Un agent sans constante n'émet rien.
+  **« Aux mêmes champs » se borne à ceux que l'arm porte** (tranché à
+  l'implémentation) : `InSync` ne déclare que le couple déclaré, donc la ligne
+  porte `agent_id`, `declared_provider`, `declared_model`, `declared_by` — et
+  c'est tout ce qui existe. Les `*_source` et `model_config_key` n'ont **aucune
+  source honnête** sur ce bras, `emit_model_drift` ne recevant que le check ;
+  les inventer serait la fausse provenance que `budget_provenance.rs` refuse en
+  toutes lettres. L'enum d'U1 gouverne, parce que c'est lui que la route et le
+  CLI sérialisent (KTD3), et l'intention de R4 — rendre la garde audible — est
+  servie par la ligne elle-même, pas par son nombre de champs.
 - R5. La garde **ne refuse jamais** : ni au boot, ni au tour. La dérive est
   rapportée avec sa provenance ; la décision (restaurer, recalibrer, ou
   réconcilier la constante) reste à l'opérateur, record en main.

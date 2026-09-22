@@ -117,6 +117,21 @@
 //! in force rather than hard-coded. A fixed key would report `default` for an
 //! agent whose model is perfectly well declared — a *false* provenance, which
 //! this module holds to be strictly worse than none.
+//!
+//! # The guard mika#2328 said was missing
+//!
+//! Everything above reports what the **runtime** resolves. It does not, on its
+//! own, say whether that is what the *repo* declares — and the 2026-09-15
+//! incident was exactly that gap: `llm_budget_resolved` would have printed
+//! `glm-5.3`, truthfully, forever, and no reader had the other half to compare
+//! it with. mika#2473 adds it, in this file, deliberately: [`declared_model`]
+//! reads the constant through the **same** [`model_config_key`] derivation and
+//! the same default rule as the cascade above, so the two sides cannot drift
+//! apart in the reader that is supposed to detect drift (KTD6).
+//! [`ModelDriftCheck::compare`] is pure; [`emit_model_drift`] is the one
+//! function of that half with an effect, and it reports — it never refuses
+//! (KTD1). The freshness half, "has the file changed since this process read
+//! it?", is [`super::config_freshness`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -924,6 +939,290 @@ pub fn emit_llm_budget_resolved(record: &ResolvedBudgetRecord) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mika#2473 — the declared side, and the drift between it and the runtime
+// ---------------------------------------------------------------------------
+
+/// What `well_known_agents.rs` says an agent runs — the **repo's** side of the
+/// question mika#2328 left open (mika#2473).
+///
+/// Everything above this line reads the *runtime*: four cascade doors, the
+/// value in force. This reads the other side, the compiled-in constant, and it
+/// reads it through the **same** key derivation ([`model_config_key`]) and the
+/// same default rule (`provider.default_model()`). A second parser would be
+/// free to diverge from the first, and the divergence would not surface as a
+/// crash: it would surface as a *false* drift reported on a correct
+/// configuration, which this module holds to be strictly worse than none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredModel {
+    /// The provider the constant selects, or [`DEFAULT_PROVIDER`] when it
+    /// carries no `llm_provider` line.
+    pub provider: ProviderKind,
+    /// The model the constant declares, or the provider's default.
+    pub model: String,
+    /// `true` when the constant carries no model line and the provider's
+    /// default applies.
+    ///
+    /// Reported rather than left implicit: "the repo declares `glm-5.2`" and
+    /// "the repo declares nothing and `glm-5.2` is what z.ai defaults to" are
+    /// two different facts, and reconciling a drift (mika#2472) means knowing
+    /// which one is on the table.
+    pub model_is_provider_default: bool,
+}
+
+/// Read the `(provider, model)` pair one `config_toml` constant declares.
+///
+/// `None` in exactly two cases, both meaning *"this text states no pair"*
+/// rather than *"the pair is the default"*:
+///
+/// - the text does not parse as TOML — the same reading as
+///   [`read_config_table`], where an absent and a malformed file are one
+///   answer, because the loud refusal belongs to `Settings::load_for_agent`,
+///   not to this reader;
+/// - `llm_provider` is present but unparseable — the same rule as
+///   [`ModelProvenance::from_layers`], which cannot name the model key either.
+///
+/// # Why the provider is trimmed before `from_str`
+///
+/// Because [`ModelProvenance::from_layers`] trims on its side. A constant
+/// written `llm_provider = " zai "` resolves perfectly well through the
+/// cascade; a declared side that did not trim would answer `None` here and a
+/// valid pair there — i.e. a **false** `Drift` carrying `unknown_provider` on a
+/// correct configuration, or worse, a `NotApplicable` that reads as "this agent
+/// has no constant" and switches the guard off in silence. The two readers face
+/// each other; they trim together or one of them lies.
+///
+/// # Why it does not walk the cascade
+///
+/// [`CascadeLayers::resolve_raw`] reads the process environment. The constant
+/// in the repo has **no** environment door: it is a literal in a `.rs` file. A
+/// declared side resolved through the cascade would read the *runtime*'s
+/// variables and agree with the runtime by construction — a guard comparing a
+/// value with itself (KTD6).
+pub fn declared_model(config_toml: &str) -> Option<DeclaredModel> {
+    let table: toml::Table = config_toml.parse().ok()?;
+
+    let provider = match config_key_as_string(&table, LLM_PROVIDER_CONFIG_KEY) {
+        None => DEFAULT_PROVIDER,
+        Some(raw) => ProviderKind::from_str(raw.trim()).ok()?,
+    };
+
+    let written = config_key_as_string(&table, &model_config_key(provider));
+    Some(DeclaredModel {
+        provider,
+        model_is_provider_default: written.is_none(),
+        model: written.unwrap_or_else(|| provider.default_model().to_string()),
+    })
+}
+
+/// The file the declared side is read from, as a log field (mika#2473).
+///
+/// A drift line without it says "the repo disagrees" and leaves the reader to
+/// find where the repo said so. Named once, here, so the WARN and the route
+/// cannot spell it two ways.
+pub const DECLARED_BY: &str = "well_known_agents.rs";
+
+/// Whether one agent runs the model its constant declares (mika#2473).
+///
+/// # Why this is a sibling of the record and not a field of it
+///
+/// [`ResolvedBudgetRecord`] has a single constructor
+/// ([`resolve_llm_budget_record`]) and knows nothing about well-known agents —
+/// `WellKnownAgent` lives in `mika-agent`. The check is therefore **built** in
+/// `mika-agent`, where the constant is in scope, and **lives** here so the
+/// route and the CLI can serialise it without depending on that crate (KTD3).
+///
+/// # Three arms, and why the third is not an absence
+///
+/// `NotApplicable` is an agent whose spec carries no `config_toml`: nothing was
+/// declared, so nothing can be out of phase. It is a distinct word rather than
+/// a silent `InSync` for the same reason [`MODEL_SOURCE_UNKNOWN_PROVIDER`] is a
+/// sixth word rather than a `default` — answering "in phase" about a comparison
+/// that never happened is a false statement made with authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ModelDriftCheck {
+    /// This agent declares no model — nothing to compare.
+    NotApplicable,
+    /// The runtime serves exactly what the repo declares.
+    InSync {
+        /// The provider the constant selects.
+        declared_provider: String,
+        /// The model the constant declares.
+        declared_model: String,
+    },
+    /// The runtime serves something else — reported with the door it came
+    /// through, never with a refusal (KTD1).
+    Drift {
+        /// The provider the constant selects.
+        declared_provider: String,
+        /// The model the constant declares.
+        declared_model: String,
+        /// The provider in force, or the raw string that failed to parse.
+        runtime_provider: String,
+        /// The model in force, or `""` when the provider itself is unreadable.
+        runtime_model: String,
+        /// Door the model came through, or [`MODEL_SOURCE_UNKNOWN_PROVIDER`].
+        runtime_model_source: String,
+        /// Door the provider came through.
+        runtime_provider_source: String,
+        /// The `config.toml` key an operator would edit to resolve the drift.
+        ///
+        /// Empty exactly when the runtime provider is unreadable — there is no
+        /// model key to name, and `runtime_model_source = unknown_provider`
+        /// already says which line to look at. Naming a plausible key there
+        /// would be a false provenance.
+        model_config_key: String,
+    },
+}
+
+impl ModelDriftCheck {
+    /// Compare the declared pair to the resolved record. **Pure**: it reads no
+    /// file, touches no environment, and cannot refuse anything (KTD1).
+    ///
+    /// Drift iff the provider or the model differs. A record whose `model` is
+    /// `""` — the [`MODEL_SOURCE_UNKNOWN_PROVIDER`] shape — is a drift like any
+    /// other, reported with that word rather than absorbed: an agent whose
+    /// `llm_provider` line has been made unreadable is precisely the state an
+    /// operator needs told.
+    pub fn compare(declared: Option<&DeclaredModel>, record: &ResolvedBudgetRecord) -> Self {
+        let Some(declared) = declared else {
+            return Self::NotApplicable;
+        };
+
+        let declared_provider = declared.provider.config_prefix().to_string();
+        if record.provider == declared_provider && record.model == declared.model {
+            return Self::InSync {
+                declared_provider,
+                declared_model: declared.model.clone(),
+            };
+        }
+
+        Self::Drift {
+            declared_provider,
+            declared_model: declared.model.clone(),
+            runtime_provider: record.provider.clone(),
+            runtime_model: record.model.clone(),
+            runtime_model_source: record.model_source.clone(),
+            runtime_provider_source: record.provider_source.clone(),
+            model_config_key: record.model_config_key.clone(),
+        }
+    }
+}
+
+/// Emit the mika#2473 D1 line for one agent — **the single emission site** of
+/// the code↔runtime guard.
+///
+/// The sibling of [`emit_llm_budget_resolved`], and posted here rather than in
+/// `mika-agent` for the reason that function gives for its own placement: the
+/// event's field names are a log format an operator greps, and a format written
+/// at the call site is a format that acquires a second spelling.
+///
+/// # One line per agent per init, and no deduplication
+///
+/// [`emit_llm_budget_resolved`] deduplicates because provider construction is a
+/// *per-turn* event. This is called once per agent at `init_agent`, so the
+/// repetition it would bound does not exist; a dedup map here would only be a
+/// second thing to reset in tests. The frequency argument is the one this
+/// module already makes above: *"a warning that contradicts a decision gets
+/// muted. What earns an operator's attention is a crossing."* Three agents,
+/// three lines, at startup — that is a crossing being reported, not a drumbeat.
+///
+/// # Reports, never refuses (KTD1)
+///
+/// No `bail!`, no `Err`, no panic. The drift on this fleet is a sequence of
+/// dated operator decisions in three `config.toml` files; refusing to boot on
+/// it would lay the fleet down over a *valid* configuration — which is exactly
+/// the failure mode `llm_budget_retry_unreachable` had to name for itself. This
+/// produces the fact; the decision (restore, recalibrate, or reconcile the
+/// constant) belongs to the operator with the record in hand.
+///
+/// `NotApplicable` emits **nothing**: an agent with no constant has no drift to
+/// report, and a line saying so on every boot would be the noise that gets the
+/// other two muted.
+pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck) {
+    match check {
+        ModelDriftCheck::NotApplicable => {}
+        ModelDriftCheck::InSync {
+            declared_provider,
+            declared_model,
+        } => {
+            // Emitted on purpose, at INFO. Without it, "no WARN" is
+            // indistinguishable from "the guard did not run" — the exact
+            // ambiguity that let a glm-5.3 serve mika-qa for weeks while the
+            // repo said glm-5.2 and nothing anywhere said otherwise.
+            tracing::info!(
+                event = "well_known_model_in_sync",
+                agent_id,
+                declared_provider,
+                declared_model,
+                declared_by = DECLARED_BY,
+                "this agent runs the model its constant declares (mika#2473)"
+            );
+        }
+        ModelDriftCheck::Drift {
+            declared_provider,
+            declared_model,
+            runtime_provider,
+            runtime_model,
+            runtime_model_source,
+            runtime_provider_source,
+            model_config_key,
+        } => {
+            tracing::warn!(
+                event = "well_known_model_drift",
+                agent_id,
+                declared_provider,
+                declared_model,
+                runtime_provider,
+                runtime_model,
+                runtime_model_source,
+                runtime_provider_source,
+                model_config_key,
+                declared_by = DECLARED_BY,
+                "this agent does NOT run the model the repo declares for it: the runtime \
+                 value came through the door named by `runtime_model_source`, and the \
+                 declaration lives in `declared_by`. Nothing is refused (mika#2473 KTD1) — \
+                 restoring the file, recalibrating the agent, or reconciling the constant \
+                 is an operator decision, and this line is the fact it needs"
+            );
+        }
+    }
+}
+
+/// Clear every budget variable — and, since mika#2328, every variable that can
+/// move the resolved model — from the process env.
+///
+/// The model half has to clear `MIKA_LLM_PROVIDER` and all thirteen
+/// `MIKA_*_MODEL` variables: an ambient one would silently put a test's cascade
+/// one door higher than the door it means to exercise.
+///
+/// # Why it is exported rather than private to `mod tests` (mika#2473)
+///
+/// The `MIKA_{PREFIX}_MODEL` mapping is derived here, from [`model_env_var`],
+/// and a second caller needing a clean cascade — `llm::config_freshness`, and
+/// `mika-agent`'s boot tests after it — would otherwise have to re-derive it.
+/// A re-derivation of this list does not fail loudly when it drifts: it leaves
+/// one ambient variable set, which puts the test's cascade one door higher than
+/// the door it means to exercise, and the test stays green while measuring
+/// something else. So the list stays single, under the `test-utils` feature the
+/// crate already carries for exactly this shape (mika#2331 §3.4).
+///
+/// # Safety
+/// Test-only, serialized by `#[serial]`.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clean_budget_env() {
+    unsafe {
+        std::env::remove_var(HTTP_TIMEOUT_ENV_VAR);
+        std::env::remove_var(AGENT_TOTAL_TIMEOUT_ENV_VAR);
+        std::env::remove_var(MAX_TOKENS_ENV_VAR);
+        std::env::remove_var(LLM_PROVIDER_ENV_VAR);
+        for provider in ProviderKind::ALL {
+            std::env::remove_var(model_env_var(*provider));
+        }
+    }
+}
+
 /// Forget every emitted signature — test-only, so one test's emission cannot
 /// silence another's.
 #[cfg(test)]
@@ -940,27 +1239,6 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use serial_test::serial;
-
-    /// Clear every budget variable — and, since mika#2328, every variable that
-    /// can move the resolved model — from the process env.
-    ///
-    /// The model half has to clear `MIKA_LLM_PROVIDER` and all thirteen
-    /// `MIKA_*_MODEL` variables: an ambient one would silently put a test's
-    /// cascade one door higher than the door it means to exercise.
-    ///
-    /// # Safety
-    /// Test-only, serialized by `#[serial]`.
-    fn clean_budget_env() {
-        unsafe {
-            std::env::remove_var(HTTP_TIMEOUT_ENV_VAR);
-            std::env::remove_var(AGENT_TOTAL_TIMEOUT_ENV_VAR);
-            std::env::remove_var(MAX_TOKENS_ENV_VAR);
-            std::env::remove_var(LLM_PROVIDER_ENV_VAR);
-            for provider in ProviderKind::ALL {
-                std::env::remove_var(model_env_var(*provider));
-            }
-        }
-    }
 
     fn homes() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2024,5 +2302,364 @@ mod tests {
         );
 
         clean_budget_env();
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2473 U1 — the declared side, the comparison, and the line it emits
+    // -----------------------------------------------------------------------
+
+    /// One captured `tracing` event: its level and **every** field.
+    ///
+    /// Richer than the capture inside
+    /// [`tests::mika2362_retry_unreachable_fires_on_the_incident_geometry_only`],
+    /// which keeps the `event` name alone. AC3 of mika#2473 reads "the drift is
+    /// said once, **with its door**": a probe that read the name and stopped
+    /// would sign that sentence without ever looking at the door.
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: HashMap<String, String>,
+    }
+
+    struct CaptureVisitor<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureLayer(std::sync::Arc<Mutex<Vec<CapturedEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            event.record(&mut CaptureVisitor(&mut fields));
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    fields,
+                });
+            }
+        }
+    }
+
+    /// Install a capturing subscriber on **this thread** and hand back its sink.
+    ///
+    /// `set_default` is thread-local, so a test holding the guard sees its own
+    /// emissions and nobody else's — which is what makes the "emits nothing"
+    /// arm of the AC3 test a real control rather than a race.
+    fn capture_events() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<Mutex<Vec<CapturedEvent>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let sink = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(&sink)));
+        (tracing::subscriber::set_default(subscriber), sink)
+    }
+
+    /// mika#2473 U1 / R2 — the declared side is read by the **same** key
+    /// derivation as the resolved side, for every provider.
+    ///
+    /// The equivalence KTD6 rests on, pinned empirically rather than argued:
+    /// write the constant's text into a virgin `agent_home` with no variable
+    /// set, resolve it through [`ModelProvenance`], and the pair must be the
+    /// one [`declared_model`] reads from the text alone. A second parser would
+    /// be free to diverge from the first — and the divergence would surface as
+    /// a *false* drift, which this module holds to be strictly worse than none.
+    ///
+    /// The padded-provider case at the end is not decoration: `from_layers`
+    /// trims before `from_str`, so a constant written `llm_provider = " zai "`
+    /// resolves fine through the cascade. A declared side that did not trim
+    /// would answer `None` there — reported as `NotApplicable`, i.e. a guard
+    /// silently switched off on a correct configuration.
+    #[test]
+    #[serial]
+    fn mika2473_declared_model_equals_the_cascade_on_a_clean_home() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        for provider in ProviderKind::ALL {
+            let prefix = provider.config_prefix();
+
+            let with_model = format!("llm_provider = \"{prefix}\"\n{prefix}_model = \"probe\"\n");
+            std::fs::write(agent.join("config.toml"), &with_model).unwrap();
+            let cascade = ModelProvenance::resolve(&global, &agent);
+            let declared = declared_model(&with_model)
+                .unwrap_or_else(|| panic!("{prefix} : la constante déclare un couple lisible"));
+            assert_eq!(
+                Some(declared.provider),
+                cascade.provider,
+                "{prefix} : le fournisseur déclaré doit être celui que la cascade résout"
+            );
+            assert_eq!(
+                Some(declared.model.as_str()),
+                cascade.effective_model(),
+                "{prefix} : le modèle déclaré doit être celui que la cascade résout"
+            );
+            assert!(
+                !declared.model_is_provider_default,
+                "{prefix} : un modèle écrit n'est pas le défaut du fournisseur"
+            );
+
+            let without_model = format!("llm_provider = \"{prefix}\"\n");
+            std::fs::write(agent.join("config.toml"), &without_model).unwrap();
+            let cascade = ModelProvenance::resolve(&global, &agent);
+            let declared = declared_model(&without_model).unwrap();
+            assert_eq!(
+                declared.model,
+                provider.default_model(),
+                "{prefix} : sans ligne modèle, la règle de défaut est celle du fournisseur"
+            );
+            assert!(
+                declared.model_is_provider_default,
+                "{prefix} : et elle est dite, pas devinée par le lecteur"
+            );
+            assert_eq!(
+                Some(declared.model.as_str()),
+                cascade.effective_model(),
+                "{prefix} : la même règle de défaut que la cascade applique"
+            );
+        }
+
+        assert!(
+            declared_model("llm_provider = \"nope\"\n").is_none(),
+            "un fournisseur illisible ne se lit pas : même règle que ModelProvenance::from_layers"
+        );
+        assert_eq!(
+            declared_model(" llm_provider = \" zai \"\n")
+                .map(|d| (d.provider, d.model))
+                .unwrap(),
+            (
+                ProviderKind::ZAi,
+                ProviderKind::ZAi.default_model().to_string()
+            ),
+            "le fournisseur déclaré est trimmé avant from_str, comme from_layers le fait"
+        );
+
+        clean_budget_env();
+    }
+
+    /// mika#2473 U1 / R3, R4 — `compare` a trois bras, et un fournisseur
+    /// illisible est une dérive rapportée, jamais absorbée.
+    #[test]
+    #[serial]
+    fn mika2473_compare_has_three_arms_and_unknown_provider_is_a_drift() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        let constant =
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k2.5\"\n";
+        std::fs::write(agent.join("config.toml"), constant).unwrap();
+        let declared = declared_model(constant).unwrap();
+
+        let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+        assert_eq!(
+            ModelDriftCheck::compare(None, &record),
+            ModelDriftCheck::NotApplicable,
+            "un agent sans constante n'est pas comparable : il n'est pas « en phase »"
+        );
+        assert_eq!(
+            ModelDriftCheck::compare(Some(&declared), &record),
+            ModelDriftCheck::InSync {
+                declared_provider: "openrouter".to_string(),
+                declared_model: "moonshotai/kimi-k2.5".to_string(),
+            },
+            "constante et disque identiques : en phase"
+        );
+
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k3\"\n",
+        )
+        .unwrap();
+        let drifted = resolve_llm_budget_record("mika-arch", &global, &agent);
+        match ModelDriftCheck::compare(Some(&declared), &drifted) {
+            ModelDriftCheck::Drift {
+                declared_model,
+                runtime_model,
+                runtime_model_source,
+                model_config_key,
+                ..
+            } => {
+                assert_eq!(declared_model, "moonshotai/kimi-k2.5");
+                assert_eq!(runtime_model, "moonshotai/kimi-k3");
+                assert_eq!(
+                    runtime_model_source, "agent_config",
+                    "la dérive est rapportée AVEC sa porte"
+                );
+                assert_eq!(
+                    model_config_key, "openrouter_model",
+                    "et avec la clé qu'un opérateur éditerait"
+                );
+            }
+            other => panic!("une édition du modèle sur disque est une dérive : {other:?}"),
+        }
+
+        std::fs::write(agent.join("config.toml"), "llm_provider = \"nope\"\n").unwrap();
+        let unknown = resolve_llm_budget_record("mika-arch", &global, &agent);
+        match ModelDriftCheck::compare(Some(&declared), &unknown) {
+            ModelDriftCheck::Drift {
+                runtime_provider,
+                runtime_model,
+                runtime_model_source,
+                ..
+            } => {
+                assert_eq!(runtime_provider, "nope");
+                assert_eq!(runtime_model, "");
+                assert_eq!(
+                    runtime_model_source, MODEL_SOURCE_UNKNOWN_PROVIDER,
+                    "un modèle vide est une dérive dite unknown_provider, jamais absorbée en « en phase »"
+                );
+            }
+            other => panic!("un fournisseur illisible est une dérive : {other:?}"),
+        }
+
+        clean_budget_env();
+    }
+
+    /// mika#2473 U1 / R3 — un modèle posé par l'environnement est une dérive,
+    /// rapportée avec sa porte.
+    ///
+    /// Les deux contrôles dans le même appel (`a_probe_needs_both`) : sans le
+    /// bras « sans la variable », le test ne distingue pas une garde qui voit
+    /// la porte d'une garde qui rapporte `Drift` en toutes circonstances.
+    #[test]
+    #[serial]
+    fn mika2473_a_model_set_by_env_is_a_drift_with_its_door() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        let constant = "llm_provider = \"zai\"\nzai_model = \"glm-5.2\"\n";
+        std::fs::write(agent.join("config.toml"), constant).unwrap();
+        let declared = declared_model(constant).unwrap();
+
+        // Contrôle négatif : sans la variable, la constante est en phase.
+        let clean = resolve_llm_budget_record("mika-qa", &global, &agent);
+        assert!(
+            matches!(
+                ModelDriftCheck::compare(Some(&declared), &clean),
+                ModelDriftCheck::InSync { .. }
+            ),
+            "sans variable d'environnement, le disque porte la constante : en phase"
+        );
+
+        // SAFETY: test-only, sérialisé par `#[serial]`, nettoyé en sortie.
+        unsafe { std::env::set_var("MIKA_ZAI_MODEL", "glm-5.3") };
+        let doored = resolve_llm_budget_record("mika-qa", &global, &agent);
+        match ModelDriftCheck::compare(Some(&declared), &doored) {
+            ModelDriftCheck::Drift {
+                runtime_model,
+                runtime_model_source,
+                ..
+            } => {
+                assert_eq!(runtime_model, "glm-5.3");
+                assert_eq!(
+                    runtime_model_source, "process_env",
+                    "une variable de service est une dérive au même titre qu'une édition du fichier"
+                );
+            }
+            other => panic!("MIKA_ZAI_MODEL déplace le modèle en service : {other:?}"),
+        }
+
+        clean_budget_env();
+    }
+
+    /// mika#2473 U1 / AC3 — **le seul test qui observe l'émission**.
+    ///
+    /// Sans lui, « la dérive est dite une fois, avec sa porte » n'est attestée
+    /// que par un `grep` post-déploiement, que le plan lui-même dit confondable
+    /// avec un binaire périmé. Les trois bras, dont le troisième est le
+    /// contrôle négatif : sans lui le test ne distingue pas « n'émet rien » de
+    /// « émet toujours ».
+    #[test]
+    #[serial]
+    fn mika2473_the_drift_line_carries_its_level_and_its_fields() {
+        let (_guard, seen) = capture_events();
+
+        emit_model_drift("mika-cli", &ModelDriftCheck::NotApplicable);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "contrôle négatif : un agent sans constante n'émet rien"
+        );
+
+        emit_model_drift(
+            "mika-dev",
+            &ModelDriftCheck::InSync {
+                declared_provider: "zai".to_string(),
+                declared_model: "glm-5.2".to_string(),
+            },
+        );
+        {
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1, "en phase : une ligne, pas zéro");
+            let in_sync = &events[0];
+            assert_eq!(
+                in_sync.fields.get("event").map(String::as_str),
+                Some("well_known_model_in_sync"),
+                "une absence de WARN doit être distinguable d'une garde qui n'a pas tourné"
+            );
+            assert_eq!(in_sync.level, tracing::Level::INFO);
+            assert_eq!(
+                in_sync.fields.get("agent_id").map(String::as_str),
+                Some("mika-dev")
+            );
+            assert_eq!(
+                in_sync.fields.get("declared_by").map(String::as_str),
+                Some(DECLARED_BY)
+            );
+        }
+
+        emit_model_drift(
+            "mika-arch",
+            &ModelDriftCheck::Drift {
+                declared_provider: "openrouter".to_string(),
+                declared_model: "moonshotai/kimi-k2.5".to_string(),
+                runtime_provider: "openrouter".to_string(),
+                runtime_model: "moonshotai/kimi-k3".to_string(),
+                runtime_model_source: "agent_config".to_string(),
+                runtime_provider_source: "agent_config".to_string(),
+                model_config_key: "openrouter_model".to_string(),
+            },
+        );
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 2, "la dérive ajoute UNE ligne");
+        let drift = &events[1];
+        assert_eq!(
+            drift.level,
+            tracing::Level::WARN,
+            "la dérive est un WARN : un INFO se perdrait dans 19 Go de journal"
+        );
+        for (name, expected) in [
+            ("event", "well_known_model_drift"),
+            ("agent_id", "mika-arch"),
+            ("declared_provider", "openrouter"),
+            ("declared_model", "moonshotai/kimi-k2.5"),
+            ("runtime_provider", "openrouter"),
+            ("runtime_model", "moonshotai/kimi-k3"),
+            ("runtime_model_source", "agent_config"),
+            ("runtime_provider_source", "agent_config"),
+            ("model_config_key", "openrouter_model"),
+            ("declared_by", "well_known_agents.rs"),
+        ] {
+            assert_eq!(
+                drift.fields.get(name).map(String::as_str),
+                Some(expected),
+                "champ {name} de R4"
+            );
+        }
     }
 }
