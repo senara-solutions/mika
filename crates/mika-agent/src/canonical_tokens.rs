@@ -547,39 +547,6 @@ mod tests {
         "crates/mika-agent/src/async_db.rs",
     ];
 
-    /// Découpe une source en `(nom de fonction, corps)`, commentaires retirés.
-    ///
-    /// Les commentaires sont écartés **d'abord** : sans ça le corps d'une
-    /// fonction avale le doc-comment de la suivante, et une prose qui *décrit*
-    /// la lecture interdite se lit comme la lecture elle-même. Même discipline
-    /// et même raison que `ready_label_handler`'s `production_fn_bodies`.
-    fn fn_bodies(src: &str) -> Vec<(String, String)> {
-        let stripped: String = src
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut out = Vec::new();
-        let mut cursor = 0usize;
-        while let Some(pos) = stripped[cursor..].find("fn ") {
-            let sig_start = cursor + pos + 3;
-            let after = &stripped[sig_start..];
-            let name_end = after.find(['(', '<', ' ']).unwrap_or(after.len());
-            let name = after[..name_end].to_string();
-            let body = match after[name_end..].find("fn ") {
-                Some(next) => &after[name_end..name_end + next],
-                None => &after[name_end..],
-            };
-            out.push((name, body.to_string()));
-            cursor = sig_start + name_end;
-        }
-        out
-    }
-
     /// **Test 11 / R2 — un seul lecteur décisionnel de la preuve.**
     ///
     /// Deux niveaux, et le second est le porteur. (a) hors plomberie, le seul
@@ -634,12 +601,23 @@ mod tests {
         );
 
         // (b) Dans le fichier propriétaire, une seule fonction lit la preuve.
-        let src = std::fs::read_to_string(repo_root().join(owner)).expect("lire executor.rs");
+        //     Le contenu est celui que `production_sources` a déjà lu — une
+        //     seconde lecture disque du même fichier n'apporterait rien.
+        let src = callers
+            .iter()
+            .find(|c| *c == owner)
+            .and_then(|_| {
+                production_sources()
+                    .into_iter()
+                    .find(|(rel, _)| rel == owner)
+                    .map(|(_, content)| content)
+            })
+            .expect("le propriétaire vient d'être trouvé dans production_sources");
         let production = match src.find("\n#[cfg(test)]\nmod tests {") {
             Some(i) => &src[..i],
             None => &src[..],
         };
-        let readers: Vec<String> = fn_bodies(production)
+        let readers: Vec<String> = crate::source_scan::fn_bodies(production)
             .into_iter()
             .filter(|(_, body)| body.contains(&needle))
             .map(|(name, _)| name)

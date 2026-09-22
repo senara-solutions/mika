@@ -1246,17 +1246,20 @@ where
     //    de choisir. Laisser la phrase telle quelle après avoir rétabli la
     //    parité serait garder celle qui a rendu la divergence invisible.
     //
-    //    Le split `owner/repo` ne peut pas échouer — `owner_repo()` délègue à
-    //    `normalize_owner_repo`, qui garantit le séparateur — mais la branche
-    //    impossible route vers `groom`, la direction sûre : au routage, un
-    //    signal illisible ne satisfait jamais un terme.
+    //    Le split ne peut pas échouer — `owner_repo()` délègue à
+    //    `normalize_owner_repo`, qui garantit le séparateur. Le `unwrap_or`
+    //    reconstruit ce que cette fonction aurait rendu plutôt que de
+    //    fabriquer un état de grooming qui n'a pas été mesuré : un faux
+    //    `MarkersMissing` polluerait le `reasoning` de mika#2242 avec un
+    //    pseudo-callout, et un `unwrap()` échangerait une impossibilité contre
+    //    une panique.
     let owner_repo = location.owner_repo();
-    let groomed_state = match owner_repo.split_once('/') {
-        Some((owner, repo)) => {
-            crate::skills::executor::groomed_state(db, owner, repo, location.number, &body).await
-        }
-        None => crate::skills::executor::GroomedState::MarkersMissing(vec!["unparsable_repo_ref"]),
-    };
+    let (owner, repo) = owner_repo.split_once('/').unwrap_or((
+        crate::webhook_dispatch::DEFAULT_DISPATCH_OWNER,
+        location.repo_ref.as_str(),
+    ));
+    let groomed_state =
+        crate::skills::executor::groomed_state(db, owner, repo, location.number, &body).await;
 
     // 5b. mika#2242 — name the CAUSE when the routing falls back to `groom`.
     //
@@ -1303,7 +1306,12 @@ where
     //    `_ =>` (mika#2484 D1) — extraite pour que le bras `ProofUnreadable`
     //    soit attestable sans une base en panne.
     let (target_tool, target_skill, dispatch_class) = route_for(&groomed_state);
-    let is_groomed = target_skill == "dev-pilot";
+    // Lu sur l'état, jamais par comparaison au nom du skill : le littéral
+    // ferait dépendre un booléen de la valeur de retour d'une autre fonction.
+    let is_groomed = matches!(
+        groomed_state,
+        crate::skills::executor::GroomedState::Groomed
+    );
 
     // 7. Pre-create the task in DB. The LLM's tool call will reuse this
     //    `task_id` rather than calling `create_task` first — removes one
@@ -3284,15 +3292,12 @@ mod tests {
                 Some(i) => &src[..i],
                 None => src,
             };
-            for f in ["fn route_for(", "fn routing_note("] {
-                let start = production
-                    .find(f)
+            let bodies = crate::source_scan::fn_bodies(production);
+            for f in ["route_for", "routing_note"] {
+                let (_, body) = bodies
+                    .iter()
+                    .find(|(name, _)| name == f)
                     .unwrap_or_else(|| panic!("{f} doit exister — sinon ce scan vise un mort"));
-                // Le corps s'arrête à la prochaine définition de niveau
-                // supérieur, qui commence en colonne 0.
-                let rest = &production[start..];
-                let end = rest[1..].find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
-                let body = &rest[..end];
                 assert!(
                     !body.contains("_ =>"),
                     "{f} porte un bras joker : un cinquième `GroomedState` s'y \

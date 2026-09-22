@@ -90,6 +90,55 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
     })
 }
 
+/// Découpe une source Rust en `(nom de fonction, corps)`, commentaires retirés.
+///
+/// Les gardes structurelles de ce crate posent toutes la même question — *quelle
+/// fonction de production porte ce motif ?* — et ont besoin du même découpage
+/// pour y répondre. Un seul lecteur, plutôt qu'une copie par garde : c'est la
+/// classe que `grooming_marker` a dû graver une fois (mika#2158, une regex
+/// copiée dont le commentaire disait « Mirrors … » et qui a ensuite raté deux
+/// élargissements).
+///
+/// **Les commentaires sont retirés d'abord**, et c'est porteur : sans ça le
+/// corps d'une fonction avale le doc-comment de la suivante, et une prose qui
+/// *décrit* le motif interdit se lit comme une violation de celui-ci. Ce n'est
+/// pas une hypothèse — c'est ce que la première exécution de la garde de
+/// mika#2323 a rapporté.
+///
+/// Le corps de chaque fonction est borné au prochain `fn ` **à n'importe quelle
+/// indentation** : `\nfn ` raterait `pub async fn` et toute méthode d'un `impl`,
+/// ce qui ferait courir chaque corps jusqu'à la fin du fichier.
+///
+/// Cette fonction ne tronque pas le code de test : c'est à l'appelant de
+/// décider de sa moitié de production, les gardes n'ayant pas toutes la même
+/// borne.
+pub(crate) fn fn_bodies(src: &str) -> Vec<(String, String)> {
+    let stripped: String = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = stripped[cursor..].find("fn ") {
+        let sig_start = cursor + pos + 3;
+        let after = &stripped[sig_start..];
+        let name_end = after.find(['(', '<', ' ']).unwrap_or(after.len());
+        let name = after[..name_end].to_string();
+        let body = match after[name_end..].find("fn ") {
+            Some(next) => &after[name_end..name_end + next],
+            None => &after[name_end..],
+        };
+        out.push((name, body.to_string()));
+        cursor = sig_start + name_end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
