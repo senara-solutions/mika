@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-ngrok deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -130,6 +130,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
 	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
@@ -137,6 +138,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh
@@ -175,6 +177,9 @@ test-pr-origin: ## Run the PR-origin marker + report suites (mika#2026)
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash scripts/test-pr-origin-report.sh
 
+test-stamp-issue-seat: ## Verify dispatch-lib claims the issue with dispatch:loop and releases it on exit (mika#2155)
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
+
 test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 
@@ -183,6 +188,10 @@ test-github-token-not-in-sandbox: ## Verify the GitHub token is host-reachable b
 
 test-sandbox-git-usable: ## Verify git works inside the pilot sandbox and containment stays closed (mika#2141)
 	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+
+test-shared-checkout-guard: ## Pin the shared-checkout guard (both modes) and its run_shell wiring, negative control included (mika#2107 / mika#2449)
+	@bash scripts/test-guard-shared-checkout.sh
+	@bash scripts/test-shell-exec-guard.sh
 
 verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
 	@bash scripts/verify-no-secret-in-setenv.sh

@@ -4587,6 +4587,20 @@ impl TaskEngine {
                             }
                         }
 
+                        // mika#2446 — la ligne porte désormais sa preuve.
+                        //
+                        // Elle **affirmait** un décalage de version sans porter
+                        // de quoi l'établir : ni la version du binaire, ni son
+                        // empreinte git, ni son pid, ni l'inventaire des
+                        // triggers qu'il sait router. La surface opérateur de
+                        // mika#2337 prescrivait « établir la version du binaire
+                        // en exécution » sans fournir l'instrument. Le coût est
+                        // mesuré : quatre heures, deux redémarrages, un
+                        // `cargo clean`, et une hypothèse (« objet compilé
+                        // périmé ») qu'un seul de ces champs aurait réfutée sur
+                        // place.
+                        let attribution = super::dispatcher::binary_attribution();
+
                         // A named event, not the generic `task dispatch failed`
                         // — which is indistinguishable from a network failure
                         // and is what made this class unreadable in the log.
@@ -4596,9 +4610,17 @@ impl TaskEngine {
                             label = %label,
                             trigger = %trigger,
                             trigger_type = %trigger_type_val,
+                            binary_version = %attribution.version,
+                            binary_git_hash = %attribution.git_hash,
+                            process_id = attribution.process_id,
+                            process_name = %attribution.process_name,
+                            routable_triggers = %attribution.routable_triggers,
                             "mika#2337: run_skill trigger registered but not routable by this \
                              binary — this is a version skew between the merged code and the \
-                             running code, not a defect of the dispatch itself"
+                             running code, not a defect of the dispatch itself. mika#2446: \
+                             compare `trigger` against `routable_triggers` and read \
+                             `binary_git_hash` — if that commit carries the arm, the skew is \
+                             refuted and the cause is elsewhere."
                         );
 
                         if let Err(audit_err) = db
@@ -4608,8 +4630,20 @@ impl TaskEngine {
                                 &format!("task:{task_id}"),
                                 None,
                                 Some("failed"),
+                                // Les mêmes valeurs dans le `reasoning`, pour que
+                                // la question soit répondable en SQL sans grep sur
+                                // dix-neuf gigaoctets de journal.
                                 Some(&format!(
-                                    "label:{label} trigger:{trigger} trigger_type:{trigger_type_val}"
+                                    "label:{label} trigger:{trigger} \
+                                     trigger_type:{trigger_type_val} \
+                                     binary_version:{} binary_git_hash:{} \
+                                     process_id:{} process_name:{} \
+                                     routable_triggers:{}",
+                                    attribution.version,
+                                    attribution.git_hash,
+                                    attribution.process_id,
+                                    attribution.process_name,
+                                    attribution.routable_triggers,
                                 )),
                                 None,
                             )

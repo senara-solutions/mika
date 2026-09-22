@@ -43,6 +43,9 @@ DISPATCH_LIB="$SCRIPT_DIR/dispatch-lib.sh"
 
 PASS=0
 FAIL=0
+# mika#2149: a third column, so a guard that could not arm is never read as a
+# bare green. Incremented only by a probe that says SKIP out loud.
+SKIPPED=0
 
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
@@ -3917,8 +3920,13 @@ assert_not_contains "U1: missing issue plan does not blame architect convergence
 # KTD5: dispatch_claude_pilot and _run_claude_pilot need a real pilot and CLI,
 # so the classification lives in its own callable function the harness can run
 # with an injected environment — the same shape as _find_issue_plan's probes.
+# mika#2149: a sixth argument carries `.api_error_status` (cpp#54), and a
+# seventh selects which stream the probe returns — `stdout` (default) or
+# `stderr`, because the halt_family.unknown line (R-4) lives on stderr and the
+# 2>/dev/null here used to make that stream unobservable.
 _classify_probe() {
     local guardrail_line="$1" turns="${2:-2}" subtype="${3:-}" reason="${4:-}" mode="${5:-full}"
+    local api_error_status="${6:-}" stream="${7:-stdout}"
     local tmp log_id
     tmp=$(mktemp -d)
     log_id="probe-1772"
@@ -3937,7 +3945,12 @@ _classify_probe() {
         STDERR_FILE=""
         SUBTYPE="$subtype"
         TERMINATION_REASON="$reason"
-        _classify_terminated_session "$mode" 2>/dev/null
+        API_ERROR_STATUS="$api_error_status"
+        if [ "$stream" = "stderr" ]; then
+            _classify_terminated_session "$mode" 2>&1 >/dev/null
+        else
+            _classify_terminated_session "$mode" 2>/dev/null
+        fi
     )
     rm -rf "$tmp"
 }
@@ -4106,13 +4119,18 @@ assert_contains "U3b: the re-dispatch note names the plan it found" \
 
 # --- mika#1772 review round: the two populations of `terminated` -----------
 #
-# `status: terminated` is set both by a guardrail abort (subtype in
-# stall_detected|empty_response|idle_timeout) and by an SDK limit
-# (error_max_turns|error_max_budget_usd). The first usually kills a session that
-# did nothing; the second often kills one that did a great deal. Treating them
-# alike would skip the mika#1282 dirty-worktree rescue for the second and tell
-# the operator "nothing was written" about a branch carrying commits — the exact
-# defect class this ticket closes, reintroduced by its own fix.
+# `status: terminated` is set both by a guardrail abort and by an SDK limit.
+# The first usually kills a session that did nothing; the second often kills
+# one that did a great deal. Treating them alike would skip the mika#1282
+# dirty-worktree rescue for the second and tell the operator "nothing was
+# written" about a branch carrying commits — the exact defect class this ticket
+# closes, reintroduced by its own fix.
+#
+# The subtype vocabulary is deliberately NOT listed here (mika#2149): upstream
+# it is `GuardrailAbortReason.guardrail` in claude-pilot's types.py plus
+# `SDK_TERMINATION_SUBTYPES` in agent.py; downstream it is `_halt_family` in
+# dispatch-lib.sh. The drift guard further down reads the former and checks the
+# latter — a comment nobody executes went stale by five values in eighteen days.
 
 echo ""
 echo "Test: terminated sessions that left work behind (mika#1772 review)"
@@ -4181,6 +4199,254 @@ assert_contains "full mode states the measurement behind its claim" \
 CLASSIFY_NO_CAUSE=$(_classify_probe '' 2 '' '' 'full') || CLASSIFY_NO_CAUSE=""
 assert_contains "an unrecorded cause is reported as unrecorded" \
     "cause not recorded" "$CLASSIFY_NO_CAUSE"
+
+# --- mika#2149: every halt motif gets a family and a retry hint downstream ---
+#
+# The subtype vocabulary is owned upstream by `GuardrailAbortReason.guardrail`
+# (claude-pilot/src/claude_pilot/types.py) plus `SDK_TERMINATION_SUBTYPES` and
+# the cpp#187 transport halt in agent.py. Downstream, `_halt_family` in
+# dispatch-lib.sh is the ONLY place that enumerates it — a `case` with a `*)`
+# arm, so a value added upstream lands on stderr as `halt_family.unknown` the
+# first time it is seen instead of silently joining the prose. This comment
+# deliberately lists no value: the two tables are the source of truth, and T6
+# below checks them against each other.
+
+echo ""
+echo "Test: halt motifs are classified downstream (mika#2149)"
+echo "--------------------------------------------------------"
+
+# T1 — table-driven: one row per known subtype, both lines present.
+while IFS='|' read -r subtype family hint; do
+    T1_OUT=$(_classify_probe '' 2 "$subtype" 'x' 'full') || T1_OUT=""
+    assert_contains "T1: $subtype -> Halt class: $family" \
+        "Halt class: $family" "$T1_OUT"
+    assert_contains "T1: $subtype -> Retry hint: $hint" \
+        "Retry hint: $hint" "$T1_OUT"
+done <<'T1_TABLE'
+rate_limited|quota_throttled|transient
+awaiting_model|model_never_resumed|transient
+awaiting_tool|tool_never_returned|investigate
+idle_timeout|session_silent|investigate
+stall_detected|model_unproductive|investigate
+empty_response|model_unproductive|investigate
+watchdog_error|pilot_bug|investigate
+prompt_cache_dead|substrate|investigate
+error_max_turns|budget_exhausted|deterministic
+error_max_budget_usd|budget_exhausted|deterministic
+transport_message_too_large|transport|investigate
+T1_TABLE
+
+# T2 — a subtype outside the table is classed unknown/investigate AND said on
+# stderr; a known one is not (negative control, same call shape).
+T2_OUT=$(_classify_probe '' 2 'foo_bar' 'x' 'full') || T2_OUT=""
+assert_contains "T2: unknown subtype -> Halt class: unknown" \
+    "Halt class: unknown" "$T2_OUT"
+assert_contains "T2: unknown subtype -> Retry hint: investigate" \
+    "Retry hint: investigate" "$T2_OUT"
+T2_ERR=$(_classify_probe '' 2 'foo_bar' 'x' 'full' '' stderr) || T2_ERR=""
+assert_contains "T2: unknown subtype is named on stderr" \
+    "halt_family.unknown subtype=foo_bar" "$T2_ERR"
+T2_ERR_KNOWN=$(_classify_probe '' 2 'idle_timeout' 'x' 'full' '' stderr) || T2_ERR_KNOWN=""
+assert_not_contains "T2 (negative control): a known subtype is silent on stderr" \
+    "halt_family.unknown" "$T2_ERR_KNOWN"
+
+# T3 — api_error_status (cpp#54) is a qualifier on the Halt: line, present
+# only when the JSON carried it.
+T3_OUT=$(_classify_probe '' 2 'rate_limited' 'backoff exhausted' 'full' '429') || T3_OUT=""
+assert_contains "T3: api_error_status renders as (HTTP n) on the Halt: line" \
+    "Halt: rate_limited (HTTP 429)" "$T3_OUT"
+T3_NONE=$(_classify_probe '' 2 'rate_limited' 'backoff exhausted' 'full' '') || T3_NONE=""
+assert_not_contains "T3 (negative control): no status -> no (HTTP" \
+    "(HTTP" "$T3_NONE"
+assert_contains "T3 (negative control): the Halt: line is otherwise intact" \
+    "Halt: rate_limited — backoff exhausted" "$T3_NONE"
+
+# T4 — fallback path: no subtype on the JSON, the `[guardrail]` line in stderr
+# (ANSI-coloured, as ui.py:113 writes it) feeds the same table.
+T4_LINE=$(printf '\033[38;5;208m[guardrail]\033[0m \033[1mawaiting_model\033[0m: model-wait ceiling 900s exceeded')
+T4_OUT=$(_classify_probe "$T4_LINE" 2 '' '' 'full') || T4_OUT=""
+assert_contains "T4: a stderr-only halt is classified like a JSON one" \
+    "Halt class: model_never_resumed" "$T4_OUT"
+assert_contains "T4: the Halt: line keeps the scraped text" \
+    "Halt: [guardrail] awaiting_model:" "$T4_OUT"
+T4_NONE=$(_classify_probe 'no guardrail line here' 2 '' '' 'full') || T4_NONE=""
+assert_contains "T4 (negative control): no [guardrail] line -> unknown" \
+    "Halt class: unknown" "$T4_NONE"
+assert_contains "T4 (negative control): 'cause not recorded' is preserved" \
+    "cause not recorded" "$T4_NONE"
+T4_NONE_ERR=$(_classify_probe 'no guardrail line here' 2 '' '' 'full' '' stderr) || T4_NONE_ERR=""
+assert_not_contains "T4 (negative control): an unrecorded cause is not reported as upstream drift" \
+    "halt_family.unknown" "$T4_NONE_ERR"
+
+# T5 — banner mode carries both lines too.
+T5_OUT=$(_classify_probe '' 12 'awaiting_tool' 'tool-wait ceiling exceeded' 'banner') || T5_OUT=""
+assert_contains "T5: banner mode carries Halt class:" \
+    "Halt class: tool_never_returned" "$T5_OUT"
+assert_contains "T5: banner mode carries Retry hint:" \
+    "Retry hint: investigate" "$T5_OUT"
+
+# T6 — the drift guard (C-5): read the upstream Literal, demand a family for
+# every value. Runs on the dispatch host, where claude-pilot is always present
+# (it is what this file dispatches). Elsewhere it SKIPs and says so.
+#
+# T6-arm (F1, first architect pass): a SKIP buried in thousands of output lines
+# is indistinguishable from a green to the eye that reads the last line. So the
+# block emits EXACTLY ONE `DRIFT-GUARD:` marker on stdout, and a companion
+# assertion reads that stdout back — a bare green with no marker is a red. The
+# block runs in the current shell (so PASS/FAIL/SKIPPED survive) with its stdout
+# duplicated into a capture file by process substitution.
+_t6_locate_types_py() {
+    # An explicit variable is authoritative — including when it points nowhere,
+    # which is how T6-arm control (a) forces the SKIP branch.
+    if [ -n "${CLAUDE_PILOT_TYPES:-}" ]; then
+        [ -r "$CLAUDE_PILOT_TYPES" ] && printf '%s\n' "$CLAUDE_PILOT_TYPES"
+        return 0
+    fi
+    # <meta>/mika and <meta>/.claude/worktrees/<slug>/mika both have
+    # claude-pilot/ one or three levels above the repo root.
+    local top c
+    # From the script's own repo, never the caller's cwd (mika#2149 review, #6):
+    # launched from the meta-repo root, a bare rev-parse resolved the wrong
+    # toplevel and the guard SKIPped on the very host it exists to protect.
+    top=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null) || return 0
+    for c in "$top/../claude-pilot/src/claude_pilot/types.py" \
+             "$top/../../../../claude-pilot/src/claude_pilot/types.py"; do
+        if [ -r "$c" ]; then
+            (cd "$(dirname "$c")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$c")")
+            return 0
+        fi
+    done
+    return 0
+}
+
+_t6_drift_guard() {
+    local types_py values n v family
+    types_py=$(_t6_locate_types_py)
+    if [ -z "$types_py" ]; then
+        echo "DRIFT-GUARD: SKIP — types.py unreachable (set CLAUDE_PILOT_TYPES)"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    # The `guardrail: Literal[ ... ]` block, EVERY quoted token — then fail
+    # closed on any token outside the shape a subtype can have (mika#2149
+    # review, #3): a charset filter in the extraction excluded a digit-bearing
+    # name instead of failing on it, so the guard counted it out and stayed
+    # green. The shape mirrors the runtime scrape in dispatch-lib.sh.
+    values=$(sed -n '/guardrail: Literal\[/,/\]/p' "$types_py" | grep -o '"[^"]*"' | tr -d '"' || true)
+    n=$(printf '%s\n' "$values" | grep -c . || true)
+    echo "DRIFT-GUARD: armed against $types_py ($n values)"
+    if [ "$n" -eq 0 ]; then
+        FAIL=$((FAIL + 1))
+        echo "  ✗ T6: the Literal block was found empty — the sed anchor no longer matches types.py"
+        return 0
+    fi
+    for v in $values; do
+        if ! grep -Eq -- '^[a-z][a-z0-9_]*$' <<<"$v"; then
+            FAIL=$((FAIL + 1))
+            echo "  ✗ T6: upstream token '$v' is outside the subtype shape [a-z][a-z0-9_]* — widen the runtime scrape and this guard together"
+            continue
+        fi
+        family=$( ( source "$DISPATCH_LIB" 2>/dev/null || true; _halt_family "$v" 2>/dev/null | cut -d'|' -f1 ) )
+        # Positive control first: an empty family (function renamed, source
+        # aborted in the subshell) must not pass the drift check vacuously.
+        assert_eq "T6 drift: upstream value '$v' resolved to a non-empty family" \
+            "yes" "$([ -n "$family" ] && echo yes || echo no)"
+        assert_not_contains "T6 drift: upstream value '$v' has a downstream family (got: $family)" \
+            "unknown" "$family"
+    done
+}
+
+T6_CAPTURE=$(mktemp)
+_t6_drift_guard > >(tee "$T6_CAPTURE")
+wait $! 2>/dev/null || true
+T6_MARKER_COUNT=$(grep -c '^DRIFT-GUARD: ' "$T6_CAPTURE" || true)
+assert_eq "T6-arm: exactly one DRIFT-GUARD marker was emitted on stdout" \
+    "1" "$T6_MARKER_COUNT"
+rm -f "$T6_CAPTURE"
+
+# T6 fixtures — the guard's own branches, driven in a subshell so its
+# counters do not leak into this run's (mika#2149 review, #3 and testing gaps).
+# Each fixture is a minimal types.py; the guard's stdout is the assertion
+# surface, and its FAIL count is printed last so the fail-closed direction is
+# pinned by number, not by prose.
+_t6_fixture_probe() {
+    local body="$1" fx
+    fx=$(mktemp)
+    printf '%s\n' "$body" > "$fx"
+    (
+        PASS=0; FAIL=0; SKIPPED=0
+        CLAUDE_PILOT_TYPES="$fx" _t6_drift_guard
+        echo "FAIL=$FAIL SKIPPED=$SKIPPED"
+    )
+    rm -f "$fx"
+}
+# (a) a digit-bearing name is iterated, not silently dropped: it reaches the
+#     table and comes back unknown, and the guard names it.
+T6_FX_DIGIT=$(_t6_fixture_probe '    guardrail: Literal[
+        "idle_timeout",
+        "http_529",
+    ]')
+assert_contains "T6 fixture: a digit-bearing upstream value is counted" \
+    "(2 values)" "$T6_FX_DIGIT"
+assert_contains "T6 fixture: a digit-bearing unknown value is named red" \
+    "✗ T6 drift: upstream value 'http_529' has a downstream family (got: unknown)" "$T6_FX_DIGIT"
+assert_contains "T6 fixture: exactly one red for the one unknown value" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_DIGIT"
+# (b) a token outside the subtype shape fails closed, by name.
+T6_FX_SHAPE=$(_t6_fixture_probe '    guardrail: Literal[
+        "idle_timeout",
+        "Bad-Token",
+    ]')
+assert_contains "T6 fixture: an out-of-shape token is refused by name" \
+    "upstream token 'Bad-Token' is outside the subtype shape" "$T6_FX_SHAPE"
+assert_contains "T6 fixture: the refusal counts as a FAIL" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_SHAPE"
+# (c) a matched-but-empty Literal block is a red, not a vacuous green.
+T6_FX_EMPTY=$(_t6_fixture_probe '    guardrail: Literal[
+    ]')
+assert_contains "T6 fixture: an empty Literal block is named" \
+    "the Literal block was found empty" "$T6_FX_EMPTY"
+assert_contains "T6 fixture: an empty Literal block is a FAIL" \
+    "FAIL=1 SKIPPED=0" "$T6_FX_EMPTY"
+# (d) the SKIP branch, in-file: marker + SKIPPED, zero content assertions.
+T6_FX_SKIP=$( ( PASS=0; FAIL=0; SKIPPED=0; CLAUDE_PILOT_TYPES=/nonexistent _t6_drift_guard; echo "FAIL=$FAIL SKIPPED=$SKIPPED PASS=$PASS" ) )
+assert_contains "T6 fixture: unreachable types.py emits the SKIP marker" \
+    "DRIFT-GUARD: SKIP" "$T6_FX_SKIP"
+assert_contains "T6 fixture: unreachable types.py counts SKIPPED and asserts nothing" \
+    "FAIL=0 SKIPPED=1 PASS=0" "$T6_FX_SKIP"
+
+# T2-sink — the drift line through the PRODUCTION channel (mika#2149 review,
+# #1). The probe mirrors dispatch_claude_pilot: fd 2 is /dev/null (the
+# `exec 9>>"$TRACE_FILE" 2>/dev/null` at its top), and the two sinks are the
+# files the callback tail and the persisted .stderr are built from. A bare
+# `>&2` passes the earlier T2 (which merges fd 2 in the probe) and lands
+# nowhere here — that is the defect this probe exists to keep closed.
+_classify_sink_probe() {
+    local subtype="$1" tmp
+    tmp=$(mktemp -d)
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        exec 2>/dev/null
+        STATUS="terminated"; TURNS=2; DURATION=1; SESSION_ID=s; LOG_ID="probe-sink"
+        PILOT_LOG_DIR="$tmp"
+        STDERR_FILE="$tmp/stderr.tmp"; : > "$STDERR_FILE"
+        PERSISTENT_STDERR="$tmp/probe-sink.stderr"; : > "$PERSISTENT_STDERR"
+        SUBTYPE="$subtype"; TERMINATION_REASON="x"; API_ERROR_STATUS=""
+        _classify_terminated_session >/dev/null
+        printf 'tail:%s\n' "$(cat "$STDERR_FILE")"
+        printf 'persisted:%s\n' "$(cat "$PERSISTENT_STDERR")"
+    )
+    rm -rf "$tmp"
+}
+T2_SINK=$(_classify_sink_probe foo_bar) || T2_SINK=""
+assert_contains "T2-sink: the drift line reaches the callback-tail source (STDERR_FILE)" \
+    "tail:dispatch-lib: halt_family.unknown subtype=foo_bar" "$T2_SINK"
+assert_contains "T2-sink: the drift line reaches the persisted .stderr" \
+    "persisted:dispatch-lib: halt_family.unknown subtype=foo_bar" "$T2_SINK"
+T2_SINK_KNOWN=$(_classify_sink_probe idle_timeout) || T2_SINK_KNOWN=""
+assert_not_contains "T2-sink (negative control): a known subtype writes nothing to either sink" \
+    "halt_family.unknown" "$T2_SINK_KNOWN"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \
@@ -4504,12 +4770,20 @@ time.sleep(30)
     i=0
     while [ $i -lt 20 ] && [ ! -f "$marker" ]; do sleep 0.05; i=$((i + 1)); done
     [ -f "$marker" ] && launched=yes
-    # Order matters: the missing-binary line ends in "(falling back to fs-only)",
-    # so matching fs-only first would swallow it and make the two fallbacks
-    # indistinguishable -- the exact confusion the last assertion guards against.
+    # mika#2049 re-tokenised these two lines. Pre-2049 BOTH ended in "(falling
+    # back to fs-only)" and only one carried a stable token, so this `case` had
+    # to be ordered defensively to keep them apart -- and an operator using
+    # `pilot_egress_guard.unreachable` as THE predicate read a nominal regime on
+    # a fleet whose proxy binary was never deployed (the gap mika#2050 had to
+    # document). Each cause now carries its own token, so the two arms are
+    # disjoint by construction rather than by ordering.
+    #
+    # The strings no longer say "falling back" because nothing falls back any
+    # more: the caller refuses. Leaving them would have made Signal S (mika#2050)
+    # count a population that can no longer exist.
     case "$out" in
-        *"Phase 2b network cut disabled"*) msg=phase2b ;;
-        *"falling back to fs-only"*) msg=fs-only ;;
+        *"pilot_egress_guard.binary_missing"*) msg=binary-missing ;;
+        *"pilot_egress_guard.unreachable"*) msg=unreachable ;;
         *"pilot-egress-proxy launched"*) msg=launched-ok ;;
         *) msg=none ;;
     esac
@@ -4519,8 +4793,8 @@ time.sleep(30)
 
 # THE regression. Pre-fix this is "rc=0 launched=yes msg=launched-ok": the
 # orphan file satisfies [ -S ], the guard affirms a launch that never happened.
-assert_eq "orphan socket + proxy that dies before binding => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "orphan socket + proxy that dies before binding => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies)"
 
 # The liveness probe must still recognise a real listener after the probe was
@@ -4530,20 +4804,22 @@ assert_eq "live listener => already-alive, proxy not relaunched" \
     "$(_egress_guard_probe live dies)"
 
 # No file at the path: this already worked pre-fix. Locks it against regression.
-assert_eq "no socket at path + proxy that dies => fs-only fallback fires" \
-    "rc=1 launched=yes msg=fs-only" \
+assert_eq "no socket at path + proxy that dies => guard reports unreachable" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe absent dies)"
 
-# The two fallbacks must stay distinguishable: a missing binary is a deploy
-# state, an unreachable socket is a runtime failure. Same rc, different line.
-assert_eq "missing proxy binary => Phase 2b disabled, not fs-only" \
-    "rc=1 launched=no msg=phase2b" \
+# The two causes must stay distinguishable: a missing binary is a deploy state
+# (remedy: `make install`), an unreachable socket is a runtime failure (remedy:
+# restart the relay). Same rc, different token, different gesture -- which is
+# why mika#2049 gave each one a token of its own.
+assert_eq "missing proxy binary => binary_missing, not unreachable" \
+    "rc=1 launched=no msg=binary-missing" \
     "$(_egress_guard_probe ghost missing)"
 
 # The probe passes the path as argv, never interpolated into python source
 # (plan KTD2). A quote in the path used to be a syntax error waiting to happen.
 assert_eq "socket path containing a single quote does not break the probe" \
-    "rc=1 launched=yes msg=fs-only" \
+    "rc=1 launched=yes msg=unreachable" \
     "$(_egress_guard_probe ghost dies "mika'\''egress.sock")"
 
 # R8: no fake-proxy output may reach the operational proxy log.
@@ -6910,11 +7186,45 @@ assert_eq "T11 (b): un findings-1-fd.md résiduel ne déclenche aucune relance" 
 assert_not_contains "T11 (b): et rien n'est journalisé" \
     "fire_disposition_revise_retried" "$T2306_T11"
 
+# --- mika#2449: aucun message de récupération de stash ne nomme le checkout principal ---
+#
+# Deux sites de dispatch-lib stashent un worktree sale et impriment une
+# consigne « recover with: git -C <dir> stash apply <sha> ». Le site A
+# (_clean_worktree_for_rebase) nomme le worktree ; le site B (_set_up_worktree,
+# relic non canonique) nommait `$SUB_REPO_DIR` — le checkout PRINCIPAL. Exécutée,
+# cette consigne dépose le contenu non committé d'un worktree dans le checkout de
+# déploiement, exactement la signature du sinistre du 2026-09-21 (staged +
+# modified sur main, rebuild bloqué). Le lecteur de ce message est un acteur non
+# contenu (opérateur, mika-dev lisant un dispatch en échec), donc une
+# prescription écrite est un producteur latent.
+#
+# Scan de source à ALLOWLIST VIDE : toute ligne portant à la fois `stash apply`
+# et `recover with` est un site ; aucun ne peut nommer SUB_REPO_DIR. Quand il
+# tire, la résolution est de corriger le message, jamais d'ajouter une entrée.
+# Contrôle de bonne foi : ≥ 2 sites trouvés, sinon le scan est vert parce qu'il
+# ne regarde rien (classe mika#2205).
+T2449_RECOVER_SITES=$(grep -n 'stash apply' "$DISPATCH_LIB" | grep 'recover with' || true)
+T2449_SITE_COUNT=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'recover with' || true)
+assert_eq "mika#2449 bonne foi: le scan trouve ≥ 2 sites « recover with … stash apply »" "yes" \
+    "$([ "$T2449_SITE_COUNT" -ge 2 ] && echo yes || echo "non ($T2449_SITE_COUNT)")"
+assert_eq "mika#2449: aucun site « recover with » ne nomme SUB_REPO_DIR (allowlist vide)" "0" \
+    "$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'SUB_REPO_DIR' || true)"
+# Le site B doit nommer le worktree CANONIQUE, pas le relic : celui-ci est
+# supprimé quelques lignes plus bas (`worktree remove --force "$existing_wt"`),
+# donc une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
+T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'stale-worktree-cleanup\|existing_wt' || true)
+assert_contains "mika#2449: le site B (relic) prescrit le worktree canonique \$WORKTREE_DIR" \
+    'git -C $WORKTREE_DIR stash apply' "$T2449_SITE_B"
+assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt (supprimé plus bas)" \
+    'git -C $existing_wt stash apply' "$T2449_SITE_B"
+assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
+    'NOT in the primary checkout' "$T2449_SITE_B"
+
 # --- Summary ---
 
 echo ""
 echo "========================================"
-echo "Results: $PASS passed, $FAIL failed"
+echo "Results: $PASS passed, $FAIL failed, SKIPPED: $SKIPPED"
 echo "========================================"
 
 if [ "$FAIL" -gt 0 ]; then

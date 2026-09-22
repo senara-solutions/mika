@@ -44,6 +44,106 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
+/// Les triggers `run_skill` que **ce binaire** sait router (mika#2446).
+///
+/// **Projection du `match`, jamais son remplaçant.** La vérité d'exécution
+/// reste le `match trigger_name` de [`TaskDispatcher::dispatch_run_skill`] : on
+/// ne le remplace pas par une table de dispatch dynamique, ce qui déplacerait
+/// la décision dans une donnée — et une donnée périmée ne fait rougir aucun
+/// compilateur. Cette constante est un **inventaire**, et son honnêteté est
+/// tenue par une garde de source
+/// (`mika2446_l_inventaire_est_la_projection_exacte_du_match`, dans
+/// `tests/eval/test_recurring_trigger_wiring_2337.rs`) qui parse le bloc `match`
+/// et asserte l'égalité ensembliste. Un inventaire qui mentirait serait
+/// strictement pire que pas d'inventaire.
+///
+/// Il existe parce que la ligne de mort par trigger inconnu
+/// ([`DispatchError::UnknownTrigger`]) **affirmait sa cause sans la porter** :
+/// elle prescrivait « établir la version du binaire en exécution » sans fournir
+/// l'instrument pour le faire. Un opérateur a dû recourir à `/proc/<pid>/exe`,
+/// `strings | grep -c` et `mika --version` — puis a formulé une hypothèse qu'un
+/// seul champ de la ligne aurait réfutée immédiatement.
+///
+/// Deux lecteurs : le champ `routable_triggers` de l'événement
+/// `recurring_unknown_trigger` (`engine.rs`) et de l'attestation de démarrage
+/// `task_engine_trigger_registry` (`server/mod.rs`), et le refus de
+/// `mika tasks rearm` sur un label dont le trigger n'est pas routable ici.
+///
+/// **Refusé : dériver l'inventaire au runtime.** Il n'y a pas de réflexion sur
+/// un `match` en Rust, et toute dérivation serait une seconde liste écrite à la
+/// main — c'est-à-dire le problème, avec une étape de plus.
+pub const ROUTABLE_TRIGGERS: &[&str] = &[
+    "heartbeat",
+    "reflection",
+    "auto_pull_groomed",
+    "wip_rescue",
+    "qa_review_reconcile",
+    "worktree_reap",
+    "curator_review",
+];
+
+/// L'inventaire sous une forme prête à journaliser : `"a,b,c"`.
+///
+/// Un site unique parce que trois émetteurs le rendent (la ligne de mort, son
+/// audit, l'attestation de démarrage) et qu'un séparateur qui diverge entre
+/// deux d'entre eux coupe une population en deux sans le dire.
+pub fn routable_triggers_csv() -> String {
+    ROUTABLE_TRIGGERS.join(",")
+}
+
+/// Ce binaire sait-il router ce trigger ? Lecteur unique de [`ROUTABLE_TRIGGERS`]
+/// pour les prédicats (le CLI `mika tasks rearm`, mika#2446 R-5).
+pub fn is_routable_trigger(trigger: &str) -> bool {
+    ROUTABLE_TRIGGERS.contains(&trigger)
+}
+
+/// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
+///
+/// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
+/// être lisible **seule** — sans `strings`, sans `/proc`, sans `mika --version`
+/// lancé quatre heures plus tard sur un processus qui n'existe plus.
+///
+/// **Ce que ça n'atteste pas, dit ici plutôt que découvert :** la version du
+/// binaire qui *refuse*, jamais celle qui a *enregistré* la récurrente. Les deux
+/// peuvent différer — c'est précisément l'hypothèse de mika#2446 — et poser un
+/// tampon à l'enregistrement serait une seconde écriture sur un chemin nominal
+/// pour une population pathologique. L'inventaire du refusant suffit à trancher.
+pub struct BinaryAttribution {
+    /// Version sémantique servie.
+    pub version: &'static str,
+    /// Empreinte git, **rapportée telle quelle**. `"unknown"` (build hors
+    /// checkout, couche Docker) est une réponse — « ce binaire ne peut pas
+    /// énoncer sa provenance » — et non une absence de réponse : jamais corrigé,
+    /// jamais masqué. C'est le champ décisif : si c'est le commit qui porte le
+    /// bras, le décalage de version est réfuté et la cause est ailleurs.
+    pub git_hash: &'static str,
+    /// Quel processus a refusé.
+    pub process_id: u32,
+    /// `mika-spirit` ou `mika` — sépare le démon d'un `mika chat` qui tire les
+    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet, et
+    /// `cli_mode` ne court-circuite jamais le dispatch `run_skill`).
+    pub process_name: String,
+    /// L'inventaire **de ce binaire**, à comparer au trigger refusé.
+    pub routable_triggers: String,
+}
+
+/// L'attribution du processus courant. Trois émetteurs la rendent : la ligne de
+/// mort, sa ligne `audit_events`, et l'attestation de démarrage.
+pub fn binary_attribution() -> BinaryAttribution {
+    BinaryAttribution {
+        version: mika_common::build_info::VERSION,
+        git_hash: mika_common::build_info::GIT_HASH,
+        process_id: std::process::id(),
+        // Un exécutable illisible rend `"unknown"` : le champ dit alors qu'il ne
+        // sait pas, ce qui reste une information — la même règle que `git_hash`.
+        process_name: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        routable_triggers: routable_triggers_csv(),
+    }
+}
+
 /// Les scans périodiques qui résolvent leur token GitHub via
 /// [`resolve_periodic_scan_token`] (mika#2205).
 ///
@@ -1655,12 +1755,49 @@ impl TaskDispatcher {
             "auto_pull: running groomed ticket selection"
         );
 
+        // mika#2049 — is the host egress relay down? Resolved ONCE per tick,
+        // here, because this is the type that holds the global home the shell
+        // guard stamps under (same trajectory as mika#2329's hot STOP, and the
+        // reason `auto_pull` takes this as a parameter rather than reading it).
+        //
+        // Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+        // "serving". That cannot open the network — the protection is the shell
+        // guard, which probes the socket on every dispatch and reads no stamp.
+        // The worst a false "serving" buys is one refused dispatch.
+        let egress_verdict = crate::pilot_egress_stamp::relay_verdict(
+            &self.global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        );
+        if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } = &egress_verdict {
+            // One line per tick, not per ticket: the per-ticket record is the
+            // exclusion ledger's `egress_relay_down` rows (mika#2131 doctrine —
+            // detail in `audit_events`, shape in one INFO line).
+            info!(
+                event = "auto_pull_egress_relay_down",
+                motif = %motif,
+                age_secs,
+                trace_id = %trace_id,
+                "auto_pull: host egress relay is down — tickets are skipped, not \
+                 re-driven, so none is parked by the outage (mika#2049)"
+            );
+        }
+
+        // mika#2470 — what Phase 2 needs to dispatch a rescued ticket by a
+        // direct, in-process call of the ready-label handler instead of
+        // re-applying the label and waiting for a webhook that the outage it
+        // covers may never deliver.
+        let direct_dispatch = crate::auto_pull::DirectDispatchCtx {
+            skills: self.skills.as_ref(),
+            global_home_dir: &self.global_home_dir,
+        };
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
             &label_auth,
             &trace_id,
             &session_id,
+            egress_verdict.is_down(),
+            &direct_dispatch,
         )
         .await;
 
@@ -3816,6 +3953,7 @@ async fn try_dispatch_pilot_after_groom_success(
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(

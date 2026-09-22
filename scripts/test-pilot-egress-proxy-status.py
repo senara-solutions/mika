@@ -42,26 +42,75 @@ from importlib.machinery import SourceFileLoader
 # `grep 2026-08-28` composes across both files. The tests below assert the
 # stamp is present and parseable, then strip it so the message-shape assertions
 # established by mika#1901 keep reading against the un-prefixed text.
+# mika#2152: the assertion holds on the PROXY's lines — see `_PROXY_PREFIXES`
+# and `_FOREIGN_LINE_RES` below for how a captured line is classified first.
 _TS_PREFIX_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (?P<rest>.*)$"
 )
 
+# mika#2152: `_strip_ts` asserts the timestamp only on lines the proxy is the
+# author of. Authorship is decidable by prefix: `_log` is the proxy's sole
+# emitter and every message it is handed opens with one of these. Adding a
+# prefix to the proxy without adding it here fails `test_prefix_inventory_*`
+# AND every helper caller ("unknown prefix") — loud on purpose (AC3).
+_PROXY_PREFIXES: tuple[str, ...] = (
+    "[egress]",
+    "[egress-shim]",
+    "[anthropic-proxy]",
+    "[mitm-forward]",
+)
+
+# Lines other writers put on the SAME stderr the tests capture. Each entry is
+# a source we have seen and deliberately excluded from the timestamp assertion,
+# never a wildcard. Today: asyncio's slow-callback warning, armed because
+# `IsolatedAsyncioTestCase` runs its loop in debug mode; it reaches the
+# redirected stderr through `logging.lastResort`. Run 33715931630, 2026-09-03.
+_FOREIGN_LINE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^Executing <(?:Task|Handle|TimerHandle)\b.*> took \d+\.\d+ seconds$"),
+)
+
 
 def _strip_ts(test: unittest.TestCase, lines: list[str]) -> list[str]:
-    """Assert every non-empty line is timestamped + parseable, return the
-    message bodies with the stamp removed. Enforcing this on the shared test
-    helpers makes AC1 (all lines stamped) hold across every logging path these
-    tests already exercise, not just the ones that name the timestamp."""
+    """Return the message bodies of the PROXY's lines, stamp removed, having
+    asserted each one is timestamped + parseable (mika#2030 AC1). Enforcing
+    this on the shared test helper makes AC1 hold across every logging path
+    these tests already exercise, not just the ones that name the timestamp.
+
+    The captured stderr is shared: asyncio's debug loop writes here too
+    (mika#2152). So every line is classified before anything is asserted:
+      * a known foreign line (`_FOREIGN_LINE_RES`) is skipped — not the
+        proxy's, not its invariant;
+      * a proxy line (opens with one of `_PROXY_PREFIXES`, after its stamp)
+        must be stamped — a bare one fails, that is the AC2 the helper exists
+        to hold;
+      * anything else fails: an unlisted prefix means the proxy grew an
+        emitter nobody inventoried; an unlisted foreign line means a new
+        writer shares the stream. Both are for a human to classify, never
+        for the helper to ignore.
+    """
     stripped: list[str] = []
     for line in lines:
         if not line:
             continue
+        if any(pattern.match(line) for pattern in _FOREIGN_LINE_RES):
+            continue
         match = _TS_PREFIX_RE.match(line)
-        test.assertIsNotNone(match, f"log line is not timestamped: {line!r}")
-        assert match is not None  # for type-checkers; assertIsNotNone already failed
+        if match is None:
+            if line.startswith(_PROXY_PREFIXES):
+                test.fail(f"proxy log line is not timestamped: {line!r}")
+            test.fail(
+                f"unclassified stderr line (neither a proxy prefix in "
+                f"{_PROXY_PREFIXES} nor a listed foreign source): {line!r}"
+            )
         # A stamp that is merely shaped right is not enough — it must parse.
         datetime.datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%S.%fZ")
-        stripped.append(match.group("rest"))
+        rest = match.group("rest")
+        if not rest.startswith(_PROXY_PREFIXES):
+            test.fail(
+                f"timestamped line carries an unknown prefix — add it to "
+                f"_PROXY_PREFIXES if the proxy now emits it: {line!r}"
+            )
+        stripped.append(rest)
     return stripped
 
 # `scripts/mika-pilot-egress-proxy` has no .py extension (it is installed as a
@@ -1127,6 +1176,101 @@ class TimestampTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# mika#2152 — `_strip_ts` must assert the timestamp on the PROXY's lines only.
+#
+# The stderr the tests capture is shared: `IsolatedAsyncioTestCase` runs its
+# loop in debug mode, asyncio's slow-callback warning goes to the handlerless
+# `asyncio` logger, `logging.lastResort` resolves `sys.stderr` at emission
+# time, and `redirect_stderr` swallows it into the same buffer as the proxy.
+# ---------------------------------------------------------------------------
+
+# Verbatim from run 33715931630 (2026-09-03T04:40Z, Python 3.10): the line that
+# made a healthy PR red. Kept whole so the regression test reads the real thing.
+_RUN_33715931630_LINE = (
+    "Executing <Task pending name='Task-1' "
+    "coro=<IsolatedAsyncioTestCase._asyncioLoopRunner() running at "
+    "/usr/lib/python3.10/unittest/async_case.py:101> wait_for=<Future pending "
+    "cb=[Task.task_wakeup()] created at /usr/lib/python3.10/asyncio/base_events.py:429> "
+    "created at /usr/lib/python3.10/unittest/async_case.py:117> took 0.191 seconds"
+)
+
+# The second shape asyncio's debug loop emits, observed locally (3.14) with
+# `slow_callback_duration = 0.0` on 2026-09-21: a Handle, not a Task. Frozen
+# next to the run's line so the `<Handle …>` coverage reads a real sample,
+# not a free-hand string (architect S2, first pass).
+_OBSERVED_HANDLE_LINE = (
+    "Executing <Handle _run_until_complete_cb(<Task finishe...unners.py:110>) at "
+    "/usr/lib/python3.14/asyncio/base_events.py:181 created at "
+    "/usr/lib/python3.14/asyncio/events.py:94> took 0.000 seconds"
+)
+
+
+class ForeignLineFilterTests(unittest.TestCase):
+    """The helper in isolation: the real run's line, the proxy's own lines, and
+    the two refusals (AC2 bare proxy line, AC3 unknown prefix / unclassified)."""
+
+    def test_the_real_asyncio_line_is_skipped_and_proxy_lines_survive(self) -> None:
+        # AC1 + AC4: the run's exact line is in the buffer next to a real proxy
+        # line — the noise is dropped, the proxy line is returned, stamp removed.
+        stripped = _strip_ts(
+            self, [_RUN_33715931630_LINE, "2026-09-03T04:40:00.000Z [egress] ALLOW 127.0.0.1:0"]
+        )
+        self.assertEqual(stripped, ["[egress] ALLOW 127.0.0.1:0"])
+
+    def test_handle_and_timer_handle_shapes_are_foreign_too(self) -> None:
+        # `asyncio.base_events._format_handle` renders three shapes: the Task's
+        # repr, a Handle's, a TimerHandle's. The first two are frozen samples;
+        # the third is derived from the same formatter, since nothing in this
+        # suite schedules a timer under the debug loop.
+        timer_line = (
+            "Executing <TimerHandle when=12.5 _set_result_unless_cancelled(<Future pending>) "
+            "at /usr/lib/python3.14/asyncio/futures.py:311 created at "
+            "/usr/lib/python3.14/asyncio/base_events.py:711> took 0.000 seconds"
+        )
+        self.assertEqual(_strip_ts(self, [_OBSERVED_HANDLE_LINE, timer_line]), [])
+
+    def test_bare_proxy_line_still_fails(self) -> None:
+        # AC2 — the non-negotiable negative control, term by term: a line the
+        # proxy authored that is NOT stamped must still turn the test red,
+        # whichever of the four prefixes it carries. A helper that accepted any
+        # line would have swapped a flaky test for a useless one.
+        for prefix in _PROXY_PREFIXES:
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(AssertionError, "not timestamped"):
+                    _strip_ts(self, [f"{prefix} ERROR x"])
+
+    def test_timestamped_line_with_unknown_prefix_fails(self) -> None:
+        # AC3 — a stamped line whose prefix nobody inventoried is a new proxy
+        # emitter (or a stamped stranger): red, with the remedy in the message.
+        with self.assertRaisesRegex(AssertionError, "unknown prefix"):
+            _strip_ts(self, ["2026-09-21T00:00:00.000Z [new-thing] hi"])
+
+    def test_unclassified_line_fails(self) -> None:
+        # AC3 — neither a proxy prefix nor a listed foreign source: a new writer
+        # shares the stream, and the helper refuses to ignore it in silence.
+        with self.assertRaisesRegex(AssertionError, "unclassified"):
+            _strip_ts(self, ["some other writer"])
+
+    def test_prefix_inventory_matches_the_proxy_source(self) -> None:
+        # D-1 — the compile-time half of AC3: every literal prefix a `_log(`
+        # call opens with is in `_PROXY_PREFIXES`, and every inventoried prefix
+        # still has a caller. Sets, not counts: the one composed call
+        # (`_log(f"{line} {detail}")`) is invisible to the regex and needs not
+        # be seen, its `[anthropic-proxy]` prefix is already found six times.
+        # Any bracketed first token in either quote style counts (digits,
+        # uppercase, underscores included), so a new emitter cannot slip past
+        # this guard on the shape of its name alone.
+        source = _PROXY_PATH.read_text(encoding="utf-8")
+        found = set(re.findall(r'''_log\(\s*f?["'](\[[^\]]+\])''', source, re.MULTILINE))
+        self.assertTrue(found, "regex found no _log( prefix in the proxy source")
+        self.assertEqual(
+            found,
+            set(_PROXY_PREFIXES),
+            f"source vs inventory differ by {found ^ set(_PROXY_PREFIXES)}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # mitmproxy addon (the CONNECT path)
 #
 # The addon imports `mitmproxy`, which is a pilot-host dependency and is not
@@ -1585,6 +1729,34 @@ class ReadinessProbeVsErrorTests(unittest.IsolatedAsyncioTestCase):
         # Silenced, but not swallowed: it is counted, so the fix is not merely
         # taping over the log. (Anti-vacuity, counter half.)
         self.assertEqual(proxy._readiness_probe_count, before + 1)
+
+    async def test_connect_then_close_stays_silent_under_slow_callback_noise(self) -> None:
+        # mika#2152: the CI failure reproduced by its cause, not by injection.
+        # A threshold of 0 makes asyncio's debug loop flag EVERY callback as
+        # slow, so the warning lands in the redirected stderr deterministically —
+        # on a loaded runner it took 0.191s to get there by accident.
+        loop = asyncio.get_running_loop()
+        before = loop.slow_callback_duration
+        loop.slow_callback_duration = 0.0
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stderr(buffer):
+                await proxy.handle_host_client(_reader_of(), self._Writer(fail_drain=True))
+                # Yield once INSIDE the redirect: since 3.12 `asyncio.wait_for`
+                # awaits inline instead of wrapping a Task, so on an EOF reader
+                # the handler never suspends and the task step — where asyncio
+                # writes the slow-callback line — would otherwise end AFTER this
+                # block, on the real stderr. On 3.10 (CI) the extra yield is
+                # harmless: `wait_for` already suspended the step in the block.
+                await asyncio.sleep(0)
+            raw = buffer.getvalue()
+        finally:
+            loop.slow_callback_duration = before
+        # Positive control: the noise WAS there. Without this the test is vacuous.
+        self.assertIn("Executing <", raw, "expected asyncio's slow-callback line in stderr")
+        self.assertFalse(_TS_PREFIX_RE.match(raw.splitlines()[0]), "the noise is not stamped")
+        # And the helper reads through it: the probe is still silent.
+        self.assertEqual(_strip_ts(self, raw.splitlines()), [])
 
     async def test_malformed_connect_still_emits_one_error(self) -> None:
         # A peer that DID speak — a malformed CONNECT line — then dropped. A

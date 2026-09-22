@@ -84,7 +84,14 @@ mod eval {
     // mika#2276 AC2 — la porte : `deadline dépassé ⇒ verdict posté`. Chaîne
     // complète, du vrai agent loop au POST, avec le poster injecté.
     mod test_deadline_verdict_2276;
+
     mod test_deferred_dispatch_idempotent_ack;
+
+    // mika#2242 — fermer une PR umbrella sans merge dé-groome ses sous-tickets,
+    // et rien ne nommait la cause. Le producteur estampille à la fermeture, le
+    // lecteur relit au routage ; les deux contrôles négatifs (fermeture mergée,
+    // premier grooming) sont les tests porteurs.
+    mod test_degroom_attribution_2242;
     mod test_di_builders;
     mod test_dispatch_fired_at_stamped;
     mod test_dispatch_no_grooming_marker_guard;

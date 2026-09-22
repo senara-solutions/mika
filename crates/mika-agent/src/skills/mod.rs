@@ -1430,6 +1430,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: false,
                 estimated_duration_secs: None,
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/tmux"),
         }];
@@ -1693,6 +1694,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
@@ -1753,6 +1755,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: false,
                 estimated_duration_secs: None,
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/x"),
         };
@@ -1812,6 +1815,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
@@ -1952,6 +1956,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/dev-pilot"),
         }];
@@ -2003,6 +2008,7 @@ mod tests {
                 command: "./run.sh".to_string(),
                 long_running: false,
                 estimated_duration_secs: None,
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/tmux"),
         }];
