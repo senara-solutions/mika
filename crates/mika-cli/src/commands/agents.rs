@@ -50,7 +50,276 @@ pub async fn run(args: AgentsArgs) -> Result<()> {
             },
             &mut io::stdout(),
         ),
+        AgentsCommand::Budget { agent, format } => {
+            let name = agent
+                .or(args.agent_flag.agent)
+                .unwrap_or_else(|| home::read_active_agent(&global_home));
+            budget(&name, &format, &mut io::stdout()).await
+        }
     }
+}
+
+/// `mika agents budget` — render the budget record **mika-spirit attested**.
+///
+/// # Why nothing is resolved here
+///
+/// `BudgetProvenance::resolve` reads the `process_env` **of the process that
+/// calls it**. A subcommand resolving locally would report `agent_config` at 240
+/// while mika-spirit runs at 300 under a service variable — a field asserting,
+/// with authority, a setting that is not in force. That is mika#2304's defect
+/// verbatim (`--verbose` printing the requested model while the turn ran under
+/// another) and mika#2270's lesson (the server held the answer and discarded
+/// it). So: **spirit attests, the CLI renders. Never the reverse.**
+///
+/// The structural half of that rule is
+/// `budget_tests::mika2457_the_cli_resolves_no_budget_locally`, a source scan
+/// with an allowlist shipped empty. When it fires, the second reader is removed
+/// — not allowlisted.
+///
+/// # "Not attested" is an answer, and it is the honest one
+///
+/// Spirit unreachable, or answering 404, prints *"not attested"* and **no
+/// values**. That population is ambiguous — a binary predating this change, an
+/// agent this server does not serve, a daemon that is down — and that ambiguity
+/// is preferable to a wrong number, which is the population mika#2304 had to
+/// name for exactly this reason.
+///
+/// # The cause is said, even though the values are not
+///
+/// "No values" does not license a false *explanation*. A `401` (this shell's
+/// `MIKA_INTERNAL_TOKEN` is not the server's), a `5xx`, or a body the mirror
+/// cannot read (version skew) are not "unreachable, predating the fix, or not
+/// serving this agent", and printing that sentence for them sends the operator
+/// after the wrong remedy. So the fetch returns an [`UnattestedCause`] and the
+/// render names it — still with no budget value.
+async fn budget(name: &str, format: &OutputFormat, out: &mut impl Write) -> Result<()> {
+    let base = crate::commands::dashboard::spirit_url();
+    let url = format!(
+        "{}/api/v1/agents/{}/budget",
+        base.trim_end_matches('/'),
+        name
+    );
+    let token = crate::commands::dashboard::auth_token()?;
+
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    let record = match response {
+        Err(_) => Err(UnattestedCause::Unreachable),
+        Ok(resp) if !resp.status().is_success() => {
+            Err(UnattestedCause::Status(resp.status().as_u16()))
+        }
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| serde_json::from_value::<BudgetRecord>(v["budget"].clone()).ok())
+            .ok_or(UnattestedCause::Malformed),
+    };
+
+    let record = match record {
+        Ok(record) => record,
+        Err(cause) => return render_unattested(name, format, &base, cause, out),
+    };
+
+    match format {
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&record)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&record)?)?,
+        OutputFormat::Text => render_budget_text(&record, out)?,
+    }
+    Ok(())
+}
+
+/// The record as mika-spirit serves it.
+///
+/// Deserialized into a local mirror rather than importing
+/// `mika_common::llm::ResolvedBudgetRecord`: the CLI may be talking to a spirit
+/// of another version, so an unknown field must not fail the render. The fields
+/// below are the ones this surface prints.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BudgetRecord {
+    agent_id: String,
+    http_timeout_secs: u64,
+    agent_total_timeout_secs: u64,
+    max_attempts: u32,
+    effective_max_attempts: u32,
+    retry_reachable: bool,
+    llm_max_tokens: u32,
+    reachable_output_tokens: u64,
+    http_source: String,
+    total_source: String,
+    max_tokens_source: String,
+    provider: String,
+    provider_source: String,
+    model: String,
+    model_source: String,
+    model_config_key: String,
+    resolved_at: String,
+}
+
+/// mika#2328's sixth provenance word: a door carried an `llm_provider` the
+/// reader cannot parse, so the model key's *name* is unknown.
+///
+/// Pre-existing behaviour (`budget_provenance.rs`), not introduced here — this
+/// surface only has to not lose it in transit. Reporting `default` there would
+/// state "no door carried the model", which is unknown and possibly false.
+const MODEL_SOURCE_UNKNOWN_PROVIDER: &str = "unknown_provider";
+
+fn render_budget_text(record: &BudgetRecord, out: &mut impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "{:<32} (résolu le {})",
+        record.agent_id, record.resolved_at
+    )?;
+    writeln!(
+        out,
+        "  provider   {:<20} ({})",
+        record.provider, record.provider_source
+    )?;
+    if record.model_source == MODEL_SOURCE_UNKNOWN_PROVIDER {
+        // `effective_model()` is `None` on this crossing, so the field arrives
+        // empty. Printing an empty value would read as "no model", which is not
+        // what is known — what is known is that the provider is unreadable.
+        writeln!(
+            out,
+            "  model      (non résolu — provider illisible : \"{}\")",
+            record.provider
+        )?;
+    } else {
+        writeln!(
+            out,
+            "  model      {:<20} ({}, clé: {})",
+            record.model, record.model_source, record.model_config_key
+        )?;
+    }
+    writeln!(
+        out,
+        "  plafond    {:<20} ({})",
+        format!("{} s", record.http_timeout_secs),
+        record.http_source
+    )?;
+    writeln!(
+        out,
+        "  enveloppe  {:<20} ({})",
+        format!("{} s", record.agent_total_timeout_secs),
+        record.total_source
+    )?;
+    writeln!(
+        out,
+        "  max_tokens {:<20} ({})",
+        record.llm_max_tokens, record.max_tokens_source
+    )?;
+    writeln!(
+        out,
+        "  atteignable {} tokens",
+        record.reachable_output_tokens
+    )?;
+    writeln!(
+        out,
+        "  tentatives {} nominales / {} atteignables{}",
+        record.max_attempts,
+        record.effective_max_attempts,
+        if record.retry_reachable {
+            ""
+        } else {
+            "  ⚠ dernière tentative nominale inatteignable (mika#2362)"
+        }
+    )?;
+    Ok(())
+}
+
+/// Why the server attested nothing (mika#2457).
+///
+/// Every variant still renders **no value**; what they separate is the remedy.
+/// A `404` keeps the ambiguous sentence (a binary predating the route and an
+/// agent this server does not serve answer identically), the others do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnattestedCause {
+    /// No HTTP answer at all: refused, timed out, DNS — the daemon is down or
+    /// `MIKA_SPIRIT_URL` points elsewhere.
+    Unreachable,
+    /// The server answered with a non-2xx status.
+    Status(u16),
+    /// A 2xx whose body this CLI's mirror cannot read — version skew between the
+    /// CLI and the spirit it talks to.
+    Malformed,
+}
+
+impl UnattestedCause {
+    /// Wire value of the `reason` field in JSON/YAML — scripts branch on it.
+    fn reason(self) -> &'static str {
+        match self {
+            UnattestedCause::Unreachable => "unreachable",
+            UnattestedCause::Status(401 | 403) => "unauthorized",
+            UnattestedCause::Status(404) => "not_found",
+            UnattestedCause::Status(_) => "http_error",
+            UnattestedCause::Malformed => "malformed_response",
+        }
+    }
+
+    /// The one sentence the text render gives as the cause.
+    fn explain(self, base: &str) -> String {
+        match self {
+            UnattestedCause::Unreachable => {
+                format!("  mika-spirit à {base} est injoignable.")
+            }
+            UnattestedCause::Status(code @ (401 | 403)) => format!(
+                "  mika-spirit à {base} a refusé le jeton ({code}) : le \
+                 MIKA_INTERNAL_TOKEN de ce shell n'est pas celui du serveur."
+            ),
+            UnattestedCause::Status(404) => format!(
+                "  mika-spirit à {base} a répondu 404 : binaire antérieur au \
+                 correctif, ou il ne sert pas cet agent."
+            ),
+            UnattestedCause::Status(code) => {
+                format!("  mika-spirit à {base} a répondu {code}.")
+            }
+            UnattestedCause::Malformed => format!(
+                "  mika-spirit à {base} a répondu, mais son record est illisible \
+                 par ce CLI (versions divergentes ?)."
+            ),
+        }
+    }
+}
+
+/// Render the "this server attested nothing" population — with no values.
+fn render_unattested(
+    name: &str,
+    format: &OutputFormat,
+    base: &str,
+    cause: UnattestedCause,
+    out: &mut impl Write,
+) -> Result<()> {
+    // One value for both structured formats, so a field added here cannot
+    // reach one serializer and miss the other.
+    let mut payload = serde_json::json!({
+        "agent_id": name,
+        "attested": false,
+        "spirit_url": base,
+        "reason": cause.reason(),
+    });
+    if let UnattestedCause::Status(code) = cause {
+        payload["status"] = serde_json::json!(code);
+    }
+    match format {
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&payload)?)?,
+        OutputFormat::Text => {
+            writeln!(out, "{name}")?;
+            writeln!(out, "  (non attesté — ce serveur n'a rien attesté)")?;
+            writeln!(out, "{}", cause.explain(base))?;
+            writeln!(
+                out,
+                "  Aucune valeur locale n'est affichée : la résoudre ici lirait \
+                 l'environnement de CE process, pas celui du serveur."
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn list(global_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
@@ -1009,6 +1278,358 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path, depth: u32) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn render(record: &BudgetRecord) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        render_budget_text(record, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn sample() -> BudgetRecord {
+        BudgetRecord {
+            agent_id: "mika-arch".to_string(),
+            http_timeout_secs: 240,
+            agent_total_timeout_secs: 900,
+            max_attempts: 3,
+            effective_max_attempts: 3,
+            retry_reachable: true,
+            llm_max_tokens: 32_768,
+            reachable_output_tokens: 9_000,
+            http_source: "agent_config".to_string(),
+            total_source: "agent_config".to_string(),
+            max_tokens_source: "agent_config".to_string(),
+            provider: "openrouter".to_string(),
+            provider_source: "agent_config".to_string(),
+            model: "moonshotai/kimi-k2.5".to_string(),
+            model_source: "agent_config".to_string(),
+            model_config_key: "openrouter_model".to_string(),
+            resolved_at: "2026-09-21T06:12:44Z".to_string(),
+        }
+    }
+
+    /// mika#2457 U4 — the attested render carries every fact the § 6 reading
+    /// table branches on, **including the date**.
+    ///
+    /// The probe exists to separate three worlds (`agent_config` / `process_env`
+    /// / `default`), so a render that dropped a provenance would leave the
+    /// operator with the values and none of the three remedies. `resolved_at` is
+    /// asserted for the reason F3 names: a record nobody can date cannot be
+    /// compared against the `config.toml` mtime, and the comparison *is* what
+    /// makes the drift decidable.
+    #[test]
+    fn mika2457_the_attested_render_carries_the_values_and_their_provenance() {
+        let text = render(&sample());
+
+        assert!(text.contains("mika-arch"));
+        assert!(
+            text.contains("2026-09-21T06:12:44Z"),
+            "la sortie doit dire QUAND elle a été vraie : {text}"
+        );
+        assert!(text.contains("240 s"), "plafond absent : {text}");
+        assert!(text.contains("900 s"), "enveloppe absente : {text}");
+        assert!(text.contains("32768"), "max_tokens absent : {text}");
+        assert!(
+            text.contains("moonshotai/kimi-k2.5"),
+            "modèle absent : {text}"
+        );
+        assert!(
+            text.contains("openrouter_model"),
+            "la clé qu'un opérateur éditerait doit être nommée : {text}"
+        );
+        assert!(
+            text.matches("agent_config").count() >= 4,
+            "chaque fait porte sa provenance — c'est ce qui sépare les trois \
+             mondes du § 6 : {text}"
+        );
+    }
+
+    /// mika#2457 U4 (non-régression) — an unreadable provider renders as such,
+    /// never as an empty model.
+    ///
+    /// `unknown_provider` is **pre-existing** behaviour (`budget_provenance.rs`,
+    /// mika#2328); this ticket introduces no new refusal. What is asserted here
+    /// is only that the provenance survives the trip through the record and the
+    /// route. On that crossing `effective_model()` is `None`, so the field
+    /// arrives empty — and printing an empty value would read as "no model
+    /// declared", which is not what is known. What is known is that the provider
+    /// could not be parsed, and the raw string that failed is the actionable
+    /// half.
+    #[test]
+    fn mika2457_an_unreadable_provider_is_rendered_as_unresolved_not_as_empty() {
+        let mut record = sample();
+        record.provider = "zorglub".to_string();
+        record.model = String::new();
+        record.model_source = MODEL_SOURCE_UNKNOWN_PROVIDER.to_string();
+        record.model_config_key = String::new();
+
+        let text = render(&record);
+        assert!(
+            text.contains("non résolu") && text.contains("zorglub"),
+            "le brut qui a échoué à parser est la moitié actionnable : {text}"
+        );
+        assert!(
+            !text.contains("model      \n") && !text.contains("model       ("),
+            "un modèle vide se lirait « aucun modèle déclaré », ce qui est \
+             inconnu et possiblement faux : {text}"
+        );
+    }
+
+    /// mika#2457 U4 — the retry-unreachable geometry is surfaced, not silently
+    /// rendered as nominal.
+    #[test]
+    fn mika2457_an_unreachable_retry_is_named_in_the_render() {
+        let mut record = sample();
+        record.max_attempts = 2;
+        record.effective_max_attempts = 1;
+        record.retry_reachable = false;
+
+        let text = render(&record);
+        assert!(
+            text.contains("mika#2362"),
+            "une géométrie dont la dernière tentative est inatteignable doit \
+             le dire : {text}"
+        );
+    }
+
+    /// mika#2457 U4 **negative control** — an unreachable server prints "not
+    /// attested" and **no value**.
+    ///
+    /// This is the control the whole unit rests on. Without it, "the CLI reads
+    /// the server" and "the CLI computes locally" produce the *same* output on
+    /// a workstation where both processes share an environment — which is
+    /// exactly the machine this test would be written on. Asserting that the
+    /// unreachable path prints no number is what makes the difference
+    /// observable at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2457_an_unreachable_server_attests_nothing_and_no_local_value() {
+        // Safety: test-only env vars, serialized by `#[serial]`.
+        unsafe {
+            // Port 1 is reserved and never listening — the "daemon is down" case.
+            std::env::set_var("MIKA_SPIRIT_URL", "http://127.0.0.1:1");
+            // Well-formed (64 hex): `#[serial]` does not fence unmarked tests
+            // that call `Settings::load`, which rejects a malformed token.
+            std::env::set_var("MIKA_INTERNAL_TOKEN", "ab".repeat(32));
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        budget("mika-arch", &OutputFormat::Text, &mut out)
+            .await
+            .expect("an unreachable server is an answer, not an error");
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(
+            text.contains("non attesté"),
+            "le serveur n'a rien attesté, et c'est ce qu'il faut dire : {text}"
+        );
+        // The values a local resolution would have produced on this machine.
+        for forbidden in ["120", "300", "240", "900", "agent_config", "process_env"] {
+            assert!(
+                !text.contains(forbidden),
+                "aucune valeur résolue localement ne doit être affichée — \
+                 « {forbidden} » est apparu : {text}"
+            );
+        }
+
+        // JSON keeps the same contract: a flag, never a fabricated record.
+        let mut out: Vec<u8> = Vec::new();
+        budget("mika-arch", &OutputFormat::Json, &mut out)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["attested"], false);
+        assert!(
+            json["http_timeout_secs"].is_null() && json["model"].is_null(),
+            "un record non attesté ne porte aucune valeur : {json}"
+        );
+
+        unsafe {
+            std::env::remove_var("MIKA_SPIRIT_URL");
+            std::env::remove_var("MIKA_INTERNAL_TOKEN");
+        }
+    }
+
+    /// mika#2457 — a server that ANSWERS without attesting is not told apart
+    /// by "no values" alone: the render names the cause.
+    ///
+    /// The negative control above only drives connection-refused. A `401` (a
+    /// stale `MIKA_INTERNAL_TOKEN`), a `5xx`, and a 2xx body the mirror cannot
+    /// read used to share its sentence — "unreachable, predating the fix, or not
+    /// serving this agent" — which is a false diagnosis for all three. Each case
+    /// here must still print no value, and must say which answer it got.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2457_a_non_2xx_or_unreadable_answer_names_its_cause() {
+        use axum::{Router, http::StatusCode, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/api/v1/agents/denied/budget",
+                get(|| async { (StatusCode::UNAUTHORIZED, "{\"error\":\"unauthorized\"}") }),
+            )
+            .route(
+                "/api/v1/agents/broken/budget",
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+            )
+            .route(
+                "/api/v1/agents/skewed/budget",
+                get(|| async { (StatusCode::OK, "{\"budget\":{\"agent_id\":\"skewed\"}}") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Safety: test-only env vars, serialized by `#[serial]`.
+        unsafe {
+            std::env::set_var("MIKA_SPIRIT_URL", format!("http://{addr}"));
+            std::env::set_var("MIKA_INTERNAL_TOKEN", "ab".repeat(32));
+        }
+
+        for (agent, needle, reason, status) in [
+            ("denied", "MIKA_INTERNAL_TOKEN", "unauthorized", Some(401)),
+            ("broken", "a répondu 500", "http_error", Some(500)),
+            ("ghost", "a répondu 404", "not_found", Some(404)),
+            ("skewed", "illisible", "malformed_response", None),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Text, &mut out).await.unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("non attesté"), "{agent} : {text}");
+            assert!(
+                text.contains(needle),
+                "{agent} : la cause réelle doit être nommée ({needle}) : {text}"
+            );
+            if agent != "ghost" {
+                assert!(
+                    !text.contains("antérieur au correctif"),
+                    "{agent} : le diagnostic 404 ne doit pas couvrir une autre \
+                     réponse : {text}"
+                );
+            }
+
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Json, &mut out).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(json["attested"], false, "{agent} : {json}");
+            assert_eq!(json["reason"], reason, "{agent} : {json}");
+            assert_eq!(json["status"].as_u64(), status, "{agent} : {json}");
+            assert!(
+                json["http_timeout_secs"].is_null() && json["model"].is_null(),
+                "{agent} : un record non attesté ne porte aucune valeur : {json}"
+            );
+
+            let mut out: Vec<u8> = Vec::new();
+            budget(agent, &OutputFormat::Yaml, &mut out).await.unwrap();
+            let yaml: serde_json::Value =
+                serde_yaml::from_slice(&out).expect("the YAML render must parse");
+            assert_eq!(yaml["reason"], reason, "{agent} (yaml) : {yaml}");
+            assert_eq!(yaml["attested"], false, "{agent} (yaml) : {yaml}");
+        }
+
+        server.abort();
+        unsafe {
+            std::env::remove_var("MIKA_SPIRIT_URL");
+            std::env::remove_var("MIKA_INTERNAL_TOKEN");
+        }
+    }
+
+    /// mika#2457 U4 — **the CLI resolves no budget locally**, structurally.
+    ///
+    /// The behavioural control above proves *that* output came from the server.
+    /// It cannot see a second reader added six months from now on another CLI
+    /// path: that regression would make no decision wrong, it would make the
+    /// guarantee inoperative in silence, and every behavioural assertion would
+    /// stay green. That is the class
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` and
+    /// `mika2205_periodic_scans_do_not_read_the_pat_field_directly` had to close
+    /// with a source scan, for exactly this reason.
+    ///
+    /// **Allowlist shipped EMPTY, and measured empty at HEAD.** When this test
+    /// fires, the resolution is **removed**, never allowlisted: an allowlist
+    /// that stops being empty here *is* the mika#2304 false green reintroduced —
+    /// the CLI printing a locally computed value with the authority of an
+    /// attestation.
+    #[test]
+    fn mika2457_the_cli_resolves_no_budget_locally() {
+        const ALLOWED: &[&str] = &[];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+
+        // Each needle is a way to resolve a budget in this process rather than
+        // read one the server resolved.
+        let needles = [
+            "BudgetProvenance",
+            "ModelProvenance",
+            "resolve_llm_budget_record",
+            "effective_budget",
+            "effective_llm_http_timeout_secs",
+            "http_timeout_secs()",
+            "llm_timeout_budget",
+        ];
+
+        let mut violations: Vec<String> = Vec::new();
+        scanner.for_each(|path, source| {
+            let rel = path
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if ALLOWED.contains(&rel.as_str()) {
+                return;
+            }
+            for (idx, line) in source.lines().enumerate() {
+                // A comment naming the rule is not a violation of it — the prose
+                // above `budget()` names these symbols precisely in order to say
+                // they are NOT called here, and a guard counting that mention
+                // would forbid explaining itself.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for needle in needles {
+                    if line.contains(needle) {
+                        violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                    }
+                }
+            }
+        });
+
+        assert!(
+            violations.is_empty(),
+            "le CLI ne doit résoudre aucun budget localement : spirit atteste, le \
+             CLI rend. Quand ce scan tire, on RETIRE le second lecteur, on ne \
+             l'allowliste pas — une allowlist qui cesse d'être vide ici est le \
+             faux vert mika#2304 réintroduit.\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// The guard above must actually look at something — a scanner that found
+    /// no file would make it vacuous and green for ever.
+    #[test]
+    fn mika2457_the_local_resolution_scan_is_not_vacuous() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let files = scanner.files();
+        assert!(
+            files.len() > 10,
+            "le scan doit voir le crate, sinon il est vide de sens : {} fichier(s)",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("commands/agents.rs")),
+            "le scan doit voir le fichier qui porte la commande"
+        );
+    }
 }
 
 #[cfg(test)]

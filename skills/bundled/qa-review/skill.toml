@@ -27,7 +27,14 @@ timeout_secs = 30
 # Same gesture, same reason as self-dev-webhook-qa/skill.toml (mika#2248).
 # 73728 < the 81 920 hard ceiling (skills/index.rs:27); the gate fires again at
 # 70 041 bytes. The declared size costs nothing — the real size is injected.
-max_prompt_size = 73728
+# Raised from 73728 to 77824 (76 KB) for mika#2423, on 2026-09-21. U3 (the
+# policy-refusal exclusion on the Data Integrity line, the diff-read condition
+# on `[⏭️]` in 2.5.3, and the reason the CI boundary is kept) adds 1 370 bytes
+# to a prompt that sat at 69 275 — 766 bytes under the 95 % gate. Same shape as
+# the two raises above: the prompt's subject is a closed enumeration, and the
+# fix for a self-contradicting rule is not to delete one of its halves.
+# 77824 < the 81 920 hard ceiling; the gate fires again at 73 932 bytes.
+max_prompt_size = 77824
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =
 # ["qa-review"]` — mais c'est une arête ENTRANTE, et `callback_safe_skills()`

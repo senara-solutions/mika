@@ -138,7 +138,7 @@
 # production.
 - name: "dispatch:loop"
   color: "1d76db"
-  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Un seul dispatcher par ticket."
+  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Posée et retirée par dispatch-lib le temps d'un dispatch (mika#2155). Un seul dispatcher par ticket."
 
 - name: "dispatch:ssc"
   color: "5319e7"

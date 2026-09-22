@@ -1560,6 +1560,11 @@ _dispatch_lib_term_trap() {
 
 _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
+    # mika#2155: crash/cancel backstop for the claim — the nominal path already
+    # released in _deliver_callback (and lowered the flag, so this is a no-op
+    # there). Before the CALLBACK_SENT guard on purpose: the nominal path
+    # returns early there, and a failed nominal release still needs this retry.
+    _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
     # Cleanup architect-stderr side-channel tmpfile (mika#2278)
@@ -2560,6 +2565,19 @@ _set_up_worktree() {
             fi
         fi
 
+        # mika#2155: claim the ticket for the loop BEFORE the first mutation
+        # below — the fetch, the non-canonical worktree removal, the
+        # `worktree add`. Placed after every no-dispatch exit above (closed
+        # issue, redundant groom) so a dispatch that never happens never claims,
+        # and skipped on a dry run for the same reason. `|| true`: AC2, the
+        # label is a signal, not a barrier. ISSUE_SEAT_CLAIMED is set even when
+        # the stamp failed: it means "this dispatch went past its no-dispatch
+        # exits", not "the write succeeded" — the EXIT trap releases on it.
+        if [ "$DRY_RUN" != "true" ] && [ "$DRY_RUN" != "1" ]; then
+            _stamp_issue_seat "$REPO" "$ISSUE_NUM" "$LABELS" || true
+            ISSUE_SEAT_CLAIMED=1
+        fi
+
         # Sync main before branching to avoid stale worktrees.
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
 
@@ -2612,7 +2630,16 @@ _set_up_worktree() {
                     if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
                         local stash_sha
                         stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $SUB_REPO_DIR stash apply ${stash_sha:-<sha>})" >&2
+                        # mika#2449: the recovery hint names the CANONICAL worktree,
+                        # never `$SUB_REPO_DIR` (the primary/deployment checkout) and
+                        # never `$existing_wt` (removed fourteen lines below, so the
+                        # hint would fail the moment an operator reads it). Applying a
+                        # worktree's uncommitted state in the primary checkout is the
+                        # exact signature of the 2026-09-21 incident (staged+modified
+                        # on main, `pull --ff-only` refused). The stash stack is shared
+                        # repo-wide, so the SHA resolves from any worktree of the repo.
+                        # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
+                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $WORKTREE_DIR stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
                     else
                         echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
                     fi
@@ -6572,6 +6599,118 @@ _record_pr_origin_epoch() {
     return 0
 }
 
+# _stamp_issue_seat <repo> <issue_num> <labels_csv> — claim the issue for the loop.
+#
+# Symmetric to _stamp_pr_origin (mika#2026), carried by the ISSUE and not the PR:
+# the loop is a dispatch seat like ssc and mpc (webhook_dispatch.rs
+# CURRENT_DISPATCH_SEAT), and until mika#2155 it was the only seat that never
+# said so. `origin:loop` on the PR answers "who produced this artefact?" and is
+# permanent; `dispatch:loop` on the issue answers "who is writing on this branch
+# right now?" and lives exactly as long as the dispatch — see _release_issue_seat.
+#
+# `labels_csv` is the snapshot _set_up_worktree already fetched for its own
+# #2012 gate — one `gh issue view` per dispatch (mika#2178), no second read
+# inside this function. The engine's seat gate read GitHub separately and
+# earlier, in Rust (executor.rs fetch_issue_labels_unless_pull_request), before
+# it spawned this handler: a `dispatch:*` posed between that read and this one
+# shows up here as owned_by_other. Passing the snapshot in also makes the
+# function testable with the three label populations injected directly.
+#
+# Three outcomes, on that snapshot:
+#   another dispatch:* present  → dispatch_seat.owned_by_other, NO write (AC3)
+#   dispatch:loop present       → dispatch_seat.already_owned,  NO write (AC2)
+#   no dispatch:* at all        → gh issue edit --add-label dispatch:loop
+#
+# This is NOT a second classifier. classify_dispatch_seat (Rust) knows the seat
+# list, the empty seat, the multiple-seat case; this function answers one binary
+# question — "may I write dispatch:loop here without covering someone's claim?"
+# — and an unknown seat, an empty seat, or two seats all answer "no" for the
+# same reason. Refusing the DISPATCH stays the engine's job (mika#2084, three
+# sites upstream of dispatch-lib); a fourth refusal in shell is the drift #2084
+# built one pure function to avoid.
+#
+# No `gh label create` fallback, unlike _stamp_pr_origin: dispatch:loop is a
+# SEAT label whose vocabulary is guarded Rust↔YAML on mika (mika#2092). Creating
+# it on the fly on mika-cloud / mika-skills / mika-platform would fabricate a
+# seat outside that guard. On those repos the edit fails, `stamp_failed` says
+# so, and the dispatch proceeds — the ticket puts other repos out of scope.
+#
+# The label is written as a literal, not `dispatch:${SEAT}`: rule L5 in
+# scripts/check-canonical-tokens.sh ignores any label containing `$`, and the
+# literal is what lets it confront this write with .github/labels.yml. That is
+# a third copy of the word "loop" (Rust, YAML, shell) — Rust↔YAML is guarded by
+# check-dispatch-seats-declared.sh, shell↔YAML by L5; transitivity holds.
+#
+# Returns 0 when the issue carries the label, 1 when it could not be applied —
+# with a named line on stderr. Callers MUST invoke with `|| true`: the label is
+# a signal for the other seats, not a barrier for this one (AC2).
+_stamp_issue_seat() {
+    local repo="$1" issue="$2" labels_csv="$3" seat_labels
+    [ -n "$repo" ] && [ -n "$issue" ] || return 0
+
+    seat_labels=$(printf '%s\n' "$labels_csv" | tr ',' '\n' | sed 's/^ *//;s/ *$//' \
+        | tr '[:upper:]' '[:lower:]' | grep '^dispatch:' || true)
+
+    if [ -n "$seat_labels" ]; then
+        if [ "$seat_labels" = "dispatch:loop" ]; then
+            echo "dispatch_seat.already_owned: ${repo}#${issue} already carries dispatch:loop; not re-stamping" >&2
+            return 0
+        fi
+        echo "dispatch_seat.owned_by_other: ${repo}#${issue} carries '$(printf '%s\n' "$seat_labels" | paste -sd, -)'; refusing to stamp dispatch:loop — the engine's seat gate (mika#2084) is the authority on whether this dispatch may proceed" >&2
+        return 1
+    fi
+
+    # Bounded: a hanging GitHub API must not hold the dispatch it merely announces.
+    if timeout 15 gh issue edit "$issue" --repo "senara-solutions/${repo}" --add-label dispatch:loop >/dev/null 2>&1; then
+        echo "dispatch_seat.stamped: ${repo}#${issue} labeled dispatch:loop" >&2
+        return 0
+    fi
+    echo "dispatch_seat.stamp_failed: could not apply dispatch:loop to ${repo}#${issue} — other seats will not see this claim; dispatch proceeds" >&2
+    return 1
+}
+
+# _release_issue_seat <repo> <issue_num> — end the loop's live claim (AC4).
+#
+# Decision (mika#2155 C-4): dispatch:loop is retired BEFORE the callback that
+# lets mika-dev start the next dispatch on this ticket (`_deliver_callback`,
+# ahead of `mika ask --task-complete`), and again at the head of the EXIT trap
+# as the crash/cancel backstop. Two sites, one claim: the first successful
+# release drops ISSUE_SEAT_CLAIMED, the second is then a no-op. Releasing after
+# the callback instead would leave a window where the next dispatch reads a
+# label its predecessor is about to remove, does not stamp (already_owned), and
+# then runs unclaimed for its whole life — the seat gate disarmed by the very
+# mechanism meant to arm it (review finding #2). Kept past the exit it would answer "who
+# is writing on this branch?" with a name when nobody is: between a groom and
+# its implement, between an open PR and its review, a human seat may take the
+# branch, and a `dispatch:mpc` posed beside a stale `dispatch:loop` reads
+# `multiple_seat_labels` and is refused — fail-closed, but one manual gesture
+# per ticket for everyone. The permanent provenance is `origin:loop` on the PR.
+#
+# Unconditional once the dispatch went past its no-dispatch exits
+# (ISSUE_SEAT_CLAIMED=1), whether or not THIS run's stamp succeeded: a
+# dispatch:loop left by an earlier run that died without its EXIT trap
+# (SIGKILL, host reboot) is stale, and this is where it heals — gating on
+# "I stamped it" would keep that residue forever (the next run reads
+# already_owned, does not stamp, and would therefore never release).
+# dispatch:loop is the loop's label — nothing else writes it, so nothing else
+# is being undone here. Never names any other dispatch:* label. Bounded: this
+# runs in the exit trap, whose job is to get RESULT back to mika-dev.
+_release_issue_seat() {
+    local repo="$1" issue="$2"
+    [ "${ISSUE_SEAT_CLAIMED:-0}" = "1" ] || return 0
+    [ -n "$repo" ] && [ -n "$issue" ] || return 0
+    if timeout 15 gh issue edit "$issue" --repo "senara-solutions/${repo}" --remove-label dispatch:loop >/dev/null 2>&1; then
+        # The claim is over: the second site (callback, then exit trap) becomes
+        # a no-op instead of a second, idempotent-but-pointless API call. On
+        # failure the flag stays up so that later site retries once more.
+        ISSUE_SEAT_CLAIMED=0
+        echo "dispatch_seat.released: ${repo}#${issue} no longer carries dispatch:loop" >&2
+        return 0
+    fi
+    echo "dispatch_seat.release_failed: could not remove dispatch:loop from ${repo}#${issue} — the claim outlives this dispatch until the next one on this ticket exits" >&2
+    return 1
+}
+
 # _derive_recovery_pr_title — Compute a conventional-commit PR title for
 # recovery-class PRs. Called by the recovery block (mika#1282 + mika#1396).
 #
@@ -7071,6 +7210,10 @@ _deliver_callback() {
     # a callback does not arrive. Its own failure is announced rather than
     # swallowed — a silent gate is the defect this ticket exists to remove.
     _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the callback unchanged" >&2
+    # mika#2155: end the loop's live claim BEFORE the message that can start
+    # the next dispatch on this ticket. No-op unless _set_up_worktree claimed
+    # (ISSUE_SEAT_CLAIMED=1); the EXIT trap repeats it only if this one failed.
+    _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     set +e
     if [ -n "$AGENT" ]; then
         mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
@@ -7515,6 +7658,9 @@ EOF
 
     # Initialize callback guard
     CALLBACK_SENT=0
+    # mika#2155: the EXIT trap reads this; it must exist even when
+    # _set_up_worktree was never reached.
+    ISSUE_SEAT_CLAIMED=0
 
     _parse_input_json
 

@@ -608,8 +608,223 @@ static LAST_EMITTED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 /// copy, which is the same value by a longer route.
 const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 
-/// Emit `llm_budget_resolved` for one agent — the line that answers "under
-/// which plafond did this turn run?" (mika#2293 AC1).
+/// One agent's resolved budget and model, as a value (mika#2457).
+///
+/// # Why this type exists
+///
+/// `llm_budget_resolved` already carried every field below, and it answered the
+/// question mika#2293 was opened for. What it could not do is answer it **on
+/// demand**: it is emitted once per agent per resolved pair, deduplicated, into
+/// a log file measured in gigabytes. An operator asking *"which model and which
+/// budget is mika-arch running under, and through which door?"* had no surface
+/// to ask. That gap is what let mika-arch's `240/900`, shipped 2026-09-06, fail
+/// in silence until the 2026-09-11 measurement, and it is what swallowed
+/// mika#2457: three different plafonds were asserted for the same agent — 240
+/// (the checkout), 420 (mika#2342), 300 (mika#2457) — and **not one** had ever
+/// been established by reading an instrument.
+///
+/// # The field this type adds, and the one it must not
+///
+/// [`Self::resolved_at`] is the only addition, and it is a fact **about the
+/// record**, not a second opinion about the budget: it dates the resolution, it
+/// does not redo it. It is deliberately **absent from
+/// [`dedup_signature`]** — two identical resolutions at two instants must stay
+/// one line, or the field meant to document the deduplication would annul it.
+/// Pinned by `mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key`,
+/// which **forces** two distinct instants: the field is stamped to the second,
+/// so two resolutions back to back almost always carry the same string, and a
+/// test relying on the clock to separate them would stay green over the leak.
+///
+/// # Why it is a value and not a re-resolution
+///
+/// A consumer that re-resolved would read `process_env` **of its own process**.
+/// On a workstation where a CLI and the daemon share an environment that reads
+/// identically; on a server where a service variable shadows the per-agent
+/// `config.toml` it reports a setting that is not in force, with the authority
+/// of a measurement. That is mika#2304's defect one field over (`--verbose`
+/// printing the *requested* model while the turn ran under another). So this
+/// record is resolved **once, by the process that serves the agent**, and every
+/// consumer renders it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedBudgetRecord {
+    /// The agent this record was resolved for.
+    pub agent_id: String,
+    /// The per-call plafond in force, floors applied ([`LlmTimeoutBudget`]).
+    pub http_timeout_secs: u64,
+    /// The per-agent envelope in force, fallbacks applied.
+    pub agent_total_timeout_secs: u64,
+    /// `floor(envelope / plafond)`, clamped to the provider hard cap.
+    pub max_attempts: u32,
+    /// How many of those attempts the deadline guard can actually reach
+    /// (mika#2362).
+    pub effective_max_attempts: u32,
+    /// `effective_max_attempts == max_attempts`.
+    pub retry_reachable: bool,
+    /// What the mika#2342 watchdog is sized on.
+    pub worst_case_failure_secs: u64,
+    /// The per-call output-token budget in force (mika#2280).
+    pub llm_max_tokens: u32,
+    /// What the plafond can physically carry at the assumed throughput floor.
+    pub reachable_output_tokens: u64,
+    /// Door the plafond came through — `agent_config` / `process_env` / …
+    pub http_source: String,
+    /// Door the envelope came through.
+    pub total_source: String,
+    /// Door the output budget came through.
+    pub max_tokens_source: String,
+    /// The plafond as written, or `""` when nothing was read.
+    pub http_raw: String,
+    /// The envelope as written, or `""`.
+    pub total_raw: String,
+    /// The output budget as written, or `""`.
+    pub max_tokens_raw: String,
+    /// The provider in force, or the raw string that failed to parse.
+    pub provider: String,
+    /// Door the provider came through.
+    pub provider_source: String,
+    /// The model in force, or `""` when the provider itself is unreadable.
+    pub model: String,
+    /// Door the model came through, or [`MODEL_SOURCE_UNKNOWN_PROVIDER`].
+    pub model_source: String,
+    /// The `config.toml` key an operator would edit to change the model.
+    pub model_config_key: String,
+    /// When this record was resolved — RFC 3339 UTC (mika#2457).
+    ///
+    /// The record is frozen at `init_agent` and reports **the state the agent
+    /// runs under**, never the state of the disk at the instant of the read.
+    /// The two coincide unless someone edited the `config.toml` since boot —
+    /// which is precisely the out-of-repo drift mika#2328 measured. Without a
+    /// date, `model = moonshotai/kimi-k2.5` cannot be told apart from "the disk
+    /// changed after this record was taken". This field does not lift that
+    /// ambiguity on its own; it makes it **decidable** against the file's mtime.
+    pub resolved_at: String,
+}
+
+/// Resolve one agent's budget and model into a [`ResolvedBudgetRecord`].
+///
+/// **The single constructor of the record** (mika#2457). A second one would be
+/// free to diverge from this one — the class `grooming_marker` (mika#2158) had
+/// to close once, where promotion and dispatch routing answered the same
+/// question differently for months while nothing broke.
+///
+/// Never panics, for the same reason [`BudgetProvenance::resolve`] does not.
+pub fn resolve_llm_budget_record(
+    agent_id: &str,
+    global_home: &Path,
+    agent_home: &Path,
+) -> ResolvedBudgetRecord {
+    // One read of the four cascade doors, two facts drawn from it: the budget
+    // pair and the model. They are read together by whoever diagnoses a cut
+    // turn, so they are resolved together.
+    let layers = CascadeLayers::read(global_home, agent_home);
+    let provenance = BudgetProvenance::from_layers(&layers);
+    let model = ModelProvenance::from_layers(&layers);
+    let budget = provenance.effective_budget();
+
+    let max_attempts = budget.max_attempts(REPORTED_ATTEMPT_HARD_CAP);
+    let effective_max_attempts = budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP);
+
+    ResolvedBudgetRecord {
+        agent_id: agent_id.to_string(),
+        http_timeout_secs: budget.http_timeout_secs(),
+        agent_total_timeout_secs: budget.agent_total_timeout_secs(),
+        max_attempts,
+        effective_max_attempts,
+        retry_reachable: effective_max_attempts == max_attempts,
+        worst_case_failure_secs: budget.worst_case_failure_secs(REPORTED_ATTEMPT_HARD_CAP),
+        // mika#2280: the output budget in force, and what the plafond can
+        // physically carry. Context only — **no WARN is emitted for it**. A
+        // declared budget above the reachable figure is not a defect in itself:
+        // mika#2296 chose exactly that for mika-arch, as "a ceiling made
+        // non-binding". A guard firing on the declaration would contradict a
+        // documented decision at every startup, and a warning that contradicts a
+        // decision gets muted. What earns an operator's attention is a
+        // *crossing*, once per cut call — that is `llm_call_cap_exhausted`, on
+        // the rails that apply the plafond.
+        llm_max_tokens: provenance.effective_max_tokens(),
+        reachable_output_tokens: budget
+            .reachable_output_tokens(super::budget::output_tokens_per_sec_floor()),
+        http_source: provenance.http.source.as_str().to_string(),
+        total_source: provenance.agent_total.source.as_str().to_string(),
+        max_tokens_source: provenance.max_tokens.source.as_str().to_string(),
+        http_raw: provenance.http.raw_or_empty().to_string(),
+        total_raw: provenance.agent_total.raw_or_empty().to_string(),
+        max_tokens_raw: provenance.max_tokens.raw_or_empty().to_string(),
+        // mika#2328 — the model half. `model_config_key` names the key an
+        // operator would edit, which is how the "resolved from the provider,
+        // never hard-coded" rule becomes checkable from the record alone.
+        provider: model.provider_name().to_string(),
+        provider_source: model.provider_value.source.as_str().to_string(),
+        model: model.effective_model().unwrap_or("").to_string(),
+        model_source: model.model_source_name().to_string(),
+        model_config_key: model.model_config_key(),
+        resolved_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    }
+}
+
+/// The deduplication key of one resolved budget.
+///
+/// Written once and read by the emitter *and* by its test (mika#2362): the test
+/// used to rebuild this string by hand, so extending the key silently broke it
+/// — a copy of a predicate, in the ticket that exists to remove copies of a
+/// predicate.
+///
+/// `effective_max_attempts` is part of the key: without it, a geometry change
+/// that moves only *reachability* — the very thing the new fields report —
+/// would be deduplicated away as "no change".
+///
+/// `llm_max_tokens` and `reachable_output_tokens` joined it in mika#2280, and
+/// the reason is that lesson applied twice rather than a second paragraph: a
+/// configuration change moving only the output budget is exactly what the new
+/// fields exist to say, so leaving it out of the key would silence the event on
+/// the only change it was added for.
+///
+/// The model and its provenance are part of it for the same reason (mika#2328):
+/// an out-of-repo model swap moves neither timeout, and a signature blind to it
+/// would silence the single line that reports the swap.
+///
+/// **`resolved_at` is deliberately NOT part of it** (mika#2457): it is a fact
+/// about the record, not about the budget, and including it would make every
+/// resolution a "change" and annul the deduplication outright.
+fn dedup_signature(record: &ResolvedBudgetRecord) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        record.http_timeout_secs,
+        record.agent_total_timeout_secs,
+        record.http_source,
+        record.total_source,
+        record.effective_max_attempts,
+        record.llm_max_tokens,
+        record.max_tokens_source,
+        record.reachable_output_tokens,
+        record.provider,
+        record.provider_source,
+        record.model,
+        record.model_source,
+    )
+}
+
+/// Resolve `agent_id`'s budget and emit `llm_budget_resolved` for it — the line
+/// that answers "under which plafond did this turn run?" (mika#2293 AC1).
+///
+/// Since mika#2457 this is [`resolve_llm_budget_record`] followed by
+/// [`emit_llm_budget_resolved`], which carries the gating, deduplication and
+/// scope doctrine; kept for the callers that have no use for the record itself
+/// (`teams::engine`).
+pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
+    emit_llm_budget_resolved(&resolve_llm_budget_record(
+        agent_id,
+        global_home,
+        agent_home,
+    ));
+}
+
+/// Emit `llm_budget_resolved` for an already-resolved record (mika#2457).
+///
+/// Split from [`log_llm_budget_resolved`] so `server::init_agent` can **keep**
+/// the record it emits instead of resolving the cascade twice — two resolutions
+/// milliseconds apart being two chances to disagree, and the second one being
+/// the value nobody would have checked.
 ///
 /// # Ungated on purpose
 ///
@@ -631,59 +846,9 @@ const REPORTED_ATTEMPT_HARD_CAP: u32 = super::DEFAULT_ATTEMPTS_HARD_CAP;
 /// asks is about an agent's *nominal* budget, not what a skill overrides for one
 /// turn. Said here so a reader looking for an override's budget knows it was
 /// never written, rather than concluding the instrument is broken.
-/// The deduplication key of one resolved budget.
-///
-/// Written once and read by the emitter *and* by its test (mika#2362): the test
-/// used to rebuild this string by hand, so extending the key silently broke it
-/// — a copy of a predicate, in the ticket that exists to remove copies of a
-/// predicate.
-///
-/// `effective_max_attempts` is part of the key: without it, a geometry change
-/// that moves only *reachability* — the very thing the new fields report —
-/// would be deduplicated away as "no change".
-///
-/// `llm_max_tokens` and `reachable_output_tokens` joined it in mika#2280, and
-/// the reason is that lesson applied twice rather than a second paragraph: a
-/// configuration change moving only the output budget is exactly what the new
-/// fields exist to say, so leaving it out of the key would silence the event on
-/// the only change it was added for.
-///
-/// The model and its provenance are part of it for the same reason (mika#2328):
-/// an out-of-repo model swap moves neither timeout, and a signature blind to it
-/// would silence the single line that reports the swap.
-fn dedup_signature(provenance: &BudgetProvenance, model: &ModelProvenance) -> String {
-    let budget = provenance.effective_budget();
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        budget.http_timeout_secs(),
-        budget.agent_total_timeout_secs(),
-        provenance.http.source.as_str(),
-        provenance.agent_total.source.as_str(),
-        budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP),
-        provenance.effective_max_tokens(),
-        provenance.max_tokens.source.as_str(),
-        budget.reachable_output_tokens(super::budget::output_tokens_per_sec_floor()),
-        model.provider_name(),
-        model.provider_value.source.as_str(),
-        model.effective_model().unwrap_or(""),
-        model.model_source_name(),
-    )
-}
-
-pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &Path) {
-    // One read of the four cascade doors, two facts drawn from it: the budget
-    // pair and the model. They are read together by whoever diagnoses a cut
-    // turn, so they are resolved and emitted together.
-    let layers = CascadeLayers::read(global_home, agent_home);
-    let provenance = BudgetProvenance::from_layers(&layers);
-    let model = ModelProvenance::from_layers(&layers);
-    let budget = provenance.effective_budget();
-
-    let max_attempts = budget.max_attempts(REPORTED_ATTEMPT_HARD_CAP);
-    let effective_max_attempts = budget.effective_max_attempts(REPORTED_ATTEMPT_HARD_CAP);
-    let retry_reachable = effective_max_attempts == max_attempts;
-
-    let signature = dedup_signature(&provenance, &model);
+pub fn emit_llm_budget_resolved(record: &ResolvedBudgetRecord) {
+    let agent_id = record.agent_id.as_str();
+    let signature = dedup_signature(record);
 
     let mut seen = LAST_EMITTED
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -695,43 +860,32 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
     seen.insert(agent_id.to_string(), signature);
     drop(seen);
 
-    // mika#2280: the output budget in force, its door, and what the plafond can
-    // physically carry. Context only — **no WARN is emitted here**. A declared
-    // budget above the reachable figure is not a defect in itself: mika#2296
-    // chose exactly that for mika-arch, as "a ceiling made non-binding". A guard
-    // firing on the declaration would contradict a documented decision at every
-    // startup, and a warning that contradicts a decision gets muted. What earns
-    // an operator's attention is a *crossing*, once per cut call — that is
-    // `llm_call_cap_exhausted`, on the rails that apply the plafond.
-    let llm_max_tokens = provenance.effective_max_tokens();
-    let reachable_output_tokens =
-        budget.reachable_output_tokens(super::budget::output_tokens_per_sec_floor());
+    let max_attempts = record.max_attempts;
+    let effective_max_attempts = record.effective_max_attempts;
+    let retry_reachable = record.retry_reachable;
 
     tracing::info!(
         event = "llm_budget_resolved",
         agent_id,
-        http_timeout_secs = budget.http_timeout_secs(),
-        agent_total_timeout_secs = budget.agent_total_timeout_secs(),
+        http_timeout_secs = record.http_timeout_secs,
+        agent_total_timeout_secs = record.agent_total_timeout_secs,
         max_attempts,
         effective_max_attempts,
         retry_reachable,
-        worst_case_failure_secs = budget.worst_case_failure_secs(REPORTED_ATTEMPT_HARD_CAP),
-        llm_max_tokens,
-        reachable_output_tokens,
-        http_source = provenance.http.source.as_str(),
-        total_source = provenance.agent_total.source.as_str(),
-        max_tokens_source = provenance.max_tokens.source.as_str(),
-        http_raw = provenance.http.raw_or_empty(),
-        total_raw = provenance.agent_total.raw_or_empty(),
-        max_tokens_raw = provenance.max_tokens.raw_or_empty(),
-        // mika#2328 — the model half. `model_config_key` names the key an
-        // operator would edit, which is how the "resolved from the provider,
-        // never hard-coded" rule becomes checkable from the log alone.
-        provider = model.provider_name(),
-        provider_source = model.provider_value.source.as_str(),
-        model = model.effective_model().unwrap_or(""),
-        model_source = model.model_source_name(),
-        model_config_key = model.model_config_key(),
+        worst_case_failure_secs = record.worst_case_failure_secs,
+        llm_max_tokens = record.llm_max_tokens,
+        reachable_output_tokens = record.reachable_output_tokens,
+        http_source = record.http_source,
+        total_source = record.total_source,
+        max_tokens_source = record.max_tokens_source,
+        http_raw = record.http_raw,
+        total_raw = record.total_raw,
+        max_tokens_raw = record.max_tokens_raw,
+        provider = record.provider,
+        provider_source = record.provider_source,
+        model = record.model,
+        model_source = record.model_source,
+        model_config_key = record.model_config_key,
         "resolved LLM timeout budget (mika#2293)"
     );
 
@@ -755,12 +909,12 @@ pub fn log_llm_budget_resolved(agent_id: &str, global_home: &Path, agent_home: &
         tracing::warn!(
             event = "llm_budget_retry_unreachable",
             agent_id,
-            http_timeout_secs = budget.http_timeout_secs(),
-            agent_total_timeout_secs = budget.agent_total_timeout_secs(),
+            http_timeout_secs = record.http_timeout_secs,
+            agent_total_timeout_secs = record.agent_total_timeout_secs,
             max_attempts,
             effective_max_attempts,
-            http_source = provenance.http.source.as_str(),
-            total_source = provenance.agent_total.source.as_str(),
+            http_source = record.http_source,
+            total_source = record.total_source,
             "this agent's last nominal LLM retry cannot run: after an attempt consuming the \
              full per-call cap the remaining envelope is at or below the non-transport retry \
              threshold (1.0 × cap), so the deadline guard refuses it. The envelope being an \
@@ -1068,12 +1222,14 @@ mod tests {
 
         // Reads the emitter's own key rather than rebuilding it: a hand-written
         // copy here is what broke when mika#2362 extended the signature.
-        let signature_now = || {
-            dedup_signature(
-                &BudgetProvenance::resolve(&global, &agent),
-                &ModelProvenance::resolve(&global, &agent),
-            )
-        };
+        //
+        // mika#2457 — it now reads the emitter's own *record*. That is NOT a
+        // control on `resolved_at`: the field is stamped to the second, so two
+        // calls back to back almost always carry the same string. The leak is
+        // pinned by `mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key`,
+        // which forces the two instants apart.
+        let signature_now =
+            || dedup_signature(&resolve_llm_budget_record("mika-arch", &global, &agent));
 
         let first = signature_now();
         log_llm_budget_resolved("mika-arch", &global, &agent);
@@ -1146,12 +1302,8 @@ mod tests {
             )
             .unwrap();
         };
-        let signature_now = || {
-            dedup_signature(
-                &BudgetProvenance::resolve(&global, &agent),
-                &ModelProvenance::resolve(&global, &agent),
-            )
-        };
+        let signature_now =
+            || dedup_signature(&resolve_llm_budget_record("mika-arch", &global, &agent));
 
         write_config(8_192);
         let first = signature_now();
@@ -1548,12 +1700,8 @@ mod tests {
             )
             .unwrap();
         };
-        let signature_now = || {
-            dedup_signature(
-                &BudgetProvenance::resolve(&global, &agent),
-                &ModelProvenance::resolve(&global, &agent),
-            )
-        };
+        let signature_now =
+            || dedup_signature(&resolve_llm_budget_record("mika-qa", &global, &agent));
 
         write_model("glm-5.2");
         let before = signature_now();
@@ -1580,6 +1728,301 @@ mod tests {
         }
 
         reset_dedup_for_test();
+        clean_budget_env();
+    }
+
+    /// mika#2457 U1 — the record carries the same resolution as the two
+    /// provenance readers, on **every** position of the cascade.
+    ///
+    /// This is the test that makes the record honest rather than merely
+    /// well-typed. `ResolvedBudgetRecord` flattens `BudgetProvenance` and
+    /// `ModelProvenance` into strings a route can serve; a field wired to the
+    /// wrong source would compile, would serve, and would answer the one
+    /// question this ticket exists to settle — *through which door?* — with
+    /// authority and wrongly. Those two readers are themselves pinned against
+    /// `Settings::load_for_agent` by the two `*_equals_load_for_agent_*` tests
+    /// above, so chaining to them transitively anchors the record to what the
+    /// runtime actually merges.
+    ///
+    /// Four positions, because a record that only ever met `agent_config` would
+    /// pass while reporting `agent_config` unconditionally.
+    #[test]
+    #[serial]
+    fn mika2457_the_record_equals_the_provenance_readers_on_every_cascade_position() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+
+        let check = |position: &str| {
+            let record = resolve_llm_budget_record("mika-arch", &global, &agent);
+            let provenance = BudgetProvenance::resolve(&global, &agent);
+            let model = ModelProvenance::resolve(&global, &agent);
+            let budget = provenance.effective_budget();
+
+            assert_eq!(
+                record.http_timeout_secs,
+                budget.http_timeout_secs(),
+                "{position}: plafond du record ≠ plafond résolu"
+            );
+            assert_eq!(
+                record.agent_total_timeout_secs,
+                budget.agent_total_timeout_secs(),
+                "{position}: enveloppe du record ≠ enveloppe résolue"
+            );
+            assert_eq!(
+                record.llm_max_tokens,
+                provenance.effective_max_tokens(),
+                "{position}: budget de sortie du record ≠ budget résolu"
+            );
+            assert_eq!(
+                record.http_source,
+                provenance.http.source.as_str(),
+                "{position}: provenance du plafond perdue en traversant le record"
+            );
+            assert_eq!(
+                record.total_source,
+                provenance.agent_total.source.as_str(),
+                "{position}: provenance de l'enveloppe perdue"
+            );
+            assert_eq!(
+                record.max_tokens_source,
+                provenance.max_tokens.source.as_str(),
+                "{position}: provenance du budget de sortie perdue"
+            );
+            assert_eq!(
+                record.http_raw,
+                provenance.http.raw_or_empty(),
+                "{position}: brut du plafond perdu"
+            );
+            assert_eq!(
+                record.provider,
+                model.provider_name(),
+                "{position}: provider perdu"
+            );
+            assert_eq!(
+                record.provider_source,
+                model.provider_value.source.as_str(),
+                "{position}: provenance du provider perdue"
+            );
+            assert_eq!(
+                record.model,
+                model.effective_model().unwrap_or(""),
+                "{position}: modèle perdu"
+            );
+            assert_eq!(
+                record.model_source,
+                model.model_source_name(),
+                "{position}: provenance du modèle perdue"
+            );
+            assert_eq!(
+                record.model_config_key,
+                model.model_config_key(),
+                "{position}: clé de config du modèle perdue"
+            );
+            assert_eq!(record.agent_id, "mika-arch");
+            assert!(
+                !record.resolved_at.is_empty(),
+                "{position}: un record non daté ne dit pas de quand il est vrai"
+            );
+            record
+        };
+
+        // Position 5 — nothing declared anywhere: the compiled-in constants.
+        let default_record = check("position 5 (défaut compilé)");
+        assert_eq!(default_record.http_source, "default");
+        assert_eq!(default_record.http_raw, "", "rien n'a été lu");
+
+        // Position 4 — global config.toml only.
+        std::fs::write(
+            global.join("config.toml"),
+            "llm_http_timeout_secs = 130\nagent_total_timeout_secs = 400\n\
+             llm_max_tokens = 2048\nllm_provider = \"openrouter\"\n\
+             openrouter_model = \"global/model\"\n",
+        )
+        .unwrap();
+        let global_record = check("position 4 (config.toml global)");
+        assert_eq!(global_record.http_source, "global_config");
+        assert_eq!(
+            global_record.model_source, "global_config",
+            "un modèle venant du fichier partagé ne doit pas se rapporter per-agent"
+        );
+
+        // Position 3 — per-agent config.toml beats the global one.
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n\
+             llm_max_tokens = 32768\nllm_provider = \"openrouter\"\n\
+             openrouter_model = \"moonshotai/kimi-k2.5\"\n",
+        )
+        .unwrap();
+        let agent_record = check("position 3 (config.toml per-agent)");
+        assert_eq!(agent_record.http_source, "agent_config");
+        assert_eq!(agent_record.http_timeout_secs, 240);
+        assert_eq!(agent_record.model, "moonshotai/kimi-k2.5");
+        assert_eq!(agent_record.model_config_key, "openrouter_model");
+
+        // Position 2 — the process env beats both files. This is H2, the world
+        // the mika#2457 probe exists to separate from the other two.
+        // Safety: test-only env vars, serialized by `#[serial]`.
+        unsafe {
+            std::env::set_var(HTTP_TIMEOUT_ENV_VAR, "300");
+        }
+        let env_record = check("position 2 (env du process)");
+        assert_eq!(
+            env_record.http_source, "process_env",
+            "une variable de service qui écrase le config.toml doit se dire"
+        );
+        assert_eq!(env_record.http_timeout_secs, 300);
+        assert_eq!(
+            env_record.agent_total_timeout_secs, 900,
+            "l'enveloppe n'a pas bougé — la provenance est par clé, pas par couple"
+        );
+        assert_eq!(env_record.total_source, "agent_config");
+
+        // Position 1 — the per-agent `.env` beats the process env (mika#2218).
+        std::fs::write(agent.join(".env"), format!("{HTTP_TIMEOUT_ENV_VAR}=420\n")).unwrap();
+        let dotenv_record = check("position 1 (.env per-agent)");
+        assert_eq!(dotenv_record.http_source, "agent_dotenv");
+        assert_eq!(dotenv_record.http_timeout_secs, 420);
+
+        clean_budget_env();
+    }
+
+    /// mika#2457 U1 — the record has **one** construction site.
+    ///
+    /// A source scan, because a behavioural test cannot see this class: a second
+    /// constructor would make no assertion fail the day it is written. It would
+    /// be a resolver free to diverge from this one — silently, later, with every
+    /// test still green. That is the class `grooming_marker` (mika#2158) had to
+    /// close after promotion and dispatch routing answered the same question
+    /// differently for months, and the reason the plan's Fire-Disposition puts
+    /// this detector under option (a) rather than calling it redundant.
+    ///
+    /// Scope: this crate, which owns the type, plus `mika-agent`, the one
+    /// consumer that holds a record and could be tempted to assemble its own in
+    /// `init_agent`. `mika-agent` is reached by relative path and **skipped when
+    /// absent** (a crates.io checkout of `mika-common` alone), so this half is
+    /// best-effort — the this-crate half below is not, and is asserted
+    /// non-vacuous.
+    ///
+    /// **Allowlist shipped empty, and it is not a slot**: when this fires, the
+    /// second constructor is removed, not listed.
+    #[test]
+    fn mika2457_the_record_has_a_single_construction_site() {
+        use crate::source_guard::ProductionScanner;
+
+        const ALLOWED: &[&str] = &[];
+        const NEEDLE: &str = "ResolvedBudgetRecord {";
+
+        let collect = |scanner: &ProductionScanner, label: &str| {
+            let mut hits: Vec<String> = Vec::new();
+            scanner.for_each(|path, source| {
+                let rel = path
+                    .strip_prefix(scanner.src_root())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                if ALLOWED.contains(&rel.as_str()) {
+                    return;
+                }
+                for (idx, line) in source.lines().enumerate() {
+                    // A doc-comment naming the type is not a construction of it.
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    // Two shapes carry the needle without constructing
+                    // anything, and both are excluded by their own syntax
+                    // rather than by a path allowlist: the declaration
+                    // (`pub struct ResolvedBudgetRecord {`) and a function's
+                    // return type followed by its body brace
+                    // (`) -> ResolvedBudgetRecord {`). A *real* construction
+                    // inside such a function still sits on its own line and is
+                    // caught, so neither exclusion widens the guard.
+                    if trimmed.starts_with("pub struct") || trimmed.starts_with("struct") {
+                        continue;
+                    }
+                    if line.contains("-> ResolvedBudgetRecord {") {
+                        continue;
+                    }
+                    if line.contains(NEEDLE) {
+                        hits.push(format!("{label}/{rel}:{}", idx + 1));
+                    }
+                }
+            });
+            hits
+        };
+
+        let own = ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            own.files().len() > 5,
+            "le scan doit voir ce crate, sinon il est vide de sens"
+        );
+        let mut hits = collect(&own, "mika-common");
+
+        let agent_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("mika-agent")
+            .join("src");
+        if agent_src.is_dir() {
+            hits.extend(collect(&ProductionScanner::new(&agent_src), "mika-agent"));
+        }
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "le record doit avoir UN seul constructeur (`resolve_llm_budget_record`) : \
+             un second serait libre d'en diverger, sans qu'aucune assertion ne rougisse \
+             le jour où il est écrit. Quand ce scan tire, on retire le second \
+             constructeur — on ne l'allowliste pas.\nsites trouvés : {hits:?}"
+        );
+    }
+
+    /// mika#2457 U1 — `resolved_at` dates the record and never keys it.
+    ///
+    /// The only control on that key. `resolved_at` is stamped to the second, so
+    /// two resolutions back to back almost always carry the same string and a
+    /// signature that included it would still compare equal — green over the
+    /// leak, red only when a run happened to straddle a second boundary. The
+    /// second record is therefore the first one **re-dated by hand**, and the
+    /// test first asserts the two instants differ (the negative control)
+    /// before asserting the signatures are still equal. It also asserts the field is
+    /// populated: a record nobody can date is the ambiguity § 6 exists to
+    /// resolve.
+    #[test]
+    #[serial]
+    fn mika2457_resolved_at_dates_the_record_and_stays_out_of_the_dedup_key() {
+        clean_budget_env();
+        let (_tmp, global, agent) = homes();
+        std::fs::write(
+            agent.join("config.toml"),
+            "llm_http_timeout_secs = 240\nagent_total_timeout_secs = 900\n",
+        )
+        .unwrap();
+
+        let first = resolve_llm_budget_record("mika-arch", &global, &agent);
+        // Re-dated by hand rather than resolved a second time: the clock would
+        // almost always hand back the same second, and the control would be
+        // a flake instead of a guard.
+        let mut second = first.clone();
+        second.resolved_at = "1970-01-01T00:00:00Z".to_string();
+
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&first.resolved_at).is_ok(),
+            "resolved_at doit être un instant RFC 3339 lisible, pas une chaîne libre : {}",
+            first.resolved_at
+        );
+        assert_ne!(
+            first.resolved_at, second.resolved_at,
+            "contrôle négatif : les deux enregistrements doivent porter deux instants \
+             distincts, sinon l'égalité ci-dessous ne prouve rien"
+        );
+        assert_eq!(
+            dedup_signature(&first),
+            dedup_signature(&second),
+            "deux résolutions identiques doivent rester UNE ligne : un resolved_at \
+             dans la clé annulerait la déduplication que mika#2293 a posée"
+        );
+
         clean_budget_env();
     }
 }

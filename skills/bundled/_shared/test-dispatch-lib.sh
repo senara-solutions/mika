@@ -7186,6 +7186,40 @@ assert_eq "T11 (b): un findings-1-fd.md résiduel ne déclenche aucune relance" 
 assert_not_contains "T11 (b): et rien n'est journalisé" \
     "fire_disposition_revise_retried" "$T2306_T11"
 
+# --- mika#2449: aucun message de récupération de stash ne nomme le checkout principal ---
+#
+# Deux sites de dispatch-lib stashent un worktree sale et impriment une
+# consigne « recover with: git -C <dir> stash apply <sha> ». Le site A
+# (_clean_worktree_for_rebase) nomme le worktree ; le site B (_set_up_worktree,
+# relic non canonique) nommait `$SUB_REPO_DIR` — le checkout PRINCIPAL. Exécutée,
+# cette consigne dépose le contenu non committé d'un worktree dans le checkout de
+# déploiement, exactement la signature du sinistre du 2026-09-21 (staged +
+# modified sur main, rebuild bloqué). Le lecteur de ce message est un acteur non
+# contenu (opérateur, mika-dev lisant un dispatch en échec), donc une
+# prescription écrite est un producteur latent.
+#
+# Scan de source à ALLOWLIST VIDE : toute ligne portant à la fois `stash apply`
+# et `recover with` est un site ; aucun ne peut nommer SUB_REPO_DIR. Quand il
+# tire, la résolution est de corriger le message, jamais d'ajouter une entrée.
+# Contrôle de bonne foi : ≥ 2 sites trouvés, sinon le scan est vert parce qu'il
+# ne regarde rien (classe mika#2205).
+T2449_RECOVER_SITES=$(grep -n 'stash apply' "$DISPATCH_LIB" | grep 'recover with' || true)
+T2449_SITE_COUNT=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'recover with' || true)
+assert_eq "mika#2449 bonne foi: le scan trouve ≥ 2 sites « recover with … stash apply »" "yes" \
+    "$([ "$T2449_SITE_COUNT" -ge 2 ] && echo yes || echo "non ($T2449_SITE_COUNT)")"
+assert_eq "mika#2449: aucun site « recover with » ne nomme SUB_REPO_DIR (allowlist vide)" "0" \
+    "$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'SUB_REPO_DIR' || true)"
+# Le site B doit nommer le worktree CANONIQUE, pas le relic : celui-ci est
+# supprimé quelques lignes plus bas (`worktree remove --force "$existing_wt"`),
+# donc une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
+T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'stale-worktree-cleanup\|existing_wt' || true)
+assert_contains "mika#2449: le site B (relic) prescrit le worktree canonique \$WORKTREE_DIR" \
+    'git -C $WORKTREE_DIR stash apply' "$T2449_SITE_B"
+assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt (supprimé plus bas)" \
+    'git -C $existing_wt stash apply' "$T2449_SITE_B"
+assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
+    'NOT in the primary checkout' "$T2449_SITE_B"
+
 # --- Summary ---
 
 echo ""
