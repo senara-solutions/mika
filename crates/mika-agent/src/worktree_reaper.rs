@@ -1363,10 +1363,13 @@ async fn record_reaped(
         size.truncated,
         disposition.as_str(),
     );
+    // mika#2469 : le nom écrit — et celui que le WARN d'échec nomme — vient
+    // du même site ; en `observe` la ligne d'échec ne dit pas « reaped ».
+    let outcome = outcome_for(disposition);
     if let Err(e) = db
         .log_audit_event(
             session_id,
-            outcome_for(disposition).event,
+            outcome.event,
             &reaped_audit_key(&candidate.path),
             None,
             size.bytes.map(|b| b.to_string()).as_deref(),
@@ -1377,9 +1380,11 @@ async fn record_reaped(
     {
         warn!(
             worktree_path = %candidate.path,
+            tool_name = outcome.event,
             error = %e,
             trace_id,
-            "worktree_reap: audit write failed (reaped)"
+            "worktree_reap: audit write failed ({})",
+            outcome.event
         );
     }
 }
