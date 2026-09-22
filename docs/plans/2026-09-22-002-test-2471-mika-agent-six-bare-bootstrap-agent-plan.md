@@ -3,11 +3,13 @@
 **Ticket :** senara-solutions/mika#2471
 **Branche :** `test/2471/mika-agent-six-bare-bootstrap-agent`
 **Type :** correctif de substrat de test (comportement de production inchangé)
-**Base :** `main` @ `ff02386f` — la PR compagnon #2441 (mika#2073) est mergée le
-2026-09-22 10:20Z ; `bootstrap_agent_with_tier` (`home.rs:404`) et la garde
-(`home.rs:2513`) sont sur `main`. Le callout `Branch: test/2073/…` du corps
-initial pointait sur une branche supprimée au merge ; il est remplacé par
-celui-ci.
+**Base :** branche rebasée sur `main` @ `9aa39998` (la mesure initiale portait sur
+`ff02386f`) — la PR compagnon #2441 (mika#2073) est mergée le 2026-09-22 10:20Z ;
+`bootstrap_agent_with_tier` (`home.rs:404`) et la garde (`home.rs:2513`) sont sur
+`main`. Le callout `Branch: test/2073/…` du corps initial pointait sur une branche
+supprimée au merge ; il est remplacé par celui-ci. Toutes les ancres de ce plan
+ont été re-vérifiées sur `9aa39998` — voir la note de révision en fin de document
+pour les deux nombres descriptifs qui ont bougé.
 
 ---
 
@@ -41,7 +43,7 @@ toucher non plus.
 
 Trois `set_var("MIKA_AGENT_TIER", …)` hors `home.rs`, tous sériels :
 
-- `crates/mika-agent/src/server/mod.rs:1993` — `agent_state_tier_survives_env_drift`, `#[serial_test::serial]`
+- `crates/mika-agent/src/server/mod.rs:1998` — `agent_state_tier_survives_env_drift`, `#[serial_test::serial]` (attribut `:1993`)
 - `crates/mika-agent/src/server/tier_guard.rs:464` — `error_message_does_not_contradict_a_tier_the_env_disagrees_with`, `#[serial_test::serial]`
 - `crates/mika-cli/src/commands/agents.rs:2143` — `mika2230_the_env_is_the_fallback_when_the_flag_is_absent`, `#[serial_test::serial]`
 
@@ -51,20 +53,25 @@ troisième est dans `mika-cli` — un autre binaire, donc il ne court contre rie
 aujourd'hui ; il est cité parce que le scan élargi le verra, et qu'il est sériel.
 
 Les autres lecteurs `AgentTier::from_env()` en position de test —
-`server/mod.rs:1996` et `:2004` — sont dans le test sériel de `:1993`. Tous les
+`server/mod.rs:2001` et `:2009` — sont dans le test sériel ci-dessus. Tous les
 autres appels du workspace (`mika-cli/commands/{setup,agents,ask,chat}.rs`,
 `mika-agent/src/bin/mika-spirit.rs`, `tools/create_agent.rs`, `server/{mod,state}.rs`)
 sont de production, hors de portée du scan par construction.
 
 ### 1.3 Le périmètre élargi, mesuré
 
-`crates/` porte **610** fichiers `.rs` (mika-agent 461, mika-cli 52, mika-common
-40, mika-gateway 40, mika-a2a 10, mika-os 7), dont 255 sous `tests/`, `benches/`
-ou `src/bin/`. Le walker du garde, lancé sur les 610 à la tête de #2441
-(`9d3214e9`), rend `tests_seen=7836 offenders=5 desyncs=0` — mesure de l'opérateur,
-commentaire du 2026-09-22 02:22Z. Les cinq offenders sont exactement les cinq
-items de test du §1.1 ; `:3210` est invisible parce que `pre_seed_identity` n'a
-pas d'attribut de test.
+`crates/` porte **611** fichiers `.rs` sur `9aa39998` (mika-agent 462, mika-cli 52,
+mika-common 40, mika-gateway 40, mika-a2a 10, mika-os 7). Le walker du garde,
+lancé sur les **610** que portait la tête de #2441 (`9d3214e9`), rend
+`tests_seen=7836 offenders=5 desyncs=0` — mesure de l'opérateur, commentaire du
+2026-09-22 02:22Z. Les cinq offenders sont exactement les cinq items de test du
+§1.1 ; `:3210` est invisible parce que `pre_seed_identity` n'a pas d'attribut de
+test.
+
+Le `+1` fichier entre les deux commits est du bruit de `main`, pas un signal : il
+ne change ni la population d'offenders (l'étape 7 la re-mesure) ni les planchers
+du §2.3, qui sont dimensionnés à ~2/3 de la mesure précisément pour ne pas avoir
+à suivre ce nombre commit par commit.
 
 **Pourquoi inclure `tests/` et `src/bin/`.** Un test d'intégration compile dans
 son propre binaire, donc un `#[test]` nu qui y lit le tier ne court contre aucun
@@ -84,7 +91,7 @@ générique sur le texte, mais deux détails le bornent à un fichier :
    (`home.rs:2473`). Élargi tel quel, il attribuerait un offender de
    `well_known_agents.rs` à `home.rs`. L'étiquette devient un paramètre.
 2. **Le garde-fou « a-t-il lu ? »** est `scan.tests_seen >= 40` sur un seul
-   fichier (`home.rs:2524`). Sur 610 fichiers ce nombre ne dit plus rien : un
+   fichier (`home.rs:2524`). Sur 611 fichiers ce nombre ne dit plus rien : un
    walker dont la racine a dérivé vers `crates/mika-agent` seul verrait encore
    ~6 000 items. Le garde-fou doit vérifier **la présence des deux fichiers
    ancres**, chacun avec son propre plancher, en plus d'un plancher global.
@@ -179,7 +186,7 @@ Trois assertions, dans cet ordre, **avant** les desyncs et les offenders :
 |---|---|---|---|
 | `per_file["mika-common/src/home.rs"] >= 40` | conservé de mika#2073 | 67 `#[test]` | la racine a dérivé, ou `home.rs` a été renommé |
 | `per_file["mika-agent/src/well_known_agents.rs"] >= 40` | même plancher | 76 `#[test]` | le walk n'a pas atteint le crate où vivent les six sites |
-| `files.len() >= 400 && total.tests_seen >= 4000` | ~2/3 de la mesure | 610 / 7 836 | la racine pointe sur un sous-arbre |
+| `files.len() >= 400 && total.tests_seen >= 4000` | ~2/3 de la mesure | 611 / ~7 836 | la racine pointe sur un sous-arbre |
 
 Les deux ancres sont **load-bearing** : elles nomment les deux fichiers dont
 l'histoire de cette garde est faite, et un walk qui ne les voit pas n'atteste
@@ -371,19 +378,19 @@ est non vide, ce que la première passe architecte ne pouvait pas vérifier
   Ce ticket ferme le seul cas réel connu à la main.
 - Faire tourner `rust_sources_under` chez les quinze autres gardes qui écrivent
   la boucle — hygiène séparée, sans lien avec la course.
-- **Tout carve-out de répertoire, `benches/` compris.** La mesure de 610 fichiers
+- **Tout carve-out de répertoire, `benches/` compris.** La mesure de 611 fichiers
   les inclut, « aucun filtre de répertoire » les couvre, et en exclure un serait
   la même allowlist déguisée que pour `tests/` (§1.3).
 
 ## Risques
 
-- **Un desync sur un des 610 fichiers.** Mesuré à zéro sur `9d3214e9` ; `main`
-  a avancé de trois commits (a0c5d1ff, 469061dc, ff02386f) sans toucher un
-  fichier à raw string inhabituel, mais l'étape 7 le re-mesure. Si un desync
+- **Un desync sur un des 611 fichiers.** Mesuré à zéro sur `9d3214e9` ; `main` a
+  depuis avancé jusqu'à `9aa39998` sans toucher un fichier à raw string
+  inhabituel, mais l'étape 7 le re-mesure. Si un desync
   apparaît, c'est une faute du walk (probablement une forme de littéral que
   `source_guard::scan_line` ne porte pas) : la réparer dans `source_guard`, pas
   exclure le fichier.
-- **Coût du garde.** 610 lectures + 7 836 walks de corps par exécution de
+- **Coût du garde.** 611 lectures + ~7 836 walks de corps par exécution de
   `cargo test -p mika-common --lib`. Les gardes voisins (`budget_provenance`,
   `agent_loop::mika2247_…`) font déjà des walks de crate ; mesurer une fois le
   temps du test à l'étape 10 et le noter dans le corps de PR — si > 2 s, le dire,
@@ -404,3 +411,18 @@ est non vide, ce que la première passe architecte ne pouvait pas vérifier
   DoD. Deux lectures de cohérence de l'architecte appliquées : pas de carve-out
   `benches/` (hors périmètre), et la justification du commit unique corrigée
   (la lettre du ticket, pas le bisect).
+- 2026-09-22 — re-vérification des ancres après rebase de la branche sur `main`
+  @ `9aa39998`. **Rien de décisionnel n'a bougé** : les six sites sont aux mêmes
+  lignes (`:2252`, `:2273`, `:3210`, `:3660`, `:3681`, `:3705`), `:927` reste le
+  seul appel de production, `bootstrap_agent_with_tier` est à `home.rs:404`, la
+  garde à `:2513`, le walker à `:2389` avec son étiquette `home.rs` codée en dur
+  et son plancher `tests_seen >= 40` sur un fichier, `rust_sources_under`
+  (`source_guard.rs:932`) n'a toujours aucun appelant, les deux fichiers-ancres
+  portent 67 et 76 `#[test]`, et la cible d'AC4 est bien en place dans
+  `crates/mika-common/CLAUDE.md` (« **Its scope is `crates/mika-common/src/home.rs`
+  only** » + la mention de mika#2471 comme suivi, toutes deux sur la même ligne).
+  Trois nombres **descriptifs** rafraîchis : le compte de fichiers (610 → 611),
+  le poseur de `server/mod.rs` (`:1993` → `:1998`, son attribut sériel restant à
+  `:1993`) et ses deux lecteurs `from_env` voisins (`:1996`/`:2004` →
+  `:2001`/`:2009`). Aucun n'est load-bearing — les planchers du §2.3 sont à 400 et
+  4 000 —, mais un plan qui cite une ligne doit citer la bonne.
