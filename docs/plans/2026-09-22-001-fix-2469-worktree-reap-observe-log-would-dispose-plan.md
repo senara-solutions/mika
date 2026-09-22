@@ -284,6 +284,28 @@ Dans `mod tests` de `worktree_reaper.rs`.
 - Une phrase de provenance : *« mika#2469 : avant ce fix, `observe` écrivait
   `worktree_reaped` avec `disposition=observe` ; les lignes antérieures au
   déploiement se distinguent par `reasoning` »*.
+- **HALT 1 — inchangée, et c'est dit (F2 arch pass 1).** La halte vise un
+  *retrait effectif* (« a worktree of an open PR, or a human worktree, was
+  removed ») ; après ce fix `worktree_reaped` ne désigne plus **que** cela, donc
+  la consigne « read `worktree_reaped` to establish which term read true » est
+  plus exacte qu'avant, pas moins. Aucune réécriture. On lui ajoute une seule
+  demi-phrase de symétrie, pour que le lecteur en observe sache où regarder :
+  *« (in `observe`, the symmetric line is `worktree_reap_would_dispose` — it
+  names a worktree the predicate would have removed, and HALT 1 applies to it
+  as a dry-run signal: an open-PR or human worktree in that population is the
+  same false positive, caught before arming) »*.
+- **Rectification du corps du ticket (F1 arch pass 1 — convention
+  issue-as-versioned-contract, mika#2169/#2158, appliquée mika#2170 rev 1,
+  mika#2449 rev 3).** Le corps dit *« seul le wording de la ligne
+  `worktree_reaped` ne distingue pas observe/enact »* ; le plan livre aussi un
+  second `tool_name` d'audit. Le corps est rectifié par un **encadré daté**
+  (`> **Rectification 2026-09-22 :** le symptôme couvre aussi
+  `audit_events.tool_name` — `REAPED_TOOL` est une seule constante servant
+  d'event tracing et de tool_name d'audit (plan M1) ; la requête opérateur
+  documentée « liste exacte des retraits » ment de la même façon en observe.
+  Périmètre : les deux surfaces.`) **plus un commentaire d'avis d'édition**
+  daté. Le groomer l'écrit au moment d'attacher les callouts Branch/Plan ; la
+  DoD vérifie qu'il est là avant merge.
 
 ---
 
@@ -309,9 +331,12 @@ Tests, tous dans `worktree_reaper::tests`, préfixe `mika2469_` :
 - **T2 — `mika2469_le_triplet_a_une_seule_source`** (R4, D2). `outcome_for(Armed)`
   rend `(REAPED_TOOL, REAPED_MESSAGE)` ; `outcome_for(Observe)` rend
   `(WOULD_DISPOSE_TOOL, WOULD_DISPOSE_MESSAGE)` ; les deux events diffèrent ;
-  `WOULD_DISPOSE_MESSAGE` contient `"non retiré"` et **ne contient pas** le mot
-  `"retiré"` seul en fin de phrase (précisément : ne se termine pas par
-  `" retiré"`) ; `REAPED_MESSAGE` est le texte historique à l'octet près.
+  **les deux messages sont pinés à l'octet près** (F3 arch pass 1 — tester
+  la chose, pas une ombre de la chose) : `REAPED_MESSAGE ==
+  "worktree_reap: worktree de PR terminale retiré"` (texte historique) et
+  `WOULD_DISPOSE_MESSAGE == "worktree_reap: worktree de PR terminale éligible — observe, non retiré"`.
+  En surplus, et seulement en surplus : `WOULD_DISPOSE_MESSAGE.contains("non retiré")`,
+  qui documente l'intention si un jour la constante est reformulée.
 - **T3 — `mika2420_chaque_retrait_ecrit_une_ligne_daudit`** (existant, R7) :
   reste vert, non modifié — c'est le contrôle que le chemin `armed` n'a pas
   bougé.
@@ -335,6 +360,13 @@ dans ce crate hors `memory/`) ; c'est D2 qui le couvre : le message que
       `main` consignée dans le corps de la PR ; contrôle négatif T5 rapporté.
 - [ ] `grep -n 'worktree_reaped' crates/mika-agent/src` ne rend que
       `worktree_reaper.rs` (garde T4).
+- [ ] `grep -rn 'would_dispose' crates/mika-agent/src` ne rend que
+      `worktree_reaper.rs` (F4 arch pass 1 : la vacuité de l'allowlist est
+      vérifiée à l'implémentation, pas seulement au groom).
+- [ ] Le corps de mika#2469 porte l'encadré `**Rectification 2026-09-22 :**`
+      (extension à `audit_events.tool_name`) et un commentaire d'avis d'édition
+      daté existe sur le ticket (F1 arch pass 1). Vérifiable :
+      `gh issue view 2469 --repo senara-solutions/mika --json body -q .body | grep -c 'Rectification 2026-09-22'` ≥ 1.
 - [ ] `grep -n '"worktree_reap: worktree de PR terminale retiré"' crates/` rend
       **un seul** site (la constante `REAPED_MESSAGE`).
 - [ ] Aucune valeur de réglage, aucun terme T1–T7, aucun compteur du tick,
@@ -368,8 +400,9 @@ T4 ; AC3 ← R7, T3 (non modifié), D5. L'extension à la surface d'audit (R2/R3
 n'est pas une AC du corps : c'est M1 — la même constante nourrit les deux
 surfaces, et AC2 dit « l'event `worktree_reaped` », qui est cette constante.
 Corriger le log seul aurait laissé la requête documentée en CLAUDE.md mentir de
-la même façon ; c'est inscrit ici pour que l'architecte le voie comme un choix,
-pas comme une dérive.
+la même façon. L'architecte (pass 1, F1) a ratifié l'extension **à condition
+qu'elle soit portée dans le corps du ticket** : c'est la rectification datée
+prescrite en U4 et vérifiée en DoD.
 
 ---
 
@@ -381,8 +414,9 @@ Ce plan ne livre qu'un détecteur nouveau : la seconde needle du garde SOLE
 WRITER (U2/T4). Elle ne peut pas tirer sur le code existant, et c'est
 vérifiable avant d'écrire une ligne : la chaîne `worktree_reap_would_dispose`
 n'existe nulle part dans `crates/` à HEAD (`grep -rn would_dispose crates/`
-rend vide au moment du groom). L'allowlist est livrée vide et son vide est
-asserté ; si un jour la garde tire, la résolution est de retirer le second
+rend vide au moment du groom), **et la DoD re-vérifie ce vide à
+l'implémentation** (case `grep -rn 'would_dispose'`, F4). L'allowlist est livrée
+vide et son vide est asserté ; si un jour la garde tire, la résolution est de retirer le second
 site, jamais d'y ajouter une entrée (forme mika#2323, mika#1940, mika#2267).
 
 Aucun détecteur n'est livré désarmé.
