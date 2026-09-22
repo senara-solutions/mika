@@ -2527,6 +2527,173 @@ proactifs ».
   hypothèse ; et mika#2245 (défaut-racine de contexte) plus le ticket frère
   « boilerplate », que le ticket pose lui-même comme trois clusters distincts.
 
+### La fenêtre de conversation est réglable par tenant, et la DB ne peut que rétrécir (mika#2425)
+
+**Deux clés `customer_config`, pas de variable d'environnement.** Elles sont ici
+parce que l'opérateur qui cherche « comment isoler l'historique d'un tenant »
+cherche dans le voisinage des deux sections précédentes, qui règlent le même
+genre de chose au même endroit.
+
+```bash
+mika config set context_history_scope session --agent <tenant>   # rétrécir
+mika config set context_history_scope agent   --agent <tenant>   # ANNULER
+mika config set context_history_max_tokens 4000 --agent <tenant>
+mika config set context_history_max_tokens none --agent <tenant> # ANNULER
+```
+
+| clé | valeurs | neutre |
+|---|---|---|
+| `context_history_scope` | `agent` \| `session` | `agent` |
+| `context_history_max_tokens` | `none` \| entier `>= 500` | `none` |
+
+- **Le besoin, mesuré (L8, 2026-09-19).** **86–99 % de la fenêtre actuelle
+  (`scope = agent`) est du contenu d'AUTRES sessions** sur chaque tenant
+  (a8c12d0c : 3 220 → 330 tok médian). C'est à la fois le levier d'isolation de
+  session et celui de réduction de transit. Ce qui manquait n'était pas le
+  réglage — `[context.history]` existe depuis mika#2295 — mais un chemin
+  d'édition **par tenant** : `mika config set` n'écrit que des clés plates, et
+  pour les quatre agents bien connus la section est *code-owned* et réconciliée
+  au démarrage (mika#2330).
+
+- **Trois mesures déplacent la lettre du ticket, et elles sont le premier
+  livrable.** *(R1)* `reconcile_well_known_identity` n'a **jamais** tourné contre
+  un agent client : `provision_well_known_agents` boucle sur `WELL_KNOWN_AGENTS`,
+  les quatre agents d'ingénierie. L'exigence #2 du ticket (« qu'une valeur
+  opérateur dans une section code-owned ne soit pas écrasée au restart ») décrit
+  donc une population que L8 n'a pas mesurée. *(R2)* `load_agent_context` relit
+  l'identité **à chaque tour** et c'est le funnel des trois boucles : le réglage
+  est *hot*, il prend effet au tour suivant sans redémarrage — ce qui est la
+  condition pour qu'un réglage par tenant soit utilisable sur un démon partagé.
+  *(R3)* voir la halte ci-dessous : sur le chemin Telegram, `session` ne retire
+  pas 90 %, il **vide**.
+
+- **La cascade ne peut que RÉTRÉCIR, et c'est structurel.** L'identité déclare un
+  **plancher de rôle** ; la DB le rend plus étroit, jamais plus large. `session`
+  gagne toujours ; le plafond effectif est le `min` des deux, `None` valant
+  l'infini. La même asymétrie est déjà écrite un fichier plus loin, **sur ce
+  champ exact**, pour mika#1951. Elle achète quatre choses : mika#2295 n'est pas
+  rouvrable depuis une ligne de base ; la réversibilité est gratuite
+  (`delete_customer_config` **n'existe pas** — poser le neutre *est*
+  l'annulation, et la règle est ce qui rend ce geste sûr) ; les deux asymétries
+  (appelant mika#1951, tenant mika#2425) composent dans le même sens ; et le jour
+  où ces clés seront exposées au modèle, il ne pourra pas élargir sa propre
+  fenêtre. **Coût nommé :** un opérateur ne peut pas élargir la fenêtre de
+  mika-arch depuis la DB — c'est refusé **et dit**, et le remède est une édition
+  de `well_known_agents.rs`, ce qui est correct puisque le code déclare cette
+  borne comme une propriété du rôle.
+
+- **`0` est refusé, plancher à 500.** `Some(0)` est le sentinel d'omission qui
+  vide l'historique : décision de **rôle**, portée par l'identité, jamais
+  préférence de tenant. Un `0` posé par erreur est *un effacement de contexte
+  déguisé en configuration* — la phrase que `deserialize_history_max_tokens`
+  porte déjà.
+
+- **Non atteignables par le modèle**, à dessein : elles sont absentes de
+  `SETTABLE_CONFIG_KEYS`, qui **est** la surface de l'outil `set_config`, donc
+  l'omission est le geste entier. La seule population mesurée est un besoin
+  **opérateur**, et déduire une amnésie conversationnelle d'une phrase ordinaire
+  (« oublie ce qu'on a dit ») est un mode de panne que personne n'a mesuré.
+  **Suivi**, précondition : une demande utilisateur mesurée plus la sonde S2
+  verte.
+
+### Surfaces opérateur
+
+```bash
+# Quel couple est en vigueur pour ce tenant, et par quelle porte ?
+grep context_history_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{agent_id, scope, scope_source, max_tokens, max_tokens_source, session_minting}'
+
+# Un élargissement a-t-il été tenté ? (régime attendu : VIDE)
+grep context_history_widening_refused "$MIKA_SPIRIT_LOG_FILE"
+
+# Une valeur illisible a-t-elle été écrite hors de l'outil ? (régime attendu : VIDE)
+grep context_history_value_unreadable "$MIKA_SPIRIT_LOG_FILE"
+
+# La fenêtre réellement assemblée — instrument mika#2305, INCHANGÉ
+grep context_window_assembled "$MIKA_SPIRIT_LOG_FILE" \
+  | jq 'select(.agent_id == "<tenant>")
+        | {history_scope, distinct_sessions, message_count, history_bytes}'
+```
+
+`context_history_resolved` est **dédupliqué sur l'état résolu** : une répétition
+à l'identique est tue, un **changement** est ré-émis — c'est ce qui rend « le
+réglage a été posé à 14 h 02 » lisible sur une ligne. Il est **indépendant de
+tout réglage de télémétrie** : c'est un événement de *configuration*, et il doit
+rester lisible précisément quand on a coupé les appels pour réduire le bruit
+(doctrine mika#2293 : *un réglage qu'on ne peut pas observer n'est pas un
+réglage, c'est un espoir*). `context_window_assembled` **n'est pas élargi** — il
+porte déjà les quatre nombres dont la vérification a besoin depuis
+mika#2295/#2305, et inventer un second instrument créerait deux vérités.
+
+| `scope` | `scope_source` | lecture |
+|---|---|---|
+| `agent` | `default` | **nominal** — rien n'est posé, comportement d'aujourd'hui |
+| `session` | `identity` | un rôle déclare la borne (mika-arch) |
+| `session` | `customer_config` | l'opérateur a posé le rétrécissement — **lire `session_minting` avant de conclure sur le gain** |
+| `session` | `identity`, avec un `agent` en DB | un élargissement a été tenté et refusé — voir le WARN |
+
+`session_minting` ∈ `{singleton, per_message}` est le champ qui rend R3 lisible
+sans lire le code : il dit si « session » veut dire *une conversation* ou *un
+message* pour cet agent.
+
+### Sondes post-déploiement, et leurs haltes
+
+**S1 — le défaut n'a pas bougé (immédiat).** Avant toute écriture de clé, les
+quatre agents bien connus produisent un `context_history_resolved` identique à ce
+que le dépôt déclare : mika-arch `session`/`8000` en `identity`, les autres
+`agent`/`null` en `default`. *Halte* — un couple qui diffère signifie que la
+cascade a changé une valeur en vigueur, ce que l'AC3 interdit : **désarmer avant
+tout autre diagnostic** (poser le neutre sur l'agent concerné).
+
+**S2 — l'établissement de R3, préalable à TOUTE décision de réglage.** Sur un
+tenant Telegram représentatif, 24 h de trafic réel :
+
+```bash
+grep context_window_assembled "$MIKA_SPIRIT_LOG_FILE" \
+  | jq 'select(.agent_id == "<tenant>") | {message_count, distinct_sessions}'
+```
+
+Si `distinct_sessions` vaut 1 et `message_count` vaut 1 sur la quasi-totalité des
+lignes, alors une session **est** un message pour ce tenant : `scope = session`
+n'a rien à y retirer, il n'y a pas de gain, seulement une perte. **Halte : ne
+poser la clé sur aucun tenant de cette forme**, et ouvrir le suivi « scope
+`channel` » avec ce compte en précondition. **La mesure L8 ne dispense pas de
+cette sonde** — elle a porté sur une population dont R3 établit qu'elle n'est pas
+celle-là. Le `mika config set` imprime cet avertissement de lui-même, en nommant
+la conséquence et cette sonde ; il **avertit et ne refuse pas**, un agent piloté
+en CLI ou en A2A avec des `--session-id` stables étant une population légitime.
+
+**S3 — le gain, si S2 l'autorise.** Sur un tenant dont les sessions portent
+plusieurs messages, comparer `history_bytes` avant et après. *Halte* — un
+`history_scope: "session"` avec `distinct_sessions > 1` signifie que le filtre ne
+filtre pas : la fuite est sous `rebuild_context` et non dans le réglage, et c'est
+la halte que mika#2305 a déjà écrite pour cet instrument.
+
+**S4 — contrôle négatif du refus.** `context_history_widening_refused` doit
+rester vide. Une occurrence est un opérateur qui croit avoir élargi et ne l'a pas
+fait ; la ligne nomme l'agent, la clé et la valeur demandée.
+
+**S5 — halte de déploiement.** Aucune ligne `context_history_resolved` alors que
+le tenant a tourné ⇒ le binaire servi est antérieur au correctif (classe
+mika#2340) : **établir le déploiement avant toute conclusion sur les valeurs.**
+
+### Ce que ce travail n'achète PAS
+
+- **Aucun gain de tokens par lui-même.** Il livre le levier ; le gain dépend
+  d'une décision de réglage que S2 conditionne. Annoncer les 90 % comme livrés
+  transporterait la mesure L8 sur une population que R3 établit comme différente.
+- **Aucune borne sur la mémoire agent-scoped.** `search_memory`, la core memory,
+  les faits structurés et le résumé conversationnel traversent toutes les
+  sessions par conception — c'est un autre axe, déjà nommé dans le dépôt pour
+  mika-arch, et ce qui disparaît ici est l'historique **brut** des derniers tours.
+- **Aucune protection contre `mika agents reprovision`**, qui reste le geste qui
+  réécrit un `identity.toml` de tenant. Il ne touche pas la DB, donc le
+  rétrécissement posé lui survit — effet du choix de site, pas garantie ajoutée.
+- **Aucune surface console**, `mika-cloud` étant hors de ce workspace ; et **pas
+  de troisième scope `channel`**, qui serait la réponse juste à la charte pour un
+  tenant Telegram (l'unité y est le *chat*, ni la session ni l'agent) —
+  **suivi**, précondition : la sonde S2.
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)

@@ -445,6 +445,51 @@ inject = true
 max_tokens = 0
 ```
 
+### `[context.history]` is a role FLOOR, narrowed per tenant (mika#2425)
+
+`scope` (`agent` | `session`) and `max_tokens` bound the conversation window
+(mika#2295). Since mika#2425 the identity's values are a **floor**: two
+`customer_config` keys — `context_history_scope`, `context_history_max_tokens` —
+may make the window narrower for one agent and **never wider**. `session` always
+wins; the effective ceiling is the `min`, with `None` as infinity.
+
+`agent_loop::context_history` owns the cascade and is its **only** site. Three
+guards hold that, and each covers a class the others cannot see:
+
+- `mika2425_identity_context_history_has_a_single_reader` — a source scan,
+  allowlist shipped **empty**. A second production site reading
+  `identity.context.history` would apply the floor **without** the narrowing,
+  silently, with every behavioural assertion still green (the `grooming_marker`
+  class, mika#2158). Its good-faith control is
+  `mika2425_the_reader_scan_reddens_on_a_second_reader`; note the predicate
+  anchors on non-comment lines, because prose *about* the field is not a read and
+  the decision site carries three paragraphs of it (the mika#2050 Signal S shape).
+- `mika2305_the_scope_has_a_single_decisional_reader` — **amended, not excepted**:
+  the count goes `2 → 3` and the path constraint relaxes from `agent_loop/mod.rs`
+  to `agent_loop/`. The resolver is not a second answer to *"which rows may this
+  window draw from?"*; it **produces** the answer `scoped_session_id` consumes.
+  The resolver's `match` keeps its three arms on one line each, deliberately: a
+  rustfmt reflow splits it into two sites and the guard reads that as two
+  competing answers.
+- `tests/eval/test_context_history_per_tenant_2425.rs` — the behavioural half.
+  Neither source scan can see a decision site that reads the *right* field and
+  simply never consults the database, so only a real turn with a real row closes
+  it. Four cases: the narrowing reaches the window, the negative control without
+  the row, a refused widening (said as well as refused), and the neutral
+  cancelling a narrowing on the next turn with no restart.
+
+Both keys are **absent from `SETTABLE_CONFIG_KEYS`** — that constant is the
+`set_config` tool surface, so the omission is the whole refusal, and it is
+asserted (`mika2425_the_db_half_is_absent_from_the_tool_surface`). `0` is refused
+for the ceiling with a floor of 500: `Some(0)` is the omission sentinel that
+empties the history, a role decision carried by the identity.
+
+Operator surfaces (`context_history_resolved`, `context_history_widening_refused`),
+the reading table, the five probes and the **R3 halt** — on a non-singleton agent
+a "session" *is* a message, so `session` does not trim the window, it empties it
+— live in the root `CLAUDE.md` § *La fenêtre de conversation est réglable par
+tenant*.
+
 ## Session Configuration
 
 `[session]` section in `identity.toml` makes an agent **single-session-by-nature** (mika#1401). `SessionIdentityConfig` in `prompt.rs` deserializes it.
