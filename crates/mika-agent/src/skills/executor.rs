@@ -1555,10 +1555,17 @@ fn groom_provenance_verdict(
                           callback carrying 'Outcome: PLAN_GROOMED' exists under a \
                           task for this issue — markers may be pre-stamped by hand, \
                           or the proof aged past the 30-day task retention",
+            // mika#2484 — une phrase de ce champ est devenue FAUSSE par l'effet
+            // de ce ticket, et la laisser serait livrer la régression que
+            // mika#2287 a nommée : un texte de remède qui prescrit une route
+            // morte. Elle disait « Re-applying the `ready` label does NOT help
+            // … the handler dispatches dev-pilot and lands here again » — c'est
+            // exactement ce que le routage corrigé ne fait plus. Seule cette
+            // phrase change ; le reste du payload est inchangé à l'octet près.
             "recovery": "Groom through the autonomous loop: dispatch dev-groom via \
                          'mika ask --agent mika-dev \"groom <typed-ref>\"'. Re-applying \
-                         the `ready` label does NOT help while the markers are present \
-                         — the handler dispatches dev-pilot and lands here again. If the \
+                         the `ready` label also works since mika#2484 — markers without \
+                         proof now route to dev-groom, not dev-pilot. Either way, if the \
                          plan already resolves on the dispatch branch (hand-groomed \
                          ticket), dev-groom answers `already_groomed` and mints no proof \
                          — remove the plan from the branch first so a fresh loop groom \
@@ -9467,12 +9474,23 @@ Harness ticket.
                     .await
                     .expect_err("callouts sans preuve refusent");
             assert_eq!(no_proof["error"], "dispatch_grooming_not_verified");
+            let recovery = no_proof["recovery"].as_str().expect("recovery présent");
             assert!(
-                no_proof["recovery"]
-                    .as_str()
-                    .expect("recovery présent")
-                    .contains("already_groomed"),
+                recovery.contains("already_groomed"),
                 "le champ `recovery` est déplacé à l'identique : {no_proof}"
+            );
+            // La seule phrase de ce payload que mika#2484 change, et elle
+            // change parce que ce ticket la rend fausse : la laisser serait
+            // prescrire une route morte, la régression que mika#2287 a nommée.
+            assert!(
+                !recovery.contains("does NOT help"),
+                "le `recovery` prescrit encore que re-poser `ready` ne sert à \
+                 rien — c'est ce que le routage corrigé a cessé d'être vrai : \
+                 {recovery}"
+            );
+            assert!(
+                recovery.contains("route to dev-groom, not dev-pilot"),
+                "le `recovery` doit nommer la route qui marche : {recovery}"
             );
 
             // (4) `dispatch_check_failed` — base injoignable, FAIL-CLOSED.

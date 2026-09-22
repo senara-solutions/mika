@@ -534,10 +534,21 @@ pub(crate) fn route_for(
         // mika#2484, inchangé.
         GroomedState::MarkersMissing(_)
         // Callouts présents, aucune preuve : le défaut que mika#2484 ferme.
-        // Routé `groom` parce que le dev-groom qui en sort **produit la preuve
-        // manquante** ; routé `implement`, il partait se faire refuser
-        // `dispatch_grooming_not_verified` à l'étape 9d, et le ticket
-        // recommençait au tour suivant.
+        // Routé `groom` **parce que c'est la seule route qui peut produire la
+        // preuve manquante** ; routé `implement`, il part se faire refuser
+        // `dispatch_grooming_not_verified` à l'étape 9d, sans aucune issue.
+        //
+        // Ce n'est PAS une garantie de convergence, et la nuance est la limite
+        // nommée en D4 : si le plan résout encore sur la branche de dispatch,
+        // le dev-groom répond `already_groomed` (mika#2012) et ne frappe
+        // **aucune** preuve — le ticket repassera au tour suivant. Cette
+        // population-là est bornée ailleurs, par le budget de re-drive de
+        // mika#2020, au même endroit qu'avant ce ticket. Ce que le routage
+        // achète est le cas où le plan n'est plus sur la branche : là le groom
+        // converge et frappe la preuve, là où l'ancien chemin ne le pouvait
+        // jamais. Coût assumé du changement : la tentative consomme désormais
+        // un subprocess et le slot `groom`, là où l'étape 9d la refusait à bon
+        // marché.
         | GroomedState::MarkersWithoutProof
         // Preuve illisible : au routage, la direction sûre est le travail le
         // moins dangereux, pas le plus avancé (R4).

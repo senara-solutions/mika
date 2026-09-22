@@ -1779,10 +1779,20 @@ régression de mika#2120).
 
 **Le feeder n'est pas touché non plus, et le DoD du ticket est écarté avec sa
 raison.** Gater la promotion `ready` sur la preuve retirerait au ticket
-callouté-sans-preuve **le seul mécanisme capable de le réparer** : avec le
-routage corrigé, promouvoir `ready` déclenche le `dev-groom` qui produit la
-preuve manquante. Le churn mesuré n'était pas un excès de promotions, c'était une
-promotion qui aboutissait au mauvais dispatch. On répare l'aboutissement.
+callouté-sans-preuve **la seule route qui peut produire la preuve manquante** :
+avec le routage corrigé, promouvoir `ready` déclenche un `dev-groom`. Le churn
+mesuré n'était pas un excès de promotions, c'était une promotion qui aboutissait
+au mauvais dispatch. On répare l'aboutissement.
+
+**Et ce n'est pas une garantie de convergence — la limite est nommée.** Si le
+plan résout encore sur la branche de dispatch, le `dev-groom` répond
+`already_groomed` (mika#2012) et ne frappe **aucune** preuve : le ticket
+repassera au tour suivant, borné par le budget de re-drive de mika#2020, au
+même endroit qu'avant ce ticket. Ce que le routage achète est le cas où le plan
+n'est plus sur la branche — là le groom converge. Coût assumé : cette tentative
+consomme désormais un subprocess et le slot `groom`, là où l'étape 9d la
+refusait à bon marché. Voir la halte 6 de la sonde S3 dans le `CLAUDE.md`
+racine.
 
 **`route_for` / `routing_note` sont des fonctions pures**, extraites du corps du
 handler parce que le bras `ProofUnreadable` n'est pas atteignable de bout en

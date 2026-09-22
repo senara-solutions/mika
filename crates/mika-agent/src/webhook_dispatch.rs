@@ -64,6 +64,10 @@ pub(crate) fn is_ready_label_dispatch_marker(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
+/// Le verbe d'intention, à un seul site — il décide d'un refus d'outil et son
+/// orthographe est donc porteuse.
+const GROOMING_INTENT_VERB: &str = "groom";
+
 /// True when the turn was opened by an **explicit grooming request**
 /// (mika#2484 D5).
 ///
@@ -95,10 +99,6 @@ pub(crate) fn is_ready_label_dispatch_marker(msg: &str) -> bool {
 /// qui commence par `[GitHub] Issue labeled ready on` sur le chemin webhook ou
 /// par le texte d'une revue de PR sur la relance de verdict. Aucun des quatre
 /// ne commence par `groom `.
-/// Le verbe d'intention, à un seul site — il décide d'un refus d'outil et son
-/// orthographe est donc porteuse.
-const GROOMING_INTENT_VERB: &str = "groom";
-
 pub(crate) fn is_grooming_intent_message(msg: &str) -> bool {
     let trimmed = msg.trim_start();
     let Some(rest) = trimmed.get(..GROOMING_INTENT_VERB.len()) else {

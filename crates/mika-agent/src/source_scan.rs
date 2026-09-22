@@ -112,12 +112,23 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
 /// Cette fonction ne tronque pas le code de test : c'est à l'appelant de
 /// décider de sa moitié de production, les gardes n'ayant pas toutes la même
 /// borne.
+///
+/// # Une ligne qui commence par `*` n'est pas forcément un commentaire
+///
+/// `*guard = x;` et la continuation d'une multiplication sont du Rust valide
+/// commençant par `*`. Les retirer aveuglément rendrait **invisible** au scan
+/// toute lecture écrite sur une telle ligne : la garde resterait verte pendant
+/// que la divergence qu'elle existe pour refuser reviendrait. La continuation
+/// d'un bloc `/* … */` s'écrit `* ` ou `*/`, jamais `*identifiant` — c'est ce
+/// que le prédicat ci-dessous distingue.
 pub(crate) fn fn_bodies(src: &str) -> Vec<(String, String)> {
     let stripped: String = src
         .lines()
         .filter(|l| {
             let t = l.trim_start();
-            !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            let block_continuation =
+                t == "*" || t.starts_with("* ") || t.starts_with("*/") || t.starts_with("*\t");
+            !(t.starts_with("//") || t.starts_with("/*") || block_continuation)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -166,6 +177,50 @@ mod tests {
         assert!(is_test_source_path(Path::new(
             "/repo/crates/mika-agent/src/perimeter/tests.rs"
         )));
+    }
+
+    /// Une ligne de code commençant par `*` doit survivre au dépouillement des
+    /// commentaires (mika#2484).
+    ///
+    /// **C'est la moitié porteuse du helper.** Un filtre qui retire toute ligne
+    /// commençant par `*` avale `*guard = x;`, donc rend **invisible** aux
+    /// gardes structurelles toute lecture écrite sur une telle ligne : le scan
+    /// resterait vert pendant que la divergence qu'il refuse reviendrait. Aucun
+    /// test de la garde elle-même ne peut voir ça — elle passerait.
+    #[test]
+    fn mika2484_a_deref_line_is_code_not_a_comment() {
+        let src = "\
+fn writes_through_a_guard(db: &Db) {
+    let mut guard = lock();
+    *guard = db.has_completed_groom_for_issue(\"u\");
+}
+
+fn unrelated() {
+    /* bloc
+     * continuation
+     */
+    let _ = 1;
+}
+";
+        let bodies = fn_bodies(src);
+        let (_, writer) = bodies
+            .iter()
+            .find(|(name, _)| name == "writes_through_a_guard")
+            .expect("la fonction doit être découpée");
+        assert!(
+            writer.contains("has_completed_groom_for_issue"),
+            "une ligne de déréférencement a été prise pour un commentaire — \
+             toute garde bâtie sur ce découpage devient décorative : {writer}"
+        );
+
+        let (_, other) = bodies
+            .iter()
+            .find(|(name, _)| name == "unrelated")
+            .expect("la seconde fonction doit être découpée");
+        assert!(
+            !other.contains("continuation"),
+            "la continuation d'un bloc /* */ reste un commentaire : {other}"
+        );
     }
 
     #[test]
