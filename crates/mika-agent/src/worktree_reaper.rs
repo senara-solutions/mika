@@ -187,13 +187,61 @@ pub const ALL_REFUSAL_REASONS: &[&str] = &[
     REASON_PROCESS_SCAN_UNREADABLE,
 ];
 
-/// `audit_events.tool_name` écrit à chaque retrait.
+/// `audit_events.tool_name` écrit à chaque retrait **effectif** — et event
+/// tracing de la même ligne : une seule constante sert les deux surfaces.
 ///
 /// **SOLE WRITER** — ce module est le seul site qui écrit ce nom. C'est ce qui
 /// fait de `SELECT … WHERE tool_name = 'worktree_reaped'` la liste exacte des
 /// worktrees que la boucle a retirés, donc la réponse directe au garde-fou 3 du
-/// ticket.
+/// ticket. **Réservé à `armed`** (mika#2469) : en `observe` la même ligne
+/// s'écrit sous [`WOULD_DISPOSE_TOOL`], jamais sous ce nom — sinon la requête
+/// ci-dessus compterait des observations parmi les retraits, en silence.
 pub const REAPED_TOOL: &str = "worktree_reaped";
+
+/// `audit_events.tool_name` (et event tracing) écrit en `observe` **à la place
+/// de** [`REAPED_TOOL`] : la population qui *serait* retirée (mika#2469).
+///
+/// Même contrat SOLE WRITER que son aîné, tenu par la même garde à deux
+/// needles. Avant mika#2469, `observe` écrivait `worktree_reaped` avec
+/// `disposition=observe` dans `reasoning` : les lignes antérieures au
+/// déploiement se distinguent par ce champ, pas par le nom.
+pub const WOULD_DISPOSE_TOOL: &str = "worktree_reap_would_dispose";
+
+/// Message INFO d'un retrait effectif (`armed`). Texte historique, inchangé.
+pub const REAPED_MESSAGE: &str = "worktree_reap: worktree de PR terminale retiré";
+
+/// Message INFO d'un candidat éligible en `observe` : nomme l'éligibilité
+/// **et** nie le retrait dans la même phrase, pour qu'un lecteur qui ne voit
+/// que le message (grep, tail, alerte) sache qu'il ne s'est rien passé.
+pub const WOULD_DISPOSE_MESSAGE: &str =
+    "worktree_reap: worktree de PR terminale éligible — observe, non retiré";
+
+/// Ce que le tick écrit pour un candidat qui a franchi les sept termes, selon
+/// ce qui lui est **réellement** arrivé (mika#2469, règle mika#2249 : une ligne
+/// ne revendique jamais une disposition qui n'a pas eu lieu).
+///
+/// `event` sert à la fois d'event tracing et de `tool_name` d'audit — c'est
+/// l'invariant historique, rendu explicite : les deux surfaces ne peuvent pas
+/// diverger sans toucher [`outcome_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    pub event: &'static str,
+    pub message: &'static str,
+}
+
+/// Source unique du triplet (event, tool_name, message) par disposition.
+pub fn outcome_for(disposition: Disposition) -> Outcome {
+    match disposition {
+        Disposition::Armed => Outcome {
+            event: REAPED_TOOL,
+            message: REAPED_MESSAGE,
+        },
+        Disposition::Observe => Outcome {
+            event: WOULD_DISPOSE_TOOL,
+            message: WOULD_DISPOSE_MESSAGE,
+        },
+    }
+}
 
 /// `audit_events.tool_name` écrit à chaque refus, dédupliqué sur 24 h.
 pub const SKIPPED_TOOL: &str = "worktree_reap_skipped";
@@ -1860,19 +1908,26 @@ mod tests {
         }
     }
 
-    /// Le `tool_name` d'audit des retraits a **un seul writer** dans le crate.
+    /// Les `tool_name` d'audit des retraits **et** des observations ont **un
+    /// seul writer** dans le crate.
     ///
     /// Un test comportemental ne peut pas voir cette classe : un second writer
     /// ne rendrait aucune décision fausse, il rendrait
-    /// `SELECT … WHERE tool_name = 'worktree_reaped'` inexacte, en silence.
+    /// `SELECT … WHERE tool_name = 'worktree_reaped'` (ou sa jumelle
+    /// `'worktree_reap_would_dispose'`, mika#2469) inexacte, en silence.
+    /// L'allowlist est **vide** et le reste : quand la garde tire, on retire le
+    /// second site, on n'y ajoute pas une entrée.
     #[test]
     fn mika2420_le_tool_name_daudit_a_un_seul_writer() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this_module = src_root.join("worktree_reaper.rs");
-        // Écrit en deux morceaux pour que la garde ne se dénonce pas elle-même.
-        let needle = format!("worktree{}", "_reaped");
+        // Écrites en deux morceaux pour que la garde ne se dénonce pas elle-même.
+        let needles = [
+            format!("worktree{}", "_reaped"),
+            format!("worktree_reap_{}", "would_dispose"),
+        ];
 
-        let mut offenders = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
         let mut stack = vec![src_root.clone()];
         let mut scanned = 0usize;
         while let Some(dir) = stack.pop() {
@@ -1890,19 +1945,87 @@ mod tests {
                 }
                 let content = std::fs::read_to_string(&path).expect("lecture de fichier source");
                 scanned += 1;
-                if content.contains(&needle) {
-                    offenders.push(path.display().to_string());
+                for needle in &needles {
+                    if content.contains(needle.as_str()) {
+                        offenders.push(format!("{} — `{needle}`", path.display()));
+                    }
                 }
             }
         }
         assert!(scanned > 0, "la garde n'a scanné aucun fichier");
         assert!(
             offenders.is_empty(),
-            "mika#2420 — `{needle}` est SOLE WRITER de `worktree_reaper.rs`. \
-             Un second writer rendrait la requête opérateur inexacte sans rien \
-             casser.\n{}",
+            "mika#2420/mika#2469 — `worktree_reaped` et `worktree_reap_would_dispose` \
+             sont SOLE WRITER de `worktree_reaper.rs`. Un second writer rendrait \
+             la requête opérateur inexacte sans rien casser.\n{}",
             offenders.join("\n")
         );
+    }
+
+    // -- mika#2469 : en observe, la ligne dit ce qu'elle ferait ---------------
+
+    /// T1 (R2/R3) — en `observe`, l'audit ne revendique pas un retrait : la
+    /// ligne s'appelle `worktree_reap_would_dispose`, et **aucune** ligne
+    /// `worktree_reaped` n'existe.
+    #[tokio::test]
+    async fn mika2469_en_observe_laudit_ne_revendique_pas_un_retrait() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let candidate = ReapCandidate {
+            path: WT.to_string(),
+            branch: "fix/2469/x".to_string(),
+            pr_number: 2469,
+            pr_state: "MERGED".to_string(),
+            pr_url: "https://github.com/senara-solutions/mika/pull/2469".to_string(),
+        };
+        let size = SizeMeasurement {
+            bytes: Some(1_000),
+            truncated: false,
+        };
+        record_reaped(
+            &db,
+            "session-2469",
+            &candidate,
+            &size,
+            Disposition::Observe,
+            "trace-1",
+        )
+        .await;
+
+        let events = db.get_audit_events("session-2469").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == WOULD_DISPOSE_TOOL)
+            .expect("une ligne worktree_reap_would_dispose doit exister en observe");
+        assert_eq!(row.target_key, format!("worktree:{WT}"));
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("disposition=observe"), "{reasoning}");
+        assert!(
+            !events.iter().any(|e| e.tool_name == REAPED_TOOL),
+            "en observe, aucune ligne `worktree_reaped` ne doit être écrite"
+        );
+    }
+
+    /// T2 (R4, D2) — le triplet a une seule source, et les deux messages sont
+    /// pinés à l'octet près (F3 arch : tester la chose, pas une ombre).
+    #[test]
+    fn mika2469_le_triplet_a_une_seule_source() {
+        let armed = outcome_for(Disposition::Armed);
+        let observe = outcome_for(Disposition::Observe);
+        assert_eq!(armed.event, REAPED_TOOL);
+        assert_eq!(armed.message, REAPED_MESSAGE);
+        assert_eq!(observe.event, WOULD_DISPOSE_TOOL);
+        assert_eq!(observe.message, WOULD_DISPOSE_MESSAGE);
+        assert_ne!(armed.event, observe.event);
+        assert_eq!(
+            REAPED_MESSAGE,
+            "worktree_reap: worktree de PR terminale retiré"
+        );
+        assert_eq!(
+            WOULD_DISPOSE_MESSAGE,
+            "worktree_reap: worktree de PR terminale éligible — observe, non retiré"
+        );
+        // En surplus : documente l'intention si la constante est un jour reformulée.
+        assert!(WOULD_DISPOSE_MESSAGE.contains("non retiré"));
     }
 
     // -- V5 : le cap est un cap sur les écritures ---------------------------
