@@ -1284,8 +1284,12 @@ pub async fn reap_terminal_worktrees(
                 bytes_total = bytes_total.saturating_add(b);
             }
 
+            // mika#2469 : le triplet (event, tool_name, message) vient d'un seul
+            // site — en `observe` la ligne dit ce qu'elle *ferait*, jamais
+            // « retiré ».
+            let outcome = outcome_for(cfg.disposition);
             info!(
-                event = REAPED_TOOL,
+                event = outcome.event,
                 worktree_path = %candidate.path,
                 branch = %candidate.branch,
                 pr_number = candidate.pr_number,
@@ -1297,7 +1301,8 @@ pub async fn reap_terminal_worktrees(
                 branch_deleted = removal.branch_deleted,
                 disposition = cfg.disposition.as_str(),
                 trace_id,
-                "worktree_reap: worktree de PR terminale retiré"
+                "{}",
+                outcome.message
             );
             record_reaped(db, session_id, &candidate, &size, cfg.disposition, trace_id).await;
         }
@@ -1360,7 +1365,7 @@ async fn record_reaped(
     if let Err(e) = db
         .log_audit_event(
             session_id,
-            REAPED_TOOL,
+            outcome_for(disposition).event,
             &reaped_audit_key(&candidate.path),
             None,
             size.bytes.map(|b| b.to_string()).as_deref(),
