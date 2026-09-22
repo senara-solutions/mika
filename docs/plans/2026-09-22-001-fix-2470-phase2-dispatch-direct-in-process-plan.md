@@ -20,7 +20,7 @@ observable ». Le filet a « réussi » trois fois sans rien dispatcher.
 ### Ce que la lecture du code confirme — mot pour mot le corps du ticket
 
 La boucle de sauvetage de `phase2_reconcile_stuck_ready`
-(`crates/mika-agent/src/auto_pull.rs:3925-3969`) fait, pour chaque survivant :
+(`crates/mika-agent/src/auto_pull.rs:3867-3967`) fait, pour chaque survivant :
 
 ```
 promotion_gate_allows(…)                     // porte de fraîcheur de branche
@@ -204,8 +204,10 @@ ce plan ne le duplique pas. `auto_pull` écrit **sa** ligne :
 
 - `tool_name = "stuck_ready_direct_dispatch"`, `target_key = "issue:<n>"`,
   `after_value ∈ {dispatched, handled, passthrough}` (le `action_label` du
-  `VerdictAction`), `detail = "issue=<n> action=<a> task_id=<id|none>"`,
-  `trace_id` du tick.
+  `VerdictAction`), `reasoning = "issue=<n> action=<a> task_id=<id|none>"`
+  (le paramètre de `AsyncDatabase::log_audit_event`, colonne
+  `audit_events.reasoning` — il n'y a pas de colonne `detail`), `trace_id` du
+  tick.
 
 `SELECT after_value, count(*) FROM audit_events WHERE tool_name =
 'stuck_ready_direct_dispatch' GROUP BY 1` répond « combien de sauvetages ont
@@ -324,7 +326,7 @@ défaut). Puis `log_audit_event("stuck_ready_direct_dispatch", …)` (D5). Puis
 le churn inchangé. Enrichir `info!(issue = n, "stuck_ready_reconciled")` avec
 `direct_dispatch = action_label, task_id = …`.
 
-Réécrire le commentaire de tête de la boucle (`auto_pull.rs:3919-3924`) :
+Réécrire le commentaire de tête de la boucle (`auto_pull.rs:3867-3871`) :
 « Option A — reuse the webhook pipeline » devient la description de D3.
 
 ### U4 — Doc module et `CLAUDE.md` du crate
@@ -358,7 +360,10 @@ sans un chantier hors périmètre.
 
 **Mutation :** inverser l'ordre dans U3 (churn puis dispatch) → T7 rougit
 seul. Retirer le fetcher injecté (passer `fetch_issue_body_and_labels_via_gh`)
-→ T2 rougit seul (`BodyFetchFailed`, zéro parente).
+→ **T2, T3 et T4 rougissent** (`body_fetch_failed` à l'étape 4 du handler, zéro
+parente : les trois passent par `fetch_issue` avec le jeton `"fake"`) ; **T5
+reste vert** parce que la porte 2c (`pilot_in_flight`) précède l'étape 4 ;
+T1, T6, T7 inchangés.
 
 `cargo test -p mika-agent`, `cargo clippy --all-targets -- -D warnings`,
 `cargo fmt --check` verts.
@@ -368,7 +373,8 @@ seul. Retirer le fetcher injecté (passer `fetch_issue_body_and_labels_via_gh`)
 ## Definition of Done
 
 - [ ] U1–U4 livrés.
-- [ ] T1–T7 verts ; les deux mutations vérifiées (T7 seul, T2 seul).
+- [ ] T1–T7 verts ; les deux mutations vérifiées (ordre inversé → T7 seul ;
+      fetcher retiré → T2+T3+T4 rouges, T5 vert).
 - [ ] `ready_label_handler.rs` : diff **vide**.
 - [ ] Constantes `STUCK_READY_THRESHOLD_DEFAULT_SECS`, `MAX_STUCK_RESCUE_PER_TICK`,
       `CIRCUIT_BREAKER_THRESHOLD`, budget re-drive : inchangées.
@@ -453,7 +459,7 @@ construction, et rouge si un futur diff inverse l'ordre. Pas d'allowlist.
 Après déploiement, au premier `stuck_ready_reconciled` réel :
 
 ```sql
-select a.target_key, a.after_value, a.detail, a.trace_id
+select a.target_key, a.after_value, a.reasoning, a.trace_id
   from audit_events a where a.tool_name = 'stuck_ready_direct_dispatch'
  order by a.created_at desc limit 5;
 select count(*) from tasks
@@ -517,7 +523,7 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
 
 ## Références
 
-- `crates/mika-agent/src/auto_pull.rs:3562-3969` — `phase2_reconcile_stuck_ready`, boucle de sauvetage `:3919-3969`.
+- `crates/mika-agent/src/auto_pull.rs:3575-3969` — `phase2_reconcile_stuck_ready`, boucle de sauvetage `:3867-3967`.
 - `crates/mika-agent/src/auto_pull.rs:2953-2981` — `apply_ready_label` (ré-écriture, pas de dispatch).
 - `crates/mika-agent/src/ready_label.rs:580-649` — `apply_ready` → `write_ready_label`.
 - `crates/mika-agent/src/server/ready_label_handler.rs:337-464` — entrées publiques, couture `_with_fetcher`.
@@ -533,6 +539,18 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
 
 ## Revision history
 
+- 2026-09-22 — v4, `/ce:plan` mode reprise (pipeline `/mika`, orchestrator-CC) :
+  vérification de confiance contre `origin/main` (branche 0 derrière). Ancres
+  structurelles tenues ; dérive de lignes seulement (`phase2_reconcile_stuck_ready`
+  à `auto_pull.rs:3575`, boucle de sauvetage `:3867-3967`, commentaire « Option A »
+  `:3867`). Une précision d'exécutabilité pour U3/D5 : `action_label` est **privé**
+  à `ready_label_handler.rs` (`fn action_label`, `:195`) — `auto_pull` mappe
+  `VerdictAction` → `{dispatched, handled, passthrough}` par un `match` local à
+  trois bras, mêmes valeurs, pour tenir la case DoD « diff vide sur le handler ».
+  Revue doc (`/ce:doc-review`, coherence + feasibility) : trois citations de
+  lignes réalignées ; D5/S1 corrigés `detail` → `reasoning` (seule colonne
+  d'`audit_events` qui existe) ; mutation « fetcher retiré » précisée (T2+T3+T4
+  rouges, T5 vert — T3/T4 passent aussi par l'étape 4 `fetch_issue`).
 - 2026-09-22 — v1, /ce:plan par orchestrator-CC, avant première passe mika-arch.
 - 2026-09-22 — v3, seconde passe mika-arch : **Verdict: GROOMED** (même session,
   kimi-k3). F1/F2/F3 RESOLVED, aucun constat nouveau. Précision non bloquante
