@@ -74,7 +74,7 @@
 //! | levier | effet | quand |
 //! |---|---|---|
 //! | `MIKA_WORKTREE_REAP=0` | **annule la row récurrente** | au démarrage, désactivation durable |
-//! | `MIKA_WORKTREE_REAP_DISPOSITION=observe` | le scan mesure et journalise, **ne supprime rien** | validation d'une nouvelle machine |
+//! | `MIKA_WORKTREE_REAP_DISPOSITION=observe` | le scan mesure et journalise, **ne supprime rien** — écrit `worktree_reap_would_dispose`, jamais `worktree_reaped` (mika#2469) | validation d'une nouvelle machine |
 //! | le fichier sentinelle de [`crate::auto_pull_stop::WORKTREE_REAP_SCAN`] | court-circuite le tick | **pendant un incident, à chaud** |
 //!
 //! Le troisième est lu par [`crate::auto_pull_stop`], déjà paramétré par nom de
@@ -187,19 +187,220 @@ pub const ALL_REFUSAL_REASONS: &[&str] = &[
     REASON_PROCESS_SCAN_UNREADABLE,
 ];
 
-/// `audit_events.tool_name` écrit à chaque retrait.
+/// `audit_events.tool_name` écrit à chaque retrait **effectif** — et event
+/// tracing de la même ligne : une seule constante sert les deux surfaces.
 ///
 /// **SOLE WRITER** — ce module est le seul site qui écrit ce nom. C'est ce qui
 /// fait de `SELECT … WHERE tool_name = 'worktree_reaped'` la liste exacte des
 /// worktrees que la boucle a retirés, donc la réponse directe au garde-fou 3 du
-/// ticket.
+/// ticket. **Réservé à `armed`** (mika#2469) : en `observe` la même ligne
+/// s'écrit sous [`WOULD_DISPOSE_TOOL`], jamais sous ce nom — sinon la requête
+/// ci-dessus compterait des observations parmi les retraits, en silence.
 pub const REAPED_TOOL: &str = "worktree_reaped";
+
+/// `audit_events.tool_name` (et event tracing) écrit en `observe` **à la place
+/// de** [`REAPED_TOOL`] : la population qui *serait* retirée (mika#2469).
+///
+/// Même contrat SOLE WRITER que son aîné, tenu par la même garde à deux
+/// needles. Avant mika#2469, `observe` écrivait `worktree_reaped` avec
+/// `disposition=observe` dans `reasoning` : les lignes antérieures au
+/// déploiement se distinguent par ce champ, pas par le nom.
+pub const WOULD_DISPOSE_TOOL: &str = "worktree_reap_would_dispose";
+
+/// Message INFO d'un retrait effectif (`armed`). Texte historique, inchangé.
+pub const REAPED_MESSAGE: &str = "worktree_reap: worktree de PR terminale retiré";
+
+/// Message INFO d'un candidat éligible en `observe` : nomme l'éligibilité
+/// **et** nie le retrait dans la même phrase, pour qu'un lecteur qui ne voit
+/// que le message (grep, tail, alerte) sache qu'il ne s'est rien passé.
+pub const WOULD_DISPOSE_MESSAGE: &str =
+    "worktree_reap: worktree de PR terminale éligible — observe, non retiré";
+
+/// Ce que le tick écrit pour un candidat qui a franchi les sept termes, selon
+/// ce qui lui est **réellement** arrivé (mika#2469, règle mika#2249 : une ligne
+/// ne revendique jamais une disposition qui n'a pas eu lieu).
+///
+/// `event` sert à la fois d'event tracing et de `tool_name` d'audit — c'est
+/// l'invariant historique, rendu explicite : les deux surfaces ne peuvent pas
+/// diverger sans toucher [`outcome_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outcome {
+    pub event: &'static str,
+    pub message: &'static str,
+}
+
+/// Source unique du triplet (event, tool_name, message) par disposition.
+pub fn outcome_for(disposition: Disposition) -> Outcome {
+    match disposition {
+        Disposition::Armed => Outcome {
+            event: REAPED_TOOL,
+            message: REAPED_MESSAGE,
+        },
+        Disposition::Observe => Outcome {
+            event: WOULD_DISPOSE_TOOL,
+            message: WOULD_DISPOSE_MESSAGE,
+        },
+    }
+}
 
 /// `audit_events.tool_name` écrit à chaque refus, dédupliqué sur 24 h.
 pub const SKIPPED_TOOL: &str = "worktree_reap_skipped";
 
 /// Horizon de déduplication des refus (D9, doctrine mika#2131).
 const REFUSAL_DEDUP_SECS: i64 = 86_400;
+
+// ---------------------------------------------------------------------------
+// La sonde de saleté du checkout principal (mika#2449)
+// ---------------------------------------------------------------------------
+
+/// `audit_events.tool_name` écrit quand un checkout **principal** configuré
+/// porte des modifications non committées (mika#2449 R3).
+///
+/// **SOLE WRITER** — ce module est le seul site qui écrit ce nom, épinglé par
+/// [`tests::mika2449_le_tool_name_main_checkout_dirty_a_un_seul_writer`]. Un
+/// second writer rendrait inexacte, en silence, la requête d'attribution que
+/// chaque ligne recopie.
+///
+/// # Pourquoi cette sonde vit ici (D2)
+///
+/// Le faucheur énumère **déjà** les checkouts via `MIKA_WORKTREE_REAP_REPO_DIRS`
+/// (défaut : `/data/workspace/mika-platform/mika` — exactement le checkout sali
+/// le 2026-09-21), tourne **déjà** sur un tick, écrit **déjà** ses lignes
+/// d'audit. Coût : un `git status --porcelain` par checkout et par tick. Zéro
+/// nouvelle variable, zéro nouveau scan récurrent.
+///
+/// # Ce que la sonde fait, et ne fait PAS (D3, D5, R5)
+///
+/// Elle **date** : la prochaine occurrence a un instant, et la requête
+/// `tool_calls` qui **nomme** le producteur (celle qui a résolu M0 en une
+/// requête) est recopiée dans le `reasoning` avec ses bornes. Elle ne nomme
+/// **aucun producteur elle-même** — écrire « le dernier dispatch » serait la
+/// dérivation tardive que mika#2368 refuse. Elle ne nettoie **rien** : ni pop,
+/// ni stash, ni reset (décision Vincent). Et elle ne **bloque rien** : un
+/// checkout principal sale n'empêche pas un dispatch (le worktree est ailleurs,
+/// les trois PR du sinistre ont abouti) ; il empêche un `pull --ff-only`, un
+/// geste d'opérateur. Refuser le dispatch coucherait la boucle pour un défaut de
+/// poste de build.
+pub const MAIN_CHECKOUT_DIRTY_TOOL: &str = "main_checkout_dirty";
+
+/// Plafond de chemins portés par une ligne (même valeur que `DIRTY_FILES` de
+/// `dispatch-lib.sh`, `head -20`). **Jamais** de contenu de fichier.
+const MAIN_CHECKOUT_DIRTY_MAX_PATHS: usize = 20;
+
+/// Borne de temps du `git status` de la sonde. Un checkout sur un disque lent
+/// ne doit pas retenir le tick : au-delà, le checkout est « illisible », ce
+/// qui est un signal nommé, jamais « propre ».
+const MAIN_CHECKOUT_STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// L'état d'un checkout principal, tel que [`classify_main_checkout`] le lit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainCheckoutState {
+    /// `git status --porcelain` vide. **Zéro ligne** (AC4).
+    Clean,
+    /// Au moins une entrée. `files` est plafonné à
+    /// [`MAIN_CHECKOUT_DIRTY_MAX_PATHS`] ; `file_count` est le compte **réel**.
+    Dirty {
+        file_count: usize,
+        files: Vec<String>,
+        truncated: bool,
+        /// Empreinte stable de la liste complète (ordre indifférent) — la clé
+        /// de déduplication : même liste sur deux ticks = une ligne ; liste
+        /// changée = une seconde (D4).
+        fingerprint: String,
+    },
+    /// `git status` n'a pas répondu ou a échoué. Sort le checkout de la
+    /// population **et le dit** — jamais replié sur `Clean` (R6, D5).
+    Unreadable,
+}
+
+/// Fonction **pure** : décide l'état d'un checkout depuis la sortie de
+/// `git status --porcelain` (`None` = commande échouée ou hors délai).
+///
+/// Testable sans git. Les chemins sont les lignes porcelain entières (statut
+/// et chemin, ex. `M  scripts/x`, `?? site/y`), triées pour que l'empreinte ne
+/// dépende pas de l'ordre de sortie.
+pub fn classify_main_checkout(status_porcelain: Option<&str>) -> MainCheckoutState {
+    let Some(out) = status_porcelain else {
+        return MainCheckoutState::Unreadable;
+    };
+    let mut lines: Vec<String> = out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
+        return MainCheckoutState::Clean;
+    }
+    lines.sort();
+    let file_count = lines.len();
+    let fingerprint = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        for l in &lines {
+            l.hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    };
+    let truncated = file_count > MAIN_CHECKOUT_DIRTY_MAX_PATHS;
+    lines.truncate(MAIN_CHECKOUT_DIRTY_MAX_PATHS); // safe-byte-slice: Vec<String> element count, not a byte offset into a str
+    MainCheckoutState::Dirty {
+        file_count,
+        files: lines,
+        truncated,
+        fingerprint,
+    }
+}
+
+/// Clé d'audit de la sonde : `main_checkout:<repo_dir>@<empreinte>`.
+///
+/// L'empreinte est **dans la clé** pour que la déduplication soit par
+/// `(checkout, liste)`, sur le modèle de [`refusal_audit_key`] et de
+/// `pr:{repo}#{n}@{sha}` (mika#2347). Le préfixe `main_checkout:<repo_dir>`
+/// reste stable, donc `WHERE target_key LIKE 'main_checkout:/data/…/mika@%'`
+/// liste toutes les saletés d'un même checkout.
+pub fn main_checkout_audit_key(repo_dir: &str, fingerprint: &str) -> String {
+    format!("main_checkout:{repo_dir}@{fingerprint}")
+}
+
+/// La requête d'attribution que la ligne d'audit recopie (§ Sondes 1b du plan).
+///
+/// Bornes : `window_start` = le dernier tick où ce checkout a été vu **propre**
+/// par ce process (« unknown » après un redémarrage ou au premier tick),
+/// `window_end` = l'instant de la détection. Le filtre de chemin porte les deux
+/// derniers segments du checkout (`mika-platform/mika`), qui est la forme que
+/// les commandes mesurées écrivent (`cd ~/workspace/mika-platform/mika`).
+pub fn main_checkout_attribution_query(
+    repo_dir: &str,
+    window_start: Option<&str>,
+    window_end: &str,
+) -> String {
+    let tail = {
+        let parts: Vec<&str> = repo_dir.trim_end_matches('/').rsplit('/').take(2).collect();
+        parts.iter().rev().cloned().collect::<Vec<_>>().join("/")
+    };
+    let start = window_start.unwrap_or("<dernier tick propre : inconnu, prendre la ligne main_checkout_dirty précédente ou le dernier déploiement>");
+    format!(
+        "SELECT id, agent_id, session_id, created_at, substr(input, 1, 200) FROM tool_calls \
+         WHERE tool_name = 'run_shell' AND created_at BETWEEN '{start}' AND '{window_end}' \
+         AND input LIKE '%{tail}%' AND (input LIKE '%checkout %--%' OR input LIKE '%stash%' \
+         OR input LIKE '%reset%' OR input LIKE '%merge%' OR input LIKE '%pull%') \
+         ORDER BY created_at;"
+    )
+}
+
+/// Le dernier instant où chaque checkout a été vu propre **par ce process**.
+///
+/// En mémoire, perdu au redémarrage **à dessein** : « checkout propre ⇒ zéro
+/// ligne » (AC4) interdit de persister les ticks propres, et un process neuf
+/// dit « inconnu » plutôt que d'inventer une borne. C'est la borne basse de la
+/// requête d'attribution ; sans elle la requête n'a pas de fenêtre et
+/// l'enquête repart de zéro (M4).
+fn last_clean_ticks() -> &'static std::sync::Mutex<HashMap<String, DateTime<Utc>>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<HashMap<String, DateTime<Utc>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 
 // ---------------------------------------------------------------------------
 // Configuration — trois paliers
@@ -231,7 +432,8 @@ const DEFAULT_REPO_DIR: &str = "/data/workspace/mika-platform/mika";
 /// Le scan supprime-t-il, ou se contente-t-il de mesurer ?
 ///
 /// Patron de mika#2249 : *la détection est inconditionnelle, seule la
-/// disposition est gardée*. En observation, les lignes d'audit sont écrites avec
+/// disposition est gardée*. En observation, les lignes d'audit sont écrites sous
+/// [`WOULD_DISPOSE_TOOL`] (jamais [`REAPED_TOOL`], mika#2469) avec
 /// `disposition: "observe"`, ce qui donne à l'opérateur la population exacte qui
 /// *serait* supprimée, avant de l'armer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1105,6 +1307,11 @@ pub async fn reap_terminal_worktrees(
             continue;
         }
 
+        // mika#2449 U3 — la sonde de saleté du checkout principal. Après la
+        // garde ci-dessus (un chemin sans dépôt n'est pas un signal), avant le
+        // registre. Son résultat n'entre dans aucun compte de ce tick.
+        let _ = probe_main_checkout(db, session_id, repo_dir, now, trace_id).await;
+
         let Some(porcelain) = run_git(repo_dir, &["worktree", "list", "--porcelain"]).await else {
             warn!(
                 event = "worktree_reap_failed",
@@ -1236,8 +1443,12 @@ pub async fn reap_terminal_worktrees(
                 bytes_total = bytes_total.saturating_add(b);
             }
 
+            // mika#2469 : le triplet (event, tool_name, message) vient d'un seul
+            // site — en `observe` la ligne dit ce qu'elle *ferait*, jamais
+            // « retiré ».
+            let outcome = outcome_for(cfg.disposition);
             info!(
-                event = REAPED_TOOL,
+                event = outcome.event,
                 worktree_path = %candidate.path,
                 branch = %candidate.branch,
                 pr_number = candidate.pr_number,
@@ -1249,7 +1460,8 @@ pub async fn reap_terminal_worktrees(
                 branch_deleted = removal.branch_deleted,
                 disposition = cfg.disposition.as_str(),
                 trace_id,
-                "worktree_reap: worktree de PR terminale retiré"
+                "{}",
+                outcome.message
             );
             record_reaped(db, session_id, &candidate, &size, cfg.disposition, trace_id).await;
         }
@@ -1289,6 +1501,186 @@ pub fn refusal_audit_key(path: &str, reason: &str) -> String {
     format!("worktree:{path}@{reason}")
 }
 
+/// Sonde le checkout principal `repo_dir` et écrit, dédupliqué, s'il est sale.
+///
+/// **Non bloquant, fail-open** : rien de ce qui sort d'ici ne change le
+/// verdict de fauche, le compte fauché ni le compte d'échecs du tick (AC7).
+/// Rend l'état lu, pour les tests.
+///
+/// # Le placement est porteur (U3)
+///
+/// Appelée **après** la garde `repo_dir.join(".git").exists()` du faucheur —
+/// et re-vérifiée ici, ceinture et bretelles. En tête de boucle, la sonde
+/// sonderait un chemin sans dépôt : en production conteneurisée, chaque
+/// checkout configuré produirait une émission « illisible » à chaque tick,
+/// pour toujours. « Pas de checkout à ce chemin » et « `git status` illisible
+/// sur un checkout réel » sont **deux** états, et seul le second est un signal.
+async fn probe_main_checkout(
+    db: &AsyncDatabase,
+    session_id: &str,
+    repo_dir: &Path,
+    now: DateTime<Utc>,
+    trace_id: &str,
+) -> MainCheckoutState {
+    if !repo_dir.join(".git").exists() {
+        // Hors population par construction : le faucheur a déjà émis
+        // `worktree_reap_no_checkout` pour ce chemin.
+        return MainCheckoutState::Unreadable;
+    }
+    let repo_key = repo_dir.display().to_string();
+
+    // Hors délai → `None` → `Unreadable`, jamais « propre ».
+    // `--no-optional-locks` : `git status` rafraîchit l'index sous
+    // `index.lock` ; sur le checkout de déploiement, un `pull --ff-only` de
+    // l'opérateur lancé dans la même fenêtre échouerait « index.lock: File
+    // exists » — le symptôme même du ticket, produit par le diagnostic.
+    let status: Option<String> = tokio::time::timeout(
+        MAIN_CHECKOUT_STATUS_TIMEOUT,
+        run_git(repo_dir, &["--no-optional-locks", "status", "--porcelain"]),
+    )
+    .await
+    .unwrap_or_default();
+    let state = classify_main_checkout(status.as_deref());
+
+    match &state {
+        MainCheckoutState::Clean => {
+            if let Ok(mut m) = last_clean_ticks().lock() {
+                m.insert(repo_key, now);
+            }
+        }
+        MainCheckoutState::Unreadable => {
+            // Signal nommé, jamais « propre ». Une ligne par tick, comme
+            // `worktree_reap_no_checkout` : pour un état anormal, la vivacité
+            // est l'information.
+            warn!(
+                event = "main_checkout_unreadable",
+                repo_dir = %repo_key,
+                trace_id,
+                "main_checkout: `git status --porcelain` a échoué ou dépassé {}s — \
+                 checkout sorti de la population de la sonde ce tick (mika#2449)",
+                MAIN_CHECKOUT_STATUS_TIMEOUT.as_secs()
+            );
+        }
+        MainCheckoutState::Dirty {
+            file_count,
+            files,
+            truncated,
+            fingerprint,
+        } => {
+            let window_start = last_clean_ticks()
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&repo_key).copied())
+                .map(|t| crate::timestamp::format(&t));
+            record_main_checkout_dirty(
+                db,
+                session_id,
+                &repo_key,
+                *file_count,
+                files,
+                *truncated,
+                fingerprint,
+                window_start.as_deref(),
+                now,
+                trace_id,
+            )
+            .await;
+        }
+    }
+    state
+}
+
+/// Écrit la saleté **une fois par (checkout, empreinte) et par 24 h** (D4).
+///
+/// Un checkout sale le reste des jours ; une ligne par tick (144/j) déplacerait
+/// le churn que mika#2131 borne. Un **changement** de liste ré-écrit. L'horizon
+/// de 24 h : sans lui, un checkout nettoyé puis re-sali n'écrirait rien la
+/// seconde fois. La ligne WARN suit la ligne d'audit — même clé, même
+/// déduplication — pour qu'un `grep main_checkout_dirty` du journal et un
+/// `SELECT … WHERE tool_name = 'main_checkout_dirty'` comptent la même chose.
+#[allow(clippy::too_many_arguments)]
+async fn record_main_checkout_dirty(
+    db: &AsyncDatabase,
+    session_id: &str,
+    repo_dir: &str,
+    file_count: usize,
+    files: &[String],
+    truncated: bool,
+    fingerprint: &str,
+    window_start: Option<&str>,
+    now: DateTime<Utc>,
+    trace_id: &str,
+) {
+    let key = main_checkout_audit_key(repo_dir, fingerprint);
+    let since = crate::timestamp::format(
+        &now.checked_sub_signed(chrono::TimeDelta::seconds(REFUSAL_DEDUP_SECS))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+    );
+    match db
+        .count_recent_audit_events_for_target(MAIN_CHECKOUT_DIRTY_TOOL, &key, &since)
+        .await
+    {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            debug!(
+                repo_dir,
+                error = %e,
+                trace_id,
+                "main_checkout: relecture du marqueur de saleté impossible, écriture sautée"
+            );
+            return;
+        }
+    }
+
+    let window_end = crate::timestamp::format(&now);
+    let files_joined = files.join(", ");
+    let query = main_checkout_attribution_query(repo_dir, window_start, &window_end);
+    let reasoning = format!(
+        "files({file_count}{}): {files_joined}\nwindow_start={} window_end={window_end}\nattribution: {query}",
+        if truncated {
+            format!(", capped at {MAIN_CHECKOUT_DIRTY_MAX_PATHS}")
+        } else {
+            String::new()
+        },
+        window_start.unwrap_or("unknown"),
+    );
+
+    warn!(
+        event = MAIN_CHECKOUT_DIRTY_TOOL,
+        repo_dir,
+        file_count,
+        files = %files_joined,
+        truncated,
+        fingerprint,
+        window_start = window_start.unwrap_or("unknown"),
+        window_end = %window_end,
+        trace_id,
+        "main_checkout: le checkout principal porte des modifications non \
+         committées — rien n'est nettoyé ; la requête d'attribution est dans \
+         audit_events.reasoning (mika#2449)"
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            MAIN_CHECKOUT_DIRTY_TOOL,
+            &key,
+            None,
+            Some(&file_count.to_string()),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            repo_dir,
+            error = %e,
+            trace_id,
+            "main_checkout: audit write failed (dirty)"
+        );
+    }
+}
+
 async fn record_reaped(
     db: &AsyncDatabase,
     session_id: &str,
@@ -1309,10 +1701,13 @@ async fn record_reaped(
         size.truncated,
         disposition.as_str(),
     );
+    // mika#2469 : le nom écrit — et celui que le WARN d'échec nomme — vient
+    // du même site ; en `observe` la ligne d'échec ne dit pas « reaped ».
+    let outcome = outcome_for(disposition);
     if let Err(e) = db
         .log_audit_event(
             session_id,
-            REAPED_TOOL,
+            outcome.event,
             &reaped_audit_key(&candidate.path),
             None,
             size.bytes.map(|b| b.to_string()).as_deref(),
@@ -1323,9 +1718,11 @@ async fn record_reaped(
     {
         warn!(
             worktree_path = %candidate.path,
+            tool_name = outcome.event,
             error = %e,
             trace_id,
-            "worktree_reap: audit write failed (reaped)"
+            "worktree_reap: audit write failed ({})",
+            outcome.event
         );
     }
 }
@@ -1860,19 +2257,26 @@ mod tests {
         }
     }
 
-    /// Le `tool_name` d'audit des retraits a **un seul writer** dans le crate.
+    /// Les `tool_name` d'audit des retraits **et** des observations ont **un
+    /// seul writer** dans le crate.
     ///
     /// Un test comportemental ne peut pas voir cette classe : un second writer
     /// ne rendrait aucune décision fausse, il rendrait
-    /// `SELECT … WHERE tool_name = 'worktree_reaped'` inexacte, en silence.
+    /// `SELECT … WHERE tool_name = 'worktree_reaped'` (ou sa jumelle
+    /// `'worktree_reap_would_dispose'`, mika#2469) inexacte, en silence.
+    /// L'allowlist est **vide** et le reste : quand la garde tire, on retire le
+    /// second site, on n'y ajoute pas une entrée.
     #[test]
     fn mika2420_le_tool_name_daudit_a_un_seul_writer() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this_module = src_root.join("worktree_reaper.rs");
-        // Écrit en deux morceaux pour que la garde ne se dénonce pas elle-même.
-        let needle = format!("worktree{}", "_reaped");
+        // Écrites en deux morceaux pour que la garde ne se dénonce pas elle-même.
+        let needles = [
+            format!("worktree{}", "_reaped"),
+            format!("worktree_reap_{}", "would_dispose"),
+        ];
 
-        let mut offenders = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
         let mut stack = vec![src_root.clone()];
         let mut scanned = 0usize;
         while let Some(dir) = stack.pop() {
@@ -1890,19 +2294,87 @@ mod tests {
                 }
                 let content = std::fs::read_to_string(&path).expect("lecture de fichier source");
                 scanned += 1;
-                if content.contains(&needle) {
-                    offenders.push(path.display().to_string());
+                for needle in &needles {
+                    if content.contains(needle.as_str()) {
+                        offenders.push(format!("{} — `{needle}`", path.display()));
+                    }
                 }
             }
         }
         assert!(scanned > 0, "la garde n'a scanné aucun fichier");
         assert!(
             offenders.is_empty(),
-            "mika#2420 — `{needle}` est SOLE WRITER de `worktree_reaper.rs`. \
-             Un second writer rendrait la requête opérateur inexacte sans rien \
-             casser.\n{}",
+            "mika#2420/mika#2469 — `worktree_reaped` et `worktree_reap_would_dispose` \
+             sont SOLE WRITER de `worktree_reaper.rs`. Un second writer rendrait \
+             la requête opérateur inexacte sans rien casser.\n{}",
             offenders.join("\n")
         );
+    }
+
+    // -- mika#2469 : en observe, la ligne dit ce qu'elle ferait ---------------
+
+    /// T1 (R2/R3) — en `observe`, l'audit ne revendique pas un retrait : la
+    /// ligne s'appelle `worktree_reap_would_dispose`, et **aucune** ligne
+    /// `worktree_reaped` n'existe.
+    #[tokio::test]
+    async fn mika2469_en_observe_laudit_ne_revendique_pas_un_retrait() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let candidate = ReapCandidate {
+            path: WT.to_string(),
+            branch: "fix/2469/x".to_string(),
+            pr_number: 2469,
+            pr_state: "MERGED".to_string(),
+            pr_url: "https://github.com/senara-solutions/mika/pull/2469".to_string(),
+        };
+        let size = SizeMeasurement {
+            bytes: Some(1_000),
+            truncated: false,
+        };
+        record_reaped(
+            &db,
+            "session-2469",
+            &candidate,
+            &size,
+            Disposition::Observe,
+            "trace-1",
+        )
+        .await;
+
+        let events = db.get_audit_events("session-2469").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == WOULD_DISPOSE_TOOL)
+            .expect("une ligne worktree_reap_would_dispose doit exister en observe");
+        assert_eq!(row.target_key, format!("worktree:{WT}"));
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("disposition=observe"), "{reasoning}");
+        assert!(
+            !events.iter().any(|e| e.tool_name == REAPED_TOOL),
+            "en observe, aucune ligne `worktree_reaped` ne doit être écrite"
+        );
+    }
+
+    /// T2 (R4, D2) — le triplet a une seule source, et les deux messages sont
+    /// pinés à l'octet près (F3 arch : tester la chose, pas une ombre).
+    #[test]
+    fn mika2469_le_triplet_a_une_seule_source() {
+        let armed = outcome_for(Disposition::Armed);
+        let observe = outcome_for(Disposition::Observe);
+        assert_eq!(armed.event, REAPED_TOOL);
+        assert_eq!(armed.message, REAPED_MESSAGE);
+        assert_eq!(observe.event, WOULD_DISPOSE_TOOL);
+        assert_eq!(observe.message, WOULD_DISPOSE_MESSAGE);
+        assert_ne!(armed.event, observe.event);
+        assert_eq!(
+            REAPED_MESSAGE,
+            "worktree_reap: worktree de PR terminale retiré"
+        );
+        assert_eq!(
+            WOULD_DISPOSE_MESSAGE,
+            "worktree_reap: worktree de PR terminale éligible — observe, non retiré"
+        );
+        // En surplus : documente l'intention si la constante est un jour reformulée.
+        assert!(WOULD_DISPOSE_MESSAGE.contains("non retiré"));
     }
 
     // -- V5 : le cap est un cap sur les écritures ---------------------------
@@ -2262,6 +2734,326 @@ branch refs/heads/fix/live/x
         assert_eq!(
             reasons,
             std::collections::HashSet::from([REASON_DIRTY, REASON_PR_OPEN])
+        );
+    }
+    // -- mika#2449 : la sonde de saleté du checkout principal ---------------
+
+    /// V3 — fonction pure : propre → rien ; sale → compte, chemins, empreinte ;
+    /// illisible → signal nommé, jamais « propre ».
+    #[test]
+    fn mika2449_classify_main_checkout_trois_etats() {
+        assert_eq!(classify_main_checkout(Some("")), MainCheckoutState::Clean);
+        assert_eq!(
+            classify_main_checkout(Some("\n  \n")),
+            MainCheckoutState::Clean
+        );
+        assert_eq!(classify_main_checkout(None), MainCheckoutState::Unreadable);
+
+        let dirty = classify_main_checkout(Some(
+            "M  skills/bundled/_shared/dispatch-lib.sh\n?? site/index.html\nA  scripts/smoke-webhook-chain\n",
+        ));
+        let MainCheckoutState::Dirty {
+            file_count,
+            files,
+            truncated,
+            fingerprint,
+        } = dirty
+        else {
+            panic!("attendu Dirty");
+        };
+        assert_eq!(file_count, 3);
+        assert!(!truncated);
+        assert_eq!(files.len(), 3);
+        assert!(
+            files.iter().any(|f| f.ends_with("dispatch-lib.sh")),
+            "{files:?}"
+        );
+        assert_eq!(
+            fingerprint.len(),
+            16,
+            "empreinte hex 64 bits : {fingerprint}"
+        );
+    }
+
+    /// V3 — l'empreinte ne dépend pas de l'ordre de sortie de git, et deux
+    /// listes différentes ont deux empreintes (c'est la clé de D4).
+    #[test]
+    fn mika2449_lempreinte_est_stable_et_discriminante() {
+        let fp = |s: &str| match classify_main_checkout(Some(s)) {
+            MainCheckoutState::Dirty { fingerprint, .. } => fingerprint,
+            other => panic!("attendu Dirty, obtenu {other:?}"),
+        };
+        assert_eq!(fp("M  a\n?? b\n"), fp("?? b\nM  a\n"));
+        assert_ne!(fp("M  a\n?? b\n"), fp("M  a\n"));
+        assert_ne!(
+            fp("M  a\n"),
+            fp("?? a\n"),
+            "le statut fait partie de la liste"
+        );
+    }
+
+    /// V3 — plafond de 20 chemins : `files` est tronqué, `file_count` reste
+    /// le compte réel, et l'empreinte couvre la liste ENTIÈRE (deux checkouts
+    /// à 25 fichiers dont 20 communs ne se confondent pas).
+    #[test]
+    fn mika2449_les_chemins_sont_plafonnes_mais_le_compte_et_lempreinte_non() {
+        let mk = |n: usize, suffix: &str| {
+            (0..n)
+                .map(|i| format!("?? f{i:02}{suffix}\n"))
+                .collect::<String>()
+        };
+        let a = classify_main_checkout(Some(&mk(25, "")));
+        let MainCheckoutState::Dirty {
+            file_count,
+            files,
+            truncated,
+            fingerprint: fp_a,
+        } = a
+        else {
+            panic!("attendu Dirty");
+        };
+        assert_eq!(file_count, 25);
+        assert_eq!(files.len(), MAIN_CHECKOUT_DIRTY_MAX_PATHS);
+        assert!(truncated);
+        let b = mk(20, "") + "?? zz1\n?? zz2\n?? zz3\n?? zz4\n?? zz5\n";
+        let MainCheckoutState::Dirty {
+            fingerprint: fp_b, ..
+        } = classify_main_checkout(Some(&b))
+        else {
+            panic!("attendu Dirty");
+        };
+        assert_ne!(
+            fp_a, fp_b,
+            "l'empreinte porte la liste entière, pas les 20 premiers"
+        );
+    }
+
+    /// La clé d'audit et la requête d'attribution portent le checkout, les
+    /// bornes de fenêtre et le filtre de chemin sous la forme mesurée.
+    #[test]
+    fn mika2449_cle_et_requete_dattribution() {
+        let repo = "/data/workspace/mika-platform/mika";
+        assert_eq!(
+            main_checkout_audit_key(repo, "deadbeef00000000"),
+            "main_checkout:/data/workspace/mika-platform/mika@deadbeef00000000"
+        );
+        let q = main_checkout_attribution_query(
+            repo,
+            Some("2026-09-20T17:00:00Z"),
+            "2026-09-20T17:30:00Z",
+        );
+        assert!(q.contains("FROM tool_calls"), "{q}");
+        assert!(q.contains("tool_name = 'run_shell'"), "{q}");
+        assert!(
+            q.contains("BETWEEN '2026-09-20T17:00:00Z' AND '2026-09-20T17:30:00Z'"),
+            "{q}"
+        );
+        assert!(q.contains("LIKE '%mika-platform/mika%'"), "{q}");
+        assert!(q.contains("checkout %--%") && q.contains("stash"), "{q}");
+        let unknown = main_checkout_attribution_query(repo, None, "2026-09-20T17:30:00Z");
+        assert!(unknown.contains("inconnu"), "{unknown}");
+        // La sonde ne nomme aucun producteur (D3).
+        assert!(!q.contains("mika-qa") && !q.contains("pilot"), "{q}");
+    }
+
+    /// V3b — placement : un `repo_dir` sans `.git` ne produit AUCUNE émission
+    /// de saleté (c'est `worktree_reap_no_checkout` qui parle, en amont).
+    #[tokio::test]
+    async fn mika2449_un_chemin_sans_depot_nemet_rien() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let state =
+            probe_main_checkout(&db, "session-2449", tmp.path(), Utc::now(), "trace-1").await;
+        assert_eq!(state, MainCheckoutState::Unreadable);
+        let rows = db
+            .get_audit_event_rows_by_tool_name(MAIN_CHECKOUT_DIRTY_TOOL)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "aucune ligne main_checkout_dirty sans dépôt"
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} dans {}", dir.display());
+    }
+
+    /// AC3 / AC4 / V4 sur un vrai dépôt : propre → zéro ligne ; sali → une
+    /// ligne datée portant le checkout, le compte, les chemins et la requête
+    /// d'attribution dont la borne basse est le dernier tick propre ; même
+    /// liste sur deux ticks → une seule ligne ; liste changée → une seconde.
+    #[tokio::test]
+    async fn mika2449_un_checkout_sale_ecrit_une_ligne_datee_et_dedupliquee() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("mika");
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("scripts/x.sh"), "a\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        let repo_key = repo.display().to_string();
+
+        // Tick 1 : propre → zéro ligne (AC4), et l'instant est mémorisé.
+        let t1 = crate::timestamp::parse("2026-09-20T17:00:00Z").unwrap();
+        let s1 = probe_main_checkout(&db, "s", &repo, t1, "trace").await;
+        assert_eq!(s1, MainCheckoutState::Clean);
+        assert!(
+            db.get_audit_event_rows_by_tool_name(MAIN_CHECKOUT_DIRTY_TOOL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Tick 2 : sali (le geste de M0 : index + arbre) → une ligne.
+        std::fs::write(repo.join("scripts/x.sh"), "b\n").unwrap();
+        git(&repo, &["add", "scripts/x.sh"]);
+        std::fs::write(repo.join("site.html"), "new\n").unwrap();
+        let t2 = crate::timestamp::parse("2026-09-20T17:10:00Z").unwrap();
+        let s2 = probe_main_checkout(&db, "s", &repo, t2, "trace").await;
+        assert!(
+            matches!(s2, MainCheckoutState::Dirty { file_count: 2, .. }),
+            "{s2:?}"
+        );
+        let rows = db
+            .get_audit_event_rows_by_tool_name(MAIN_CHECKOUT_DIRTY_TOOL)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (target_key, _before, after_value, reasoning) = &rows[0];
+        assert!(
+            target_key.starts_with(&format!("main_checkout:{repo_key}@")),
+            "{target_key}"
+        );
+        assert_eq!(after_value.as_deref(), Some("2"));
+        let reasoning = reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("M  scripts/x.sh"), "{reasoning}");
+        assert!(reasoning.contains("?? site.html"), "{reasoning}");
+        assert!(
+            reasoning.contains("window_start=2026-09-20T17:00:00Z window_end=2026-09-20T17:10:00Z"),
+            "la borne basse est le dernier tick propre : {reasoning}"
+        );
+        assert!(reasoning.contains("FROM tool_calls"), "{reasoning}");
+
+        // Tick 3 : même liste → aucune seconde ligne (D4).
+        let t3 = crate::timestamp::parse("2026-09-20T17:20:00Z").unwrap();
+        probe_main_checkout(&db, "s", &repo, t3, "trace").await;
+        assert_eq!(
+            db.get_audit_event_rows_by_tool_name(MAIN_CHECKOUT_DIRTY_TOOL)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Tick 4 : la liste change → une seconde ligne (changement d'état).
+        std::fs::write(repo.join("third.txt"), "x\n").unwrap();
+        let t4 = crate::timestamp::parse("2026-09-20T17:30:00Z").unwrap();
+        probe_main_checkout(&db, "s", &repo, t4, "trace").await;
+        assert_eq!(
+            db.get_audit_event_rows_by_tool_name(MAIN_CHECKOUT_DIRTY_TOOL)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // R5 — rien n'a été nettoyé : l'arbre est toujours sale.
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!st.stdout.is_empty(), "la sonde ne doit rien nettoyer (R5)");
+    }
+
+    /// V4 (non-blocage) — un checkout principal sale ne change ni le verdict de
+    /// fauche ni le compte : la fonction pure de sélection ignore l'état du
+    /// checkout principal par construction (elle ne le reçoit pas), et la
+    /// sonde ne touche à aucun compteur du tick. Contrôle par le type : la
+    /// signature de `select_worktrees_to_reap` ne porte pas de
+    /// `MainCheckoutState`.
+    #[test]
+    fn mika2449_la_sonde_nentre_pas_dans_le_verdict_de_fauche() {
+        let src = include_str!("worktree_reaper.rs");
+        let sig_start = src
+            .find("pub fn select_worktrees_to_reap(")
+            .expect("signature de select_worktrees_to_reap");
+        let sig = &src[sig_start..sig_start + 600];
+        assert!(
+            !sig.contains("MainCheckoutState"),
+            "le verdict de fauche ne doit pas dépendre de l'état du checkout principal"
+        );
+        // Et le branchement dans la boucle jette le résultat.
+        assert!(
+            src.contains("let _ = probe_main_checkout("),
+            "le résultat de la sonde n'entre dans aucun compte du tick"
+        );
+    }
+
+    /// U5 — `main_checkout_dirty` a **un seul writer** dans le crate.
+    ///
+    /// Un second writer rendrait la requête d'attribution que chaque ligne
+    /// recopie inexacte, en silence (allowlist vide ; quand ça tire, on retire
+    /// le second site). Contrôle de bonne foi : `scanned > 0`.
+    #[test]
+    fn mika2449_le_tool_name_main_checkout_dirty_a_un_seul_writer() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = src_root.join("worktree_reaper.rs");
+        let needle = format!("main_checkout{}", "_dirty");
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![src_root.clone()];
+        let mut scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("lecture de src/").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || path == this_module
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).expect("lecture de fichier source");
+                scanned += 1;
+                if content.contains(&needle) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(scanned > 0, "la garde n'a scanné aucun fichier");
+        assert!(
+            offenders.is_empty(),
+            "mika#2449 — `{needle}` est SOLE WRITER de `worktree_reaper.rs`.\n{}",
+            offenders.join("\n")
+        );
+        // Et ce module l'écrit à exactement un site (`event = MAIN_CHECKOUT_DIRTY_TOOL`
+        // et `log_audit_event(…, MAIN_CHECKOUT_DIRTY_TOOL, …)` dans la même fonction).
+        let here = include_str!("worktree_reaper.rs");
+        let literal_sites = here.matches(&format!("\"{needle}\"")).count();
+        assert_eq!(
+            literal_sites, 1,
+            "le littéral doit vivre dans la seule constante"
         );
     }
 }

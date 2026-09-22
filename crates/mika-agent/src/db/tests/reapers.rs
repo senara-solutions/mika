@@ -2723,3 +2723,262 @@ fn test_unified_timeline_includes_null_trace_id() {
         "legacy rows with NULL trace_id should appear in unified_timeline"
     );
 }
+
+// -- mika#2184 : la vivacité directe d'un tour différé (U1/T1) --
+
+/// Attache une session au wrapper, exactement comme `dispatch_resume_agent` le
+/// fait : `sessions.task_id = <id du wrapper>`, par égalité et non par préfixe.
+fn attach_wrapper_session(db: &Database, wrapper_id: &str, session_id: &str) {
+    db.create_session_with_parent(session_id, "mika", "system", None, None, Some(wrapper_id))
+        .unwrap();
+}
+
+/// Pose une ligne `llm_calls` sur la session, datée `age_secs` dans le passé.
+fn seed_llm_call_at(db: &Database, session_id: &str, id: &str, age_secs: i64) {
+    db.save_llm_call(
+        id,
+        "mika",
+        session_id,
+        None,
+        "mock",
+        "mock-model",
+        1,
+        1,
+        None,
+        None,
+        10,
+        None,
+        "success",
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    db.conn
+        .execute(
+            "UPDATE llm_calls SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             WHERE id = ?1",
+            // `age_secs` may be negative (a row in the future — the clock-skew
+            // case). `-{-600} seconds` is `--600 seconds`, which SQLite rejects
+            // and turns into a NULL the NOT NULL constraint then refuses, so the
+            // sign is composed rather than interpolated.
+            params![id, format!("{:+} seconds", -age_secs)],
+        )
+        .unwrap();
+}
+
+/// Pose une ligne `tool_calls` sur la session, datée `age_secs` dans le passé.
+fn seed_tool_call_at(db: &Database, session_id: &str, id: &str, age_secs: i64) {
+    db.save_tool_call(
+        id,
+        "mika",
+        session_id,
+        None,
+        None,
+        0,
+        "run_shell",
+        "builtin",
+        None,
+        Some("{}"),
+        Some("ok"),
+        true,
+        false,
+        10,
+        None,
+    )
+    .unwrap();
+    db.conn
+        .execute(
+            "UPDATE tool_calls SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+             WHERE id = ?1",
+            // `age_secs` may be negative (a row in the future — the clock-skew
+            // case). `-{-600} seconds` is `--600 seconds`, which SQLite rejects
+            // and turns into a NULL the NOT NULL constraint then refuses, so the
+            // sign is composed rather than interpolated.
+            params![id, format!("{:+} seconds", -age_secs)],
+        )
+        .unwrap();
+}
+
+/// T1 — aucune session sur le wrapper : `None`, jamais `0`.
+///
+/// `None` et `Some(0)` disent deux choses opposées (doctrine mika#2331), et
+/// c'est la moitié de la valeur de D2 : rendre un âge plutôt qu'un booléen ne
+/// sert à rien si l'absence se lit comme « une activité, il y a zéro seconde ».
+#[test]
+fn mika2184_activity_age_is_none_without_a_session() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    attach_deferred_wrapper(&db, &parent_id, "completed");
+
+    assert_eq!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+            .unwrap(),
+        None
+    );
+}
+
+/// T1 — une session existe mais ne porte aucune ligne : `None` encore.
+///
+/// Contrôle distinct du précédent : il sépare « la jointure ne trouve pas de
+/// session » de « la jointure trouve une session vide ». Une implémentation qui
+/// compterait les sessions plutôt que les lignes passerait le premier et
+/// rougirait ici.
+#[test]
+fn mika2184_activity_age_is_none_when_the_session_carries_no_row() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &wrapper_id, "deferred-dispatch-empty");
+
+    assert_eq!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+            .unwrap(),
+        None
+    );
+}
+
+/// T1 — `llm_calls` seul suffit.
+#[test]
+fn mika2184_activity_age_reads_llm_calls() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &wrapper_id, "deferred-dispatch-llm");
+    seed_llm_call_at(&db, "deferred-dispatch-llm", "lc-1", 120);
+
+    let age = db
+        .find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+        .unwrap()
+        .expect("an llm_calls row must be seen");
+    assert!(
+        (115..=125).contains(&age),
+        "expected ~120 s, got {age} — the age is read off llm_calls.created_at"
+    );
+}
+
+/// T1 — `tool_calls` seul suffit aussi.
+///
+/// Les deux tables comptent, et pas seulement la première : un tour peut
+/// enchaîner des outils entre deux appels LLM, et ne lire que `llm_calls`
+/// rendrait un tour occupé pour silencieux.
+#[test]
+fn mika2184_activity_age_reads_tool_calls() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &wrapper_id, "deferred-dispatch-tool");
+    seed_tool_call_at(&db, "deferred-dispatch-tool", "tc-1", 90);
+
+    let age = db
+        .find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+        .unwrap()
+        .expect("a tool_calls row must be seen");
+    assert!(
+        (85..=95).contains(&age),
+        "expected ~90 s, got {age} — the age is read off tool_calls.created_at"
+    );
+}
+
+/// T1 — quand les deux existent, c'est le **minimum** qui sort.
+///
+/// Un `MAX` rendrait la ligne la plus vieille et ferait passer un tour vif pour
+/// mort ; une somme ou une moyenne n'auraient aucun sens. Le test croise les
+/// deux tables dans le sens défavorable (la ligne récente est le `tool_calls`)
+/// pour qu'une implémentation ne lisant que `llm_calls` rougisse.
+#[test]
+fn mika2184_activity_age_takes_the_minimum_of_both_tables() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &wrapper_id, "deferred-dispatch-both");
+    seed_llm_call_at(&db, "deferred-dispatch-both", "lc-1", 1800);
+    seed_tool_call_at(&db, "deferred-dispatch-both", "tc-1", 60);
+
+    let age = db
+        .find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+        .unwrap()
+        .expect("both rows exist");
+    assert!(
+        (55..=65).contains(&age),
+        "expected the MINIMUM (~60 s), got {age}"
+    );
+}
+
+/// T4 (moitié DB) — contrôle négatif de cible : l'activité d'une **autre**
+/// parente ne traverse pas.
+///
+/// Sans lui, « la jointure discrimine » serait indistinguable de « la jointure
+/// épargne tout le monde » : un prédicat qui rendrait l'âge le plus récent de
+/// tout l'agent passerait chacun des tests ci-dessus.
+#[test]
+fn mika2184_activity_of_another_parent_does_not_cross() {
+    let db = db();
+    let candidate = create_pending_issue_parent(&db, 2184, 3600);
+    attach_deferred_wrapper(&db, &candidate, "completed");
+
+    let other = create_pending_issue_parent(&db, 9999, 3600);
+    let other_wrapper = attach_deferred_wrapper(&db, &other, "completed");
+    attach_wrapper_session(&db, &other_wrapper, "deferred-dispatch-other");
+    seed_llm_call_at(&db, "deferred-dispatch-other", "lc-other", 30);
+
+    assert_eq!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &candidate)
+            .unwrap(),
+        None,
+        "the candidate has no activity of its own"
+    );
+    assert!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &other)
+            .unwrap()
+            .is_some(),
+        "the other parent does, which is what makes the negative control non-vacuous"
+    );
+}
+
+/// T1 — une session attachée à un callback **réel** (non différé) ne compte pas.
+///
+/// Le prédicat porte sur les wrappers différés : c'est leur tour silencieux que
+/// mika#2181 abrite et que ce ticket mesure. Un dispatch réel en vol est déjà
+/// couvert par la clause (2) de `find_orphaned_pending_issue_tasks`, et le
+/// compter ici élargirait l'épargne à une population qui n'en a pas besoin.
+#[test]
+fn mika2184_activity_on_a_real_callback_is_out_of_the_population() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let real = attach_real_callback(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &real, "callback-real");
+    seed_llm_call_at(&db, "callback-real", "lc-real", 10);
+
+    assert_eq!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+            .unwrap(),
+        None,
+        "only deferred wrappers are in the population"
+    );
+}
+
+/// T1 — une ligne datée dans le **futur** (horloge décalée) rend `0`, jamais un
+/// âge négatif.
+///
+/// « Très récent », jamais « très vieux » : le clamp est fail-safe vers
+/// l'épargne, dans le sens de l'asymétrie du ticket.
+#[test]
+fn mika2184_a_future_row_clamps_to_zero_rather_than_going_negative() {
+    let db = db();
+    let parent_id = create_pending_issue_parent(&db, 2184, 3600);
+    let wrapper_id = attach_deferred_wrapper(&db, &parent_id, "completed");
+    attach_wrapper_session(&db, &wrapper_id, "deferred-dispatch-future");
+    seed_llm_call_at(&db, "deferred-dispatch-future", "lc-future", -600);
+
+    assert_eq!(
+        db.find_deferred_wrapper_activity_age_secs("mika", &parent_id)
+            .unwrap(),
+        Some(0),
+        "a row in the future means 'very recent', never 'very old'"
+    );
+}

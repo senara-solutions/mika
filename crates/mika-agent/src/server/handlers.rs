@@ -1473,6 +1473,10 @@ async fn run_agent_for_message(
             &session_id,
             &req.request_id,
             &skills,
+            // mika#2049 — the global home, read off the dispatcher, which is
+            // already the canonical carrier for it (mika#2329 wired it there for
+            // the hot STOP). `AgentState` is per-agent; the egress stamp is not.
+            &a.dispatcher.global_home_dir,
         )
         .await;
         match ready_label_action {

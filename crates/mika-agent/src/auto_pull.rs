@@ -79,9 +79,32 @@ use crate::async_db::AsyncDatabase;
 use crate::ready_label::{
     self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
 };
+use crate::server::ready_label_handler;
+use crate::server::verdict_handler::VerdictAction;
+use crate::skills::SkillRegistry;
+use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
+use std::path::Path;
 
 /// Default repo for auto-pull (mika-only for v1).
 const DEFAULT_REPO: &str = "senara-solutions/mika";
+
+/// What Phase 2 must hold to dispatch a rescued ticket **in-process**
+/// (mika#2470).
+///
+/// The two references the ready-label handler needs beyond what the tick
+/// already carries: the agent's loaded skill registry (step 9a resolves the
+/// dispatch tool from it) and the **global** home (the mika#2049 egress-relay
+/// stamp is read under it). Both live on `TaskDispatcher` and descend from
+/// there.
+///
+/// Deliberately **not** `Option<…>`: a `None` would mean "behave as before" —
+/// re-apply the label and wait for a webhook that may never come — which is
+/// precisely the defect this ticket closes. An absent context must fail to
+/// compile, not silently reintroduce it.
+pub struct DirectDispatchCtx<'a> {
+    pub skills: &'a SkillRegistry,
+    pub global_home_dir: &'a Path,
+}
 
 /// Maximum failure count before a ticket is skipped by the circuit-breaker.
 const CIRCUIT_BREAKER_THRESHOLD: i64 = 3;
@@ -1264,6 +1287,33 @@ const FILTER_READY_PARKED: &str = "ready_parked";
 /// That is the whole of mika#2361: the gesture the operator makes is not the
 /// gesture that re-enters, and until this name existed nothing said so.
 const FILTER_ABANDONED_OPERATOR_HELD: &str = "abandoned_operator_held";
+/// The host egress relay is down, so no dispatch can leave contained and every
+/// re-drive would be spent on a refusal (mika#2049).
+///
+/// # Why this filter exists at all, since it protects nothing
+///
+/// The protection is the shell guard in `dispatch-lib`, which refuses the launch
+/// on a **fresh probe** and reads no persistent state. This filter buys the
+/// operator's own acceptance criterion: *« proxy relancé ⇒ le dispatch reprend
+/// sans intervention sur les tickets »*. Without it, a refused dispatch leaves
+/// the ticket `ready`, Phase 2 re-drives it every ~15 min, and at
+/// `MIKA_AUTO_PULL_MAX_REDRIVES` (default 3) the ticket is **abandoned** —
+/// `operator-review` posted, `ready` removed, a comment written (mika#2020). A
+/// relay outage of about an hour would park every `ready` ticket behind an
+/// operator label, and resuming would cost one gesture per ticket.
+///
+/// # `Skip`, never `SkipAndResetBudget`
+///
+/// Waiting for a relay is right; calling the wait a success is what made the
+/// mika#2020 budget unreachable — measured at 31 re-drives against a counter
+/// reading 1 (mika#2158). Same sentence, same reason, third occurrence.
+///
+/// The name is shared **verbatim** with the `ready_label_outcome` gate of
+/// mika#2323: same cause, two distinct audit surfaces that an operator
+/// aggregates separately. A divergent spelling would cut one outage's
+/// population in two, which is the error both wire-format scans exist to make
+/// impossible.
+const FILTER_EGRESS_DOWN: &str = "egress_relay_down";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -1577,6 +1627,12 @@ struct StuckReadyFacts {
     redrive_count: i64,
     /// `redrive_abandoned_at` is set — this ticket was handed to the operator.
     abandoned: bool,
+    /// The host egress relay is down (mika#2049). **Global to the tick, not
+    /// per-ticket** — it is resolved once by the caller and copied onto every
+    /// ticket's facts, because the decision function is where the reason gets a
+    /// name and a ledger row. Resolving it per ticket would read the same file a
+    /// hundred times per tick to answer the same question.
+    egress_relay_down: bool,
 }
 
 /// What Phase 2 should do with one `ready` ticket (mika#2020).
@@ -1746,6 +1802,26 @@ fn classify_stuck_ready(
     if facts.live_pilot {
         return StuckReadyVerdict::Skip {
             reason: FILTER_LIVE_PILOT,
+        };
+    }
+
+    // mika#2049 — the egress relay is down, so no dispatch can leave contained.
+    //
+    // Placed AFTER the three "a dispatch is already running" branches and
+    // BEFORE everything that mutates a ticket's state. The three above name a
+    // more precise cause and change nothing; from here on, every branch either
+    // clears a budget (`ReEntry`), spends one (`Eligible`) or parks the ticket
+    // (`Abandon`) — and during an outage none of those should happen at all.
+    //
+    // Blocking `ReEntry` for the duration of the outage costs one extra tick
+    // after the relay returns. Letting it through would clear the budget and
+    // make the ticket `Eligible` on the next tick, which is the re-drive this
+    // branch exists to withhold.
+    //
+    // `Skip`, never `SkipAndResetBudget` — see [`FILTER_EGRESS_DOWN`].
+    if facts.egress_relay_down {
+        return StuckReadyVerdict::Skip {
+            reason: FILTER_EGRESS_DOWN,
         };
     }
 
@@ -2982,12 +3058,22 @@ async fn record_ready_refusal(
 /// sert **uniquement** aux écritures de label, parce que le PAT résolu du spirit
 /// authentifie sans porter `issues: write` — 34 `--add-label` refusés le
 /// 2026-09-07, sur trois chemins de ce module.
+///
+/// # `egress_relay_down` (mika#2049)
+///
+/// Resolved **once per tick by the caller**, which is the only place holding the
+/// global home the shell guard writes its stamp under (same trajectory as
+/// mika#2329's hot STOP). Passed in rather than read here so this function keeps
+/// doing no filesystem work of its own, and so a test can drive both states
+/// without touching the disk.
 pub async fn auto_pull_groomed_ticket(
     db: &AsyncDatabase,
     github_token: &str,
     label_auth: &LabelWriteToken,
     trace_id: &str,
     session_id: &str,
+    egress_relay_down: bool,
+    ctx: &DirectDispatchCtx<'_>,
 ) -> Option<u64> {
     // Fetch open issues once (F4: client-side filter for the `ready` label).
     let issues = match gh_list_open_issues(github_token).await {
@@ -3060,6 +3146,8 @@ pub async fn auto_pull_groomed_ticket(
         trace_id,
         session_id,
         &mut ledger,
+        egress_relay_down,
+        ctx,
     )
     .await;
     debug!(
@@ -3495,6 +3583,94 @@ async fn phase1_promote_groomed(
     Some(candidate.number)
 }
 
+/// Audit `tool_name` of the line Phase 2 writes for each rescued ticket
+/// (mika#2470 D5): what **auto_pull** decided, distinct from the handler's own
+/// `ready_label_outcome` line, which names the gate. Join the two on
+/// `trace_id`.
+pub const STUCK_READY_DIRECT_DISPATCH_TOOL_NAME: &str = "stuck_ready_direct_dispatch";
+
+/// The marker text Phase 2 hands the ready-label handler for a rescued ticket
+/// (mika#2470 D4).
+///
+/// The handler reads only the prefix plus `<owner/repo>#<n>` bounded by the
+/// first blank (`parse_ready_label_location`), then the **last** line for the
+/// actor (`parse_event_actor`, tolerant — absent → `None`). No `Labeled by: @…`
+/// line is written: that field is a GitHub login by contract, and a pseudo-login
+/// would put a fictitious actor in the audit. The origin is carried by the
+/// tick's `session_id` (`auto-pull-<uuid>`) and by the
+/// [`STUCK_READY_DIRECT_DISPATCH_TOOL_NAME`] line instead. The same text is the
+/// handler's `originating_message` at step 9d, where its prefix authorises the
+/// dispatch (guard 0) exactly as the webhook marker does.
+fn synthesize_ready_label_marker(issue_number: u64) -> String {
+    format!(
+        "{READY_LABEL_DISPATCH_MARKER}{DEFAULT_REPO}#{issue_number} — (auto_pull phase2_stuck_rescue)"
+    )
+}
+
+/// The coarse disposition of a [`VerdictAction`] for the audit line — the same
+/// three words the handler's private `action_label` uses, kept here so the
+/// handler ships with a zero diff (mika#2470 DoD).
+fn direct_dispatch_action_label(action: &VerdictAction) -> &'static str {
+    match action {
+        VerdictAction::Dispatched { .. } => "dispatched",
+        VerdictAction::Handled { .. } => "handled",
+        VerdictAction::Passthrough { .. } => "passthrough",
+    }
+}
+
+/// mika#2470 (third-pass mika-arch, Option A) — is the remove→add churn moot
+/// for this rescue?
+///
+/// The churn has two roles: reset the label age (the mika#1824 D3 throttle)
+/// and act as a redundant trigger. Both are pointless when the direct call did
+/// **not** dispatch and yet the engine already holds the ticket — a `pending`
+/// parent left by 9d (slot taken → deferred wrapper) or 9a/9b (tool missing):
+/// filter 4a excludes such a ticket next tick, so the age reset throttles
+/// nothing, and the churn's `labeled` can only collide at the handler's step 7
+/// (`task_create_failed` → `Passthrough` → one LLM turn spent on a ticket the
+/// engine has already queued). On `Dispatched` the churn keeps both roles.
+///
+/// Pure so it can be pinned without the network the rescue loop needs.
+fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
+    !matches!(action, VerdictAction::Dispatched { .. }) && engine_holds_ticket
+}
+
+/// mika#2470 — dispatch a rescued ticket by a **direct, in-process** call of the
+/// ready-label handler. The webhook channel may be dead: nothing here depends
+/// on it.
+///
+/// This is the handler the gateway's `labeled ready` event reaches — its fifteen
+/// gates (repo allowlist, live pilot, egress relay, seat, held, groomed →
+/// `dev-pilot` / not → `dev-groom`, slot and deferral, spawn) apply unchanged,
+/// by construction rather than by copy (D1). The issue body and labels the tick
+/// has already read are handed in as the injected fetcher (D2): no `gh issue
+/// view` per rescue, and the handler decides on the **same snapshot** the
+/// Phase 2 filters just used to call the ticket eligible.
+async fn dispatch_rescued_ticket_in_process(
+    db: &AsyncDatabase,
+    ctx: &DirectDispatchCtx<'_>,
+    issue: &Issue,
+    github_token: &str,
+    trace_id: &str,
+    session_id: &str,
+) -> VerdictAction {
+    let text = synthesize_ready_label_marker(issue.number);
+    let body = issue.body.clone();
+    let labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
+    ready_label_handler::try_handle_ready_label_dispatch_with_fetcher(
+        &text,
+        db,
+        Some(github_token),
+        None,
+        session_id,
+        trace_id,
+        ctx.skills,
+        ctx.global_home_dir,
+        move |_owner_repo, _number, _token| async move { Ok((body, labels)) },
+    )
+    .await
+}
+
 /// Phase 2 (mika#1824): reconcile stuck-ready tickets — those that *have* the
 /// `ready` label but were never dispatched (webhook dropped, mika-dev busy at
 /// fire time, dispatch-gate silent-accept). Runs regardless of queue depth.
@@ -3505,9 +3681,12 @@ async fn phase1_promote_groomed(
 /// recorded in the tick's [`ExclusionLedger`] (mika#2131 — it used to be a
 /// `stuck_ready_reconcile_skipped` DEBUG that this server's log filter never
 /// collected, which is how #1651 and #1403 were dropped silently for six days).
-/// Survivors past the age threshold are remove→add rescued (capped at
-/// [`MAX_STUCK_RESCUE_PER_TICK`]), emitting `stuck_ready_reconciled` INFO on
-/// success. Returns the rescue count.
+/// Survivors past the age threshold are **dispatched in-process** by a direct
+/// call of the ready-label handler (mika#2470 — the net exists to survive the
+/// loss of the webhook channel, so it must not depend on that channel to act),
+/// then remove→add churned (capped at [`MAX_STUCK_RESCUE_PER_TICK`]) to reset
+/// the label age and as a redundant trigger, emitting `stuck_ready_reconciled`
+/// INFO on success. Returns the rescue count.
 #[allow(clippy::too_many_arguments)]
 async fn phase2_reconcile_stuck_ready(
     db: &AsyncDatabase,
@@ -3518,6 +3697,8 @@ async fn phase2_reconcile_stuck_ready(
     trace_id: &str,
     session_id: &str,
     ledger: &mut ExclusionLedger,
+    egress_relay_down: bool,
+    ctx: &DirectDispatchCtx<'_>,
 ) -> usize {
     let threshold = stuck_ready_threshold_secs();
     let redrive_budget = max_redrives();
@@ -3667,6 +3848,7 @@ async fn phase2_reconcile_stuck_ready(
             circuit_broken,
             redrive_count,
             abandoned,
+            egress_relay_down,
         };
 
         let verdict = classify_stuck_ready(issue, &facts, redrive_budget);
@@ -3799,17 +3981,52 @@ async fn phase2_reconcile_stuck_ready(
         }
     }
 
-    // Rescue loop: remove→add the `ready` label (Option A — reuse the webhook
-    // pipeline). Capped at MAX_STUCK_RESCUE_PER_TICK; overflow waits for the
-    // next tick. The remove→add cycle resets the label-age timestamp, so a
-    // rescued-but-still-undispatched ticket self-throttles for a full threshold
-    // window (D3).
+    // Rescue loop (mika#2470 D3): dispatch **first**, by a direct in-process
+    // call of the ready-label handler, then remove→add the `ready` label.
+    //
+    // The churn used to be the only trigger — it fired a `labeled(ready)` on
+    // GitHub's side and waited for the webhook to come back. When the inbound
+    // channel is down (the 2026-09-21 eno1 outage: 0 webhooks for hours, three
+    // `stuck_ready_reconciled` lines, zero tasks created), that trigger fires
+    // into the void. The direct call is the trigger now; the churn stays for
+    // two reasons: it resets the label-age timestamp, so a rescued ticket whose
+    // pilot dies quickly self-throttles for a full threshold window (mika#1824
+    // D3, the re-drive budget of mika#2020 keeps its cadence), and it is a
+    // redundant trigger on a live channel.
+    //
+    // What the churn's `labeled` meets at the handler depends on what the
+    // direct call returned, and dispatching first is a **timing margin**, not
+    // an ordering invariant. On `Dispatched`, step 9i is a `tokio::spawn`
+    // (`skills/executor.rs`): the pgid is written by the detached task *after*
+    // the handler returns, so gate 2c can only refuse the churn's `labeled` as
+    // `pilot_in_flight` once that write has landed — normally milliseconds,
+    // against two `gh` round trips plus the GitHub → gateway → agent hop. A
+    // `labeled` that beats the write lands in the step 7 → 9i window where 2c
+    // sees no pilot and 6b would kill the newborn (mika#2335); probe S2 (two
+    // `gate=dispatched` within a minute) is what measures that margin. On a
+    // non-`Dispatched` outcome that left a `pending` parent behind (9d slot
+    // taken → deferred wrapper; 9a/9b tool missing), the churn's `labeled`
+    // passes 2c (no pgid) and 6b (pending is not superseded), collides at step
+    // 7 on the active-URL index and returns `Passthrough` — one LLM turn spent
+    // on a ticket the engine already holds. No second pilot, no kill (R3
+    // strictly holds); the cost is that turn, named in probe S2.
+    //
+    // Capped at MAX_STUCK_RESCUE_PER_TICK **attempts** — counted before the
+    // direct call, not on churn success: a `gh_remove_label` failure
+    // `continue`s below without touching `rescued`, and every attempt now runs
+    // the handler's full readiness chain (real GitHub calls, a spawn or a
+    // deferred wrapper), so a sustained label-write failure (the mika#2228 PAT
+    // class) must not turn the cap into "every candidate, every tick".
+    // Overflow waits for the next tick.
     let mut rescued = 0usize;
+    let mut attempted = 0usize;
     for &n in &selected {
-        if rescued >= MAX_STUCK_RESCUE_PER_TICK {
+        if attempted >= MAX_STUCK_RESCUE_PER_TICK {
             warn!(
                 cap = MAX_STUCK_RESCUE_PER_TICK,
-                deferred = selected.len() - rescued,
+                attempted,
+                rescued,
+                deferred = selected.len() - attempted,
                 "auto_pull: phase 2 rescue cap reached; deferring rest to next tick"
             );
             break;
@@ -3836,27 +4053,106 @@ async fn phase2_reconcile_stuck_ready(
         // from `phase2_stuck_rescue` carrying
         // `reason=salvage_work_on_stale_branch` with a `non_plan_files` list
         // that contains no `docs/plans/` sibling.
-        match issues.iter().find(|i| i.number == n) {
-            Some(issue) => {
-                if !promotion_gate_allows(
-                    db,
-                    github_token,
-                    label_auth,
-                    issue,
-                    "phase2_stuck_rescue",
-                    trace_id,
-                    session_id,
-                )
-                .await
-                {
-                    ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
-                    continue;
+        // The issue is needed twice below — for the staleness gate and for the
+        // in-process dispatch (its body and labels are the injected fetcher).
+        // Without it we can neither decide nor dispatch, and churning the label
+        // without dispatching is exactly the defect of mika#2470: skip, loudly.
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            warn!(
+                issue = n,
+                "auto_pull: candidate absent from the issue list; cannot decide or \
+                 dispatch — rescue skipped"
+            );
+            continue;
+        };
+        if !promotion_gate_allows(
+            db,
+            github_token,
+            label_auth,
+            issue,
+            "phase2_stuck_rescue",
+            trace_id,
+            session_id,
+        )
+        .await
+        {
+            ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
+            continue;
+        }
+
+        // mika#2470 — the dispatch itself. The handler's own `ready_label_outcome`
+        // line names the gate that decided; this line says what auto_pull got
+        // back, under the tick's trace_id, so `SELECT after_value, count(*) …
+        // GROUP BY 1` answers "how many rescues actually dispatched" (D5).
+        attempted += 1;
+        let action =
+            dispatch_rescued_ticket_in_process(db, ctx, issue, github_token, trace_id, session_id)
+                .await;
+        let action_label = direct_dispatch_action_label(&action);
+        let task_id = match &action {
+            VerdictAction::Dispatched { task_id, .. } => task_id.as_str(),
+            _ => "none",
+        };
+        // Option A (third-pass mika-arch on the groom session): when the direct
+        // call did not dispatch but the engine now holds the ticket (a
+        // `pending`/`in_progress` parent left by 9a/9b/9d), the churn is moot —
+        // see [`churn_is_moot`]. A probe error reads as "not held", so the churn
+        // runs as it did before Option A: here a skipped churn would be the
+        // costlier silence.
+        let engine_holds_ticket = if matches!(action, VerdictAction::Dispatched { .. }) {
+            false
+        } else {
+            let issue_url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+            match db.has_active_self_dev_task_for_issue(&issue_url).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        issue = n,
+                        "auto_pull: post-dispatch in-flight probe failed; churning as before"
+                    );
+                    false
                 }
             }
-            None => warn!(
+        };
+        let churn_moot = churn_is_moot(&action, engine_holds_ticket);
+        let churn = if churn_moot {
+            "skipped_in_flight"
+        } else {
+            "churned"
+        };
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                STUCK_READY_DIRECT_DISPATCH_TOOL_NAME,
+                &format!("issue:{n}"),
+                None,
+                Some(action_label),
+                Some(&format!(
+                    "issue={n} action={action_label} task_id={task_id} churn={churn}"
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                error = %e,
                 issue = n,
-                "auto_pull: candidate absent from the issue list; staleness gate skipped"
-            ),
+                "auto_pull: failed to write stuck_ready_direct_dispatch audit event"
+            );
+        }
+        if churn_moot {
+            // The engine already queued this ticket: no age to reset, nothing
+            // for a redundant trigger to do but collide. Counted as an attempt,
+            // never as a rescue, and no re-drive budget point is spent — the
+            // ticket sits in the engine's deferred queue, not in the loop's.
+            info!(
+                issue = n,
+                direct_dispatch = action_label,
+                "stuck_ready_churn_skipped_in_flight"
+            );
+            ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_IN_FLIGHT);
+            continue;
         }
 
         if let Err(e) = gh_remove_label(label_auth, n, "ready").await {
@@ -3899,7 +4195,12 @@ async fn phase2_reconcile_stuck_ready(
         if let Err(e) = db.increment_auto_pull_redrive(DEFAULT_REPO, n).await {
             warn!(error = %e, issue = n, "auto_pull: failed to increment re-drive counter");
         }
-        info!(issue = n, "stuck_ready_reconciled");
+        info!(
+            issue = n,
+            direct_dispatch = action_label,
+            task_id,
+            "stuck_ready_reconciled"
+        );
         rescued += 1;
     }
 
@@ -5068,6 +5369,405 @@ This ticket has been GROOMED and is ready.
         }
     }
 
+    /// mika#2470 — what a test hands Phase 2 for the in-process dispatch
+    /// context: an empty registry (step 9a of the handler then exits on
+    /// `tool_not_found`, before any spawn) and a real, empty home (the mika#2049
+    /// egress gate reads "the relay serves"). The fixture owns both so the
+    /// borrowed [`DirectDispatchCtx`] can be built at the call site.
+    struct TestCtxFixture {
+        skills: SkillRegistry,
+        home: tempfile::TempDir,
+    }
+
+    impl TestCtxFixture {
+        fn ctx(&self) -> DirectDispatchCtx<'_> {
+            DirectDispatchCtx {
+                skills: &self.skills,
+                global_home_dir: self.home.path(),
+            }
+        }
+    }
+
+    fn test_ctx_fixture() -> TestCtxFixture {
+        TestCtxFixture {
+            skills: SkillRegistry::empty(),
+            home: tempfile::tempdir().expect("temp home"),
+        }
+    }
+
+    // ── mika#2470: Phase 2 dispatches by a direct, in-process call of the handler ──
+
+    /// T1 — the synthesised marker round-trips through the handler's own
+    /// parser to `(senara-solutions/mika, n)`, carries no actor line, and names
+    /// a dispatchable repository — so it clears gate 2b with no fictitious
+    /// `Labeled by:` login in the audit (D4).
+    #[test]
+    fn mika2470_synthesized_marker_round_trips_through_the_handler_parser() {
+        let text = synthesize_ready_label_marker(2470);
+        assert!(text.starts_with(READY_LABEL_DISPATCH_MARKER));
+
+        let loc = ready_label_handler::parse_ready_label_location(&text)
+            .expect("the handler must parse the marker it is handed");
+        assert_eq!(loc.owner_repo(), DEFAULT_REPO);
+        assert_eq!(loc.number, 2470);
+        assert!(
+            crate::webhook_dispatch::is_dispatchable_repo(&loc.repo_ref),
+            "the synthesised repo must clear gate 2b"
+        );
+        assert_eq!(
+            ready_label_handler::parse_event_actor(&text),
+            None,
+            "no `Labeled by:` line: the actor field is a GitHub login by contract"
+        );
+    }
+
+    /// The tick's audit lines for one session, by `tool_name`.
+    async fn audit_after_values(db: &AsyncDatabase, session: &str, tool: &str) -> Vec<String> {
+        db.get_audit_events(session)
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .filter(|e| e.tool_name == tool)
+            .filter_map(|e| e.after_value)
+            .collect()
+    }
+
+    /// Parents (tracking rows carrying the issue URL) for one issue, any status.
+    async fn parents_for(db: &AsyncDatabase, n: u64) -> usize {
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+        db.get_tasks_by_status(vec![
+            "pending".to_string(),
+            "in_progress".to_string(),
+            "blocked".to_string(),
+            "completed".to_string(),
+            "failed".to_string(),
+            "cancelled".to_string(),
+            "expired".to_string(),
+            "delivered".to_string(),
+        ])
+        .await
+        .expect("list tasks")
+        .iter()
+        .filter(|t| t.reference_url.as_deref() == Some(url.as_str()))
+        .count()
+    }
+
+    fn mem_db() -> AsyncDatabase {
+        AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        )
+    }
+
+    /// T2 — hermetic, in-memory: a groomed issue reaches the handler's step 7
+    /// **without any `gh` running** — the injected fetcher was taken (D2, R6):
+    /// with the real fetcher and a fake token the handler would exit at
+    /// `body_fetch_failed` and no parent would exist. One `self_dev` parent
+    /// carrying the issue URL is the observable; the empty registry then stops
+    /// the walk at 9a (`tool_not_found`), before any spawn.
+    #[tokio::test]
+    async fn mika2470_direct_dispatch_reaches_precreate_without_gh() {
+        let db = mem_db();
+        let fx = test_ctx_fixture();
+        let n = 2470u64;
+        let issue = make_issue(n, GROOMED_BODY, &["ready"], "t");
+
+        let action = dispatch_rescued_ticket_in_process(
+            &db,
+            &fx.ctx(),
+            &issue,
+            "fake",
+            "trace",
+            "auto-pull-t2",
+        )
+        .await;
+
+        assert_eq!(
+            parents_for(&db, n).await,
+            1,
+            "R1 : une parente self_dev existe à la fin — sans webhook, sans `gh`"
+        );
+        assert!(
+            matches!(action, VerdictAction::Handled { .. }),
+            "with an empty registry the walk ends at 9a: Handled, not Dispatched"
+        );
+        assert_eq!(
+            audit_after_values(&db, "auto-pull-t2", "ready_label_outcome").await,
+            vec!["tool_not_found".to_string()],
+            "the handler's own outcome line names the gate, under the tick's session"
+        );
+    }
+
+    /// T3 — the groom/implement decision is the handler's, not auto_pull's (R2,
+    /// AC2): an ungroomed body prepares `dev-groom`, a groomed one `dev-pilot`.
+    #[tokio::test]
+    async fn mika2470_the_handler_decides_groom_vs_implement() {
+        for (body, expected) in [
+            (UNGROOMED_BODY, "dev-groom_dispatch_prepared"),
+            (GROOMED_BODY, "dev-pilot_dispatch_prepared"),
+        ] {
+            let db = mem_db();
+            let fx = test_ctx_fixture();
+            let issue = make_issue(2470, body, &["ready"], "t");
+            let session = format!("auto-pull-t3-{expected}");
+
+            let _ = dispatch_rescued_ticket_in_process(
+                &db,
+                &fx.ctx(),
+                &issue,
+                "fake",
+                "trace",
+                &session,
+            )
+            .await;
+
+            assert_eq!(
+                audit_after_values(&db, &session, "ready_label_handled").await,
+                vec![expected.to_string()],
+                "body={body:?}"
+            );
+        }
+    }
+
+    /// T4 — a decision gate refuses **before** step 7 (R2): `ready` over a hold
+    /// label creates zero tasks and is audited as `operator_held`.
+    #[tokio::test]
+    async fn mika2470_a_held_ticket_is_refused_before_precreate() {
+        let db = mem_db();
+        let fx = test_ctx_fixture();
+        let n = 2470u64;
+        let issue = make_issue(n, GROOMED_BODY, &["ready", "blocked"], "t");
+
+        let action = dispatch_rescued_ticket_in_process(
+            &db,
+            &fx.ctx(),
+            &issue,
+            "fake",
+            "trace",
+            "auto-pull-t4",
+        )
+        .await;
+
+        assert_eq!(
+            parents_for(&db, n).await,
+            0,
+            "zéro tâche : la porte 4c refuse avant l'étape 7"
+        );
+        assert!(matches!(action, VerdictAction::Handled { .. }));
+        assert_eq!(
+            audit_after_values(&db, "auto-pull-t4", "ready_label_outcome").await,
+            vec!["operator_held".to_string()]
+        );
+    }
+
+    /// T5 — our call arrives second (R3, the reverse direction of D3): a live
+    /// pilot behind the issue makes the direct dispatch a refusal at gate 2c,
+    /// zero tasks created. The pilot is this very process, alive by
+    /// construction (the `mika2279_phase2_skips…` shape).
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn mika2470_a_live_pilot_refuses_the_direct_dispatch() {
+        use crate::db::NewTask;
+
+        let db = mem_db();
+        let fx = test_ctx_fixture();
+        let n = 2470u64;
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+
+        let parent = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: format!("ready-label: {DEFAULT_REPO}#{n}"),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: Some(url.clone()),
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: Some("issue".to_string()),
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create parent");
+        db.update_task_status(&parent, "in_progress")
+            .await
+            .expect("parent in progress");
+
+        let pid = std::process::id();
+        let start_time = crate::task_engine::process_liveness::read_process_start_time(pid)
+            .expect("read own start time");
+        let child = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: Some(parent.clone()),
+                depth: 1,
+                label: "long_running:run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("create child");
+        db.set_task_process_id(&child, Some(i64::from(pid)))
+            .await
+            .expect("record pgid");
+        db.set_task_metadata_field(&child, "process_start_time", &start_time.to_string())
+            .await
+            .expect("record start time");
+        assert_eq!(
+            parents_for(&db, n).await,
+            1,
+            "contrôle positif : une parente semée"
+        );
+
+        let issue = make_issue(n, GROOMED_BODY, &["ready"], "t");
+        let _ = dispatch_rescued_ticket_in_process(
+            &db,
+            &fx.ctx(),
+            &issue,
+            "fake",
+            "trace",
+            "auto-pull-t5",
+        )
+        .await;
+
+        assert_eq!(
+            parents_for(&db, n).await,
+            1,
+            "INVARIANT VIOLÉ : le dispatch direct a créé une seconde parente alors \
+             qu'un pilote tourne — la porte 2c doit refuser (mika#2279)"
+        );
+        assert_eq!(
+            audit_after_values(&db, "auto-pull-t5", "ready_label_outcome").await,
+            vec!["pilot_in_flight".to_string()]
+        );
+        let parent_row = db.get_task(&parent).await.unwrap().unwrap();
+        assert_eq!(
+            parent_row.status, "in_progress",
+            "le pilote vivant n'est pas supersédé"
+        );
+    }
+
+    /// T7 — the order is the R3 guarantee (D3): inside
+    /// `phase2_reconcile_stuck_ready`, the in-process dispatch **precedes** the
+    /// `ready` removal that starts the churn. A future diff that swaps them
+    /// reopens the mika#2335 kill window; this scan turns red on it.
+    #[test]
+    fn mika2470_direct_dispatch_precedes_the_label_churn() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auto_pull.rs"),
+        )
+        .expect("read auto_pull.rs");
+        let start = src
+            .find("async fn phase2_reconcile_stuck_ready(")
+            .expect("phase2_reconcile_stuck_ready must exist");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("function body must close");
+        let body = &body[..end];
+
+        let dispatch = body
+            .find("dispatch_rescued_ticket_in_process(db, ctx, issue")
+            .expect("Phase 2 must dispatch in-process (mika#2470 R1)");
+        let churn = body
+            .find("gh_remove_label(label_auth, n, \"ready\")")
+            .expect("the remove→add churn must remain (mika#2470 R4)");
+        assert!(
+            dispatch < churn,
+            "mika#2470 D3 VIOLATED: the in-process dispatch must precede the \
+             remove→add churn, or a live-channel `labeled` can land inside the \
+             step 7 → 9i window and kill the newborn pilot (mika#2335)"
+        );
+
+        // The per-tick cap bounds **attempts**, counted before the direct call
+        // (review finding #2 on mika#2470): the cap check reads `attempted`
+        // and the increment sits before the dispatch, so a run of
+        // `gh_remove_label` failures cannot turn the cap into "every candidate".
+        let cap_check = body
+            .find("attempted >= MAX_STUCK_RESCUE_PER_TICK")
+            .expect("the rescue cap must count attempts, not churn successes");
+        let attempt_increment = body
+            .find("attempted += 1;")
+            .expect("each direct-dispatch attempt must be counted");
+        assert!(
+            cap_check < attempt_increment && attempt_increment < dispatch,
+            "mika#2470 cap VIOLATED: `attempted` must be checked at the top of \
+             the loop and incremented before dispatch_rescued_ticket_in_process, \
+             or a sustained label-write failure dispatches every candidate per tick"
+        );
+        assert!(
+            !body.contains("rescued >= MAX_STUCK_RESCUE_PER_TICK"),
+            "the cap must not be re-keyed on churn successes"
+        );
+
+        // Option A (third-pass mika-arch): the churn is guarded by
+        // `churn_is_moot` between the dispatch and the label removal.
+        let guard = body
+            .find("if churn_moot {")
+            .expect("the churn must be guarded by churn_is_moot (mika#2470 Option A)");
+        assert!(
+            dispatch < guard && guard < churn,
+            "mika#2470 Option A VIOLATED: the churn_is_moot guard must sit between \
+             the direct dispatch and gh_remove_label"
+        );
+    }
+
+    /// T8 — Option A's predicate, pure (third-pass mika-arch): the churn is
+    /// moot only when the direct call did **not** dispatch **and** the engine
+    /// holds the ticket. Term by term, so neutralising either does not pass.
+    #[test]
+    fn mika2470_churn_is_moot_only_when_not_dispatched_and_held() {
+        let dispatched = VerdictAction::Dispatched {
+            pre_digest: String::new(),
+            task_id: "t".to_string(),
+        };
+        let handled = VerdictAction::Handled {
+            pre_digest: String::new(),
+        };
+        let passthrough = VerdictAction::Passthrough { enrichment: None };
+
+        // The moot case: deferred at 9d (Handled) or 9a/9b, parent pending.
+        assert!(churn_is_moot(&handled, true));
+        assert!(churn_is_moot(&passthrough, true));
+        // Contrôles négatifs, terme par terme.
+        assert!(
+            !churn_is_moot(&dispatched, true),
+            "Dispatched keeps the churn"
+        );
+        assert!(!churn_is_moot(&dispatched, false));
+        assert!(
+            !churn_is_moot(&handled, false),
+            "a refusal that left no task (2b–4c) still churns: age reset applies"
+        );
+        assert!(!churn_is_moot(&passthrough, false));
+    }
+
     const GROOMED_BODY: &str = r#"> - **Branch:** `feat/123/x`
 > - **Plan:** `docs/plans/2026-06-01-001-x.md` (committed on branch @ abc1234)
 > - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400"#;
@@ -5674,6 +6374,7 @@ This ticket has been GROOMED and is ready.
             circuit_broken: false,
             redrive_count,
             abandoned: false,
+            egress_relay_down: false,
         }
     }
 
@@ -6553,6 +7254,7 @@ This ticket has been GROOMED and is ready.
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
         let mut ledger = ExclusionLedger::default();
 
+        let fx = test_ctx_fixture();
         let rescued = phase2_reconcile_stuck_ready(
             &db,
             "fake-token",
@@ -6562,10 +7264,24 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
+            &fx.ctx(),
         )
         .await;
 
         assert_eq!(rescued, 0, "a held ticket is never re-driven");
+        // mika#2470 T6 — Phase 2 dispatches only what it rescues: a refused
+        // ticket must leave no `stuck_ready_direct_dispatch` line behind.
+        assert!(
+            db.get_audit_events("session")
+                .await
+                .expect("read audit events")
+                .iter()
+                .all(|e| e.tool_name != STUCK_READY_DIRECT_DISPATCH_TOOL_NAME),
+            "contrôle négatif : un ticket non sauvé n'est pas dispatché"
+        );
         assert!(
             ledger.entries.contains(&(
                 ExclusionPhase::Phase2StuckReady,
@@ -6617,6 +7333,7 @@ This ticket has been GROOMED and is ready.
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
         let mut ledger = ExclusionLedger::default();
 
+        let fx = test_ctx_fixture();
         let rescued = phase2_reconcile_stuck_ready(
             &db,
             "fake-token",
@@ -6626,6 +7343,10 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
+            &fx.ctx(),
         )
         .await;
 
@@ -7018,6 +7739,18 @@ This ticket has been GROOMED and is ready.
         assert_eq!(FILTER_PROBE_ERROR, "state_probe_failed");
         assert_eq!(FILTER_SEAT_REFUSED, "seat_refused");
         assert_eq!(FILTER_READY_PARKED, "ready_parked");
+        assert_eq!(FILTER_ABANDONED_OPERATOR_HELD, "abandoned_operator_held");
+        // mika#2049 — the SAME value as `ReadyLabelGate::EgressRelayDown`'s wire
+        // name, deliberately: one cause, two audit surfaces an operator
+        // aggregates separately. A divergent spelling would cut one outage's
+        // population in two, which is the error both scans exist to prevent.
+        assert_eq!(FILTER_EGRESS_DOWN, "egress_relay_down");
+        assert_eq!(
+            FILTER_EGRESS_DOWN,
+            crate::server::ready_label_handler::ReadyLabelGate::EgressRelayDown.wire_name(),
+            "mika#2049 — the two surfaces must name the same outage identically; \
+             pinning each side alone would let them drift apart in silence"
+        );
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
         // mika#2361 — the audit `tool_name`s are wire format too: an operator
         // greps them by hand, so a rename silently empties their query.
@@ -7245,6 +7978,7 @@ This ticket has been GROOMED and is ready.
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
         let mut ledger = ExclusionLedger::default();
 
+        let fx = test_ctx_fixture();
         let rescued = phase2_reconcile_stuck_ready(
             &db,
             "fake-token",
@@ -7254,6 +7988,10 @@ This ticket has been GROOMED and is ready.
             "trace",
             "session",
             &mut ledger,
+            // mika#2049 — the relay serves in these fixtures; the egress-down
+            // path has its own test below.
+            false,
+            &fx.ctx(),
         )
         .await;
 
@@ -7282,5 +8020,170 @@ This ticket has been GROOMED and is ready.
             "attendre un pilote ne dépense pas le budget de re-drive"
         );
         assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
+    }
+
+    // ── mika#2049 : la garde B (relais d'egress mort) ──
+
+    /// §5.1 assertion 6 — le **verdict**. `Skip`, jamais `SkipAndResetBudget`.
+    ///
+    /// Attendre un relais est juste ; appeler l'attente un succès est ce qui a
+    /// rendu le budget de mika#2020 inatteignable — mesuré à 31 re-drives contre
+    /// un compteur affichant 1 (mika#2158). Troisième occurrence de la même
+    /// phrase, et c'est pour ça qu'elle est asserte plutôt que commentée.
+    #[test]
+    fn mika2049_le_relais_mort_rend_skip_et_ne_remet_pas_le_budget_a_zero() {
+        let issue = make_issue(1, GROOMED_BODY, &["ready"], "t");
+        let mut f = facts(2);
+        f.egress_relay_down = true;
+
+        assert_eq!(
+            classify_stuck_ready(&issue, &f, 3),
+            StuckReadyVerdict::Skip {
+                reason: FILTER_EGRESS_DOWN
+            },
+            "un relais mort doit SAUTER le ticket sous son propre nom"
+        );
+
+        // Contrôle négatif : c'est bien le drapeau qui décide. Sans lui, le même
+        // ticket est éligible — donc l'assertion ci-dessus ne peut pas passer
+        // sur une constante.
+        let mut clean = facts(2);
+        clean.egress_relay_down = false;
+        assert_eq!(
+            classify_stuck_ready(&issue, &clean, 3),
+            StuckReadyVerdict::Eligible,
+            "sans panne, le ticket reste éligible — sinon l'assertion précédente \
+             ne prouverait rien sur le drapeau"
+        );
+    }
+
+    /// §5.1 assertion 6 (suite) — le **tick**, et ce qu'il ne touche pas.
+    ///
+    /// L'assertion pure ci-dessus dit le verdict ; celle-ci dit que la boucle
+    /// l'applique, nomme l'exclusion sous son propre nom, et **ne dépense pas**
+    /// le budget de re-drive — qui est tout l'objet de la garde (R5).
+    #[tokio::test]
+    async fn mika2049_un_tick_sous_panne_ne_parque_ni_ne_depense() {
+        use crate::db::Database;
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let n = 2049u64;
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let fx = test_ctx_fixture();
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            true, // le relais est mort
+            &fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "aucun re-drive pendant une panne de relais");
+        assert!(
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_EGRESS_DOWN)),
+            "l'exclusion doit être comptable sous son propre nom : c'est la \
+             requête qui répond « combien de tickets la panne a-t-elle épargnés ? » \
+             ; ledger = {:?}",
+            ledger.entries
+        );
+
+        let (redrives, abandoned) = db
+            .get_auto_pull_redrive_state(DEFAULT_REPO, n)
+            .await
+            .expect("read redrive state");
+        assert_eq!(
+            redrives, 0,
+            "attendre un relais ne dépense pas le budget — sans quoi une panne \
+             d'une heure parquerait chaque ticket derrière `operator-review`"
+        );
+        assert!(!abandoned, "et ne mène pas à l'abandon du ticket");
+
+        // Contrôle négatif : relais servant, même ticket. L'exclusion
+        // `egress_relay_down` ne doit PAS apparaître — sans quoi cette suite
+        // serait satisfaite par une garde qui refuse tout le monde.
+        let mut ledger_up = ExclusionLedger::default();
+        let fx = test_ctx_fixture();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger_up,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+        assert!(
+            !ledger_up
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_EGRESS_DOWN),
+            "sans panne, aucune exclusion d'egress ; ledger = {:?}",
+            ledger_up.entries
+        );
+    }
+
+    /// §5.1 assertion 7 — **l'invariant qui rend la garde B atteignable**.
+    ///
+    /// Le TTL du marqueur doit rester strictement supérieur au seuil de
+    /// stuck-ready. Une rédaction antérieure du plan posait 600 s « soit un tick
+    /// d'`auto_pull` », en raisonnant sur la cadence du tick ; le nombre qui
+    /// gouverne est le **seuil d'âge du label**, 900 s. À `TTL = 600 < 900`, le
+    /// marqueur est périmé **à chaque fois que Phase 2 le regarde**, la garde
+    /// n'est jamais consultée avec un marqueur frais, et une panne d'une heure
+    /// parque chaque ticket — exactement le résultat que la garde existe pour
+    /// éviter, avec une suite de tests verte.
+    ///
+    /// C'est la classe mika#2362 : deux nombres corrects l'un sans l'autre,
+    /// dont la relation n'était écrite nulle part.
+    #[test]
+    fn mika2049_le_ttl_du_marqueur_depasse_le_seuil_de_stuck_ready() {
+        let ttl = crate::pilot_egress_stamp::DOWN_TTL_DEFAULT_SECS;
+        let seuil = STUCK_READY_THRESHOLD_DEFAULT_SECS;
+
+        assert!(
+            ttl > seuil,
+            "mika#2049 — le TTL du marqueur d'egress ({ttl} s) doit dépasser le \
+             seuil de stuck-ready ({seuil} s), sinon le marqueur est périmé à \
+             chaque regard de Phase 2 et la garde B ne mord JAMAIS. Ne baissez \
+             pas l'un sans refaire cette arithmétique : le symptôme (des tickets \
+             parqués pendant une panne de relais) ne ressemble en rien à sa cause."
+        );
+
+        // Contrôle négatif de la correction elle-même : à 600 s — la valeur
+        // qu'une rédaction antérieure du plan proposait — la relation est FAUSSE.
+        // Sans cette ligne, l'assertion ci-dessus passerait aussi sur un TTL mal
+        // dimensionné si quelqu'un baissait le seuil en même temps.
+        assert!(
+            600 <= seuil,
+            "le contrôle négatif suppose un seuil >= 600 s ; s'il a bougé, \
+             refaites le tableau de `DOWN_TTL_DEFAULT_SECS`"
+        );
+
+        // Et la marge est écrite, pas seulement la stricte supériorité : le
+        // défaut est à deux fois le seuil.
+        assert!(
+            ttl >= 2 * seuil,
+            "le défaut vise deux fois le seuil ({} s attendus au moins, {ttl} s posés)",
+            2 * seuil
+        );
     }
 }

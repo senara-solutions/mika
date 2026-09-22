@@ -85,6 +85,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
 - `mika agents reprovision <name> [--tier <t>] [--identity-only] [--dry-run] [--yes]` — Re-apply an existing agent's authoritative `identity.toml` **and** `soul.md` (mika#2230). Both, because a tier has two axes since mika#2023 and the mika#1962 guard reads either. Differential, backs up what it overwrites in `0600`, refuses a template whose `[skills].allowlist` is absent or empty, and touches neither `config.toml` nor the DB. Runbook: `docs/operator/agent-identity-reprovision.md` § 7.
+- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. Depuis mika#2473 elle porte aussi une ligne `code` : ce que le **dépôt** déclare pour cet agent, et si le runtime en sert un autre. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
 - `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@samidarko/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
@@ -473,6 +474,19 @@ Optional (callback watchdog):
 - `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` — Grace window (seconds) before the childless-parent reaper transitions a `self_dev` **issue** parent left `in_progress` with **zero** callback children to `failed` (default: 1800, 30 min). The deterministic backstop for silent pilot death (#1687): a parent that reached `in_progress` without ever recording a callback child falls through both orphan reapers (they INNER-JOIN a delivered callback child) and the watchdog (it keys off the callback child's PID). Deliberately far larger than the orphan reaper's 600s grace because a legitimately-dispatching parent is childless only for the sub-second window between its `pending → in_progress` transition and the callback-child row commit. Invalid/≤0 values fall back to the default (WARN-logged). Runs every 60-tick DB scan. Grep `task_engine_childless_reaper.reaped` in `$MIKA_SPIRIT_LOG_FILE` for each silent-pilot death made visible + terminal; sustained >5/day signals an upstream dispatch-path root cause (this reaper is the visibility/terminal backstop, not the primary fix).
 - `MIKA_STUCK_PENDING_REAPER_GRACE_SECS` — Grace window (seconds) before the stuck-pending reaper acts on a `pending` `self_dev` **issue** parent that no callback child represents any more (default: 2700, 45 min; mika#2045). The nominal `pending → failed` transition was measured at 17–25 min, so 45 min sits at 1.8x the top of that window and a merely slow task is never touched. Invalid/≤0 values fall back to the default (WARN-logged). Shared with the `mika tasks stuck` probe so operator and engine report on one population.
 - `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` — Window (seconds) during which a *promoted* deferred wrapper still counts as representing its parent for the stuck-pending reaper (default: 2700, deliberately equal to the grace above; mika#2181). Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later. Counting `pending` alone made the reaper call a healthy parent unrepresented milliseconds after promotion and burn its re-arm budget in two ticks. The window is **bounded** because on the silent-turn error path a wrapper stays `completed` forever, and an unbounded predicate would make that corpse a permanent shield against repair. Invalid/≤0 **and values above 30 days** fall back to the default (WARN-logged) — the upper clamp is load-bearing: SQLite returns NULL for an out-of-range `strftime` modifier, so an absurd override would silently restore the mika#2181 predicate rather than widen the window. Grep `stuck_pending_sheltered_by_promoted_wrapper` in `$MIKA_SPIRIT_LOG_FILE` to see which parents the window is currently holding back — sparing happens inside SQL, so without that line an empty reaper reads the same whether it is idle or withholding.
+- `MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS` — Window (seconds) within which an **activity row** on a deferred wrapper's session proves the turn is working, and spares its parent from the stuck-pending reaper **whatever the age of its promotion** (default `600`; mika#2184). The direct measure that succeeds the proxy window above; the two coexist, the proxy filtering first in SQL and this one afterwards in the application, where it can log what it saw.
+
+  **Why the constant above could not be raised instead, measured.** Over 30 days, **139 of 799** delivered wrappers (17 %) delivered past 2700 s, **81** of their parents were expired `stuck_pending_no_deferred_wrapper`, and **8** of those were expired **2820–4996 s** after promotion — out of reach of *any* value of `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` compatible with a useful reaper. And the argument cuts the other way from how it reads: a wrapper delayed by a service restart is a **healthy** wrapper, i.e. exactly the one that must not be killed, so a bigger number buys coverage by blinding the reaper for longer. *A window on a proxy is a dated debt.*
+
+  **600 s** = 2× the default turn envelope (`AGENT_TOTAL_TIMEOUT` 300 s, mika#2189), which covers a whole turn *and* the interval to the next call with a factor of 2 of margin — deliberately twice mika#1652's 300 s for team runs, because the expensive error here is killing a live turn. House three-tier parse (absent/empty → default; unreadable, `0`, negative, or **above 30 days** → default with a WARN naming the value between quotes). The clamp is **not** the anti-`strftime` mechanism of its neighbour — this threshold never enters the SQL — it is the coherence of the knob: an absurd setting would spare every parent for ever.
+
+  **Three causes of delay, and they do not share a measure.** (A) the turn runs and is slow — the case this closes; (B) `AgentBusy`, where `dispatch_resume_agent` returns before opening a session, so **there is nothing to measure** — not covered, and the refusal is reasoned: the only available signal would be "the agent has activity elsewhere", true almost permanently on mika-dev, which would disarm the reaper under cover of precision (**follow-up named**); (C) a service restart, covered not by a measurement but by the admission that none took place — a process whose uptime is under the window **could not have observed** it, so zero rows there is an unavailability, not a silence. *What cannot extinguish itself cannot spare*: that is why a disarmed telemetry (`MIKA_STORE_LLM_CALLS` and `MIKA_STORE_TOOL_CALLS` both off) **reaps** with a WARN, while a young process spares.
+
+  **Operator surfaces.** `grep stuck_pending_sheltered_by_activity "$MIKA_SPIRIT_LOG_FILE" | jq -c '{task_id, issue, last_activity_secs, cause}'` — `cause` ∈ `{"active", "not_yet_observable"}`, and `last_activity_secs` is `null` on the second (mika#2331: `null` is never `0`). SQL: `SELECT count(*) FROM audit_events WHERE tool_name = 'stuck_pending_sheltered_by_activity';`. **This name is deliberately distinct from `stuck_pending_sheltered_by_promoted_wrapper`, which is untouched** — that one *carries its own cause*, and routing an unrelated spare through it would make the name false and split in two the population mika#2181's probe counts. Two names, two counts, subtractable. Same established motif as `phantom_aged_out` / `phantom_sweep_spared` (mika#2156). Each is SOLE WRITER of its name, pinned by a source scan.
+
+  **Five probes, and their halts.** **(1) Characterisation, to run BEFORE concluding on AC2:** on `~/.mika/data/mika.db`, for parents expired `stuck_pending_no_deferred_wrapper`, measure how many carried activity on one of their deferred wrappers' sessions in the 600 s before expiry. *Halt 1* — if the proportion is **nil**, the tail is made of B and/or C and **this ticket does not close the residue**: do not widen the window by reflex (that is the very gesture the ticket refuses), read which cause dominates, and open the follow-up or note that the uptime guard suffices for C. **(2) The measure bites (48 h):** expected regime **non-empty and low** — each line is a healthy parent the reaper was about to kill. *Halt 2* — if the count carries nominal traffic (several spares an hour on different parents), the measure is no longer sparing, it is disarming: establish *which* predicate is too wide before tuning anything. **This is a spare term, not a path.** **(3) The proxy debt retires:** `grep stuck_pending_sheltered_by_promoted_wrapper "$MIKA_SPIRIT_LOG_FILE" | wc -l` should **decrease** relative to probe 2. A joint plateau says the two protect disjoint populations, which is a **result** to write down, not a breakage. **(4) Both inertias are mute:** `grep stuck_pending_activity_not_recorded` and `grep stuck_pending_activity_window_invalid` — expected **zero** each. *Halt 3* — any hit on the first is a reaper running without its direct measure, i.e. this ticket rendered inert by a setting: check `store_llm_calls` / `store_tool_calls` first, do not touch the predicate. **(5) Negative control:** `stuck_pending_task_expired` must **keep** appearing. Zero expiries over a week means the reaper has stopped reaping altogether — the fault probe 2 looks for, seen from the other end. *A silent reaper reads exactly like a reaper with nothing to do* (mika#2205).
+
+  **Out of scope, deliberately:** the mika#2181 predicate itself (merged, correct in its domain, and the proxy window is kept unchanged under the direct measure); the reaper's TOCTOU; and the **phantom-sweep sibling** of this ticket's first comment — a NULL-PID `action_type='none'` row queued behind a busy slot produces **no** activity row at all, so measuring activity would spare it exactly zero times. Its discriminant is different (`has_live_deferred_wrapper_child`, already named in `dispatch_liveness`'s doc-comment as the hole in its guard), its population is different, its blast radius is different. **Follow-up, with its precondition:** establish that the class still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since raised the grace to 14400 s (`SELECT date(created_at), count(*) FROM audit_events WHERE tool_name = 'phantom_aged_out' AND created_at > '2026-09-10' GROUP BY 1;` — zero rows means **do not open it**, a second discriminant would be a guard with no population).
 - `MIKA_PHANTOM_SWEEP_AGE_SECONDS` — Grace period (seconds) before the watchdog phantom sweep transitions a NULL-PID `action_type='none'` tracking row that has been `in_progress`/`blocked` past this threshold to `failed` (mika#1712, default `14400` since mika#2156 — see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS` for the measured rationale). Startup sweep (AC5) still runs at age=0, but neither path is decided by the clock alone any more: since mika#2156 both consult the row's dispatch child and spare it while that process is alive, because a tracking row's `updated_at` is never bumped while its dispatch works. The SQL cutoff is `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-<n> seconds')`. Sweep telemetry: a per-row `audit_events` row with `tool_name='phantom_aged_out'` for each transition written and `tool_name='phantom_sweep_spared'` for each one the liveness guard withheld (mika#2156); a per-row `phantom_sweep_spared` INFO log line (fields: `source`, `task_id`, `child_task_id`, `process_id`, `updated_at`); a per-pass `phantom_sweep_complete` INFO log line (fields: `source` in `{"startup_sweep","watchdog_tick"}`, `count`, `spared_count`, `error_count`, `lookup_error_count`, `unusable_child_count`, `agent_id`); and `phantom_sweep_large_backlog` WARN when a single pass sweeps >100 rows (it still keys on `count`, so sparing never triggers it — anomalous state, feeds the mika#1934 cause-racine investigation).
 
 ### `fired_at` est le premier instant où le moteur a travaillé sous une ligne (mika#2133)
@@ -1122,6 +1136,106 @@ Observabilité du budget effectif + garde de demi-configuration (mika#2293) :
   par une variable d'environnement fleet-wide — voir la garde ci-dessus pour
   pourquoi.
 
+**La ligne existait, la question restait sans surface (mika#2457).**
+`llm_budget_resolved` répondait déjà — une fois par agent et par couple résolu,
+dédupliquée, dans ~19 Go de journal. L'opérateur qui veut *poser* la question n'avait
+rien. C'est ce trou qui a laissé le `240/900` du 06/09 échouer en silence jusqu'au
+11/09, et qui a avalé mika#2457 : **trois** plafonds ont été affirmés pour le même
+agent — **240** (le dépôt), **420** (mika#2342), **300** (mika#2457) — et **aucun**
+n'avait jamais été établi par lecture d'instrument.
+
+```bash
+mika agents budget --agent mika-arch                     # ce sous quoi l'agent TOURNE, daté
+stat -c '%y  %n' ~/.mika/agents/mika-arch/config.toml    # ce que le disque PORTE, daté
+```
+
+- **Spirit atteste, le CLI rend — jamais l'inverse.** `AgentState.budget_record` est
+  figé à l'`init_agent` (contrat *not hot-swappable*, comme `tier` et `deployment`) et
+  `GET /api/v1/agents/{id}/budget` le sert tel quel. Ni la route ni le CLI ne relisent
+  le disque : recalculer lirait le `process_env` du **process lecteur**, donc
+  rapporterait un réglage qui n'est pas en vigueur avec l'autorité d'une mesure — le
+  défaut mika#2304 d'un champ à côté. Serveur injoignable ou 404 ⇒ *« non attesté »*,
+  **aucune valeur locale affichée**.
+- **Le gel est la propriété, et la datation est ce qui le rend lisible.** Le record
+  répond « sous quoi cet agent tourne », jamais « que porte le disque maintenant ».
+  Les deux coïncident sauf si quelqu'un a édité le `config.toml` depuis le démarrage —
+  c'est-à-dire précisément la dérive hors dépôt que mika#2328 a mesurée. D'où les deux
+  dates : `resolved_at` **postérieur** au mtime ⇒ la sonde tranche sans réserve ;
+  `resolved_at` **antérieur** ⇒ le record reste vrai de ce qui **tourne** (donc décisif
+  pour diagnostiquer un tour coupé) mais ne dit rien du disque, dont la valeur
+  n'entrera en service qu'au prochain redémarrage.
+- **Table de lecture.** `model` ≠ celui du dépôt ⇒ dérive hors dépôt **confirmée et
+  mesurée** : noter la valeur, sa provenance et `resolved_at` **avant** de toucher au
+  disque ; le préalable est un ticket de réconciliation modèle + calibration
+  (mika#1190), pas une baisse de `max_tokens`. `http_source = process_env` ⇒ une
+  variable de service écrase le `config.toml` : le remède est de la **retirer de
+  l'environnement du service**, ce qui referme aussi la question ouverte de mika#2342.
+  `http_source = agent_config` à la valeur attendue ⇒ le réglage est en vigueur et la
+  cause est ailleurs — **ne pas conclure sur `max_tokens`**. `max_tokens_source =
+  default` ⇒ provisionnement gelé, geste de provisionnement et non de code.
+- **Halte — aucune ligne, agent inconnu.** Le binaire servi est antérieur au correctif
+  (classe mika#2340) ou l'agent n'est pas servi par ce process. Établir le déploiement
+  **avant** toute conclusion sur les valeurs.
+- **Ce que ce travail n'achète PAS.** Aucune valeur de réglage ne bouge : plafond,
+  enveloppe, `llm_max_tokens` et modèle sont inchangés, et les deux tests qui figent la
+  géométrie de mika-arch (`test_mika_arch_config_toml_is_valid_toml`,
+  `mika2280_the_three_shipped_geometries_and_their_verdict`) passent sans modification.
+  Ce livrable **mesure** la dérive code↔runtime ; il ne la refuse pas — la garde est le
+  suivi que mika#2328 s'est écrit. Et aucun mécanisme de repli modèle n'est introduit :
+  voir *Hors périmètre* du plan mika#2457 pour ses trois préconditions.
+
+**La garde annoncée ci-dessus est livrée, et elle ne refuse toujours rien (mika#2473).**
+Deux détecteurs, deux questions différentes, et aucun des deux ne couche la flotte.
+
+- **D1, au boot : ce que le dépôt déclare vs ce que la cascade a résolu.** À chaque
+  `init_agent`, spirit compare le couple `(provider, modèle)` de la constante
+  `config_toml` de l'agent bien connu à celui du record mika#2457, et émet **une**
+  ligne par agent et par init : `well_known_model_drift` (WARN) sur divergence,
+  `well_known_model_in_sync` (INFO) en phase, **rien** pour un agent qui ne déclare
+  aucun modèle. Ce troisième bras est ce qui sépare « la garde s'est tue » de « la
+  garde n'a pas tourné ». Le résultat est **gelé** sur `AgentState` et servi en
+  sibling du record sur `GET /api/v1/agents/{id}/budget`.
+- **D2, au tour : ce que le process sert vs ce que le disque porte maintenant.** Un
+  `stat` du `config.toml` par tour, une re-résolution par mtime distinct, et
+  `agent_config_changed_since_boot` — WARN avec `restart_required = true` quand un
+  champ du record a bougé, INFO sinon. **`restart_required = false` ne veut pas dire
+  « rien n'a changé »** : le record ne porte ni `openrouter_base_url`, ni `zai_base_url`,
+  ni `log_level`, donc une édition de ces clés y tombe, et le message le dit plutôt que
+  d'affirmer qu'aucun champ effectif n'a bougé. Un `stat` illisible **sort le tour de
+  la population** et le dit sous son propre nom, `agent_config_mtime_unreadable`.
+
+```bash
+# D1 — une ligne par agent bien connu, avant tout tour
+grep -E 'well_known_model_(drift|in_sync)' "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{agent_id, declared_model, runtime_model, runtime_model_source}'
+mika agents budget --agent mika-arch    # la ligne `code … — DÉRIVE …` est rendue
+
+# D2 — les deux contrôles, dans l'ordre
+touch ~/.mika/agents/mika-arch/config.toml && mika ask --agent mika-arch "ping"
+grep agent_config_changed_since_boot "$MIKA_SPIRIT_LOG_FILE" | tail -1 | jq .restart_required
+```
+
+**Attendu sur ce poste au 2026-09-22, et c'est une mesure, pas une prédiction :**
+mika-arch en **dérive** (`kimi-k2.5` au dépôt, `kimi-k3` sur disque depuis le 18/09),
+mika-qa en **dérive** (`zai/glm-5.2` au dépôt, `openrouter/z-ai/glm-5.2` depuis le
+19/09), mika-dev **en phase**. Le `touch` doit rendre `restart_required: false` ; une
+édition réelle du modèle, `true`.
+
+**Halte 1 — zéro ligne D1 après un restart.** Le binaire servi est antérieur au
+correctif (classe mika#2340) : établir le déploiement **avant** toute conclusion sur
+la dérive. Une garde qu'on n'a pas déployée se lit exactement comme une flotte saine.
+**Halte 2 — D1 tire sur les trois agents à chaque boot.** Ce n'est pas du bruit à
+museler : c'est l'état de ce poste, rendu lisible, et `MIKA_DISABLE_AGENT_PROVISIONING=1`
+est ce qui le gèle là. La résolution appartient à la réconciliation modèle +
+calibration (mika#1190), jamais à un filtre ni à un `#[ignore]`.
+**Halte 3 — la dérive persiste après une correction du `config.toml` sans redémarrage.**
+C'est le contrat, pas un défaut : le record est figé au boot, et D2 est précisément ce
+qui rend cet écart décidable au lieu de le laisser deviner.
+
+**Le côté déclaré est celui du BINAIRE servi**, pas du checkout : un `mika-spirit` en
+retard sur `main` déclare la constante d'hier et rapportera une dérive qui n'existe
+que dans son propre passé (`feedback_binary_staleness_vs_main`).
+
 `mika ask --model` atteint enfin l'exécutant, et `--verbose` cesse de répondre à sa place (mika#2304) :
 - **Le défaut, et il est plus large que le ticket ne le dit.** Le ticket vise
   `--remote` ; les deux portes étaient cassées. Depuis mika#1727, `mika ask` **sans**
@@ -1574,6 +1688,155 @@ Aucun filtre acteur n'existe ; ce qui manquait, c'est de savoir quelle porte a r
 - **Surfaces opérateur.** SQL — `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'ready_label_outcome' GROUP BY 1 ORDER BY 2 DESC;` donne la distribution des portes, la mesure que le ticket demandait et qui n'existait pas ; `SELECT * FROM audit_events WHERE tool_name = 'ready_label_outcome' AND target_key = 'senara-solutions/mika#2323' ORDER BY created_at DESC;` répond directement à « pourquoi ce ticket n'a-t-il pas dispatché ? », en une requête plutôt qu'en un grep sur dix-neuf gigaoctets. Journal — `grep ready_label_received $MIKA_SPIRIT_LOG_FILE | jq -c '{repo, num, actor}'` (une ligne par `labeled ready` réellement reçu) et `grep ready_label_outcome …` (sa porte).
 - **Sonde post-déploiement, 48 h, avec ses deux haltes.** *Halte 1 — l'instrument ne voit rien.* Un `labeled ready` humain posé, confirmé par la timeline GitHub, et **aucune** ligne `ready_label_received` : ne pas élargir le handler. L'événement n'atteint pas l'agent ; la cause est dans le chemin de livraison (file bornée, 429, circuit breaker, DLQ) et c'est **ce chemin** qu'il faut instrumenter, pas ce prédicat. *Halte 2 — une porte domine.* Si une valeur de `gate` concentre les refus (typiquement `operator_held` ou `pilot_in_flight`), le défaut n'est pas dans le handler : la porte a raison et un producteur en amont repose le label. C'est ce producteur qu'il faut traiter, et il a son propre ticket.
 
+Un dé-groomage est un fait estampillé par son producteur (mika#2242) :
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` sans comprendre
+pourquoi cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-09-08.** Fermer une PR **umbrella** qui déclare
+  `Closes #<sous-ticket>` **dé-groome** ses sous-tickets : le plan et le marqueur
+  `GROOMED` vivent sur la **branche de l'umbrella**, jamais sur le corps de
+  l'issue du sous-ticket, et le routage groom-vs-impl lit ce corps. #2131 a
+  conservé `ready` sans aucun callout ; chaque dispatch a re-routé vers `groom`.
+  Résolu à la main, en re-groomant #2131 standalone avec le plan récupéré sur la
+  branche morte de la PR #2226.
+- **Ce que la lecture du code déplace dans le ticket.** *(a)* L'option 2 du
+  ticket — « le sélecteur détecte que ce ticket était closingIssue d'une umbrella
+  fermée » — **n'est pas implémentable depuis le sous-ticket** : le nom canonique
+  d'un plan d'umbrella ne porte aucun numéro de sous-ticket (le créneau `<issue>`
+  contient le mot `umbrella`), donc ni `_find_issue_plan` ni un `git log --all`
+  ne le retrouvent ; et GitHub n'expose pas la direction issue → PR fermantes
+  (l'inverse, `PullRequest.closingIssuesReferences`, existe seul). **Le lien
+  n'est lisible qu'à un instant : la fermeture de la PR.** *(b)* La boucle
+  « indéfiniment » du ticket est **déjà bornée** depuis mika#2020 (trois
+  re-drives puis abandon) et mika#2279 (porte 2c). Ce qui restait ouvert est
+  double et se ferme par le même couple : rien ne nommait la cause, et le travail
+  revu — un plan plus deux passes architecte — était jeté.
+- **Un enregistrement, pas une action.** `pull_request.closed` est un **événement
+  unique non rejouable**, perdable aux quatre endroits que la maison a mesurés
+  (file bornée mika#1870 → 429 → disjoncteur → DLQ `dead`). C'est la classe dont
+  la couche C de #1694 est morte. On n'y accroche donc pas une action : on y
+  écrit un **fait durable** que des lecteurs ultérieurs consultent.
+- **Deux noms, deux populations, chacun à écrivain unique**, et c'est ce qui rend
+  les sondes lisibles. `closing_pr_closed_unmerged` (producteur) compte **toute**
+  fermeture sans merge × ref fermante, y compris les anodines — une PR de
+  brouillon fermée, une PR remplacée. `ready_label_degroomed` (lecteur) compte le
+  sous-ensemble qui a **effectivement** reflué en `groom` en portant le marqueur,
+  c'est-à-dire le défaut. **Le compte du producteur doit dominer largement celui
+  du lecteur** : c'est le régime sain, et il n'est soustractible que tant que
+  chaque nom a un seul écrivain (scan
+  `canonical_tokens::tests::mika2242_the_two_audit_names_have_a_single_writer`,
+  allowlist livrée vide). Cinquième emploi du motif après
+  `phantom_aged_out`/`phantom_sweep_spared` (mika#2156).
+- **Le routage ne change pas, et c'est un refus raisonné.** Un ticket dé-groomé
+  continue de partir en `groom`, même `dispatch_class`, même `ReadyLabelGate`.
+  Halter serait la lettre de l'option 2, et c'est refusé sur deux mesures : la
+  boucle n'est plus le mal à éviter (mika#2020), et **re-groomer un ticket
+  dé-groomé est un travail correct** — le plan est inatteignable depuis l'issue,
+  et un groom qui aboutit rétablit précisément les callouts qui manquent. C'est
+  d'ailleurs le remède que l'opérateur a appliqué à la main. *Un filet, pas un
+  chemin* (mika#2334).
+- **Fail-open sur toute lecture.** Registre illisible, marqueur absent,
+  `reasoning` inexploitable : le routage est identique à aujourd'hui. Le seul
+  effet possible d'une défaillance est de **perdre une explication**, jamais d'en
+  fabriquer une fausse. La granularité est porteuse : la décision du lecteur ne
+  tient qu'à la **présence** de la ligne, la branche est un enrichissement — un
+  `reasoning` illisible rend donc « dé-groomé par pr#N, branche inconnue »,
+  jamais un silence.
+- **Fenêtre de 90 jours, dérivée et non réécrite.** Le lecteur interroge sur
+  `evidence::audit::AUDIT_RETENTION_DAYS`, la constante que
+  `compact_old_audit_events` consomme : deux littéraux laisseraient la fenêtre
+  survivre aux lignes qu'elle lit, c'est-à-dire une recherche qui cesse de
+  trouver **en silence**. Coût nommé : un ticket délié il y a plus de 90 jours
+  perd son attribution et se relit comme « simplement non groomé » — le
+  comportement d'avant ce correctif.
+- **Portée agent : une condition de fonctionnement.** `audit_events` est scopé
+  par `agent_id`, donc producteur et lecteur doivent tourner sur le même agent.
+  Ils le font : `route_event` rend `mika-dev` pour `pull_request.closed` **et**
+  pour `issues.labeled`. Écrit au site d'émission parce que si ça cessait d'être
+  vrai, le marqueur deviendrait invisible **sans qu'aucun test ne rougisse**.
+  Limite corollaire : la résolution de siège (mika#2084) pourrait router les deux
+  événements d'un dépôt vers des sièges distincts — le lecteur retomberait alors
+  sur le comportement d'aujourd'hui, fail-open, jamais une attribution fausse.
+
+### SQL
+
+```sql
+-- « Pourquoi ce ticket n'est-il plus groomé, et où est son plan ? »
+SELECT created_at, after_value, reasoning FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged'
+   AND target_key = 'issue:senara-solutions/mika#2131';
+
+-- Quelle umbrella a délié quoi (population du producteur)
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le défaut réellement vécu (population du lecteur) — doit être TRÈS inférieure
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_degroomed' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `closing_pr_closed_unmerged` | INFO | **non vide, faible** | une fermeture sans merge a délié un ticket de sa PR fermante. Fréquent et souvent anodin. |
+| `ready_label_degroomed` | INFO | **proche de zéro** | chaque ligne est du grooming revu qu'on est en train de re-payer. |
+| `closing_pr_body_truncated_no_refs` | WARN | **inconnu, à mesurer** | l'angle mort de troncature. Non vide ⇒ des fermetures unmerged passent sous le radar du producteur. |
+| `ready_label_degroom_ledger_unreadable` | WARN | **vide** | toute occurrence est une attribution perdue (jamais fausse). |
+| `closing_pr_marker_write_failed` | WARN | **vide** | le marqueur n'a pas été écrit ; le nettoyage de rows, lui, a bien eu lieu. |
+
+- **L'angle mort, nommé et NON corrigé.** `format_event_text` tronque le corps de
+  PR à 2 000 caractères et `parse_closing_issue_refs` lit **ce corps tronqué** :
+  les lignes `Closes #N` d'une umbrella — corps typiquement long — peuvent tomber
+  au-delà. Le producteur serait alors **silencieusement inerte pour exactement la
+  population qu'il vise**, et un détecteur inerte se lit comme un détecteur sain
+  (mika#2205). D'où `closing_pr_body_truncated_no_refs`. Le fermer demanderait
+  d'aller chercher le corps complet en GraphQL, dans un handler qui ne fait
+  **aucune** lecture réseau et sur **toute** fermeture de PR — donc de changer la
+  population du nettoyage de rows existant. **Ticket de suivi, précondition : que
+  cette ligne soit non vide.**
+
+### Sondes, et leurs haltes
+
+1. **Contrôle positif du producteur (7 jours).** `closing_pr_closed_unmerged`
+   non vide. **Halte 1 —** vide alors que des PR ont été fermées sans merge :
+   **ne pas élargir le prédicat**, lire d'abord
+   `closing_pr_body_truncated_no_refs`. Si *elle* est non vide, le producteur est
+   inerte par troncature et le remède est son suivi. Si les deux sont vides,
+   établir le déploiement (classe mika#2340) avant toute conclusion — *une ligne
+   absente ne prouve rien tant qu'on n'a pas établi que le binaire qui tourne
+   sait l'écrire*.
+2. **Attribution du lecteur (30 jours).** `ready_label_degroomed` doit rester
+   proche de zéro. **Halte 2 —** si ce compte porte du trafic nominal, ce n'est
+   pas le lecteur qui est trop large : des tickets dé-groomés sont dispatchés en
+   série, et c'est la **décision de refus** ci-dessus qu'il faut rouvrir (copier
+   le plan vers chaque sous-ticket à la décomposition) — avec ce compte comme
+   précondition.
+3. **Le défaut fondateur n'est PAS rattrapé.** Le marqueur de #2131 n'existe pas
+   et n'existera pas : la PR #2226 a été fermée avant ce correctif, et **rien ici
+   ne rétro-remplit le registre** — fabriquer une ligne d'audit datée d'un
+   événement qu'on n'a pas observé serait l'inverse de tout ce que ce travail
+   défend. La sonde est la **prochaine** occurrence.
+4. **Contrôle négatif de bruit (7 jours).** Aucun `ready_label_degroomed` sur un
+   ticket portant ses trois callouts. **Halte 3 —** une occurrence signifie que
+   le lecteur est atteint sur le chemin `implement`, donc mal placé : le
+   corriger, ne pas filtrer en aval.
+
+**Ce que ce travail n'achète pas.** Il ne réutilise aucun plan automatiquement :
+il rend le plan **désignable** (un numéro de PR, une branche) là où il fallait
+une archéologie. Il ne rétro-remplit rien. Et `ready_label_degroomed` ne peut pas
+voir un ticket dont personne ne repose le label : *une attribution que personne
+ne déclenche reste un silence*.
+
+**Hors périmètre, délibérément :** la copie du plan aux sous-tickets à la
+décomposition (refus raisonné ci-dessus, **suivi** conditionné à la sonde 2) ;
+l'angle mort de troncature (**suivi** conditionné à la sonde 1) ; le halt au
+routage ; la réutilisation automatique du plan par le pilote de groom ;
+`claude-pilot#166`, qui vit dans un autre dépôt ; et le rétro-remplissage du
+registre.
+
 Optional (authentification des deux scans périodiques — mika#2205):
 - **`auto_pull` et `wip_rescue` résolvent PAT-first / App-fallback, plus PAT-seul.** Les deux gardes de `task_engine/dispatcher.rs` lisaient `self.github_token` — le PAT seul, peuplé depuis `Settings::agent_github_token()` — alors que le dispatcher détenait déjà `settings` et `github_app`, et que le convertisseur canonique `Settings::resolve_github_token` existait à côté. Le 2026-09-05 le PAT a disparu de l'environnement du spirit à ~16:20 et **les deux scans sont morts à la même seconde** (`auto_pull: running groomed ticket selection` dernier `16:20:00.320868Z`, `wip_rescue: running auto-resume scan` dernier `16:20:00.320882Z`), alors que le chemin App était sain (`manager_token_refreshed` jusqu'à 23:17Z, zéro `gh_app_token_exchange_failed`). Précédent identique et non généralisé : mika#2013 sur le cycle mika-manager.
 - **Identité (ADR-008).** Le repli App est acceptable **ici** parce qu'aucune opération de ces deux scans n'est de celles dont GitHub lit l'auteur : `auto_pull` bascule le label `ready` et lit ; `wip_rescue` rebase, pousse sur une branche de brouillon, `gh pr ready`, commente. Les chemins qui **exigent** l'identité machine (revue/merge de PR, où `mika-qa` approuvant une PR `mika-dev` sous l'identité App partagée est refusé par GitHub) ne passent pas par là et ne sont pas touchés — y compris le troisième site PAT-seul du même fichier, l'auto-fire post-grooming, laissé hors périmètre à dessein.
@@ -1654,10 +1917,10 @@ Optional (terminal-worktree reaper — mika#2420):
 - **Why the prior art failed, in one sentence of its own doc.** #1694 was three layers — A (audit), B (bulk removal), C (a `pull_request.closed` webhook handler) — and admitted in writing that *"layers A/B clean up whatever slips through"*. **That sentence is the defect**: layer C is a handler on a **single, non-replayable** event, losable in four places the house has already measured (bounded webhook queue mika#1870, 429, circuit breaker → DLQ → `dead`, an empty LLM turn `webhook_zero_tools` only opposes once) — the exact class mika#2334 had to close for `pull_request.opened`. And the catch-up was delegated to A and B, **which are manual**. The gesture whose three-hour half-life Vincent measures *is* layer B.
 - **Scan only, no hook**, four reasons in decreasing weight. (1) The scan covers the **already-accumulated** population — the eleven measured worktrees; a hook never catches up on what it missed, which is the property that defeated #1694. (2) The hook's latency is negligible against the measured rate: the disk climbs ~8 %/h, so a ten-minute tick costs ~1.3 % of disk. (3) One mechanism is one place to debug. (4) House doctrine — *a net, not a path* (mika#2334); a hook stays possible later **on top of** this scan, and the order is constrained only in that direction.
 - `MIKA_WORKTREE_REAP` — kill-switch (default armed). `0` **cancels** the recurring row rather than skipping its registration: a row posted by an earlier startup would otherwise outlive the disarm — the exact defect mika#2271 had to repair.
-- `MIKA_WORKTREE_REAP_DISPOSITION` — `armed` (default) | `observe`. In observation the scan measures and logs and **removes nothing**, writing its audit rows with `disposition: "observe"` — which gives the operator the exact population that *would* be removed, before arming it. Patron mika#2249: *detection is unconditional, only disposition is gated.* An unrecognized value **stays armed** with a WARN naming it between quotes: a disarm by typo would make the scan look active while it deleted nothing.
+- `MIKA_WORKTREE_REAP_DISPOSITION` — `armed` (default) | `observe`. In observation the scan measures and logs and **removes nothing**, writing `worktree_reap_would_dispose` rows (never `worktree_reaped`) with `disposition: "observe"` — which gives the operator the exact population that *would* be removed, before arming it. Patron mika#2249: *detection is unconditional, only disposition is gated.* An unrecognized value **stays armed** with a WARN naming it between quotes: a disarm by typo would make the scan look active while it deleted nothing. **mika#2469:** before this fix, `observe` wrote `worktree_reaped` with `disposition=observe` in `reasoning`, so the log said « retiré » about a worktree still on disk and the operator query below counted observations among removals; rows written before the deploy are told apart by `reasoning LIKE '%disposition=observe%'`, not by name.
 - `MIKA_WORKTREE_REAP_REPO_DIRS` — `:`-separated checkouts (default `/data/workspace/mika-platform/mika`). The `owner/repo` is **derived** from `git remote get-url origin`, never declared in a second list — two lists to keep in sync is a programmed divergence.
 - `MIKA_WORKTREE_REAP_GRACE_SECS` — delay after the PR closes before the worktree is eligible (default `900`, three times a turn envelope: covers a merge callback still in flight, costs ~2 % of disk at 8 %/h).
-- `MIKA_WORKTREE_REAP_MAX_PER_TICK` — cap **on writes**, applied by the caller after the filter (default `3`). At a ten-minute tick it absorbs the eleven measured worktrees in under an hour while spreading the deletion I/O — an `rm -rf` of 34 Go is an I/O storm, and this cap is what bounds it. In steady state (2 to 4 merged PRs/day) it is never reached. The three numeric keys use the house three-tier parse; **`0` does not disarm** — that is the kill-switch's job, and the inverse would make a typo a silent disarm on a destructive scan.
+- `MIKA_WORKTREE_REAP_MAX_PER_TICK` — cap **on writes**, applied by the caller after the filter (default `3`). At a ten-minute tick it absorbs the eleven measured worktrees in under an hour while spreading the deletion I/O — an `rm -rf` of 34 Go is an I/O storm, and this cap is what bounds it. In steady state (2 to 4 merged PRs/day) it is never reached. **It applies in `observe` too** — an observe tick names at most this many eligible worktrees, so the dry-run of a backlog takes several ticks (see the post-deploy probes below). The three numeric keys use the house three-tier parse; **`0` does not disarm** — that is the kill-switch's job, and the inverse would make a typo a silent disarm on a destructive scan.
 - **Hot STOP**: `touch ~/.mika/state/worktree-reap-stop` short-circuits the tick (≤ 10 min), `rm` resumes it. Second use of the mika#2329 mechanism, which shipped parameterized by scan name and refused to extend itself for want of a measured need: **a destructive operation is precisely that need** — during an incident one wants to stop what deletes without restarting mika-spirit. Same semantics: existence is STOP, content is never read; the recurring row is **never** touched, so reversibility is the absence of machinery (no contact with the mika#1742 anti-zombie guard, the mika#2271 config-cancel exemption, or `RECURRING_ZOMBIE_GRACE_HOURS`).
 - **Three levers, three scopes, none redundant**: the kill-switch is durable and boot-time, the disposition is for validating a new machine, the STOP file is for an incident, hot.
 - **The asymmetry decides everything, and it is written before the rest.** A false negative keeps a dead worktree for ten minutes; a false positive destroys hours of work in a decision worktree, **irreversibly**. So **every term of the predicate is fail-safe towards *keep*, without exception** — the **inverse** of `wip_rescue`'s fail-closed (mika#2199), and the inversion is reasoned: there an unreadable signal had to exclude the PR because a replay cost the whole queue; here an unreadable signal must keep, because a wrongful removal does not repair. **That trade-off is local; it does not transport.**
@@ -1674,15 +1937,56 @@ Optional (terminal-worktree reaper — mika#2420):
    WHERE tool_name = 'worktree_reap_skipped' GROUP BY 1 ORDER BY 2 DESC;
   SELECT target_key, created_at FROM audit_events
    WHERE tool_name = 'worktree_reaped' ORDER BY created_at DESC;
+  SELECT target_key, created_at FROM audit_events
+   WHERE tool_name = 'worktree_reap_would_dispose' ORDER BY created_at DESC;
   ```
-  `worktree_reaped` is **SOLE WRITER** (pinned by a source scan), which is what makes the second query the exact list of worktrees the loop removed — the ticket's guard-rail 3. Grep in `$MIKA_SPIRIT_LOG_FILE`: `worktree_reaped` (one INFO per removal, carrying `worktree_path`, `branch`, `pr_number`, `pr_state`, `bytes_reclaimed` (nullable), `bytes_reclaimed_truncated`, `disposition`); `worktree_reap_tick` (aggregate, **emitted only when the tick acts** — zero action, zero line); `worktree_reap_failed` (WARN — **must stay empty**); `worktree_reap_no_checkout` (WARN — R10, the no-op is **said**: in containerized production the worktrees do not live on the agent's filesystem, and without this line the scan's silence would read exactly like that of a scan that runs and finds nothing, class mika#2205); `worktree_reap_no_token` (WARN); `worktree_reap_stop_armed` / `_lifted` (INFO, one line per short-circuited tick — for a switch, liveness *is* the information, same doctrine as mika#2329 and Signal P of mika#2156).
-- **Post-deploy probes, and their four halts.** Start in `observe` for one tick, read the population that *would* be removed, then arm — that is the verification the mode exists to offer. Volume probe (first tick then 24 h): the count of terminal-PR worktrees trends to zero and stays there. Disk probe: `/data` stops crossing 80 % in nominal operation.
-  **HALT 1 — a worktree of an open PR, or a human worktree, was removed.** `touch ~/.mika/state/worktree-reap-stop` **immediately**, then diagnose. A false positive is irreversible and is not settled by tuning a threshold; read `worktree_reaped` to establish which term read true when it was not.
+  `worktree_reaped` is **SOLE WRITER** (pinned by a source scan), which is what makes the second query the exact list of worktrees the loop removed — the ticket's guard-rail 3 — and since mika#2469 it is **reserved to `armed`**: the third query is the population the scan *would* have removed in `observe`, written under its own `tool_name` by the same module, held by the same two-needle guard. Both surfaces (log event and audit `tool_name`) come from one function, `outcome_for(disposition)`, so they cannot diverge. Grep in `$MIKA_SPIRIT_LOG_FILE`: `worktree_reaped` (one INFO per removal, carrying `worktree_path`, `branch`, `pr_number`, `pr_state`, `bytes_reclaimed` (nullable), `bytes_reclaimed_truncated`, `disposition`); `worktree_reap_would_dispose` (same fields, INFO, one per eligible worktree in `observe` — message « éligible — observe, non retiré »); `worktree_reap_tick` (aggregate, **emitted only when the tick acts** — zero action, zero line); `worktree_reap_failed` (WARN — **must stay empty**); `worktree_reap_no_checkout` (WARN — R10, the no-op is **said**: in containerized production the worktrees do not live on the agent's filesystem, and without this line the scan's silence would read exactly like that of a scan that runs and finds nothing, class mika#2205); `worktree_reap_no_token` (WARN); `worktree_reap_stop_armed` / `_lifted` (INFO, one line per short-circuited tick — for a switch, liveness *is* the information, same doctrine as mika#2329 and Signal P of mika#2156).
+- **Post-deploy probes, and their four halts.** Start in `observe` and read the population that *would* be removed (the `worktree_reap_would_dispose` lines — mika#2469) — that is the verification the mode exists to offer, and **one tick does not deliver it**: the write cap (`MIKA_WORKTREE_REAP_MAX_PER_TICK`, default `3`) is consumed in `observe` exactly as in `armed` (`budget -= 1` runs before the disposition match in `reap_terminal_worktrees`), and it is shared across `MIKA_WORKTREE_REAP_REPO_DIRS`, so one tick names at most 3 of the N eligible worktrees. Leave `observe` on for `ceil(N / MAX_PER_TICK)` ticks — until a tick writes no `worktree_reap_would_dispose` row that `SELECT DISTINCT target_key` has not already returned — or export a larger `MIKA_WORKTREE_REAP_MAX_PER_TICK` for the observe pass, then arm. Arming after a single tick would remove the other N-3 without their ever having been dry-run. Volume probe (first tick then 24 h): the count of terminal-PR worktrees trends to zero and stays there. Disk probe: `/data` stops crossing 80 % in nominal operation.
+  **HALT 1 — a worktree of an open PR, or a human worktree, was removed.** `touch ~/.mika/state/worktree-reap-stop` **immediately**, then diagnose. A false positive is irreversible and is not settled by tuning a threshold; read `worktree_reaped` to establish which term read true when it was not (in `observe`, the symmetric line is `worktree_reap_would_dispose` — it names a worktree the predicate would have removed, and HALT 1 applies to it as a dry-run signal: an open-PR or human worktree in that population is the same false positive, caught before arming — provided `observe` ran long enough for the whole population to be named, see the cap above).
   **HALT 2 — the disk still fills while no merged worktree remains.** The cause is elsewhere: the `target/` of **open** PRs. **Do not widen the predicate** — that would delete live work for a sizing problem. Open the follow-up ticket (shared `CARGO_TARGET_DIR`, or selective `cargo clean` on inactive worktrees).
   **HALT 3 — `dirty` or `unpushed_commits` dominate the motif distribution.** That population is undelivered work on already-merged PRs, i.e. a defect **upstream** — the mika#1282 post-flight recovery did not do its job. Not a setting of this scan. Open the follow-up ticket with the distribution attached; do not remove those worktrees blindly.
   **HALT 4 — `outside_managed_root` is non-empty.** A path outside the managed root reached the predicate. Disarm and establish how, before anything else.
 - **Named residual risk.** When `refs/remotes/origin/<branch>` is **absent**, T7 reads `Clean` rather than `Unreadable`: this term is only reached for a worktree whose PR is terminal, hence whose branch *was* pushed, so the ref's absence means the remote deleted it after the PR closed. Reading it as unreadable would keep nearly the whole targeted population, i.e. make the scan inert exactly where it must serve (class mika#2205). The cost, stated: a PR **closed without merging** whose remote branch was deleted will see its commits go with the worktree — they remain reachable in the PR's history on GitHub, and the dirty half still protects **uncommitted** work.
 - **Out of scope, deliberately:** layers A and B of #1694 (`worktrees-audit` / `worktrees-clean`, in the mika-platform repo) are unchanged and remain the manual gesture; remote branches; the `target/` of open PRs (HALT 2); and reopening #1694 itself, which is an orchestrator gesture the PR body signals rather than performs.
+
+Optional (le checkout principal est un checkout de déploiement, et `run_shell` ne peut plus le rompre — mika#2449):
+- **Le défaut, mesuré le 2026-09-21.** Avant le rebuild #2446, le checkout **main** de `mika/` portait 15 fichiers non committés (staged + modified) — `site/*`, `scripts/check-landing-tokens.sh`, `scripts/smoke-webhook-chain`, `skills/bundled/_shared/dispatch-lib.sh` + tests — et `git pull --ff-only` refusait. Le ticket accusait « trois pilotes ». **Réfuté par la mesure** : `tool_calls` nomme le producteur au geste près — **mika-qa, par `run_shell`**, pendant ses revues QA des PR #2434/#2435/#2436 (`1835d8bb` 17:22:52Z, `eba3682f` 18:33:39Z, `930f5200` 19:04:37Z le 2026-09-20 ; revues soumises à 17:22:49Z / 18:35:22Z / 19:06:02Z), par `cd ~/workspace/mika-platform/mika && git checkout <ref> -- <paths>` — sans restauration, ou avec une restauration **inerte** (`git checkout -- <paths>` relit l'**index**, que la commande précédente vient d'écraser). Classe récurrente, n ≥ 5 depuis le 09-06. Un pilote sandboxé **ne peut pas** produire cela (bwrap `--chdir`/`--clearenv`, seul bind rw = le worktree) ; les handlers exec tournent en `current_dir(skill_dir)` et n'héritent de rien. Le prompt `qa-review` prescrivait déjà un worktree détaché (§ 2B) : prompt-only ne tient pas au substrat de la boucle (mika#2120), et la moitié structurelle manquait.
+- **Pourquoi mika#2107 ne couvrait pas ce cas, par construction.** Son T1 exempte toute session non enracinée dans un worktree lié — voulu, pour ne pas casser `/mika-platform-sync-main`. mika-qa n'a **pas** de worktree : son `run_shell` tourne depuis `skill_dir`, et le `cd` est dans la commande. D'où un **second mode** du même script, `scripts/guard-shared-checkout --decide-primary <platform-dir> <cwd> <command>`, qui partage le parseur (suivi de `cd`/`pushd`, `-C`, `--work-tree`, chaînes `&&`/`;`/`|`, expansion `~`/`$HOME`, résolution **physique** de la cible — `~/workspace` est un symlink) et inverse la population : *la cible effective est un checkout PRINCIPAL sous la plateforme* (`.git` est un **répertoire** ; un worktree lié porte un fichier `gitdir:` et sort). Les deux modes coexistent ; #2107 protège une session-worktree contre le partagé, #2449 protège le partagé contre un agent sans worktree.
+- **Le prédicat est l'INVARIANT d'un checkout de déploiement, pas « toute mutation ».** Refuser toute écriture casserait la boucle : mika-dev synchronise main par `run_shell` (`git fetch origin && git merge --ff-only origin/main`, mesuré 09-09/16/17/20), enlève des worktrees, supprime des branches locales. Admis (préservent *arbre = index = HEAD sur origin/main*) : toute lecture, `fetch`, `ls-remote`, `remote`, `push`, `pull --ff-only`, `merge --ff-only` (le drapeau cherché dans les arguments du verbe, et la ref bornée à `origin`/`main`/`origin/main` — `merge --ff-only origin/fix/x` avancerait `main` sur une tête non revue que le preflight accepte comme « ahead »), `worktree *`, `branch` sans `-f/-m/-M/-c/-C`, `tag`, `prune`, `gc`, `checkout -- <paths>`, `restore <paths>` sans `--source/--staged`. Refusés : `checkout <ref>` / `<ref> -- <paths>` / `-b` / `--force` / `--detach`, `switch`, `stash` (nu/push/pop/apply/drop ; `list`/`show` lisent), `pull`/`merge` sans `--ff-only`, `rebase`, `cherry-pick`, `revert`, `branch -f/-m/-c` (`branch -f main <sha>` déplace la ref sous HEAD sans toucher l'arbre — population mesurée 0, refusé par construction), `reset`, `clean`, `add`, `rm`, `mv`, `commit`, et **tout verbe inconnu** (fail-closed sur l'inconnu : c'est une garde d'écriture, la lecture est énumérée). Population mesurée depuis le 01/09 : 2 972 commandes git de `run_shell` visant un checkout principal, **~101 refusées (3,4 %), toutes de la classe du défaut ou de celle de mika#2107**. **Ce que ça ne couvre pas, nommé** : un script du dépôt qui mute (`make …`, `scripts/mika-platform-sync-main`), une indirection par variable (`R=…; cd $R && git stash`), un `bash -c '…'` ou un `eval` — la garde lit une ligne de commande, pas ce qu'elle exécute ; c'est la sonde U3 qui date ce que la garde n'a pas vu.
+- **Le branchement : `templates/skills/shell-exec/handlers/run.sh`.** `MIKA_PLATFORM_DIR` (défaut `$HOME/workspace/mika-platform`, résolu `pwd -P` comme `dispatch-lib.sh` et `deploy-mika`) et `MIKA_GUARD_SHARED_CHECKOUT` sont lus **avant** la boucle de scrub des `MIKA_*` et passés en **arguments** — après le scrub ils n'existent plus, et une garde qui les lirait là tomberait ouverte sur tout hôte sans rien dire. Le refus sort sur **stdout** avec exit 1, donc dans `tool_calls.output` préfixé `Exit code: 1` — surface SQL sans nouvel événement. **Fail-open dit** : sur un tenant sans plateforme, silence (rien à protéger) ; sur un poste **avec** plateforme et **sans** script, une ligne stderr `shell-exec: shared-checkout guard not found at <path> (fail-open)` ; une garde qui plante (exit ≠ 0/1) laisse passer et le dit. Un prédicat qui tient **refuse** — c'est son objet, pas une panne. **La dérogation est le même levier que mika#2107**, `MIKA_GUARD_SHARED_CHECKOUT=0` posé sur l'environnement du **service** (le modèle ne peut pas l'atteindre, le handler scrubbe), et elle est **dite à chaque appel** sur stderr (`shell-exec: shared-checkout guard disarmed by MIKA_GUARD_SHARED_CHECKOUT=0 (operator override)`) et journalisée (`mode=primary bypass`) : un bypass posé pour une intervention et oublié serait sinon une garde silencieusement absente pour tous les agents (mika#2329 : pour un interrupteur, la vivacité *est* l'information).
+- **La sonde de saleté : `main_checkout_dirty`, portée par le faucheur de mika#2420 (D2).** Il énumère déjà les checkouts (`MIKA_WORKTREE_REAP_REPO_DIRS`, défaut = le checkout sali), tourne déjà sur un tick de 10 min, écrit déjà ses audits ; coût : un `git status --porcelain` par checkout et par tick, borné à 20 s. **Non bloquante** : un checkout principal sale n'empêche pas un dispatch (le worktree est ailleurs) ; il empêche un `pull --ff-only`, geste d'opérateur. **Rien n'est nettoyé** — ni pop, ni stash, ni reset (décision Vincent). Dédupliquée par `(checkout, empreinte de la liste)` sur 24 h (doctrine mika#2131) : même liste sur deux ticks = une ligne, liste changée = une seconde ; **checkout propre ⇒ zéro ligne**. `git status` illisible → `main_checkout_unreadable` (WARN), jamais « propre ». **U3 reste justifié une fois U4 posé** : la garde couvre le geste casual en clair par `run_shell` — 100 % du trafic mesuré, et rien d'autre ; la sonde couvre ce que la garde ne voit pas par construction (un script du dépôt qui mute, un geste humain, un producteur hors `run_shell`, un bypass oublié) et c'est elle qui **date** la prochaine occurrence : sans date, la requête d'attribution n'a pas de bornes.
+- **La sonde DATE, `tool_calls` NOMME (D3, M4).** La ligne d'audit porte le checkout, le compte, les chemins (plafonnés à 20, jamais de contenu), la fenêtre `[dernier tick propre vu par ce process, détection]` (« unknown » après un redémarrage — les ticks propres ne sont pas persistés, AC4) et **la requête d'attribution recopiée** dans `reasoning`. Elle ne nomme **aucun producteur** : « le dernier dispatch » serait la dérivation tardive que mika#2368 refuse.
+- **Surfaces opérateur.**
+  ```bash
+  # 1a. Le checkout principal est-il sale, et depuis quelle fenêtre ?
+  grep main_checkout_dirty "$MIKA_SPIRIT_LOG_FILE" | jq -c '{repo_dir, file_count, files, window_start, window_end}'
+  ```
+  ```sql
+  SELECT target_key, created_at, reasoning FROM audit_events
+   WHERE tool_name = 'main_checkout_dirty' ORDER BY created_at DESC;
+  -- 1b. QUI a écrit dans la fenêtre ? — la requête que `reasoning` recopie, bornes remplies ;
+  --     c'est celle qui a résolu M0 en une requête.
+  SELECT id, agent_id, session_id, created_at, substr(input, 1, 200) FROM tool_calls
+   WHERE tool_name = 'run_shell' AND created_at BETWEEN '<window_start>' AND '<window_end>'
+     AND input LIKE '%mika-platform/mika%'
+     AND (input LIKE '%checkout %--%' OR input LIKE '%stash%' OR input LIKE '%reset%'
+          OR input LIKE '%merge%' OR input LIKE '%pull%') ORDER BY created_at;
+  -- 2. La garde mord-elle ? (régime attendu : NON VIDE les premiers jours, décroissant ensuite)
+  SELECT agent_id, count(*) FROM tool_calls
+   WHERE tool_name = 'run_shell' AND output LIKE '%REFUS (shared-checkout-guard, mika#2449)%'
+   GROUP BY 1;
+  ```
+  ```bash
+  # 3. Journal de la garde (même fichier que mika#2107, lignes préfixées mode=primary)
+  grep 'mode=primary' "${MIKA_HOME:-$HOME/.mika}/state/shared-checkout-guard.log" | tail
+  # 3b. CONTRÔLE POSITIF — la garde est-elle seulement branchée sur ce binaire ?
+  grep -c 'decide-primary' ~/.mika/skills/shell-exec/handlers/run.sh     # attendu : ≥ 1
+  grep 'shared-checkout guard not found' "$MIKA_SPIRIT_LOG_FILE"        # attendu : vide
+  grep 'shared-checkout guard disarmed'  "$MIKA_SPIRIT_LOG_FILE"        # attendu : vide hors intervention
+  ```
+- **Cinq haltes.** *Halte 1 — 1a vide pendant que le checkout est visiblement sale* : ne pas élargir le prédicat ; lire `MIKA_WORKTREE_REAP_REPO_DIRS`, puis vérifier que le binaire déployé porte le correctif (classe mika#2340). *Halte 2 — 2 vide ET 3b rend 0* : la garde n'est pas dans la bibliothèque seedée (`~/.mika/skills/` est une projection du binaire) ; rebuild → seed → relire. **Zéro refus ne vaut « sain » que si 3b est non nul.** *Halte 3 — 2 porte du trafic soutenu sur un même agent après une semaine* : lire les commandes refusées **avant** de toucher à l'allow-list ; un refus répété sur une forme légitime est une entrée D7 à ajouter avec sa raison (la **forme** du verbe, jamais l'agent ni le chemin) ; un refus répété sur `checkout <ref> -- <paths>` est le prompt à relire, pas la garde à assouplir. *Halte 4 — un checkout sale réapparaît (1a) avec 2 vide* : le producteur n'est pas `run_shell` — rejouer 1b **sans** le filtre `tool_name`, puis la classe humaine/orchestrateur (mika#2107 couvre les sessions Claude Code ; un `cm`/spawn hors hook est possible). *Halte 5 — la ligne fail-open apparaît (3b)* : le script n'est pas là où le handler le cherche — `MIKA_PLATFORM_DIR` du **service** (pas d'un shell) ou checkout déplacé ; réparer le déploiement, pas le handler.
+- **Gardes.** `scripts/test-guard-shared-checkout.sh` (les trois commandes de M0 **verbatim**, `fa92720d`, `d53b91e3`, les formes mika-dev, F2, F3, hors population, mode worktree inchangé) et `scripts/test-shell-exec-guard.sh` (le branchement, l'arbre du principal **intact** après refus, contrôle positif de fixture, fail-open, dérogation, la variable décide, sole writer du jeton, et le **contrôle négatif vu rouge** : handler dépouillé → M0 passe et salit l'arbre) — `make test-shared-checkout-guard`, CI `shared-checkout-guard-lint`. `test-dispatch-lib.sh` tient à allowlist vide qu'aucun message « recover with … stash apply » de `dispatch-lib.sh` ne nomme `SUB_REPO_DIR` (le site B de `_set_up_worktree` prescrivait le checkout principal — corrigé, il nomme le worktree canonique). `main_checkout_dirty` est SOLE WRITER par scan de source.
+- **Hors périmètre, délibérément :** nettoyer ou committer le checkout principal ; un outil `sync_main` dédié pour mika-dev (l'allow-list D7 est une *tolérance*, l'incapacité serait un handler qui ne sait faire que `fetch` + `merge --ff-only` — préalable : relire les 84 commandes mika-dev sur main) ; l'écriture perdue dans le tmpfs `mika/` du sandbox (forme mika#2205) ; le démarrage pilote non contenu muet (préalable : une mesure qui montre un dispatch sans bwrap — aucune à ce jour).
 
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 

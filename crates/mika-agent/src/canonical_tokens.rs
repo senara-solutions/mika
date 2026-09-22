@@ -425,6 +425,113 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2242 — les deux noms d'audit du dé-groomage ont un writer chacun.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test en dessous l'assert.**
+    ///
+    /// Quand ce scan tire, c'est qu'un **second** site écrit l'un des deux noms
+    /// — donc que la propriété SOLE WRITER dont dépendent les requêtes SQL de
+    /// `CLAUDE.md` est fausse. La résolution est de **renommer** ce second site,
+    /// jamais de l'excepter : une exception rendrait les `GROUP BY` de
+    /// l'opérateur silencieusement faux, ce qui est strictement pire que le
+    /// silence que mika#2242 remplace.
+    const SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Les deux noms, et le module de production qui a le droit de les écrire.
+    ///
+    /// Les aiguilles sont composées à l'exécution pour que **ce fichier ne se
+    /// dénonce pas lui-même** — le motif de `worktree_reaper.rs`.
+    fn degroom_audit_names() -> [(String, &'static str); 2] {
+        [
+            (
+                format!("closing_pr{}", "_closed_unmerged"),
+                "crates/mika-agent/src/server/upstream_close_handler.rs",
+            ),
+            (
+                format!("ready_label{}", "_degroomed"),
+                "crates/mika-agent/src/server/ready_label_handler.rs",
+            ),
+        ]
+    }
+
+    /// Un nom d'audit qui a deux écrivains rend une requête opérateur inexacte
+    /// **sans rien casser** — aucune décision ne devient fausse, seules les deux
+    /// populations cessent d'être soustractibles. C'est la classe qu'aucun test
+    /// comportemental ne peut voir, d'où un scan de source.
+    #[test]
+    fn mika2242_the_two_audit_names_have_a_single_writer() {
+        let names = degroom_audit_names();
+        let sources = production_sources();
+        let mut offenders = Vec::new();
+        let mut witnesses = 0usize;
+
+        for (needle, owner) in &names {
+            let mut writers = Vec::new();
+            for (rel, content) in &sources {
+                if SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                    continue;
+                }
+                // Le nom cherché dans les LITTÉRAUX, jamais dans la ligne
+                // entière : la déclaration `const CLOSING_PR_CLOSED_UNMERGED_TOOL`
+                // porte le nom dans son IDENTIFIANT, et l'accuser reviendrait à
+                // accuser la déclaration d'être son propre second writer.
+                let carries = content
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                    })
+                    .any(|line| {
+                        string_literals(line)
+                            .iter()
+                            .any(|lit| lit.contains(needle.as_str()))
+                    });
+                if carries {
+                    writers.push(rel.clone());
+                }
+            }
+
+            // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement
+            // comme un scan propre (mika#2103 / mika#2205). Le propriétaire doit
+            // être trouvé, sans quoi la garde est décorative.
+            assert!(
+                writers.iter().any(|w| w == owner),
+                "mika#2242 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+                 vise un nom mort, il ne vérifie rien"
+            );
+            witnesses += 1;
+
+            for w in writers.iter().filter(|w| *w != owner) {
+                offenders.push(format!("{needle} est aussi écrit par {w} (owner: {owner})"));
+            }
+        }
+
+        assert_eq!(witnesses, names.len(), "un nom n'a pas été vérifié");
+        assert!(
+            offenders.is_empty(),
+            "mika#2242 — chacun de ces deux noms d'audit doit avoir UN SEUL site \
+             d'écriture en production :\n  {}\n\n\
+             RÉSOLUTION : renommer le second site. Ne PAS l'ajouter à \
+             SOLE_WRITER_EXCEPTIONS — les deux populations (toute fermeture \
+             unmerged, vs. celles qui ont effectivement reflué en groom) ne sont \
+             soustractibles que tant que chaque nom a un écrivain.",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2242_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "SOLE_WRITER_EXCEPTIONS est livrée vide et doit le rester : quand le scan \
+             tire, on renomme le second écrivain. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait

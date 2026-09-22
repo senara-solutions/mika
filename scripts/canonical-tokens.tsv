@@ -25,6 +25,10 @@
 #   exact:line-anchored   `(?m)^…` / `grep -E '^…'` — position and case fixed
 #   exact:word-boundary   `\b…\b` — case fixed, position free
 #   exact:prefix          `starts_with` / `strip_prefix` — byte-exact prefix
+#   exact:suffix          `ends_with` — byte-exact, anchored at the TAIL. Not
+#                         `exact:literal`: the position is part of the read, and
+#                         that is the whole discriminator between a marker and a
+#                         prose that merely mentions it (mika#2050's class).
 #   exact:literal         `grep -F`, `match_indices`, substring equality
 #   ci:line-anchored      `(?i)` — CASE IS READ; rule L2 must NOT fire here
 #   ci+emphasis:…         `(?i)` plus a markdown-emphasis run (mika#1828)
@@ -202,6 +206,21 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 [GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::classify_event	exact:prefix
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_unauthorized_webhook_dispatch	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
+
+# ── Gateway body-truncation marker (mika#2242 R6). `truncate_body` appends it
+# when it cuts a webhook body; `upstream_close_handler` reads it at the TAIL to
+# tell "no closing ref in this PR" from "the refs may have been cut off". Same
+# gateway-formatting coupling as the two prefixes above, same fail-open
+# consequence: a reworded marker costs the instrument, never the behaviour.
+# The two readers DISAGREE ON POSITION, and the divergence is real rather than
+# an artefact of this table — which is why the `tolérance` column carries it.
+# `parse_verdict` asks "was this body cut at all?" and reads the marker
+# ANYWHERE (`contains`); `upstream_close_handler` asks "was it cut HERE, at the
+# tail?" and anchors. Found by the mika#2242 guard, declared as measured:
+# unifying them is a decision outside this ticket.
+[truncated]	B	crates/mika-agent/src/server/upstream_close_handler.rs::TRUNCATED_BODY_MARKER	exact:suffix
+[truncated]	B	crates/mika-agent/src/server/verdict.rs::parse_verdict	exact:literal
+
 [callback:	B	crates/mika-agent/src/agent_loop/mod.rs::ANCHORING_PHRASES	exact:prefix
 [callback:	B	crates/mika-agent/src/agent_loop/mod.rs::callback_milestone_advance_trigger	exact:prefix
 [callback:	B	crates/mika-agent/src/agent_loop/mod.rs::callback_trigger_active	exact:prefix

@@ -311,7 +311,10 @@ pub(crate) enum SeatVerdict {
     /// (mika#2084 AC3): a fix that turns "unlabelled" into "refused" stops the
     /// whole loop, which is worse than the defect it repairs.
     NoSeatLabel,
-    /// Labelled for this engine's own seat — dispatch proceeds.
+    /// Labelled for this engine's own seat — dispatch proceeds. Stamped by
+    /// dispatch-lib (`_stamp_issue_seat`) when it takes the ticket and
+    /// released (`_release_issue_seat`) when it exits (mika#2155); between two
+    /// dispatches an unclaimed ticket reads [`SeatVerdict::NoSeatLabel`].
     OwnedByCurrentSeat { label: String },
     /// Labelled for a different, known seat — refused (mika#2084 AC1).
     OwnedByOtherSeat { label: String, seat: String },
