@@ -129,14 +129,26 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   pas encore été rapporté, spirit re-résout le record **depuis le disque** (sans
   toucher `AgentState.budget_record`), le compare au record du boot hors
   `resolved_at`, et émet une fois par mtime : WARN
-  `agent_config_changed_since_boot` avec `restart_required = true` si un champ
-  effectif diffère, INFO avec `restart_required = false` sinon (commentaire
-  édité, `touch`). Champs : `agent_id`, `config_mtime` (RFC 3339 UTC),
+  `agent_config_changed_since_boot` avec `restart_required = true` **ssi un
+  champ du record budget/modèle de mika#2457 diffère**, INFO avec
+  `restart_required = false` sinon. Le bras `false` n'est **pas** « rien n'a
+  changé » : `ResolvedBudgetRecord` ne porte ni `openrouter_base_url`, ni
+  `zai_base_url`, ni `log_level`, donc une édition de ces clés — un geste réel
+  sur ces agents, et qui change l'endpoint servi — y tombe. Le message dit donc
+  *« aucun champ du record budget/modèle n'a bougé — un autre champ du fichier
+  peut néanmoins exiger un redémarrage »*, jamais *« aucun champ effectif n'a
+  bougé »* : la seconde formulation ferait rester un opérateur sur l'ancien
+  endpoint en lui disant que tout va bien. Champs : `agent_id`, `config_mtime` (RFC 3339 UTC),
   `provider_on_disk`, `model_on_disk`, `provider_in_service`,
   `model_in_service`, `budget_changed`.
 - R9. D2 coûte un `stat` par tour et **une** re-résolution par mtime distinct ;
-  il ne lit ni ne relit rien tant que le mtime n'a pas bougé. Un agent sans note
-  de boot (run d'équipe, `teams/engine.rs:217`) ne déclenche rien.
+  il ne lit ni ne relit rien tant que le mtime n'a pas bougé. D2 évalue **tout
+  tour qui passe par `load_agent_context`, runs d'équipe compris** — c'est la
+  conséquence directe de KTD5, dont l'entonnoir unique inclut `:6590`, qui est
+  `run_team_agent_inner_impl` — et ne déclenche rien pour un agent dont ce
+  process ne détient **aucune note de boot**, `BOOT_NOTES` étant clé par
+  `agent_id` seul. La population exempte est donc l'agent d'équipe que ce
+  process n'a jamais passé à `init_agent`, et non « les runs d'équipe ».
 
 ### Scope Boundaries
 
@@ -159,6 +171,15 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
 - **Les overrides per-skill** (`make_provider_for`, `config.rs:1857`) — hors
   périmètre, même angle mort que mika#2293 et mika#2457 : la question est le
   modèle *nominal* de l'agent.
+- **L'override de modèle par l'appelant** (`mika.model_override` /
+  `mika ask --model`, mika#2304 ; `server/a2a.rs::caller_model_provider` `:621`,
+  qui construit son provider par le même `make_provider_for`) — hors périmètre
+  pour la même raison, et **nommé** parce que le pré-vol est une pratique vivante
+  sur ce poste : le `config.toml` de mika-arch porte une campagne `arch-probe`
+  datée du 2026-09-18. L'équivalence de KTD2 est énoncée pour les tours **sans**
+  override d'appelant ; sur un tour qui en porte un, `mika agents budget` dira
+  `in_sync` pendant que le `turn_usage` du tour portera un troisième modèle, et
+  les deux auront raison.
 - **Le `.env` per-agent dans D2** — hors périmètre : D2 surveille le fichier
   que les trois éditions datées de ce poste ont touché. Le `.env` reste couvert
   par D1 au boot (R3).
@@ -206,9 +227,12 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   `LAST_EMITTED` `:601`, et les tests cités `mika2293_dedup_silences_repetition_and_re_emits_a_change`
   `:1059 → :1213`, `mika2328_the_model_key_is_the_one_settings_reads_for_every_provider`
   `:1404 → :1556`, `mod tests` `:836 → :939`. Le second site de
-  `log_llm_budget_resolved` est `teams/engine.rs:222` (plan : `:217`) — R9 tient :
-  ce site ne construit pas d'`AgentState`, donc aucune note de boot, donc D2 ne
-  s'y déclenche pas. Les sites `llm.model_name()` cités `:917, :1580, :1605` sont
+  `log_llm_budget_resolved` est `teams/engine.rs:222` (plan : `:217`). **Et
+  c'est le mauvais site pour juger R9** — corrigé dans R9 ci-dessus après
+  vérification : D2 ne vit pas là mais dans `load_agent_context`, que le chemin
+  d'équipe traverse bel et bien (`:6590` est dans `run_team_agent_inner_impl`,
+  `agent_loop/mod.rs:6571`). L'absence d'`AgentState` à ce site n'exempte donc
+  rien ; ce qui exempte, c'est l'absence de note de boot. Les sites `llm.model_name()` cités `:917, :1580, :1605` sont
   aujourd'hui `:773, :810, :840` et `:1586, :1611` ; `emit_turn_usage` `:8489` est
   **exact**.
 - **Sont exactes et n'ont pas bougé** : tout `well_known_agents.rs` (`config_toml`
@@ -253,7 +277,7 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   ferait de `budget_guard` (`server/budget_guard.rs`, qui refuse une paire
   *invalide*) le modèle d'une garde qui refuserait une configuration *valide*.
   Le motif « a warning that contradicts a decision gets muted »
-  (`budget_provenance.rs:699-704`) tranche : une ligne par condition, jamais
+  (`budget_provenance.rs:739-742`) tranche : une ligne par condition, jamais
   par tour. Gouverne R5.
 - KTD2. **Le côté runtime de D1 est le record mika#2457, pas une relecture.**
   `turn_usage.model` = `llm.model_name()` = `Settings::active_llm_config().model`
@@ -299,7 +323,7 @@ boot (server/mod.rs::init_agent, après resolve_llm_budget_record)
   AgentState { budget_record, model_drift: Arc<ModelDriftCheck>, .. }
 
 tour (agent_loop/mod.rs::load_agent_context)
-  detect_config_change(db.agent_id(), home_dir) -> Option<ConfigChangedSinceBoot>
+  detect_config_change(db.agent_id()) -> Option<ConfigChangedSinceBoot>
     stat mtime == noté ? None : (déjà rapporté ? None : re-résoudre, comparer, noter, Some)
   report_config_change(&finding)  : WARN si restart_required, INFO sinon
 
@@ -311,8 +335,10 @@ CLI  mika agents budget               ->  ligne `code … (well_known_agents.rs)
 
 U1 → U2 → U3 → U4 → U5 → U6. U1 et U2 sont `mika-common` et ne dépendent que de
 #2461 ; U3/U4 sont `mika-agent` ; U5 est `mika-cli` ; U6 est la documentation.
-U4 (D2) ne dépend pas de U3 (D1) mais partage sa note de boot avec U3 au même
-site d'`init_agent`.
+La logique de comparaison d'U4 (D2) est indépendante de celle d'U3 (D1), mais
+U4 **dépend de U3** pour la note de boot : `detect_config_change` rend `None`
+quand aucune note n'existe, donc D2 est inerte tant qu'U3 n'appelle pas
+`note_config_at_boot` à `init_agent`.
 
 ## Implementation Units
 
@@ -320,7 +346,7 @@ site d'`init_agent`.
 
 - **Goal.** Lire ce qu'une constante `config_toml` déclare, avec la dérivation
   de clé existante, et comparer purement au record.
-- **Requirements.** R2, R3, R5 (pas d'effet), KTD3, KTD6.
+- **Requirements.** R2, R3, R4, R5 (pas d'effet de refus), KTD1, KTD3, KTD6.
 - **Files.** `crates/mika-common/src/llm/budget_provenance.rs`,
   `crates/mika-common/src/llm/mod.rs` (ré-export).
 - **Approach.**
@@ -338,6 +364,14 @@ site d'`init_agent`.
     **ou** `record.model != declared.model`. Un `record.model == ""`
     (`unknown_provider`, `:164`) est une dérive rapportée avec
     `runtime_model_source = unknown_provider`, jamais absorbée.
+  - `pub fn emit_model_drift(agent_id: &str, check: &ModelDriftCheck)` — **le
+    site unique d'émission de D1**, posé ici et non dans `mika-agent`, à côté
+    d'`emit_llm_budget_resolved` (`:849`) dont il est le frère : WARN
+    `well_known_model_drift` sur `Drift`, INFO `well_known_model_in_sync` sur
+    `InSync`, **rien** sur `NotApplicable`, portant les champs de R4 plus
+    `declared_by = DECLARED_BY`. La comparaison (`compare`) reste pure ;
+    l'émission est la seule fonction de cette unité qui a un effet, et KTD1
+    tient parce qu'elle n'a que celui-là — aucun `bail!`, aucun `Err`.
   - Doc-comment du module : une section *« The guard mika#2328 said was
     missing »* qui renvoie ici depuis le paragraphe existant sur `turn_usage`.
 - **Test Scenarios.**
@@ -356,8 +390,21 @@ site d'`init_agent`.
   - `mika2473_a_model_set_by_env_is_a_drift_with_its_door` : constante en phase
     sur disque, `MIKA_<P>_MODEL` posé ⇒ `Drift` avec `runtime_model_source = process_env`
     (contrôle : sans la variable, `InSync` — les deux dans le même test).
-- **Verification.** `cargo test -p mika-common llm::budget_provenance` vert ;
-  tous les tests `mika2293_*`, `mika2328_*`, `mika2457_*` existants inchangés.
+  - `mika2473_the_drift_line_carries_its_level_and_its_fields` — **le seul test
+    qui observe AC3**, sans lequel « la dérive est dite une fois, avec sa porte »
+    n'est attesté par rien d'autre qu'un `grep` post-déploiement que le plan
+    lui-même dit confondable avec un binaire périmé. Installer une couche
+    `tracing_subscriber` capturante (motif déjà en place dans ce dépôt,
+    `builtin_handlers.rs:9716`), appeler `emit_model_drift` sur les trois bras
+    et asserter : sur `Drift`, le nom d'événement `well_known_model_drift`, le
+    niveau **WARN** et les huit champs de R4 plus
+    `declared_by = "well_known_agents.rs"` ; sur `InSync`, le nom
+    `well_known_model_in_sync` et le niveau **INFO** ; sur `NotApplicable`,
+    **aucune ligne** — ce troisième bras est le contrôle négatif, et sans lui le
+    test ne distingue pas « n'émet rien » de « émet toujours ».
+- **Verification.** `cargo test -p mika-common -- llm::budget_provenance` vert,
+  **compte de tests non nul** ; tous les tests `mika2293_*`, `mika2328_*`,
+  `mika2457_*` existants inchangés.
 
 ### U2. `config_freshness` — la note de boot et la détection au tour (mika-common)
 
@@ -372,6 +419,19 @@ site d'`init_agent`.
     dans `static BOOT_NOTES: OnceLock<Mutex<HashMap<String, BootNote>>>`.
   - `pub fn note_config_at_boot(agent_id, global_home, agent_home, record: &ResolvedBudgetRecord)` :
     `std::fs::metadata(agent_home/config.toml).and_then(|m| m.modified()).ok()`.
+  - **Un `stat` illisible sort le tour de la population — il n'est jamais un
+    terme satisfait.** Écrit ici parce que la lecture littérale du reste fait
+    l'inverse en silence : `mtime` et `reported` sont tous deux
+    `Option<SystemTime>` et `reported` démarre à `None`, donc un `stat` qui
+    échoue rend `None`, égale `reported`, et se lit « déjà rapporté » — un
+    `config.toml` présent au boot puis supprimé ou rendu illisible ne serait
+    jamais signalé. La maison tranche l'inverse deux fois : mika#2277 sort du
+    périmètre un signal de vivacité illisible sous son propre nom, mika#2328
+    donne à un fournisseur illisible le mot distinct `unknown_provider` plutôt
+    que de le fondre dans `default`. Donc : lecture impossible ⇒ `None`,
+    `reported` **intact**, et une ligne nommée `agent_config_mtime_unreadable`
+    (WARN, **régime attendu : zéro**) ; et `reported` prend une représentation
+    qui ne peut pas égaler une lecture manquée.
   - `pub struct ConfigChangedSinceBoot { agent_id, config_mtime: String /* RFC 3339 UTC */, provider_on_disk, model_on_disk, provider_in_service, model_in_service, budget_changed: bool, restart_required: bool }`.
   - `pub fn detect_config_change(agent_id: &str) -> Option<ConfigChangedSinceBoot>` :
     pas de note ⇒ `None` ; mtime courant == noté ⇒ `None` ; == `reported` ⇒
@@ -406,7 +466,7 @@ site d'`init_agent`.
 
 - **Goal.** Établir la dérive code↔runtime là où le record est résolu, avant le
   premier tour, et la garder pour la route.
-- **Requirements.** R1, R4, R5, R6, KTD1, KTD2, KTD3.
+- **Requirements.** R1, R4, R5, R6, R8 (la note de boot, sans laquelle D2 est inerte), KTD1, KTD2, KTD3.
 - **Files.** `crates/mika-agent/src/server/mod.rs` (`init_agent`, `:446` ; après
   la ligne `emit_llm_budget_resolved(&budget_record)` de #2461),
   `crates/mika-agent/src/server/state.rs` (`AgentState`, `:27` ;
@@ -416,8 +476,8 @@ site d'`init_agent`.
 - **Approach.**
   - Dans `init_agent` : `let declared = crate::well_known_agents::find_well_known_agent(agent_name).and_then(|s| s.config_toml).and_then(mika_common::llm::declared_model);`
     `let model_drift = ModelDriftCheck::compare(declared.as_ref(), &budget_record);`
-    puis émission (R4) via une fonction `emit_model_drift(agent_name, &model_drift)`
-    dans `mika-common` à côté de `emit_llm_budget_resolved` ; puis
+    puis `mika_common::llm::emit_model_drift(agent_name, &model_drift)` — **livré
+    et testé par U1**, appelé ici, jamais redéfini (R4) ; puis
     `note_config_at_boot(agent_name, global_home, agent_home, &budget_record)` (U2) ;
     puis `model_drift: Arc::new(model_drift)` sur `AgentState`.
   - `handle_agent_budget` : `json!({ "budget": &*agent_state.budget_record, "model_drift": &*agent_state.model_drift })`.
@@ -431,7 +491,17 @@ site d'`init_agent`.
   - `mika2473_a_freshly_provisioned_well_known_agent_has_no_drift_and_an_edit_has` (`well_known_agents.rs`, `#[serial]`, env `MIKA_*_MODEL` nettoyé) :
     pour chaque spec de `WELL_KNOWN_AGENTS` avec `config_toml: Some`,
     `declared_model(config_toml).is_some()` (les trois constantes déclarent un
-    couple lisible) ; `provision_well_known_agents(home, settings, false)` ;
+    couple lisible) ; `provision_well_known_agents(home, settings, false)` —
+    **avec `test_settings_with_kg_roots()`** (`well_known_agents.rs:1585`) et
+    `home/agents` créé au préalable, faute de quoi ce test ne mesure pas ce
+    qu'il prétend : `build_mika_arch_identity` (`:412-422`) rend `Err` quand
+    `kg_docs_roots` est absent, le provisionnement `continue` sans écrire de
+    `config.toml`, et mika-arch — l'agent même sur lequel la *Fire-Disposition*
+    est bâtie — résout alors la cascade vide (`DEFAULT_PROVIDER`, anthropic) et
+    rend `Drift` là où le contrôle positif attend `InSync`. Le saut est déjà
+    épinglé par `test_provision_skips_mika_arch_when_kg_docs_roots_unset`
+    (`:1679`). **Une spec sautée au provisionnement est un défaut de montage du
+    test, jamais une dérive à asserter** ;
     `compare(declared, resolve_llm_budget_record(name, home, agent_home))` ⇒
     `InSync` (contrôle positif) ; réécrire `<p>_model` dans le `config.toml`
     provisionné ⇒ `Drift` (contrôle négatif, même test). `MIKA_TEST`
@@ -440,11 +510,19 @@ site d'`init_agent`.
     `test_state_full` étendu d'un paramètre `model_drift` ; état avec
     `Drift{..}` ⇒ `json["model_drift"]["status"] == "drift"` et les deux modèles
     présents ; état avec `NotApplicable` ⇒ `"not_applicable"` ; 404 ⇒ ni
-    `budget` ni `model_drift`.
+    `budget` ni `model_drift`. **Plus un bras de gel, sans lequel la seconde
+    moitié d'AC4 n'est attestée par rien** : réécrire le modèle dans le
+    `config.toml` de l'agent **après** la construction de l'état, prouver que le
+    disque a bougé, puis asserter que `json["model_drift"]` est identique à sa
+    valeur d'avant la mutation. Miroir exact de
+    `mika2457_the_route_serves_the_record_of_the_init_not_the_disk`
+    (`server/mod.rs:4577`), qui fait déjà ce geste pour le record — et qui ne
+    peut pas l'attester pour le sibling, puisqu'il n'indexe que
+    `json["budget"]["http_timeout_secs"]` et que ses assertions ne bougent pas.
   - Non-régression : `mika2457_budget_route_serves_the_record_or_404s` et
     `mika2457_the_route_serves_the_record_of_the_init_not_the_disk` verts sans
     modification de leurs assertions.
-- **Verification.** `cargo test -p mika-agent well_known_agents server::` vert.
+- **Verification.** `cargo test -p mika-agent -- well_known_agents server::` vert, compte non nul.
 
 ### U4. D2 dans `load_agent_context` — un `stat` par tour (mika-agent)
 
@@ -520,11 +598,33 @@ site d'`init_agent`.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p mika-common llm::budget_provenance llm::config_freshness
-cargo test -p mika-agent well_known_agents server:: agent_loop::mika2473
-cargo test -p mika-cli commands::agents
-cargo test -p mika-common mika2457   # le scan « un seul constructeur » reste vert, allowlist vide
+cargo test -p mika-common -- llm::budget_provenance llm::config_freshness
+cargo test -p mika-agent -- well_known_agents server:: agent_loop::
+cargo test -p mika-cli -- commands::agents
+cargo test -p mika-common -- mika2457   # le scan « un seul constructeur » reste vert, allowlist vide
 ```
+
+**Deux formes de ces commandes sont fausses, et l'une des deux est verte.**
+*(a) Les filtres passent derrière `--`.* `cargo test` n'accepte qu'un seul
+`TESTNAME` positionnel : une seconde ligne de filtre est refusée par
+`error: unexpected argument '…' found` et rien ne tourne. Mesuré sur ce poste
+(cargo 1.93.1) — bruyant, donc sans danger, mais le contrat était inexécutable
+tel qu'il était écrit. *(b) Le filtre du scan D2 est `agent_loop::`, jamais
+`agent_loop::mika2473`.* Les tests de ce module vivent dans
+`#[cfg(test)] mod tests` (`agent_loop/mod.rs:9546`), donc leur chemin réel est
+`agent_loop::tests::mika2473_…`, dont `agent_loop::mika2473` n'est **pas** une
+sous-chaîne — le filtre libtest en est une, et il ne matche rien. Mesuré, les
+deux contrôles dans le même appel : `agent_loop::mika2342` rend
+`0 passed; 5185 filtered out` **et sort 0** ; `agent_loop::tests::mika2342` rend
+`2 passed`. AC7 aurait donc été signée par une commande verte qui n'exécute
+aucun test — la sonde inerte que la *Fire-Disposition* de ce plan refuse par
+ailleurs. `agent_loop::` corrige la classe **et** fait tourner la suite
+existante que l'insertion d'U4 pourrait casser, ce qu'U4 déclare déjà
+autoritatif pour son propre vert.
+
+**Lire le compte, jamais le seul code de sortie.** Chaque ligne doit rapporter
+un nombre de tests **non nul** : un `0 passed` qui sort 0 est la forme que ce
+correctif existe pour fermer.
 
 Chaque contrôle négatif (U1 env-door, U2 mtime, U3 édition post-provision, U5
 *en phase* absent) est **vu rouge** en neutralisant son terme avant d'être vu
@@ -601,15 +701,22 @@ du bruit à museler, c'est l'état de ce poste, lisible. La résolution appartie
    une fois dans `agent_loop/mod.rs`, dans `load_agent_context` ; scan de
    source livré, allowlist vide.
 8. **AC8 — Rien ne bouge.** Aucune constante de `well_known_agents.rs`, aucune
-   valeur de `budget_provenance.rs`, aucun test `mika2293_*` / `mika2328_*` /
-   `mika2457_*` modifié pour passer.
+   valeur de `budget_provenance.rs`, **aucune assertion** des tests
+   `mika2293_*` / `mika2328_*` / `mika2457_*` modifiée pour passer — seuls les
+   appels à `test_state_full` gagnent mécaniquement le paramètre `model_drift`.
+   La précision est nécessaire pour que le critère soit satisfiable : U3 étend
+   la signature de `test_state_full` (`server/mod.rs:2102`), qui est appelée
+   depuis le corps de `mika2457_the_route_serves_the_record_of_the_init_not_the_disk`
+   (`:4586`), lequel ne compilerait pas sans gagner l'argument. C'est la
+   formulation qu'U3 portait déjà (« verts sans modification de leurs
+   assertions ») ; l'intention d'AC8 est intacte.
 9. **AC9 — Fire-Disposition renseignée** : la section ci-dessus nomme
    l'option par détecteur, mesure la population pré-existante, et écrit la
    conduite au déclenchement.
 
 ## Definition of Done
 
-- [ ] U1 : `declared_model`, `DeclaredModel`, `ModelDriftCheck::compare`, `emit_model_drift` livrés et ré-exportés ; trois tests verts, contrôles négatifs vus rouges
+- [ ] U1 : `declared_model`, `DeclaredModel`, `ModelDriftCheck::compare`, `emit_model_drift` livrés et ré-exportés ; **quatre** tests verts (dont celui qui observe l'émission — AC3), contrôles négatifs vus rouges
 - [ ] U2 : `config_freshness` livré (`note_config_at_boot`, `detect_config_change`, `report_config_change`) ; trois tests verts
 - [ ] U3 : `init_agent` compare, émet, note, garde ; route étendue ; `test_state_full` étendu ; deux tests verts ; doc-comments `MIKA_DEV_CONFIG` / `MIKA_QA_CONFIG` renvoient à la garde
 - [ ] U4 : un appel dans `load_agent_context` ; scan structurel vert, allowlist vide
@@ -623,7 +730,7 @@ du bruit à museler, c'est l'état de ce poste, lisible. La résolution appartie
 
 - Ticket mika#2473 ; DoD de mika#2457 (AC7, suivi (b)) ; mika#2328 (classe, doc-comment `well_known_agents.rs:228-244`) ; mika#2327 (verdict perdu).
 - `crates/mika-agent/src/well_known_agents.rs` : `WellKnownAgent.config_toml` `:62`, `MIKA_DEV_CONFIG` `:181`, `MIKA_QA_CONFIG` `:251`, `MIKA_ARCH_CONFIG` `:1524`, `reconcile_well_known_config` `:759`, `find_well_known_agent` `:823`, `provision_well_known_agents` `:884` (chemin gelé `:885-899`), `WELL_KNOWN_AGENTS` `:477`.
-- `crates/mika-common/src/llm/budget_provenance.rs` : en-tête (trois mondes, cascade inversée, « a false provenance is strictly worse than none »), `ModelProvenance` `:283`, `effective_model` `:333`, `model_config_key` `:368`, `CascadeLayers::read` `:503`, porte process-env `:528`, `config_key_as_string` `:588`, dédup `LAST_EMITTED` / `log_llm_budget_resolved` `:673`, « a warning that contradicts a decision gets muted » `:697-704`, tests `:836`, `:1059`, `:1404`, `:1499`.
+- `crates/mika-common/src/llm/budget_provenance.rs` : en-tête (trois mondes, cascade inversée, « a false provenance is strictly worse than none »), `ModelProvenance` `:283`, `effective_model` `:333`, `model_config_key` `:368`, `CascadeLayers::read` `:503`, porte process-env `:528`, `config_key_as_string` `:588`, dédup `LAST_EMITTED` / `log_llm_budget_resolved` `:673`, « a warning that contradicts a decision gets muted » `:739-742`, tests `:836`, `:1059`, `:1404`, `:1499`.
 - PR #2461 (`feat/2457/p1-substrat-mika-arch-verdict-sous-le` @ `c72e40ea`) : `ResolvedBudgetRecord` (derive `Clone, PartialEq, Eq, Serialize, Deserialize`), `resolve_llm_budget_record`, `emit_llm_budget_resolved`, `AgentState.budget_record`, `handle_agent_budget`, CLI `budget()` / `BudgetRecord` / `render_budget_text` / `render_unattested`, tests `mika2457_*`.
 - `crates/mika-agent/src/server/mod.rs` : `init_agent` `:446`, `run_server` `:757`, provisioning `:808`, `budget_guard` `:822` ; `server/budget_guard.rs` (refus d'une paire invalide — le contre-modèle de KTD1) ; `server/state.rs` `AgentState` `:27`, `AppState.agents` `:120`.
 - `crates/mika-agent/src/agent_loop/mod.rs` : `load_agent_context` `:478` et ses trois appelants `:4647`, `:5713`, `:6590` ; `emit_turn_usage` `:8489` et ses sites `:917`, `:1580`, `:1605` (`llm.model_name()`).
