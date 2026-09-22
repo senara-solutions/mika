@@ -1782,6 +1782,14 @@ impl TaskDispatcher {
             );
         }
 
+        // mika#2470 — what Phase 2 needs to dispatch a rescued ticket by a
+        // direct, in-process call of the ready-label handler instead of
+        // re-applying the label and waiting for a webhook that the outage it
+        // covers may never deliver.
+        let direct_dispatch = crate::auto_pull::DirectDispatchCtx {
+            skills: self.skills.as_ref(),
+            global_home_dir: &self.global_home_dir,
+        };
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
@@ -1789,6 +1797,7 @@ impl TaskDispatcher {
             &trace_id,
             &session_id,
             egress_verdict.is_down(),
+            &direct_dispatch,
         )
         .await;
 
