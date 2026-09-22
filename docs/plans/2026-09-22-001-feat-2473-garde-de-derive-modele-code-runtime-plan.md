@@ -625,11 +625,14 @@ cargo test -p mika-common -- mika2457   # le scan « un seul constructeur » res
 ```
 
 **Deux formes de ces commandes sont fausses, et l'une des deux est verte.**
-*(a) Les filtres passent derrière `--`.* `cargo test` n'accepte qu'un seul
-`TESTNAME` positionnel : une seconde ligne de filtre est refusée par
-`error: unexpected argument '…' found` et rien ne tourne. Mesuré sur ce poste
-(cargo 1.93.1) — bruyant, donc sans danger, mais le contrat était inexécutable
-tel qu'il était écrit. *(b) Le filtre du scan D2 est `agent_loop::`, jamais
+*(a) Les filtres passent derrière `--`.* **Avant** `--`, `cargo test` n'accepte
+qu'un seul `TESTNAME` positionnel et refuse le second par
+`error: unexpected argument '…' found` — rien ne tourne. **Derrière** `--` ce ne
+sont plus des arguments de cargo mais de libtest, qui en accepte plusieurs et les
+combine en OU. Les deux moitiés sont mesurées sur ce poste (cargo 1.93.1) : la
+forme d'origine échoue à l'analyse des arguments, la forme corrigée fait tourner
+623 tests (77 + 546). C'est bruyant dans les deux cas, donc sans danger — mais le
+contrat était inexécutable tel qu'il était écrit. *(b) Le filtre du scan D2 est `agent_loop::`, jamais
 `agent_loop::mika2473`.* Les tests de ce module vivent dans
 `#[cfg(test)] mod tests` (`agent_loop/mod.rs:9546`), donc leur chemin réel est
 `agent_loop::tests::mika2473_…`, dont `agent_loop::mika2473` n'est **pas** une

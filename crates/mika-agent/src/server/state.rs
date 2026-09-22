@@ -127,6 +127,31 @@ pub struct AgentState {
     /// one field over — a value asserting a setting that is not in force, with
     /// the authority of a measurement.
     pub budget_record: Arc<mika_common::llm::ResolvedBudgetRecord>,
+    /// Whether this agent runs the model `well_known_agents.rs` declares for it
+    /// (mika#2473 D1). Established ONCE at `init_agent`, from the same
+    /// [`Self::budget_record`] the line above freezes, and **never**
+    /// recalculated — a sibling of the record, not a field of it (KTD3): the
+    /// record has a single constructor and knows nothing about well-known
+    /// agents, while this comparison needs the compiled-in constant.
+    ///
+    /// `NotApplicable` for every agent whose spec carries no `config_toml` —
+    /// nothing was declared, so nothing can be out of phase. That word is not a
+    /// quiet `in_sync`: answering "in phase" about a comparison that never
+    /// happened is a false statement made with authority.
+    ///
+    /// **It reports; it never refuses (KTD1).** The drift this fleet carries is
+    /// a sequence of dated operator decisions in three `config.toml` files;
+    /// laying the fleet down over a *valid* configuration would make
+    /// `budget_guard` — which refuses an *invalid* pair — the model of a guard
+    /// that refuses a correct one. Restoring the file, recalibrating the agent,
+    /// or reconciling the constant (mika#2472) is the operator's call, and this
+    /// is the fact they need in hand.
+    ///
+    /// Served verbatim by `GET /api/v1/agents/{id}/budget` beside `budget`, and
+    /// frozen for the same reason: re-comparing at request time would read the
+    /// *reader's* process environment and report a drift, or an absence of one,
+    /// that is not the one this agent runs under.
+    pub model_drift: Arc<mika_common::llm::ModelDriftCheck>,
 }
 
 /// Shared application state for the Axum HTTP server.

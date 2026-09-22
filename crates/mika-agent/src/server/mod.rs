@@ -486,6 +486,40 @@ async fn init_agent(
     let budget_record =
         mika_common::llm::resolve_llm_budget_record(agent_name, global_home, agent_home);
     mika_common::llm::emit_llm_budget_resolved(&budget_record);
+
+    // mika#2473 D1 — the record above says what the RUNTIME serves; the constant
+    // in `well_known_agents.rs` says what the REPO declares. Until now nothing
+    // compared the two, and the cost of that silence is measured: mika-qa ran
+    // glm-5.3 for weeks while the repo said glm-5.2, and the divergence surfaced
+    // as a lost verdict on PR #2327 rather than as a line anyone could grep.
+    //
+    // The declared side is read by the SAME key derivation as the resolved one
+    // (`mika_common::llm::declared_model`, KTD6) — a second parser would be free
+    // to diverge and report a *false* drift on a correct configuration, which is
+    // strictly worse than none. The comparison is pure, and the emission is
+    // `emit_model_drift`'s alone: the event's field names are a log format an
+    // operator greps, and a format written at the call site is a format that
+    // acquires a second spelling.
+    //
+    // **Nothing here can refuse (KTD1).** No `?`, no `bail!`, no panic — the
+    // drift on this fleet is a sequence of dated operator decisions, and
+    // refusing to boot on a *valid* configuration is the failure mode this guard
+    // exists to avoid becoming. `budget_guard` stays the only thing that refuses,
+    // and only on an *invalid* pair.
+    let declared = crate::well_known_agents::find_well_known_agent(agent_name)
+        .and_then(|spec| spec.config_toml)
+        .and_then(mika_common::llm::declared_model);
+    let model_drift = mika_common::llm::ModelDriftCheck::compare(declared.as_ref(), &budget_record);
+    mika_common::llm::emit_model_drift(agent_name, &model_drift);
+
+    // mika#2473 D2 — the note the per-turn detector reads. Taken HERE, where the
+    // record was just resolved, and not at the first turn: a first turn can
+    // already be posterior to an edit, and a note taken then would call the
+    // edited file the boot state. Without this call `detect_config_change` is
+    // inert by construction (it keys on `agent_id` and answers `None` when this
+    // process holds no note), which is what exempts an agent this process never
+    // initialised — not the kind of turn.
+    mika_common::llm::note_config_at_boot(agent_name, global_home, agent_home, &budget_record);
     let github_token = agent_settings.agent_github_token().map(String::from);
     let agent_llm = agent_settings.make_llm_provider()?;
     let db_path = home::container_db_path(global_home);
@@ -669,6 +703,7 @@ async fn init_agent(
         kg_config,
         canonical_session_id,
         budget_record: Arc::new(budget_record),
+        model_drift: Arc::new(model_drift),
     };
 
     debug!(agent = agent_name, home = %agent_home.display(), "initialized agent");
@@ -2093,16 +2128,25 @@ mod tests {
             agent_settings,
             tier,
             std::path::PathBuf::from("/tmp/mika-test"),
+            mika_common::llm::ModelDriftCheck::NotApplicable,
         )
     }
 
     /// Same as [`test_state_with_settings_and_tier`] but lets the caller pin the
     /// agent's home directory — used by the mika#2457 freshness test, which must
-    /// resolve the budget record from a home it can then mutate on disk.
+    /// resolve the budget record from a home it can then mutate on disk — and
+    /// the mika#2473 drift check the route serves beside the record.
+    ///
+    /// `model_drift` is a PARAMETER rather than something computed here on
+    /// purpose: production establishes it in `init_agent` against a well-known
+    /// agent's constant, and a test state named "mika" declares nothing. A helper
+    /// that derived it would hand every caller the same `not_applicable` and the
+    /// route test could never exercise the `drift` arm it exists to pin.
     fn test_state_full(
         agent_settings: Settings,
         tier: mika_common::home::AgentTier,
         home_dir: std::path::PathBuf,
+        model_drift: mika_common::llm::ModelDriftCheck,
     ) -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
@@ -2146,6 +2190,7 @@ mod tests {
             budget_record: Arc::new(mika_common::llm::resolve_llm_budget_record(
                 "mika", &home_dir, &home_dir,
             )),
+            model_drift: Arc::new(model_drift),
             home_dir,
         };
 
@@ -4587,6 +4632,7 @@ mod tests {
             test_settings(),
             mika_common::home::AgentTier::Default,
             home.clone(),
+            mika_common::llm::ModelDriftCheck::NotApplicable,
         );
         state.ready.store(true, Ordering::Release);
 
@@ -4621,6 +4667,159 @@ mod tests {
             json["budget"]["http_timeout_secs"], 240,
             "la route doit servir le record de l'init : un recalcul par requête \
              est le faux vert mika#2304 (afficher ce qui est demandé, pas ce qui tourne)"
+        );
+    }
+
+    /// mika#2473 U3 / R6, AC4 — la route rend le sibling `model_drift` à côté du
+    /// record, et le gèle comme elle gèle le record.
+    ///
+    /// Trois arms de sérialisation, puis **le bras de gel**, sans lequel la
+    /// seconde moitié d'AC4 ne serait attestée par rien :
+    /// `mika2457_the_route_serves_the_record_of_the_init_not_the_disk` fait déjà
+    /// ce geste pour le record, mais il n'indexe que
+    /// `json["budget"]["http_timeout_secs"]` — il ne peut rien dire du sibling,
+    /// et le laisser l'attester serait un vert emprunté.
+    ///
+    /// **L'assertion du milieu est porteuse** : sans prouver que le disque a
+    /// réellement bougé, un vert ici serait compatible avec un test qui n'a rien
+    /// muté. Neutraliser le terme — réécrire le `config.toml` à l'identique —
+    /// fait rougir cette assertion-là et non la finale, ce qui est exactement ce
+    /// qu'on lui demande de distinguer.
+    #[tokio::test]
+    async fn mika2473_the_budget_route_serves_the_drift_beside_the_record() {
+        async fn budget_json(state: AppState) -> serde_json::Value {
+            state.ready.store(true, Ordering::Release);
+            let resp = test_app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/agents/mika/budget")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let drift = mika_common::llm::ModelDriftCheck::Drift {
+            declared_provider: "openrouter".to_string(),
+            declared_model: "moonshotai/kimi-k2.5".to_string(),
+            runtime_provider: "openrouter".to_string(),
+            runtime_model: "moonshotai/kimi-k3".to_string(),
+            runtime_model_source: "agent_config".to_string(),
+            runtime_provider_source: "agent_config".to_string(),
+            model_config_key: "openrouter_model".to_string(),
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::write(
+            home.join("config.toml"),
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k3\"\n",
+        )
+        .unwrap();
+
+        let state = test_state_full(
+            test_settings(),
+            mika_common::home::AgentTier::Default,
+            home.clone(),
+            drift.clone(),
+        );
+        let json = budget_json(state).await;
+        assert_eq!(
+            json["model_drift"]["status"], "drift",
+            "la route doit rendre le statut de la dérive à côté du record"
+        );
+        assert_eq!(
+            json["model_drift"]["declared_model"], "moonshotai/kimi-k2.5",
+            "les deux modèles doivent être présents : sans le déclaré, la ligne \
+             dit qu'il y a dérive sans dire par rapport à quoi"
+        );
+        assert_eq!(json["model_drift"]["runtime_model"], "moonshotai/kimi-k3");
+        assert_eq!(
+            json["model_drift"]["model_config_key"], "openrouter_model",
+            "la clé qu'un opérateur éditerait est la moitié actionnable du sibling"
+        );
+        assert!(
+            json["budget"]["model"].is_string(),
+            "le record reste servi tel quel : le sibling s'ajoute, il ne remplace rien"
+        );
+
+        // `not_applicable` — un agent qui ne déclare rien. Un mot distinct, pas
+        // un `in_sync` silencieux : répondre « en phase » d'une comparaison qui
+        // n'a jamais eu lieu est une fausse affirmation faite avec autorité.
+        let tmp_na = tempfile::tempdir().unwrap();
+        let json_na = budget_json(test_state_full(
+            test_settings(),
+            mika_common::home::AgentTier::Default,
+            tmp_na.path().to_path_buf(),
+            mika_common::llm::ModelDriftCheck::NotApplicable,
+        ))
+        .await;
+        assert_eq!(json_na["model_drift"]["status"], "not_applicable");
+
+        // 404 : ni budget ni dérive. Un agent que ce process ne sert pas n'a
+        // aucune dérive MESURÉE, et `not_applicable` y serait une réponse à une
+        // question que personne n'a posée.
+        let state_404 = test_state_full(
+            test_settings(),
+            mika_common::home::AgentTier::Default,
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            drift.clone(),
+        );
+        state_404.ready.store(true, Ordering::Release);
+        let resp = test_app(state_404)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/agents/inexistant/budget")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json_404: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json_404["budget"].is_null(), "404 inchangé : aucun budget");
+        assert!(
+            json_404["model_drift"].is_null(),
+            "404 inchangé : aucune dérive, même `not_applicable`"
+        );
+
+        // ---- Le bras de gel (AC4, seconde moitié) ----
+        let state = test_state_full(
+            test_settings(),
+            mika_common::home::AgentTier::Default,
+            home.clone(),
+            drift,
+        );
+        state.ready.store(true, Ordering::Release);
+
+        // Le disque bouge APRÈS la construction de l'état — la forme d'une
+        // édition hors dépôt sur un serveur qui tourne.
+        std::fs::write(
+            home.join("config.toml"),
+            "llm_provider = \"openrouter\"\nopenrouter_model = \"moonshotai/kimi-k2.5\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            mika_common::llm::resolve_llm_budget_record("mika", &home, &home).model,
+            "moonshotai/kimi-k2.5",
+            "le disque doit avoir réellement bougé — et il porte désormais le \
+             modèle DÉCLARÉ, donc une route qui recomparait rendrait `in_sync`"
+        );
+
+        let after = budget_json(state).await;
+        assert_eq!(
+            after["model_drift"], json["model_drift"],
+            "la route sert la dérive établie à l'init, pas celle que le disque \
+             porte à l'instant de la requête : une re-comparaison ici lirait \
+             l'environnement du LECTEUR et rendrait `in_sync` sur un agent qui \
+             tourne toujours sous l'autre modèle"
         );
     }
 
