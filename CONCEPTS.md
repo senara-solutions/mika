@@ -62,6 +62,14 @@ A groom proof has a retention half-life: once the store prunes it, the ticket re
 
 The pattern by which one ticket keeps one dispatch identity across grooming and implementation: when a groom converges, the same parent task is re-classed from grooming to implementation and the pilot is launched against it, rather than a second parent being created. It exists so that an issue never holds two active dispatch rows at once. Its consequence for any reader is that the parent's class is not a stable fact — a check that needs "this was groomed" must read the [groom proof](#groom-proof), not the parent.
 
+### Dispatch seat
+
+Which *engine* owns a ticket while it is being written on: the autonomous loop, or one of the interactive Claude Code seats (`ssc`, `mpc`). Carried on the GitHub issue as a `dispatch:<seat>` label, read by the engine's seat gate, which refuses a loop dispatch on a ticket another seat has claimed. It is not the exec-slot lease (which bounds how many dispatches one agent runs, per class) and not the PR's `origin:` label (which records who produced an artefact and never changes). The vocabulary is written three times — Rust, `labels.yml`, and the shell literal in dispatch-lib — and guarded in pairs, so an undeclared seat is a label that label-sync deletes silently.
+
+### Seat claim
+
+The loop's own `dispatch:loop` label, stamped by dispatch-lib when it takes a ticket and released before the callback that lets the next dispatch start, with the exit trap as crash/cancel backstop. A live claim, not a provenance: between two dispatches an unclaimed ticket reads as unlabelled, and a human seat may take it. Stale only when a run died without its trap; the next dispatch on that ticket reads it as already owned, does not re-stamp, and releases it on its own way out.
+
 ## Flagged ambiguities
 
 - *Guard* had been used for both a structural CI check and an in-process runtime assertion. In this glossary **structural guard** names the CI-enforced kind; a runtime assertion is not one.
