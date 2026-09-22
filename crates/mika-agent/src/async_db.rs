@@ -6,10 +6,10 @@ use tokio::sync::oneshot;
 
 use crate::db::{
     AgentRow, AgentWithStats, AuditEvent, BackgroundTaskCounts, Commitment, CoreMemoryEntry,
-    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRegistryRow,
-    SearchResult, ServedContent, Session, SessionMessage, SessionWithStats, SkillOverride, Task,
-    TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow, TeamRunFilters,
-    TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
+    Database, Event, FailedSend, NewTask, Person, Preference, RecordOutcome, RecurringRearmTarget,
+    RecurringRegistryRow, SearchResult, ServedContent, Session, SessionMessage, SessionWithStats,
+    SkillOverride, Task, TaskFilters, TaskHealthSummary, TaskMessage, TaskSessionRow, TeamRow,
+    TeamRunFilters, TeamRunRow, TeamRunSummary, TeamWorkspaceEntry, TimelineFilters, TimelineRow,
 };
 use crate::server::tasks_stream::{TaskEventFrame, TaskEventsChannel};
 
@@ -399,6 +399,28 @@ impl AsyncDatabase {
             .await
     }
 
+    /// mika#2446 — the most recent dead recurring row of `label`, the one
+    /// `mika tasks rearm` resurrects. See
+    /// [`Database::find_recurring_rearm_target`].
+    pub async fn find_recurring_rearm_target(
+        &self,
+        label: &str,
+    ) -> Result<Option<RecurringRearmTarget>> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.find_recurring_rearm_target(&a, &l))
+            .await
+    }
+
+    /// mika#2446 — stamp the operator lift on every dead recurring row of
+    /// `label`. See [`Database::mark_recurring_operator_rearm`].
+    pub async fn mark_recurring_operator_rearm(&self, label: &str) -> Result<usize> {
+        let a = self.agent_id.clone();
+        let l = label.to_owned();
+        self.with_db(move |db| db.mark_recurring_operator_rearm(&a, &l))
+            .await
+    }
+
     pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
         // mika#1758 note: this method cancels 0..N recurring rows keyed by
         // (agent_id, label) without returning the affected task ids. Emitting
@@ -738,6 +760,23 @@ impl AsyncDatabase {
         let tk = target_key.to_owned();
         let sn = since.to_owned();
         self.with_db(move |db| db.count_recent_audit_events_for_target(&a, &tn, &tk, &sn))
+            .await
+    }
+
+    /// Most recent audit row for (tool_name, target_key) newer than `since`:
+    /// `(after_value, reasoning, created_at)`. Used by mika#2242's reader, which
+    /// needs *which* row rather than how many.
+    pub async fn latest_audit_event_for_target(
+        &self,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestAuditEventProjection>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let tk = target_key.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.latest_audit_event_for_target(&a, &tn, &tk, &sn))
             .await
     }
 
@@ -1212,6 +1251,19 @@ impl AsyncDatabase {
             db.find_live_deferred_wrapper_child(&a, &p, promoted_liveness_seconds, x.as_deref())
         })
         .await
+    }
+
+    /// Age of the most recent activity row on the sessions of this parent's
+    /// deferred wrappers (mika#2184, U1).
+    /// See [`Database::find_deferred_wrapper_activity_age_secs`].
+    pub async fn find_deferred_wrapper_activity_age_secs(
+        &self,
+        parent_task_id: &str,
+    ) -> Result<Option<i64>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        self.with_db(move |db| db.find_deferred_wrapper_activity_age_secs(&a, &p))
+            .await
     }
 
     /// Find `pending` self_dev issue parents that no callback child represents

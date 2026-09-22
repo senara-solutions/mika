@@ -36,6 +36,46 @@ const PR_CLOSED_PREFIX: &str = "[GitHub] PR closed:";
 /// Sentinel line indicating a merged PR (gateway appends this on close events).
 const MERGED_TRUE_LINE: &str = "\nMerged: true";
 
+/// Suffix `truncate_body` appends when it cut a webhook body
+/// (`mika-gateway/src/github.rs`).
+///
+/// The coupling to the gateway's formatting is the one this module **already**
+/// assumes for `ISSUE_CLOSED_PREFIX`, `PR_CLOSED_PREFIX` and `MERGED_TRUE_LINE`,
+/// and it is fail-open: if the gateway changes the marker we lose the R6
+/// instrument, never the behaviour. Declared in `scripts/canonical-tokens.tsv`
+/// next to this file's two other entries — on déclare, on n'allowliste pas.
+const TRUNCATED_BODY_MARKER: &str = "[truncated]";
+
+/// `audit_events.tool_name` of the mika#2242 dé-groomage marker.
+///
+/// # The name states what was MEASURED, never its interpretation
+///
+/// A closing PR that is closed without merging unties its `Closes #N`
+/// sub-tickets from the plan the PR's branch carries. Whether `#N` was
+/// *groomed* is not knowable here: this handler holds the PR's body, not the
+/// issue's, and fetching it would be a network read in a handler that performs
+/// none. "Dé-groomé" is an interpretation, and the entitled writer is the
+/// reader — `server::ready_label_handler`, which holds the issue body and finds
+/// the callouts missing.
+///
+/// # SOLE WRITER
+///
+/// This module is the only production site writing this name, which is what
+/// makes the `GROUP BY` of `CLAUDE.md` § *un dé-groomage est attribuable*
+/// subtractible against its sibling `ready_label_degroomed`. Pinned by
+/// `canonical_tokens::tests::mika2242_the_two_audit_names_have_a_single_writer`.
+pub const CLOSING_PR_CLOSED_UNMERGED_TOOL: &str = "closing_pr_closed_unmerged";
+
+/// `audit_events.target_key` of the marker, and the key the reader queries by
+/// **exact equality** — never a `LIKE`, which would match `#234` against
+/// `#2343` (the mika#2347 trap).
+///
+/// One writer, one reader, one function: the two halves cannot spell the key
+/// differently, which is the only way they could fail to meet.
+pub fn degroom_marker_key(owner_repo: &str, issue_number: u64) -> String {
+    format!("issue:{owner_repo}#{issue_number}")
+}
+
 /// Matches closing keywords (`Closes`/`Fixes`/`Resolves`, any inflection) plus a
 /// same-repo issue reference (`#<n>`) in a PR body. Case-insensitive.
 static CLOSING_REF_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -104,6 +144,29 @@ async fn handle_pr_closed(text: &str, db: &AsyncDatabase, session_id: &str, trac
 
     let issue_numbers = parse_closing_issue_refs(text);
     if issue_numbers.is_empty() {
+        // mika#2242 R6 — the blind spot, said out loud rather than inherited in
+        // silence. `format_event_text` truncates the PR body at 2 000 chars, and
+        // `parse_closing_issue_refs` reads THAT body: an umbrella's `Closes #N`
+        // lines are typically long-bodied, so they can fall past the cut. The
+        // producer below would then be inert for exactly the population it
+        // targets — and a silently inert detector reads exactly like a healthy
+        // one (mika#2205).
+        //
+        // Scoped to the unmerged branch because that is the only branch that
+        // writes a marker; a truncated merged close loses nothing this ticket
+        // adds. Named and instrumented, NOT corrected: closing it means fetching
+        // the full body over the network, which changes the population of the
+        // row cleanup below — a blast radius R2 forbids. Its follow-up is
+        // conditioned on this line being non-empty.
+        if !merged && body_is_truncated(text) {
+            warn!(
+                event = "closing_pr_body_truncated_no_refs",
+                pr_url = %pr_url,
+                "upstream_close: unmerged PR closed with a TRUNCATED body and no \
+                 Closes/Fixes ref parsed — a dé-groomage marker may be missing \
+                 (mika#2242 R6)"
+            );
+        }
         debug!(
             pr_url = %pr_url,
             "upstream_close: PR body carries no Closes/Fixes issue refs — nothing to clean up"
@@ -111,8 +174,31 @@ async fn handle_pr_closed(text: &str, db: &AsyncDatabase, session_id: &str, trac
         return;
     }
 
+    // Read once, outside the loop: the branch is a property of the PR, not of
+    // the ref. Free — it rides on the webhook header the gateway already writes.
+    let head_branch = extract_head_branch(text);
+
     for number in issue_numbers {
         let issue_url = format!("https://github.com/{owner}/{repo}/issues/{number}");
+
+        // mika#2242 — on the unmerged branch ONLY. A merged PR closes its issue;
+        // there is no dé-groomage to attribute. The write is fire-and-forget and
+        // precedes nothing: it must not be able to fail the row cleanup below
+        // (R2), so its failure is a `warn!` exactly like the `log_audit_event`
+        // already inside `cleanup_rows_for_issue_url`.
+        if !merged {
+            record_closing_pr_closed_unmerged(
+                db,
+                session_id,
+                trace_id,
+                &format!("{owner}/{repo}"),
+                number,
+                &pr_url,
+                head_branch.as_deref(),
+            )
+            .await;
+        }
+
         cleanup_rows_for_issue_url(
             db,
             session_id,
@@ -123,6 +209,115 @@ async fn handle_pr_closed(text: &str, db: &AsyncDatabase, session_id: &str, trac
             result,
         )
         .await;
+    }
+}
+
+/// Stamp the durable record that PR `pr_url` was closed **without merging**
+/// while declaring `Closes #issue_number` (mika#2242 R1).
+///
+/// The link "umbrella → sub-ticket" is readable at exactly one instant — this
+/// one, where the PR's body is in hand. From the sub-ticket afterwards it is not
+/// reconstructible: an umbrella plan's canonical filename carries no sub-ticket
+/// number (the `<issue>` slot holds the word `umbrella`), and GitHub exposes
+/// `PullRequest.closingIssuesReferences` but no issue → closing-PRs direction.
+/// So this is a fact stamped by its producer, never reconstructed afterwards —
+/// the rule mika#2026 wrote for PR origin and mika#2249 for the dispatch
+/// worktree.
+async fn record_closing_pr_closed_unmerged(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    owner_repo: &str,
+    issue_number: u64,
+    pr_url: &str,
+    head_branch: Option<&str>,
+) {
+    let target_key = degroom_marker_key(owner_repo, issue_number);
+    let pr_ref = pr_reference(pr_url);
+    // A `clé=valeur` record separated by spaces — the convention already in
+    // force in this file (`event_type={} reference_url={}`) and in
+    // `ready_label_handler` (`repo={} number={} target_skill={} groomed={}`).
+    // Not a new format; the house's.
+    //
+    // An unreadable branch omits the key rather than writing an empty one: the
+    // reader's DECISION rests on the row's PRESENCE, and the branch is an
+    // enrichment for the operator. A `head_branch=` with nothing after it would
+    // read as a branch literally named "".
+    let reasoning = match head_branch {
+        Some(branch) => format!("pr_url={pr_url} head_branch={branch} merged=false"),
+        None => format!("pr_url={pr_url} merged=false"),
+    };
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            CLOSING_PR_CLOSED_UNMERGED_TOOL,
+            &target_key,
+            None,
+            Some(&pr_ref),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "closing_pr_marker_write_failed",
+            target_key = %target_key,
+            pr_url = %pr_url,
+            error = %e,
+            "upstream_close: failed to write the dé-groomage marker (non-fatal)"
+        );
+        return;
+    }
+
+    info!(
+        event = "closing_pr_closed_unmerged",
+        issue = %target_key,
+        pr = %pr_ref,
+        pr_url = %pr_url,
+        head_branch = head_branch.unwrap_or("<unknown>"),
+        "upstream_close: closing PR closed without merging — its sub-ticket is \
+         untied from the plan that branch carries (mika#2242)"
+    );
+}
+
+/// `true` when the gateway cut this message's body.
+///
+/// The body is the **last** segment `format_event_text` appends for a `closed`
+/// action, so the marker lands at the end of the text. Anchoring on the tail is
+/// what separates it from prose that merely *contains* the word — the false
+/// positive class mika#2050 measured on Signal S, where a pilot writing *about*
+/// a marker was counted as an emission of it.
+fn body_is_truncated(text: &str) -> bool {
+    text.trim_end().ends_with(TRUNCATED_BODY_MARKER)
+}
+
+/// The PR's head branch, from the header line the gateway writes:
+/// `[GitHub] PR closed: {repo}#{n} — {title} (branch: {branch})`.
+///
+/// Read from the **first** line only, and from its **last** `(branch: …)` run,
+/// so a PR whose title happens to contain that shape cannot displace the real
+/// one. Returns `None` on anything else — an unreadable branch costs the
+/// operator a pointer, never a decision.
+fn extract_head_branch(text: &str) -> Option<String> {
+    let header = text.lines().next()?;
+    let tail = header.rsplit_once(" (branch: ")?.1;
+    let branch = tail.strip_suffix(')')?.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
+/// `pr#{n}` — the `after_value` wire format both halves of mika#2242 write.
+///
+/// This is the column an operator `GROUP BY`s ("which umbrella untied what"), so
+/// the producer and the reader must emit the same shape; the reader gets it by
+/// re-emitting this row's value verbatim rather than recomputing it.
+fn pr_reference(pr_url: &str) -> String {
+    let tail = pr_url.rsplit('/').next().unwrap_or_default();
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        format!("pr#{tail}")
+    } else {
+        format!("pr#{digits}")
     }
 }
 
@@ -324,5 +519,87 @@ mod tests {
         let unmerged = "[GitHub] PR closed: a/b#1 — t (branch: x)\nurl\nMerged: false\n\nCloses #1";
         assert!(merged.contains(MERGED_TRUE_LINE));
         assert!(!unmerged.contains(MERGED_TRUE_LINE));
+    }
+
+    // -- mika#2242 — les fonctions pures du producteur ----------------------
+
+    #[test]
+    fn mika2242_extract_head_branch_reads_the_gateway_header() {
+        let text = "[GitHub] PR closed: senara-solutions/mika#2226 — fix: umbrella \
+                    (branch: fix/umbrella-auto-pull-exclusion-observability)\n\
+                    https://github.com/senara-solutions/mika/pull/2226\nMerged: false";
+        assert_eq!(
+            extract_head_branch(text).as_deref(),
+            Some("fix/umbrella-auto-pull-exclusion-observability")
+        );
+    }
+
+    /// Un titre portant lui-même la forme `(branch: …)` ne doit pas déplacer la
+    /// vraie branche : c'est la **dernière** occurrence de la ligne d'en-tête qui
+    /// compte, jamais la première.
+    #[test]
+    fn mika2242_a_title_carrying_the_shape_does_not_displace_the_branch() {
+        let text = "[GitHub] PR closed: a/b#1 — doc: explain (branch: foo) syntax \
+                    (branch: real/branch)\nurl\nMerged: false";
+        assert_eq!(extract_head_branch(text).as_deref(), Some("real/branch"));
+    }
+
+    #[test]
+    fn mika2242_extract_head_branch_is_none_without_the_shape() {
+        assert_eq!(extract_head_branch(""), None);
+        assert_eq!(
+            extract_head_branch("[GitHub] PR closed: a/b#1 — t\nurl"),
+            None
+        );
+        // Une branche vide n'est pas une branche : mieux vaut omettre la clé que
+        // d'écrire `head_branch=` et laisser lire un nom littéralement vide.
+        assert_eq!(
+            extract_head_branch("[GitHub] PR closed: a/b#1 — t (branch: )"),
+            None
+        );
+    }
+
+    /// La troncature est **ancrée en queue**. Un corps qui parle du marqueur sans
+    /// le porter en fin de texte n'est pas tronqué — le faux positif de prose que
+    /// mika#2050 a mesuré sur le Signal S.
+    #[test]
+    fn mika2242_truncation_is_tail_anchored_not_a_substring() {
+        let cut = "[GitHub] PR closed: a/b#1 — t (branch: x)\nurl\nMerged: false\n\nCorps…\n\n[truncated]";
+        assert!(body_is_truncated(cut));
+        // Tolère un saut de ligne final, que le transport peut ajouter.
+        assert!(body_is_truncated(&format!("{cut}\n")));
+
+        let prose = "[GitHub] PR closed: a/b#1 — t (branch: x)\nurl\nMerged: false\n\n\
+                     Le gateway appose [truncated] quand il coupe un corps.";
+        assert!(
+            !body_is_truncated(prose),
+            "un corps qui MENTIONNE le marqueur n'est pas un corps tronqué"
+        );
+        assert!(!body_is_truncated(""));
+    }
+
+    #[test]
+    fn mika2242_pr_reference_is_the_wire_shape() {
+        assert_eq!(
+            pr_reference("https://github.com/senara-solutions/mika/pull/2226"),
+            "pr#2226"
+        );
+        // Forme dégradée : on rend quelque chose de lisible plutôt que de perdre
+        // la ligne — le `GROUP BY` reste honnête, il nomme ce qu'on a lu.
+        assert_eq!(pr_reference("https://github.com/a/b/pull/abc"), "pr#abc");
+    }
+
+    #[test]
+    fn mika2242_marker_key_is_exact_and_unambiguous() {
+        assert_eq!(
+            degroom_marker_key("senara-solutions/mika", 2131),
+            "issue:senara-solutions/mika#2131"
+        );
+        // Le piège mika#2347 : la clé de `#234` ne doit jamais être un préfixe
+        // de celle de `#2343` sous une comparaison exacte — et elles diffèrent.
+        assert_ne!(
+            degroom_marker_key("a/b", 234),
+            degroom_marker_key("a/b", 2343)
+        );
     }
 }

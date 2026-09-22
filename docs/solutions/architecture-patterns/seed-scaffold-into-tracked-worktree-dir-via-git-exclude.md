@@ -11,6 +11,7 @@ applies_when:
   - "Those files would otherwise show as untracked in `git status`, breaking a downstream rebase or a clean-worktree invariant"
   - "A blanket `cp -r` would also overwrite the branch's own tracked versions of same-named files"
   - "Pinning the true cause of a groomed ticket whose stated premise (layer/mechanism) is an unconfirmed hypothesis"
+  - "Establishing whether a `.claude/commands/` file is missing from a repo, deleted from it, or merely seeded-and-excluded in a dispatch worktree"
 tags:
   - worktree-hygiene
   - dispatch-lib
@@ -19,6 +20,8 @@ tags:
   - autonomous-loop
   - phase-0-pin
   - mika-1415
+  - mika-2001
+  - scope-boundary
 ---
 
 # Seed ephemeral scaffold into a tracked worktree dir without dirtying git status
@@ -96,6 +99,77 @@ writer of `.claude/commands/` into a worktree is `dispatch-lib.sh`'s `cp -r`, fi
 The "two distinct surfaces" model (a deploy surface separate from dispatch-lib) collapsed
 to one. The survey's "regenerated each deploy" was an unconfirmed correlation, not a
 mechanism.
+
+## Effet de lecture : un fichier semé se lit comme un fichier supprimé
+
+Le masquage ci-dessus est délibéré et sert la propreté du rebase. Il a un **effet de
+lecture** que ce document ne disait pas, et qui a coûté trois enquêtes : il rend le
+mécanisme invisible à qui interroge git. Mesure, dans n'importe quel worktree de
+dispatch :
+
+```bash
+ls .claude/commands/        | wc -l   # une vingtaine de fichiers présents sur disque
+git ls-files .claude/commands/ | wc -l   # 4 — et ce 4 est l'invariant
+```
+
+Le premier nombre varie avec le jeu de commandes du meta-repo au moment du dispatch ; le
+second est fixé par `b831cbd5` (2026-05-26) et par `mika/CLAUDE.md` § Directory Structure,
+qui nomme les quatre : `mika.md`, `mika-doc-audit.md`, `mika-issue.md`, `mika-issues.md`.
+L'écart entre les deux, ce sont les commandes d'orchestration du meta-repo — dont
+`mika-groom-ticket.md`, `mika-groom-plan-only.md`, `mika-groom-milestone.md`,
+`mika-revise-plan.md` — semées par `_seed_worktree_slash_commands` et listées dans
+`$(git rev-parse --git-common-dir)/info/exclude`.
+
+**Un observateur qui demande à git voit une absence là où le pipeline voit un fichier qui
+marche.** D'où la règle de lecture :
+
+> L'absence dans `git ls-files` d'un fichier `.claude/commands/` présent sur disque est
+> l'état **nominal** d'un worktree de dispatch, jamais la preuve d'une suppression.
+
+Le geste qui tranche tient en une commande — elle distingue « jamais suivi ici » de
+« retiré », et dans le second cas elle rend le commit et son motif :
+
+```bash
+git log --oneline --all -- .claude/commands/
+```
+
+Sur ce dépôt elle rend deux commits de cette famille, et ils ne disent pas la même
+chose : `b831cbd5` est le retrait des dix-huit commandes meta, `5045762a` (#1095) la
+suppression d'une copie re-propagée depuis. Le second est le plus instructif — une
+commande meta qui réapparaît ici est traitée comme un défaut à corriger, jamais comme
+l'état attendu.
+
+### Le coût, mesuré trois fois
+
+| Quand | Qui | Ce qui a été lu | Ce qui était vrai |
+|---|---|---|---|
+| 2026-08-26 | mika-qa, à la revue de PR#1994 | `AC3 ❌ — .claude/commands/ groom files removed from repo, Units 3-4 not implementable` | PR#1994 (`8f46caa9`) ne touche aucun fichier sous `.claude/` ; le retrait est `b831cbd5`, antérieur de trois mois |
+| 2026-09-19 | mika#2306 | — | a dû re-mesurer `git ls-files` pour établir que ces commandes ne sont pas éditables depuis ce dépôt, et a routé sa livraison par `_FIRE_DISPOSITION_RULE` (`dispatch-lib.sh`), le seul canal que `mika` contrôle |
+| 2026-09-21 | mika#2001 | le finding ci-dessus, promu en ticket de suivi | même conclusion, re-établie une troisième fois |
+
+Chacune de ces trois lectures était de bonne foi : c'est la lecture naturelle d'un
+mécanisme conçu pour être invisible. La parade n'est pas un nouveau détecteur — celui de
+cette classe existe déjà et il passe :
+`skills/bundled/_shared/tests/test_seed_worktree_slash_commands.sh` assert
+`mika-groom-ticket.md` comme cas *meta-only seeded* et vérifie qu'il atterrit dans
+`info/exclude` exactement une fois (11/11 le 2026-09-21).
+
+**Mesuré en chemin, et c'est un défaut à part entière : ce script n'est câblé ni au
+`Makefile` ni à `.github/workflows/`.** `make test-dispatch-lib` lance
+`test-dispatch-lib.sh` et `test_dev_groom_dirty_rescue.sh` — pas celui-ci, dont le seul
+point d'entrée est la ligne `# Run:` de son propre en-tête. Il ne tourne donc qu'à la
+main, et **une garde qui ne tourne pas se lit exactement comme une garde verte.** Le
+câbler est un suivi, nommé dans la PR de mika#2001 et délibérément non fait là-bas
+(périmètre documentaire). En attendant, la parade effectivement disponible est cette
+section, plus la demi-phrase posée dans `mika/CLAUDE.md` § Directory Structure — sur la
+surface que toute session lit au démarrage.
+
+**Corollaire, et c'est la moitié qui coûte le plus cher :** « rétablir le chemin attendu »
+en committant l'un de ces fichiers dans le sous-dépôt est la mauvaise réparation. Elle
+ferait gagner la copie du sous-dépôt sur celle du meta-repo — invariant 1 ci-dessus —
+donc deux sources de vérité divergentes pour le prescripteur de grooming, **et la
+divergence ne produirait aucun signal**. Le commentaire du code le dit à l'avance
+(« this would silently shadow it », risque mika#1173).
 
 ## Why This Matters
 

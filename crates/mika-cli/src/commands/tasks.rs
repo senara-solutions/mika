@@ -190,6 +190,27 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
+        Some(TaskCommand::Rearm { label }) => {
+            match mika_agent::task_engine::rearm_recurring_task(db, &label).await {
+                Ok(outcome) => {
+                    println!(
+                        "\n  Re-armed recurring task \"{}\" (trigger {}, cron {}).\n  \
+                         Lifted the zombie veto on {} dead row(s); most recent: {} ({}).\n  \
+                         Recorded in audit_events as recurring_operator_rearm.\n",
+                        outcome.label,
+                        outcome.trigger,
+                        outcome.cron_expr,
+                        outcome.rows_marked,
+                        outcome.dead_task_id,
+                        outcome.dead_status,
+                    );
+                }
+                Err(e) => {
+                    eprintln!("\n  Refused: {e}\n");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(TaskCommand::Stuck { format }) => {
             let grace = mika_agent::task_engine::stuck_pending_reaper_grace_secs();
             // The probe must see exactly the population the reaper acts on

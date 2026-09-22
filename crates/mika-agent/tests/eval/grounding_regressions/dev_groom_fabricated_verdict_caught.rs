@@ -89,6 +89,7 @@ fn make_dev_groom_skill() -> SkillEntry {
                 command: "echo test".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(300),
+                detaches_command: false,
             },
             skill_dir: PathBuf::from("/skills/dev-groom"),
         }],

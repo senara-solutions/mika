@@ -820,6 +820,7 @@ async fn try_engine_dispatch(
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             return EngineDispatchResult::Fallback {
@@ -4397,6 +4398,7 @@ mod tests {
                 command: "run.sh".to_string(),
                 long_running: true,
                 estimated_duration_secs: Some(600),
+                detaches_command: false,
             },
             skill_dir: tmp.path().to_path_buf(),
         }];

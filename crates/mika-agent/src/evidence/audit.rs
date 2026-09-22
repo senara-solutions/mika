@@ -40,6 +40,29 @@ pub const AUTH_BOUNDARY_TOOL_NAME: &str = "auth_boundary";
 /// making the row look like it came from a turn.
 pub const AUTH_BOUNDARY_SESSION_ID: &str = "auth-boundary";
 
+/// How long an `audit_events` row survives before
+/// [`Database::compact_old_audit_events`] folds it into a monthly summary.
+///
+/// Declared next to the function that purges, so a reader whose window must not
+/// outlive the ledger derives it from the same number rather than repeating it.
+/// The first such reader is mika#2242's, and the two diverging would give it a
+/// window over rows that no longer exist — a lookup that silently stops finding
+/// anything, which reads exactly like a ticket that was never dé-groomé.
+///
+/// Its half-life is a named cost, not an oversight: a sub-ticket untied more
+/// than `AUDIT_RETENTION_DAYS` ago loses its attribution and reads as "simply
+/// not groomed" — i.e. today's behaviour. Fail-open in the safe direction.
+pub const AUDIT_RETENTION_DAYS: u32 = 90;
+
+/// `(after_value, reasoning, created_at)` of a single `audit_events` row, as
+/// [`Database::latest_audit_event_for_target`] projects it (mika#2242).
+///
+/// Named rather than spelled inline: the two `Option`s are the columns' real
+/// nullability, and a reader that flattened either would hand its caller a
+/// value the ledger does not carry — the "`null` is never `0`" rule mika#2331
+/// had to write for `request_bytes`.
+pub type LatestAuditEventProjection = (Option<String>, Option<String>, String);
+
 impl Database {
     // ===== Audit Events =====
 

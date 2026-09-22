@@ -124,6 +124,232 @@ pub async fn ensure_recurring_task(
     }
 }
 
+/// Pourquoi `mika tasks rearm` a refusé (mika#2446 R-4/R-5).
+///
+/// Chaque refus nomme ce qui le fonde : un geste opérateur refusé sans
+/// raison lisible est un geste qu'on contourne au jugé — en éditant la base,
+/// précisément ce que la commande existe pour rendre inutile.
+#[derive(Debug, thiserror::Error)]
+pub enum RearmError {
+    /// Aucune ligne récurrente morte pour ce label. Jamais de création ex
+    /// nihilo : créer une récurrente depuis un label inconnu serait le seul
+    /// geste capable d'introduire un trigger non routable.
+    #[error(
+        "no dead recurring task labelled `{label}` for agent `{agent_id}` — \
+         nothing to re-arm (a rearm never creates a recurrence ex nihilo)"
+    )]
+    NoDeadRow { agent_id: String, label: String },
+    /// Une ligne active existe déjà : il n'y a rien à ressusciter.
+    #[error("recurring task `{label}` is already armed — nothing to re-arm")]
+    AlreadyArmed { label: String },
+    /// `ensure_recurring_task` n'enregistre que des `run_skill` ; ré-armer
+    /// autre chose passerait par un chemin qui réécrirait l'action.
+    #[error(
+        "recurring task `{label}` (task {task_id}) has action_type `{action_type}`; \
+         `mika tasks rearm` only re-registers run_skill recurrences"
+    )]
+    NotRunSkill {
+        label: String,
+        task_id: String,
+        action_type: String,
+    },
+    /// L'`action_config` de la ligne morte ne porte pas de `trigger` lisible :
+    /// sans trigger, la routabilité ne peut pas être établie — refus.
+    #[error(
+        "recurring task `{label}` (task {task_id}) carries no readable `trigger` in its \
+         action_config — routability cannot be established, refusing"
+    )]
+    NoTrigger { label: String, task_id: String },
+    /// R-5 / AC7 — le binaire courant ne sait pas router ce trigger.
+    /// Ré-armer ne produirait qu'une mort de plus par trigger inconnu.
+    #[error(
+        "refusing to re-arm `{label}`: trigger `{trigger}` is not routable by this binary \
+         (mika {version}, git {git_hash}); routable triggers: {routable_triggers}. \
+         Re-arming would only produce another unknown-trigger death — deploy a binary \
+         that carries the arm first."
+    )]
+    NotRoutable {
+        label: String,
+        trigger: String,
+        version: String,
+        git_hash: String,
+        routable_triggers: String,
+    },
+    /// La ligne morte n'a pas de `cron_expr` : l'opérateur ne doit pas en
+    /// retaper un, donc la commande refuse plutôt que d'en inventer un.
+    #[error("recurring task `{label}` (task {task_id}) has no cron_expr to re-register with")]
+    NoCron { label: String, task_id: String },
+    /// Le marqueur est posé et tracé, mais la ré-inscription n'a pas pris —
+    /// une autre garde a refusé ; le journal porte son WARN.
+    #[error(
+        "re-registration of `{label}` did not take after the operator lift — \
+         read the mika#1742 warning in the log"
+    )]
+    NotRegistered { label: String },
+    #[error(transparent)]
+    Db(#[from] anyhow::Error),
+}
+
+/// Ce qu'un `mika tasks rearm` réussi a fait (mika#2446 R-4).
+#[derive(Debug, Clone)]
+pub struct RearmOutcome {
+    /// Le label tel que stocké (la recherche est `COLLATE NOCASE`).
+    pub label: String,
+    pub trigger: String,
+    pub cron_expr: String,
+    /// La ligne morte la plus récente — celle dont la mort est absoute.
+    pub dead_task_id: String,
+    pub dead_status: String,
+    /// Nombre de lignes mortes marquées par cet acte (toutes celles du label).
+    pub rows_marked: usize,
+}
+
+/// Ré-arme une récurrente morte sans attendre la fenêtre de grâce
+/// mika#1742 et sans édition manuelle de la base (mika#2446 R-4/R-5).
+///
+/// Séquence, et l'ordre est porteur :
+/// 1. résoudre la ligne morte la plus récente du label — absente → refus,
+///    jamais de création ex nihilo ;
+/// 2. lire son `trigger` et **refuser s'il n'est pas routable par ce
+///    binaire** (AC7), en nommant le trigger, la version, l'empreinte git et
+///    l'inventaire ;
+/// 3. **tracer l'acte AVANT de le poser** (`audit_events`,
+///    `tool_name = 'recurring_operator_rearm'`) : un acte non tracé est ce que
+///    ce geste refuse d'être, donc un audit illisible annule tout ;
+/// 4. poser le marqueur sur les lignes mortes du label ;
+/// 5. ré-enregistrer via [`ensure_recurring_task`] avec le `cron_expr` et
+///    l'`action_config` lus **sur la ligne morte**, puis vérifier qu'une ligne
+///    active existe.
+///
+/// **Refusé : une exemption automatique au second décès.** Ce serait désarmer
+/// mika#1742 pour toute la classe. Le ré-armement est un acte explicite,
+/// imputable, et chaque décès postérieur retrouve un veto armé.
+pub async fn rearm_recurring_task(
+    db: &AsyncDatabase,
+    label: &str,
+) -> Result<RearmOutcome, RearmError> {
+    if db.get_recurring_task_cron(label).await?.is_some() {
+        return Err(RearmError::AlreadyArmed {
+            label: label.to_string(),
+        });
+    }
+
+    let target = db
+        .find_recurring_rearm_target(label)
+        .await?
+        .ok_or_else(|| RearmError::NoDeadRow {
+            agent_id: db.agent_id.clone(),
+            label: label.to_string(),
+        })?;
+
+    // La recherche est insensible à la casse ; la vérification d'activité
+    // ci-dessus lit le label tapé. On la refait sur l'orthographe stockée.
+    if target.label != label && db.get_recurring_task_cron(&target.label).await?.is_some() {
+        return Err(RearmError::AlreadyArmed {
+            label: target.label.clone(),
+        });
+    }
+
+    if target.action_type != action_type::RUN_SKILL {
+        return Err(RearmError::NotRunSkill {
+            label: target.label.clone(),
+            task_id: target.task_id.clone(),
+            action_type: target.action_type.clone(),
+        });
+    }
+
+    let trigger = serde_json::from_str::<serde_json::Value>(&target.action_config)
+        .ok()
+        .and_then(|v| v.get("trigger").and_then(|t| t.as_str()).map(str::to_owned))
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| RearmError::NoTrigger {
+            label: target.label.clone(),
+            task_id: target.task_id.clone(),
+        })?;
+
+    // AC7 — le lecteur unique de l'inventaire pour les prédicats.
+    if !dispatcher::is_routable_trigger(&trigger) {
+        let attribution = dispatcher::binary_attribution();
+        warn!(
+            event = "recurring_operator_rearm_refused",
+            label = %target.label,
+            trigger = %trigger,
+            binary_version = %attribution.version,
+            binary_git_hash = %attribution.git_hash,
+            routable_triggers = %attribution.routable_triggers,
+            "mika#2446: rearm refused — trigger not routable by this binary"
+        );
+        return Err(RearmError::NotRoutable {
+            label: target.label.clone(),
+            trigger,
+            version: attribution.version.to_string(),
+            git_hash: attribution.git_hash.to_string(),
+            routable_triggers: attribution.routable_triggers,
+        });
+    }
+
+    let cron_expr = target
+        .cron_expr
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| RearmError::NoCron {
+            label: target.label.clone(),
+            task_id: target.task_id.clone(),
+        })?;
+
+    // Tracer AVANT de poser : si la trace ne s'écrit pas, rien n'est changé.
+    let attribution = dispatcher::binary_attribution();
+    db.log_audit_event(
+        &format!("system-{}", db.agent_id()),
+        "recurring_operator_rearm",
+        &format!("label:{}", target.label),
+        Some(&target.status),
+        Some("rearmed"),
+        Some(&format!(
+            "dead_task:{} trigger:{} cron:{} dead_updated_at:{} \
+             binary_version:{} binary_git_hash:{}",
+            target.task_id,
+            trigger,
+            cron_expr,
+            target.updated_at,
+            attribution.version,
+            attribution.git_hash,
+        )),
+        None,
+    )
+    .await?;
+
+    let rows_marked = db.mark_recurring_operator_rearm(&target.label).await?;
+
+    ensure_recurring_task(db, &target.label, &cron_expr, &target.action_config).await;
+
+    if db.get_recurring_task_cron(&target.label).await?.is_none() {
+        return Err(RearmError::NotRegistered {
+            label: target.label.clone(),
+        });
+    }
+
+    info!(
+        event = "recurring_operator_rearm",
+        label = %target.label,
+        trigger = %trigger,
+        cron = %cron_expr,
+        dead_task_id = %target.task_id,
+        dead_status = %target.status,
+        rows_marked,
+        "mika#2446: recurring task re-armed by operator"
+    );
+
+    Ok(RearmOutcome {
+        label: target.label,
+        trigger,
+        cron_expr,
+        dead_task_id: target.task_id,
+        dead_status: target.status,
+        rows_marked,
+    })
+}
+
 /// Check if heartbeat is enabled for the agent from identity.toml config.
 /// Returns `true` (default) unless `[heartbeat] enabled = false`.
 pub async fn heartbeat_enabled_for_agent(home_dir: &Path) -> bool {
@@ -275,5 +501,139 @@ mod tests {
             "un échec terminal récent doit toujours bloquer la ré-inscription \
              (mika#1742) — statuts observés : {statuses:?}"
         );
+    }
+
+    // ── mika#2446 — `mika tasks rearm <label>` (AC6 / AC7) ──────────────
+
+    const REAP_LABEL: &str = "worktree_reap";
+    const REAP_CRON: &str = "0 */10 * * * *";
+    const REAP_CONFIG: &str = r#"{"trigger":"worktree_reap"}"#;
+
+    /// Inscrit `label` puis le fait mourir `failed` dans la fenêtre de grâce,
+    /// de cause quelconque (non marquée) — l'état qui arme le veto mika#1742.
+    async fn kill_in_window(db: &AsyncDatabase, label: &str, cron: &str, config: &str) {
+        ensure_recurring_task(db, label, cron, config).await;
+        let label = label.to_string();
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET status = 'failed',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')
+                 WHERE label = ?1",
+                rusqlite::params![label],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// AC6 — le ré-armement lève le veto sans attendre 24 h ni éditer la
+    /// base, ré-inscrit avec le cron lu sur la ligne morte, et trace l'acte.
+    #[tokio::test]
+    async fn mika2446_rearm_revives_a_dead_recurrence_and_traces_the_act() {
+        let db = test_async_db();
+        kill_in_window(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+
+        // Précondition : le chemin nominal (redémarrage) est refusé par le veto.
+        ensure_recurring_task(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+        assert_eq!(
+            statuses_for(&db, REAP_LABEL).await,
+            vec!["failed".to_string()]
+        );
+
+        let outcome = rearm_recurring_task(&db, REAP_LABEL)
+            .await
+            .expect("un trigger routable doit être ré-armé");
+        assert_eq!(outcome.label, REAP_LABEL);
+        assert_eq!(outcome.trigger, "worktree_reap");
+        assert_eq!(outcome.cron_expr, REAP_CRON);
+        assert_eq!(outcome.dead_status, "failed");
+        assert_eq!(outcome.rows_marked, 1);
+
+        let statuses = statuses_for(&db, REAP_LABEL).await;
+        assert!(
+            statuses.iter().any(|s| s == "recurring_active"),
+            "la récurrente doit être ré-inscrite — statuts : {statuses:?}"
+        );
+        assert_eq!(
+            db.get_recurring_task_cron(REAP_LABEL)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(REAP_CRON),
+            "le cron est lu sur la ligne morte, jamais retapé"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name("recurring_operator_rearm")
+                .await
+                .unwrap(),
+            1,
+            "l'acte doit être tracé dans audit_events"
+        );
+    }
+
+    /// AC7 — un trigger que ce binaire ne sait pas router est refusé, en
+    /// nommant le trigger et l'inventaire ; rien n'est tracé, marqué ni
+    /// ré-inscrit (ré-armer ne produirait qu'une mort de plus).
+    #[tokio::test]
+    async fn mika2446_rearm_refuses_a_trigger_this_binary_cannot_route() {
+        let db = test_async_db();
+        kill_in_window(&db, "zorglub_scan", REAP_CRON, r#"{"trigger":"zorglub"}"#).await;
+
+        let err = rearm_recurring_task(&db, "zorglub_scan")
+            .await
+            .expect_err("un trigger non routable doit être refusé");
+        match &err {
+            RearmError::NotRoutable {
+                trigger,
+                routable_triggers,
+                ..
+            } => {
+                assert_eq!(trigger, "zorglub");
+                assert_eq!(routable_triggers, &dispatcher::routable_triggers_csv());
+            }
+            other => panic!("attendu NotRoutable, obtenu {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(rendered.contains("zorglub"), "le refus nomme le trigger");
+        assert!(
+            rendered.contains("worktree_reap"),
+            "le refus nomme l'inventaire routable : {rendered}"
+        );
+
+        assert_eq!(
+            statuses_for(&db, "zorglub_scan").await,
+            vec!["failed".to_string()]
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name("recurring_operator_rearm")
+                .await
+                .unwrap(),
+            0,
+            "un refus ne trace pas d'acte"
+        );
+        // Aucun marqueur posé : le chemin nominal reste refusé par le veto.
+        ensure_recurring_task(&db, "zorglub_scan", REAP_CRON, r#"{"trigger":"zorglub"}"#).await;
+        assert_eq!(
+            statuses_for(&db, "zorglub_scan").await,
+            vec!["failed".to_string()]
+        );
+    }
+
+    /// Jamais de création ex nihilo, et rien à ré-armer sur une ligne vivante.
+    #[tokio::test]
+    async fn mika2446_rearm_refuses_unknown_and_already_armed_labels() {
+        let db = test_async_db();
+        assert!(matches!(
+            rearm_recurring_task(&db, REAP_LABEL).await,
+            Err(RearmError::NoDeadRow { .. })
+        ));
+        assert!(statuses_for(&db, REAP_LABEL).await.is_empty());
+
+        ensure_recurring_task(&db, REAP_LABEL, REAP_CRON, REAP_CONFIG).await;
+        assert!(matches!(
+            rearm_recurring_task(&db, REAP_LABEL).await,
+            Err(RearmError::AlreadyArmed { .. })
+        ));
     }
 }
