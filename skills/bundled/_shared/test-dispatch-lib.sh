@@ -4839,6 +4839,76 @@ assert_eq "socket path containing a single quote does not break the probe" \
 assert_eq "fake-proxy output never reaches the operational proxy log" \
     "0" "$(_egress_log_fixture_hits)"
 
+# --- mika#2051: the refusal line names the pid it just launched -------------
+#
+# A SISTER function rather than an extension of `_egress_guard_probe`, and the
+# reason is the probe's contract: it CLASSIFIES the output into one token
+# (`msg=unreachable`) and then throws the text away. Five assertions above
+# compare its `rc=… launched=… msg=…` string by strict equality, so widening it
+# by one field would redden all five for a need that concerns one. The two
+# functions say what they each do: one tests the DECISION, this one the TEXT.
+#
+# Same fake proxy, same log redirect -- the redirect is not incidental. Without
+# it the fake proxy's traceback lands in the operational log, the very file this
+# ticket exists to make legible, and the assertion at the end of the block above
+# is what catches that regression.
+_egress_guard_line() {
+    local tmp sock bin logdir out
+    tmp=$(mktemp -d)
+    sock="$tmp/mika-pilot-egress.sock"
+    bin="$tmp/fake-proxy"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    cat > "$bin" <<'FAKE_PROXY'
+#!/bin/bash
+echo "fake-proxy: dying before bind (mika#2041 test fixture)" >&2
+exit 1
+FAKE_PROXY
+    chmod +x "$bin"
+
+    # The orphan shape: bind then close without unlink. `[ -S ]` is satisfied,
+    # nothing listens -- the population mika#2041 measured.
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.close()
+' "$sock"
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        _PILOT_EGRESS_SOCK="$sock"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
+        export MIKA_TEST_LAUNCH_MARKER="$tmp/launched"
+        _ensure_pilot_egress_proxy 2>&1 >/dev/null
+    ) || true
+    rm -rf "$tmp"
+    printf '%s' "$out"
+}
+
+_EGRESS_UNREACHABLE_LINE=$(_egress_guard_line)
+
+# The joint. `pilot_egress_startup.begin pid=<pid>` is the proxy's first line
+# (contract held by test_startup_emits_a_begin_breadcrumb_before_bind); the
+# launcher's SUCCESS line already carried the pid and its FAILURE line -- the
+# only one this ticket exists to diagnose -- did not. Without it the operator
+# joins the dispatch `.stderr` to a cumulative proxy log by timestamp, which is
+# the friction that made the 2026-08-29 diagnosis expensive.
+assert_eq "mika#2051: the unreachable refusal names the pid it launched" \
+    "yes" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The published predicates grep `^dispatch-lib: ` + a contiguous token (Signal S
+# anchor, runbook §2). Assert THAT invariant, never the pid's position: pinning
+# the position would freeze a wording choice where what matters is what the
+# operator greps bite on.
+assert_eq "mika#2051: the refusal keeps its anchor and contiguous token" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.unreachable ' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
 # ============================================================================
 # Dispatchable-repo allowlist: shell defense in depth (mika#2062)
 # ============================================================================
