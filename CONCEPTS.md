@@ -26,6 +26,20 @@ The evidence a non-terminal architect disposition (`Disposition: READY`, `Verdic
 
 "Quoting the brief" means its words, not its bytes: the brief is markdown and a model quotes what it read, so inline markers and apostrophe shape fold away on both sides before comparison, while a paraphrase or an exact quote of a different document is still refused. The comparison runs against the brief message of the turn being answered, never against a file the model opened or an earlier ticket in its session. A first miss earns one corrective re-prompt; a second is escalated with its cause (anchors found, anchors valid, miss reason) as a terminal `ESCALATE`, which downstream reads before any textual verdict tier. It is a runtime guard, not a [structural guard](#structural-guard).
 
+### Sole writer
+
+An audit or log name that exactly one module is allowed to emit, so that a query filtering on that name is the exact population of what that module did and nothing else. The property is held by a [structural guard](#structural-guard) that scans the source for the name outside its owning module, with an allowlist shipped empty; when the guard fires, the second site is removed, never allowlisted. Two spellings of one population, or a second writer of one name, split or pollute the population silently — no decision is wrong, only the operator's count.
+
+Any name the module emits *instead of* the primary one under another disposition (see [gated disposition](#gated-disposition)) is a sole-writer name too, held by the same guard.
+
+## Scans
+
+### Gated disposition
+
+The shape of a periodic scan whose detection runs unconditionally while only its effect is gated: an *armed* setting acts (removes, kills, transitions), an *observe* setting measures and records the same population without acting. Observation exists so an operator can read what the scan would do before letting it do it.
+
+Every line the scan writes says what actually happened, never what was intended: under observe, an event, audit name, or message that names the action is a false record. Where the action's name is already contractual, it is reserved to the armed effect and the observed case gets its own name in the same family; where the existing name is that of the detection, the effect is carried by explicit fields. Either way the event, the audit name, and the message come from one source per disposition, so the surfaces cannot disagree. A write cap that bounds the armed effect also bounds what one observe pass names, so a full dry-run of a backlog takes as many passes as the cap implies.
+
 ## Pilot containment
 
 ### Pilot sandbox
