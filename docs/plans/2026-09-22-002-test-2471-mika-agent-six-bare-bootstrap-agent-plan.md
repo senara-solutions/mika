@@ -131,9 +131,11 @@ commit final** mais avec une preuve intermédiaire :
    `mika-agent/src/well_known_agents.rs`, et `desyncs=0`. Sortie collée
    verbatim dans le corps de PR (AC3).
 2. U2 — convertir les six sites. Le même test passe au vert.
-3. Commit unique des deux gestes (+ U3, U4). Un commit intermédiaire où la garde
-   est rouge rendrait `main` inlivrable à un bisect ; la preuve du rouge vit dans
-   le corps de PR, pas dans l'historique.
+3. Commit unique des deux gestes (+ U3, U4). Le motif n'est pas le bisect —
+   une PR qui atterrit en un commit ne fait jamais voir l'état rouge à `main` —
+   mais la lettre du ticket : « deux gestes indissociables, dans cet ordre, au
+   même commit ». Un commit où la garde est rouge est un commit inlivrable, et la
+   preuve du rouge vit dans le corps de PR (AC3), pas dans l'historique.
 
 ### 2.2 Surface du walker
 
@@ -233,6 +235,18 @@ Inchangée de mika#2073 pour les trois détecteurs ; ce plan n'en ajoute aucun, 
 de répertoire (§1.3). Une exclusion `tests/` serait une allowlist avec un autre
 nom.
 
+**Le sixième site n'est attesté par AUCUN détecteur, et c'est écrit ici plutôt
+que découvert en revue (F2, première passe architecte).** `pre_seed_identity`
+(`:3210`) n'a pas d'attribut de test, donc le scan ne le voit ni avant ni après
+la conversion : la preuve rouge attend **cinq** offenders, et le vert d'après
+U2 en attend **zéro** — ni l'un ni l'autre ne dit quoi que ce soit de `:3210`.
+Ce qui l'atteste est donc, et seulement : (a) le vert de
+`cargo test -p mika-agent --lib`, qui exerce les douze appelants du helper ;
+(b) la **revue de diff**, qui compte six conversions et un `:927` intact ;
+(c) le doc-comment posé sur le helper en U2 étape 9, qui **nomme** l'angle mort
+au site plutôt que de le laisser au plan. Un angle mort connu se nomme, il ne se
+tait pas (classe mika#2205).
+
 **Ce qu'elle ne couvre toujours pas.** Elle lit du texte, pas un AST : un alias
 (`use home::bootstrap_agent as b;`), un appel dont le nom et la `(` ne sont pas
 sur la même ligne (que rustfmt n'émet pas, mais que rien n'interdit), ou un
@@ -274,7 +288,9 @@ réel à la main, il ne prétend pas la lever.
 
 8. Les six appels du §1.1 → `bootstrap_agent_with_tier(…, AgentTier::Default)`
    (§2.5). `:927` intact — le diff de ce fichier ne touche que le module `tests`.
-9. Doc-comment d'une ligne sur `pre_seed_identity`.
+9. Doc-comment sur `pre_seed_identity` : pourquoi le helper pose le tier (douze
+   appelants nus couverts d'un coup) **et** qu'il est hors de portée du scan par
+   construction — c'est l'attestation (c) de la Fire-Disposition.
 10. Le même test qu'en 7 passe au vert ; `cargo test -p mika-agent --lib` vert.
 
 ### U3 — documentation (`crates/mika-common/CLAUDE.md`)
@@ -305,6 +321,9 @@ réel à la main, il ne prétend pas la lever.
       §2.3 ; allowlist vide, aucun filtre de répertoire.
 - [ ] La garde a été **vue rouge** sur les cinq items de test avant U2, sortie
       collée verbatim dans le corps de PR, `desyncs=0`.
+- [ ] Le sixième site (`:3210`) est attesté par les trois voies de la
+      Fire-Disposition — vert `-p mika-agent --lib`, compte de six conversions au
+      diff, doc-comment nommant l'angle mort — et par aucun détecteur.
 - [ ] Le contrôle de bonne foi est vert et inchangé dans ses assertions.
 - [ ] Les doc-comments du garde et du contrôle disent la portée réelle (§1.5,
       Fire-Disposition).
@@ -319,7 +338,9 @@ réel à la main, il ne prétend pas la lever.
 ## Acceptance criteria
 
 Transcrits verbatim du corps de mika#2471 (état du 2026-09-22 après correction
-AC3 par le groomeur).
+AC3 par le groomeur), chacun lié à l'unité qui le livre — la section existe et
+est non vide, ce que la première passe architecte ne pouvait pas vérifier
+(`gh_read` ne lit pas les fichiers du dépôt) et a soulevé en F1.
 
 - **AC1** — Les six appels de test de `well_known_agents.rs` passent le tier
   explicitement. `:927` (production) est inchangé. → U2, étapes 8-9.
@@ -350,6 +371,9 @@ AC3 par le groomeur).
   Ce ticket ferme le seul cas réel connu à la main.
 - Faire tourner `rust_sources_under` chez les quinze autres gardes qui écrivent
   la boucle — hygiène séparée, sans lien avec la course.
+- **Tout carve-out de répertoire, `benches/` compris.** La mesure de 610 fichiers
+  les inclut, « aucun filtre de répertoire » les couvre, et en exclure un serait
+  la même allowlist déguisée que pour `tests/` (§1.3).
 
 ## Risques
 
@@ -371,3 +395,12 @@ AC3 par le groomeur).
 ## Revision history
 
 - 2026-09-22 — plan initial (groom sur `main` @ `ff02386f`, après merge de #2441).
+- 2026-09-22 — première passe mika-arch (`c84b4c7e`, ITERATE) : les cinq
+  incertitudes endossées telles quelles (garde-fou à deux ancres, inclusion de
+  `tests/` et `src/bin/`, signature `(label, source)`, mesurer-sans-optimiser,
+  racine canonisée). F1 (section AC non attestée) : la section existait déjà —
+  l'attestation est rendue explicite plutôt que la section ajoutée. F2
+  (attestation du sixième site) : appliqué en Fire-Disposition, U2 étape 9 et
+  DoD. Deux lectures de cohérence de l'architecte appliquées : pas de carve-out
+  `benches/` (hors périmètre), et la justification du commit unique corrigée
+  (la lettre du ticket, pas le bisect).
