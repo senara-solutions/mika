@@ -3944,6 +3944,7 @@ async fn try_dispatch_pilot_after_groom_success(
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(
