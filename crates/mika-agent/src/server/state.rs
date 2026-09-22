@@ -105,6 +105,28 @@ pub struct AgentState {
     /// `None` for normal agents (default: fresh session per message). Resolved
     /// once at `init_agent` time from the agent's identity.
     pub canonical_session_id: Option<String>,
+    /// The LLM budget and model this agent was initialized under (mika#2457).
+    ///
+    /// Resolved ONCE at `init_agent`, from the same call that emits
+    /// `llm_budget_resolved`, and **never recalculated** — the same
+    /// *not hot-swappable* contract as [`Self::tier`] (mika#1962) and
+    /// [`Self::deployment`] (mika#2290), for the same reason: this is the state
+    /// the agent **runs under**, not the state the disk carries now.
+    ///
+    /// **The freeze is the property, and its cost is made legible rather than
+    /// hidden.** A frozen record answers *"under what is this agent running?"*
+    /// and never *"what does the disk say at this instant?"*. The two coincide
+    /// unless someone edited the `config.toml` since boot — which is exactly the
+    /// out-of-repo drift mika#2328 measured on mika-qa, and the branch mika#2457
+    /// judges most likely for mika-arch. Hence `resolved_at` on the record: the
+    /// two questions stay distinguishable by date instead of being conflated.
+    ///
+    /// Read by `GET /api/v1/agents/{id}/budget`, which serves it verbatim. That
+    /// route deliberately does **not** re-read the disk: recomputing there would
+    /// report the *reader's* process environment, which is mika#2304's defect
+    /// one field over — a value asserting a setting that is not in force, with
+    /// the authority of a measurement.
+    pub budget_record: Arc<mika_common::llm::ResolvedBudgetRecord>,
 }
 
 /// Shared application state for the Axum HTTP server.
