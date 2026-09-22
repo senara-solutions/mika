@@ -1500,6 +1500,140 @@ Optional (dispatch concurrency cap — mika#2160):
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+### Un callout de corps sans preuve en base route vers `groom` (mika#2484)
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` — ou qui cherche
+pourquoi un `mika ask "groom …"` refuse un dispatch — cherche dans le voisinage
+de la porte ci-dessus.
+
+- **Les deux défauts mesurés le 2026-09-22 (reprise substrat de #2471).**
+  *(1)* #2471 portait les trois callouts de grooming dans son **corps** — posés
+  par un re-groom de spawn orchestrateur, hors moteur, qui ne frappe aucune
+  preuve en base. Il était vu « groomé », promu `ready`, la tâche
+  `ready-label 0c49ce05` partait en dev-pilot, et la porte mika#1620 la refusait
+  `dispatch_grooming_not_verified`. Chaque tour recommençait. *(2)*
+  `mika ask --agent mika-dev "groom mika issue#2471"` sur ce même ticket a
+  produit le callback **implement** `5460a97f`, qui a ouvert la PR #2483 — une
+  implémentation sur un grooming que le chemin moteur n'a jamais vérifié,
+  c'est-à-dire un **contournement de la porte de preuve**. Le *même* message,
+  après retrait des callouts du corps, a correctement dispatché un dev-groom.
+
+- **Le défaut 1 ne vivait pas dans le feeder, et le remède que le DoD proposait
+  est contre-productif.** Il vivait dans le **routage** du `ready_label_handler`,
+  dont l'étape 5 décidait sur la forme du callout pendant que sa propre porte
+  9d refusait sur la preuve — une divergence à quatre étapes d'écart dans le même
+  handler. Gater le feeder sur la preuve, une fois le routage réparé, retirerait
+  au ticket callouté-sans-preuve **le seul mécanisme capable de le réparer** :
+  la promotion `ready` déclenche désormais le dev-groom qui produit la preuve
+  manquante. Sans elle, le ticket resterait dans le backlog pour toujours, sous
+  une ligne d'exclusion que personne ne relit quotidiennement. *Le churn mesuré
+  n'était pas un excès de promotions : c'était une promotion qui aboutissait au
+  mauvais dispatch.* Aucune ligne d'`auto_pull.rs` n'est touchée.
+
+- **Ce que ce travail n'achète PAS.** Il ne produit **aucune preuve manquante** :
+  un ticket groomé hors moteur reste sans preuve ; ce qui change est ce que le
+  moteur en **fait**, pas ce qu'il en **sait**. Il ne ferme pas le cas
+  `already_groomed` (voir ci-dessous) — il le borne au même endroit
+  qu'aujourd'hui (budget de re-drive mika#2020) et corrige le texte qui
+  prescrivait une route morte. Il ne garantit pas que le modèle appelle le bon
+  outil : il garantit qu'il **ne peut pas appeler le mauvais**. Et aucun
+  compteur de « combien de tickets sont groomés hors moteur » n'est livré — S1
+  compte ceux que la boucle **rencontre**, et un ticket que personne ne relance
+  reste invisible.
+
+- **Le texte de sortie `already_groomed` de `dispatch-lib.sh` ne prescrit plus
+  « Dispatch dev-pilot to implement ».** Depuis mika#2287 cette moitié mène
+  droit à `dispatch_grooming_not_verified`, et un `already_groomed` ne frappe
+  aucune preuve — délibérément : *une garde qui lit sa preuve de la
+  revendication ne peut pas la réfuter*. Le geste nommé est désormais celui que
+  `groom_provenance_verdict` nomme déjà dans son champ `recovery` : retirer le
+  plan de la branche **et** les callouts du corps, puis laisser la boucle
+  re-groomer.
+
+### SQL
+
+```sql
+-- S1 — les tickets qui seraient partis en implement sur un grooming non vérifié
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_markers_without_proof' GROUP BY 1 ORDER BY 2 DESC;
+
+-- S4 — contrôle négatif : la base ne répond pas
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_groom_proof_unreadable';
+
+-- S2 — les contournements de la porte de preuve interceptés
+SELECT count(*) FROM tasks WHERE result LIKE '%dispatch_grooming_intent_mismatch%';
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `ready_label_markers_without_proof` | INFO | **non vide, faible** | chaque ligne est un ticket routé en `groom` au lieu de partir se faire refuser |
+| `ready_label_groom_proof_unreadable` | INFO | **vide** | toute occurrence est une base qui ne répond pas |
+| `dispatch_grooming_intent_mismatch` | (dans `tasks.result`) | **zéro ou très proche** | chaque ligne est un contournement de porte intercepté |
+
+### Sondes, et leurs six haltes
+
+1. **S1 — le routage mord (48 h).** `ready_label_markers_without_proof` non vide
+   et faible.
+   **Halte 1 — vide alors que `dispatch_grooming_not_verified` continue
+   d'apparaître.** Le refus se produit **ailleurs** que sur le chemin
+   ready-label — `mika ask`, relance de verdict, ou auto-fire. **Ne pas élargir
+   le routage** : établir d'abord quel appelant de `validate_dispatch_readiness`
+   a refusé, les trois remèdes diffèrent.
+   **Halte 2 — vide, et `dispatch_grooming_not_verified` aussi, et aucun
+   dispatch n'a eu lieu.** Établir le déploiement avant toute conclusion (classe
+   mika#2340) : *une ligne absente ne prouve rien tant qu'on n'a pas établi que
+   le binaire qui tourne sait l'écrire.*
+   **Halte 3 — le compte porte du trafic nominal** (plusieurs par heure, sur des
+   tickets différents). Le prédicat n'est pas trop large : soit la flotte a une
+   population massive de tickets groomés hors moteur, soit la rétention de
+   30 jours purge plus vite qu'on ne croyait. **Ne pas désarmer** — mesurer la
+   répartition entre les deux causes, qui décide du suivi (exemption de prune vs
+   geste de re-grooming).
+
+2. **S2 — la garde d'intention (48 h).** Régime attendu **zéro ou très proche** :
+   la table de routage de `self-dev` donne au modèle la bonne route, et la garde
+   est le filet.
+   **Halte 4 — flot soutenu.** La moitié intention n'atteint pas ce chemin :
+   **vérifier le déploiement du prompt bundled avant de toucher à la garde**
+   (`cat ~/.mika/skills/.manifest-writer`, mika#2340) — un `system_prompt.md`
+   édité dans l'arbre est invisible jusqu'au `make deploy`.
+   **Halte 5 — une régression sur un chemin moteur** (un dev-pilot légitime
+   refusé). Le tableau des quatre chemins est faux quelque part : lire quel
+   chemin peuple `originating_message` avec un texte commençant par `groom `,
+   **ne pas ajouter d'exception au prédicat** avant de l'avoir établi.
+
+3. **S3 — rejeu du défaut fondateur.** Sur un ticket portant les trois callouts
+   et sans preuve : `mika ask --agent mika-dev "groom mika issue#<n>"` → la tâche
+   callback doit porter `dispatch_class='groom'` ; puis poser `ready`
+   (**remove → add**, mika#2323 : GitHub n'émet `labeled` que sur une transition)
+   → même attendu.
+   **Halte 6 — le ticket part en groom et revient `already_groomed` en boucle.**
+   C'est la limite nommée ci-dessus, pas une régression : vérifier que le budget
+   de re-drive se consomme (`auto_pull_redrive_abandoned` après trois tours) et
+   que le commentaire d'abandon est posé. Si le budget **ne** se consomme pas,
+   c'est mika#2158 qui a rouvert (un compteur remis à zéro par l'action qu'il
+   compte) et c'est **là** qu'il faut chercher.
+
+### Suivi (hors périmètre, nommé)
+
+- **Exempter les lignes `PLAN_GROOMED` du prune de 30 jours** — suivi déjà
+  ouvert par mika#2287. Sa priorité baisse sans s'annuler : son absence ne
+  dégrade plus aucun chemin (le pire cas est identique à l'état antérieur, le
+  meilleur converge). **Précondition** : que S1 montre une part significative
+  d'occurrences imputables à la rétention plutôt qu'au grooming hors moteur.
+- **`/mika-groom-ticket` doit-il frapper une ligne-preuve ?** Différé à
+  Vincent/Prime par mika#2287, inchangé ici — ce travail rend le cul-de-sac
+  convergent au lieu de terminal, il ne préempte pas la décision.
+- **`already_groomed` devrait-il être terminal plutôt que de consommer le budget
+  de re-drive ?** **Précondition** : que la halte 6 montre que cette population
+  existe en volume.
+- **La garde d'intention devrait-elle vérifier le numéro d'issue ?** Arbitrage
+  assumé, à rouvrir si la halte 5 montre un faux positif.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash

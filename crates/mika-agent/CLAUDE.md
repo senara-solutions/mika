@@ -1734,6 +1734,89 @@ operator typo or an unconfigured agent, not a defect of the channel).
 
 **Long-running:** `long_running: true` + `estimated_duration_secs` in `skill.toml`. Conversation mode and `DeferredDispatch` silent mode (#1058). Creates callback task, injects `__mika_task_id` and `__mika_agent` env vars, spawns detached process. PID recorded for orphan cleanup. **Callback deferred dispatch (#1058):** When a callback or DeferredDispatch turn calls a long-running tool and `long_running_ctx` is `None`, the executor gate intercepts the call via `callback_task_id` on `ToolContext`. Instead of a hard error, it runs `check_lineage_cycle()` (lineage walk on `(repo, issue_number, skill)` tuple, max 4 hops, fail-open on extraction failure) and, if no cycle is detected, calls `register_deferred_callback()` to enqueue the dispatch. Returns `{"status": "deferred", "deferred": true}` so the LLM knows not to retry. The deferred callback fires as a `DeferredDispatch` silent turn which HAS `LongRunningContext` injected. Cycle detection rejects same-tuple re-dispatch (e.g., `groom-#159 → retry-groom-#159`) but allows cross-skill chains (e.g., `groom-#159 → pilot-#159`). **Dispatch-readiness guard (#525):** before spawning, `validate_dispatch_readiness()` enforces seven checks: (0) unauthorized webhook dispatch (#933) — if `originating_message` is present and matches the Webhook Fallthrough domain (`[GitHub]` prefix excluding ready-label, PR, and check-suite events), rejects with `unauthorized_webhook_dispatch` before any DB access. Pure string-prefix check, cheapest guard. Predicate shared via `crate::webhook_dispatch::is_unauthorized_webhook_dispatch()`. (1) task status must be `pending` or `in_progress` (rejects `blocked`/`completed`/`cancelled` with structured JSON error `task_not_dispatchable`), (2) no active callback child task may exist (rejects with `task_active_dispatch`), (3) no other task of the same dispatch class may have an active callback child — per-class slot guard (rejects with `global_dispatch_active`, scoped to `agent_id` + `dispatch_class`) (#583, #1001). `dispatch_class` is `'implement'` (dev-pilot, deploy_mika) or `'groom'` (dev-groom); pre-v34 NULL rows are treated as `'implement'` via SQL `COALESCE`. One implement + one groom dispatch may run concurrently per agent. The rejection JSON includes `blocker_kind` (`"real_callback"` or `"deferred_wrapper"`) and `blocking_label` for agent-native diagnostics (#1172 W3), (4) per-turn dispatch counter must be zero — only one long-running dispatch per agent turn (rejects with `dispatch_limit_exceeded`) (#583), (5) grooming-marker check (#919, #1108) — if the task's `reference_url` points to a GitHub issue AND the dispatch skill is `dev-pilot` AND `task.type == "issue"`, fetches the issue body via REST API and checks for three canonical grooming callouts: `> - **Branch:**`, `docs/plans/`, and a `second-pass` marker (canonical `(GROOMED)` or spec-tolerated `(READY, paraphrased GROOMED ...)`). Rejects with `dispatch_no_grooming_marker` (listing `missing_signals`) if any are absent. Bypass predicates: non-`dev-pilot` skill, non-issue task type, non-GitHub-issue reference_url, or `MIKA_DISPATCH_BYPASS_GROOMING_CHECK=1` env var (WARN-logged). Fail-open when no `github_token` configured; fail-closed on API errors. Coupled pair with `skills/bundled/self-dev/system_prompt.md:253` (defense-in-depth prompt-level check), (6) GitHub `blockedBy` check — if the task's `reference_url` points to a GitHub issue, queries the GraphQL API for open blockers and rejects with `dispatch_blocked_by` if any are still open (#713). Fail-open when no `github_token` configured (check skipped with warning); fail-closed on API errors. Uses GraphQL variables (not string interpolation) for injection safety. `extract_open_blocker_numbers()` parses the response. `LongRunningContext` carries `dispatch_count: AtomicU32` initialized to 0 per turn; incremented after task creation and path validation, right before subprocess spawn. `LongRunningContext` also carries `originating_message: Option<String>` (#933) — populated from the latest user-role message in conversation mode, `None` for silent triggers. Fail-closed on DB errors. Auto-transitions `pending` tasks to `in_progress` on successful dispatch. Stricter than the shared `validate_task()` which also allows `blocked` for `delegate_task`. **Dispatch-rejection observability (#1108):** All 7 rejection sites write the structured JSON error to `tasks.result` via `record_dispatch_rejection()` (fire-and-forget, warn on DB failure). This surfaces rejection reasons to operator-visible surfaces (`mika tasks list`, dashboard task detail) without requiring DB-level inspection. The `write_task_dispatch_rejection()` DB method is agent-unscoped (keyed by `task_id` + `trigger_type = 'manual'`) because the earliest rejection site (unauthorized webhook) fires before the task is fetched.
 
+### Un seul lecteur de la preuve de grooming (mika#2484)
+
+`skills::executor::groomed_state(db, owner, repo, number, issue_body)` répond à
+**« un `dev-pilot` peut-il partir sur ce ticket ? »** et il est le seul à le
+faire. La porte (check 5 ci-dessus, via `evaluate_grooming_gate`) et le routage
+du `ready_label_handler` en descendent tous deux.
+
+**La divergence que ça ferme vivait à l'intérieur d'un même handler, à quatre
+étapes d'écart.** L'étape 5 décidait `dev-pilot` vs `dev-groom` sur
+`check_grooming_markers` **seul** — la forme du callout — sous un commentaire
+qui affirmait « Same code path as `validate_dispatch_readiness` gate (#919) ».
+C'était vrai en #919 ; depuis mika#1620 / mika#2287 la porte porte **deux**
+couches, forme *et* preuve. Alors le handler choisissait `dev-pilot` puis
+refusait à l'étape 9d le `dev-pilot` qu'il venait de choisir
+(`dispatch_grooming_not_verified`), le ticket restait `ready`, et le tour
+suivant recommençait. Mot pour mot la classe que mika#2158 a dû fermer un cran
+plus haut. Depuis mika#2470 la Phase 2 d'`auto_pull` dispatche in-process par ce
+même handler, donc **un seul site réparé couvre le webhook et le filet**.
+
+**Quatre bras, et pas un booléen.** Trois causes mènent à `dev-groom` et
+appellent trois lectures opérateur différentes :
+
+| `GroomedState` | routage | ligne écrite |
+|---|---|---|
+| `Groomed` (callouts + preuve) | `dev-pilot` / `implement` | — (le chemin nominal reste muet) |
+| `MarkersMissing` (premier grooming) | `dev-groom` / `groom` | inchangé — `note_degroomed_ticket` (mika#2242) |
+| `MarkersWithoutProof` (groomé hors moteur, ou preuve purgée) | `dev-groom` / `groom` | `ready_label_markers_without_proof` |
+| `ProofUnreadable` (base en panne) | `dev-groom` / `groom` | `ready_label_groom_proof_unreadable` |
+
+Les fondre dans un `bool` rendrait la population mesurée de mika#2484
+**incomptable**, et ferait lire une panne de base comme un succès du correctif —
+même motif que `below_threshold` / `no_ready_label_event` (mika#2131) et
+`in_flight_self_dev` / `live_pilot_orphaned_parent` (mika#2279). Les deux sites
+de consommation font un `match` exhaustif **sans bras `_ =>`**.
+
+**`check_grooming_markers` n'est pas touchée, et c'est structurel.**
+`grooming_marker.rs` porte un test de parité entre `auto_pull::is_groomed` et
+`check_grooming_markers(..).is_empty()` ; y intégrer la preuve le casserait — et
+à raison : `is_groomed` répond de la **forme**, question à laquelle la base n'a
+rien à dire et que le feeder pose légitimement sans elle. Deux questions, deux
+noms ; la seconde appelle la première, jamais l'inverse (ce serait une
+régression de mika#2120).
+
+**Le feeder n'est pas touché non plus, et le DoD du ticket est écarté avec sa
+raison.** Gater la promotion `ready` sur la preuve retirerait au ticket
+callouté-sans-preuve **le seul mécanisme capable de le réparer** : avec le
+routage corrigé, promouvoir `ready` déclenche le `dev-groom` qui produit la
+preuve manquante. Le churn mesuré n'était pas un excès de promotions, c'était une
+promotion qui aboutissait au mauvais dispatch. On répare l'aboutissement.
+
+**`route_for` / `routing_note` sont des fonctions pures**, extraites du corps du
+handler parce que le bras `ProofUnreadable` n'est pas atteignable de bout en
+bout : une base en panne ferait aussi échouer la pré-création de la row **et**
+l'écriture d'audit qu'on veut observer.
+
+**Garde d'intention (R7/R8).** `validate_dispatch_readiness` refuse
+`dispatch_grooming_intent_mismatch` quand `originating_message` commence par
+`groom ` (insensible à la casse, blanc de tête toléré) **et** que le `skill`
+demandé est `dev-pilot`. `webhook_dispatch::is_grooming_intent_message` est
+ancré sur le **mot** : `starts_with("groom")` nu mordrait sur « grooming report
+for mika#N », et le contrôle négatif est un test nommé. Pré-subprocess pour la
+raison de mika#1646 — `run_claude_pilot` spawne un processus et crée un
+worktree, donc une garde post-hoc *constate* le contournement de la porte de
+preuve sans l'empêcher. Elle ne peut pas mordre sur les quatre chemins moteur,
+et c'est **structurel** : `originating_message` vaut `None` sur l'auto-fire
+post-groom (mika#1614) et sur tout tour de callback, et commence par `[GitHub]`
+sur le webhook et la relance de verdict. Le refus porte sur le tour entier —
+dériver le numéro d'issue ajouterait un second parseur là où le seul cas
+légitime (la chaîne dev-groom → dev-pilot) ne passe pas par ce chemin.
+
+**Gardes structurelles**, toutes avec **allowlist livrée vide** :
+`canonical_tokens::tests::mika2484_un_seul_lecteur_decisionnel_de_la_preuve`
+(scan à deux niveaux : un seul fichier hors plomberie lit la preuve, et dans ce
+fichier une seule fonction), `…_les_noms_d_evenement_sont_un_format_de_fil`
+(SOLE WRITER des deux `tool_name`), et
+`ready_label_handler::tests::mika2484::…_le_routage_n_a_pas_de_bras_joker`.
+Quand le premier tire, **on retire la lecture**, on n'ajoute pas d'entrée
+(doctrine mika#2201). Aucun test comportemental ne peut voir ces classes : un
+second lecteur ne rend aucune décision fausse *le jour où il est écrit*.
+
+Surfaces opérateur, régimes attendus et haltes : `CLAUDE.md` racine
+§ *Un callout de corps sans preuve en base route vers `groom`*.
+
 **Cancel discriminator protocol (#749):** When `cancel_task_and_kill` terminates a long-running subprocess, it pre-writes a reason file at `/tmp/mika-cancel-reason-{pid}` with `STATUS=CANCELLED_BY_OPERATOR` before sending SIGTERM. The shell-side TERM trap in `dispatch-lib.sh` writes `STATUS=CANCELLED_BY_SIGNAL` only if no reason file exists (belt-and-suspenders for signal-initiated cancels). The EXIT trap reads the reason file and prefixes the callback envelope so the consumer (`self-dev-callback`) can distinguish cancel from crash. Two discriminators: `CANCELLED_BY_OPERATOR` (cancel_task initiated) and `CANCELLED_BY_SIGNAL` (signal-initiated, no pre-write). Absence of the prefix = existing `HANDLER CRASH` / success paths fire unchanged (backward compatible).
 
 ## MCP (Model Context Protocol) Client

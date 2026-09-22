@@ -64,6 +64,56 @@ pub(crate) fn is_ready_label_dispatch_marker(msg: &str) -> bool {
     msg.starts_with(READY_LABEL_DISPATCH_MARKER)
 }
 
+/// True when the turn was opened by an **explicit grooming request**
+/// (mika#2484 D5).
+///
+/// # Le défaut que ça ferme
+///
+/// `mika ask --agent mika-dev "groom mika issue#2471"` sur un ticket portant
+/// déjà les callouts de grooming a produit un callback **implement** qui a
+/// ouvert une PR — une implémentation sur un grooming que le chemin moteur n'a
+/// jamais vérifié, c'est-à-dire un contournement de la porte de preuve. Le même
+/// message, après retrait des callouts du corps, a correctement dispatché un
+/// `dev-groom`. Une intention explicite ne peut pas dépendre de l'état apparent
+/// du corps du ticket.
+///
+/// # L'ancrage sur le mot est ce qui rend le prédicat sûr
+///
+/// Ce n'est pas un détail de regex : `starts_with("groom")` nu mordrait sur
+/// « grooming report for mika#N », qui est une demande de rapport et non une
+/// demande de grooming. L'espace (ou la tabulation) obligatoire sépare
+/// `groom ` de `grooming`, et le contrôle négatif est un test nommé.
+///
+/// Insensible à la casse, tolérant au blanc de tête — un opérateur écrit
+/// « Groom … » et « ␣groom … » indifféremment.
+///
+/// # Pourquoi ce prédicat ne peut pas tuer le chemin nominal (R8)
+///
+/// Propriété **structurelle**, établie par lecture et non par prudence : il lit
+/// `originating_message`, qui vaut `None` sur l'auto-fire post-groom
+/// (mika#1614, posé explicitement à `None`) et sur tout tour de callback, et
+/// qui commence par `[GitHub] Issue labeled ready on` sur le chemin webhook ou
+/// par le texte d'une revue de PR sur la relance de verdict. Aucun des quatre
+/// ne commence par `groom `.
+pub(crate) fn is_grooming_intent_message(msg: &str) -> bool {
+    let trimmed = msg.trim_start();
+    let Some(rest) = trimmed.get(..GROOMING_INTENT_VERB.len()) else {
+        return false;
+    };
+    if !rest.eq_ignore_ascii_case(GROOMING_INTENT_VERB) {
+        return false;
+    }
+    // Le séparateur obligatoire : c'est lui qui sépare `groom ` de `grooming`.
+    matches!(
+        trimmed.as_bytes().get(GROOMING_INTENT_VERB.len()),
+        Some(b' ' | b'\t')
+    )
+}
+
+/// Le verbe d'intention, à un seul site — il décide d'un refus d'outil et son
+/// orthographe est donc porteuse.
+const GROOMING_INTENT_VERB: &str = "groom";
+
 /// Owner applied to a bare `<repo>` reference. The loop only ever operates on
 /// `senara-solutions` repositories; a marker that omits the owner is a gateway
 /// short-form, not an invitation to guess another org.
@@ -956,6 +1006,96 @@ mod tests {
                 !sentence.contains("owns it"),
                 "{labels:?} has no identified owner — claiming one misleads the \
                  operator: {sentence}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2484 — l'intention de grooming, et l'ancrage sur le mot.
+    // ---------------------------------------------------------------------
+
+    /// La forme mesurée sur #2471, et les deux autres que la table de routage
+    /// de `self-dev` reconnaît.
+    #[test]
+    fn mika2484_une_demande_de_grooming_est_reconnue() {
+        for msg in [
+            "groom mika issue#2471",
+            "groom mika#2471",
+            "groom ticket mika#2471",
+            "groom senara-solutions/mika issue#2471 en priorité",
+        ] {
+            assert!(
+                is_grooming_intent_message(msg),
+                "{msg:?} est une intention de grooming explicite"
+            );
+        }
+    }
+
+    /// **Test 8 — le contrôle négatif du mot, et c'est le test porteur.**
+    ///
+    /// `starts_with("groom")` nu mordrait sur « grooming report » : une demande
+    /// de *rapport* deviendrait un refus de dispatch. C'est l'espace obligatoire
+    /// qui sépare `groom ` de `grooming`, et ce test est ce qui empêche
+    /// quelqu'un de « simplifier » le prédicat en le cassant.
+    #[test]
+    fn mika2484_grooming_report_n_est_pas_une_intention() {
+        for msg in [
+            "grooming report for mika#2471",
+            "grooming status",
+            "groomed tickets this week",
+            "groom",
+            "",
+        ] {
+            assert!(
+                !is_grooming_intent_message(msg),
+                "{msg:?} n'est PAS une demande de grooming — un faux positif ici \
+                 refuse un dispatch légitime"
+            );
+        }
+    }
+
+    /// **Test 9 — les quatre chemins moteur ne mordent pas.**
+    ///
+    /// Propriété structurelle et non prudentielle : trois d'entre eux ont
+    /// `originating_message = None` (auto-fire mika#1614, tour de callback), et
+    /// le quatrième porte un préfixe `[GitHub]`. Ce test épingle la moitié
+    /// observable — qu'aucun texte réel de ces chemins ne commence par `groom `.
+    #[test]
+    fn mika2484_les_quatre_chemins_moteur_ne_mordent_pas() {
+        for msg in [
+            // Chemin webhook ready-label.
+            "[GitHub] Issue labeled ready on senara-solutions/mika#2471 — reprise",
+            // Relance de verdict : le texte d'une revue de PR.
+            "[GitHub] PR review submitted on senara-solutions/mika#2483\nVERDICT: block[ci]",
+            // Un tour de callback.
+            "[callback: long_running:run_claude_pilot] Outcome: PLAN_GROOMED",
+            // La forme typée d'une implémentation.
+            "implement mika issue#2471",
+        ] {
+            assert!(
+                !is_grooming_intent_message(msg),
+                "{msg:?} est un chemin moteur : la garde d'intention doit être \
+                 structurellement hors de sa route (R8)"
+            );
+        }
+        // Le cas `None` n'est pas un texte : la garde ne s'arme que sous
+        // `if let Some(msg) = originating_message`, et c'est ce qui couvre
+        // l'auto-fire et le tour de callback.
+    }
+
+    /// **Test 10 — insensibilité à la casse et tolérance au blanc de tête.**
+    #[test]
+    fn mika2484_casse_et_blanc_de_tete() {
+        for msg in [
+            "Groom mika issue#2471",
+            "GROOM mika#2471",
+            "  groom mika issue#2471",
+            "\n\tgroom mika#2471",
+            "groom\tmika#2471",
+        ] {
+            assert!(
+                is_grooming_intent_message(msg),
+                "{msg:?} — un opérateur écrit indifféremment"
             );
         }
     }
