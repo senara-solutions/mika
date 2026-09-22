@@ -140,6 +140,16 @@ troncature** : un littéral fuyant posé *après* la ligne 602 doit faire rougir
 garde. C'est le seul cas du harnais dont l'échec signifie « le garde ne regarde
 pas où il croit regarder » plutôt que « une règle est trop étroite ».
 
+### Ces mesures réfutent le corps du ticket ; elles ne le rectifient pas
+
+M1 réfute la prémisse *« currently latent »*, M2 réfute la liste des quatre
+candidats, et cette section conclut à un p1 de fuite quand le titre du ticket
+porte encore « hygiene ». **Le plan ne ratifie pas cette divergence de son
+propre chef** : la spec est un contrat versionné, et c'est l'opérateur qui la
+rectifie — pas le plan qui l'absorbe en silence. La rectification est donc
+prescrite en **§9**, texte prêt à poser, avec la part que ce document ne peut
+pas exécuter lui-même nommée au même endroit.
+
 ---
 
 ## 2. Inventaire de la population (partie A)
@@ -428,7 +438,13 @@ dont le périmètre n'est pas dit est une promesse qu'on relit mal.
 
 ---
 
-## 4. Fire-Disposition
+## Fire-Disposition (§4)
+
+> Le titre porte l'ancre `## Fire-Disposition` **en tête**, et son numéro de
+> section entre parenthèses : le détecteur de `dispatch-lib` est
+> `grep -qE '^## Fire-Disposition'` (`dispatch-lib.sh:5847`), que la forme
+> numérotée `## 4. Fire-Disposition` ne matche pas — la section existait et le
+> garde la lisait absente. Les renvois internes « §4 » restent valides.
 
 Ce plan livre trois détecteurs : la règle 1 et la règle 2 de
 `check-substrate-leak.sh`, et le harnais anti-vacuité.
@@ -438,7 +454,7 @@ violations est livrée VIDE.**
 
 Deux mécanismes distincts, et la distinction est la moitié qui compte :
 
-1. **Les six violations de §2.1 sont converties par U2, pas allowlistées.**
+1. **Les neuf violations de §2.1 sont converties par U2, pas allowlistées.**
    L'allowlist du garde ne reçoit aucune entrée. C'est la règle mika#2201 —
    *« on déclare, on n'allowliste pas »* : quand la règle 1 tire, la résolution
    est de retirer le second site, jamais de l'exempter.
@@ -471,7 +487,15 @@ sujet.**
 
 ---
 
-## 5. Acceptance criteria
+## Acceptance criteria (§5)
+
+> Même ancre que `## Fire-Disposition` ci-dessus, et pour la même raison
+> mesurée : le gate U2 est `grep -qi '^## Acceptance criteria'`
+> (`scripts/verify-pipeline.sh:147`), ancré en début de ligne, que la forme
+> numérotée `## 5. Acceptance criteria` ne matche pas — vérifié par
+> `grep -ci` rendant `0` sur la rev 3. La section existait et le garde la lisait
+> absente ; le PR aurait échoué en CI sur mika#1600. Les renvois internes « §5 »
+> (§1, §7 DoD) restent valides.
 
 Transcrites du corps du ticket :
 
@@ -552,12 +576,29 @@ antérieur — classe mika#2340), et c'est le chemin qu'il faut établir d'abord
 - V1 à V6 verts ; le job `substrate-leak-lint` présent et passant en CI.
 - La troncature du garde porte sur le module de test et **échoue bruyamment**
   quand son marqueur bouge (M5) — vérifié par N2 et N3.
+- **N1 est la preuve de la première divergence de §5, pas un contrôle négatif
+  parmi quatre.** Il pose le littéral exact de M3 — *« rotate
+  `MIKA_BRAVE_API_KEY` on mika-gateway »* — dans une fonction **séparée** du
+  constructeur, c'est-à-dire précisément l'écriture que la règle-constructeur de
+  l'AC (« rejects `ToolOutput::error(...)` calls with substrate-token strings »)
+  laisse passer. Sa rougeur **est** la justification de la règle-littéral ; s'il
+  passe au vert, la divergence n'est pas démontrée et c'est la règle 2 qu'il faut
+  reprendre avant tout le reste, jamais l'AC qu'il faut assouplir (doctrine
+  mika#2103, §3.3, §3.4).
 - `docs/skills.md` ne promet plus, il nomme.
 - Le corps de PR déclare les deux divergences de §5 et le changement de contrat
   de §3.5 (le texte opérateur reste lisible sur tier `Default`, après le repli
   neutre et une ligne blanche).
 - Les jugements de §2.4 tranchés **explicitement** dans le code, par annotation
   portant sa raison — jamais par omission.
+- **Les deux rectifications de §9 sont posées sur le corps du ticket avant
+  dispatch d'implémentation** : le callout de branche canonique (§9.1) et
+  l'encadré de rectification daté (§9.2), ce dernier doublé de son commentaire
+  d'avis d'édition. **Gestes d'opérateur / de dispatch-lib, hors du contrat de ce
+  document** (§9.0) : leur absence ne bloque pas la revue du plan, elle bloque la
+  ratification de la divergence — un ticket dont le corps affirme encore
+  « latent » pendant que le plan implémente un p1 est un contrat que personne ne
+  peut relire.
 
 ---
 
@@ -586,3 +627,146 @@ antérieur — classe mika#2340), et c'est le chemin qu'il faut établir d'abord
 - `mika-gateway`, `mika-cli`, `skills/bundled/**` (§3.3).
 - Les deux registres persona sur les replis convertis (§3.2).
 - La *cause* des pannes substrat que ces messages décrivent.
+
+---
+
+## 9. Rectifications requises au corps du ticket
+
+### 9.0 — Ce que ce document peut et ne peut pas faire ici
+
+**Could not address: F1 (moitié GitHub) — Could not address: F2 (moitié
+GitHub).** Les deux findings prescrivent une écriture **dans le corps du
+ticket** : un callout de branche canonique (F1), un encadré de rectification
+daté plus un commentaire d'avis d'édition (F2). Cette révision est produite sous
+`/mika-revise-plan`, dont le contrat est **content-only** — un seul fichier
+touché, le plan, et explicitement *« no `gh issue edit` »*. Dans le flux
+autonome, l'écriture du corps appartient à `dispatch-lib` (callout de branche,
+après convergence architecte) et à l'opérateur (rectification de spec). Le
+pilote de révision ne peut donc pas poser ces deux textes lui-même, et le dire
+est préférable à le simuler.
+
+**Ce qui est adressé, et c'est la moitié qui compte pour F2 :** le plan cesse de
+réfuter le corps en silence. §1 renvoie désormais explicitement ici, les deux
+textes sont livrés prêts à poser plutôt que laissés à reconstruire, et le DoD
+(§7) fait de leur pose une condition antérieure au dispatch d'implémentation.
+La divergence est **déclarée et en attente de ratification par l'opérateur**,
+jamais absorbée par le plan — ce que demande la convention
+« issue-as-versioned-contract » invoquée par F2.
+
+### 9.1 — F1 : callout de branche canonique
+
+Le ticket porte le label `ready` (commentaire de garde 2026-09-22T08:20Z) et son
+corps ne nomme aucune branche canonique, alors que ce callout est la surface
+parsée pour la dérivation de branche (convention §1.5). Texte à poser, forme
+canonique **sans préfixe de dépôt** — mika#2120 : le préfixe n'est pas
+redondant mais faux, le chemin étant résolu sous la racine du sous-dépôt :
+
+```
+> [!NOTE]
+> - **Branch:** `chore/1964/agent-core-sweep-sibling-builtin`
+> - **Plan:** `docs/plans/2026-09-22-001-chore-1964-agent-core-sweep-sibling-builtin-plan.md`
+```
+
+### 9.2 — F2 : encadré de rectification daté
+
+M1 et M2 réfutent deux affirmations factuelles du corps, et le titre porte
+encore « hygiene » quand §1 conclut à un p1 de fuite servi aujourd'hui. Texte à
+poser :
+
+```
+> [!IMPORTANT]
+> **Rectification du 2026-09-22 (grooming mika#1964, plan rev 2).** Trois
+> affirmations de ce corps sont réfutées par la lecture du code à HEAD
+> `367be118`. Elles sont rectifiées ici plutôt que contournées par le plan.
+>
+> 1. **« currently latent because FAMILY_AGENT_SKILL_ALLOWLIST excludes them »
+>    est faux.** Cette allowlist gate les *skills*, jamais les *builtin tools* :
+>    `pr_merge_with_gate` et `resolve_issue_order` sont enregistrés par
+>    `default_tools()` et présents dans le tableau d'outils de tout agent, quel
+>    que soit son tier ; le seul filtre qui pourrait les retirer est
+>    `[tools].disabled` de l'identité, et l'identité famille n'en déclare aucun.
+>    Le message « Set MIKA_GITHUB_TOKEN or configure a GitHub App. » est **servi
+>    à un tenant famille aujourd'hui**. Sévérité : p1 de fuite, non latente.
+> 2. **La liste des quatre candidats est périmée.** `run_gws` est converti
+>    (mika#2118) ; le dispatch MCP est hors population ; `run_gh` ne nomme plus
+>    aucune variable et la ligne citée n'existe plus. Seul `pr_merge_with_gate`
+>    subsiste, et la population réelle compte **neuf** sites — dont trois que ce
+>    corps ne nomme pas : la seconde branche de remédiation de
+>    `pr_merge_with_gate`, `send_message`, et la garde d'action destructive de
+>    mika#1646. Inventaire mesuré : §2.1 du plan.
+> 3. **Le titre « hygiene » est périmé** — voir 1. La fuite la plus grave est
+>    dans le handler `web_search`, sur le chemin créé par mika#1971, et atteint
+>    exactement la population que mika#1783 protégeait (§1, M3).
+>
+> Aucune AC n'est affaiblie. Deux d'entre elles sont satisfaites par une forme
+> strictement plus forte que leur lettre ; la divergence est déclarée en §5 du
+> plan et verrouillée par le contrôle négatif N1 (§7).
+```
+
+Commentaire d'avis d'édition à poster sur le ticket, pour que la modification du
+contrat soit datée et attribuable plutôt que découverte dans un diff de corps :
+
+```
+Corps édité le 2026-09-22 (grooming mika#1964) : encadré de rectification ajouté
+— la prémisse « latent » est réfutée (M1), la liste des candidats est remplacée
+par l'inventaire mesuré à neuf sites (M2), et la sévérité passe de « hygiene » à
+p1 de fuite. Aucune AC modifiée. Détail et mesures : §1 et §9.2 du plan.
+```
+
+---
+
+## Revision history
+
+- **rev 4 (2026-09-22)** — re-groom idempotent. Aucun finding en entrée ; le
+  correctif vient d'avoir cherché la **même classe de défaut** que rev 3 sur les
+  autres sections gardées du plan, plutôt que de tenir pour isolé un défaut dont
+  la cause — la numérotation `## N. ` désancre un `grep -qE '^## Titre'` — n'a
+  rien de spécifique à Fire-Disposition.
+  - **Trouvée sur `## Acceptance criteria`, et celle-là est gardée par CI.** Le
+    gate U2 (`scripts/verify-pipeline.sh:147`, mika#1600) est
+    `grep -qi '^## Acceptance criteria'` ; le titre `## 5. Acceptance criteria`
+    rendait `0` au `grep -ci`. La section était complète depuis rev 1 et le garde
+    la lisait **absente** : le PR d'implémentation aurait échoué en CI sur une
+    section présente, c'est-à-dire sur le diagnostic le moins lisible qui soit.
+    Titre corrigé en `## Acceptance criteria (§5)`, sur le modèle exact de rev 3 ;
+    les renvois internes « §5 » restent valides, aucun autre caractère ne bouge.
+  - **Population balayée, pas échantillonnée** : les deux seuls prédicats ancrés
+    qui s'appliquent à un plan sont relevés à HEAD — celui de `verify-pipeline.sh`
+    (l'unique de ce fichier) et celui de `dispatch-lib.sh:5847`. Les deux
+    matchent désormais, vérifié par `grep -c`. `## 7. Definition of Done` reste
+    numérotée : **aucun garde ne la lit**, et la renommer par symétrie aurait posé
+    une convention sans détecteur derrière elle.
+- **rev 3 (2026-09-22)** — révision sur le finding synthétique `F-FD` émis par
+  `dispatch-lib` (mika#2306), non par l'architecte.
+  - **F-FD adressée, et la mesure déplace le finding.** La section réclamée
+    n'était pas absente : elle existait depuis rev 1, sous le titre
+    `## 4. Fire-Disposition`, portant déjà l'option (a) de mika#1574, son
+    allowlist livrée vide, la distinction conversion-vs-annotation et la halte de
+    volume. Ce qui manquait était l'**ancre** : le détecteur est
+    `grep -qE '^## Fire-Disposition'` (`dispatch-lib.sh:5847`), ancré en début de
+    ligne, que la numérotation `## 4. ` désancre. Le titre devient
+    `## Fire-Disposition (§4)` — l'ancre matche, les huit renvois internes « §4 »
+    (§2.3, §3.3 décision 2, §7, §8 risque 1) restent valides, et aucun autre
+    caractère du plan ne bouge.
+  - **Aucune disposition n'a été inventée** : la disposition posée est celle de
+    rev 1, inchangée. Le plan livre bien trois détecteurs, donc le gate n'est pas
+    N/A et la branche « dis-le explicitement » du finding ne s'applique pas.
+- **rev 2 (2026-09-22)** — révision sur findings de première passe architecte
+  (`mika-arch-groom-ticket`, `Disposition: ITERATE`).
+  - **F3 adressée** : §4 disait « les six violations de §2.1 » quand §2.1, §3.2
+    et §7 en comptent neuf ; le reste périmé est corrigé. Le volume de §2.3
+    (≈ 21 sites = 9 conversions + ≈ 12 annotations) et la halte de §4 étaient
+    déjà calés sur neuf et ne bougent pas.
+  - **F4 adressée** : §7 lie désormais explicitement N1 à la première divergence
+    de §5 — N1 n'est plus « un contrôle négatif parmi quatre » mais la preuve que
+    la règle-littéral couvre le défaut M3 que la règle-constructeur de l'AC
+    ratait, avec la conduite prescrite s'il passe au vert (reprendre la règle 2,
+    jamais assouplir l'AC).
+  - **F1 et F2 adressées pour leur moitié réalisable ; moitié GitHub non
+    exécutable sous ce contrat** — voir §9.0, qui porte les deux lignes
+    « Could not address » et leur raison. Le plan cesse de réfuter le corps en
+    silence : §1 renvoie à §9, les textes de rectification sont livrés prêts à
+    poser (§9.1 callout de branche, §9.2 encadré daté + commentaire d'avis
+    d'édition), et §7 fait de leur pose une condition antérieure au dispatch
+    d'implémentation. La pose elle-même revient à `dispatch-lib` et à
+    l'opérateur ; c'est leur geste, pas celui du pilote de révision.
