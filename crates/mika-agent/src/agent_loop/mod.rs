@@ -476,6 +476,20 @@ struct AgentContext {
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
+    // mika#2473 D2 — the disk may have moved since this process froze its budget
+    // record at `init_agent` (boot freeze, mika#1962 / mika#2457 U2: the record
+    // reports what the agent RUNS UNDER, never what the file carries now). One
+    // `stat` per turn against the mtime noted at boot; one re-resolution per
+    // distinct mtime (R9). This is the single call site — `load_agent_context`
+    // is the funnel of all three loops (conversation, silent, team), so a guard
+    // posed in one loop body would be blind to the other two (KTD5), and a
+    // second call here would split the per-mtime dedup across two callers.
+    // It REPORTS and never REFUSES (KTD1): no `?`, no new failure path — a
+    // detector that cannot read anything simply says nothing.
+    if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {
+        mika_common::llm::report_config_change(&finding);
+    }
+
     let soul_content = tokio::fs::read_to_string(home_dir.join("soul.md"))
         .await
         .unwrap_or_default();
@@ -15628,6 +15642,133 @@ mod tests {
             mika1883_open_coded_fold_sites(a_mere_read).is_empty(),
             "reading a usage field is not folding it — flagging reads would make \
              the guard fire on `build_turn_usage_fields` and get disarmed"
+        );
+    }
+
+    /// The enclosing `fn` of each `detect_config_change(` call site in a Rust
+    /// source, as `(1-based line, enclosing fn, trimmed text)`.
+    ///
+    /// **Prose is not a call site.** A line whose content starts with `//`
+    /// *names* the primitive without calling it; flagging those would make the
+    /// only way to keep the guard green to stop naming the contract in comments,
+    /// which is how a structural guard gets disarmed by the people it serves.
+    fn mika2473_freshness_check_sites(src: &str) -> Vec<(usize, String, String)> {
+        let mut enclosing = String::from("<no enclosing fn>");
+        let mut sites = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let text = line.trim();
+            if let Some(name) = mika2473_declared_fn_name(text) {
+                enclosing = name;
+            }
+            if text.starts_with("//") {
+                continue;
+            }
+            if text.contains("detect_config_change(") {
+                sites.push((i + 1, enclosing.clone(), text.to_string()));
+            }
+        }
+        sites
+    }
+
+    /// `fn f(` / `async fn f(` / `pub(crate) async fn f(` → `f`; anything else
+    /// that merely mentions `fn ` (a doc comment, a `let` binding) → `None`.
+    fn mika2473_declared_fn_name(trimmed: &str) -> Option<String> {
+        let (head, rest) = trimmed.split_once("fn ")?;
+        let is_declaration = head.split_whitespace().all(|token| {
+            matches!(
+                token,
+                "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe" | "extern"
+            )
+        });
+        if !is_declaration {
+            return None;
+        }
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// **AC7 (mika#2473)** — the config-freshness check has exactly one call
+    /// site, and that site is the funnel.
+    ///
+    /// `load_agent_context` is the single entry point of the three loops —
+    /// conversation (`run_agent`), silent, and team (`run_team_agent_inner_impl`)
+    /// — so one call there evaluates every turn that runs on this process
+    /// (KTD5). A second call, added inside one loop body by an author who did
+    /// not know the funnel existed, costs a second `stat` per turn and — the
+    /// real damage — splits the "one report per distinct mtime" contract
+    /// (R9/KTD4) across two callers of a dedup map keyed by `agent_id`, not by
+    /// call site: whichever site ran first would silence the other, and which
+    /// one that is would depend on the loop.
+    ///
+    /// Shipped with **no allowlist**, and the pre-existing population at HEAD
+    /// was **zero** — so the first entry anyone would want to add here is
+    /// exactly the second site this scan exists to refuse. Conduct when it
+    /// fires: **remove the second call site**, never allowlist it. The same
+    /// rule `mika1883_run_usage_accumulates_only_via_the_one_helper` states for
+    /// its own empty list, one module over.
+    #[test]
+    fn mika2473_the_freshness_check_sits_in_the_one_funnel() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+        let sites = mika2473_freshness_check_sites(&production);
+
+        let rendered = sites
+            .iter()
+            .map(|(line, enclosing, text)| {
+                format!("agent_loop/mod.rs:{line} (in `{enclosing}`): {text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#2473 AC7 — `detect_config_change` must be called exactly once \
+             in `agent_loop/mod.rs`. Remove the extra call site; do not \
+             allowlist it — two sites share one dedup key and silence each \
+             other:\n{rendered}"
+        );
+        assert_eq!(
+            sites[0].1, "load_agent_context",
+            "mika#2473 KTD5 — the one call must sit in `load_agent_context`, the \
+             funnel of the three loops. A guard in a single loop is blind to the \
+             other two:\n{rendered}"
+        );
+    }
+
+    /// Good-faith control for the scan above: it catches the shape it claims to,
+    /// rather than being a predicate that matches nothing.
+    #[test]
+    fn mika2473_the_funnel_scan_catches_a_second_site() {
+        let funnel = "async fn load_agent_context(db: &AsyncDatabase) -> Result<AgentContext> {\n    \
+             if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {}\n}\n";
+        let one = mika2473_freshness_check_sites(funnel);
+        assert_eq!(one.len(), 1, "the legal shape is one site");
+        assert_eq!(
+            one[0].1, "load_agent_context",
+            "and it is attributed to the funnel"
+        );
+
+        let two = format!(
+            "{funnel}\nasync fn run_team_agent_inner_impl() {{\n    \
+             let _ = mika_common::llm::detect_config_change(\"mika-arch\");\n}}\n"
+        );
+        let both = mika2473_freshness_check_sites(&two);
+        assert_eq!(both.len(), 2, "a second call site must be caught");
+        assert_eq!(
+            both[1].1, "run_team_agent_inner_impl",
+            "and named by the fn that added it"
+        );
+
+        let prose = "/// The funnel calls `detect_config_change(` once.\nfn f() {}\n";
+        assert!(
+            mika2473_freshness_check_sites(prose).is_empty(),
+            "naming the primitive in a comment is not calling it — flagging \
+             prose is how this guard would get disarmed"
         );
     }
 
