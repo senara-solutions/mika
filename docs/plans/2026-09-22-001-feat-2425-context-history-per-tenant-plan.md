@@ -2,7 +2,18 @@
 
 **Ticket :** senara-solutions/mika#2425
 **Type :** feat
-**Statut :** plan v1 (contenu seul — architecte en aval)
+**Statut :** plan v2 (contenu seul — architecte en aval)
+
+> **Divergence plan ↔ ticket, ratifiée et non silencieuse.** Ce plan remplace les
+> exigences 1 et 2 du corps de mika#2425 (« un verbe CLI/console qui écrit la
+> section nested `[context.history]` de l'`identity.toml` » ; « l'interaction avec
+> le réconciliateur (#2330) ») par un mécanisme `customer_config` — refus 1 et
+> point 1 du § *Pourquoi « rétrécir seulement »*. Le corps du ticket porte encore
+> la formulation d'origine ; **U10 en prescrit la rectification**, selon la
+> convention issue-as-versioned-contract établie sur mika#2169/#2158 : corps édité
+> avec encadré daté, avis d'édition en commentaire, annotation de clôture ici. Un
+> lecteur aval qui lit le ticket avant ce plan doit trouver la divergence écrite
+> dans le ticket, jamais la déduire de l'écart.
 
 ---
 
@@ -109,7 +120,9 @@ Elle achète ici quatre choses d'un coup :
 
 1. **L'exigence #2 du ticket est dissoute, pas implémentée.** La valeur opérateur
    ne vit pas dans une section code-owned, donc le réconciliateur ne la voit
-   jamais. Aucune ligne de `CODE_OWNED_IDENTITY_SECTIONS` ne bouge.
+   jamais. Aucune ligne de `CODE_OWNED_IDENTITY_SECTIONS` ne bouge. *Dissoudre
+   n'est pas ratifier* : le corps du ticket continuerait d'exiger cette
+   interaction tant que U10 n'est pas exécuté.
 2. **mika#2295 ne peut pas se rouvrir.** Personne ne peut remettre mika-arch en
    `scope = agent` depuis la DB.
 3. **La réversibilité est gratuite.** `delete_customer_config` **n'existe pas**
@@ -155,6 +168,12 @@ satisfaites par la DB et mieux. Trois mesures :
   `load_agent_context` le lit déjà deux fois (`timezone`, `language`) à la ligne
   d'à côté de `load_identity_async` : le lecteur atterrit au bon endroit sans
   nouveau chemin d'accès.
+
+**Ce refus est une divergence avec la lettre du ticket, et il ne se ratifie pas
+ici.** Un plan qui réfute une exigence sans que le ticket le dise laisse deux
+contrats contradictoires en circulation, dont un seul est lu par l'opérateur qui
+arrive par la recherche GitHub. La rectification du corps est prescrite par
+**U10**, gatée par **AC9** et par une case de DoD.
 
 ### Refus 2 — exposer les clés au modèle (`SETTABLE_CONFIG_KEYS`) en v1
 
@@ -214,6 +233,33 @@ Telegram est bien celle que L8 vise.
 - **U9** — Documentation : entrée dans `crates/mika-agent/docs/configuration.md`
   et `docs/configuration.md` (sync via `scripts/sync-agent-docs.sh`), plus la
   section d'exploitation dans `CLAUDE.md` (surfaces, sondes, haltes).
+- **U10** — **Rectification du corps de mika#2425**, parce que ce plan réfute deux
+  de ses trois exigences et qu'une divergence qu'aucune des deux surfaces ne porte
+  n'est pas ratifiée : elle est seulement invisible. Trois gestes, dans cet ordre,
+  et aucun n'est optionnel :
+  1. **Corps du ticket édité**, avec un encadré daté en tête constatant que les
+     exigences 1 (verbe écrivant la section nested `[context.history]` de
+     l'`identity.toml`) et 2 (interaction avec le réconciliateur #2330) sont
+     **remplacées** par le mécanisme `customer_config`, et nommant les trois
+     mesures qui l'imposent (R1 — le réconciliateur ne touche aucun tenant ;
+     refus 1 — aucun backend n'écrit `identity.toml`, et satisfaire #2 sur les
+     well-known inverserait mika#2330 ; mika#2358 — `customer_config` est le site
+     que la maison a déjà choisi pour cette classe). Le texte d'origine est
+     **conservé** sous l'encadré, jamais réécrit en place : un contrat versionné
+     garde ce qu'il a dit.
+  2. **Avis d'édition en commentaire** sur le ticket, nommant la date, la PR ou le
+     plan qui motive l'édition, et ce qui a changé — sans quoi l'édition est un
+     fait que seul l'historique GitHub porte, invisible à qui lit le fil.
+  3. **Annotation de clôture dans ce plan** — l'encadré en tête de ce fichier,
+     déjà posé, plus la mention explicite dans le corps de PR que la rectification
+     a été faite et où la lire.
+
+  L'exigence 3 du ticket (défaut inchangé) est **satisfaite telle quelle** par U8
+  et ne fait l'objet d'aucune rectification. Citation : convention
+  issue-as-versioned-contract établie sur mika#2169 et mika#2158 (corps édité +
+  avis d'édition + annotation de clôture) ; `docs/architecture/review-guide.md`
+  § divergence plan ↔ spec — un plan ne ratifie pas unilatéralement une divergence
+  avec le ticket qui le commande.
 
 ## Non-requirements (hors périmètre, délibérément)
 
@@ -551,6 +597,12 @@ mika#2340) : **établir le déploiement avant toute conclusion sur les valeurs.*
       sondes et leurs haltes.
 - [ ] Les deux suivis (exposition au modèle ; scope `channel`) ouverts avec leur
       précondition écrite, ou nommés dans le corps de PR avec `Tracked in:`.
+- [ ] **U10 exécuté avant merge** : corps de mika#2425 édité (encadré daté en
+      tête, texte d'origine conservé dessous), avis d'édition posté en
+      commentaire, et corps de PR nommant la rectification avec le lien du
+      commentaire. *Cette case est un gate, pas une formalité* — le mécanisme
+      livré ne correspond pas à la lettre du ticket, et un merge sans elle laisse
+      un contrat périmé faisant autorité sur la surface la plus consultée.
 
 ## Acceptance criteria
 
@@ -573,3 +625,36 @@ mika#2340) : **établir le déploiement avant toute conclusion sur les valeurs.*
   avertissement nommant la conséquence (R3) et la sonde, sans refuser le geste.
 - **AC8** — Les deux clés ne sont pas atteignables par le modèle via
   `set_config`, et cette absence est tenue par une assertion (D4).
+- **AC9** — **La divergence avec le ticket est ratifiée sur le ticket, pas
+  seulement dans le plan.** Le corps de mika#2425 porte, au merge, un encadré daté
+  constatant que ses exigences 1 et 2 sont remplacées par le mécanisme
+  `customer_config` et nommant les mesures qui l'imposent ; son texte d'origine
+  est conservé sous l'encadré ; un commentaire d'avis d'édition existe sur le fil.
+  Vérification : lire le corps du ticket et le fil — un lecteur qui n'ouvre que le
+  ticket doit repartir avec le bon contrat. **Non délégable au corps de PR seul**
+  (une PR se referme et ne s'indexe pas comme le ticket) et non délégable au plan
+  seul (rien ne mène du ticket au plan avant que le callout `Plan:` ne soit posé).
+  Citation : mika#2169, mika#2158.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-09-22)** : addressed F1 en prescrivant la rectification du corps
+  de mika#2425 — le plan réfutait les exigences 1 et 2 du ticket sans qu'aucune
+  exigence, case de DoD ni AC ne demande de mettre le ticket à jour, laissant la
+  divergence non ratifiée pour tout lecteur aval. Quatre gestes : (a) **U10**
+  ajouté aux *Requirements*, prescrivant les trois gestes de la convention
+  issue-as-versioned-contract (corps édité avec encadré daté et texte d'origine
+  conservé, avis d'édition en commentaire, annotation de clôture dans le plan) et
+  notant que l'exigence 3 du ticket est satisfaite telle quelle par U8 ; (b)
+  **AC9** ajoutée, gatant la ratification sur le ticket lui-même et nommant
+  pourquoi ni le corps de PR ni le plan ne peuvent en tenir lieu ; (c) une **case
+  de DoD** faisant de U10 un gate avant merge ; (d) l'**annotation de clôture** —
+  encadré daté en tête du plan, plus deux renvois courts vers U10 depuis le refus 1
+  et depuis le point 1 du § *Pourquoi « rétrécir seulement »*, aux deux endroits où
+  le texte dissolvait une exigence sans dire qu'elle restait écrite ailleurs.
+  Citations préservées : mika#2169 / mika#2158 (convention), review-guide
+  § divergence plan ↔ spec. Aucune AC affaiblie, aucun mécanisme modifié : R1–R3,
+  les trois refus, U1–U9, V1–V8, D1–D4/D3b, les surfaces et les sondes S1–S5 sont
+  inchangés.
