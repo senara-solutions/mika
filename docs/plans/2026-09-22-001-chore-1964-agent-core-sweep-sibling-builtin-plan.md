@@ -37,7 +37,7 @@ ticket est un p1 de fuite, pas une hygiène.
 
 | candidat du ticket | état mesuré |
 |---|---|
-| `run_gws` (OAuth) | **converti** par mika#2118 — `apply_gws_credential_state` (`builtin_handlers.rs:3951`) route `NeverConfigured` via `substrate_unavailable` + `dispatch_substrate_diagnostic`, avec deux registres persona |
+| `run_gws` (OAuth) | **converti** par mika#2118 — `builtin_handlers.rs::apply_gws_credential_state` (`:3949`) route `NeverConfigured` via `substrate_unavailable` + `dispatch_substrate_diagnostic`, avec deux registres persona |
 | MCP dispatch | **hors population** — aucun `ToolOutput::error` porteur d'un token substrat sur ce chemin |
 | `run_gh` @ `builtin_handlers.rs:2472` | **la ligne n'existe plus** ; `run_gh` est à `3116`, ses chemins token sont `3276-3291` et **n'émettent aucun message de configuration** — l'absence de token est silencieuse, `classify_gh_error` classe le refus GitHub sans nommer de variable |
 | `pr_merge_with_gate` | **non converti**, et c'est la fuite que M1 rend atteignable |
@@ -111,7 +111,7 @@ L'écriture évidente de cette troncature — couper à la première occurrence 
 `#[cfg(test)]` — **est fausse sur le fichier principal du périmètre**, et
 d'une manière qui ne se voit pas :
 
-- `builtin_handlers.rs:601-603` porte une paire `#[cfg(not(test))]` /
+- `builtin_handlers.rs:600-602` porte une paire `#[cfg(not(test))]` /
   `#[cfg(test)]` sur `PROGRESS_TICKER_INTERVAL` ;
 - le module de test réel commence à `:4493`.
 
@@ -153,6 +153,23 @@ pas exécuter lui-même nommée au même endroit.
 ---
 
 ## 2. Inventaire de la population (partie A)
+
+> **Comment lire les positions de ce document — et pourquoi elles périmeront
+> pendant votre propre travail.** Tous les numéros de ligne sont relevés à HEAD
+> `367be118` et re-vérifiés à rev 5 (§10). **Le symbole fait foi, jamais le
+> numéro** : c'est la règle que mika#2201 a dû écrire pour
+> `scripts/canonical-tokens.tsv` — un site se déclare `chemin::symbole`, *« jamais
+> un numéro de ligne, qui pourrit en silence »*.
+>
+> Ici la dérive n'est pas un risque, c'est une **certitude, et elle est causée par
+> l'implémentation elle-même** : U2 convertit neuf sites dans ces deux fichiers et
+> chaque conversion grossit son site (un littéral devient un couple repli +
+> diagnostic), donc **toute position en aval de la première conversion est fausse
+> dès que celle-ci est faite**. Un implémenteur qui traite §2.1 dans l'ordre du
+> tableau ouvrira `:4744` sur autre chose que le faux-vert de M4. Re-localiser par
+> symbole (`map_substrate_error`, `apply_gws_credential_state`,
+> `web_search_family_tier_http_401_no_leak`) est la conduite, et non conclure que
+> l'inventaire est faux.
 
 Périmètre déclaré : `crates/mika-agent/src/skills/builtin_handlers.rs` et
 `crates/mika-agent/src/tools/*.rs`, **code de production seulement** — troncature
@@ -198,7 +215,7 @@ Des littéraux portent un token substrat **sans jamais atteindre le LLM** :
 revue (`:3025`, qui nomme `MIKA_STORE_TOOL_CALLS` **au journal**, pas au modèle
 — à distinguer de son voisin `:2813`, qui est servi et figure donc en §2.1), et
 — cas central — le **second argument** de `substrate_unavailable`, dont nommer la
-surface opérateur est la raison d'être (`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC:3929`
+surface opérateur est la raison d'être (`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC:3926`
 nomme `XDG_CONFIG_HOME`, correctement ; idem les quatre diagnostics déjà
 conformes de §2.2, `:227`, `:240`, `:449`, `:463`).
 
@@ -715,8 +732,70 @@ p1 de fuite. Aucune AC modifiée. Détail et mesures : §1 et §9.2 du plan.
 
 ---
 
+## 10. Re-vérification des mesures (rev 5)
+
+Un re-groom idempotent n'a pas de findings en entrée : son livrable est de
+**re-confronter le plan à l'arbre**, parce qu'un plan dont les mesures ont pourri
+se lit exactement comme un plan juste. Relevé à la branche de grooming, base
+`367be118`.
+
+**Les cinq mesures tiennent, et les trois plus contre-intuitives ont été
+re-mesurées plutôt que reconduites :**
+
+| mesure | re-vérification | verdict |
+|---|---|---|
+| M1 | `tools/mod.rs:1058-1059` enregistre bien les deux builtins ; `apply_agent_tool_visibility` est à `agent_loop/mod.rs:7799` ; `FAMILY_AGENT_SKILL_ALLOWLIST` à `home.rs:722` | **tient** |
+| M2 | `run_gh` est à `:3116` (le `:2472` du ticket est bien mort) ; `apply_gws_credential_state` présent et conforme | **tient** |
+| M3 | `:307` `ToolOutput::error(map_substrate_error(…))` et les deux branches fuyantes inchangées, `rotate MIKA_BRAVE_API_KEY` compris | **tient** |
+| M4 | `grep -rn web_search_no_raw_401_operator_error crates/` rend **une seule ligne**, et c'est le commentaire de `:4740` — le garde compagnon n'existe toujours pas | **tient** |
+| M5 | paire `#[cfg(not(test))]`/`#[cfg(test)]` à **600/602**, `mod tests` à **4494** — la troncature naïve laisse toujours ≈ 3 890 lignes de production hors scan | **tient** |
+
+**Les deux gardes ancrés matchent, vérifié par `grep -c` et non par lecture :**
+`grep -cE '^## Fire-Disposition'` → `1`, `grep -ci '^## Acceptance criteria'` → `1`.
+La **seconde moitié** du gate AC — que rev 4 n'avait pas éprouvée, n'ayant regardé
+que le `grep` d'en-tête — passe aussi : le `sed` de `verify-pipeline.sh:154`
+extrait un contenu non vide entre le titre et `## 6.`. Vérifier la première
+moitié d'un garde et déclarer le garde satisfait est la classe même que rev 3 et
+rev 4 ont fermée ; elle est donc close ici sur les deux moitiés.
+
+**L'exhaustivité affirmée par rev 4 est confirmée par un balayage indépendant**
+plutôt que reconduite sur parole : les seuls prédicats ancrés `^## ` de
+`scripts/`, `skills/bundled/_shared/` et `.github/workflows/` sont ceux de
+`verify-pipeline.sh` (AC) et de `dispatch-lib.sh:5847`/`:5912`
+(Fire-Disposition). Les deux autres occurrences (`^## AC6 verbatim ground truth`)
+lisent un **corps de PR**, pas un plan — hors population.
+
+**Trois positions avaient dérivé**, toutes dans la zone GWS ou à un cran de la
+paire `cfg` : `apply_gws_credential_state` `:3951` → `:3949`,
+`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC` `:3929` → `:3926`, paire `cfg`
+`:601-603` → `:600-602`. Corrigées. Aucune ne changeait une conclusion — le
+symbole restait juste dans les trois cas, ce qui **est** l'argument de la note
+d'ancrage de §2.
+
+---
+
 ## Revision history
 
+- **rev 5 (2026-09-22)** — re-groom idempotent, aucun finding en entrée. Le plan
+  est re-confronté à l'arbre (§10) : **les cinq mesures tiennent**, les deux
+  gardes ancrés matchent, et l'exhaustivité affirmée par rev 4 est confirmée par
+  un balayage indépendant plutôt que reconduite sur parole.
+  - **Deux moitiés de garde plutôt qu'une.** Rev 4 avait éprouvé le `grep`
+    d'en-tête du gate AC ; sa **seconde** moitié (le `sed` de
+    `verify-pipeline.sh:154`, qui exige un contenu non vide) ne l'avait pas été.
+    Elle passe. Vérifier une moitié et déclarer le garde satisfait est exactement
+    la classe que rev 3 et rev 4 ont fermée — elle est close ici des deux côtés.
+  - **Trois positions avaient dérivé** (`:3951`→`:3949`, `:3929`→`:3926`,
+    `:601-603`→`:600-602`) ; corrigées. Aucune ne changeait une conclusion, le
+    symbole restant juste dans les trois cas.
+  - **La trouvaille est structurelle, pas cette dérive-là.** Le plan dirige par
+    numéro de ligne, et **U2 périme ces numéros par son propre travail** : chaque
+    conversion grossit son site, donc toute position en aval de la première est
+    fausse dès qu'elle est faite. Ce n'est pas un risque, c'est une certitude de
+    construction. §2 reçoit une note d'ancrage appliquant au plan la règle que
+    mika#2201 a écrite pour `canonical-tokens.tsv` — *le symbole fait foi, jamais
+    le numéro* — avec la conduite prescrite : re-localiser, ne pas conclure que
+    l'inventaire est faux.
 - **rev 4 (2026-09-22)** — re-groom idempotent. Aucun finding en entrée ; le
   correctif vient d'avoir cherché la **même classe de défaut** que rev 3 sur les
   autres sections gardées du plan, plutôt que de tenir pour isolé un défaut dont
