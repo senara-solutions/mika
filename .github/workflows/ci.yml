@@ -279,8 +279,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       # Les quatre occurrences mesurées de mika#2107 sont des fixtures nommées.
-      - name: Pin the guard's behaviour on the four measured occurrences (mika#2107)
+      # mika#2449 added the `--decide-primary` mode (run_shell → primary
+      # checkout); the same harness pins both modes, M0's three commands verbatim.
+      - name: Pin the guard's behaviour on the four measured occurrences (mika#2107) and the primary-checkout mode (mika#2449)
         run: bash scripts/test-guard-shared-checkout.sh
+      # The wiring of the primary mode into the shell-exec handler. A handler
+      # that calls nothing is green exactly like one that refuses; this harness
+      # strips the call and checks that it would go red (mika#2449 V5).
+      - name: Pin the run_shell wiring of the primary-checkout guard, negative control included (mika#2449)
+        run: bash scripts/test-shell-exec-guard.sh
       # La régression que ce check attrape ne rend AUCUNE décision fausse : elle
       # rend la garde absente, et les assertions comportementales ci-dessus
       # restent toutes vertes pendant que plus aucune session ne la charge.

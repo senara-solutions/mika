@@ -2612,7 +2612,16 @@ _set_up_worktree() {
                     if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
                         local stash_sha
                         stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $SUB_REPO_DIR stash apply ${stash_sha:-<sha>})" >&2
+                        # mika#2449: the recovery hint names the CANONICAL worktree,
+                        # never `$SUB_REPO_DIR` (the primary/deployment checkout) and
+                        # never `$existing_wt` (removed fourteen lines below, so the
+                        # hint would fail the moment an operator reads it). Applying a
+                        # worktree's uncommitted state in the primary checkout is the
+                        # exact signature of the 2026-09-21 incident (staged+modified
+                        # on main, `pull --ff-only` refused). The stash stack is shared
+                        # repo-wide, so the SHA resolves from any worktree of the repo.
+                        # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
+                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $WORKTREE_DIR stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
                     else
                         echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
                     fi
