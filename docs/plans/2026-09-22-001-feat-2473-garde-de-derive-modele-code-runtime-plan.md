@@ -182,9 +182,66 @@ verrait que D1 laisserait cette moitié de la classe silencieuse.
   `blockedBy mika#2457` ; la garde de dispatch (`validate_dispatch_readiness`,
   check 6) tient le dispatch tant que #2457 est ouvert, et dispatch-lib rebase
   la branche sur `origin/main` au dispatch.
-- Si les noms ci-dessus ont bougé entre `c72e40ea` et le merge, `/ce:doc-review`
-  et `/ce:review` du pipeline les rattrapent ; la conception ne dépend d'aucun
-  autre nom.
+- **Levée, et mesurée.** PR #2461 est **mergée** (2026-09-22T10:21:29Z), mika#2457
+  fermé ; la branche de ce ticket est rebasée sur `origin/main` @ `9aa39998`.
+  Le contrôle promis ci-dessous a été fait avant `/ce:work`, contre le `main`
+  post-merge et non contre `c72e40ea` : **aucun nom n'a bougé**. Les quatorze
+  symboles dont ce plan dépend existent avec la forme attendue —
+  `ResolvedBudgetRecord` (`:649`, dérive `Debug, Clone, PartialEq, Eq, Serialize,
+  Deserialize` — load-bearing pour la comparaison hors `resolved_at` d'U2 et pour
+  KTD3), `resolve_llm_budget_record(agent_id, global_home, agent_home)` (`:711`),
+  `emit_llm_budget_resolved` (`:849`), `AgentState.budget_record` (`state.rs:129`),
+  `handle_agent_budget` (`dashboard.rs:315`, rendant aujourd'hui
+  `json!({ "budget": … })` — le point d'extension d'U3/R6), `budget()` (`:95`),
+  `BudgetRecord` (`:144`), `render_budget_text` (`:172`), `render_unattested`
+  (`:290`), `sample()` (`:1293`), `ProviderKind::ALL` / `config_prefix` /
+  `default_model` (`llm/mod.rs:581`, `:598`, `:687`), `find_well_known_agent`
+  (`:823`), `load_agent_context` (`:478`).
+- **Ce qui a bougé, ce sont les numéros de ligne — dans les deux fichiers que
+  #2461 a touchés, et là seulement.** À rectifier en lisant, non en recopiant les
+  ancres de la section *Sources* : `init_agent` `:446 → :450`, `run_server`
+  `:757 → :775`, l'appel `budget_guard` `:822 → :840`, `AppState.agents`
+  `:120 → :142` ; dans `budget_provenance.rs`, `homes()` `:811 → :965`
+  (`clean_budget_env` `:953`), `log_llm_budget_resolved` `:673 → :814`, dédup
+  `LAST_EMITTED` `:601`, et les tests cités `mika2293_dedup_silences_repetition_and_re_emits_a_change`
+  `:1059 → :1213`, `mika2328_the_model_key_is_the_one_settings_reads_for_every_provider`
+  `:1404 → :1556`, `mod tests` `:836 → :939`. Le second site de
+  `log_llm_budget_resolved` est `teams/engine.rs:222` (plan : `:217`) — R9 tient :
+  ce site ne construit pas d'`AgentState`, donc aucune note de boot, donc D2 ne
+  s'y déclenche pas. Les sites `llm.model_name()` cités `:917, :1580, :1605` sont
+  aujourd'hui `:773, :810, :840` et `:1586, :1611` ; `emit_turn_usage` `:8489` est
+  **exact**.
+- **Sont exactes et n'ont pas bougé** : tout `well_known_agents.rs` (`config_toml`
+  `:62`, `MIKA_DEV_CONFIG` `:181`, `MIKA_QA_CONFIG` `:251`, `MIKA_ARCH_CONFIG`
+  `:1524`, `reconcile_well_known_config` `:759`, `find_well_known_agent` `:823`,
+  `provision_well_known_agents` `:884`, `WELL_KNOWN_AGENTS` `:477`) et tout
+  `agent_loop/mod.rs` (`load_agent_context` `:478` et ses trois appelants `:4647`,
+  `:5713`, `:6590` — KTD5 tient tel quel), plus `AgentState` `:27`,
+  `model_config_key` `:368`, `config_key_as_string` `:588`, `ModelProvenance`
+  `:283`, `effective_model` `:333`, `CascadeLayers::read` `:503`,
+  `MODEL_SOURCE_UNKNOWN_PROVIDER` `:164`, `make_llm_provider` `:1833`,
+  `make_provider_for` `:1857`, `LlmResponse` `:185` — qui **ne porte toujours pas**
+  de champ `model` de réponse, ce qui maintient la frontière de périmètre que
+  KTD2 pose.
+- **Une correction de fond, en faveur de KTD1.** La phrase citée par KTD1 — *« a
+  warning that contradicts a decision gets muted »* — n'est pas en `:697-704`
+  mais en **`:739-742`**, et son contexte réel la **renforce** : *« A guard firing
+  on the declaration would contradict a documented decision **at every startup**,
+  and a warning that contradicts a decision gets muted. What earns an operator's
+  attention is a *crossing*. »* C'est mot pour mot la situation de D1 sur ce poste
+  — trois agents, une émission par boot — et c'est ce qui justifie que D1 émette
+  **une ligne par agent et par init** (R4) et non par tour, et que la
+  *Fire-Disposition* refuse l'allowlist plutôt que de museler. Voisin utile pour
+  U2, à lire avant d'écrire la dédup par mtime : `:895-897`, qui explique pourquoi
+  une émission est placée **après** le `return` de dédup.
+- Le scan « un seul constructeur » de mika#2457 est
+  `mika2457_the_record_has_a_single_construction_site` (`:1910`) ; il exclut déjà
+  `pub struct` et `-> ResolvedBudgetRecord {` (`:1941-1946`). U2 **appelle** le
+  constructeur sans en créer un second : le scan reste vert, allowlist vide,
+  conformément à la *Fire-Disposition*. Les deux tests de route à garder verts
+  sont `mika2457_budget_route_serves_the_record_or_404s` (`server/mod.rs:4501`) et
+  `mika2457_the_route_serves_the_record_of_the_init_not_the_disk` (`:4577`), et
+  `test_state_full` est en `server/mod.rs:2102` (appelé `:2092`, `:4586`).
 
 ## Planning Contract
 
