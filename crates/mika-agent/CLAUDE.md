@@ -123,6 +123,28 @@ effect of a read-only GET. `mika agents budget` renders that 404 as *"not
 attested"* and prints **no** locally computed value; the CLI-side structural
 guard is in `crates/mika-cli/CLAUDE.md`.
 
+*And the drift, frozen with it (mika#2473).* `AgentState.model_drift` is
+established at the same `init_agent`, from the same record, and served as a
+**sibling** of it: `{ budget, model_drift }`. A sibling rather than a field,
+because `ResolvedBudgetRecord` keeps its single constructor and its dedup
+signature untouched — the scan that refuses a second constructor stays green with
+an empty allowlist. `init_agent` compares what `well_known_agents.rs` declares for
+this agent against what the cascade resolved, emits `well_known_model_drift` (WARN)
+or `well_known_model_in_sync` (INFO) once, and takes the boot note D2 needs. **No
+new error path**: nothing here refuses a boot. The three agents of a dev
+workstation are in measured drift today (mika-arch `kimi-k2.5`→`kimi-k3`, mika-qa
+`zai`→`openrouter`), and reporting them *is* the deliverable — muting that
+population with an allowlist would rebuild the silent guard mika#2328 measured.
+
+*And once per turn, whether the disk moved under the process.* The per-turn half
+sits at the head of `load_agent_context` — the **single funnel** of all three
+loops, team runs included, which is why `mika2473_the_freshness_check_sits_in_the_one_funnel`
+is a source scan asserting exactly one call site and shipping no allowlist: two
+sites would share one dedup key and silence each other. Its companion control
+(`…_catches_a_second_site`) keeps that scan from going vacuous. A turn whose agent
+this process never initialized finds no boot note and triggers nothing — that, and
+not "team runs", is the exempt population.
+
 *A half-configured pair now fails at boot.* `server::budget_guard::assert_llm_budgets_valid`
 runs in `run_server` after `provision_well_known_agents` (which writes the
 `config.toml` carrying the pair) and before any agent is initialized, over the same
