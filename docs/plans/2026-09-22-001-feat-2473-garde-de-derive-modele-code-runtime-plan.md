@@ -352,7 +352,13 @@ quand aucune note n'existe, donc D2 est inerte tant qu'U3 n'appelle pas
 - **Approach.**
   - `pub struct DeclaredModel { pub provider: ProviderKind, pub model: String, pub model_is_provider_default: bool }`
     et `pub fn declared_model(config_toml: &str) -> Option<DeclaredModel>` :
-    parse en `toml::Table` ; `llm_provider` absent ⇒ `DEFAULT_PROVIDER` ;
+    parse en `toml::Table` ; `llm_provider` **trimmé avant `from_str`**, comme
+    `ModelProvenance::from_layers` (`:304`) le fait de son côté — sans quoi une
+    future constante écrite avec une espace parasite ferait rendre `None` ici et
+    un couple valide là-bas, c'est-à-dire un `Drift` **faux** rapporté avec
+    `unknown_provider` sur une configuration correcte, que le test d'U1 ne
+    verrait pas puisqu'il écrit son propre texte sans padding ; absent ⇒
+    `DEFAULT_PROVIDER` ;
     présent mais illisible ⇒ `None` (même règle que `ModelProvenance::from_layers`,
     `:308-313`) ; modèle = `config_key_as_string(&table, &model_config_key(p))`
     ou `p.default_model()`.
@@ -492,6 +498,12 @@ quand aucune note n'existe, donc D2 est inerte tant qu'U3 n'appelle pas
     pour chaque spec de `WELL_KNOWN_AGENTS` avec `config_toml: Some`,
     `declared_model(config_toml).is_some()` (les trois constantes déclarent un
     couple lisible) ; `provision_well_known_agents(home, settings, false)` —
+    la précondition « env `MIKA_*_MODEL` nettoyé » a besoin d'un helper que
+    `budget_provenance.rs` garde privé à son module de test (`clean_budget_env`
+    `:953`) : l'exporter sous la feature `test-utils` dont `mika-agent` dépend
+    déjà, plutôt que de ré-écrire `format!("MIKA_{}_MODEL", …)` ici — ce serait
+    la seconde copie d'une dérivation dont le doc-comment dit qu'une table
+    serait un second endroit où se tromper —
     **avec `test_settings_with_kg_roots()`** (`well_known_agents.rs:1585`) et
     `home/agents` créé au préalable, faute de quoi ce test ne mesure pas ce
     qu'il prétend : `build_mika_arch_identity` (`:412-422`) rend `Err` quand
