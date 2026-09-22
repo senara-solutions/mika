@@ -534,6 +534,10 @@ meurt trois fois, et c'est un autre ticket (celui du pilote), pas celui-ci.
 ## Revision history
 
 - 2026-09-22 — v1, /ce:plan par orchestrator-CC, avant première passe mika-arch.
+- 2026-09-22 — v3, seconde passe mika-arch : **Verdict: GROOMED** (même session,
+  kimi-k3). F1/F2/F3 RESOLVED, aucun constat nouveau. Précision non bloquante
+  retenue : la case DoD F2 est cochée dans le commentaire de clôture du groom
+  **avec la sortie du grep** comme preuve.
 - 2026-09-22 — v2, après première passe mika-arch (ITERATE, session
   `2cee847f-41fa-4a32-bffc-6cd9cc9b71fe`, kimi-k3) :
   **F1** rectification tracée (encadré daté dans le corps + avis d'édition
