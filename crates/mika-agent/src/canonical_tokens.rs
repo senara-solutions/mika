@@ -521,6 +521,187 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2484 — un seul lecteur décisionnel de la preuve de grooming, et
+    // deux noms d'audit à écrivain unique.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// La population a été relevée avant rédaction : `has_completed_groom_for_issue`
+    /// avait exactement **un** appelant décisionnel, `evaluate_grooming_gate`,
+    /// que mika#2484 remplace par `groomed_state`. Quand ce scan tire, **la
+    /// résolution est de retirer la lecture**, jamais d'ajouter une entrée
+    /// (doctrine mika#2201, « on déclare, on n'allowliste pas ») : c'est
+    /// exactement la divergence que mika#2158 a dû graver une fois, où deux
+    /// sites répondaient différemment à la même question pendant des mois sans
+    /// qu'aucune assertion ne rougisse.
+    const GROOM_PROOF_READERS_ALLOWED: &[&str] = &[];
+
+    /// Les deux fichiers d'**infrastructure** de la preuve : la définition SQL
+    /// et son enveloppe asynchrone. Ni l'un ni l'autre ne *décide* quoi que ce
+    /// soit — ils transportent. Les accuser reviendrait à interdire à la
+    /// fonction d'exister.
+    const GROOM_PROOF_PLUMBING: &[&str] = &[
+        "crates/mika-agent/src/db/tasks.rs",
+        "crates/mika-agent/src/async_db.rs",
+    ];
+
+    /// **Test 11 / R2 — un seul lecteur décisionnel de la preuve.**
+    ///
+    /// Deux niveaux, et le second est le porteur. (a) hors plomberie, le seul
+    /// fichier de production qui *appelle* la preuve est `skills/executor.rs` ;
+    /// (b) dans ce fichier, la seule fonction qui la lit est `groomed_state`.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second lecteur
+    /// ne rendrait aucune décision fausse **le jour où il est écrit**. Il
+    /// divergerait plus tard, en silence, avec toutes les assertions vertes —
+    /// ce qui est littéralement ce qui est arrivé entre l'étape 5 du handler et
+    /// sa porte 9d entre mika#1620 et mika#2484.
+    #[test]
+    fn mika2484_un_seul_lecteur_decisionnel_de_la_preuve() {
+        // Composée à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("has_completed{}", "_groom_for_issue");
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+
+        let mut callers = Vec::new();
+        for (rel, content) in production_sources() {
+            if GROOM_PROOF_PLUMBING.contains(&rel.as_str())
+                || GROOM_PROOF_READERS_ALLOWED.contains(&rel.as_str())
+            {
+                continue;
+            }
+            let reads = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| line.contains(&needle));
+            if reads {
+                callers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            callers.iter().any(|c| c == owner),
+            "mika#2484 — `{needle}` n'est lue nulle part dans {owner} : ce scan vise \
+             un mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = callers.iter().filter(|c| *c != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2484 — la preuve de grooming a un second lecteur : {strangers:?}\n\n\
+             RÉSOLUTION : retirer la lecture et passer par `groomed_state`. Ne PAS \
+             l'ajouter à GROOM_PROOF_READERS_ALLOWED — deux lecteurs, c'est la \
+             divergence de mika#2158 rouverte, et elle est invisible aux tests."
+        );
+
+        // (b) Dans le fichier propriétaire, une seule fonction lit la preuve.
+        //     Le contenu est celui que `production_sources` a déjà lu — une
+        //     seconde lecture disque du même fichier n'apporterait rien.
+        let src = callers
+            .iter()
+            .find(|c| *c == owner)
+            .and_then(|_| {
+                production_sources()
+                    .into_iter()
+                    .find(|(rel, _)| rel == owner)
+                    .map(|(_, content)| content)
+            })
+            .expect("le propriétaire vient d'être trouvé dans production_sources");
+        let production = match src.find("\n#[cfg(test)]\nmod tests {") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        let readers: Vec<String> = crate::source_scan::fn_bodies(production)
+            .into_iter()
+            .filter(|(_, body)| body.contains(&needle))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            readers,
+            vec!["groomed_state".to_string()],
+            "mika#2484 — la preuve doit être lue par `groomed_state` et par elle \
+             seule ; `evaluate_grooming_gate` et le routage du ready-label en \
+             descendent. Trouvé : {readers:?}"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist du test 11.
+    #[test]
+    fn mika2484_l_allowlist_du_lecteur_unique_est_livree_vide() {
+        assert!(
+            GROOM_PROOF_READERS_ALLOWED.is_empty(),
+            "GROOM_PROOF_READERS_ALLOWED est livrée vide et doit le rester : quand le \
+             scan tire, on RETIRE la lecture. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
+    /// **Test 12 — les deux noms d'événement du routage sont un format de fil.**
+    ///
+    /// Ils atterrissent dans `audit_events.tool_name` et l'opérateur en fait des
+    /// `GROUP BY` (sondes S1 et S4). Deux écrivains rendraient les deux
+    /// populations — « groomé hors moteur » et « la base ne répond pas » — non
+    /// soustractibles, c'est-à-dire feraient lire une panne comme un succès du
+    /// correctif. Septième emploi du motif après `phantom_aged_out` /
+    /// `phantom_sweep_spared` (mika#2156).
+    #[test]
+    fn mika2484_les_noms_d_evenement_sont_un_format_de_fil() {
+        let owner = "crates/mika-agent/src/server/ready_label_handler.rs";
+        let names = [
+            format!("ready_label{}", "_markers_without_proof"),
+            format!("ready_label{}", "_groom_proof_unreadable"),
+        ];
+        let sources = production_sources();
+        let mut offenders = Vec::new();
+
+        for needle in &names {
+            let mut writers = Vec::new();
+            for (rel, content) in &sources {
+                // Le nom cherché dans les LITTÉRAUX : la déclaration
+                // `const READY_LABEL_…_TOOL` le porte dans son IDENTIFIANT, et
+                // l'accuser reviendrait à accuser la déclaration d'être son
+                // propre second écrivain.
+                let carries = content
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                    })
+                    .any(|line| {
+                        string_literals(line)
+                            .iter()
+                            .any(|lit| lit.contains(needle.as_str()))
+                    });
+                if carries {
+                    writers.push(rel.clone());
+                }
+            }
+            assert!(
+                writers.iter().any(|w| w == owner),
+                "mika#2484 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+                 vise un nom mort"
+            );
+            for w in writers.iter().filter(|w| *w != owner) {
+                offenders.push(format!("{needle} est aussi écrit par {w}"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2484 — chacun de ces deux noms doit avoir UN SEUL site \
+             d'écriture en production :\n  {}\n\n\
+             RÉSOLUTION : renommer le second site. Les deux populations ne sont \
+             comptables séparément que tant que chaque nom a un écrivain.",
+            offenders.join("\n  ")
+        );
+    }
+
     /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
     #[test]
     fn mika2242_the_sole_writer_allowlist_is_empty() {

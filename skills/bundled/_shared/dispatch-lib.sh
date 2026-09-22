@@ -2548,7 +2548,17 @@ _set_up_worktree() {
                 # it attests.
                 plan_provenance=$(_plan_provenance "$SUB_REPO_DIR" "$BRANCH" "$existing_plan")
                 echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan resolves on the branch (${plan_provenance}) and its header does not claim another ticket; re-grooming would loop (mika#2012, provenance mika#2034)" >&2
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                # mika#2484 U5 — la note ne prescrit plus une route morte.
+                # Elle disait « Dispatch dev-pilot to implement », et depuis
+                # mika#2287 cette moitié mène droit à
+                # `dispatch_grooming_not_verified` : la porte exige un callback
+                # groom terminé portant `Outcome: PLAN_GROOMED`, qu'aucun
+                # `already_groomed` ne frappe — délibérément, une garde qui lit
+                # sa preuve de la revendication ne peut pas la réfuter. Le geste
+                # nommé ici est celui que `groom_provenance_verdict` nomme déjà
+                # dans son champ `recovery`. Un texte de remède qui nomme une
+                # route morte coûte un tour de boucle et une lecture.
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carrying Outcome: PLAN_GROOMED exists, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0

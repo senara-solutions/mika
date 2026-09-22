@@ -1502,7 +1502,7 @@ assert_not_contains "the stale-callout signal is not the refusal signal reused" 
 # The refusal RESULT must be machine-readable: mika-dev's callback turn and the
 # audit dashboard both consume it. Rebuild it with the same printf and prove jq
 # can reach every field.
-REFUSAL_JSON=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+REFUSAL_JSON=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: the provenance gate refuses it. Remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
     "mika" "2012" "fix/2012/plan-gate" "docs/plans/2026-08-27-001-plan.md")
 assert_eq "refusal RESULT is valid JSON" "0" "$(printf '%s' "$REFUSAL_JSON" | jq -e . >/dev/null 2>&1; echo $?)"
 assert_eq "refusal RESULT exposes .reason to jq" "already_groomed" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.reason')"
@@ -1511,6 +1511,19 @@ assert_eq "refusal RESULT exposes .plan to jq" "docs/plans/2026-08-27-001-plan.m
 assert_eq "refusal RESULT exposes .branch to jq" "fix/2012/plan-gate" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.branch')"
 assert_contains "the refusal printf in the source matches the shape tested here" \
     '{"status":"auto_skipped","reason":"already_groomed"' "$SETUP_WT_SRC"
+
+# --- mika#2484 U5 : la note ne prescrit plus une route morte ---
+# Le texte disait « Dispatch dev-pilot to implement ». Depuis mika#2287 cette
+# moitié mène droit à `dispatch_grooming_not_verified` : la porte exige un
+# callback groom terminé portant `Outcome: PLAN_GROOMED`, et un
+# `already_groomed` n'en frappe aucun — délibérément (une garde qui lit sa
+# preuve de la revendication ne peut pas la réfuter). Un texte de remède qui
+# nomme une route morte coûte un tour de boucle et une lecture.
+assert_not_contains "the already_groomed note no longer prescribes dev-pilot" \
+    'Dispatch dev-pilot to implement' "$SETUP_WT_SRC"
+assert_contains "the already_groomed note names the gesture that works" \
+    'remove the plan from the branch AND the grooming callouts from the issue body' \
+    "$SETUP_WT_SRC"
 
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
