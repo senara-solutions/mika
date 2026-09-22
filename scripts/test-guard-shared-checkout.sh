@@ -588,6 +588,10 @@ expect_primary allow "tag / gc / prune" "$SKILL_CWD" "git -C $PRIMARY tag v0 && 
 
 printf '\n== mika#2449 V6 — les formes qui rompent l'"'"'invariant sont refusées, terme par terme ==\n'
 expect_primary deny "merge origin/main --no-edit (mesuré 09-20, mika-dev) — non-ff" "$SKILL_CWD" "git -C $PRIMARY merge origin/main --no-edit"
+expect_primary deny "merge --ff-only origin/fix/x (revue #2478) — avancerait main sur une tête non revue" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only origin/fix/x"
+expect_primary deny "pull --ff-only origin fix/x" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only origin fix/x"
+expect_primary allow "pull --ff-only origin main (forme mika-dev)" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only origin main"
+expect_primary allow "merge --ff-only main (ref locale de déploiement)" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only main"
 expect_primary deny "pull sans --ff-only" "$SKILL_CWD" "git -C $PRIMARY pull origin main"
 expect_primary deny "stash nu" "$SKILL_CWD" "git -C $PRIMARY stash"
 expect_primary deny "stash push" "$SKILL_CWD" "git -C $PRIMARY stash push -m x"
@@ -625,6 +629,10 @@ if [ "$(bash "$GUARD" --decide-primary '' "$SKILL_CWD" "git -C $PRIMARY reset --
 if [ "$(bash "$GUARD" --decide-primary "$TMPROOT/nexiste-pas" "$SKILL_CWD" "git -C $PRIMARY reset --hard" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "platform-dir absent → allow"; else ko "platform-dir absent → allow"; fi
 if [ "$(bash "$GUARD" --decide-primary "relatif/plateforme" "$SKILL_CWD" "git -C $PRIMARY reset --hard" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "platform-dir relatif → allow (jamais normalisé en /)"; else ko "platform-dir relatif → allow"; fi
 expect_primary allow "commande sans git" "$SKILL_CWD" "cd $PRIMARY && make test && ls -la"
+expect_primary allow "continuation de ligne : git -C <principal> \\⏎log (revue #2478 — \\ n'est pas un verbe)" "$SKILL_CWD" "git -C $PRIMARY \\
+log --oneline -1"
+expect_primary allow "continuation de ligne devant fetch" "$SKILL_CWD" "git -C $PRIMARY \\
+  fetch origin"
 expect_primary allow "sous-shell : (cd <principal> && git show x) && git reset --hard dans /tmp" "$OUTSIDE" "(cd $PRIMARY && git show HEAD:seed.txt) && git reset --hard"
 
 printf '\n== mika#2449 F3 — la dérogation désarme AUSSI ce mode, et elle est journalisée ==\n'

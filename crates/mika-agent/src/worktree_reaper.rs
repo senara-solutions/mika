@@ -1476,9 +1476,13 @@ async fn probe_main_checkout(
     let repo_key = repo_dir.display().to_string();
 
     // Hors délai → `None` → `Unreadable`, jamais « propre ».
+    // `--no-optional-locks` : `git status` rafraîchit l'index sous
+    // `index.lock` ; sur le checkout de déploiement, un `pull --ff-only` de
+    // l'opérateur lancé dans la même fenêtre échouerait « index.lock: File
+    // exists » — le symptôme même du ticket, produit par le diagnostic.
     let status: Option<String> = tokio::time::timeout(
         MAIN_CHECKOUT_STATUS_TIMEOUT,
-        run_git(repo_dir, &["status", "--porcelain"]),
+        run_git(repo_dir, &["--no-optional-locks", "status", "--porcelain"]),
     )
     .await
     .unwrap_or_default();

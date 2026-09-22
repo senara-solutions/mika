@@ -42,6 +42,14 @@
 # obfusqué n'est pas la classe mesurée ; le mur, c'est le bac à sable de
 # mika#2141, et il est déjà posé.
 #
+# LIMITES CONNUES DU PARSEUR, nommées pour que le prochain incident soit
+# attribuable et non mystérieux : une indirection par variable
+# (`R=~/…/mika; cd $R && git stash`), un sous-shell explicite
+# (`bash -c 'cd … && git stash'`, `sh -c`), un `eval '…'` et un script du
+# dépôt qui mute (`make …`) passent tous les deux modes — la garde lit une
+# ligne de commande, pas ce qu'elle exécute. En mode primaire, la sonde
+# `main_checkout_dirty` (mika#2449 U3) date ce que la garde n'a pas vu.
+#
 # FAIL-OPEN, décidé et non découvert : un script absent, illisible ou perdu
 # laisse passer la commande. Un fail-closed coucherait toutes les sessions du
 # dépôt — dispatches et orchestrateur en incident compris — pour un défaut de
@@ -371,9 +379,27 @@ verb_is_deploy_safe() {
 		return 0
 		;;
 	pull | merge)
+		# `--ff-only` seul ne suffit pas : `merge --ff-only origin/fix/x`
+		# avance `main` sur une tête de feature non revue dès qu'elle est
+		# fast-forwardable, le preflight de déploiement accepte « on main,
+		# ahead of origin », et `make deploy` embarque du code non revu —
+		# puis `pull --ff-only` échoue (« diverged »), le symptôme même de
+		# mika#2449. La ref admise est donc l'histoire de déploiement :
+		# aucune (pull nu), `origin`, `main`, `origin/main`, `origin main`.
+		local ff=0 pos
 		for tok in "${args[@]+"${args[@]}"}"; do
-			[ "$tok" = --ff-only ] && return 0
+			case $tok in
+			--ff-only) ff=1 ;;
+			-*) ;;
+			*)
+				case $tok in
+				origin | main | origin/main | refs/remotes/origin/main) ;;
+				*) return 1 ;;
+				esac
+				;;
+			esac
 		done
+		[ "$ff" = 1 ] && return 0
 		return 1
 		;;
 	branch)
@@ -638,6 +664,10 @@ decide_command() {
 				k=$((k + 1))
 				;;
 			-*) ;;
+			# Continuation de ligne (`git -C x \`⏎`log …`) : un `\` nu n'est
+			# pas un verbe. Le prendre pour tel donnait un verbe inconnu, donc
+			# un refus fail-closed sur une lecture légitime (revue mika#2449).
+			\\) ;;
 			*)
 				verb=$tok
 				k=$((k + 1))

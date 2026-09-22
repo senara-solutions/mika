@@ -132,7 +132,7 @@ git -C "$PRIMARY" reset -q --hard "$HEAD_BEFORE"
 printf '\n== AC6 — une lecture et les formes de synchronisation passent, et s'"'"'exécutent ==\n'
 run_handler "$(json_cmd "git -C $PRIMARY log --oneline -1")"
 if [ "$STATUS" -eq 0 ] && grep -q seed <<<"$OUT"; then ok "git log : exit 0 et la sortie est celle de git"; else ko "git log passe" "exit=$STATUS out=$OUT err=$ERR"; fi
-run_handler "$(json_cmd "cd ~/workspace/mika-platform/mika && git fetch origin 2>/dev/null; git merge --ff-only HEAD && echo SYNC_OK")"
+run_handler "$(json_cmd "cd ~/workspace/mika-platform/mika && git fetch origin 2>/dev/null; git merge --ff-only main && echo SYNC_OK")"
 if [ "$STATUS" -eq 0 ] && grep -q SYNC_OK <<<"$OUT"; then ok "fetch && merge --ff-only : exit 0, exécuté"; else ko "merge --ff-only passe" "exit=$STATUS out=$OUT"; fi
 run_handler "$(json_cmd "git -C $PRIMARY show feat:scripts/check-landing-tokens.sh")"
 if [ "$STATUS" -eq 0 ] && grep -q '^feat$' <<<"$OUT"; then ok "show <branch>:<path> (la recette qa-review) : exit 0, contenu rendu"; else ko "show passe" "exit=$STATUS out=$OUT"; fi
