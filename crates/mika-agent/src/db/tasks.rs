@@ -146,6 +146,12 @@ impl Database {
     /// label inside the window meets a fully armed veto. The lift buys one
     /// restart, not immunity.
     ///
+    /// **mika#2446 — operator lift.** Rows carrying
+    /// [`RECURRING_OPERATOR_REARM_PATH`] — written by
+    /// [`Database::mark_recurring_operator_rearm`] when an operator runs
+    /// `mika tasks rearm <label>` — are skipped too. An act, not an exemption:
+    /// it absolves only the rows that existed when it was taken.
+    ///
     /// Non-goal here: fixing the *underlying* dispatch failure for Mika's
     /// specific `curator_review` (Problem A in the ticket). Root-claude's
     /// diagnosis notes PR#1726 (RouteFuture/dashmap wedge) likely already
@@ -187,6 +193,8 @@ impl Database {
                    AND NOT (?5 = 0
                             AND json_valid(metadata)
                             AND COALESCE(json_extract(metadata, ?6), 0) = 1)
+                   AND NOT (json_valid(metadata)
+                            AND COALESCE(json_extract(metadata, ?7), 0) = 1)
                  ORDER BY updated_at DESC LIMIT 1",
                 params![
                     task.agent_id,
@@ -194,7 +202,8 @@ impl Database {
                     RECURRING_ZOMBIE_GRACE_SQL,
                     RECURRING_CONFIG_CANCEL_REVERTED_PATH,
                     i64::from(lift_already_spent),
-                    RECURRING_UNKNOWN_TRIGGER_PATH
+                    RECURRING_UNKNOWN_TRIGGER_PATH,
+                    RECURRING_OPERATOR_REARM_PATH
                 ],
                 |r| {
                     Ok((
@@ -399,6 +408,74 @@ impl Database {
                      ?2, 1)
              WHERE id = ?1 AND trigger_type = 'recurring'",
             params![task_id, RECURRING_UNKNOWN_TRIGGER_PATH],
+        )?;
+        Ok(n)
+    }
+
+    /// mika#2446 — the most recent dead recurring row of `(agent_id, label)`,
+    /// the one `mika tasks rearm` resurrects. `None` when the label never had a
+    /// recurring row in a veto-arming state.
+    ///
+    /// No grace-window filter: a death older than the window no longer arms the
+    /// veto, but it still carries the `cron_expr` and `action_config` a rearm
+    /// re-registers — the operator must never retype a cron.
+    pub fn find_recurring_rearm_target(
+        &self,
+        agent_id: &str,
+        label: &str,
+    ) -> Result<Option<RecurringRearmTarget>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, label, status, cron_expr, action_type, action_config, updated_at
+                 FROM tasks
+                 WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+                   AND trigger_type = 'recurring'
+                   AND status IN ('failed', 'cancelled', 'expired')
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![agent_id, label],
+                |r| {
+                    Ok(RecurringRearmTarget {
+                        task_id: r.get(0)?,
+                        label: r.get(1)?,
+                        status: r.get(2)?,
+                        cron_expr: r.get(3)?,
+                        action_type: r.get(4)?,
+                        action_config: r.get(5)?,
+                        updated_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// mika#2446 — stamp [`RECURRING_OPERATOR_REARM_PATH`] on every dead
+    /// recurring row of `(agent_id, label)`. Returns the number of rows marked.
+    ///
+    /// **Every** dead row, not only the latest: the guard picks the most recent
+    /// *unexempted* death inside the window, so absolving the latest alone would
+    /// surface the one before it and the rearm would be refused by its own
+    /// history. Rows dying *after* this call carry no marker and arm the veto
+    /// normally — mika#1742 stays armed for every other death.
+    ///
+    /// Mirrors [`Database::revert_config_cancel_recurring_task`]: the status is
+    /// not rewritten and `updated_at` is not touched, so the audit trail keeps
+    /// the real date of each death and the marker ages out with its row.
+    /// Writes the integer `1` — see [`Database::mark_recurring_unknown_trigger`]
+    /// for why a string would be invisible to the guard.
+    pub fn mark_recurring_operator_rearm(&self, agent_id: &str, label: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE tasks
+             SET metadata = json_set(
+                     CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                     ?3, 1)
+             WHERE agent_id = ?1 AND label = ?2 COLLATE NOCASE
+               AND trigger_type = 'recurring'
+               AND status IN ('failed', 'cancelled', 'expired')
+               AND NOT (json_valid(metadata)
+                        AND COALESCE(json_extract(metadata, ?3), 0) = 1)",
+            params![agent_id, label, RECURRING_OPERATOR_REARM_PATH],
         )?;
         Ok(n)
     }
@@ -2544,6 +2621,93 @@ impl Database {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Age, in seconds, of the most recent activity row on the sessions attached
+    /// to this parent's deferred wrappers — `None` when there is none
+    /// (mika#2184, U1).
+    ///
+    /// **The direct liveness measure the proxy window could not be.** mika#2181
+    /// shelters a promoted wrapper while its `completed_at` is younger than
+    /// `promoted_wrapper_liveness_secs()`. That is a proxy on the *promotion*
+    /// instant, and it leaves a measured residue: over 30 days, 139 of 799
+    /// delivered wrappers (17 %) delivered past 2700 s, 81 of their parents were
+    /// expired `stuck_pending_no_deferred_wrapper`, and 8 of those were expired
+    /// 2820–4996 s after promotion — out of reach of *any* value of that
+    /// constant compatible with a useful reaper. Widening the window buys
+    /// coverage by blinding the reaper for longer; this reads whether the turn is
+    /// actually working.
+    ///
+    /// **The join is by equality, not by prefix.** The turn that consumes a
+    /// promoted wrapper is a `SilentTrigger::DeferredDispatch`, dispatched by
+    /// `dispatch_resume_agent`, which opens its session through
+    /// `create_session_with_parent(&session_id, …, task_id = Some(&task.id))` —
+    /// where `task.id` is **the wrapper**. So:
+    ///
+    /// ```text
+    /// parent P → wrappers W (trigger_type='callback', parent_task_id = P.id,
+    ///                        label = DEFERRED_DISPATCH_LABEL)
+    ///          → sessions S (sessions.task_id = W.id)
+    ///          → llm_calls / tool_calls (session_id = S.id)
+    /// ```
+    ///
+    /// That is stricter than the shape mika#1652 uses for team runs, which has
+    /// to fall back on `session_id LIKE 'team-' || r.id || '%'`. The `task_id`
+    /// column has existed since v19 and is written there — no migration, no
+    /// column.
+    ///
+    /// **It returns an age, never a boolean** (mika#2184 D2), for three reasons
+    /// in order of weight: the threshold leaves the SQL and becomes a parameter
+    /// of a pure function, testable at its boundaries without a database; the
+    /// log line can then *name* the age, which mika#2277 paid dearly for not
+    /// doing (two false positives read "nominal" on first inspection because a
+    /// single age was reported on a disposition crossing three); and `None` is
+    /// never `0` (mika#2331) — no activity is not activity of age zero.
+    ///
+    /// A **negative** age (clock skew, a row stamped in the future) is clamped to
+    /// `0`: it means "very recent", never "very old". Fail-safe towards sparing,
+    /// which is the direction of this ticket's asymmetry — a parent killed in
+    /// error loses hours of work, a parent spared in error costs one more tick.
+    ///
+    /// SOLE READER of the question *"does this wrapper show activity?"*
+    /// (mika#2184 R7/D7), pinned by
+    /// `mika2184_wrapper_activity_has_a_single_reader`. Deliberately **not**
+    /// unified with `find_stuck_team_runs`: disjoint populations, different
+    /// joins, and an abstraction drawn over two points whose joins differ is the
+    /// wrong abstraction.
+    pub fn find_deferred_wrapper_activity_age_secs(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+    ) -> Result<Option<i64>> {
+        let age: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(age) FROM (
+                   SELECT CAST(strftime('%s','now') - strftime('%s', lc.created_at) AS INTEGER) AS age
+                     FROM tasks w
+                     JOIN sessions s ON s.task_id = w.id
+                     JOIN llm_calls lc ON lc.session_id = s.id
+                    WHERE w.agent_id = ?1 AND w.parent_task_id = ?2
+                      AND w.trigger_type = 'callback' AND w.label = ?3
+                   UNION ALL
+                   SELECT CAST(strftime('%s','now') - strftime('%s', tc.created_at) AS INTEGER)
+                     FROM tasks w
+                     JOIN sessions s ON s.task_id = w.id
+                     JOIN tool_calls tc ON tc.session_id = s.id
+                    WHERE w.agent_id = ?1 AND w.parent_task_id = ?2
+                      AND w.trigger_type = 'callback' AND w.label = ?3
+                 )",
+                params![
+                    agent_id,
+                    parent_task_id,
+                    crate::agent::DEFERRED_DISPATCH_LABEL
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(age.map(|a| a.max(0)))
     }
 
     /// Find `blocked` self_dev issue parents refused on a busy dispatch slot,

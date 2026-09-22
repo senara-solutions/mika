@@ -239,8 +239,12 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
-    /// The message to send (use "-" to read from stdin)
-    pub message: String,
+    /// The message to send. Three doors, and they resolve in this order
+    /// (mika#1982): the argument wins when present; the "-" sentinel always
+    /// reads the standard input, terminal or not; and an absent argument reads
+    /// the standard input when it is not a terminal. Absent on a terminal is a
+    /// usage error, never a silent wait.
+    pub message: Option<String>,
     /// Correlate this message with a task for observability. Without --task-complete,
     /// only records the task-id in session/trace metadata. With --task-complete, marks
     /// the callback task as completed.
@@ -436,6 +440,43 @@ pub enum AgentsCommand {
         #[arg(long)]
         dry_run: bool,
         /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Show the LLM budget and model an agent is running under, with provenance
+    ///
+    /// Reads the record mika-spirit resolved when it initialized the agent. It
+    /// is deliberately NOT computed here: this process's environment is not the
+    /// server's, so a local resolution could report a setting that is not in
+    /// force, with the authority of a measurement (mika#2457).
+    Budget {
+        /// Agent to report on (defaults to --agent, then the active agent)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
+    /// Re-apply the authoritative identity.toml and soul.md for an existing agent
+    Reprovision {
+        /// Agent name to re-provision
+        name: String,
+        /// Tier template to apply (customer agents only): default | family | champion.
+        /// Defaults to MIKA_AGENT_TIER. Refused for well-known agents.
+        //
+        // Deliberately `Option<String>` and not a clap `ValueEnum`: the tier
+        // vocabulary and its fail-closed rule (mika#2023 AC2) live in
+        // `AgentTier::parse`, and a `ValueEnum` would restate them here and
+        // diverge the day a fourth tier arrives (mika#2230 D2).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Re-apply identity.toml only, leaving soul.md untouched
+        #[arg(long)]
+        identity_only: bool,
+        /// Show what would be written without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the typed-name confirmation
         #[arg(long, short)]
         yes: bool,
     },
@@ -809,6 +850,29 @@ pub enum MilestoneCommand {
         #[arg(long, default_value_t = 3)]
         silence_threshold_days: u32,
     },
+    /// List Phase 1 reports written to the offline sink, most recent first
+    /// (mika#2267).
+    ///
+    /// The cadence writes a report to the offline sink whenever no delivery
+    /// URL is configured, and as a fallback when an HTTP delivery fails. Until
+    /// mika#2267 nothing read that directory — this is the reader. The output
+    /// always names the directory it consulted and how that path was decided,
+    /// because the CLI (run by the operator) and the daemon (run by the
+    /// service, possibly under another HOME) can resolve different ones.
+    Reports {
+        /// Restrict to one milestone: `<owner/repo>#<number>`. Absent → all.
+        #[arg(long)]
+        target: Option<String>,
+        /// Print the most recent report's Markdown to stdout instead of
+        /// listing. `--format` is ignored: the content is the output.
+        #[arg(long)]
+        latest: bool,
+        /// How many entries to list. Ignored with `--latest`.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Args)]
@@ -841,6 +905,17 @@ pub enum TaskCommand {
         /// this task (mika#2335). Required in non-interactive contexts.
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Re-arm a dead recurring task without waiting out the 24 h zombie-veto
+    /// window and without editing the database (mika#2446).
+    ///
+    /// Refuses when the label has no dead row (a rearm never creates a
+    /// recurrence), when it is already armed, and when its trigger is not
+    /// routable by this binary. The act is recorded in `audit_events`
+    /// (`tool_name = 'recurring_operator_rearm'`).
+    Rearm {
+        /// Recurring task label (e.g. `worktree_reap`)
+        label: String,
     },
     /// Force-promote the next pending deferred dispatch wrapper for a class.
     /// Fails if the per-class dispatch slot is occupied, unless --override is set.

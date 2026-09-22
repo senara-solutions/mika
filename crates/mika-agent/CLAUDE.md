@@ -101,6 +101,103 @@ budget, not what a skill overrides for one turn. Reader lives in
 `mika_common::llm::budget_provenance` (see `mika-common/CLAUDE.md` for why the
 cascade is rebuilt rather than recorded, and why its inverted order is pinned).
 
+*The pair is now readable on demand, and the freeze is the property (mika#2457).*
+`AgentState.budget_record` holds the `ResolvedBudgetRecord` this agent was
+initialized under — resolved **once** at `init_agent`, from the same call that
+emits `llm_budget_resolved`, and never recalculated. Same *not hot-swappable*
+contract as `tier` (mika#1962) and `deployment` (mika#2290), for the same reason:
+it reports the state the agent **runs under**, not what the disk carries now.
+`GET /api/v1/agents/{id}/budget` (dashboard-or-internal auth, like its
+`/sessions` and `/audit` neighbours) serves it verbatim, `resolved_at` included.
+
+**It does not re-read the disk, and that refusal is the design.** Recomputing at
+request time would walk the cascade in *this* process and could name a setting
+that is not in force — mika#2304's defect one field over. It is also what keeps
+the route and the disk **two distinct facts**, whose difference *is* the drift
+measurement mika#2457 asks for: the operator compares `resolved_at` against the
+`config.toml` mtime, and a route that refreshed itself would erase the
+comparison. A **404** means "this server has not resolved that agent", never a
+default — the lookup reads the resolved-agent map rather than `resolve_agent`,
+which would lazily construct an agent (DB, skills, task engine, KG) as a side
+effect of a read-only GET. `mika agents budget` renders that 404 as *"not
+attested"* and prints **no** locally computed value; the CLI-side structural
+guard is in `crates/mika-cli/CLAUDE.md`.
+
+*And the drift, frozen with it (mika#2473).* `AgentState.model_drift` is
+established at the same `init_agent`, from the same record, and served as a
+**sibling** of it: `{ budget, model_drift }`. A sibling rather than a field,
+because `ResolvedBudgetRecord` keeps its single constructor and its dedup
+signature untouched — the scan that refuses a second constructor stays green with
+an empty allowlist. `init_agent` compares what `well_known_agents.rs` declares for
+this agent against what the cascade resolved, emits `well_known_model_drift` (WARN)
+or `well_known_model_in_sync` (INFO) once, and takes the boot note D2 needs. **No
+new error path**: nothing here refuses a boot. **Two** of the three agents on a
+dev workstation are in measured drift today (mika-arch `kimi-k2.5`→`kimi-k3`,
+mika-qa `zai`→`openrouter`); the third, mika-dev, is in phase — and reporting all
+three, whichever the verdict, *is* the deliverable — muting that
+population with an allowlist would rebuild the silent guard mika#2328 measured.
+
+*And once per turn, whether the disk moved under the process.* The per-turn half
+sits at the head of `load_agent_context` — the **single funnel** of all three
+loops, team runs included, which is why `mika2473_the_freshness_check_sits_in_the_one_funnel`
+is a source scan asserting exactly one call site and shipping no allowlist: two
+sites would share one dedup key and silence each other. **That scan walks the
+whole crate**, not `agent_loop/mod.rs` alone: it shipped reading one file, which
+left it green on a second call site in `server/`, `teams/` or `task_engine/` —
+i.e. blind exactly where a stranger to this contract would write, and reading as
+coverage while covering nothing (measured: a `detect_config_change` planted in
+`init_agent` kept the one-file form green). Its companion control
+(`…_catches_a_second_site`) keeps the scan from going vacuous and now injects its
+second site in a **different** file. A turn whose agent this process never
+initialized finds no boot note and triggers nothing — that, and not "team runs",
+is the exempt population.
+
+*Nothing on that per-turn path may panic, refuse, or shout every turn.* Three
+properties the review of mika#2473 had to close, all in
+`mika-common::llm::config_freshness`. (a) The mtime is formatted by a **fallible**
+conversion with a named fallback (`CONFIG_MTIME_UNREPRESENTABLE`);
+`DateTime::<Utc>::from(SystemTime)` ends in an `.unwrap()` and a filesystem will
+store an instant outside chrono's range, so the shipped form could panic on a
+turn — and it wrote `reported` *before* converting, which marked the drift
+reported and lost it for good. (b) The global `BOOT_NOTES` mutex is **not held
+across the `stat` nor across `resolve_llm_budget_record`** (itself up to three
+more synchronous reads): it is shared by every agent, so one slow `config.toml`
+serialised every other agent's turn. Releasing it opens a race, closed by
+re-checking `Reported::covers` under the second acquisition, so R9's
+at-most-once-per-distinct-mtime still holds. (c) `agent_config_mtime_unreadable`
+is emitted on the **onset and on the recovery**, not once per turn — the readable
+path was deduplicated and this one was not, so a `config.toml` made unreadable
+produced one WARN per turn for ever on an arm whose expected regime is zero
+(mika#2131). The population semantics are untouched: an unreadable `stat` still
+leaves the population and still leaves `BootNote::reported` intact.
+
+*`restart_required` answers "a value in service differs", not "the record
+differs".* `ResolvedBudgetRecord` carries `*_source` and `*_raw` provenance, so
+moving a setting between cascade doors **at the same value** used to raise the
+loud arm and WARN that a restart was needed — a false alarm about a change a
+restart would not apply. The comparison now clears dating *and* provenance on
+both clones, and a door-only move lands on the INFO arm, whose wording already
+says exactly that.
+
+*The D1 assembly is a function, so it can be tested as one.*
+`server::establish_model_drift(agent, global_home, agent_home, &record)` carries
+`find_well_known_agent → config_toml → declared_model → compare →
+emit_model_drift → note_config_at_boot` and returns the check. Inline, the
+sequence was only ever exercised through its primitives: swapping
+`global_home`/`agent_home` at the note, or dropping a step, compiled and passed
+every test while D2 watched a file nobody edits.
+`mika2473_the_boot_assembly_returns_the_check_and_takes_the_note` asserts the
+verdict, the note under the right key, **and** that D2 then sees an edit to *that
+agent's* `config.toml` — the only term that catches the swap.
+
+*The D1 line says whether the declared model was written or defaulted.*
+`declared_model_is_provider_default` rides both comparing arms of
+`ModelDriftCheck` onto `well_known_model_drift` / `well_known_model_in_sync`. It
+was computed and never read; on the line it is actionable — reconciling the
+constant means **writing** a model key when nothing declared one and **editing**
+one when something did, and on the in-sync arm it says the agreement rests on a
+provider default the provider can move without any file changing.
+
 *A half-configured pair now fails at boot.* `server::budget_guard::assert_llm_budgets_valid`
 runs in `run_server` after `provision_well_known_agents` (which writes the
 `config.toml` carrying the pair) and before any agent is initialized, over the same
@@ -234,6 +331,24 @@ Twelve sequential post-conditions on assistant text responses, plus one early-ac
 
 Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a posted PR review changes no setting, the same literal reason as 5c/5d/6f. Applies uniformly across modes (a promise made inside a heartbeat turn is exactly as empty, and compaction carries it into the next one). Second violation in the same turn: budget spent, EndTurn accepted, `guard.unactioned_frequency_promise_uncorrected` WARN emitted — **expected regime zero**, and without it that residue would be indistinguishable from a healthy turn. Predicate units in `evidence::guards::tests::mika2358_*` (including the control that separates "reads the calls" from "reads a word": the same text passes once `set_config` is in the summaries); production-path coverage in `tests/eval/test_unactioned_frequency_promise_2358.rs` (measured turn, honest-admission negative control, factual-description negative control, retry-budget boundary). Config keys, the four-producer perimeter, operator greps and the post-deploy probe: root `CLAUDE.md` § *Une consigne de fréquence a un site d'inscription*.
 
+5f. **Response language-drift guard (mika#2247 AC2):** Refuses assistant text measured in a language other than the one **this tenant declared** through the `language` key of `customer_config`. Position 5f, immediately after 5e, whose shape, `intent_guard_retries` budget and `guard.*` telemetry it reuses.
+
+**Founding measurement, 2026-09-06, MikaSenara captures.** One thread flipped EN↔FR: « So — who are you… », « All good », then « Bonjour ! Je suis Mika… ». The tenant's persona (`FAMILY_SOUL`) already prescribed French **twice, once in bold**, and the drift happened anyway — which is precisely why a third sentence was refused as the remedy (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, mika#2120: nine recurrences under prompt enforcement against zero when the fact is posed by code). What was missing was a **declared** axis and a structural half, not another instruction.
+
+**The discriminant is closed-list function words, and the reason is fail-open cheapness.** `measure_response_language` counts hits from two closed lists (`le la les de des un une et est dans que pour` / `the a an of and is in that for to`) and issues a verdict only when **three** independent thresholds clear: ≥12 word tokens, ≥3 hits for the winner, and a ≥2-hit lead. No new dependency, and function words are the part of a text a model does *not* vary — a proper noun, a code identifier or an emoji contributes to neither score. **Anything else is `Undetermined` and the guard does not fire**: « Bonjour 🌸 », « OK », « All good » must stay undecidable, because on a general-public tenant a false positive costs a needlessly re-prompted honest turn and a reply the person waits longer for. That is the expensive error here, not the missed drift.
+
+`expected` is a parameter of the pure function rather than a caller-side `if`, for mika#2290's reason: "an undeclared tenant is never guarded" then carries its own test instead of living in one branch of the agent loop. **The third state is the common one** — every engineering agent and every un-configured tenant declares nothing, resolves `None`, and is byte-identical to the pre-mika#2247 behaviour.
+
+Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guards` (#1178) — a posted PR review does not license answering in the wrong language, the same literal reason as 5c/5d/5e. Applies uniformly across modes: a heartbeat that opens in the wrong language is exactly as wrong, and it is the turn that *starts* the exchange. Second violation in the same turn: budget spent, EndTurn accepted, `guard.response_language_drift_uncorrected` WARN emitted — **expected regime zero**. **What this guard does NOT do, written at the site rather than discovered:** a one-shot re-prompt does not *guarantee* AC2; it bounds it and makes the residue countable. If the post-deploy measurement shows a non-negligible residue, the remedy is an engine net (mika#2368 shape), **not a second re-prompt — and that is a ticket, not a setting**. Predicate units in `evidence::guards::tests::mika2247_*`; production-path coverage in `tests/eval/doctrine_regressions/tenant_register_held.rs` (measured drift, undeclared-tenant negative control, nominal turn). Config key, its four measured refusals of an env var, operator greps and the post-deploy probe with its three halts: root `CLAUDE.md` § *Le tenant grand-public tient son registre*.
+
+5g. **Time-of-day greeting guard (mika#2247 AC3):** Refuses a greeting that names a part of the day the tenant is not in. Position 5g, immediately after 5f.
+
+**It is a net, not the mechanism, and the two are tuned in opposite directions.** The measured symptom — a « belle journée » sent in the evening — had no instruction defect behind it: the prompt posed UTC and left the model **two untooled inferences** (convert to the zone, then derive a moment of day). The fix is therefore the *posed fact*: `write_time_section` now computes and renders `Local time (Asia/Singapore): 2026-09-06 20:14 / Sunday evening`, parsing both an IANA name and a fixed offset (the second because rows predating `validate_config_value` still carry `+08:00`, and reading only the first would make AC3 silently inert on exactly those tenants). This guard sits behind that fact, so its lexicon is a **closed, narrow list** where 5f's is a measurement. Two entries are deliberately permissive and say so: `bonjour` admits the afternoon (French uses it until the evening) and `bonne nuit` admits the evening (going to bed at nine is not an error).
+
+**Fail-open on an unknown hour**, and `local_part_of_day` is taken by the pure function for 5f's reason. It is threaded from `prompt::resolve_local_part_of_day`, computed once per turn from the **same instant and the same timezone** the `## Current Time` section renders — a second parse would be free to disagree about what "evening" means, and the guard would then refuse the very greeting the prompt asked for. When no usable timezone is declared there is no local hour, so there is nothing to contradict; the prompt has already forbidden a time-stamped greeting on that path and states the ignorance rather than leaving the void that produced the symptom.
+
+Single retry, not skipped by `skip_remaining_guards`, `guard.time_of_day_greeting_mismatch_uncorrected` for the residue — same contract as 5f above.
+
 6. **Intent-precondition registry (#702):** Registry-driven guard that generalizes the webhook zero-tools guard (#696). `INTENT_GUARDS` is a const array of `IntentPrecondition` entries, each with a trigger function, satisfaction check, and correction message. Retry tracking uses `HashSet<&'static str>` keyed by label (one retry per entry). Current entries: (a) `webhook_ready_label_dispatch` (#846, #907, #1089) — if user message matches the `[GitHub] Issue labeled ready on` marker, requires `run_claude_pilot` attempt (dispatch via dev-pilot, or auto-groom via dev-groom). Post-#1089: the `send_message` grooming-rejection path was removed — all legitimate paths call `run_claude_pilot`; (b) `webhook_no_unauthorized_dispatch` (#910) — if user message starts with `[GitHub]` but does NOT match the ready-label marker, rejects when `run_claude_pilot` was successfully called (only successful calls — failed attempts are already blocked by the dispatch-readiness guard in `executor.rs`). Engine-level fix for recurring unauthorized dispatch from comment events (#798, #838, #910) where prompt-level source-check rules drifted under load. Post-#933: this post-hoc EndTurn guard is **defense-in-depth** — the primary prevention is the pre-hoc tool-boundary gate in `validate_dispatch_readiness()` check (0) which rejects `run_claude_pilot` before the subprocess spawns. Post-#1102: the trigger predicate now delegates to `is_unauthorized_webhook_dispatch()` from `crate::webhook_dispatch` — the same positive-allowlist predicate used by the tool-boundary guard. PR review and check-suite events (qa/ci skill territory) no longer trip the guard. Shared predicates live in `crate::webhook_dispatch` module; (c) `webhook_zero_tools` — if user message starts with `[GitHub]` and zero successful tool calls, rejects once (unchanged #696 behavior); (d) `resume_reconcile` — if user message contains resume/continue verb + milestone/project reference and no successful `check_task` or `list_tasks` call was made, rejects once; (e) `callback_terminal_action` (#870) — if user message starts with `[callback:` (Silent mode callback trigger), requires BOTH `update_task_status` AND `send_message` before EndTurn. AND-shape: both tools must be attempted (success or failure). Also has an inline mirror guard in the empty-text exit path for Silent mode, where the INTENT_GUARDS registry is not evaluated (the registry only fires in the non-empty text branch). `CALLBACK_TERMINAL_ACTION_LABEL` and `CALLBACK_TERMINAL_ACTION_CORRECTION` shared consts keep both sites in sync. **Two carve-outs, both read by both sites because they share the `callback_trigger_active` predicate:** `[callback:deferred-dispatch]` (mika#1011, own contract) and `[callback: long_running:build_mika]` (mika#2355 — a build callback owns no self_dev parent to mark terminal; the #870 audit's "only one callback flow exists" was false, `build_mika` was a second one, and imposing this contract on it let three mika-qa turns answer "Build succeeded" via `send_message` with no PR verdict on 2026-09-17). `build_callback_trigger_context` is the framing half of the same carve-out: it prescribes the self_dev terminal contract to every callback except a build callback, which is told its own (a posted `run_gh pr review`). The discriminant — label, message marker, satisfaction predicate, correction — lives in `crate::qa_build_callback` and nowhere else.
 6a. **QA build-callback verdict guard (mika#2355):** Inline guard (not in `INTENT_GUARDS`), label `qa_build_callback_verdict`. Trigger is **conjunctive** — the user message starts with `[callback: long_running:build_mika]` AND `qa-review` is among the turn's injected skills (`loaded_skill_names`, a `run_loop` parameter threaded from all three call sites; in silent mode that is `callback_safe_skills()`, exactly where mika#2355 B1 made `qa-review-build-callback` reachable). Satisfied by a **successful** `run_gh` call whose input carries `"pr"` and `"review"` (`qa_build_callback::pr_review_posted_in_turn`, the same predicate as early-accept 3b). Single retry via `intent_guard_retries`, correction `QA_VERDICT_REQUIRED_CORRECTION` naming `run_gh pr review` and the `VERDICT:` line. Inline because the registry's `fn(&str) -> bool` sees the message alone, and the label does not distinguish mika-qa from mika-dev — mika-dev carries `build-mika` in its allowlist and launches builds that owe nobody a verdict; armed on the label alone this guard would trade the QA loop-breaker for a dev one (AC4b). Has an empty-text mirror in the Silent exit path like 6(e)/6b, because a bare EndTurn is the shape a turn with nothing to say takes. Coupled with the 6(e) carve-out above: the one removes the wrong contract from the build flow, the other supplies the right one. Production-path coverage: `tests/eval/test_qa_build_callback_verdict_2355.rs` drives `run_silent_agent` through both exit sites. What this guard does **not** do: post anything itself — a second EndTurn without a review is accepted (single-retry contract). What it now does on that path is **say so**: the turn raises `SilentTurnOutcome.qa_verdict_unmet`, and the engine-side `hold[review]` net reads it in the dispatcher (mika#2368 — see § *Verdict Net*, "The second reason"). The guard's one-shot budget is unchanged; the net succeeds it rather than extending it.
 6b. **Callback milestone advance guard (#991):** Inline guard (not in `INTENT_GUARDS` const array) that enforces queue advancement on milestone/project-context callback turns. Triggers on `[callback:` + `[milestone-parent: <id>]` markers in the user message (the marker is injected by `run_silent_agent` after a DB lookup of the parent task type). Satisfied by EITHER Path A: `run_claude_pilot` call (advance to next child), OR Path B: `update_task_status` targeting the parent task ID with status `blocked`/`completed` (halt or finish). Inline because the satisfied predicate needs the parent_task_id from the user message. Composes with `callback_terminal_action` (entry e) — a milestone-context callback must satisfy BOTH guards. Also has an empty-text exit mirror guard. Companion `SilentTrigger::PostCallbackAdvance` fires a second advance turn if the first callback turn did not advance; auto-blocks the milestone if the second turn also fails. **Webhook companion guard (#1218, paired with #991):** Sibling inline guard for `pull_request.closed(merged:true)` webhook turns. Triggers on the `[milestone-parent: <id>]` marker prepended by `server::milestone_context_handler` when the PR-closed event correlates to a task with a `milestone`/`project` parent. Satisfaction has three valid paths: Path A (`run_claude_pilot` or `run_claude_pilot_groom` — advance), Path B (`update_task_status` on parent with `blocked`/`completed` — halt), Path C (`deploy_mika` + `send_message` — deploy-hook ack per self-dev-webhook-qa step 5.5.b). Mutually exclusive triggers with #991: the callback prefix `[callback:` and the webhook prefix `[GitHub] PR closed:` cannot both appear on a single user message. The marker parser `extract_milestone_parent_id` and the constant `MILESTONE_PARENT_MARKER` are shared with #991.
@@ -279,7 +394,15 @@ Skills with `[context.*]` sections have their data pre-fetched by the engine bef
 
 **Per-agent override:** mika-arch sets `[context.summary] inject = false`, removing the *conversation summary* layer from its system prompt entirely (mika#1009 leak protection). New agents that disable summary injection should be listed here.
 
-**Stop-signal convention (mika#1813):** the `stop_topic_*` preference key prefix (`prompt::STOP_TOPIC_PREFIX`) captures user requests to stop being re-nagged on a subject. When the user says "arrête" / "stop bringing this up" on subject X, the agent persists a `store_fact(category='preference', key='stop_topic_<slug>', value=…)` in the same turn. `AgentContext::load_agent_context` (`agent_loop/mod.rs`) fetches these via `search_preferences(STOP_TOPIC_PREFIX)` on every turn, filters the result through `prompt::filter_stop_topic_preferences` (strict `category` prefix — `search_preferences` is a substring LIKE over both `category` and `value`, so an unfiltered load would surface false positives and mute unrelated axes), and threads the filtered set into `PromptContext` (conversation) and `SilentPromptContext` (silent). `build_system_prompt` and `build_silent_prompt` render them as a `<stopped-topics>` block with an explicit "do NOT re-initiate on these" instruction. The state layer is the structural gate — the block re-appears on every future turn even if the model forgets, so the pattern degrades gracefully. Direct user questions about a stopped topic remain answerable (stop = don't re-initiate; question = respond normally). DB read is fail-open with a `stop_topic_load_failed` WARN log so a persistent DB failure is greppable instead of silently disabling suppression. **Compact-provider carve-out (mika#1925):** `build_compact_system_prompt` (used for `ProviderKind::MikaModel`) does NOT render the block or rules — the ≤5 KB budget cannot afford it and MikaModel is not currently used for production family-tier or operator-tier agents. mika#1925 tracks wiring a size-capped variant when MikaModel goes live for real tenants. **Team-agent inheritance (mika#1926):** team-child prompts thread `stopped_topics` from the CHILD agent's own DB, not the orchestrator's — the decision on whether the operator's stop-signals should propagate down through team delegation is open under mika#1926.
+**Stop-signal convention (mika#1813):** the `stop_topic_*` preference key prefix (`prompt::STOP_TOPIC_PREFIX`) captures user requests to stop being re-nagged on a subject. When the user says "arrête" / "stop bringing this up" on subject X, the agent persists a `store_fact(category='preference', key='stop_topic_<slug>', value=…)` in the same turn. `AgentContext::load_agent_context` (`agent_loop/mod.rs`) fetches these via `search_preferences(STOP_TOPIC_PREFIX)` on every turn, filters the result through `prompt::filter_stop_topic_preferences` (strict `category` prefix — `search_preferences` is a substring LIKE over both `category` and `value`, so an unfiltered load would surface false positives and mute unrelated axes), and threads the filtered set into `PromptContext` (conversation) and `SilentPromptContext` (silent). `build_system_prompt` and `build_silent_prompt` render them as a `<stopped-topics>` block with an explicit "do NOT re-initiate on these" instruction. The state layer is the structural gate — the block re-appears on every future turn even if the model forgets, so the pattern degrades gracefully. Direct user questions about a stopped topic remain answerable (stop = don't re-initiate; question = respond normally). DB read is fail-open with a `stop_topic_load_failed` WARN log so a persistent DB failure is greppable instead of silently disabling suppression. **Compact-provider path — wired since mika#1925.** All three builders now render the contract; `build_compact_system_prompt` (`ProviderKind::MikaModel`) carries an abbreviated form of it. Three things a future editor needs, because each undoes itself if guessed:
+
+- **The `persist` rule is unconditional there, and that is the fix.** The ticket asked only for a block gated on `stopped_topics` being non-empty; on that path the state was unreachable. The compact builder renders no `## Instructions`, so nothing told a MikaModel agent to write a `stop_topic_*` preference, and `build_silent_prompt` carries `consult` only — so the table stayed empty and a conditional block would have rendered never. Putting `persist` back under the condition restores a no-op with a green suite over it; `mika1925_compact_prompt_renders_persist_even_with_no_stopped_topics` is what reddens if someone does.
+- **It was never a byte arbitration.** The compact sections totalled ≈ 437 bytes against the 5120 asserted ceiling before this change, and 934 after (1335 with three stopped topics) — still ~74 % unused. What bites is the section-count assertion and, behind it, the OOD completion mode the compact prompt exists to avoid, which was made of *markdown headings*. Form, not mass. The `persist` rule therefore carries no heading; the conditional `## Stopped Topics` section is the fifth, and raising that count again means naming the section, its ticket and what it guarantees, as the comment in `test_build_compact_system_prompt_size_bound` does.
+- **AC4 is a blocking precondition, not a deferral.** mika#1925's calibration pass on MikaModel (mika#1190 discipline) is **not satisfied** and was not simulated — a mock validates prompt shape, never model obedience. It is not executable in this repo for three independent reasons: no MikaModel endpoint exists (`default_base_url` is an Ollama-shaped `http://localhost:11434` nothing serves); `calibration::providers::create_real_provider` returns `None` for any provider lacking a `MIKA_<PREFIX>_API_KEY` and exempts only `ProviderKind::Ollama`, so MikaModel cannot be instantiated without a key it has no use for; and none of the four role suites exercises a conversational agent or the stop-signal contract. **Before MikaModel serves a real tenant, run that pass** — those three dependencies are its cost, and they are a follow-up ticket's body.
+
+**Open scope question, posed and deliberately not settled here.** Three sibling carve-outs on the same builder cite mika#1925 as their follow-up — `## Distribution Doctrine` (mika#1814), the hosting line (mika#2290), `## Mika Doctrine` (mika#2292) — which reads it as an umbrella, while its acceptance criteria name only `stopped_topics`, mika#1813's AC2 and mika#1813's pinning test. Both readings cannot be true. The three were left closed and their five pinning tests green and untouched: each carries its own cost analysis, and mika#2292's is written as an **accepted** cost, not a postponement, so closing them together would assume one answer fits four. Recommendation for the operator: three sibling tickets, one per carve-out, each carrying its own trade-off, and mika#1925 closed on its literal scope.
+
+**Team-agent inheritance (mika#1926):** team-child prompts thread `stopped_topics` from the CHILD agent's own DB, not the orchestrator's — the decision on whether the operator's stop-signals should propagate down through team delegation is open under mika#1926.
 
 ## Context Injection Configuration
 
@@ -424,6 +547,34 @@ Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `
 **Delegate session persistence:** `delegate_task` creates a `delegate-{uuid}` session with parent linkage, persists task and response as messages. `AgentParams` has `global_home_dir` distinct from per-agent `home_dir`. **Team conversation continuity:** injects previous run context into orchestrator's system prompt. **Coverage check (#286):** `decompose()` re-prompts once if the orchestrator silently omits team members; falls through with `warn!` log (`team_coverage_gap`) on second miss. `TeamRun.coverage_retry_fired` bool persists via checkpoint JSON.
 
 **Local-member reach: name-addressed, not `a2a_call` (mika#1653).** `delegate_task` is the **conversation-mode** local-delegation tool (name-addressed). In a **team run** there is no per-member reach tool: the orchestrator reaches members by listing them in the decompose-JSON task-assignment array (`[{"agent","task","output_file"}]`); the engine spawns each assigned member's session by name (decompose→spawn→resume) and members exchange results via workspace files. `a2a_call` is **suppressed from the team-mode tool array** (`teams::engine::build_team_tool_registry` removes the `TEAM_SUPPRESSED_TOOLS` entries from the team's private `ToolRegistry`; regression-gated by `test_team_registry_suppresses_a2a_call`). `a2a_call` is **remote-only** — external, cross-container agents addressed by URL; it has no local fast-path and 503s on local siblings (no gateway route exists for `~/.mika/agents/<name>`). Its description and SSRF-rejection error redirect local targets to `delegate_task` (ADR-009). Composes with mika#1652 (containment): this prevents the 503-loop, the reaper catches residual stuck `team_runs`.
+
+**A run's terminal disposition is one compile-checked decision (mika#1940).**
+`RunStatus::disposition(&self) -> RunDisposition<'_>` (`teams/types.rs`) is **the**
+exhaustive match over the enum, with no `_` arm; `is_terminal_failure()` and the
+failure reason are *derived* from it, never written beside it, which makes "it is
+a failure ⟺ it has a reason" true by construction rather than true by test. The
+constant `NO_DELEGATION_REASON` gives the field-less `FailedNoDelegation` variant
+a single write site for the **operator** register — `engine.rs`'s
+`team_runs.failure_reason` column and the CLI's `stderr`; `notification.rs` keeps
+its own, deliberately different, **user** register (mika#2290/#2292's rule).
+
+**The split it closed is between forms, not between authors.** `FailedNoDelegation`
+(mika#1676) and `FailedTransport` (mika#1671) were added after the CLI was
+written. The three exhaustive matches in this crate — `Display`, the DB-column
+match in `engine.rs`, `notification.rs` — followed **both**; the three
+hand-written patterns in `mika-cli` (`matches!`, two `if let`) followed **neither**.
+`matches!` and `if let` are exactly the two forms that keep compiling when a
+variant appears, i.e. the class mika#2023 M2 had to name in writing about
+`tier == AgentTier::Family`. The remedy was not six more arms but taking the right
+to enumerate away from the call sites: `mika-cli` now classifies through
+`commands/team_outcome.rs`, which names no variant, and
+`mika1940_no_hand_written_run_status_predicate_in_the_cli` (a `ProductionScanner`
+source scan) refuses a new one — **with an allowlist shipped empty**, since there
+is nothing to exempt, so no slot in which to drop the next lapse (mika#2323).
+Verified by hand at delivery: a seventh variant fails to compile at exactly four
+sites — `disposition()`, `Display`, `engine.rs`'s column match, `notification.rs`
+— and **zero** in `mika-cli`. Exit-code and `stdout` contract: `crates/mika-cli/CLAUDE.md`
+§ `mika ask`.
 
 ### Task Tracking
 
@@ -900,14 +1051,92 @@ STOP). What makes that acceptable is the **visibility**, not the reasoning: the
 operator sees the effect in ≤ 10 min. If the reader ever becomes fallible in a way
 the operator cannot observe (DB, network), redo the trade-off rather than transport it.
 
-**Scope:** `auto_pull` only. `is_stopped`/`stop_file_path` are parameterized by scan
-name so extending to `wip_rescue` / `qa_review_reconcile` is one line each — not done
-here, because stopping QA review is not the same decision as stopping the feeder.
+**Scope: `auto_pull`, then `worktree_reap` (mika#2420).** `is_stopped`/`stop_file_path`
+are parameterized by scan name, and mika#2329 shipped that parameterization while
+explicitly refusing to use it twice, for want of a measured need: *"stopping QA review
+is not the same decision as stopping the feeder."* **A destructive operation is
+precisely that need** — during an incident one wants to stop what *deletes* without
+restarting mika-spirit, which is the thing one least wants to do with dispatches in
+flight. `wip_rescue` and `qa_review_reconcile` still have **no** switch: stopping them
+destroys nothing, and shipping gestures nobody asked for stays YAGNI.
 Structural guard `mika2329_le_chemin_du_fichier_sentinelle_a_un_seul_lecteur` refuses
-a second occurrence of the path literal under `src/`; a copy would make no decision
-wrong the day it is written, which is exactly why no behavioural test can see it
-(`grooming_marker` precedent). Operator surfaces, the exact gesture, and the
-post-deploy probe: root `CLAUDE.md` § *Optional (STOP global à chaud — mika#2329)*.
+a second occurrence of **either** scan's path literal under `src/` — extended with the
+second scan in the same commit, because a scan born outside the guard is a scan on
+which the `grooming_marker` lesson replays. A copy would make no decision wrong the day
+it is written, which is exactly why no behavioural test can see it. Note the guard is
+deliberately literal: naming the sentinel path in a *doc comment* is a hit too, so both
+call sites reference the constant and the operator-facing path lives in `CLAUDE.md`.
+Operator surfaces, the exact gesture, and the post-deploy probe: root `CLAUDE.md`
+§ *Optional (STOP global à chaud — mika#2329)* and § *Optional (terminal-worktree
+reaper — mika#2420)*.
+
+### Terminal-Worktree Reaper (mika#2420)
+
+`worktree_reaper` — the **fifth** recurring scan, beside `auto_pull`, `wip_rescue` and
+`qa_review_reconcile` in `task_engine/dispatcher.rs`, carried by mika-dev, cron
+`0 */10 * * * *`. It removes the dispatch worktrees under `.claude/worktrees/` whose PR
+is terminal — and their `target/` with them, which is the 25-to-44-Go consumer the
+founding ticket measures. Outside the LLM, outside the pilot session, triggered by time.
+
+**It is the only scan of the family whose action is destructive and irreversible**, and
+three things follow from that, in this order in the body of `dispatch_worktree_reap`:
+the STOP short-circuit is **first**, before any token resolution; the disposition is
+gated separately from the detection (`MIKA_WORKTREE_REAP_DISPOSITION=observe`); and
+every term of the predicate is fail-safe towards *keep*.
+
+**Three measurements moved the diagnosis, and they are the first deliverable.** The
+ticket reads prior art **#1694** as "closed but ineffective". (M1) It is a **dormeur**,
+a live line of `docs/dormeurs.md` whose wake condition is now met — mika#2420 is its
+*wake*, and U6 removes the line per the register's contract. (M2) Its logic **never
+reached `main`**: commit `097cc66c` carries a real implementation saved as `wip()` by
+the mika#1282 recovery and never promoted. (M3) Its own doc admits the defect in
+writing — *"layers A/B clean up whatever slips through"* — where A and B are **manual**
+and C is a `pull_request.closed` webhook handler, i.e. a **single non-replayable event**
+losable in the four places mika#2334 already had to name. The gesture whose three-hour
+half-life the ticket measures *is* layer B.
+
+**Shape.** `screen_worktrees` (T1–T6) and `apply_work_states` (T7) are pure functions
+carrying the whole decision; `select_worktrees_to_reap` composes them for tests while
+production calls them in sequence so the two `git` subprocesses of T7 are only paid for
+the survivors of T1–T6. The registry is read from `git worktree list --porcelain` —
+**the worktree path is declared, never derived** (mika-platform#58) — and `prunable`
+entries are dropped (they belong to `git worktree prune`, their directory is already
+gone). One `gh pr list --state all` per repo per tick; the `owner/repo` is derived from
+`git remote get-url origin` rather than declared in a second list to keep in sync.
+
+**The cap is a cap on writes**, applied by the caller after the filter (mika#2347's
+lesson transposed): applied upstream it would cap *skips*, and refused candidates would
+consume the tick in place of treatable ones. Pinned by
+`mika2420_un_refus_ne_consomme_pas_la_place_dun_traitable`.
+
+**Token** via `resolve_periodic_scan_token` (PAT-first, App fallback), covered by the
+mika#2205 structural guard, which was extended to this fifth scan in the same commit.
+The scan writes **nothing** on the forge (`gh pr list` is its only call), so there is no
+author for GitHub to read in the ADR-008 sense and no
+`resolve_periodic_scan_label_token`. `PeriodicScan` gained a variant, so
+`mika2334_every_scan_variant_is_covered` fails to compile until the guards enumerate it.
+
+**SOLE WRITER** of both audit `tool_name`s — `worktree_reaped` (`armed`, an effective
+removal) and `worktree_reap_would_dispose` (`observe`, the population that *would* be
+removed — mika#2469) — pinned by the same two-needle source scan. That is what makes
+`SELECT … WHERE tool_name = 'worktree_reaped'` the exact list of worktrees the loop
+removed, i.e. the ticket's guard-rail 3: since mika#2469 the name is reserved to the
+removal, and `outcome_for(disposition)` is the one site the log event and the audit
+`tool_name` both read, so the two surfaces cannot diverge. Refusals are written under
+`worktree_reap_skipped`, keyed `worktree:<path>@<motif>` and **deduplicated on 24 h**
+(mika#2131): a dirty worktree of a merged PR would otherwise write a row every ten
+minutes, and a motif *change* rewrites because it is a state change.
+
+**The negative control is what makes the positive one mean anything, and it had to
+assert the motif.** A vacuity-only assertion is **insensitive for T3 and T4**, both
+absorbed downstream by T5 (no known PR ⇒ no `closedAt` ⇒ refused; an open PR carries
+`closedAt: null` ⇒ refused). Verified by mutation, not by reasoning: removing T3 shifts
+the motif from `pr_unknown` to `pr_closed_at_unreadable` while leaving a vacuity-only
+test green. All seven terms were mutated one at a time and each was observed red.
+
+**Config, the eleven motifs, the four halts and the named residual risk** (an absent
+`refs/remotes/origin/<branch>` reads `Clean`, not `Unreadable`): root `CLAUDE.md`
+§ *Optional (terminal-worktree reaper — mika#2420)*.
 
 ### Unknown-Trigger Veto Lift (mika#2337)
 
@@ -1205,17 +1434,101 @@ worse than the silence it replaces.
 
 **Three composers + one loop.** `Reader` (`reader.rs`) wraps `gh` CLI (`api`/`issue list`/`pr list`) mirroring the `auto_pull::gh_list_open_issues` subprocess shape and composes `MilestoneState` (sub-issues + progress counts + recent activity). `Assessor` (`assessor.rs`) applies four rules (stale-blocker, silent-progress, silence-in-JOURS, priority ranking) and classifies `Severity` (Healthy/Attention/Blocked). `Reporter` (`reporter.rs`) formats the § 2d Markdown report. `run_manager_cycle` in `cadence.rs` orchestrates read→assess→deliver with hybrid cadence: event-driven trigger on `state_digest` change + 6h plancher heartbeat (« l'absence d'event EST l'event »).
 
-**Wrapper-only INV-2.** No new GitHub API client dep; `Reader` uses `tokio::process::Command::new("gh")` verbatim from `auto_pull.rs`. Delivery uses the existing workspace `reqwest` — bearer-token POST to `MIKA_MANAGER_DELIVERY_URL` (normal) or `MIKA_MANAGER_ESCALATION_URL` (Severity::Blocked → Vincent-direct route). Both URLs unset → offline sink at `MIKA_MANAGER_SINK_DIR` so nothing is lost during bring-up.
+**Wrapper-only INV-2.** No new GitHub API client dep; `Reader` uses `tokio::process::Command::new("gh")` verbatim from `auto_pull.rs`. Delivery uses the existing workspace `reqwest` — bearer-token POST to `MIKA_MANAGER_DELIVERY_URL` (normal) or `MIKA_MANAGER_ESCALATION_URL` (Severity::Blocked → Vincent-direct route). Both URLs unset → offline sink at `MIKA_MANAGER_OFFLINE_SINK_DIR` so nothing is lost during bring-up. **That variable name is the one the code reads, and this line used to carry a different one** (`MIKA_MANAGER_SINK_DIR`, which exists nowhere) while the line six paragraphs down spelled it correctly — the class mika#1971 named in as many words: *a deployer who followed it put the key in the one place it could not work*. The occurrence is fixed; the class is closed by `mika2267_every_manager_env_const_is_declared_in_env_example`, which refuses an `ENV_*` const the code reads and `.env.example` does not declare.
 
 **Structural LECTURE-seule enforcement.** `no_dispatch_test.rs` greps the module tree for forbidden write-authority tokens (`run_claude_pilot`, `pr_merge_with_gate`, `gh api "PATCH"`, `gh issue edit`, …) and fails the test binary if any executable code contains them. Prompt-level "no dispatch" rules are fragile per `feedback_prompt_enforcement_fragile` — this test is the structural gate. Comments are stripped before scanning so doc prose can describe what's forbidden.
 
 **CLI surface.** `mika milestone {read,assess,report} <owner/repo>#<number>` — thin adapter in `crates/mika-cli/src/commands/milestone.rs`. Report subcommand emits Markdown to stdout; `read`/`assess` default to pretty JSON (also YAML via `--format yaml`).
 
-**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`).
+### The offline sink has a reader (mika#2267)
+
+**The defect, and the rectification the code imposed on the ticket.** mika#2267 read the symptom as a broken cm delivery channel (*"sink offline vs endpoint, à déterminer"*) and offered two branches: repair the delivery, or document the fallback sink. Reading the code moves the diagnosis one notch, and that displacement is the first deliverable. **The channel was not a pierced pipe: the fallback sink had no reader at all.** Exhaustive search over the tree returned `offline_sink` / `OFFLINE_SINK` at exactly three sites — the write (`cadence.rs`), the config (`spawn.rs`), the prose (this file). Zero CLI command, zero tool, zero HTTP route, zero runbook, zero consumer. From the point of view of the human who owes the Reader fidelity verdict, **"the channel is broken" and "the channel is a well" produce exactly the same bytes: none.** Same class as mika#2205 (*a silently inert scan reads exactly like a scan that found nothing to do*) and mika#2131's mute exclusions.
+
+**Scope constraint, stated rather than discovered.** `control-monitor` is **not in this workspace** (it holds `claude-pilot/` and `mika/` only), so no line of this repo can make a cm endpoint exist or make it live. This work takes the second branch the ticket explicitly authorises — and makes it better than documentation by shipping a **reader**. Prose saying "reports are in `~/.mika/manager/sink/`" leaves the verdict hanging on an `ls` someone has to remember; a subcommand makes it executable and, above all, **names the path it consulted**, which is the only way the CLI-and-daemon-disagree case becomes readable in one line instead of an investigation. Repairing the cm delivery stays a **follow-up ticket**, and its precondition is the measurement this work produces: until one knows whether a URL was ever posted, "repair the channel" is repairing blind.
+
+**`mika milestone reports`** — `--target <owner/repo>#<n>` restricts to one milestone, `--latest` prints the most recent report's Markdown, `--limit` (default 20) caps the listing, `--format text|json|yaml`. **The load-bearing property is that an absent directory is not an empty one:** `SinkListing` has three variants (`DirAbsent` / `Empty` / `Entries`), never a bare empty list, because the two say opposite things — *the cadence has never written HERE* against *the cadence wrote here and the sink was emptied* — and collapsing them would reproduce, at the reader's own surface, the silence it exists to lift. The output **always names the consulted path and its provenance**, on the nominal path too.
+
+**One resolver, and the guard that keeps it one.** The path used to be composed inline in `manager_config_from_env`. A CLI reader recomposing it would be free to diverge from the writer — **and a reader that looks somewhere the writer does not is precisely the defect being closed, reproduced one layer up**. `milestone_manager::sink_dir::resolve_offline_sink_dir() -> (PathBuf, SinkDirSource)` is the sole site; writer and reader both go through it. `mika2267_sink_dir_resolution_has_a_single_reader` is a source scan over `crates/mika-agent/src` **and** `crates/mika-cli/src` refusing two needles — the env-var **literal** (a second reader relying on its own copy of the name) and the `.join("sink")` recomposition (a second reader refabricating the default path). **Allowlist shipped empty:** when it fires, remove the second site, do not allowlist it. No behavioural test can see that class — a second resolver makes no decision wrong the day it is written; it diverges later, in silence, with every assertion still green.
+
+**`manager_delivery_resolved` (INFO, once per cadence start)** — the line that settles the ticket's own question without reading the source. Fields: `milestone`, `route_normal` / `route_escalation` (`"http"` | `"offline_sink"` — what a non-`Blocked` and a `Blocked` severity will respectively take), `delivery_url_set`, `escalation_url_set`, `delivery_token_present`, `offline_sink_dir` (the **resolved** path), `sink_dir_source` (`"env"` | `"default"`). A distinct event rather than more fields on `manager_cadence_start`: it is a *configuration* event answering "where do my reports go?", not "the cadence started", and it must grep alone — exact precedent and identical reasoning, `llm_budget_resolved` (mika#2293), *un réglage qu'on ne peut pas observer n'est pas un réglage, c'est un espoir*. `delivery_token_present` is a **boolean** — never the value, never a prefix, never a length (doctrine `api_key_present`, asserted by a negative test that sweeps *every* field, because a leak arrives through the field nobody thought to look at). **Its absence while the cadence runs means the deployed binary predates the fix (class mika#2340)** — establish the deployment before concluding anything about the channel; never read the silence as "all is well".
+
+**`route` is a wire format, and the fallback stopped being mute.** Three constants, one site (`ROUTE_HTTP` / `ROUTE_OFFLINE_SINK` / `ROUTE_OFFLINE_SINK_FALLBACK`), pinned by test. The post-HTTP-failure fallback was **the only one of the three write paths emitting nothing**: it wrote the sink, set `delivered = true`, and left no line saying a report had been written or where. It now emits `manager_cycle_delivered` under `offline_sink_fallback`, **deliberately distinct** from `offline_sink`: the two populations say opposite things — *no URL was posted* (nominal bring-up, nothing is broken) against *a URL was posted and failed* (a real fault) — and merging them would erase the exact distinction the ticket asks to draw. Two crossed tests hold it: asserting only that the failure emits *a* line would be satisfied by reusing `offline_sink`.
+
+**What this does NOT change.** `CycleOutcome::delivered` keeps its meaning: `true` on all three paths. It is an output field read by tests and telemetry, and hardening it would change a public contract for a gain `manager_delivery_resolved` and the fallback route already deliver. What was missing was never a stricter boolean — **it was knowing where.** A future ticket that genuinely wants to tell "read" from "written" must first define what "read" means; that is not a boolean question. The sink **format** is unchanged too (`write_offline_sink` still writes `report_markdown` alone, not the full `DeliveryBody`), with the named consequence that **the reader cannot filter by severity** — it lives in the report body, not in a machine header. Writing the full JSON would be richer but would change the format of files already on disk in production, and nothing in the ticket asks for that filter; date ordering covers the measured need, which is reading the latest report. A named limit, not an oversight.
+
+**Operator probes, and their halts.** (1) `grep manager_delivery_resolved "$MIKA_SPIRIT_LOG_FILE" | jq '{route_normal, route_escalation, delivery_url_set, offline_sink_dir, sink_dir_source}'` — `route_normal: "offline_sink"` means **no URL was ever posted**: the reports have been on disk from the start, the cm channel never existed, and the remedy is a configuration gesture plus the cm follow-up ticket, **not a code fix**. `route_normal: "http"` sends you to probe 2. **Halt — no line at all while the cadence runs:** class mika#2340, establish the deployment first. (2) `grep manager_cycle_delivered "$MIKA_SPIRIT_LOG_FILE" | jq -r .route | sort | uniq -c` — `http` dominant means delivery works and the symptom is **downstream** (the cm consumer does not render the reports): **halt, do not touch this repo**. `offline_sink_fallback` dominant means the endpoint refuses, and `manager_cycle_delivery_failed` carries the error; the cm follow-up then opens **with a count rather than an intuition**. (3) `mika milestone reports --latest` must return a non-empty Phase 1 report — **that is the criterion unblocking the Reader fidelity verdict**. **Halt — empty output while probe 1 says `offline_sink`:** the CLI and the daemon do not resolve the same path (different `HOME`, service under another user); compare the printed path against probe 1's `offline_sink_dir`, which is exactly why the reader names it. **Expected regimes:** `manager_delivery_resolved` one line per start, always present; `offline_sink_fallback` **zero in a healthy regime** — any occurrence is a configured endpoint refusing.
+
+**Out of scope, named.** The sink has **no rotation** and grows unbounded; the reader makes the volume visible, which is the precondition for deciding on rotation — a follow-up ticket if the probe shows a problematic volume. And `emit_auth_alarm` (`spawn.rs`) still writes **nothing** to the sink when `escalation_url` is unset: it returns early and only the `error!` survives. A real hole, found on the way and deliberately **distinct** — a lost report is not a lost alarm, and fixing it requires deciding what an alarm in a well even means. **Follow-up ticket.**
+
+**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`). **All ten are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
 
 **Cadence spawn.** `spawn.rs` (`manager_config_from_env` + `spawn_manager_cycle_task`, the latter taking an `Arc<dyn TokenResolver>` since mika#2013) wires the cycle as a background tokio task at `server::run_server` startup. Env-gated on `MIKA_MANAGER_TARGET_MILESTONE`: unset → INFO `manager_cadence_disabled` and no spawn; set-and-valid → INFO `manager_cadence_start` + spawn; set-and-malformed → ERROR `manager_cadence_config_invalid` and no spawn (startup continues). The loop polls at `cfg.poll_interval` and calls `run_manager_cycle`; the cycle body itself decides whether to deliver (state-change OR heartbeat-elapsed) and is a no-op otherwise. Cycle failures log at WARN and do not stop the loop — except a sustained authentication failure, which escalates per the token-renewal note below (mika#2013). Graceful shutdown responds to a dedicated `manager_shutdown_token` (sibling to `kg_shutdown_token` and `webhook_queue_shutdown`) — cancelled at the same `.with_graceful_shutdown` site. Structurally mirrors `kg::resolver_tick::spawn_resolver_tick_task` (same `tokio::select!` shape, same fail-open discipline, same `info!/warn!` lifecycle events). Injection-verified per `todos/mika-manager-cadence-wiring-injection-verification.md`.
 
 **Token renewal + auth alarm (mika#2013).** The cycle token is re-resolved **before every cycle** through a `TokenResolver` (`SettingsTokenResolver` in production — PAT first per ADR-008, GitHub App installation token as fallback), never frozen at spawn. The founding bug: `ManagerConfig.github_token` was resolved once in `manager_config_from_env` and forwarded verbatim to `gh` forever, so an App installation token (~1h TTL) left the manager cycling 401 until the process restarted — 16 `manager_cycle_error auth_class=401` in one night with nothing louder than a WARN. The renewal machinery already lived in `GitHubApp::installation_token()` (memory cache + 5-min expiry buffer); the defect was only that it was asked once. A change in the resolved value emits `manager_token_refreshed` (INFO, presence booleans only — never token material). Paired with it, `AuthFailureTracker` counts the **duration** of an unbroken `AuthClass::Unauthorized` run (a duration, not a cycle count: `poll_interval` is operator-configurable, so N cycles has no stable temporal meaning). Past `AUTH_PERSISTENT_FAILURE_THRESHOLD` (30 min) it emits `manager_auth_persistent_failure` (ERROR) and escalates to `MIKA_MANAGER_ESCALATION_URL`, re-announcing at most hourly (`AUTH_ALARM_REEMIT_INTERVAL`). The escalation carries a dedicated `AuthAlarmBody`, **not** a `DeliveryBody` — the alarm fires because the milestone could not be read, so an `Assessment` there would be fabricated state on the wire. Any successful cycle clears the window; non-401 failures neither advance nor clear it (a network blip is not proof of recovery, nor of auth failure). A failed re-resolution KEEPS the previous token rather than overwriting it with `None` — `reader.rs` only sets `GH_TOKEN` when `Some`, so overwriting would silently drop the cycle onto the host's ambient credentials. The refresh is bounded by `TOKEN_REFRESH_TIMEOUT` (15s) because it sits outside the `select!` on the cancellation token and `GitHubApp` holds its cache write-lock across an un-timed HTTP call. `AuthClass::Forbidden` is excluded from the alarm — a known gap tracked as mika#2063, left open because AC3 of the ratified mika#2013 plan asserts 403 does not fire.
+
+**Post-mika#1968 hardening (mika#1975).** Three changes, none of which moves a
+delivery route or an alarm threshold.
+
+*The boot probe is bounded.* `verify_gh_auth` wraps its single `gh` call in
+`GH_AUTH_PROBE_TIMEOUT` (15s, a named constant, deliberately not
+env-configurable — the same YAGNI rule `AUTH_PERSISTENT_FAILURE_THRESHOLD`
+states). **What an unbounded probe blocked was never startup**, contrary to the
+ticket: `spawn_manager_cycle_task` returns its handle immediately and
+`run_server` never awaits it, while the probe runs *inside* the spawned task.
+What it blocked is the **cadence loop before its first tick** —
+`tokio::time::interval` is built after the probe — so a hung `gh` meant zero
+cycles for ever, and it survived graceful shutdown too (`ProcessGhRunner::run`
+has no timeout, and the `select!` on `cancel` is downstream of the probe, so
+nothing drops the future `kill_on_drop` would need). The silence looked
+healthy: `manager_cadence_start` and `manager_delivery_resolved` are both
+emitted *before* the probe. New `AuthClass::Timeout` (`auth_class=timeout`),
+posed on the `Err(Elapsed)` arm and **nowhere else** — `classify_cycle_error`
+carries no `Timeout` pattern, and `"timed out"` stays under `Network` because a
+transport timeout is an observation about the network while this variant is a
+statement about a budget we enforced. Excluded from `is_auth_failure` for
+`Network`'s reason: a slow host is not a closed door.
+
+*The classifier stops reading its own arguments.* `ProcessGhRunner` now fails
+with a typed `GhCommandError { args, stderr }` (house precedent: `DeliveryError`
++ `downcast_ref`, and the mika#2179 rule that error classes come from the
+variant). `classify_cycle_error` / `classify_milestone_probe_error` take
+`&anyhow::Error` and classify the **`stderr` alone**, falling open to the
+rendered string when the downcast misses. The vector this closes is structural
+rather than measured: the rendered error carried
+`gh api /repos/{owner}/{repo}/milestones/{N}`, so with
+`MIKA_MANAGER_TARGET_MILESTONE=owner/repo#403` *every* failure of that call —
+a 500, an unrecognised DNS wording, a parse error — classified `Forbidden`,
+reached `is_auth_failure` and fired the 30-minute alarm with the wrong class and
+the wrong hint. The three numeric tests additionally go through
+`has_http_status`, which requires a status marker (`http`/`status`/`code`)
+within 24 characters upstream and non-digit boundaries. **No non-numeric pattern
+was removed** — `unauthorized`, `bad credentials`, `gh auth login`,
+`authentication token not found`: the last two are mika#2013's *missing-token*
+shapes, which carry no HTTP status at all, and dropping one would make a
+token-less manager classify `Other`, i.e. reopen the blindness mika#2013 closed.
+That invariant (*the tightening removes false positives only*) is pinned by a
+frozen corpus, `mika1975_the_classification_of_every_measured_auth_shape_is_unchanged`.
+`stderr_head` deliberately keeps the **whole** rendered string, command line
+included: the tightening is on what is *classified*, never on what is *logged*.
+
+*The spawn guard cannot poison.* `MANAGER_SPAWN_GUARD` is an `AtomicBool` with
+`swap(true, SeqCst)` instead of a `Mutex<bool>` + `.lock().unwrap()`. The ticket
+asked for `PoisonError` recovery; the critical section was a `bool` read, a
+`warn!` and a `bool` write, so **the only realistic panic site in it was the
+logging macro** — a recovery path that logs is unreliable exactly when it is
+needed. No poisoning test was added: asserting "it does not poison" on a type
+with no poisoning is empty.
+
+**Out of scope, named.** AC4 (proactive App-token refresh) is mika#2013's whole
+subject and was removed from this ticket by an operator comment dated
+2026-08-29; mika#2013 has since shipped it (`refresh_cycle_token`). The
+cycle-body `gh` calls in `Reader::read` remain unbounded — same class, larger
+blast radius (the loop freezes mid-cycle, in steady state), different remedy
+(a per-call budget must compose with `poll_interval` and with
+`MissedTickBehavior::Burst`), and a single global timeout in
+`ProcessGhRunner::run` is refused because one constant cannot fit both
+`gh api /milestones/N` and `gh pr list --limit 100 --search`, nor the CLI paths
+where an operator is waiting. That is its own ticket.
 
 **Phase 2 gates NOT wired.** Dispatch authority stays gated behind the three portes (forge-gate loop-résistance + contention exec + INTERNAL_TOKEN alignment) documented in the brief § 3. This module contains no dispatch class, no `run_claude_pilot` invocation site, no scope-approval callsite. Promotion to Phase 2 requires updating both `no_dispatch_test.rs` FORBIDDEN_TOKENS and the module docstring atomically.
 
@@ -1749,6 +2062,139 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **SilentTrigger variants:** `Heartbeat`, `Reflection`, `Callback`, `SkillRun`, `Reminder`, `PostCallbackAdvance` (#991), `DeferredDispatch` (mika#1011). Each produces correct system-prompt framing. `PostCallbackAdvance` is an engine-side structural backstop — fired by the dispatcher after a milestone/project-context callback turn completes without advancing the queue. `DeferredDispatch` is an engine-side auto-recovery for `global_dispatch_active` rejections — when `run_claude_pilot` is rejected because another dispatch is active, the engine registers a `pending` callback task with label `long_running:run_claude_pilot:deferred`. When the blocking dispatch completes, the deferred callback is promoted (status → `completed`) and dispatched on the next engine tick as a `DeferredDispatch` turn whose only required action is `run_claude_pilot` (enforced by the `deferred_dispatch_action` INTENT_GUARD). **Promotion paths (mika#1070):** (1) Inline — `dispatch_next_deferred_callback()` (`pub(crate)`) fires after `mark_task_delivered` on a non-deferred callback. mika#1124 re-added the inline anti-cascade guard at `dispatcher.rs:495`: when a `:deferred` wrapper itself completes (e.g., the silent turn no-ops), inline chain-promotion is SKIPPED — relying on the periodic backstop instead. This prevents the no-op-cascade failure mode where N wrappers drain the queue inline without ever dispatching. Real (non-deferred) callback completions still chain-promote immediately. (2) Periodic backstop — `promote_pending_deferred_if_idle()` runs every `DB_SCAN_INTERVAL_TICKS` (60 ticks), iterates over the `dispatch_class` values (`DISPATCH_CLASSES = &["implement", "groom"]` — pinned to `derive_dispatch_class` at `skills/executor.rs` via a shape test in `engine.rs`), checks `has_any_active_callback_for_class(class)` (excludes deferred wrappers via `label NOT LIKE '%:deferred'`, scopes by `COALESCE(dispatch_class, 'implement') = ?`), and promotes one wrapper per idle class per tick via `dispatch_next_deferred_callback_for_class(class)` (mika#1175). Per-class iteration prevents cross-class throughput halving when wrappers from multiple classes are co-pending. Placed BEFORE `dispatch_undelivered_callbacks` for same-tick dispatch. Fail-closed per-class on DB errors — one class's check error does not stall the other. The agent-wide siblings `has_any_active_callback()` and `dispatch_next_deferred_callback()` are kept for the inline-promotion path in `handle_task_complete` (out-of-scope for #1175, see plan § Open question 1). **Both slot predicates must exclude `:deferred` wrappers (mika#1163).** `has_any_active_callback`/`has_any_active_callback_for_class` (engine backstop) AND `has_active_callback_tasks_excluding` (per-class gate inside `validate_dispatch_readiness`) all apply `label NOT LIKE '%:deferred'`. The earlier asymmetric version caused a multi-wrapper deadlock: when two parents each held a pending wrapper, every dispatch attempt from one wrapper saw the OTHER wrapper as slot-occupied and registered yet another wrapper, with no real dispatch ever spawning. **AgentBusy recovery (mika#1070):** when `dispatch_resume_agent` returns `AgentBusy` in `handle_task_complete`, the callback keeps `completed` status (not reset to `pending`) with `next_fire_at` set to now+30s for retry delay. `dispatch_undelivered_callbacks` has a `next_fire_at` guard that skips tasks whose retry delay has not expired. γ composition: the LLM's `send_message` notification and the engine's deferred callback are independent; `validate_dispatch_readiness()` arbitrates any race. Per-agent cap of 10 pending deferred callbacks prevents flood. `cancel_task()` cascades to callback children (both immediate and deferred). **No-op wrapper detection (mika#1172 R9):** When a `:deferred` wrapper completes, the dispatcher checks `has_non_deferred_active_callback_child(parent_task_id)`. If no active child exists, emits `deferred_dispatch_noop_completion` WARN + audit event — the silent turn failed to spawn a real dispatch (mika#1124 regression signal). **Dispatch lifecycle audit events (mika#1172 W4):** Three events written to `audit_events`: `deferred_dispatch_promoted` (on each inline or periodic backstop promotion, with promoted task ID), `deferred_dispatch_registered` (on deferred callback registration at `global_dispatch_active` rejection), `deferred_dispatch_noop_completion` (on no-op wrapper detection). Promote methods (`promote_next_deferred_callback`, `promote_next_deferred_callback_for_class`) return `Option<String>` (promoted task ID) instead of `bool` to enable meaningful audit event resource_id. **(3) Force-promote (mika#1453)** — `promote_deferred_callback` agent tool (fail-closed: rejects when slot busy, no override) and `mika tasks promote-deferred <class>` CLI verb (with `--override` for cancel-then-promote). Both call `force_promote_deferred_for_class()` which shares the `has_any_active_callback_for_class()` predicate (mika#1163 parity). `find_active_callback_for_class()` identifies the blocker for the CLI override path. Three audit event types: `deferred_dispatch_force_promote_succeeded`, `deferred_dispatch_force_promote_rejected_slot_busy`, `deferred_dispatch_force_promote_override`. **What the stuck-pending reaper makes of a promoted wrapper (mika#2181).** Promotion writes `status = 'completed'`; the silent turn that consumes the wrapper only reaches `delivered` when it *returns*, minutes later under a slow model. For the reaper's predicate (`find_orphaned_pending_issue_tasks`) a deferred wrapper therefore counts as **live** when it is `pending`, **or** `completed` with a `completed_at` newer than `now - MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (default 2700s, `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`). The bound is load-bearing, not a rounding: on the silent-turn error path the wrapper is re-armed but never marked `delivered`, so it stays `completed` forever, and an unbounded predicate would turn that corpse into a permanent shield against repair. `delivered`, `failed` and `cancelled` are never live. `has_live_deferred_wrapper_child` (renamed from `has_pending_deferred_wrapper_child`) answers the same question with the same predicate — the two must not diverge. The `mika tasks stuck` probe takes the same two windows as the reaper, so probe and engine report on one population.
 
+#### The direct measure that succeeds the proxy window (mika#2184)
+
+**What mika#2181 could not reach, measured.** Its window is a proxy on the
+*promotion* instant, and the residue is in the code's own doc-comment: over 30
+days, **139 of 799** delivered wrappers (17 %) delivered past 2700 s, **81** of
+their parents were expired `stuck_pending_no_deferred_wrapper`, and **8** of
+those were expired **2820–4996 s** after promotion — out of reach of *any* value
+of the constant compatible with a useful reaper. Widening it is the wrong reflex,
+and the ticket's argument for that is the one worth keeping: a wrapper delayed by
+a restart is a **healthy** wrapper, so a bigger number buys coverage by blinding
+the reaper for longer. *A window on a proxy is a dated debt*
+(`docs/solutions/best-practices/une-fenetre-bornee-sur-un-proxy-est-une-dette-datee-2026-09-05.md`).
+
+**The chain is joined by equality, and it already existed.** The turn consuming a
+promoted wrapper is a `SilentTrigger::DeferredDispatch`, and
+`dispatch_resume_agent` opens its session with
+`create_session_with_parent(…, task_id = Some(&task.id))` where `task.id` is **the
+wrapper**. So `parent → wrappers (label = DEFERRED_DISPATCH_LABEL) → sessions
+(sessions.task_id = wrapper.id) → llm_calls / tool_calls`. Stricter than mika#1652,
+which has to fall back on `session_id LIKE 'team-' || r.id || '%'`. The `task_id`
+column has existed since v19: no migration, no column.
+
+**Three causes of delay, and they do NOT share a measure — this is the ticket's
+own premise, corrected.** The ticket writes that the silent turn "produces those
+same rows". True *when the turn runs*. A wrapper `completed` and not `delivered`
+past 2700 s has three causes: **(A)** the turn runs and is slow — the AC1 case,
+and the only one an activity measure covers; **(B)** `AgentBusy` — the agent lock
+is held elsewhere and `dispatch_resume_agent` returns `Err` **before**
+`create_session_with_parent`, so there is no session and nothing to measure;
+**(C)** a service restart — nothing was running, and neither was the reaper.
+This work closes **A** by measurement and **C** by an admission (see
+`NotYetObservable` below); **B is not covered, and the refusal is reasoned** —
+the only available signal would be "the agent has activity somewhere else", which
+is true almost permanently on mika-dev and would disarm the reaper under cover of
+precision. Follow-up named.
+
+**Filtered in the application, never as a third `NOT EXISTS`.** The reflex would
+be one more clause in `find_orphaned_pending_issue_tasks`. Refused, and the
+refusal is written in the doc mika#2181 itself shipped: *"the shelter lives in a
+SQL `NOT EXISTS`: a sheltered parent never becomes a candidate and never traverses
+the application. No log, no audit, no counter […] indistinguishable from a healthy
+regime."* That is the defect mika#2181 had to repair after the fact with
+`find_parents_sheltered_by_promoted_wrapper`; doing it a second time in the same
+function would re-dig the hole just filled. The SQL yields the candidates (proxy
+window included, unchanged) and the direct measure filters afterwards, where it
+can log.
+
+**The DB returns an AGE, not a boolean.** `find_deferred_wrapper_activity_age_secs`
+— `None` when no row exists, and `None` is never `0` (mika#2331). Three reasons in
+order of weight: the threshold leaves the SQL and becomes a parameter of a pure
+function, testable at its boundaries without a database; the log line can then
+*name* the age, which mika#2277 paid dearly for not doing (two false positives read
+"nominal" on first inspection because one age was reported on a disposition
+crossing three); and a negative age (clock skew) clamps to `0` — "very recent",
+never "very old", fail-safe towards sparing.
+
+**Four states, and the disposition follows BOUNDEDNESS, not certainty.**
+`classify_wrapper_activity(last_activity_age_secs, window_secs, engine_uptime_secs,
+telemetry_armed)` is a pure function reading no global state; the disposition is an
+exhaustive `match` with **no `_ =>` arm** (the `hosting_ground_truth_line` pattern,
+mika#2290).
+
+| state | disposition | why |
+|---|---|---|
+| `Active` | **spare** | the turn is demonstrably working |
+| `NotYetObservable` | **spare** | the ignorance is **bounded**: it extinguishes itself as soon as uptime exceeds the window. Covers cause C |
+| `Silent` | reap | today's behaviour, bit for bit |
+| `NotRecorded` | reap + WARN | the ignorance is **permanent**: sparing here would restore the corpse-shield mika#2181 had to bound |
+
+*What cannot extinguish itself cannot spare.* `NotYetObservable` and `NotRecorded`
+are two variants rather than one `Unobservable { reason }` precisely because their
+disposition differs — **a reason that decides is not a reason, it is a state**.
+`telemetry_armed = store_llm_calls || store_tool_calls` is a setting that is
+**read**, never inferred from an absence of rows: telling "telemetry is off" from
+"the agent did nothing" is impossible by observation, which is the confusion
+mika#2277 condemns.
+
+**`MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS`**, default **600 s** = 2× the default
+turn envelope (`AGENT_TOTAL_TIMEOUT` 300 s, mika#2189), so it covers a whole turn
+*and* the interval to the next call with a factor of 2 of margin. Deliberately
+twice mika#1652's 300 s for team runs: the expensive error here is killing a live
+turn. House three-tier parse, plus a 30-day clamp — **not** the anti-`strftime`
+mechanism of `PROMOTED_WRAPPER_LIVENESS_MAX_SECS` (this threshold never enters the
+SQL), but the coherence of the knob: an absurd setting would spare every parent for
+ever, which is what `NotRecorded` already refuses on the other axis.
+
+**Two event names, and that rectifies AC4's letter while holding its intent.** AC4
+asks that `stuck_pending_sheltered_by_promoted_wrapper` "distinguish the two spare
+causes"; the literal reading is a `cause` field on that event. **Refused:** its name
+*carries* its cause, so routing an unrelated spare through it would make the name
+false and split in two the population mika#2181's probe counts to measure whether
+its debt is retiring. The house has an established way to keep two populations
+countable apart and has used it three times — `phantom_aged_out` /
+`phantom_sweep_spared` (mika#2156), `qa_deadline_verdict` / `qa_callback_verdict`
+(mika#2368), `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). So
+`stuck_pending_sheltered_by_promoted_wrapper` is **untouched** and
+`stuck_pending_sheltered_by_activity` is its sibling, each SOLE WRITER of its own
+name, pinned by `mika2184_the_two_spare_causes_have_one_writer_each`.
+
+**One reader, held by a source scan.** `mika2184_wrapper_activity_has_a_single_reader`
+refuses a second production site joining `tasks → sessions → llm_calls/tool_calls`,
+**allowlist shipped empty** — when it fires, remove the second site, do not exempt
+it. That is the `grooming_marker` lesson (mika#2158), which this very file has
+already paid a second time with `has_pending_deferred_wrapper_child`. The needle is
+a conjunction of three terms, each added by a measured false positive: it must not
+accuse `find_stuck_team_runs` (whose join is a `LIKE` on `session_id`) nor Signal A
+of `get_task_health_summary` (which walks the same three tables in the opposite
+direction). **Deliberately not unified with mika#1652:** disjoint populations,
+different joins — an abstraction drawn over two points whose joins differ is the
+wrong abstraction. What is shared is the *pattern*, not the code.
+
+**What a fresh process means for tests.** A newly constructed `TaskEngine` has zero
+uptime, so `classify_wrapper_activity` answers `NotYetObservable` and the reaper
+spares **everything** — correctly. Every reaper test that expects an action
+therefore declares that precondition through the `observing_engine` helper, rather
+than inheriting it from `Instant::now()` happening to be old enough.
+
+**The phantom-sweep sibling (comment 1 of mika#2184) is a SEPARATE fix, and the
+reason is structural.** A NULL-PID `action_type='none'` tracking row queued behind
+a busy slot produces **no** `llm_calls` and **no** `tool_calls`: it has not started.
+Measuring activity would spare it exactly zero times. Its discriminant is already
+named, in writing, in `dispatch_liveness`'s own doc-comment — *"a tracking row still
+waiting for a dispatch slot has no PID-carrying child at all — only a deferred
+wrapper — so this guard cannot see it"* — and the remedy there is to consult the
+deferred wrapper (`has_live_deferred_wrapper_child`, a predicate that already exists
+and has nothing to do with activity). Different population, different discriminant,
+different blast radius. **Precondition before opening it:** establish that the class
+still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since
+raised the grace to 14400 s.
+
+Operator surfaces, the five probes and their halts: root `CLAUDE.md`
+§ *Optional (mesure directe de vivacité du tour différé — mika#2184)*.
+
 #### A represented parent has nothing to repair (mika#2413)
 
 **The failure, measured 2026-09-19.** Three tickets were un-parked at once
@@ -1880,6 +2326,8 @@ indicator.
 
 **The seat vocabulary is written twice and guarded (mika#2092).** `KNOWN_DISPATCH_SEATS` (`webhook_dispatch.rs`) and the `dispatch:*` entries of `.github/labels.yml` are one list in two files, and they must move in the same commit. An undeclared seat is not merely undocumented: label-sync runs with `delete-other-labels: true`, so it is a label GitHub deletes from the repo and from every issue carrying it, without an `unlabeled` event — after which `classify_dispatch_seat` reads `NoSeatLabel` everywhere and the gate refuses nothing, silently. That happened on 2026-08-30 at 09:12:51Z, an hour before mika#2084 shipped, and it is why `dispatch:loop` — the label making `SeatVerdict::OwnedByCurrentSeat` reachable at all — did not exist until mika#2092. `scripts/check-dispatch-seats-declared.sh` now compares the two lists **both ways** (an orphan label resolves to `Unresolvable` and refuses the ticket, which is the mirror failure) and fails CI via the `dispatch-seats-lint` job; `scripts/test-check-dispatch-seats-declared.sh` pins its negative behaviour. `dispatch:zorglub`, the unknown-seat test fixture below, must stay undeclared.
 
+**The seat vocabulary is written a third time, and the loop now says its own name (mika#2155).** `skills/bundled/_shared/dispatch-lib.sh` writes the literal `dispatch:loop` — `_stamp_issue_seat` adds it to the issue when dispatch-lib takes the ticket (after the #2012 groom gate, before `git fetch origin main`, from the `LABELS` snapshot dispatch-lib fetched for its own gate — a read **later** than the engine's Rust one, so a `dispatch:*` posed between the two shows up as `owned_by_other` and is logged, never overwritten), and `_release_issue_seat` removes it **before** `mika ask --task-complete` in `_deliver_callback` — the message that lets mika-dev start the next dispatch on the ticket — with a second call at the head of the EXIT trap as the crash/cancel backstop (the first successful release lowers `ISSUE_SEAT_CLAIMED`, so the second is a no-op). Releasing only at exit would let the next dispatch read a label its predecessor is about to remove, skip its own stamp (`already_owned`), and run unclaimed for its whole life. Before that, the gate was one-directional: the loop refused a ticket claimed by ssc/mpc, but a human seat had no structural way to see the loop had taken theirs. The shell copy is a literal, not `dispatch:${SEAT}`, so rule L5 of `scripts/check-canonical-tokens.sh` confronts it with `labels.yml`; Rust↔YAML stays guarded by `check-dispatch-seats-declared.sh`. Two labels, two lifetimes: `origin:loop` on the PR answers *who produced this artefact* and is permanent (mika#2026); `dispatch:loop` on the issue answers *who is writing on this branch right now* and lives exactly as long as the dispatch. The stamp never writes over another `dispatch:*` (the refusal stays the engine's job — no second classifier in shell) and never blocks a dispatch when GitHub refuses it. A `dispatch:loop` seen with no live dispatch is the residue of a run killed without its trap; the next dispatch on that ticket reads it `already_owned` and releases it on its own exit. **Named residue, not closed here:** two dispatch-lib runs genuinely live on the same ticket at once (the exec-slot lease is keyed per `(agent_id, dispatch_class)`, not per issue; the ready-label path refuses that via `live_pilot_for_issue`, the other `validate_dispatch_readiness` callers do not) would still see the first exit strip the label from under the second — incidence unmeasured; wake condition: a `dispatch_seat.already_owned` in a dispatch trace while `tasks` shows another live dispatch on the same `repo#N`. `test_stamp_issue_seat.sh` pins the site order and the four no-write populations.
+
 **The exec slot is CLAIMED, not checked.** `has_active_callback_tasks_excluding` is a bare SELECT: on `None` the dispatch path proceeds, and the callback row that makes the slot observably held is written much later by the caller. In between, `validate_dispatch_readiness` performs several GitHub round-trips (issue body, open-PR, grooming markers — 10s timeout each), and four production callers enter it (`ready_label_handler`, the tool boundary, `task_engine::dispatcher`, `verdict_handler`). Two dispatchers could therefore both read "free" and both proceed — the 2026-08-30 shape, where a second writer landed on a branch SSC already had a PR open on. A slot two claimants can simultaneously believe they hold is not arbitration, it is a convention. `dispatch_slot_leases` (PRIMARY KEY `(agent_id, dispatch_class)`) makes the claim a fact: `try_acquire_dispatch_slot()` runs one `INSERT … ON CONFLICT … WHERE expired OR same-holder` inside an IMMEDIATE transaction, so the second claimant's INSERT collides rather than races. The claim is the **LAST** gate in `validate_dispatch_readiness`, on purpose — no fallible step follows it, which is why no error path needs to release a lease. Refusal is `dispatch_slot_contended`, registers a deferred wrapper like any other rejection, and writes an audit event naming the holder. The lease TTL (`DISPATCH_SLOT_LEASE_TTL_SECS`, 120s, override `MIKA_DISPATCH_SLOT_LEASE_TTL_SECS`) is what keeps fail-closed from becoming loop-breaking: it must exceed the window it guards (validation done → callback row exists, i.e. a process spawn) and stay far below a real dispatch's duration, so a dispatcher that dies mid-claim stalls its class for one TTL rather than forever.
 
 **Operator priority.** The three dispatchers are not peers: `operator > mika_manager > mika_dev`. `promote_pending_deferred_if_idle()` consults `has_pending_operator_task_for_class()` and stands down when the operator has `pending` work in that class, so an automatic wrapper promotion cannot take the slot out from under work the operator already drafted (they cannot see the queue and would simply find their dispatch refused). This check is fail-OPEN, unlike the slot-occupancy check above it — a busy slot is information we must have, whereas priority is a preference, and fail-closing here would strand deferred wrappers and cost the loop its recovery path. `force_promote_deferred_for_class` (mika#1453) is unaffected: it is the operator's own escape hatch, not the automatic path.
@@ -1964,6 +2412,8 @@ The audit row's `reasoning` carries **all three** idle ages since mika#2277 (`wo
 
 **Cost, bounded by ordering rather than by a cache.** Phase 2 resolves the fact **only when `in_flight` is false**, and `classify_stuck_ready` keeps its `live_pilot` branch *after* the `in_flight` one — pinned by `mika2279_the_nominal_in_flight_case_is_still_named_in_flight`, because a branch that drifted above would both charge the nominal case a `/proc` probe and merge two populations that must stay countable apart. The verdict is `Skip`, never `SkipAndResetBudget`: waiting for a pilot is right, calling the wait a success is what made the mika#2020 guard unreachable (mika#2158).
 
+**Phase 2 dispatches in-process; the churn is age and redundancy, never the sole trigger (mika#2470).** The stuck-ready net exists to survive the loss of the inbound webhook channel — and until mika#2470 its only action was a remove→add churn of `ready` whose `labeled` event had to *come back through that channel* to dispatch anything. Measured 2026-09-21 (eno1 unplugged, 0 webhooks for hours): three `stuck_ready_reconciled` lines, `count(tasks) = 0`. The rescue loop now calls `server::ready_label_handler::try_handle_ready_label_dispatch_with_fetcher` **directly, before the churn**, handing it the body and labels the tick already read as the injected fetcher (zero `gh issue view` per rescue; the handler decides on the same snapshot the Phase 2 filters used). Its fifteen gates apply unchanged, by call rather than by copy — `ready_label_handler.rs` carries a zero diff. Dispatch-before-churn is a **timing margin on a live channel, not an ordering invariant**: step 9i is a `tokio::spawn`, so the pgid is written by the detached task *after* the handler returns `Dispatched`, and gate 2c refuses the churn's `labeled` as `pilot_in_flight` only once that write has landed (milliseconds, against two `gh` round trips plus the GitHub → gateway → agent hop; a `labeled` that beats it lands in the step 7 → 9i window where 6b would kill the newborn, mika#2335 — probe S2 measures the margin: two `gate=dispatched` within a minute is the halt). On a non-`Dispatched` outcome that left a `pending` parent (9d slot taken → deferred wrapper; 9a/9b tool missing), the churn's `labeled` passes 2c and 6b, collides at step 7 on the active-URL index and returns `Passthrough` — one LLM turn spent on a ticket the engine already holds, no second pilot, no kill. The churn stays because it resets the label age (the mika#1824 D3 throttle; mika#2020 budget unchanged) — **except when the engine already holds the ticket** (third-pass mika-arch, Option A): `churn_is_moot(action, engine_holds)` = not `Dispatched` **and** `has_active_self_dev_task_for_issue(url)`; then the audit line carries `churn=skipped_in_flight`, the ledger records `in_flight_self_dev`, no re-drive budget point is spent, and the loop `continue`s — the age reset would throttle nothing (filter 4a excludes the ticket next tick) and the redundant trigger could only collide. A probe error churns as before (fail-open to the older shape). `rescued` counts churned rescues only; the audit line's `churn=` field says which. The per-tick cap `MAX_STUCK_RESCUE_PER_TICK` bounds **attempts** (counted before the direct call), not churn successes: a `gh_remove_label` failure `continue`s without a rescue, and every attempt runs the handler's readiness chain with real side effects. `DirectDispatchCtx { skills, global_home_dir }` descends from `TaskDispatcher` and is **not** an `Option` — an absent context is a compile error, not a silent return to label-and-wait. **SOLE WRITER** of `tool_name = 'stuck_ready_direct_dispatch'` (`target_key = issue:<n>`, `after_value ∈ {dispatched, handled, passthrough}`, `reasoning = issue=<n> action=<a> task_id=<id|none>`, under the tick's `trace_id`): `dispatched` is the primary success, the `self_dev` parent its topological consequence; on `handled`/`passthrough` join `ready_label_outcome` on `trace_id` to read the gate. `task_id` is known only for `Dispatched`; a `handled` line may still have left a `pending` parent (slot taken, tool absent) — find it by `tasks.reference_url`. Order pinned by `mika2470_direct_dispatch_precedes_the_label_churn` (source scan).
+
 **Filter B is not redundant with gate A.** "Terminal parent + live pilot" has other legitimate producers, the clearest of which is written in the code itself: when the supersession's kill does **not** land (EPERM, survival past SIGKILL), `tracking_cleanup` deliberately leaves the row and its pgid intact so a reaper can still reach the process. Add `mika tasks cancel --yes` and the grooming branch of `tools/create_task.rs`. **Out of scope, deliberately:** the LLM path into the supersede (`tools/create_task.rs`), whose legitimacy is not settled by this predicate.
 
 **Operator surfaces.** `ready_label_pilot_in_flight` (INFO + an `audit_events` row of the same name, keyed on the issue reference — no `task_id` exists at that point by construction, which is the property the gate is defined by), and the `live_pilot_orphaned_parent` exclusion filter on the `auto_pull` side. Queries, expected regimes and the 48 h post-deploy probe: root `CLAUDE.md` § *Un `labeled ready` répété sur un pilote vif est un NO-OP*.
@@ -2029,6 +2479,8 @@ Structured telemetry for the five fabrication-class EndTurn guards. Each guard f
 | `guard.dev_groom_fabrication` | 5b | Claims Verdict without `run_claude_pilot_groom` call |
 | `guard.doctrine_public_promo` | 5c | Proposes / drafts a prohibited public-launch surface (Show HN, Product Hunt, Reddit launch, Twitter promo, growth-hack) in violation of Mika's invitation-only distribution doctrine (mika#1814) |
 | `guard.false_local_hosting_claim` | 5d | Asserts this instance runs locally (or that the user's data never leaves their machine) while the resolved `Deployment` is not `Local` (mika#2290). Extra fields: `deployment`, `persona`, `matched_subject`, `matched_assertion` |
+| `guard.response_language_drift` | 5f | Answers in a language other than the one this tenant declared via `customer_config.language` (mika#2247). Extra fields: `expected_language`, `detected_language`, `detected_hits`, `expected_hits`. Expected regime: **low but non-zero** — each line is a turn caught |
+| `guard.time_of_day_greeting_mismatch` | 5g | Greets with a formula naming a part of the day the tenant is not in, while the local hour is known (mika#2247). Extra fields: `greeting`, `implied_part`, `actual_part` |
 | `guard.asserted_unavailability` | 6c | Claims tool unavailable when it's in the enabled set |
 | `guard.assert_grounded` | 6d | Affirms resource state without grounding tool call |
 
@@ -2045,6 +2497,8 @@ Fields: `trace_id`, `agent_id`, `session_id`, `step`, `guard_correlation_id` (`{
 | Event name | Fires when | Key fields |
 |---|---|---|
 | `guard.false_local_hosting_claim_uncorrected` | Guard 5d already fired this turn and the re-prompted response still asserts local hosting (mika#2290) | `deployment`, `matched_subject`, `matched_assertion`, `step`, `label` |
+| `guard.response_language_drift_uncorrected` | Guard 5f already fired and the re-prompted response is still in the wrong language (mika#2247) | `expected_language`, `detected_language`, `step`, `label` |
+| `guard.time_of_day_greeting_mismatch_uncorrected` | Guard 5g already fired and the re-prompted response still names the wrong part of the day (mika#2247) | `greeting`, `implied_part`, `actual_part`, `step`, `label` |
 
 **Expected regime: zero lines.** It exists because that population is otherwise indistinguishable from a healthy turn — the blind spot the Fire-Disposition gate (mika#1574) is there to close. It is **not** a second correction: the family grants one re-prompt, and a guard that diverged from its neighbours on that point would become the one everybody re-reads to find out why.
 

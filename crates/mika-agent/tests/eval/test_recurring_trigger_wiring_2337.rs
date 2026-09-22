@@ -36,6 +36,46 @@
 //! du 2026-09-16**, qui est un décalage entre le code mergé et le code en
 //! exécution : les deux littéraux étaient cohérents dans le source. Rendre
 //! lisible au démarrage la version réellement en exécution appartient au suivi.
+//!
+//! # mika#2446 — la deuxième occurrence de cette classe, et ses quatre gardes
+//!
+//! Le suivi nommé ci-dessus est arrivé : `worktree_reap` est mort deux fois sur
+//! deux redémarrages, et la lecture du code réfute les trois hypothèses du
+//! ticket (« objet compilé périmé » est structurellement impossible en Rust —
+//! l'unité de compilation est la crate, pas le fichier, et la registration comme
+//! le bras vivent dans `mika-agent` ; le refus au troisième redémarrage est le
+//! comportement **nominal** de mika#2337 ; et les cinq gardes ci-dessus sont
+//! vertes sur ce checkout). Le défaut réel est une **absence d'attribution** :
+//! la ligne de mort affirmait un décalage de version sans porter de quoi
+//! l'établir.
+//!
+//! Quatre gardes s'ajoutent ici, chacune avec sa disposition déclarée :
+//!
+//! - **D-1** [`mika2446_l_inventaire_est_la_projection_exacte_du_match`] —
+//!   `ROUTABLE_TRIGGERS` est l'égal ensembliste des bras du `match`. Liste
+//!   blanche **vide** : quand elle tire, on corrige la constante. Une exception
+//!   ici recréerait très exactement le défaut que la garde interdit, un
+//!   inventaire qui ment.
+//! - **D-2** [`mika2446_chaque_trigger_routable_a_un_armement`] — la sonde de
+//!   tir a une entrée d'herméticité **par** membre de `ROUTABLE_TRIGGERS`.
+//!   **Aucune liste blanche du tout** : une entrée « ce trigger est dispensé
+//!   d'armement » signifierait « ce trigger est tiré en test sans ceinture »,
+//!   c'est-à-dire la possibilité qu'une sonde supprime de vrais worktrees.
+//! - **D-3** [`mika2446_le_stop_precede_le_jeton_et_git_dans_le_reaper`] — dans
+//!   `dispatch_worktree_reap`, le test du STOP précède la première résolution de
+//!   jeton et la première invocation de `git`. **Aucune ligne de production
+//!   n'est déplacée** : la propriété est déjà vraie (mika#2420 l'a écrite avec
+//!   son raisonnement sur le site) ; la garde l'épingle parce que la sûreté
+//!   d'une sonde destructive en dépend désormais.
+//! - **D-4** — le contrôle négatif `zorglub` atteste en plus la présence et la
+//!   **non-vacuité** des champs d'attribution sur la ligne émise. Complément et
+//!   non jumeau de `build_info::tests::git_hash_is_never_empty`, qui couvre la
+//!   *constante* : une constante saine câblée sur rien produirait une ligne
+//!   muette avec un test vert. Halte-et-remontée — un champ vide signifie que
+//!   l'instrument ne tient pas sa promesse, donc que le correctif est faux.
+//!
+//! Et la sonde elle-même, [`mika2446_chaque_trigger_routable_est_tire`], tire
+//! **chaque** membre de l'inventaire par le chemin récurrent réel.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -166,6 +206,61 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// mika#2446 — l'appel à `ensure_recurring_task` situé à `call_idx` est-il le
+/// ré-enregistrement de `rearm_recurring_task`, précédé dans le même corps par
+/// le test `is_routable_trigger(` ?
+///
+/// Borné à `task_engine/mod.rs` et à cette seule fonction : l'exception est un
+/// site, pas une forme. Le corps est délimité par la déclaration de
+/// `rearm_recurring_task` et l'appel lui-même ; une autre déclaration `fn`
+/// entre les deux signifie que l'appel n'est pas dans ce corps.
+fn operator_rearm_site_is_routability_gated(rel: &str, src: &str, call_idx: usize) -> bool {
+    if rel != "task_engine/mod.rs" {
+        return false;
+    }
+    let Some(fn_start) = src[..call_idx].rfind("fn rearm_recurring_task(") else {
+        return false;
+    };
+    let body = &src[fn_start + "fn rearm_recurring_task(".len()..call_idx];
+    !body.contains("\nfn ") && !body.contains(" fn ") && body.contains("is_routable_trigger(")
+}
+
+/// mika#2446 — l'exception ci-dessus existe, est unique, et son précondition
+/// tient : dans `rearm_recurring_task`, le refus de routabilité précède le
+/// ré-enregistrement. Si un futur éditeur déplace l'appel avant le test (ou
+/// retire le test), ce test rougit — et la garde de classe retombe dans sa
+/// halte au lieu de laisser passer un enregistrement non gardé.
+#[test]
+fn mika2446_le_reenregistrement_operateur_est_garde_par_la_routabilite() {
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = scanner.src_root().to_path_buf();
+
+    let mut gated_sites = 0usize;
+    for path in scanner.files() {
+        let production = scanner.production_of(&path);
+        let src = production.as_str();
+        let rel = path
+            .strip_prefix(&src_dir)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let mut from = 0usize;
+        while let Some(rel_idx) = src[from..].find("ensure_recurring_task(") {
+            let idx = from + rel_idx;
+            from = idx + "ensure_recurring_task(".len();
+            if operator_rearm_site_is_routability_gated(&rel, src, idx) {
+                gated_sites += 1;
+            }
+        }
+    }
+    assert_eq!(
+        gated_sites, 1,
+        "exactement un site de ré-enregistrement opérateur doit être reconnu, \
+         et il doit être précédé du test de routabilité"
+    );
+}
+
 /// Les triggers `run_skill` enregistrés en production : `trigger → site`.
 ///
 /// La population est celle des **appels** à `task_engine::ensure_recurring_task`,
@@ -216,6 +311,20 @@ fn registered_triggers() -> BTreeMap<String, String> {
                  4e (`action_config`). Si la signature a changé, c'est ici qu'il \
                  faut la suivre — pas dans une exemption."
             );
+
+            // mika#2446 — une seule exception, nommée : le ré-armement
+            // opérateur ré-enregistre l'`action_config` lu sur une ligne morte,
+            // donc non littéral par construction. La propriété que cette garde
+            // protège (tout trigger enregistré a un bras) y est tenue à
+            // l'exécution par `is_routable_trigger`, dont l'inventaire est
+            // lui-même gardé égal au `match` (D-1). L'exception ne vaut que si
+            // ce test PRÉCÈDE l'appel dans le corps de `rearm_recurring_task` ;
+            // toute autre forme retombe dans la halte ci-dessous.
+            if string_literal_content(&args[3]).is_none()
+                && operator_rearm_site_is_routability_gated(&rel, src, idx)
+            {
+                continue;
+            }
 
             let literal = string_literal_content(&args[3]).unwrap_or_else(|| {
                 panic!(
@@ -382,6 +491,23 @@ fn test_db() -> AsyncDatabase {
 /// l'exécution du scan appelle le réseau et n'a pas sa place dans un test
 /// hermétique.
 fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+    test_dispatcher_in(db, Path::new("/tmp"), Path::new(GLOBAL_HOME_ABSENT))
+}
+
+/// mika#2329 — home global inexistant : aucun STOP n'y est armé, chemin nominal.
+const GLOBAL_HOME_ABSENT: &str = "/tmp/mika-test-global-home-absent";
+
+/// Le même dispatcher, avec ses deux homes **choisis** (mika#2446).
+///
+/// La sonde exhaustive en a besoin pour deux raisons opposées : armer le STOP
+/// sous un `global_home` temporaire (`worktree_reap`), et garantir qu'aucun
+/// `identity.toml` de la machine ne traîne sous le `home` de l'agent
+/// (`reflection`, dont le pré-filtre lit l'identité).
+fn test_dispatcher_in(
+    db: AsyncDatabase,
+    home_dir: &Path,
+    global_home_dir: &Path,
+) -> Arc<TaskDispatcher> {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let mut settings = mika_common::config::Settings::load(tmp.path()).expect("load settings");
     // `Settings::load` lit l'environnement : un PAT présent sur la machine de
@@ -395,9 +521,8 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
         tools: Arc::new(default_tools()),
         skills: Arc::new(SkillRegistry::empty()),
         message_sender: Some(Arc::new(NoopSender)),
-        home_dir: PathBuf::from("/tmp"),
-        // mika#2329 — home global inexistant : aucun STOP n'y est armé, chemin nominal.
-        global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
+        home_dir: home_dir.to_path_buf(),
+        global_home_dir: global_home_dir.to_path_buf(),
         embedding_client: None,
         brave_api_key: None,
         gateway_url: None,
@@ -410,6 +535,7 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
         settings,
         pr_reviews_posted: None,
         auto_pull_stop_armed: AtomicBool::new(false),
+        worktree_reap_stop_armed: AtomicBool::new(false),
         proactive_budget_reported: std::sync::Mutex::new(None),
     })
 }
@@ -433,6 +559,19 @@ async fn fire_recurring(
     action_config: &str,
     settled: impl Fn(&mika_agent::db::Task) -> bool,
 ) -> String {
+    let dispatcher = test_dispatcher(db.clone());
+    fire_recurring_with(db, label, action_config, dispatcher, settled).await
+}
+
+/// La même sonde, avec son dispatcher **fourni** — le seul degré de liberté
+/// dont la sonde exhaustive de mika#2446 a besoin pour armer ses ceintures.
+async fn fire_recurring_with(
+    db: &AsyncDatabase,
+    label: &str,
+    action_config: &str,
+    dispatcher: Arc<TaskDispatcher>,
+    settled: impl Fn(&mika_agent::db::Task) -> bool,
+) -> String {
     mika_agent::task_engine::ensure_recurring_task(db, label, "* * * * * *", action_config).await;
 
     let id = db
@@ -444,7 +583,6 @@ async fn fire_recurring(
         .map(|t| t.id)
         .expect("la récurrence doit être enregistrée");
 
-    let dispatcher = test_dispatcher(db.clone());
     let mut engine = TaskEngine::new(db.clone(), dispatcher);
     engine.startup_recovery().await.expect("startup recovery");
 
@@ -558,6 +696,64 @@ async fn mika2337_un_trigger_inconnu_meurt_nomme_audite_et_marque() {
         1,
         "la classe doit être audible en SQL — sans quoi elle n'est lisible que \
          par grep sur des giga-octets de journal"
+    );
+
+    // **D-4 (mika#2446) — la ligne porte sa preuve, et les champs ne sont pas
+    // vides.** Disposition : halte-et-remontée. Un champ d'attribution vide
+    // signifie qu'un binaire ne peut pas énoncer sa propre provenance sur le
+    // seul chemin où cette provenance est décisive — ce n'est ni une exception à
+    // inscrire ni un atterrissage à désactiver, c'est le correctif qui est faux.
+    //
+    // Complément, non jumeau, de `build_info::tests::git_hash_is_never_empty` :
+    // celui-là couvre la **constante**, celui-ci le **câblage** vers le champ
+    // émis. Une constante saine branchée sur rien produirait une ligne muette
+    // avec un test vert.
+    let rows = db
+        .get_audit_event_rows_by_tool_name("recurring_unknown_trigger")
+        .await
+        .expect("lire les lignes d'audit");
+    let reasoning = rows
+        .first()
+        .and_then(|(_, _, _, reasoning)| reasoning.clone())
+        .expect("la ligne d'audit doit porter un `reasoning`");
+
+    for field in [
+        "binary_version:",
+        "binary_git_hash:",
+        "process_id:",
+        "process_name:",
+        "routable_triggers:",
+    ] {
+        let value = reasoning
+            .split_once(field)
+            .map(|(_, rest)| rest.split_whitespace().next().unwrap_or(""))
+            .unwrap_or_else(|| {
+                panic!(
+                    "mika#2446 — le champ `{field}` manque du `reasoning` de la ligne de \
+                     mort. Sans lui, trancher entre « binaire ancien » et « défaut de \
+                     routage » exige `strings` et `/proc` sur un processus qui n'existe \
+                     plus. reasoning: {reasoning}"
+                )
+            });
+        assert!(
+            !value.is_empty(),
+            "mika#2446 — le champ `{field}` est **vide**. `unknown` est une réponse \
+             valide (build hors checkout) ; le vide n'en est pas une : il dit que \
+             l'instrument livré ne tient pas sa promesse. reasoning: {reasoning}"
+        );
+    }
+
+    // L'inventaire émis est bien celui de ce binaire, et il ne contient pas le
+    // trigger refusé — c'est cette comparaison, et elle seule, qui donne la
+    // lecture « décalage de version confirmé » sans sortir de la ligne.
+    assert!(
+        reasoning.contains("routable_triggers:heartbeat,"),
+        "l'inventaire doit être rendu tel que `routable_triggers_csv` le compose ; \
+         reasoning: {reasoning}"
+    );
+    assert!(
+        !mika_agent::task_engine::dispatcher::is_routable_trigger("zorglub"),
+        "le contrôle négatif ne vaut que si `zorglub` est bien hors de l'inventaire"
     );
 
     // Lu en JSON plutôt que par `get_task_metadata_field`, qui rend une chaîne :

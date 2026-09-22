@@ -86,7 +86,7 @@ export function Features() {
 
 function FeatureCard({ icon: Icon, title, description }: Feature) {
   return (
-    <div className="group h-full rounded-2xl border border-white/[0.05] bg-bg-card p-7 transition-all duration-300 hover:border-accent/40 hover:shadow-[0_0_30px_rgba(124,106,247,0.08),inset_0_1px_0_rgba(124,106,247,0.1)]">
+    <div className="group h-full rounded-2xl border border-white/[0.05] bg-bg-card p-7 transition-all duration-300 hover:border-accent/40 hover:shadow-[0_0_30px_color-mix(in_srgb,var(--color-accent)_8%,transparent),inset_0_1px_0_color-mix(in_srgb,var(--color-accent)_10%,transparent)]">
       <div className="mb-5 flex h-11 w-11 items-center justify-center rounded-xl bg-accent/10 text-accent transition-colors group-hover:bg-accent group-hover:text-white">
         <Icon className="h-5 w-5" strokeWidth={2} />
       </div>

@@ -23,7 +23,7 @@ When Mika runs for the first time, it bootstraps the home directory at
   soul.md            # Personality definition (system prompt)
   heartbeat.md       # Heartbeat checklist for proactive behaviors
   user.md            # User self-description (seeds initial context)
-  mcp.json           # MCP server configuration (optional, see below)
+  mcp.json           # Legacy MCP server config — migrated once, no longer read (see below)
   data/
     mika.db          # SQLite database (conversations, memory, reminders)
   logs/              # Log files
@@ -46,11 +46,23 @@ Bootstrap never overwrites existing files. If a file already exists, the default
 content is skipped. This means you can safely customize any file and re-run
 `mika setup` without losing changes.
 
-### mcp.json
+### mcp-servers.json (MCP servers)
 
-MCP (Model Context Protocol) servers are configured in `{agent_home}/mcp.json`.
-This file is not bootstrapped automatically -- create it via `mika mcp add` or
-by writing the file manually.
+**MCP configuration is operator-global, not per-agent** (mika#1737). It is read
+from the first of these that resolves:
+
+1. `MIKA_MCP_CONFIG` (absolute path override)
+2. `$XDG_CONFIG_HOME/mika/mcp-servers.json`
+3. `$HOME/.config/mika/mcp-servers.json`
+4. `./mcp-servers.json` (last resort; emits a warning)
+
+The per-agent `{agent_home}/mcp.json` shown in the tree above is **legacy**: it
+is copied once to the resolved path on first startup and is not read afterwards.
+
+The file is not bootstrapped automatically -- create it via `mika mcp add` or by
+writing it manually. A server configured there is loaded for **every** agent on
+this installation; see [mcp.md](mcp.md) for the isolation procedure and the
+availability-by-mode table.
 
 ```json
 {
@@ -94,10 +106,13 @@ by writing the file manually.
 - `mika mcp enable <name>` -- Enable a disabled server
 - `mika mcp disable <name>` -- Disable without removing
 
-**Security:** `mcp.json` is written with `0600` permissions on Unix. Header and
+`mika mcp add` exposes no `--env` flag: a stdio server that needs an environment
+variable requires hand-editing the file.
+
+**Security:** the file is written with `0600` permissions on Unix. Header and
 env values are redacted in debug output. Header values passed via `--header` on
 the command line are visible in shell history and process listings -- for
-sensitive tokens, edit `mcp.json` directly.
+sensitive tokens, edit the file directly.
 
 ---
 
@@ -535,9 +550,18 @@ logged under distinct event names (`identity_toml_absent`,
 different remediations. Note that **deleting the file and restarting does not
 regenerate it**: bootstrap only runs on an uninitialized home. A fail-closed
 start also empties the agent's `skills/` directory of its bundled-skill symlinks
-(re-materialized on the first valid start). The supported re-provisioning gesture
-is in `docs/operator/agent-identity-reprovision.md` in the repository — the path
-is written out rather than linked because this page is also shipped as a
+(re-materialized on the first valid start).
+
+The supported re-provisioning gesture is **`mika agents reprovision <agent>`**
+(mika#2230), which re-applies the authoritative `identity.toml` **and** `soul.md`
+— both, because a tier has two axes since mika#2023 and the boot-time tier guard
+reads either of them. It is differential (an identical file is left alone),
+backs up anything it overwrites as `<file>.bak.<timestamp>` in `0600`, refuses a
+template whose `[skills].allowlist` is absent or empty, and touches neither
+`config.toml` nor the database. Start with `--dry-run`. Full runbook, including
+the tier-change procedure and what the verb deliberately does not do, in
+`docs/operator/agent-identity-reprovision.md` in the repository — the path is
+written out rather than linked because this page is also shipped as a
 crate-local copy where a relative link would dangle.
 
 To customize, edit `~/.mika/identity.toml`:

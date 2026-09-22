@@ -106,6 +106,24 @@ pub const RECURRING_UNKNOWN_TRIGGER_PATH: &str = "$.unknown_trigger_death";
 /// closed. The lift buys **one** restart, not immunity.
 pub const RECURRING_UNKNOWN_TRIGGER_LIFT_CONSUMED_PATH: &str = "$.unknown_trigger_lift_consumed";
 
+/// mika#2446: JSON path of the marker an **operator** writes on a dead
+/// recurring row through `mika tasks rearm <label>` — the explicit, traced
+/// counterpart of the automatic exemptions above.
+///
+/// A row carrying this marker is invisible to the mika#1742 refuse-to-zombie
+/// guard, exactly like [`RECURRING_CONFIG_CANCEL_REVERTED_PATH`]. The lift is
+/// **per-row**: it absolves the deaths that existed when the operator acted,
+/// never a later one — a fresh death is a fresh row without the marker and
+/// meets a fully armed veto. The terminal status is not rewritten (the death
+/// stays a dated fact) and `updated_at` is not touched, so the marker ages out
+/// of the grace window together with the row and leaves no debt.
+///
+/// Load-bearing: bound as a parameter by
+/// [`Database::mark_recurring_operator_rearm`] (writer),
+/// [`Database::create_recurring_task_if_absent`] (the guard) and
+/// [`Database::list_recurring_registry`] (its `zombie_veto_active` mirror).
+pub const RECURRING_OPERATOR_REARM_PATH: &str = "$.operator_rearm";
+
 /// SQL for the unified_timeline VIEW — cross-subsystem event correlation.
 /// Used in both clean-slate schema creation and incremental migration.
 const UNIFIED_TIMELINE_VIEW_SQL: &str = "\
@@ -539,6 +557,24 @@ pub enum TeamRunIdFilter {
     NotNull,
     /// team_run_id = specific value
     Specific(String),
+}
+
+/// mika#2446 — the dead recurring row `mika tasks rearm <label>` resurrects.
+///
+/// Carries what re-registration needs (`cron_expr`, `action_config`) read off
+/// the dead row itself, so the operator never retypes a cron, plus the fields
+/// that name the death being absolved.
+#[derive(Debug, Clone)]
+pub struct RecurringRearmTarget {
+    pub task_id: String,
+    /// The label as stored — the lookup is `COLLATE NOCASE`, re-registration
+    /// must use the stored spelling.
+    pub label: String,
+    pub status: String,
+    pub cron_expr: Option<String>,
+    pub action_type: String,
+    pub action_config: String,
+    pub updated_at: String,
 }
 
 /// mika#2360 — closed projection of the recurring-task registry.
@@ -1815,6 +1851,50 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// The most recent `audit_events` row for (agent, tool_name, target_key)
+    /// with `created_at > since` — its `after_value`, `reasoning` and
+    /// `created_at` (mika#2242).
+    ///
+    /// # Why this is not [`Self::count_recent_audit_events_for_target`]
+    ///
+    /// That sibling answers *how many*, which is all a dedup or a circuit
+    /// breaker needs. mika#2242's reader needs *which one*: a count lets it say
+    /// "dé-groomé" and not "by PR #2226, branch `fix/umbrella-…`" — and the
+    /// pointer is the half that saves the reviewed work. Same predicate, same
+    /// agent scoping, one more column projected.
+    ///
+    /// `since` must be an ISO 8601 UTC timestamp (`%Y-%m-%dT%H:%M:%SZ`); string
+    /// comparison is correct because the column format is fixed-width UTC.
+    ///
+    /// `after_value` is returned as the `Option<String>` the column actually is.
+    /// Coercing a NULL to `""` would hand the caller a value indistinguishable
+    /// from a row that carried an empty one — the "`null` is never `0`" rule
+    /// mika#2331 had to write for `request_bytes`.
+    ///
+    /// `id DESC` breaks the tie: `created_at` is second-granularity, so two rows
+    /// written inside one second are otherwise ordered arbitrarily.
+    pub fn latest_audit_event_for_target(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestAuditEventProjection>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT after_value, reasoning, created_at FROM audit_events
+                 WHERE agent_id = ?1 AND tool_name = ?2 AND target_key = ?3
+                   AND created_at > ?4
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![agent_id, tool_name, target_key, since],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Read a `schema_meta` value, or `None` when the key was never stamped.
@@ -5571,7 +5651,9 @@ impl Database {
                             )
                             AND json_valid(t.metadata)
                             AND COALESCE(json_extract(t.metadata, ?5), 0) = 1
-                        ),
+                        )
+                        AND NOT (json_valid(t.metadata)
+                                 AND COALESCE(json_extract(t.metadata, ?8), 0) = 1),
                         0
                     ) AS zombie_veto_active
              FROM tasks t
@@ -5590,6 +5672,7 @@ impl Database {
                     RECURRING_UNKNOWN_TRIGGER_PATH,
                     limit as i64,
                     offset as i64,
+                    RECURRING_OPERATOR_REARM_PATH,
                 ],
                 |r| {
                     Ok(RecurringRegistryRow {

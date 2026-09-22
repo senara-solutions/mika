@@ -1284,6 +1284,274 @@ fn frequency_sentence_is_suppressed(text: &str, start: usize, end: usize) -> boo
 }
 
 // ---------------------------------------------------------------------------
+// mika#2247 — Response language-drift guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the language-drift guard
+/// (mika#2247 AC2). Inline guard at position 5f, immediately after 5e
+/// (`unactioned_frequency_promise`), whose shape, single-retry budget and
+/// `guard.*` telemetry it reuses.
+pub(crate) const RESPONSE_LANGUAGE_DRIFT_LABEL: &str = "response_language_drift";
+
+/// Structured result of a language-drift detection.
+pub(crate) struct LanguageDriftMatch {
+    /// The language the tenant declared (`fr` / `en`).
+    pub(crate) expected: &'static str,
+    /// The language this response was measured in.
+    pub(crate) detected: &'static str,
+    /// Function-word hits for the detected language, for the log line.
+    pub(crate) detected_hits: usize,
+    /// Function-word hits for the declared language.
+    pub(crate) expected_hits: usize,
+}
+
+/// French function words. Closed list, deliberately short: a discriminant, not
+/// a dictionary.
+const FRENCH_FUNCTION_WORDS: &[&str] = &[
+    "le", "la", "les", "de", "des", "un", "une", "et", "est", "dans", "que", "pour",
+];
+
+/// English function words. Same size and same role as its French sibling, so
+/// neither language has a structural scoring advantage.
+const ENGLISH_FUNCTION_WORDS: &[&str] = &[
+    "the", "a", "an", "of", "and", "is", "in", "that", "for", "to",
+];
+
+/// Minimum number of word tokens before the measurement means anything.
+///
+/// « Bonjour 🌸 », « OK », « All good » must stay **undecidable**: on a
+/// general-public tenant a false positive costs a needlessly re-prompted turn
+/// and a delayed answer, which is a worse trade than one missed drift. Twelve
+/// is comfortably above every short acknowledgement in the measured thread.
+const LANGUAGE_MIN_TOKENS: usize = 12;
+
+/// Minimum function-word hits the winning language must carry on its own.
+const LANGUAGE_MIN_HITS: usize = 3;
+
+/// Minimum lead the winner must have over the loser.
+///
+/// Both lists share tokens with the other language's ordinary vocabulary (`a`
+/// is an English article and a French verb; `est` is French and a compass point
+/// in English), so a one-hit lead decides nothing.
+const LANGUAGE_MIN_MARGIN: usize = 2;
+
+/// What [`measure_response_language`] concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LanguageVerdict {
+    /// Measured French, with enough tokens and enough margin.
+    French,
+    /// Measured English, likewise.
+    English,
+    /// Too short, too poor in function words, or too close to call. **The guard
+    /// does not fire.**
+    Undetermined,
+}
+
+/// Measure the language of a response by closed-list function words
+/// (mika#2247 AC2).
+///
+/// # Why function words and not a language-detection crate
+///
+/// No new dependency, and the discriminant is the part of a text a model does
+/// **not** vary: a French sentence carries `le`/`de`/`et` whatever its subject,
+/// and a proper noun, a code identifier or an emoji contributes to neither
+/// score. That is also what makes the fail-open cheap — a text with no function
+/// words at all simply scores zero on both sides.
+///
+/// # Fail-open, and it is what decides the feasibility of the whole axis
+///
+/// Three independent thresholds must all clear before a verdict is issued
+/// ([`LANGUAGE_MIN_TOKENS`], [`LANGUAGE_MIN_HITS`], [`LANGUAGE_MIN_MARGIN`]).
+/// Anything short, emoji-only, a bare proper noun, or code returns
+/// [`LanguageVerdict::Undetermined`], and the guard above does not fire. On a
+/// general-public tenant a false positive costs a re-prompted honest turn and a
+/// reply the person waits longer for; that is the expensive error here, not the
+/// missed drift.
+pub(crate) fn measure_response_language(text: &str) -> LanguageVerdict {
+    let lower = text.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.len() < LANGUAGE_MIN_TOKENS {
+        return LanguageVerdict::Undetermined;
+    }
+
+    let fr = tokens
+        .iter()
+        .filter(|t| FRENCH_FUNCTION_WORDS.contains(t))
+        .count();
+    let en = tokens
+        .iter()
+        .filter(|t| ENGLISH_FUNCTION_WORDS.contains(t))
+        .count();
+
+    let (winner, hits, loser_hits) = if fr >= en {
+        (LanguageVerdict::French, fr, en)
+    } else {
+        (LanguageVerdict::English, en, fr)
+    };
+
+    if hits < LANGUAGE_MIN_HITS || hits < loser_hits + LANGUAGE_MIN_MARGIN {
+        return LanguageVerdict::Undetermined;
+    }
+    winner
+}
+
+/// Detect a response written in a language other than the tenant's declared one
+/// (mika#2247 AC2).
+///
+/// `expected` is a parameter rather than a caller-side `if` for the reason
+/// mika#2290 wrote down for `deployment`: "an undeclared tenant is never
+/// guarded" then becomes a property of this pure function, carrying its own
+/// test, instead of living in one branch of the agent loop.
+///
+/// # What this guard does NOT do, written here rather than discovered
+///
+/// A one-shot re-prompt does not **guarantee** AC2. It bounds it and makes the
+/// residue countable, through `guard.response_language_drift_uncorrected` —
+/// exactly the gesture 5d and 5e make for their own residual populations. The
+/// acceptance criterion's word « tenue » is therefore delivered as *bounded and
+/// measured*, not as *impossible*. If the post-deploy measurement shows a
+/// non-negligible residue, the remedy is an engine net (mika#2368 shape), not a
+/// second re-prompt — **and that is a ticket, not a setting**.
+pub(crate) fn detect_response_language_drift(
+    text: &str,
+    expected: Option<crate::config_keys::TenantLanguage>,
+) -> Option<LanguageDriftMatch> {
+    // An undeclared tenant is not guarded: there is no fact to drift from.
+    let expected = expected?;
+
+    let measured = measure_response_language(text);
+    let detected = match (measured, expected) {
+        (LanguageVerdict::Undetermined, _) => return None,
+        (LanguageVerdict::French, crate::config_keys::TenantLanguage::French)
+        | (LanguageVerdict::English, crate::config_keys::TenantLanguage::English) => return None,
+        (LanguageVerdict::French, _) => crate::config_keys::TenantLanguage::French,
+        (LanguageVerdict::English, _) => crate::config_keys::TenantLanguage::English,
+    };
+
+    // Recomputed for the log line only: the decision above is already taken.
+    let lower = text.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let count = |list: &[&str]| tokens.iter().filter(|t| list.contains(t)).count();
+    let (detected_hits, expected_hits) = match detected {
+        crate::config_keys::TenantLanguage::French => {
+            (count(FRENCH_FUNCTION_WORDS), count(ENGLISH_FUNCTION_WORDS))
+        }
+        crate::config_keys::TenantLanguage::English => {
+            (count(ENGLISH_FUNCTION_WORDS), count(FRENCH_FUNCTION_WORDS))
+        }
+    };
+
+    Some(LanguageDriftMatch {
+        expected: expected.as_str(),
+        detected: detected.as_str(),
+        detected_hits,
+        expected_hits,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// mika#2247 — Time-of-day greeting guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the greeting guard
+/// (mika#2247 AC3). Inline guard at position 5g, immediately after 5f.
+pub(crate) const TIME_OF_DAY_GREETING_LABEL: &str = "time_of_day_greeting_mismatch";
+
+/// Structured result of a greeting/time mismatch.
+pub(crate) struct GreetingMismatch {
+    /// The greeting as it appears in the response.
+    pub(crate) greeting: String,
+    /// The part of the day it names or implies.
+    pub(crate) implied: &'static str,
+    /// The part of the day actually computed from the tenant's local time.
+    pub(crate) actual: &'static str,
+}
+
+/// Closed, narrow set of **explicitly time-stamped** greetings, and the parts of
+/// the day each one is correct in (mika#2247 AC3).
+///
+/// Narrow on purpose, and narrower than it could be. The fact is now *computed*
+/// and posed in `## Runtime`, so this guard is a net and not the mechanism: its
+/// risk profile is very different from the language guard's, and a wide lexicon
+/// on a general-public tenant would break honest turns. `bonjour` admits both
+/// morning and afternoon because French uses it until the evening; `bonne nuit`
+/// admits the evening because someone going to bed at nine is not making a
+/// mistake. What stays is the shape the ticket measured: a greeting that names a
+/// part of the day the tenant is not in.
+const TIME_STAMPED_GREETINGS: &[(&str, &[&str])] = &[
+    ("belle journée", &["morning", "afternoon"]),
+    ("bonne journée", &["morning", "afternoon"]),
+    ("bonne matinée", &["morning"]),
+    ("bon après-midi", &["afternoon"]),
+    ("bonne soirée", &["evening", "night"]),
+    ("bonjour", &["morning", "afternoon"]),
+    ("bonsoir", &["evening", "night"]),
+    ("bonne nuit", &["evening", "night"]),
+    ("good morning", &["morning"]),
+    ("good afternoon", &["afternoon"]),
+    ("good evening", &["evening", "night"]),
+    ("good night", &["evening", "night"]),
+    ("lovely day", &["morning", "afternoon"]),
+    ("have a good day", &["morning", "afternoon"]),
+];
+
+/// Detect a greeting that names a part of the day the tenant is not in
+/// (mika#2247 AC3).
+///
+/// # Fail-open on an unknown hour, and that is the whole safety argument
+///
+/// `local_part_of_day` is `None` whenever no usable timezone is declared, and
+/// the function then returns `None` immediately: with no local hour there is
+/// nothing for a greeting to contradict, and the prompt has already forbidden a
+/// time-stamped greeting on that path. The parameter is taken by the pure
+/// function rather than tested by the caller, for mika#2290's reason: "an
+/// undeclared tenant is never guarded" then carries its own test instead of
+/// living in a branch of the agent loop.
+///
+/// # Why this guard is narrow where 5f is not
+///
+/// AC2's mechanism *is* its guard — a language cannot be repaired mechanically.
+/// AC3's mechanism is the posed fact; this is a net behind it. So the two are
+/// tuned in opposite directions: 5f measures a whole text and accepts a broad
+/// population, 5g matches a closed list and refuses anything it is not sure of.
+pub(crate) fn detect_time_of_day_greeting_mismatch(
+    text: &str,
+    local_part_of_day: Option<&str>,
+) -> Option<GreetingMismatch> {
+    let actual = local_part_of_day?;
+    let lower = text.to_lowercase();
+
+    for (greeting, admissible) in TIME_STAMPED_GREETINGS {
+        if !lower.contains(greeting) {
+            continue;
+        }
+        if admissible.contains(&actual) {
+            continue;
+        }
+        // `admissible` is non-empty by construction; its first entry is the part
+        // of the day the greeting most directly names.
+        return Some(GreetingMismatch {
+            greeting: (*greeting).to_string(),
+            implied: admissible[0],
+            actual: match actual {
+                "morning" => "morning",
+                "afternoon" => "afternoon",
+                "evening" => "evening",
+                _ => "night",
+            },
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // mika#1646 — Destructive-action grounding guard (pre-execution)
 // ---------------------------------------------------------------------------
 //
@@ -3529,6 +3797,187 @@ mod tests {
             .is_none(),
             "`la veille` = the day before; the qualifier is what makes it a subject"
         );
+    }
+
+    // -- mika#2247 response language-drift tests --
+
+    use crate::config_keys::TenantLanguage;
+
+    /// The founding drift: a tenant that declared French answers in English.
+    #[test]
+    fn mika2247_english_answer_on_a_french_tenant_is_a_drift() {
+        let text = "So, who are you and what would you like me to help you with \
+                    today? I am here for anything that is on your mind.";
+        let m = detect_response_language_drift(text, Some(TenantLanguage::French))
+            .expect("an English paragraph on a `fr` tenant is the measured defect");
+        assert_eq!(m.expected, "fr");
+        assert_eq!(m.detected, "en");
+        assert!(m.detected_hits >= m.expected_hits + 2);
+    }
+
+    /// The mirror case, so the guard is not French-shaped.
+    #[test]
+    fn mika2247_french_answer_on_an_english_tenant_is_a_drift() {
+        let text = "Bonjour, je suis là pour t'accompagner dans la journée et pour \
+                    te rappeler les choses que tu ne veux pas oublier.";
+        let m = detect_response_language_drift(text, Some(TenantLanguage::English))
+            .expect("a French paragraph on an `en` tenant drifts too");
+        assert_eq!(m.expected, "en");
+        assert_eq!(m.detected, "fr");
+    }
+
+    /// The nominal case must cost nothing.
+    #[test]
+    fn mika2247_a_response_in_the_declared_language_does_not_fire() {
+        let french = "Bonjour, je suis là pour t'accompagner dans la journée et pour \
+                      te rappeler les choses que tu ne veux pas oublier.";
+        assert!(detect_response_language_drift(french, Some(TenantLanguage::French)).is_none());
+
+        let english = "So, who are you and what would you like me to help you with \
+                       today? I am here for anything that is on your mind.";
+        assert!(detect_response_language_drift(english, Some(TenantLanguage::English)).is_none());
+    }
+
+    /// **The fail-open control, and it is the property that decides the axis.**
+    ///
+    /// A short acknowledgement carries no measurable language. Firing on one
+    /// would re-prompt an honest turn and make a general-public tenant wait, on
+    /// a text nobody can classify. One test per shape rather than one for all
+    /// three (mika#2277 lesson): a single case would pass on a predicate that
+    /// only reads the token count.
+    #[test]
+    fn mika2247_short_text_is_undetermined() {
+        for text in ["OK", "Bonjour 🌸", "All good", "👍", "Mika", ""] {
+            assert_eq!(
+                measure_response_language(text),
+                LanguageVerdict::Undetermined,
+                "{text:?} must stay undecidable — a false positive costs an honest turn"
+            );
+            assert!(
+                detect_response_language_drift(text, Some(TenantLanguage::French)).is_none(),
+                "{text:?} must not fire the guard"
+            );
+            assert!(
+                detect_response_language_drift(text, Some(TenantLanguage::English)).is_none(),
+                "{text:?} must not fire the guard"
+            );
+        }
+    }
+
+    /// Long enough, but too poor in function words to decide: a list of proper
+    /// nouns, an identifier dump, an emoji wall.
+    #[test]
+    fn mika2247_a_long_text_without_function_words_is_undetermined() {
+        let text = "Alex Marie Kim Yuki Sofia Noor Mateo Aisha Lars Priya Chen Omar Ines";
+        assert_eq!(
+            measure_response_language(text),
+            LanguageVerdict::Undetermined,
+            "thirteen proper nouns decide nothing"
+        );
+    }
+
+    /// Too close to call. `a` is an English article and a French verb, so a
+    /// one-hit lead must not be a verdict.
+    #[test]
+    fn mika2247_a_narrow_lead_is_undetermined() {
+        // Four French hits (`il a` contributes `a` to English), one English.
+        let text = "Alex a dit quelque chose hier soir pendant que Marie \
+                    regardait tranquillement par la fenêtre ouverte";
+        let verdict = measure_response_language(text);
+        assert!(
+            matches!(
+                verdict,
+                LanguageVerdict::French | LanguageVerdict::Undetermined
+            ),
+            "a French sentence must never be measured English, got {verdict:?}"
+        );
+    }
+
+    /// An undeclared tenant is never guarded — the third state, and the reason
+    /// `expected` is a parameter of the pure function rather than a branch of
+    /// the agent loop.
+    #[test]
+    fn mika2247_an_undeclared_tenant_is_never_guarded() {
+        let text = "So, who are you and what would you like me to help you with \
+                    today? I am here for anything that is on your mind.";
+        assert!(
+            detect_response_language_drift(text, None).is_none(),
+            "no declaration, no ground truth, nothing to drift from"
+        );
+    }
+
+    // -- mika#2247 time-of-day greeting tests --
+
+    /// The founding symptom: « belle journée » sent in the evening.
+    #[test]
+    fn mika2247_a_daytime_farewell_in_the_evening_is_caught() {
+        let m = detect_time_of_day_greeting_mismatch(
+            "Je te laisse, belle journée à toi !",
+            Some("evening"),
+        )
+        .expect("this is the measured defect, word for word");
+        assert_eq!(m.greeting, "belle journée");
+        assert_eq!(m.actual, "evening");
+    }
+
+    /// The nominal case must cost nothing.
+    #[test]
+    fn mika2247_the_same_farewell_in_the_afternoon_does_not_fire() {
+        assert!(
+            detect_time_of_day_greeting_mismatch(
+                "Je te laisse, belle journée à toi !",
+                Some("afternoon")
+            )
+            .is_none()
+        );
+    }
+
+    /// **Fail-open on an unknown hour** — one of the two properties that decide
+    /// this guard's safety. With no declared timezone there is no local hour, so
+    /// there is nothing for a greeting to contradict; the prompt has already
+    /// forbidden a time-stamped greeting on that path.
+    #[test]
+    fn mika2247_an_unknown_hour_never_fires_the_greeting_guard() {
+        for text in [
+            "Bonsoir !",
+            "Good morning!",
+            "Je te laisse, belle journée à toi !",
+        ] {
+            assert!(
+                detect_time_of_day_greeting_mismatch(text, None).is_none(),
+                "{text:?} with no known local hour must fail open"
+            );
+        }
+    }
+
+    /// A greeting that names no part of the day is never a violation — which is
+    /// also the remedy the correction message offers.
+    #[test]
+    fn mika2247_a_time_neutral_greeting_is_never_a_mismatch() {
+        for part in ["morning", "afternoon", "evening", "night"] {
+            assert!(
+                detect_time_of_day_greeting_mismatch("Salut ! Je suis là.", Some(part)).is_none(),
+                "a neutral greeting must pass at {part}"
+            );
+        }
+    }
+
+    /// The list is narrow on purpose, and these two entries are where the
+    /// narrowness is deliberate: French uses `bonjour` until the evening, and
+    /// someone saying `bonne nuit` at nine in the evening is not mistaken.
+    #[test]
+    fn mika2247_the_greeting_list_is_deliberately_permissive_at_two_points() {
+        assert!(
+            detect_time_of_day_greeting_mismatch("Bonjour !", Some("afternoon")).is_none(),
+            "`bonjour` is correct all afternoon in French"
+        );
+        assert!(
+            detect_time_of_day_greeting_mismatch("Bonne nuit !", Some("evening")).is_none(),
+            "going to bed at nine is not an error"
+        );
+        // …but the shapes the ticket measured still fire.
+        assert!(detect_time_of_day_greeting_mismatch("Bonjour !", Some("night")).is_some());
+        assert!(detect_time_of_day_greeting_mismatch("Good morning!", Some("evening")).is_some());
     }
 
     // -- mika#1646 destructive-action grounding tests --

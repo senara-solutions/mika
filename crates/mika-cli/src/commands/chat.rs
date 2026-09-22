@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, AppContext};
 use crate::tui::app::{
     AgentRequest, AgentResponse, AgentStatus, App, ChatMessage, ChatRole, TeamRequest,
@@ -27,7 +28,7 @@ use mika_agent::agent::{self, AgentParams, check_onboarding};
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
-use mika_agent::teams::types::{RunStatus, TeamEvent};
+use mika_agent::teams::types::TeamEvent;
 use mika_agent::tools;
 use mika_common::claude::ThinkingConfig;
 use mika_common::config::Settings;
@@ -216,6 +217,7 @@ async fn spawn_agent_worker(
         settings: ctx.settings.clone(),
         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
         auto_pull_stop_armed: AtomicBool::new(false),
+        worktree_reap_stop_armed: AtomicBool::new(false),
         proactive_budget_reported: std::sync::Mutex::new(None),
     });
     let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
@@ -1101,12 +1103,56 @@ pub async fn run_team(
                     .await
                     {
                         Ok(run) => {
-                            if let RunStatus::Failed(reason) = run.status {
-                                let _ = response_tx.send(TeamEvent::RunFailed(reason));
-                            } else {
-                                let deliverable = run.deliverable.unwrap_or_default();
-                                let _ = response_tx.send(TeamEvent::Deliverable(deliverable));
-                            }
+                            // mika#1940 — same classifier as `mika ask --team`.
+                            let event = match crate::commands::team_outcome::classify(&run) {
+                                // Routing a failure to `RunFailed` is what makes
+                                // the damage structurally impossible rather than
+                                // merely forbidden: the TUI persists to the DB
+                                // only on the `Deliverable` branch
+                                // (`tui/app.rs`, `save_message("", "assistant",
+                                // …)`). Before this, a `FailedNoDelegation` run
+                                // carried `deliverable = Some(retry_reply)`, so
+                                // a failed run's text became a durable
+                                // `assistant` turn, re-read as context by every
+                                // later turn — the only one of the three defect
+                                // sites whose damage outlived the session.
+                                TeamOutcome::Failed {
+                                    diagnostic,
+                                    partial,
+                                } => {
+                                    let mut msg = diagnostic;
+                                    if let Some(partial) = partial {
+                                        msg.push('\n');
+                                        msg.push_str(
+                                            crate::commands::team_outcome::PARTIAL_OUTPUT_MARKER,
+                                        );
+                                        msg.push('\n');
+                                        msg.push_str(&partial);
+                                    }
+                                    TeamEvent::RunFailed(msg)
+                                }
+                                TeamOutcome::Delivered { text } => TeamEvent::Deliverable(text),
+                                TeamOutcome::CompletedWithoutDeliverable => {
+                                    TeamEvent::Deliverable(String::new())
+                                }
+                                // Current behaviour kept deliberately: the TUI
+                                // answers an empty deliverable with "Team
+                                // completed with no deliverable.", which is
+                                // false for a suspended run (it did not
+                                // complete, it is awaiting callbacks). Fixing
+                                // that needs an extra `TeamEvent` variant whose
+                                // fan-out touches both CLI callbacks, the TUI
+                                // and the engine's emission sites —
+                                // disproportionate for a p3 this is not about.
+                                // `ask.rs`, which has no interface state
+                                // machine, gets the honest note today; the
+                                // asymmetry is deliberate and tracked
+                                // (mika#1940, scope-out (b)).
+                                TeamOutcome::Pending { .. } => {
+                                    TeamEvent::Deliverable(String::new())
+                                }
+                            };
+                            let _ = response_tx.send(event);
                         }
                         Err(e) => {
                             let _ = response_tx.send(TeamEvent::RunFailed(format!("{e}")));

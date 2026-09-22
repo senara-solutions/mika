@@ -210,6 +210,30 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-a2a-timeout-literals.sh
 
+  canonical-tokens-lint:
+    name: Canonical Token Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The list must be EXHAUSTIVE against the code that matches (mika#2201,
+      # Prime's closing bound). This mode is the shell half of that guard; the
+      # Rust half runs in the normal `cargo test` job
+      # (canonical_tokens::tests::mika2201_*). They are complementary, not
+      # redundant: one starts from the reading FORM, the other from the TOKEN.
+      - name: Confront the canonical list to the tree (mika#2201)
+        run: bash scripts/canonical-tokens-survey.sh --check
+      # The lint itself, on S1 — the repository's prescribers. A prompt that
+      # prescribes a wrong form reproduces it on every ticket it produces, which
+      # is where `seconde passe` would have become systematic again.
+      - name: Reject non-canonical machine tokens in prescribers (mika#2201)
+        run: bash scripts/check-canonical-tokens.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103). This suite also pins the half that
+      # matters most here: that the lint does NOT bite on `seconde passe`, which
+      # `grooming_marker.rs` reads by written decision (mika#2201 § R1).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-canonical-tokens.sh
+
   dispatch-seats-lint:
     name: Dispatch Seat Declaration Lint
     runs-on: ubuntu-22.04
@@ -225,6 +249,22 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-dispatch-seats-declared.sh
 
+  landing-tokens-lint:
+    name: Landing Token Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The landing consumes the rulebook §2 palette from @samidarko/ui/theme.css
+      # (mika#1804, LC.5). A colour literal written back into site/ is a colour
+      # that stops tracking the rulebook — silently, and only visible the next
+      # time the rulebook moves. `site/` has no other automated check at all.
+      - name: Reject hardcoded colours in the landing (mika#1804)
+        run: bash scripts/check-landing-tokens.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint and dispatch-seats-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-landing-tokens.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
@@ -239,8 +279,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       # Les quatre occurrences mesurées de mika#2107 sont des fixtures nommées.
-      - name: Pin the guard's behaviour on the four measured occurrences (mika#2107)
+      # mika#2449 added the `--decide-primary` mode (run_shell → primary
+      # checkout); the same harness pins both modes, M0's three commands verbatim.
+      - name: Pin the guard's behaviour on the four measured occurrences (mika#2107) and the primary-checkout mode (mika#2449)
         run: bash scripts/test-guard-shared-checkout.sh
+      # The wiring of the primary mode into the shell-exec handler. A handler
+      # that calls nothing is green exactly like one that refuses; this harness
+      # strips the call and checks that it would go red (mika#2449 V5).
+      - name: Pin the run_shell wiring of the primary-checkout guard, negative control included (mika#2449)
+        run: bash scripts/test-shell-exec-guard.sh
       # La régression que ce check attrape ne rend AUCUNE décision fausse : elle
       # rend la garde absente, et les assertions comportementales ci-dessus
       # restent toutes vertes pendant que plus aucune session ne la charge.

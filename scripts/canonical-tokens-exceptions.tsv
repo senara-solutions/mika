@@ -1,0 +1,35 @@
+# Named exceptions to scripts/check-canonical-tokens.sh (mika#2201).
+#
+# SHIPPED EMPTY, AND MEASURED EMPTY ON 2026-09-20. If this file is non-empty at
+# merge time, its contents ARE the measure of the pre-existing defect, and every
+# row carries its follow-up ticket.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FOUR MANDATORY FIELDS, TAB-SEPARATED:
+#
+#   fichier   repo-relative path of the accused file
+#   jeton     the token or callout key the lint accused
+#   ticket    the follow-up ticket that will remove this row
+#   date      YYYY-MM-DD the row was added
+#
+# A row missing any of the four fails the build. An exception without a ticket
+# is a permanent exception wearing a temporary one's clothes.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SELF-CLEANING, AND THAT IS WHAT SEPARATES THIS FROM A JUNK DRAWER.
+#
+# The lint refuses a row whose file no longer carries the accused token. So a
+# row reddens ON THE DAY OF THE REPAIR rather than surviving it by months. That
+# is the whole defence against § R4: *one token wrongly accused, and the lint
+# stops being read* — and its mirror, *one exception that outlives its cause,
+# and the list becomes the drawer the real regression hides in*.
+#
+# NEVER a broad pattern. One row, one file, one token.
+#
+# NOTE — this file has NO counterpart for the exhaustiveness scan. There, the
+# doctrine admits no exception: a match site is DECLARED in
+# scripts/canonical-tokens.tsv, never allowlisted. A match site nobody wants to
+# declare is a match site to delete (mika#2201 § D5/D6).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# fichier	jeton	ticket	date

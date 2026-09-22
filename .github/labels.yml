@@ -138,7 +138,7 @@
 # production.
 - name: "dispatch:loop"
   color: "1d76db"
-  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Un seul dispatcher par ticket."
+  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Posée et retirée par dispatch-lib le temps d'un dispatch (mika#2155). Un seul dispatcher par ticket."
 
 - name: "dispatch:ssc"
   color: "5319e7"
@@ -202,6 +202,16 @@
 - name: human-review-required
   color: "d93f0b"
   description: "wip-rescue: le démon a bailé vers un humain (conflit/erreur), à résoudre à la main"
+
+# Written by `_finalize_pr_gate` (dispatch-lib.sh) when AC7's formal
+# multi-agent review is missing. Undeclared until mika#2201's L5 rule found it:
+# fifth occurrence of the class named in
+# docs/solutions/best-practices/un-label-denforcement-non-declare-echoue-en-silence-2026-09-01.md
+# — and its write is followed by `|| true`, so the failure was silent on both
+# ends. This sync runs with delete-other-labels: true.
+- name: needs-multi-agent-review
+  color: "d93f0b"
+  description: "dispatch-lib _finalize_pr_gate: AC7 formal multi-agent review missing on this PR"
 
 - name: rescue-after-review
   color: "b60205"

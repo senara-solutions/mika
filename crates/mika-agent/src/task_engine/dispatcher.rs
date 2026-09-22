@@ -44,6 +44,106 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
+/// Les triggers `run_skill` que **ce binaire** sait router (mika#2446).
+///
+/// **Projection du `match`, jamais son remplaçant.** La vérité d'exécution
+/// reste le `match trigger_name` de [`TaskDispatcher::dispatch_run_skill`] : on
+/// ne le remplace pas par une table de dispatch dynamique, ce qui déplacerait
+/// la décision dans une donnée — et une donnée périmée ne fait rougir aucun
+/// compilateur. Cette constante est un **inventaire**, et son honnêteté est
+/// tenue par une garde de source
+/// (`mika2446_l_inventaire_est_la_projection_exacte_du_match`, dans
+/// `tests/eval/test_recurring_trigger_wiring_2337.rs`) qui parse le bloc `match`
+/// et asserte l'égalité ensembliste. Un inventaire qui mentirait serait
+/// strictement pire que pas d'inventaire.
+///
+/// Il existe parce que la ligne de mort par trigger inconnu
+/// ([`DispatchError::UnknownTrigger`]) **affirmait sa cause sans la porter** :
+/// elle prescrivait « établir la version du binaire en exécution » sans fournir
+/// l'instrument pour le faire. Un opérateur a dû recourir à `/proc/<pid>/exe`,
+/// `strings | grep -c` et `mika --version` — puis a formulé une hypothèse qu'un
+/// seul champ de la ligne aurait réfutée immédiatement.
+///
+/// Deux lecteurs : le champ `routable_triggers` de l'événement
+/// `recurring_unknown_trigger` (`engine.rs`) et de l'attestation de démarrage
+/// `task_engine_trigger_registry` (`server/mod.rs`), et le refus de
+/// `mika tasks rearm` sur un label dont le trigger n'est pas routable ici.
+///
+/// **Refusé : dériver l'inventaire au runtime.** Il n'y a pas de réflexion sur
+/// un `match` en Rust, et toute dérivation serait une seconde liste écrite à la
+/// main — c'est-à-dire le problème, avec une étape de plus.
+pub const ROUTABLE_TRIGGERS: &[&str] = &[
+    "heartbeat",
+    "reflection",
+    "auto_pull_groomed",
+    "wip_rescue",
+    "qa_review_reconcile",
+    "worktree_reap",
+    "curator_review",
+];
+
+/// L'inventaire sous une forme prête à journaliser : `"a,b,c"`.
+///
+/// Un site unique parce que trois émetteurs le rendent (la ligne de mort, son
+/// audit, l'attestation de démarrage) et qu'un séparateur qui diverge entre
+/// deux d'entre eux coupe une population en deux sans le dire.
+pub fn routable_triggers_csv() -> String {
+    ROUTABLE_TRIGGERS.join(",")
+}
+
+/// Ce binaire sait-il router ce trigger ? Lecteur unique de [`ROUTABLE_TRIGGERS`]
+/// pour les prédicats (le CLI `mika tasks rearm`, mika#2446 R-5).
+pub fn is_routable_trigger(trigger: &str) -> bool {
+    ROUTABLE_TRIGGERS.contains(&trigger)
+}
+
+/// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
+///
+/// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
+/// être lisible **seule** — sans `strings`, sans `/proc`, sans `mika --version`
+/// lancé quatre heures plus tard sur un processus qui n'existe plus.
+///
+/// **Ce que ça n'atteste pas, dit ici plutôt que découvert :** la version du
+/// binaire qui *refuse*, jamais celle qui a *enregistré* la récurrente. Les deux
+/// peuvent différer — c'est précisément l'hypothèse de mika#2446 — et poser un
+/// tampon à l'enregistrement serait une seconde écriture sur un chemin nominal
+/// pour une population pathologique. L'inventaire du refusant suffit à trancher.
+pub struct BinaryAttribution {
+    /// Version sémantique servie.
+    pub version: &'static str,
+    /// Empreinte git, **rapportée telle quelle**. `"unknown"` (build hors
+    /// checkout, couche Docker) est une réponse — « ce binaire ne peut pas
+    /// énoncer sa provenance » — et non une absence de réponse : jamais corrigé,
+    /// jamais masqué. C'est le champ décisif : si c'est le commit qui porte le
+    /// bras, le décalage de version est réfuté et la cause est ailleurs.
+    pub git_hash: &'static str,
+    /// Quel processus a refusé.
+    pub process_id: u32,
+    /// `mika-spirit` ou `mika` — sépare le démon d'un `mika chat` qui tire les
+    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet, et
+    /// `cli_mode` ne court-circuite jamais le dispatch `run_skill`).
+    pub process_name: String,
+    /// L'inventaire **de ce binaire**, à comparer au trigger refusé.
+    pub routable_triggers: String,
+}
+
+/// L'attribution du processus courant. Trois émetteurs la rendent : la ligne de
+/// mort, sa ligne `audit_events`, et l'attestation de démarrage.
+pub fn binary_attribution() -> BinaryAttribution {
+    BinaryAttribution {
+        version: mika_common::build_info::VERSION,
+        git_hash: mika_common::build_info::GIT_HASH,
+        process_id: std::process::id(),
+        // Un exécutable illisible rend `"unknown"` : le champ dit alors qu'il ne
+        // sait pas, ce qui reste une information — la même règle que `git_hash`.
+        process_name: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        routable_triggers: routable_triggers_csv(),
+    }
+}
+
 /// Les scans périodiques qui résolvent leur token GitHub via
 /// [`resolve_periodic_scan_token`] (mika#2205).
 ///
@@ -54,6 +154,7 @@ enum PeriodicScan {
     AutoPull,
     WipRescue,
     QaReviewReconcile,
+    WorktreeReap,
 }
 
 impl PeriodicScan {
@@ -63,6 +164,7 @@ impl PeriodicScan {
             Self::AutoPull => "auto_pull_no_token",
             Self::WipRescue => "wip_rescue_no_token",
             Self::QaReviewReconcile => "qa_review_reconcile_no_token",
+            Self::WorktreeReap => "worktree_reap_no_token",
         }
     }
 
@@ -72,6 +174,10 @@ impl PeriodicScan {
             Self::AutoPull => "aucune sélection de ticket groomé ne s'exécute",
             Self::WipRescue => "aucun brouillon wip-rescue n'est repris",
             Self::QaReviewReconcile => "aucune PR ouverte sans revue n'est rattrapée (mika#2334)",
+            Self::WorktreeReap => {
+                "aucun worktree de PR terminale n'est retiré, et le disque continue \
+                 de se remplir (mika#2420)"
+            }
         }
     }
 }
@@ -98,6 +204,9 @@ impl PeriodicScan {
 /// - `auto_pull` — bascule du label `ready` (`gh issue edit`), lectures `gh`.
 /// - `wip_rescue` — rebase, push sur une branche de brouillon, `gh pr ready`,
 ///   commentaire de PR.
+/// - `worktree_reap` — **lecture seule côté forge** (`gh pr list`) ; tout le
+///   reste est local (`git worktree remove`). Aucune écriture GitHub, donc
+///   aucun auteur à lire (mika#2420).
 ///
 /// L'identité bot de l'App est donc acceptable en repli ici. Les chemins qui
 /// **exigent** l'identité machine (revue/merge de PR) ne passent pas par cette
@@ -415,6 +524,14 @@ pub struct TaskDispatcher {
     /// une transition si le STOP est armé au premier tick — même raisonnement que
     /// le jeu de déduplication mika#2131.
     pub auto_pull_stop_armed: AtomicBool,
+    /// Dernier état connu de l'interrupteur STOP du reaper de worktrees
+    /// (mika#2420). Même contrat que [`Self::auto_pull_stop_armed`] ci-dessus —
+    /// détection de transition seulement, état perdu au redémarrage.
+    ///
+    /// Un champ distinct et non un partage : les deux STOP sont deux décisions
+    /// distinctes (arrêter le feeder n'est pas arrêter le reaper), et un état
+    /// partagé écrirait une transition sur le mauvais scan.
+    pub worktree_reap_stop_armed: AtomicBool,
     /// Last `proactive_budget_resolved` couple this process announced (mika#2358).
     ///
     /// Deduplication only, on the same doctrine as `auto_pull_stop_armed` above
@@ -576,6 +693,7 @@ impl TaskDispatcher {
             "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
             "wip_rescue" => Ok(self.dispatch_wip_rescue(task).await?),
             "qa_review_reconcile" => Ok(self.dispatch_qa_review_reconcile(task).await?),
+            "worktree_reap" => Ok(self.dispatch_worktree_reap(task).await?),
             "curator_review" => Ok(self.dispatch_curator_review(task).await?),
             // mika#2337 — a dedicated variant, not `anyhow!`. The caller needs to
             // tell "this binary does not know that trigger" from "the dispatch
@@ -1459,24 +1577,44 @@ impl TaskDispatcher {
     /// fire-and-forget : un échec d'audit ne doit pas changer le verdict du
     /// court-circuit — l'interrupteur mord même si la table est illisible.
     async fn record_auto_pull_stop_transition(&self, task: &Task, state: &str) {
+        self.record_stop_transition(
+            task,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+            "auto_pull_stop",
+            "scan:auto_pull_groomed",
+            state,
+        )
+        .await;
+    }
+
+    /// Une transition du STOP d'un scan, écrite en `audit_events`.
+    ///
+    /// Paramétré par scan depuis mika#2420 : le reaper de worktrees a son propre
+    /// interrupteur, et un second corps copié aurait dérivé du premier. Le
+    /// `tool_name` reste **distinct par scan** — c'est ce qui laisse l'opérateur
+    /// compter deux populations séparément.
+    async fn record_stop_transition(
+        &self,
+        task: &Task,
+        scan: &str,
+        tool_name: &str,
+        target_key: &str,
+        state: &str,
+    ) {
         if let Err(e) = self
             .db
             .log_audit_event(
                 // Underscores, comme le `tool_name` et le nom d'événement — et
                 // surtout pas le littéral du chemin du fichier, que la garde
                 // structurelle T7 réserve à `auto_pull_stop.rs`.
-                &format!("auto_pull_stop-{}", task.id),
-                "auto_pull_stop",
-                "scan:auto_pull_groomed",
+                &format!("{tool_name}-{}", task.id),
+                tool_name,
+                target_key,
                 None,
                 Some(state),
                 Some(&format!(
                     "fichier sentinelle : {}",
-                    crate::auto_pull_stop::stop_file_path(
-                        &self.global_home_dir,
-                        crate::auto_pull_stop::AUTO_PULL_SCAN,
-                    )
-                    .display()
+                    crate::auto_pull_stop::stop_file_path(&self.global_home_dir, scan).display()
                 )),
                 None,
             )
@@ -1484,9 +1622,10 @@ impl TaskDispatcher {
         {
             warn!(
                 task_id = %task.id,
+                tool_name = %tool_name,
                 state = %state,
                 error = %e,
-                "failed to record auto_pull_stop transition"
+                "failed to record stop transition"
             );
         }
     }
@@ -1616,12 +1755,49 @@ impl TaskDispatcher {
             "auto_pull: running groomed ticket selection"
         );
 
+        // mika#2049 — is the host egress relay down? Resolved ONCE per tick,
+        // here, because this is the type that holds the global home the shell
+        // guard stamps under (same trajectory as mika#2329's hot STOP, and the
+        // reason `auto_pull` takes this as a parameter rather than reading it).
+        //
+        // Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+        // "serving". That cannot open the network — the protection is the shell
+        // guard, which probes the socket on every dispatch and reads no stamp.
+        // The worst a false "serving" buys is one refused dispatch.
+        let egress_verdict = crate::pilot_egress_stamp::relay_verdict(
+            &self.global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        );
+        if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } = &egress_verdict {
+            // One line per tick, not per ticket: the per-ticket record is the
+            // exclusion ledger's `egress_relay_down` rows (mika#2131 doctrine —
+            // detail in `audit_events`, shape in one INFO line).
+            info!(
+                event = "auto_pull_egress_relay_down",
+                motif = %motif,
+                age_secs,
+                trace_id = %trace_id,
+                "auto_pull: host egress relay is down — tickets are skipped, not \
+                 re-driven, so none is parked by the outage (mika#2049)"
+            );
+        }
+
+        // mika#2470 — what Phase 2 needs to dispatch a rescued ticket by a
+        // direct, in-process call of the ready-label handler instead of
+        // re-applying the label and waiting for a webhook that the outage it
+        // covers may never deliver.
+        let direct_dispatch = crate::auto_pull::DirectDispatchCtx {
+            skills: self.skills.as_ref(),
+            global_home_dir: &self.global_home_dir,
+        };
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
             &label_auth,
             &trace_id,
             &session_id,
+            egress_verdict.is_down(),
+            &direct_dispatch,
         )
         .await;
 
@@ -1783,6 +1959,130 @@ impl TaskDispatcher {
                     task_id = %task.id,
                     trace_id = %trace_id,
                     "qa_review_reconcile: no action taken"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retire les worktrees de dispatch dont la PR est terminale (mika#2420).
+    ///
+    /// Cinquième scan périodique, fond-de-file comme ses voisins : ni tour
+    /// silencieux, ni LLM, ni session pilote. Il lit le registre git et l'état
+    /// des PR, puis retire les worktrees que plus rien ne réclame — avec leur
+    /// `target/`, qui est le consommateur de 25 à 44 Go que le ticket mesure.
+    ///
+    /// **C'est le seul scan de la famille dont l'action est destructive et
+    /// irréversible.** Trois choses en découlent et se lisent dans cet ordre
+    /// dans le corps : le court-circuit STOP est **en tête**, avant toute
+    /// résolution de token ; la disposition est gardée séparément de la
+    /// détection (`MIKA_WORKTREE_REAP_DISPOSITION=observe`) ; et tous les termes
+    /// du prédicat sont fail-safe vers *conserver*, ce qui est documenté au site
+    /// de la décision, dans [`crate::worktree_reaper`].
+    ///
+    /// Aucune écriture GitHub, donc pas de
+    /// `resolve_periodic_scan_label_token` : le seul appel à la forge est un
+    /// `gh pr list`.
+    async fn dispatch_worktree_reap(&self, task: &Task) -> Result<()> {
+        // mika#2420 / mika#2329 — court-circuit STOP en TÊTE, avant la
+        // résolution de token (potentiellement un échange GitHub App sur le
+        // réseau) et avant tout `git`. Même placement et même raisonnement que
+        // le STOP d'`auto_pull`, avec une raison de plus : pendant un incident,
+        // ce qu'on veut arrêter le plus vite est ce qui supprime.
+        //
+        // La row récurrente n'est **jamais** touchée — ni annulée, ni marquée,
+        // ni reprogrammée. La réversibilité est l'absence de machinerie.
+        if crate::auto_pull_stop::is_stopped(
+            &self.global_home_dir,
+            crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+        ) {
+            let was_armed = self.worktree_reap_stop_armed.swap(true, Ordering::Relaxed);
+            // INFO à chaque tick : pour un interrupteur, la vivacité EST
+            // l'information (même doctrine que mika#2329, Signal P de mika#2156).
+            info!(
+                task_id = %task.id,
+                stop_file = %crate::auto_pull_stop::stop_file_path(
+                    &self.global_home_dir,
+                    crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                ).display(),
+                event = "worktree_reap_stop_armed",
+                "worktree_reap: STOP armé — tick court-circuité, aucun worktree touché"
+            );
+            if !was_armed {
+                self.record_stop_transition(
+                    task,
+                    crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                    "worktree_reap_stop",
+                    "scan:worktree_reap",
+                    "armed",
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        if self.worktree_reap_stop_armed.swap(false, Ordering::Relaxed) {
+            info!(
+                task_id = %task.id,
+                event = "worktree_reap_stop_lifted",
+                "worktree_reap: STOP levé — reprise du reaper"
+            );
+            self.record_stop_transition(
+                task,
+                crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                "worktree_reap_stop",
+                "scan:worktree_reap",
+                "lifted",
+            )
+            .await;
+        }
+
+        // mika#2205 — PAT d'abord, App en repli. Lire l'état d'une PR n'est pas
+        // une opération dont GitHub lit l'auteur au sens d'ADR-008, et ce scan
+        // n'écrit rien sur la forge : le repli App est légitime.
+        let resolved = resolve_periodic_scan_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::WorktreeReap,
+        )
+        .await;
+        let github_token = match resolved.as_deref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("worktree-reap-{}", uuid::Uuid::new_v4());
+
+        debug!(
+            task_id = %task.id,
+            trace_id = %trace_id,
+            "worktree_reap: running terminal-worktree scan"
+        );
+
+        let result = crate::worktree_reaper::reap_terminal_worktrees(
+            &self.db,
+            github_token,
+            &trace_id,
+            &session_id,
+        )
+        .await;
+
+        match result {
+            Some(count) => {
+                info!(
+                    task_id = %task.id,
+                    reaped = count,
+                    trace_id = %trace_id,
+                    "worktree_reap: scan complete"
+                );
+            }
+            None => {
+                debug!(
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    "worktree_reap: no action taken"
                 );
             }
         }
@@ -3653,6 +3953,7 @@ async fn try_dispatch_pilot_after_groom_success(
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(
@@ -4043,10 +4344,11 @@ mod tests {
     /// Couplé structurellement à l'énumération par
     /// `mika2334_every_scan_variant_is_covered` : ajouter une variante casse la
     /// compilation de ce test tant qu'elle n'est pas ajoutée ici.
-    const ALL_PERIODIC_SCANS: [PeriodicScan; 3] = [
+    const ALL_PERIODIC_SCANS: [PeriodicScan; 4] = [
         PeriodicScan::AutoPull,
         PeriodicScan::WipRescue,
         PeriodicScan::QaReviewReconcile,
+        PeriodicScan::WorktreeReap,
     ];
 
     /// Le couplage : le `match` exhaustif refuse de compiler quand une variante
@@ -4057,12 +4359,13 @@ mod tests {
             match scan {
                 PeriodicScan::AutoPull
                 | PeriodicScan::WipRescue
-                | PeriodicScan::QaReviewReconcile => {}
+                | PeriodicScan::QaReviewReconcile
+                | PeriodicScan::WorktreeReap => {}
             }
         }
         assert_eq!(
             ALL_PERIODIC_SCANS.len(),
-            3,
+            4,
             "une variante de PeriodicScan a été ajoutée : l'ajouter à \
              ALL_PERIODIC_SCANS, sinon les gardes mika#2205 ne la couvrent pas"
         );
@@ -4172,6 +4475,10 @@ mod tests {
             // mika#2334 — le quatrième scan naît avec la garde, il ne la
             // rejoint pas après une panne.
             "dispatch_qa_review_reconcile",
+            // mika#2420 — idem pour le cinquième, dont l'action est en plus
+            // destructive : un PAT absent tuerait le reaper pendant que le
+            // disque se remplit.
+            "dispatch_worktree_reap",
         ] {
             let sig = format!("async fn {fn_name}(");
             let start = src
@@ -4217,27 +4524,35 @@ mod tests {
         )
         .expect("la garde doit pouvoir lire dispatcher.rs");
 
-        let sig = "async fn dispatch_auto_pull_groomed(";
-        let start = src
-            .find(sig)
-            .expect("dispatch_auto_pull_groomed doit exister");
-        let rest = &src[start + sig.len()..];
-        let end = rest.find("\n    async fn ").unwrap_or(rest.len());
-        let body = &rest[..end];
+        // mika#2420 — le cinquième scan porte le même interrupteur, et la garde
+        // couvre les deux : un STOP posé plus bas que la résolution de token
+        // paierait un échange GitHub App par tick pour ne rien faire, et sur un
+        // scan destructif il retarderait en plus l'arrêt qu'un opérateur
+        // demande en pleine incidence.
+        for fn_name in ["dispatch_auto_pull_groomed", "dispatch_worktree_reap"] {
+            let sig = format!("async fn {fn_name}(");
+            let start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("{fn_name} doit exister"));
+            let rest = &src[start + sig.len()..];
+            let end = rest.find("\n    async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
 
-        let stop_at = body
-            .find("auto_pull_stop::is_stopped")
-            .expect("le court-circuit STOP mika#2329 doit être dans dispatch_auto_pull_groomed");
-        let token_at = body
-            .find("resolve_periodic_scan_token")
-            .expect("la résolution de token doit être dans dispatch_auto_pull_groomed");
+            let stop_at = body
+                .find("auto_pull_stop::is_stopped")
+                .unwrap_or_else(|| panic!("le court-circuit STOP doit être dans {fn_name}"));
+            let token_at = body
+                .find("resolve_periodic_scan_token")
+                .unwrap_or_else(|| panic!("la résolution de token doit être dans {fn_name}"));
 
-        assert!(
-            stop_at < token_at,
-            "mika#2329 — le court-circuit STOP doit précéder toute résolution de \
-             token, sinon un STOP armé paie deux résolutions (dont un échange \
-             GitHub App sur le réseau) à chaque tick pour ne rien faire"
-        );
+            assert!(
+                stop_at < token_at,
+                "mika#2329 — dans {fn_name}, le court-circuit STOP doit précéder \
+                 toute résolution de token, sinon un STOP armé paie une \
+                 résolution (dont un échange GitHub App sur le réseau) à chaque \
+                 tick pour ne rien faire"
+            );
+        }
     }
 
     fn test_db() -> AsyncDatabase {
@@ -4285,6 +4600,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         }
     }

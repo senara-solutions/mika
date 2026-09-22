@@ -1,5 +1,4 @@
 use anyhow::Result;
-use std::io::Read;
 use uuid::Uuid;
 
 use crate::cli::OutputFormat;
@@ -265,17 +264,16 @@ pub async fn run(
             tracing::warn!(error = %e, "failed to create session");
         }
     }
-    // Read message from arg, or from stdin if "-"
-    let user_message = if message == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        message.to_string()
-    };
+    // mika#1982: `message` arrives already resolved — the argument, the "-"
+    // sentinel, or the piped input, decided once in `mika_cli::ask_message`.
+    // The read that used to live here is gone; keeping a second one would be
+    // the divergence that module exists to close.
+    let user_message = message.to_string();
 
+    // Kept as defence in depth: this function is `pub`, so it can be reached by
+    // a caller that did not go through the resolver.
     if user_message.is_empty() {
-        anyhow::bail!("Empty message. Provide a message argument or pipe via stdin with \"-\".");
+        anyhow::bail!("Empty message. Provide a message argument or pipe one in.");
     }
 
     // --task-complete path: validate and complete the callback task, then exit.
@@ -729,6 +727,14 @@ struct TeamRunMeta {
     run_id: String,
     status: String,
     iterations: u32,
+    /// Operator-register reason on a terminal failure (mika#1940).
+    ///
+    /// Additive and omitted when absent, so a successful run serialises
+    /// byte-for-byte as before. The ticket names scripting as the impact, and
+    /// forcing a script to parse `stderr` for the reason would have closed only
+    /// the half that is not useful to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
 }
 
 /// Run a team workflow in non-interactive mode (mika ask --team).
@@ -742,18 +748,15 @@ pub async fn run_team_ask(
     format: &OutputFormat,
     global_home: &std::path::Path,
 ) -> Result<()> {
-    use mika_agent::teams::types::{RunStatus, TeamEvent};
+    use crate::commands::team_outcome::{self, TeamOutcome};
+    use mika_agent::teams::types::TeamEvent;
     use mika_common::config::Settings;
 
-    // Read message from stdin if "-"
-    let goal = if message == "-" {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.trim().to_string()
-    } else {
-        message.to_string()
-    };
+    // mika#1982: same as the local path above — the goal arrives resolved, and
+    // the second copy of the sentinel read that used to live here is gone.
+    let goal = message.to_string();
 
+    // Defence in depth: this function is `pub`.
     if goal.is_empty() {
         anyhow::bail!("Empty message. Provide a goal for the team.");
     }
@@ -853,24 +856,52 @@ pub async fn run_team_ask(
     .await?;
     team_db.shutdown();
 
-    let is_failure = matches!(&run.status, RunStatus::Failed(_));
+    // mika#1940 — one classifier for both CLI surfaces, reading the enum's own
+    // exhaustive disposition rather than a pattern written here.
+    let outcome = team_outcome::classify(&run);
+
+    // The diagnostic goes to stderr in every format: stderr is already this
+    // command's progress channel, and a machine-readable format should not be
+    // the only place a failure is legible.
+    let failure_reason = match &outcome {
+        TeamOutcome::Failed { diagnostic, .. } => {
+            eprintln!("Error: {diagnostic}");
+            Some(diagnostic.clone())
+        }
+        _ => None,
+    };
 
     match format {
-        OutputFormat::Text => {
-            if let Some(ref deliverable) = run.deliverable {
-                println!("{deliverable}");
-            } else if let RunStatus::Failed(ref msg) = run.status {
-                eprintln!("Error: {msg}");
+        OutputFormat::Text => match &outcome {
+            // stdout is the success channel. A failed run leaves it empty so a
+            // `RESULT=$(mika ask --team …)` cannot capture a plausible answer to
+            // a question that failed (mika#1940 D4). The partial text is not
+            // thrown away — it goes to stderr, behind a marker saying what it is.
+            TeamOutcome::Delivered { text } => println!("{text}"),
+            TeamOutcome::CompletedWithoutDeliverable => {
+                eprintln!("Note: the team run completed without producing a deliverable.");
             }
-        }
+            TeamOutcome::Failed { partial, .. } => {
+                if let Some(partial) = partial {
+                    eprintln!("{}", team_outcome::PARTIAL_OUTPUT_MARKER);
+                    eprintln!("{partial}");
+                }
+            }
+            TeamOutcome::Pending { note } => eprintln!("Note: {note}"),
+        },
         OutputFormat::Json => {
             let response = AskTeamJsonResponse {
                 role: "assistant",
+                // Unchanged on purpose (mika#1940, scope-out (d)): this format
+                // already carried the correct discriminant in `team_run.status`,
+                // so it was never the broken surface, and emptying it would take
+                // information away from consumers of a wire format that worked.
                 content: run.deliverable.clone(),
                 team_run: TeamRunMeta {
                     run_id: run.run_id.clone(),
                     status: format!("{}", run.status),
                     iterations: run.iteration,
+                    failure_reason: failure_reason.clone(),
                 },
             };
             println!("{}", serde_json::to_string(&response)?);
@@ -883,14 +914,18 @@ pub async fn run_team_ask(
                     run_id: run.run_id.clone(),
                     status: format!("{}", run.status),
                     iterations: run.iteration,
+                    failure_reason,
                 },
             };
             print!("{}", serde_yaml::to_string(&response)?);
         }
     }
 
-    if is_failure {
-        std::process::exit(1);
+    // The decision lives in a pure function; `process::exit` stays a one-line
+    // edge. Same split as `remote_ask::exit_code_for`.
+    let code = team_outcome::exit_code(&outcome);
+    if code != 0 {
+        std::process::exit(code);
     }
 
     Ok(())
@@ -899,6 +934,45 @@ pub async fn run_team_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The team envelope is byte-identical on a successful run (mika#1940 R7).
+    ///
+    /// `failure_reason` is additive and `skip_serializing_if`-omitted, so a run
+    /// that did not fail serialises exactly as it did before the field existed.
+    /// Asserted against a literal re-typed from the pre-fix output, not against
+    /// a re-serialisation of the same struct — which would prove nothing.
+    #[test]
+    fn mika1940_team_envelope_is_byte_identical_on_a_successful_run() {
+        let ok = AskTeamJsonResponse {
+            role: "assistant",
+            content: Some("the answer".to_string()),
+            team_run: TeamRunMeta {
+                run_id: "run-1".to_string(),
+                status: "completed".to_string(),
+                iterations: 2,
+                failure_reason: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"role":"assistant","content":"the answer","team_run":{"run_id":"run-1","status":"completed","iterations":2}}"#
+        );
+
+        let failed = AskTeamJsonResponse {
+            role: "assistant",
+            content: None,
+            team_run: TeamRunMeta {
+                run_id: "run-2".to_string(),
+                status: "failed_no_delegation".to_string(),
+                iterations: 1,
+                failure_reason: Some("no delegation".to_string()),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&failed).unwrap(),
+            r#"{"role":"assistant","content":null,"team_run":{"run_id":"run-2","status":"failed_no_delegation","iterations":1,"failure_reason":"no delegation"}}"#
+        );
+    }
 
     #[test]
     fn test_json_response_with_content() {

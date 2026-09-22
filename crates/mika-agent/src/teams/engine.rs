@@ -662,15 +662,19 @@ impl TeamEngine {
         self.run.solo_absorption =
             self.run.status == RunStatus::Completed && self.run.delegation_count == 0;
 
-        // Update run status in DB
-        let no_delegation_reason = "orchestrator returned a conversational reply for an actionable goal and \
-             delegated to zero members (after one reinforced retry)";
+        // Update run status in DB. The reason for the field-less
+        // `FailedNoDelegation` comes from the one place that owns the operator
+        // register (mika#1940 D5) — it used to be inlined here and re-invented
+        // differently in `notification.rs`.
         let (status_str, failure_reason) = match &self.run.status {
             RunStatus::Running => ("running", None),
             RunStatus::Completed => ("completed", None),
             RunStatus::Suspended => ("suspended", None),
             RunStatus::Failed(reason) => ("failed", Some(reason.as_str())),
-            RunStatus::FailedNoDelegation => ("failed_no_delegation", Some(no_delegation_reason)),
+            RunStatus::FailedNoDelegation => (
+                "failed_no_delegation",
+                Some(crate::teams::types::NO_DELEGATION_REASON),
+            ),
             RunStatus::FailedTransport(reason) => ("failed_transport", Some(reason.as_str())),
         };
         if let Err(e) = self

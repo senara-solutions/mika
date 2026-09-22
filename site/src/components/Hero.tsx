@@ -12,7 +12,7 @@ export function Hero() {
         className="pointer-events-none absolute inset-0 -z-10"
         style={{
           background:
-            "radial-gradient(ellipse 800px 500px at 50% 40%, rgba(124,106,247,0.12) 0%, transparent 70%)",
+            "radial-gradient(ellipse 800px 500px at 50% 40%, color-mix(in srgb, var(--color-accent) 12%, transparent) 0%, transparent 70%)",
         }}
       />
 

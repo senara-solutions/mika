@@ -9,6 +9,20 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed
 
 INPUT=$(cat)
 
+# --- mika#2449: shared-checkout guard inputs, read BEFORE the scrub ---------
+# The scrub loop below unsets every MIKA_* variable, MIKA_PLATFORM_DIR and
+# MIKA_GUARD_SHARED_CHECKOUT included. Both are read here, resolved, and
+# passed to the guard as ARGUMENTS (never through the child's environment):
+# a guard that read them after the scrub would see nothing and fall open on
+# every host, indistinguishable from a host with nothing to protect.
+# Same resolution as dispatch-lib.sh (`PLATFORM_DIR=…; pwd -P`) and
+# deploy-mika/handlers/run.sh, on purpose — `~/workspace` is a symlink to
+# `/data/workspace` on the measured host, and the guard compares against the
+# physical path.
+_GUARD_PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+_GUARD_PLATFORM_DIR=$(cd "$_GUARD_PLATFORM_DIR" 2>/dev/null && pwd -P) || _GUARD_PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+_GUARD_BYPASS="${MIKA_GUARD_SHARED_CHECKOUT:-1}"
+
 # Scrub all MIKA_* env vars so subprocesses cannot leak secrets
 # Mirrors the Rust executor's scrub_mika_env_vars() wildcard approach
 for _mika_var in $(env | grep '^MIKA_' | cut -d= -f1); do unset "$_mika_var"; done
@@ -109,6 +123,74 @@ if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(curl|wget)([^A-Za-z0
     exit 1
 fi
 # --- end shell-exec egress containment ---
+
+# --- mika#2449: shared-checkout guard — the primary checkout is a deployment
+# checkout, and run_shell must be UNABLE to break its invariant.
+#
+# Measured producer (tool_calls 1835d8bb / eba3682f / 930f5200, 2026-09-20):
+# mika-qa, through this very handler, ran `cd ~/workspace/mika-platform/mika &&
+# git checkout <ref> -- <paths>` during three QA reviews and restored nothing
+# (`git checkout -- <paths>` re-reads the INDEX the previous command just
+# overwrote — an inert "cleanup"). Result: 15 staged+modified files on main,
+# `git pull --ff-only` refused, the orchestrator's rebuild blocked (#2446).
+# Recurring class, n ≥ 5 since 09-06. The qa-review prompt already prescribed
+# a throwaway detached worktree (§ 2B); prompt-only enforcement does not hold at
+# loop substrate (mika#2120). This is the structural half.
+#
+# mika#2107's guard cannot cover this population by construction: its T1
+# exempts every session not rooted in a linked worktree, and mika-qa has no
+# worktree — its cwd is the skill directory and the `cd` is inside the command.
+# Hence the guard's second mode, `--decide-primary`, which shares the parser
+# and inverts the population: target = a PRIMARY checkout under the platform
+# dir (`.git` is a directory). Predicate = the deployment-checkout invariant
+# (D7 allow-list: fetch / pull --ff-only / merge --ff-only / worktree * /
+# branch without -f/-m/-c / push / any read pass; checkout <ref>, stash,
+# reset, non-ff merge, branch -f … are refused; unknown verbs fail closed).
+#
+# FAIL-OPEN on a missing script, and it is SAID: a tenant without a platform
+# checkout has nothing to protect (silence); a host WITH a platform and WITHOUT
+# the script prints the fail-open line below — the only thing separating
+# "nothing to refuse" from "nothing is armed" (mika#2107, same sentence). A
+# guard that crashes (exit ≠ 0/1) also falls open and says so: a broken guard
+# must not take run_shell down for every agent. A predicate that HOLDS
+# refuses — that is its purpose, not an outage.
+#
+# The refusal goes to STDOUT with exit 1, so it lands in `tool_calls.output`
+# prefixed `Exit code: 1` — an SQL surface without a new event (D8):
+#   SELECT agent_id, count(*) FROM tool_calls
+#    WHERE tool_name = 'run_shell'
+#      AND output LIKE '%REFUS (shared-checkout-guard, mika#2449)%' GROUP BY 1;
+# This handler never writes that token itself — it relays the guard's text
+# (SOLE WRITER of the token is the guard; pinned by test-shell-exec-guard.sh).
+#
+# The override is the same lever as mika#2107 — MIKA_GUARD_SHARED_CHECKOUT=0,
+# read above, before the scrub — and it is SAID ON EVERY CALL: a bypass set
+# for an intervention and forgotten would otherwise be a guard silently absent
+# for all agents, indistinguishable from a guard that had nothing to refuse
+# (F3; mika#2329: for a switch, liveness IS the information). One line per
+# call rather than "first call": the handler is one process per call, it has
+# no "first". The guard is still invoked under the override so the bypass is
+# journaled in ~/.mika/state/shared-checkout-guard.log (`mode=primary bypass`).
+_GUARD_SCRIPT="$_GUARD_PLATFORM_DIR/mika/scripts/guard-shared-checkout"
+_GUARD_CWD="${WORKDIR:-$PWD}"
+if [ "$_GUARD_BYPASS" = 0 ]; then
+    echo "shell-exec: shared-checkout guard disarmed by MIKA_GUARD_SHARED_CHECKOUT=0 (operator override)" >&2
+    if [ -f "$_GUARD_SCRIPT" ]; then
+        MIKA_GUARD_SHARED_CHECKOUT=0 bash "$_GUARD_SCRIPT" --decide-primary "$_GUARD_PLATFORM_DIR" "$_GUARD_CWD" "$COMMAND" >/dev/null 2>&1 || true
+    fi
+elif [ -f "$_GUARD_SCRIPT" ]; then
+    _GUARD_REASON=$(bash "$_GUARD_SCRIPT" --decide-primary "$_GUARD_PLATFORM_DIR" "$_GUARD_CWD" "$COMMAND" 2>/dev/null)
+    _GUARD_STATUS=$?
+    if [ "$_GUARD_STATUS" -eq 1 ]; then
+        printf '%s\n' "$_GUARD_REASON"
+        exit 1
+    elif [ "$_GUARD_STATUS" -ne 0 ]; then
+        echo "shell-exec: shared-checkout guard exited $_GUARD_STATUS at $_GUARD_SCRIPT (fail-open)" >&2
+    fi
+elif [ -d "$_GUARD_PLATFORM_DIR" ]; then
+    echo "shell-exec: shared-checkout guard not found at $_GUARD_SCRIPT (fail-open)" >&2
+fi
+# --- end shared-checkout guard ---
 
 if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
     cd "$WORKDIR" || exit 1

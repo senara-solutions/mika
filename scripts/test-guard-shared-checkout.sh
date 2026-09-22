@@ -504,6 +504,160 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# mika#2449 — mode `--decide-primary` : la garde du checkout PRINCIPAL
+#
+# Population inverse de mika#2107 : un agent SANS worktree (mika-qa par
+# `run_shell`) dont la commande `cd` dans le checkout de déploiement. Les trois
+# commandes de M0 sont rejouées VERBATIM (chemins longs abrégés à l'identique du
+# ticket), plus `fa92720d` (09-20 11:31Z) et `d53b91e3` (09-15).
+#
+# La fixture porte un `~/workspace` SYMLINK vers `/data/workspace`, comme
+# gentux : c'est le chemin que M0 traverse, et un platform-dir résolu par
+# `pwd -P` ne matche la forme `~/…` que si la garde résout physiquement.
+# ---------------------------------------------------------------------------
+printf '\n== mika#2449 — --decide-primary : préconditions de fixture ==\n'
+PLAT_ROOT="$TMPROOT/p2449"
+mkdir -p "$PLAT_ROOT/data/workspace/mika-platform" "$PLAT_ROOT/home"
+ln -s ../data/workspace "$PLAT_ROOT/home/workspace"
+PLATFORM=$(cd -- "$PLAT_ROOT/data/workspace/mika-platform" && pwd -P)
+FAKE_HOME=$(cd -- "$PLAT_ROOT/home" && pwd -P)
+# Le méta-dépôt est lui-même un checkout principal (make deploy y tourne).
+git -C "$PLATFORM" init -q -b main
+git -C "$PLATFORM" -c user.email=guard@test -c user.name=guard commit -q --allow-empty -m meta
+PRIMARY=$(build_repo_pair "$PLATFORM" mika wt-unused)
+rm -rf "$PLATFORM/wt-unused"
+git -C "$PRIMARY" worktree prune
+mkdir -p "$PLATFORM/.claude/worktrees/fix-2449-x"
+git -C "$PRIMARY" worktree add -q -b fix/2449/x "$PLATFORM/.claude/worktrees/fix-2449-x/mika" >/dev/null 2>&1
+LINKED="$PLATFORM/.claude/worktrees/fix-2449-x/mika"
+OUTSIDE=$(build_repo_pair "$TMPROOT/outside" other-repo wt-other)
+
+if [ -d "$PRIMARY/.git" ]; then ok "le checkout principal porte un .git RÉPERTOIRE (le terme P4 est observable)"; else ko "le checkout principal porte un .git RÉPERTOIRE"; fi
+if [ -f "$LINKED/.git" ]; then ok "le worktree lié sous .claude/worktrees porte un .git FICHIER"; else ko "le worktree lié porte un .git FICHIER"; fi
+if [ "$(cd -- "$FAKE_HOME/workspace/mika-platform" && pwd -P)" = "$PLATFORM" ]; then ok "~/workspace est un symlink vers la plateforme résolue (forme gentux)"; else ko "~/workspace symlink"; fi
+
+# expect_primary <allow|deny> <name> <cwd> <command>   (HOME = la fixture)
+expect_primary() {
+	local want=$1 name=$2 cwd=$3 command=$4
+	local out status
+	out=$(HOME="$FAKE_HOME" bash "$GUARD" --decide-primary "$PLATFORM" "$cwd" "$command" 2>&1)
+	status=$?
+	case $want in
+	allow) if [ "$status" -eq 0 ]; then ok "$name"; else ko "$name" "attendu allow, obtenu deny: $out"; fi ;;
+	deny) if [ "$status" -eq 1 ]; then ok "$name"; else ko "$name" "attendu deny, obtenu allow (exit $status)"; fi ;;
+	esac
+}
+SKILL_CWD="$TMPROOT/skill-dir"
+mkdir -p "$SKILL_CWD"
+
+printf '\n== mika#2449 AC5 — les trois commandes de M0, verbatim → refus ==\n'
+M0_1='cd ~/workspace/mika-platform/mika && git -C . checkout 146b536d -- scripts/check-landing-tokens.sh scripts/test-check-landing-tokens.sh site/ && bash scripts/check-landing-tokens.sh'
+M0_2='cd ~/workspace/mika-platform/mika && git checkout origin/fix/2135/x -- scripts/smoke-webhook-chain scripts/test-smoke-webhook-chain.sh && bash scripts/test-smoke-webhook-chain.sh; git checkout -- scripts/smoke-webhook-chain scripts/test-smoke-webhook-chain.sh'
+M0_3='cd ~/workspace/mika-platform/mika && git fetch origin chore/1943/x && git checkout origin/chore/1943/x -- skills/bundled/_shared/dispatch-lib.sh skills/bundled/_shared/test-dispatch-lib.sh && make test-dispatch-lib'
+expect_primary deny "1835d8bb 09-20 17:22Z (#2434) — cd ~ && git -C . checkout <sha> -- <paths>" "$SKILL_CWD" "$M0_1"
+expect_primary deny "eba3682f 09-20 18:33Z (#2435) — checkout <ref> -- <paths> puis restauration inerte" "$SKILL_CWD" "$M0_2"
+expect_primary deny "930f5200 09-20 19:04Z (#2436) — fetch (admis) && checkout <ref> -- <paths>" "$SKILL_CWD" "$M0_3"
+expect_primary deny "fa92720d 09-20 11:31Z — git stash && git checkout <branche> dans main" "$SKILL_CWD" 'cd ~/workspace/mika-platform/mika && git stash && git checkout fix/1940/x'
+expect_primary deny "d53b91e3 09-15 — checkout origin/feat/2310/… -- crates/ docs/plans" "$SKILL_CWD" 'cd ~/workspace/mika-platform/mika && git checkout origin/feat/2310/x -- crates/mika-agent docs/plans'
+
+printf '\n== mika#2449 D8 — le refus nomme le jeton, la cible, le verbe, le remède et la dérogation ==\n'
+REFUS_OUT=$(HOME="$FAKE_HOME" bash "$GUARD" --decide-primary "$PLATFORM" "$SKILL_CWD" "$M0_1" 2>&1)
+for needle in 'REFUS (shared-checkout-guard, mika#2449)' "$PRIMARY" '`git checkout`' 'worktree add --detach' 'MIKA_GUARD_SHARED_CHECKOUT=0'; do
+	if grep -qF -- "$needle" <<<"$REFUS_OUT"; then ok "le motif porte « $needle »"; else ko "le motif porte « $needle »" "$REFUS_OUT"; fi
+done
+
+printf '\n== mika#2449 AC5 — l'"'"'arbre du principal est INTACT après les refus ==\n'
+if [ -z "$(git -C "$PRIMARY" status --porcelain)" ]; then ok "git status --porcelain vide sur le principal"; else ko "git status --porcelain vide sur le principal" "$(git -C "$PRIMARY" status --porcelain)"; fi
+if [ "$(git -C "$PRIMARY" rev-parse --abbrev-ref HEAD)" = main ]; then ok "HEAD du principal toujours sur main"; else ko "HEAD du principal toujours sur main"; fi
+
+printf '\n== mika#2449 AC6 — les formes de synchronisation de mika-dev PASSENT ==\n'
+expect_primary allow "mika-dev 09-09/16/17/20 — git fetch origin && git merge --ff-only origin/main" "$SKILL_CWD" 'cd ~/workspace/mika-platform/mika && git fetch origin && git merge --ff-only origin/main'
+expect_primary allow "mika-dev 09-09 — git pull --ff-only" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only"
+expect_primary allow "mika-dev 09-06 — worktree remove … && push origin --delete <b>" "$SKILL_CWD" "git -C $PRIMARY worktree remove --force /x/y && git -C $PRIMARY push origin --delete fix/x"
+expect_primary allow "branch -D (supprime une ref qui n'est pas sous HEAD)" "$SKILL_CWD" "git -C $PRIMARY branch -D fix/x"
+expect_primary allow "branch --show-current" "$SKILL_CWD" "git -C $PRIMARY branch --show-current"
+expect_primary allow "branch -a / -r (listes)" "$SKILL_CWD" "git -C $PRIMARY branch -a && git -C $PRIMARY branch -r"
+expect_primary allow "show <branch>:<path> (la recette qa-review l. 277)" "$SKILL_CWD" "git -C $PRIMARY show origin/fix/x:scripts/foo"
+expect_primary allow "diff / log / status / rev-parse / ls-files (lectures)" "$SKILL_CWD" "cd $PRIMARY && git diff main..origin/x && git log -3 && git status && git rev-parse HEAD && git ls-files"
+expect_primary allow "stash list (lecture)" "$SKILL_CWD" "git -C $PRIMARY stash list"
+expect_primary allow "checkout -- <paths> (relit l'index, inerte si l'invariant tient)" "$SKILL_CWD" "git -C $PRIMARY checkout -- scripts/smoke-webhook-chain"
+expect_primary allow "restore <paths> sans --source/--staged" "$SKILL_CWD" "git -C $PRIMARY restore scripts/x"
+expect_primary allow "worktree add / list / prune" "$SKILL_CWD" "git -C $PRIMARY worktree add --detach /tmp/w origin/x && git -C $PRIMARY worktree list && git -C $PRIMARY worktree prune"
+expect_primary allow "fetch --prune ; ls-remote ; remote -v" "$SKILL_CWD" "git -C $PRIMARY fetch --prune origin; git -C $PRIMARY ls-remote origin; git -C $PRIMARY remote -v"
+expect_primary allow "tag / gc / prune" "$SKILL_CWD" "git -C $PRIMARY tag v0 && git -C $PRIMARY gc && git -C $PRIMARY prune"
+
+printf '\n== mika#2449 V6 — les formes qui rompent l'"'"'invariant sont refusées, terme par terme ==\n'
+expect_primary deny "merge origin/main --no-edit (mesuré 09-20, mika-dev) — non-ff" "$SKILL_CWD" "git -C $PRIMARY merge origin/main --no-edit"
+expect_primary deny "merge --ff-only origin/fix/x (revue #2478) — avancerait main sur une tête non revue" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only origin/fix/x"
+expect_primary deny "pull --ff-only origin fix/x" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only origin fix/x"
+expect_primary allow "pull --ff-only origin main (forme mika-dev)" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only origin main"
+expect_primary allow "QA block[ac] AC6 — merge --ff-only origin/main 2>&1 (une redirection n'est pas une ref)" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only origin/main 2>&1"
+expect_primary allow "QA block[ac] AC6 — pull --ff-only >/dev/null 2>&1" "$SKILL_CWD" "git -C $PRIMARY pull --ff-only >/dev/null 2>&1"
+expect_primary allow "QA block[ac] AC6 — fetch && merge --ff-only origin/main 2> /dev/null (opérateur nu + cible)" "$SKILL_CWD" "git -C $PRIMARY fetch origin && git -C $PRIMARY merge --ff-only origin/main 2> /dev/null"
+expect_primary allow "merge --ff-only origin/main > /tmp/out.log" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only origin/main > /tmp/out.log"
+expect_primary deny "…mais la ref reste bornée sous redirection : merge --ff-only origin/fix/x 2>&1" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only origin/fix/x 2>&1"
+expect_primary allow "checkout -- <paths> 2>/dev/null" "$SKILL_CWD" "git -C $PRIMARY checkout -- scripts/x 2>/dev/null"
+expect_primary deny "checkout <ref> -- <paths> 2>&1 reste refusé" "$SKILL_CWD" "git -C $PRIMARY checkout origin/x -- a 2>&1"
+expect_primary allow "merge --ff-only main (ref locale de déploiement)" "$SKILL_CWD" "git -C $PRIMARY merge --ff-only main"
+expect_primary deny "pull sans --ff-only" "$SKILL_CWD" "git -C $PRIMARY pull origin main"
+expect_primary deny "stash nu" "$SKILL_CWD" "git -C $PRIMARY stash"
+expect_primary deny "stash push" "$SKILL_CWD" "git -C $PRIMARY stash push -m x"
+expect_primary deny "stash pop (dépose du contenu étranger)" "$SKILL_CWD" "git -C $PRIMARY stash pop"
+expect_primary deny "stash apply <sha>" "$SKILL_CWD" "git -C $PRIMARY stash apply abc"
+expect_primary deny "reset --hard" "$SKILL_CWD" "git -C $PRIMARY reset --hard"
+expect_primary deny "reset (toutes formes)" "$SKILL_CWD" "git -C $PRIMARY reset HEAD~1"
+expect_primary deny "checkout <ref>" "$SKILL_CWD" "git -C $PRIMARY checkout fix/1940/x"
+expect_primary deny "checkout --force <ref> (mesuré 2026-09-17, mika-cloud)" "$SKILL_CWD" "git -C $PRIMARY checkout --force feat/245/x"
+expect_primary deny "checkout -b" "$SKILL_CWD" "git -C $PRIMARY checkout -b nouvelle"
+expect_primary deny "checkout --detach" "$SKILL_CWD" "git -C $PRIMARY checkout --detach origin/main"
+expect_primary deny "switch" "$SKILL_CWD" "git -C $PRIMARY switch fix/x"
+expect_primary deny "restore --source" "$SKILL_CWD" "git -C $PRIMARY restore --source origin/x scripts/foo"
+expect_primary deny "restore --staged" "$SKILL_CWD" "git -C $PRIMARY restore --staged scripts/foo"
+expect_primary deny "branch -f main <sha> (F2 : déplace la ref sous HEAD sans toucher l'arbre)" "$SKILL_CWD" "git -C $PRIMARY branch -f main abc123"
+expect_primary deny "branch -m main autre (F2)" "$SKILL_CWD" "git -C $PRIMARY branch -m main autre"
+expect_primary deny "branch -M / -c / -C (F2)" "$SKILL_CWD" "git -C $PRIMARY branch -c main copie"
+expect_primary deny "rebase" "$SKILL_CWD" "git -C $PRIMARY rebase origin/main"
+expect_primary deny "cherry-pick / revert / am / apply" "$SKILL_CWD" "git -C $PRIMARY cherry-pick abc"
+expect_primary deny "add / rm / mv / commit / clean / update-index" "$SKILL_CWD" "git -C $PRIMARY add -A && git -C $PRIMARY commit -m x"
+expect_primary deny "clean -fdx" "$SKILL_CWD" "git -C $PRIMARY clean -fdx"
+expect_primary deny "verbe inconnu de la table → fail-closed (filter-branch)" "$SKILL_CWD" "git -C $PRIMARY filter-branch --all"
+expect_primary deny "-C <principal> sans cd" "$SKILL_CWD" "git -C $PRIMARY checkout origin/x -- a"
+expect_primary deny "pushd <principal> && …" "$SKILL_CWD" "pushd $PRIMARY && git reset --hard && popd"
+expect_primary deny "GIT_WORK_TREE=<principal>" "$SKILL_CWD" "GIT_WORK_TREE=$PRIMARY GIT_DIR=$PRIMARY/.git git checkout origin/x -- a"
+expect_primary deny "le méta-dépôt lui-même est un checkout de déploiement" "$SKILL_CWD" "cd $PLATFORM && git checkout foo"
+expect_primary deny "\$HOME/workspace/… (variante de M0)" "$SKILL_CWD" 'cd $HOME/workspace/mika-platform/mika && git checkout x -- a'
+
+printf '\n== mika#2449 V7 — hors population ==\n'
+expect_primary allow "même geste dans un worktree LIÉ (.claude/worktrees/…) → population de mika#2107, pas celle-ci" "$SKILL_CWD" "cd $LINKED && git checkout origin/x -- a b"
+expect_primary allow "même geste dans un worktree lié, via -C" "$SKILL_CWD" "git -C $LINKED reset --hard"
+expect_primary allow "même geste hors plateforme (/tmp/autre-dépôt)" "$SKILL_CWD" "cd $OUTSIDE && git checkout foo -- bar && git stash"
+expect_primary allow "cible inexistante → la commande échoue d'elle-même" "$SKILL_CWD" "git -C $PLATFORM/nexiste-pas checkout foo"
+if [ "$(bash "$GUARD" --decide-primary '' "$SKILL_CWD" "git -C $PRIMARY reset --hard" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "platform-dir vide → allow"; else ko "platform-dir vide → allow"; fi
+if [ "$(bash "$GUARD" --decide-primary "$TMPROOT/nexiste-pas" "$SKILL_CWD" "git -C $PRIMARY reset --hard" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "platform-dir absent → allow"; else ko "platform-dir absent → allow"; fi
+if [ "$(bash "$GUARD" --decide-primary "relatif/plateforme" "$SKILL_CWD" "git -C $PRIMARY reset --hard" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "platform-dir relatif → allow (jamais normalisé en /)"; else ko "platform-dir relatif → allow"; fi
+expect_primary allow "commande sans git" "$SKILL_CWD" "cd $PRIMARY && make test && ls -la"
+expect_primary allow "continuation de ligne : git -C <principal> \\⏎log (revue #2478 — \\ n'est pas un verbe)" "$SKILL_CWD" "git -C $PRIMARY \\
+log --oneline -1"
+expect_primary allow "continuation de ligne devant fetch" "$SKILL_CWD" "git -C $PRIMARY \\
+  fetch origin"
+expect_primary allow "sous-shell : (cd <principal> && git show x) && git reset --hard dans /tmp" "$OUTSIDE" "(cd $PRIMARY && git show HEAD:seed.txt) && git reset --hard"
+
+printf '\n== mika#2449 F3 — la dérogation désarme AUSSI ce mode, et elle est journalisée ==\n'
+: >"$MIKA_GUARD_SHARED_CHECKOUT_LOG"
+if [ "$(MIKA_GUARD_SHARED_CHECKOUT=0 HOME="$FAKE_HOME" bash "$GUARD" --decide-primary "$PLATFORM" "$SKILL_CWD" "$M0_1" >/dev/null 2>&1; echo $?)" = 0 ]; then ok "MIKA_GUARD_SHARED_CHECKOUT=0 → M0_1 passe"; else ko "MIKA_GUARD_SHARED_CHECKOUT=0 → M0_1 passe"; fi
+if grep -q 'mode=primary bypass MIKA_GUARD_SHARED_CHECKOUT=0' "$MIKA_GUARD_SHARED_CHECKOUT_LOG"; then ok "le bypass est journalisé avec mode=primary"; else ko "le bypass est journalisé avec mode=primary" "$(cat "$MIKA_GUARD_SHARED_CHECKOUT_LOG")"; fi
+
+printf '\n== mika#2449 — journal : mode=primary, et le refus est journalisé ==\n'
+: >"$MIKA_GUARD_SHARED_CHECKOUT_LOG"
+HOME="$FAKE_HOME" bash "$GUARD" --decide-primary "$PLATFORM" "$SKILL_CWD" "$M0_1" >/dev/null 2>&1
+if grep -q "mode=primary deny platform=$PLATFORM target=$PRIMARY verb=checkout" "$MIKA_GUARD_SHARED_CHECKOUT_LOG"; then ok "ligne de journal préfixée mode=primary avec plateforme, cible et verbe"; else ko "ligne de journal mode=primary" "$(cat "$MIKA_GUARD_SHARED_CHECKOUT_LOG")"; fi
+
+printf '\n== mika#2449 — le mode worktree (mika#2107) est INCHANGÉ par le second mode ==\n'
+expect deny "mika#2107 T1–T4 tiennent toujours : reset --hard depuis un worktree vers le principal" "$LINKED" "$PRIMARY" "git reset --hard"
+expect allow "mika#2107 : une écriture DANS son propre worktree reste admise (cas nominal)" "$LINKED" "$LINKED" "git add -A && git commit -m x"
+expect deny "mika#2107 : merge --ff-only vers le principal depuis un worktree reste refusé (D7 n'est pas T3)" "$LINKED" "$PRIMARY" "git merge --ff-only origin/main"
+
+# ---------------------------------------------------------------------------
 # Fire-Disposition — la table d'exceptions est vide, et c'est ASSERTÉ
 # ---------------------------------------------------------------------------
 printf '\n== Fire-Disposition — allowlist: zero entries ==\n'

@@ -31,7 +31,7 @@ use super::cadence::{
     DeliveryError, DeliveryFailureKind, ManagerConfig, classify_delivery_auth,
     run_manager_cycle_with_auth,
 };
-use super::reader::{GhRunner, ProcessGhRunner};
+use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
@@ -41,17 +41,29 @@ use mika_common::github_app::GitHubApp;
 use serde::Serialize;
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// mika#1968 AC6 — process-scoped guard against double-spawn of the cadence
-/// task. `Mutex<bool>` (not `OnceLock`) is deliberate: the extra ~40ns cost is
-/// irrelevant for a boot-time call, and a `Mutex` allows the test suite to
-/// reset the guard between tests via `reset_spawn_guard_for_test()`. See §6a
-/// of the plan for the design rationale.
+/// task.
+///
+/// **`AtomicBool`, not `Mutex<bool>` (mika#1975 AC2, plan D4).** The guard used
+/// to be a `Mutex<bool>` taken with `.lock().unwrap()`, and mika#1975 asked for
+/// `PoisonError` recovery. Recovering is the wrong shape here: the critical
+/// section held exactly three things — a `bool` read, a `warn!`, a `bool`
+/// write — and `as_display()` is a `format!` over a `String` and a `u64` that
+/// cannot panic, so **the only realistic panic site inside it was the logging
+/// macro itself**. A recovery path that logs is unreliable in precisely the
+/// case that produces it. `swap(true, SeqCst)` is the compare-and-set the
+/// mutex was emulating: one atomic operation, no lock, no poisoning to
+/// recover from, and no `.unwrap()` on a shared static.
+///
+/// The test-suite resettability that motivated `Mutex` over `OnceLock` is
+/// unchanged — `reset_spawn_guard_for_test()` is a `store(false)`.
 ///
 /// This guard collapses single-process double-init (root-cause candidate #2:
 /// `run_server()` re-entering, or a bin-side loop firing spawn twice). It does
@@ -65,11 +77,11 @@ use tracing::{error, info, warn};
 /// `pid` values), root cause is two processes — investigate the supervise-daemon
 /// restart discipline / stale-PID reap. That fix is out-of-scope for this
 /// module (belongs on an OpenRC init-script ticket per plan §6d).
-static MANAGER_SPAWN_GUARD: Mutex<bool> = Mutex::new(false);
+static MANAGER_SPAWN_GUARD: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
 fn reset_spawn_guard_for_test() {
-    *MANAGER_SPAWN_GUARD.lock().unwrap() = false;
+    MANAGER_SPAWN_GUARD.store(false, Ordering::SeqCst);
 }
 
 /// Env-var name for the Phase 1 single-target milestone. Setting this
@@ -83,7 +95,12 @@ pub const ENV_DELIVERY_TOKEN: &str = "MIKA_MANAGER_DELIVERY_TOKEN";
 pub const ENV_ESCALATION_URL: &str = "MIKA_MANAGER_ESCALATION_URL";
 pub const ENV_HEALTH_URL: &str = "MIKA_MANAGER_HEALTH_URL";
 pub const ENV_CHECKPOINT_DIR: &str = "MIKA_MANAGER_CHECKPOINT_DIR";
-pub const ENV_OFFLINE_SINK_DIR: &str = "MIKA_MANAGER_OFFLINE_SINK_DIR";
+
+// `ENV_OFFLINE_SINK_DIR` vit dans `sink_dir.rs` depuis mika#2267 : l'écrivain
+// et le lecteur CLI doivent passer par le MÊME résolveur, et la garde
+// structurelle qui le tient a besoin d'un fichier propriétaire unique. Voir
+// `super::sink_dir`.
+pub use super::sink_dir::ENV_OFFLINE_SINK_DIR;
 
 /// Default heartbeat interval in seconds (6 hours per brief § verdict 2).
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: i64 = 21_600;
@@ -94,9 +111,6 @@ pub const DEFAULT_SILENCE_THRESHOLD_DAYS: u32 = 3;
 /// when neither `state_changed` nor `heartbeat_fired` is true, so a shorter
 /// poll costs one `gh` invocation and a digest comparison — cheap.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
-/// Fallback root for checkpoint/offline-sink dirs when the env vars and
-/// `HOME` are all unset (last-resort — should not be reached in production).
-const FALLBACK_STATE_ROOT: &str = "/tmp/mika-manager";
 
 /// Assemble a `ManagerConfig` from the current process env, or return
 /// `Ok(None)` when the feature-gate env var is unset.
@@ -164,9 +178,12 @@ pub async fn manager_config_from_env(
     let github_token = settings.resolve_github_token(github_app).await;
 
     let checkpoint_dir = read_path_env(ENV_CHECKPOINT_DIR)
-        .unwrap_or_else(|| default_state_root().join("checkpoints"));
-    let offline_sink_dir =
-        read_path_env(ENV_OFFLINE_SINK_DIR).unwrap_or_else(|| default_state_root().join("sink"));
+        .unwrap_or_else(|| super::sink_dir::default_state_root().join("checkpoints"));
+
+    // mika#2267 C1 — le puits passe par LE résolveur, que le lecteur CLI
+    // appelle aussi. Composer le chemin ici une seconde fois est précisément le
+    // défaut que le ticket ferme, reproduit une couche plus haut.
+    let (offline_sink_dir, sink_dir_source) = super::sink_dir::resolve_offline_sink_dir();
 
     Ok(Some(ManagerConfig {
         target,
@@ -180,6 +197,7 @@ pub async fn manager_config_from_env(
         health_url,
         checkpoint_dir,
         offline_sink_dir,
+        sink_dir_source,
     }))
 }
 
@@ -228,20 +246,17 @@ pub fn spawn_manager_cycle_task(
     );
 
     // mika#1968 AC6 (change 6a) — process-scoped guard. See MANAGER_SPAWN_GUARD
-    // docstring for the failure-mode discrimination this covers.
-    {
-        let mut guard = MANAGER_SPAWN_GUARD.lock().unwrap();
-        if *guard {
-            warn!(
-                target: "mika::milestone_manager",
-                event = "manager_cadence_spawn_duplicate_rejected",
-                pid = std::process::id(),
-                milestone = %cfg.target.as_display(),
-                "spawn_manager_cycle_task called twice within same process — second call rejected"
-            );
-            return None;
-        }
-        *guard = true;
+    // docstring for the failure-mode discrimination this covers, and for why
+    // mika#1975 made it lock-free.
+    if MANAGER_SPAWN_GUARD.swap(true, Ordering::SeqCst) {
+        warn!(
+            target: "mika::milestone_manager",
+            event = "manager_cadence_spawn_duplicate_rejected",
+            pid = std::process::id(),
+            milestone = %cfg.target.as_display(),
+            "spawn_manager_cycle_task called twice within same process — second call rejected"
+        );
+        return None;
     }
 
     Some(tokio::spawn(async move {
@@ -255,6 +270,8 @@ pub fn spawn_manager_cycle_task(
             escalation_url_set = cfg.escalation_url.is_some(),
             "mika-manager cadence started"
         );
+
+        emit_delivery_resolved(&cfg);
 
         // mika#1968 AC5 + mika#1974 — boot-time GitHub auth sanity call.
         // Runs before the cycle loop starts so any auth/scope failure is
@@ -298,6 +315,9 @@ pub fn spawn_manager_cycle_task(
                     }
                     AuthClass::Network => {
                         "gh cannot reach GitHub — check network/DNS/TLS from daemon host"
+                    }
+                    AuthClass::Timeout => {
+                        "the boot-time probe exceeded its own budget — check whether `gh` is slow on this host before raising GH_AUTH_PROBE_TIMEOUT; the cadence continues (fail-open)"
                     }
                     AuthClass::Other => "unexpected failure — see stderr_head for details",
                 };
@@ -409,7 +429,12 @@ pub fn spawn_manager_cycle_task(
                     // for `manager_cycle_error auth_class=401` to separate
                     // auth failures from transient network failures without
                     // regex-parsing the free-text error body.
-                    let auth_class = classify_cycle_error(&format!("{e}"));
+                    // mika#1975 D5 — classify the typed `stderr`, never the
+                    // rendered string: the latter carries the `gh` command
+                    // line, whose operator-chosen milestone number made every
+                    // failure on `owner/repo#403` read as `Forbidden`. The
+                    // `error = %e` field below still logs the whole string.
+                    let auth_class = classify_cycle_error(&e);
                     warn!(
                         target: "mika::milestone_manager",
                         event = "manager_cycle_error",
@@ -454,6 +479,48 @@ pub fn spawn_manager_cycle_task(
     }))
 }
 
+// ---- mika#2267 C3 — où vont mes rapports ? -------------------------------
+
+/// Émettre `manager_delivery_resolved` : la ligne qui tranche la question de
+/// mika#2267 (« sink offline vs endpoint, à déterminer ») **sans lire le
+/// source**.
+///
+/// Événement distinct plutôt qu'enrichissement de `manager_cadence_start` :
+/// c'est un événement de *configuration*, il répond à « où vont mes rapports ? »
+/// et non à « la cadence a démarré », et il doit se grep seul. Précédent exact
+/// et même raisonnement : `llm_budget_resolved` (mika#2293). Modifier la forme
+/// d'un événement que des sondes existantes lisent serait par ailleurs un
+/// changement de format de fil gratuit.
+///
+/// **`delivery_token_present` est un booléen** — jamais la valeur, jamais un
+/// préfixe, jamais une longueur. Contrainte dure, doctrine `api_key_present` du
+/// `CLAUDE.md` racine, assertée par un test négatif.
+///
+/// Son **absence** pendant que la cadence tourne signifie que le binaire
+/// déployé est antérieur au correctif (classe mika#2340) — établir le
+/// déploiement avant toute conclusion sur le canal, jamais lire le silence
+/// comme « tout va bien ».
+///
+/// **`pub` pour son test de contrat, pas pour des appelants.** C'est l'unique
+/// émetteur de `manager_delivery_resolved` ; l'assertion négative — aucun
+/// matériel de credential n'atteint un champ — doit piloter le site d'émission
+/// réel, sinon elle atteste une copie de lui.
+pub fn emit_delivery_resolved(cfg: &ManagerConfig) {
+    info!(
+        target: "mika::milestone_manager",
+        event = "manager_delivery_resolved",
+        milestone = %cfg.target.as_display(),
+        route_normal = super::cadence::route_name_for(cfg.delivery_url.as_deref()),
+        route_escalation = super::cadence::route_name_for(cfg.escalation_url.as_deref()),
+        delivery_url_set = cfg.delivery_url.is_some(),
+        escalation_url_set = cfg.escalation_url.is_some(),
+        delivery_token_present = cfg.delivery_token.is_some(),
+        offline_sink_dir = %cfg.offline_sink_dir.display(),
+        sink_dir_source = cfg.sink_dir_source.as_str(),
+        "mika-manager delivery routing resolved"
+    );
+}
+
 // ---- mika#1968 AC5 GitHub auth verification ------------------------------
 
 /// Classification of a `manager_cycle_error` for operator observability.
@@ -479,32 +546,152 @@ pub enum AuthClass {
     MilestoneNotFound,
     /// Network-layer failure (connection refused, DNS, TLS, transport reset).
     Network,
+    /// mika#1975 AC1 — **our own** probe budget cut the boot-time `gh` call
+    /// (`GH_AUTH_PROBE_TIMEOUT`). Distinct from `Network` on purpose: the
+    /// `Network` hint says *« gh cannot reach GitHub — check network/DNS/TLS »*,
+    /// which is false of a merely slow host, and the two remedies differ
+    /// (« the network is dead » vs « the budget is too tight, or this host is
+    /// loaded »).
+    ///
+    /// **Posed at the site, never derived from text.** This variant is written
+    /// on the `Err(Elapsed)` arm of `verify_gh_auth` and nowhere else;
+    /// `classify_cycle_error` carries no `Timeout` pattern. Note it already
+    /// carries `"timed out"` — under `Network`, where it belongs: that string
+    /// is a *transport* observation, while this variant is a statement about a
+    /// budget **we** enforced. Rebranching one onto the other would amputate
+    /// `Network` of a real pattern in silence, and would reclassify no probe
+    /// timeout (the probe's timeout never goes through a classifier at all).
+    /// `mika1975_a_transport_timeout_is_still_a_network_error` pins it.
+    ///
+    /// Deliberately **outside** `is_auth_failure`: a slow network is not a
+    /// closed door.
+    Timeout,
     /// Anything else — genuine server-side or parsing failures.
     Other,
 }
 
 impl AuthClass {
+    /// **Wire format.** These strings land in `auth_class=` on
+    /// `manager_gh_auth_check_failed` / `manager_cycle_error` and operators
+    /// `grep` and `GROUP BY` them. Renaming one splits a population without
+    /// saying so; `mika1975_auth_class_as_str_is_a_wire_format` pins all six.
     fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "401",
             Self::Forbidden => "403",
             Self::MilestoneNotFound => "404_milestone_not_found",
             Self::Network => "network",
+            Self::Timeout => "timeout",
             Self::Other => "other",
         }
     }
 }
 
-/// Classify a cycle error string emitted by the `Reader` path into one of
-/// four operator-relevant buckets. String-based because the underlying
-/// `gh` subprocess surface is a string.
+/// Markers that make a three-digit run an HTTP **status** rather than an
+/// arbitrary number (mika#1975 D6).
+const HTTP_STATUS_MARKERS: &[&str] = &["http", "status", "code"];
+
+/// How far back a status marker may sit, in characters, for the digits that
+/// follow to count as a status code. Wide enough for `"status":"401"` and
+/// `bad credentials (http 401)`, narrow enough that an `HTTP 500:` earlier in
+/// the line cannot vouch for a `401` appearing in a URL path much later.
+const HTTP_STATUS_MARKER_WINDOW_CHARS: usize = 24;
+
+/// The last `n` characters of `prefix`, without slicing at a byte offset that
+/// might fall inside a multi-byte character.
+fn tail_chars(prefix: &str, n: usize) -> &str {
+    let Some(skip) = n.checked_sub(1) else {
+        // A zero-character window admits nothing. Unreachable at the shipped
+        // constant, but `None => prefix` would mean "the whole prefix", i.e.
+        // the exact opposite, so it is written rather than left to the call
+        // site's current value.
+        return "";
+    };
+    match prefix.char_indices().rev().nth(skip) {
+        // `char_indices` yields char-boundary offsets by construction.
+        Some((i, _)) => &prefix[i..], // safe-byte-slice: offset comes from char_indices
+        None => prefix,
+    }
+}
+
+/// `true` when `code` appears in `lower` **as an HTTP status** rather than as
+/// an arbitrary number (mika#1975 AC3, plan D6).
+///
+/// Two conditions, both required:
+///
+/// 1. **Non-digit boundaries** — so `4011` and `1401` never match `401`.
+/// 2. **A status marker within the preceding window** — one of
+///    [`HTTP_STATUS_MARKERS`] inside the last
+///    [`HTTP_STATUS_MARKER_WINDOW_CHARS`] characters before the digits.
+///
+/// | string | verdict | why |
+/// |---|---|---|
+/// | `http 401` | ✔ | marker `http` |
+/// | `bad credentials (http 401)` | ✔ | idem |
+/// | `http/2 401 unauthorized` | ✔ | idem |
+/// | `"status":"401"` | ✔ | marker `status` |
+/// | `/milestones/401` | ✘ | no marker upstream |
+/// | `--milestone 403` | ✘ | idem |
+/// | `milestone:401` | ✘ | idem |
+/// | `4011`, `1401` | ✘ | digit boundary |
+///
+/// **Why not a plain `contains("http 401")`.** It would cover every shape
+/// already present in this module's test corpus — and so look sufficient —
+/// while missing the JSON body form `"status":"401"` that GitHub emits. A
+/// tightening that passes the existing tests by losing a true positive is
+/// exactly the trap D7 exists to refuse.
+///
+/// **Residual, named rather than papered over.** A bare `Error: 403` with no
+/// marker and no `forbidden` anywhere would now read `Other` where it used to
+/// read `Forbidden`. No such shape is measured — every `gh` failure carries
+/// either `HTTP <code>` or the word — and this is precisely why D7 forbids
+/// touching the non-numeric patterns, which are what keep the real
+/// populations reachable. If such a shape ever shows up in
+/// `manager_cycle_error`, the remedy is **one more marker here**, never a
+/// return to the bare `contains`.
+fn has_http_status(lower: &str, code: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(code) {
+        // safe-byte-slice: `from` is a previous `find` result (char boundary)
+        let start = from + rel;
+        let end = start + code.len();
+        let boundary_before = start == 0 || !bytes[start - 1].is_ascii_digit();
+        let boundary_after = end >= bytes.len() || !bytes[end].is_ascii_digit();
+        if boundary_before && boundary_after {
+            let prefix = &lower[..start]; // safe-byte-slice: `find` offset is a char boundary
+            let window = tail_chars(prefix, HTTP_STATUS_MARKER_WINDOW_CHARS);
+            if HTTP_STATUS_MARKERS.iter().any(|m| window.contains(m)) {
+                return true;
+            }
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Classify a cycle error **string** into one of the operator-relevant
+/// buckets. Prefer [`classify_cycle_error`], which feeds this the typed
+/// `stderr` alone; this entry point exists for the string fallback and for
+/// the frozen D7 corpus.
 ///
 /// **404 handling:** intentionally not surfaced here — a 404 mid-cycle (an
 /// issue that got deleted, an artifact URL that went stale) is orthogonal to
 /// milestone-scope auth. Only the boot-time milestone probe uses
 /// `classify_milestone_probe_error` which adds 404 discrimination on top of
-/// this classifier's four-bucket base.
-fn classify_cycle_error(err_text: &str) -> AuthClass {
+/// this classifier's base.
+///
+/// **What mika#1975 changed, and what it deliberately did not.** The three
+/// numeric tests (`401`/`403`/`404`) go through [`has_http_status`], which
+/// requires a status marker upstream — so a milestone numbered 401 or 403 in
+/// the command line no longer classifies its own failures as an auth problem.
+/// **No non-numeric pattern was removed.** `unauthorized`, `bad credentials`,
+/// `gh auth login` and `authentication token not found` stay verbatim: the last
+/// two are mika#2013's shapes for a *missing* token, which carries no HTTP
+/// status at all because `gh` never reaches the API. Dropping them would make
+/// a token-less manager classify `Other`, which `is_auth_failure` ignores —
+/// the exact silent blindness mika#2013 closed (plan D7).
+fn classify_cycle_error_text(err_text: &str) -> AuthClass {
     let lower = err_text.to_ascii_lowercase();
     // mika#2013 — `Unauthorized` means "token missing/invalid/expired" per this
     // enum's own docstring, and *missing* has a shape that carries no 401 at
@@ -513,14 +700,17 @@ fn classify_cycle_error(err_text: &str) -> AuthClass {
     // with no resolvable token classifies as `Other`, which the persistent-auth
     // tracker deliberately ignores — leaving exactly the silent blindness this
     // ticket exists to end.
-    if lower.contains("401")
+    if has_http_status(&lower, "401")
         || lower.contains("unauthorized")
         || lower.contains("bad credentials")
         || lower.contains("gh auth login")
         || lower.contains("authentication token not found")
     {
         AuthClass::Unauthorized
-    } else if lower.contains("403") || lower.contains("forbidden") || lower.contains("rate limit") {
+    } else if has_http_status(&lower, "403")
+        || lower.contains("forbidden")
+        || lower.contains("rate limit")
+    {
         AuthClass::Forbidden
     } else if lower.contains("connection refused")
         || lower.contains("connection reset")
@@ -535,12 +725,37 @@ fn classify_cycle_error(err_text: &str) -> AuthClass {
     }
 }
 
-/// Classify a `verify_gh_auth` milestone-probe error string. Adds 404
-/// discrimination on top of `classify_cycle_error` (mika#1974 AC2). Kept
+/// Classify a cycle error, reading the **`stderr` alone** when the failure is
+/// typed (mika#1975 AC3, plan D5).
+///
+/// `ProcessGhRunner` returns a [`GhCommandError`] carrying `args` and `stderr`
+/// separately, precisely so this classifier never reads the command line it
+/// composed itself. That line holds operator-chosen digits
+/// (`/milestones/{N}`, `--milestone {N}`, `milestone:{N}`), and reading them
+/// is what made a 500 on `owner/repo#403` classify as `Forbidden` and fire the
+/// auth alarm with the wrong class.
+///
+/// **Fail-open on the downcast**, back to today's behaviour: a JSON parse
+/// error, a sink I/O error or a test mock is not a `GhCommandError`, and it
+/// still classifies on its rendered text. `{e}` and not `{e:#}` deliberately —
+/// widening the text seen would add false positives, the opposite of the goal.
+fn classify_cycle_error(err: &anyhow::Error) -> AuthClass {
+    match err.downcast_ref::<GhCommandError>() {
+        Some(gh) => classify_cycle_error_text(&gh.stderr),
+        None => classify_cycle_error_text(&format!("{err}")),
+    }
+}
+
+/// Classify a `verify_gh_auth` milestone-probe error **string**. Adds 404
+/// discrimination on top of `classify_cycle_error_text` (mika#1974 AC2). Kept
 /// separate from the cycle classifier so the two contexts stay decoupled —
 /// 404 during the boot-time milestone probe means "target milestone gone /
 /// wrong repo" (a distinct operator remediation from a mid-cycle 404).
-fn classify_milestone_probe_error(err_text: &str) -> AuthClass {
+///
+/// mika#1975: the `404` test goes through [`has_http_status`] like its two
+/// siblings; the textual `not found` fallback is untouched, and so is the
+/// delegation order below.
+fn classify_milestone_probe_error_text(err_text: &str) -> AuthClass {
     // mika#2013 — delegate FIRST, then apply the 404 discrimination only to
     // what the base classifier could not place. The previous order tested
     // `not found` up front, which swallowed the auth shape
@@ -549,17 +764,65 @@ fn classify_milestone_probe_error(err_text: &str) -> AuthClass {
     // `MIKA_MANAGER_TARGET_MILESTONE` for what is actually a token problem.
     // A genuine 404 (`gh: Not Found (HTTP 404)`) still lands here, because the
     // base classifier returns `Other` for it.
-    let base = classify_cycle_error(err_text);
+    let base = classify_cycle_error_text(err_text);
     if base != AuthClass::Other {
         return base;
     }
     let lower = err_text.to_ascii_lowercase();
-    if lower.contains("404") || lower.contains("not found") {
+    if has_http_status(&lower, "404") || lower.contains("not found") {
         AuthClass::MilestoneNotFound
     } else {
         AuthClass::Other
     }
 }
+
+/// Typed sibling of [`classify_milestone_probe_error_text`] — same contract as
+/// [`classify_cycle_error`]: read the `stderr` alone when the failure carries
+/// one, fall back to the rendered string otherwise.
+fn classify_milestone_probe_error(err: &anyhow::Error) -> AuthClass {
+    match err.downcast_ref::<GhCommandError>() {
+        Some(gh) => classify_milestone_probe_error_text(&gh.stderr),
+        None => classify_milestone_probe_error_text(&format!("{err}")),
+    }
+}
+
+/// Upper bound on the boot-time auth probe's single `gh` call (mika#1975 AC1).
+///
+/// **What an unbounded probe actually blocks — and the ticket understates it.**
+/// It is not startup: `spawn_manager_cycle_task` returns its `JoinHandle`
+/// immediately and `run_server` never awaits it, while `verify_gh_auth` runs
+/// *inside* the spawned task. What a hung `gh` blocks is the **cadence loop
+/// before its first tick** — `tokio::time::interval` is only built after the
+/// probe — so the outcome is zero cycles and zero reports, for ever. And it is
+/// unbounded in every direction: `ProcessGhRunner::run` has no timeout of its
+/// own, and `kill_on_drop(true)` only helps if something drops the future,
+/// which the `select!` on `cancel` cannot do because it is downstream of the
+/// probe. A hung probe therefore survives graceful shutdown too. The log makes
+/// it look healthy: `manager_cadence_start` and `manager_delivery_resolved` are
+/// both emitted *before* the probe, so the journal reads "cadence started",
+/// "route resolved", then silence.
+///
+/// **15s, not the 5s the AC names (plan D2).** Three reasons. (1) The upper
+/// bound costs nothing observable: the first real tick lands `poll_interval`
+/// (300s by default) after the probe, because `interval.tick().await`
+/// deliberately consumes the immediate fire — 15s against 300s of slack is 5%
+/// of one cycle, in the only case where the probe is slow at all. (2) The
+/// *lower* bound does cost: the probe is fail-open (log-and-continue), so a
+/// false timeout blocks nothing but writes an `error!` on
+/// `manager_gh_auth_check_failed`, the very surface mika#2013 exists to make
+/// trustworthy — and a merely slow network producing an auth ERROR at startup
+/// teaches the operator to ignore that line. `gh` is a Go binary to start, plus
+/// a TLS handshake, plus a GET; a few seconds at p99 on a loaded host is not an
+/// anomaly. (3) 15s is already the module's only network-timeout figure —
+/// `TOKEN_REFRESH_TIMEOUT`, `HttpReportDeliverer` and `HttpAuthAlarmSink` all
+/// use it, and a second, different number is one more value to re-read.
+///
+/// Deliberately **not** env-configurable: the same YAGNI rule
+/// `AUTH_PERSISTENT_FAILURE_THRESHOLD` states in as many words, and a new
+/// `MIKA_MANAGER_*` variable would additionally owe `.env.example` an entry
+/// (`mika2267_every_manager_env_const_is_declared_in_env_example`) for a knob
+/// nobody has asked to turn.
+const GH_AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Failure detail from `verify_gh_auth` — mirrors the discriminator shape
 /// of `classify_cycle_error` so the boot-time and cycle-time surfaces stay
@@ -607,7 +870,27 @@ pub async fn verify_gh_auth<R: GhRunner>(
     target: &MilestoneRef,
 ) -> Result<(), GhAuthError> {
     let path = format!("/repos/{}/milestones/{}", target.repo, target.number);
-    match runner.run(&["api", &path]).await {
+    // mika#1975 AC1 (plan D1) — the budget wraps the call **here**, inside the
+    // probe, rather than at the one call site. Same reasoning as mika#2290's
+    // guard 5d taking `deployment` as a parameter instead of leaving it to a
+    // caller-side `if`: the bound is then a property of the function, carries
+    // its own test, and a future second caller inherits it instead of having
+    // to remember it.
+    let probe = tokio::time::timeout(GH_AUTH_PROBE_TIMEOUT, runner.run(&["api", &path])).await;
+    let outcome = match probe {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            return Err(GhAuthError {
+                auth_class: AuthClass::Timeout,
+                stderr_head: format!(
+                    "probe timed out after {}s — `gh api {path}` did not return",
+                    GH_AUTH_PROBE_TIMEOUT.as_secs()
+                ),
+                exit_code: -1,
+            });
+        }
+    };
+    match outcome {
         Ok(body) => {
             // Parse-or-fail: a successful HTTP response must contain the
             // milestone with the EXPECTED number. Mismatched number implies
@@ -643,7 +926,17 @@ pub async fn verify_gh_auth<R: GhRunner>(
         }
         Err(e) => {
             let raw = format!("{e}");
-            let auth_class = classify_milestone_probe_error(&raw);
+            // mika#1975 D5 — classification reads the typed `stderr` alone;
+            // `stderr_head` keeps the **whole** rendered string, command line
+            // included. The two consumers of `raw` want different things and
+            // rebranching `stderr_head` onto `.stderr` "for consistency" would
+            // compile, pass every test, and amputate the log of the
+            // `gh api /repos/o/r/milestones/N` that says *which* call failed —
+            // on the very surface mika#2013 exists to make trustworthy. The
+            // command line is noise to the classifier and signal to the
+            // operator. `mika1975_the_probe_log_still_names_the_failing_call`
+            // is the assertion that reddens on that edit.
+            let auth_class = classify_milestone_probe_error(&e);
             // The `ProcessGhRunner` error format is `gh <args> failed: <stderr>`.
             // Take the first ~200 chars for the log line.
             let stderr_head = raw.chars().take(200).collect();
@@ -838,7 +1131,10 @@ struct AuthAlarm {
 /// "Hors périmètre"). A transport hiccup is not an auth failure; folding it in
 /// would make the auth signal unreadable. `MilestoneNotFound` never reaches
 /// this path either: `classify_cycle_error` maps a mid-cycle 404 to `Other`,
-/// and only the boot-time milestone probe raises `MilestoneNotFound`. So the
+/// and only the boot-time milestone probe raises `MilestoneNotFound`. Nor does
+/// `Timeout` (mika#1975): it is posed only on the probe's `Err(Elapsed)` arm,
+/// and a probe budget that cut is not a closed door — the same reasoning that
+/// keeps `Network` out. So the
 /// widening is bounded to exactly the two genuine "auth doesn't pass" classes —
 /// it does not enlarge the surface the way an unbounded "any failure" tracker
 /// (option 3 taken literally) would. The `auth_alarm_never_fires_for_non_auth_classes`
@@ -1176,19 +1472,6 @@ fn read_string_env(name: &str) -> Option<String> {
 /// Read an optional path env var. Empty/whitespace-only → `None`.
 fn read_path_env(name: &str) -> Option<PathBuf> {
     read_string_env(name).map(PathBuf::from)
-}
-
-/// Resolve the fallback root for state directories (checkpoint + offline sink)
-/// when the explicit env vars are unset. Prefers `$HOME/.mika/manager`; falls
-/// back to a well-known /tmp path (last-resort, should not be hit in
-/// production but keeps the spawn from panicking if HOME is unset).
-fn default_state_root() -> PathBuf {
-    if let Ok(home) = env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        return PathBuf::from(home).join(".mika").join("manager");
-    }
-    PathBuf::from(FALLBACK_STATE_ROOT)
 }
 
 /// Convert a `chrono::Duration` to `std::time::Duration`, clamping negatives
@@ -1549,6 +1832,7 @@ mod tests {
             health_url: None,
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
+            sink_dir_source: super::super::sink_dir::SinkDirSource::Default,
         }
     }
 
@@ -1822,22 +2106,22 @@ mod tests {
     #[tokio::test]
     async fn classify_cycle_error_discriminates_403_and_network() {
         assert_eq!(
-            classify_cycle_error("gh api foo failed: HTTP 403: Rate limit exceeded"),
+            classify_cycle_error_text("gh api foo failed: HTTP 403: Rate limit exceeded"),
             AuthClass::Forbidden
         );
         assert_eq!(
-            classify_cycle_error(
+            classify_cycle_error_text(
                 "gh api foo failed: Get https://api.github.com/rate_limit: dial tcp: dns lookup failed"
             ),
             AuthClass::Network
         );
         assert_eq!(
-            classify_cycle_error("gh api foo failed: HTTP 500: Internal Server Error"),
+            classify_cycle_error_text("gh api foo failed: HTTP 500: Internal Server Error"),
             AuthClass::Other
         );
         // 404 mid-cycle stays Other (orthogonal to milestone-scope auth).
         assert_eq!(
-            classify_cycle_error("gh api foo failed: HTTP 404: Not Found"),
+            classify_cycle_error_text("gh api foo failed: HTTP 404: Not Found"),
             AuthClass::Other,
             "cycle-body 404s must remain Other — the milestone-probe classifier owns 404-discrimination"
         );
@@ -1850,29 +2134,29 @@ mod tests {
     async fn classify_milestone_probe_error_discriminates_404() {
         // 404 → MilestoneNotFound (the new class).
         assert_eq!(
-            classify_milestone_probe_error(
+            classify_milestone_probe_error_text(
                 "gh api /repos/senara-solutions/mika/milestones/999 failed: HTTP 404: Not Found"
             ),
             AuthClass::MilestoneNotFound
         );
         // Bare "not found" string (belt-and-braces phrasing).
         assert_eq!(
-            classify_milestone_probe_error("gh api foo failed: milestone not found"),
+            classify_milestone_probe_error_text("gh api foo failed: milestone not found"),
             AuthClass::MilestoneNotFound
         );
         // 401 still classifies as Unauthorized (delegated).
         assert_eq!(
-            classify_milestone_probe_error("gh api foo failed: HTTP 401: Bad credentials"),
+            classify_milestone_probe_error_text("gh api foo failed: HTTP 401: Bad credentials"),
             AuthClass::Unauthorized
         );
         // 403 still classifies as Forbidden (delegated).
         assert_eq!(
-            classify_milestone_probe_error("gh api foo failed: HTTP 403: Forbidden"),
+            classify_milestone_probe_error_text("gh api foo failed: HTTP 403: Forbidden"),
             AuthClass::Forbidden
         );
         // Network still classifies as Network (delegated).
         assert_eq!(
-            classify_milestone_probe_error("gh api foo failed: dial tcp: dns lookup failed"),
+            classify_milestone_probe_error_text("gh api foo failed: dial tcp: dns lookup failed"),
             AuthClass::Network
         );
     }
@@ -2038,8 +2322,14 @@ mod tests {
     /// mika#1968 AC6 test — second call within the same process is rejected
     /// with `None` (defense-in-depth against single-process double-init).
     /// Guard reset via `reset_spawn_guard_for_test()` so this test stays
-    /// hermetic; without the reset the guard would leak across tests since
-    /// `Mutex<bool>` is process-scoped.
+    /// hermetic; without the reset the guard would leak across tests since the
+    /// `AtomicBool` is process-scoped.
+    ///
+    /// **Unchanged by mika#1975 AC2, deliberately.** This is the guard's
+    /// behaviour test, and its behaviour did not change when the `Mutex<bool>`
+    /// became an `AtomicBool`. No poisoning test joins it either: after the
+    /// swap there is no poisoned state to reach, and asserting "it does not
+    /// poison" on a type that has no poisoning is empty.
     #[tokio::test]
     #[serial]
     async fn spawn_manager_cycle_task_second_call_rejected() {
@@ -2320,6 +2610,16 @@ mod tests {
     /// bounded exclusion the ticket's "Hors périmètre" ratifies: `Network` and
     /// `Other` are not auth failures, and `MilestoneNotFound` never reaches the
     /// cycle path (a mid-cycle 404 classifies as `Other`).
+    ///
+    /// **mika#1975 adds `Timeout` to the same set, and for `Network`'s reason:
+    /// a probe budget that cut is not a closed door.** It is posed only on
+    /// `verify_gh_auth`'s `Err(Elapsed)` arm, so like `MilestoneNotFound` it
+    /// never reaches the cycle path either — but the exclusion is asserted
+    /// here rather than left to that topology, because the topology is what a
+    /// future edit would change. The prose and the loop are extended together:
+    /// a docstring enumerating a smaller population than its own loop is the
+    /// defect this file already had once (`MANAGER_SPAWN_GUARD` arguing for
+    /// the `Mutex` mika#1975 removes).
     #[test]
     fn auth_alarm_never_fires_for_non_auth_classes() {
         let t0 = Instant::now();
@@ -2327,6 +2627,7 @@ mod tests {
             AuthClass::Other,
             AuthClass::Network,
             AuthClass::MilestoneNotFound,
+            AuthClass::Timeout,
         ] {
             let mut tracker = AuthFailureTracker::default();
             assert!(tracker.on_failure(class, t0).is_none());
@@ -2569,7 +2870,7 @@ mod tests {
             "authentication token not found for host github.com",
         ] {
             assert_eq!(
-                classify_cycle_error(text),
+                classify_cycle_error_text(text),
                 AuthClass::Unauthorized,
                 "unauthenticated gh shape must reach the auth alarm: {text}"
             );
@@ -2584,21 +2885,366 @@ mod tests {
     #[test]
     fn classify_milestone_probe_error_prefers_auth_shape_over_not_found() {
         assert_eq!(
-            classify_milestone_probe_error("authentication token not found for host github.com"),
+            classify_milestone_probe_error_text(
+                "authentication token not found for host github.com"
+            ),
             AuthClass::Unauthorized
         );
         // Anti-vacuity: a genuine 404 must still classify as a missing
         // milestone, otherwise the reordering traded one misdiagnosis for
         // another.
         assert_eq!(
-            classify_milestone_probe_error(
+            classify_milestone_probe_error_text(
                 "gh api /repos/x/milestones/9 failed: gh: Not Found (HTTP 404)"
             ),
             AuthClass::MilestoneNotFound
         );
         assert_eq!(
-            classify_milestone_probe_error("gh: Bad credentials (HTTP 401)"),
+            classify_milestone_probe_error_text("gh: Bad credentials (HTTP 401)"),
             AuthClass::Unauthorized
+        );
+    }
+
+    // ---- mika#1975 AC3 — the classifier reads the stderr, not its own args --
+
+    /// mika#1975 D6 — the eight rows of the plan's table, on the pure
+    /// predicate, isolated from everything else.
+    #[test]
+    fn mika1975_has_http_status_units() {
+        // Accepted: a status marker sits in the window before the digits.
+        for s in [
+            "http 401",
+            "bad credentials (http 401)",
+            "http/2 401 unauthorized",
+            "{\"status\":\"401\",\"message\":\"bad credentials\"}",
+        ] {
+            assert!(
+                has_http_status(s, "401"),
+                "must read as an HTTP status: {s:?}"
+            );
+        }
+        // Refused: operator-chosen digits in a command line.
+        assert!(!has_http_status("gh api /repos/o/r/milestones/401", "401"));
+        assert!(!has_http_status("gh issue list --milestone 403", "403"));
+        assert!(!has_http_status("gh pr list --search milestone:401", "401"));
+        // Refused: digit boundaries.
+        assert!(!has_http_status("http 4011", "401"));
+        assert!(!has_http_status("http 1401", "401"));
+        // Window bound: a marker far upstream does not vouch for later digits.
+        assert!(!has_http_status(
+            "http 500 internal server error while reading /repos/o/r/milestones/401",
+            "401"
+        ));
+    }
+
+    /// mika#1975 AC3, **typing control**. A failure whose command line carries
+    /// `401` and whose stderr is a plain 500 must classify `Other`: the
+    /// classifier reads the typed `stderr`, so the digits it composed itself
+    /// never reach it.
+    ///
+    /// Required *alongside* its non-typed sibling below — this one alone would
+    /// leave the pattern tightening untested (the args are already gone by the
+    /// time the predicate runs), and that one alone would leave the typing
+    /// untested. Each was verified red by neutralising **its** half, not both
+    /// at once (lesson mika#2277).
+    #[test]
+    fn mika1975_typed_error_classifies_on_stderr_only() {
+        let err = anyhow::Error::new(GhCommandError {
+            args: "api /repos/o/r/milestones/401".into(),
+            stderr: "HTTP 500: Internal Server Error".into(),
+        });
+        assert_eq!(
+            classify_cycle_error(&err),
+            AuthClass::Other,
+            "a 500 on milestone #401 is not an auth failure"
+        );
+
+        // The 403 half of the same shape — this is the one that reached
+        // `is_auth_failure` and fired the 30-minute alarm with the wrong hint.
+        let err = anyhow::Error::new(GhCommandError {
+            args: "issue list --repo o/r --milestone 403".into(),
+            stderr: "HTTP 500: Internal Server Error".into(),
+        });
+        assert_eq!(classify_cycle_error(&err), AuthClass::Other);
+        assert!(
+            !is_auth_failure(classify_cycle_error(&err)),
+            "a 500 must not advance the persistent-auth-failure window"
+        );
+
+        // Anti-vacuity: a genuine 401 in the stderr still classifies.
+        let err = anyhow::Error::new(GhCommandError {
+            args: "api /repos/o/r/milestones/401".into(),
+            stderr: "HTTP 401: Bad credentials".into(),
+        });
+        assert_eq!(classify_cycle_error(&err), AuthClass::Unauthorized);
+    }
+
+    /// mika#1975 AC3, **pattern-tightening control**. The same failure as a
+    /// flat string — the fail-open path, which every non-`gh` error takes —
+    /// must also classify `Other`. This is what proves `has_http_status` is
+    /// doing work rather than the typing alone carrying the test.
+    #[test]
+    fn mika1975_untyped_string_still_narrows_the_numeric_patterns() {
+        let flat = "gh api /repos/o/r/milestones/401 failed: HTTP 500: Internal Server Error";
+        assert_eq!(
+            classify_cycle_error(&anyhow::anyhow!("{flat}")),
+            AuthClass::Other
+        );
+        assert_eq!(classify_cycle_error_text(flat), AuthClass::Other);
+
+        let flat =
+            "gh issue list --repo o/r --milestone 403 failed: HTTP 500: Internal Server Error";
+        assert_eq!(classify_cycle_error_text(flat), AuthClass::Other);
+
+        // Anti-vacuity: the fail-open path still classifies a real signal.
+        assert_eq!(
+            classify_cycle_error(&anyhow::anyhow!(
+                "gh api /repos/o/r/milestones/401 failed: HTTP 401: Bad credentials"
+            )),
+            AuthClass::Unauthorized
+        );
+    }
+
+    /// mika#1975 D7 — **the invariant that protects the alarm.** Every
+    /// auth-shaped string this module has ever measured must classify exactly
+    /// as it did before the tightening.
+    ///
+    /// The class is what feeds `is_auth_failure` → `AuthFailureTracker`: a real
+    /// 401 demoted to `Other` is ignored by the tracker, and the manager goes
+    /// blind again for the ~14 h of mika#2013's founding incident. So this
+    /// corpus is frozen — it describes measured `gh` shapes and does not get
+    /// "refreshed".
+    #[test]
+    fn mika1975_the_classification_of_every_measured_auth_shape_is_unchanged() {
+        let cycle_corpus: &[(&str, AuthClass)] = &[
+            // 401 shapes.
+            (
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 401: Bad credentials",
+                AuthClass::Unauthorized,
+            ),
+            ("gh: Bad credentials (HTTP 401)", AuthClass::Unauthorized),
+            (
+                "gh api foo failed: 401 Unauthorized",
+                AuthClass::Unauthorized,
+            ),
+            // mika#2013's four token-absent shapes — no HTTP status at all,
+            // which is exactly why the non-numeric patterns must stay.
+            (
+                "gh api /repos/x/milestones/1 failed: To get started with GitHub CLI, please run: gh auth login",
+                AuthClass::Unauthorized,
+            ),
+            (
+                "authentication token not found for host github.com",
+                AuthClass::Unauthorized,
+            ),
+            // 403 shapes.
+            (
+                "gh api foo failed: HTTP 403: Rate limit exceeded",
+                AuthClass::Forbidden,
+            ),
+            (
+                "gh api foo failed: HTTP 403: Forbidden",
+                AuthClass::Forbidden,
+            ),
+            (
+                "gh api /repos/senara-solutions/mika/milestones/30 failed: HTTP 403: Resource not accessible by integration",
+                AuthClass::Forbidden,
+            ),
+            // Network + Other, unchanged.
+            (
+                "gh api foo failed: Get https://api.github.com/rate_limit: dial tcp: dns lookup failed",
+                AuthClass::Network,
+            ),
+            (
+                "gh api foo failed: HTTP 500: Internal Server Error",
+                AuthClass::Other,
+            ),
+            ("gh api foo failed: HTTP 404: Not Found", AuthClass::Other),
+        ];
+        for (text, expected) in cycle_corpus {
+            assert_eq!(
+                classify_cycle_error_text(text),
+                *expected,
+                "classification drifted for: {text}"
+            );
+        }
+
+        let probe_corpus: &[(&str, AuthClass)] = &[
+            (
+                "gh api /repos/senara-solutions/mika/milestones/999 failed: HTTP 404: Not Found",
+                AuthClass::MilestoneNotFound,
+            ),
+            (
+                "gh api foo failed: milestone not found",
+                AuthClass::MilestoneNotFound,
+            ),
+            (
+                "gh api /repos/x/milestones/9 failed: gh: Not Found (HTTP 404)",
+                AuthClass::MilestoneNotFound,
+            ),
+            (
+                "authentication token not found for host github.com",
+                AuthClass::Unauthorized,
+            ),
+            (
+                "gh api foo failed: HTTP 401: Bad credentials",
+                AuthClass::Unauthorized,
+            ),
+            (
+                "gh api foo failed: HTTP 403: Forbidden",
+                AuthClass::Forbidden,
+            ),
+            (
+                "gh api foo failed: dial tcp: dns lookup failed",
+                AuthClass::Network,
+            ),
+        ];
+        for (text, expected) in probe_corpus {
+            assert_eq!(
+                classify_milestone_probe_error_text(text),
+                *expected,
+                "probe classification drifted for: {text}"
+            );
+        }
+    }
+
+    /// mika#1975 U2 — **amputation control.** The probe's log line must keep
+    /// naming *which* `gh` call failed, even though classification now reads
+    /// the `stderr` alone.
+    ///
+    /// Both halves live in one test on purpose: either one alone is satisfied
+    /// by the regression this exists to refuse (rebranching `stderr_head` onto
+    /// `.stderr` "for consistency" keeps the class right and loses the call).
+    #[tokio::test]
+    async fn mika1975_the_probe_log_still_names_the_failing_call() {
+        let runner = TypedFailureRunner {
+            args: "api /repos/o/r/milestones/12".into(),
+            stderr: "HTTP 401: Bad credentials".into(),
+        };
+        let err = verify_gh_auth(&runner, &test_target())
+            .await
+            .expect_err("a 401 must return Err");
+        assert_eq!(err.auth_class, AuthClass::Unauthorized);
+        assert!(
+            err.stderr_head.contains("/repos/o/r/milestones/12"),
+            "stderr_head must still name the failing call — the operator reads \
+             it to know WHICH gh invocation broke: {}",
+            err.stderr_head
+        );
+    }
+
+    // ---- mika#1975 AC1 — the boot-time probe is bounded --------------------
+
+    /// A `GhRunner` that sleeps before answering. Used with
+    /// `#[tokio::test(start_paused = true)]` so the virtual clock makes both
+    /// budget tests instantaneous and deterministic.
+    struct SleepingGhRunner {
+        delay: Duration,
+        body: String,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for SleepingGhRunner {
+        async fn run(&self, _args: &[&str]) -> Result<String> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.body.clone())
+        }
+    }
+
+    /// A `GhRunner` that fails with a **typed** `GhCommandError`, so tests can
+    /// exercise the `downcast_ref` path the production runner takes.
+    struct TypedFailureRunner {
+        args: String,
+        stderr: String,
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for TypedFailureRunner {
+        async fn run(&self, _args: &[&str]) -> Result<String> {
+            Err(anyhow::Error::new(GhCommandError {
+                args: self.args.clone(),
+                stderr: self.stderr.clone(),
+            }))
+        }
+    }
+
+    /// mika#1975 AC1 — a `gh` that never returns is cut by the probe's own
+    /// budget instead of blocking the cadence loop before its first tick.
+    #[tokio::test(start_paused = true)]
+    async fn mika1975_the_auth_probe_is_bounded() {
+        let runner = SleepingGhRunner {
+            delay: Duration::from_secs(60),
+            body: milestone_success_body(),
+        };
+        let err = verify_gh_auth(&runner, &test_target())
+            .await
+            .expect_err("a hung probe must not hang the caller");
+        assert_eq!(
+            err.auth_class,
+            AuthClass::Timeout,
+            "our own budget cutting is not a network failure"
+        );
+        assert_eq!(err.auth_class.as_str(), "timeout");
+        assert!(
+            err.stderr_head.contains("timed out"),
+            "the log line must say what happened: {}",
+            err.stderr_head
+        );
+    }
+
+    /// mika#1975 AC1, **negative control**. Without it, "the probe is bounded"
+    /// is indistinguishable from "the probe always fails".
+    #[tokio::test(start_paused = true)]
+    async fn mika1975_a_probe_just_under_the_budget_succeeds() {
+        let runner = SleepingGhRunner {
+            delay: GH_AUTH_PROBE_TIMEOUT - Duration::from_secs(1),
+            body: milestone_success_body(),
+        };
+        verify_gh_auth(&runner, &test_target())
+            .await
+            .expect("a probe answering inside the budget must still return Ok(())");
+    }
+
+    /// mika#1975 D3 — `as_str()` is a wire format: operators `grep`
+    /// `auth_class=` and `GROUP BY` the result. All six values pinned.
+    #[test]
+    fn mika1975_auth_class_as_str_is_a_wire_format() {
+        assert_eq!(AuthClass::Unauthorized.as_str(), "401");
+        assert_eq!(AuthClass::Forbidden.as_str(), "403");
+        assert_eq!(
+            AuthClass::MilestoneNotFound.as_str(),
+            "404_milestone_not_found"
+        );
+        assert_eq!(AuthClass::Network.as_str(), "network");
+        assert_eq!(AuthClass::Timeout.as_str(), "timeout");
+        assert_eq!(AuthClass::Other.as_str(), "other");
+    }
+
+    /// mika#1975 D3 — **boundary control for the new variant.** A transport
+    /// timeout reported by `gh` stays `Network`.
+    ///
+    /// This is the one assertion that reddens if someone, having just added
+    /// `AuthClass::Timeout`, rebranches `lower.contains("timed out")` onto it
+    /// "for consistency". That edit compiles, passes the whole suite, and
+    /// amputates `Network` of a pattern in silence — while reclassifying *no*
+    /// probe timeout, since the probe's own budget never goes through a
+    /// classifier at all.
+    #[test]
+    fn mika1975_a_transport_timeout_is_still_a_network_error() {
+        for text in [
+            "gh: request timed out",
+            "gh api foo failed: Get https://api.github.com: net/http: request timed out",
+        ] {
+            assert_eq!(
+                classify_cycle_error_text(text),
+                AuthClass::Network,
+                "a transport timeout is a network observation, not our budget: {text}"
+            );
+        }
+        // And the cycle classifier carries no Timeout pattern at all.
+        assert_ne!(
+            classify_cycle_error_text("gh: the probe timed out after 15s"),
+            AuthClass::Timeout
         );
     }
 }

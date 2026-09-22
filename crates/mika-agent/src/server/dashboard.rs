@@ -283,6 +283,67 @@ pub async fn handle_agent_sessions(
     .into_response()
 }
 
+/// GET /api/v1/agents/:id/budget — the LLM budget and model this agent is
+/// **running under**, with the provenance of each half (mika#2457).
+///
+/// # What it serves, and what it refuses to do
+///
+/// It returns `AgentState.budget_record` verbatim — the record resolved once at
+/// `init_agent`, `resolved_at` included. It does **not** re-read the disk and
+/// does not recompute anything, and that refusal is the whole design rather than
+/// an economy:
+///
+/// - Recomputing here would walk the cascade in **this** process. On a host
+///   where a service variable shadows the per-agent `config.toml`, the answer
+///   would name a setting that is not in force, with the authority of a
+///   measurement. That is mika#2304's defect one field over (`--verbose`
+///   printing the requested model while the turn ran under another) and
+///   mika#2270's lesson (the server held the answer and threw it away).
+/// - Refusing to re-read is also what keeps the route and the disk **two
+///   distinct facts**, whose difference *is* the drift measurement mika#2457
+///   asks for. An operator compares `resolved_at` against the `config.toml`
+///   mtime; a route that refreshed itself would erase the comparison.
+///
+/// # And the drift, frozen with it (mika#2473)
+///
+/// Beside `budget`, the response carries `model_drift`: whether this agent runs
+/// the model `well_known_agents.rs` declares for it, as established at
+/// `init_agent` from that same record. It is served under the identical refusal
+/// — nothing is re-read, nothing is re-compared. A comparison redone here would
+/// walk the cascade in the *reader's* process and could report `in_sync` about a
+/// runtime that is not the one this agent boots under, which is the same defect
+/// one field over. The 404 arm carries no `model_drift` for the same reason it
+/// carries no `budget`: an agent this process does not serve has no drift
+/// measured, and `not_applicable` would be an answer to a question nobody asked.
+///
+/// # 404 means "this server has not resolved that agent", never a default
+///
+/// The lookup is a read of the resolved-agent map, deliberately **not**
+/// `resolve_agent` — that would lazily construct the agent (DB, skills, task
+/// engine, KG) as a side effect of a read-only observability GET. An agent this
+/// process does not serve has no budget *in force* to report, and inventing one
+/// would be exactly the false green U1/U2 exist to prevent. The CLI renders that
+/// 404 as *"not attested"* rather than falling back to a locally computed value.
+pub async fn handle_agent_budget(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> impl IntoResponse {
+    match state.agents.get(&agent_id) {
+        Some(agent_state) => Json(serde_json::json!({
+            "budget": &*agent_state.budget_record,
+            "model_drift": &*agent_state.model_drift,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("agent '{agent_id}' is not resolved on this server"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Query parameters for the audit endpoint (pagination + optional filters).
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {

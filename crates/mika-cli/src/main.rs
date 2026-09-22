@@ -67,6 +67,23 @@ async fn main() -> Result<()> {
     let continue_session =
         cli.continue_session || cli.command.as_ref().is_some_and(|c| c.continue_override());
 
+    // mika#1982 — the `ask` message is resolved ONCE, here, upstream of the
+    // three branchings that consume it (`--team` just below, then `--remote`
+    // and the local agent in the main dispatch). There is no single point
+    // downstream of all three: the team branch returns before the main `match`
+    // is ever reached.
+    //
+    // The resolution is scoped to `Commands::Ask` and must NOT be hoisted above
+    // it. Eight other subcommands read the standard input for their own account
+    // — `credential-helper` speaks the git credential protocol on it — and a
+    // read at binary startup would steal their input.
+    let ask_message = match cli.command {
+        Some(Commands::Ask(ref args)) => Some(mika_cli::ask_message::resolve_from_process_stdin(
+            args.message.as_deref(),
+        )?),
+        _ => None,
+    };
+
     if let Some(team_name) = team_override {
         let team_name = team::normalize_team_name(team_name);
         team::validate_team_name(&team_name)?;
@@ -132,9 +149,17 @@ async fn main() -> Result<()> {
                 let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
 
                 // verbose not forwarded — conflicts_with = "team" prevents this combination at parse time
+                //
+                // mika#1982: the goal is the message resolved upstream, never
+                // `args.message`. The `expect` documents the invariant — this
+                // arm is only reachable for `Commands::Ask`, which is exactly
+                // the variant the resolution covers — rather than re-resolving
+                // here, since a second resolution site is a second decision.
                 return commands::ask::run_team_ask(
                     &team_name,
-                    &args.message,
+                    ask_message
+                        .as_deref()
+                        .expect("mika#1982: resolved for every Commands::Ask"),
                     run_id.as_deref(),
                     &args.format,
                     &global_home,
@@ -306,6 +331,16 @@ async fn main() -> Result<()> {
         Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
         Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
         Some(Commands::Ask(args)) => {
+            // mika#1982: both doors below take the message resolved upstream.
+            // `--remote` in particular used to pass `args.message` raw, so a
+            // `cat plan.md | mika ask --remote <url> -` sent the literal `"-"`
+            // — one byte — and got back a plausible answer to a question that
+            // was never asked. Same class as mika#2304: a channel that does not
+            // reach the executant, whose no-op is indistinguishable from a
+            // success.
+            let ask_message = ask_message
+                .as_deref()
+                .expect("mika#1982: resolved for every Commands::Ask");
             // Remote mode (R1, plan 2026-06-09-003): bypass the in-process agent loop and
             // dispatch to a cloud Mika agent via the gateway's A2A proxy. Flag wins over env.
             let remote_url = args
@@ -329,7 +364,7 @@ async fn main() -> Result<()> {
                 // the split that cost mika#2304 a follow-up cannot recur here —
                 // omitting it would be a deliberate act, not an oversight.
                 return match mika_cli::remote_ask::run_remote(
-                    &args.message,
+                    ask_message,
                     remote_url,
                     fmt,
                     args.verbose,
@@ -350,7 +385,7 @@ async fn main() -> Result<()> {
                 };
             }
             match commands::ask::run(
-                &args.message,
+                ask_message,
                 &agent_name,
                 args.task_id.as_deref(),
                 args.task_complete,

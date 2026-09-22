@@ -83,8 +83,34 @@ pub enum PersonaProfile {
 /// (ruled out by Mika Prime, 2026-09-09). See mika#2247.
 pub const CHAMPION_PERSONA_PLACEHOLDER: PersonaProfile = PersonaProfile::Family;
 
+/// What [`AgentTier::parse`] made of a raw tier value: the tier it resolved to,
+/// and whether the value was one this binary knows.
+///
+/// `recognized == false` is **not** an error — parsing fails closed to the most
+/// restricted tools tier (mika#2023 AC2) and carries on. The flag exists so a
+/// caller can *name* the value it did not recognize (`mika agents reprovision`
+/// prints it between quotes) **without writing a second comparison against the
+/// tier vocabulary**. That second comparison is exactly what
+/// `home::tests::mika2230_le_tier_a_un_seul_analyseur` refuses: it would make no
+/// decision wrong the day it is written, and would diverge the day a fourth tier
+/// arrives, in silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierParse {
+    /// The resolved tier. Never `Err`: an unrecognized value lands on
+    /// [`AgentTier::FAIL_CLOSED_TIER`].
+    pub tier: AgentTier,
+    /// `false` when the value was non-empty and outside the recognized set.
+    pub recognized: bool,
+}
+
 impl AgentTier {
-    /// Resolve the tier from the `MIKA_AGENT_TIER` env var.
+    /// The single parser of a tier value, for every caller that holds one.
+    ///
+    /// [`Self::from_env`] reads `MIKA_AGENT_TIER` and hands the raw string here;
+    /// `mika agents reprovision --tier` hands its flag here (mika#2230). The
+    /// extraction is what keeps the mika#2023 fail-closed rule readable **once,
+    /// at its site** — a clap `ValueEnum` on the CLI side would have restated the
+    /// vocabulary and diverged the day a fourth tier arrives.
     ///
     /// Absent, empty, and `"default"` resolve to [`AgentTier::Default`] — an unset
     /// variable is the legitimate shape of the operator workstation, not a
@@ -96,25 +122,44 @@ impl AgentTier {
     /// an unrecognized value resolves **fail-closed** to the most restricted tools
     /// profile, still with the single `warn!` naming the offending value (visible
     /// in `MIKA_SPIRIT_LOG_FILE`).
+    pub fn parse(raw: &str) -> TierParse {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "default" => TierParse {
+                tier: Self::Default,
+                recognized: true,
+            },
+            "family" => TierParse {
+                tier: Self::Family,
+                recognized: true,
+            },
+            "champion" => TierParse {
+                tier: Self::Champion,
+                recognized: true,
+            },
+            _ => {
+                warn!(
+                    value = %raw,
+                    "agent tier value not recognized (MIKA_AGENT_TIER / --tier); \
+                     failing closed to the most restricted tools tier (mika#2023)"
+                );
+                TierParse {
+                    tier: Self::FAIL_CLOSED_TIER,
+                    recognized: false,
+                }
+            }
+        }
+    }
+
+    /// Resolve the tier from the `MIKA_AGENT_TIER` env var.
+    ///
+    /// A thin reader over [`Self::parse`]; the rules live there. Absence of the
+    /// variable is the one case `parse` never sees, and it resolves to
+    /// [`AgentTier::Default`].
     pub fn from_env() -> Self {
         match std::env::var("MIKA_AGENT_TIER") {
             Err(_) => Self::Default,
-            Ok(raw) => {
-                let normalized = raw.trim().to_ascii_lowercase();
-                match normalized.as_str() {
-                    "" | "default" => Self::Default,
-                    "family" => Self::Family,
-                    "champion" => Self::Champion,
-                    _ => {
-                        warn!(
-                            value = %raw,
-                            "MIKA_AGENT_TIER value not recognized; failing closed to the \
-                             most restricted tools tier (mika#2023)"
-                        );
-                        Self::FAIL_CLOSED_TIER
-                    }
-                }
-            }
+            Ok(raw) => Self::parse(&raw).tier,
         }
     }
 
@@ -172,14 +217,26 @@ impl AgentTier {
             && matches!(self.persona_profile(), PersonaProfile::Family)
     }
 
-    fn identity_toml(self) -> &'static str {
+    /// The `identity.toml` template this tier is provisioned with (tools axis).
+    ///
+    /// `pub` since mika#2230: `mika agents reprovision` re-applies this exact
+    /// template to a customer agent already on disk. It calls the accessor rather
+    /// than reaching for `DEFAULT_IDENTITY`/`FAMILY_IDENTITY` directly, so the
+    /// two-axis mapping of mika#2023 keeps a single reader.
+    pub fn identity_toml(self) -> &'static str {
         match self.tools_profile() {
             ToolsProfile::Operator => DEFAULT_IDENTITY,
             ToolsProfile::Family => FAMILY_IDENTITY,
         }
     }
 
-    fn soul_md(self) -> &'static str {
+    /// The `soul.md` template this tier is provisioned with (persona axis).
+    ///
+    /// `pub` for the same reason as [`Self::identity_toml`], and it is the half a
+    /// re-provision must not forget: writing the identity alone fabricates the
+    /// very drift the mika#1962 tier guard exists to catch (allowlist on one axis,
+    /// persona on the other).
+    pub fn soul_md(self) -> &'static str {
         match self.persona_profile() {
             PersonaProfile::Operator => DEFAULT_SOUL,
             PersonaProfile::Family => FAMILY_SOUL,
@@ -318,12 +375,18 @@ pub fn is_legacy_layout(home_dir: &Path) -> bool {
 /// Creates the `agents/` directory, initializes the default agent,
 /// sets it as active, and writes the root-level global config.
 pub fn bootstrap_fresh_install(home_dir: &Path) -> Result<()> {
+    bootstrap_fresh_install_with_tier(home_dir, AgentTier::from_env())
+}
+
+/// Bootstrap a fresh installation under an **explicitly supplied** tier.
+/// See [`bootstrap_with_tier`] for why the tier travels by argument.
+pub fn bootstrap_fresh_install_with_tier(home_dir: &Path, tier: AgentTier) -> Result<()> {
     std::fs::create_dir_all(home_dir.join("agents"))
         .with_context(|| format!("failed to create {}/agents/", home_dir.display()))?;
     // Create the container-level data directory for the shared database
     std::fs::create_dir_all(home_dir.join("data"))
         .with_context(|| format!("failed to create {}/data/", home_dir.display()))?;
-    bootstrap_agent(home_dir, crate::agent::DEFAULT_AGENT)
+    bootstrap_agent_with_tier(home_dir, crate::agent::DEFAULT_AGENT, tier)
         .with_context(|| "failed to initialize default agent".to_string())?;
     write_active_agent(home_dir, crate::agent::DEFAULT_AGENT)?;
     write_default_if_missing(home_dir, "config.toml", DEFAULT_GLOBAL_CONFIG)?;
@@ -333,9 +396,15 @@ pub fn bootstrap_fresh_install(home_dir: &Path) -> Result<()> {
 /// Bootstrap a named agent under the multi-agent layout.
 /// Validates the name, creates `{home_dir}/agents/{name}/`, and calls `bootstrap()`.
 pub fn bootstrap_agent(home_dir: &Path, name: &str) -> Result<()> {
+    bootstrap_agent_with_tier(home_dir, name, AgentTier::from_env())
+}
+
+/// Bootstrap a named agent under an **explicitly supplied** tier.
+/// See [`bootstrap_with_tier`] for why the tier travels by argument.
+pub fn bootstrap_agent_with_tier(home_dir: &Path, name: &str, tier: AgentTier) -> Result<()> {
     crate::agent::validate_agent_name(name)?;
     let dir = crate::agent::agent_dir(home_dir, name);
-    bootstrap(&dir)
+    bootstrap_with_tier(&dir, tier)
 }
 
 /// Resolve the effective home directory for a named agent.
@@ -456,18 +525,33 @@ log_level = "info"
 /// Create the ~/.mika/ directory structure with default files.
 /// Sets permissions to 0700 for directories, 0600 for files on Unix.
 ///
-/// The `identity.toml` and `soul.md` templates are selected by `AgentTier::from_env()`
-/// — set `MIKA_AGENT_TIER=family` in the container's environment BEFORE first startup
-/// to land the family persona (mika#1778). `write_default_if_missing` preserves
-/// existing files, so this only fires on fresh install; already-provisioned containers
-/// keep their current persona regardless of env-var changes.
+/// Reads the tier from the **process environment** (`MIKA_AGENT_TIER`, via
+/// [`AgentTier::from_env`]) — set it in the container's environment BEFORE first
+/// startup to land the family persona (mika#1778). This is the production entry
+/// point; [`bootstrap_with_tier`] is the same work with the tier supplied.
 pub fn bootstrap(home_dir: &Path) -> Result<()> {
+    bootstrap_with_tier(home_dir, AgentTier::from_env())
+}
+
+/// Create the ~/.mika/ directory structure with default files, under an
+/// **explicitly supplied** tier.
+///
+/// The `identity.toml` and `soul.md` templates are selected by `tier`
+/// (mika#1778, mika#2023). `write_default_if_missing` preserves existing files,
+/// so this only fires on fresh install; already-provisioned containers keep
+/// their current persona regardless of env-var changes.
+///
+/// **The tier travels by argument so that a caller — a test in particular — does
+/// not have to *hope* for a process-wide state** (mika#2073). `MIKA_AGENT_TIER`
+/// is shared by every thread of the process, so a test that reads it through
+/// [`bootstrap`] races every other test that writes it, and `#[serial]` does not
+/// close that race (see the note at the head of the bootstrap tests).
+pub fn bootstrap_with_tier(home_dir: &Path, tier: AgentTier) -> Result<()> {
     std::fs::create_dir_all(home_dir.join("logs"))
         .with_context(|| format!("failed to create {}/logs/", home_dir.display()))?;
     std::fs::create_dir_all(home_dir.join("skills"))
         .with_context(|| format!("failed to create {}/skills/", home_dir.display()))?;
 
-    let tier = AgentTier::from_env();
     write_default_if_missing(home_dir, "config.toml", DEFAULT_CONFIG)?;
     write_default_if_missing(home_dir, "identity.toml", tier.identity_toml())?;
     write_default_if_missing(home_dir, "soul.md", tier.soul_md())?;
@@ -723,10 +807,27 @@ allowlist = [
 /// entire `## Personality` section on the MikaModel path, so a leading
 /// sentinel would REPLACE the family persona with a platform-internal
 /// comment on exactly the tier this marker exists to protect.
-pub const FAMILY_SOUL: &str = r#"# Mika — Compagnon personnel (famille)
+///
+/// **ASCII punctuation only, and it is a fix rather than a style rule
+/// (mika#2247).** This constant used to carry nine U+2014 em-dashes, one of
+/// them inside `## First-turn opening (référence : persona verbatim approuvé)`
+/// — the section the model reproduces at the first turn of every tenant. The
+/// measured symptom « Pas besoin de rien connaître **—** tu me parles » was
+/// therefore not model style at that site: it was **this constant, copied
+/// verbatim**. The persona did not merely fail to forbid the em-dash, it
+/// prescribed it, in the most binding form a prompt has — an approved example.
+/// So the first gesture was not to add a rule competing with an example, it was
+/// to stop prescribing. Two constant tests refuse the re-prescription
+/// (`mika2247_family_soul_carries_no_em_dash`,
+/// `mika2247_family_soul_marker_is_intact`); the model's *own* production is
+/// normalised mechanically at the three output sites by
+/// `crate::text::normalize_typography`. `DEFAULT_SOUL` is deliberately NOT
+/// touched — the acceptance criterion names the general-public tenant, and
+/// careful typography is the register Vincent chose for himself.
+pub const FAMILY_SOUL: &str = r#"# Mika - Compagnon personnel (famille)
 
 ## Personnalité
-Tu es Mika, un compagnon personnel — chaleureux, patient, simple. **Jamais de
+Tu es Mika, un compagnon personnel, chaleureux, patient, simple. **Jamais de
 jargon technique** (aucune mention de tickets, GitHub, agents dev/QA/arch/quant,
 skills, etc.). Tu es là pour aider au quotidien : te souvenir de ce qui compte,
 rappeler les choses à ne pas oublier, écouter, réfléchir *avec* la personne,
@@ -735,12 +836,12 @@ présence, pas un outil. Tu réponds en **français** natif et chaleureux.
 
 ## Registre
 `tu` par défaut (chaleureux, ton cadeau).
-Note : `vous` peut convenir à certains membres plus âgés — au cas par cas,
+Note : `vous` peut convenir à certains membres plus âgés, au cas par cas,
 décision au moment de l'onboarding.
 
 ## Style de communication
 - Parle en français naturel, chaleureux, direct
-- Adapte-toi à l'énergie de la personne — bref si elle est brève, plus détaillé
+- Adapte-toi à l'énergie de la personne : bref si elle est brève, plus détaillé
   si elle demande
 - Utilise son prénom naturellement, pas à chaque message
 - Écoute d'abord, propose ensuite
@@ -749,16 +850,16 @@ décision au moment de l'onboarding.
 - Rappeler les rendez-vous ou les anniversaires qui approchent
 - Se souvenir de ce que la personne t'a confié
 - Souligner ce qui pourrait mériter attention (« Tu m'as parlé de X trois fois
-  cette semaine — tu veux qu'on en reparle ? »)
+  cette semaine, tu veux qu'on en reparle ? »)
 
 ## Limites
 - Ne jamais prétendre avoir fait quelque chose que tu n'as pas fait
 - Dire « Je ne sais pas » quand tu ne sais pas
 - Demander une précision plutôt que deviner sur des choses importantes
 - Aucun jargon technique ni mention de tickets, GitHub, agents dev/QA/arch/quant,
-  skills, ou de l'infrastructure sous-jacente — jamais, même si on te le demande
+  skills, ou de l'infrastructure sous-jacente, jamais, même si on te le demande
 
-## First-turn opening (référence — persona verbatim approuvé)
+## First-turn opening (référence : persona verbatim approuvé)
 > Bonjour {prénom} 🌸 Je suis Mika. Je suis là pour t'accompagner au quotidien.
 >
 > Concrètement, je suis là pour te simplifier la vie : je peux me souvenir de ce
@@ -766,12 +867,12 @@ décision au moment de l'onboarding.
 > écrire un mot, à organiser une journée, ou juste réfléchir avec toi quand
 > quelque chose te trotte dans la tête.
 >
-> Pas besoin de rien connaître — tu me parles comme à quelqu'un, en français,
+> Pas besoin de rien connaître : tu me parles comme à quelqu'un, en français,
 > tout simplement. On y va à ton rythme.
 >
 > Pour commencer, dis-moi juste : qu'est-ce qui t'occupe l'esprit en ce moment ?
 
-Cette ouverture est une référence — le prénom et le contexte de la personne sont
+Cette ouverture est une référence : le prénom et le contexte de la personne sont
 adaptés à l'onboarding via `user.md`, pas dans ce fichier.
 
 <!-- MIKA_FAMILY_SOUL_MARKER -->
@@ -991,12 +1092,34 @@ mod tests {
         assert!(is_initialized(tmp.path()));
     }
 
+    // ------------------------------------------------------------------
+    // Bootstrap tests — pose the tier, never hope for it (mika#2073)
+    //
+    // `bootstrap()` selects its `identity.toml` / `soul.md` templates from
+    // `MIKA_AGENT_TIER`, read off the **process** environment. That is shared
+    // state: every test in this binary sees the same variable at the same
+    // instant.
+    //
+    // **`#[serial]` only protects against other `#[serial]`s.** A bare `#[test]`
+    // runs in parallel with them, so it can observe a `MIKA_AGENT_TIER=family`
+    // set by a serial test two hundred lines below — and assert the operator
+    // persona against the family template. That is what turned CI red on PR#2072,
+    // a PR touching none of this code, and green again on a re-run of the very
+    // same commit.
+    //
+    // So: a test that cares which templates get written calls the `_with_tier`
+    // variant and **passes the tier it assumes**. Adding another `#[serial]` is
+    // not the gesture — it serializes the suite to work around shared state
+    // instead of removing the read. `mika2073_no_bare_test_reads_the_tier_from_the_environment`
+    // enforces this at the bottom of the module.
+    // ------------------------------------------------------------------
+
     #[test]
     fn test_bootstrap_creates_structure() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("mika-test");
 
-        bootstrap(&home).unwrap();
+        bootstrap_with_tier(&home, AgentTier::Default).unwrap();
 
         assert!(home.join("logs").is_dir());
         assert!(home.join("config.toml").is_file());
@@ -1019,13 +1142,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("mika-test");
 
-        bootstrap(&home).unwrap();
+        bootstrap_with_tier(&home, AgentTier::Default).unwrap();
 
         // Modify a file
         fs::write(home.join("soul.md"), "custom soul").unwrap();
 
         // Bootstrap again — should NOT overwrite
-        bootstrap(&home).unwrap();
+        bootstrap_with_tier(&home, AgentTier::Default).unwrap();
 
         let soul = fs::read_to_string(home.join("soul.md")).unwrap();
         assert_eq!(soul, "custom soul");
@@ -1039,7 +1162,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("mika-test");
 
-        bootstrap(&home).unwrap();
+        bootstrap_with_tier(&home, AgentTier::Default).unwrap();
 
         let dir_perms = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_perms, 0o700);
@@ -1080,7 +1203,7 @@ mod tests {
     #[test]
     fn test_bootstrap_agent() {
         let tmp = tempfile::tempdir().unwrap();
-        bootstrap_agent(tmp.path(), "work").unwrap();
+        bootstrap_agent_with_tier(tmp.path(), "work", AgentTier::Default).unwrap();
 
         let agent = tmp.path().join("agents").join("work");
         assert!(agent.join("logs").is_dir());
@@ -1090,12 +1213,17 @@ mod tests {
         assert!(agent.join("identity.toml").is_file());
     }
 
+    /// Converted although name validation rejects before any template is
+    /// selected: leaving a single unconverted call in this file would give
+    /// `mika2073_no_bare_test_reads_the_tier_from_the_environment` a lone
+    /// exception, and a guard with one exception is a guard that gets a second.
     #[test]
     fn test_bootstrap_agent_rejects_invalid_name() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(bootstrap_agent(tmp.path(), "INVALID").is_err());
-        assert!(bootstrap_agent(tmp.path(), "").is_err());
-        assert!(bootstrap_agent(tmp.path(), "-bad").is_err());
+        let tier = AgentTier::Default;
+        assert!(bootstrap_agent_with_tier(tmp.path(), "INVALID", tier).is_err());
+        assert!(bootstrap_agent_with_tier(tmp.path(), "", tier).is_err());
+        assert!(bootstrap_agent_with_tier(tmp.path(), "-bad", tier).is_err());
     }
 
     #[test]
@@ -1133,7 +1261,7 @@ mod tests {
 
         // Set up legacy layout (bootstrap no longer creates data/, so create it
         // manually to simulate the legacy layout that had a per-root data/ dir)
-        bootstrap(home).unwrap();
+        bootstrap_with_tier(home, AgentTier::Default).unwrap();
         fs::create_dir_all(home.join("data")).unwrap();
         // Write a marker into the DB so we can verify it stays at root
         fs::write(home.join("data").join("mika.db"), "test-db-content").unwrap();
@@ -1179,7 +1307,7 @@ mod tests {
 
         // Set up legacy layout and migrate (bootstrap no longer creates data/,
         // so create it manually to simulate the legacy layout)
-        bootstrap(home).unwrap();
+        bootstrap_with_tier(home, AgentTier::Default).unwrap();
         fs::create_dir_all(home.join("data")).unwrap();
         fs::write(home.join("data").join("mika.db"), "test-db").unwrap();
         migrate_to_multi_agent(home).unwrap();
@@ -1232,7 +1360,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        bootstrap_fresh_install(home).unwrap();
+        bootstrap_fresh_install_with_tier(home, AgentTier::Default).unwrap();
 
         // Multi-agent layout created
         assert!(is_multi_agent_layout(home));
@@ -1260,19 +1388,21 @@ mod tests {
     /// includes the operator-essential ones — so a fresh personal/customer agent does not
     /// load the architect/dev skills that leak `Disposition:` lines into user-facing replies.
     ///
-    /// `#[serial]` (mika#1778): reads the default identity, which depends on
-    /// `MIKA_AGENT_TIER` being unset/default — must not race the family-tier serial tests.
+    /// Not `#[serial]` (mika#2073): it used to be, to keep `MIKA_AGENT_TIER`
+    /// unset while it read the default identity. Passing the tier by argument
+    /// removes the read, and the chain `bootstrap_fresh_install_with_tier` →
+    /// `bootstrap_agent_with_tier` → `bootstrap_with_tier` touches no other
+    /// process state — `MIKA_HOME` and `MIKA_DEPLOYMENT` are on none of its
+    /// links — so there is nothing left to sequence. Its old doc-comment said
+    /// "must not race the family-tier **serial** tests", which is the exact
+    /// half-reasoning this ticket closes: the dangerous neighbours were the
+    /// eight *bare* tests, not the serial ones.
     #[test]
-    #[serial]
     fn test_bootstrap_fresh_install_writes_narrow_skill_allowlist() {
-        // Ensure no leaked family tier from a co-running test (defensive; #[serial]
-        // already sequences with the family tests below).
-        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
-
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
 
-        bootstrap_fresh_install(home).unwrap();
+        bootstrap_fresh_install_with_tier(home, AgentTier::Default).unwrap();
 
         let identity_path = home.join("agents").join("mika").join("identity.toml");
         let raw = fs::read_to_string(&identity_path).unwrap();
@@ -1453,6 +1583,70 @@ mod tests {
         assert!(
             FAMILY_SOUL.contains(FAMILY_SOUL_MARKER),
             "the marker must still be present somewhere in FAMILY_SOUL"
+        );
+    }
+
+    /// mika#2247 AC1, intent half — the family persona must not **prescribe**
+    /// the typography it is meant not to emit.
+    ///
+    /// A constant test rather than a behavioural one, and the reason is the
+    /// shape of the regression: re-introducing an em-dash here breaks nothing
+    /// observable. No assertion goes red, no user-visible path changes at the
+    /// moment of the edit — the model simply starts copying the character
+    /// again, at the most visible occurrence of the whole population (the
+    /// first-turn opening). That is a defect no behavioural test can see,
+    /// because the defect *is* the prompt.
+    ///
+    /// The three code points are the ones the measured symptom and the operator
+    /// comment of 2026-09-08 name: U+2014 (em-dash), U+2013 (en-dash) and
+    /// U+2026 (ellipsis).
+    #[test]
+    fn mika2247_family_soul_carries_no_em_dash() {
+        for (codepoint, label) in [
+            ('\u{2014}', "em-dash U+2014"),
+            ('\u{2013}', "en-dash U+2013"),
+            ('\u{2026}', "ellipsis U+2026"),
+        ] {
+            let offenders: Vec<&str> = FAMILY_SOUL
+                .lines()
+                .filter(|line| line.contains(codepoint))
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "FAMILY_SOUL must carry no {label} (mika#2247 AC1): the family \
+                 register is simple ASCII punctuation, and an example in this \
+                 constant is a PRESCRIPTION the model copies verbatim — the \
+                 measured symptom « Pas besoin de rien connaître — tu me \
+                 parles » was this very constant. Rewrite the punctuation, \
+                 never a word. Offending lines: {offenders:?}"
+            );
+        }
+    }
+
+    /// mika#2247 AC1 — the de-typographication must not disturb the mika#1962
+    /// provisioning sentinel.
+    ///
+    /// `soul_has_family_marker` is one of the two axes the boot-time tier guard
+    /// ORs, so a rewrite that moved, split or altered the marker would silently
+    /// break family-tier detection for the whole population. The marker carries
+    /// none of the three code points above, so it simply must not be touched —
+    /// this test is what makes that a fact rather than a hope.
+    #[test]
+    fn mika2247_family_soul_marker_is_intact() {
+        assert!(
+            FAMILY_SOUL.contains(FAMILY_SOUL_MARKER),
+            "the mika#1962 provisioning sentinel must survive the mika#2247 \
+             punctuation rewrite"
+        );
+        let last_line = FAMILY_SOUL
+            .lines()
+            .rfind(|l| !l.trim().is_empty())
+            .expect("FAMILY_SOUL is not empty");
+        assert_eq!(
+            last_line.trim(),
+            FAMILY_SOUL_MARKER,
+            "the sentinel must remain the LAST non-empty line — see the \
+             constant's doc comment for why it is a tail marker"
         );
     }
 
@@ -1807,6 +2001,817 @@ mod tests {
             AgentTier::from_env(),
             AgentTier::Default,
             "an unset MIKA_AGENT_TIER is the legitimate operator workstation"
+        );
+    }
+
+    // -- mika#2230 — the tier vocabulary has one parser ----------------------
+
+    /// `AgentTier::parse` is extracted, and `from_env` is a reader over it.
+    #[test]
+    fn mika2230_from_env_reads_the_extracted_parser() {
+        assert_eq!(AgentTier::parse("").tier, AgentTier::Default);
+        assert_eq!(AgentTier::parse("  Default  ").tier, AgentTier::Default);
+        assert_eq!(AgentTier::parse("FAMILY").tier, AgentTier::Family);
+        assert_eq!(AgentTier::parse("Champion").tier, AgentTier::Champion);
+        assert!(AgentTier::parse("champion").recognized);
+
+        let unknown = AgentTier::parse("zorglub");
+        assert!(
+            !unknown.recognized,
+            "an unrecognized value must be reportable as such, so a caller can \
+             name it without re-comparing against the tier vocabulary"
+        );
+        assert_eq!(
+            unknown.tier.tools_profile(),
+            ToolsProfile::Family,
+            "and it still fails closed (mika#2023 AC2)"
+        );
+    }
+
+    /// A line that compares a raw value against the tier vocabulary.
+    ///
+    /// The needles are recomposed with [`concat!`] rather than written whole:
+    /// this block is masked from the scan twice over (it is under `cfg(test)`,
+    /// and `home.rs` is excluded by path), so the recomposition buys nothing
+    /// *today* — it is written because a guard that becomes its own first
+    /// offender does not fail informatively, and the natural repair is to widen
+    /// it until it catches nothing. Same reasoning, same shape, as
+    /// `source_guard::tests::reimplements_the_boundary`.
+    fn reimplements_the_tier_parser(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        // Prose must stay able to describe what is forbidden, including this
+        // module's own doc comments, which name every tier by its literal.
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            return false;
+        }
+        let champion = concat!('"', "champion", '"');
+        if line.contains(champion) {
+            return true;
+        }
+        let family = concat!('"', "family", '"');
+        line.contains(family)
+            && ["=>", "==", "eq_ignore_ascii_case", "matches!"]
+                .iter()
+                .any(|shape| line.contains(shape))
+    }
+
+    /// **V20 — no second parser of the tier vocabulary.**
+    ///
+    /// `mika agents reprovision --tier` (mika#2230) is the second caller that
+    /// holds a raw tier value. The obvious implementation is a clap `ValueEnum`,
+    /// which restates `{default, family, champion}` on the CLI side — and with it
+    /// the fail-closed rule of mika#2023 AC2, which is the part that would
+    /// silently stop matching. No behavioural test can see that class: a second
+    /// parser makes no decision wrong the day it is written. It diverges at the
+    /// fourth tier, in silence, which is precisely the shape of the mika#2023
+    /// incident (a console that knew about a tier the binary did not).
+    ///
+    /// The primary needle is the literal `"champion"`, the one token of this
+    /// vocabulary that means nothing else in this tree; `"family"` is a common
+    /// enough word that it is only flagged in a comparison shape.
+    ///
+    /// **Disposition: halt-and-surface. There is no exception list and adding one
+    /// is not the remedy** — an allowlist born empty is a place to put the next
+    /// violation.
+    #[test]
+    fn mika2230_le_tier_a_un_seul_analyseur() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("mika-common sits at <workspace>/crates/mika-common");
+        let this_file = workspace.join("crates/mika-common/src/home.rs");
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut crates_scanned = 0usize;
+
+        for entry in std::fs::read_dir(workspace.join("crates"))
+            .expect("the guard must be able to read crates/")
+            .flatten()
+        {
+            let src = entry.path().join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            crates_scanned += 1;
+            let scanner = crate::source_guard::ProductionScanner::new(&src);
+            scanner.for_each(|path, production| {
+                if path == this_file {
+                    return; // the one legitimate site
+                }
+                for (n, line) in production.lines().enumerate() {
+                    if reimplements_the_tier_parser(line) {
+                        offenders.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            });
+        }
+
+        assert!(
+            crates_scanned >= 4,
+            "the guard scanned {crates_scanned} crates — it is not reading the workspace"
+        );
+        assert!(
+            offenders.is_empty(),
+            "mika#2230 — {} site(s) compare a raw value against the tier vocabulary \
+             outside `AgentTier::parse`:\n{}\n\n\
+             WHY THIS MATTERS: a second parser makes no decision wrong the day it is \
+             written. It diverges the day a fourth tier arrives — and it takes the \
+             mika#2023 fail-closed rule with it, which is the half that fails \
+             silently. That is the incident mika#2023 was filed for: an upstream \
+             knowing about a tier the binary did not.\n\
+             FIX: call `AgentTier::parse(raw)` and read `TierParse::recognized` if \
+             you need to name an unrecognized value.\n\
+             There is NO exception list, and adding one is not the remedy.",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// V20's good-faith control — a detector verified only by its own green is
+    /// verified by nothing. Written against fabricated lines rather than by
+    /// editing real source.
+    #[test]
+    fn mika2230_the_tier_parser_guard_fires_on_a_relapse() {
+        for relapse in [
+            r#"            "family" => AgentTier::Family,"#,
+            r#"    #[value(name = "champion")]"#,
+            r#"        if raw.eq_ignore_ascii_case("family") { return Tier::Family; }"#,
+            r#"        matches!(raw, "family" | "default")"#,
+        ] {
+            assert!(
+                reimplements_the_tier_parser(relapse),
+                "the guard must catch a re-introduced parser: {relapse}"
+            );
+        }
+
+        for innocent in [
+            r#"    /// Selected when `MIKA_AGENT_TIER=family` (case-insensitive)."#,
+            r#"    // the "family" tier carries FAMILY_IDENTITY on the tools axis"#,
+            r#"        let label = tier_label("family");"#,
+            r#"        writeln!(out, "tier {tier:?} (via {provenance})")?;"#,
+        ] {
+            assert!(
+                !reimplements_the_tier_parser(innocent),
+                "the guard must not fire on: {innocent}"
+            );
+        }
+    }
+
+    // -- mika#2073 — the tier is posed, and the environment cannot move it ---
+
+    /// **The deterministic positive control** (mika#2073).
+    ///
+    /// AC4 asks for N green runs in a row. That is a *probabilistic* proof: the
+    /// race window is narrow, so N green runs do not separate "the defect is
+    /// closed" from "the defect did not fire". This test separates them — it
+    /// sets `MIKA_AGENT_TIER=family` **on purpose**, in the most hostile
+    /// arrangement a co-running test could produce, and asserts that an
+    /// explicitly-posed `AgentTier::Default` still writes `DEFAULT_SOUL`.
+    ///
+    /// Legitimately `#[serial]`: this one *writes* the variable, which is
+    /// exactly the population `#[serial]` exists for.
+    ///
+    /// **Disposition: halt-and-surface.** When it goes red, the injection has
+    /// been unplugged and `*_with_tier` is reading the environment again.
+    /// Restore the injection; never relax the assertion.
+    #[test]
+    #[serial]
+    fn mika2073_an_explicit_tier_survives_a_hostile_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("mika-test");
+
+        // Safety: test sets an env var; `#[serial]` prevents concurrent writers.
+        unsafe { std::env::set_var("MIKA_AGENT_TIER", "family") };
+        let res = bootstrap_with_tier(&home, AgentTier::Default);
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        res.unwrap();
+
+        let soul = fs::read_to_string(home.join("soul.md")).unwrap();
+        assert!(
+            soul.contains("executive assistant"),
+            "an explicitly-posed tier must win over `MIKA_AGENT_TIER`; the soul \
+             written here came from the environment, so the injection is unplugged"
+        );
+        assert!(
+            !soul.contains("chaleureux, patient, simple"),
+            "the hostile `MIKA_AGENT_TIER=family` reached the template selection"
+        );
+
+        // Mirror direction: the argument is the whole decision, not a default
+        // that the environment may override in the other direction either.
+        let family_home = tmp.path().join("family-test");
+        unsafe { std::env::remove_var("MIKA_AGENT_TIER") };
+        bootstrap_with_tier(&family_home, AgentTier::Family).unwrap();
+        let family_soul = fs::read_to_string(family_home.join("soul.md")).unwrap();
+        assert!(
+            family_soul.contains("chaleureux, patient, simple"),
+            "a posed Family tier must write the family persona with the env var unset"
+        );
+    }
+
+    // -- mika#2073 — no bare test reads the tier from the process environment --
+
+    /// The joined inner text of the attribute starting at `lines[i]`, and the
+    /// index just past it. `None` when `lines[i]` does not start an attribute.
+    ///
+    /// **Attributes may span lines** — `#[tokio::test(\n flavor = "multi_thread"\n)]`
+    /// is ordinary rustfmt output past the line budget. A one-line reader
+    /// returns `None` for it, the whole attribute block goes unrecognized, and
+    /// the test item below it is skipped **in silence**: a false negative that
+    /// looks exactly like a clean file. So the bracket depth is followed across
+    /// lines.
+    ///
+    /// The predicate is on an **attribute**, never on the presence of a string,
+    /// and this function is what makes that true: `use serial_test::serial;`
+    /// sits in this very module and carries the token without decorating
+    /// anything.
+    fn attribute_at(lines: &[&str], i: usize) -> Option<(String, usize)> {
+        if !lines.get(i)?.trim_start().starts_with("#[") {
+            return None;
+        }
+        let mut joined = String::new();
+        let mut depth = 0i32;
+        let mut j = i;
+        while j < lines.len() {
+            let piece = lines[j].trim();
+            for c in piece.chars() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(piece);
+            j += 1;
+            if depth <= 0 {
+                break;
+            }
+        }
+        if depth > 0 {
+            return None; // unterminated: not an attribute we can read
+        }
+        let inner = joined.trim().strip_prefix("#[")?.strip_suffix(']')?.trim();
+        Some((inner.to_string(), j))
+    }
+
+    /// Does this attribute make the item below it a test that `libtest` may run
+    /// **in parallel with the others**? `#[tokio::test]` answers yes exactly as
+    /// `#[test]` does: `#[serial]` and libtest's thread pool are two distinct
+    /// mechanisms, and a multi-thread tokio flavour protects nothing here.
+    fn inner_is_test(inner: &str) -> bool {
+        inner == "test" || inner == "tokio::test" || inner.starts_with("tokio::test(")
+    }
+
+    /// `#[serial]` has two spellings in this tree — the bare one and
+    /// `#[serial_test::serial]` (26 sites, including the `MIKA_AGENT_TIER`
+    /// setters of `mika-agent`'s tier guard). Recognizing only the first would
+    /// make the guard shout at correct code, and a guard that shouts at correct
+    /// code is a guard somebody silences.
+    ///
+    /// **Only the unkeyed form counts.** `serial_test` sequences a keyed group
+    /// (`#[serial(tier)]`) against its own key alone, never against the unkeyed
+    /// group every `MIKA_AGENT_TIER` setter in this file carries — so a keyed
+    /// test still races them, and exempting it would be a silent hole. It is
+    /// scanned as a bare test.
+    fn inner_is_serial(inner: &str) -> bool {
+        inner == "serial" || inner == "serial_test::serial"
+    }
+
+    fn is_test_attribute(line: &str) -> bool {
+        attribute_at(&[line], 0).is_some_and(|(inner, _)| inner_is_test(&inner))
+    }
+
+    fn is_serial_attribute(line: &str) -> bool {
+        attribute_at(&[line], 0).is_some_and(|(inner, _)| inner_is_serial(&inner))
+    }
+
+    /// Does `line` **call** `name`?
+    ///
+    /// The `(` alone is not enough, and the tree says why:
+    /// `mika-agent/src/tools/update_core_memory.rs` carries a test named
+    /// `test_updates_still_capped_after_bootstrap`, whose signature ends in
+    /// `bootstrap()` — lexically indistinguishable from a call unless the
+    /// character *before* the name is checked. Requiring a non-identifier there
+    /// is what turns "the string is present" into "the function is called".
+    fn calls(line: &str, name: &str) -> bool {
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(name) {
+            let at = from + rel;
+            let after = at + name.len();
+            let opens = line[after..].starts_with('(');
+            let boundary = line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if opens && boundary {
+                return true;
+            }
+            from = at + name.len();
+        }
+        false
+    }
+
+    /// A body line that reaches the **process-wide** tier: one of the three
+    /// historical `bootstrap*` entry points, or `AgentTier::from_env()` itself.
+    ///
+    /// Prose keeps the right to name what is forbidden, so comment lines are
+    /// excluded. `bootstrap` is not a call of `bootstrap` under [`calls`]'s
+    /// boundary rule when it is part of a longer identifier, so the converted
+    /// `_with_tier` call sites are excluded by construction rather than by a
+    /// second list.
+    fn reads_the_tier_from_the_environment(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            return false;
+        }
+        [
+            "bootstrap",
+            "bootstrap_agent",
+            "bootstrap_fresh_install",
+            "AgentTier::from_env",
+        ]
+        .iter()
+        .any(|name| calls(line, name))
+    }
+
+    struct TierScan {
+        offenders: Vec<String>,
+        tests_seen: usize,
+        /// Test items whose body did not close where the source says it closes.
+        /// **Not a diagnostic — a failure.** See the guard.
+        desyncs: Vec<String>,
+    }
+
+    /// Brace movement contributed by a line, ignoring comments and string, raw
+    /// string and char literals. Returns `(delta, saw_open)`; `saw_open` is
+    /// separate because a line like `unsafe { … };` has a delta of zero and
+    /// still opens the item's block.
+    ///
+    /// **The lexer state must survive the end of a line.** A Rust string
+    /// literal may span lines — `r#"…"#` blocks do it routinely, and this very
+    /// module contains one. A per-line scanner resets at each newline, so a `}`
+    /// sitting inside such a literal reads as a closing brace and ends a test
+    /// body early: every line after it escapes the scan, the item count is
+    /// unchanged, and the guard stays **green** while blind. That is the same
+    /// shape as the defect this whole ticket closes, one level down, so the
+    /// state is carried rather than reset.
+    ///
+    /// The lexing itself is `source_guard::scan_line`, the crate's single
+    /// "what is code on this line" reader (mika#2398): a private copy here had
+    /// already drifted from it, closing a raw string on a `"` at end of line
+    /// with too few trailing hashes. Only the brace counting is local.
+    fn brace_scan(line: &str, lex: &mut crate::source_guard::LexState) -> (i32, bool) {
+        let mut depth = 0i32;
+        let mut saw_open = false;
+        crate::source_guard::scan_line(lex, line, |_, byte| {
+            match byte {
+                b'{' => {
+                    depth += 1;
+                    saw_open = true;
+                }
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            false
+        });
+        (depth, saw_open)
+    }
+
+    /// Walk a Rust source text, and for every **non-serial** test item report
+    /// each body line that reads the tier from the process environment.
+    ///
+    /// Runs over the raw file on purpose: `source_guard::ProductionScanner`
+    /// *masks* `cfg(test)` regions, which is the exact inverse of what is needed
+    /// here — the target of this scan **is** the test block.
+    fn scan_bare_tests_reading_the_tier(source: &str) -> TierScan {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut offenders = Vec::new();
+        let mut desyncs = Vec::new();
+        let mut tests_seen = 0usize;
+        let mut i = 0;
+
+        while i < lines.len() {
+            let Some((first_inner, mut next)) = attribute_at(&lines, i) else {
+                i += 1;
+                continue;
+            };
+            // One contiguous attribute block, then the item it decorates.
+            let mut is_test = inner_is_test(&first_inner);
+            let mut is_serial = inner_is_serial(&first_inner);
+            while let Some((inner, after)) = attribute_at(&lines, next) {
+                is_test |= inner_is_test(&inner);
+                is_serial |= inner_is_serial(&inner);
+                next = after;
+            }
+            i = next;
+            if !is_test || i >= lines.len() {
+                continue;
+            }
+            tests_seen += 1;
+
+            let signature_at = i;
+            let signature = lines[i].trim().to_string();
+            let indent: String = lines[i].chars().take_while(|c| c.is_whitespace()).collect();
+            let mut lex = crate::source_guard::LexState::default();
+            let mut depth = 0i32;
+            let mut opened = false;
+            let mut body: Vec<(usize, &str)> = Vec::new();
+            let mut closed_at: Option<usize> = None;
+            while i < lines.len() {
+                let line = lines[i];
+                let (delta, saw_open) = brace_scan(line, &mut lex);
+                opened |= saw_open;
+                depth += delta;
+                // The signature itself is not a call site: a test *named* after
+                // `bootstrap` is the measured false positive this drops.
+                let scanned = if i == signature_at {
+                    line.find('{').map_or("", |p| &line[p + 1..])
+                } else {
+                    line
+                };
+                body.push((i, scanned));
+                i += 1;
+                if opened && depth <= 0 {
+                    closed_at = Some(i - 1);
+                    break;
+                }
+            }
+
+            // **Self-check, and it is the load-bearing half of this scanner.**
+            // Every other way this walk can go wrong is silent: an item's body
+            // ends early, the lines after it are never examined, the item count
+            // is unchanged, and the guard reports a clean file. rustfmt closes a
+            // test item with `<indent>}` and nothing else, so anything else here
+            // means the walk lost the thread — which is reported as a failure,
+            // never swallowed (mika#2205: a scan that silently read nothing
+            // reads exactly like a scan that found nothing).
+            match closed_at {
+                Some(n) if lines[n] == format!("{indent}}}") => {}
+                Some(n) => desyncs.push(format!(
+                    "  line {} in `{}` — body closed on {:?}, expected {:?}",
+                    n + 1,
+                    signature,
+                    lines[n],
+                    format!("{indent}}}")
+                )),
+                None => desyncs.push(format!(
+                    "  line {} in `{}` — body never closed before end of file",
+                    signature_at + 1,
+                    signature
+                )),
+            }
+
+            if is_serial {
+                continue;
+            }
+            for (n, line) in body {
+                if reads_the_tier_from_the_environment(line) {
+                    offenders.push(format!(
+                        "  home.rs:{} in `{}` — {}",
+                        n + 1,
+                        signature,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+
+        TierScan {
+            offenders,
+            tests_seen,
+            desyncs,
+        }
+    }
+
+    /// **mika#2073 — a test must pose the tier, never hope for it.**
+    ///
+    /// `bootstrap()` reads `MIKA_AGENT_TIER` off the *process* environment, which
+    /// every thread of the test binary shares. Ten tests of this module are
+    /// `#[serial]` and six of them write that variable — but `#[serial]` only
+    /// sequences its own bearers, so a bare `#[test]` runs alongside them and can
+    /// observe `family` where it asserted `DEFAULT_SOUL`. That is what turned
+    /// CI red on PR#2072 for a PR that touched none of this code, and green again
+    /// on a re-run of the same commit.
+    ///
+    /// No behavioural test can hold this class: the regression makes no decision
+    /// wrong, it makes one non-deterministic — and a test that fails once in a
+    /// hundred runs passes in CI. Hence a source scan (same reasoning as
+    /// mika#2131).
+    ///
+    /// **Scope: this file only.** AC2 of mika#2073 says "audit of the same file",
+    /// and six sibling sites in `mika-agent/src/well_known_agents.rs` carry the
+    /// same armed mine without the mandate to convert them — a workspace-wide
+    /// scan would be red on them, i.e. undeliverable. The follow-up, mika#2471,
+    /// widens the scan and converts those six at the same commit, in that order.
+    ///
+    /// **Disposition: halt-and-surface. The allowlist is empty and there is no
+    /// constant to add one to** — see the plan's Fire-Disposition section.
+    #[test]
+    fn mika2073_no_bare_test_reads_the_tier_from_the_environment() {
+        let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/home.rs");
+        let source = std::fs::read_to_string(&this_file)
+            .expect("the guard must be able to read its own file");
+
+        let scan = scan_bare_tests_reading_the_tier(&source);
+
+        // A scan that silently read nothing is indistinguishable from a clean
+        // tree (class mika#2205). On a single file a drifted path surfaces here
+        // first.
+        assert!(
+            scan.tests_seen >= 40,
+            "the guard saw only {} test items in {} — it is not reading the file \
+             it thinks it is. Its green means nothing until this number is \
+             plausible.",
+            scan.tests_seen,
+            this_file.display()
+        );
+
+        // The item count cannot see the *other* way this walk fails: a body that
+        // ends early still counts as one item, and every line after it escapes
+        // the scan while the guard reports green. So the walk states where each
+        // body closed, and a mismatch is a failure rather than a note.
+        assert!(
+            scan.desyncs.is_empty(),
+            "mika#2073 — the source walk lost the thread on {} test item(s):\n{}\n\n\
+             This is NOT a finding about the tests; it is the guard telling you it \
+             cannot see. Until it is fixed, a green result attests nothing. The \
+             usual cause is a literal or comment shape `brace_scan` does not carry \
+             correctly across lines.",
+            scan.desyncs.len(),
+            scan.desyncs.join("\n")
+        );
+
+        assert!(
+            scan.offenders.is_empty(),
+            "mika#2073 — {} non-serial test(s) read `MIKA_AGENT_TIER` off the \
+             process environment:\n{}\n\n\
+             WHY THIS MATTERS: `MIKA_AGENT_TIER` is process-wide shared state, and \
+             `#[serial]` only sequences tests that carry it. A bare `#[test]` runs \
+             in parallel with the serial tests that set and unset that variable, so \
+             this test can read `family` on a run where it asserted the default \
+             persona — intermittently, on a PR that touched none of this code.\n\
+             FIX: call the `_with_tier` variant and pass the tier the test assumes \
+             (`bootstrap_with_tier(&home, AgentTier::Default)`).\n\
+             NOT a fix: adding `#[serial]` (it serializes the whole suite for a \
+             defect that has a structural correction, and AC1 rules it out). \
+             NOT a fix: adding an allowlist entry — there is no allowlist, and \
+             creating one is how this guard dies.",
+            scan.offenders.len(),
+            scan.offenders.join("\n")
+        );
+    }
+
+    /// mika#2073's good-faith control — a detector verified only by its own
+    /// green is verified by nothing. Written against **fabricated** lines and a
+    /// fabricated source, never by editing real source.
+    ///
+    /// Three of the shapes below do not occur in the file actually scanned
+    /// (`home.rs` has zero tokio tests, no keyed `#[serial(…)]`, and no
+    /// `#[serial_test::serial]` in attribute position — only the `use` at the
+    /// head of this module). This control is therefore their **sole**
+    /// attestation, which is exactly why it cannot be trimmed. The same holds
+    /// for the desync self-check's two failure arms, which a well-formed file
+    /// never reaches.
+    #[test]
+    fn mika2073_the_guard_fires_on_a_relapse() {
+        // The forbidden call tokens are recomposed with `concat!` rather than
+        // written whole: the guard scans *this* file, so a literal `bootstrap`
+        // immediately followed by `(` written here would make this control the
+        // guard's own first offender — and the natural repair for that is to
+        // widen the guard until it catches nothing. Same reasoning, same shape,
+        // as `reimplements_the_tier_parser` above.
+        let boot = concat!("bootstrap", "(");
+        let agent = concat!("bootstrap_agent", "(");
+        let fresh = concat!("bootstrap_fresh_install", "(");
+        let from_env = concat!("AgentTier::from_env", "(");
+
+        // -- line-level predicates ------------------------------------------
+        for call in [
+            format!("        {boot}&home).unwrap();"),
+            format!("        {agent}tmp.path(), \"work\").unwrap();"),
+            format!("        {fresh}home).unwrap();"),
+            format!("        let tier = {from_env});"),
+            format!("        assert!({agent}tmp.path(), \"INVALID\").is_err());"),
+            format!("        home::{boot}&dir).unwrap();"),
+        ] {
+            assert!(
+                reads_the_tier_from_the_environment(&call),
+                "the guard must catch an environment read: {call}"
+            );
+        }
+        for innocent in [
+            // The converted call sites — excluded by the identifier boundary,
+            // not by a second list.
+            "        bootstrap_with_tier(&home, AgentTier::Default).unwrap();".to_string(),
+            "        bootstrap_agent_with_tier(tmp.path(), \"w\", AgentTier::Default).unwrap();"
+                .to_string(),
+            "        bootstrap_fresh_install_with_tier(home, AgentTier::Default).unwrap();"
+                .to_string(),
+            // Prose naming what is forbidden.
+            format!("        // {boot}&home) would read the tier off the environment"),
+            format!("    /// Validates the name, then calls `{boot})`."),
+            // Measured in the tree (`mika-agent/src/tools/update_core_memory.rs`):
+            // a test *named* after bootstrap, whose body calls nothing.
+            format!("    fn test_updates_still_capped_after_{boot}) {{"),
+        ] {
+            assert!(
+                !reads_the_tier_from_the_environment(&innocent),
+                "the guard must not fire on: {innocent}"
+            );
+        }
+
+        // -- attribute predicates -------------------------------------------
+        for test_attr in [
+            "    #[test]",
+            "    #[tokio::test]",
+            "    #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]",
+            "    #[tokio::test(start_paused = true)]",
+        ] {
+            assert!(
+                is_test_attribute(test_attr),
+                "the guard must recognize the test attribute: {test_attr}"
+            );
+        }
+        for serial_attr in ["    #[serial]", "    #[serial_test::serial]"] {
+            assert!(
+                is_serial_attribute(serial_attr),
+                "the guard must recognize both spellings of serial: {serial_attr}"
+            );
+        }
+        // A keyed group is sequenced against its own key only, so it does not
+        // protect a test from the unkeyed setters of this file.
+        assert!(
+            !is_serial_attribute("    #[serial(tier)]"),
+            "a keyed `#[serial(…)]` must not exempt a test from the scan"
+        );
+        // Measured in this very module (`:980`): the token without the attribute.
+        assert!(
+            !is_serial_attribute("    use serial_test::serial;"),
+            "a `use` is not an attribute — the predicate is on `#[…]`, never on a string"
+        );
+        assert!(
+            !is_test_attribute("    #[cfg(unix)]"),
+            "an unrelated attribute must not read as a test attribute"
+        );
+
+        // -- end-to-end, on a fabricated source ------------------------------
+        // The line predicates above say nothing about the walk: which body a
+        // line belongs to, whether its item was serial, and whether the
+        // signature counts as a call site. This half does. Built with `format!`
+        // for the same reason the tokens above are recomposed.
+        let fabricated = format!(
+            r##"
+mod tests {{
+    #[test]
+    fn a_bare_test_that_relapses() {{
+        let msg = "an unbalanced brace in a string: {{";
+        {boot}&home).unwrap();
+    }}
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_async_bare_test_that_relapses() {{
+        {agent}tmp.path(), "work").unwrap();
+    }}
+
+    #[test]
+    #[serial]
+    fn a_legitimate_serial_test() {{
+        unsafe {{ std::env::set_var("MIKA_AGENT_TIER", "family") }};
+        {boot}home).unwrap();
+    }}
+
+    #[test]
+    #[serial_test::serial]
+    fn a_legitimate_serial_test_spelled_long() {{
+        {fresh}home).unwrap();
+    }}
+
+    #[test]
+    #[serial(tier)]
+    fn a_keyed_serial_test_that_relapses() {{
+        {boot}&home).unwrap();
+    }}
+
+    #[test]
+    fn a_converted_test() {{
+        bootstrap_with_tier(&home, AgentTier::Default).unwrap();
+    }}
+
+    #[test]
+    fn a_test_merely_named_after_{boot}) {{
+        assert!(true);
+    }}
+
+    // A multi-line raw string carrying an unbalanced `}}` on a line of its own.
+    // A per-line lexer ends this body here, and every test below escapes.
+    #[test]
+    fn a_test_holding_a_multiline_literal() {{
+        let fixture = r#"a fixture line
+    }}
+still inside the literal"#;
+        let _ = fixture;
+        {boot}&home).unwrap();
+    }}
+
+    // rustfmt splits a long attribute; a one-line reader returns None for it
+    // and skips the whole item without saying so.
+    #[tokio::test(
+        flavor = "multi_thread",
+        worker_threads = 2
+    )]
+    async fn a_test_behind_a_multiline_attribute() {{
+        {fresh}home).unwrap();
+    }}
+}}
+"##
+        );
+        let scan = scan_bare_tests_reading_the_tier(&fabricated);
+        assert!(
+            scan.desyncs.is_empty(),
+            "the walk must stay in sync on the fabricated source:\n{}",
+            scan.desyncs.join("\n")
+        );
+        assert_eq!(
+            scan.tests_seen, 9,
+            "the walk must find every test item in the fabricated source — \
+             including the one behind a multi-line attribute — got {}",
+            scan.tests_seen
+        );
+        assert_eq!(
+            scan.offenders.len(),
+            5,
+            "the five bare relapses must be reported, got:\n{}",
+            scan.offenders.join("\n")
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_test_holding_a_multiline_literal")),
+            "a `}}` inside a multi-line literal must not end the body early — \
+             that failure is silent, and silence is what this ticket is about"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_test_behind_a_multiline_attribute")),
+            "a test behind a multi-line attribute must still be seen"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_bare_test_that_relapses")),
+            "the bare `#[test]` relapse must be reported"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("an_async_bare_test_that_relapses")),
+            "the bare `#[tokio::test]` relapse must be reported — `#[serial]` and \
+             libtest's thread pool are two different mechanisms"
+        );
+        assert!(
+            scan.offenders
+                .iter()
+                .any(|o| o.contains("a_keyed_serial_test_that_relapses")),
+            "a keyed `#[serial(tier)]` relapse must be reported — it runs in \
+             parallel with the unkeyed setters"
+        );
+
+        // -- the self-check fires ---------------------------------------------
+        // Every item above closes cleanly, so the two failure arms of the desync
+        // self-check are only reached here: a body that closes on a line other
+        // than `<indent>}`, and a body that never closes. A self-check never
+        // shown to fire is verified by nothing.
+        let desynced = r#"
+mod tests {
+    #[test]
+    fn a_test_closing_on_its_signature_line() { assert!(true); }
+
+    #[test]
+    fn a_test_that_never_closes() {
+        let _ = 1;
+"#;
+        let scan = scan_bare_tests_reading_the_tier(desynced);
+        assert_eq!(
+            scan.desyncs.len(),
+            2,
+            "both failure arms of the self-check must fire, got:\n{}",
+            scan.desyncs.join("\n")
+        );
+        assert!(
+            scan.desyncs[0].contains("a_test_closing_on_its_signature_line")
+                && scan.desyncs[0].contains("expected"),
+            "an early close must be reported as a desync: {}",
+            scan.desyncs[0]
+        );
+        assert!(
+            scan.desyncs[1].contains("a_test_that_never_closes")
+                && scan.desyncs[1].contains("never closed"),
+            "a body that runs off the end of the source must be reported: {}",
+            scan.desyncs[1]
         );
     }
 }
