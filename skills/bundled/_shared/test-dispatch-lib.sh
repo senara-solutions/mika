@@ -7596,6 +7596,388 @@ _t2492_title_probe() {
 assert_eq "U3c: le titre de la classe nouvelle est le sujet du commit d'implémentation" \
     "fix(2492): le vrai sujet du commit du pilote" "$(_t2492_title_probe 2>/dev/null)"
 
+# =============================================================================
+# mika#2493 — un deny non-terminal survécu est une NOTE, jamais un « halted »
+# =============================================================================
+#
+# Ce que ces détecteurs mesurent. Le champ `result` préfixait « PIPELINE
+# FAILURE: … halted by policy deny » alors que le refus n'avait pas arrêté la
+# session et qu'elle avait livré. Le libellé a fait conclure « échec » à tort
+# deux fois — opérateur ET orchestrateur — dans l'incident de la nuit du
+# 2026-09-22. Preuves re-mesurées (M0) : sessions `98b60020` (2 refus) et
+# `a0886164` (5 refus), **zéro terminal**, toutes deux `status: success`.
+#
+# Trois unités, trois populations de test :
+#   U1 — la garde `[ -z "$VALID_PLAN" ]` (T8, T9, T15, T16)
+#   U2 — le prédicat de létalité + la note annexée (T1–T7, T10, T11)
+#   U3 — la dé-troncature de l'événement rapporté (T13, T14)
+#
+# Herméticité : aucune fixture ne touche le réseau ni la forge. Les deux sondes
+# bout-en-bout redéfinissent `_pr_list_url` dans leur sous-shell.
+
+echo ""
+echo "Test mika#2493 : le libellé suit la létalité du deny"
+echo "----------------------------------------------------"
+
+T2493_FIXTURE_DIR=$(mktemp -d)
+
+# --- T1–T7 : le prédicat de létalité ----------------------------------------
+#
+# D2 : le prédicat porte sur le FICHIER, jamais sur la ligne capturée. Trois
+# raisons mesurées — le marqueur sort de la première ligne dans 23 % des cas
+# (M2, dont la preuve `98b60020`) ; une session porte plusieurs refus ; et un
+# refus terminal termine sa session (M4), donc « au moins un terminal » et « le
+# dernier est terminal » coïncident, la première formulation seule survivant à
+# la troncature.
+
+_t2493_lethality() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _policy_deny_lethality "$1"
+    )
+}
+
+# T1 — refus non-terminal mono-ligne (forme la plus fréquente : 1093 des 1185
+# marqueurs mesurés depuis cpp#151).
+printf '\x1b[31m[policy:deny]\x1b[0m Bash: env | head -3 [bash-env] (non-terminal)\n' \
+    > "$T2493_FIXTURE_DIR/nonterm.stderr"
+assert_eq "T1: refus non-terminal mono-ligne ⇒ non-terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/nonterm.stderr")"
+
+# T2 — refus terminal. La population que le verbe « halted » doit garder.
+printf '[policy:deny] Bash: rm -rf /etc [bash-destructive] (terminal)\n' \
+    > "$T2493_FIXTURE_DIR/term.stderr"
+assert_eq "T2: refus terminal ⇒ terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/term.stderr")"
+
+# T3 — forme antérieure à cpp#151 (2026-09-04) : aucun marqueur nulle part.
+# D3 : rien n'est affirmé. Replier sur `non-terminal` poserait l'affirmation
+# fausse dans l'autre sens ; replier sur `terminal` reconduirait le défaut.
+printf '[policy:deny] Bash: gh auth status 2>&1 | head -10\n' \
+    > "$T2493_FIXTURE_DIR/undeclared.stderr"
+assert_eq "T3: refus sans marqueur (pré-cpp#151) ⇒ undeclared" \
+    "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/undeclared.stderr")"
+
+# T4 — LE test qui sépare « lit le fichier » de « lit la ligne ». C'est la forme
+# exacte de la preuve `98b60020` du ticket : `<detail>` multi-ligne, marqueur en
+# 3ᵉ ligne. Toute implémentation qui lirait la ligne capturée par un
+# `grep -m1` rougit ici — et serait donc fausse sur une des deux preuves.
+printf '%s\n' \
+    '[2026-09-22T17:35:39.081Z] [policy:deny] Bash: cd /data/workspace/mika-platform/.claude/worktrees/test-2471/mika \' \
+    '  && git log --oneline -5 \' \
+    '  && echo done [bash-cd] (non-terminal)' \
+    > "$T2493_FIXTURE_DIR/multiline.stderr"
+assert_eq "T4: refus multi-ligne, marqueur en 3ᵉ ligne (forme 98b60020) ⇒ non-terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/multiline.stderr")"
+
+# T5 — plusieurs refus : la question est « un terminal existe-t-il ? », pas
+# « le premier l'était-il ? ». `a0886164` en porte cinq.
+printf '%s\n' \
+    '[policy:deny] Bash: a [r1] (non-terminal)' \
+    '[policy:deny] Bash: b [r2] (non-terminal)' \
+    '[policy:deny] Bash: c [r3] (non-terminal)' \
+    '[policy:deny] Bash: d [r4] (non-terminal)' \
+    '[policy:deny] Bash: e [r5] (terminal)' \
+    > "$T2493_FIXTURE_DIR/four_then_term.stderr"
+assert_eq "T5: quatre non-terminaux suivis d'un terminal ⇒ terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/four_then_term.stderr")"
+
+# T6 — CONTRÔLE NÉGATIF. `(non-terminal)` ne contient pas la sous-chaîne
+# `(terminal)` : la parenthèse ouvrante qu'elle exige est occupée par le `-`.
+# Inverser cette discrimination reclasserait d'un coup les 1093 refus
+# non-terminaux mesurés — c'est l'erreur que ce test existe pour attraper, et
+# elle ne se voit sur aucune des fixtures positives ci-dessus.
+printf '%s\n' \
+    '[policy:deny] Bash: x [r1] (non-terminal)' \
+    '[policy:deny] Bash: y [r2] (non-terminal)' \
+    > "$T2493_FIXTURE_DIR/only_nonterm.stderr"
+assert_eq "T6 (contrôle négatif): un fichier de non-terminaux ne rend JAMAIS terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/only_nonterm.stderr")"
+# Et la vérification directe de la propriété de sous-chaîne dont tout dépend.
+assert_eq "T6: la sous-chaîne (terminal) n'est pas contenue dans (non-terminal)" \
+    "1" "$(printf '%s\n' 'x (non-terminal)' 'y (terminal)' | grep -c -F '(terminal)' || true)"
+
+# T7 — fail-open préservé, dans les deux formes d'indisponibilité.
+assert_eq "T7: fichier absent ⇒ undeclared (fail-open)" \
+    "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/does_not_exist.stderr")"
+printf '[policy:deny] Bash: z [r] (terminal)\n' > "$T2493_FIXTURE_DIR/unreadable.stderr"
+chmod 000 "$T2493_FIXTURE_DIR/unreadable.stderr" 2>/dev/null || true
+if [ -r "$T2493_FIXTURE_DIR/unreadable.stderr" ]; then
+    # root ignore les bits de permission : la sonde ne peut pas s'armer, et le
+    # dire est ce qui empêche de lire un vert à vide (mika#2149).
+    SKIPPED=$((SKIPPED + 1))
+    echo "  SKIP T7: fichier illisible — le processus lit malgré chmod 000 (root ?)"
+else
+    assert_eq "T7: fichier illisible ⇒ undeclared (fail-open)" \
+        "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/unreadable.stderr")"
+fi
+chmod 644 "$T2493_FIXTURE_DIR/unreadable.stderr" 2>/dev/null || true
+
+# --- T13–T14 : l'événement rapporté est dé-tronqué et borné (U3) -------------
+#
+# U3 est la condition de VÉRIFIABILITÉ de U2 : sans lui, le message affirme
+# « non-terminal » en joignant une preuve où le marqueur n'apparaît pas (23 %
+# des cas) — un troisième « croire sur parole » dans un ticket dont le sujet est
+# un libellé qu'on a cru sur parole.
+
+_t2493_excerpt() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        sed 's/\x1b\[[0-9;]*[mK]//g' "$1" | _policy_deny_excerpt
+    )
+}
+
+T2493_EXCERPT_MULTILINE=$(_t2493_excerpt "$T2493_FIXTURE_DIR/multiline.stderr")
+assert_contains "T13: l'extrait porte le [rule-id] (perdu par grep -m1)" \
+    "[bash-cd]" "$T2493_EXCERPT_MULTILINE"
+assert_contains "T13: l'extrait porte le marqueur de létalité" \
+    "(non-terminal)" "$T2493_EXCERPT_MULTILINE"
+assert_contains "T13: et il porte toujours la première ligne du refus" \
+    "[policy:deny] Bash: cd /data/workspace" "$T2493_EXCERPT_MULTILINE"
+# Contrôle de bonne foi : ce que l'ancien prédicat rendait sur cette même
+# fixture. Si ce test rougit, c'est que la fixture ne reproduit plus la forme
+# de M2 et que T13 ne mesure plus rien.
+assert_not_contains "T13 (bonne foi): grep -m1 sur la même fixture PERD le rule-id" \
+    "[bash-cd]" "$(sed 's/\x1b\[[0-9;]*[mK]//g' "$T2493_FIXTURE_DIR/multiline.stderr" | grep -m1 '\[policy:deny\]' || true)"
+
+# T14 — bornes de D6 : un refus mono-ligne sans marqueur suivi de bruit de
+# journal s'arrête à la première ligne ouvrant un autre événement.
+printf '%s\n' \
+    '[policy:deny] Bash: gh auth status' \
+    '[debug] tool_use id=abc' \
+    '[debug] tool_result bytes=1200' \
+    '[done] Success | 5 turns' \
+    > "$T2493_FIXTURE_DIR/deny_then_noise.stderr"
+T2493_EXCERPT_NOISE=$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_then_noise.stderr")
+assert_contains "T14: l'extrait porte le refus" \
+    "[policy:deny] Bash: gh auth status" "$T2493_EXCERPT_NOISE"
+assert_not_contains "T14: et n'emporte pas le bruit [debug] qui suit" \
+    "[debug]" "$T2493_EXCERPT_NOISE"
+assert_not_contains "T14: ni la ligne de fin de session" \
+    "[done]" "$T2493_EXCERPT_NOISE"
+# Plafond : sans marqueur ET sans autre événement, la capture reste bornée.
+{
+    printf '[policy:deny] Bash: long-command \\\n'
+    for _i in $(seq 1 40); do printf '  arg%s \\\n' "$_i"; done
+} > "$T2493_FIXTURE_DIR/deny_unbounded.stderr"
+assert_eq "T14: sans marqueur ni autre événement, la capture est plafonnée" \
+    "12" "$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_unbounded.stderr" | grep -c . || true)"
+
+# --- T8 : garde de préemption, formulée sur la POPULATION des sites ----------
+#
+# Formulé sur la population — toute branche qui déclare un halt sur un deny —
+# et non sur deux lignes nommées, pour qu'un troisième site futur soit vu.
+# M5 est la mesure qui requalifie U1 : les trois autres branches de la chaîne
+# du site dev-groom portaient DÉJÀ `[ -z "$VALID_PLAN" ]`. La branche de refus
+# était la seule à ne pas la porter — et c'est elle qui est en tête. U1 rend à
+# cette branche la condition que ses sœurs ont ; il n'en invente pas une.
+#
+# « On déclare, on n'allowliste pas » (mika#2201, mika#2323) : quand ce scan
+# tire, la résolution est d'ajouter la garde au site fautif, JAMAIS d'ajouter
+# une entrée ici.
+POLICY_DENY_UNGUARDED_ALLOWED=""   # mika#2493 : LIVRÉE VIDE, et un test le tient
+assert_eq "T8: allowlist des sites de halt sans garde — zero entries" \
+    "" "$POLICY_DENY_UNGUARDED_ALLOWED"
+
+# Le scan associe chaque libellé de halt à la condition de la branche qui
+# l'englobe, et vérifie que cette condition porte les DEUX gardes. La portée de
+# `cond` est bornée à 15 lignes pour qu'un libellé lointain n'hérite pas de la
+# condition d'un autre bloc.
+T2493_HALT_SCAN=$(awk '
+    /^[[:space:]]*(el)?if .*\$POLICY_DENY/ { cond = $0; age = 0; next }
+    cond != "" { age++; if (age > 15) cond = "" }
+    /RESULT="PIPELINE FAILURE:.*halted by.*policy deny/ {
+        seen++
+        if (cond !~ /-z "\$VALID_PLAN"/) bad_plan++
+        if (cond !~ /POLICY_DENY_LETHALITY" = "terminal"/) bad_leth++
+    }
+    END { printf "%d:%d:%d", seen + 0, bad_plan + 0, bad_leth + 0 }
+' "$DISPATCH_LIB")
+# Bonne foi d'abord : un scan qui ne trouve aucun site passerait vert à vide.
+assert_eq "T8 (bonne foi): le scan voit les deux sites de halt existants" \
+    "yes" "$([ "${T2493_HALT_SCAN%%:*}" -ge 2 ] && echo yes || echo "non ($T2493_HALT_SCAN)")"
+assert_eq "T8: tout site de halt sur deny porte la garde [ -z \"\$VALID_PLAN\" ]" \
+    "0" "$(printf '%s' "$T2493_HALT_SCAN" | cut -d: -f2)"
+assert_eq "T8: tout site de halt sur deny est réservé à la létalité terminal" \
+    "0" "$(printf '%s' "$T2493_HALT_SCAN" | cut -d: -f3)"
+
+# L'ORDRE DES CONJOINTS est porteur (D1) : les deux assertions d'ordre
+# existantes (Test 13, Test 14) cherchent la sous-chaîne littérale
+# `if [ -n "$POLICY_DENY" ]`. Mettre la garde en tête les ferait rougir pour un
+# résultat identique — et donnerait l'apparence d'un fix qui corrige ses tests.
+assert_eq "D1: les deux sites gardent POLICY_DENY en conjoint de tête" \
+    "2" "$(grep -c 'if \[ -n "\$POLICY_DENY" \] && \[ -z "\$VALID_PLAN" \]' "$DISPATCH_LIB" || true)"
+
+# --- T9, T10, T11, T15, T16 : comportement bout-en-bout ---------------------
+#
+# Les deux sens du DoD, sur la forme exacte des deux preuves : dev-groom,
+# HEAD inchangé, un refus dans le stderr — et `VALID_PLAN` peuplé ou vide.
+
+_t2493_e2e() {
+    # $1 = chemin d'une fixture stderr ; $2 = "plan" pour peupler VALID_PLAN.
+    local base_dir wt_dir log_dir pre_head
+    base_dir=$(mktemp -d); wt_dir="$base_dir/wt"; log_dir="$base_dir/logs"
+    mkdir -p "$log_dir" "$wt_dir/docs/plans"
+    git init -q "$wt_dir" 2>/dev/null
+    printf 'seed\n' > "$wt_dir/seed.txt"
+    if [ "${2:-}" = "plan" ]; then
+        # >500 octets (seuil mika#1033) + en-tête nommant l'issue (tier 2).
+        {
+            printf '# Plan mika issue#9493\n\n**Ticket:** mika issue#9493\n\n'
+            for _i in $(seq 1 40); do printf 'Ligne de corps du plan, pour franchir le seuil de 500 octets.\n'; done
+        } > "$wt_dir/docs/plans/2026-09-23-001-fix-9493-sonde-plan.md"
+    fi
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "seed" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+    cp "$1" "$log_dir/t2493probe.stderr"
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+
+        # Herméticité : aucune requête forge. Le détecteur mika#2178 T9 balaie
+        # tout ce qui suit sa section — ces redéfinitions sont ce qui permet à
+        # la sonde de tourner sans réseau ni jeton.
+        _pr_list_url() { _LAST_PR_QUERY_RC=0; printf ''; }
+        _stamp_pr_origin() { return 0; }
+
+        PILOT_LOG_DIR="$log_dir"
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD="$pre_head"     # HEAD inchangé — la forme des deux preuves
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-groom"
+        REPO="mika"
+        BRANCH="fix/9493/sonde"
+        ISSUE_NUM="9493"
+        SESSION_ID="sonde-2493"
+        LOG_ID="t2493probe"
+        STATUS="success"
+        PILOT_EXIT=0
+        RESULT="claude-pilot session completed."
+        RESCUED_DIRTY_WORKTREE=0
+
+        exec 9>&2
+        _post_flight_recovery 2>/dev/null
+
+        printf '%s' "$RESULT"
+    )
+
+    rm -rf "$base_dir"
+}
+
+# T9 — DoD point 1. La population fondatrice : dev-groom qui a livré son plan,
+# refus non-terminal survécu. Ni « PIPELINE FAILURE » ni « halted ».
+T2493_E2E_SURVIVED=$(_t2493_e2e "$T2493_FIXTURE_DIR/nonterm.stderr" plan 2>/dev/null)
+assert_not_contains "T9 (DoD-1): plan livré + deny non-terminal ⇒ pas de PIPELINE FAILURE" \
+    "PIPELINE FAILURE:" "$T2493_E2E_SURVIVED"
+assert_not_contains "T9 (DoD-1): plan livré + deny non-terminal ⇒ pas de « halted »" \
+    "halted" "$T2493_E2E_SURVIVED"
+# AC4 — le refus est REQUALIFIÉ, jamais supprimé : il reste visible en annexe.
+assert_contains "AC4: le refus non-terminal reste visible dans le result (note)" \
+    "the session continued past it" "$T2493_E2E_SURVIVED"
+assert_contains "AC4: et la note joint la preuve du refus" \
+    "Observed deny:" "$T2493_E2E_SURVIVED"
+assert_contains "AC4: la note nomme la létalité lue" \
+    "Lethality marker: (non-terminal)" "$T2493_E2E_SURVIVED"
+# Idempotence : les deux sites peuvent tirer sur un même dispatch dev-groom.
+assert_eq "La note n'est annexée qu'une fois, même quand les deux sites tirent" \
+    "1" "$(grep -c 'the session continued past it' <<<"$T2493_E2E_SURVIVED" || true)"
+
+# T15 — LE TEST DE L'EFFET, et non de la formulation (M6). Le faux
+# `PIPELINE FAILURE:` ne se contentait pas de mal nommer : il CAPTURAIT le
+# classificateur de la ligne `Outcome:`. T9 assertte une ABSENCE de sous-chaîne,
+# qu'une reformulation malheureuse pourrait satisfaire sans rien réparer ; T15
+# assertte la PRÉSENCE du bon classement, qu'on ne peut pas obtenir par accident.
+assert_contains "T15 (AC6): la session est classée PLAN_COMMITTED" \
+    "Outcome: PLAN_COMMITTED" "$T2493_E2E_SURVIVED"
+assert_not_contains "T15 (AC6): et non PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_SURVIVED"
+
+# T16 — CONTRÔLE NÉGATIF de T15. Même fixture, `VALID_PLAN` vide : une session
+# qui n'a réellement rien produit continue d'être classée PIPELINE_INCOMPLETE.
+# C'est ce qui distingue « le correctif répare le faux positif » de « le
+# correctif a désarmé le classificateur ».
+T2493_E2E_NOPLAN=$(_t2493_e2e "$T2493_FIXTURE_DIR/nonterm.stderr" 2>/dev/null)
+assert_contains "T16 (contrôle négatif): sans plan, la session reste PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_NOPLAN"
+assert_contains "T16: et le diagnostic de la branche qui s'applique garde la parole" \
+    "_find_issue_plan returned empty" "$T2493_E2E_NOPLAN"
+# D4 : le refus est annexé, il n'ÉVINCE pas le vrai diagnostic. Remplacer
+# « pas de plan trouvé, causes probables (a) dérive (b) bug de découverte » par
+# « halted by policy deny » déplacerait le mensonge du ticket au lieu de le
+# fermer — on substituerait au vrai diagnostic un faux, sous couvert de précision.
+assert_contains "D4: sans plan non plus, le deny non-terminal n'est qu'une annexe" \
+    "the session continued past it" "$T2493_E2E_NOPLAN"
+assert_not_contains "D4: et le verbe « halted » n'apparaît pas pour autant" \
+    "halted" "$T2493_E2E_NOPLAN"
+
+# T10 — DoD point 2, le SENS INVERSE. Un refus terminal produit toujours le
+# libellé, augmenté de la mention de sa létalité. Le verbe reste disponible
+# pour les vrais halts : c'est la moitié qu'un correctif trop large casserait.
+T2493_E2E_TERMINAL=$(_t2493_e2e "$T2493_FIXTURE_DIR/term.stderr" 2>/dev/null)
+assert_contains "T10 (DoD-2): deny terminal ⇒ le result porte « halted »" \
+    "halted" "$T2493_E2E_TERMINAL"
+assert_contains "T10 (DoD-2): et la mention (terminal)" \
+    "(terminal)" "$T2493_E2E_TERMINAL"
+assert_contains "T10: le libellé historique du site dev-groom est conservé (REQ7)" \
+    "halted by claude-pilot policy deny" "$T2493_E2E_TERMINAL"
+assert_contains "T10: et la session est bien classée en échec" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_TERMINAL"
+# AC3 : les deux sens sont deux tests distincts, et T5/T6 tiennent la frontière.
+assert_not_contains "T10: un halt terminal n'annexe pas en plus la note de survie" \
+    "the session continued past it" "$T2493_E2E_TERMINAL"
+
+# T11 — D5, contrainte DURE sur la note, assertée sur le TEXTE PRODUIT et non
+# sur la constante. `dispatch-lib.sh` grep le contenu de `RESULT` pour cinq
+# jetons ; une note d'information qui en introduirait un reclasserait la session
+# en échec — exactement le défaut réparé, reconstruit par le correctif.
+T2493_NOTE_ONLY=$(
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        RESULT=""
+        _annex_policy_deny_note "non-terminal" "[policy:deny] Bash: x [r] (non-terminal)"
+        printf '%s' "$RESULT"
+    )
+)
+assert_contains "T11 (bonne foi): la sonde produit bien la note" \
+    "Observed deny:" "$T2493_NOTE_ONLY"
+for _tok in "PIPELINE FAILURE:" "STRUCTURAL VIOLATION:" "HANDLER CRASH"; do
+    assert_not_contains "T11 (D5): la note ne porte pas le jeton « $_tok »" \
+        "$_tok" "$T2493_NOTE_ONLY"
+done
+assert_eq "T11 (D5): la note n'ouvre aucune ligne par STATUS=CANCELLED" \
+    "0" "$(grep -c '^STATUS=CANCELLED' <<<"$T2493_NOTE_ONLY" || true)"
+assert_eq "T11 (D5): la note n'ouvre aucune ligne par Outcome: PIPELINE_INCOMPLETE" \
+    "0" "$(grep -c '^Outcome: PIPELINE_INCOMPLETE' <<<"$T2493_NOTE_ONLY" || true)"
+# Le même prédicat que le lecteur de reclassement applique, appliqué à la note.
+assert_eq "T11 (D5): le prédicat de reclassement de dispatch-lib ne mord pas sur la note" \
+    "0" "$(grep -cE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE)' <<<"$T2493_NOTE_ONLY" || true)"
+
+# T3 bout-en-bout — REQ4/AC5 : une létalité non déclarée n'affirme rien, et le
+# message dit POURQUOI, en nommant le build du pilote plutôt que la lecture.
+T2493_E2E_UNDECLARED=$(_t2493_e2e "$T2493_FIXTURE_DIR/undeclared.stderr" plan 2>/dev/null)
+assert_contains "AC5: létalité non déclarée ⇒ ni terminal ni non-terminal affirmé" \
+    "Lethality marker: undeclared" "$T2493_E2E_UNDECLARED"
+assert_contains "AC5: et le message impute l'absence au build du pilote (cpp#151)" \
+    "cpp#151" "$T2493_E2E_UNDECLARED"
+assert_not_contains "AC5: un undeclared ne produit pas « halted »" \
+    "halted" "$T2493_E2E_UNDECLARED"
+
+# --- Herméticité de cette section (patron mika#2178 T9) ---------------------
+T2493_SECTION=$(sed -n '/^# mika#2493 — un deny non-terminal survécu est une NOTE/,$p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2493 a trouvé la section" \
+    "yes" "$(if [ -n "$T2493_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2493_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2493_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+
+rm -rf "$T2493_FIXTURE_DIR"
+
 # --- Summary ---
 
 echo ""
