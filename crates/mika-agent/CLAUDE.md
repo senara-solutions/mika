@@ -1051,7 +1051,78 @@ STOP). What makes that acceptable is the **visibility**, not the reasoning: the
 operator sees the effect in ≤ 10 min. If the reader ever becomes fallible in a way
 the operator cannot observe (DB, network), redo the trade-off rather than transport it.
 
-**Scope: `auto_pull`, then `worktree_reap` (mika#2420).** `is_stopped`/`stop_file_path`
+**`AUTO_PULL_SCAN` is the loop's NEW-DISPATCH BRAKE, not a scan's private switch
+(mika#2498).** Its name says a scan; its scope is wider, and reading the name as
+the scope cost an incident. On 2026-09-23 the sentinel posted at 05:38 did
+short-circuit the feeder tick — and an implement fired anyway at 06:11:39Z
+(`ff694ec0`, 103 turns, 17.86 USD), because a converged groom chains straight
+into its implementation through the **engine auto-fire**
+(`try_dispatch_pilot_after_groom_success`, mika#1614), which goes through no
+tick. The operator could only cancel it in reaction.
+
+**Widened in its documented sense, never duplicated.** mika#2420's criterion is
+*a distinct decision deserves a distinct file* — but the two routes have the
+**same output** (a fresh dev-pilot dispatch) reached by two paths: the feeder
+promotes `ready` then dispatches in-process (mika#2470), the auto-fire dispatches
+directly. An operator who stops one and not the other has stopped nothing, which
+is exactly the incident. A second sentinel (`groom-implement-stop`) was refused
+for that reason: it splits one operator decision into two gestures, and the
+gesture of muscle memory — posting the file of the incident — would then yield
+today's behaviour while looking like a stop.
+
+**The criterion for a future consumer**, and it is not "am I a scan?": *does it
+start **new** pilot work?* If yes, read this sentinel, whatever the entry door.
+If no, it needs its own scan name (mika#2420's criterion). That is what
+deliberately leaves out `verdict_handler` (`block[ac]` / `block[ci]` repair an
+open PR — a **continuation**, not new work) and a `ready` posted by hand during a
+STOP (whether a file outranks the gesture an operator just made is a product
+decision, not substrate).
+
+**The refusal is convergent, never terminal**, which is what makes the widening
+acceptable: it does not cancel the groom, does not lose the plan (committed and
+pushed by `_push_branch`), creates no row, and leaves the parent `in_progress` /
+`groom` — one more refusal in a groove the function's existing skip paths (no
+token, tool absent from the registry, handler not long-running, flip impossible,
+readiness refused, callback creation failed, handler script missing) had already
+dug, which is what keeps the change small. On release,
+the stuck-ready reconciler re-drives the ticket; and since no tick runs during
+the STOP, **no point of the re-drive budget is spent** (mika#2020). Useful side
+effect, and it answers the "groom-only" half of the ticket without introducing
+any new state: under STOP the in-flight grooms converge, commit their plan, and
+do not chain.
+
+**Placement is the whole of the surface's meaning.** The guard sits after step 3
+(the predicate establishing that a dispatch *will* happen — groom class,
+`Outcome: PLAN_GROOMED`, parent with a parseable issue URL) and **before step 5c**
+(the parent's `dispatch_class` flip groom→implement). At the head of the
+function its line would have meant "a callback arrived during a STOP", a fact
+with no associated conduct, dozens of times a day; after 5c it would leave a
+parent labelled `implement` with no implement in flight and the next legitimate
+dispatch counted on the wrong slot (#1001). It is also before step 4 (the token):
+a STOP is an **operator decision**, a missing token an **environment fact** — the
+operator must see the line of the gesture they made, including on a host with no
+token. `dispatcher::tests::mika2498_le_refus_ne_bascule_pas_le_dispatch_class_du_parent`
+exists for that placement and nothing else.
+
+**Surfaces:** INFO `groom_pilot_autofire_stopped` (fields `parent_task_id`,
+`callback_task_id`, `repo`, `issue`, `stop_file` — rendered by `stop_file_path`,
+never a literal) and an `audit_events` row under the **same `tool_name` as the
+nominal path** (`task_engine_groom_pilot_dispatcher`) with
+`after_value = 'stopped_by_sentinel'` against the nominal `'implement_dispatched'`.
+One name, the outcome in `after_value`, so a `GROUP BY after_value` yields both
+counts in one query, subtractable — the `ready_label_outcome` motif (mika#2323),
+and deliberately not the two-names motif of `phantom_aged_out` /
+`phantom_sweep_spared`, which applies when each name carries its own cause. Named
+and dated cost: a bare `SELECT count(*) WHERE tool_name = …` changes meaning at
+this deploy; `WHERE after_value = 'implement_dispatched'` stays exact on both
+sides and is the query to write. The three values are pinned as a wire format by
+`mika2498_les_valeurs_daudit_sont_un_format_de_fil`, and the log name has a
+single production writer (`mika2498_le_nom_du_refus_a_un_seul_ecrivain`,
+allowlist shipped empty).
+
+**Which scans get a file of their own: `auto_pull`, then `worktree_reap`
+(mika#2420).** Distinct question from the paragraph above, which is about how far
+*one* sentinel reaches. `is_stopped`/`stop_file_path`
 are parameterized by scan name, and mika#2329 shipped that parameterization while
 explicitly refusing to use it twice, for want of a measured need: *"stopping QA review
 is not the same decision as stopping the feeder."* **A destructive operation is
