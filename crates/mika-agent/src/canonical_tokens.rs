@@ -812,4 +812,214 @@ mod tests {
              vide est un emplacement où déposer la prochaine infraction (mika#2323)."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2495 — aucune fixture ne sonde une plage d'adresses de documentation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les plages réservées à la documentation : les trois IPv4 de la RFC 5737
+    /// et le préfixe IPv6 de la RFC 3849.
+    ///
+    /// **Assemblées par `concat!` de fragments**, donc ce fichier ne porte
+    /// littéralement aucun des motifs qu'il cherche. Sans cela le scan rougirait
+    /// à sa première exécution, sur sa propre définition — le motif de
+    /// `worktree_reaper.rs` et de `mika2498_le_nom_du_refus_a_un_seul_ecrivain`
+    /// ci-dessus.
+    fn doc_range_needles() -> Vec<&'static str> {
+        vec![
+            concat!("192.0", ".2."),
+            concat!("198.51", ".100."),
+            concat!("203.0", ".113."),
+            concat!("2001:", "db8"),
+            concat!("2001:", "0db8"),
+        ]
+    }
+
+    /// Les plages de documentation qu'une source porte **hors commentaire**.
+    ///
+    /// Le dépouillement passe par [`crate::source_scan::strip_comment_lines`] —
+    /// le lecteur unique du prédicat, extrait par mika#2495 de `fn_bodies` — et
+    /// c'est ce qui rend la garde compatible avec sa propre réparation : le
+    /// doc-comment de `probe_executor_health_returns_none_on_unreachable_endpoint`
+    /// **nomme** l'adresse fautive pour expliquer pourquoi on ne s'en sert plus.
+    ///
+    /// Une simple recherche par corps de fonction (`fn_bodies`) serait
+    /// insuffisante : un `const BOGUS: &str = "…"` à portée de module lui
+    /// échapperait.
+    fn doc_range_hits(src: &str, needles: &[&'static str]) -> Vec<&'static str> {
+        let code = crate::source_scan::strip_comment_lines(src);
+        needles
+            .iter()
+            .copied()
+            .filter(|n| code.contains(n))
+            .collect()
+    }
+
+    /// **Toutes** les sources Rust sous `crates/`, code de test INCLUS.
+    ///
+    /// La population est **inversée** par rapport à [`production_sources`], et
+    /// c'est délibéré : les gardes voisines de ce module cherchent un motif
+    /// qu'un site de production ne doit pas porter et écartent les fixtures, qui
+    /// le posent légitimement. Ici le motif fautif vit *dans* le code de test —
+    /// c'est même son habitat exclusif, une source de production ne codant
+    /// jamais une IP en dur — donc le scan doit l'inclure, et l'inclusion ne
+    /// crée aucun faux positif côté production.
+    fn all_rust_sources() -> Vec<(String, String)> {
+        let crates_dir = repo_root().join("crates");
+        let mut out = Vec::new();
+        let mut stack = vec![crates_dir];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    // `target/` est un artefact de build, pas de la source.
+                    if name == "target" {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(repo_root())
+                    .expect("chemin sous la racine")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                out.push((rel, content));
+            }
+        }
+
+        assert!(
+            !out.is_empty(),
+            "aucune source Rust trouvée sous crates/ — un scan qui ne scanne rien est un \
+             laissez-passer vide, pas un scan propre (mika#2103)"
+        );
+        out
+    }
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Le recensement exhaustif de l'arbre à la livraison ne rendait qu'une
+    /// occurrence — celle que mika#2495 corrige — donc il n'y a rien à excepter.
+    /// Quand ce scan tire, **on répare la fixture**, on ne l'exempte pas
+    /// (doctrine mika#2201, « on déclare, on n'allowliste pas ») : une adresse
+    /// de documentation dans une fixture est verte sur le CI et rouge en
+    /// pilote, ce qui est exactement la panne invisible que ce ticket a payée
+    /// 6,95 USD de session QA.
+    const ALLOWED_DOC_RANGE_FIXTURES: &[&str] = &[];
+
+    /// **AC4 — la classe est refusée structurellement.**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe. Une nouvelle fixture
+    /// sondant `203.0.113.x` serait verte partout où on la regarde — sur le CI
+    /// réel, qui ne porte aucun proxy — et rouge uniquement dans le bac à sable
+    /// pilote, où personne ne regarde jusqu'à ce qu'une revue QA se bloque
+    /// dessus. C'est cette signature qui justifie un scan de source plutôt
+    /// qu'une assertion.
+    #[test]
+    fn mika2495_aucune_fixture_ne_sonde_une_plage_de_documentation() {
+        let needles = doc_range_needles();
+        let sources = all_rust_sources();
+
+        // Anti-vacuité sur la POPULATION, pas sur le résultat : le scan ne vaut
+        // que si sa population est bien celle qui est inversée. Si quelqu'un le
+        // recâble un jour sur `production_sources()` — le réflexe, puisque c'est
+        // ce que font ses quatre voisines — il ne regarderait plus le seul
+        // endroit où le motif vit, et se tairait en ayant l'air sain.
+        assert!(
+            sources
+                .iter()
+                .any(|(rel, _)| crate::source_scan::is_test_source_path(Path::new(rel))),
+            "mika#2495 — la population du scan ne contient aucune source de test : elle a \
+             été recâblée sur la moitié de production, où le motif cherché ne vit jamais. \
+             Le scan est alors décoratif (mika#2103)."
+        );
+
+        let mut offenders = Vec::new();
+        for (rel, content) in &sources {
+            if ALLOWED_DOC_RANGE_FIXTURES.contains(&rel.as_str()) {
+                continue;
+            }
+            for hit in doc_range_hits(content, &needles) {
+                offenders.push(format!("{rel} porte {hit}…"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2495 — une fixture sonde une plage d'adresses réservée à la \
+             documentation (RFC 5737 / RFC 3849) :\n  {}\n\n\
+             RÉSOLUTION : remplacer la fixture par un port de boucle locale fermé \
+             (`TcpListener::bind(\"127.0.0.1:0\")` puis `drop`). Un proxy intercepte \
+             une adresse non routable et rend un 400, jamais une erreur de transport — \
+             le test est alors vert sur le CI et rouge en pilote. Ne PAS ajouter \
+             d'entrée à ALLOWED_DOC_RANGE_FIXTURES.\n\n\
+             Une mention en COMMENTAIRE n'est pas accusée : si cette ligne apparaît \
+             pour de la prose, c'est le dépouillement de \
+             `source_scan::strip_comment_lines` qu'il faut lire, pas l'aiguille qu'il \
+             faut rétrécir.",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// **Contrôle de non-vacuité — le scan attrape une fixture plantée.**
+    ///
+    /// Sans lui, « la garde se tait » et « la garde ne regarde rien » se lisent
+    /// pareil : c'est la classe que ce module nomme déjà (*une garde qui ne
+    /// vérifie rien est une décoration*, mika#2103). Il assert les deux moitiés
+    /// du prédicat — le littéral est vu, la prose ne l'est pas — parce qu'une
+    /// aiguille qui n'attraperait plus rien et un dépouillement qui avalerait
+    /// tout produisent le même vert.
+    #[test]
+    fn mika2495_le_scan_attrape_une_fixture_plantee() {
+        let needles = doc_range_needles();
+
+        // Composée à l'exécution, pour la raison qui vaut pour l'aiguille : ce
+        // fichier ne doit porter aucun des motifs qu'il cherche.
+        let planted = format!("const BOGUS: &str = \"http://{}9:1/health\";", needles[2]);
+        assert_eq!(
+            doc_range_hits(&planted, &needles),
+            vec![needles[2]],
+            "le scan ne voit plus un littéral planté : l'aiguille ou le dépouillement \
+             est cassé, et la garde est devenue décorative"
+        );
+
+        // L'autre moitié : la même adresse, en prose, n'est PAS une violation.
+        // C'est le faux positif que le doc-comment de la fixture réparée
+        // produirait — il nomme l'adresse pour expliquer pourquoi on ne s'en
+        // sert plus.
+        let prose = format!(
+            "    /// La fixture précédente sondait `{}9` (RFC 5737).",
+            needles[2]
+        );
+        assert!(
+            doc_range_hits(&prose, &needles).is_empty(),
+            "le scan accuse une mention en commentaire : il rougirait sur la prose qui \
+             documente le défaut, et la réparation deviendrait indicible"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus. Le jour où quelqu'un y
+    /// dépose une entrée, c'est ce test qui rougit — et non un `grep` qui ment
+    /// des mois plus tard.
+    #[test]
+    fn mika2495_l_allowlist_des_plages_de_documentation_est_livree_vide() {
+        assert!(
+            ALLOWED_DOC_RANGE_FIXTURES.is_empty(),
+            "ALLOWED_DOC_RANGE_FIXTURES est livrée vide et doit le rester : quand le scan \
+             tire, on RÉPARE la fixture, on ne l'exempte pas — une adresse de \
+             documentation dans une fixture est verte sur le CI et rouge en pilote, ce \
+             qui est la panne que mika#2495 a payée 6,95 USD."
+        );
+    }
 }
