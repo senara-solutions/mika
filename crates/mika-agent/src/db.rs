@@ -1853,6 +1853,50 @@ impl Database {
         Ok(n)
     }
 
+    /// The most recent `audit_events` row for (agent, tool_name, target_key)
+    /// with `created_at > since` — its `after_value`, `reasoning` and
+    /// `created_at` (mika#2242).
+    ///
+    /// # Why this is not [`Self::count_recent_audit_events_for_target`]
+    ///
+    /// That sibling answers *how many*, which is all a dedup or a circuit
+    /// breaker needs. mika#2242's reader needs *which one*: a count lets it say
+    /// "dé-groomé" and not "by PR #2226, branch `fix/umbrella-…`" — and the
+    /// pointer is the half that saves the reviewed work. Same predicate, same
+    /// agent scoping, one more column projected.
+    ///
+    /// `since` must be an ISO 8601 UTC timestamp (`%Y-%m-%dT%H:%M:%SZ`); string
+    /// comparison is correct because the column format is fixed-width UTC.
+    ///
+    /// `after_value` is returned as the `Option<String>` the column actually is.
+    /// Coercing a NULL to `""` would hand the caller a value indistinguishable
+    /// from a row that carried an empty one — the "`null` is never `0`" rule
+    /// mika#2331 had to write for `request_bytes`.
+    ///
+    /// `id DESC` breaks the tie: `created_at` is second-granularity, so two rows
+    /// written inside one second are otherwise ordered arbitrarily.
+    pub fn latest_audit_event_for_target(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        target_key: &str,
+        since: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestAuditEventProjection>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT after_value, reasoning, created_at FROM audit_events
+                 WHERE agent_id = ?1 AND tool_name = ?2 AND target_key = ?3
+                   AND created_at > ?4
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![agent_id, tool_name, target_key, since],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Read a `schema_meta` value, or `None` when the key was never stamped.
     pub fn get_schema_meta(&self, key: &str) -> Result<Option<String>> {
         let value = self

@@ -572,6 +572,13 @@ _ensure_pilot_egress_proxy() {
     fi
     nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
         >>"$log_file" 2>&1 </dev/null &
+    # mika#2051: captured HERE, not read from `$!` further down, because the
+    # failure path below needs it -- and that path is the only one this ticket
+    # exists to diagnose. `$!` still holds this pid at both later sites (nothing
+    # backgrounds in between: the connectability probe runs python3 in the
+    # FOREGROUND), so this is not a bug fix; it is the value being needed
+    # earlier than it was read.
+    local proxy_pid=$!
     disown 2>/dev/null || true
     # Wait for the proxy to actually accept a connection (bounded). Testing
     # for the socket FILE here is what made the fallback below unreachable in
@@ -591,10 +598,26 @@ _ensure_pilot_egress_proxy() {
     if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
         _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT"
         # See the sibling message above on why "falling back to fs-only" is gone.
-        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — refusing the dispatch (mika#2049)" >&2
+        #
+        # mika#2051: the pid is the JOINT. The proxy stamps its own pid on its
+        # first line (`pilot_egress_startup.begin pid=<pid>`, mika#2086), so the
+        # key already existed on one side and was simply not printed on the
+        # other -- leaving the operator to join a per-dispatch `.stderr` to a
+        # cumulative proxy log by timestamp. That is the friction that made the
+        # 2026-08-29 diagnosis expensive. No new correlation id: inventing one
+        # would be a second vocabulary for a join the pid already makes, and it
+        # would have to survive `nohup`.
+        #
+        # Placed BEFORE the em dash on purpose: the dash separates the finding
+        # (this identified proxy did not bind) from its consequence (the
+        # dispatch is refused). The pid qualifies the finding. The published
+        # predicates bite on the `^dispatch-lib: ` anchor and the contiguous
+        # token, both untouched -- see `_egress_guard_line` in the test suite,
+        # which asserts the invariant and deliberately not this position.
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s (pid $proxy_pid) — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
-    echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
+    echo "dispatch-lib: pilot-egress-proxy launched (pid $proxy_pid, log $log_file)" >&2
     return 0
 }
 
@@ -1543,6 +1566,29 @@ _pr_list_url() {
 # (never both). $1 is the full line body, e.g. "PR: <url>" or "NO_PR: <reason>".
 _set_pr_status_line() {
     RESULT="$(printf '%s' "$RESULT" | sed '/^PR: /d; /^NO_PR: /d')
+${1}"
+}
+
+# mika#2492 — the sister of the above, for the `Outcome:` line.
+#
+# Deliberately NOT a reuse of `_set_pr_status_line`: that one knows only
+# `PR:`/`NO_PR:` and has never touched `Outcome:`. This one strips any prior
+# line-anchored `Outcome:` and appends, which makes the "exactly one `Outcome:`
+# line" contract true BY CONSTRUCTION rather than by coincidence of ordering —
+# the same property the comment above claims for its elder.
+#
+# The window it exists for: `_post_flight_recovery` poses an `Outcome:` while
+# still inside `_run_claude_pilot` (mika#940 Unit 3), and Path B may later open
+# a PR that makes a truer one available. $1 is the full line body, e.g.
+# "Outcome: PR_OPENED — <url>".
+_set_outcome_line() {
+    local _body
+    _body="$(printf '%s' "$RESULT" | sed '/^Outcome: /d')"
+    # Trim trailing newlines so the appended block always reads as exactly one
+    # blank separator, whatever the stripped line left behind.
+    while [ "${_body%$'\n'}" != "$_body" ]; do _body="${_body%$'\n'}"; done
+    RESULT="${_body}
+
 ${1}"
 }
 
@@ -2548,7 +2594,17 @@ _set_up_worktree() {
                 # it attests.
                 plan_provenance=$(_plan_provenance "$SUB_REPO_DIR" "$BRANCH" "$existing_plan")
                 echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan resolves on the branch (${plan_provenance}) and its header does not claim another ticket; re-grooming would loop (mika#2012, provenance mika#2034)" >&2
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                # mika#2484 U5 — la note ne prescrit plus une route morte.
+                # Elle disait « Dispatch dev-pilot to implement », et depuis
+                # mika#2287 cette moitié mène droit à
+                # `dispatch_grooming_not_verified` : la porte exige un callback
+                # groom terminé portant `Outcome: PLAN_GROOMED`, qu'aucun
+                # `already_groomed` ne frappe — délibérément, une garde qui lit
+                # sa preuve de la revendication ne peut pas la réfuter. Le geste
+                # nommé ici est celui que `groom_provenance_verdict` nomme déjà
+                # dans son champ `recovery`. Un texte de remède qui nomme une
+                # route morte coûte un tour de boucle et une lecture.
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carrying Outcome: PLAN_GROOMED exists, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
@@ -4052,6 +4108,225 @@ ${RESULT}"
     fi
 }
 
+# _pilot_had_no_shipping_tail — true when this dispatch launched a pilot whose
+# PERIMETER did not include opening a PR, AND whose session concluded.
+#
+# mika#2492. Two axes, and the crossing is the whole point. The autonomous loop
+# dispatches every groomed ticket under `/ce-work <plan>` (the mika#1074
+# override in `_detect_plan_on_branch`), and `/ce-work` is, in its own words,
+# "implementation and local verification only, without the shipping tail". Such
+# a pilot never opens a PR — that is its scope, not a truncation. Until this
+# ticket the nominal path was therefore classified as a wreck
+# (`commit-pushed-no-pr`), which armed three independent guards against the very
+# PR the loop exists to produce.
+#
+# The stamp is written by its PRODUCER (see the two `PILOT_SHIPPING_TAIL=` sites
+# in `dispatch_claude_pilot` / `_detect_plan_on_branch`), never reconstructed
+# here — same motif as `origin:loop` (mika#2026), `closing_pr_closed_unmerged`
+# (mika#2242) and `qa_review_pr_target` (mika#2368).
+#
+# The `STATUS = success` term is the SECOND axis: a session killed by a
+# guardrail or an SDK limit carries `STATUS = terminated` (see the branch at
+# `_run_claude_pilot`'s terminated guard and `_halt_family`'s
+# `error_max_turns`), never `success`. Truncated work must not be presented as
+# complete just because its perimeter had no shipping tail. This is the same
+# term the mika#940 Unit 1 guard below already uses, read at the same place.
+#
+# Fail-safe (mika#2492 R4): every indeterminacy returns false, which falls back
+# to the pre-ticket behaviour. An unreadable signal is never a satisfied term.
+_pilot_had_no_shipping_tail() {
+    [ "${SKILL:-}" = "dev-pilot" ]            || return 1
+    [ "${PILOT_SHIPPING_TAIL:-}" = "absent" ] || return 1
+    [ "${STATUS:-}" = "success" ]             || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# mika#2493 — reading a policy deny: its LETHALITY and its full EVENT.
+#
+# Two functions, two questions, deliberately separate. The verb "halted" belongs
+# to a deny that ENDED the session; a deny the session survived is a note. Until
+# this ticket both were labelled identically, and that label made an operator
+# AND the orchestrator conclude "failure" on two sessions that had succeeded
+# (mika#2493 M0: sessions 98b60020 and a0886164, seven denies between them,
+# ZERO terminal).
+# ---------------------------------------------------------------------------
+
+# Line cap for the deny-event excerpt below. Bounded because a stderr written
+# before cpp#151 carries no lethality marker ANYWHERE, so a scan that only
+# stopped on the marker would run to end-of-file.
+_POLICY_DENY_EXCERPT_MAX_LINES=12
+
+# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print the first
+# `[policy:deny]` event in full rather than its first line only (mika#2493 U3).
+#
+# WHY this is not a one-line grep. The rendered deny is
+#   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
+# and `<detail>` is multi-line whenever the refused command is. The lethality
+# marker (cpp#151) FOLLOWS the `[rule-id]` at the END of `<detail>`, so on a
+# multi-line deny a `grep -m1` capture loses BOTH. Measured (mika#2493 M2):
+# 62 of the 268 stderr files carrying a deny since cpp#151 — 23 %, and the
+# ticket's own proof `98b60020` is among them — lose their marker to that
+# capture. The message this excerpt lands in tells the operator to "read the
+# halt event's bracketed [rule-id] FIRST"; on those 62 that instruction was
+# structurally inexecutable. Same doctrine point 3 as mika#2312: never truncate
+# the command when reporting it.
+#
+# Three stop conditions, all three needed (mika#2493 D6): the lethality marker
+# (inclusive — it is the end of the event), a line that visibly OPENS another
+# log event (leading `[`, the shape of `[init]` / `[debug]` / `[2026-…]`), and
+# the line cap. Without the cap a pre-cpp#151 file runs to EOF; without the
+# other-event stop a one-line deny followed by `[debug]` noise drags that noise
+# to the cap.
+#
+# Continuation lines are printed INDENTED. Two reasons: the caller interpolates
+# the first line right after `Halt event: `, so leaving it flush keeps that
+# shape byte-identical; and indenting neutralises the two line-ANCHORED
+# reclassification tokens (`^STATUS=CANCELLED`, `^Outcome: PIPELINE_INCOMPLETE`)
+# that a continuation line could otherwise open (mika#2493 D5).
+# COST, named: the three UNANCHORED tokens are not neutralised. A refused
+# command whose text literally contains `PIPELINE FAILURE:` would still
+# reclassify the session. That exposure is pre-existing (the current site
+# already interpolates the raw deny line) and scrubbing the evidence would
+# contradict the non-truncation doctrine this function exists to honour.
+#
+# Reads stdin so the caller keeps its own `sed`-based ANSI strip visible at the
+# site. Never short-circuits its input: the awk program keeps draining stdin
+# after it is done printing, so the upstream `sed` can never take SIGPIPE and
+# be promoted to the pipeline's status under `pipefail` (mika#2055 class).
+_policy_deny_excerpt() {
+    awk -v max="${_POLICY_DENY_EXCERPT_MAX_LINES:-12}" '
+        done_printing { next }
+        !started {
+            if (index($0, "[policy:deny]") > 0) {
+                started = 1
+                n = 1
+                print
+                if ($0 ~ /\((non-)?terminal\)/) done_printing = 1
+            }
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*\[/) { done_printing = 1; next }
+            n++
+            print "    " $0
+            if ($0 ~ /\((non-)?terminal\)/ || n >= max) done_printing = 1
+        }
+    '
+}
+
+# _policy_deny_lethality <stderr_path> — print exactly one of
+# `terminal` | `non-terminal` | `undeclared` (mika#2493 U2, D2).
+#
+# The predicate is on the FILE, never on a captured line. Three measured
+# reasons: the marker sits outside the first line in 23 % of cases (M2); a
+# single session carries several denies (five for `a0886164`), so the useful
+# question is "does a terminal one exist?" rather than "was the first one?";
+# and a terminal deny ENDS its session (M4, verified on `da4aa7ae`: sole deny,
+# terminal, line 160 of 166), which makes "at least one terminal" and "the last
+# one is terminal" coincide while only the former survives truncation.
+#
+# The discrimination is a literal substring test, and it is safe in the one
+# direction that matters: `(non-terminal)` does NOT contain `(terminal)` — the
+# opening parenthesis the latter requires is occupied by the `-`. Getting that
+# backwards would reclassify the 1093 measured non-terminal denies in one go,
+# which is what the negative-control test exists to catch.
+#
+# `undeclared` asserts NOTHING, and that is the only safe reading (D3). The
+# marker does not exist before cpp#151 (2026-09-04), so on that population no
+# lethality can be read: folding it onto `non-terminal` would state the false
+# thing in the other direction, folding it onto `terminal` would reproduce the
+# very defect being repaired. Same house motif as `unknown_provider`
+# (mika#2328) and `pilot_stall_signal_unavailable` (mika#2277) — an unreadable
+# signal is NAMED, never folded onto a readable value.
+#
+# Fail-open: absent, unreadable, or empty file → `undeclared`.
+#
+# COST, named: the scan is on the whole file, so a session whose pilot PROSE
+# contains the literal `(terminal)` reads as terminal. That is the mika#2050
+# Signal-S class (the pilot's own prose shares the file). It is bounded by the
+# U1 guard: the branch this feeds is only reached when NO deliverable was
+# produced, so the worst case is a session that produced nothing being called
+# `halted (terminal)` instead of carrying a non-terminal note.
+_policy_deny_lethality() {
+    local _stderr_path="${1:-}"
+    local _stripped=""
+
+    if [ -n "$_stderr_path" ] && [ -f "$_stderr_path" ] && [ -r "$_stderr_path" ]; then
+        _stripped=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_stderr_path" 2>/dev/null) || _stripped=""
+    fi
+
+    if [ -z "$_stripped" ]; then
+        printf '%s' 'undeclared'
+        return 0
+    fi
+
+    if grep -qF -- '(terminal)' <<<"$_stripped"; then
+        printf '%s' 'terminal'
+    elif grep -qF -- '(non-terminal)' <<<"$_stripped"; then
+        printf '%s' 'non-terminal'
+    else
+        printf '%s' 'undeclared'
+    fi
+}
+
+# Sentinel the note below is keyed on. Both POLICY_DENY sites can fire on one
+# dev-groom dispatch (HEAD unchanged AND the plan-validation chain), so without
+# an idempotence key the same note would be annexed twice.
+_POLICY_DENY_NOTE_SENTINEL="Note: a policy deny was observed and the session continued past it"
+
+# _annex_policy_deny_note <lethality> <excerpt> — append the factual note for a
+# deny that did NOT end the session (mika#2493 U2 step 4, D4).
+#
+# The asymmetry is the conceptual core. A TERMINAL deny *is* the cause, so it
+# replaces the branch's diagnosis, as today. A NON-TERMINAL one is not: the
+# session ran on after it. Replacing a true diagnosis ("no plan found, likely
+# (a) drift (b) a discovery bug") with "halted by policy deny" MOVES the
+# ticket's lie instead of closing it — it substitutes a false cause for a real
+# one under cover of precision. So the branch that applies keeps the floor and
+# the deny is reported in ANNEX, because it may well have hindered the pilot
+# without killing it.
+#
+# Corollary, accepted and deliberate: the note is also written on a SUCCESSFUL
+# session. That is exactly what the ticket asks for — a survived non-terminal
+# deny is a note. It is short, factual and non-alarming.
+#
+# HARD constraint (D5): the note must carry none of the reclassification tokens
+# `dispatch-lib.sh` itself greps for (`PIPELINE FAILURE:`,
+# `STRUCTURAL VIOLATION:`, `HANDLER CRASH`, `^STATUS=CANCELLED`,
+# `^Outcome: PIPELINE_INCOMPLETE`). An informational note that introduced one
+# would reclassify the session as a failure — the repaired defect, rebuilt by
+# its own fix. Held by a test on the PRODUCED TEXT, not by review.
+_annex_policy_deny_note() {
+    local _lethality="${1:-}" _excerpt="${2:-}" _reading=""
+
+    [ "$_lethality" = "non-terminal" ] || [ "$_lethality" = "undeclared" ] || return 0
+    # `if`, not `&& return` — a non-zero `&&` chain is what `set -e` kills.
+    if grep -qF -- "$_POLICY_DENY_NOTE_SENTINEL" <<<"${RESULT:-}"; then
+        return 0
+    fi
+
+    # NOTE ON WORDING: this text must contain neither the reclassification tokens
+    # of D5 nor the word the terminal branch owns. A note that said "not halted"
+    # would still put that word in a `result` an operator greps, which is the
+    # confusion being repaired — and the mika#2493 verification contract asserts
+    # its absence on this population.
+    if [ "$_lethality" = "non-terminal" ]; then
+        _reading="Lethality marker: (non-terminal) — claude-pilot states this refusal did not end the session."
+    else
+        # D3: say WHY nothing is asserted, and say that the missing half is the
+        # pilot build's declaration, not this dispatch's reading.
+        _reading="Lethality marker: undeclared — this session's stderr carries no lethality marker at all, in either of the two forms claude-pilot emits, so its lethality cannot be read. The marker exists from cpp#151 onwards (2026-09-04); an older build declares nothing. Neither reading is asserted."
+    fi
+
+    RESULT="${RESULT}
+
+${_POLICY_DENY_NOTE_SENTINEL} (mika#2493). It is reported for completeness, not as a cause — the diagnosis above stands on its own. A refusal can hinder a pilot without ending its session, and this one did not end it.
+${_reading}
+
+Observed deny: ${_excerpt}"
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -4103,21 +4378,48 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
+            POLICY_DENY_LETHALITY="undeclared"
             _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                # mika#2493 (U3): the whole deny EVENT, not its first line. A
+                # `grep -m1 '[policy:deny]'` loses the [rule-id] and the
+                # lethality marker on every multi-line deny — 23 % of the
+                # measured population, the ticket's own proof 98b60020 among
+                # them. The ANSI strip stays here, at the site.
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                    | grep -m1 '\[policy:deny\]' || true)
+                    | _policy_deny_excerpt || true)
+                POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
             fi
 
             # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
             # expected when the plan was already committed in a prior run.
             # The architect pass (_iterate_groom_loop) is what matters — don't
             # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
-            if [ -n "$POLICY_DENY" ]; then
+            #
+            # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — a session that DELIVERED
+            # cannot be labelled by a deny, whatever its lethality. Measured
+            # (M5): the three other branches of this chain already ask "was a
+            # plan produced?" before declaring a failure; the deny branch was the
+            # only one that did not, and it is the one in front. So this restores
+            # a local coherence rather than inventing a predicate. For dev-pilot
+            # VALID_PLAN is structurally empty, so the guard is always true and
+            # behaviour here is unchanged.
+            #
+            # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it
+            # by putting the guard first. test-dispatch-lib.sh looks for the
+            # literal substring `if [ -n "$POLICY_DENY" ]` to measure this
+            # branch's position (Test 13, Test 14); leading with the guard would
+            # redden two tests nothing asks us to touch, for an identical result.
+            if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
                 # Class C — policy-deny halt. The pilot tried to do legitimate
                 # work and was prevented by a tier1/policy allow-list gap. NOT
                 # to be confused with LLM drift or genuine dirty-worktree-rescue.
-                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
+                #
+                # mika#2493 (U2): reached only for a deny whose marker says
+                # (terminal) — the verb "halted" belongs to a refusal that ended
+                # the session. A non-terminal or undeclared deny is annexed as a
+                # note after this chain instead.
+                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -4157,6 +4459,15 @@ ${RESULT}"
                 RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} (status ${STATUS:-unknown}) but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
 
 ${RESULT}"
+            fi
+
+            # mika#2493 (U2 step 4, D4): a deny the session survived is annexed
+            # AFTER the chain, never in place of it. The branch that applies keeps
+            # the floor; the deny is reported because it may have hindered the
+            # pilot without killing it. No-op for a terminal deny (already said
+            # above) and for no deny at all.
+            if [ -n "$POLICY_DENY" ]; then
+                _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
             fi
         fi
 
@@ -4296,25 +4607,52 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
+        POLICY_DENY_LETHALITY="undeclared"
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-            # Strip ANSI color codes, then extract the first [policy:deny] line.
+            # Strip ANSI color codes, then extract the first [policy:deny] event.
             # The line shape is
             #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
             # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
             # rule-id tag, so the rule-id is the last *bracketed* token, not the
             # last token. An absent tag means `rule_id=None` — the policy default
             # deny (no rule matched), NOT a non-deterministic refusal.
+            # mika#2493 (U3): the EVENT, not just its first line — `<detail>` is
+            # multi-line whenever the refused command is, and both the rule-id and
+            # the marker sit at its END. The ANSI strip stays here, at the site.
             POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                | grep -m1 '\[policy:deny\]' || true)
+                | _policy_deny_excerpt || true)
+            POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
         fi
 
-        if [ -n "$POLICY_DENY" ]; then
+        # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — this is the branch that
+        # produced the ticket. It tested POLICY_DENY at the head of the chain with
+        # NO condition, so a dev-groom that had written its plan, committed it and
+        # succeeded was labelled a pipeline failure the moment any refusal sat in
+        # its stderr (M0: sessions 98b60020 and a0886164, seven denies, zero
+        # terminal, both `status: success`). The correct intent is written three
+        # lines above, in the comment this branch has always carried:
+        # "Disambiguate by reading the persistent stderr ... BEFORE DECLARING
+        # DRIFT" — the deny was meant to disambiguate a failure already
+        # established, and was implemented as a priority diagnosis. There is
+        # nothing to disambiguate once the session has delivered.
+        #
+        # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it by
+        # putting the guard first. test-dispatch-lib.sh looks for the literal
+        # substring `if [ -n "$POLICY_DENY" ]` to measure this branch's position
+        # against the drift message (Test 13); leading with the guard would redden
+        # a test nothing asks us to touch, for an identical result. What the fix
+        # changes is WHEN both conditions apply, never their relative order.
+        if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
             # Class C — policy-deny-induced early halt. The pilot made a
             # legitimate research request that hit a tier1/policy allow-list
             # gap. This is NOT LLM drift; the operator should investigate
             # the deny rule, not the pilot's reasoning.
-            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
+            #
+            # mika#2493 (U2): reached only for a deny whose marker says
+            # (terminal). A non-terminal or undeclared deny is annexed as a note
+            # after this chain, so the branch that really applies keeps the floor.
+            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -4354,6 +4692,14 @@ ${RESULT}"
             # plan, not the gate itself.
             echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
         fi
+
+        # mika#2493 (U2 step 4, D4): annexed AFTER the chain, never in place of
+        # it. Corollary accepted deliberately — this also fires on a SUCCESSFUL
+        # dev-groom, which is exactly what the ticket asks for: a survived
+        # non-terminal deny is a note. No-op for a terminal deny and for no deny.
+        if [ -n "$POLICY_DENY" ]; then
+            _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
+        fi
     fi
 
     # Issue #138: Discover actual PR URL from the branch
@@ -4392,7 +4738,12 @@ ${RESULT}"
     #   - $PR_URL empty: PR-discovery above found nothing.
     #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
     #     the zero-commit check earlier in this block already fires.
-    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+    #   - ! _pilot_had_no_shipping_tail (mika#2492): the sentence this block
+    #     writes — "Pipeline truncated before git push + gh pr create" — is
+    #     FALSE for a pilot whose perimeter never had that step. Without this
+    #     term the nominal `/ce-work` path takes a `PIPELINE FAILURE:` and the
+    #     Unit 3 cascade below mechanically falls to PIPELINE_INCOMPLETE.
+    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && ! _pilot_had_no_shipping_tail; then
         RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
 
 ${RESULT}"
@@ -4419,6 +4770,24 @@ Outcome: PR_OPENED — ${PR_URL}"
         RESULT="${RESULT}
 
 Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
+    elif _pilot_had_no_shipping_tail; then
+        # mika#2492. This value is TRANSITORY on the nominal path: Path B, a few
+        # hundred lines below in `dispatch_claude_pilot`, opens the draft PR and
+        # rewrites this line to `PR_OPENED` via `_set_outcome_line`. Nobody reads
+        # `^Outcome: ` in between — the only two readers are
+        # `_measure_cycle_output` and `_gate_non_empty_cycle`, reached from
+        # `_deliver_callback` (after Path B) and from the EXIT trap.
+        #
+        # The EXIT trap is the one intermediate reader, and it is exactly why
+        # this arm exists rather than falling through to the `UNKNOWN — inspect
+        # worktree manually.` default: on the population where dispatch-lib dies
+        # between here and Path B, this sentence is TRUE at the instant it is
+        # read (no PR was opened, the work waits in the worktree) and it is at
+        # least as actionable as the `PIPELINE_INCOMPLETE — manual recovery
+        # needed` that population receives today, with a named motive on top.
+        RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation."
     else
         RESULT="${RESULT}
 
@@ -6734,7 +7103,11 @@ _derive_recovery_pr_title() {
     local labels="$5"
     local issue_title="$6"
 
-    if [ "$recovery_class" = "commit-pushed-no-pr" ]; then
+    # mika#2492 widens this arm to `no-shipping-tail`: both classes reach here
+    # with the pilot's own implementation commit at the branch tip, so its
+    # subject is the right title for either. The other two callers (dirty-worktree,
+    # and any fallback) are untouched.
+    if [ "$recovery_class" = "commit-pushed-no-pr" ] || [ "$recovery_class" = "no-shipping-tail" ]; then
         local impl_subject
         impl_subject=$(git -C "$wt_dir" log -1 --format='%s' HEAD 2>/dev/null)
         if [ -n "$impl_subject" ]; then
@@ -7311,6 +7684,12 @@ _detect_plan_on_branch() {
         # form or claude-pilot exits 7ms with `[error] pipeline_incomplete:` (no
         # API call). See mika#1345.
         ENTRY_COMMAND="/ce-work $PLAN_PATH"
+        # mika#2492: `/ce-work` is "implementation and local verification only,
+        # without the shipping tail" — this pilot will not open a PR, and that
+        # is its perimeter, not a truncation. Stamped HERE, on the line that
+        # takes the decision, so the fact travels from its producer instead of
+        # being reconstructed downstream. Read by `_pilot_had_no_shipping_tail`.
+        PILOT_SHIPPING_TAIL="absent"
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
@@ -7690,6 +8069,12 @@ EOF
     case "$SKILL" in
       dev-pilot)
         ENTRY_COMMAND="/mika"
+        # mika#2492: declare the pilot's shipping perimeter at the site that
+        # decides it. `/mika` carries plan → work → review → … → git push +
+        # gh pr create, so this pilot is expected to open its own PR and a
+        # commit-without-PR really is a truncation. `_detect_plan_on_branch`
+        # overwrites this with `absent` when it overrides the entry command.
+        PILOT_SHIPPING_TAIL="present"
         # mika#940: signal claude-pilot to fail the session if `gh pr create`
         # is never invoked. Caught by the source-level pipeline_incomplete
         # detection in claude-pilot-py (Unit 2). Defense-in-depth against the
@@ -7854,9 +8239,17 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
     #   commit on origin; PR was never opened. dispatch-lib opens it.
     #
     # Runs after _push_branch (lines 558-564) and before _deliver_callback.
+    # - "no-shipping-tail" (mika#2492): the pilot's perimeter never included
+    #   opening a PR (`/ce-work`), and its session concluded. dispatch-lib opens
+    #   the PR because that has been its job since mika#1271 — this is the
+    #   NOMINAL path of the autonomous loop, not a wreck, so it carries neither
+    #   the RECOVERY_PENDING marker nor the wip(mika#1383) marker commit.
     local RECOVERY_CLASS=""
     if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then
         RECOVERY_CLASS="dirty-worktree"
+    elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
+         && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && _pilot_had_no_shipping_tail; then
+        RECOVERY_CLASS="no-shipping-tail"
     elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
          && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ]; then
         RECOVERY_CLASS="commit-pushed-no-pr"
@@ -7869,6 +8262,13 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
         if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
             _rescue_title=$(_derive_recovery_pr_title "dirty-worktree" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session wrote file changes but never committed. dispatch-lib auto-committed with \`wip()\` prefix."
+        elif [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+            # mika#2492: the truth of this class, and it is not a wreck. The
+            # title comes from the pilot's real head commit, exactly as for
+            # commit-pushed-no-pr — both classes share the topology "the pilot
+            # committed", they differ only on whether that was its whole job.
+            _rescue_title=$(_derive_recovery_pr_title "no-shipping-tail" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
+            _rescue_class_fact="The pilot ran under \`/ce-work <plan>\` (mika#1074 plan-on-branch override), whose perimeter is implementation and local verification only — without the shipping tail. It committed the plan's work and concluded; opening the PR is dispatch-lib's job (mika#1271), not a step it truncated before. This PR is draft because its review has not happened yet — never because its content is in doubt."
         else
             _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session committed and pushed but did not open a PR (\`gh pr create\` failed, or the pilot ended its turn before invoking it — mika#1383). dispatch-lib opened this PR from the existing branch."
@@ -7965,10 +8365,27 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             # parent task false-fails as `callback_delivered_without_pr_url`
             # despite the rescued PR being open and reviewable. See mika#871
             # R4 for the canonical contract.
-            RESULT="${RESULT}
+            if [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+                # mika#2492: the nominal path. No `RECOVERY_PENDING: true` —
+                # that marker is what makes self-dev-callback write
+                # `unpushed_recovery_pending` into tasks.metadata, which makes
+                # the qa-webhook Guard 1 skip the autonomous review and escalate
+                # to the operator. A pilot that did exactly what its perimeter
+                # asked has nothing pending.
+                RESULT="${RESULT}
+Draft PR (opened by dispatch-lib): ${PR_URL}
+PR: ${PR_URL}"
+                # The `Outcome:` posed inside _post_flight_recovery named this
+                # very window ("did not reach PR creation"); it is now false, and
+                # the sister of _set_pr_status_line replaces it in one line so
+                # the one-Outcome-line contract holds by construction.
+                _set_outcome_line "Outcome: PR_OPENED — ${PR_URL}"
+            else
+                RESULT="${RESULT}
 Draft PR (dispatch-lib recovery): ${PR_URL}
 PR: ${PR_URL}
 RECOVERY_PENDING: true"
+            fi
             # mika#1613: structured marker parsed by self-dev-callback, which
             # writes `unpushed_recovery_pending: true` into tasks.metadata. That
             # flag makes the qa-webhook recovery-skip guard fire so this rescue

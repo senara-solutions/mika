@@ -178,6 +178,18 @@ allowlist = [\n\
 /// it. Reconciling that drift requires a passing calibration on the model
 /// actually in service (mika#1190); it is its own piece of work, deliberately
 /// not opened by mika#2296.
+///
+/// **That drift is no longer something a reader has to reconstruct (mika#2473).**
+/// At every `init_agent`, spirit compares the pair declared below to the pair
+/// the cascade resolves and says which it got: `well_known_model_drift` (WARN)
+/// when they differ — with `declared_model`, `runtime_model`, the door
+/// `runtime_model_source` names, and `model_config_key` — or
+/// `well_known_model_in_sync` (INFO) when they agree. Nothing is refused (KTD1):
+/// the line is the fact, the reconciliation is an operator decision.
+///
+/// ```text
+/// mika agents budget --agent mika-dev    # la dérive, lue sur le serveur
+/// ```
 const MIKA_DEV_CONFIG: &str = r#"# Mika Dev — autonomous development agent.
 # Base model switched to glm-5.2 per mika#1633 (cost reduction).
 
@@ -239,8 +251,23 @@ log_level = "info"
 /// **What says so:** the `llm_budget_resolved` INFO event now carries `model`,
 /// `model_source` and `model_config_key` beside the timeout pair (mika#2328 U2).
 /// `model_source = agent_config` with a `model` other than the line below is the
-/// drift, measured. Nothing here *prevents* it — this is an instrument, not a
-/// guard.
+/// drift, measured.
+///
+/// **And since mika#2473, the divergence is stated as such rather than left to
+/// be reconstructed from a record.** At every `init_agent`, spirit compares the
+/// pair this constant declares to the pair the cascade resolves and emits one
+/// line per agent: `well_known_model_drift` (WARN) when they differ, carrying
+/// `declared_model`, `runtime_model`, `runtime_model_source` — the door the
+/// running value came through — and `model_config_key`, the key an operator
+/// would edit; `well_known_model_in_sync` (INFO) when they agree, so that an
+/// absence of WARN stays distinguishable from a guard that never ran. It still
+/// *prevents* nothing (KTD1): reconciling the drift is an operator decision
+/// (mika#2472), and refusing to boot over a valid configuration is precisely
+/// what this guard exists not to become.
+///
+/// ```text
+/// mika agents budget --agent mika-qa     # la dérive, lue sur le serveur
+/// ```
 ///
 /// ```text
 /// grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \
@@ -2249,7 +2276,12 @@ mod tests {
         fs::create_dir_all(home.join("agents")).unwrap();
 
         // Create mika-dev with custom soul
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let dev_home = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(dev_home.join("soul.md"), "custom soul content").unwrap();
 
@@ -2270,7 +2302,12 @@ mod tests {
         fs::create_dir_all(home.join("agents")).unwrap();
 
         // Only mika-dev exists
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         assert!(!mika_common::agent::agent_exists(home, "mika-qa"));
 
         provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
@@ -2795,6 +2832,147 @@ mod tests {
         );
     }
 
+    /// mika#2473 U3 / R1, R2 — un agent bien connu fraîchement provisionné sert
+    /// exactement le couple que sa constante déclare, et une édition de son
+    /// `config.toml` sur disque est une dérive nommée.
+    ///
+    /// # Deux préconditions de montage, et pourquoi elles sont load-bearing
+    ///
+    /// `test_settings_with_kg_roots()` **et** `home/agents` créé au préalable :
+    /// sans l'un des deux, `build_mika_arch_identity` rend `Err`, le
+    /// provisionnement `continue` sans écrire de `config.toml`, mika-arch résout
+    /// alors une cascade vide (`DEFAULT_PROVIDER`) et le contrôle positif
+    /// asserte `InSync` contre un `Drift` — un défaut de montage déguisé en
+    /// dérive. Le saut est épinglé par
+    /// `test_provision_skips_mika_arch_when_kg_docs_roots_unset`. D'où
+    /// l'assertion `agent_exists` avant toute comparaison : une spec sautée au
+    /// provisionnement est un défaut de montage du test, jamais une dérive à
+    /// asserter.
+    ///
+    /// `clean_budget_env()` (exporté par `mika-common` sous `test-utils`, jamais
+    /// ré-écrit ici — une seconde dérivation de `MIKA_{PREFIX}_MODEL` serait
+    /// libre de diverger de la première) : un `MIKA_OPENROUTER_MODEL` ambiant
+    /// sur ce poste mettrait la cascade une porte plus haut que celle que ce
+    /// test exerce, et le contrôle positif rougirait sur une configuration
+    /// correcte.
+    ///
+    /// # Le contrôle négatif, vu rouge
+    ///
+    /// L'édition post-provision réécrit la clé modèle que le record nomme
+    /// lui-même (`record.model_config_key`) plutôt qu'une clé re-dérivée ici.
+    /// Neutraliser son terme — ne pas réécrire le fichier — rend le second
+    /// `compare` `InSync` et l'assertion rougit : le contrôle n'est pas vide.
+    #[test]
+    #[serial_test::serial]
+    fn mika2473_a_freshly_provisioned_well_known_agent_has_no_drift_and_an_edit_has() {
+        use mika_common::llm::{
+            ModelDriftCheck, clean_budget_env, declared_model, resolve_llm_budget_record,
+        };
+
+        clean_budget_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("agents")).unwrap();
+        provision_well_known_agents(home, &test_settings_with_kg_roots(), false);
+
+        let mut declaring = 0usize;
+        let mut silent = 0usize;
+
+        for spec in WELL_KNOWN_AGENTS {
+            let agent_home = mika_common::agent::agent_dir(home, spec.name);
+            let record = resolve_llm_budget_record(spec.name, home, &agent_home);
+
+            let Some(config_toml) = spec.config_toml else {
+                assert_eq!(
+                    ModelDriftCheck::compare(None, &record),
+                    ModelDriftCheck::NotApplicable,
+                    "{} ne déclare aucun modèle : rien n'a été comparé, et le dire \
+                     est autre chose que dire « en phase »",
+                    spec.name
+                );
+                silent += 1;
+                continue;
+            };
+
+            assert!(
+                mika_common::agent::agent_exists(home, spec.name),
+                "{} n'a pas été provisionné : c'est un défaut de montage de ce \
+                 test, jamais une dérive à asserter",
+                spec.name
+            );
+
+            let declared = declared_model(config_toml).unwrap_or_else(|| {
+                panic!(
+                    "{} doit déclarer un couple (provider, modèle) lisible",
+                    spec.name
+                )
+            });
+
+            // Contrôle positif : le disque que le provisionnement vient d'écrire
+            // porte ce que la constante déclare.
+            match ModelDriftCheck::compare(Some(&declared), &record) {
+                ModelDriftCheck::InSync { .. } => {}
+                other => panic!(
+                    "{} fraîchement provisionné devrait être en phase avec sa \
+                     propre constante, et rend {other:?}",
+                    spec.name
+                ),
+            }
+
+            // Contrôle négatif : une édition réelle du modèle sur disque.
+            const IMPOSTEUR: &str = "un-modele-que-personne-ne-declare";
+            assert_ne!(
+                declared.model, IMPOSTEUR,
+                "le modèle imposteur doit différer du modèle déclaré, sinon \
+                 l'édition n'édite rien"
+            );
+            let edited = format!(
+                "llm_provider = \"{}\"\n{} = \"{IMPOSTEUR}\"\n",
+                record.provider, record.model_config_key
+            );
+            fs::write(agent_home.join("config.toml"), &edited).unwrap();
+
+            match ModelDriftCheck::compare(
+                Some(&declared),
+                &resolve_llm_budget_record(spec.name, home, &agent_home),
+            ) {
+                ModelDriftCheck::Drift {
+                    declared_model: d,
+                    runtime_model,
+                    model_config_key,
+                    ..
+                } => {
+                    assert_eq!(d, declared.model);
+                    assert_eq!(
+                        runtime_model, IMPOSTEUR,
+                        "la dérive doit nommer le modèle RÉELLEMENT en vigueur"
+                    );
+                    assert_eq!(
+                        model_config_key, record.model_config_key,
+                        "la dérive doit nommer la clé qu'un opérateur éditerait"
+                    );
+                }
+                other => panic!(
+                    "une édition du modèle de {} est une dérive, et rend {other:?}",
+                    spec.name
+                ),
+            }
+
+            declaring += 1;
+        }
+
+        assert_eq!(
+            declaring, 3,
+            "trois agents bien connus déclarent un modèle (mika-dev, mika-qa, \
+             mika-arch) : un compte différent veut dire que ce test a mesuré \
+             autre chose que ce qu'il annonce"
+        );
+        assert_eq!(silent, 1, "mika-test ne déclare aucun config.toml");
+
+        clean_budget_env();
+    }
+
     /// mika#2296 T2 — no well-known agent declares an output budget below 8192.
     ///
     /// The scan reads DECLARATIONS, never absences: an agent whose spec carries
@@ -3206,8 +3384,29 @@ mod tests {
 
     /// Pre-seed an agent on disk with a custom identity.toml content,
     /// bypassing the spec-driven provisioner.
+    ///
+    /// **The tier is posed here, and that covers twelve callers at once
+    /// (mika#2471).** `bootstrap_agent` reads `MIKA_AGENT_TIER` off the
+    /// *process* environment, which this binary shares with two
+    /// `#[serial_test::serial]` tests that set it to `family`
+    /// (`server/mod.rs`, `server/tier_guard.rs`). `#[serial]` sequences only
+    /// its own bearers, so every bare `#[test]` calling this helper raced them.
+    ///
+    /// **This site is the scan's blind spot, named rather than left silent.**
+    /// `mika2073_no_bare_test_reads_the_tier_from_the_environment` walks test
+    /// *items*; a helper carries no `#[test]` attribute, so the guard saw
+    /// neither the defect before this line nor the fix in it — five offenders
+    /// before, zero after, and neither number says anything about this
+    /// function. What attests it is the green of `cargo test -p mika-agent
+    /// --lib`, which exercises the twelve callers. If this call ever reverts to
+    /// `bootstrap_agent`, no detector will say so.
     fn pre_seed_identity(home: &Path, agent_name: &str, content: &str) {
-        mika_common::home::bootstrap_agent(home, agent_name).unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            agent_name,
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, agent_name);
         fs::write(agent_dir.join("identity.toml"), content).unwrap();
     }
@@ -3657,7 +3856,12 @@ mod tests {
         let home = tmp.path();
 
         // Pre-seed mika-dev with an old config (no openrouter).
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
         fs::write(agent_dir.join("config.toml"), "log_level = \"info\"\n").unwrap();
@@ -3678,7 +3882,12 @@ mod tests {
         let home = tmp.path();
 
         // Pre-seed with the correct config.
-        mika_common::home::bootstrap_agent(home, "mika-dev").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-dev",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-dev");
         fs::write(agent_dir.join("identity.toml"), MIKA_DEV_IDENTITY).unwrap();
         fs::write(agent_dir.join("config.toml"), MIKA_DEV_CONFIG).unwrap();
@@ -3702,7 +3911,12 @@ mod tests {
         // Pre-seed mika-test (which has config_toml: None) with a custom config.
         // mika-qa moved to Some(MIKA_QA_CONFIG) in mika#1670, so mika-test is now
         // the well-known agent exemplifying the None-config skip path.
-        mika_common::home::bootstrap_agent(home, "mika-test").unwrap();
+        mika_common::home::bootstrap_agent_with_tier(
+            home,
+            "mika-test",
+            mika_common::home::AgentTier::Default,
+        )
+        .unwrap();
         let agent_dir = mika_common::agent::agent_dir(home, "mika-test");
         fs::write(agent_dir.join("identity.toml"), MIKA_TEST_IDENTITY).unwrap();
         let custom = "log_level = \"debug\"\n";
