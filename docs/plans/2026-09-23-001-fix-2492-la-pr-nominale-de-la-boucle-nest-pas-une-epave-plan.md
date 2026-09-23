@@ -152,10 +152,14 @@ un chemin qui n'en manquait pas ; ce que le substrat fait, il le fait.
 | **absente (`/ce-work`)** | **oui** | **`no-shipping-tail` (nominal)** | **la seule case qui bouge** |
 | absente | non | `commit-pushed-no-pr` (épave) | **aucun** |
 
-L'axe B est indispensable : #2484 a bien fini en `error_max_turns` (mesuré dans
-`153c2044-….log`). Un travail tronqué ne doit pas être présenté comme complet,
-même quand son périmètre n'avait pas de queue. **Les deux phénomènes coexistent
-et sont orthogonaux** ; le ticket les confond, le croisement les sépare.
+L'axe B est indispensable, et **la population mesurée porte ses deux états** —
+c'est ce que rev 2 a établi en nommant les témoins (U0, finding F3) : #2484 a
+fini en `[guardrail] error_max_turns` (`153c2044-….log`) quand #2425 a fini en
+`[done] Success | 142 turns` (`d8aa26ee-….log`), tous deux sous `/ce-work`. Un
+travail tronqué ne doit pas être présenté comme complet, même quand son périmètre
+n'avait pas de queue. **Les deux phénomènes coexistent et sont orthogonaux** ; le
+ticket les confond, le croisement les sépare — et la troisième ligne du tableau
+n'est pas une hypothèse, elle a déjà un cas.
 
 ### D3 — Le label `wip-rescue` est CONSERVÉ, et c'est un arbitrage, pas un oubli
 
@@ -198,13 +202,38 @@ publier ». Rien ne change : la classe nouvelle passe par le même appel. C'est 
 marqueur qui décidera, en aval, si un DECISION-CORE peut être un-drafté — et
 c'est précisément la garantie qu'il ne faut pas contourner.
 
-### D6 — Le prédicat de complétude est mesuré (U0), pas supposé
+### D6 — Le prédicat de complétude est établi par lecture du dépôt (rev 2)
 
-`STATUS` et `SUBTYPE` sont en main dans dispatch-lib, mais **ce que `STATUS`
-vaut sur une session `error_max_turns` n'est pas établi par lecture du code
-seul** : claude-pilot est hors dépôt. U0 est donc une **mesure**, et le prédicat
-de U2 n'est figé qu'après elle. Le fail-safe (R4) rend l'erreur bénigne dans un
-seul sens : un doute classe « épave », c'est-à-dire le comportement d'aujourd'hui.
+**Rev 1 de ce plan affirmait que ce prédicat n'était pas établissable par lecture
+du code seul, claude-pilot étant hors dépôt, et le renvoyait à une mesure sur
+journaux. La lecture faite en rev 2 (F3) réfute les deux moitiés**, et la
+correction va dans le sens du durcissement, pas de l'assouplissement :
+
+1. **Le mapping est écrit et consommé dans ce dépôt.** `dispatch-lib.sh:3071`
+   pose `STATUS` depuis le JSON du pilote ; `:3074-3087` énonce que
+   `status: terminated` couvre **les deux** populations d'arrêt (abort guardrail
+   et limite SDK) ; `:3169` embranche dessus ; et `_halt_family` (`:3520`) nomme
+   `error_max_turns` comme un `SDK_TERMINATION_SUBTYPES`, table atteinte depuis
+   `_classify_terminated_session`, elle-même appelée **uniquement** sous
+   `STATUS = "terminated"` (`:3170`, `:3184`). Une session `error_max_turns`
+   porte donc `STATUS = "terminated"`, jamais `"success"`. Le prédicat
+   `STATUS = "success"` de U2 est **figé** et n'attend plus rien.
+2. **La mesure que rev 1 prescrivait était inexécutable.** `STATUS`/`SUBTYPE`
+   sont lus du **stdout** du pilote (`:3071`, `:3087`), capturé dans
+   `$STDOUT_FILE`, un `mktemp` **supprimé ligne 3068**. Le JSON n'atterrit ni
+   dans `<id>.log` ni dans `<id>.stderr` — vérifié sur le cas mesuré #2484 :
+   `grep -o '"subtype":"[a-z_]*"'` et `grep -o '"is_error":[a-z]*'` (les deux
+   commandes que rev 1 publiait) rendent **zéro ligne** sur les deux fichiers.
+   Un plan qui prescrit une mesure impossible ne livre pas une prudence, il
+   livre une étape qui sera sautée ou bricolée.
+
+Ce que les journaux archivés portent est un **marqueur de prose**, pas le couple
+JSON : `[done] Success | N turns | $C | Ts` d'un côté, `[guardrail] <subtype>: …`
+de l'autre. C'est sur lui que porte le contrôle U0 ci-dessous, et il suffit à
+nommer les deux populations témoins.
+
+Le fail-safe (R4) reste la protection de fond, et son sens est inchangé : un
+doute classe « épave », c'est-à-dire le comportement d'aujourd'hui.
 
 ---
 
@@ -212,7 +241,9 @@ seul sens : un doute classe « épave », c'est-à-dire le comportement d'aujour
 
 **Dans le périmètre**
 - `skills/bundled/_shared/dispatch-lib.sh` : estampille du périmètre, classe
-  `no-shipping-tail`, corps de PR, ligne `Outcome:`, bloc mika#940 Unit 1.
+  `no-shipping-tail`, corps de PR, ligne `Outcome:` (bras dédié dans le bloc
+  Unit 3 + nouvelle fonction `_set_outcome_line`, sœur de `_set_pr_status_line`),
+  bloc mika#940 Unit 1.
 - `skills/bundled/_shared/test-dispatch-lib.sh` : tests + scans structurels.
 - `.github/labels.yml` : **vérification** que tout label écrit par le chemin
   modifié y est déclaré (aucun label nouveau n'est introduit).
@@ -240,23 +271,48 @@ seul sens : un doute classe « épave », c'est-à-dire le comportement d'aujour
 
 ## Implementation Units
 
-### U0 — Mesurer ce que `STATUS` vaut sur une session tronquée (précède tout code)
+### U0 — Contrôle des deux populations témoins sur journal (précède tout code)
 
-Aucune ligne de code. Sur les journaux déjà en main, établir le couple
-`(STATUS, SUBTYPE)` d'une session `error_max_turns` — `153c2044-…` (#2484) est le
-cas mesuré — et celui d'une session conclue proprement.
+Aucune ligne de code. Le prédicat lui-même est **déjà établi** par lecture du
+dépôt (D6) ; ce qui reste est le contrôle qu'il a bien **deux** populations dans
+la vraie vie, et que la classe nouvelle n'en absorbe pas une. **Les deux témoins
+sont nommés** — c'est la rectification F3 de rev 2, rev 1 se bornant à affirmer
+que « les quatre cas mesurés ont tous tronqué », ce qui est faux :
+
+| population | témoin | marqueur terminal mesuré |
+|---|---|---|
+| **session conclue proprement** | `d8aa26ee-322f-4946-94c9-9d2bfd2565ca.log` (#2425) | `[done] Success \| 142 turns \| $48.50 \| 2950s` |
+| **session tronquée** | `153c2044-9d38-4458-abfa-322c3c174020.log` (#2484) | `[guardrail] error_max_turns: SDK limit reached after 201 turns` |
 
 ```bash
-grep -o '"subtype":"[a-z_]*"' /var/log/claude-pilot/153c2044-9d38-4458-abfa-322c3c174020.log | tail -3
-grep -o '"is_error":[a-z]*'  /var/log/claude-pilot/153c2044-9d38-4458-abfa-322c3c174020.log | tail -3
+tail -2 /var/log/claude-pilot/d8aa26ee-322f-4946-94c9-9d2bfd2565ca.log   # [done] Success
+tail -2 /var/log/claude-pilot/153c2044-9d38-4458-abfa-322c3c174020.log   # [guardrail] error_max_turns
 ```
 
-**Halte U0 — si les deux populations rendent le même couple**, il n'existe pas
-de prédicat de complétude lisible depuis dispatch-lib : **ne pas inventer de
-proxy**. La classe nouvelle est alors livrée conditionnée au seul axe A, ce qui
-ferait traiter une session tronquée comme nominale — inacceptable — donc le
-travail **s'arrête et remonte à l'opérateur** (cf. `## Fire-Disposition`,
-branche c). Écrire le résultat de U0 dans la description de PR, quel qu'il soit.
+Le témoin « conclu proprement » **existe donc dans la population mesurée
+elle-même**, et il porte l'axe A (`/ce-work`, M1) : #2425 est, à la lettre, un
+cas de la classe `no-shipping-tail` que ce plan crée. Les deux autres journaux de
+M1 (`08f8fe27` #2051, `a0886164` #2471) portent un marqueur `[guardrail]` et
+tombent dans la seconde ligne du tableau.
+
+**Le couple JSON `(STATUS, SUBTYPE)` n'est PAS relisible sur ces fichiers** (D6,
+point 2) : ne pas le chercher, ne pas en inventer un proxy. Le marqueur de prose
+ci-dessus est ce que les journaux portent, et le mapping vers `STATUS` est établi
+par le code, pas par eux.
+
+**Halte U0 — trois issues, dont la troisième est celle que rev 1 omettait.**
+(i) Le témoin « conclu » manque (journal purgé) → en produire un avec
+`grep -l '\[done\] Success' /var/log/claude-pilot/*.log | head`, qui balaie les
+~2 800 journaux du répertoire ; ne pas conclure à son absence sans cette commande.
+(ii) Les deux témoins rendent le même marqueur terminal → le croisement D2 n'a
+pas deux états observables : **ne pas livrer la classe nouvelle sur le seul
+axe A**, ce qui ferait traiter une session tronquée comme nominale ; le travail
+s'arrête et remonte à l'opérateur (`## Fire-Disposition`, branche c).
+(iii) Le mapping de D6 est contredit par la lecture (un `[done] Success` dont la
+session serait classée `terminated`, ou l'inverse) → **halte** : le prédicat de
+U2 est faux et c'est lui qu'il faut refaire, jamais le contourner par un proxy.
+
+Écrire le résultat de U0 dans la description de PR, quel qu'il soit.
 
 ### U1 — L'axe A est estampillé par son producteur
 
@@ -267,7 +323,7 @@ Dans `dispatch_claude_pilot`, bras `dev-pilot)` du `case "$SKILL"`
 PILOT_SHIPPING_TAIL="present"   # /mika porte commit→PR dans son périmètre
 ```
 
-Dans `_detect_plan_on_branch` (`dispatch-lib.sh:7340`), **à la ligne même qui
+Dans `_detect_plan_on_branch` (`dispatch-lib.sh:7346`), **à la ligne même qui
 pose l'override** et nulle part ailleurs :
 
 ```bash
@@ -281,13 +337,40 @@ PILOT_SHIPPING_TAIL="absent"    # mika#2492 : /ce-work est « implementation and
 Deux sites d'écriture, un par valeur, chacun adjacent à la décision qu'il
 décrit. Motif maison : un fait estampillé par son producteur, jamais reconstruit
 (mika#2026 `origin:loop`, mika#2242 `closing_pr_closed_unmerged`, mika#2368
-`qa_review_pr_target`). La branche `else` de `_detect_plan_on_branch` (callout
-présent, fichier absent) **n'écrit rien** : elle retombe sur `/mika`, donc sur la
-valeur `present` déjà posée.
+`qa_review_pr_target`). La branche `else` de `_detect_plan_on_branch`
+(`:7348-7350`, callout présent, fichier absent) **n'écrit rien** : elle retombe
+sur `/mika`, donc sur la valeur `present` déjà posée.
 
-`dev-groom` ne pose pas la variable (`_detect_plan_on_branch` retourne tôt), et
-la classe nouvelle est gardée par `SKILL = dev-pilot` : une variable vide sort de
-la classe (R4).
+**L'unicité du chemin d'entrée est établie par lecture (finding F5).** Le site
+qui pose `present` doit dominer *tout* chemin atteignant la sélection de classe
+avec `SKILL = dev-pilot`, sans quoi une entrée non estampillée lirait une
+variable vide. Quatre lectures le donnent, et elles composent :
+
+1. **`SKILL` a un seul site d'écriture** — `:1716`, dans `_parse_input_json`,
+   depuis le JSON d'entrée. Aucune autre affectation dans le fichier.
+2. **Le `case` est exhaustif et fatal** — `:7723-7750` n'a que trois bras,
+   `dev-pilot)`, `dev-groom)` et `*) echo "Unknown skill" >&2; exit 1`. Il n'y a
+   donc pas de valeur de `SKILL` qui traverse le `case` sans l'un des deux bras
+   nommés, et `dev-pilot` n'en a qu'un.
+3. **La suite est linéaire** — de `:7751` (`_setup_gh_auth`) à `:7893` (la
+   sélection de classe), `dispatch_claude_pilot` est une séquence sans boucle,
+   sans `goto` et sans second point d'entrée ; les sorties anticipées
+   (`_handle_dry_run`, les `_deliver_callback` + `exit` de `_set_up_worktree` aux
+   `:2535`/`:2586`, le `return` du push guard `:7771`) **quittent** la fonction,
+   elles ne la ré-entrent pas.
+4. **`dispatch_claude_pilot` n'a que deux appelants**, tous deux sans argument :
+   `skills/bundled/dev-pilot/handlers/run.sh:7` et
+   `skills/bundled/dev-groom/handlers/run.sh:7`.
+
+Conséquence : tout dispatch qui atteint `:7893` avec `SKILL = dev-pilot` a
+traversé le bras `dev-pilot)` et porte donc `present` ou `absent`, jamais une
+variable vide. **T5 pin cette propriété du côté où elle peut régresser** (un
+second site d'écriture) ; la lecture ci-dessus couvre l'autre côté (un site
+d'entrée qui n'écrirait rien), qu'aucun scan ne peut atteindre.
+
+`dev-groom` ne pose pas la variable (`_detect_plan_on_branch` retourne à `:7317`
+sur la garde `SKILL = dev-pilot`), et la classe nouvelle est gardée par
+`SKILL = dev-pilot` : une variable vide sort de la classe (R4).
 
 ### U2 — Le prédicat de la classe nouvelle
 
@@ -301,15 +384,19 @@ Une fonction, un seul lecteur décisionnel de l'estampille :
 _pilot_had_no_shipping_tail() {
     [ "${SKILL:-}" = "dev-pilot" ]                || return 1
     [ "${PILOT_SHIPPING_TAIL:-}" = "absent" ]     || return 1
-    [ "${STATUS:-}" = "success" ]                 || return 1   # prédicat figé par U0
+    [ "${STATUS:-}" = "success" ]                 || return 1   # cf. D6
     return 0
 }
 ```
 
-Le troisième terme est **écrit après U0** et ajusté à ce qu'elle mesure. Le
-précédent du terme `STATUS = "success"` existe dans le fichier : le bloc mika#940
-Unit 1 (`dispatch-lib.sh:4428`) l'emploie déjà pour « ne pas double-classer une
-session déjà en échec ».
+Le troisième terme est **figé** (D6, rev 2) : une session arrêtée par un
+guardrail ou une limite SDK porte `STATUS = "terminated"` et non `"success"`,
+ce qui est établi par `dispatch-lib.sh:3074-3087`, `:3169-3170` et `_halt_family`
+`:3520`. Le précédent de ce terme exact existe dans le fichier : le bloc mika#940
+Unit 1 (`dispatch-lib.sh:4428`, commenté `:4421-4422`) l'emploie déjà pour « ne
+pas double-classer une session déjà en échec ». Ce n'est donc pas un prédicat
+inventé pour ce ticket — c'est le prédicat de complétude que ce fichier emploie
+déjà, lu au même endroit.
 
 ### U3 — La classe `no-shipping-tail`, et ses quatre différences
 
@@ -320,8 +407,9 @@ cette classe : le pipeline n'avait pas cette étape. Sans ce site, le RESULT por
 un `PIPELINE FAILURE:` et la ligne `Outcome:` retombe mécaniquement sur
 `PIPELINE_INCOMPLETE` (`dispatch-lib.sh:4438`).
 
-**(b) Sélection de classe (`dispatch-lib.sh:7891`)** — un bras **avant**
-`commit-pushed-no-pr`, la garde `RESCUED_DIRTY_WORKTREE` restant première :
+**(b) Sélection de classe (`dispatch-lib.sh:7890-7896`)** — un bras **avant**
+`commit-pushed-no-pr` (`:7893-7895`), la garde `RESCUED_DIRTY_WORKTREE` (`:7891`)
+restant première :
 
 ```bash
 elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
@@ -338,15 +426,69 @@ eu lieu — **jamais** parce que son contenu serait douteux. Le commit marqueur
 La ligne `RECOVERY_PENDING: true` (`dispatch-lib.sh:8004`) est posée pour les
 seules classes `dirty-worktree` et `commit-pushed-no-pr`.
 
-**(d) Ligne `Outcome:`** — pour cette classe, `Outcome: PR_OPENED — <url>`.
-`Outcome:` est posé dans `_post_flight_recovery` **avant** que Path B n'ouvre la
-PR ; sans (a) il vaudrait `PIPELINE_INCOMPLETE`, avec (a) il vaut `UNKNOWN`
-(aucune `PR_URL` à cet instant). Path B doit donc le réécrire, en respectant le
-contrat « une seule ligne `Outcome:` » — même geste que `_set_pr_status_line`
-pour `PR:` : supprimer par `sed '/^Outcome: /d'` puis ré-ajouter.
+**(d) Ligne `Outcome:` — les deux sites, la fenêtre entre eux, et son
+arbitrage.** Rev 1 énonçait la valeur transitoire `UNKNOWN` sans citer les sites
+ni établir que personne ne lit entre les deux, et invoquait `_set_pr_status_line`
+de mémoire. Les trois points sont repris ici par lecture (finding F2).
 
-`_stamp_pr_origin … loop`, le label `wip-rescue` (D3), l'appel à
-`_measure_pipeline_verified` (D5) et la ligne canonique `PR:` sont **inchangés**.
+*Site de pose* — bloc **mika#940 Unit 3**, `dispatch-lib.sh:4434-4459`, à
+l'intérieur de `_post_flight_recovery` (`:4088`), elle-même appelée depuis
+`_run_claude_pilot` (`:3177`), donc **pendant** `_run_claude_pilot "$ENTRY_COMMAND"`
+à `:7756`. C'est une cascade à quatre bras, et la classe nouvelle en traverse
+trois faux : `PIPELINE FAILURE:` absent (c'est (a) qui le retire), `PR_URL` vide
+(la PR n'existe pas encore), `SKILL = dev-groom` faux. Elle tombe donc sur le
+`else` `:4455-4458`, `Outcome: UNKNOWN — inspect worktree manually.`
+
+*Site de réécriture* — bloc **mika#1282/#1396 Unit 2**, `:7879-8046` (« Path B »),
+après `_push_branch` (`:7867`) et `_signal_rescue_into_open_pr` (`:7877`) ; le
+`gh pr create --draft` est à `:7975` et la valeur finale est posée dans le bras
+`[ -n "$RESCUED_PR_URL" ]` (`:7983`).
+
+*L'anti-fenêtre, établie* — les seuls lecteurs de `^Outcome: ` dans le fichier
+sont `_measure_cycle_output` (`:3338`) et `_gate_non_empty_cycle` (`:3427`,
+`:3441`), et ces deux fonctions n'ont que **deux** points d'appel :
+`_deliver_callback` (`:7245`), qui s'exécute à `:8047` donc **après** Path B, et
+le trap EXIT (`:1673`). Les réécritures `sed 's/Outcome: .*/…/'` de `:7799` et
+`:7841` sont dans la branche dev-groom et sortent de la classe par
+`SKILL = dev-pilot`. **Sur le chemin nominal, personne ne lit entre la pose et la
+réécriture.**
+
+*La fenêtre résiduelle est réelle, et elle est nommée plutôt que niée* — le trap
+EXIT est un lecteur intermédiaire pour la seule population « dispatch-lib meurt
+entre `:4459` et `:8046` ». Rev 1 y aurait laissé `UNKNOWN — inspect worktree
+manually`, **moins actionnable qu'aujourd'hui** (`PIPELINE_INCOMPLETE — manual
+recovery needed`) : une régression silencieuse sur une population de crash. Le
+remède est donc de rendre la valeur de la fenêtre **vraie à son instant** plutôt
+que d'essayer de supprimer la fenêtre. Un bras dédié est ajouté au bloc Unit 3,
+**avant** le `else`, gardé par `_pilot_had_no_shipping_tail` :
+
+```
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation.
+```
+
+C'est exact : si le process meurt là, la PR n'a effectivement pas été ouverte, et
+le travail du pilote attend dans le worktree. L'actionnabilité est identique à
+celle d'aujourd'hui sur cette population, et le motif nommé vaut mieux que le
+`manual recovery needed` générique qu'elle reçoit actuellement.
+
+*Le mécanisme de réécriture est une fonction NOUVELLE* — `_set_outcome_line`,
+calquée sur `_set_pr_status_line` (`:1567-1570`) **sans la réutiliser** : celle-ci
+ne connaît que `PR:`/`NO_PR:` (`sed '/^PR: /d; /^NO_PR: /d'`) et n'a jamais
+touché `Outcome:`. La sœur fait `sed '/^Outcome: /d'` puis append, ce qui rend le
+contrat « exactement une ligne `Outcome:` » vrai **par construction** et non par
+coïncidence d'ordre — la propriété même que le commentaire de `:1561-1566`
+revendique pour son aînée. Elle n'est appelée que dans le bras `no-shipping-tail`
+de Path B ; les autres classes ne la traversent pas (R3).
+
+*Et le test existe quand même* — l'anti-fenêtre est établie **aujourd'hui**, par
+une lecture qu'un futur appel de `_gate_non_empty_cycle` entre les deux sites
+invaliderait sans rien casser de visible. T1 assert donc la valeur finale **et**
+l'unicité (`grep -c '^Outcome: ' = 1`), et T8 (ci-dessous) pin la fenêtre
+elle-même.
+
+`_stamp_pr_origin … loop` (`:7987`), le label `wip-rescue` (`:7989`, D3), l'appel
+à `_measure_pipeline_verified` (`:7964`, D5) et la ligne canonique `PR:`
+(`:8003`) sont **inchangés**.
 
 ### U4 — Les labels écrits par le chemin modifié sont déclarés
 
@@ -376,9 +518,28 @@ couvrent déjà mika#1383 et mika#1396 :
   qu'à **un** site du fichier — le site d'override de `_detect_plan_on_branch`.
 - **T6 (structurel, D-detector).** Le bloc conditionné par
   `RECOVERY_CLASS = "no-shipping-tail"` n'émet jamais `RECOVERY_PENDING: true`.
-- **T7 (prise du guard U3a).** La conjonction du bloc mika#940 Unit 1 nomme bien
-  `_pilot_had_no_shipping_tail` — un test comportemental sur le RESULT ne
-  distinguerait pas « la garde a pris » de « le RESULT ne portait rien ».
+- **T7 (prise du guard U3a) — deux moitiés, parce qu'un scan de présence
+  surestime sa force (finding F4).** Rev 1 se contentait de vérifier que le
+  jeton `_pilot_had_no_shipping_tail` *apparaît* dans le bloc mika#940 Unit 1 —
+  ce qui reste vrai si quelqu'un écrit la conjonction **sans la négation**, cas
+  où la garde s'inverse et où la classe nouvelle reçoit un `PIPELINE FAILURE:`
+  sur chaque session qu'elle est censée épargner. D'où :
+  - **T7a (structurel).** Le jeton cherché est `! _pilot_had_no_shipping_tail`
+    **complet, négation incluse**, et il est cherché dans la **ligne de la
+    conjonction** (`dispatch-lib.sh:4428`), pas dans le fichier entier — un
+    scan à l'échelle du fichier serait satisfait par l'appel que (b) fait à la
+    sélection de classe, où le jeton apparaît légitimement **sans** `!`.
+  - **T7b (comportemental).** Périmètre absent + session conclue → le RESULT
+    **ne contient pas** `PIPELINE FAILURE:`. C'est la moitié qu'aucun scan ne
+    donne : elle atteste que la garde *a pris*, là où T7a atteste seulement
+    qu'elle est *écrite*.
+- **T8 (fenêtre `Outcome:`, finding F2).** Sur la classe nouvelle, la valeur
+  posée par `_post_flight_recovery` **avant** Path B est
+  `PIPELINE_INCOMPLETE — no_shipping_tail: …` (jamais `UNKNOWN`), et la valeur
+  après Path B est `PR_OPENED — <url>`, en une seule ligne `Outcome:` dans les
+  deux états. Ce test pin la fenêtre que la lecture d'U3(d) établit comme sans
+  lecteur : si un lecteur y apparaît un jour, c'est cette assertion qui dira ce
+  qu'il aura lu.
 
 ---
 
@@ -387,36 +548,72 @@ couvrent déjà mika#1383 et mika#1396 :
 | # | Quoi | Comment | Attendu |
 |---|---|---|---|
 | V1 | U0 est faite et écrite | lecture des deux journaux | le couple `(STATUS, SUBTYPE)` des deux populations, reporté dans la PR |
-| V2 | Harness vert | `bash skills/bundled/_shared/test-dispatch-lib.sh` | 0 échec, T1–T7 présents |
-| V3 | Contrôle négatif **vu rouge** | retirer le terme `PILOT_SHIPPING_TAIL` de `_pilot_had_no_shipping_tail`, relancer | T2 et T4 rougissent ; restaurer |
+| V2 | Harness vert | `bash skills/bundled/_shared/test-dispatch-lib.sh` | 0 échec, T1–T8 présents |
+| V3a | Contrôle négatif **vu rouge** — l'axe A | retirer le terme `PILOT_SHIPPING_TAIL` de `_pilot_had_no_shipping_tail`, relancer | T2 et T4 rougissent ; restaurer |
+| V3b | Contrôle négatif **vu rouge** — la négation du guard (F4) | retirer le `!` de `! _pilot_had_no_shipping_tail` en `dispatch-lib.sh:4428`, relancer | **T7a et T7b rougissent** ; restaurer |
+| V3c | Contrôle négatif **vu rouge** — l'axe B | forcer `STATUS = "success"` dans le scénario tronqué de T2, relancer | T2 rougit ; restaurer |
 | V4 | Structure des bundles | `make verify-bundled-skills` | vert |
 | V5 | Shell propre | `shellcheck` sur les deux fichiers touchés | pas de régression |
 | V6 | R3 tenu | `git diff` relu bras par bras | les trois croisements inchangés ne traversent aucune ligne modifiée |
 | V7 | Rust intact | `cargo test -p mika-agent` | vert (aucun fichier Rust touché — contrôle de non-effet) |
 
 V3 est la vérification porteuse : un scan et deux tests comportementaux qui n'ont
-jamais été vus rouges n'attestent pas qu'ils mordent.
+jamais été vus rouges n'attestent pas qu'ils mordent. **V3b est celle que rev 1
+n'avait pas** (finding F4) : elle est la seule à distinguer « le guard est écrit »
+de « le guard est écrit dans le bon sens », et sa cible est une inversion d'un
+seul caractère — exactement la classe de régression qu'un scan de présence laisse
+passer en restant vert.
 
 ---
 
 ## Definition of Done
 
+**Item 0 — geste opérateur, ordonnancé AVANT toute implémentation.**
+
+- [ ] **Le corps de #2492 est rectifié par l'opérateur.** Ce plan réfute le
+      diagnostic du ticket sur trois points mesurés (M1 entry command `/ce-work`,
+      M2 absence de queue d'expédition par construction, M3 travail non
+      orphelin) et **reformule AC1 et AC3**. Le corps du ticket, lui, porte
+      toujours sa lettre d'origine. La convention mika#2169/#2158 impose que
+      cette divergence soit portée **sur le ticket** : un encadré daté nommant
+      M1/M2/M3 et la reformulation des deux AC, plus un commentaire d'avis
+      d'édition. C'est un **geste opérateur** — ni l'implémenteur ni l'architecte
+      ne ratifient unilatéralement une divergence entre un plan et la
+      spécification qu'il corrige, et un plan qui se contente de la consigner
+      dans une description de PR laisse le ticket dire le faux à tout lecteur
+      ultérieur. **Tant que cet item n'est pas fait, le reste du DoD n'est pas
+      engagé** : implémenter d'abord reviendrait à livrer contre une
+      spécification que personne n'a accepté de corriger.
+
+**Le reste, dans l'ordre.**
+
 - [ ] U0 est faite, son résultat est écrit dans la description de PR, et le
-      prédicat de U2 en découle (ou la halte U0 est déclenchée et remontée).
+      contrôle des deux témoins confirme D6 (ou l'une des trois issues de la
+      halte U0 est déclenchée et remontée).
 - [ ] Le périmètre d'expédition est estampillé à deux sites, un par valeur.
 - [ ] Une session sans queue d'expédition qui conclut produit une PR draft sans
       `RECOVERY_PENDING: true`, sans commit marqueur, avec `Outcome: PR_OPENED`.
 - [ ] Les trois autres croisements sont inchangés, et un test le pin.
 - [ ] Tout terme illisible retombe sur le comportement actuel, et un test le pin.
-- [ ] V1–V7 passent, V3 inclus (contrôle négatif vu rouge).
-- [ ] La description de PR nomme la rectification (M1/M2/M3) et ce que le plan
-      **ne** livre **pas** de la lettre du ticket.
+- [ ] La ligne `Outcome:` vaut `PR_OPENED` en fin de chemin nominal et
+      `PIPELINE_INCOMPLETE — no_shipping_tail: …` dans la fenêtre de crash,
+      en un seul exemplaire dans les deux états (T8).
+- [ ] V1–V7 passent, V3a/V3b/V3c inclus (les trois contrôles négatifs vus rouges).
+- [ ] La description de PR nomme la rectification (M1/M2/M3), ce que le plan
+      **ne** livre **pas** de la lettre du ticket, et **renvoie à l'encadré du
+      ticket** plutôt que de s'y substituer (item 0).
 
 ## Acceptance criteria
 
 Le ticket porte trois critères. Deux sont **reformulés** parce que leur lettre
 suppose un chemin que la population mesurée n'emprunte pas (M1/M2) ; la
 reformulation est nommée ligne à ligne plutôt que silencieuse.
+
+**La reformulation n'est pas acquise par le fait d'être écrite ici** (finding
+F1). Elle doit être portée sur le corps de #2492 par l'opérateur, sous la
+convention mika#2169/#2158, et c'est l'**item 0 du DoD** — ordonnancé avant toute
+implémentation. Aucun AC ci-dessous n'est tenu par un plan qui reformule seul ce
+qu'un ticket continue d'affirmer.
 
 - [ ] **AC1 — reformulé.** *Lettre du ticket :* « Le pipeline `/mika` ouvre une
       PR draft juste après `work` (avant review), vérifié sur un implement. »
@@ -445,9 +642,13 @@ reformulation est nommée ligne à ligne plutôt que silencieuse.
 ## Fire-Disposition
 
 Ce plan livre des détecteurs : **T5** (un seul site écrit l'estampille), **T6**
-(la classe nouvelle n'émet jamais `RECOVERY_PENDING: true`) et **T7** (le guard
-U3a nomme bien son prédicat) sont des scans de source dont le chemin de succès
-est « aucune violation trouvée ».
+(la classe nouvelle n'émet jamais `RECOVERY_PENDING: true`) et **T7a** (la
+conjonction du bloc Unit 1 porte le jeton `! _pilot_had_no_shipping_tail`,
+négation incluse) sont des scans de source dont le chemin de succès est « aucune
+violation trouvée ». **T7b et T8 ne sont pas des détecteurs** mais des tests
+comportementaux, et c'est délibéré : F4 a établi qu'un scan de présence seul
+surestime sa force sur T7, donc la moitié « la garde a pris » est portée par un
+comportement, jamais par un grep.
 
 **Option retenue : (a) exception nommée en allowlist — allowlist livrée VIDE.**
 
@@ -462,7 +663,12 @@ est « aucune violation trouvée ».
   grep -c "PILOT_SHIPPING_TAIL"        skills/bundled/_shared/dispatch-lib.sh   # attendu 0 avant U1
   grep -c "no-shipping-tail"           skills/bundled/_shared/dispatch-lib.sh   # attendu 0 avant U3
   grep -c "_pilot_had_no_shipping_tail" skills/bundled/_shared/dispatch-lib.sh  # attendu 0 avant U2
+  grep -c "_set_outcome_line"          skills/bundled/_shared/dispatch-lib.sh   # attendu 0 avant U3(d)
+  grep -c "no_shipping_tail"           skills/bundled/_shared/dispatch-lib.sh   # attendu 0 avant U3(d)
   ```
+  Les deux derniers sont ajoutés en rev 2 : U3(d) introduit une fonction et un
+  motif d'`Outcome:` qui n'existaient pas au plan initial, et un homonyme sur
+  l'un des deux ferait mentir la même halte que sur les trois autres.
   **Halte :** un compte non nul signifie qu'un jeton homonyme existe déjà —
   établir lequel **avant** d'écrire le scan, jamais l'allowlister.
 - **Assertion auto-nettoyante :** un test refuse que l'une des trois allowlists
@@ -573,9 +779,29 @@ autonome n'a pas tourné.
 
 ## Références
 
-- `skills/bundled/_shared/dispatch-lib.sh` — `_detect_plan_on_branch` (7307),
-  bloc mika#940 Unit 1 (4428), sélection de classe (7891), commit marqueur
-  (7930), `RECOVERY_PENDING` (8004), export `CLAUDE_PILOT_REQUIRE_PR` (7732).
+- `skills/bundled/_shared/dispatch-lib.sh` — **estampille et entrée :**
+  `_parse_input_json` pose `SKILL` (1716, site unique) ; `case "$SKILL"` exhaustif
+  avec `*) exit 1` (7723-7750) ; bras `dev-pilot)` (7724-7733) dont l'export
+  `CLAUDE_PILOT_REQUIRE_PR` (7732) ; `_detect_plan_on_branch` (7307), garde
+  `SKILL = dev-pilot` (7317), **site de l'override `/ce-work`** (7346), branche
+  `else` sans écriture (7348-7350) ; appelants externes
+  `dev-pilot/handlers/run.sh:7`, `dev-groom/handlers/run.sh:7`.
+  **Prédicat de complétude (D6) :** `STATUS` posé du stdout JSON (3071), `SUBTYPE`
+  (3087), commentaire sur les deux populations de `terminated` (3074-3087),
+  embranchement (3169-3170, 3184), `_halt_family` et `error_max_turns`
+  (3501-3529, spéc. 3520), garde `STATUS = success` déjà employée (4421-4422).
+  **Ligne `Outcome:` — pose, lecture, réécriture (U3d) :** `_post_flight_recovery`
+  (4088), appelée depuis `_run_claude_pilot` (3177) ; bloc mika#940 Unit 1 (4428) ;
+  bloc Unit 3, cascade de pose (4434-4459) dont le `else` `UNKNOWN` (4455-4458) ;
+  **seuls lecteurs** `_measure_cycle_output` (3338) et `_gate_non_empty_cycle`
+  (3427, 3441), atteints depuis le trap EXIT (1673) et `_deliver_callback` (7245) ;
+  réécritures dev-groom hors classe (7799, 7841) ; `_set_pr_status_line` et son
+  contrat d'unicité (1561-1570).
+  **Path B (bloc Unit 2) :** 7879-8046 ; sélection de classe (7890-7896), bras
+  `commit-pushed-no-pr` (7893-7895) ; commit marqueur (7930-7947) ;
+  `_measure_pipeline_verified` (7964) ; `gh pr create --draft` (7975) ;
+  `_stamp_pr_origin` (7987) ; label `wip-rescue` (7989) ; ligne `PR:` (8003) ;
+  `RECOVERY_PENDING: true` (8004) ; `_deliver_callback` (8047).
 - `skills/bundled/self-dev-webhook-qa/system_prompt.md` — Guard 1 (248),
   Guard 2 (251-254), interdiction `gh pr ready` / guard mika#1682 (325).
 - `skills/bundled/self-dev-callback/system_prompt.md` — consommateur de
@@ -600,3 +826,79 @@ autonome n'a pas tourné.
   par construction, M3 travail non orphelin), déplace le remède de
   `.claude/commands/mika.md` vers `dispatch-lib.sh`, et reformule AC1 et AC3 dont
   la lettre suppose un chemin que la population mesurée n'emprunte pas.
+
+- **2026-09-23 — rev 2.** Adresse les cinq findings de la première passe
+  architecte. **Deux d'entre eux corrigent le plan par la mesure, pas seulement
+  par l'ajout.**
+
+  - **F1 (BLOCKING) — rectification du corps du ticket.** Ajout d'un **item 0**
+    au DoD, ordonnancé **avant toute implémentation** : l'opérateur porte sur le
+    corps de #2492 un encadré daté nommant M1/M2/M3 et la reformulation d'AC1/AC3,
+    plus un commentaire d'avis d'édition (convention mika#2169/#2158). L'intro de
+    `## Acceptance criteria` dit désormais qu'aucun AC n'est tenu par un plan qui
+    reformule seul ce qu'un ticket continue d'affirmer, et le dernier item du DoD
+    renvoie à l'encadré au lieu de s'y substituer.
+
+  - **F2 (BLOCKING) — U3(d), la réécriture d'`Outcome:`.** Les deux sites sont
+    nommés par lecture (pose : bloc mika#940 Unit 3, `:4434-4459`, dans
+    `_post_flight_recovery` `:4088` appelée depuis `_run_claude_pilot` `:3177` ;
+    réécriture : bloc Unit 2 « Path B », `:7879-8046`, valeur finale `:7983`).
+    L'anti-fenêtre est **établie** : les seuls lecteurs de `^Outcome: ` sont
+    `_measure_cycle_output` (`:3338`) et `_gate_non_empty_cycle` (`:3427`, `:3441`),
+    atteints uniquement depuis `_deliver_callback` (`:7245`, donc après Path B)
+    et le trap EXIT (`:1673`). La **fenêtre résiduelle de crash** est nommée
+    plutôt que niée, et son arbitrage corrige une régression silencieuse de rev 1 :
+    laisser `UNKNOWN — inspect worktree manually` y aurait été **moins
+    actionnable qu'aujourd'hui**, d'où un bras dédié posant
+    `PIPELINE_INCOMPLETE — no_shipping_tail: …`, exact à son instant. Rev 1
+    invoquait `_set_pr_status_line` de mémoire : la lecture montre qu'elle ne
+    connaît que `PR:`/`NO_PR:` (`:1567-1570`), donc `_set_outcome_line` est
+    déclarée **nouvelle** et calquée, pas réutilisée. Le test d'unicité demandé
+    en repli est livré **en plus** de l'anti-fenêtre (T8), parce qu'un futur
+    lecteur intermédiaire invaliderait la lecture sans rien casser de visible.
+
+  - **F3 (sharpening) — le témoin « session conclue proprement ».** Nommé :
+    `d8aa26ee-…log` (#2425), marqueur `[done] Success | 142 turns | $48.50 | 2950s`,
+    contre `153c2044-…log` (#2484), `[guardrail] error_max_turns`. Le témoin
+    **existe dans la population mesurée elle-même** et porte l'axe A — #2425 est
+    déjà un cas de la classe `no-shipping-tail`. La halte U0 passe de deux à
+    trois issues (témoin purgé / marqueurs identiques / mapping contredit).
+    **Deux corrections de fond en découlent.** (i) Les deux commandes de U0 en
+    rev 1 étaient **inexécutables** : `STATUS`/`SUBTYPE` viennent du stdout du
+    pilote (`:3071`, `:3087`), capturé dans un `mktemp` supprimé `:3068`, et ne
+    sont ni dans `<id>.log` ni dans `<id>.stderr` — vérifié, zéro ligne rendue
+    sur les deux fichiers. (ii) D6 affirmait que le prédicat n'était pas
+    établissable par lecture, claude-pilot étant hors dépôt : réfuté, le mapping
+    est écrit et consommé **ici** (`:3074-3087`, `:3169-3170`, `_halt_family`
+    `:3520`), donc le prédicat `STATUS = "success"` est **figé** et U0 devient un
+    contrôle sur marqueur de prose, non une mesure dont dépendrait le code.
+
+  - **F4 (sharpening) — T7 surestimait sa force.** Scindé : **T7a** cherche le
+    jeton `! _pilot_had_no_shipping_tail` **négation incluse**, et dans la ligne
+    de la conjonction (`:4428`) plutôt que dans le fichier entier — un scan à
+    l'échelle du fichier serait satisfait par l'appel légitime, sans `!`, de la
+    sélection de classe. **T7b** est comportemental : la classe nouvelle produit
+    un RESULT **sans** `PIPELINE FAILURE:`. V3 devient V3a/V3b/V3c, dont **V3b**
+    est le contrôle négatif manquant : retirer le `!` doit faire rougir T7a *et*
+    T7b, une inversion d'un seul caractère étant exactement ce qu'un scan de
+    présence laisse passer en restant vert.
+
+  - **F5 (sharpening) — exhaustivité des chemins d'entrée.** Établie par lecture
+    et écrite dans U1 : `SKILL` a un site d'écriture unique (`:1716`) ; le `case`
+    est exhaustif et fatal (`:7723-7750`, `*) exit 1`) ; la suite jusqu'à la
+    sélection de classe (`:7893`) est linéaire, ses sorties anticipées quittant
+    la fonction sans la ré-entrer ; et `dispatch_claude_pilot` n'a que deux
+    appelants (`dev-pilot/handlers/run.sh:7`, `dev-groom/handlers/run.sh:7`).
+    La note dit quel côté T5 couvre (un second site d'écriture) et quel côté
+    seule la lecture couvre (un site d'entrée qui n'écrirait rien).
+
+  Corrections de `file:line` faites au passage, chacune vérifiée sur l'arbre :
+  override `/ce-work` `:7346` (et non `:7340`), sélection de classe `:7890-7896`
+  avec le bras `commit-pushed-no-pr` en `:7893-7895` (et non `:7891`). La section
+  `## Références` est réécrite par domaine — entrée/estampille, prédicat de
+  complétude, ligne `Outcome:`, Path B — F2 ayant relevé qu'elle ne citait ni la
+  pose d'`Outcome:` ni Path B.
+
+  **Aucun AC n'est affaibli par cette révision.** AC1/AC2/AC3 sont inchangés dans
+  leur substance ; ce qui est ajouté est la condition — item 0 — sans laquelle
+  leur reformulation n'engage personne.
