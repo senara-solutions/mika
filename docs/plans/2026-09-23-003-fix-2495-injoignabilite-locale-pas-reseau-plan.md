@@ -228,6 +228,16 @@ allowlist née vide est un emplacement où déposer la prochaine violation »*).
 classe reste ouverte pour un `.invalid` réellement composé ; le jour où une
 mesure en montre un, l'aiguille s'étend d'une ligne.
 
+**Ce relevé est une justification, jamais une couverture** — distinction à
+garder explicite dans le corps de PR. La population du scan est `crates/**/*.rs`
+et rien d'autre ; deux des cinq sites recensés (`test-smoke-search-substrate.sh`,
+`test_sandbox_git_usable.sh`) sont des sources shell, donc hors de cette
+population par construction. Ils ont été relus **plus loin que le scan ne
+regarde** pour établir qu'aucun d'eux n'assert une injoignabilité, c'est-à-dire
+pour justifier de **ne pas** élargir l'aiguille. Lire ce tableau comme une
+promesse de couverture serait un contresens : le scan ne dit rien des sources
+non-Rust, et ce plan ne prétend pas qu'il le fasse.
+
 ## Fire-Disposition
 
 Ce plan livre deux détecteurs : le test réparé
@@ -288,8 +298,142 @@ la population étant vide et le cadrage déjà tranché par l'umbrella #2491.
 - **Aucun job CI** n'est ajouté : le scan est un `#[test]`, donc `cargo test`
   le porte déjà.
 
+## Item 0 — ratification opérateur du corps du ticket (AVANT implémentation)
+
+**Ce plan écarte les deux pistes que le corps de #2495 propose et renomme le test
+que sa DoD nomme.** La substance de ce refus est mesurée (§ *Le mécanisme*,
+§ *Ce que le ticket propose*) — mais **le corps du ticket est le contrat
+versionné, et l'opérateur seul ratifie une divergence.** L'en-tête de #2495 le
+dit lui-même : *« Ne PAS mettre `ready` sans ratification opérateur »*. Le
+correctif ne doit donc pas partir sur un corps qui prescrit encore deux voies
+refusées et un nom de test qui n'existera plus.
+
+Convention appliquée : mika#2169 / mika#2158 — un plan qui réfute son ticket
+fournit l'encadré de rectification **rédigé et daté**, plus le texte du
+commentaire d'avis d'édition. Le geste est opérateur ; ce plan ne l'exécute pas,
+il le rend exécutable sans rédaction supplémentaire.
+
+Les deux blocs ci-dessous sont **du texte à appliquer tel quel** dans le corps de
+#2495. Ils ne touchent aucune autre section : ni l'en-tête, ni le contexte, ni
+le lien vers l'umbrella #2491.
+
+> **Note de provenance.** Les citations verbatim du corps (« Fix proposé », la
+> ligne DoD, la clause d'en-tête) proviennent de la relecture `gh_read` de la
+> première passe architecte, `gh` n'étant pas authentifié dans le bac à sable de
+> révision. L'opérateur qui applique R1/R2 relit le corps courant avant de
+> remplacer : si une section a bougé depuis, c'est le remplacement qu'il faut
+> ajuster, jamais la voie retenue.
+
+### R1 — remplacement de la section « Fix proposé »
+
+La section actuelle propose : *« Le proxy d'egress ne doit pas répondre aux
+adresses RFC 5737/3849 ; OU le test skip sous `MIKA_PILOT_CONTAINED` »*. Elle est
+remplacée en entier par :
+
+```markdown
+## Fix proposé (rectifié le 2026-09-23 — grooming mika#2495)
+
+**Aucune des deux pistes initialement proposées n'est retenue**, et le motif du
+refus de la première est factuel : le grooming a reproduit le défaut dans le bac
+à sable pilote et mesuré une cause différente de celle que ce corps supposait.
+L'adresse `192.0.2.1` n'est **jamais résolue ni composée**. `reqwest` détecte
+`HTTP_PROXY` par défaut ; `192.0.2.1` n'est pas dans le `NO_PROXY` du bac à
+sable ; la requête part donc au relais d'egress en forme absolue
+(`GET http://192.0.2.1:1/health HTTP/1.1`), forme que le relais ne sert pas — il
+rend `400 Bad Request`, d'où `Some(false)` au lieu de `None`, en 0,03 s.
+
+Pistes écartées :
+
+- *« Le proxy d'egress ne doit pas répondre aux adresses RFC 5737/3849 »* — le
+  relais ne répond pas à une adresse : il répond `400` à une requête de proxy
+  malformée, sans jamais regarder l'hôte. Il n'y a pas de branche à corriger, il
+  faudrait en créer une. Elle ferait de surcroît entrer la connaissance des
+  fixtures de test dans la frontière de containment, fail-closed depuis
+  mika#2049 — rayon d'explosion maximal pour un gain nul en production. Et elle
+  laisserait la classe ouverte : le défaut n'est pas « RFC 5737 », c'est « une
+  fixture dont l'injoignabilité est une propriété du réseau », que tout proxy
+  intercepte sous n'importe quel littéral.
+- *« Le test skip sous `MIKA_PILOT_CONTAINED` »* — cela désarme le détecteur
+  exactement sur le chemin qui édite ce code, le pilote étant l'auteur des
+  modifications de `cadence.rs`. La variable est par ailleurs un proxy pour la
+  vraie condition, qui est « un proxy HTTP est configuré » : un poste de
+  développement portant `HTTP_PROXY` resterait rouge pendant que le défaut serait
+  déclaré fermé.
+
+**Voie retenue — exprimer l'injoignabilité comme une propriété LOCALE.** La
+fixture bind `127.0.0.1:0`, lit le port que le noyau lui attribue, libère la
+socket, puis sonde ce port fermé : la connexion rend `ECONNREFUSED` sous proxy
+comme sans, la boucle locale n'étant jamais proxifiée. La forme a été exécutée
+verte *à l'intérieur* du bac à sable qui casse l'ancienne fixture. Un scan de
+source refuse en outre le retour d'un littéral de plage de documentation
+(RFC 5737 / RFC 3849) dans `crates/**/*.rs`, avec une allowlist livrée vide.
+
+Aucune ligne du relais d'egress, de `dispatch-lib.sh` ou du corps de
+`probe_executor_health` n'est touchée.
+```
+
+### R2 — remplacement de la ligne DoD
+
+La ligne actuelle nomme `probe_executor_health_returns_none_on_bogus_host` et
+demande « vert dans le bwrap (skip ou proxy) ». Elle est remplacée par :
+
+```markdown
+**DoD** : `probe_executor_health_returns_none_on_unreachable_endpoint` passe vert
+dans le bwrap du pilote **et** sur le CI réel — sans saut conditionnel et sans
+modification du relais d'egress. Le test est renommé : `…_on_bogus_host`
+décrivait la prémisse écartée (un hôte fantaisiste), alors que ce qui est asserté
+est un point de terminaison injoignable.
+```
+
+**Le renommage devient ainsi ratifié plutôt que silencieux.** Sans R2, un `grep`
+du nom que la DoD porte ne trouverait plus rien après merge.
+
+### D1 — commentaire d'avis d'édition à poster sur #2495
+
+À poster **après** application de R1 et R2, pour que l'édition du corps laisse
+une trace datée et attribuée plutôt qu'une réécriture muette :
+
+```markdown
+Avis d'édition du corps — grooming mika#2495, 2026-09-23.
+
+Le corps de ce ticket vient d'être amendé sur deux points : la section « Fix
+proposé » (remplacée) et la ligne DoD (remplacée). Aucune autre section n'est
+touchée.
+
+Motif : le grooming a reproduit le défaut dans le bac à sable pilote et mesuré
+une cause différente de celle que le corps supposait. L'adresse RFC 5737 n'est
+jamais résolue ni composée — `reqwest` route la requête vers le relais d'egress
+via `HTTP_PROXY`, et le relais rend `400` sur la forme absolue, d'où
+`Some(false)` en 0,03 s. Les deux pistes proposées sont donc écartées : la
+première sur un défaut de prémisse (le relais ne regarde jamais l'hôte) doublé
+d'un rayon d'explosion sur une frontière de containment fail-closed (mika#2049) ;
+la seconde parce qu'elle désarme le détecteur sur le chemin même qui édite ce
+code, et parce que `MIKA_PILOT_CONTAINED` est un proxy pour la vraie condition
+(« un proxy HTTP est configuré »).
+
+Voie retenue : la fixture exprime son injoignabilité localement — bind sur
+`127.0.0.1:0` puis drop, ce qui rend `ECONNREFUSED` sous proxy comme sans. Le
+test est renommé `probe_executor_health_returns_none_on_unreachable_endpoint`,
+d'où la rectification de la ligne DoD : le nom qu'elle porte doit être celui qui
+existera après le correctif.
+
+Le raisonnement complet, les motifs de refus, la garde de non-retour et son
+allowlist vide sont dans le plan committé sur la branche de ce ticket.
+```
+
+### Halte
+
+Si l'opérateur refuse la voie retenue, **le correctif ne part pas** : ni le
+renommage ni le scan de source ne sont exécutables sous un corps qui prescrit
+encore une des deux pistes écartées. Le geste est alors de rouvrir le grooming,
+pas d'implémenter contre le contrat.
+
 ## Definition of Done
 
+- **Item 0 — le corps de #2495 est rectifié par l'opérateur** (R1 + R2 appliqués,
+  D1 posté en commentaire) **avant toute ligne de code.** Le ticket ne porte plus
+  aucune prescription des deux pistes écartées, et sa DoD nomme le test tel qu'il
+  existera.
 - `probe_executor_health_returns_none_on_unreachable_endpoint` passe **dans le
   bwrap du pilote** (mesuré, pas supposé) et **sur le CI réel** de la PR.
 - Aucune adresse de plage de documentation (RFC 5737 / RFC 3849) ne subsiste
@@ -303,9 +447,15 @@ la population étant vide et le cadrage déjà tranché par l'umbrella #2491.
 ## Acceptance criteria
 
 Le corps du ticket porte une DoD d'une ligne et pas de section
-`## Acceptance criteria` ; les critères ci-dessous en sont dérivés, et le
-premier est la DoD verbatim.
+`## Acceptance criteria` ; les critères ci-dessous en sont dérivés, et AC1 est
+la DoD verbatim — **après** la rectification que AC0 exige, puisque ce plan
+écarte les deux voies que cette DoD suppose.
 
+0. **AC0 — la divergence est ratifiée, pas subie.** Le corps de #2495 porte les
+   remplacements R1 et R2 du § *Item 0*, et le commentaire D1 y est posté.
+   Vérification : lecture du corps et de son fil de commentaires. **Bloquant
+   pour le démarrage** : aucune ligne de code ne part sous un corps prescrivant
+   encore le patch du relais ou le saut sous `MIKA_PILOT_CONTAINED`.
 1. **AC1 — vert des deux côtés.**
    `probe_executor_health_returns_none_on_unreachable_endpoint` passe dans le
    bac à sable pilote (`--unshare-net` + `HTTP_PROXY` posé) et sur le CI réel.
@@ -376,3 +526,41 @@ proxifiée — et c'est celle-là qu'il faut mesurer avant toute autre conclusio
 - mika#2321 / `crate::source_scan` — le lecteur unique de la classification de
   source et du découpage par fonction.
 - mika#2323 — le faux positif d'une garde accusant sa propre prose.
+- mika#2169 / mika#2158 — convention « un plan qui réfute son ticket fournit
+  l'encadré de rectification rédigé et daté, plus l'avis d'édition ». Appliquée
+  au § *Item 0*.
+- `docs/architecture/review-guide.md` § spec-fidelity — le corps du ticket est le
+  contrat versionné ; l'opérateur ratifie la divergence, pas l'architecte.
+
+## Revision history
+
+- **rev 2 (2026-09-23)** — première passe architecte, `Disposition: ITERATE`,
+  une finding bloquante et deux de sharpening.
+  - **F1 (bloquante) — plan réfutant le ticket sans encadré de rectification
+    rédigé.** Adressée par une section `## Item 0 — ratification opérateur du
+    corps du ticket`, placée **avant** la DoD, portant les trois artefacts que la
+    finding exige : (R1) le texte de remplacement complet de la section « Fix
+    proposé », nommant les deux pistes écartées avec leurs motifs et la voie
+    retenue ; (R2) le texte de remplacement de la ligne DoD, qui **ratifie le
+    renommage** `…_on_bogus_host` → `…_on_unreachable_endpoint` au lieu de le
+    laisser silencieux ; (D1) le texte du commentaire d'avis d'édition à poster
+    sur #2495. La clause d'en-tête du ticket (*« Ne PAS mettre `ready` sans
+    ratification opérateur »*) est désormais citée, et la convention mika#2169 /
+    mika#2158 nommée avec sa citation review-guide § spec-fidelity. La DoD gagne
+    un item 0 et les AC un AC0, tous deux bloquants pour le démarrage ; une
+    halte explicite dit ce qui se passe si l'opérateur refuse la voie retenue
+    (rouvrir le grooming, ne pas implémenter contre le contrat). Une note de
+    provenance dit d'où viennent les citations verbatim du corps, `gh` n'étant
+    pas authentifié dans le bac à sable de révision.
+  - **S1 (sharpening) — distinction population / justification sur le relevé
+    `.invalid`.** Adressée dans le § *Hors population, avec sa mesure* : la
+    population du scan est `crates/**/*.rs` et rien d'autre ; le relevé des cinq
+    sites lit délibérément **plus loin que le scan ne regarde**, pour justifier
+    de ne pas élargir l'aiguille. Deux des cinq sont des sources shell, donc hors
+    population par construction. La phrase nomme explicitement le contresens à
+    éviter dans le corps de PR.
+  - **S2 (sharpening) — le renommage laissait la DoD du ticket littéralement
+    inassouvie.** Adressée par R2 ci-dessus, qui fait du renommage un acte
+    ratifié par l'opérateur dans le corps, et non un écart découvert après merge
+    par un `grep` qui ne trouve plus rien.
+  - Aucune AC n'a été affaiblie ; AC0 en ajoute une, bloquante.
