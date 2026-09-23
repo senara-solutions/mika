@@ -7337,6 +7337,265 @@ assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt
 assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
     'NOT in the primary checkout' "$T2449_SITE_B"
 
+# --- mika#2492: la PR nominale de la boucle n'est pas une épave ---
+#
+# Tout ticket groomé est dispatché sous `/ce-work <plan>` (override mika#1074),
+# dont le périmètre est « implementation and local verification only, without
+# the shipping tail ». Ce pilote n'ouvre donc JAMAIS de PR — c'est son périmètre,
+# pas une troncature — et dispatch-lib classait pourtant sa PR en épave
+# (`commit-pushed-no-pr`), ce qui armait trois gardes contre la PR même que la
+# boucle existe pour produire.
+#
+# Le croisement a DEUX axes et une seule case change :
+#   A périmètre (present/absent) × B session (conclue/tronquée)
+# Les deux états de B existent dans la population mesurée du 2026-09-22 :
+# #2425 (`[done] Success | 142 turns`) contre #2484 (`[guardrail]
+# error_max_turns`), tous deux sous `/ce-work`.
+
+echo ""
+echo "Test mika#2492: classe no-shipping-tail — le chemin nominal cesse d'être une épave"
+echo "---------------------------------------------------------------------------------"
+
+# --- T1/T2/T3/T4 : le prédicat, sur ses quatre croisements (comportemental) ---
+#
+# Sonde pure : source la lib, pose les deux axes, interroge le prédicat.
+# $1 = PILOT_SHIPPING_TAIL, $2 = STATUS, $3 = SKILL
+_t2492_predicate() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PILOT_SHIPPING_TAIL="$1"
+        STATUS="$2"
+        SKILL="$3"
+        if _pilot_had_no_shipping_tail; then echo "yes"; else echo "no"; fi
+    )
+}
+
+assert_eq "T1: périmètre absent + session conclue ⇒ classe nouvelle" \
+    "yes" "$(_t2492_predicate absent success dev-pilot)"
+assert_eq "T2 (contrôle négatif, axe B): périmètre absent + session tronquée ⇒ épave" \
+    "no" "$(_t2492_predicate absent terminated dev-pilot)"
+assert_eq "T3 (non-régression, axe A): périmètre présent + session conclue ⇒ inchangé" \
+    "no" "$(_t2492_predicate present success dev-pilot)"
+assert_eq "T3 (non-régression): périmètre présent + session tronquée ⇒ inchangé" \
+    "no" "$(_t2492_predicate present terminated dev-pilot)"
+assert_eq "T4 (fail-safe R4): estampille vide ⇒ comportement d'avant le ticket" \
+    "no" "$(_t2492_predicate '' success dev-pilot)"
+assert_eq "T4 (fail-safe R4): statut vide ⇒ comportement d'avant le ticket" \
+    "no" "$(_t2492_predicate absent '' dev-pilot)"
+assert_eq "T4 (fail-safe R4): dev-groom n'entre jamais dans la classe" \
+    "no" "$(_t2492_predicate absent success dev-groom)"
+
+# --- T7b/T8 : la garde a PRIS, et la ligne Outcome de la fenêtre (comportemental) ---
+#
+# Un scan de présence ne distingue pas « la garde est écrite » de « la garde est
+# écrite dans le bon sens » : retirer le `!` de la conjonction du bloc mika#940
+# Unit 1 est une régression d'UN caractère qui laisse T7a vert. Cette sonde
+# exécute `_post_flight_recovery` sur un vrai dépôt et lit le RESULT produit.
+#
+# $1 = PILOT_SHIPPING_TAIL, $2 = STATUS. Rend le RESULT complet.
+_t2492_recovery_probe() {
+    local base_dir wt_dir pre_head
+    base_dir=$(mktemp -d)
+    wt_dir="$base_dir/worktree"
+
+    git init -q "$wt_dir" 2>/dev/null
+    echo "initial" > "$wt_dir/file.txt"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "initial" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+    # Le pilote a commité : HEAD avance, worktree propre.
+    echo "impl" > "$wt_dir/feature.rs"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "fix(2492): the pilot's own implementation commit" 2>/dev/null
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        # Stub : aucune sortie réseau depuis le harness. `gh` n'est jamais
+        # invoqué via `command`, donc la fonction l'emporte.
+        gh() { return 1; }
+
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD=$(git -C "$wt_dir" rev-parse HEAD)
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-pilot"
+        REPO="mika"
+        BRANCH="fix/2492/probe"
+        ISSUE_NUM="2492"
+        SESSION_ID="t2492"
+        LOG_ID="t2492"
+        RESULT="claude-pilot completed (status: ${2})."
+        RESCUED_DIRTY_WORKTREE=0
+        PILOT_SHIPPING_TAIL="$1"
+        STATUS="$2"
+
+        exec 9>&2
+        _post_flight_recovery 2>/dev/null
+        printf '%s' "$RESULT"
+    )
+
+    rm -rf "$base_dir"
+}
+
+T2492_NOMINAL=$(_t2492_recovery_probe absent success 2>/dev/null)
+assert_not_contains "T7b: périmètre absent + conclue ⇒ AUCUN PIPELINE FAILURE (la garde a pris)" \
+    "PIPELINE FAILURE:" "$T2492_NOMINAL"
+assert_contains "T8: la fenêtre avant Path B porte un motif nommé, jamais UNKNOWN" \
+    "Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation." \
+    "$T2492_NOMINAL"
+assert_not_contains "T8: et jamais le UNKNOWN générique (moins actionnable qu'aujourd'hui)" \
+    "Outcome: UNKNOWN" "$T2492_NOMINAL"
+assert_eq "T8: exactement une ligne Outcome dans la fenêtre" \
+    "1" "$(printf '%s\n' "$T2492_NOMINAL" | grep -c '^Outcome: ' || true)"
+
+# Contrôle négatif de la même sonde : le périmètre présent garde son
+# PIPELINE FAILURE, mot pour mot. Sans lui, T7b ne distingue pas « la garde
+# discrimine » de « le bloc mika#940 ne fire plus du tout ».
+T2492_PRESENT=$(_t2492_recovery_probe present success 2>/dev/null)
+assert_contains "T7b (contrôle négatif): périmètre présent ⇒ PIPELINE FAILURE inchangé" \
+    "PIPELINE FAILURE: claude-pilot produced commits" "$T2492_PRESENT"
+assert_contains "T3: et sa ligne Outcome reste PIPELINE_INCOMPLETE — manual recovery needed" \
+    "Outcome: PIPELINE_INCOMPLETE — manual recovery needed." "$T2492_PRESENT"
+assert_eq "T3: une seule ligne Outcome sur ce croisement aussi" \
+    "1" "$(printf '%s\n' "$T2492_PRESENT" | grep -c '^Outcome: ' || true)"
+
+# Le fail-safe, vu de bout en bout : estampille vide ⇒ chemin d'avant le ticket.
+T2492_UNSTAMPED=$(_t2492_recovery_probe '' success 2>/dev/null)
+assert_contains "T4 (bout en bout): estampille vide ⇒ PIPELINE FAILURE, comme avant" \
+    "PIPELINE FAILURE: claude-pilot produced commits" "$T2492_UNSTAMPED"
+
+# --- T8 (suite) : _set_outcome_line rend le contrat vrai par construction ---
+_t2492_outcome_line_probe() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        RESULT="body line
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation."
+        _set_outcome_line "Outcome: PR_OPENED — https://example/pr/1"
+        printf '%s' "$RESULT"
+    )
+}
+T2492_OUTCOME=$(_t2492_outcome_line_probe 2>/dev/null)
+assert_eq "T8: après réécriture, exactement une ligne Outcome" \
+    "1" "$(printf '%s\n' "$T2492_OUTCOME" | grep -c '^Outcome: ' || true)"
+assert_contains "T8: et c'est la plus vraie des deux" \
+    "Outcome: PR_OPENED — https://example/pr/1" "$T2492_OUTCOME"
+assert_not_contains "T8: l'ancienne valeur de la fenêtre a disparu" \
+    "no_shipping_tail" "$T2492_OUTCOME"
+assert_contains "T8: le corps du RESULT est préservé" \
+    "body line" "$T2492_OUTCOME"
+
+# --- T5 : l'estampille est écrite à UN site par valeur (scan, allowlist vide) ---
+#
+# « On déclare, on n'allowliste pas » (mika#2201) : quand ce scan tire, la
+# résolution est de RETIRER le second site, jamais d'y ajouter une entrée. La
+# lecture couvre l'autre moitié — qu'aucun chemin d'entrée n'atteigne la
+# sélection de classe sans estamper — et aucun scan ne peut l'atteindre :
+# `SKILL` a un site d'écriture unique, le `case` de `dispatch_claude_pilot` est
+# exhaustif et fatal (`*) exit 1`), la suite est linéaire, et la fonction n'a
+# que deux appelants (dev-pilot/handlers/run.sh, dev-groom/handlers/run.sh).
+SHIPPING_TAIL_WRITERS_ALLOWED=""   # mika#2492: livrée VIDE, et un test le tient
+assert_eq "T5: allowlist des écrivains de l'estampille — zero entries" \
+    "" "$SHIPPING_TAIL_WRITERS_ALLOWED"
+assert_eq "T5: PILOT_SHIPPING_TAIL=\"absent\" n'est écrit qu'à un seul site" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL="absent"' "$DISPATCH_LIB" || true)"
+assert_eq "T5: PILOT_SHIPPING_TAIL=\"present\" n'est écrit qu'à un seul site" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL="present"' "$DISPATCH_LIB" || true)"
+# Le site `absent` doit être celui de l'override — pas un site voisin qui
+# devinerait le périmètre après coup.
+T2492_DETECT_FN=$(sed -n '/^_detect_plan_on_branch() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "T5: le site « absent » est la ligne même qui pose l'override /ce-work" \
+    'PILOT_SHIPPING_TAIL="absent"' "$T2492_DETECT_FN"
+assert_contains "T5: et il est adjacent à l'override qu'il décrit" \
+    'ENTRY_COMMAND="/ce-work $PLAN_PATH"' "$T2492_DETECT_FN"
+# Un seul lecteur décisionnel de l'estampille : le prédicat. Tout autre lecteur
+# ferait diverger deux jugements d'un même fait.
+assert_eq "T5: l'estampille n'a qu'un lecteur décisionnel (le prédicat)" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL:-' "$DISPATCH_LIB" || true)"
+
+# --- T7a : la conjonction du bloc mika#940 Unit 1 porte la NÉGATION ---
+#
+# Cherchée sur la LIGNE de la conjonction, pas dans le fichier : à l'échelle du
+# fichier, l'appel légitime — et sans `!` — de la sélection de classe satisfait
+# un scan de présence naïf.
+UNIT1_GUARD_EXEMPT=""   # mika#2492: livrée VIDE
+assert_eq "T7a: allowlist d'exemption du guard Unit 1 — zero entries" \
+    "" "$UNIT1_GUARD_EXEMPT"
+T2492_UNIT1_LINE=$(grep -n 'STATUS" = "success" \] && \[ "\$SKILL" = "dev-pilot"' "$DISPATCH_LIB" | head -1)
+assert_contains "T7a: la conjonction Unit 1 porte « ! _pilot_had_no_shipping_tail » (négation incluse)" \
+    '! _pilot_had_no_shipping_tail' "$T2492_UNIT1_LINE"
+
+# --- T6 : le bras de la classe nouvelle n'émet JAMAIS RECOVERY_PENDING ---
+NO_TAIL_RECOVERY_PENDING_ALLOWED=""   # mika#2492: livrée VIDE
+assert_eq "T6: allowlist RECOVERY_PENDING de la classe nouvelle — zero entries" \
+    "" "$NO_TAIL_RECOVERY_PENDING_ALLOWED"
+PATHB_2492=$(sed -n '/Unit 2 (mika#1282 + mika#1396): open a draft PR/,/^    _deliver_callback/p' "$DISPATCH_LIB")
+# Ancré sur le `if` à douze espaces — l'`elif` du bras titre/fact porte la même
+# comparaison et ouvrirait la plage trop tôt. Les commentaires sont retirés : le
+# scan porte sur le CODE, et le commentaire de ce bras nomme légitimement le
+# marqueur qu'il n'émet pas (même geste que GATE_CODE au test 15).
+T2492_NOTAIL_ARM=$(printf '%s\n' "$PATHB_2492" \
+    | sed -n '/^            if \[ "\$RECOVERY_CLASS" = "no-shipping-tail"/,/^            else$/p' \
+    | grep -v '^[[:space:]]*#')
+assert_contains "T6 (bonne foi): le bras de la classe nouvelle existe dans Path B" \
+    'PR: ${PR_URL}' "$T2492_NOTAIL_ARM"
+assert_not_contains "T6: et il n'émet jamais RECOVERY_PENDING: true (Guard 1 désarmée)" \
+    "RECOVERY_PENDING: true" "$T2492_NOTAIL_ARM"
+assert_contains "T6: il réécrit la ligne Outcome en PR_OPENED" \
+    '_set_outcome_line "Outcome: PR_OPENED — ${PR_URL}"' "$T2492_NOTAIL_ARM"
+# R3 : l'autre bras garde son marqueur, mot pour mot.
+assert_contains "T3 (R3): le bras des épaves émet toujours RECOVERY_PENDING: true" \
+    "RECOVERY_PENDING: true" "$PATHB_2492"
+
+# --- Sélection de classe : le bras nouveau est AVANT l'épave, et gardé ---
+T2492_SELECT=$(printf '%s\n' "$PATHB_2492" | sed -n '/local RECOVERY_CLASS=""/,/^    fi$/p')
+assert_contains "U3b: le bras no-shipping-tail est gardé par le prédicat" \
+    '_pilot_had_no_shipping_tail; then' "$T2492_SELECT"
+assert_contains "U3b: la garde RESCUED_DIRTY_WORKTREE reste première" \
+    'RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then' "$T2492_SELECT"
+T2492_NOTAIL_POS=$(printf '%s\n' "$T2492_SELECT" | grep -n 'RECOVERY_CLASS="no-shipping-tail"' | head -1 | cut -d: -f1)
+T2492_WRECK_POS=$(printf '%s\n' "$T2492_SELECT" | grep -n 'RECOVERY_CLASS="commit-pushed-no-pr"' | head -1 | cut -d: -f1)
+assert_eq "U3b: le bras no-shipping-tail précède le bras commit-pushed-no-pr" "yes" \
+    "$([ -n "$T2492_NOTAIL_POS" ] && [ -n "$T2492_WRECK_POS" ] && [ "$T2492_NOTAIL_POS" -lt "$T2492_WRECK_POS" ] && echo yes || echo "non ($T2492_NOTAIL_POS vs $T2492_WRECK_POS)")"
+
+# --- Le commit marqueur reste réservé aux épaves (égalité stricte) ---
+# La borne de fin est `RESCUED_PR_URL=` seul : écrire le motif complet de
+# l'invocation ferait de cette ligne une fausse positive du détecteur
+# d'herméticité mika#2178 T9, qui balaie tout ce qui suit sa propre section.
+T2492_MARKER_GUARD=$(printf '%s\n' "$PATHB_2492" | sed -n '/RECOVERY_CLASS" = "commit-pushed-no-pr"/,/^        RESCUED_PR_URL=/p')
+assert_not_contains "U3c: le commit marqueur wip(mika#1383) n'atteint pas la classe nouvelle" \
+    "no-shipping-tail" "$T2492_MARKER_GUARD"
+assert_eq "U3c: _set_outcome_line n'est appelée qu'au seul bras de la classe nouvelle" \
+    "1" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+
+# --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
+assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
+    '_measure_pipeline_verified "$WORKTREE_DIR"' "$PATHB_2492"
+# D3 : le label est CONSERVÉ — le retirer sortirait la PR de wip_rescue.rs,
+# seul mécanisme qui la rebase, la passe à clippy et la sort du draft, sans que
+# qa_review_reconcile (qui exige isDraft == false) la rattrape.
+assert_contains "D3: le label wip-rescue reste appliqué (sinon la PR sort de tous les filets)" \
+    'add-label "wip-rescue"' "$PATHB_2492"
+
+# --- Le titre de la classe nouvelle vient du vrai commit d'implémentation ---
+_t2492_title_probe() {
+    local base_dir wt_dir
+    base_dir=$(mktemp -d); wt_dir="$base_dir/wt"
+    git init -q "$wt_dir" 2>/dev/null
+    echo x > "$wt_dir/a"; git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "fix(2492): le vrai sujet du commit du pilote" 2>/dev/null
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _derive_recovery_pr_title "no-shipping-tail" "$wt_dir" "mika" "2492" "" "titre d'issue"
+    )
+    rm -rf "$base_dir"
+}
+assert_eq "U3c: le titre de la classe nouvelle est le sujet du commit d'implémentation" \
+    "fix(2492): le vrai sujet du commit du pilote" "$(_t2492_title_probe 2>/dev/null)"
+
 # --- Summary ---
 
 echo ""
