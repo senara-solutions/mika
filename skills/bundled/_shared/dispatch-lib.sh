@@ -1569,6 +1569,29 @@ _set_pr_status_line() {
 ${1}"
 }
 
+# mika#2492 — the sister of the above, for the `Outcome:` line.
+#
+# Deliberately NOT a reuse of `_set_pr_status_line`: that one knows only
+# `PR:`/`NO_PR:` and has never touched `Outcome:`. This one strips any prior
+# line-anchored `Outcome:` and appends, which makes the "exactly one `Outcome:`
+# line" contract true BY CONSTRUCTION rather than by coincidence of ordering —
+# the same property the comment above claims for its elder.
+#
+# The window it exists for: `_post_flight_recovery` poses an `Outcome:` while
+# still inside `_run_claude_pilot` (mika#940 Unit 3), and Path B may later open
+# a PR that makes a truer one available. $1 is the full line body, e.g.
+# "Outcome: PR_OPENED — <url>".
+_set_outcome_line() {
+    local _body
+    _body="$(printf '%s' "$RESULT" | sed '/^Outcome: /d')"
+    # Trim trailing newlines so the appended block always reads as exactly one
+    # blank separator, whatever the stripped line left behind.
+    while [ "${_body%$'\n'}" != "$_body" ]; do _body="${_body%$'\n'}"; done
+    RESULT="${_body}
+
+${1}"
+}
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -4085,6 +4108,39 @@ ${RESULT}"
     fi
 }
 
+# _pilot_had_no_shipping_tail — true when this dispatch launched a pilot whose
+# PERIMETER did not include opening a PR, AND whose session concluded.
+#
+# mika#2492. Two axes, and the crossing is the whole point. The autonomous loop
+# dispatches every groomed ticket under `/ce-work <plan>` (the mika#1074
+# override in `_detect_plan_on_branch`), and `/ce-work` is, in its own words,
+# "implementation and local verification only, without the shipping tail". Such
+# a pilot never opens a PR — that is its scope, not a truncation. Until this
+# ticket the nominal path was therefore classified as a wreck
+# (`commit-pushed-no-pr`), which armed three independent guards against the very
+# PR the loop exists to produce.
+#
+# The stamp is written by its PRODUCER (see the two `PILOT_SHIPPING_TAIL=` sites
+# in `dispatch_claude_pilot` / `_detect_plan_on_branch`), never reconstructed
+# here — same motif as `origin:loop` (mika#2026), `closing_pr_closed_unmerged`
+# (mika#2242) and `qa_review_pr_target` (mika#2368).
+#
+# The `STATUS = success` term is the SECOND axis: a session killed by a
+# guardrail or an SDK limit carries `STATUS = terminated` (see the branch at
+# `_run_claude_pilot`'s terminated guard and `_halt_family`'s
+# `error_max_turns`), never `success`. Truncated work must not be presented as
+# complete just because its perimeter had no shipping tail. This is the same
+# term the mika#940 Unit 1 guard below already uses, read at the same place.
+#
+# Fail-safe (mika#2492 R4): every indeterminacy returns false, which falls back
+# to the pre-ticket behaviour. An unreadable signal is never a satisfied term.
+_pilot_had_no_shipping_tail() {
+    [ "${SKILL:-}" = "dev-pilot" ]            || return 1
+    [ "${PILOT_SHIPPING_TAIL:-}" = "absent" ] || return 1
+    [ "${STATUS:-}" = "success" ]             || return 1
+    return 0
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -4425,7 +4481,12 @@ ${RESULT}"
     #   - $PR_URL empty: PR-discovery above found nothing.
     #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
     #     the zero-commit check earlier in this block already fires.
-    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+    #   - ! _pilot_had_no_shipping_tail (mika#2492): the sentence this block
+    #     writes — "Pipeline truncated before git push + gh pr create" — is
+    #     FALSE for a pilot whose perimeter never had that step. Without this
+    #     term the nominal `/ce-work` path takes a `PIPELINE FAILURE:` and the
+    #     Unit 3 cascade below mechanically falls to PIPELINE_INCOMPLETE.
+    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && ! _pilot_had_no_shipping_tail; then
         RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
 
 ${RESULT}"
@@ -4452,6 +4513,24 @@ Outcome: PR_OPENED — ${PR_URL}"
         RESULT="${RESULT}
 
 Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
+    elif _pilot_had_no_shipping_tail; then
+        # mika#2492. This value is TRANSITORY on the nominal path: Path B, a few
+        # hundred lines below in `dispatch_claude_pilot`, opens the draft PR and
+        # rewrites this line to `PR_OPENED` via `_set_outcome_line`. Nobody reads
+        # `^Outcome: ` in between — the only two readers are
+        # `_measure_cycle_output` and `_gate_non_empty_cycle`, reached from
+        # `_deliver_callback` (after Path B) and from the EXIT trap.
+        #
+        # The EXIT trap is the one intermediate reader, and it is exactly why
+        # this arm exists rather than falling through to the `UNKNOWN — inspect
+        # worktree manually.` default: on the population where dispatch-lib dies
+        # between here and Path B, this sentence is TRUE at the instant it is
+        # read (no PR was opened, the work waits in the worktree) and it is at
+        # least as actionable as the `PIPELINE_INCOMPLETE — manual recovery
+        # needed` that population receives today, with a named motive on top.
+        RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation."
     else
         RESULT="${RESULT}
 
@@ -6767,7 +6846,11 @@ _derive_recovery_pr_title() {
     local labels="$5"
     local issue_title="$6"
 
-    if [ "$recovery_class" = "commit-pushed-no-pr" ]; then
+    # mika#2492 widens this arm to `no-shipping-tail`: both classes reach here
+    # with the pilot's own implementation commit at the branch tip, so its
+    # subject is the right title for either. The other two callers (dirty-worktree,
+    # and any fallback) are untouched.
+    if [ "$recovery_class" = "commit-pushed-no-pr" ] || [ "$recovery_class" = "no-shipping-tail" ]; then
         local impl_subject
         impl_subject=$(git -C "$wt_dir" log -1 --format='%s' HEAD 2>/dev/null)
         if [ -n "$impl_subject" ]; then
@@ -7344,6 +7427,12 @@ _detect_plan_on_branch() {
         # form or claude-pilot exits 7ms with `[error] pipeline_incomplete:` (no
         # API call). See mika#1345.
         ENTRY_COMMAND="/ce-work $PLAN_PATH"
+        # mika#2492: `/ce-work` is "implementation and local verification only,
+        # without the shipping tail" — this pilot will not open a PR, and that
+        # is its perimeter, not a truncation. Stamped HERE, on the line that
+        # takes the decision, so the fact travels from its producer instead of
+        # being reconstructed downstream. Read by `_pilot_had_no_shipping_tail`.
+        PILOT_SHIPPING_TAIL="absent"
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
@@ -7723,6 +7812,12 @@ EOF
     case "$SKILL" in
       dev-pilot)
         ENTRY_COMMAND="/mika"
+        # mika#2492: declare the pilot's shipping perimeter at the site that
+        # decides it. `/mika` carries plan → work → review → … → git push +
+        # gh pr create, so this pilot is expected to open its own PR and a
+        # commit-without-PR really is a truncation. `_detect_plan_on_branch`
+        # overwrites this with `absent` when it overrides the entry command.
+        PILOT_SHIPPING_TAIL="present"
         # mika#940: signal claude-pilot to fail the session if `gh pr create`
         # is never invoked. Caught by the source-level pipeline_incomplete
         # detection in claude-pilot-py (Unit 2). Defense-in-depth against the
@@ -7887,9 +7982,17 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
     #   commit on origin; PR was never opened. dispatch-lib opens it.
     #
     # Runs after _push_branch (lines 558-564) and before _deliver_callback.
+    # - "no-shipping-tail" (mika#2492): the pilot's perimeter never included
+    #   opening a PR (`/ce-work`), and its session concluded. dispatch-lib opens
+    #   the PR because that has been its job since mika#1271 — this is the
+    #   NOMINAL path of the autonomous loop, not a wreck, so it carries neither
+    #   the RECOVERY_PENDING marker nor the wip(mika#1383) marker commit.
     local RECOVERY_CLASS=""
     if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then
         RECOVERY_CLASS="dirty-worktree"
+    elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
+         && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && _pilot_had_no_shipping_tail; then
+        RECOVERY_CLASS="no-shipping-tail"
     elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
          && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ]; then
         RECOVERY_CLASS="commit-pushed-no-pr"
@@ -7902,6 +8005,13 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
         if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
             _rescue_title=$(_derive_recovery_pr_title "dirty-worktree" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session wrote file changes but never committed. dispatch-lib auto-committed with \`wip()\` prefix."
+        elif [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+            # mika#2492: the truth of this class, and it is not a wreck. The
+            # title comes from the pilot's real head commit, exactly as for
+            # commit-pushed-no-pr — both classes share the topology "the pilot
+            # committed", they differ only on whether that was its whole job.
+            _rescue_title=$(_derive_recovery_pr_title "no-shipping-tail" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
+            _rescue_class_fact="The pilot ran under \`/ce-work <plan>\` (mika#1074 plan-on-branch override), whose perimeter is implementation and local verification only — without the shipping tail. It committed the plan's work and concluded; opening the PR is dispatch-lib's job (mika#1271), not a step it truncated before. This PR is draft because its review has not happened yet — never because its content is in doubt."
         else
             _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session committed and pushed but did not open a PR (\`gh pr create\` failed, or the pilot ended its turn before invoking it — mika#1383). dispatch-lib opened this PR from the existing branch."
@@ -7998,10 +8108,27 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             # parent task false-fails as `callback_delivered_without_pr_url`
             # despite the rescued PR being open and reviewable. See mika#871
             # R4 for the canonical contract.
-            RESULT="${RESULT}
+            if [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+                # mika#2492: the nominal path. No `RECOVERY_PENDING: true` —
+                # that marker is what makes self-dev-callback write
+                # `unpushed_recovery_pending` into tasks.metadata, which makes
+                # the qa-webhook Guard 1 skip the autonomous review and escalate
+                # to the operator. A pilot that did exactly what its perimeter
+                # asked has nothing pending.
+                RESULT="${RESULT}
+Draft PR (opened by dispatch-lib): ${PR_URL}
+PR: ${PR_URL}"
+                # The `Outcome:` posed inside _post_flight_recovery named this
+                # very window ("did not reach PR creation"); it is now false, and
+                # the sister of _set_pr_status_line replaces it in one line so
+                # the one-Outcome-line contract holds by construction.
+                _set_outcome_line "Outcome: PR_OPENED — ${PR_URL}"
+            else
+                RESULT="${RESULT}
 Draft PR (dispatch-lib recovery): ${PR_URL}
 PR: ${PR_URL}
 RECOVERY_PENDING: true"
+            fi
             # mika#1613: structured marker parsed by self-dev-callback, which
             # writes `unpushed_recovery_pending: true` into tasks.metadata. That
             # flag makes the qa-webhook recovery-skip guard fire so this rescue
