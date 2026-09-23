@@ -4141,6 +4141,192 @@ _pilot_had_no_shipping_tail() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# mika#2493 — reading a policy deny: its LETHALITY and its full EVENT.
+#
+# Two functions, two questions, deliberately separate. The verb "halted" belongs
+# to a deny that ENDED the session; a deny the session survived is a note. Until
+# this ticket both were labelled identically, and that label made an operator
+# AND the orchestrator conclude "failure" on two sessions that had succeeded
+# (mika#2493 M0: sessions 98b60020 and a0886164, seven denies between them,
+# ZERO terminal).
+# ---------------------------------------------------------------------------
+
+# Line cap for the deny-event excerpt below. Bounded because a stderr written
+# before cpp#151 carries no lethality marker ANYWHERE, so a scan that only
+# stopped on the marker would run to end-of-file.
+_POLICY_DENY_EXCERPT_MAX_LINES=12
+
+# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print the first
+# `[policy:deny]` event in full rather than its first line only (mika#2493 U3).
+#
+# WHY this is not a one-line grep. The rendered deny is
+#   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
+# and `<detail>` is multi-line whenever the refused command is. The lethality
+# marker (cpp#151) FOLLOWS the `[rule-id]` at the END of `<detail>`, so on a
+# multi-line deny a `grep -m1` capture loses BOTH. Measured (mika#2493 M2):
+# 62 of the 268 stderr files carrying a deny since cpp#151 — 23 %, and the
+# ticket's own proof `98b60020` is among them — lose their marker to that
+# capture. The message this excerpt lands in tells the operator to "read the
+# halt event's bracketed [rule-id] FIRST"; on those 62 that instruction was
+# structurally inexecutable. Same doctrine point 3 as mika#2312: never truncate
+# the command when reporting it.
+#
+# Three stop conditions, all three needed (mika#2493 D6): the lethality marker
+# (inclusive — it is the end of the event), a line that visibly OPENS another
+# log event (leading `[`, the shape of `[init]` / `[debug]` / `[2026-…]`), and
+# the line cap. Without the cap a pre-cpp#151 file runs to EOF; without the
+# other-event stop a one-line deny followed by `[debug]` noise drags that noise
+# to the cap.
+#
+# Continuation lines are printed INDENTED. Two reasons: the caller interpolates
+# the first line right after `Halt event: `, so leaving it flush keeps that
+# shape byte-identical; and indenting neutralises the two line-ANCHORED
+# reclassification tokens (`^STATUS=CANCELLED`, `^Outcome: PIPELINE_INCOMPLETE`)
+# that a continuation line could otherwise open (mika#2493 D5).
+# COST, named: the three UNANCHORED tokens are not neutralised. A refused
+# command whose text literally contains `PIPELINE FAILURE:` would still
+# reclassify the session. That exposure is pre-existing (the current site
+# already interpolates the raw deny line) and scrubbing the evidence would
+# contradict the non-truncation doctrine this function exists to honour.
+#
+# Reads stdin so the caller keeps its own `sed`-based ANSI strip visible at the
+# site. Never short-circuits its input: the awk program keeps draining stdin
+# after it is done printing, so the upstream `sed` can never take SIGPIPE and
+# be promoted to the pipeline's status under `pipefail` (mika#2055 class).
+_policy_deny_excerpt() {
+    awk -v max="${_POLICY_DENY_EXCERPT_MAX_LINES:-12}" '
+        done_printing { next }
+        !started {
+            if (index($0, "[policy:deny]") > 0) {
+                started = 1
+                n = 1
+                print
+                if ($0 ~ /\((non-)?terminal\)/) done_printing = 1
+            }
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*\[/) { done_printing = 1; next }
+            n++
+            print "    " $0
+            if ($0 ~ /\((non-)?terminal\)/ || n >= max) done_printing = 1
+        }
+    '
+}
+
+# _policy_deny_lethality <stderr_path> — print exactly one of
+# `terminal` | `non-terminal` | `undeclared` (mika#2493 U2, D2).
+#
+# The predicate is on the FILE, never on a captured line. Three measured
+# reasons: the marker sits outside the first line in 23 % of cases (M2); a
+# single session carries several denies (five for `a0886164`), so the useful
+# question is "does a terminal one exist?" rather than "was the first one?";
+# and a terminal deny ENDS its session (M4, verified on `da4aa7ae`: sole deny,
+# terminal, line 160 of 166), which makes "at least one terminal" and "the last
+# one is terminal" coincide while only the former survives truncation.
+#
+# The discrimination is a literal substring test, and it is safe in the one
+# direction that matters: `(non-terminal)` does NOT contain `(terminal)` — the
+# opening parenthesis the latter requires is occupied by the `-`. Getting that
+# backwards would reclassify the 1093 measured non-terminal denies in one go,
+# which is what the negative-control test exists to catch.
+#
+# `undeclared` asserts NOTHING, and that is the only safe reading (D3). The
+# marker does not exist before cpp#151 (2026-09-04), so on that population no
+# lethality can be read: folding it onto `non-terminal` would state the false
+# thing in the other direction, folding it onto `terminal` would reproduce the
+# very defect being repaired. Same house motif as `unknown_provider`
+# (mika#2328) and `pilot_stall_signal_unavailable` (mika#2277) — an unreadable
+# signal is NAMED, never folded onto a readable value.
+#
+# Fail-open: absent, unreadable, or empty file → `undeclared`.
+#
+# COST, named: the scan is on the whole file, so a session whose pilot PROSE
+# contains the literal `(terminal)` reads as terminal. That is the mika#2050
+# Signal-S class (the pilot's own prose shares the file). It is bounded by the
+# U1 guard: the branch this feeds is only reached when NO deliverable was
+# produced, so the worst case is a session that produced nothing being called
+# `halted (terminal)` instead of carrying a non-terminal note.
+_policy_deny_lethality() {
+    local _stderr_path="${1:-}"
+    local _stripped=""
+
+    if [ -n "$_stderr_path" ] && [ -f "$_stderr_path" ] && [ -r "$_stderr_path" ]; then
+        _stripped=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_stderr_path" 2>/dev/null) || _stripped=""
+    fi
+
+    if [ -z "$_stripped" ]; then
+        printf '%s' 'undeclared'
+        return 0
+    fi
+
+    if grep -qF -- '(terminal)' <<<"$_stripped"; then
+        printf '%s' 'terminal'
+    elif grep -qF -- '(non-terminal)' <<<"$_stripped"; then
+        printf '%s' 'non-terminal'
+    else
+        printf '%s' 'undeclared'
+    fi
+}
+
+# Sentinel the note below is keyed on. Both POLICY_DENY sites can fire on one
+# dev-groom dispatch (HEAD unchanged AND the plan-validation chain), so without
+# an idempotence key the same note would be annexed twice.
+_POLICY_DENY_NOTE_SENTINEL="Note: a policy deny was observed and the session continued past it"
+
+# _annex_policy_deny_note <lethality> <excerpt> — append the factual note for a
+# deny that did NOT end the session (mika#2493 U2 step 4, D4).
+#
+# The asymmetry is the conceptual core. A TERMINAL deny *is* the cause, so it
+# replaces the branch's diagnosis, as today. A NON-TERMINAL one is not: the
+# session ran on after it. Replacing a true diagnosis ("no plan found, likely
+# (a) drift (b) a discovery bug") with "halted by policy deny" MOVES the
+# ticket's lie instead of closing it — it substitutes a false cause for a real
+# one under cover of precision. So the branch that applies keeps the floor and
+# the deny is reported in ANNEX, because it may well have hindered the pilot
+# without killing it.
+#
+# Corollary, accepted and deliberate: the note is also written on a SUCCESSFUL
+# session. That is exactly what the ticket asks for — a survived non-terminal
+# deny is a note. It is short, factual and non-alarming.
+#
+# HARD constraint (D5): the note must carry none of the reclassification tokens
+# `dispatch-lib.sh` itself greps for (`PIPELINE FAILURE:`,
+# `STRUCTURAL VIOLATION:`, `HANDLER CRASH`, `^STATUS=CANCELLED`,
+# `^Outcome: PIPELINE_INCOMPLETE`). An informational note that introduced one
+# would reclassify the session as a failure — the repaired defect, rebuilt by
+# its own fix. Held by a test on the PRODUCED TEXT, not by review.
+_annex_policy_deny_note() {
+    local _lethality="${1:-}" _excerpt="${2:-}" _reading=""
+
+    [ "$_lethality" = "non-terminal" ] || [ "$_lethality" = "undeclared" ] || return 0
+    # `if`, not `&& return` — a non-zero `&&` chain is what `set -e` kills.
+    if grep -qF -- "$_POLICY_DENY_NOTE_SENTINEL" <<<"${RESULT:-}"; then
+        return 0
+    fi
+
+    # NOTE ON WORDING: this text must contain neither the reclassification tokens
+    # of D5 nor the word the terminal branch owns. A note that said "not halted"
+    # would still put that word in a `result` an operator greps, which is the
+    # confusion being repaired — and the mika#2493 verification contract asserts
+    # its absence on this population.
+    if [ "$_lethality" = "non-terminal" ]; then
+        _reading="Lethality marker: (non-terminal) — claude-pilot states this refusal did not end the session."
+    else
+        # D3: say WHY nothing is asserted, and say that the missing half is the
+        # pilot build's declaration, not this dispatch's reading.
+        _reading="Lethality marker: undeclared — this session's stderr carries no lethality marker at all, in either of the two forms claude-pilot emits, so its lethality cannot be read. The marker exists from cpp#151 onwards (2026-09-04); an older build declares nothing. Neither reading is asserted."
+    fi
+
+    RESULT="${RESULT}
+
+${_POLICY_DENY_NOTE_SENTINEL} (mika#2493). It is reported for completeness, not as a cause — the diagnosis above stands on its own. A refusal can hinder a pilot without ending its session, and this one did not end it.
+${_reading}
+
+Observed deny: ${_excerpt}"
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -4192,21 +4378,48 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
+            POLICY_DENY_LETHALITY="undeclared"
             _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                # mika#2493 (U3): the whole deny EVENT, not its first line. A
+                # `grep -m1 '[policy:deny]'` loses the [rule-id] and the
+                # lethality marker on every multi-line deny — 23 % of the
+                # measured population, the ticket's own proof 98b60020 among
+                # them. The ANSI strip stays here, at the site.
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                    | grep -m1 '\[policy:deny\]' || true)
+                    | _policy_deny_excerpt || true)
+                POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
             fi
 
             # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
             # expected when the plan was already committed in a prior run.
             # The architect pass (_iterate_groom_loop) is what matters — don't
             # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
-            if [ -n "$POLICY_DENY" ]; then
+            #
+            # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — a session that DELIVERED
+            # cannot be labelled by a deny, whatever its lethality. Measured
+            # (M5): the three other branches of this chain already ask "was a
+            # plan produced?" before declaring a failure; the deny branch was the
+            # only one that did not, and it is the one in front. So this restores
+            # a local coherence rather than inventing a predicate. For dev-pilot
+            # VALID_PLAN is structurally empty, so the guard is always true and
+            # behaviour here is unchanged.
+            #
+            # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it
+            # by putting the guard first. test-dispatch-lib.sh looks for the
+            # literal substring `if [ -n "$POLICY_DENY" ]` to measure this
+            # branch's position (Test 13, Test 14); leading with the guard would
+            # redden two tests nothing asks us to touch, for an identical result.
+            if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
                 # Class C — policy-deny halt. The pilot tried to do legitimate
                 # work and was prevented by a tier1/policy allow-list gap. NOT
                 # to be confused with LLM drift or genuine dirty-worktree-rescue.
-                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
+                #
+                # mika#2493 (U2): reached only for a deny whose marker says
+                # (terminal) — the verb "halted" belongs to a refusal that ended
+                # the session. A non-terminal or undeclared deny is annexed as a
+                # note after this chain instead.
+                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -4246,6 +4459,15 @@ ${RESULT}"
                 RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} (status ${STATUS:-unknown}) but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
 
 ${RESULT}"
+            fi
+
+            # mika#2493 (U2 step 4, D4): a deny the session survived is annexed
+            # AFTER the chain, never in place of it. The branch that applies keeps
+            # the floor; the deny is reported because it may have hindered the
+            # pilot without killing it. No-op for a terminal deny (already said
+            # above) and for no deny at all.
+            if [ -n "$POLICY_DENY" ]; then
+                _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
             fi
         fi
 
@@ -4385,25 +4607,52 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
+        POLICY_DENY_LETHALITY="undeclared"
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-            # Strip ANSI color codes, then extract the first [policy:deny] line.
+            # Strip ANSI color codes, then extract the first [policy:deny] event.
             # The line shape is
             #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
             # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
             # rule-id tag, so the rule-id is the last *bracketed* token, not the
             # last token. An absent tag means `rule_id=None` — the policy default
             # deny (no rule matched), NOT a non-deterministic refusal.
+            # mika#2493 (U3): the EVENT, not just its first line — `<detail>` is
+            # multi-line whenever the refused command is, and both the rule-id and
+            # the marker sit at its END. The ANSI strip stays here, at the site.
             POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                | grep -m1 '\[policy:deny\]' || true)
+                | _policy_deny_excerpt || true)
+            POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
         fi
 
-        if [ -n "$POLICY_DENY" ]; then
+        # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — this is the branch that
+        # produced the ticket. It tested POLICY_DENY at the head of the chain with
+        # NO condition, so a dev-groom that had written its plan, committed it and
+        # succeeded was labelled a pipeline failure the moment any refusal sat in
+        # its stderr (M0: sessions 98b60020 and a0886164, seven denies, zero
+        # terminal, both `status: success`). The correct intent is written three
+        # lines above, in the comment this branch has always carried:
+        # "Disambiguate by reading the persistent stderr ... BEFORE DECLARING
+        # DRIFT" — the deny was meant to disambiguate a failure already
+        # established, and was implemented as a priority diagnosis. There is
+        # nothing to disambiguate once the session has delivered.
+        #
+        # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it by
+        # putting the guard first. test-dispatch-lib.sh looks for the literal
+        # substring `if [ -n "$POLICY_DENY" ]` to measure this branch's position
+        # against the drift message (Test 13); leading with the guard would redden
+        # a test nothing asks us to touch, for an identical result. What the fix
+        # changes is WHEN both conditions apply, never their relative order.
+        if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
             # Class C — policy-deny-induced early halt. The pilot made a
             # legitimate research request that hit a tier1/policy allow-list
             # gap. This is NOT LLM drift; the operator should investigate
             # the deny rule, not the pilot's reasoning.
-            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
+            #
+            # mika#2493 (U2): reached only for a deny whose marker says
+            # (terminal). A non-terminal or undeclared deny is annexed as a note
+            # after this chain, so the branch that really applies keeps the floor.
+            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -4442,6 +4691,14 @@ ${RESULT}"
             # invocation is one of multiple valid paths to producing a
             # plan, not the gate itself.
             echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
+        fi
+
+        # mika#2493 (U2 step 4, D4): annexed AFTER the chain, never in place of
+        # it. Corollary accepted deliberately — this also fires on a SUCCESSFUL
+        # dev-groom, which is exactly what the ticket asks for: a survived
+        # non-terminal deny is a note. No-op for a terminal deny and for no deny.
+        if [ -n "$POLICY_DENY" ]; then
+            _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
         fi
     fi
 
