@@ -4839,6 +4839,110 @@ assert_eq "socket path containing a single quote does not break the probe" \
 assert_eq "fake-proxy output never reaches the operational proxy log" \
     "0" "$(_egress_log_fixture_hits)"
 
+# --- mika#2051: the refusal line names the pid it just launched -------------
+#
+# A SISTER function rather than an extension of `_egress_guard_probe`, and the
+# reason is the probe's contract: it CLASSIFIES the output into one token
+# (`msg=unreachable`) and then throws the text away. Five assertions above
+# compare its `rc=… launched=… msg=…` string by strict equality, so widening it
+# by one field would redden all five for a need that concerns one. The two
+# functions say what they each do: one tests the DECISION, this one the TEXT.
+#
+# Same fake proxy, same log redirect -- the redirect is not incidental. Without
+# it the fake proxy's traceback lands in the operational log, the very file this
+# ticket exists to make legible, and the assertion at the end of the block above
+# is what catches that regression.
+# _egress_guard_line [bin_state]   bin_state: dies (default) | missing
+_egress_guard_line() {
+    local bin_state="${1:-dies}"
+    local tmp sock bin logdir out
+    tmp=$(mktemp -d)
+    sock="$tmp/mika-pilot-egress.sock"
+    bin="$tmp/fake-proxy"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    cat > "$bin" <<'FAKE_PROXY'
+#!/bin/bash
+echo "fake-proxy: dying before bind (mika#2041 test fixture)" >&2
+exit 1
+FAKE_PROXY
+    chmod +x "$bin"
+    [ "$bin_state" = "missing" ] && rm -f "$bin"
+
+    # The orphan shape: bind then close without unlink. `[ -S ]` is satisfied,
+    # nothing listens -- the population mika#2041 measured.
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.close()
+' "$sock"
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        _PILOT_EGRESS_SOCK="$sock"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
+        export MIKA_TEST_LAUNCH_MARKER="$tmp/launched"
+        _ensure_pilot_egress_proxy 2>&1 >/dev/null
+    ) || true
+    rm -rf "$tmp"
+    printf '%s' "$out"
+}
+
+_EGRESS_UNREACHABLE_LINE=$(_egress_guard_line)
+
+# The joint. `pilot_egress_startup.begin pid=<pid>` is the proxy's first line
+# (contract held by test_startup_emits_a_begin_breadcrumb_before_bind); the
+# launcher's SUCCESS line already carried the pid and its FAILURE line -- the
+# only one this ticket exists to diagnose -- did not. Without it the operator
+# joins the dispatch `.stderr` to a cumulative proxy log by timestamp, which is
+# the friction that made the 2026-08-29 diagnosis expensive.
+assert_eq "mika#2051: the unreachable refusal names the pid it launched" \
+    "yes" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The published predicates grep `^dispatch-lib: ` + a contiguous token (Signal S
+# anchor, runbook §2). Assert THAT invariant, never the pid's position: pinning
+# the position would freeze a wording choice where what matters is what the
+# operator greps bite on.
+assert_eq "mika#2051: the refusal keeps its anchor and contiguous token" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.unreachable ' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The Signal S predicate (CLAUDE.md) stops at the token FAMILY, `pilot_egress_guard.`,
+# precisely so it covers both causes -- mika#2050's lesson being that an operator
+# who takes `unreachable` for THE predicate reads a nominal regime on a fleet
+# whose proxy binary was never deployed. A predicate published over two tokens
+# needs both to be witnessed, or half of it is an assumption.
+_EGRESS_BINARY_MISSING_LINE=$(_egress_guard_line missing)
+
+assert_eq "mika#2051: the Signal S family predicate bites on unreachable" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+assert_eq "mika#2051: the Signal S family predicate bites on binary_missing" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.binary_missing ' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# binary_missing launched NO proxy, so it has no pid to name. Stamping one would
+# be a false statement, and this is the negative control that keeps the pid from
+# being spread to the line where it would be a lie.
+assert_eq "mika#2051: binary_missing names no pid, because it launched none" \
+    "no" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# R8 again, and it must be HERE rather than only above: the sister function
+# launches its own fake proxy, so the earlier assertion -- which runs before
+# these calls -- cannot witness it. A log override that regressed only in
+# `_egress_guard_line` would leave the first check green while this suite wrote
+# fake-proxy tracebacks into the operational log, i.e. destroyed the very
+# evidence surface mika#2051 exists to make legible.
+assert_eq "mika#2051: the sister function does not reach the operational proxy log either" \
+    "0" "$(_egress_log_fixture_hits)"
+
 # ============================================================================
 # Dispatchable-repo allowlist: shell defense in depth (mika#2062)
 # ============================================================================

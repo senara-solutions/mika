@@ -572,6 +572,13 @@ _ensure_pilot_egress_proxy() {
     fi
     nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
         >>"$log_file" 2>&1 </dev/null &
+    # mika#2051: captured HERE, not read from `$!` further down, because the
+    # failure path below needs it -- and that path is the only one this ticket
+    # exists to diagnose. `$!` still holds this pid at both later sites (nothing
+    # backgrounds in between: the connectability probe runs python3 in the
+    # FOREGROUND), so this is not a bug fix; it is the value being needed
+    # earlier than it was read.
+    local proxy_pid=$!
     disown 2>/dev/null || true
     # Wait for the proxy to actually accept a connection (bounded). Testing
     # for the socket FILE here is what made the fallback below unreachable in
@@ -591,10 +598,26 @@ _ensure_pilot_egress_proxy() {
     if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
         _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT"
         # See the sibling message above on why "falling back to fs-only" is gone.
-        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — refusing the dispatch (mika#2049)" >&2
+        #
+        # mika#2051: the pid is the JOINT. The proxy stamps its own pid on its
+        # first line (`pilot_egress_startup.begin pid=<pid>`, mika#2086), so the
+        # key already existed on one side and was simply not printed on the
+        # other -- leaving the operator to join a per-dispatch `.stderr` to a
+        # cumulative proxy log by timestamp. That is the friction that made the
+        # 2026-08-29 diagnosis expensive. No new correlation id: inventing one
+        # would be a second vocabulary for a join the pid already makes, and it
+        # would have to survive `nohup`.
+        #
+        # Placed BEFORE the em dash on purpose: the dash separates the finding
+        # (this identified proxy did not bind) from its consequence (the
+        # dispatch is refused). The pid qualifies the finding. The published
+        # predicates bite on the `^dispatch-lib: ` anchor and the contiguous
+        # token, both untouched -- see `_egress_guard_line` in the test suite,
+        # which asserts the invariant and deliberately not this position.
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s (pid $proxy_pid) — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
-    echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
+    echo "dispatch-lib: pilot-egress-proxy launched (pid $proxy_pid, log $log_file)" >&2
     return 0
 }
 
