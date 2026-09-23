@@ -1059,11 +1059,16 @@ impl TaskDispatcher {
             // ready_label_handler engine-side path, mika#1572) — no `gh` label
             // round-trip, no LLM-mediated turn, so it fires every time. The
             // prompt-level path in self-dev-callback remains as defense-in-depth.
+            //
+            // mika#2498 : `global_home_dir` porte le frein de dispatch de la
+            // boucle — le même champ que le court-circuit d'`auto_pull` lit déjà
+            // (aucune plomberie nouvelle).
             try_dispatch_pilot_after_groom_success(
                 &self.db,
                 task,
                 self.github_token.as_deref(),
                 &self.skills,
+                &self.global_home_dir,
             )
             .await;
         }
@@ -3826,6 +3831,34 @@ fn is_team_child_callback(task: &Task) -> bool {
     task.team_run_id.is_some() && task.parent_task_id.is_some()
 }
 
+/// Le `tool_name` que porte **toute** issue de l'auto-fire post-grooming.
+///
+/// Un seul nom pour les deux issues, et c'est une décision (mika#2498). La
+/// doctrine maison impose deux noms quand deux populations doivent rester
+/// soustractibles **et que chaque nom porte sa propre cause** — `phantom_aged_out`
+/// / `phantom_sweep_spared` (mika#2156), `qa_deadline_verdict` /
+/// `qa_callback_verdict` (mika#2368). Ici les deux issues appartiennent au **même
+/// dispatcheur**, sur la **même population** (les callbacks de groom qui ont
+/// convergé) : `after_value` porte déjà l'issue, et l'y ajouter garde le nom vrai.
+/// Un `GROUP BY after_value` rend alors les deux comptes d'une requête,
+/// soustractibles. Précédent exact : `ready_label_outcome` (mika#2323), un
+/// `tool_name`, la porte dans `after_value`.
+///
+/// **Coût nommé et daté :** un `SELECT count(*) WHERE tool_name = …` nu change de
+/// sens au déploiement de mika#2498. `WHERE after_value = 'implement_dispatched'`
+/// reste exact de part et d'autre, et c'est la requête à écrire.
+const GROOM_PILOT_DISPATCHER_TOOL: &str = "task_engine_groom_pilot_dispatcher";
+
+/// L'état d'où partent les deux issues : le groom vient d'être livré.
+const GROOM_PILOT_BEFORE_VALUE: &str = "groom_delivered";
+
+/// L'issue nominale : le dispatch implement est parti.
+const GROOM_PILOT_DISPATCHED_VALUE: &str = "implement_dispatched";
+
+/// L'issue mika#2498 : le frein de dispatch de la boucle était armé, rien n'est
+/// parti et rien n'a été écrit.
+const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
+
 /// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
 /// in its result text, re-add the `ready` label on the GitHub issue so the
 /// ready-label webhook handler dispatches dev-pilot. This is the structural
@@ -3864,13 +3897,16 @@ fn is_team_child_callback(task: &Task) -> bool {
 /// rejection, handler missing) the function logs a WARN and returns. The
 /// prompt-level path in `self-dev-callback` remains as defense-in-depth.
 ///
-/// Audit event written under `tool_name='task_engine_groom_pilot_dispatcher'`
-/// with `after_value='implement_dispatched'` for traceability.
+/// Audit event written under [`GROOM_PILOT_DISPATCHER_TOOL`] with
+/// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
+/// mika#2498, [`GROOM_PILOT_STOPPED_VALUE`] on the branch where the loop's
+/// dispatch brake refused the auto-fire.
 async fn try_dispatch_pilot_after_groom_success(
     db: &AsyncDatabase,
     task: &Task,
     github_token: Option<&str>,
     skills: &SkillRegistry,
+    global_home: &std::path::Path,
 ) {
     // 1. Groom-class callbacks only.
     if task.dispatch_class.as_deref() != Some("groom") {
@@ -3900,6 +3936,75 @@ async fn try_dispatch_pilot_after_groom_success(
         Some(parsed) => parsed,
         None => return,
     };
+
+    // 3bis. Le frein de dispatch de la boucle (mika#2498).
+    //
+    //    **Placement.** Les étapes 1–3 sont le *prédicat* qui décide qu'un
+    //    dispatch aura lieu — classe `groom`, marqueur de convergence, parent
+    //    avec URL d'issue parsable — et rien n'a encore été écrit. Une ligne
+    //    émise ici signifie donc « le STOP a refusé un dispatch », la seule
+    //    lecture actionnable ; émise en tête de fonction elle aurait signifié
+    //    « un callback est arrivé pendant un STOP », un fait sans conduite
+    //    associée, des dizaines de fois par jour.
+    //
+    //    Avant l'étape 4 (jeton) : le STOP est une **décision de l'opérateur**,
+    //    l'absence de jeton un **fait d'environnement** — l'opérateur doit voir
+    //    la ligne du geste qu'il a posé, y compris sur un hôte sans jeton.
+    //
+    //    Impérativement avant l'étape 5c, qui bascule le `dispatch_class` du
+    //    parent groom→implement : une garde placée après laisserait un parent
+    //    étiqueté `implement` sans aucun implement en vol, et le prochain
+    //    dispatch légitime serait compté sur le mauvais slot (#1001).
+    //
+    //    **Le refus ne touche rien** — pas d'annulation du groom, pas de plan
+    //    perdu (il est committé et poussé), aucune row créée. Le parent reste
+    //    `in_progress` / `groom` et sera fauché par `reap_orphaned_parent_tasks`
+    //    (#871) comme il l'est déjà par les cinq chemins de saut voisins. À la
+    //    levée du STOP, le réconciliateur stuck-ready le re-drive : *le refus est
+    //    convergent, pas terminal*.
+    //
+    //    Le chemin du fichier n'est jamais recomposé — il passe par le lecteur
+    //    unique de `auto_pull_stop` (garde mika#2329).
+    if crate::auto_pull_stop::is_stopped(global_home, crate::auto_pull_stop::AUTO_PULL_SCAN) {
+        let stop_file = crate::auto_pull_stop::stop_file_path(
+            global_home,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+        );
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(
+            event = "groom_pilot_autofire_stopped",
+            parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            repo = %repo,
+            issue = issue_num,
+            stop_file = %stop_file.display(),
+            trace_id = %trace_id,
+            "engine: groom-pilot auto-fire refused — the loop's dispatch brake is \
+             armed (mika#2498); the groom is kept, nothing was dispatched"
+        );
+
+        let system_session = format!("system-{}", parent.agent_id);
+        let reason = format!("groom_pilot_autofire_stopped (issue: {repo}#{issue_num})");
+        if let Err(e) = db
+            .log_audit_event(
+                &system_session,
+                GROOM_PILOT_DISPATCHER_TOOL,
+                &parent_id,
+                Some(GROOM_PILOT_BEFORE_VALUE),
+                Some(GROOM_PILOT_STOPPED_VALUE),
+                Some(&reason),
+                Some(&trace_id),
+            )
+            .await
+        {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to write groom-pilot-dispatcher stop audit event"
+            );
+        }
+        return;
+    }
 
     // 4. GitHub token required (the grooming-marker readiness check fetches the
     //    issue body; without a token it fails-open, but the dispatch is
@@ -4110,10 +4215,10 @@ async fn try_dispatch_pilot_after_groom_success(
     if let Err(e) = db
         .log_audit_event(
             &system_session,
-            "task_engine_groom_pilot_dispatcher",
+            GROOM_PILOT_DISPATCHER_TOOL,
             &parent_id,
-            Some("groom_delivered"),
-            Some("implement_dispatched"),
+            Some(GROOM_PILOT_BEFORE_VALUE),
+            Some(GROOM_PILOT_DISPATCHED_VALUE),
             Some(&reason),
             Some(&trace_id),
         )
@@ -4571,6 +4676,13 @@ mod tests {
     /// machine, et les tests s'en trouveraient couplés à son disque.
     const TEST_GLOBAL_HOME: &str = "/tmp/mika-test-global-home-absent";
 
+    /// Le home global des tests qui ne portent **aucun** frein armé — donc le
+    /// chemin nominal de mika#2498, celui que tous les tests historiques de
+    /// l'auto-fire prennent.
+    fn no_stop_home() -> &'static std::path::Path {
+        std::path::Path::new(TEST_GLOBAL_HOME)
+    }
+
     fn test_dispatcher_with_homes(
         db: AsyncDatabase,
         home_dir: PathBuf,
@@ -4609,12 +4721,7 @@ mod tests {
 
     /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
     fn arm_auto_pull_stop(global_home: &std::path::Path) {
-        let path = crate::auto_pull_stop::stop_file_path(
-            global_home,
-            crate::auto_pull_stop::AUTO_PULL_SCAN,
-        );
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "").unwrap();
+        arm_stop_for(global_home, crate::auto_pull_stop::AUTO_PULL_SCAN);
     }
 
     fn lift_auto_pull_stop(global_home: &std::path::Path) {
@@ -6986,6 +7093,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -7008,6 +7116,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -7044,6 +7153,7 @@ mod tests {
             &task,
             None,
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -7068,6 +7178,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -7179,6 +7290,319 @@ mod tests {
         let cb = db.get_task_unscoped(&cb_id).await.unwrap().unwrap();
         assert_eq!(cb.dispatch_class.as_deref(), Some("implement"));
         assert_eq!(cb.parent_task_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    // ---- mika#2498: la sentinelle borne l'auto-fire groom→implement ----
+
+    /// Les `after_value` écrits sous [`GROOM_PILOT_DISPATCHER_TOOL`] pour ce
+    /// parent, dans l'ordre. C'est la surface opérateur du § 9 du plan — les deux
+    /// issues du même dispatcheur, soustractibles par `GROUP BY after_value`.
+    async fn groom_pilot_audit_outcomes(db: &AsyncDatabase, parent_id: &str) -> Vec<String> {
+        db.get_audit_events("system-mika")
+            .await
+            .expect("la lecture des audit_events ne doit pas échouer")
+            .into_iter()
+            .filter(|e| e.tool_name == GROOM_PILOT_DISPATCHER_TOOL && e.target_key == parent_id)
+            .filter_map(|e| e.after_value)
+            .collect()
+    }
+
+    /// Arme le frein d'un scan donné sous le home global fourni, sans jamais
+    /// recomposer le chemin (garde mika#2329 : `auto_pull_stop` en est le lecteur
+    /// unique, y compris pour les tests).
+    fn arm_stop_for(global_home: &std::path::Path, scan: &str) {
+        let path = crate::auto_pull_stop::stop_file_path(global_home, scan);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+    }
+
+    /// Un registre portant **réellement** `run_claude_pilot` comme handler exec
+    /// long-running — le motif de `verdict_handler`'s `dev_pilot` fixture.
+    ///
+    /// **C'est ce qui empêche T1 et T5 d'être vides.** Avec un
+    /// `SkillRegistry::empty()`, la fonction sort à l'étape 5a (outil absent du
+    /// registre) *avant* la bascule 5c, donc « le `dispatch_class` n'a pas
+    /// bougé » serait trivialement vrai et ne dirait rien du placement de la
+    /// garde. Avec ce registre, une garde descendue sous 5c laisse la bascule se
+    /// produire et T5 rougit — ce pour quoi il existe.
+    ///
+    /// Le `TempDir` est rendu à l'appelant : il doit vivre aussi longtemps que le
+    /// registre, sinon `skill_dir` désigne un répertoire supprimé.
+    fn dev_pilot_registry() -> (tempfile::TempDir, crate::skills::SkillRegistry) {
+        use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+        use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
+        use mika_common::claude::ToolDefinition;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("run.sh"), "#!/bin/sh\nexit 0").unwrap();
+
+        let mut dev_pilot = SkillEntry {
+            manifest: SkillManifest {
+                skill: SkillInfo {
+                    name: "dev-pilot".to_string(),
+                    description: "dev-pilot skill".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                    data_grade: Default::default(),
+                },
+                triggers: Triggers { keywords: vec![] },
+                llm: Default::default(),
+                constraints: Default::default(),
+                output: Default::default(),
+                context: std::collections::HashMap::new(),
+                variants: Default::default(),
+            },
+            dir: tmp.path().to_path_buf(),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_overrides: std::collections::HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
+            model_overrides: std::collections::HashMap::new(),
+        };
+        dev_pilot.skill_tools = vec![ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "dispatch".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+                detaches_command: false,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        }];
+
+        let registry = crate::skills::SkillRegistry::from_test_entries(vec![dev_pilot]);
+        (tmp, registry)
+    }
+
+    /// **T1 / AC1 + AC6** — le frein armé refuse le dispatch, et le dit.
+    ///
+    /// Trois assertions parce que « rien n'est parti » et « quelque chose l'a
+    /// dit » sont deux faits distincts : sans la row d'audit, un refus serait
+    /// indistinguable d'un auto-fire qui n'a jamais eu lieu (classe mika#2205).
+    #[tokio::test]
+    async fn mika2498_la_sentinelle_refuse_lauto_fire_et_le_dit() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+        // Registre RÉEL : sans lui, « aucune row callback » serait vrai par
+        // l'étape 5a (outil absent) et n'attesterait rien du frein.
+        let (_skill_dir, skills) = dev_pilot_registry();
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(&db, &task, Some("ghp_token"), &skills, tmp.path())
+            .await;
+
+        let children = db.get_child_tasks(&parent_id).await.unwrap();
+        let implement_children: Vec<&Task> = children
+            .iter()
+            .filter(|c| {
+                c.label.starts_with("long_running:run_claude_pilot") && !c.label.contains("_groom")
+            })
+            .collect();
+        assert!(
+            implement_children.is_empty(),
+            "sous frein armé, aucune row callback d'implémentation ne doit naître — \
+             trouvé : {:?}",
+            implement_children
+                .iter()
+                .map(|c| &c.label)
+                .collect::<Vec<_>>()
+        );
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.iter().any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "le refus doit être attribuable : une row `{GROOM_PILOT_STOPPED_VALUE}` \
+             est attendue, trouvé {outcomes:?}"
+        );
+        assert!(
+            !outcomes.iter().any(|o| o == GROOM_PILOT_DISPATCHED_VALUE),
+            "aucun dispatch n'a eu lieu : `{GROOM_PILOT_DISPATCHED_VALUE}` ne doit \
+             pas apparaître, trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T2 / AC2 — contrôle négatif, et il est porteur.**
+    ///
+    /// Sans lui, T1 passerait sur une fonction qui rend la main
+    /// inconditionnellement. Fixture identique, frein **absent** : la fonction
+    /// doit dépasser le contrôle et atteindre son chemin de saut préexistant
+    /// (registre vide ⇒ `run_claude_pilot` introuvable, étape 5a), donc n'écrire
+    /// aucune row d'audit du tout.
+    #[tokio::test]
+    async fn mika2498_sans_sentinelle_le_chemin_preexistant_est_atteint() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        // Rien n'est armé : `state/` n'existe même pas, le cas nominal.
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.is_empty(),
+            "frein absent : la garde ne doit rien écrire, et le saut préexistant \
+             (5a, outil absent du registre) n'écrit rien non plus — trouvé {outcomes:?}"
+        );
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "le saut de l'étape 5a précède la bascule 5c — comportement inchangé"
+        );
+    }
+
+    /// **T3 / AC3** — les scans ne se coupent pas l'un l'autre.
+    ///
+    /// Miroir d'`auto_pull_stop::tests::mika2329_le_chemin_est_parametre_par_le_scan`,
+    /// au site de production cette fois : le frein du reaper de worktrees
+    /// (mika#2420) est une décision distincte et ne doit rien arrêter ici.
+    #[tokio::test]
+    async fn mika2498_le_frein_du_reaper_narrete_pas_lauto_fire() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::WORKTREE_REAP_SCAN);
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            !outcomes.iter().any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "un frein posé sur un autre scan ne doit pas arrêter l'auto-fire — \
+             trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T4 / AC4** — la ligne signifie « un dispatch a été refusé », pas « un
+    /// callback est arrivé pendant un STOP ».
+    ///
+    /// Épingle le placement du § 4 du plan : un callback de groom **non
+    /// convergé** (`PLAN_ITERATE`) sort à l'étape 2, avant la garde. Une garde
+    /// remontée en tête de fonction ferait rougir ce test — et, en production,
+    /// écrirait un fait sans conduite associée des dizaines de fois par jour.
+    #[tokio::test]
+    async fn mika2498_un_callback_non_converge_nemet_aucun_refus() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, false, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.is_empty(),
+            "un groom qui n'a pas convergé n'aurait dispatché de toute façon : \
+             la garde ne doit rien écrire — trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T5 / AC5 — et c'est sa seule raison d'être.**
+    ///
+    /// Attrape une garde placée **après** l'étape 5c. Celle-ci bascule le
+    /// `dispatch_class` du parent groom→implement *avant* le contrôle de
+    /// readiness, pour que la garde de slot par classe (#1001) porte sur le bon
+    /// slot. Une garde placée après laisserait un parent étiqueté `implement`
+    /// sans aucun implement en vol, et le prochain dispatch légitime serait
+    /// compté sur le mauvais slot.
+    #[tokio::test]
+    async fn mika2498_le_refus_ne_bascule_pas_le_dispatch_class_du_parent() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+        // Registre RÉEL — c'est ce qui rend ce test sensible au placement : avec
+        // un registre vide, la fonction sortirait à 5a *avant* la bascule et
+        // l'assertion serait trivialement vraie.
+        let (_skill_dir, skills) = dev_pilot_registry();
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(&db, &task, Some("ghp_token"), &skills, tmp.path())
+            .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "le refus n'écrit rien : le parent reste groom-class, sans quoi un slot \
+             `implement` serait compté occupé par un dispatch qui n'existe pas (#1001)"
+        );
+        // Et la garde a bien été *atteinte* — sans cette moitié, une garde
+        // descendue sous 5a passerait le test en sortant plus tôt.
+        assert!(
+            groom_pilot_audit_outcomes(&db, &parent_id)
+                .await
+                .iter()
+                .any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "la garde doit avoir été atteinte et avoir refusé"
+        );
+    }
+
+    /// **T7 / AC7** — les valeurs d'audit sont un format de fil.
+    ///
+    /// Elles atterrissent dans `audit_events.tool_name` / `.after_value` et
+    /// l'opérateur en fait des `GROUP BY` (§ 9 du plan). Deux orthographes d'une
+    /// même issue couperaient une population en deux sans le dire — la leçon que
+    /// mika#2323 a dû engraver.
+    #[test]
+    fn mika2498_les_valeurs_daudit_sont_un_format_de_fil() {
+        assert_eq!(
+            GROOM_PILOT_DISPATCHER_TOOL,
+            "task_engine_groom_pilot_dispatcher"
+        );
+        assert_eq!(GROOM_PILOT_DISPATCHED_VALUE, "implement_dispatched");
+        assert_eq!(GROOM_PILOT_STOPPED_VALUE, "stopped_by_sentinel");
+        // `before_value` n'est pas un discriminant de population, mais il est du
+        // même fil : deux orthographes rendraient une jointure historique fausse.
+        assert_eq!(GROOM_PILOT_BEFORE_VALUE, "groom_delivered");
+        assert_ne!(
+            GROOM_PILOT_DISPATCHED_VALUE, GROOM_PILOT_STOPPED_VALUE,
+            "les deux issues doivent rester soustractibles"
+        );
     }
 
     // ---- mika#2287: the #1620 dispatch gate must survive the #1614 flip ----
