@@ -60,17 +60,24 @@ mensonge : il n'y a rien à désambiguïser quand la session a livré.
 `grep -m1 '\[policy:deny\]'` capture **une ligne**. Or le `<detail>` d'un refus
 est multi-ligne dès que la commande l'est, et le suffixe `(terminal)` /
 `(non-terminal)` (cpp#151) **suit** le `[rule-id]` en fin de `<detail>`.
-Mesuré sur la session de grooming de ce ticket même :
 
-```
-[TS] [policy:deny] Bash: cd /var/log/claude-pilot && ls -t *.log … | while read
-[TS]   sz=$(stat -c%s "$f"); mt=$(stat -c '%y' "$f" | cut -c1-16)
-[TS]   ec=$(head -c 4000 "$f" | grep -oE '…')  [bash-grep] (non-terminal)
+La démonstration n'est pas une reconstruction : c'est le même prédicat appliqué
+aux **deux preuves du ticket**, dont les captures sont reproduites ci-dessous
+telles que `grep -m1` les rend (ANSI strippé) :
+
+```bash
+grep -m1 'policy:deny' /var/log/claude-pilot/98b60020-….stderr
+# [2026-09-22T17:35:39.081Z] [policy:deny] Bash: cd /data/workspace/mika-platform/.claude/worktrees/test-2471-…/mika
+#                                                                    ↑ ni [rule-id], ni marqueur : ils sont plus bas
+
+grep -m1 'policy:deny' /var/log/claude-pilot/a0886164-….stderr
+# [2026-09-22T19:29:38.507Z] [policy:deny] Bash: env | grep -iE '…' | sed '…' ; … [bash-grep] (non-terminal)
+#                                                                                  ↑ ici la capture suffit
 ```
 
-Le `grep -m1` rend la **première** ligne : ni `[bash-grep]`, ni
-`(non-terminal)`. Population, sur les stderr postérieurs au déploiement de
-cpp#151 :
+**Deux preuves, un prédicat, deux lisibilités opposées.** La première perd le
+marqueur, la seconde le porte. Population, sur les stderr postérieurs au
+déploiement de cpp#151 :
 
 ```bash
 find /var/log/claude-pilot -name '*.stderr' -newermt '2026-09-05' \
@@ -122,6 +129,71 @@ Unique refus, terminal, en ligne 160 sur 166. La sémantique tient : un refus
 terminal finit la session. C'est ce qui autorise le prédicat de U2 à poser la
 question sous la forme « **un** refus terminal existe-t-il dans ce fichier ? »
 plutôt que « le premier / le dernier est-il terminal ? ».
+
+### M5 — `POLICY_DENY` est la SEULE branche de sa chaîne qui n'est pas indexée sur `VALID_PLAN`
+
+C'est la mesure qui requalifie U1, et elle se lit sur quatre lignes du site B :
+
+| Ligne | Condition de branche | Indexée sur `VALID_PLAN` ? |
+|---|---|---|
+| 4345 | `[ -n "$POLICY_DENY" ]` | **non** |
+| 4362 | `[ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" = "unknown" ]` | oui |
+| 4370 | `[ -z "$VALID_PLAN" ] && [ "$CE_PLAN_INVOKED" != "1" ]` | oui |
+| 4375 | `[ -z "$VALID_PLAN" ]` | oui |
+
+Les trois branches d'échec de cette chaîne posent **déjà** la question « un plan
+a-t-il été produit ? » avant de déclarer un échec. La branche de refus est la
+seule à ne pas la poser — et c'est elle qui est en tête. U1 ne pose donc pas une
+garde nouvelle : il **rend à la branche de refus la condition que ses trois
+sœurs portent déjà**. Un correctif qui restaure une cohérence locale est plus
+sûr qu'un correctif qui invente un prédicat, et c'est la même mesure qui explique
+pourquoi le défaut est passé inaperçu : la chaîne *paraît* homogène à la lecture.
+
+### M6 — La conséquence observable est la ligne `Outcome:`, et elle est mécanique
+
+`dispatch-lib.sh:4436` classe la session en lisant `RESULT` :
+
+```bash
+if grep -qF -- "PIPELINE FAILURE:" <<<"$RESULT"; then
+    RESULT="${RESULT}\n\nOutcome: PIPELINE_INCOMPLETE — manual recovery needed."
+elif [ -n "$PR_URL" ]; then …
+elif [ "$SKILL" = "dev-groom" ] && [ -n "${VALID_PLAN:-}" ]; then
+    RESULT="${RESULT}\n\nOutcome: PLAN_COMMITTED — ${VALID_PLAN}"
+```
+
+Le faux `PIPELINE FAILURE:` ne se contentait donc pas de mal nommer : il
+**capturait le classificateur**. Sur la forme des deux preuves — dev-groom,
+`VALID_PLAN` peuplé, refus non-terminal — U1 fait basculer cette ligne de
+`Outcome: PIPELINE_INCOMPLETE — manual recovery needed` à
+`Outcome: PLAN_COMMITTED — <plan>`, sans qu'aucune ligne de U2 n'intervienne.
+
+C'est **l'effet mesurable du correctif**, plus net que l'absence d'une
+sous-chaîne, et il est testable comme tel (T15).
+
+### M7 — Le lecteur lésé est l'humain et l'orchestrateur, jamais la machine à états
+
+Le ticket dit que le libellé a fait conclure « échec » à tort **deux fois**. La
+question « lequel des consommateurs a été trompé ? » a une réponse mesurée, et
+elle borne le périmètre.
+
+`skills/bundled/self-dev-callback/system_prompt.md` porte, pour le callback
+groom, l'ordre inverse et l'écrit en toutes lettres :
+
+> *« Body-marker GROOMED check (**MUST run BEFORE any `PIPELINE FAILURE:`
+> routing**) … Do NOT check the callback result text for `PIPELINE FAILURE:` or
+> `Outcome:` lines — the body marker is authoritative. »*
+
+**Cette moitié structurelle a tenu** : c'est très exactement pourquoi
+`98b60020` a atteint `Outcome: PLAN_GROOMED` malgré son libellé mensonger. La
+machine à états n'a pas été trompée parce qu'elle a contrat de ne pas lire ce
+texte.
+
+Deux conséquences. **(a)** Le périmètre exclut tout changement de routage : il
+n'y a rien à réparer dans le handler, et y toucher casserait un contrat qui
+fonctionne. **(b)** Le défaut est bien, et seulement, un défaut de **texte
+destiné à un lecteur qui n'a pas ce contrat** — l'opérateur, et
+l'orchestrateur-CC qui lit le `result` brut. C'est ce qui justifie qu'un
+correctif de libellé soit le correctif entier, et non une demi-mesure.
 
 ---
 
@@ -205,10 +277,18 @@ tests que rien ne demande de toucher, pour un résultat identique — et aurait
 donné l'apparence d'un fix qui corrige ses propres tests.
 
 `VALID_PLAN` est résolu en haut de `_post_flight_recovery`
-(`dispatch-lib.sh:4104-4124`) et n'est peuplé que sous `[ "$SKILL" =
-"dev-groom" ]`. Pour `dev-pilot` il est donc **structurellement vide**, la
-garde est toujours vraie, et le site A se comporte exactement comme avant
-(REQ8). La même forme de garde vaut aux deux sites : un seul concept, pas deux.
+(`dispatch-lib.sh:4104-4124`), dans la **même fonction** que les deux sites et
+avant eux, et n'est peuplé que sous `[ "$SKILL" = "dev-groom" ]`. Pour
+`dev-pilot` il est donc **structurellement vide**, la garde est toujours vraie,
+et le site A se comporte exactement comme avant (REQ8). La même forme de garde
+vaut aux deux sites : un seul concept, pas deux.
+
+**Et ce n'est pas un prédicat inventé pour l'occasion.** M5 mesure que les trois
+autres branches de la chaîne du site B portent déjà `[ -z "$VALID_PLAN" ]` :
+U1 rend à la branche de refus la condition que ses sœurs ont, il n'en ajoute pas
+une quatrième. La revue doit donc porter sur *« pourquoi cette branche
+en était-elle dispensée ? »* — et la réponse est M1 : elle a été implantée comme
+diagnostic prioritaire au lieu de désambiguïsation.
 
 **Alternative écartée — garder sur `STATUS = success`.** Le ticket la propose
 (« ne jamais préfixer … quand `status: success` »). Elle est plus large que le
@@ -293,11 +373,23 @@ relecture.
 
 **Effet de bord, nommé parce qu'il est réel et voulu :** en retirant
 `PIPELINE FAILURE:` d'un `result` qui n'aurait pas dû le porter, U1 rend la
-main aux gates en aval. Pour une session qui a livré (les deux preuves), rien
-ne tire. Pour une session qui n'a rien produit, le gate `empty_completion`
-(mika#1996) reprend la main et pose son propre diagnostic — lequel est le
-**bon** : « ce cycle n'a rien produit », plutôt que « halted par un refus qui ne
-l'a pas arrêtée ».
+main aux classificateurs en aval. Et contrairement à ce qu'une première lecture
+suggère, **quelque chose tire — c'est le correctif** :
+
+- *Session qui a livré (les deux preuves).* Le classificateur de `:4436`
+  (M6) cesse d'être capturé par la sous-chaîne et retombe sur sa branche juste :
+  `Outcome: PIPELINE_INCOMPLETE` → `Outcome: PLAN_COMMITTED`. C'est l'effet
+  recherché, mécanique, et **c'est là que se mesure le correctif** (T15).
+- *Session qui n'a rien produit.* Le gate `empty_completion` (mika#1996)
+  reprend la main et pose son propre diagnostic — lequel est le **bon** : « ce
+  cycle n'a rien produit », plutôt que « halted par un refus qui ne l'a pas
+  arrêtée ».
+
+La contrainte de jetons ci-dessus est ce qui garantit que l'annexe de D4 ne
+re-capture pas le classificateur par la porte de derrière : une note qui
+contiendrait `PIPELINE FAILURE:` rétablirait `PIPELINE_INCOMPLETE` et annulerait
+U1 en silence. C'est pourquoi T11 porte sur le **texte produit** et non sur la
+constante.
 
 ### D6 — La capture est dé-tronquée, bornée dans les deux régimes
 
@@ -335,7 +427,15 @@ sites `POLICY_DENY` et une fonction nouvelle) et
   lit ; il ne demande rien à `claude-pilot`.
 - **Les autres classifications de `RESULT`** — `_classify_terminated_session`,
   le gate `empty_completion`, la rescue de worktree sale, le gate structurel de
-  complétion. Aucune n'est touchée ; D5 nomme la seule interaction.
+  complétion. Aucune n'est touchée ; D5 nomme la seule interaction. Le
+  classificateur de `:4436` n'est pas modifié non plus : U1 change ce qu'il
+  **lit**, jamais ce qu'il fait (M6).
+- **Le routage du callback groom.** M7 mesure que
+  `self-dev-callback/system_prompt.md` a déjà contrat de ne PAS lire ce texte —
+  le marqueur de corps est autoritaire et prime explicitement sur tout routage
+  `PIPELINE FAILURE:`. Cette moitié fonctionne, et c'est elle qui a sauvé
+  `98b60020`. **Ne rien y toucher** : le défaut est dans le texte servi à des
+  lecteurs qui n'ont pas ce contrat, pas dans la machine à états qui l'ignore.
 - **Le rattrapage rétroactif.** Aucun `result` déjà délivré n'est réécrit. Les
   deux callbacks de M0 gardent leur texte : la sonde est la prochaine
   occurrence.
@@ -428,6 +528,19 @@ pour exercer le strip.
   `PIPELINE FAILURE:`, `STRUCTURAL VIOLATION:`, `HANDLER CRASH`,
   `STATUS=CANCELLED`, `Outcome: PIPELINE_INCOMPLETE` (D5). Assertion portée sur
   le **texte produit**, pas sur la constante.
+- **T15** — **le test de l'effet, et non de la formulation** (M6). Sur la forme
+  exacte des deux preuves — dev-groom, `VALID_PLAN` peuplé, refus non-terminal —
+  la ligne de classification produite par `:4436` est
+  `Outcome: PLAN_COMMITTED`, et **non** `Outcome: PIPELINE_INCOMPLETE`.
+
+  T9 assertte une **absence** de sous-chaîne, ce qu'une reformulation malheureuse
+  du libellé pourrait satisfaire sans rien réparer ; T15 assertte la **présence
+  du bon classement**, qu'on ne peut pas obtenir par accident. Les deux sont
+  gardés : une absence et une présence ne se remplacent pas.
+- **T16** — **contrôle négatif de T15** : la même fixture avec `VALID_PLAN`
+  **vide** (session qui n'a réellement rien produit) continue de rendre
+  `Outcome: PIPELINE_INCOMPLETE`. C'est ce qui distingue « le correctif répare
+  le faux positif » de « le correctif a désarmé le classificateur ».
 
 **Non-régression (REQ7)**
 
@@ -450,7 +563,7 @@ pour exercer le strip.
 ## Definition of Done
 
 - U1, U2, U3 implémentés dans `dispatch-lib.sh`.
-- T1–T14 écrits et verts ; `make test-dispatch-lib` sans échec.
+- T1–T16 écrits et verts ; `make test-dispatch-lib` sans échec.
 - Les deux assertions d'ordre existantes intactes dans le diff.
 - Aucune règle de policy modifiée, aucun autre classificateur de `RESULT`
   touché.
@@ -476,15 +589,20 @@ ci-dessous sont dérivés de son DoD et des Requirements.
   la présence de la note.
 - **AC5** — Un refus dont la létalité n'est pas déclarée n'est affirmé ni
   terminal ni non-terminal. Couvert par T3.
-- **AC6** — `make test-dispatch-lib` et `make verify-bundled-skills` passent.
+- **AC6** — Sur la forme des deux preuves, la session est **classée**
+  `Outcome: PLAN_COMMITTED` et non `Outcome: PIPELINE_INCOMPLETE` (M6). Couvert
+  par T15, avec T16 pour contrôle négatif. C'est le critère qui mesure l'effet
+  plutôt que la formulation, et celui auquel une sonde post-déploiement peut
+  répondre sans interpréter un texte.
+- **AC7** — `make test-dispatch-lib` et `make verify-bundled-skills` passent.
 
 ---
 
 ## Fire-Disposition
 
-Ce plan livre des détecteurs : T1–T14, dont T6 (contrôle négatif), T8 (scan
-structurel sur la population des sites lisant `POLICY_DENY`) et T11 (contrainte
-de jetons).
+Ce plan livre des détecteurs : T1–T16, dont T6 et T16 (contrôles négatifs), T8
+(scan structurel sur la population des sites lisant `POLICY_DENY`) et T11
+(contrainte de jetons).
 
 **Option retenue : (a) — exception nommée en allowlist, allowlist livrée
 VIDE.**
@@ -492,8 +610,9 @@ VIDE.**
 Aucune violation préexistante ne subsiste au moment du merge, et ce n'est pas
 une chance : les trois unités de correctif précèdent les détecteurs **dans le
 même commit**, donc la population que T8 mesure est conforme (2 sites sur 2)
-avant que T8 n'existe. T6 et T11 portent sur du code neuf. Il n'y a donc rien à
-excepter.
+avant que T8 n'existe. T6, T11 et T15 portent sur du code neuf ; T16 assertte un
+comportement **préservé**, donc conforme par construction avant comme après. Il
+n'y a donc rien à excepter.
 
 **Détail d'implémentation de l'allowlist.** T8 porte une constante
 d'exception explicite, déclarée vide :
@@ -527,19 +646,29 @@ texte destiné à un lecteur humain et au parseur de `self-dev-callback`. Les
 sondes sont donc des lectures, et leur silence ne prouve rien tant qu'aucun
 dispatch n'a rencontré de refus (mika#2205).
 
-**S1 — Le libellé ne ment plus (7 jours).** Sur les dispatches ayant abouti,
-aucun `result` ne porte `halted` alors que la session a livré.
+**S1 — Le classement ne ment plus (7 jours).** La sonde porte sur la ligne
+`Outcome:` (M6), pas sur une interprétation du libellé : un dev-groom ayant
+produit son plan et rencontré un refus non-terminal doit être classé
+`PLAN_COMMITTED`, jamais `PIPELINE_INCOMPLETE`.
 
 ```bash
+# 1. La population rencontrée : dispatches postérieurs au déploiement portant un refus
 find /var/log/claude-pilot -name '*.stderr' -newermt '<date-de-déploiement>' \
   | xargs grep -l '\[policy:deny\]' | wc -l
+
+# 2. Parmi eux, ceux ne portant QUE des non-terminaux (la population visée)
+find /var/log/claude-pilot -name '*.stderr' -newermt '<date-de-déploiement>' \
+  | xargs grep -L -E '[^-]\(terminal\)'
 ```
 
-donne la population rencontrée. **Halte 1 — cette population est nulle** :
-aucune conclusion ne peut être tirée, la sonde n'a rien observé. **Établir le
-déploiement avant de conclure quoi que ce soit** (classe mika#2340) — le
-substrat `dispatch-lib.sh` n'atteint un agent que par `make deploy`, et une
-correction présente dans l'arbre est invisible tant qu'elle n'est pas seedée.
+Croiser avec la ligne `Outcome:` du `result` des callbacks correspondants.
+
+**Halte 1 — la population de l'étape 1 est nulle** : aucune conclusion ne peut
+être tirée, la sonde n'a rien observé. **Établir le déploiement avant de
+conclure quoi que ce soit** (classe mika#2340) — le substrat `dispatch-lib.sh`
+n'atteint un agent que par `make deploy`, et une correction présente dans
+l'arbre est invisible tant qu'elle n'est pas seedée. *Un correctif non déployé
+se lit exactement comme un correctif qui marche.*
 
 **S2 — Le verbe reste disponible pour les vrais halts.** Un refus terminal doit
 continuer de produire `halted (terminal)`. **Halte 2 — plus aucun `halted` nulle
@@ -628,3 +757,27 @@ premier.
 - **2026-09-23** — rédaction initiale. Mesures M0–M4 prises sur
   `/var/log/claude-pilot/` (2441 stderr, fenêtre 2026-05-15 → 2026-09-23).
   Trois rectifications du ticket posées en R1–R3.
+- **2026-09-23 (2ᵉ passe)** — re-groom idempotent. **Chaque affirmation
+  structurelle du plan a été re-vérifiée contre le code plutôt que reprise**, et
+  toutes tiennent : les huit lignes `POLICY_DENY` (4138/4141/4149/4155,
+  4331/4341/4345/4352), la portée de `VALID_PLAN` (résolu en 4104, même fonction,
+  avant les deux sites), les champs du stdout pilote (R1 — pas de
+  `denial_is_terminal`), le lecteur de reclassement (`:3427`), et le fait que les
+  deux assertions d'ordre cherchent une **sous-chaîne** et survivent donc à
+  l'ajout d'un conjoint (D1).
+
+  M2 ne s'appuie plus sur une reconstruction : les captures `grep -m1` des deux
+  preuves y sont reproduites telles que mesurées — la première **perd** son
+  `[rule-id]` et son marqueur, la seconde les porte. M0 re-mesuré au chiffre près
+  (2 et 5 refus, **zéro terminal**).
+
+  Quatre ajouts, tous issus de cette vérification : **M5** (la branche
+  `POLICY_DENY` est la seule de sa chaîne à ne pas être indexée sur `VALID_PLAN`
+  — U1 restaure une cohérence au lieu d'inventer une garde) ; **M6** (le faux
+  `PIPELINE FAILURE:` capturait le classificateur de `:4436` ; l'effet mesurable
+  du correctif est la bascule `PIPELINE_INCOMPLETE` → `PLAN_COMMITTED`) ;
+  **M7** (le callback groom a déjà contrat d'ignorer ce texte — c'est ce qui a
+  sauvé `98b60020` ; les lecteurs lésés sont l'humain et l'orchestrateur, d'où
+  l'exclusion explicite du routage hors périmètre) ; et **T15/T16 + AC6**, qui
+  mesurent l'effet plutôt que la formulation. D5 corrigé en conséquence : son
+  « rien ne tire » était faux, et ce qui tire est le correctif lui-même.
