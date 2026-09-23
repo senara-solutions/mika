@@ -85,7 +85,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
 - `MIKA_EVAL_KG_PROVIDERS=default cargo test -p mika-agent --test eval -- --ignored --nocapture kg_provider_eval` — Run KG provider comparison eval (requires API keys for all selected providers)
 - `cargo run --bin mika` — Run TUI CLI (default: chat, or `mika status`, `mika memory`, `mika kg status`, etc.)
 - `mika agents reprovision <name> [--tier <t>] [--identity-only] [--dry-run] [--yes]` — Re-apply an existing agent's authoritative `identity.toml` **and** `soul.md` (mika#2230). Both, because a tier has two axes since mika#2023 and the mika#1962 guard reads either. Differential, backs up what it overwrites in `0600`, refuses a template whose `[skills].allowlist` is absent or empty, and touches neither `config.toml` nor the DB. Runbook: `docs/operator/agent-identity-reprovision.md` § 7.
-- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
+- `mika agents budget [--agent <name>]` — Quel budget et quel modèle un agent fait-il **tourner**, et par quelle porte de la cascade (mika#2457). Lit le record que mika-spirit a figé à l'`init_agent` ; la première ligne porte `resolved_at`, donc la sortie dit *quand* elle a été vraie. Ne résout **rien** localement : serveur injoignable ou 404 ⇒ *« non attesté »*, aucune valeur affichée. Depuis mika#2473 elle porte aussi une ligne `code` : ce que le **dépôt** déclare pour cet agent, et si le runtime en sert un autre. C'est la commande de la sonde du § *Observabilité du budget effectif* ci-dessous.
 - `cargo run --bin mika-spirit` — Run HTTP server (requires `MIKA_ROUTING_URL` and `MIKA_INTERNAL_TOKEN`)
 - `VITE_MIKA_DASHBOARD_TOKEN=<token> npm run dev:dashboard` — Run dashboard dev server (builds `@samidarko/ui` first, requires mika-spirit on :8080)
 - `npm run build --prefix dashboard` — Build dashboard for production (sets `VITE_BASE_PATH=/dashboard/` automatically)
@@ -266,12 +266,14 @@ After KG-related deploys, four signals tell you the fix is working. The second r
 - **Signal N — wip-rescue staleness probe (#1631).** `grep stale-against-main` in GitHub PR labels — any open draft PR with this label has a type-incompatible rebase against current main. The `wip-staleness-check` workflow runs on every push to main and probes all `wip(` titled or `wip-rescue` labelled draft PRs. Operator action: rebase the branch, fix clippy errors, then promote from draft.
 - **Signal P — phantom sweep telemetry (mika#1712, mika#2156).** `grep phantom_sweep_complete $MIKA_SPIRIT_LOG_FILE | jq '{source, count, spared_count, lookup_error_count, agent_id}'` — one INFO line per sweep pass with `source` in `{"startup_sweep","watchdog_tick"}` (startup fires once per restart; watchdog fires on every 60-tick DB scan when at least one row was swept, spared, errored, or skipped). **Since mika#2156, `count: 0` with `spared_count > 0` is the healthy shape, not an anomaly** — it means the liveness guard withheld a transition because the row's dispatch is still running. A spared row is re-selected and re-spared on every pass (sparing writes no status change), so one dispatch running past the grace window emits one line pair per minute until it finishes; that is expected, not a leak. Steady state with no dispatch in flight: mostly silent, occasional non-zero `count` as genuine orphans age past the grace window then get swept. Anomaly signal: `grep phantom_sweep_large_backlog $MIKA_SPIRIT_LOG_FILE` should return zero lines after the first post-deploy startup — any hit means a single sweep pass transitioned > 100 rows, which feeds mika#1934's cause-racine investigation immediately. Audit-events SQL surface: `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'phantom_aged_out'` (rows actually transitioned since deploy) and its mika#2156 sibling `... WHERE tool_name = 'phantom_sweep_spared'` (transitions the liveness guard withheld). The two names are deliberately distinct so the first keeps meaning "swept". Config surface: `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default `14400` since mika#2156) tunes the AC3 watchdog grace window; startup sweep (AC5) always runs at age=0 and is unaffected. Both paths spare a row whose dispatch child process is still alive — `grep phantom_sweep_spared $MIKA_SPIRIT_LOG_FILE | jq '{source, task_id, child_task_id, process_id}'` shows each withheld transition. Anomaly signal for the guard itself: a non-zero `unusable_child_count` means a dispatch child carried a PID but no readable `process_start_time`, so the guard could not rule out PID reuse and fell back to sweeping — that is the one path that silently returns the sweeper to its pre-mika#2156 behaviour, so a persistent non-zero count there deserves investigation. A non-zero `lookup_error_count` means rows were skipped because the child lookup failed; they are re-examined on the next pass.
 - **Signal Q — pilot secret-channel delivery (mika#2039, sink corrected by mika#2050).** `grep -l '^dispatch-lib: sandbox secret' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — emitted by the sandbox entrypoint prologue when a secret file bound into the pilot sandbox is unreadable or empty. **The sink is the per-dispatch stderr file, never `$MIKA_SPIRIT_LOG_FILE`** — this entry named the latter until mika#2050 and the command returned nothing whatever the state. `$_PILOT_SECRET_PROLOGUE` is prepended to the `bwrap` invocation inside `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` and then persists to `$_PILOT_LOG_DIR/<task-id>.stderr`; Signal S below carries the full trajectory and the same two halts apply. Steady state: zero lines. Any hit means the pilot started **without** `GH_TOKEN`, so it will run a full session and then fail at `git push` / `gh pr create` — the diagnostic exists so that late failure is traceable to the channel rather than misread as pilot drift. The token no longer travels through `bwrap --setenv` (that put it in the world-readable process argv); it is materialised as a `0600` file under `/run/mika-pilot-secrets/` inside the sandbox. Two CI guards hold the invariant — `make test-sandbox-secret-argv` (no credential-shaped value reaches the argv or the `BASH_XTRACEFD` trace) and `make verify-no-secret-in-setenv` (deny-by-default over the `--setenv` allowlist) — and `scripts/canary-pilot-containment` PART 0 probes a live sandbox's argv on the host after a deploy.
-- **Signal S — pilot started without the network cut (mika#2041, mika#2050).** `grep -l '^dispatch-lib: .*falling back to fs-only' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — one file per dispatch whose Phase 2b egress proxy did not take, so the pilot ran with **filesystem containment only and no network cut**. **Steady state: zero occurrences.** This is not a counter that tolerates a background noise floor; the state it announces is degraded-but-functional — nothing breaks, no dispatch fails, no PR goes missing — which is precisely the shape that survives for days unnoticed, and is what mika#2041 measured on 2026-08-29 (four minutes of dispatches without egress and not one line to say so). **Anomaly: any occurrence.**
+- **Signal S — the egress relay did not serve (mika#2041, mika#2050, posture inverted by mika#2049, predicate repaired by mika#2051).** `grep -l '^dispatch-lib: pilot_egress_guard\.' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — one file per dispatch whose Phase 2b egress relay did not serve. **Steady state: zero occurrences. Anomaly: any occurrence.** **Canonical surface: `docs/operator/pilot-egress-relay.md`** — tokens, three-question diagnosis, the proxy-log signature table (§3 Q3.1) and the gestures live there; this entry is the grep and its traps, not a second copy of the runbook.
+  - **What this entry announced until 2026-09-20, and no longer does.** It grepped for a filesystem-only-fallback string, and it described the resulting regime as degraded-but-functional: the pilot ran on, no dispatch was lost, no PR went missing. **Both statements are dead**, and the dead strings are deliberately not requoted here — a future operator grepping this file for them must find nothing, or a corpse reads as a live prescription. mika#2049 (`b86062f8`, operator decision after a bearing from Prime) made the posture **fail-closed**: the relay unavailable ⇒ the dispatch is **refused** (`CONTAINMENT REFUSAL`, exit 78), escalated to Telegram, and the pilot never leaves without its network cut. No environment variable lifts the refusal. The emitting code dropped that string along with the behaviour, so **the old grep could not return a single line whatever the state** — published under a "zero expected" regime, which is how a dead instrument reads exactly like a healthy fleet (class mika#2205, on the very entry that carries *"a signal nobody looks for is not an improvement on a silence"*). Third correction of Signal S after the two of mika#2050, and **nothing reddened**: `scripts/canonical-tokens.tsv` (mika#2201) declares no egress token, so this file's operator predicates are outside its population — named as follow-up by mika#2051, not closed by it, because that guard would have an existing population of its own to measure first. **The consequence for the reader is a change of conduct: this failure is no longer silent.** It stops the loop, loudly, and the Telegram escalation normally reaches you before this grep does.
   - **The sink is a glob, and that is the one thing this entry exists to get right.** Every other entry in this series greps a single file, and the two that concern `dispatch-lib` name `server.log` (Signal M) or `$MIKA_SPIRIT_LOG_FILE` (Signal Q, corrected above). Copying that shape here yields a command that returns **nothing, ever**. The guard `_ensure_pilot_egress_proxy` is reached only from `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` (a `mktemp`) and then scrubs and persists to `$_PILOT_LOG_DIR/<task-id>.stderr`, with `_PILOT_LOG_DIR = ${PILOT_LOG_DIR:-/var/log/claude-pilot}` — hence one file per dispatch. That sink is already the established forensic surface: `dispatch-lib` re-reads it itself to extract `[policy:deny]` lines (mika#1097).
   - **Anchor on `^dispatch-lib: `, because the pilot's own prose shares the file.** That stderr file carries everything the sandboxed session wrote, so a bare token grep matches text a pilot wrote *about* the signal. Measured 2026-09-20 on gentux: `grep -l pilot_egress_guard.unreachable` returned one file, and its content was a timestamped sentence from the grooming session **of this very ticket** — not a guard emission. Every real emission begins at column 0 with `dispatch-lib: `, and every pilot line is timestamped (`[2026-09-20T15:12:57.693Z] …`), so the anchor separates them cleanly. Any future session discussing this entry re-creates that false positive; the anchor is what keeps the instrument readable.
-  - **Positive control — `zero` must be shown to mean healthy, not blind.** `grep -l '^dispatch-lib: pilot-egress-proxy launched' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` counts the dispatches where the proxy **did** take. Read the two together: zero fallbacks **with** a non-zero launch count is a healthy fleet; zero of both means the command is looking at the wrong place or no dispatch has run, and proves nothing about egress (the mika#2205 class — a silently inert probe reads exactly like a healthy one). Measured 2026-09-20 on gentux: 0 fallbacks against 12 launches.
-  - **Grep the fallback, use the token as the discriminant — not the reverse.** There are **two** paths into fs-only and only one carries a stable token: the proxy failing to bind within 3 s emits `pilot_egress_guard.unreachable …`, while the binary simply being absent emits `mika-pilot-egress-proxy not found at … (falling back to fs-only)`, which the code's own comment marks as the expected deployment-window case. Both share the string `falling back to fs-only`, so that is the predicate covering the whole population. **Consequence: zero occurrences of `pilot_egress_guard.unreachable` does NOT prove the network cut is active** — an operator applying the token as the predicate reads a nominal regime on a fleet whose proxy binary was never deployed. Once a hit is found, `grep -l '^dispatch-lib: pilot_egress_guard.unreachable' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` separates "the proxy died" from "the binary is missing"; the two call for different remedies. Keep the anchor here too — this is the grep the ticket's own body proposed unanchored, and it is the one the pilot-prose false positive above landed on.
-  - **Remedy.** Inspect `${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log` to learn why the proxy did not take — and if that file is absent, read `/tmp/mika-pilot-egress-proxy.log`, the fallback the proxy uses when the log directory is not writable. Both paths are named because looking for only the first is how an operator concludes "no log, so nothing ran".
+  - **Positive control — `zero` must be shown to mean healthy, not blind.** `grep -l '^dispatch-lib: pilot-egress-proxy launched' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` counts the dispatches where the proxy **did** take. Read the two together: zero refusals **with** a non-zero launch count is a healthy fleet; zero of both means the command is looking at the wrong place or no dispatch has run, and proves nothing about egress (the mika#2205 class — a silently inert probe reads exactly like a healthy one). Measured 2026-09-20 on gentux: 0 refusals against 12 launches. That launch line is unchanged by mika#2051 — it already carried its pid; only the refusal line gained one.
+  - **Grep the family, use the token as the discriminant — not the reverse.** There are **two causes**, and since mika#2049 each carries its own stable token, which is why the predicate above stops at `pilot_egress_guard\.` rather than naming one: the proxy failing to bind within 3 s emits `pilot_egress_guard.unreachable …`, the binary simply being absent emits `pilot_egress_guard.binary_missing …` (the deployment-window case). **Neither falls back any more — both refuse the dispatch.** **The mika#2050 lesson survives the posture change and is what this bullet exists for: zero occurrences of `pilot_egress_guard.unreachable` does NOT prove the network cut is active** — an operator applying that one token as the predicate reads a nominal regime on a fleet whose proxy binary was never deployed, which is now `binary_missing`'s population. Once a hit is found, grep the two tokens separately to tell "the proxy died" (remedy: `scripts/canary-pilot-containment --restart-relay`) from "the binary is missing" (remedy: `make install` on the dispatch host); the two call for different gestures. A third token, `pilot_egress_guard.recovered`, marks the resumption. Keep the anchor on each — this is the grep the ticket's own body proposed unanchored, and it is the one the pilot-prose false positive above landed on.
+  - **Joining a refusal to the dead proxy: the pid, never the clock (mika#2051).** `pilot_egress_guard.unreachable` carries `(pid N)` since mika#2051; the proxy stamps `pilot_egress_startup.begin pid=N` as its own first line since #2086. The dispatch `.stderr` is per-dispatch and the proxy log is cumulative, so that pid is what makes the join exact instead of temporal — the friction that made the 2026-08-29 diagnosis expensive. `binary_missing` deliberately carries **no** pid: that path launched no proxy, and inventing one would be a false statement. What each combination of proxy-log lines means is the runbook's §3 Q3.1 table, and reading it is a **host** gesture: a dispatched pilot cannot see `/var/log/mika/` (bwrap does not mount it, class mika#2165), so that file's absence from a dispatch session is never evidence of "no recurrence".
+  - **Remedy — the runbook, `docs/operator/pilot-egress-relay.md`, is the canonical surface.** Its §3 walks the three questions in order (binary installed → socket connectable → what the proxy log says) and its §4 carries the gestures; §3 Q3.1 is the signature table that says what the proxy log's lines *mean*, which is the half a `tail` does not give you. The short form: inspect `${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log`, and if that file is absent read `/tmp/mika-pilot-egress-proxy.log`, the fallback the proxy uses when the log directory is not writable. Both paths are named because looking for only the first is how an operator concludes "no log, so nothing ran".
   - **Halt 1 — the grep is empty *and* `PILOT_LOG_DIR` / `MIKA_PILOT_LOG_DIR` disagree.** The glob is then pointing somewhere other than where `dispatch-lib` writes, and the silence means nothing. The two variables are deliberately distinct (`scrub_mika_env_vars` strips every `MIKA_*` from the dispatch child) and their divergence is already documented under mika#2249 — establish the configuration before concluding anything about egress.
   - **Halt 2 — do not carry this command over to Signal M by analogy.** `pilot_push_guard.{clean,violation}` is emitted by `_check_pilot_force_push`, called at the top level of `dispatch_claude_pilot` **after** `_run_claude_pilot` and therefore **outside** the `2>"$STDERR_FILE"` redirection; its stderr is the `Stdio::piped()` handle from `spawn_long_running_exec`, which the executor reads **only** in its `if !status.success()` branch. On a dispatch that succeeds the pipe is dropped unread, so those lines land in no file at all — see the note on Signal M. Same class as this ticket, one line away, found by the verification this ticket prescribes.
   - **Limit — the revise path captures nothing.** `_launch_revise_pilot` (the ITERATE branch of autonomous grooming) calls the same guard but redirects to a `mktemp` under `/tmp` that it deletes a few lines later, with no persistent copy. The zero-occurrence steady state above holds for the **dispatch** path only; on the revise path the silence is structural, not evidence.
@@ -1072,6 +1074,58 @@ stat -c '%y  %n' ~/.mika/agents/mika-arch/config.toml    # ce que le disque PORT
   suivi que mika#2328 s'est écrit. Et aucun mécanisme de repli modèle n'est introduit :
   voir *Hors périmètre* du plan mika#2457 pour ses trois préconditions.
 
+**La garde annoncée ci-dessus est livrée, et elle ne refuse toujours rien (mika#2473).**
+Deux détecteurs, deux questions différentes, et aucun des deux ne couche la flotte.
+
+- **D1, au boot : ce que le dépôt déclare vs ce que la cascade a résolu.** À chaque
+  `init_agent`, spirit compare le couple `(provider, modèle)` de la constante
+  `config_toml` de l'agent bien connu à celui du record mika#2457, et émet **une**
+  ligne par agent et par init : `well_known_model_drift` (WARN) sur divergence,
+  `well_known_model_in_sync` (INFO) en phase, **rien** pour un agent qui ne déclare
+  aucun modèle. Ce troisième bras est ce qui sépare « la garde s'est tue » de « la
+  garde n'a pas tourné ». Le résultat est **gelé** sur `AgentState` et servi en
+  sibling du record sur `GET /api/v1/agents/{id}/budget`.
+- **D2, au tour : ce que le process sert vs ce que le disque porte maintenant.** Un
+  `stat` du `config.toml` par tour, une re-résolution par mtime distinct, et
+  `agent_config_changed_since_boot` — WARN avec `restart_required = true` quand un
+  champ du record a bougé, INFO sinon. **`restart_required = false` ne veut pas dire
+  « rien n'a changé »** : le record ne porte ni `openrouter_base_url`, ni `zai_base_url`,
+  ni `log_level`, donc une édition de ces clés y tombe, et le message le dit plutôt que
+  d'affirmer qu'aucun champ effectif n'a bougé. Un `stat` illisible **sort le tour de
+  la population** et le dit sous son propre nom, `agent_config_mtime_unreadable`.
+
+```bash
+# D1 — une ligne par agent bien connu, avant tout tour
+grep -E 'well_known_model_(drift|in_sync)' "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{agent_id, declared_model, runtime_model, runtime_model_source}'
+mika agents budget --agent mika-arch    # la ligne `code … — DÉRIVE …` est rendue
+
+# D2 — les deux contrôles, dans l'ordre
+touch ~/.mika/agents/mika-arch/config.toml && mika ask --agent mika-arch "ping"
+grep agent_config_changed_since_boot "$MIKA_SPIRIT_LOG_FILE" | tail -1 | jq .restart_required
+```
+
+**Attendu sur ce poste au 2026-09-22, et c'est une mesure, pas une prédiction :**
+mika-arch en **dérive** (`kimi-k2.5` au dépôt, `kimi-k3` sur disque depuis le 18/09),
+mika-qa en **dérive** (`zai/glm-5.2` au dépôt, `openrouter/z-ai/glm-5.2` depuis le
+19/09), mika-dev **en phase**. Le `touch` doit rendre `restart_required: false` ; une
+édition réelle du modèle, `true`.
+
+**Halte 1 — zéro ligne D1 après un restart.** Le binaire servi est antérieur au
+correctif (classe mika#2340) : établir le déploiement **avant** toute conclusion sur
+la dérive. Une garde qu'on n'a pas déployée se lit exactement comme une flotte saine.
+**Halte 2 — D1 tire sur les trois agents à chaque boot.** Ce n'est pas du bruit à
+museler : c'est l'état de ce poste, rendu lisible, et `MIKA_DISABLE_AGENT_PROVISIONING=1`
+est ce qui le gèle là. La résolution appartient à la réconciliation modèle +
+calibration (mika#1190), jamais à un filtre ni à un `#[ignore]`.
+**Halte 3 — la dérive persiste après une correction du `config.toml` sans redémarrage.**
+C'est le contrat, pas un défaut : le record est figé au boot, et D2 est précisément ce
+qui rend cet écart décidable au lieu de le laisser deviner.
+
+**Le côté déclaré est celui du BINAIRE servi**, pas du checkout : un `mika-spirit` en
+retard sur `main` déclare la constante d'hier et rapportera une dérive qui n'existe
+que dans son propre passé (`feedback_binary_staleness_vs_main`).
+
 `mika ask --model` atteint enfin l'exécutant, et `--verbose` cesse de répondre à sa place (mika#2304) :
 - **Le défaut, et il est plus large que le ticket ne le dit.** Le ticket vise
   `--remote` ; les deux portes étaient cassées. Depuis mika#1727, `mika ask` **sans**
@@ -1448,6 +1502,140 @@ Optional (dispatch concurrency cap — mika#2160):
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+### Un callout de corps sans preuve en base route vers `groom` (mika#2484)
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` — ou qui cherche
+pourquoi un `mika ask "groom …"` refuse un dispatch — cherche dans le voisinage
+de la porte ci-dessus.
+
+- **Les deux défauts mesurés le 2026-09-22 (reprise substrat de #2471).**
+  *(1)* #2471 portait les trois callouts de grooming dans son **corps** — posés
+  par un re-groom de spawn orchestrateur, hors moteur, qui ne frappe aucune
+  preuve en base. Il était vu « groomé », promu `ready`, la tâche
+  `ready-label 0c49ce05` partait en dev-pilot, et la porte mika#1620 la refusait
+  `dispatch_grooming_not_verified`. Chaque tour recommençait. *(2)*
+  `mika ask --agent mika-dev "groom mika issue#2471"` sur ce même ticket a
+  produit le callback **implement** `5460a97f`, qui a ouvert la PR #2483 — une
+  implémentation sur un grooming que le chemin moteur n'a jamais vérifié,
+  c'est-à-dire un **contournement de la porte de preuve**. Le *même* message,
+  après retrait des callouts du corps, a correctement dispatché un dev-groom.
+
+- **Le défaut 1 ne vivait pas dans le feeder, et le remède que le DoD proposait
+  est contre-productif.** Il vivait dans le **routage** du `ready_label_handler`,
+  dont l'étape 5 décidait sur la forme du callout pendant que sa propre porte
+  9d refusait sur la preuve — une divergence à quatre étapes d'écart dans le même
+  handler. Gater le feeder sur la preuve, une fois le routage réparé, retirerait
+  au ticket callouté-sans-preuve **le seul mécanisme capable de le réparer** :
+  la promotion `ready` déclenche désormais le dev-groom qui produit la preuve
+  manquante. Sans elle, le ticket resterait dans le backlog pour toujours, sous
+  une ligne d'exclusion que personne ne relit quotidiennement. *Le churn mesuré
+  n'était pas un excès de promotions : c'était une promotion qui aboutissait au
+  mauvais dispatch.* Aucune ligne d'`auto_pull.rs` n'est touchée.
+
+- **Ce que ce travail n'achète PAS.** Il ne produit **aucune preuve manquante** :
+  un ticket groomé hors moteur reste sans preuve ; ce qui change est ce que le
+  moteur en **fait**, pas ce qu'il en **sait**. Il ne ferme pas le cas
+  `already_groomed` (voir ci-dessous) — il le borne au même endroit
+  qu'aujourd'hui (budget de re-drive mika#2020) et corrige le texte qui
+  prescrivait une route morte. Il ne garantit pas que le modèle appelle le bon
+  outil : il garantit qu'il **ne peut pas appeler le mauvais**. Et aucun
+  compteur de « combien de tickets sont groomés hors moteur » n'est livré — S1
+  compte ceux que la boucle **rencontre**, et un ticket que personne ne relance
+  reste invisible.
+
+- **Le texte de sortie `already_groomed` de `dispatch-lib.sh` ne prescrit plus
+  « Dispatch dev-pilot to implement ».** Depuis mika#2287 cette moitié mène
+  droit à `dispatch_grooming_not_verified`, et un `already_groomed` ne frappe
+  aucune preuve — délibérément : *une garde qui lit sa preuve de la
+  revendication ne peut pas la réfuter*. Le geste nommé est désormais celui que
+  `groom_provenance_verdict` nomme déjà dans son champ `recovery` : retirer le
+  plan de la branche **et** les callouts du corps, puis laisser la boucle
+  re-groomer.
+
+### SQL
+
+```sql
+-- S1 — les tickets qui seraient partis en implement sur un grooming non vérifié
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_markers_without_proof' GROUP BY 1 ORDER BY 2 DESC;
+
+-- S4 — contrôle négatif : la base ne répond pas
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_groom_proof_unreadable';
+
+-- S2 — les contournements de la porte de preuve interceptés
+SELECT count(*) FROM tasks WHERE result LIKE '%dispatch_grooming_intent_mismatch%';
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `ready_label_markers_without_proof` | INFO | **non vide, faible** | chaque ligne est un ticket routé en `groom` au lieu de partir se faire refuser |
+| `ready_label_groom_proof_unreadable` | INFO | **vide** | toute occurrence est une base qui ne répond pas |
+| `dispatch_grooming_intent_mismatch` | (dans `tasks.result`) | **zéro ou très proche** | chaque ligne est un contournement de porte intercepté |
+
+### Sondes, et leurs six haltes
+
+1. **S1 — le routage mord (48 h).** `ready_label_markers_without_proof` non vide
+   et faible.
+   **Halte 1 — vide alors que `dispatch_grooming_not_verified` continue
+   d'apparaître.** Le refus se produit **ailleurs** que sur le chemin
+   ready-label — `mika ask`, relance de verdict, ou auto-fire. **Ne pas élargir
+   le routage** : établir d'abord quel appelant de `validate_dispatch_readiness`
+   a refusé, les trois remèdes diffèrent.
+   **Halte 2 — vide, et `dispatch_grooming_not_verified` aussi, et aucun
+   dispatch n'a eu lieu.** Établir le déploiement avant toute conclusion (classe
+   mika#2340) : *une ligne absente ne prouve rien tant qu'on n'a pas établi que
+   le binaire qui tourne sait l'écrire.*
+   **Halte 3 — le compte porte du trafic nominal** (plusieurs par heure, sur des
+   tickets différents). Le prédicat n'est pas trop large : soit la flotte a une
+   population massive de tickets groomés hors moteur, soit la rétention de
+   30 jours purge plus vite qu'on ne croyait. **Ne pas désarmer** — mesurer la
+   répartition entre les deux causes, qui décide du suivi (exemption de prune vs
+   geste de re-grooming).
+
+2. **S2 — la garde d'intention (48 h).** Régime attendu **zéro ou très proche** :
+   la table de routage de `self-dev` donne au modèle la bonne route, et la garde
+   est le filet.
+   **Halte 4 — flot soutenu.** La moitié intention n'atteint pas ce chemin :
+   **vérifier le déploiement du prompt bundled avant de toucher à la garde**
+   (`cat ~/.mika/skills/.manifest-writer`, mika#2340) — un `system_prompt.md`
+   édité dans l'arbre est invisible jusqu'au `make deploy`.
+   **Halte 5 — une régression sur un chemin moteur** (un dev-pilot légitime
+   refusé). Le tableau des quatre chemins est faux quelque part : lire quel
+   chemin peuple `originating_message` avec un texte commençant par `groom `,
+   **ne pas ajouter d'exception au prédicat** avant de l'avoir établi.
+
+3. **S3 — rejeu du défaut fondateur.** Sur un ticket portant les trois callouts
+   et sans preuve : `mika ask --agent mika-dev "groom mika issue#<n>"` → la tâche
+   callback doit porter `dispatch_class='groom'` ; puis poser `ready`
+   (**remove → add**, mika#2323 : GitHub n'émet `labeled` que sur une transition)
+   → même attendu.
+   **Halte 6 — le ticket part en groom et revient `already_groomed` en boucle.**
+   C'est la limite nommée ci-dessus, pas une régression : vérifier que le budget
+   de re-drive se consomme (`auto_pull_redrive_abandoned` après trois tours) et
+   que le commentaire d'abandon est posé. Si le budget **ne** se consomme pas,
+   c'est mika#2158 qui a rouvert (un compteur remis à zéro par l'action qu'il
+   compte) et c'est **là** qu'il faut chercher.
+
+### Suivi (hors périmètre, nommé)
+
+- **Exempter les lignes `PLAN_GROOMED` du prune de 30 jours** — suivi déjà
+  ouvert par mika#2287. Sa priorité baisse sans s'annuler : son absence ne
+  dégrade plus aucun chemin (le pire cas est identique à l'état antérieur, le
+  meilleur converge). **Précondition** : que S1 montre une part significative
+  d'occurrences imputables à la rétention plutôt qu'au grooming hors moteur.
+- **`/mika-groom-ticket` doit-il frapper une ligne-preuve ?** Différé à
+  Vincent/Prime par mika#2287, inchangé ici — ce travail rend le cul-de-sac
+  convergent au lieu de terminal, il ne préempte pas la décision.
+- **`already_groomed` devrait-il être terminal plutôt que de consommer le budget
+  de re-drive ?** **Précondition** : que la halte 6 montre que cette population
+  existe en volume.
+- **La garde d'intention devrait-elle vérifier le numéro d'issue ?** Arbitrage
+  assumé, à rouvrir si la halte 5 montre un faux positif.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash
@@ -1467,7 +1655,38 @@ Optional (STOP global à chaud — mika#2329) :
    WHERE tool_name = 'auto_pull_stop' ORDER BY created_at DESC;
   ```
   Une ligne par **transition** (`armed` / `lifted`), jamais par tick — doctrine mika#2131 : l'information durable est « le STOP a été armé à telle heure », pas « il l'était encore à 14 h 32 », et 144 lignes/jour en audit déplaceraient dans la table le churn que la doctrine borne. La détection de transition est en mémoire sur le dispatcher et **perdue au redémarrage, à dessein** : un process neuf re-photographie l'état qu'il trouve et écrit une transition si le STOP est armé au premier tick.
-- **Portée : `auto_pull` seul.** `MIKA_DEV_WIP_RESCUE` et `MIKA_QA_REVIEW_RECONCILE` ont le même défaut boot-time et le lecteur est paramétré par le nom du scan pour que l'extension soit une ligne chacun — mais elle n'est pas faite : arrêter la revue QA n'est pas la même décision qu'arrêter le feeder, et livrer trois interrupteurs dont deux n'ont jamais été demandés créerait trois gestes à documenter et à tester pour un besoin mesuré sur un seul. **Ticket de suivi.**
+- **Quels scans ont un interrupteur.** `auto-pull`, et `worktree-reap` depuis mika#2420 (§ *terminal-worktree reaper*, fichier distinct, décision distincte). `MIKA_DEV_WIP_RESCUE` et `MIKA_QA_REVIEW_RECONCILE` ont le même défaut boot-time et le lecteur reste paramétré par nom de scan pour que l'extension soit une ligne chacun — mais elle n'est pas faite : arrêter la revue QA n'est pas la même décision qu'arrêter le feeder, et livrer des interrupteurs que personne n'a demandés créerait des gestes à documenter et à tester pour un besoin mesuré ailleurs. **Ticket de suivi.**
+
+- **Portée de la sentinelle `auto-pull` : c'est le FREIN DE DISPATCH NEUF de la boucle, pas l'interrupteur privé d'un scan (mika#2498).** Son nom dit un scan ; lire le nom comme la portée a coûté un incident. Le 2026-09-23, sentinelle posée à **05:38** locales : le tick du feeder se court-circuite comme prévu, et un implement part quand même à **06:11:39Z** (`ff694ec0`, 103 tours, 17,86 USD, parent `resume_agent` `107f8849`). Un groom convergé enchaîne sur son implémentation par l'**auto-fire moteur** (`try_dispatch_pilot_after_groom_success`, mika#1614), qui ne passe par **aucun tick**. L'opérateur n'a pu que l'annuler en réaction. C'est la forme de panne que ce mécanisme nomme lui-même pour une autre raison : *« un STOP silencieusement inopérant se lit exactement comme un STOP qui marche »*.
+  - **Élargie dans son sens, jamais dupliquée.** Le critère de mika#2420 est *« une décision distincte mérite un fichier distinct »* — or les deux routes ont la **même sortie** (un dispatch dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un opérateur qui arrête l'une et pas l'autre n'a rien arrêté : c'est l'incident. Un second fichier (`groom-implement-stop`) est **refusé** pour cette raison — il scinde une décision d'opérateur en deux gestes, et celui de la mémoire musculaire rendrait alors le comportement d'aujourd'hui en ayant l'air d'arrêter. Renommer la sentinelle est refusé aussi : le fichier peut être armé **en ce moment** sur l'hôte, et la mémoire musculaire est ce qu'un frein de P0 ne doit pas casser. Ce qui change est la portée **documentée**, pas le geste.
+  - **Le critère pour un futur consommateur**, et ce n'est pas « suis-je un scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire cette sentinelle, quelle que soit la porte d'entrée. Sinon, il lui faut un nom de scan à soi.
+  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition.
+  - **Le refus est convergent, jamais terminal**, et c'est ce qui rend l'élargissement acceptable plutôt que destructeur : il n'annule pas le groom, ne perd pas le plan (committé et poussé par `_push_branch`), ne retire pas `ready`, ne marque rien `failed`, ne crée aucune row. Le parent reste `in_progress` / `groom` — une raison de refus de plus dans un sillon que les chemins de saut existants de la fonction (pas de jeton, outil absent du registre, handler non long-running, flip impossible, readiness refusée, création du callback échouée, script de handler absent) creusaient déjà, et c'est ce qui garde le changement petit. À la levée, le réconciliateur stuck-ready le re-drive (in-process depuis mika#2470) ; et pendant le STOP aucun tick ne tourne, donc **aucun point du budget de re-drive n'est consommé** (mika#2020). **Effet de bord utile :** sous STOP, les grooms en vol convergent, committent leur plan et **ne chaînent pas** — c'est littéralement la « pause grooms-seuls » demandée, obtenue sans introduire d'état nouveau.
+  - **Surfaces.** Journal : `groom_pilot_autofire_stopped` (INFO — champs `parent_task_id`, `callback_task_id`, `repo`, `issue`, `stop_file`, ce dernier rendu par `stop_file_path`, jamais un littéral). Base : une row sous le **même `tool_name` que le chemin nominal**, la porte dans `after_value` — motif `ready_label_outcome` (mika#2323), délibérément **pas** le motif à deux noms de `phantom_aged_out` / `phantom_sweep_spared`, qui s'applique quand chaque nom porte sa propre cause ; ici les deux issues appartiennent au même dispatcheur et à la même population.
+    ```bash
+    # La garde a-t-elle mordu ? (régime attendu : non vide pendant un STOP, vide hors STOP)
+    grep groom_pilot_autofire_stopped "$MIKA_SPIRIT_LOG_FILE" \
+      | jq -c '{parent_task_id, callback_task_id, repo, issue, stop_file}'
+    ```
+    ```sql
+    -- Les deux issues du même dispatcheur, soustractibles en une requête
+    SELECT after_value, count(*) FROM audit_events
+     WHERE tool_name = 'task_engine_groom_pilot_dispatcher' GROUP BY 1;
+    ```
+    | événement | niveau | régime attendu | lecture |
+    |---|---|---|---|
+    | `groom_pilot_autofire_stopped` | INFO | **non vide pendant un STOP, vide hors STOP** | chaque ligne est un implement que l'opérateur n'a pas eu à annuler en réaction |
+    | `after_value = 'stopped_by_sentinel'` | audit | idem | le même fait, comptable et daté |
+    | `after_value = 'implement_dispatched'` | audit | **zéro pendant un STOP** | toute occurrence dans une fenêtre de STOP est une fuite — sonde S2 |
+
+    **Coût nommé et daté :** un `SELECT count(*) WHERE tool_name = 'task_engine_groom_pilot_dispatcher'` **nu** change de sens au déploiement. `WHERE after_value = 'implement_dispatched'` reste **exact de part et d'autre**, et c'est la requête à écrire.
+  - **Sonde S1 — la garde mord.** Armer la sentinelle pendant qu'un groom est en vol et le laisser converger. Attendu : la ligne INFO apparaît, aucune row callback `long_running:run_claude_pilot` n'est créée sous ce parent, le `dispatch_class` du parent vaut toujours `groom`, et le compte `implement_dispatched` n'a pas bougé.
+  - **Sonde S2 — attribution des fuites (48 h), et c'est elle qui décide des suivis ci-dessus.** Sur la fenêtre d'un STOP, croiser les dispatches réellement partis : `grep ready_label_outcome "$MIKA_SPIRIT_LOG_FILE" | jq -c 'select(.gate == "dispatched")'`. Zéro ligne ⇒ la voie prompt-level et le « label à la main » n'ont rien produit, et les suivis restent fermés. Des lignes ⇒ le suivi s'ouvre **avec un compte**, et le `repo`/`num` dit laquelle des deux.
+  - **Halte 1 — la ligne apparaît ET un pilote a tourné quand même.** Une **autre** route a dispatché. **Ne pas élargir cette garde par réflexe** : lire `ready_label_outcome` (S2) et établir laquelle des trois routes non couvertes a servi ; les trois remèdes diffèrent.
+  - **Halte 2 — aucune ligne, et aucun implement.** On ne peut **rien** conclure : vérifier d'abord qu'un groom a réellement convergé dans la fenêtre (`grep 'Outcome: PLAN_GROOMED'`, ou un callback `delivered` portant le marqueur). *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (classe mika#2205). Vérifier ensuite que le binaire servi porte le correctif (classe mika#2340) **avant** toute conclusion sur le prédicat.
+  - **Halte 3 — la ligne apparaît alors qu'aucun STOP n'est posé.** Le lecteur regarde ailleurs que là où l'opérateur écrit : comparer le champ `stop_file` avec le chemin réellement posé et vérifier `MIKA_HOME` / `global_home_dir` **avant** de toucher au prédicat. Le fail-open de `Path::exists` ne peut produire que l'inverse (un STOP non vu), jamais un faux positif — donc une ligne de trop est une erreur de **chemin**, pas de prédicat.
+  - **Halte 4 — après la levée, le ticket n'est jamais dispatché.** La prémisse de convergence est fausse. Lire le registre d'exclusion **avant** d'ajouter le moindre mécanisme de ré-armement : `SELECT after_value, created_at FROM audit_events WHERE tool_name = 'auto_pull_exclusion' AND target_key = 'issue:<n>' ORDER BY created_at DESC LIMIT 5;`. Il nomme le vrai filtre (`not_groomed`, `below_threshold`, `operator_review_or_blocked`, `abandoned_operator_held`, …), et aucun de ces remèdes ne vit dans l'auto-fire.
+
 - **Sonde post-déploiement, avec sa halte.** Sur la première occasion réelle : armer, vérifier la ligne INFO au tick suivant, vérifier qu'aucun ticket n'est promu `ready` pendant la fenêtre (`tool_name = 'auto_feeder'` silencieux), lever, vérifier la reprise. Si le feeder **ne reprend pas** après la levée : **halte, et ne pas redémarrer pour réparer** — un redémarrage effacerait la preuve. C'est la signature du mécanisme d'annulation de row (une row a été touchée quelque part) et elle se lit dans `tasks` sur la row `auto_pull_groomed`, pas dans le log.
 - **Latence :** ≤ 10 min (`AUTO_PULL_CRON = "0 */10 * * * *"`), ce qui est l'exigence écrite du ticket (« prendre effet au tick suivant »). Un STOP instantané reste le geste existant — arrêter le service — et ce mécanisme sert précisément le cas où l'on ne veut pas le poser.
 
@@ -1523,6 +1742,155 @@ Aucun filtre acteur n'existe ; ce qui manquait, c'est de savoir quelle porte a r
 - **L'acteur est lisible et ne décide de RIEN.** Le gateway appose une dernière ligne `Labeled by: @<login>` aux événements `issues.labeled`. Elle est **ajoutée en fin de texte**, donc `starts_with(READY_LABEL_DISPATCH_MARKER)` est intact, `parse_ready_label_location` (qui borne son token au premier espace après le marqueur) ne peut pas l'atteindre, et `webhook_queue_v2::classify_event` ne lit que la première ligne — la coalescence est inchangée. Lecture tolérante côté agent : ligne absente, malformée, login vide, ancien gateway servant un nouvel agent (ou l'inverse) → `None`, jamais une erreur, jamais un refus. **Invariant dur : aucune décision de refus ne lit ce champ** — le brancher sur un prédicat créerait précisément le filtre acteur que ce ticket établit comme inexistant et place hors périmètre. Tenu par le scan de source `mika2323_no_gate_predicate_reads_the_actor`, dont l'allowlist `ACTOR_READING_PREDICATES_ALLOWED` est livrée **vide** : **la résolution quand il tire est de retirer la lecture**, jamais d'ajouter une entrée.
 - **Surfaces opérateur.** SQL — `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'ready_label_outcome' GROUP BY 1 ORDER BY 2 DESC;` donne la distribution des portes, la mesure que le ticket demandait et qui n'existait pas ; `SELECT * FROM audit_events WHERE tool_name = 'ready_label_outcome' AND target_key = 'senara-solutions/mika#2323' ORDER BY created_at DESC;` répond directement à « pourquoi ce ticket n'a-t-il pas dispatché ? », en une requête plutôt qu'en un grep sur dix-neuf gigaoctets. Journal — `grep ready_label_received $MIKA_SPIRIT_LOG_FILE | jq -c '{repo, num, actor}'` (une ligne par `labeled ready` réellement reçu) et `grep ready_label_outcome …` (sa porte).
 - **Sonde post-déploiement, 48 h, avec ses deux haltes.** *Halte 1 — l'instrument ne voit rien.* Un `labeled ready` humain posé, confirmé par la timeline GitHub, et **aucune** ligne `ready_label_received` : ne pas élargir le handler. L'événement n'atteint pas l'agent ; la cause est dans le chemin de livraison (file bornée, 429, circuit breaker, DLQ) et c'est **ce chemin** qu'il faut instrumenter, pas ce prédicat. *Halte 2 — une porte domine.* Si une valeur de `gate` concentre les refus (typiquement `operator_held` ou `pilot_in_flight`), le défaut n'est pas dans le handler : la porte a raison et un producteur en amont repose le label. C'est ce producteur qu'il faut traiter, et il a son propre ticket.
+
+Un dé-groomage est un fait estampillé par son producteur (mika#2242) :
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` sans comprendre
+pourquoi cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-09-08.** Fermer une PR **umbrella** qui déclare
+  `Closes #<sous-ticket>` **dé-groome** ses sous-tickets : le plan et le marqueur
+  `GROOMED` vivent sur la **branche de l'umbrella**, jamais sur le corps de
+  l'issue du sous-ticket, et le routage groom-vs-impl lit ce corps. #2131 a
+  conservé `ready` sans aucun callout ; chaque dispatch a re-routé vers `groom`.
+  Résolu à la main, en re-groomant #2131 standalone avec le plan récupéré sur la
+  branche morte de la PR #2226.
+- **Ce que la lecture du code déplace dans le ticket.** *(a)* L'option 2 du
+  ticket — « le sélecteur détecte que ce ticket était closingIssue d'une umbrella
+  fermée » — **n'est pas implémentable depuis le sous-ticket** : le nom canonique
+  d'un plan d'umbrella ne porte aucun numéro de sous-ticket (le créneau `<issue>`
+  contient le mot `umbrella`), donc ni `_find_issue_plan` ni un `git log --all`
+  ne le retrouvent ; et GitHub n'expose pas la direction issue → PR fermantes
+  (l'inverse, `PullRequest.closingIssuesReferences`, existe seul). **Le lien
+  n'est lisible qu'à un instant : la fermeture de la PR.** *(b)* La boucle
+  « indéfiniment » du ticket est **déjà bornée** depuis mika#2020 (trois
+  re-drives puis abandon) et mika#2279 (porte 2c). Ce qui restait ouvert est
+  double et se ferme par le même couple : rien ne nommait la cause, et le travail
+  revu — un plan plus deux passes architecte — était jeté.
+- **Un enregistrement, pas une action.** `pull_request.closed` est un **événement
+  unique non rejouable**, perdable aux quatre endroits que la maison a mesurés
+  (file bornée mika#1870 → 429 → disjoncteur → DLQ `dead`). C'est la classe dont
+  la couche C de #1694 est morte. On n'y accroche donc pas une action : on y
+  écrit un **fait durable** que des lecteurs ultérieurs consultent.
+- **Deux noms, deux populations, chacun à écrivain unique**, et c'est ce qui rend
+  les sondes lisibles. `closing_pr_closed_unmerged` (producteur) compte **toute**
+  fermeture sans merge × ref fermante, y compris les anodines — une PR de
+  brouillon fermée, une PR remplacée. `ready_label_degroomed` (lecteur) compte le
+  sous-ensemble qui a **effectivement** reflué en `groom` en portant le marqueur,
+  c'est-à-dire le défaut. **Le compte du producteur doit dominer largement celui
+  du lecteur** : c'est le régime sain, et il n'est soustractible que tant que
+  chaque nom a un seul écrivain (scan
+  `canonical_tokens::tests::mika2242_the_two_audit_names_have_a_single_writer`,
+  allowlist livrée vide). Cinquième emploi du motif après
+  `phantom_aged_out`/`phantom_sweep_spared` (mika#2156).
+- **Le routage ne change pas, et c'est un refus raisonné.** Un ticket dé-groomé
+  continue de partir en `groom`, même `dispatch_class`, même `ReadyLabelGate`.
+  Halter serait la lettre de l'option 2, et c'est refusé sur deux mesures : la
+  boucle n'est plus le mal à éviter (mika#2020), et **re-groomer un ticket
+  dé-groomé est un travail correct** — le plan est inatteignable depuis l'issue,
+  et un groom qui aboutit rétablit précisément les callouts qui manquent. C'est
+  d'ailleurs le remède que l'opérateur a appliqué à la main. *Un filet, pas un
+  chemin* (mika#2334).
+- **Fail-open sur toute lecture.** Registre illisible, marqueur absent,
+  `reasoning` inexploitable : le routage est identique à aujourd'hui. Le seul
+  effet possible d'une défaillance est de **perdre une explication**, jamais d'en
+  fabriquer une fausse. La granularité est porteuse : la décision du lecteur ne
+  tient qu'à la **présence** de la ligne, la branche est un enrichissement — un
+  `reasoning` illisible rend donc « dé-groomé par pr#N, branche inconnue »,
+  jamais un silence.
+- **Fenêtre de 90 jours, dérivée et non réécrite.** Le lecteur interroge sur
+  `evidence::audit::AUDIT_RETENTION_DAYS`, la constante que
+  `compact_old_audit_events` consomme : deux littéraux laisseraient la fenêtre
+  survivre aux lignes qu'elle lit, c'est-à-dire une recherche qui cesse de
+  trouver **en silence**. Coût nommé : un ticket délié il y a plus de 90 jours
+  perd son attribution et se relit comme « simplement non groomé » — le
+  comportement d'avant ce correctif.
+- **Portée agent : une condition de fonctionnement.** `audit_events` est scopé
+  par `agent_id`, donc producteur et lecteur doivent tourner sur le même agent.
+  Ils le font : `route_event` rend `mika-dev` pour `pull_request.closed` **et**
+  pour `issues.labeled`. Écrit au site d'émission parce que si ça cessait d'être
+  vrai, le marqueur deviendrait invisible **sans qu'aucun test ne rougisse**.
+  Limite corollaire : la résolution de siège (mika#2084) pourrait router les deux
+  événements d'un dépôt vers des sièges distincts — le lecteur retomberait alors
+  sur le comportement d'aujourd'hui, fail-open, jamais une attribution fausse.
+
+### SQL
+
+```sql
+-- « Pourquoi ce ticket n'est-il plus groomé, et où est son plan ? »
+SELECT created_at, after_value, reasoning FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged'
+   AND target_key = 'issue:senara-solutions/mika#2131';
+
+-- Quelle umbrella a délié quoi (population du producteur)
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'closing_pr_closed_unmerged' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le défaut réellement vécu (population du lecteur) — doit être TRÈS inférieure
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_degroomed' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `closing_pr_closed_unmerged` | INFO | **non vide, faible** | une fermeture sans merge a délié un ticket de sa PR fermante. Fréquent et souvent anodin. |
+| `ready_label_degroomed` | INFO | **proche de zéro** | chaque ligne est du grooming revu qu'on est en train de re-payer. |
+| `closing_pr_body_truncated_no_refs` | WARN | **inconnu, à mesurer** | l'angle mort de troncature. Non vide ⇒ des fermetures unmerged passent sous le radar du producteur. |
+| `ready_label_degroom_ledger_unreadable` | WARN | **vide** | toute occurrence est une attribution perdue (jamais fausse). |
+| `closing_pr_marker_write_failed` | WARN | **vide** | le marqueur n'a pas été écrit ; le nettoyage de rows, lui, a bien eu lieu. |
+
+- **L'angle mort, nommé et NON corrigé.** `format_event_text` tronque le corps de
+  PR à 2 000 caractères et `parse_closing_issue_refs` lit **ce corps tronqué** :
+  les lignes `Closes #N` d'une umbrella — corps typiquement long — peuvent tomber
+  au-delà. Le producteur serait alors **silencieusement inerte pour exactement la
+  population qu'il vise**, et un détecteur inerte se lit comme un détecteur sain
+  (mika#2205). D'où `closing_pr_body_truncated_no_refs`. Le fermer demanderait
+  d'aller chercher le corps complet en GraphQL, dans un handler qui ne fait
+  **aucune** lecture réseau et sur **toute** fermeture de PR — donc de changer la
+  population du nettoyage de rows existant. **Ticket de suivi, précondition : que
+  cette ligne soit non vide.**
+
+### Sondes, et leurs haltes
+
+1. **Contrôle positif du producteur (7 jours).** `closing_pr_closed_unmerged`
+   non vide. **Halte 1 —** vide alors que des PR ont été fermées sans merge :
+   **ne pas élargir le prédicat**, lire d'abord
+   `closing_pr_body_truncated_no_refs`. Si *elle* est non vide, le producteur est
+   inerte par troncature et le remède est son suivi. Si les deux sont vides,
+   établir le déploiement (classe mika#2340) avant toute conclusion — *une ligne
+   absente ne prouve rien tant qu'on n'a pas établi que le binaire qui tourne
+   sait l'écrire*.
+2. **Attribution du lecteur (30 jours).** `ready_label_degroomed` doit rester
+   proche de zéro. **Halte 2 —** si ce compte porte du trafic nominal, ce n'est
+   pas le lecteur qui est trop large : des tickets dé-groomés sont dispatchés en
+   série, et c'est la **décision de refus** ci-dessus qu'il faut rouvrir (copier
+   le plan vers chaque sous-ticket à la décomposition) — avec ce compte comme
+   précondition.
+3. **Le défaut fondateur n'est PAS rattrapé.** Le marqueur de #2131 n'existe pas
+   et n'existera pas : la PR #2226 a été fermée avant ce correctif, et **rien ici
+   ne rétro-remplit le registre** — fabriquer une ligne d'audit datée d'un
+   événement qu'on n'a pas observé serait l'inverse de tout ce que ce travail
+   défend. La sonde est la **prochaine** occurrence.
+4. **Contrôle négatif de bruit (7 jours).** Aucun `ready_label_degroomed` sur un
+   ticket portant ses trois callouts. **Halte 3 —** une occurrence signifie que
+   le lecteur est atteint sur le chemin `implement`, donc mal placé : le
+   corriger, ne pas filtrer en aval.
+
+**Ce que ce travail n'achète pas.** Il ne réutilise aucun plan automatiquement :
+il rend le plan **désignable** (un numéro de PR, une branche) là où il fallait
+une archéologie. Il ne rétro-remplit rien. Et `ready_label_degroomed` ne peut pas
+voir un ticket dont personne ne repose le label : *une attribution que personne
+ne déclenche reste un silence*.
+
+**Hors périmètre, délibérément :** la copie du plan aux sous-tickets à la
+décomposition (refus raisonné ci-dessus, **suivi** conditionné à la sonde 2) ;
+l'angle mort de troncature (**suivi** conditionné à la sonde 1) ; le halt au
+routage ; la réutilisation automatique du plan par le pilote de groom ;
+`claude-pilot#166`, qui vit dans un autre dépôt ; et le rétro-remplissage du
+registre.
 
 Optional (authentification des deux scans périodiques — mika#2205):
 - **`auto_pull` et `wip_rescue` résolvent PAT-first / App-fallback, plus PAT-seul.** Les deux gardes de `task_engine/dispatcher.rs` lisaient `self.github_token` — le PAT seul, peuplé depuis `Settings::agent_github_token()` — alors que le dispatcher détenait déjà `settings` et `github_app`, et que le convertisseur canonique `Settings::resolve_github_token` existait à côté. Le 2026-09-05 le PAT a disparu de l'environnement du spirit à ~16:20 et **les deux scans sont morts à la même seconde** (`auto_pull: running groomed ticket selection` dernier `16:20:00.320868Z`, `wip_rescue: running auto-resume scan` dernier `16:20:00.320882Z`), alors que le chemin App était sain (`manager_token_refreshed` jusqu'à 23:17Z, zéro `gh_app_token_exchange_failed`). Précédent identique et non généralisé : mika#2013 sur le cycle mika-manager.

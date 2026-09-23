@@ -5500,13 +5500,37 @@ This ticket has been GROOMED and is ready.
 
     /// T3 — the groom/implement decision is the handler's, not auto_pull's (R2,
     /// AC2): an ungroomed body prepares `dev-groom`, a groomed one `dev-pilot`.
+    ///
+    /// # Ce que mika#2484 a changé dans ce test, et ce qu'il n'a PAS changé
+    ///
+    /// L'intention est intacte — **le handler décide les deux branches** — et
+    /// c'est elle que ce test épingle. Ce qui a bougé est la définition de
+    /// « groomé » : depuis mika#2484 les callouts sont la **forme**, et un
+    /// `dev-pilot` exige en plus la **preuve** en base (un callback groom
+    /// terminé portant `Outcome: PLAN_GROOMED`), parce que l'étape 5 et la
+    /// porte 9d du même handler répondaient jusque-là différemment à la même
+    /// question. La branche `dev-pilot` pose donc la preuve ; sans elle,
+    /// `GROOMED_BODY` seul rend désormais `dev-groom`, et c'est le correctif,
+    /// pas une régression.
     #[tokio::test]
     async fn mika2470_the_handler_decides_groom_vs_implement() {
-        for (body, expected) in [
-            (UNGROOMED_BODY, "dev-groom_dispatch_prepared"),
-            (GROOMED_BODY, "dev-pilot_dispatch_prepared"),
+        for (body, with_proof, expected) in [
+            (UNGROOMED_BODY, false, "dev-groom_dispatch_prepared"),
+            (GROOMED_BODY, true, "dev-pilot_dispatch_prepared"),
         ] {
-            let db = mem_db();
+            let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+            if with_proof {
+                // L'API d'écriture de production (mika#2310), jamais un
+                // `INSERT` SQL brut : un fixture SQL peut fabriquer exactement
+                // la ligne que la production ne produit pas.
+                crate::db::tests::completed_groom_pair(
+                    &sync_db,
+                    "mika",
+                    &format!("https://github.com/{DEFAULT_REPO}/issues/2470"),
+                    crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
+                );
+            }
+            let db = AsyncDatabase::new_with_agent(sync_db, "mika");
             let fx = test_ctx_fixture();
             let issue = make_issue(2470, body, &["ready"], "t");
             let session = format!("auto-pull-t3-{expected}");

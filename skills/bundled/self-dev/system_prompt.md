@@ -14,7 +14,7 @@ Before executing any workflow, inspect the user's most recent message for these 
 | `implement <repo> project#<n>` (e.g., `implement mika project#5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
 | `implement <repo> issue#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
 | `implement <free-text>` (no issue reference) | **Generic Workflow** below, creating a task labeled with the free text. |
-| `groom <repo>#<n>` or `groom ticket <repo>#<n>` (e.g., `groom mika#214`) | **Grooming Dispatch** below. Do NOT execute the Generic Workflow. |
+| `groom <repo> issue#<n>`, `groom <repo>#<n>` or `groom ticket <repo>#<n>` (e.g., `groom mika issue#214`, `groom mika#214`) | **Grooming Dispatch** below. Do NOT execute the Generic Workflow — **even when the ticket body already carries a `Plan:` callout**. A body callout is a shape, not proof of grooming; the engine refuses a `dev-pilot` dispatch on this turn anyway (mika#2484). |
 | `[GitHub] PR …` / `[GitHub] PR review …` / `[claude-pilot] …` webhook markers | The corresponding webhook skill has priority; fall through to `Webhook Fallthrough` below only if none matched. |
 
 **Self-check while executing:** if you find yourself in Steps 1–3 of the Generic Workflow but the user's original message contained the word "milestone" or "project", STOP. You're on the wrong branch. Go to the Milestone or Project Workflow section and start from Step M1 / P1.
