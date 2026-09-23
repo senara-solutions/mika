@@ -1032,6 +1032,17 @@ impl TaskDispatcher {
         // are captured even if the agent exhausts its step budget.
         if is_callback {
             try_extract_callback_metadata(&self.db, task).await;
+            // mika#2496 U4: the cost half of the "120 turns / 40 USD" rule has
+            // no enforcement point upstream (`_sdk_guardrail_kwargs` ends on
+            // `pass`), so this MEASURES the population instead of pretending to
+            // bound it. Runs right after the metadata write, on the same parsed
+            // fields, and stops nothing.
+            try_report_pilot_cost_overrun(
+                &self.db,
+                task,
+                self.settings.effective_pilot_cost_alert_usd(),
+            )
+            .await;
             // mika#965: Write a human-readable callback summary to task_messages
             // so the dispatch session's next rebuild_context() includes it.
             try_write_callback_summary(&self.db, task).await;
@@ -4232,6 +4243,129 @@ async fn try_dispatch_pilot_after_groom_success(
     }
 }
 
+/// Audit `tool_name` under which a pilot cost overrun is recorded (mika#2496).
+///
+/// **SOLE WRITER.** This module is the only production site that writes it, and
+/// `canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer`
+/// refuses a second one. The property is what makes the operator's
+/// `SELECT count(*), avg(after_value) … WHERE tool_name = 'pilot_cost_overrun'`
+/// an exact count of the population the follow-up ticket has to size, instead
+/// of a number two writers can disagree about.
+pub(crate) const PILOT_COST_OVERRUN_TOOL: &str = "pilot_cost_overrun";
+
+/// Report — never prevent — a finished pilot dispatch whose cost crossed the
+/// alert threshold (mika#2496 U4).
+///
+/// **Retrospective by construction, and that is the whole of what this can be.**
+/// The dollar half of the rule ("kill at 120 turns / 40 USD") has no enforcement
+/// point anywhere: `claude-pilot`'s `_sdk_guardrail_kwargs` carries
+/// `if config.maxBudgetUsd > 0:` and ends on `pass`, and none of its
+/// application-level guardrails (`stallThreshold`, `emptyResponseThreshold`,
+/// `idleTimeoutMs`, `toolWaitCeilingMs`, `modelWaitCeilingMs`) measures dollars
+/// — they all measure time or productivity. So this counts and dates a
+/// population; it stops nothing, and the PR that ships it says so rather than
+/// letting the row read as a brake.
+///
+/// That count is the **explicit precondition** of the follow-up ticket on
+/// `senara-solutions/claude-pilot`: without it, that ticket opens on an
+/// intuition. It is also what tells the two readings of a quiet fleet apart —
+/// see the halt in the root `CLAUDE.md` (probe S4): a mute measurement and a
+/// fleet under the threshold produce the same silence, so a zero count while
+/// runs are known to exceed 40 USD means `extract_callback_fields` is not
+/// parsing `Cost:` on this population, never that all is well.
+///
+/// **An absent `cost_usd` emits nothing, and is never read as `0`** (mika#2331:
+/// `null` is never `0`). A dispatch whose callback carries no cost line is not
+/// a free dispatch; it is an unmeasured one, and reporting it at zero would put
+/// a false member into the very population this exists to size.
+///
+/// Best-effort and fire-and-forget, like its four siblings above: an audit
+/// write that fails warns and returns. Measuring a cost must not be able to
+/// break the delivery of the callback that carries it.
+async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshold_usd: f64) {
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    if extracted.is_null() {
+        return;
+    }
+    let pilot = &extracted["claude_pilot"];
+
+    // Absent → nothing. See the `null` is never `0` note above.
+    let cost_usd = match pilot.get("cost_usd").and_then(|v| v.as_f64()) {
+        Some(c) => c,
+        None => return,
+    };
+    if !(cost_usd > threshold_usd) {
+        return;
+    }
+
+    let turns = pilot.get("turns").and_then(|v| v.as_u64());
+
+    // The ticket coordinates live on the PARENT's `reference_url` — the
+    // callback child carries a pgid and never a reference (the same two-row
+    // topology mika#2279 and mika#2335 had to name). Unresolvable coordinates
+    // downgrade the line, they never suppress it: a cost overrun on a dispatch
+    // whose parent cannot be read is still an overrun, and dropping it would
+    // silently shrink the population.
+    let mut repo = None;
+    let mut issue = None;
+    if let Some(parent_id) = &task.parent_task_id
+        && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
+        && let Some(url) = parent.reference_url.as_deref()
+        && let Some((r, n)) = parse_repo_issue_from_url(url)
+    {
+        repo = Some(r);
+        issue = Some(n);
+    }
+
+    warn!(
+        event = "pilot_cost_overrun",
+        repo = repo.as_deref().unwrap_or("unknown"),
+        issue = issue,
+        task_id = %task.id,
+        cost_usd = cost_usd,
+        turns = turns,
+        threshold_usd = threshold_usd,
+        "engine: pilot dispatch cost crossed the alert threshold (measured, not prevented — \
+         no dollar brake exists upstream)"
+    );
+
+    // `after_value` carries the cost and nothing else: it is what the operator
+    // averages. Repo/issue/turns ride in `reasoning`, which is free text.
+    let reasoning = format!(
+        "repo:{} issue:{} turns:{} threshold_usd:{threshold_usd}",
+        repo.as_deref().unwrap_or("unknown"),
+        issue.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+        turns.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+    );
+    let session_id = task
+        .created_by_session
+        .clone()
+        .unwrap_or_else(|| format!("callback-{}", task.id));
+    if let Err(e) = db
+        .log_audit_event(
+            &session_id,
+            PILOT_COST_OVERRUN_TOOL,
+            &format!("task:{}", task.id),
+            None,
+            Some(&format!("{cost_usd}")),
+            Some(&reasoning),
+            None,
+        )
+        .await
+    {
+        warn!(
+            task_id = %task.id,
+            error = %e,
+            "engine: failed to write pilot_cost_overrun audit event"
+        );
+    }
+}
+
 /// Parse `senara-solutions/<repo>/issues/<n>` from a reference URL.
 /// Returns `(repo, issue_number)` on match, `None` otherwise.
 fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
@@ -5634,6 +5768,223 @@ mod tests {
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
         // Should not panic or error — just returns early
         try_extract_callback_metadata(&db, &task).await;
+    }
+
+    // ===== try_report_pilot_cost_overrun tests (mika#2496 U4 / V5) =====
+
+    /// Build a parent + its callback child carrying `result`, and return the
+    /// loaded callback task. Mirrors the two-row topology production writes:
+    /// the issue URL lives on the PARENT, the dispatch on the child.
+    async fn mika2496_dispatch_pair(db: &AsyncDatabase, result: &str) -> Task {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#2484".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/2484".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("callback-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some(result))
+            .await
+            .unwrap();
+        db.get_task_unscoped(&callback_id).await.unwrap().unwrap()
+    }
+
+    /// The population the follow-up cpp ticket has to size: #2484's own numbers.
+    const MIKA2496_RUNAWAY: &str = "claude-pilot completed (status: done).\n\
+         Session: runaway\n\
+         Turns: 201\n\
+         Cost: $86.00\n\
+         Duration: 9960000ms";
+
+    #[tokio::test]
+    async fn mika2496_a_cost_above_the_threshold_is_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2496_RUNAWAY).await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "mika#2496 — #2484's 86 USD must land in the population the cpp \
+             follow-up ticket is conditioned on"
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == PILOT_COST_OVERRUN_TOOL)
+            .expect("the audit row must be readable from the callback session");
+        // `after_value` carries the cost and nothing else: it is the column the
+        // operator's `avg()` reads.
+        assert_eq!(row.after_value.as_deref(), Some("86"));
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(reasoning.contains("issue:2484"), "reasoning: {reasoning}");
+        assert!(reasoning.contains("turns:201"), "reasoning: {reasoning}");
+    }
+
+    /// **Contrôle négatif.** Without it, "the measurement decides" would be
+    /// indistinguishable from "the measurement fires on every dispatch" — and a
+    /// row written on every callback would drown the very population it exists
+    /// to size.
+    #[tokio::test]
+    async fn mika2496_a_cost_below_the_threshold_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "claude-pilot completed (status: done).\n\
+             Session: nominal\nTurns: 91\nCost: $7.07\nDuration: 996000ms",
+        )
+        .await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2496 — a nominal dispatch must not enter the overrun population"
+        );
+    }
+
+    /// The threshold is the decision, not a constant baked into the predicate:
+    /// the same run is an overrun at 40 and is not at 100.
+    #[tokio::test]
+    async fn mika2496_the_threshold_is_what_decides() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2496_RUNAWAY).await;
+
+        try_report_pilot_cost_overrun(&db, &task, 100.0).await;
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// **`null` is never `0`** (mika#2331). A callback with no `Cost:` line is
+    /// an UNMEASURED dispatch, not a free one; counting it at zero would put a
+    /// false member into the population — and, at any positive threshold, would
+    /// silently make the measurement report fewer overruns than there are.
+    #[tokio::test]
+    async fn mika2496_an_absent_cost_is_not_a_zero_cost() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "claude-pilot completed (status: done).\nSession: unmeasured\nTurns: 201",
+        )
+        .await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2496 — an absent cost must emit nothing, never a zero"
+        );
+    }
+
+    /// Unresolvable ticket coordinates DOWNGRADE the line, they never suppress
+    /// it. An overrun on a dispatch whose parent cannot be read is still an
+    /// overrun, and dropping it would silently shrink the population.
+    #[tokio::test]
+    async fn mika2496_an_orphan_dispatch_still_counts() {
+        let db = test_db();
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some(MIKA2496_RUNAWAY))
+            .await
+            .unwrap();
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     // ===== try_write_callback_summary tests (mika#965) =====
