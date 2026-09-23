@@ -337,7 +337,7 @@ _pilot_max_turns() {
         # Le ROLLBACK, explicite : le drapeau ne sera pas passé.
         _PILOT_MAX_TURNS=""
         _PILOT_MAX_TURNS_SOURCE="env"
-    elif printf '%s' "$PILOT_MAX_TURNS" | grep -qE '^[1-9][0-9]*$'; then
+    elif grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
         _PILOT_MAX_TURNS="$PILOT_MAX_TURNS"
         _PILOT_MAX_TURNS_SOURCE="env"
     else

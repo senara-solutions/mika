@@ -4299,7 +4299,12 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
         Some(c) => c,
         None => return,
     };
-    if !(cost_usd > threshold_usd) {
+    // `partial_cmp` rather than `cost_usd <= threshold_usd`: the two differ on an
+    // incomparable value, and the difference runs the wrong way. A NaN cost is an
+    // UNMEASURED dispatch, so it must fall OUT of the population — which is what
+    // `!= Some(Greater)` says, and what `<=` would silently invert into a reported
+    // overrun carrying a garbage figure. Same rule as the absent `cost_usd` above.
+    if cost_usd.partial_cmp(&threshold_usd) != Some(std::cmp::Ordering::Greater) {
         return;
     }
 
