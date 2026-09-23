@@ -7329,7 +7329,13 @@ _rescue_touches_tracked_tree() {
         _measured=1
         seg="${f%%/*}"
         # A file at the repo root has itself as its first segment.
-        if printf '%s\n' "$_tree" | grep -qxF -- "$seg"; then
+        # Here-string, never `printf … | grep -q` (mika#2055): `grep -q` exits at
+        # the first match and closes the pipe, the producer takes SIGPIPE and
+        # exits 141, and under the `pipefail` this library is sourced into that
+        # 141 becomes the pipeline's status — so a segment that IS known would
+        # read as unknown, which is the exact direction that refuses a real
+        # implementation. A here-string has no pipeline and no SIGPIPE.
+        if grep -qxF -- "$seg" <<<"$_tree"; then
             return 0
         fi
     done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
