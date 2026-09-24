@@ -117,7 +117,8 @@ déjà payé.
 | le modèle du pin de format de fil | `mika2420_les_motifs_sont_un_format_de_fil` | `worktree_reaper.rs:2235` |
 | la cadence | `WORKTREE_REAP_CRON` | `server/mod.rs:119` |
 | le nom SOLE WRITER à ne pas réutiliser | `REAPED_TOOL = "worktree_reaped"` | `worktree_reaper.rs` |
-| `flock` sans crate nouvelle | `libc.workspace = true` | `crates/mika-agent/Cargo.toml:76` |
+| `flock` sans crate nouvelle | `libc.workspace = true`, **sous `[target.'cfg(target_os = "linux")'.dependencies]`** | `crates/mika-agent/Cargo.toml:75-76` |
+| le patron d'appel `libc` gardé, avec son repli nommé | `is_same_process_alive` (`#[cfg(target_os = "linux")]` interne) | `task_engine/process_liveness.rs:52` |
 | les tests en tmpdir | `tempfile.workspace = true` (dev-dep) | `crates/mika-agent/Cargo.toml:80` |
 
 Conséquence directe pour U2 : la population n'est pas à recalculer. C'est
@@ -159,10 +160,34 @@ le seul candidat retenu — le dernier point où le refus est encore gratuit).
 ### P5 : le mécanisme, nommé — et il n'ajoute aucune dépendance
 
 `flock(2)` n'est pas exposé par `std`, donc ce terme pourrait exiger une crate nouvelle.
-**Il n'en exige aucune** : `libc` est déjà une dépendance de `crates/mika-agent`
-(`libc.workspace = true`, `Cargo.toml:76`), et `libc::flock(fd, LOCK_EX | LOCK_NB)`
-suffit — acquisition **non bloquante**, relâchée immédiatement, jamais une attente à
-l'intérieur d'un tick.
+**Il n'en exige aucune** : `libc` est déjà une dépendance de `crates/mika-agent`, et
+`libc::flock(fd, LOCK_EX | LOCK_NB)` suffit — acquisition **non bloquante**, relâchée
+immédiatement, jamais une attente à l'intérieur d'un tick.
+
+**Mais la dépendance est conditionnée à Linux**, et l'écrire « déjà présente » sans
+cette réserve casse le build ailleurs. `libc` vit sous
+`[target.'cfg(target_os = "linux")'.dependencies]`, donc `cargo_build_lock_is_free`
+suit le patron établi par `is_same_process_alive` : un bloc
+`#[cfg(target_os = "linux")]` **avec un repli non-Linux nommé**, comme le doc-comment
+de ce voisin le fait (« On non-Linux platforms (always returns false — watchdog
+disabled) »). Le sens du repli n'est pas libre : hors Linux le verrou est
+**inévaluable**, donc il **conserve**, et la purge ne fire jamais sur macOS. Rendre
+« libre » y serait purger sur la seule plateforme où l'on ne peut pas vérifier qu'un
+build tourne. La cible de production est Linux (`Dockerfile.agent`, OpenRC), donc le
+coût est nul ; ce qui est en jeu est `cargo build` sur le poste d'un développeur, plus
+la release cross-plateforme.
+
+**Deux absences, deux dispositions opposées — et c'est ce qui se confond.** Les mots se
+ressemblent et les conséquences sont inverses :
+
+| ce qui manque | lecture | disposition |
+|---|---|---|
+| aucun `.cargo-lock` sous `target/` | cargo n'a jamais construit ici | terme **satisfait** → purge permise |
+| l'appel `flock` (non-Linux) | on ne peut pas regarder | **inévaluable** → conserve |
+
+Traiter la première comme la seconde rend le bras inerte sur une population saine
+(c'est le § suivant) ; traiter la seconde comme la première purge à l'aveugle. Deux
+variantes distinctes de `LockProbe`, jamais un booléen.
 
 Le fichier verrouillé est **découvert, jamais deviné** : cargo pose son verrou de build
 sur `<target>/<profil>/.cargo-lock`, et le profil est une donnée de l'invocation (`debug`,
@@ -209,7 +234,11 @@ Un échec de suppression est journalisé et n'échoue jamais le tick.
 
 Aucune migration, aucune clé de config ; quatre variables d'environnement, avec le
 parse maison à trois paliers (absent/vide → défaut ; illisible, `0` ou négatif → défaut
-**plus un WARN nommant la valeur entre guillemets**).
+**plus un WARN nommant la valeur entre guillemets**). Ce parse **existe déjà dans le
+fichier** — `parse_positive_i64` et `parse_positive_usize`, que `config_from_env` utilise
+pour les quatre variables du reaper : les réutiliser, jamais en réécrire un cinquième
+(deux parses du même contrat sont deux parses qui peuvent diverger sur le palier du
+milieu, et c'est le palier qui porte le WARN).
 
 - **`MIKA_TARGET_PURGE`** — kill-switch, **défaut armé**. `0` désarme sans redéploiement.
 - **`MIKA_TARGET_PURGE_DISPOSITION`** — `armed` (défaut) | `observe`. En observation le
@@ -259,10 +288,35 @@ aucune E/S réseau, aucun accès disque hors de ce qu'on lui passe. Plus
 `cargo_build_lock_is_free(target) -> LockProbe` (trois états : libre / tenu /
 **inévaluable**, ce dernier conservant).
 
-**U2 — la collecte et la disposition.** Branchement à la fin de `reap_terminal_worktrees`,
-sur les refus `pr_open` du même tick. Suppression gardée, mesure de taille
+**U2 — la collecte et la disposition.** Suppression gardée, mesure de taille
 best-effort via `measure_tree_size` (`bytes_reclaimed` est un `Option` — **`null` n'est
-jamais `0`**, doctrine mika#2331).
+jamais `0`**, doctrine mika#2331 ; et ce walker-là **inclut** `target/`, ce qui est
+précisément l'exigence ici — son doc-comment écrit pourquoi le walker de
+`worktree_activity` ne convient pas).
+
+**Le site de branchement, au plus précis — « à la fin de la fonction » serait faux.**
+Les refus ne sont pas une donnée de fin de fonction : ils sont calculés **par dépôt, à
+l'intérieur de la boucle `for repo_dir in &repo_dirs`**. Le bras se greffe donc dans
+cette boucle, **après** la boucle de disposition du reaper, là où trois choses sont
+vivantes en même temps :
+
+- `screened.refusals` — **et pas `selection.refusals`** : T4 pousse `REASON_PR_OPEN`
+  dans `screen_worktrees`, tandis que `selection.refusals` ne porte que les refus T7
+  (`dirty`, `unpushed_commits`). Filtrer le mauvais vecteur rend une population vide,
+  c'est-à-dire un bras qui se lit comme sain en ne faisant rien (classe mika#2205).
+- `prs_by_branch` — nécessaire au `pr_number` de la surface opérateur (voir plus bas).
+- `budget` — celui du reaper, **à ne pas décrémenter** (le nôtre est distinct).
+
+Greffer après la boucle des dépôts obligerait à accumuler les refus à travers les
+dépôts et perdrait `prs_by_branch` : plus de code pour moins d'information.
+
+**Interaction de budget, à connaître.** Le `if budget == 0 { break; }` du reaper est en
+**tête** de la boucle des dépôts : si le reaper épuise son budget sur le premier dépôt,
+les suivants sont sautés en entier — purge comprise. Avec le défaut (`max_per_tick = 3`
+côté reaper, un seul dépôt dans `MIKA_WORKTREE_REAP_REPO_DIRS`) le cas est théorique, et
+la purge se rattrape au tick suivant (10 min) ; c'est une **borne, pas une perte**. Ne
+pas « réparer » ça en partageant un budget : deux budgets distincts est la décision, et
+la faire dépendre du reaper rendrait la purge muette les jours de gros ménage.
 
 **U3 — les motifs, en format de fil séparé.** `ALL_PURGE_REFUSAL_REASONS`, **distincte**
 de `ALL_REFUSAL_REASONS` : deux populations comptables qui doivent rester
@@ -348,6 +402,12 @@ sans lui, une implémentation qui traiterait l'absence comme `build_lock_unreada
 passerait tous les autres tests en ne purgeant jamais rien. Le second atteste que le
 fichier est **découvert** et non deviné sur le profil `debug`.
 
+**V3c — le repli de plateforme conserve.** Un test `#[cfg(not(target_os = "linux"))]`
+asserte que `cargo_build_lock_is_free` y rend l'état inévaluable (donc conserve), et
+`cargo check` hors Linux fait partie de la vérification (AC11). Sans lui, le sens du
+repli n'est fixé par rien et l'inversion — « libre » hors Linux — passerait tous les
+autres tests en purgeant sur la plateforme où l'on ne peut pas voir un build tourner.
+
 **V4 — les gardes de chemin** : un `target` qui est un lien symbolique vers un arbre
 voisin est refusé, et **la cible existe toujours** après le tick (l'assertion porte sur
 la cible, pas sur le refus — c'est le seul faux positif irréversible de ce livrable).
@@ -396,8 +456,17 @@ SELECT target_key, created_at FROM audit_events
 | `target_purge_would_dispose` | INFO | non vide **en `observe` seulement** | la population du dry-run |
 | `target_purge_failed` | WARN | **vide** | toute occurrence est une suppression refusée par le système de fichiers |
 
-Les refus sont dédupliqués par `(worktree, motif)` sur 24 h, comme chez le reaper
-(doctrine mika#2131) : l'information durable est « ce worktree est tenu par ce motif »,
+**`pr_number` est résolu, pas porté.** `ReapRefusal` porte `path`, `branch` et `reason`
+— rien de plus. Le numéro se lit dans `prs_by_branch` (vivant au site de branchement,
+ci-dessus) via la branche du refus, qui est `Some` sur toute cette population par
+construction (T2 a déjà refusé un HEAD détaché avant que T4 ne puisse pousser
+`pr_open`). Un `pr_number` illisible **dégrade la ligne, ne suspend pas la purge** : le
+champ vaut `null`, sur le modèle de `repo=unknown` (mika#2496) — un worktree purgé dont
+on ne sait pas nommer la PR reste un worktree purgé, et le taire rétrécirait le compte
+en silence.
+
+Les refus sont dédupliqués par `(worktree, motif)` sur 24 h via une clé de la forme de
+`refusal_audit_key`, comme chez le reaper (doctrine mika#2131) : l'information durable est « ce worktree est tenu par ce motif »,
 pas « il l'était encore à 14 h 32 » — la vivacité est le rôle de l'agrégat par tick.
 **Zéro purge et zéro refus ⇒ zéro ligne.**
 
@@ -492,8 +561,12 @@ disque serait un autre mécanisme, avec sa propre population.
    allowlist vide portant son assertion auto-nettoyante.
 9. **AC9 — les tests ne sortent pas de leur tmpdir**, y compris sur les chemins d'échec.
 10. **AC10 — zéro deny hors bac à sable** pendant la session d'implémentation.
-11. **AC11 — aucune dépendance nouvelle.** `Cargo.toml` est inchangé : P5 s'appuie sur
-    `libc`, déjà présent dans `crates/mika-agent`.
+11. **AC11 — aucune dépendance nouvelle, et le build reste multi-plateforme.**
+    `Cargo.toml` est inchangé : P5 s'appuie sur `libc`, déjà présent. Mais comme cette
+    dépendance est conditionnée à Linux, l'AC n'est satisfaite que si `cargo check`
+    passe aussi hors Linux — donc si l'appel est sous `#[cfg(target_os = "linux")]` avec
+    un repli non-Linux qui **conserve**. Un `Cargo.toml` inchangé et un build cassé sur
+    macOS satisferait la lettre de cette AC en la trahissant.
 
 ## Hors périmètre, délibérément
 
