@@ -78,6 +78,41 @@
 //! boot-time et **n'ont toujours pas d'interrupteur** : leur arrêt ne détruit
 //! rien, et livrer des gestes que personne n'a demandés reste du YAGNI.
 //!
+//! # [`AUTO_PULL_SCAN`] est le frein de dispatch de la boucle (mika#2498)
+//!
+//! Son nom dit un scan ; sa **portée** est plus large, et la confondre avec son
+//! nom a coûté un incident. Le 2026-09-23, la sentinelle posée à 05:38 a bien
+//! court-circuité le tick du feeder — et un implement est parti quand même à
+//! 06:11:39Z, parce qu'un groom convergé enchaîne sur son implémentation par
+//! l'**auto-fire moteur** ([`crate::task_engine`], mika#1614), qui ne passe par
+//! aucun tick. L'opérateur croyait avoir arrêté la boucle ; il n'avait arrêté
+//! qu'une de ses deux portes.
+//!
+//! **Ce n'est pas une décision distincte, donc pas un second fichier.** Le
+//! critère de mika#2420 est *« une décision distincte mérite un fichier
+//! distinct »* — or les deux routes ont la **même sortie** (un dispatch
+//! dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis
+//! dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un
+//! opérateur qui arrête l'une et pas l'autre n'a rien arrêté — c'est exactement
+//! l'incident. La sentinelle est donc élargie **dans son sens**, pas dupliquée.
+//! Scinder aurait garanti que le geste de mémoire musculaire — poser le fichier
+//! de l'incident — rende le comportement d'aujourd'hui en ayant l'air d'arrêter.
+//!
+//! **Le critère pour un futur consommateur**, et il n'est pas « suis-je un
+//! scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire
+//! cette sentinelle — quelle que soit la porte d'entrée. Sinon, il faut un nom
+//! de scan à soi (le critère de mika#2420). C'est ce qui laisse dehors, à
+//! dessein, `verdict_handler` (`block[ac]` / `block[ci]` réparent une PR
+//! ouverte : une **continuation**, pas du travail neuf) et un `ready` posé à la
+//! main pendant un STOP (savoir si un fichier prime sur le geste que
+//! l'opérateur vient de poser est une décision produit, pas substrat).
+//!
+//! **Le refus est convergent, jamais terminal**, et c'est ce qui rend
+//! l'élargissement acceptable : il n'annule pas le groom, ne perd pas le plan
+//! (committé et poussé), n'écrit aucune row. À la levée, le réconciliateur
+//! stuck-ready re-drive le ticket — et pendant le STOP aucun tick ne tourne,
+//! donc **aucun point du budget de re-drive n'est consommé** (mika#2020).
+//!
 //! # Un seul lecteur
 //!
 //! Le prédicat vit **ici** et nulle part ailleurs. Précédent explicite :
