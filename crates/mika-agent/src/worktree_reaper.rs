@@ -1304,7 +1304,7 @@ pub async fn reap_terminal_worktrees(
     let mut bytes_total: u64 = 0;
 
     for repo_dir in &repo_dirs {
-        if budget == 0 {
+        if should_stop_repo_loop(budget, purge_budget, purge_cfg.enabled) {
             break;
         }
 
@@ -1392,96 +1392,108 @@ pub async fn reap_terminal_worktrees(
         }
 
         // T7, puis **le cap, appliqué après le filtre** (leçon mika#2347).
-        let mut work_states = HashMap::new();
-        for candidate in &screened.candidates {
-            let state = collect_work_state(Path::new(&candidate.path), &candidate.branch).await;
-            work_states.insert(candidate.path.clone(), state);
-        }
-        let selection = apply_work_states(screened.candidates, &work_states);
-        for refusal in &selection.refusals {
-            refused += 1;
-            record_refusal(db, session_id, refusal, now, trace_id).await;
-        }
-
-        for candidate in selection.candidates {
-            if budget == 0 {
-                break;
+        //
+        // Enveloppé dans `budget > 0` depuis mika#2511 : la boucle des dépôts ne
+        // casse plus sur le seul budget du faucheur, donc sans cette garde un
+        // budget épuisé ferait payer deux `git` par candidat
+        // (`collect_work_state`) pour une boucle de disposition qui casserait
+        // aussitôt. Tout ce qui **précède** reste inconditionnel —
+        // `probe_main_checkout` (la sonde de saleté mika#2449), le registre, le
+        // remote, `list_prs`, `screen_worktrees` et l'écriture de ses refus :
+        // `screened.refusals` et `prs_by_branch` sont exactement les deux
+        // entrées dont la purge a besoin.
+        if budget > 0 {
+            let mut work_states = HashMap::new();
+            for candidate in &screened.candidates {
+                let state = collect_work_state(Path::new(&candidate.path), &candidate.branch).await;
+                work_states.insert(candidate.path.clone(), state);
             }
-
-            // Re-vérification après canonicalisation : un lien symbolique ou un
-            // chemin fabriqué ne doit atteindre la disposition sous aucune
-            // forme. La garde syntaxique de T1 a déjà refusé `..` et les chemins
-            // relatifs ; celle-ci refuse ce que seul le système de fichiers
-            // peut révéler.
-            if !canonical_path_is_managed(&candidate.path) {
+            let selection = apply_work_states(screened.candidates, &work_states);
+            for refusal in &selection.refusals {
                 refused += 1;
-                record_refusal(
-                    db,
-                    session_id,
-                    &ReapRefusal {
-                        path: candidate.path.clone(),
-                        branch: Some(candidate.branch.clone()),
-                        reason: REASON_OUTSIDE_MANAGED_ROOT,
-                    },
-                    now,
-                    trace_id,
-                )
-                .await;
-                continue;
+                record_refusal(db, session_id, refusal, now, trace_id).await;
             }
 
-            budget -= 1;
-            let size = measure_tree_size(Path::new(&candidate.path));
+            for candidate in selection.candidates {
+                if budget == 0 {
+                    break;
+                }
 
-            let removal = match cfg.disposition {
-                Disposition::Observe => Removal {
-                    removed: false,
-                    parent_removed: false,
-                    branch_deleted: false,
-                },
-                Disposition::Armed => remove_worktree(repo_dir, &candidate).await,
-            };
+                // Re-vérification après canonicalisation : un lien symbolique ou un
+                // chemin fabriqué ne doit atteindre la disposition sous aucune
+                // forme. La garde syntaxique de T1 a déjà refusé `..` et les chemins
+                // relatifs ; celle-ci refuse ce que seul le système de fichiers
+                // peut révéler.
+                if !canonical_path_is_managed(&candidate.path) {
+                    refused += 1;
+                    record_refusal(
+                        db,
+                        session_id,
+                        &ReapRefusal {
+                            path: candidate.path.clone(),
+                            branch: Some(candidate.branch.clone()),
+                            reason: REASON_OUTSIDE_MANAGED_ROOT,
+                        },
+                        now,
+                        trace_id,
+                    )
+                    .await;
+                    continue;
+                }
 
-            if cfg.disposition == Disposition::Armed && !removal.removed {
-                failed += 1;
-                warn!(
-                    event = "worktree_reap_failed",
-                    stage = "remove",
+                budget -= 1;
+                let size = measure_tree_size(Path::new(&candidate.path));
+
+                let removal = match cfg.disposition {
+                    Disposition::Observe => Removal {
+                        removed: false,
+                        parent_removed: false,
+                        branch_deleted: false,
+                    },
+                    Disposition::Armed => remove_worktree(repo_dir, &candidate).await,
+                };
+
+                if cfg.disposition == Disposition::Armed && !removal.removed {
+                    failed += 1;
+                    warn!(
+                        event = "worktree_reap_failed",
+                        stage = "remove",
+                        worktree_path = %candidate.path,
+                        branch = %candidate.branch,
+                        pr_number = candidate.pr_number,
+                        trace_id,
+                        "worktree_reap: `git worktree remove --force` a échoué"
+                    );
+                    continue;
+                }
+
+                disposed += 1;
+                if let Some(b) = size.bytes {
+                    bytes_total = bytes_total.saturating_add(b);
+                }
+
+                // mika#2469 : le triplet (event, tool_name, message) vient d'un seul
+                // site — en `observe` la ligne dit ce qu'elle *ferait*, jamais
+                // « retiré ».
+                let outcome = outcome_for(cfg.disposition);
+                info!(
+                    event = outcome.event,
                     worktree_path = %candidate.path,
                     branch = %candidate.branch,
                     pr_number = candidate.pr_number,
+                    pr_state = %candidate.pr_state,
+                    pr_url = %candidate.pr_url,
+                    bytes_reclaimed = size.bytes,
+                    bytes_reclaimed_truncated = size.truncated,
+                    parent_removed = removal.parent_removed,
+                    branch_deleted = removal.branch_deleted,
+                    disposition = cfg.disposition.as_str(),
                     trace_id,
-                    "worktree_reap: `git worktree remove --force` a échoué"
+                    "{}",
+                    outcome.message
                 );
-                continue;
+                record_reaped(db, session_id, &candidate, &size, cfg.disposition, trace_id).await;
             }
-
-            disposed += 1;
-            if let Some(b) = size.bytes {
-                bytes_total = bytes_total.saturating_add(b);
-            }
-
-            // mika#2469 : le triplet (event, tool_name, message) vient d'un seul
-            // site — en `observe` la ligne dit ce qu'elle *ferait*, jamais
-            // « retiré ».
-            let outcome = outcome_for(cfg.disposition);
-            info!(
-                event = outcome.event,
-                worktree_path = %candidate.path,
-                branch = %candidate.branch,
-                pr_number = candidate.pr_number,
-                pr_state = %candidate.pr_state,
-                pr_url = %candidate.pr_url,
-                bytes_reclaimed = size.bytes,
-                bytes_reclaimed_truncated = size.truncated,
-                parent_removed = removal.parent_removed,
-                branch_deleted = removal.branch_deleted,
-                disposition = cfg.disposition.as_str(),
-                trace_id,
-                "{}",
-                outcome.message
-            );
-            record_reaped(db, session_id, &candidate, &size, cfg.disposition, trace_id).await;
         }
 
         // mika#2497 — le troisième bras, **après** la disposition du faucheur.
@@ -1505,10 +1517,16 @@ pub async fn reap_terminal_worktrees(
         .await;
     }
 
-    if purge_stats.purged > 0 || purge_stats.failed > 0 {
+    // mika#2511 B6 — `would_purge` est dans la condition, et c'est la moitié non
+    // triviale de la veille (c) : corriger le compteur **seul** rendrait
+    // `target_purge_tick` muet dans le mode même que la sonde S0 de mika#2497
+    // prescrit d'utiliser en premier, c'est-à-dire une régression
+    // d'observabilité introduite par un correctif d'observabilité.
+    if purge_stats.purged > 0 || purge_stats.would_purge > 0 || purge_stats.failed > 0 {
         info!(
             event = "target_purge_tick",
             purged = purge_stats.purged,
+            would_purge = purge_stats.would_purge,
             failed = purge_stats.failed,
             refused = purge_stats.refused,
             bytes_reclaimed = purge_stats.bytes,
@@ -1921,6 +1939,19 @@ pub const PURGE_REASON_RECENTLY_ACTIVE: &str = "recently_active";
 pub const PURGE_REASON_MTIME_UNREADABLE: &str = "mtime_unreadable";
 /// Un `cargo` travaille dans ce répertoire : son verrou de build est tenu (P5).
 pub const PURGE_REASON_BUILD_LOCK_HELD: &str = "build_lock_held";
+/// Le verrou était **libre au filtre amont et tenu à l'acquisition** : un
+/// `cargo` a démarré dans la fenêtre que mika#2511 ferme (P5, second étage).
+///
+/// **Motif distinct de [`PURGE_REASON_BUILD_LOCK_HELD`], et c'est tout son
+/// objet** : chaque ligne est une suppression que l'état d'avant mika#2511
+/// aurait laissé passer sur un arbre en cours de build. Fusionner les deux
+/// populations rendrait cette mesure incomptable ; la clé de dédup
+/// [`purge_refusal_audit_key`] porte déjà le motif, donc elles restent
+/// soustractibles sans autre changement.
+///
+/// **Régime attendu : non vide et faible.** Un compte nul ne prouve pas que le
+/// défaut n'existait pas — voir la halte S3 du `CLAUDE.md` racine.
+pub const PURGE_REASON_BUILD_LOCK_RACED: &str = "build_lock_raced";
 /// Le verrou de build n'a pas pu être sondé (P5) — `open` refusé, `flock` en
 /// échec sur autre chose que `EWOULDBLOCK`, ou plateforme non-Linux.
 ///
@@ -1940,6 +1971,10 @@ pub const PURGE_REASON_OUTSIDE_MANAGED_ROOT: &str = "outside_managed_root";
 /// un `tool_name` différent, donc les populations ne se mélangent pas.
 ///
 /// Épinglé par [`tests::mika2497_les_motifs_de_purge_sont_un_format_de_fil`].
+///
+/// mika#2511 y ajoute [`PURGE_REASON_BUILD_LOCK_RACED`] **en queue** : un ajout,
+/// jamais un renommage — aucune population existante ne change de nom ni de
+/// sens, et les `GROUP BY` publiés restent exacts.
 pub const ALL_PURGE_REFUSAL_REASONS: &[&str] = &[
     PURGE_REASON_NO_TARGET_DIR,
     PURGE_REASON_TARGET_NOT_A_DIR,
@@ -1950,6 +1985,7 @@ pub const ALL_PURGE_REFUSAL_REASONS: &[&str] = &[
     PURGE_REASON_BUILD_LOCK_HELD,
     PURGE_REASON_BUILD_LOCK_UNREADABLE,
     PURGE_REASON_OUTSIDE_MANAGED_ROOT,
+    PURGE_REASON_BUILD_LOCK_RACED,
 ];
 
 /// `audit_events.tool_name` (et event tracing) d'une purge **effective**.
@@ -2314,6 +2350,30 @@ pub fn select_target_purges(
     }
 }
 
+/// Quand la boucle des dépôts peut cesser (mika#2511, bloquant (b)).
+///
+/// Les deux bras ont des budgets **distincts** (mika#2497) ; casser sur celui du
+/// faucheur seul prive la purge de tous les dépôts suivants — ce qui contredit
+/// le « budget distinct » revendiqué — **et lui prend aussi la sonde de saleté
+/// mika#2449** : le `break` est en tête du corps de boucle, donc il saute
+/// `probe_main_checkout`, la seule chose qui *date* la prochaine occurrence de
+/// cette classe. Sans date, la requête d'attribution sur `tool_calls` n'a pas de
+/// bornes.
+///
+/// Le terme de la purge intègre son kill-switch : sans lui, un bras désarmé
+/// garderait la boucle vivante pour rien — B4.
+///
+/// Prédicat pur nommé plutôt qu'une conjonction en ligne : il est testable à ses
+/// quatre coins sans monter de dépôt factice, et il est l'endroit où le
+/// raisonnement est écrit.
+pub fn should_stop_repo_loop(
+    reaper_budget: usize,
+    purge_budget: usize,
+    purge_enabled: bool,
+) -> bool {
+    reaper_budget == 0 && (purge_budget == 0 || !purge_enabled)
+}
+
 /// `<worktree>/target`, en chaîne — un seul site le compose.
 pub fn target_dir_of(worktree_path: &str) -> String {
     Path::new(worktree_path)
@@ -2386,6 +2446,187 @@ pub fn inspect_target_dir(worktree: &Path, now: SystemTime) -> TargetState {
     TargetState::Present { idle_secs }
 }
 
+/// Les `.cargo-lock` d'un `target/`, **découverts et jamais devinés**.
+///
+/// Un seul énumérateur, consommé par les **deux** étages de P5 : le filtre
+/// ([`cargo_build_lock_is_free`]) et l'acquisition tenue
+/// ([`acquire_cargo_build_locks`]). Deux énumérations pourraient diverger — le
+/// filtre verrait un profil que l'acquisition ne verrouille pas, c'est-à-dire
+/// le défaut que mika#2511 ferme, reproduit un cran plus bas.
+///
+/// `Err(())` quand l'énumération elle-même a échoué : la population est alors
+/// **inconnue, jamais vide**. Le `bool` dit qu'au moins une entrée n'a pas pu
+/// être inspectée — le terme est alors inévaluable même si les entrées lues
+/// sont libres.
+#[cfg(target_os = "linux")]
+#[allow(clippy::result_unit_err)]
+fn cargo_lock_paths(target: &Path) -> Result<(Vec<PathBuf>, bool), ()> {
+    let Ok(read) = std::fs::read_dir(target) else {
+        return Err(());
+    };
+    let mut paths = Vec::new();
+    let mut partial = false;
+    for entry in read {
+        let Ok(entry) = entry else {
+            partial = true;
+            continue;
+        };
+        let path = entry.path();
+        let Ok(meta) = path.symlink_metadata() else {
+            partial = true;
+            continue;
+        };
+        if meta.is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let lock = path.join(".cargo-lock");
+        if !lock.is_file() {
+            continue;
+        }
+        paths.push(lock);
+    }
+    Ok((paths, partial))
+}
+
+/// Les verrous de build **tenus**, relâchés au `Drop` (mika#2511).
+///
+/// `flock` est relâché par la fermeture du descripteur ; garder les `File`
+/// vivants **est** la totalité du mécanisme. L'`impl Drop` explicite est là
+/// malgré cela, pour la raison que [`probe_one_cargo_lock`] donnait déjà à son
+/// propre site : la fermeture le relâcherait de toute façon, le dire rend
+/// l'intention lisible.
+///
+/// # Ce que tenir le verrou protège, et ce qu'il ne protège pas
+///
+/// `flock(2)` porte sur une *open file description*, donc sur l'inode. Le
+/// `remove_dir_all` supprime `<target>/<profil>/.cargo-lock` en cours de route :
+/// une fois cet unlink passé, un `cargo` qui démarre **crée un nouvel inode** au
+/// même chemin et prend un verrou dessus sans jamais rencontrer le nôtre.
+///
+/// | fenêtre | avant mika#2511 | après |
+/// |---|---|---|
+/// | sonde → début de la suppression | **non protégée** | protégée |
+/// | début de la suppression → unlink du `.cargo-lock` | non protégée | protégée |
+/// | unlink → fin de la suppression | non protégée | **toujours non protégée** |
+///
+/// Le résidu est réel et acceptable pour la raison que mika#2497 a écrite comme
+/// fondement de tout le bras : *un faux positif coûte du temps de rebuild,
+/// jamais une perte* — et un `cargo` qui démarre dans la seconde moitié d'un
+/// `remove_dir_all` est un build de quelques secondes.
+///
+/// Un `rename(target, target.mika-purge-<n>)` ramènerait cette fenêtre à
+/// quelques microsecondes et est **refusé** : le répertoire renommé n'est couvert
+/// par aucun `.gitignore`, donc `git status --porcelain` le liste `??`, donc T7
+/// du faucheur mika#2420 lit le worktree `dirty` et refuse de le retirer — un
+/// orphelin de 40 Go dans un worktree devenu non-retirable, soit le problème que
+/// ce bras existe pour résoudre, aggravé.
+#[must_use = "relâcher le garde avant la suppression rouvre la fenêtre mika#2511"]
+pub struct CargoBuildLockGuard {
+    #[cfg(target_os = "linux")]
+    held: Vec<std::fs::File>,
+}
+
+impl std::fmt::Debug for CargoBuildLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(target_os = "linux")]
+        let n = self.held.len();
+        #[cfg(not(target_os = "linux"))]
+        let n = 0usize;
+        f.debug_struct("CargoBuildLockGuard")
+            .field("held", &n)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CargoBuildLockGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        for file in &self.held {
+            // SAFETY: descripteur valide que nous possédons, encore ouvert.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+/// Ce qu'une tentative d'acquisition a pu dire (mika#2511).
+///
+/// Miroir de [`LockProbe`] côté second étage, avec la même règle de maison :
+/// **un signal qu'on ne peut pas lire n'est jamais un terme satisfait.**
+#[derive(Debug)]
+#[must_use = "une acquisition ignorée relâche ses verrous immédiatement"]
+pub enum LockAcquisition {
+    /// Tous les verrous sont à nous, et le restent tant que le garde vit.
+    Acquired(CargoBuildLockGuard),
+    /// Au moins un verrou est tenu par un `cargo`.
+    Held,
+    /// On n'a pas pu regarder. **Conserve.**
+    Unevaluable,
+}
+
+/// P5, second étage : **acquérir et retenir** les verrous de build de `target/`.
+///
+/// Appelée juste avant la disposition, elle ferme la fenêtre TOCTOU que le
+/// filtre amont laisse ouverte : entre la sonde et le `remove_dir_all` il y a
+/// des points `.await` et une mesure d'arbre, et avec un cap de deux candidats
+/// par tick le **second** a devant lui la suppression complète du premier —
+/// des dizaines de secondes sur 40 Go.
+///
+/// Trois propriétés :
+///
+/// 1. **les `File` sont retenus**, donc les verrous aussi, jusqu'au `Drop` ;
+/// 2. **un seul verrou tenu annule toute l'acquisition**, et les descripteurs
+///    déjà acquis sont relâchés par le `drop` du `Vec` partiel — pas de verrou
+///    orphelin ;
+/// 3. **`Unevaluable` conserve**, comme partout ailleurs dans ce bras. Hors
+///    Linux l'acquisition rend `Unevaluable`, donc la purge n'y fire jamais —
+///    ce qui est déjà le cas aujourd'hui pour le filtre.
+pub fn acquire_cargo_build_locks(target: &Path) -> LockAcquisition {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let Ok((locks, partial)) = cargo_lock_paths(target) else {
+            return LockAcquisition::Unevaluable;
+        };
+        if partial {
+            // La population des profils est incomplète : on ne peut pas tenir
+            // ce qu'on n'a pas su énumérer.
+            return LockAcquisition::Unevaluable;
+        }
+
+        let mut held: Vec<std::fs::File> = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            let file = match std::fs::OpenOptions::new().read(true).open(lock) {
+                Ok(f) => f,
+                // Disparu entre l'énumération et l'ouverture : personne ne le
+                // tient, et il n'y a rien à retenir.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // `held` est relâché par son `Drop` en sortant.
+                Err(_) => return LockAcquisition::Unevaluable,
+            };
+            // SAFETY: `file` est un descripteur valide que nous possédons, et
+            // `LOCK_NB` garantit que l'appel ne bloque jamais.
+            let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if acquired == 0 {
+                held.push(file);
+                continue;
+            }
+            return match std::io::Error::last_os_error().raw_os_error() {
+                // `EWOULDBLOCK == EAGAIN` sous Linux : un `cargo` travaille ici.
+                Some(libc::EWOULDBLOCK) => LockAcquisition::Held,
+                _ => LockAcquisition::Unevaluable,
+            };
+        }
+        LockAcquisition::Acquired(CargoBuildLockGuard { held })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        LockAcquisition::Unevaluable
+    }
+}
+
 /// Sonde un `.cargo-lock` précis. Linux seulement.
 #[cfg(target_os = "linux")]
 fn probe_one_cargo_lock(path: &Path) -> LockProbe {
@@ -2442,28 +2683,15 @@ fn probe_one_cargo_lock(path: &Path) -> LockProbe {
 pub fn cargo_build_lock_is_free(target: &Path) -> LockProbe {
     #[cfg(target_os = "linux")]
     {
-        let Ok(read) = std::fs::read_dir(target) else {
+        // Même énumérateur que [`acquire_cargo_build_locks`] (mika#2511) : un
+        // profil que le filtre voit et que l'acquisition ne verrouille pas
+        // serait un trou silencieux.
+        let Ok((locks, partial)) = cargo_lock_paths(target) else {
             return LockProbe::Unevaluable;
         };
-        let mut unevaluable = false;
-        for entry in read {
-            let Ok(entry) = entry else {
-                unevaluable = true;
-                continue;
-            };
-            let path = entry.path();
-            let Ok(meta) = path.symlink_metadata() else {
-                unevaluable = true;
-                continue;
-            };
-            if meta.is_symlink() || !meta.is_dir() {
-                continue;
-            }
-            let lock = path.join(".cargo-lock");
-            if !lock.is_file() {
-                continue;
-            }
-            match probe_one_cargo_lock(&lock) {
+        let mut unevaluable = partial;
+        for lock in &locks {
+            match probe_one_cargo_lock(lock) {
                 // Un seul verrou tenu suffit, et il l'emporte sur un
                 // inévaluable : c'est l'information la plus spécifique.
                 LockProbe::Held => return LockProbe::Held,
@@ -2506,9 +2734,16 @@ pub fn target_path_is_disposable(target: &Path) -> bool {
 }
 
 /// Ce qu'un tick a fait côté purge.
+///
+/// `purged` et `would_purge` sont **deux compteurs, jamais un seul** (mika#2511,
+/// veille (c) de mika#2469) : incrémenter `purged` en `observe` ferait dire à
+/// l'agrégat `target_purge_tick` qu'un dry-run a supprimé quelque chose.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TargetPurgeStats {
+    /// Suppressions **effectives** (`armed` seulement).
     purged: usize,
+    /// Candidats éligibles non retirés (`observe` seulement).
+    would_purge: usize,
     failed: usize,
     refused: usize,
     bytes: u64,
@@ -2583,30 +2818,68 @@ async fn purge_stale_target_dirs(
         }
         let target = Path::new(&candidate.target_path);
 
-        if !target_path_is_disposable(target) {
-            stats.refused += 1;
-            record_purge_refusal(
-                db,
-                session_id,
-                &TargetPurgeRefusal {
-                    worktree_path: candidate.worktree_path.clone(),
-                    branch: candidate.branch.clone(),
-                    reason: PURGE_REASON_OUTSIDE_MANAGED_ROOT,
-                },
-                now,
-                trace_id,
-            )
-            .await;
-            continue;
-        }
+        // Les deux gardes tardives, dans cet ordre. La première était déjà là :
+        // la sûreté du chemin est re-vérifiée après canonicalisation. La
+        // seconde est mika#2511 — **l'acquisition est le dernier acte avant la
+        // suppression**, et il n'y a entre elles ni `.await`, ni appel réseau,
+        // ni opération non bornée. C'est la propriété que le scan structurel
+        // `mika2511_toute_suppression_est_precedee_de_lacquisition` tient.
+        //
+        // L'acquisition a lieu dans les **deux** dispositions, `observe`
+        // comprise : sans cela `observe` rendrait une population plus large que
+        // ce que `armed` retirerait, et la sonde S0 de mika#2497 — « commencer
+        // en observe et lire la population qui serait retirée » — mentirait sur
+        // son propre objet.
+        let acquisition = if target_path_is_disposable(target) {
+            match acquire_cargo_build_locks(target) {
+                LockAcquisition::Acquired(guard) => Ok(guard),
+                LockAcquisition::Held => Err(PURGE_REASON_BUILD_LOCK_RACED),
+                LockAcquisition::Unevaluable => Err(PURGE_REASON_BUILD_LOCK_UNREADABLE),
+            }
+        } else {
+            Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT)
+        };
+        let guard = match acquisition {
+            Ok(guard) => guard,
+            Err(reason) => {
+                stats.refused += 1;
+                record_purge_refusal(
+                    db,
+                    session_id,
+                    &TargetPurgeRefusal {
+                        worktree_path: candidate.worktree_path.clone(),
+                        branch: candidate.branch.clone(),
+                        reason,
+                    },
+                    now,
+                    trace_id,
+                )
+                .await;
+                continue;
+            }
+        };
 
+        // Le débit suit l'acquisition, et non l'inverse : le cap est un
+        // **plafond d'écritures par tick** (leçon mika#2347, *un cap sur les
+        // écritures, jamais sur les sauts*), et un refus tardif n'écrit rien.
+        // Conséquence assumée : un tick où deux candidats sont refusés à
+        // l'acquisition peut en tenter un troisième — l'acquisition est bon
+        // marché, et le cap borne les tempêtes d'E/S, qui viennent des
+        // suppressions.
         *budget -= 1;
+        // Sous verrou : la mesure porte sur un arbre qu'aucun `cargo` ne peut
+        // plus étendre, et ses 2 s de budget sortent de la fenêtre non protégée
+        // au lieu d'y entrer.
         let size = measure_tree_size(target);
 
         let removed = match cfg.disposition {
             Disposition::Observe => true,
             Disposition::Armed => std::fs::remove_dir_all(target).is_ok(),
         };
+        // Explicite, après la suppression : le `Drop` le ferait en fin
+        // d'itération, le dire ici nomme la borne de la protection.
+        drop(guard);
+
         if cfg.disposition == Disposition::Armed && !removed {
             stats.failed += 1;
             warn!(
@@ -2619,7 +2892,12 @@ async fn purge_stale_target_dirs(
             continue;
         }
 
-        stats.purged += 1;
+        // La dérivation suit la disposition, au même endroit que
+        // [`purge_outcome_for`] — source unique du triplet de surfaces.
+        match cfg.disposition {
+            Disposition::Armed => stats.purged += 1,
+            Disposition::Observe => stats.would_purge += 1,
+        }
         if let Some(b) = size.bytes {
             stats.bytes = stats.bytes.saturating_add(b);
         }
@@ -4608,6 +4886,14 @@ branch refs/heads/fix/live/x
     ///
     /// C'est la correction que mika#2469 a dû apporter à son aîné ; elle est
     /// prise d'emblée ici.
+    ///
+    /// **Corrigé par mika#2511 (veille (c)) :** l'assertion portait
+    /// `stats.purged == 1` en `observe`, ce qui **figeait le défaut** — le
+    /// compteur en mémoire revendiquait une suppression dans un mode qui ne
+    /// supprime rien. Elle porte désormais sur `would_purge`. C'est une
+    /// correction, pas un assouplissement : la moitié durable de ce test
+    /// (`target_purge_would_dispose` écrit, `target_purged` absent) est
+    /// inchangée et reste l'assertion porteuse.
     #[tokio::test]
     async fn mika2497_v5_observe_ne_supprime_rien() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4636,7 +4922,12 @@ branch refs/heads/fix/live/x
         )
         .await;
 
-        assert_eq!(stats.purged, 1, "la détection est inconditionnelle");
+        assert_eq!(stats.would_purge, 1, "la détection est inconditionnelle");
+        assert_eq!(
+            stats.purged, 0,
+            "mika#2511 — `observe` ne revendique aucune suppression, y compris \
+             dans le compteur en mémoire que lit `target_purge_tick`"
+        );
         assert!(target.exists(), "en observe, rien n'est supprimé");
         assert!(target.join("debug/deps/libfoo.rlib").exists());
 
@@ -4864,6 +5155,10 @@ branch refs/heads/fix/live/x
                 "build_lock_held",
                 "build_lock_unreadable",
                 "outside_managed_root",
+                // mika#2511 : **ajout en queue**, jamais un renommage. Aucune
+                // population existante ne change de nom ni de sens, et les
+                // `GROUP BY` publiés restent exacts. Daté dans CLAUDE.md.
+                "build_lock_raced",
             ],
             "renommer un motif est une rupture de format de fil : la dater dans \
              CLAUDE.md, jamais mettre ce test à jour en silence"
@@ -4986,6 +5281,524 @@ branch refs/heads/fix/live/x
             observe.message.contains("non purgé"),
             "le message d'observation doit nier le retrait dans sa propre phrase"
         );
+    }
+
+    // =======================================================================
+    // mika#2511 — tenir le verrou pendant la suppression, découpler les budgets
+    // =======================================================================
+
+    /// Un `.cargo-lock` **tenu**, comme le ferait un `cargo` en cours de build.
+    ///
+    /// Déterministe et sans course : `flock` porte sur l'*open file
+    /// description*, donc deux `open()` du même chemin dans le **même**
+    /// processus obtiennent deux OFD distinctes et la seconde acquisition
+    /// `LOCK_EX|LOCK_NB` échoue avec `EWOULDBLOCK`. Aucun thread, aucun `fork`,
+    /// aucune temporisation.
+    #[cfg(target_os = "linux")]
+    fn hold_lock_file(path: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+        // SAFETY: descripteur valide possédé par le test.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "le test doit pouvoir prendre le verrou");
+        file
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hold_cargo_lock(target: &Path, profile: &str) -> std::fs::File {
+        free_cargo_lock(target, profile);
+        hold_lock_file(&target.join(profile).join(".cargo-lock"))
+    }
+
+    /// Un `.cargo-lock` **libre** dans un profil.
+    fn free_cargo_lock(target: &Path, profile: &str) {
+        let dir = target.join(profile);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".cargo-lock"), b"").unwrap();
+    }
+
+    /// **V1** — un verrou tenu au moment de l'acquisition rend `Held`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mika2511_v1_lacquisition_rend_held_quand_un_verrou_est_tenu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        let _held = hold_cargo_lock(&target, "debug");
+        assert!(matches!(
+            acquire_cargo_build_locks(&target),
+            LockAcquisition::Held
+        ));
+    }
+
+    /// **V2** — aucun `.cargo-lock` du tout : cargo n'a jamais construit ici,
+    /// donc l'acquisition réussit. C'est l'absence qui **satisfait** le terme,
+    /// jamais celle qui le rend inévaluable (la distinction que
+    /// [`LockProbe`] documente et que ce test épingle au second étage).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mika2511_v2_lacquisition_reussit_sans_aucun_cargo_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        assert!(matches!(
+            acquire_cargo_build_locks(&target),
+            LockAcquisition::Acquired(_)
+        ));
+    }
+
+    /// **V3 / AC3** — un `target/` qu'on ne peut pas énumérer est
+    /// **inévaluable**, donc il conserve. La règle de maison, au second étage :
+    /// *un signal qu'on ne peut pas lire n'est jamais un terme satisfait.*
+    ///
+    /// Hors Linux (N5) l'acquisition rend `Unevaluable` par construction — c'est
+    /// la branche `#[cfg(not(target_os = "linux"))]`, et la purge n'y fire
+    /// jamais, exactement comme le filtre amont aujourd'hui.
+    #[test]
+    fn mika2511_v3_un_target_illisible_est_inevaluable_donc_conserve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("il-n-y-a-pas-de-target-ici");
+        assert!(matches!(
+            acquire_cargo_build_locks(&absent),
+            LockAcquisition::Unevaluable
+        ));
+    }
+
+    /// **V4 — le test porteur du ticket.** Le garde tient *réellement* : tant
+    /// qu'il vit, une seconde acquisition rend `Held` ; après `drop`, elle
+    /// réussit.
+    ///
+    /// C'est la propriété que la fenêtre TOCTOU laissait ouverte — la sonde
+    /// prenait le verrou et le relâchait aussitôt, donc rien n'empêchait un
+    /// `cargo` de démarrer entre elle et le `remove_dir_all`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mika2511_v4_le_garde_tient_reellement_le_verrou() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        free_cargo_lock(&target, "debug");
+
+        let guard = match acquire_cargo_build_locks(&target) {
+            LockAcquisition::Acquired(g) => g,
+            other => panic!("acquisition attendue, obtenu {other:?}"),
+        };
+
+        assert!(
+            matches!(cargo_build_lock_is_free(&target), LockProbe::Held),
+            "tant que le garde vit, le filtre amont doit voir le verrou tenu"
+        );
+        assert!(
+            matches!(acquire_cargo_build_locks(&target), LockAcquisition::Held),
+            "tant que le garde vit, une seconde acquisition doit échouer"
+        );
+
+        drop(guard);
+
+        assert!(
+            matches!(cargo_build_lock_is_free(&target), LockProbe::Free),
+            "après `drop`, le verrou doit être relâché"
+        );
+        assert!(matches!(
+            acquire_cargo_build_locks(&target),
+            LockAcquisition::Acquired(_)
+        ));
+    }
+
+    /// **V5** — un verrou dans un profil `release` est vu. Deviner
+    /// `target/debug/.cargo-lock` raterait un build `--release`, c'est-à-dire
+    /// échouerait exactement sur le cas qu'on veut voir.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mika2511_v5_un_verrou_hors_debug_est_vu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        free_cargo_lock(&target, "debug");
+        let _held = hold_cargo_lock(&target, "release");
+        assert!(matches!(
+            acquire_cargo_build_locks(&target),
+            LockAcquisition::Held
+        ));
+    }
+
+    /// **V6** — une acquisition annulée par un verrou tenu ne laisse **aucun
+    /// verrou orphelin** : les descripteurs déjà acquis sont relâchés par le
+    /// `Drop` du `Vec` partiel.
+    ///
+    /// **L'ordre de `read_dir` n'est pas garanti, donc on le *lit* au lieu de le
+    /// supposer** : le profil tenu est le **dernier** de l'énumération réelle,
+    /// ce qui garantit que le premier a bien été acquis puis annulé. Sans cette
+    /// lecture, le test serait muet sur les systèmes de fichiers où le profil
+    /// bloquant sort en tête — vert sans rien avoir exercé (classe mika#2205).
+    ///
+    /// Un compte de descripteurs sur `/proc/self/fd` serait **faux** ici : il
+    /// est par processus, et les tests de ce binaire tournent en parallèle.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mika2511_v6_une_acquisition_annulee_ne_laisse_aucun_verrou_orphelin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        for p in ["p1", "p2", "p3", "p4"] {
+            free_cargo_lock(&target, p);
+        }
+
+        let (locks, partial) = cargo_lock_paths(&target).expect("énumération lisible");
+        assert!(!partial);
+        assert!(
+            locks.len() >= 2,
+            "le scénario a besoin d'au moins deux profils"
+        );
+        let acquired_first = locks.first().unwrap().clone();
+        let blocker = locks.last().unwrap().clone();
+
+        let held = hold_lock_file(&blocker);
+        assert!(matches!(
+            acquire_cargo_build_locks(&target),
+            LockAcquisition::Held
+        ));
+
+        assert!(
+            matches!(probe_one_cargo_lock(&acquired_first), LockProbe::Free),
+            "le premier profil a été acquis puis l'acquisition a été annulée : \
+             son verrou doit avoir été relâché"
+        );
+        drop(held);
+    }
+
+    /// **V7 / AC2** — bout en bout : un `target/` dont le verrou est tenu n'est
+    /// **pas** supprimé, et un refus est écrit.
+    ///
+    /// Le motif observé ici est `build_lock_held`, celui du **filtre amont** :
+    /// `purge_stale_target_dirs` sonde elle-même avant de disposer, donc un
+    /// verrou pris *avant* l'appel est intercepté là et la re-sonde n'est jamais
+    /// atteinte. Fabriquer un `build_lock_raced` de bout en bout demanderait un
+    /// point d'injection dans la fonction de production, c'est-à-dire d'ajouter
+    /// au substrat un crochet dont le seul consommateur serait un test (§ 5.2 du
+    /// plan). Ce qui est attesté à la place : l'unité (V1-V6), le
+    /// **conservatisme** ici, et le scan structurel du § 6 — la seule garde
+    /// capable de voir « quelqu'un a retiré l'acquisition ».
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mika2511_v7_un_target_verrouille_nest_pas_supprime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        let _held = hold_cargo_lock(&target, "debug");
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2511-v7",
+            "trace-v7",
+            &[pr_open_refusal(&wt, "fix/2511/x")],
+            &index(vec![open_pr(2511, "fix/2511/x")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "aucune suppression sous un verrou tenu");
+        assert_eq!(stats.would_purge, 0);
+        assert!(target.exists(), "`target/` doit être intact");
+        assert!(target.join("debug/deps/libfoo.rlib").exists());
+        assert_eq!(stats.refused, 1, "le refus doit être écrit");
+        assert_eq!(budget, 2, "un refus n'écrit rien : il ne doit rien débiter");
+
+        let events = db.get_audit_events("session-2511-v7").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("une ligne de refus doit exister");
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some(PURGE_REASON_BUILD_LOCK_HELD)
+        );
+    }
+
+    /// **V8 / AC4 + AC5** — [`should_stop_repo_loop`] à ses quatre coins,
+    /// kill-switch inclus.
+    #[test]
+    fn mika2511_v8_la_boucle_des_depots_ne_casse_que_sur_les_deux_bras() {
+        // Le faucheur est épuisé mais la purge a du budget : **continuer** —
+        // c'est le bloquant (b), et c'est aussi ce qui rend `probe_main_checkout`
+        // (mika#2449) aux dépôts suivants.
+        assert!(!should_stop_repo_loop(0, 2, true));
+        // Le faucheur a du budget : continuer, quel que soit l'état de la purge.
+        assert!(!should_stop_repo_loop(3, 0, true));
+        assert!(!should_stop_repo_loop(3, 0, false));
+        assert!(!should_stop_repo_loop(3, 2, false));
+        // Les deux épuisés : cesser.
+        assert!(should_stop_repo_loop(0, 0, true));
+        // Faucheur épuisé + purge désarmée : cesser — B4, sans quoi un bras
+        // désarmé garderait la boucle vivante pour rien.
+        assert!(should_stop_repo_loop(0, 2, false));
+        assert!(should_stop_repo_loop(0, 0, false));
+    }
+
+    /// **V9 / AC6 + AC7** — en `observe`, `would_purge` compte et `purged` reste
+    /// à zéro.
+    ///
+    /// Corrige [`mika2497_v5_observe_ne_supprime_rien`], dont l'assertion
+    /// `stats.purged == 1` **figeait le défaut**. C'est une correction, pas un
+    /// assouplissement : la moitié durable de ce test (`target_purge_would_dispose`
+    /// écrit, `target_purged` absent) est inchangée et reste l'assertion
+    /// porteuse.
+    #[tokio::test]
+    async fn mika2511_v9_observe_compte_would_purge_et_pas_purged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2511-v9",
+            "trace-v9",
+            &[pr_open_refusal(&wt, "fix/2511/x")],
+            &index(vec![open_pr(2511, "fix/2511/x")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig {
+                disposition: Disposition::Observe,
+                ..TargetPurgeConfig::default()
+            },
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.would_purge, 1, "la détection est inconditionnelle");
+        assert_eq!(
+            stats.purged, 0,
+            "`observe` ne supprime rien, donc n'en compte aucune"
+        );
+        assert!(target.exists());
+    }
+
+    /// **V10** — contrôle négatif de V9 : en `armed`, c'est l'inverse.
+    ///
+    /// Sans lui, « la dérivation suit la disposition » serait indistinguable de
+    /// « la dérivation suit autre chose qui vaut zéro ».
+    #[tokio::test]
+    async fn mika2511_v10_armed_compte_purged_et_pas_would_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-x");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2511-v10",
+            "trace-v10",
+            &[pr_open_refusal(&wt, "fix/2511/x")],
+            &index(vec![open_pr(2511, "fix/2511/x")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1);
+        assert_eq!(
+            stats.would_purge, 0,
+            "`armed` ne compte aucun « aurait purgé »"
+        );
+        assert!(!target.exists());
+    }
+
+    // -- § 6 : le scan structurel -------------------------------------------
+
+    /// Allowlist du scan — **livrée vide, et elle le reste**.
+    const REMOVE_DIR_ALL_SITES_ALLOWED: &[&str] = &[];
+
+    /// Doctrine mika#2201 : quand le scan tire, **on rend le site conforme, on
+    /// ne l'allowliste pas**. Une allowlist née vide est une place où déposer la
+    /// prochaine infraction.
+    #[test]
+    fn mika2511_lallowlist_du_scan_est_vide() {
+        assert!(
+            REMOVE_DIR_ALL_SITES_ALLOWED.is_empty(),
+            "mika#2201 — la résolution est de rendre le site conforme"
+        );
+    }
+
+    /// Le scan du § 6, **isolé pour être vu rouge sur une fixture**.
+    ///
+    /// Rend `Ok(nombre de fonctions portant une suppression)` ou la liste des
+    /// fonctions fautives. Les lignes de commentaire sont retirées avant
+    /// l'analyse, sur le motif mesuré de mika#2050 : la prose de ce fichier cite
+    /// les jetons qu'elle décrit.
+    fn scan_remove_dir_all_sites(src: &str, allowed: &[&str]) -> Result<usize, Vec<String>> {
+        let removal = format!("remove_dir{}", "_all");
+        let acquisition = format!("acquire_cargo{}", "_build_locks");
+
+        let lines: Vec<&str> = src
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect();
+        let code = lines.join("\n");
+
+        let mut starts: Vec<(usize, String)> = Vec::new();
+        let mut offset = 0usize;
+        for line in &lines {
+            let t = line.trim_start();
+            let is_fn = ["fn ", "pub fn ", "async fn ", "pub async fn "]
+                .iter()
+                .any(|p| t.starts_with(p))
+                || (t.starts_with("pub(") && t.contains(") fn "))
+                || (t.starts_with("pub(") && t.contains(") async fn "));
+            if is_fn {
+                let name = t
+                    .split("fn ")
+                    .nth(1)
+                    .unwrap_or(t)
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                starts.push((offset, name));
+            }
+            offset += line.len() + 1;
+        }
+
+        let mut found = 0usize;
+        let mut offenders = Vec::new();
+        for (i, (start, name)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(code.len(), |(s, _)| *s);
+            let body = &code[*start..end];
+            let Some(rm) = body.find(removal.as_str()) else {
+                continue;
+            };
+            found += 1;
+            if allowed.contains(&name.as_str()) {
+                continue;
+            }
+            match body.find(acquisition.as_str()) {
+                Some(acq) if acq < rm => {}
+                _ => offenders.push(name.clone()),
+            }
+        }
+        if offenders.is_empty() {
+            Ok(found)
+        } else {
+            Err(offenders)
+        }
+    }
+
+    /// **AC10 / § 6** — toute suppression est précédée, **dans la même
+    /// fonction**, d'une acquisition du verrou de build.
+    ///
+    /// Pourquoi un scan et pas un test comportemental : retirer l'acquisition ne
+    /// rend **aucune décision fausse** le jour où on l'écrit — la purge continue
+    /// de purger, V1-V10 restent verts, et seule la fenêtre se rouvre, en
+    /// silence. C'est la classe exacte que
+    /// `mika2342_every_llm_call_is_wrapped_in_a_timeout` a dû fermer par un
+    /// scan, avec la même phrase.
+    ///
+    /// **Contrôle de non-vacuité** : le scan échoue si la suppression n'est
+    /// écrite nulle part en position exécutable — un scan visant un jeton mort
+    /// se lirait exactement comme un scan propre (mika#2496 U4, classe
+    /// mika#2205).
+    #[test]
+    fn mika2511_toute_suppression_est_precedee_de_lacquisition() {
+        let here = include_str!("worktree_reaper.rs");
+        let production = here
+            .split("#[cfg(test)]")
+            .next()
+            .expect("le module porte un `mod tests`");
+        assert!(
+            production.len() < here.len(),
+            "le module de test doit être tronqué — sinon les fixtures du scan \
+             seraient lues comme de la production"
+        );
+
+        match scan_remove_dir_all_sites(production, REMOVE_DIR_ALL_SITES_ALLOWED) {
+            Ok(found) => assert!(
+                found >= 1,
+                "contrôle de non-vacuité : aucune suppression en position \
+                 exécutable — le scan ne vérifie plus rien"
+            ),
+            Err(offenders) => panic!(
+                "mika#2511 — une suppression n'est pas précédée de l'acquisition \
+                 du verrou de build, dans: {}. La fenêtre TOCTOU est rouverte.",
+                offenders.join(", ")
+            ),
+        }
+    }
+
+    /// **Contrôle négatif du scan, vu rouge.** Sans lui, « le scan lit la
+    /// séquence » est indistinguable de « le scan ne lit rien ».
+    #[test]
+    fn mika2511_le_scan_est_vu_rouge_sur_une_suppression_non_gardee() {
+        let fixture = concat!(
+            "fn purge_quelque_chose(t: &Path) {\n",
+            "    let _ = mesure(t);\n",
+            "    let _ = std::fs::remove_dir",
+            "_all(t);\n",
+            "}\n"
+        );
+        assert_eq!(
+            scan_remove_dir_all_sites(fixture, &[]),
+            Err(vec!["purge_quelque_chose".to_string()])
+        );
+    }
+
+    /// **Contrôle négatif miroir, vu vert.** Sans lui, « le scan lit la
+    /// séquence » est indistinguable de « le scan rougit sur toute
+    /// suppression ».
+    #[test]
+    fn mika2511_le_scan_est_vert_sur_une_suppression_gardee() {
+        let fixture = concat!(
+            "fn purge_quelque_chose(t: &Path) {\n",
+            "    let g = acquire_cargo",
+            "_build_locks(t);\n",
+            "    let _ = std::fs::remove_dir",
+            "_all(t);\n",
+            "    drop(g);\n",
+            "}\n"
+        );
+        assert_eq!(scan_remove_dir_all_sites(fixture, &[]), Ok(1));
+    }
+
+    /// L'ordre compte : une acquisition **après** la suppression ne protège
+    /// rien, et le scan doit le dire.
+    #[test]
+    fn mika2511_le_scan_rougit_si_lacquisition_suit_la_suppression() {
+        let fixture = concat!(
+            "fn purge_quelque_chose(t: &Path) {\n",
+            "    let _ = std::fs::remove_dir",
+            "_all(t);\n",
+            "    let g = acquire_cargo",
+            "_build_locks(t);\n",
+            "}\n"
+        );
+        assert!(scan_remove_dir_all_sites(fixture, &[]).is_err());
     }
 
     /// Les clés d'audit sont préfixées `target:` — distinctes de celles du
