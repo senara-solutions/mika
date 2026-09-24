@@ -491,6 +491,35 @@ ou négatif → défaut **plus** un WARN nommant la valeur entre guillemets), ch
 Aucune valeur existante ne bouge : ni `MIKA_QA_CALLBACK_VERDICT_NET`, ni les
 budgets mika#2179, ni les enveloppes LLM, ni le budget d'attente #2163.
 
+## Re-localiser les six sites — l'ancre, jamais le numéro
+
+Ce plan désigne ses sites par numéro de ligne parce que c'est lisible à la
+lecture. **Un numéro de ligne pourrit en silence** — c'est très exactement ce que
+mika#2201 refuse pour son TSV de jetons (« jamais un numéro de ligne, qui pourrit
+en silence ») — et `agent_loop/mod.rs` fait plus de dix mille lignes, donc un
+implémenteur qui arrive après un autre correctif trouvera du code étranger à
+`4297`. Chaque ancre ci-dessous a été **relevée et vérifiée unique** dans
+`agent_loop/mod.rs` à la conception (HEAD `8f844ffb`) ; l'implémenteur les
+re-vérifie avant d'éditer plutôt que de se fier aux numéros.
+
+| ligne | sortie | ancre `grep` (unique) |
+|---|---|---|
+| `1433` | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
+| `3912` | `Done` — texte non vide | `mika#2368 — chemin de sortie 1/2 (texte non vide)` |
+| `4108` | `Done` — texte vide, `Silent` | `Silent-mode-only exit` |
+| `4155` | `Done` — après follow-up (**exclu**) | `agent returned empty text after follow-up` |
+| `4297` | `Done` — Force EndTurn (**P0**) | `Force EndTurn — return Done directly` |
+| `4314` | `MaxStepsExceeded` | `max_steps, "agent exceeded max tool steps"` |
+
+Deux pièges relevés au passage, qui coûteraient chacun une mauvaise édition.
+`agent exceeded max tool steps` **seul** rend trois résultats — un doc-comment de
+`attempt_continuation_turn`, le site `4314`, et le `silent agent exceeded max tool
+steps` de `run_silent_agent` — d'où le préfixe `max_steps,` dans l'ancre. Et le
+`if let Some(flag) = qa_verdict_unmet` des deux sites mika#2368 est
+**littéralement identique** aux deux endroits : seuls les commentaires qui les
+précèdent les distinguent, ce qui est aussi la raison pour laquelle U1e doit
+recopier le **bon** prédicat plutôt que le bloc d'à côté (cf. V2b).
+
 ## Unités d'implémentation
 
 | U | fichier | contenu |
