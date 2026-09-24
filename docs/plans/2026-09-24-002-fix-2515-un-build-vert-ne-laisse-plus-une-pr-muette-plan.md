@@ -502,25 +502,58 @@ implémenteur qui arrive après un autre correctif trouvera du code étranger à
 `agent_loop/mod.rs` à la conception (HEAD `8f844ffb`) ; l'implémenteur les
 re-vérifie avant d'éditer plutôt que de se fier aux numéros.
 
-**Et la dérive est déjà commencée, ce qui est la démonstration de la règle plutôt
-qu'une objection contre elle.** Re-relevé à HEAD `b1b7e7b6` : les six ancres sont
-toujours **présentes et uniques**, mais chaque numéro a glissé — `1433`→`1431`,
-`3912`→`3896`, `4108`→`4112`, `4155`→`4150`, `4297`→`4276`, `4314`→`4312`. Les
-sites de lecture en aval ont bougé de même (`run_silent_agent` : `6480`, `6525`,
-`6570` ; `post_callback_verdict_net` : `824`). Les deux sites mika#2368 (`3900`,
-`4096`), les deux `AgentBusy` (`724`, `1003`) et le commentaire mika#2136
-(`4230`) sont, eux, inchangés. Les numéros de tout ce plan sont donc à lire comme
-**des repères de lecture, jamais comme des adresses** : la table ci-dessus est ce
-qui fait foi.
+**Une version antérieure de ce plan annonçait ici une dérive des numéros, et
+cette annonce était fausse — la rectification est conservée plutôt qu'effacée,
+parce que le piège qui l'a produite attend le prochain lecteur.** Re-relevé à
+HEAD `719ab535` : les six `Ok(LoopResult::…)` sont **toujours** à `1433`, `3912`,
+`4108`, `4155`, `4297`, `4314`, inchangés. Les numéros présentés comme
+« glissés » (`1431`, `3896`, `4112`, `4150`, `4276`, `4312`) sont ceux des
+**ancres** — les commentaires et les logs qui annoncent ces sorties — jamais des
+sorties elles-mêmes. L'arithmétique suffit à le trancher sans rouvrir le
+fichier : une dérive décale tout dans le **même sens**, or `4108`→`4112` monte de
+quatre pendant que les cinq autres descendent. Deux objets distincts, mesurés
+puis soustraits l'un de l'autre.
 
-| ligne | sortie | ancre `grep` (unique) |
-|---|---|---|
-| `1433` | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
-| `3912` | `Done` — texte non vide | `mika#2368 — chemin de sortie 1/2 (texte non vide)` |
-| `4108` | `Done` — texte vide, `Silent` | `Silent-mode-only exit` |
-| `4155` | `Done` — après follow-up (**exclu**) | `agent returned empty text after follow-up` |
-| `4297` | `Done` — Force EndTurn (**P0**) | `Force EndTurn — return Done directly` |
-| `4314` | `MaxStepsExceeded` | `max_steps, "agent exceeded max tool steps"` |
+**Ce que le piège coûte à l'implémenteur, et c'est la raison d'être de ce
+paragraphe :** `grep -n '<ancre>'` ne rend **pas** la ligne du `return`, il rend
+celle de son commentaire — deux lignes plus haut pour la deadline, vingt et une
+pour le Force EndTurn, et quatre plus **bas** pour la sortie Silent, dont le
+commentaire suit son `return` au lieu de le précéder. On ancre pour **retrouver
+le site**, puis on lit le voisinage pour trouver la sortie ; on ne convertit
+jamais une ligne d'ancre en adresse d'édition.
+
+Relevés inchangés à ce même HEAD : les deux sites mika#2368 (`3900`, `4096`), les
+deux `AgentBusy` (`724`, `1003`), `post_callback_verdict_net` (`824`), le
+commentaire mika#2136 (`4230`), et les trois sites de lecture de
+`run_silent_agent` — le `default()` de la sous-branche « deadline trop proche »,
+celui du bras `DeadlineExceeded` (dont le commentaire mika#2368 motive le renvoi
+mot pour mot) et la construction finale. Les numéros de tout ce plan restent à
+lire comme **des repères de lecture, jamais comme des adresses** : la table
+ci-dessous est ce qui fait foi.
+
+**Un dernier écart de vocabulaire, à connaître avant d'éditer le site `4297` :**
+le commentaire mika#2136 qui s'y trouve l'appelle *« a FOURTH exit from
+`run_loop` »* là où ce plan en compte **six**. Les deux sont justes et ne
+comptent pas la même chose — mika#2136 numérotait les sorties qu'il avait à
+couvrir, ce plan énumère toutes celles du corps de `run_loop`. C'est la
+cardinalité **6** que le scan asserte, et elle est relevée, jamais mémorisée.
+
+Les deux colonnes de numéros sont données **séparément** et leur écart est
+explicite : c'est ce que la version antérieure avait confondu, et l'écart signé
+est ce qui rend la confusion impossible à refaire.
+
+| sortie (`return`) | ancre | écart | sortie | ancre `grep` (unique) |
+|---|---|---|---|---|
+| `1433` | `1431` | −2 | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
+| `3912` | `3896` | −16 | `Done` — texte non vide | `mika#2368 — chemin de sortie 1/2 (texte non vide)` |
+| `4108` | `4112` | **+4** | `Done` — texte vide, `Silent` | `Silent-mode-only exit` |
+| `4155` | `4150` | −5 | `Done` — après follow-up (**exclu**) | `agent returned empty text after follow-up` |
+| `4297` | `4276` | −21 | `Done` — Force EndTurn (**P0**) | `Force EndTurn — return Done directly` |
+| `4314` | `4312` | −2 | `MaxStepsExceeded` | `max_steps, "agent exceeded max tool steps"` |
+
+La ligne `4108` est celle qui porte la démonstration : son ancre **suit** son
+`return`. Un implémenteur qui traiterait la colonne « ancre » comme une adresse
+éditerait, à ce site précis, du code situé **après** la sortie qu'il visait.
 
 Deux pièges relevés au passage, qui coûteraient chacun une mauvaise édition.
 `agent exceeded max tool steps` **seul** rend trois résultats — un doc-comment de
