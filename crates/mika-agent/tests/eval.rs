@@ -111,6 +111,11 @@ mod eval {
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
     mod test_image_disposition_1784;
+    // mika#1910 — le tour de continuation dit ce qu'il a produit. Les trois
+    // valeurs que `response_chars` peut prendre y sont les trois populations que
+    // R5 refuse de confondre : `Some(n)` produit, `Some(0)` LA classe, `None`
+    // rien à mesurer.
+    mod test_continuation_response_chars_1910;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
