@@ -2104,6 +2104,93 @@ Optional (le checkout principal est un checkout de déploiement, et `run_shell` 
 - **Gardes.** `scripts/test-guard-shared-checkout.sh` (les trois commandes de M0 **verbatim**, `fa92720d`, `d53b91e3`, les formes mika-dev, F2, F3, hors population, mode worktree inchangé) et `scripts/test-shell-exec-guard.sh` (le branchement, l'arbre du principal **intact** après refus, contrôle positif de fixture, fail-open, dérogation, la variable décide, sole writer du jeton, et le **contrôle négatif vu rouge** : handler dépouillé → M0 passe et salit l'arbre) — `make test-shared-checkout-guard`, CI `shared-checkout-guard-lint`. `test-dispatch-lib.sh` tient à allowlist vide qu'aucun message « recover with … stash apply » de `dispatch-lib.sh` ne nomme `SUB_REPO_DIR` (le site B de `_set_up_worktree` prescrivait le checkout principal — corrigé, il nomme le worktree canonique). `main_checkout_dirty` est SOLE WRITER par scan de source.
 - **Hors périmètre, délibérément :** nettoyer ou committer le checkout principal ; un outil `sync_main` dédié pour mika-dev (l'allow-list D7 est une *tolérance*, l'incapacité serait un handler qui ne sait faire que `fetch` + `merge --ff-only` — préalable : relire les 84 commandes mika-dev sur main) ; l'écriture perdue dans le tmpfs `mika/` du sandbox (forme mika#2205) ; le démarrage pilote non contenu muet (préalable : une mesure qui montre un dispatch sans bwrap — aucune à ce jour).
 
+Optional (purge du `target/` d'un worktree vif — mika#2497):
+- **Le défaut que ça ferme, mesuré.** Chaque pilote / QA reconstruit un `target/` Rust de 15 à 50 Go dans son worktree, et **rien ne le purge tant que le worktree vit**. Nuit du 2026-09-22 : **+90 Go en 8 h**, `/data` à **83 %**, worktrees à **165 Go** — à un cheveu de casser moteur, QA et builds. Nettoyé à la main. Le faucheur terminal (mika#2420) ne voit pas cette population : son terme T4 exige **« aucune PR ouverte »**, donc un worktree dont la PR est ouverte lui est refusé sous le motif `pr_open` et son `target/` vit aussi longtemps que la PR. C'est le *suivi HALT-2* que mika#2420 nomme dans son propre corps.
+- **Troisième bras du tick `worktree_reap`, après le faucheur**, et l'ordre est nécessaire : ce que le faucheur vient de retirer n'existe plus. La population est **exactement** l'ensemble de ses refus `pr_open` du même tick — une donnée déjà en mémoire, sans une requête de plus, et tout le coût (`git worktree list`, l'unique `gh pr list` par dépôt, l'énumération de `/proc`, la sentinelle STOP, la déduplication des refus) est déjà payé. Cadence inchangée, aucun `PeriodicScan` nouveau, aucune row récurrente, aucune migration.
+- **L'asymétrie est INVERSE de celle du faucheur, et c'est ce qui autorise à toucher un worktree vif.** *Le faucheur supprime du travail potentiel ; ce bras supprime du dérivé pur.* Un `target/` est intégralement reconstructible par `cargo build`, donc le coût d'un faux positif est **borné à du temps de rebuild**, jamais à une perte — l'exact inverse du *« un faux positif détruit des heures de travail, irréversiblement »* qui gouverne mika#2420. **Ce que l'asymétrie n'autorise PAS :** supprimer `target/` **pendant** un `cargo build` casse ce build. Le danger n'est pas la perte de données, c'est la **concurrence**, et tout le prédicat porte là-dessus.
+- **Cinq termes conjonctifs, tous fail-safe vers *conserver*, sans exception.** P1 le chemin est managé (re-vérifié **après canonicalisation** juste avant la disposition) ; P2 `<worktree>/target/` existe et est un **répertoire**, jamais un lien symbolique ; P3 aucun processus vivant n'a son cwd sous le worktree ; P4 inactivité, sur le mtime maximum d'un ensemble **borné et déclaré** (`target/`, ses enfants directs, et les enfants de ceux-ci — profondeur 2, quelques centaines de `stat`, aucune troncature possible) ; P5 **aucun cargo ne travaille ici**, par `flock` non bloquant. `LiveCwds::Unavailable` conserve tout, exactement comme chez le faucheur.
+- **Pourquoi P5 existe.** P3 est **connu pour être troué**, et mika#2420 l'écrit lui-même : un processus peut travailler dans un worktree sans y avoir son cwd (`cargo --manifest-path`, `git -C`, un éditeur lancé ailleurs). Chez le faucheur ce trou était couvert **par la conjonction** — un tel processus travaille sur une branche dont la PR est ouverte (exclu par T4) ou produit des modifications non committées (exclu par T7). **Ici cette couverture disparaît : la PR est ouverte par définition de la population.** P5 rend ce que T4 apportait, indépendamment du cwd et de tout délai. P4 et P5 ne sont pas redondants et leur ordre est le motif de mika#2184 : **le proxy filtre d'abord** (P4, quelques `stat`, écarte la quasi-totalité), **la mesure directe tranche ensuite** (P5, sur le seul candidat retenu, dernier point où le refus est gratuit).
+- **Le verrou est DÉCOUVERT, jamais deviné.** Cargo pose son verrou sur `<target>/<profil>/.cargo-lock` et le profil est une donnée de l'invocation, donc le terme énumère les enfants directs de `target/` et sonde chaque `.cargo-lock` trouvé ; **un seul verrou tenu suffit à refuser**. Deviner `target/debug/.cargo-lock` raterait un build `--release`, c'est-à-dire échouerait exactement sur le cas qu'on veut voir.
+- **Deux absences, deux dispositions OPPOSÉES — et c'est ce qui se confond.** Aucun `.cargo-lock` sous `target/` ⇒ cargo n'a jamais construit ici ⇒ terme **satisfait**, purge permise. L'appel `flock` indisponible (non-Linux) ⇒ on ne peut pas regarder ⇒ **inévaluable**, conserve. Traiter la première comme la seconde rend le bras **inerte sur une population saine** tout en se lisant comme un disque sain (classe mika#2205) ; traiter la seconde comme la première purge à l'aveugle.
+- **Aucune dépendance nouvelle, et le build reste multi-plateforme.** `libc` est déjà là, mais **sous `[target.'cfg(target_os = "linux")'.dependencies]`** — d'où un repli non-Linux **explicite qui conserve**, sur le patron de `is_same_process_alive`. Rendre « libre » hors Linux serait purger sur la seule plateforme où l'on ne peut pas vérifier qu'un build tourne. Un `Cargo.toml` inchangé et un build cassé sur macOS satisferait la lettre de cette contrainte en la trahissant.
+- `MIKA_TARGET_PURGE` — kill-switch, **défaut armé**. `0`/`false`/`off`/`no` désarment sans redéploiement ; absent, vide ou **non reconnu** laissent armé, avec un WARN nommant la valeur entre guillemets — un désarmement par coquille sur un frein de disque serait la panne silencieuse que tout ceci ferme. Désarmé, le bras n'écrit **rien** : il ne « refuse » pas, il n'existe pas ce tick.
+- `MIKA_TARGET_PURGE_DISPOSITION` — `armed` (défaut) | `observe`. En observation le bras mesure, journalise et **ne supprime rien** (`target_purge_would_dispose`, jamais `target_purged`). Patron mika#2249 : *la détection est inconditionnelle, seule la disposition est gatée* — et la correction de mika#2469 est prise d'emblée plutôt qu'après coup.
+- `MIKA_TARGET_PURGE_IDLE_SECS` — fenêtre P4, **défaut `14400` (4 h)**, bornée des deux côtés : en dessous, une boucle QA → CI-fix active enchaîne en minutes et se ferait purger son cache entre deux itérations ; au-dessus, la fenêtre nocturne de 8 h qui a produit l'incident cesse d'être mordue.
+- `MIKA_TARGET_PURGE_MAX_PER_TICK` — **défaut `2`**, budget **distinct** de celui du faucheur (un budget partagé ferait manger au faucheur le sien, ou l'inverse). Un `remove_dir_all` de 40 Go est une tempête d'E/S : ce cap est ce qui l'étale. Les trois clés numériques suivent le parse maison à trois paliers, et le `0` **ne désarme pas** — c'est le rôle du kill-switch.
+- **Disposition propre, sentinelle STOP PARTAGÉE.** Disposition propre parce que les deux létalités diffèrent d'un ordre de grandeur : coupler forcerait l'opérateur à régler les deux sur la plus prudente, et donc à perdre la purge dès qu'il veut observer le faucheur. Sentinelle **partagée** (`~/.mika/state/worktree-reap-stop`, mika#2329) parce que la décision d'urgence est **la même** — « arrête ce qui supprime dans les worktrees ». Le court-circuit existant est en tête de tick, donc il couvre le nouveau bras sans une ligne.
+- **Livré armé, et l'argument est celui de l'asymétrie.** mika#2420 a shippé armé en s'appuyant sur mika#2272 (*« zéro était l'absence de mesure, pas la présence de prudence »*) ; l'argument est plus fort ici, le pire cas d'un faux positif étant un rebuild et non une perte. Ce qui paie la prudence est nommé et concret : les cinq termes fail-safe, la garde directe P5, le mode observe, la sentinelle partagée, le kill-switch — **et la sonde S0, qui prescrit de commencer en `observe`**.
+
+### SQL
+
+```sql
+-- Ce que la boucle a purgé (SOLE WRITER)
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'target_purged' ORDER BY created_at DESC;
+
+-- Ce qui AURAIT été purgé, en observation
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'target_purge_would_dispose' ORDER BY created_at DESC;
+
+-- La distribution des refus : la forme réelle de la population
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'target_purge_skipped' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. Qu'a-t-on purgé, et combien ça a rendu ?
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{worktree_path, branch, pr_number, idle_secs, bytes_reclaimed}'
+
+# 2. CONTRÔLE POSITIF — le bras tourne-t-il seulement ?
+grep target_purge_tick "$MIKA_SPIRIT_LOG_FILE" | tail
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `target_purged` | INFO | **non vide, quelques-uns par jour** | chaque ligne est du disque rendu sans geste humain |
+| `target_purge_tick` | INFO | émis **seulement quand le tick agit** | son silence avec zéro purge ne prouve **rien** — voir Halte 2 |
+| `target_purge_would_dispose` | INFO | non vide **en `observe` seulement** | la population du dry-run |
+| `target_purge_failed` | WARN | **vide** | toute occurrence est une suppression refusée par le système de fichiers |
+
+- **`pr_number` est résolu, pas porté.** Le refus du faucheur ne transporte que le chemin, la branche et le motif ; le numéro se lit dans l'index des PR du tick. Un `pr_number` illisible **dégrade la ligne, ne suspend pas la purge** (le champ vaut `null`, modèle `repo=unknown` de mika#2496) — un worktree purgé dont on ne sait pas nommer la PR reste un worktree purgé, et le taire rétrécirait le compte en silence.
+- Les refus sont dédupliqués par `(worktree, motif)` sur 24 h (doctrine mika#2131) : l'information durable est « ce `target/` est tenu par ce motif », pas « il l'était encore à 14 h 32 » — la vivacité est le rôle de l'agrégat par tick. **Zéro purge et zéro refus ⇒ zéro ligne.** Les clés d'audit sont préfixées `target:`, distinctes du `worktree:` du faucheur, pour que les deux populations restent soustractibles.
+
+### Sondes post-déploiement — **gestes opérateur, jamais du pilote**
+
+**S0 — commencer en `observe`.** Poser `MIKA_TARGET_PURGE_DISPOSITION=observe` et lire la population que le bras *retirerait* (`target_purge_would_dispose`). Le cap par tick (`2`) vaut **aussi en observation** : laisser tourner `ceil(N / 2)` ticks — jusqu'à ce qu'un tick ne nomme plus de worktree que `SELECT DISTINCT target_key` n'ait déjà rendu — puis armer. Armer après un seul tick retirerait les N−2 autres sans les avoir jamais vus en dry-run.
+
+**S1 — le symptôme (7 jours).** `df -h /data` : la montée nocturne cesse de rapprocher le seuil. `du -sh` sur la racine des worktrees : le total se stabilise nettement sous les 165 Go mesurés. **C'est la vérification en service, et c'est un geste d'opérateur sur l'hôte réel — aucun pilote ne l'exécute.**
+
+**S2 — l'attribution.** La requête `target_purged` doit être non vide, et croiser des worktrees dont la PR était bien **ouverte** — c'est la preuve que la population servie est celle qui est visée, et non celle de mika#2420.
+
+**S3 — non-régression de la boucle.** Aucune plainte de rebuild intempestif sur une itération QA → CI-fix. Le signal direct est la distribution de `target_purge_skipped` : `recently_active` doit **dominer** — c'est la fenêtre qui protège le travail en cours.
+
+### Les quatre haltes
+
+**Halte 1 — un build cassé par la purge.** `touch ~/.mika/state/worktree-reap-stop` **immédiatement**, puis diagnostiquer. C'est le seul mode de panne coûteux, et il ne se règle pas en bougeant un seuil : établir lequel de P3, P4 ou P5 a lu vrai alors qu'il était faux.
+
+**Halte 2 — zéro purge et zéro ligne du tout.** On ne peut **rien** conclure. Vérifier d'abord le contrôle positif (`target_purge_tick`), puis que le binaire servi porte le correctif (classe mika#2340) — *une ligne absente ne prouve rien tant qu'on n'a pas établi que le binaire qui tourne sait l'écrire*. Zéro purge avec un tick qui agit est sain ; zéro des deux ne prouve rien.
+
+**Halte 3 — `/data` remplit encore alors qu'aucun worktree inactif ne porte de `target/`.** **Ne pas raccourcir la fenêtre par réflexe** : ce serait purger le cache de travail en cours pour un problème de dimensionnement. La cause est alors le **pic de production simultanée**, que ce livrable ne borne pas. Ouvrir le suivi `CARGO_TARGET_DIR` partagé **avec la mesure**, jamais avec l'intuition.
+
+**Halte 4 — `build_lock_unreadable` ou `mtime_unreadable` domine.** Le bras est silencieusement inerte par fail-safe : il tourne et ne purge jamais rien, ce qui se lit exactement comme un disque sain (classe mika#2205). Établir pourquoi ces signaux sont illisibles **avant** de toucher au prédicat.
+
+### Ce que ce travail n'achète PAS
+
+**Il borne l'accumulation, il ne borne pas le pic.** Si les N worktrees de la nuit du 22 compilaient tous réellement, aucun n'était inactif et la purge n'aurait rien attrapé **pendant** la montée — elle attrape le résidu après. Borner le pic demande soit un `CARGO_TARGET_DIR` partagé (refusé, voir ci-dessus), soit une limite de concurrence de dispatch. **C'est la limite honnête de ce livrable, et c'est la Halte 3.** Il ne mesure pas le disque et n'a aucun seuil de remplissage : il ne sait pas que `/data` est à 83 %, il sait qu'un `target/` est inactif.
+
+### Hors périmètre, délibérément
+
+- **`CARGO_TARGET_DIR` partagé** — refusé sur trois motifs : cargo prend un **verrou exclusif** sur son répertoire de build, donc deux pilotes concurrents se **sérialisent**, ce qui couple la boucle à un mutex de build au moment même où `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` existe pour la découpler ; un target partagé entre branches divergentes **accumule** et invalide en cascade, sans GC ; et c'est un changement structurel de la performance de build, **non mesuré**. **Suivi**, dont la précondition est la Halte 3.
+- **Une purge à la fin de chaque dispatch** (`dispatch-lib.sh`) — elle détruit le cache entre l'implement et les itérations QA / CI-fix qui suivent **sur le même worktree** : on échangerait du disque contre de la latence de boucle sur le chemin **nominal**, alors que le défaut mesuré est un résidu **nocturne**.
+- **Le pic de production simultanée** et toute limite de concurrence de dispatch.
+- **`scripts/mika-platform-worktree-cleanup`** — vit dans `mika-platform`, structurellement hors d'atteinte du pilote (le worktree de dispatch ne matérialise que le sous-dépôt `mika/`), et ce dépôt garde son invariant zéro-issue.
+- **Le faucheur terminal mika#2420** — inchangé, population disjointe.
+- **Un déclencheur par pression disque** (`df` sous seuil) — autre mécanisme, autre population, aucune mesure ne le demande aujourd'hui.
+- **La purge du `target/` du checkout principal** — ce n'est pas un worktree managé, et P1 l'exclut par construction.
+
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
 **Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
