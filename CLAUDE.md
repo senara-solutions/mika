@@ -266,13 +266,15 @@ After KG-related deploys, four signals tell you the fix is working. The second r
 - **Signal N — wip-rescue staleness probe (#1631).** `grep stale-against-main` in GitHub PR labels — any open draft PR with this label has a type-incompatible rebase against current main. The `wip-staleness-check` workflow runs on every push to main and probes all `wip(` titled or `wip-rescue` labelled draft PRs. Operator action: rebase the branch, fix clippy errors, then promote from draft.
 - **Signal P — phantom sweep telemetry (mika#1712, mika#2156).** `grep phantom_sweep_complete $MIKA_SPIRIT_LOG_FILE | jq '{source, count, spared_count, lookup_error_count, agent_id}'` — one INFO line per sweep pass with `source` in `{"startup_sweep","watchdog_tick"}` (startup fires once per restart; watchdog fires on every 60-tick DB scan when at least one row was swept, spared, errored, or skipped). **Since mika#2156, `count: 0` with `spared_count > 0` is the healthy shape, not an anomaly** — it means the liveness guard withheld a transition because the row's dispatch is still running. A spared row is re-selected and re-spared on every pass (sparing writes no status change), so one dispatch running past the grace window emits one line pair per minute until it finishes; that is expected, not a leak. Steady state with no dispatch in flight: mostly silent, occasional non-zero `count` as genuine orphans age past the grace window then get swept. Anomaly signal: `grep phantom_sweep_large_backlog $MIKA_SPIRIT_LOG_FILE` should return zero lines after the first post-deploy startup — any hit means a single sweep pass transitioned > 100 rows, which feeds mika#1934's cause-racine investigation immediately. Audit-events SQL surface: `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'phantom_aged_out'` (rows actually transitioned since deploy) and its mika#2156 sibling `... WHERE tool_name = 'phantom_sweep_spared'` (transitions the liveness guard withheld). The two names are deliberately distinct so the first keeps meaning "swept". Config surface: `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default `14400` since mika#2156) tunes the AC3 watchdog grace window; startup sweep (AC5) always runs at age=0 and is unaffected. Both paths spare a row whose dispatch child process is still alive — `grep phantom_sweep_spared $MIKA_SPIRIT_LOG_FILE | jq '{source, task_id, child_task_id, process_id}'` shows each withheld transition. Anomaly signal for the guard itself: a non-zero `unusable_child_count` means a dispatch child carried a PID but no readable `process_start_time`, so the guard could not rule out PID reuse and fell back to sweeping — that is the one path that silently returns the sweeper to its pre-mika#2156 behaviour, so a persistent non-zero count there deserves investigation. A non-zero `lookup_error_count` means rows were skipped because the child lookup failed; they are re-examined on the next pass.
 - **Signal Q — pilot secret-channel delivery (mika#2039, sink corrected by mika#2050).** `grep -l '^dispatch-lib: sandbox secret' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — emitted by the sandbox entrypoint prologue when a secret file bound into the pilot sandbox is unreadable or empty. **The sink is the per-dispatch stderr file, never `$MIKA_SPIRIT_LOG_FILE`** — this entry named the latter until mika#2050 and the command returned nothing whatever the state. `$_PILOT_SECRET_PROLOGUE` is prepended to the `bwrap` invocation inside `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` and then persists to `$_PILOT_LOG_DIR/<task-id>.stderr`; Signal S below carries the full trajectory and the same two halts apply. Steady state: zero lines. Any hit means the pilot started **without** `GH_TOKEN`, so it will run a full session and then fail at `git push` / `gh pr create` — the diagnostic exists so that late failure is traceable to the channel rather than misread as pilot drift. The token no longer travels through `bwrap --setenv` (that put it in the world-readable process argv); it is materialised as a `0600` file under `/run/mika-pilot-secrets/` inside the sandbox. Two CI guards hold the invariant — `make test-sandbox-secret-argv` (no credential-shaped value reaches the argv or the `BASH_XTRACEFD` trace) and `make verify-no-secret-in-setenv` (deny-by-default over the `--setenv` allowlist) — and `scripts/canary-pilot-containment` PART 0 probes a live sandbox's argv on the host after a deploy.
-- **Signal S — pilot started without the network cut (mika#2041, mika#2050).** `grep -l '^dispatch-lib: .*falling back to fs-only' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — one file per dispatch whose Phase 2b egress proxy did not take, so the pilot ran with **filesystem containment only and no network cut**. **Steady state: zero occurrences.** This is not a counter that tolerates a background noise floor; the state it announces is degraded-but-functional — nothing breaks, no dispatch fails, no PR goes missing — which is precisely the shape that survives for days unnoticed, and is what mika#2041 measured on 2026-08-29 (four minutes of dispatches without egress and not one line to say so). **Anomaly: any occurrence.**
+- **Signal S — the egress relay did not serve (mika#2041, mika#2050, posture inverted by mika#2049, predicate repaired by mika#2051).** `grep -l '^dispatch-lib: pilot_egress_guard\.' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — one file per dispatch whose Phase 2b egress relay did not serve. **Steady state: zero occurrences. Anomaly: any occurrence.** **Canonical surface: `docs/operator/pilot-egress-relay.md`** — tokens, three-question diagnosis, the proxy-log signature table (§3 Q3.1) and the gestures live there; this entry is the grep and its traps, not a second copy of the runbook.
+  - **What this entry announced until 2026-09-20, and no longer does.** It grepped for a filesystem-only-fallback string, and it described the resulting regime as degraded-but-functional: the pilot ran on, no dispatch was lost, no PR went missing. **Both statements are dead**, and the dead strings are deliberately not requoted here — a future operator grepping this file for them must find nothing, or a corpse reads as a live prescription. mika#2049 (`b86062f8`, operator decision after a bearing from Prime) made the posture **fail-closed**: the relay unavailable ⇒ the dispatch is **refused** (`CONTAINMENT REFUSAL`, exit 78), escalated to Telegram, and the pilot never leaves without its network cut. No environment variable lifts the refusal. The emitting code dropped that string along with the behaviour, so **the old grep could not return a single line whatever the state** — published under a "zero expected" regime, which is how a dead instrument reads exactly like a healthy fleet (class mika#2205, on the very entry that carries *"a signal nobody looks for is not an improvement on a silence"*). Third correction of Signal S after the two of mika#2050, and **nothing reddened**: `scripts/canonical-tokens.tsv` (mika#2201) declares no egress token, so this file's operator predicates are outside its population — named as follow-up by mika#2051, not closed by it, because that guard would have an existing population of its own to measure first. **The consequence for the reader is a change of conduct: this failure is no longer silent.** It stops the loop, loudly, and the Telegram escalation normally reaches you before this grep does.
   - **The sink is a glob, and that is the one thing this entry exists to get right.** Every other entry in this series greps a single file, and the two that concern `dispatch-lib` name `server.log` (Signal M) or `$MIKA_SPIRIT_LOG_FILE` (Signal Q, corrected above). Copying that shape here yields a command that returns **nothing, ever**. The guard `_ensure_pilot_egress_proxy` is reached only from `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` (a `mktemp`) and then scrubs and persists to `$_PILOT_LOG_DIR/<task-id>.stderr`, with `_PILOT_LOG_DIR = ${PILOT_LOG_DIR:-/var/log/claude-pilot}` — hence one file per dispatch. That sink is already the established forensic surface: `dispatch-lib` re-reads it itself to extract `[policy:deny]` lines (mika#1097).
   - **Anchor on `^dispatch-lib: `, because the pilot's own prose shares the file.** That stderr file carries everything the sandboxed session wrote, so a bare token grep matches text a pilot wrote *about* the signal. Measured 2026-09-20 on gentux: `grep -l pilot_egress_guard.unreachable` returned one file, and its content was a timestamped sentence from the grooming session **of this very ticket** — not a guard emission. Every real emission begins at column 0 with `dispatch-lib: `, and every pilot line is timestamped (`[2026-09-20T15:12:57.693Z] …`), so the anchor separates them cleanly. Any future session discussing this entry re-creates that false positive; the anchor is what keeps the instrument readable.
-  - **Positive control — `zero` must be shown to mean healthy, not blind.** `grep -l '^dispatch-lib: pilot-egress-proxy launched' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` counts the dispatches where the proxy **did** take. Read the two together: zero fallbacks **with** a non-zero launch count is a healthy fleet; zero of both means the command is looking at the wrong place or no dispatch has run, and proves nothing about egress (the mika#2205 class — a silently inert probe reads exactly like a healthy one). Measured 2026-09-20 on gentux: 0 fallbacks against 12 launches.
-  - **Grep the fallback, use the token as the discriminant — not the reverse.** There are **two** paths into fs-only and only one carries a stable token: the proxy failing to bind within 3 s emits `pilot_egress_guard.unreachable …`, while the binary simply being absent emits `mika-pilot-egress-proxy not found at … (falling back to fs-only)`, which the code's own comment marks as the expected deployment-window case. Both share the string `falling back to fs-only`, so that is the predicate covering the whole population. **Consequence: zero occurrences of `pilot_egress_guard.unreachable` does NOT prove the network cut is active** — an operator applying the token as the predicate reads a nominal regime on a fleet whose proxy binary was never deployed. Once a hit is found, `grep -l '^dispatch-lib: pilot_egress_guard.unreachable' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` separates "the proxy died" from "the binary is missing"; the two call for different remedies. Keep the anchor here too — this is the grep the ticket's own body proposed unanchored, and it is the one the pilot-prose false positive above landed on.
-  - **Remedy.** Inspect `${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log` to learn why the proxy did not take — and if that file is absent, read `/tmp/mika-pilot-egress-proxy.log`, the fallback the proxy uses when the log directory is not writable. Both paths are named because looking for only the first is how an operator concludes "no log, so nothing ran".
-  - **Halt 1 — the grep is empty *and* `PILOT_LOG_DIR` / `MIKA_PILOT_LOG_DIR` disagree.** The glob is then pointing somewhere other than where `dispatch-lib` writes, and the silence means nothing. The two variables are deliberately distinct (`scrub_mika_env_vars` strips every `MIKA_*` from the dispatch child) and their divergence is already documented under mika#2249 — establish the configuration before concluding anything about egress.
+  - **Positive control — `zero` must be shown to mean healthy, not blind.** `grep -l '^dispatch-lib: pilot-egress-proxy launched' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` counts the dispatches where the proxy **did** take. Read the two together: zero refusals **with** a non-zero launch count is a healthy fleet; zero of both means the command is looking at the wrong place or no dispatch has run, and proves nothing about egress (the mika#2205 class — a silently inert probe reads exactly like a healthy one). Measured 2026-09-20 on gentux: 0 refusals against 12 launches. That launch line is unchanged by mika#2051 — it already carried its pid; only the refusal line gained one.
+  - **Grep the family, use the token as the discriminant — not the reverse.** There are **two causes**, and since mika#2049 each carries its own stable token, which is why the predicate above stops at `pilot_egress_guard\.` rather than naming one: the proxy failing to bind within 3 s emits `pilot_egress_guard.unreachable …`, the binary simply being absent emits `pilot_egress_guard.binary_missing …` (the deployment-window case). **Neither falls back any more — both refuse the dispatch.** **The mika#2050 lesson survives the posture change and is what this bullet exists for: zero occurrences of `pilot_egress_guard.unreachable` does NOT prove the network cut is active** — an operator applying that one token as the predicate reads a nominal regime on a fleet whose proxy binary was never deployed, which is now `binary_missing`'s population. Once a hit is found, grep the two tokens separately to tell "the proxy died" (remedy: `scripts/canary-pilot-containment --restart-relay`) from "the binary is missing" (remedy: `make install` on the dispatch host); the two call for different gestures. A third token, `pilot_egress_guard.recovered`, marks the resumption. Keep the anchor on each — this is the grep the ticket's own body proposed unanchored, and it is the one the pilot-prose false positive above landed on.
+  - **Joining a refusal to the dead proxy: the pid, never the clock (mika#2051).** `pilot_egress_guard.unreachable` carries `(pid N)` since mika#2051; the proxy stamps `pilot_egress_startup.begin pid=N` as its own first line since #2086. The dispatch `.stderr` is per-dispatch and the proxy log is cumulative, so that pid is what makes the join exact instead of temporal — the friction that made the 2026-08-29 diagnosis expensive. `binary_missing` deliberately carries **no** pid: that path launched no proxy, and inventing one would be a false statement. What each combination of proxy-log lines means is the runbook's §3 Q3.1 table, and reading it is a **host** gesture: a dispatched pilot cannot see `/var/log/mika/` (bwrap does not mount it, class mika#2165), so that file's absence from a dispatch session is never evidence of "no recurrence".
+  - **Remedy — the runbook, `docs/operator/pilot-egress-relay.md`, is the canonical surface.** Its §3 walks the three questions in order (binary installed → socket connectable → what the proxy log says) and its §4 carries the gestures; §3 Q3.1 is the signature table that says what the proxy log's lines *mean*, which is the half a `tail` does not give you. The short form: inspect `${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log`, and if that file is absent read `/tmp/mika-pilot-egress-proxy.log`, the fallback the proxy uses when the log directory is not writable. Both paths are named because looking for only the first is how an operator concludes "no log, so nothing ran".
+  - **Halt 1 — the grep is empty *and* `PILOT_LOG_DIR` / `MIKA_PILOT_LOG_DIR` disagree.** The glob is then pointing somewhere other than where `dispatch-lib` writes, and the silence means nothing. The two variables are deliberately distinct (the engine reads `MIKA_PILOT_LOG_DIR` from its own unscrubbed process env, while the shell's bare `PILOT_LOG_DIR` reaches the dispatch child only through the explicit `inject_pilot_dispatch_env` relay, since that child is built by `sandboxed_pilot_env` — `env_clear()` + a positive allowlist — which admits no bare `PILOT_*` any more than a `MIKA_*`, mika#2508) and their divergence is already documented under mika#2249 — establish the configuration before concluding anything about egress.
   - **Halt 2 — do not carry this command over to Signal M by analogy.** `pilot_push_guard.{clean,violation}` is emitted by `_check_pilot_force_push`, called at the top level of `dispatch_claude_pilot` **after** `_run_claude_pilot` and therefore **outside** the `2>"$STDERR_FILE"` redirection; its stderr is the `Stdio::piped()` handle from `spawn_long_running_exec`, which the executor reads **only** in its `if !status.success()` branch. On a dispatch that succeeds the pipe is dropped unread, so those lines land in no file at all — see the note on Signal M. Same class as this ticket, one line away, found by the verification this ticket prescribes.
   - **Limit — the revise path captures nothing.** `_launch_revise_pilot` (the ITERATE branch of autonomous grooming) calls the same guard but redirects to a `mktemp` under `/tmp` that it deletes a few lines later, with no persistent copy. The zero-occurrence steady state above holds for the **dispatch** path only; on the revise path the silence is structural, not evidence.
   - **What this does not buy.** No counter, no new event, no `audit_events` row. The only instrument is the grep above, and its silence proves nothing until somebody runs it — a signal nobody looks for is not an improvement on a silence, it is the same silence with one more log line.
@@ -489,6 +491,118 @@ Optional (callback watchdog):
   **Out of scope, deliberately:** the mika#2181 predicate itself (merged, correct in its domain, and the proxy window is kept unchanged under the direct measure); the reaper's TOCTOU; and the **phantom-sweep sibling** of this ticket's first comment — a NULL-PID `action_type='none'` row queued behind a busy slot produces **no** activity row at all, so measuring activity would spare it exactly zero times. Its discriminant is different (`has_live_deferred_wrapper_child`, already named in `dispatch_liveness`'s doc-comment as the hole in its guard), its population is different, its blast radius is different. **Follow-up, with its precondition:** establish that the class still recurs — the measured defect dates from 2026-09-07 and mika#2156 has since raised the grace to 14400 s (`SELECT date(created_at), count(*) FROM audit_events WHERE tool_name = 'phantom_aged_out' AND created_at > '2026-09-10' GROUP BY 1;` — zero rows means **do not open it**, a second discriminant would be a guard with no population).
 - `MIKA_PHANTOM_SWEEP_AGE_SECONDS` — Grace period (seconds) before the watchdog phantom sweep transitions a NULL-PID `action_type='none'` tracking row that has been `in_progress`/`blocked` past this threshold to `failed` (mika#1712, default `14400` since mika#2156 — see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS` for the measured rationale). Startup sweep (AC5) still runs at age=0, but neither path is decided by the clock alone any more: since mika#2156 both consult the row's dispatch child and spare it while that process is alive, because a tracking row's `updated_at` is never bumped while its dispatch works. The SQL cutoff is `strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-<n> seconds')`. Sweep telemetry: a per-row `audit_events` row with `tool_name='phantom_aged_out'` for each transition written and `tool_name='phantom_sweep_spared'` for each one the liveness guard withheld (mika#2156); a per-row `phantom_sweep_spared` INFO log line (fields: `source`, `task_id`, `child_task_id`, `process_id`, `updated_at`); a per-pass `phantom_sweep_complete` INFO log line (fields: `source` in `{"startup_sweep","watchdog_tick"}`, `count`, `spared_count`, `error_count`, `lookup_error_count`, `unusable_child_count`, `agent_id`); and `phantom_sweep_large_backlog` WARN when a single pass sweeps >100 rows (it still keys on `count`, so sparing never triggers it — anomalous state, feeds the mika#1934 cause-racine investigation).
 
+### `fired_at` est le premier instant où le moteur a travaillé sous une ligne (mika#2133)
+
+**Aucune variable d'environnement, aucune migration.** Cette entrée est ici parce
+que l'opérateur qui lit une ligne `tasks` pour savoir si un travail a démarré —
+et tous les faucheurs ci-dessus le font — a besoin de savoir ce que cette colonne
+dit sur chaque chemin.
+
+- **La sémantique, en une phrase qui couvre les quatre chemins :** `fired_at` est
+  **le premier instant où le moteur a commencé à travailler sous cette ligne** —
+  et pour une récurrente, le **dernier** tir.
+
+  | chemin | écrivain | instant posé |
+  |---|---|---|
+  | ordonnanceur (`recurring`, `time`) | `claim_and_fire_task` | la réclamation — **écrase** à chaque tir (D4) |
+  | dispatch d'un parent (`manual`) | `mark_parent_dispatched` (mika#2335) | le spawn |
+  | `callback` **avec** pilote | `set_task_process_id` (mika#2263) | le spawn |
+  | `callback` **sans** pilote | `stamp_task_fired_at_if_null` (mika#2133) | le début de son tour de livraison |
+  | `a2a` | `a2a_update_task_state` (mika#2133) | la transition `working` |
+
+  Ce ne sont pas cinq définitions mais une seule appliquée à plusieurs natures de
+  travail, et c'est la clause NULL-only qui la rend vraie : sur une ligne portant
+  un pilote, la livraison arrive après le spawn et ne réécrit rien.
+
+- **L'acte d'estampiller a une seule définition textuelle**,
+  `db::tasks::FIRED_AT_STAMP_IF_NULL`, interpolée par les quatre écrivains
+  NULL-only. `claim_and_fire_task` est l'exception **déclarée** (« dernier tir »)
+  et non exemptée : le registre `FIRED_AT_LITERAL_WRITERS` la nomme avec sa
+  raison, un scan de source refuse un cinquième écrivain littéral, et la
+  comparaison est **double sens** — une entrée dont le site a disparu rougit,
+  sans quoi elle exempterait silencieusement un futur homonyme.
+
+- **Ce qui reste légitimement NULL, et c'est tout l'intérêt de la colonne.** Une
+  tâche jamais tirée. En production la population témoin est la branche
+  `returnImmediately` de `message/send` : elle crée la ligne, la rend en
+  `submitted`, n'exécute aucun tour. **Un correctif qui aurait estampillé à la
+  création aurait rendu la colonne pleine et toujours aussi muette** — le défaut
+  déplacé d'un cran.
+
+- **Ce que le correctif rend possible :** `pending` depuis longtemps **sans**
+  `fired_at` redevient « jamais démarrée », et `in_progress` **avec** un
+  `fired_at` ancien devient « démarrée et bloquée ». Deux états jusque-là
+  indistinguables — et c'est très exactement la question qu'on pose à cette table
+  quand la boucle inquiète. Le 2026-09-01, une file de dix tâches `mika-dev` a été
+  lue comme figée sur le critère « `in_progress` sans `fired_at` » alors que 121
+  tâches se terminaient dans l'heure : le champ était vide sur **tout** ce chemin,
+  donc ne discriminait rien.
+
+- **Sondes opérateur, et leurs haltes.** La base n'étant pas lisible depuis le bac
+  à sable de dispatch, ces mesures sont structurellement post-déploiement.
+
+  ```sql
+  -- S1 (non-vacuité) : `a2a` doit quitter le zéro sur une fenêtre POSTÉRIEURE
+  SELECT trigger_type, COUNT(*), SUM(fired_at IS NOT NULL)
+    FROM tasks WHERE created_at > '<instant du déploiement>' GROUP BY 1;
+
+  -- S2 (attribution) : la poche « callback sans pilote » est-elle non vide ?
+  SELECT COUNT(*) FROM tasks
+   WHERE trigger_type = 'callback' AND process_id IS NULL
+     AND fired_at IS NOT NULL AND created_at > '<instant du déploiement>';
+
+  -- S3 (contrôle négatif en production) : attendu ZÉRO
+  SELECT COUNT(*) FROM tasks
+   WHERE trigger_type = 'a2a' AND status = 'pending' AND fired_at IS NOT NULL
+     AND created_at > '<instant du déploiement>';
+
+  -- S4 (non-régression historique) : à relever AVANT le déploiement, ne doit pas bouger
+  SELECT COUNT(*) FROM tasks
+   WHERE fired_at IS NOT NULL AND created_at < '<instant du déploiement>';
+  ```
+
+  **Halte S1 — `a2a` reste à zéro alors que des tours a2a ont tourné :** ne pas
+  élargir le prédicat par réflexe. Établir d'abord que le binaire servi porte le
+  correctif (classe mika#2340) ; un `a2a` à zéro sur un binaire antérieur est le
+  résultat attendu, pas un défaut du prédicat.
+  **Lecture de S1 :** `callback` est **déjà** non nul depuis mika#2263 — le lire
+  comme une preuve de ce correctif serait attribuer à ce travail ce qu'un autre a
+  livré ; c'est la lecture que S2 existe pour éviter.
+  **Lecture de S2 :** zéro **n'est pas une panne** — il signifie que tout callback
+  porte un pilote et que cet écrivain est un filet sans population. C'est un
+  résultat, à écrire comme tel, et c'est alors le filet qui mérite d'être
+  réinterrogé, pas le prédicat élargi.
+  **Halte S3 — une seule ligne :** c'est le défaut d'AC3 réalisé, la colonne
+  devenue pleine et toujours muette. Désarmer par revert **avant** diagnostic.
+  **Halte S4 — la valeur a bougé :** un écrivain rétro-estampille, ce qu'aucune
+  ligne de ce travail ne produit.
+
+- **Le statut d'une ligne `callback` ne dit toujours PAS « un pilote travaille »,
+  et c'est une décision.** Une ligne callback porte son PID en `pending`, donc un
+  garde-tableau qui compte `status='in_progress'` affiche zéro pendant qu'un
+  pilote travaille. Poser `in_progress` y ferait entrer d'un coup **toute** la
+  population des pilotes vivants dans `get_active_callback_tasks_with_pid`, la
+  requête du watchdog #959 — **qui marque la tâche `failed`** quand le processus
+  meurt. mika#2272 a borné ce périmètre par écrit (« élargir cette population-là
+  change qui marque une tâche `failed` … blast radius distinct, ticket distinct »),
+  donc le faire ici serait rouvrir en passant un périmètre qu'un ticket voisin a
+  fermé — un changement de comportement moteur habillé en observabilité.
+  **Ce que l'opérateur a à la place, et qui est un signal plus juste :**
+  `mika tasks <id>` affiche une ligne `Dispatch pilot:` alimentée par
+  `PilotLiveness` (mika#2335) — PID vérifié par `process_start_time` et mtime du
+  log du pilote. La corrélation manuelle avec `ps` est donc déjà retirée de la
+  charge de l'opérateur. **Suivi nommé :** un état intermédiaire pour la ligne
+  callback en travail, dont le préalable écrit est de décider qui marque `failed`
+  quand un pilote meurt une fois la population du watchdog non vide.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur, aucun événement de journal
+  nouveau : le défaut est une colonne vide, et **une colonne vide ne s'émet pas**.
+  Les seuls instruments sont les quatre requêtes ci-dessus, et leur silence ne
+  prouve rien tant que personne ne les exécute. Le champ devient lisible ; il ne
+  devient pas surveillé. Les lignes **historiques** ne sont pas rétro-estampillées
+  (AC6) : une estampille inventée après coup est pire qu'une absente, elle a l'air
+  d'une mesure.
+
 Optional (pilot silent-stall reaper — mika#2249):
 - **The failure this closes.** Two mika#2246 dispatches ran **2 h 18** and **58 min** with their process alive, their task `in_progress`, an empty `result`, no terminal marker in the log and no callback — until an operator disposed of them by hand. Every existing reaper fires on **task state** (`engine.rs` orphan-on-startup, stuck-`pending`, stale-`blocked`, the two self_dev parent reapers) and the PID watchdog fires on a **dead** process, so a live-and-mute dispatch was structurally invisible to all of them.
 - **The detector must be EXTERNAL to the pilot, and that word is the whole design.** Both wedged pilots ran with a working internal watchdog compiled in — `toolWaitCeiling=1800s modelWaitCeiling=900s` appear in all three logs, fields that only exist post-cpp#145 — and neither fired. A watchdog starved inside the pilot's own event loop cannot fire on a pilot-side timer either, whatever that timer measures. Hardening claude-pilot's internal watchdog is the companion ticket `senara-solutions/claude-pilot#168`, not a substitute for this one.
@@ -497,7 +611,7 @@ Optional (pilot silent-stall reaper — mika#2249):
   - **The transcript is the surface that separates.** `~/.mika/data/pilot-transcripts/<task-id>.jsonl` (mika#1705) timestamps every LLM turn; on the two false positives the largest inter-turn gap was **387 s and 376 s**, a factor of 7 under the window. It is also the *definition* of the class D1 targets (mika#1901: the SDK stream goes quiet) rather than a proxy for it. Its path is already stamped on the row the reaper scans (`metadata.pilot_transcript_expected`), so no new declaration was needed.
   - **A signal that cannot be read is NEVER a satisfied term.** Missing metadata key, absent or unreadable file, no mtime, mtime in the future — each takes the dispatch **out** of the population, never into it. Consequence worth naming: turning off `MIKA_LOG_PILOT_TRANSCRIPTS` makes every dispatch invisible to the reaper. That is why the inertia is said out loud — see the `pilot_stall_signal_unavailable` grep signal below.
 - `MIKA_PILOT_STALL_REAP_AGE_SECONDS` — silence window in seconds, applied to **each** of the three surfaces (default `2700`; `0` → default with a WARN). **The default is bounded on both sides by measurement, not chosen for roundness.** Below: a pilot whose internal watchdog *runs* cannot stay silent past **1800 s**, so the class this reaper exists to see starts above it. Above: the shorter of the two founding stalls is **58 min = 3480 s**, so a threshold at or beyond 3480 s misses that case outright — which is why the architect's prudential suggestion of 3600–5400 s was declined on measurement. The usable window is `]1800 s, 3480 s[` and 2700 s sits near its middle. Note the window is now **very** wide for the transcript (factor 7 on the measured max inter-turn gap): tightening it per surface would detect a real stall sooner, but the inter-turn distribution is measured on two runs only, so mika#2277 keeps one window and leaves the split to its own ticket.
-- `MIKA_PILOT_LOG_DIR` — directory the engine reads claude-pilot session logs from (default `/var/log/claude-pilot`), i.e. `<dir>/<callback-task-id>.log`. **Must match `dispatch-lib.sh:247`'s `${PILOT_LOG_DIR:-/var/log/claude-pilot}`**, and they are deliberately *different variable names* because `scrub_mika_env_vars` strips every `MIKA_*` from the dispatch child. mika#2165 documented what an override only the readers honour costs; here the cost has a floor — if the engine looks in the wrong place the file is simply absent, the signal is unavailable, and the dispatch falls out of the population. **A divergence can only buy inertia, never a false positive.** An empty value falls back to the default with a WARN rather than deriving `/<task-id>.log`, which would be a disarm wearing a configuration's clothes.
+- `MIKA_PILOT_LOG_DIR` — directory the engine reads claude-pilot session logs from (default `/var/log/claude-pilot`), i.e. `<dir>/<callback-task-id>.log`. **Must match `dispatch-lib.sh:247`'s `${PILOT_LOG_DIR:-/var/log/claude-pilot}`**, and they are deliberately *different variable names*: the engine reads `MIKA_PILOT_LOG_DIR` from its own unscrubbed process env, while the shell's bare `PILOT_LOG_DIR` reaches the dispatch child only through the explicit `inject_pilot_dispatch_env` relay — that child is built by `sandboxed_pilot_env` (`env_clear()` + a positive allowlist), which admits no bare `PILOT_*` any more than a `MIKA_*` (mika#2508). mika#2165 documented what an override only the readers honour costs; here the cost has a floor — if the engine looks in the wrong place the file is simply absent, the signal is unavailable, and the dispatch falls out of the population. **A divergence can only buy inertia, never a false positive.** An empty value falls back to the default with a WARN rather than deriving `/<task-id>.log`, which would be a disarm wearing a configuration's clothes.
 - `MIKA_PILOT_STALL_REAP_ENABLED` — whether the reaper may **dispose** of what it detects (default `true` since mika#2272; `0` disarms without a rebuild). **Detection is unconditional; only disposition is gated.** Disarmed, the reaper still measures and still writes its `pilot_silent_stall` audit row — it just does not signal the process and does not transition the task. That observation mode is now an explicit choice for a test or an investigation, not the default.
 - **Why the default flipped (mika#2272).** mika#2249 shipped disarmed behind a flip condition — arm once `audit_events` carries at least 3 reviewed `pilot_silent_stall` rows with zero false positives. That condition was **unsatisfiable, not unmet**: the scan filtered `status='in_progress'` while the pid lives on the `pending` callback row, so the population was empty and the count could only ever stay at zero. Measured on the production database over every row that has ever carried a `process_id`: 876 `delivered`, 19 `cancelled`, 1 `failed`, 1 `pending`, **zero `in_progress`**. Two live pilots (pgid 1926933, 1934255) went ~50 min silent on 2026-09-09 and produced no row at all. Zero was the absence of measurement, not the presence of caution.
 - **What still pays for the caution.** The asymmetry is unchanged — a false negative costs one dispatch slot, a false positive destroys hours of work in a decision-core worktree — and three things carry it, none of which moved: the fail-safe terms (a dispatch with no declared worktree, an unreadable declaration, a missing path, or an unreadable mtime falls *out* of the population); the 2700 s window, which still clears its measured negative control by roughly a factor of two; and the env disarm above. mika#2272 adds what #2249 never had — a **positive control on a real process**: an authentically live, silent pilot, seeded through the production write path onto the row shape production actually writes, is found by the scan and killed by the disposition (`crates/mika-agent/tests/eval/test_reaper_reaps_live_pending_pilot_2272.rs`).
@@ -507,6 +621,67 @@ Optional (pilot silent-stall reaper — mika#2249):
 - **Disposition writes `failed`, not `cancelled`, and pre-writes its own discriminator.** A naive SIGTERM lets `dispatch-lib`'s TERM trap write `STATUS=CANCELLED_BY_SIGNAL`, which `self-dev-callback` reads as an operator cancel and answers with *do NOT retry* — the reaper would have killed the pilot **and** the retry, and the loop would not have become self-healing, which is the only point of the ticket. So `/tmp/mika-cancel-reason-<pid>` gets `STATUS=REAPED_PILOT_SILENT_STALL` **before** the signal (the trap only writes when the file is absent), and `self-dev-callback`'s parser falls through it rather than absorbing it into a `CANCELLED_BY_*` branch. Re-dispatch is **not** carried by this ticket: `stuck_ready_reconcile` (`auto_pull.rs`) already re-drives a ticket left `ready`, with a re-drive budget (mika#2020). Adding a retry branch to a skill prompt would be prompt-enforcement on loop substrate, which `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` forbids.
 - **Operator surfaces.** SQL: `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'pilot_silent_stall'`; each row's `reasoning` carries **all three** idle ages since mika#2277 (`worktree_idle_secs`, `transcript_idle_secs`, `pilot_log_idle_secs`) plus the worktree path, `disposition_armed` and `transitioned`, and `after_value` states what actually happened (`pending`/`in_progress` when observing or when the kill failed, `failed` when it fired) rather than what was intended. Reporting the worktree age alone is precisely what made the 2026-09-10 false positives read as nominal on first inspection — `worktree_idle_secs=2758` was a true statement about a pilot that was, at that instant, streaming tool results. Grep, in `$MIKA_SPIRIT_LOG_FILE`: `pilot_silent_stall` (WARN, the disposition); `pilot_stall_signal_unavailable` (WARN, mika#2277 — a dispatch the reaper cannot see because one of its liveness signals is unreadable; emitted **once per dispatch**, bounded by the `metadata.pilot_stall_signal_unavailable_reported` stamp, and the field `missing_surfaces` names which one). Sustained `pilot_stall_signal_unavailable` on `transcript` across the fleet means `MIKA_LOG_PILOT_TRANSCRIPTS` is off and the reaper is effectively disarmed; on `pilot_log`, that `MIKA_PILOT_LOG_DIR` and `PILOT_LOG_DIR` disagree. Shell side: `dispatch_worktree_declared` / `dispatch_worktree_declare_failed` — a sustained `declare_failed` means dispatches are running unwatched.
 - **Out of scope, deliberately:** the *cause* of the SDK silence (selective Anthropic 429 throttling, lineage mika#1901) — not fixable in code, only detectable; and claude-pilot's internal watchdog (`senara-solutions/claude-pilot#168`, worked by manual spawn since claude-pilot is outside the loop's dispatchable-repo allowlist).
+
+
+Optional (pilot turn budget, armed at the source — mika#2496):
+- **The failure this closes, and the rectification it had to make to its own ticket.** The rule is *« kill at 120 turns / 40 USD »*, and it could not be applied in flight: no mika surface carries the SDK turn count in real time, and the « transcript lines » proxy is unreliable (measured ratio 1.63 on #2425, 2.16 on #2484), so #2425 truncated at **142 turns** without ever crossing its calibrated line threshold. The ticket asked for the count to be **exposed** so an engine-side brake could read it. Reading the code refuses that remedy and replaces it: **claude-pilot has carried a native, exact turn ceiling all along** — `--max-turns` is parsed, validated `>= 1`, mapped onto `GuardrailConfig.maxTurns` and handed to the SDK, which ends the run on an authentic `ResultMessage` of subtype `error_max_turns`. `dispatch-lib.sh` passed it at **none** of its three launch sites, so every dispatch ran under the upstream default `maxTurns=200`. That is what #2484 at **201 turns** actually is: the ceiling *biting*, set at 200 because nothing downstream had ever set it. A count read from outside could only kill by signalling the process group, losing the exit JSON, the callback's `Turns:`/`Cost:` and the whole post-flight recovery chain. **The divergence is ratified in the body of #2496** (operator, 2026-09-23) — the exposure half is deferred to `senara-solutions/claude-pilot` (real-time turn count per boundary), and this PR does not deliver the ticket's literal DoD.
+- **The turn ceiling is NOT a dollar ceiling, and nothing here may be read as if it were.** #2484 = 201 turns / 86 USD ⇒ ≈ **0.43 USD per turn**; at that rate **120 turns ≈ 51 USD**, above the 40 USD of the rule — and a session with a heavier context crosses 40 earlier still. So this PR closes the **first** term of the rule and **not** the second. The dollar brake has no enforcement point anywhere upstream: `claude-pilot`'s `_sdk_guardrail_kwargs` carries `if config.maxBudgetUsd > 0:` and ends on `pass`, and none of its application-level guardrails (`stallThreshold`, `emptyResponseThreshold`, `idleTimeoutMs`, `toolWaitCeilingMs`, `modelWaitCeilingMs`) measures dollars — they all measure time or productivity. The subtype `error_max_budget_usd` is therefore a termination vocabulary **nothing can emit**, which is why probe S2 below excludes it: its absence is not a signal. **`--max-budget` is passed at no site, deliberately.** It would be accepted, validated, resolved, carried to `_sdk_guardrail_kwargs` — and ignored; passing it would make the budget *look* closed in the argv, in the `pilot_budget_armed` line and to anyone opening the file. *A bound announced and inert is worse than no bound: it extinguishes the question.* What the turn ceiling does buy, measured on the known population: #2484 cut at 120 instead of 201 ≈ **40 % of the cost avoided**, #2425 at 120 instead of 142 ≈ 15 %.
+- `PILOT_MAX_TURNS` — the pilot's turn ceiling, resolved by `_pilot_max_turns` in `dispatch-lib.sh` and passed at the **three** launch sites (main dispatch, revise pilot, free-dispatch). **Unprefixed on purpose**, by a precedent held in the same file: `PILOT_LOG_DIR` is too. Neither name survives on its own: the pilot dispatch child is built by `sandboxed_pilot_env` (`env_clear()` + the positive allowlist `is_sandbox_env_allowed`), which admits neither a `MIKA_*` name nor a bare `PILOT_*`, so both reach the child only through the explicit `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`) — a bare name is a convention on that relay, not a way of slipping past a scrub (mika#2508). **Shipped DISARMED (empty default), and that is not the plan's proposed value.** Arming at 120 would truncate #2425, which reached 142 legitimately; the plan makes the measured turn distribution of *completed* runs a blocking verification (V2) prior to arming, and that distribution lives in `~/.mika/data/mika.db`, which the dispatch sandbox does not mount — an operator gesture on the host, not something the implementer can supply. The plan writes the conduct for its absence: ship disarmed and say so. **Arming is one gesture and no redeploy:** `PILOT_MAX_TURNS=120` on the service environment; or raise the single in-file default (`local _default=120` in `_pilot_max_turns`) once V2 is reported on the ticket. Three tiers, and `0` is not an invalid value but **the rollback**: unset → the fleet default; `""` or `"0"` → the flag is **not** passed and claude-pilot falls back to its own `maxTurns=200`, i.e. the pre-mika#2496 behaviour byte for byte; a positive integer → that ceiling, `source=env`; anything else → the default **plus** a `pilot_budget_invalid` line naming the offending value between quotes (a disarm by typo on a cost brake would be the silent failure this whole thing closes).
+- `pilot_cost_alert_usd` (`config.toml`) / `MIKA_PILOT_COST_ALERT_USD` — cost in USD above which a **finished** dispatch is reported as an overrun (default `40`, the rule). Note the asymmetry of prefixes with its sibling above, and it is not an oversight: this key is read by **mika-spirit**, where the `MIKA_*` scrub does not run. A non-finite or non-positive value falls back to the default — a threshold at or below zero would report *every* dispatch and drown the population the measurement exists to size; an unparseable value is a `Settings::load` error, like every numeric sibling. **Forty is posed as the rule, not measured — and that is a deliberate asymmetry with the V2 discipline demanded for the turn ceiling**, because an *alert* threshold **cuts nothing**: a false positive costs one WARN line, not a truncated run. It is to be revised on the first distribution this measurement produces, and that revision is the first deliverable of the follow-up cpp ticket. If the distribution shows 40 carrying the nominal traffic, it is the threshold that rises, never the measurement that is disarmed.
+- **The budget in force is SAID at every launch (U2).** Doctrine mika#2293, quoted because it describes this ticket word for word: *a setting you cannot observe is not a setting, it is a hope.* One line on `dispatch-lib`'s stderr:
+
+  ```
+  dispatch-lib: pilot_budget_armed max_turns=120 source=env cost_bound=absent_upstream
+  ```
+
+  **It reads the argv, never the resolver's intention** — the one way it cannot announce a ceiling that was not passed, which is the defect mika#2304 names (*a field that asserts, with authority, the override that did not happen*). `source` comes from the resolver because the argv carries no provenance, and `source=unset` says **no resolver ran** (co-location broken) rather than reporting an invented one. `max_turns=none` is the honest reading of a disarmed dispatch; the event keeps its name at that value because the positive control below counts dispatches that **resolved** a budget — zero `error_max_turns` with zero `pilot_budget_armed` says nothing at all, while zero with a non-zero arming count says the fleet does not run away (class mika#2205). The pair `max_turns=none source=default` (never armed) is distinguishable from `max_turns=none source=env` (deliberately rolled back), and the two call for opposite responses. **`cost_bound=absent_upstream` is hardcoded and that is the point:** the line refuses to announce a dollar budget because none exists, naming the absence instead of hiding it — and the day the cpp follow-up lands, that value is what changes.
+  - **Sink and anchor.** Emitted from `_run_pilot_sandboxed` and **from nowhere else** — the one function all three launch sites traverse, and whose stderr is the caller's `2>"$STDERR_FILE"`, i.e. the per-dispatch forensic file `$PILOT_LOG_DIR/<task-id>.stderr` that Signal S already reads. Emitting it *before* the launch line would send it to `dispatch-lib`'s own stderr, which the executor reads **only** under `if !status.success()`: on a dispatch that succeeds the pipe is dropped unread and the line lands in no file at all — exactly Signal M, measured by mika#2050. Always anchor on `^dispatch-lib: `, never the bare token: that `.stderr` also carries the pilot's prose, and mika#2050 measured the false positive (a session *discussing* the signal read as an emission). **Inherited limit, not closed here:** the two revise pilots redirect to a `mktemp` they delete a few lines later, so their line is persisted nowhere (Signal S, § *Limit — the revise path captures nothing*).
+- **Cost overruns are MEASURED, for want of being prevented (U4).** `try_report_pilot_cost_overrun` runs in `dispatcher.rs` right after `try_extract_callback_metadata`, on the same parsed fields, and **stops nothing**. Above the threshold it writes a `pilot_cost_overrun` WARN (`repo`, `issue`, `task_id`, `cost_usd`, `turns`, `threshold_usd`) and one `audit_events` row under the same name, **SOLE WRITER**. An **absent** `cost_usd` emits nothing and is never read as `0` (mika#2331: *`null` is never `0`*) — a callback with no cost line is not a free dispatch, it is an unmeasured one, and reporting it at zero would put a false member into the very population this exists to size. Unresolvable ticket coordinates **downgrade** the line (`repo=unknown`), they never suppress it. This is retrospective and assumed as such: it dates and counts, and that count **is** the explicit precondition of the cpp follow-up, which would otherwise open on an intuition.
+- **Operator surfaces.**
+
+  ```bash
+  # 1. Under what budget did this dispatch run? (anchor mandatory)
+  grep -h '^dispatch-lib: pilot_budget_armed' \
+       "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail
+
+  # 2. POSITIVE control — how many dispatches resolved a budget at all?
+  grep -l '^dispatch-lib: pilot_budget_armed' \
+       "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | wc -l
+
+  # 3. Did the ceiling bite? (budget_exhausted family, already classified)
+  grep -h 'error_max_turns' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail
+
+  # 4. Cost overruns (U4)
+  grep pilot_cost_overrun "$MIKA_SPIRIT_LOG_FILE" \
+    | jq -c '{repo, issue, turns, cost_usd, threshold_usd}'
+  ```
+  ```sql
+  -- The population the cpp follow-up has to size
+  SELECT count(*), round(avg(CAST(after_value AS REAL)), 2)
+    FROM audit_events WHERE tool_name = 'pilot_cost_overrun';
+  ```
+
+  | event | level | expected regime | reading |
+  |---|---|---|---|
+  | `pilot_budget_armed` | stderr | **one per dispatch** | its absence = an earlier binary (class mika#2340), **never** "no budget" |
+  | `pilot_budget_invalid` | stderr | **empty** | a typo in the variable, named between quotes |
+  | `error_max_turns` | stderr | **non-empty, low** — once armed | each line is a runaway cut short: that is the success, not the failure |
+  | `pilot_cost_overrun` | WARN | **non-empty** | sizes the cpp follow-up; decreases if the turn ceiling bounds in practice |
+
+  **The positive control (2) is not decorative.** Zero `error_max_turns` with zero `pilot_budget_armed` says nothing at all; zero with a non-zero arming count says the fleet does not run away. That is class mika#2205: *a guard you have not deployed reads exactly like a healthy fleet.*
+- **Four post-deploy probes, and their four halts.**
+  1. **S1 — the arming reaches the argv (first dispatch).** A `pilot_budget_armed` line, and `--max-turns <value>` in the real argv when armed. **Halt 1 — no line at all.** Do not touch the resolver: establish first that the binary being served carries the fix. `skills/bundled/` is read by no agent before `make deploy` → seed (class mika#2340) — `cat ~/.mika/skills/.manifest-writer`.
+  2. **S2 — the ceiling bites (30 days), and it is the execution of V3b.** At least one `error_max_turns`, classified `budget_exhausted|deterministic` by `_halt_family`, **with its recovery draft PR**. `error_max_budget_usd` does not enter this probe: no path can produce it (see above), so its absence is not a signal. **Halt 2 — a truncation with no work recovered.** The `_halt_family` promise does not hold. **Disarm (`PILOT_MAX_TURNS=0`) before any diagnosis**: a budget that destroys work is worse than the runaway it cuts.
+  3. **S3 — no regression on the nominal regime (30 days).** The share of dispatches ending `error_max_turns` must stay **marginal**. **Halt 3 — it carries nominal traffic.** The ceiling sits under the healthy population and the V2 measurement was wrong or stale: **raise the default, with the distribution**, rather than let a brake cut current work. *A brake is a brake, not a path.*
+  4. **S4 — the cost population (30 days).** The `pilot_cost_overrun` count **is** the cpp follow-up's precondition. **Halt 4 — a nil count while runs are known to exceed 40 USD.** `Cost:` parsing returns nothing on that population: check `extract_callback_fields` against a real `status: terminated` **before** concluding the fleet is under threshold. *A mute probe and a healthy fleet read the same.*
+- **Four guards, and none of them is a behavioural test — the class is invisible to one.** A fourth launch site written tomorrow without the flag makes **no** decision wrong; it simply runs unbounded, and every existing assertion stays green. That is the shape of the defect this ticket closes, reproduced one notch later.
+  - **U3 — the source scan** (`skills/bundled/_shared/test-dispatch-lib.sh`): every **launch** of `claude-pilot` in `dispatch-lib.sh` carries `--max-turns`, **allowlist shipped empty**. The predicate is frozen in five terms because a scan on "every `claude-pilot` occurrence" is wrong in both directions — the string appears ~47 times and only one family is a launch (comments, `--ro-bind-try "$HOME/.local/bin/claude-pilot"`, `--relay-config …/claude-pilot.json`, `command -v`, a `--help` smoke test, and prose inside `RESULT=` bodies): (1) the unit of analysis is the **logical invocation**, continuations `\` re-joined, never the physical line — two of the three real sites are multi-line, so a line-anchored scan would miss them; (2) comment lines are stripped **before** the join; (3) `claude-pilot` in **command position** (start of line, `;`, `|`, `&`, `(`, `{`, or the wrapper `_run_pilot_sandboxed`), a `/` being excluded so paths do not match; (4) the next token must be a **flag**, which bounds the token on the right and drops `claude-pilot.json` and the `RESULT=` prose (this term is a **measured correction** to the plan, whose four terms let `claude-pilot FAILED (exit code …)` at column zero read as a candidate); (5) **cardinality asserted at 3**, the only failure shape no fixture can see — without it a predicate grown too narrow would pass by looking at nothing (class mika#2205). Term 3 is deliberately a **disjunction** rather than the wrapper alone: a future site calling the binary outside `_run_pilot_sandboxed` would escape a wrapper-anchored predicate, and that site is also the one that would lose the network containment (mika#2049). Five negative-control fixtures built on the **forms actually present** in the file, three **seen red** and two **seen green**: N1 single-line unflagged (red), N2 multi-line with continuations, unflagged (red — attests term 1), N3 multi-line with the flag **on a continuation line** (green — the mirror of N2; without it, "the scan reads the invocation" is indistinguishable from "the scan reddens on anything multi-line"), N4 a direct call without the wrapper (red — attests term 3's disjunction), N5 good faith: a comment, a `--ro-bind-try` path and a `--relay-config` (green — attests the exclusions, without which the scan would be permanently red and therefore disarmed). Plus the co-location guard: every read of `$_PILOT_MAX_TURNS` must call `_pilot_max_turns` on the **same line**, the mechanism already in place for `_pilot_log_dir`. **When this scan fires, the resolution is to ARM the site, never to allowlist it** (doctrine mika#2201) — a launch site you do not want to arm is a site to delete.
+  - **U4 — the SOLE WRITER scan** (`canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer`, allowlist empty and pinned empty by a sibling test). It carries its own anti-vacuity assertion: the scan fails if the name is written **nowhere** in `dispatcher.rs`, because a scan aiming at a dead name verifies nothing and reads exactly like a clean one.
+  - **V4 — the resolver test** (shell harness): the three sites carry the flag; the value passed is the value resolved; `PILOT_MAX_TURNS=0` **omits** it (the rollback's negative control); an unreadable or negative value falls back to the default **and** emits the WARN; the line is anchorable on `^dispatch-lib: `; it never announces a dollar budget; and **no site passes `--max-budget`** (AC7 asserted, not merely stated).
+  - **V5 — the cost-overrun test** (Rust, `dispatcher.rs`): emitted above the threshold and **not** below (negative control), the threshold is what decides, an absent `cost_usd` emits nothing, and an orphan dispatch still counts.
+- **What is NOT testable here, written rather than discovered.** "The budget kills before 120 turns" is executed by the SDK, in another process, against a real provider. The contract **on the mika side** is *the flag reaches the argv with the right value*, and V4 attests that deterministically. The behavioural half is probe S2.
+- **AC4 (rollback by variable) is conditioned on a live measurement, and so is arming itself.** V1a is statically green — the scrub is a `MIKA_*` denylist plus `GH_TOKEN`, so an unprefixed name traverses, and `PILOT_LOG_DIR` is the precedent. V1b is the operator gesture: set `PILOT_MAX_TURNS=<value>` on the **service** environment and read `source=env` on a real `pilot_budget_armed` line. **Because the default ships disarmed, a red V1b costs more than the plan's wording suggests:** it does not merely retract the rollback claim, it makes *arming by variable* unreachable, and the only remaining route is raising the in-file default. Do not claim AC4 in a PR body or here until `source=env` has been observed — a rollback announced and unreachable during an incident is exactly the false guarantee mika#2304 names, and withdrawing it beats leaving it standing.
+- **Out of scope, deliberately:** the missing dollar brake itself (`_sdk_guardrail_kwargs`'s `pass`) and the real-time per-boundary turn count, both follow-ups on `senara-solutions/claude-pilot` — this repo cannot create either; the V2 measurement, an operator gesture on the host that gates the default's value; and the revise path's stderr, whose line is persisted nowhere (inherited from Signal S).
 
 
 Optional (callback delivery bounds — mika#2179):
@@ -1500,6 +1675,140 @@ Optional (dispatch concurrency cap — mika#2160):
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+### Un callout de corps sans preuve en base route vers `groom` (mika#2484)
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un ticket refluer en `groom` — ou qui cherche
+pourquoi un `mika ask "groom …"` refuse un dispatch — cherche dans le voisinage
+de la porte ci-dessus.
+
+- **Les deux défauts mesurés le 2026-09-22 (reprise substrat de #2471).**
+  *(1)* #2471 portait les trois callouts de grooming dans son **corps** — posés
+  par un re-groom de spawn orchestrateur, hors moteur, qui ne frappe aucune
+  preuve en base. Il était vu « groomé », promu `ready`, la tâche
+  `ready-label 0c49ce05` partait en dev-pilot, et la porte mika#1620 la refusait
+  `dispatch_grooming_not_verified`. Chaque tour recommençait. *(2)*
+  `mika ask --agent mika-dev "groom mika issue#2471"` sur ce même ticket a
+  produit le callback **implement** `5460a97f`, qui a ouvert la PR #2483 — une
+  implémentation sur un grooming que le chemin moteur n'a jamais vérifié,
+  c'est-à-dire un **contournement de la porte de preuve**. Le *même* message,
+  après retrait des callouts du corps, a correctement dispatché un dev-groom.
+
+- **Le défaut 1 ne vivait pas dans le feeder, et le remède que le DoD proposait
+  est contre-productif.** Il vivait dans le **routage** du `ready_label_handler`,
+  dont l'étape 5 décidait sur la forme du callout pendant que sa propre porte
+  9d refusait sur la preuve — une divergence à quatre étapes d'écart dans le même
+  handler. Gater le feeder sur la preuve, une fois le routage réparé, retirerait
+  au ticket callouté-sans-preuve **le seul mécanisme capable de le réparer** :
+  la promotion `ready` déclenche désormais le dev-groom qui produit la preuve
+  manquante. Sans elle, le ticket resterait dans le backlog pour toujours, sous
+  une ligne d'exclusion que personne ne relit quotidiennement. *Le churn mesuré
+  n'était pas un excès de promotions : c'était une promotion qui aboutissait au
+  mauvais dispatch.* Aucune ligne d'`auto_pull.rs` n'est touchée.
+
+- **Ce que ce travail n'achète PAS.** Il ne produit **aucune preuve manquante** :
+  un ticket groomé hors moteur reste sans preuve ; ce qui change est ce que le
+  moteur en **fait**, pas ce qu'il en **sait**. Il ne ferme pas le cas
+  `already_groomed` (voir ci-dessous) — il le borne au même endroit
+  qu'aujourd'hui (budget de re-drive mika#2020) et corrige le texte qui
+  prescrivait une route morte. Il ne garantit pas que le modèle appelle le bon
+  outil : il garantit qu'il **ne peut pas appeler le mauvais**. Et aucun
+  compteur de « combien de tickets sont groomés hors moteur » n'est livré — S1
+  compte ceux que la boucle **rencontre**, et un ticket que personne ne relance
+  reste invisible.
+
+- **Le texte de sortie `already_groomed` de `dispatch-lib.sh` ne prescrit plus
+  « Dispatch dev-pilot to implement ».** Depuis mika#2287 cette moitié mène
+  droit à `dispatch_grooming_not_verified`, et un `already_groomed` ne frappe
+  aucune preuve — délibérément : *une garde qui lit sa preuve de la
+  revendication ne peut pas la réfuter*. Le geste nommé est désormais celui que
+  `groom_provenance_verdict` nomme déjà dans son champ `recovery` : retirer le
+  plan de la branche **et** les callouts du corps, puis laisser la boucle
+  re-groomer.
+
+### SQL
+
+```sql
+-- S1 — les tickets qui seraient partis en implement sur un grooming non vérifié
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_markers_without_proof' GROUP BY 1 ORDER BY 2 DESC;
+
+-- S4 — contrôle négatif : la base ne répond pas
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'ready_label_groom_proof_unreadable';
+
+-- S2 — les contournements de la porte de preuve interceptés
+SELECT count(*) FROM tasks WHERE result LIKE '%dispatch_grooming_intent_mismatch%';
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `ready_label_markers_without_proof` | INFO | **non vide, faible** | chaque ligne est un ticket routé en `groom` au lieu de partir se faire refuser |
+| `ready_label_groom_proof_unreadable` | INFO | **vide** | toute occurrence est une base qui ne répond pas |
+| `dispatch_grooming_intent_mismatch` | (dans `tasks.result`) | **zéro ou très proche** | chaque ligne est un contournement de porte intercepté |
+
+### Sondes, et leurs six haltes
+
+1. **S1 — le routage mord (48 h).** `ready_label_markers_without_proof` non vide
+   et faible.
+   **Halte 1 — vide alors que `dispatch_grooming_not_verified` continue
+   d'apparaître.** Le refus se produit **ailleurs** que sur le chemin
+   ready-label — `mika ask`, relance de verdict, ou auto-fire. **Ne pas élargir
+   le routage** : établir d'abord quel appelant de `validate_dispatch_readiness`
+   a refusé, les trois remèdes diffèrent.
+   **Halte 2 — vide, et `dispatch_grooming_not_verified` aussi, et aucun
+   dispatch n'a eu lieu.** Établir le déploiement avant toute conclusion (classe
+   mika#2340) : *une ligne absente ne prouve rien tant qu'on n'a pas établi que
+   le binaire qui tourne sait l'écrire.*
+   **Halte 3 — le compte porte du trafic nominal** (plusieurs par heure, sur des
+   tickets différents). Le prédicat n'est pas trop large : soit la flotte a une
+   population massive de tickets groomés hors moteur, soit la rétention de
+   30 jours purge plus vite qu'on ne croyait. **Ne pas désarmer** — mesurer la
+   répartition entre les deux causes, qui décide du suivi (exemption de prune vs
+   geste de re-grooming).
+
+2. **S2 — la garde d'intention (48 h).** Régime attendu **zéro ou très proche** :
+   la table de routage de `self-dev` donne au modèle la bonne route, et la garde
+   est le filet.
+   **Halte 4 — flot soutenu.** La moitié intention n'atteint pas ce chemin :
+   **vérifier le déploiement du prompt bundled avant de toucher à la garde**
+   (`cat ~/.mika/skills/.manifest-writer`, mika#2340) — un `system_prompt.md`
+   édité dans l'arbre est invisible jusqu'au `make deploy`.
+   **Halte 5 — une régression sur un chemin moteur** (un dev-pilot légitime
+   refusé). Le tableau des quatre chemins est faux quelque part : lire quel
+   chemin peuple `originating_message` avec un texte commençant par `groom `,
+   **ne pas ajouter d'exception au prédicat** avant de l'avoir établi.
+
+3. **S3 — rejeu du défaut fondateur.** Sur un ticket portant les trois callouts
+   et sans preuve : `mika ask --agent mika-dev "groom mika issue#<n>"` → la tâche
+   callback doit porter `dispatch_class='groom'` ; puis poser `ready`
+   (**remove → add**, mika#2323 : GitHub n'émet `labeled` que sur une transition)
+   → même attendu.
+   **Halte 6 — le ticket part en groom et revient `already_groomed` en boucle.**
+   C'est la limite nommée ci-dessus, pas une régression : vérifier que le budget
+   de re-drive se consomme (`auto_pull_redrive_abandoned` après trois tours) et
+   que le commentaire d'abandon est posé. Si le budget **ne** se consomme pas,
+   c'est mika#2158 qui a rouvert (un compteur remis à zéro par l'action qu'il
+   compte) et c'est **là** qu'il faut chercher.
+
+### Suivi (hors périmètre, nommé)
+
+- **Exempter les lignes `PLAN_GROOMED` du prune de 30 jours** — suivi déjà
+  ouvert par mika#2287. Sa priorité baisse sans s'annuler : son absence ne
+  dégrade plus aucun chemin (le pire cas est identique à l'état antérieur, le
+  meilleur converge). **Précondition** : que S1 montre une part significative
+  d'occurrences imputables à la rétention plutôt qu'au grooming hors moteur.
+- **`/mika-groom-ticket` doit-il frapper une ligne-preuve ?** Différé à
+  Vincent/Prime par mika#2287, inchangé ici — ce travail rend le cul-de-sac
+  convergent au lieu de terminal, il ne préempte pas la décision.
+- **`already_groomed` devrait-il être terminal plutôt que de consommer le budget
+  de re-drive ?** **Précondition** : que la halte 6 montre que cette population
+  existe en volume.
+- **La garde d'intention devrait-elle vérifier le numéro d'issue ?** Arbitrage
+  assumé, à rouvrir si la halte 5 montre un faux positif.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash
@@ -1519,7 +1828,38 @@ Optional (STOP global à chaud — mika#2329) :
    WHERE tool_name = 'auto_pull_stop' ORDER BY created_at DESC;
   ```
   Une ligne par **transition** (`armed` / `lifted`), jamais par tick — doctrine mika#2131 : l'information durable est « le STOP a été armé à telle heure », pas « il l'était encore à 14 h 32 », et 144 lignes/jour en audit déplaceraient dans la table le churn que la doctrine borne. La détection de transition est en mémoire sur le dispatcher et **perdue au redémarrage, à dessein** : un process neuf re-photographie l'état qu'il trouve et écrit une transition si le STOP est armé au premier tick.
-- **Portée : `auto_pull` seul.** `MIKA_DEV_WIP_RESCUE` et `MIKA_QA_REVIEW_RECONCILE` ont le même défaut boot-time et le lecteur est paramétré par le nom du scan pour que l'extension soit une ligne chacun — mais elle n'est pas faite : arrêter la revue QA n'est pas la même décision qu'arrêter le feeder, et livrer trois interrupteurs dont deux n'ont jamais été demandés créerait trois gestes à documenter et à tester pour un besoin mesuré sur un seul. **Ticket de suivi.**
+- **Quels scans ont un interrupteur.** `auto-pull`, et `worktree-reap` depuis mika#2420 (§ *terminal-worktree reaper*, fichier distinct, décision distincte). `MIKA_DEV_WIP_RESCUE` et `MIKA_QA_REVIEW_RECONCILE` ont le même défaut boot-time et le lecteur reste paramétré par nom de scan pour que l'extension soit une ligne chacun — mais elle n'est pas faite : arrêter la revue QA n'est pas la même décision qu'arrêter le feeder, et livrer des interrupteurs que personne n'a demandés créerait des gestes à documenter et à tester pour un besoin mesuré ailleurs. **Ticket de suivi.**
+
+- **Portée de la sentinelle `auto-pull` : c'est le FREIN DE DISPATCH NEUF de la boucle, pas l'interrupteur privé d'un scan (mika#2498).** Son nom dit un scan ; lire le nom comme la portée a coûté un incident. Le 2026-09-23, sentinelle posée à **05:38** locales : le tick du feeder se court-circuite comme prévu, et un implement part quand même à **06:11:39Z** (`ff694ec0`, 103 tours, 17,86 USD, parent `resume_agent` `107f8849`). Un groom convergé enchaîne sur son implémentation par l'**auto-fire moteur** (`try_dispatch_pilot_after_groom_success`, mika#1614), qui ne passe par **aucun tick**. L'opérateur n'a pu que l'annuler en réaction. C'est la forme de panne que ce mécanisme nomme lui-même pour une autre raison : *« un STOP silencieusement inopérant se lit exactement comme un STOP qui marche »*.
+  - **Élargie dans son sens, jamais dupliquée.** Le critère de mika#2420 est *« une décision distincte mérite un fichier distinct »* — or les deux routes ont la **même sortie** (un dispatch dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un opérateur qui arrête l'une et pas l'autre n'a rien arrêté : c'est l'incident. Un second fichier (`groom-implement-stop`) est **refusé** pour cette raison — il scinde une décision d'opérateur en deux gestes, et celui de la mémoire musculaire rendrait alors le comportement d'aujourd'hui en ayant l'air d'arrêter. Renommer la sentinelle est refusé aussi : le fichier peut être armé **en ce moment** sur l'hôte, et la mémoire musculaire est ce qu'un frein de P0 ne doit pas casser. Ce qui change est la portée **documentée**, pas le geste.
+  - **Le critère pour un futur consommateur**, et ce n'est pas « suis-je un scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire cette sentinelle, quelle que soit la porte d'entrée. Sinon, il lui faut un nom de scan à soi.
+  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition.
+  - **Le refus est convergent, jamais terminal**, et c'est ce qui rend l'élargissement acceptable plutôt que destructeur : il n'annule pas le groom, ne perd pas le plan (committé et poussé par `_push_branch`), ne retire pas `ready`, ne marque rien `failed`, ne crée aucune row. Le parent reste `in_progress` / `groom` — une raison de refus de plus dans un sillon que les chemins de saut existants de la fonction (pas de jeton, outil absent du registre, handler non long-running, flip impossible, readiness refusée, création du callback échouée, script de handler absent) creusaient déjà, et c'est ce qui garde le changement petit. À la levée, le réconciliateur stuck-ready le re-drive (in-process depuis mika#2470) ; et pendant le STOP aucun tick ne tourne, donc **aucun point du budget de re-drive n'est consommé** (mika#2020). **Effet de bord utile :** sous STOP, les grooms en vol convergent, committent leur plan et **ne chaînent pas** — c'est littéralement la « pause grooms-seuls » demandée, obtenue sans introduire d'état nouveau.
+  - **Surfaces.** Journal : `groom_pilot_autofire_stopped` (INFO — champs `parent_task_id`, `callback_task_id`, `repo`, `issue`, `stop_file`, ce dernier rendu par `stop_file_path`, jamais un littéral). Base : une row sous le **même `tool_name` que le chemin nominal**, la porte dans `after_value` — motif `ready_label_outcome` (mika#2323), délibérément **pas** le motif à deux noms de `phantom_aged_out` / `phantom_sweep_spared`, qui s'applique quand chaque nom porte sa propre cause ; ici les deux issues appartiennent au même dispatcheur et à la même population.
+    ```bash
+    # La garde a-t-elle mordu ? (régime attendu : non vide pendant un STOP, vide hors STOP)
+    grep groom_pilot_autofire_stopped "$MIKA_SPIRIT_LOG_FILE" \
+      | jq -c '{parent_task_id, callback_task_id, repo, issue, stop_file}'
+    ```
+    ```sql
+    -- Les deux issues du même dispatcheur, soustractibles en une requête
+    SELECT after_value, count(*) FROM audit_events
+     WHERE tool_name = 'task_engine_groom_pilot_dispatcher' GROUP BY 1;
+    ```
+    | événement | niveau | régime attendu | lecture |
+    |---|---|---|---|
+    | `groom_pilot_autofire_stopped` | INFO | **non vide pendant un STOP, vide hors STOP** | chaque ligne est un implement que l'opérateur n'a pas eu à annuler en réaction |
+    | `after_value = 'stopped_by_sentinel'` | audit | idem | le même fait, comptable et daté |
+    | `after_value = 'implement_dispatched'` | audit | **zéro pendant un STOP** | toute occurrence dans une fenêtre de STOP est une fuite — sonde S2 |
+
+    **Coût nommé et daté :** un `SELECT count(*) WHERE tool_name = 'task_engine_groom_pilot_dispatcher'` **nu** change de sens au déploiement. `WHERE after_value = 'implement_dispatched'` reste **exact de part et d'autre**, et c'est la requête à écrire.
+  - **Sonde S1 — la garde mord.** Armer la sentinelle pendant qu'un groom est en vol et le laisser converger. Attendu : la ligne INFO apparaît, aucune row callback `long_running:run_claude_pilot` n'est créée sous ce parent, le `dispatch_class` du parent vaut toujours `groom`, et le compte `implement_dispatched` n'a pas bougé.
+  - **Sonde S2 — attribution des fuites (48 h), et c'est elle qui décide des suivis ci-dessus.** Sur la fenêtre d'un STOP, croiser les dispatches réellement partis : `grep ready_label_outcome "$MIKA_SPIRIT_LOG_FILE" | jq -c 'select(.gate == "dispatched")'`. Zéro ligne ⇒ la voie prompt-level et le « label à la main » n'ont rien produit, et les suivis restent fermés. Des lignes ⇒ le suivi s'ouvre **avec un compte**, et le `repo`/`num` dit laquelle des deux.
+  - **Halte 1 — la ligne apparaît ET un pilote a tourné quand même.** Une **autre** route a dispatché. **Ne pas élargir cette garde par réflexe** : lire `ready_label_outcome` (S2) et établir laquelle des trois routes non couvertes a servi ; les trois remèdes diffèrent.
+  - **Halte 2 — aucune ligne, et aucun implement.** On ne peut **rien** conclure : vérifier d'abord qu'un groom a réellement convergé dans la fenêtre (`grep 'Outcome: PLAN_GROOMED'`, ou un callback `delivered` portant le marqueur). *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (classe mika#2205). Vérifier ensuite que le binaire servi porte le correctif (classe mika#2340) **avant** toute conclusion sur le prédicat.
+  - **Halte 3 — la ligne apparaît alors qu'aucun STOP n'est posé.** Le lecteur regarde ailleurs que là où l'opérateur écrit : comparer le champ `stop_file` avec le chemin réellement posé et vérifier `MIKA_HOME` / `global_home_dir` **avant** de toucher au prédicat. Le fail-open de `Path::exists` ne peut produire que l'inverse (un STOP non vu), jamais un faux positif — donc une ligne de trop est une erreur de **chemin**, pas de prédicat.
+  - **Halte 4 — après la levée, le ticket n'est jamais dispatché.** La prémisse de convergence est fausse. Lire le registre d'exclusion **avant** d'ajouter le moindre mécanisme de ré-armement : `SELECT after_value, created_at FROM audit_events WHERE tool_name = 'auto_pull_exclusion' AND target_key = 'issue:<n>' ORDER BY created_at DESC LIMIT 5;`. Il nomme le vrai filtre (`not_groomed`, `below_threshold`, `operator_review_or_blocked`, `abandoned_operator_held`, …), et aucun de ces remèdes ne vit dans l'auto-fire.
+
 - **Sonde post-déploiement, avec sa halte.** Sur la première occasion réelle : armer, vérifier la ligne INFO au tick suivant, vérifier qu'aucun ticket n'est promu `ready` pendant la fenêtre (`tool_name = 'auto_feeder'` silencieux), lever, vérifier la reprise. Si le feeder **ne reprend pas** après la levée : **halte, et ne pas redémarrer pour réparer** — un redémarrage effacerait la preuve. C'est la signature du mécanisme d'annulation de row (une row a été touchée quelque part) et elle se lit dans `tasks` sur la row `auto_pull_groomed`, pas dans le log.
 - **Latence :** ≤ 10 min (`AUTO_PULL_CRON = "0 */10 * * * *"`), ce qui est l'exigence écrite du ticket (« prendre effet au tick suivant »). Un STOP instantané reste le geste existant — arrêter le service — et ce mécanisme sert précisément le cas où l'on ne veut pas le poser.
 
@@ -1875,6 +2215,214 @@ Optional (le checkout principal est un checkout de déploiement, et `run_shell` 
 - **Cinq haltes.** *Halte 1 — 1a vide pendant que le checkout est visiblement sale* : ne pas élargir le prédicat ; lire `MIKA_WORKTREE_REAP_REPO_DIRS`, puis vérifier que le binaire déployé porte le correctif (classe mika#2340). *Halte 2 — 2 vide ET 3b rend 0* : la garde n'est pas dans la bibliothèque seedée (`~/.mika/skills/` est une projection du binaire) ; rebuild → seed → relire. **Zéro refus ne vaut « sain » que si 3b est non nul.** *Halte 3 — 2 porte du trafic soutenu sur un même agent après une semaine* : lire les commandes refusées **avant** de toucher à l'allow-list ; un refus répété sur une forme légitime est une entrée D7 à ajouter avec sa raison (la **forme** du verbe, jamais l'agent ni le chemin) ; un refus répété sur `checkout <ref> -- <paths>` est le prompt à relire, pas la garde à assouplir. *Halte 4 — un checkout sale réapparaît (1a) avec 2 vide* : le producteur n'est pas `run_shell` — rejouer 1b **sans** le filtre `tool_name`, puis la classe humaine/orchestrateur (mika#2107 couvre les sessions Claude Code ; un `cm`/spawn hors hook est possible). *Halte 5 — la ligne fail-open apparaît (3b)* : le script n'est pas là où le handler le cherche — `MIKA_PLATFORM_DIR` du **service** (pas d'un shell) ou checkout déplacé ; réparer le déploiement, pas le handler.
 - **Gardes.** `scripts/test-guard-shared-checkout.sh` (les trois commandes de M0 **verbatim**, `fa92720d`, `d53b91e3`, les formes mika-dev, F2, F3, hors population, mode worktree inchangé) et `scripts/test-shell-exec-guard.sh` (le branchement, l'arbre du principal **intact** après refus, contrôle positif de fixture, fail-open, dérogation, la variable décide, sole writer du jeton, et le **contrôle négatif vu rouge** : handler dépouillé → M0 passe et salit l'arbre) — `make test-shared-checkout-guard`, CI `shared-checkout-guard-lint`. `test-dispatch-lib.sh` tient à allowlist vide qu'aucun message « recover with … stash apply » de `dispatch-lib.sh` ne nomme `SUB_REPO_DIR` (le site B de `_set_up_worktree` prescrivait le checkout principal — corrigé, il nomme le worktree canonique). `main_checkout_dirty` est SOLE WRITER par scan de source.
 - **Hors périmètre, délibérément :** nettoyer ou committer le checkout principal ; un outil `sync_main` dédié pour mika-dev (l'allow-list D7 est une *tolérance*, l'incapacité serait un handler qui ne sait faire que `fetch` + `merge --ff-only` — préalable : relire les 84 commandes mika-dev sur main) ; l'écriture perdue dans le tmpfs `mika/` du sandbox (forme mika#2205) ; le démarrage pilote non contenu muet (préalable : une mesure qui montre un dispatch sans bwrap — aucune à ce jour).
+
+Optional (purge du `target/` d'un worktree vif — mika#2497):
+- **Le défaut que ça ferme, mesuré.** Chaque pilote / QA reconstruit un `target/` Rust de 15 à 50 Go dans son worktree, et **rien ne le purge tant que le worktree vit**. Nuit du 2026-09-22 : **+90 Go en 8 h**, `/data` à **83 %**, worktrees à **165 Go** — à un cheveu de casser moteur, QA et builds. Nettoyé à la main. Le faucheur terminal (mika#2420) ne voit pas cette population : son terme T4 exige **« aucune PR ouverte »**, donc un worktree dont la PR est ouverte lui est refusé sous le motif `pr_open` et son `target/` vit aussi longtemps que la PR. C'est le *suivi HALT-2* que mika#2420 nomme dans son propre corps.
+- **Troisième bras du tick `worktree_reap`, après le faucheur**, et l'ordre est nécessaire : ce que le faucheur vient de retirer n'existe plus. La population est **exactement** l'ensemble de ses refus `pr_open` du même tick — une donnée déjà en mémoire, sans une requête de plus, et tout le coût (`git worktree list`, l'unique `gh pr list` par dépôt, l'énumération de `/proc`, la sentinelle STOP, la déduplication des refus) est déjà payé. Cadence inchangée, aucun `PeriodicScan` nouveau, aucune row récurrente, aucune migration.
+- **L'asymétrie est INVERSE de celle du faucheur, et c'est ce qui autorise à toucher un worktree vif.** *Le faucheur supprime du travail potentiel ; ce bras supprime du dérivé pur.* Un `target/` est intégralement reconstructible par `cargo build`, donc le coût d'un faux positif est **borné à du temps de rebuild**, jamais à une perte — l'exact inverse du *« un faux positif détruit des heures de travail, irréversiblement »* qui gouverne mika#2420. **Ce que l'asymétrie n'autorise PAS :** supprimer `target/` **pendant** un `cargo build` casse ce build. Le danger n'est pas la perte de données, c'est la **concurrence**, et tout le prédicat porte là-dessus.
+- **Cinq termes conjonctifs, tous fail-safe vers *conserver*, sans exception.** P1 le chemin est managé (re-vérifié **après canonicalisation** juste avant la disposition) ; P2 `<worktree>/target/` existe et est un **répertoire**, jamais un lien symbolique ; P3 aucun processus vivant n'a son cwd sous le worktree ; P4 inactivité, sur le mtime maximum d'un ensemble **borné et déclaré** (`target/`, ses enfants directs, et les enfants de ceux-ci — profondeur 2, quelques centaines de `stat`, aucune troncature possible) ; P5 **aucun cargo ne travaille ici**, par `flock` non bloquant. `LiveCwds::Unavailable` conserve tout, exactement comme chez le faucheur.
+- **Pourquoi P5 existe.** P3 est **connu pour être troué**, et mika#2420 l'écrit lui-même : un processus peut travailler dans un worktree sans y avoir son cwd (`cargo --manifest-path`, `git -C`, un éditeur lancé ailleurs). Chez le faucheur ce trou était couvert **par la conjonction** — un tel processus travaille sur une branche dont la PR est ouverte (exclu par T4) ou produit des modifications non committées (exclu par T7). **Ici cette couverture disparaît : la PR est ouverte par définition de la population.** P5 rend ce que T4 apportait, indépendamment du cwd et de tout délai. P4 et P5 ne sont pas redondants et leur ordre est le motif de mika#2184 : **le proxy filtre d'abord** (P4, quelques `stat`, écarte la quasi-totalité), **la mesure directe tranche ensuite** (P5, sur le seul candidat retenu, dernier point où le refus est gratuit).
+- **Le verrou est DÉCOUVERT, jamais deviné.** Cargo pose son verrou sur `<target>/<profil>/.cargo-lock` et le profil est une donnée de l'invocation, donc le terme énumère les enfants directs de `target/` et sonde chaque `.cargo-lock` trouvé ; **un seul verrou tenu suffit à refuser**. Deviner `target/debug/.cargo-lock` raterait un build `--release`, c'est-à-dire échouerait exactement sur le cas qu'on veut voir.
+- **Deux absences, deux dispositions OPPOSÉES — et c'est ce qui se confond.** Aucun `.cargo-lock` sous `target/` ⇒ cargo n'a jamais construit ici ⇒ terme **satisfait**, purge permise. L'appel `flock` indisponible (non-Linux) ⇒ on ne peut pas regarder ⇒ **inévaluable**, conserve. Traiter la première comme la seconde rend le bras **inerte sur une population saine** tout en se lisant comme un disque sain (classe mika#2205) ; traiter la seconde comme la première purge à l'aveugle.
+- **Aucune dépendance nouvelle, et le build reste multi-plateforme.** `libc` est déjà là, mais **sous `[target.'cfg(target_os = "linux")'.dependencies]`** — d'où un repli non-Linux **explicite qui conserve**, sur le patron de `is_same_process_alive`. Rendre « libre » hors Linux serait purger sur la seule plateforme où l'on ne peut pas vérifier qu'un build tourne. Un `Cargo.toml` inchangé et un build cassé sur macOS satisferait la lettre de cette contrainte en la trahissant.
+- `MIKA_TARGET_PURGE` — kill-switch, **défaut armé**. `0`/`false`/`off`/`no` désarment sans redéploiement ; absent, vide ou **non reconnu** laissent armé, avec un WARN nommant la valeur entre guillemets — un désarmement par coquille sur un frein de disque serait la panne silencieuse que tout ceci ferme. Désarmé, le bras n'écrit **rien** : il ne « refuse » pas, il n'existe pas ce tick.
+- `MIKA_TARGET_PURGE_DISPOSITION` — `armed` (défaut) | `observe`. En observation le bras mesure, journalise et **ne supprime rien** (`target_purge_would_dispose`, jamais `target_purged`). Patron mika#2249 : *la détection est inconditionnelle, seule la disposition est gatée* — et la correction de mika#2469 est prise d'emblée plutôt qu'après coup.
+- `MIKA_TARGET_PURGE_IDLE_SECS` — fenêtre P4, **défaut `14400` (4 h)**, bornée des deux côtés : en dessous, une boucle QA → CI-fix active enchaîne en minutes et se ferait purger son cache entre deux itérations ; au-dessus, la fenêtre nocturne de 8 h qui a produit l'incident cesse d'être mordue.
+- `MIKA_TARGET_PURGE_MAX_PER_TICK` — **défaut `2`**, budget **distinct** de celui du faucheur (un budget partagé ferait manger au faucheur le sien, ou l'inverse). Un `remove_dir_all` de 40 Go est une tempête d'E/S : ce cap est ce qui l'étale. Les trois clés numériques suivent le parse maison à trois paliers, et le `0` **ne désarme pas** — c'est le rôle du kill-switch.
+- **Disposition propre, sentinelle STOP PARTAGÉE.** Disposition propre parce que les deux létalités diffèrent d'un ordre de grandeur : coupler forcerait l'opérateur à régler les deux sur la plus prudente, et donc à perdre la purge dès qu'il veut observer le faucheur. Sentinelle **partagée** (`~/.mika/state/worktree-reap-stop`, mika#2329) parce que la décision d'urgence est **la même** — « arrête ce qui supprime dans les worktrees ». Le court-circuit existant est en tête de tick, donc il couvre le nouveau bras sans une ligne.
+- **Livré armé, et l'argument est celui de l'asymétrie.** mika#2420 a shippé armé en s'appuyant sur mika#2272 (*« zéro était l'absence de mesure, pas la présence de prudence »*) ; l'argument est plus fort ici, le pire cas d'un faux positif étant un rebuild et non une perte. Ce qui paie la prudence est nommé et concret : les cinq termes fail-safe, la garde directe P5, le mode observe, la sentinelle partagée, le kill-switch — **et la sonde S0, qui prescrit de commencer en `observe`**.
+
+### SQL
+
+```sql
+-- Ce que la boucle a purgé (SOLE WRITER)
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'target_purged' ORDER BY created_at DESC;
+
+-- Ce qui AURAIT été purgé, en observation
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'target_purge_would_dispose' ORDER BY created_at DESC;
+
+-- La distribution des refus : la forme réelle de la population
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'target_purge_skipped' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. Qu'a-t-on purgé, et combien ça a rendu ?
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{worktree_path, branch, pr_number, idle_secs, bytes_reclaimed}'
+
+# 2. CONTRÔLE POSITIF — le bras tourne-t-il seulement ?
+grep target_purge_tick "$MIKA_SPIRIT_LOG_FILE" | tail
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `target_purged` | INFO | **non vide, quelques-uns par jour** | chaque ligne est du disque rendu sans geste humain |
+| `target_purge_tick` | INFO | émis **seulement quand le tick agit** | son silence avec zéro purge ne prouve **rien** — voir Halte 2 |
+| `target_purge_would_dispose` | INFO | non vide **en `observe` seulement** | la population du dry-run |
+| `target_purge_failed` | WARN | **vide** | toute occurrence est une suppression refusée par le système de fichiers |
+
+- **`pr_number` est résolu, pas porté.** Le refus du faucheur ne transporte que le chemin, la branche et le motif ; le numéro se lit dans l'index des PR du tick. Un `pr_number` illisible **dégrade la ligne, ne suspend pas la purge** (le champ vaut `null`, modèle `repo=unknown` de mika#2496) — un worktree purgé dont on ne sait pas nommer la PR reste un worktree purgé, et le taire rétrécirait le compte en silence.
+- Les refus sont dédupliqués par `(worktree, motif)` sur 24 h (doctrine mika#2131) : l'information durable est « ce `target/` est tenu par ce motif », pas « il l'était encore à 14 h 32 » — la vivacité est le rôle de l'agrégat par tick. **Zéro purge et zéro refus ⇒ zéro ligne.** Les clés d'audit sont préfixées `target:`, distinctes du `worktree:` du faucheur, pour que les deux populations restent soustractibles.
+
+### Sondes post-déploiement — **gestes opérateur, jamais du pilote**
+
+**S0 — commencer en `observe`.** Poser `MIKA_TARGET_PURGE_DISPOSITION=observe` et lire la population que le bras *retirerait* (`target_purge_would_dispose`). Le cap par tick (`2`) vaut **aussi en observation** : laisser tourner `ceil(N / 2)` ticks — jusqu'à ce qu'un tick ne nomme plus de worktree que `SELECT DISTINCT target_key` n'ait déjà rendu — puis armer. Armer après un seul tick retirerait les N−2 autres sans les avoir jamais vus en dry-run.
+
+**S1 — le symptôme (7 jours).** `df -h /data` : la montée nocturne cesse de rapprocher le seuil. `du -sh` sur la racine des worktrees : le total se stabilise nettement sous les 165 Go mesurés. **C'est la vérification en service, et c'est un geste d'opérateur sur l'hôte réel — aucun pilote ne l'exécute.**
+
+**S2 — l'attribution.** La requête `target_purged` doit être non vide, et croiser des worktrees dont la PR était bien **ouverte** — c'est la preuve que la population servie est celle qui est visée, et non celle de mika#2420.
+
+**S3 — non-régression de la boucle.** Aucune plainte de rebuild intempestif sur une itération QA → CI-fix. Le signal direct est la distribution de `target_purge_skipped` : `recently_active` doit **dominer** — c'est la fenêtre qui protège le travail en cours.
+
+### Les quatre haltes
+
+**Halte 1 — un build cassé par la purge.** `touch ~/.mika/state/worktree-reap-stop` **immédiatement**, puis diagnostiquer. C'est le seul mode de panne coûteux, et il ne se règle pas en bougeant un seuil : établir lequel de P3, P4 ou P5 a lu vrai alors qu'il était faux.
+
+**Halte 2 — zéro purge et zéro ligne du tout.** On ne peut **rien** conclure. Vérifier d'abord le contrôle positif (`target_purge_tick`), puis que le binaire servi porte le correctif (classe mika#2340) — *une ligne absente ne prouve rien tant qu'on n'a pas établi que le binaire qui tourne sait l'écrire*. Zéro purge avec un tick qui agit est sain ; zéro des deux ne prouve rien.
+
+**Halte 3 — `/data` remplit encore alors qu'aucun worktree inactif ne porte de `target/`.** **Ne pas raccourcir la fenêtre par réflexe** : ce serait purger le cache de travail en cours pour un problème de dimensionnement. La cause est alors le **pic de production simultanée**, que ce livrable ne borne pas. Ouvrir le suivi `CARGO_TARGET_DIR` partagé **avec la mesure**, jamais avec l'intuition.
+
+**Halte 4 — `build_lock_unreadable` ou `mtime_unreadable` domine.** Le bras est silencieusement inerte par fail-safe : il tourne et ne purge jamais rien, ce qui se lit exactement comme un disque sain (classe mika#2205). Établir pourquoi ces signaux sont illisibles **avant** de toucher au prédicat.
+
+### Ce que ce travail n'achète PAS
+
+**Il borne l'accumulation, il ne borne pas le pic.** Si les N worktrees de la nuit du 22 compilaient tous réellement, aucun n'était inactif et la purge n'aurait rien attrapé **pendant** la montée — elle attrape le résidu après. Borner le pic demande soit un `CARGO_TARGET_DIR` partagé (refusé, voir ci-dessus), soit une limite de concurrence de dispatch. **C'est la limite honnête de ce livrable, et c'est la Halte 3.** Il ne mesure pas le disque et n'a aucun seuil de remplissage : il ne sait pas que `/data` est à 83 %, il sait qu'un `target/` est inactif.
+
+### Hors périmètre, délibérément
+
+- **`CARGO_TARGET_DIR` partagé** — refusé sur trois motifs : cargo prend un **verrou exclusif** sur son répertoire de build, donc deux pilotes concurrents se **sérialisent**, ce qui couple la boucle à un mutex de build au moment même où `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` existe pour la découpler ; un target partagé entre branches divergentes **accumule** et invalide en cascade, sans GC ; et c'est un changement structurel de la performance de build, **non mesuré**. **Suivi**, dont la précondition est la Halte 3.
+- **Une purge à la fin de chaque dispatch** (`dispatch-lib.sh`) — elle détruit le cache entre l'implement et les itérations QA / CI-fix qui suivent **sur le même worktree** : on échangerait du disque contre de la latence de boucle sur le chemin **nominal**, alors que le défaut mesuré est un résidu **nocturne**.
+- **Le pic de production simultanée** et toute limite de concurrence de dispatch.
+- **`scripts/mika-platform-worktree-cleanup`** — vit dans `mika-platform`, structurellement hors d'atteinte du pilote (le worktree de dispatch ne matérialise que le sous-dépôt `mika/`), et ce dépôt garde son invariant zéro-issue.
+- **Le faucheur terminal mika#2420** — inchangé, population disjointe.
+- **Un déclencheur par pression disque** (`df` sous seuil) — autre mécanisme, autre population, aucune mesure ne le demande aujourd'hui.
+- **La purge du `target/` du checkout principal** — ce n'est pas un worktree managé, et P1 l'exclut par construction.
+
+### Le verrou est tenu pendant la suppression, et les deux budgets sont découplés (mika#2511, 2026-09-24)
+
+**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
+déplacée.** Cette entrée est ici parce que l'opérateur qui lit un
+`target_purge_skipped` inattendu, ou qui compare un compte `purged` de part et
+d'autre du déploiement, cherche dans ce voisinage.
+
+- **Le défaut que ça ferme.** Le filtre P5 sondait le `.cargo-lock` et le
+  **relâchait aussitôt** ; la suppression venait plus tard, sans re-sonde. Entre
+  les deux : des points `.await`, une mesure d'arbre, et — avec
+  `MIKA_TARGET_PURGE_MAX_PER_TICK = 2` — la suppression complète du candidat
+  précédent. Un `cargo build` démarré dans cette fenêtre voyait son `target/`
+  disparaître sous lui. Désormais l'acquisition **retient** le `flock` de chaque
+  `.cargo-lock` pendant le `remove_dir_all` et ne le relâche qu'après.
+
+- **La borne exacte de la protection, et il faut la lire avant de la croire
+  totale.** `flock(2)` porte sur une *open file description*, donc sur l'inode —
+  et le `remove_dir_all` supprime `<target>/<profil>/.cargo-lock` en cours de
+  route.
+
+  | fenêtre | avant | après |
+  |---|---|---|
+  | sonde → début de la suppression | **non protégée** | protégée |
+  | début de la suppression → unlink du `.cargo-lock` | non protégée | protégée |
+  | unlink → fin de la suppression | non protégée | **toujours non protégée** |
+
+  **Résidu supplémentaire, qu'aucune ligne de ce ticket ne ferme : seuls les
+  `.cargo-lock` qui EXISTENT à l'acquisition sont tenus.** Un premier
+  `cargo build --release` sur un `target/` ne portant que `debug/` crée
+  `release/.cargo-lock` — un inode neuf, à un chemin que l'énumération n'avait
+  pas vu — et prend son verrou sans jamais rencontrer le nôtre. Le résidu est
+  acceptable pour la raison qui fonde tout le bras (mika#2497) : *un faux positif
+  coûte du temps de rebuild, jamais une perte*, et un `cargo` qui démarre dans la
+  seconde moitié d'un `remove_dir_all` est un build de quelques secondes.
+  Un `rename(target, target.mika-purge-<n>)` ramènerait ces trois résidus à
+  quelques microsecondes et est **refusé** : le répertoire renommé n'est couvert
+  par aucun `.gitignore`, donc `git status --porcelain` le liste `??`, donc T7 du
+  faucheur mika#2420 lit le worktree `dirty` et refuse de le retirer — un
+  orphelin de 40 Go dans un worktree devenu non-retirable, soit le problème que
+  ce bras existe pour résoudre, aggravé. **Suivi nommé**, précondition : que la
+  sonde S5 ci-dessous montre une population `build_lock_raced` non négligeable.
+
+- **Nouveau motif de refus : `build_lock_raced`, en queue de
+  `ALL_PURGE_REFUSAL_REASONS`.** **Ajout, jamais renommage** — aucune population
+  existante ne change de nom ni de sens, et les `GROUP BY` publiés plus haut
+  restent exacts. Il est **distinct de `build_lock_held`** et c'est tout son
+  objet : chaque ligne dit « le verrou était libre à la sonde et tenu à
+  l'acquisition », c'est-à-dire une suppression que l'état d'avant mika#2511
+  aurait laissé passer sur un arbre en cours de build — donc **la mesure de la
+  fenêtre que ce ticket ferme**. Les fusionner rendrait cette mesure
+  incomptable. `build_lock_unreadable` est en revanche **réutilisé** pour une
+  acquisition inévaluable : le remède opérateur est identique aux deux étages
+  (« pourquoi ce `target/` n'est-il pas lisible ? »). Décision, pas oubli.
+  **Régime attendu : non vide et faible.**
+
+- **Les deux budgets sont découplés.** La boucle des dépôts cassait sur le budget
+  du **faucheur** seul, donc un faucheur épuisé privait de purge tous les dépôts
+  suivants — en contradiction avec le « budget distinct » que le code revendique.
+  Elle ne cesse plus que lorsque **les deux** bras sont épuisés (ou le faucheur
+  épuisé et la purge désarmée). **Effet collatéral à nommer plutôt qu'à cacher :
+  ça restaure aussi `probe_main_checkout` (la sonde de saleté mika#2449) sur les
+  dépôts suivants** — le `break` était en tête de corps de boucle et sautait tout
+  ce qui suit, y compris elle. Ne se manifeste qu'avec plusieurs dépôts
+  (`MIKA_WORKTREE_REAP_REPO_DIRS` ; le défaut est mono-dépôt).
+
+- **`would_purge` compte la population `observe`, et `purged` CHANGE DE SENS au
+  déploiement.** Le bras incrémentait `purged` dans les deux dispositions, donc
+  l'agrégat `target_purge_tick` revendiquait des suppressions en dry-run. Un
+  compteur par disposition désormais, et `target_purge_tick` porte le champ
+  `would_purge`. **Conséquence pour la lecture : un compte `purged` qui enjambe
+  le déploiement compare deux vocabulaires** — avant, il incluait les
+  observations ; après, il ne compte que les suppressions effectives. La requête
+  juste est celle sur `audit_events`, dont les deux `tool_name` étaient **déjà**
+  séparés (`target_purged` / `target_purge_would_dispose`, mika#2469) et ne
+  bougent pas :
+
+  ```sql
+  SELECT tool_name, count(*) FROM audit_events
+   WHERE tool_name IN ('target_purged', 'target_purge_would_dispose')
+   GROUP BY 1;
+  ```
+
+  **Le piège que ça a failli créer :** la condition d'émission de l'agrégat était
+  `purged > 0 || failed > 0`. Corriger le compteur **seul** aurait rendu
+  `target_purge_tick` muet dans le mode même que la sonde S0 prescrit d'utiliser
+  en premier — une régression d'observabilité introduite par un correctif
+  d'observabilité. Elle lit désormais aussi `would_purge`.
+
+- **Sondes, et leurs haltes.** **S5 — la fenêtre est mesurée (30 jours) :**
+  `SELECT count(*) FROM audit_events WHERE tool_name = 'target_purge_skipped'
+  AND after_value = 'build_lock_raced';`. **Halte —** un compte qui porte du
+  trafic nominal (plusieurs par jour, sur des worktrees différents) ne veut
+  **pas** dire que le prédicat est trop large : il veut dire que des builds
+  démarrent couramment dans les fenêtres résiduelles ci-dessus, et c'est **là**
+  que le suivi `rename`-avant-suppression s'ouvre, avec ce compte comme
+  précondition. Ne pas raccourcir `MIKA_TARGET_PURGE_IDLE_SECS` par réflexe —
+  ce serait purger le cache de travail en cours pour un problème de course.
+  **S6 — contrôle négatif du zéro :** un compte **nul** ne prouve **pas** que le
+  défaut n'existait pas ; il faut qu'un `cargo` démarre pile dans la fenêtre, et
+  celle du premier candidat d'un tick est de l'ordre de 2 s (`measure_tree_size`
+  est budgété à 400 000 entrées / 2 000 ms). Avant de conclure, établir le
+  contrôle positif — que le bras a réellement purgé quelque chose :
+  `SELECT count(*) FROM audit_events WHERE tool_name = 'target_purged';`.
+  **Zéro des deux ne prouve rien** (classe mika#2205). **S7 — le découplage mord
+  (un tick, multi-dépôts) :** poser `MIKA_WORKTREE_REAP_REPO_DIRS` sur deux
+  checkouts et `MIKA_WORKTREE_REAP_MAX_PER_TICK=1` avec deux worktrees terminaux
+  dans le premier ; attendu, une activité `target_purge_tick` sur le **second**
+  dépôt et `main_checkout_dirty` consultable pour lui. **Halte —** rien sur le
+  second alors que le premier a consommé son budget : vérifier d'abord que le
+  binaire servi porte le correctif (classe mika#2340) **avant** de toucher au
+  prédicat d'arrêt.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur nouveau côté journal, aucune
+  ligne INFO nouvelle : le seul instrument ajouté est le motif d'audit ci-dessus,
+  et **son silence ne prouve rien tant que le contrôle positif n'est pas
+  établi**. La garde qui empêcherait qu'on retire l'acquisition est un **scan de
+  source** (`mika2511_toute_suppression_est_precedee_de_lacquisition`, allowlist
+  livrée vide), pas un test comportemental — retirer l'acquisition ne rend
+  **aucune décision fausse** le jour où on l'écrit : la purge continue de purger,
+  toute la suite reste verte, et seule la fenêtre se rouvre, en silence.
 
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 

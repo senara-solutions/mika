@@ -3107,6 +3107,273 @@ async fn validate_pr_review_flag_coherence(
     Err(ToolOutput::error(body.to_string()))
 }
 
+/// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
+/// check is red on the PR's head (mika#2455).
+///
+/// Third member of the pre-subprocess family, after
+/// `validate_destructive_action_grounding` (mika#1646) and
+/// `validate_pr_review_flag_coherence` (mika#2237). Same placement and the same
+/// reason: the defect is the call — by the time an EndTurn arm ran, `pass` /
+/// APPROVED would be on GitHub and only another review could contradict it.
+/// See `evidence::guards`'s mika#2455 section for the four design points; this
+/// function is their application.
+///
+/// # What it gates on, and what it deliberately does not
+///
+/// The **verdict**, never the flag. A gate on `--approve` would compose with
+/// mika#2237 into a deadlock — `--approve` refused here, `--comment` refused
+/// there for want of a recevable attempt, and no review postable at all. The
+/// output this refusal names (`block[ci]` or `hold[review]`, posted with
+/// `--comment`) is reachable whatever the turn's history, which is what makes
+/// R8 structural rather than hoped for.
+///
+/// It runs **after** mika#2237 for two reasons: it is the only link of the
+/// `run_gh` chain that makes a network call, so it must not be spent on a
+/// review mika#2237 is going to refuse anyway; and the ordering makes the
+/// composition legible — a `pass` posted as `--comment` with no attempt is
+/// refused upstream and never reaches here.
+///
+/// # Which way it fails
+///
+/// Fail-OPEN throughout, the inverse of mika#1646, and the asymmetry is
+/// computed rather than felt. A false negative leaves the misleading signal
+/// standing — the original defect, already today's regime — while the merge
+/// itself stays closed by `pr_merge_with_gate`'s own CI gate. A false positive
+/// forces the review to be rewritten and, if the model digs in, kills the turn
+/// with no review posted. So every unreadable term abstains: no PR target, no
+/// repo, no token, `gh` failing, the read timing out, unparseable output. Each
+/// abstention is **said** (`qa_ci_coherence_abstained`), never silent — an
+/// inert guard reads exactly like a healthy one (mika#2205).
+async fn validate_qa_ci_coherence(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_qa_ci_coherence_with_reader(args, repo, ctx, |pr, repo, token| async move {
+        crate::tools::pr_merge_with_gate::run_gh_checks_raw(pr, &repo, &token).await
+    })
+    .await
+}
+
+/// The mika#2455 gate with its CI reader injected.
+///
+/// **Why the seam is the subprocess and not the classification.** The
+/// production reader is `gh pr checks --required` and cannot run in a test (no
+/// network, no token), so something has to be substitutable. Putting the seam
+/// at the *parsed* checks would leave the parser and the classifier untested on
+/// the production path; putting it at the **raw stdout** means a test exercises
+/// the real parser (`parse_gh_checks`), the real classifier
+/// (`classify_ci_coherence` → `classify_checks`) and the real wiring inside
+/// `run_gh` — everything except the one thing it cannot have, the network.
+///
+/// Public because `tests/eval/` is a separate crate. It has exactly one
+/// production caller, [`validate_qa_ci_coherence`].
+pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+    read_checks: F,
+) -> Result<(), ToolOutput>
+where
+    F: FnOnce(u64, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    use crate::evidence::guards::pr_review_target;
+    use crate::evidence::guards::{
+        CiAbstention, CiCoherenceOutcome, QA_CI_COHERENCE_AUDIT_TOOL, QA_CI_READ_TIMEOUT_SECS,
+        classify_ci_coherence, qa_ci_coherence_gate_enabled,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+    use crate::tools::pr_merge_with_gate::{GH_CHECKS_PARSE_ERROR_PREFIX, parse_gh_checks};
+
+    // -- Recognition, fail-open, in increasing order of cost --
+
+    if !qa_ci_coherence_gate_enabled() {
+        return Ok(());
+    }
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+    // The discriminator is the verdict itself, never the flag (D1). Every other
+    // classified verdict — `hold[review]`, `block[ac]`, `block[ci]`,
+    // `block[dependency]`, `block[security]`, `block[pipeline]` — and a body
+    // with no `VERDICT:` line at all pass untouched (R3).
+    if !matches!(parse_verdict(&body), Verdict::Pass) {
+        return Ok(());
+    }
+
+    // Audit writes are warn-and-continue throughout: losing the ledger row must
+    // never change the guard's verdict, in either direction (mika#2237 motif).
+    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                QA_CI_COHERENCE_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(outcome),
+                Some(reasoning),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write qa-ci-coherence audit row");
+        }
+    }
+
+    let target = pr_review_target(args);
+    let target_key = format!(
+        "pr_review:{}#{}",
+        repo.unwrap_or("__default__"),
+        target.as_deref().unwrap_or("unknown")
+    );
+
+    async fn abstain(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) {
+        tracing::warn!(
+            event = "qa_ci_coherence_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2455: could not read the head's required checks — a pass verdict is let \
+             through rather than refused on an unobservable term"
+        );
+        audit(ctx, target_key, "abstained", reason).await;
+    }
+
+    // A PR identifier that is not a number cannot address `gh pr checks`, and
+    // the guard does not guess a target.
+    let Some(pr_number) = target.as_deref().and_then(|t| t.parse::<u64>().ok()) else {
+        abstain(ctx, &target_key, CiAbstention::NO_PR_TARGET).await;
+        return Ok(());
+    };
+    let Some(repo) = repo else {
+        abstain(ctx, &target_key, CiAbstention::NO_REPO).await;
+        return Ok(());
+    };
+    let Some(token) = ctx.github_token else {
+        abstain(ctx, &target_key, CiAbstention::NO_TOKEN).await;
+        return Ok(());
+    };
+
+    // -- Read, bounded --
+
+    let read = read_checks(pr_number, repo.to_string(), token.to_string());
+    let raw = match tokio::time::timeout(
+        std::time::Duration::from_secs(QA_CI_READ_TIMEOUT_SECS),
+        read,
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            abstain(ctx, &target_key, CiAbstention::GH_TIMEOUT).await;
+            return Ok(());
+        }
+        Ok(Err(_e)) => {
+            abstain(ctx, &target_key, CiAbstention::GH_FAILED).await;
+            return Ok(());
+        }
+        Ok(Ok(raw)) => raw,
+    };
+
+    let checks = match parse_gh_checks(&raw) {
+        Ok(checks) => checks,
+        Err(e) => {
+            // The discrimination goes through the shared constant, never a
+            // literal typed twice — see `GH_CHECKS_PARSE_ERROR_PREFIX`.
+            let reason = if e.starts_with(GH_CHECKS_PARSE_ERROR_PREFIX) {
+                CiAbstention::UNPARSEABLE
+            } else {
+                CiAbstention::GH_FAILED
+            };
+            abstain(ctx, &target_key, reason).await;
+            return Ok(());
+        }
+    };
+
+    // -- Decide --
+
+    let failing = match classify_ci_coherence(&checks) {
+        // R9/AC8: the nominal decision is written down. Without it, "zero
+        // refusals" would not tell a healthy fleet from an inert guard — the
+        // exact failure mika#2205 had to name for its two scans.
+        CiCoherenceOutcome::AllowedGreen => {
+            audit(
+                ctx,
+                &target_key,
+                "allowed_green",
+                "every required check on the head is green",
+            )
+            .await;
+            return Ok(());
+        }
+        // R6/AC3: a pending check refuses nothing. The review can legitimately
+        // start before the CI has concluded — `pull_request.opened` routes to
+        // mika-qa with no CI term at all — so refusing here would refuse the
+        // nominal case.
+        CiCoherenceOutcome::AllowedPending => {
+            audit(
+                ctx,
+                &target_key,
+                "allowed_pending",
+                "at least one required check is still pending, none is red",
+            )
+            .await;
+            return Ok(());
+        }
+        CiCoherenceOutcome::Refused { failing } => failing,
+    };
+
+    let failing_list = failing.join(", ");
+    tracing::warn!(
+        event = "qa_ci_coherence_refused",
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        target = %target_key,
+        pr = pr_number,
+        failing_checks = %failing_list,
+        "mika#2455: refused a pass verdict contradicted by a red required check on the head"
+    );
+    audit(
+        ctx,
+        &target_key,
+        "refused",
+        &format!("required checks failing on the head: {failing_list}"),
+    )
+    .await;
+
+    // The remedy names BOTH correct outputs and leaves the choice to the model
+    // (D3). Prescribing `block[ci]` would spend a dispatch slot on a CI failure
+    // no pilot can repair — the guard has no way to tell a red lint from a
+    // broken infra. It also names `--comment` so the rewrite does not walk into
+    // mika#2237's refusal.
+    //
+    // **No line of this body may START with `VERDICT:`** — `VERDICT_RE` is
+    // anchored on that line prefix and a stray one would be read as a verdict.
+    // The tokens themselves are named in clear, inside a sentence, and that is
+    // safe: neither reader can capture a bare token outside a line prefix
+    // (`validate_tool_arg_suffixes` looks for the complete line in
+    // `pr_review_body` and never reads a `ToolOutput::error`). Do not
+    // generalise the reasoning — it holds because both readers were read.
+    let body = serde_json::json!({
+        "error": "qa_ci_coherence_violation",
+        "doctrine": "mika#2455",
+        "target": target_key,
+        "failing_checks": failing,
+        "remedy": format!(
+            "This body carries a `pass` verdict, but {} required check(s) are failing on this \
+             PR's head: {failing_list}. A `pass` cannot assert what the CI contradicts. Re-emit \
+             this call with `--comment` and a rewritten verdict line: use `block[ci]` if the \
+             failure looks repairable by a code fix (it dispatches a bounded CI-fix pilot), or \
+             `hold[review]` if it does not (broken infrastructure, a flake, an unrelated \
+             failure) — that one only notifies the operator. Do not keep the `pass` verdict.",
+            failing.len()
+        ),
+    });
+    Err(ToolOutput::error(body.to_string()))
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -3239,6 +3506,21 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     if let Err(err) =
         validate_pr_review_flag_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await
     {
+        return err;
+    }
+
+    // CI↔verdict coherence (mika#2455): refuse a `pr review` whose body says
+    // `pass` while a required check is red on the PR's head. Placed immediately
+    // after mika#2237, and last in the chain, for two reasons. (a) It is the
+    // only link that makes a network call, and the chain runs from the most
+    // local to the most committing — spending a `gh pr checks` on a review
+    // mika#2237 is about to refuse would be paying for a decision already
+    // taken. (b) The order makes the composition legible: a `pass` posted as
+    // `--comment` with no attempt is refused upstream and never reaches here;
+    // a `pass` posted as `--approve` gets through, and it is here that the CI
+    // decides. Like its two siblings, it is NOT gated on
+    // `required_tool_arg_suffixes`: its subject is the body itself.
+    if let Err(err) = validate_qa_ci_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await {
         return err;
     }
 

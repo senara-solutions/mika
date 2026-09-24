@@ -51,6 +51,50 @@
 // property is the entire reason the extraction is mechanical.
 use super::*;
 
+/// L'acte d'estampiller `fired_at`, écrit **une seule fois** (mika#2133 AC4).
+///
+/// Fragment SQL à interpoler dans la clause `SET` d'un `UPDATE tasks`. Il pose
+/// l'instant courant **si et seulement si** la colonne est encore NULL, et rend
+/// la valeur existante sinon.
+///
+/// # Pourquoi un fragment et pas une fonction
+///
+/// AC4 demande « une seule primitive d'estampillage » et précise sa lettre :
+/// *ne pas dupliquer le `UPDATE`*. La fusion en une fonction unique n'est pas
+/// disponible — les quatre écrivains diffèrent par leur garde
+/// (`trigger_type = 'manual'`, `status IN (…)`, `?1 IS NOT NULL`), par ce
+/// qu'ils écrivent d'autre (`status`, `process_id`) et par leur atomicité
+/// requise : la transition et le stamp doivent rester **un seul acte**, donc un
+/// seul aller-retour. Un second `UPDATE` peut échouer entre les deux écritures
+/// et laisser exactement la ligne `in_progress` sans `fired_at` que ce ticket
+/// ferme. Ce que la constante garantit à la place est plus étroit et suffisant :
+/// une seule **définition textuelle** de l'acte, plus la garde de source
+/// `mika2133_fired_at_has_a_single_literal_definition` qui refuse qu'un
+/// cinquième écrivain en écrive une seconde en silence.
+///
+/// # NULL-only, jamais un écrasement
+///
+/// Les faucheurs mesurent l'âge d'un dispatch depuis ce champ
+/// (`MIKA_PILOT_STALL_REAP_AGE_SECONDS`, le balayage phantom, le watchdog
+/// #959, et la sonde `long_running` de [`Database::get_task_health_summary`],
+/// qui trie littéralement sur `fired_at ASC` avec un `fired_at < ?2`), donc un
+/// re-stamp remettrait cet âge à zéro sous eux. Le
+/// besoin n'est pas théorique : le tour de livraison d'un callback est
+/// explicitement ré-essayé par le backoff de mika#2179, et sans cette clause un
+/// callback en quarantaine verrait son `fired_at` avancer d'une heure à chaque
+/// tentative — une estampille qui a l'air d'une mesure et qui suit l'horloge du
+/// réessai.
+///
+/// **Exception déclarée, non exemptée : [`Database::claim_and_fire_task`]**
+/// écrase délibérément (mika#2133 D4). Pour une tâche `recurring`, l'estampille
+/// dit « dernier tir », pas « premier tir » — c'est la seule population qui
+/// fonctionnait avant ce ticket (56/64) et l'uniformiser vers NULL-only la
+/// figerait sur son tir inaugural.
+pub(crate) const FIRED_AT_STAMP_IF_NULL: &str = "fired_at = CASE \
+     WHEN fired_at IS NULL \
+     THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
+     ELSE fired_at END";
+
 impl Database {
     pub fn create_task(&self, task: &NewTask) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -946,22 +990,69 @@ impl Database {
         // through the missing kill. A refusal writes nothing and is silent by
         // design: the callers already treat this whole call as non-fatal, and
         // the prior status is returned either way.
+        // Le fragment d'estampillage est interpolé depuis
+        // [`FIRED_AT_STAMP_IF_NULL`] (mika#2133 AC4) : l'acte a une seule
+        // définition textuelle, et la garde de source refuse qu'un écrivain en
+        // écrive une seconde.
         self.conn.execute(
-            "UPDATE tasks
+            &format!(
+                "UPDATE tasks
                 SET status = 'in_progress',
-                    fired_at = CASE
-                                 WHEN fired_at IS NULL
-                                 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                 ELSE fired_at
-                               END,
+                    {FIRED_AT_STAMP_IF_NULL},
                     completed_at = NULL,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
               WHERE id = ?1 AND agent_id = ?2 AND trigger_type = 'manual'
-                AND status IN ('pending', 'in_progress')",
+                AND status IN ('pending', 'in_progress')"
+            ),
             params![task_id, agent_id],
         )?;
 
         Ok(old_status)
+    }
+
+    /// Estampille `fired_at` **sans toucher au statut** (mika#2133 R2).
+    ///
+    /// # La population qu'il sert
+    ///
+    /// Une ligne `callback` a deux phases. Celle qui porte un pilote est
+    /// estampillée au spawn par [`Self::set_task_process_id`] (mika#2263). Celle
+    /// qui n'en porte pas — un wrapper différé, un rendez-vous de build — ne
+    /// traverse jamais ce chemin, et le seul instant où le moteur travaille
+    /// sous elle est son **tour de livraison** : un tour LLM qui prend le verrou
+    /// d'agent pour jusqu'à l'enveloppe complète. Avant ce ticket, rien ne le
+    /// marquait, donc la ligne se lisait « jamais firée » pendant tout ce temps.
+    ///
+    /// # Pourquoi il ne touche pas au statut
+    ///
+    /// C'est ce qui le distingue de [`Self::mark_parent_dispatched`] et ce qui
+    /// le met hors du périmètre de la décision D6 : poser `in_progress` sur une
+    /// ligne callback ferait entrer toute la population des pilotes vivants dans
+    /// [`Self::get_active_callback_tasks_with_pid`], la requête du watchdog
+    /// #959 — **qui marque la tâche `failed`** quand le processus meurt. Ce
+    /// périmètre a été borné par écrit par mika#2272 ; l'élargir est un
+    /// changement de comportement moteur, pas une observabilité, et c'est un
+    /// ticket distinct.
+    ///
+    /// L'estampille est NULL-only (voir [`FIRED_AT_STAMP_IF_NULL`]) : sur une
+    /// ligne qui porte déjà un pilote, la livraison arrive après le spawn et ne
+    /// réécrit rien — c'est ce qui rend vraie la définition unique de D7,
+    /// *« le premier instant où le moteur a commencé à travailler sous cette
+    /// ligne »*, appliquée à deux natures de travail.
+    ///
+    /// Scopé par `agent_id` comme tout écrivain de cette table. Une ligne
+    /// absente n'est pas une erreur : l'appelant traite ce stamp en
+    /// `warn!`-et-continue, l'observabilité ne doit jamais faire échouer un tour.
+    pub fn stamp_task_fired_at_if_null(&self, id: &str, agent_id: &str) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "UPDATE tasks
+                SET {FIRED_AT_STAMP_IF_NULL},
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+              WHERE id = ?1 AND agent_id = ?2"
+            ),
+            params![id, agent_id],
+        )?;
+        Ok(())
     }
 
     /// Number of columns in TASK_COLUMNS (used for child_count ordinal in list_manual_tasks).
@@ -3093,19 +3184,33 @@ impl Database {
     ///   stamps nothing — that is not a dispatch;
     /// - an existing `fired_at` is never overwritten, so a re-record cannot
     ///   reset a dispatch's age under the reapers that measure it.
+    ///
+    /// **mika#2133 AC4 — le stamp vient de [`FIRED_AT_STAMP_IF_NULL`].** La
+    /// garde « un effacement ne stampe pas » a changé de couche : elle était le
+    /// `?1 IS NOT NULL` du `CASE` SQL, elle est maintenant la branche Rust
+    /// ci-dessous. Même sémantique, même aller-retour unique, et l'acte
+    /// d'estampiller n'est plus écrit ici — c'est ce qui fait qu'un cinquième
+    /// écrivain ne peut pas apparaître en silence.
     pub fn set_task_process_id(&self, id: &str, process_id: Option<i64>) -> Result<()> {
-        self.conn.execute(
+        // Le prédicat est en Rust, jamais dans le `CASE` : le SQL ne porte
+        // alors que l'acte partagé, et la seule question propre à ce site —
+        // « enregistre-t-on un PID ou l'efface-t-on ? » — se lit au-dessus.
+        let sql = if process_id.is_some() {
+            format!(
+                "UPDATE tasks
+                SET process_id = ?1,
+                    {FIRED_AT_STAMP_IF_NULL},
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+              WHERE id = ?2"
+            )
+        } else {
             "UPDATE tasks
                 SET process_id = ?1,
-                    fired_at = CASE
-                                 WHEN ?1 IS NOT NULL AND fired_at IS NULL
-                                 THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-                                 ELSE fired_at
-                               END,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-              WHERE id = ?2",
-            params![process_id, id],
-        )?;
+              WHERE id = ?2"
+                .to_string()
+        };
+        self.conn.execute(&sql, params![process_id, id])?;
         Ok(())
     }
 
@@ -3137,6 +3242,38 @@ impl Database {
     ///
     /// Returns callback tasks in `in_progress` status with a non-null process_id,
     /// used by the callback watchdog to detect dead subprocesses.
+    ///
+    /// # Sa population est VIDE par construction, et l'élargir a un prix (mika#2133 D6)
+    ///
+    /// Une ligne `callback` porte son PID en **`pending`** : l'enfant est créé
+    /// sans statut (donc `pending`), le PID y est posé juste après le spawn, et
+    /// la transition `in_progress` de #525 s'applique au **parent**. Mesuré sur
+    /// la base de production le 2026-09-09, sur chaque ligne ayant jamais porté
+    /// un `process_id` : 876 `delivered`, 19 `cancelled`, 1 `failed`, 1
+    /// `pending` — et **zéro** `in_progress`. Voir
+    /// [`Self::get_live_dispatch_callback_tasks_with_pid`], qui existe pour
+    /// cette raison.
+    ///
+    /// La conséquence visible est un second symptôme, mesuré le 2026-09-01 : un
+    /// garde-tableau qui compte `status='in_progress'` affiche **zéro pendant
+    /// qu'un pilote travaille**. Poser `in_progress` sur ces lignes y ferait
+    /// entrer d'un coup **toute** la population des pilotes vivants — et **ce
+    /// watchdog marque la tâche `failed`** quand le processus meurt. mika#2272 a
+    /// borné ce périmètre par écrit : *« élargir cette population-là change qui
+    /// marque une tâche `failed` quand un processus meurt, ce qui court contre
+    /// le moniteur de spawn ; blast radius distinct, ticket distinct. »* Les deux
+    /// compteurs de concurrence lisent déjà `IN ('pending','in_progress')` et
+    /// seraient insensibles ; celui-ci ne l'est pas, et c'est lui qui tue.
+    ///
+    /// mika#2133 a donc estampillé `fired_at` sur ce chemin **sans** toucher au
+    /// statut ([`Self::stamp_task_fired_at_if_null`]) et laissé cette requête
+    /// telle quelle. Le signal de vie faisant foi est par ailleurs déjà rendu à
+    /// l'opérateur ailleurs : `mika tasks <id>` affiche une ligne
+    /// `Dispatch pilot:` alimentée par `PilotLiveness` (mika#2335), PID vérifié
+    /// par `process_start_time` et mtime du log du pilote. **Suivi nommé :** un
+    /// état intermédiaire pour la ligne callback en travail, dont le préalable
+    /// écrit est de décider qui marque `failed` quand un pilote meurt une fois
+    /// cette population non vide.
     pub fn get_active_callback_tasks_with_pid(&self, agent_id: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks

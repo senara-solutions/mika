@@ -115,7 +115,7 @@ jobs:
           fi
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
         with:
           role-to-assume: ${{ secrets.ECR_PUSH_ROLE_ARN }}
           role-session-name: mika-agent-image-push-${{ github.run_id }}
@@ -125,7 +125,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v3
 
       # The rotation consumes `main-<short8>`, and GitHub's expression language
       # has no substring function — so the short form cannot be written inline
@@ -136,7 +136,7 @@ jobs:
         run: echo "SHORT_SHA=${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
 
       - name: Build and push mika-agent image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v6
         with:
           context: .
           file: Dockerfile.agent

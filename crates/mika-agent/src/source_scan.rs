@@ -90,6 +90,96 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
     })
 }
 
+/// Retire d'une source Rust les lignes qui sont des commentaires, et rend le
+/// reste.
+///
+/// **Le lecteur unique de ce prédicat.** Il vivait inline dans [`fn_bodies`] ;
+/// mika#2495 l'a extrait parce qu'une seconde garde en a besoin sans avoir
+/// besoin du découpage par fonction — un scan par corps de fonction raterait un
+/// `const BOGUS: &str = "…"` à portée de module. Extrait plutôt que recopié :
+/// c'est la règle écrite de ce module (« un seul lecteur, pas une copie par
+/// garde »), et la classe que `grooming_marker` a dû graver une fois (mika#2158,
+/// une regex copiée dont le commentaire disait « Mirrors … » et qui a ensuite
+/// raté deux élargissements).
+///
+/// **Ce que ça achète à une garde.** Une prose qui *décrit* le motif interdit
+/// cesse de se lire comme une violation de celui-ci. Ce n'est pas une
+/// hypothèse : c'est ce que la première exécution de la garde de mika#2323 a
+/// rapporté, et c'est exactement le faux positif que le doc-comment de
+/// `probe_executor_health_returns_none_on_unreachable_endpoint` produirait — il
+/// nomme l'adresse de documentation pour expliquer pourquoi on ne s'en sert
+/// plus.
+///
+/// **Ce que ça n'achète PAS** — le prédicat est *à la ligne*, jamais lexical :
+/// un commentaire de fin de ligne (`let x = 1; // …`) reste dans la sortie, et
+/// l'intérieur d'un bloc `/* … */` dont les lignes de continuation ne
+/// commencent pas par `*` y reste aussi. Une garde bâtie là-dessus accuse donc
+/// encore ces deux formes ; c'est un faux positif réparable en déplaçant le
+/// commentaire, pas un trou de détection.
+///
+/// # Une ligne qui commence par `*` n'est pas forcément un commentaire
+///
+/// `*guard = x;` et la continuation d'une multiplication sont du Rust valide
+/// commençant par `*`. Les retirer aveuglément rendrait **invisible** au scan
+/// toute lecture écrite sur une telle ligne : la garde resterait verte pendant
+/// que la divergence qu'elle existe pour refuser reviendrait. La continuation
+/// d'un bloc `/* … */` s'écrit `* ` ou `*/`, jamais `*identifiant` — c'est ce
+/// que le prédicat ci-dessous distingue.
+pub(crate) fn strip_comment_lines(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            let block_continuation =
+                t == "*" || t.starts_with("* ") || t.starts_with("*/") || t.starts_with("*\t");
+            !(t.starts_with("//") || t.starts_with("/*") || block_continuation)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Découpe une source Rust en `(nom de fonction, corps)`, commentaires retirés.
+///
+/// Les gardes structurelles de ce crate posent toutes la même question — *quelle
+/// fonction de production porte ce motif ?* — et ont besoin du même découpage
+/// pour y répondre. Un seul lecteur, plutôt qu'une copie par garde : c'est la
+/// classe que `grooming_marker` a dû graver une fois (mika#2158, une regex
+/// copiée dont le commentaire disait « Mirrors … » et qui a ensuite raté deux
+/// élargissements).
+///
+/// **Les commentaires sont retirés d'abord** — par [`strip_comment_lines`], dont
+/// le doc-comment porte le prédicat et ses bornes — et c'est porteur : sans ça
+/// le corps d'une fonction avale le doc-comment de la suivante, et une prose qui
+/// *décrit* le motif interdit se lit comme une violation de celui-ci. Ce n'est
+/// pas une hypothèse — c'est ce que la première exécution de la garde de
+/// mika#2323 a rapporté.
+///
+/// Le corps de chaque fonction est borné au prochain `fn ` **à n'importe quelle
+/// indentation** : `\nfn ` raterait `pub async fn` et toute méthode d'un `impl`,
+/// ce qui ferait courir chaque corps jusqu'à la fin du fichier.
+///
+/// Cette fonction ne tronque pas le code de test : c'est à l'appelant de
+/// décider de sa moitié de production, les gardes n'ayant pas toutes la même
+/// borne.
+pub(crate) fn fn_bodies(src: &str) -> Vec<(String, String)> {
+    let stripped = strip_comment_lines(src);
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = stripped[cursor..].find("fn ") {
+        let sig_start = cursor + pos + 3;
+        let after = &stripped[sig_start..];
+        let name_end = after.find(['(', '<', ' ']).unwrap_or(after.len());
+        let name = after[..name_end].to_string();
+        let body = match after[name_end..].find("fn ") {
+            Some(next) => &after[name_end..name_end + next],
+            None => &after[name_end..],
+        };
+        out.push((name, body.to_string()));
+        cursor = sig_start + name_end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +207,50 @@ mod tests {
         assert!(is_test_source_path(Path::new(
             "/repo/crates/mika-agent/src/perimeter/tests.rs"
         )));
+    }
+
+    /// Une ligne de code commençant par `*` doit survivre au dépouillement des
+    /// commentaires (mika#2484).
+    ///
+    /// **C'est la moitié porteuse du helper.** Un filtre qui retire toute ligne
+    /// commençant par `*` avale `*guard = x;`, donc rend **invisible** aux
+    /// gardes structurelles toute lecture écrite sur une telle ligne : le scan
+    /// resterait vert pendant que la divergence qu'il refuse reviendrait. Aucun
+    /// test de la garde elle-même ne peut voir ça — elle passerait.
+    #[test]
+    fn mika2484_a_deref_line_is_code_not_a_comment() {
+        let src = "\
+fn writes_through_a_guard(db: &Db) {
+    let mut guard = lock();
+    *guard = db.has_completed_groom_for_issue(\"u\");
+}
+
+fn unrelated() {
+    /* bloc
+     * continuation
+     */
+    let _ = 1;
+}
+";
+        let bodies = fn_bodies(src);
+        let (_, writer) = bodies
+            .iter()
+            .find(|(name, _)| name == "writes_through_a_guard")
+            .expect("la fonction doit être découpée");
+        assert!(
+            writer.contains("has_completed_groom_for_issue"),
+            "une ligne de déréférencement a été prise pour un commentaire — \
+             toute garde bâtie sur ce découpage devient décorative : {writer}"
+        );
+
+        let (_, other) = bodies
+            .iter()
+            .find(|(name, _)| name == "unrelated")
+            .expect("la seconde fonction doit être découpée");
+        assert!(
+            !other.contains("continuation"),
+            "la continuation d'un bloc /* */ reste un commentaire : {other}"
+        );
     }
 
     #[test]
