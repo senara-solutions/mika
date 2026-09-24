@@ -1209,6 +1209,91 @@ test green. All seven terms were mutated one at a time and each was observed red
 `refs/remotes/origin/<branch>` reads `Clean`, not `Unreadable`): root `CLAUDE.md`
 § *Optional (terminal-worktree reaper — mika#2420)*.
 
+#### The `target/` of a live-but-idle worktree (mika#2497)
+
+A **third arm of the same tick**, after the reaper, in the same module. Its
+population is **exactly** the reaper's `pr_open` refusals of that tick — the
+worktrees T4 turns away because their PR is open, and whose `target/` therefore
+lives as long as the PR (15 to 50 Go per pilot; +90 Go in 8 h on the night of
+2026-09-22, `/data` at 83 %). It is the *HALT-2 follow-up* mika#2420 names in
+its own body, and the two populations are **disjoint by construction**: T4 is
+"no open PR", this one is "open PR".
+
+**The ordering is necessary, not tidy.** What the reaper has just removed no
+longer exists; considering it for a purge would be a no-op at best and a race at
+worst. Everything else is already paid for at that point — `git worktree list`,
+the one `gh pr list` per repo, the `/proc` enumeration, the STOP sentinel, the
+refusal dedup — so the arm costs no extra query, no `PeriodicScan` variant, no
+recurring row, no migration.
+
+**The asymmetry is INVERSE to the reaper's, and that is what licenses touching a
+live worktree.** *The reaper removes potential work; this arm removes pure
+derivative.* A `target/` carries none: it is wholly reconstructible by
+`cargo build`, so a false positive costs **rebuild time, never a loss** — the
+exact inverse of *"a false positive destroys hours of work, irreversibly"*. **What
+the asymmetry does NOT license:** removing `target/` **during** a `cargo build`
+breaks that build. The danger is not data loss, it is **concurrency**, and the
+whole predicate is about that and nothing else.
+
+**Five conjunctive terms, all fail-safe towards *keep*.** `screen_target_purges`
+(P1 managed path, P2 `target/` exists and is a directory, P3 no live cwd inside,
+P4 idle past the window) then `apply_lock_probes` (P5 the cargo build lock is
+free) — the same two-stage idiom as `screen_worktrees` / `apply_work_states`, and
+for the same reason: P5 costs an `open` + a `flock` per profile and is only paid
+on the survivors (mika#2184's motif — *the proxy filters first, the direct
+measure decides last*).
+
+**P5 is what T4 used to supply.** P3 is **known to be holed** and mika#2420 says
+so itself: a process can work in a worktree without its cwd being there. At the
+reaper that hole was covered **by the conjunction** — such a process works on a
+branch whose PR is open (excluded by T4) or leaves uncommitted changes (excluded
+by T7). **Here that cover is gone: the PR is open by definition of the
+population.** P5 answers "is a cargo working in this directory", independent of
+cwd and of any delay.
+
+**The lock file is discovered, never guessed**, and the two absences it can meet
+have **opposite** dispositions — the point the words confuse most easily:
+
+| what is missing | reading | disposition |
+|---|---|---|
+| no `.cargo-lock` under `target/` | cargo never built here | `LockProbe::Free` → purge allowed |
+| the `flock` call (non-Linux) | we cannot look | `LockProbe::Unevaluable` → keep |
+
+Treating the first as the second makes the arm **inert over a healthy
+population** while reading exactly like a healthy disk (class mika#2205);
+treating the second as the first purges blind. Hence three variants, never a
+bool. `libc` is already a dependency but sits under
+`[target.'cfg(target_os = "linux")'.dependencies]`, so the call follows
+`process_liveness::is_same_process_alive`: a `#[cfg(target_os = "linux")]` block
+with an **explicit non-Linux fallback that keeps**. Rendering "free" there would
+purge on the one platform where a running build cannot be seen.
+
+**P4 walks a bounded, declared set** — `target/`, its direct children, and their
+children (depth 2) — and deliberately **not** `measure_tree_size`, whose 400 000
+entry / 2 s budget a 40 Go `target/` exceeds: a truncated walk would report an
+mtime **wrong in the dangerous direction** (under-estimating recency, i.e.
+purging a live tree). Any unreadable entry yields `None`, which keeps.
+
+**SOLE WRITER** of `target_purged` (armed) and `target_purge_would_dispose`
+(observe), pinned by a source scan whose allowlist ships empty and which carries
+its own **self-cleaning assertion** — it fails if the name is written *nowhere*,
+because a scan aiming at a dead name verifies zero things and reads exactly like
+a clean one. Refusals go under `target_purge_skipped` with `target:`-prefixed
+keys, deliberately distinct from the reaper's `worktree:` so the two populations
+stay subtractable. `ALL_PURGE_REFUSAL_REASONS` is likewise a **separate** wire
+format from `ALL_REFUSAL_REASONS`.
+
+**Every term was seen red by mutation, not by reasoning** — and one of those
+mutations paid for itself: the symlink test was **decorative**, its link pointing
+at a directory named otherwise, which guard 1 (`ends_with("/target")`) already
+refused. It is now built on the only shape that traverses guards 1 and 2 — a link
+to the `target/` of **another managed worktree**, which is exactly what guard 3
+exists to close.
+
+Config, the operator surfaces, the four probes (starting with *run in `observe`
+first*) and the four halts: root `CLAUDE.md` § *Optional (purge du `target/` d'un
+worktree vif — mika#2497)*.
+
 ### Unknown-Trigger Veto Lift (mika#2337)
 
 **The failure this closes is a veto, not a missing wire.** A `run_skill` recurrence
