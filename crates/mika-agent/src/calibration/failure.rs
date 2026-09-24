@@ -280,4 +280,63 @@ mod tests {
             "ReasoningBudgetExhausted"
         );
     }
+
+    /// The mika#1665 discriminator has **one definition site — this file — and
+    /// two consumers**; this pins their agreement (mika#1910 AC6).
+    ///
+    /// The second consumer is `scripts/measure-empty-turns`, whose rule 3 reads
+    /// the same discriminator off a `turn_usage` log line instead of off a
+    /// `ScenarioOutcome`. The two never share code — one is Rust over a struct,
+    /// the other `jq` over a JSON line — so what keeps them from drifting is
+    /// that **the same three cases are asserted on both sides**:
+    ///
+    /// | case | log line | here | analyzer |
+    /// |---|---|---|---|
+    /// | A | `MaxTokens`, `output_tokens: 1200`, `response_chars: 0` | `ReasoningBudgetExhausted` | `reasoning_budget_exhausted` |
+    /// | B | `EndTurn`, `output_tokens: 800`, `response_chars: 0` | `EmptyResponse` | `empty_response` |
+    /// | C | `MaxTokens`, `output_tokens: 0`, `response_chars: 0` | `EmptyResponse` | `empty_response` |
+    ///
+    /// The wire-side mapping is `finish_reason_is_length ⟺ stop_reason ==
+    /// "MaxTokens"` and `response_text empty ⟺ response_chars == 0`.
+    ///
+    /// The analyzer half of this table is asserted, case for case, by
+    /// `scripts/test-measure-empty-turns.sh` — N3 (A), the §2 positive control
+    /// (B), and N3b (C). **Neither half is sufficient**: this test alone would
+    /// let the analyzer spell the rule differently, and the shell suite alone
+    /// would let this function drift. Two spellings of one rule would split one
+    /// population in two without saying so.
+    ///
+    /// Case C is what makes the `output_tokens > 0` term load-bearing rather
+    /// than decorative: without it, every capped turn at zero characters would
+    /// leave the mika#1910 class and be filed as a setting problem.
+    #[test]
+    fn mika1910_the_1665_rule_agrees_with_its_second_consumer() {
+        // A — the budget was burnt on internal reasoning: a SETTING, not the class.
+        assert_eq!(
+            classify_failure(None, Some(""), Some(1200), true),
+            FailureClass::ReasoningBudgetExhausted,
+            "case A: MaxTokens + output>0 + empty text is a reasoning-budget \
+             exhaustion; `measure-empty-turns` rule 3 must class it \
+             `reasoning_budget_exhausted`, never `empty_response`"
+        );
+
+        // B — the model CONCLUDED having produced tokens and no characters.
+        // That is the mika#1910 class itself.
+        assert_eq!(
+            classify_failure(None, Some(""), Some(800), false),
+            FailureClass::EmptyResponse,
+            "case B: a turn that concludes (EndTurn) with tokens spent and no \
+             text IS the class; rule 3 must NOT capture it — it requires the \
+             output cap, and `EndTurn` says the model chose to stop"
+        );
+
+        // C — capped, but nothing was produced at all: rule 3 does not apply.
+        assert_eq!(
+            classify_failure(None, Some(""), Some(0), true),
+            FailureClass::EmptyResponse,
+            "case C: MaxTokens WITHOUT output tokens is not a reasoning-budget \
+             exhaustion — the `output_tokens > 0` term is what separates the \
+             two, on both sides of the rule"
+        );
+    }
 }
