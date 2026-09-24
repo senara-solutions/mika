@@ -1,6 +1,6 @@
 # mika#2357 — le dormeur est inscrit, et sa condition de réveil ne peut pas détecter son propre réveil
 
-**Ticket :** `mika issue#2357` · **Type :** chore (registre) · **Plan initial :** 2026-09-21 · **Révisé :** 2026-09-24
+**Ticket :** `mika issue#2357` · **Type :** chore (registre) · **Plan initial :** 2026-09-21 · **Révisé :** 2026-09-24 (M6 — la branche (b) était périmée par le changement de rail)
 
 ---
 
@@ -24,7 +24,7 @@ max 108 s). Le commentaire 1 déclare le ticket **DORMEUR**, porteur de la
 ## Ce que la lecture du dépôt a déplacé depuis le plan du 21/09
 
 **Ce plan a déjà été écrit une fois, et il a été partiellement consommé
-trois heures plus tard.** Les cinq mesures ci-dessous sont le premier livrable :
+trois heures plus tard.** Les six mesures ci-dessous sont le premier livrable :
 sans elles, la pente est de rejouer le plan du 21/09, dont la mesure centrale
 est aujourd'hui fausse.
 
@@ -70,6 +70,18 @@ conclura **exactement la même chose le jour où mika-dev tournera glm-5.3**. La
 condition ne peut pas être remplie. *Une condition de réveil fausse est pire
 qu'absente : elle sera exécutée, elle rendra une réponse, et la réponse sera
 fausse dans le sens rassurant.*
+
+**Et « lire l'autre `config.toml` » ne sauve pas la formulation** — c'est
+l'échappatoire qu'un implémenteur pressé prendra, parce que le mot est
+ambigu et désigne deux fichiers. Le premier est la constante du dépôt
+(`MIKA_DEV_CONFIG`), dont la dérive vient d'être établie. Le second est
+`~/.mika/agents/mika-dev/config.toml`, sur disque — et lui non plus n'est pas
+ce qui tourne : le record de budget est **figé à l'`init_agent`** (mika#2457),
+si bien qu'une édition du disque n'entre en service qu'au redémarrage suivant.
+C'est précisément pour rendre cet écart décidable que mika#2473 a livré
+`agent_config_changed_since_boot`. Des trois lectures possibles, **une seule
+répond à la question posée** — celle du modèle en service — et c'est
+`mika agents budget`, qui attache en outre un `resolved_at` à sa réponse.
 
 Deux défauts mineurs s'y ajoutent. *« (essai relancé) »* nomme une **intention**,
 que le contrat du fichier refuse explicitement (« plus tard », « si ça revient » :
@@ -121,6 +133,39 @@ ouvert *et* inscrit, ce qui est la disposition que l'opérateur a retenue le
 
 Ce plan ne livre donc que ce qu'une PR peut livrer : **un fichier versionné.**
 
+### M6 — La branche (b) du commentaire 1 est elle-même périmée, et l'inscrire *telle quelle* reproduirait le défaut que ce plan ferme.
+
+Le commentaire 1 écrit la régression du contournement ainsi :
+
+```
+… | jq 'select((.session_id//"")|startswith("callback-")) | select(.model=="glm-5.2" and .status=="error")'
+```
+
+L'égalité stricte `.model=="glm-5.2"` **était** juste le 17/09 et ne l'est plus.
+Le champ `model` de `turn_usage` porte le modèle tel que le **rail** le nomme, et
+le rail a changé entre-temps — ce que le commentaire 2 dit littéralement :
+*« depuis le passage des agents sur glm-5.2 **via OpenRouter** »*.
+
+| rail | ce que `turn_usage.model` porte | preuve |
+|---|---|---|
+| Z.AI direct — celui des mesures des 16–17/09 | `glm-5.2` / `glm-5.3` | `ProviderKind::ZAi::default_model()` rend `"glm-5.2"` (`llm/mod.rs:708`) |
+| OpenRouter — celui que le dépôt déclare | `z-ai/glm-5.2` | `MIKA_DEV_CONFIG` : `llm_provider = "openrouter"`, `openrouter_model = "z-ai/glm-5.2"` |
+
+**Conséquence, et elle est exactement celle de M2 :** une cellule portant
+`.model=="glm-5.2"` rend **zéro ligne quoi qu'il arrive** sur le rail en
+vigueur — y compris le jour où un callback repart en erreur, qui est le seul
+jour où elle sert. Un lecteur l'exécuterait, obtiendrait un résultat, et
+conclurait « pas de régression » **dans le sens rassurant**.
+
+C'est la classe que mika#2328 a mesurée sur mika-qa (`zai/glm-5.2` →
+`openrouter/z-ai/glm-5.2`, le rail bouge sans que le modèle change), et c'est
+le piège que ce plan avait **déjà** vu pour la branche (a) — AC4 exige d'elle
+qu'elle ne repose sur aucune égalité stricte. Reprendre (b) « telle quelle »
+appliquait donc le principe à une moitié et l'oubliait dans l'autre : le
+fichier serait livré avec une condition de réveil fausse **dans la partie que
+ce travail ajoute**. La correction est d'appliquer à (b) la règle de (a) — un
+test par sous-chaîne, robuste au préfixe de rail.
+
 ---
 
 ## La réponse à la question posée
@@ -138,7 +183,7 @@ travail.**
 - *Le résidu réel est petit, et il est réel* — M2. Une condition de réveil qui
   lit `config.toml` répondra « dormant » y compris au réveil.
 
-**Ce plan ne livre aucun code, et c'est un résultat, pas une facilité.** Les cinq
+**Ce plan ne livre aucun code, et c'est un résultat, pas une facilité.** Les six
 mesures établissent qu'il n'y a rien à corriger dans le moteur aujourd'hui.
 Inventer un livrable de code pour ne pas rendre un plan court produirait un
 correctif sur une cause non démontrée.
@@ -186,7 +231,7 @@ trois colonnes : ticket, sujet, condition de réveil) :
     change). C'est le modèle que mika-dev fait **tourner**, attesté par
     mika-spirit (mika#2457), jamais celui que le dépôt déclare. Le même fait est
     **poussé** au démarrage par `well_known_model_drift` (mika#2473).
-  - **(b)** `grep turn_usage "$MIKA_SPIRIT_LOG_FILE" | jq 'select((.session_id//"")|startswith("callback-")) | select(.model=="glm-5.2" and .status=="error")'`
+  - **(b)** `grep turn_usage "$MIKA_SPIRIT_LOG_FILE" | jq 'select((.session_id//"")|startswith("callback-")) | select(.status=="error" and ((.model//"")|contains("glm-5.2")))'`
     rend **au moins une ligne** — la régression du contournement.
 
 **Pourquoi (a) est reformulée ainsi.** Le commentaire 1 écrit « Vincent décide de
@@ -198,23 +243,41 @@ process lecteur et « affirmerait avec autorité un réglage qui n'est pas en
 vigueur ». Une condition qui lirait `config.toml` serait vérifiable **et fausse**
 (M2).
 
-**Pourquoi (b) est ajoutée telle quelle.** Elle était déjà vérifiable sans
-contexte dans le commentaire 1, et c'est la seule moitié qui protège contre une
-régression silencieuse du contournement. Son absence du registre est un trou,
-pas un choix : le registre remplace le ticket ouvert comme support de
-visibilité, donc une condition qui ne vit que dans un commentaire n'est lisible
-par personne.
+**Pourquoi (b) est ajoutée, et pourquoi PAS telle quelle.** C'est la seule
+moitié qui protège contre une régression silencieuse du contournement, et son
+absence du registre est un trou plutôt qu'un choix : le registre remplace le
+ticket ouvert comme support de visibilité, donc une condition qui ne vit que
+dans un commentaire n'est lisible par personne. Mais la forme du commentaire 1
+est périmée (M6) : `.model=="glm-5.2"` ne peut plus rendre une ligne sur le
+rail OpenRouter en vigueur. Deux écarts avec l'original, tous deux
+intentionnels :
+
+1. `contains("glm-5.2")` au lieu de l'égalité — robuste au préfixe de rail,
+   comme l'exige AC4 pour la branche (a). Elle matche `glm-5.2`,
+   `z-ai/glm-5.2` et `openrouter/z-ai/glm-5.2`.
+2. `(.model//"")` plutôt que `.model` nu — un enregistrement sans champ
+   `model` ferait échouer `contains` sur `null` et **avorterait le `jq`
+   entier** avec un code de sortie non nul, ce qu'un lecteur pressé lit comme
+   « aucune ligne ». Même raison que le `(.session_id//"")` que le
+   commentaire 1 porte déjà.
 
 **Échappement :** les `|` des deux commandes doivent être échappés `\|` dans la
-cellule markdown, comme le fait déjà la cellule de #2119.
+cellule markdown — en GFM le pipe ferme la cellule **y compris à l'intérieur
+d'un code span**. **Aucune cellule du registre ne porte de précédent** :
+`grep -c '\\|' docs/dormeurs.md` rend `0`, et aucune des onze entrées ne
+contient de `jq` ni de `grep`. Ces deux cellules sont les premières, donc il
+n'y a pas de modèle à copier — la relecture doit se faire sur le rendu, pas sur
+une analogie.
 
 ---
 
 ## Verification contract
 
 Aucun test n'est ajouté ni modifié : le livrable est une ligne de documentation,
-et les cinq mesures établissent qu'aucun comportement moteur n'est à figer. La
-vérification est une relecture, sur cinq points vérifiables :
+et les six mesures établissent qu'aucun comportement moteur n'est à figer. La
+vérification est une relecture, sur sept points vérifiables — les points 6 et 7
+sont des **gestes de relecture**, pas des livrables : rien n'est ajouté à la CI,
+donc aucun chemin de succès du type « aucune violation trouvée » n'est créé :
 
 1. `grep -c 2357 docs/dormeurs.md` rend **1** — une ligne, pas deux (la ligne est
    rectifiée, pas ajoutée à côté de l'ancienne).
@@ -224,6 +287,15 @@ vérification est une relecture, sur cinq points vérifiables :
    tard », « si ça revient »).
 5. `git diff --stat` ne touche que `docs/dormeurs.md` — traduction mécanique de
    R5, R6 et R7.
+6. **La ligne ne contient aucune égalité stricte sur un nom de modèle** —
+   `grep -n 'model=="' docs/dormeurs.md` rend zéro ligne. C'est la traduction
+   mécanique de M6 et d'AC4, et le point que la relecture ratera si elle se
+   contente de vérifier que (b) « est là ».
+7. **Le tableau se rend encore comme un tableau à trois colonnes.** Les deux
+   commandes portent des `|` ; un seul non échappé scinde la cellule et décale
+   la ligne. Vérification : la ligne compte exactement quatre `|` non échappés
+   (les deux bords plus les deux séparateurs), soit
+   `grep -n '#2357' docs/dormeurs.md | grep -o '[^\\]|' | wc -l` égal à **4**.
 
 `make lint` / `make test` restent verts par construction (aucun fichier Rust
 touché) ; la CI de la PR les exécute. Le `canonical-tokens-lint` (mika#2201)
@@ -238,6 +310,11 @@ pose aucune clé de callout, donc elle est hors de ses cinq règles.
       chacune exécutable telle quelle.
 - [ ] La branche (a) interroge `mika agents budget`, et `config.toml` a disparu
       de la ligne.
+- [ ] **Aucune des deux branches ne teste un modèle par égalité stricte** — une
+      valeur préfixée par son rail (`z-ai/…`, `openrouter/z-ai/…`) est reconnue
+      par chacune.
+- [ ] Le tableau se rend toujours sur trois colonnes : tous les `|` des deux
+      commandes sont échappés `\|`.
 - [ ] La colonne « sujet » porte le pointeur vers la procédure de mesure et la
       raison de ne pas repartir de `input_tokens: 0`.
 - [ ] Le registre compte toujours le même nombre d'entrées (rectification, pas
@@ -259,10 +336,15 @@ ci-dessous sont dérivés des Requirements et du Verification contract.*
 - **AC3** — La branche (a) interroge le modèle **en service** via
   `mika agents budget` ; ni `config.toml`, ni `well_known_agents.rs`, ni la
   constante `MIKA_DEV_CONFIG` n'y sont prescrits comme source.
-- **AC4** — La branche (a) est robuste au préfixe de rail : elle ne repose pas
-  sur une égalité stricte avec `z-ai/glm-5.2`.
+- **AC4** — **Les deux branches** sont robustes au préfixe de rail : aucune ne
+  repose sur une égalité stricte avec une valeur de modèle. Un `model` valant
+  `glm-5.2`, `z-ai/glm-5.2` ou `openrouter/z-ai/glm-5.2` est traité
+  identiquement par chacune (M6).
 - **AC5** — La branche (b) — la régression du contournement — figure au
-  registre, ce qui n'était pas le cas avant ce travail.
+  registre, ce qui n'était pas le cas avant ce travail, et **dans une forme qui
+  peut rendre une ligne sur le rail en vigueur** : elle teste par sous-chaîne,
+  et son accès au champ `model` est protégé par `//""` de sorte qu'un
+  enregistrement sans ce champ n'avorte pas le `jq`.
 - **AC6** — La colonne « sujet » nomme la procédure de mesure à suivre au réveil
   et dit pourquoi `input_tokens: 0` n'est plus la bonne preuve.
 - **AC7** — Aucun fichier hors `docs/` n'est modifié. En particulier
