@@ -637,7 +637,7 @@ se lit exactement comme un disque en bonne santé. Établir pourquoi l'énuméra
 
 ---
 
-## 11. Acceptance criteria
+## Acceptance criteria
 
 1. **AC1** — Le `flock` de chaque `.cargo-lock` du `target/` visé est **tenu**
    pendant `remove_dir_all` et relâché après ; l'acquisition est le dernier acte
