@@ -4793,7 +4793,7 @@ mod tests {
                     // la variable écrite ne l'évince PAS — c'est l'idiome
                     // canonique d'un knob opérateur avec défaut
                     // (`export VAR="${VAR:-défaut}"`), pas une variable interne.
-                    let self_referential = env_reads_in(&rhs).iter().any(|r| *r == name);
+                    let self_referential = env_reads_in(&rhs).contains(&name);
                     if !self_referential {
                         // Terme 4 : l'écriture évince.
                         written_names.insert(name);
