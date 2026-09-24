@@ -7,6 +7,25 @@
 
 ## 0. La rectification centrale — le remède proposé contredit une décision écrite du dépôt
 
+> **⚠️ DIVERGENCE PLAN↔TICKET — RATIFIÉE.** Opérateur via orchestrateur,
+> **2026-09-24 08:10Z**, portée au corps du ticket (Item 0) et à son commentaire
+> du 08:04:48Z. Le remède littéral du § *Fix proposé* point 1 — « ajouter
+> `PILOT_MAX_TURNS` à l'allowlist `is_sandbox_env_allowed` » — est **remplacé**
+> par un **relais explicite** post-`sandboxed_pilot_env` (motif mika#2354 AC9(b),
+> siblings `inject_rescue_verify_env` / `inject_arch_ask_retry_env`), avec
+> `relayed_env_pairs_preserving_empty` préservant le palier de rollback
+> `${VAR+set}`. **Raison de la ratification :** surface de sûreté plus petite —
+> le relais achemine la variable précise sans agrandir la surface générale du
+> bac à sable — et c'est le motif établi. **Les critères d'acceptation sont
+> inchangés** (`pilot_budget_armed max_turns=150 source=env` + `--max-turns 150`
+> sur la cmdline au 1er dispatch post-déploiement) : seul le moyen change.
+>
+> C'était le **F1 bloquant** de l'ESCALATE de première passe (groom `a200a497`,
+> 07:54:50Z). F2 (absence de #2508 dans la carte-enfants de mika#2491) est
+> corrigé indépendamment. Le § ci-dessous est l'argument qui a fondé la
+> divergence ; il est conservé parce que la ratification porte sur sa conclusion,
+> pas à sa place.
+
 Le ticket a **raison sur le diagnostic** et **se trompe sur le remède**, et il faut
 le dire avant tout le reste parce que le remède proposé casserait une garde
 existante.
@@ -37,8 +56,9 @@ ni la même durée de vie ni le même critère d'admission, et fait du confineme
 poubelle des réglages.
 
 **Le plan livre donc l'esprit du DoD par le mécanisme établi : relais explicite.**
-La divergence est assumée et signalée dans le corps de PR pour ratification
-opérateur ; elle ne réduit aucun critère d'acceptation, elle en change le moyen.
+La divergence ne réduit aucun critère d'acceptation, elle en change le moyen — et
+elle est **ratifiée** (encadré ci-dessus), donc le corps de PR la *rappelle* au
+lieu de la soumettre.
 
 Et le doc-comment de `RESCUE_VERIFY_ENV` avait déjà écrit, mot pour mot, la phrase
 qui condamne le nommage nu de `PILOT_MAX_TURNS` :
@@ -116,8 +136,56 @@ elle est **hors population**. C'est le faux positif que mika#2050 a mesuré sur 
 Signal S et que mika#2201 a dû nommer — le prédicat de R4 doit l'exclure, et le
 contrôle négatif N4 l'atteste.
 
-**`PILOT_LOG_DIR` est de la même classe exacte, et il est le précédent invoqué à
-tort.** Le root `CLAUDE.md` justifie le nommage nu de `PILOT_MAX_TURNS` par
+### 2.1 — Le commentaire faux n'est pas à trois sites, il est à sept
+
+Le ticket en nomme deux. La première passe de ce plan en a trouvé un troisième et
+a écrit « il y en a **trois** ». Le relevé exhaustif (`grep -rn scrub_mika_env_vars`
+sur `*.rs` / `*.md` / `*.sh`, hors `target/` et hors `docs/plans/`) en rend
+**sept sur le chemin pilote**, et ils se scindent en deux classes qui n'appellent
+pas le même geste — distinction portante, parce que confondre les deux ferait
+réécrire des phrases justes et manquer des phrases fausses.
+
+**Classe A — mécanisme faux ET conclusion fausse.** Ces sites affirment ou
+impliquent qu'un nom **nu** traverse le child de dispatch. C'est la classe qui
+**produit la panne** : c'est elle qui a fait nommer `PILOT_MAX_TURNS` nu, et elle
+ferait nommer nu le prochain réglage.
+
+| # | site | ce qu'il affirme de faux |
+|---|---|---|
+| A1 | `crates/mika-common/src/config.rs:1065` | « the unprefixed form exists because `scrub_mika_env_vars` strips every `MIKA_*` » |
+| A2 | `crates/mika-common/src/config.rs:1374` (`DEFAULT_PILOT_LOG_DIR`) | les deux noms divergent « because `scrub_mika_env_vars` strips every `MIKA_*` » |
+| A3 | `crates/mika-agent/CLAUDE.md:2506` | « Prefixed, unlike its `PILOT_MAX_TURNS` sibling, because … `scrub_mika_env_vars` does not run » |
+| A4 | `crates/mika-agent/CLAUDE.md:2527` | « different environment variables … because `scrub_mika_env_vars` strips every `MIKA_*` » |
+| A5 | `CLAUDE.md:277` (Signal S, *Halte 1*) | « deliberately distinct (`scrub_mika_env_vars` strips every `MIKA_*`) » |
+| A6 | `CLAUDE.md:502` (`MIKA_PILOT_LOG_DIR`) | « deliberately *different variable names* because `scrub_mika_env_vars` strips » |
+| A7 | `CLAUDE.md:517` (`PILOT_MAX_TURNS`) | « **Unprefixed on purpose** … so a prefixed name would be removed on the way » |
+
+A7 est **le site le plus lu et le plus faux** : il ne se trompe pas seulement de
+mécanisme, il invoque A6/A2 comme **précédent** — « `PILOT_LOG_DIR` is too, and
+mika#2249 wrote why ». Une erreur qui se cite elle-même à travers deux fichiers.
+
+**Classe B — mécanisme mal nommé, conclusion juste.** Ces sites disent qu'un
+`MIKA_*` n'atteint pas le child. C'est **vrai sous les deux mécanismes** (le scrub
+le retirerait, l'`env_clear` le retire), donc aucune décision qui en dépend n'est
+fausse et aucune panne n'en découle.
+
+| # | site | statut |
+|---|---|---|
+| B1 | `skills/bundled/_shared/dispatch-lib.sh:460` (`$HOME/.mika` écrit en toutes lettres) | conclusion **juste** — `MIKA_HOME` n'atteint pas le child |
+| B2 | `crates/mika-agent/src/pilot_egress_stamp.rs:56` | conclusion **juste** — idem, et sa table reste exacte |
+| B3 | `docs/operator/pilot-egress-relay.md:272` | conclusion **juste** — `MIKA_INTERNAL_TOKEN` est insensible au chemin env |
+
+**Périmètre retenu : la classe A est réparée, la classe B reçoit une phrase.**
+Réécrire les trois sites B serait toucher trois raisonnements corrects pour un mot,
+sur des fichiers (dont un marqueur de sûreté et un runbook opérateur) dont la
+relecture coûte plus que l'imprécision. Ils reçoivent, en une ligne chacun, la
+précision « `env_clear()` + allowlist positive, et non un scrub sélectif » **sans
+que leur conclusion ne bouge** — ce qui est le strict nécessaire pour qu'un
+lecteur qui suit la piste depuis A7 n'y retrouve pas le mécanisme réfuté.
+
+### 2.2 — `PILOT_LOG_DIR` est de la même classe exacte, et il est le précédent invoqué à tort
+
+Le root `CLAUDE.md` justifie le nommage nu de `PILOT_MAX_TURNS` par
 « `PILOT_LOG_DIR` is too, and mika#2249 wrote why ». Le précédent est lui-même
 cassé : mika#2249 a écrit que la divergence entre `MIKA_PILOT_LOG_DIR` (moteur) et
 `PILOT_LOG_DIR` (shell) « ne peut acheter que de l'inertie, jamais un faux
@@ -146,7 +214,7 @@ seconde panne.
 à un ticket qui le pèse, jamais à un effet de bord. Elles reçoivent une exception
 nommée (§ Fire-Disposition) et un suivi.
 
-**Hors périmètre** : voir § 9.
+**Hors périmètre** : voir § 10.
 
 ---
 
@@ -160,8 +228,11 @@ nommée (§ Fire-Disposition) et un suivi.
   relais qui aplatit « défini mais vide » en « absent » détruit un palier que le
   shell a délibérément construit avec `${VAR+set}`. La valeur vide doit donc être
   **relayée comme telle**, et non omise.
-- **R3 — les trois commentaires faux sont corrigés.** Le ticket en nomme deux ;
-  il y en a **trois**, et le troisième est le plus lu.
+- **R3 — les sept sites de classe A sont corrigés.** Le ticket en nomme deux, la
+  première passe en a trouvé un troisième ; le relevé exhaustif en rend **sept**
+  (§ 2.1), dont le plus lu — A7 — invoque deux des six autres comme précédent.
+  Les trois sites de classe B reçoivent la précision de mécanisme sans que leur
+  conclusion, qui est juste, ne bouge.
 - **R4 — la classe est rendue détectable.** Un scan structurel refuse qu'une
   variable opérateur lue par `dispatch-lib.sh` soit ni allowlistée, ni relayée, ni
   exceptée nommément.
@@ -250,29 +321,48 @@ de ses trois siblings, avec le commentaire de placement de la maison.
 réglage retombe sur les défauts du shell (désarmé, `/var/log/claude-pilot`), jamais
 un dispatch bloqué.
 
-### 5.2 — Les trois commentaires (R3)
+### 5.2 — Les sept sites de classe A, plus une phrase sur les trois de classe B (R3)
 
-1. **`crates/mika-common/src/config.rs`** (doc de `pilot_cost_alert_usd`) — retirer
-   l'affirmation « the unprefixed form exists because `scrub_mika_env_vars` strips
-   every `MIKA_*` from the dispatch child ». La remplacer par : le child de dispatch
-   est `env_clear()` + allowlist positive, donc **le nom nu ne traverse pas** — il
-   traverse par le relais `PILOT_DISPATCH_ENV` (mika#2508). Ce qui reste vrai et doit
-   rester écrit : `MIKA_PILOT_COST_ALERT_USD` est préfixée parce qu'elle est lue par
-   **mika-spirit**, qui n'est ni scrubbé ni `env_clear()`é — l'asymétrie de préfixe
-   est donc correcte, seule sa **justification** était fausse.
-2. **`crates/mika-agent/CLAUDE.md`** (§ cost overrun) — même correction, une phrase.
-3. **`CLAUDE.md` racine, § *pilot turn budget*, entrée `PILOT_MAX_TURNS`** — le site
-   le plus lu et **celui que le ticket ne nomme pas**. Il porte à la fois le mauvais
-   mécanisme et le précédent cassé : « **Unprefixed on purpose**, by a precedent held
-   in the same file: `PILOT_LOG_DIR` is too, and mika#2249 wrote why ». À réécrire :
-   les deux noms sont nus **par format de fil**, ils traversent par relais explicite,
-   et mika#2249 s'est trompé sur le même mécanisme. Y ajouter la correction de V1a
-   (elle a mesuré le mauvais chemin) et le fait que **V1b est désormais exécutable**.
+**Une seule formulation, reprise aux sept sites**, pour qu'un futur `grep` sur
+l'une d'elles les rende tous : *le child de dispatch n'est pas scrubbé — il est
+`env_clear()` + allowlist positive, donc aucun nom ne traverse par héritage,
+préfixé ou non ; ces deux-là traversent par relais explicite (mika#2508).*
 
-Ajouter à ce même § la ligne d'inertie que l'opérateur doit pouvoir lire : un
-`pilot_budget_armed … source=default` alors que la variable **est** posée sur le
-service ne signifie plus « défaut de flotte » mais « binaire antérieur à mika#2508 »
-(classe mika#2340) — établir le déploiement avant toute conclusion sur le réglage.
+1. **A1 — `config.rs:1065`** (doc de `pilot_cost_alert_usd`). Ce qui reste vrai et
+   doit rester écrit : `MIKA_PILOT_COST_ALERT_USD` est préfixée parce qu'elle est
+   lue par **mika-spirit**, qui n'est ni scrubbé ni `env_clear()`é. **L'asymétrie
+   de préfixe est correcte ; seule sa justification était fausse** — c'est la
+   nuance à ne pas perdre en réécrivant.
+2. **A2 — `config.rs:1374`** (`DEFAULT_PILOT_LOG_DIR`). Son raisonnement « une
+   divergence ne peut acheter que de l'inertie, jamais un faux positif » **reste
+   vrai et reste écrit** ; ce qui change est la cause de la divergence, et le fait
+   que depuis ce correctif elle devient **réglée** au lieu de garantie (§ 2.2).
+3. **A3 — `crates/mika-agent/CLAUDE.md:2506`** (§ cost overrun) — une phrase.
+4. **A4 — `crates/mika-agent/CLAUDE.md:2527`** (chemin dérivé du log pilote) — même
+   phrase ; son argument fail-safe est intact.
+5. **A5 — `CLAUDE.md:277`** (Signal S, *Halte 1*). La halte elle-même est
+   **inchangée et le reste** : lire une divergence avant de conclure sur l'egress
+   est juste. Seule la parenthèse causale est corrigée.
+6. **A6 — `CLAUDE.md:502`** (`MIKA_PILOT_LOG_DIR`) — la moitié moteur du couple.
+7. **A7 — `CLAUDE.md:517`, § *pilot turn budget*** — le site le plus lu, et le seul
+   qui porte **le mauvais mécanisme ET le précédent cassé** (« by a precedent held
+   in the same file: `PILOT_LOG_DIR` is too »). À réécrire en entier : les deux
+   noms sont nus **par format de fil** (ils sont déjà posés dans les `.env` et les
+   commandes opérateur publiées), ils traversent **par relais explicite**, et le
+   précédent invoqué était lui-même faux. Y porter aussi la correction de V1a
+   (elle a mesuré `scrub_mika_env_vars`, qui n'est pas sur ce chemin) et le fait
+   que **V1b est désormais exécutable et rouge avant ce correctif**.
+
+**Classe B (B1/B2/B3, § 2.1) — une ligne chacun, conclusion inchangée.** Préciser
+`env_clear()` + allowlist là où ils écrivent « scrub », sans toucher au
+raisonnement : celui de B1 (ne pas « harmoniser » sur `${MIKA_HOME:-…}`) et la
+table de B2 restent exacts mot pour mot.
+
+Ajouter enfin au § *pilot turn budget* la ligne d'inertie que l'opérateur doit
+pouvoir lire : un `pilot_budget_armed … source=default` alors que la variable
+**est** posée sur le service ne signifie plus « défaut de flotte » mais « binaire
+antérieur à mika#2508 » (classe mika#2340) — établir le déploiement avant toute
+conclusion sur le réglage.
 
 ### 5.3 — Le scan de classe (R4, R5)
 
@@ -294,16 +384,34 @@ les deux sens (mika#2496 U3 l'a mesuré sur un prédicat voisin) :
    `read … VAR`, `for VAR in`, en début de ligne ou après `;` / `&&` / `||` / `{`.
    Une variable écrite quelque part dans le fichier sort de la population : elle
    n'attend rien de l'extérieur.
+4bis. **Sauf si l'écriture se lit elle-même.** `export VAR="${VAR:-défaut}"` est
+   une écriture **et** une lecture d'un réglage externe — c'est l'idiome canonique
+   d'un knob opérateur avec défaut, pas une variable interne. Une écriture dont la
+   partie droite référence la variable écrite **ne l'évince pas** de la population.
+
+   **Ce terme n'est pas défensif, il est correctif.** Sans lui, le scan livré par
+   ce plan serait **rouge au premier `cargo test`** — et de la pire façon, celle
+   qui accuse le plan de mentir : `dispatch-lib.sh:8395` porte
+   `export CLAUDE_PILOT_MIN_TOOL_CALLS="${CLAUDE_PILOT_MIN_TOOL_CALLS:-3}"`, le
+   terme 4 nu l'évincerait de la population, et l'assertion auto-nettoyante du
+   § Fire-Disposition rougirait alors sur l'entrée `CLAUDE_PILOT_MIN_TOOL_CALLS`
+   de `DISPATCH_ENV_KNOWN_INERT` en disant « cette exception ne correspond à rien ».
+   Le tableau du § 2 et l'allowlist seraient **contradictoires avec le prédicat du
+   même plan**. Vérifié sur l'arbre : c'est la seule occurrence de cette forme dans
+   le fichier aujourd'hui, mais c'est la forme que prendra le prochain knob.
 5. **Builtins du shell retirés** par liste nommée (`PATH`, `HOME`, `PWD`, `SECONDS`,
    `TMPDIR`, `USER`, `HOSTNAME`, `SHELL`, `TERM`, `LANG`, `GIT_DIR`, `SSH_AUTH_SOCK`…).
    La liste est **explicite et commentée**, jamais devinée : plusieurs de ces noms
    sont par ailleurs dans `SANDBOX_ENV_CORE_ALLOWLIST` et y passeraient le test sans
    rien attester.
-6. **Population = lues − écrites − builtins.** Chaque membre doit être admis par
-   `is_sandbox_env_allowed`, présent dans une liste de relais
-   (`PILOT_DISPATCH_ENV`, `RESCUE_VERIFY_ENV`, `ARCH_ASK_RETRY_ENV`,
-   `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV`, `GH_TOKEN`), ou porter une
-   **exception nommée** (§ Fire-Disposition).
+6. **Population = lues − (écrites non self-référentielles) − builtins.** Chaque
+   membre doit être admis par `is_sandbox_env_allowed`, couvert par un relais, ou
+   porter une **exception nommée** (§ Fire-Disposition). Les relais existants :
+   `PILOT_DISPATCH_ENV`, `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des
+   `&[&str]` ; `DISPATCH_WORKTREE_ENV` et `PILOT_TRANSCRIPT_ENV` sont des **`&str`
+   scalaires** (vérifié : `executor.rs:164` et `:236`), et `GH_TOKEN` est un
+   littéral injecté en clair — les trois formes doivent être agrégées
+   explicitement, un `.iter().chain(…)` naïf sur les cinq ne compile pas.
 
 **Anti-vacuité (R5), trois assertions avant toute autre :** le fichier existe, il
 fait plus de 100 Ko, et la population extraite compte au moins 8 membres. Sans elles,
@@ -320,9 +428,13 @@ fichier, qui changera), construits sur les formes réellement présentes :
 | N3 `# echo "$OPERATOR_KNOB"` | **hors** population | terme 1 — le commentaire |
 | N4 `printf 'grep x \$OPERATOR_KNOB'` | **hors** population | terme 2 — la prose échappée |
 | N5 `echo "$_INTERNAL"` | **hors** population | terme 3 — la convention interne |
+| N6 `export KNOB="${KNOB:-3}"` | **dans** la population | terme 4bis — l'écriture self-référentielle n'évince pas |
 
-N1, N3 et N4 sont à **voir rouges** en retirant leur terme respectif avant de les
-déclarer verts : un contrôle négatif jamais vu rouge n'atteste rien.
+N1, N3, N4 et **N6** sont à **voir rouges** en retirant leur terme respectif avant
+d'être déclarés verts : un contrôle négatif jamais vu rouge n'atteste rien. N6 est
+le plus important des six — il est construit sur la forme **réellement présente**
+à `dispatch-lib.sh:8395`, et c'est le seul dont l'absence casserait le plan
+contre lui-même plutôt que de laisser passer un cas.
 
 ### 5.4 — Le test du DoD sur `is_sandbox_env_allowed`
 
@@ -418,8 +530,12 @@ nommé dans le corps de PR), et la liste est **grep-visible** en un seul site.
   rien ; **la valeur vide EST relayée** (le rollback survit) ; `relayed_env_pairs`
   est inchangée pour ses deux familles d'origine.
 - **V3** — le scan de classe est vert sur l'arbre, avec ses trois assertions
-  d'anti-vacuité et ses cinq contrôles négatifs (N1/N3/N4 **vus rouges** avant
-  d'être déclarés verts).
+  d'anti-vacuité et ses **six** contrôles négatifs (N1/N3/N4/**N6** **vus rouges**
+  avant d'être déclarés verts). **V3 est la vérification qui doit être exécutée en
+  premier** : si elle rougit sur `CLAUDE_PILOT_MIN_TOOL_CALLS`, le terme 4bis n'est
+  pas implémenté et c'est le prédicat qu'il faut corriger — **jamais** l'entrée de
+  `DISPATCH_ENV_KNOWN_INERT`, dont le retrait ferait taire le scan en le laissant
+  faux.
 - **V4** — l'assertion auto-nettoyante rougit sur une entrée `DISPATCH_ENV_KNOWN_INERT`
   factice pointant une variable que `dispatch-lib.sh` ne lit pas.
 - **V5** — non-régression : `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`,
@@ -485,16 +601,18 @@ reste la seule borne tant que ce correctif n'est pas déployé**.
 - `PILOT_MAX_TURNS` et `PILOT_LOG_DIR` sont relayées explicitement au child de
   dispatch ; les deux allowlists sandbox sont **inchangées**.
 - Le relais préserve les trois paliers du lecteur shell, valeur vide comprise.
-- Les **trois** sites de commentaire faux sont corrigés, le root `CLAUDE.md`
-  inclus ; le § *pilot turn budget* porte la correction de V1a et la nouvelle
-  lecture d'inertie.
+- Les **sept** sites de classe A sont corrigés (§ 2.1), les trois sites de classe
+  B reçoivent la précision de mécanisme sans changement de conclusion, et le
+  § *pilot turn budget* porte en plus la correction de V1a et la nouvelle lecture
+  d'inertie (`source=default` ⇒ suspecter le binaire, classe mika#2340).
 - Le scan de classe est livré, vert, avec anti-vacuité, cinq contrôles négatifs et
   son allowlist d'exceptions nommées auto-nettoyante.
 - `cargo test -p mika-agent`, `cargo clippy`, `cargo fmt --check` et
   `make test-dispatch-lib` passent.
-- Le corps de PR **nomme la divergence au DoD du ticket** (relais au lieu
-  d'allowlist), sa raison (mika#2354 AC9(b)), et la sonde S1 comme vérification
-  opérateur restante.
+- Le corps de PR **rappelle la divergence ratifiée** (relais au lieu d'allowlist,
+  opérateur 2026-09-24 08:10Z, raison : surface de sûreté plus petite), nomme les
+  deux assertions du DoD **déjà couvertes** plutôt que de les redupliquer, et pose
+  la sonde S1 comme la vérification opérateur restante.
 
 ---
 
@@ -505,10 +623,10 @@ reste la seule borne tant que ce correctif n'est pas déployé**.
    `max_turns=150 source=env` (jamais `source=default`, jamais `max_turns=none`),
    **et** la cmdline du pilote porte `--max-turns 150`.
 2. **AC2** — Un test atteste que `PILOT_MAX_TURNS` traverse `env_clear()`. *Moyen
-   divergent, assumé et ratifiable* : elle traverse par **relais explicite**, non
-   par admission dans l'allowlist — mika#2354 AC9(b) interdit la seconde voie par
-   test. L'assertion livrée est l'inverse exacte de celle demandée, et atteste la
-   même propriété finale.
+   divergent, **ratifié** le 2026-09-24 08:10Z (§ 0)* : elle traverse par **relais
+   explicite**, non par admission dans l'allowlist — mika#2354 AC9(b) interdit la
+   seconde voie par test. L'assertion livrée est l'inverse exacte de celle
+   demandée, et atteste la même propriété finale.
 3. **AC3** — Contrôle négatif : une variable non allowlistée et non relayée est
    refusée. *Déjà couvert par `sandbox_env_denies_secret_vars`* — nommé, non
    redupliqué.
@@ -517,10 +635,14 @@ reste la seule borne tant que ce correctif n'est pas déployé**.
    redupliqué.
 5. **AC5** — Les commentaires de `crates/mika-common/src/config.rs` et
    `crates/mika-agent/CLAUDE.md` sont corrigés : le mécanisme est `env_clear()` +
-   allowlist positive, et un nom nu ne suffit pas.
-6. **AC6** — *(au-delà du DoD du ticket, § 5.2.3)* Le root `CLAUDE.md`, § *pilot
-   turn budget*, est corrigé : il portait le même diagnostic faux **et** le
-   précédent cassé (`PILOT_LOG_DIR`), et c'est le site le plus lu.
+   allowlist positive, et un nom nu ne suffit pas. *Élargi par la mesure* : ces
+   deux fichiers portent **deux** sites chacun (A1/A2 et A3/A4, § 2.1), pas un.
+6. **AC6** — *(au-delà du DoD du ticket)* Le root `CLAUDE.md` est corrigé à ses
+   **trois** sites (A5 Signal S *Halte 1*, A6 `MIKA_PILOT_LOG_DIR`, A7 § *pilot
+   turn budget*). A7 est le plus lu et le seul qui porte **à la fois** le mauvais
+   mécanisme et le précédent cassé, qu'il emprunte à A6/A2 — l'erreur se citait
+   elle-même à travers deux fichiers, ce qui est la raison pour laquelle la
+   corriger à un seul site ne l'aurait pas éteinte.
 7. **AC7** — *(point 3 du ticket, exécuté)* L'angle mort de classe est relevé,
    `PILOT_LOG_DIR` est réparé avec lui, et les six inerties restantes portent une
    exception nommée avec suivi plutôt qu'un silence.
@@ -550,4 +672,12 @@ reste la seule borne tant que ce correctif n'est pas déployé**.
 - **Le frein en dollars.** Toujours absent en amont (`_sdk_guardrail_kwargs` finit
   sur `pass`) — suivi `senara-solutions/claude-pilot`, inchangé.
 - **`scrub_mika_env_vars`** et le chemin non-pilote (`executor.rs:1181`), qui reste
-  un scrub négatif et n'est pas concerné par cette classe.
+  un scrub négatif et n'est pas concerné par cette classe. Les ~30 mentions de
+  `scrub_mika_env_vars` sous `docs/solutions/`, `todos/` et les plans antérieurs
+  sont **hors population** : elles décrivent le chemin exec-handler, où le scrub
+  est bien le mécanisme, ou elles sont des archives datées qu'on ne réécrit pas.
+- **Le raisonnement des trois sites de classe B** (§ 2.1). Ils reçoivent la
+  précision de mécanisme et **rien d'autre** : leur conclusion est vraie sous les
+  deux mécanismes, et réécrire un raisonnement juste — dont un marqueur de sûreté
+  (`pilot_egress_stamp.rs`) et un runbook opérateur — pour un seul mot coûte plus
+  de relecture que l'imprécision ne coûte de confusion.
