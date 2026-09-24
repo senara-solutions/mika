@@ -202,6 +202,7 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
                 value.ok_or_else(|| anyhow::anyhow!("Usage: mika config set {key} <value>"))?;
             mika_agent::config_keys::validate_config_value(key, &val)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            warn_session_scope_on_non_singleton(key, &val, &ctx.home_dir);
             ctx.async_db.set_customer_config(key, &val).await?;
             println!("Set {key} = {val}");
         }
@@ -209,6 +210,66 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
     }
 
     Ok(())
+}
+
+/// Warn — never refuse — when `context_history_scope=session` lands on an agent
+/// that mints a fresh session per inbound message (mika#2425 U6/AC7).
+///
+/// # What the operator would otherwise not learn until it was too late
+///
+/// L8 measured that `scope = session` removes 86–99 % of the window. That
+/// measurement was taken on a population whose sessions carry several messages
+/// (CLI `mika chat`, A2A calls with a stable `--session-id`, singleton agents).
+/// On a Telegram tenant it does not remove 90 %, it **empties**: `MessageRequest`
+/// carries no `session_id`, so the `/message` handler mints a fresh
+/// `Uuid::new_v4()` per inbound message unless the agent declares
+/// `[session] singleton = true` — and neither the default nor the family
+/// identity does. For such an agent a "session" *is* a message, so the window
+/// keeps the current turn and nothing before it.
+///
+/// # Why it warns and does not refuse
+///
+/// An agent driven over CLI or A2A with stable `--session-id`s is a legitimate
+/// population, and refusing would turn this ticket's lever into a prohibition.
+/// The line names the consequence and the probe, so the decision stays the
+/// operator's — with the fact in hand rather than after the fact.
+fn warn_session_scope_on_non_singleton(key: &str, value: &str, agent_home: &Path) {
+    use mika_agent::config_keys::{CONTEXT_HISTORY_SCOPE_KEY, parse_context_history_scope};
+
+    if key != CONTEXT_HISTORY_SCOPE_KEY
+        || parse_context_history_scope(value) != Some(mika_agent::prompt::HistoryScope::Session)
+    {
+        return;
+    }
+    // A fail-closed identity (absent or malformed file) carries `singleton =
+    // false`, so it warns. That is the safe direction: the warning costs a
+    // paragraph, the silence costs a window.
+    if mika_agent::prompt::load_identity(agent_home)
+        .session
+        .singleton
+    {
+        return;
+    }
+
+    eprintln!(
+        "Warning: this agent mints a fresh session per inbound message \
+         (no `[session] singleton = true` in identity.toml)."
+    );
+    eprintln!(
+        "         For such an agent a \"session\" IS a message, so \
+         `{CONTEXT_HISTORY_SCOPE_KEY} = session` does not trim the conversation \
+         window — it empties it. The turn keeps its own message and nothing before it."
+    );
+    eprintln!(
+        "         Core memory, structured facts and the conversation summary are \
+         agent-scoped and survive; the raw history of the last turns does not."
+    );
+    eprintln!(
+        "         Measure before deciding: grep context_window_assembled \
+         \"$MIKA_SPIRIT_LOG_FILE\" | jq '{{message_count, distinct_sessions}}' — \
+         if both are 1 on nearly every line, there is nothing here to trim."
+    );
+    eprintln!("         Cancel with: mika config set {CONTEXT_HISTORY_SCOPE_KEY} agent");
 }
 
 async fn run_list(

@@ -70,6 +70,13 @@ mod eval {
     // asserts the window; this one asserts what the instrument says about it.
     mod test_context_scope_observability_2305;
 
+    // mika#2425 — the per-tenant half. Its neighbour above covers the
+    // identity-declared scope; this one covers a `customer_config` narrowing
+    // reaching the real window, the refusal of a widening, and the unchanged
+    // default. No source predicate can see a decision site that reads the right
+    // field and simply never consults the database.
+    mod test_context_history_per_tenant_2425;
+
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
