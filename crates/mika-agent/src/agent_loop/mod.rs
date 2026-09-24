@@ -9856,6 +9856,346 @@ mod tests {
     }
 
     // ===========================================================================
+    // mika#1910 — every `turn_usage` emission says what its turn produced
+    // ===========================================================================
+
+    /// The index of the closing paren matching the `(` at `open`.
+    ///
+    /// Depth-counting, string-literal aware. It cannot parse Rust — a `(` inside
+    /// a char literal or a raw string would fool it — and that is acceptable for
+    /// what it bounds: the argument list of one named call, whose real shapes are
+    /// in this file and carry neither.
+    fn matching_paren(src: &str, open: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split an argument list on its **top-level** commas, dropping the empty
+    /// tail a trailing comma leaves behind.
+    fn top_level_args(list: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut cur = String::new();
+        for c in list.chars() {
+            if in_str {
+                cur.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    cur.push(c);
+                }
+                '(' | '[' | '{' | '<' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' | '}' | '>' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ',' if depth == 0 => {
+                    out.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            }
+        }
+        let tail = cur.trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+        out.retain(|a| !a.is_empty());
+        out
+    }
+
+    /// Every invocation of the `turn_usage` field builder found in `src`, as
+    /// `(1-based line, last argument)`.
+    ///
+    /// The last argument **is** the `response_chars` position: that parameter is
+    /// declared last on `build_turn_usage_fields`, which is the one funnel all
+    /// three emission sites traverse (`save_continuation_llm_call` reaches it
+    /// through its own wrapper). So "did this site declare what it measured?"
+    /// reduces to reading one argument, which a scan can do exactly.
+    fn turn_usage_emitter_sites(src: &str) -> Vec<(usize, String)> {
+        // In halves: this function's body lives inside the file the guard scans,
+        // so writing the token whole would make the gate its own first offender
+        // — the `unwrapped_deadline_call_sites` motif one block up, and the
+        // mika#2201 class (a lint that reddens on its own prose).
+        let emitter = concat!("build_turn_usage", "_fields");
+
+        // Comments are how this ticket explains itself, and the constant's own
+        // doc-comment contains the word `None`. Strip line comments first,
+        // preserving the line structure so reported numbers stay those of `src`.
+        let cleaned: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut sites = Vec::new();
+        let mut from = 0usize;
+
+        while let Some(rel) = cleaned[from..].find(emitter) {
+            let start = from + rel;
+            from = start + emitter.len();
+
+            // A definition (`fn build_turn_usage_fields(`) is not a call site.
+            if cleaned[..start].trim_end().ends_with("fn") {
+                continue;
+            }
+            // Only whitespace may sit between the token and its `(`, or this is
+            // a mention rather than an invocation.
+            let rest = &cleaned[start + emitter.len()..];
+            let Some(open_rel) = rest.find('(') else {
+                continue;
+            };
+            if !rest[..open_rel].trim().is_empty() {
+                continue;
+            }
+
+            let open = start + emitter.len() + open_rel;
+            let Some(close) = matching_paren(&cleaned, open) else {
+                continue;
+            };
+            let args = top_level_args(&cleaned[open + 1..close]);
+            let Some(last) = args.last() else {
+                continue;
+            };
+            let line = cleaned[..start].matches('\n').count() + 1;
+            sites.push((line, last.clone()));
+        }
+
+        sites
+    }
+
+    /// The detector behind [`mika1910_every_unmeasured_site_declares_itself`],
+    /// split out so the guard can be exercised on a fabricated string rather
+    /// than by breaking the real source (mika#1910 verification contract §7).
+    ///
+    /// # Why the criterion is the DECLARATION and not the error arm
+    ///
+    /// The natural predicate — *"is this `None` inside an `Err` arm?"* — is not
+    /// one a grep can settle, and both approximations fail in **both**
+    /// directions: a lookback for `Err(` misses an error site written otherwise
+    /// (`match … { e @ LlmError::… =>`, a `?` bubbling up, a helper), and it
+    /// accepts any `None` that happens to sit under a neighbouring `Err`. So the
+    /// question is moved from the context to the declaration: *"did the author
+    /// write the token that says **I know this site measures nothing**?"* — which
+    /// a scan answers exactly, and which documents the site into the bargain.
+    fn undeclared_unmeasured_sites(src: &str) -> Vec<String> {
+        turn_usage_emitter_sites(src)
+            .into_iter()
+            .filter(|(_, last)| last == "None")
+            .map(|(line, _)| format!("{line}: passes a bare `None` for `response_chars`"))
+            .collect()
+    }
+
+    /// Every `turn_usage` emission site must declare what it measured — either a
+    /// real count, or [`RESPONSE_CHARS_UNMEASURED`] (mika#1910 U1).
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// Removing the measure breaks **no assertion**. The loop keeps working,
+    /// every existing test stays green, and the only change is that the line goes
+    /// mute again — which is the entire defect of mika#1910: the continuation
+    /// turn recorded `response_text = NULL` unconditionally, successes included,
+    /// so the one row that carries the class could not distinguish "produced a
+    /// summary" from "produced nothing". A regression that makes nothing false,
+    /// only something invisible, is the class this house guards by scanning
+    /// source (`mika2342_every_llm_call_is_wrapped_in_a_timeout` one block up,
+    /// `policy::no_bare_agent_timeout_constant_remains`,
+    /// `grooming_marker::no_grooming_regex_outside_this_module`).
+    ///
+    /// # Scope, and what a fourth site means
+    ///
+    /// This file only, and the inventory is closed at **three** sites — the loop's
+    /// `Ok` arm, the loop's `Err` arm, and the continuation turn. Per the plan's
+    /// Fire-Disposition there is **no allowlist**: an allowlist born empty is
+    /// just a place to put the next violation instead of measuring it. A fourth
+    /// site is **halt and surface** — whether it has a response to measure is a
+    /// question this guard cannot settle for its author.
+    #[test]
+    fn mika1910_every_unmeasured_site_declares_itself() {
+        // The scan reads the production half only: the test code below writes a
+        // bare `None` on purpose. The boundary comes from
+        // `mika_common::source_guard` (mika#2398) rather than a local
+        // `split_once("#[cfg(test)]")`, whose premise stopped being true at
+        // mika#2310 (an extracted test module carries no such literal).
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+
+        let offenders = undeclared_unmeasured_sites(&production);
+        assert!(
+            offenders.is_empty(),
+            "mika#1910: {} `turn_usage` emission site(s) in `agent_loop/mod.rs` pass a bare \
+             `None` for `response_chars`.\n{}\n\n\
+             WHY THIS MATTERS: `response_chars` is the ONLY surface on which the mika#1910 class \
+             is countable. `null` there means \"not measured\"; `0` means \"measured, and the \
+             model produced nothing\" — which IS the class. A bare `None` collapses the two, and \
+             the offline analyzer (`scripts/measure-empty-turns`) then classes the turn \
+             `undetermined` instead of `empty_response`: the measurement silently loses exactly \
+             the population the ticket exists to count.\n\
+             FIX: pass the count when the call returned (`Some(0)` on an empty response, never \
+             `None`), or the named constant RESPONSE_CHARS_UNMEASURED when no call returned. \
+             Do NOT pass `0` on an error arm — nothing was measured there, and `0` would be a \
+             readable lie (the mika#2331 rule on `request_bytes`, one struct away).",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// The inventory is closed at three emission sites (mika#1910 U1).
+    ///
+    /// Without this, a guard grown too narrow — a renamed builder, a changed
+    /// argument order — would pass by looking at nothing, and a green scan would
+    /// be indistinguishable from a healthy one (the mika#2205 class).
+    #[test]
+    fn mika1910_the_inventory_of_emission_sites_is_closed() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+
+        let sites = turn_usage_emitter_sites(&production);
+        assert_eq!(
+            sites.len(),
+            3,
+            "mika#1910: expected exactly 3 `turn_usage` emission sites (loop Ok arm, loop Err \
+             arm, continuation turn), found {}: {:?}.\n\
+             A FOURTH SITE IS HALT-AND-SURFACE, not an allowlist entry: whether it has a \
+             response to measure is a question this guard cannot settle for its author.\n\
+             ZERO SITES means the scan stopped seeing the builder at all — repair the scan \
+             before trusting its sibling's green.",
+            sites.len(),
+            sites
+        );
+    }
+
+    /// The guard's positive and negative controls, on fabricated snippets.
+    ///
+    /// Exercising it by breaking the real source is refused: the guard would
+    /// become untestable without reddening the repository.
+    #[test]
+    fn mika1910_guard_fires_on_a_bare_none() {
+        let emitter = concat!("build_turn_usage", "_fields");
+        let declared = concat!("RESPONSE_CHARS_", "UNMEASURED");
+
+        // Positive control — the named constant is a declaration, not a violation.
+        let good = format!(
+            "            let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               {declared},\n\
+             \x20           );\n"
+        );
+        assert!(
+            undeclared_unmeasured_sites(&good).is_empty(),
+            "the named constant must be accepted, or the guard forbids the fix itself"
+        );
+
+        // Negative control 1 — a bare `None` at the `response_chars` position.
+        let bare = format!(
+            "            let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               None,\n\
+             \x20           );\n"
+        );
+        assert_eq!(
+            undeclared_unmeasured_sites(&bare).len(),
+            1,
+            "the guard must flag a bare `None` — it is the exact shape mika#1910 removed"
+        );
+
+        // Negative control 2 — the SAME bare `None`, under a line containing
+        // `Err(`. It must STILL be flagged: this is the control that separates
+        // "the guard reads the declaration" from "the guard reads the
+        // neighbourhood". Without it, a lookback grown by accident would pass.
+        let under_err = format!(
+            "            Err(e) => {{\n\
+             \x20           let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               None,\n\
+             \x20           );\n\
+             \x20       }}\n"
+        );
+        assert_eq!(
+            undeclared_unmeasured_sites(&under_err).len(),
+            1,
+            "a bare `None` under an `Err(` line must still be flagged — the criterion is the \
+             DECLARATION, never the neighbourhood. A grep cannot decide whether a line sits in \
+             an error arm; it can decide whether its author wrote the token."
+        );
+
+        // Good faith — prose naming the shape must not be a violation, or the
+        // guard forbids documenting itself (mika#2201, mika#2050).
+        let commented = format!("            // {emitter}(.., None) was the pre-fix shape\n");
+        assert!(
+            undeclared_unmeasured_sites(&commented).is_empty(),
+            "prose naming the call must not be a violation, or the guard forbids documenting \
+             itself"
+        );
+    }
+
+    // ===========================================================================
     // mika#2247 — every user-facing output site normalises its typography
     // ===========================================================================
 

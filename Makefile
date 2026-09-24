@@ -164,6 +164,9 @@ test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
 
+test-measure-empty-turns: ## Pin the axis-B emptiness predicate and its four negative controls (mika#1910)
+	@bash scripts/test-measure-empty-turns.sh
+
 test-rescue-signal: ## Run the rescue-into-open-PR signal suite (mika#2151)
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
 
