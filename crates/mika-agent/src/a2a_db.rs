@@ -252,6 +252,41 @@ impl Database {
     }
 
     /// Update an A2A task's state (maps A2A state to internal status).
+    ///
+    /// **Estampille `fired_at` quand le tour démarre (mika#2133 R1).** C'est ici
+    /// que la définition unique de D7 s'applique au chemin a2a : *le premier
+    /// instant où le moteur a commencé à travailler sous cette ligne* est la
+    /// transition vers `working`.
+    ///
+    /// # Pourquoi le stamp vit ici et pas chez les deux appelants
+    ///
+    /// `server/a2a.rs` pose `working` à deux endroits — la branche synchrone de
+    /// `message/send` et `run_a2a_stream_turn` — et tous deux traversent cette
+    /// méthode. Le stamp y vit, au point de passage unique, plutôt que dans
+    /// chaque appelant : un site ne peut pas dériver d'un autre comme le fait
+    /// une convention par appelant. C'est la doctrine que le site jumeau
+    /// ([`Database::set_task_process_id`]) énonce déjà, et le mode de panne
+    /// qu'elle prévient est **mesuré dans ce dépôt** — les trois chemins de
+    /// dispatch parent sont nés par recopie l'un de l'autre, et c'est très
+    /// exactement ce qui a produit le défaut que mika#2335 a dû fermer.
+    ///
+    /// # Le prédicat porte sur le statut interne, jamais sur la chaîne A2A
+    ///
+    /// [`a2a_state_to_task_status`] porte un bras `_ => "pending"` qui absorbe
+    /// toute valeur inconnue : un prédicat écrit sur `a2a_state == "working"`
+    /// divergerait de la table à la première valeur de protocole ajoutée en
+    /// amont. Et le statut interne **est** la définition de « démarrée » partout
+    /// ailleurs dans cette table (`claim_and_fire_task`, `mark_parent_dispatched`,
+    /// les trois compteurs de concurrence) — un second vocabulaire créerait deux
+    /// définitions de « déclenchée », ce qu'AC4 interdit.
+    ///
+    /// # Ce qui reste légitimement NULL
+    ///
+    /// La branche `returnImmediately` de `message/send` crée la ligne et la rend
+    /// en `submitted` sans jamais exécuter de tour : elle ne traverse pas cette
+    /// méthode, donc `fired_at` y reste NULL. C'est le contrôle négatif naturel
+    /// d'AC2/AC3 en production — une tâche jamais tirée doit rester distinguable
+    /// d'une tâche en travail, ce qui est tout l'objet du ticket.
     pub fn a2a_update_task_state(&self, a2a_task_id: &str, a2a_state: &str) -> Result<()> {
         let internal_status = a2a_state_to_task_status(a2a_state);
         let now = timestamp::now();
@@ -265,9 +300,23 @@ impl Database {
             None
         };
 
-        let rows = self.conn.execute(
+        // Un seul aller-retour : la transition et le stamp restent un seul acte.
+        // Un second `UPDATE` pourrait échouer entre les deux et laisser
+        // exactement la ligne `in_progress` sans `fired_at` que ce ticket ferme.
+        let sql = if internal_status == "in_progress" {
+            format!(
+                "UPDATE tasks SET status = ?1, updated_at = ?2, completed_at = ?3, {}
+                 WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?4)",
+                crate::db::tasks::FIRED_AT_STAMP_IF_NULL
+            )
+        } else {
             "UPDATE tasks SET status = ?1, updated_at = ?2, completed_at = ?3
-             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?4)",
+             WHERE id = (SELECT task_id FROM a2a_task_map WHERE a2a_task_id = ?4)"
+                .to_string()
+        };
+
+        let rows = self.conn.execute(
+            &sql,
             rusqlite::params![internal_status, &now, completed_at, a2a_task_id],
         )?;
         if rows == 0 {

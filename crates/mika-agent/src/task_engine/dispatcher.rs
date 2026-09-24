@@ -1031,6 +1031,33 @@ impl TaskDispatcher {
         // This guarantees at minimum session_id, cost_usd, duration_ms, and turns
         // are captured even if the agent exhausts its step budget.
         if is_callback {
+            // mika#2133 R2 — le tour de livraison EST le travail du moteur sous
+            // cette ligne, et jusqu'ici rien ne le marquait. Une ligne callback
+            // qui porte un pilote a déjà son `fired_at` (posé au spawn par
+            // `set_task_process_id`, mika#2263) et la clause NULL-only ne la
+            // réécrit pas ; celle qui n'en porte pas — wrapper différé,
+            // rendez-vous de build — n'en avait aucun, donc se lisait « jamais
+            // firée » pendant tout le temps où elle tenait le verrou d'agent.
+            //
+            // Les reminders sont exclus : ils passent par `fire_task` →
+            // `claim_and_fire_task`, déjà estampillés, avec la sémantique
+            // d'écrasement « dernier tir » (mika#2133 D4) qu'un appel ici
+            // contredirait.
+            //
+            // Le statut n'est pas touché — voir `stamp_task_fired_at_if_null`
+            // pour pourquoi poser `in_progress` ici est un autre ticket.
+            //
+            // `warn!`-et-continue comme les trois sites de dispatch existants :
+            // le stamp est de l'observabilité et ne doit jamais faire échouer un
+            // tour.
+            if let Err(e) = self.db.stamp_task_fired_at_if_null(&task.id).await {
+                warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "failed to stamp fired_at on callback delivery turn"
+                );
+            }
+
             try_extract_callback_metadata(&self.db, task).await;
             // mika#2496 U4: the cost half of the "120 turns / 40 USD" rule has
             // no enforcement point upstream (`_sdk_guardrail_kwargs` ends on
