@@ -797,6 +797,86 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2496 — le nom d'audit du dépassement de coût a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est vérifiable : le nom
+    /// `pilot_cost_overrun` est **neuf**. Quand ce scan tire, **on retire le
+    /// second écrivain**, on ne l'excepte pas (doctrine mika#2201).
+    const PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Un seul écrivain du nom d'audit du dépassement de coût (mika#2496 U4).**
+    ///
+    /// La propriété est porteuse pour une raison précise : la requête opérateur
+    /// publiée dans `CLAUDE.md` —
+    /// `SELECT count(*), avg(after_value) … WHERE tool_name = 'pilot_cost_overrun'`
+    /// — **est** la précondition explicite du ticket de suivi sur
+    /// `senara-solutions/claude-pilot`, qui doit dimensionner le frein dollars
+    /// manquant. Un second écrivain ne rendrait aucune décision fausse ; il
+    /// rendrait ce compte inexact, et le ticket s'ouvrirait sur un nombre que
+    /// personne ne pourrait départager. Aucun test comportemental ne voit cette
+    /// classe — d'où un scan de source.
+    #[test]
+    fn mika2496_the_cost_overrun_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("pilot_cost{}", "_overrun");
+        let owner = "crates/mika-agent/src/task_engine/dispatcher.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2496 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2496 — le nom d'audit du dépassement de coût a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS — le compte qui dimensionne \
+             le ticket de suivi cpp n'est exact que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2496_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "PILOT_COST_OVERRUN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait

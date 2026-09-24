@@ -6335,6 +6335,299 @@ assert_contains "mika#2165: et le repli est bruyant — la moitié hôte d'AC3" 
         )
     )"
 
+echo ""
+echo "Test: le plafond de tours du pilote est armé à la source (mika#2496)"
+echo "---------------------------------------------------------------------"
+# Aucun test comportemental ne peut voir la classe que ce bloc garde. Un
+# quatrième site de lancement écrit demain sans `--max-turns` ne rend AUCUNE
+# décision fausse : il tourne simplement sans borne, et toutes les assertions
+# existantes restent vertes. C'est la forme exacte du défaut que mika#2496
+# ferme — trois sites de lancement, zéro drapeau, depuis toujours — reproduite
+# un cran plus tard. D'où un scan de source.
+#
+# LE MOTIF EST FIGÉ, parce qu'un scan sur « tout appel `claude-pilot` » est faux
+# dans les deux directions. La chaîne apparaît ~47 fois dans le fichier et une
+# seule famille est un lancement : commentaires, `--ro-bind-try
+# "$HOME/.local/bin/claude-pilot"`, `--relay-config …/claude-pilot.json`,
+# `command -v claude-pilot`, le smoke test `timeout 15 claude-pilot --help`, et
+# de la prose dans les corps `RESULT=`. Un scan naïf rougirait sur les ~44
+# autres ; resserré sur la LIGNE PHYSIQUE, il manquerait deux des trois sites
+# réels, écrits sur plusieurs lignes avec continuation `\` — `--max-turns` y vit
+# légitimement sur une ligne que le grep ne regarde pas.
+#
+# Cinq termes, dont le cinquième est une correction MESURÉE du plan :
+#
+#   1. unité d'analyse = l'INVOCATION LOGIQUE, obtenue en recollant les
+#      continuations `\`, jamais la ligne physique. C'est le terme que la forme
+#      des deux sites de revise impose (fixture N2).
+#   2. les lignes de commentaire sont retirées AVANT le recollement.
+#   3. `claude-pilot` en POSITION DE COMMANDE : précédé d'un début d'invocation
+#      (début de ligne, `;`, `|`, `&`, `(`, `{`) ou du nom du wrapper
+#      `_run_pilot_sandboxed`. Un `/` n'est pas dans ce jeu, ce qui exclut les
+#      chemins (`--ro-bind-try "…/bin/claude-pilot"`).
+#   4. le token suivant est exigé d'être un DRAPEAU (`[[:space:]]+-`). Ça borne
+#      le jeton par la droite — `claude-pilot.json` et `claude-pilot-py` ne
+#      peuvent plus matcher — et ça exclut la prose.
+#   5. la CARDINALITÉ est assertée à 3. Sans elle, un prédicat devenu trop
+#      étroit passerait au vert en ne regardant plus rien (classe mika#2205),
+#      et c'est la seule forme de panne qu'aucune des cinq fixtures ne voit.
+#
+# Le terme 4 N'EST PAS dans le plan, et il a été ajouté sur une mesure : le plan
+# nomme « de la prose dans les corps `RESULT=` » parmi ce que le scan doit
+# exclure, mais ses quatre termes ne l'excluaient pas. `dispatch-lib.sh` porte
+# `claude-pilot FAILED (exit code ${PILOT_EXIT}).` EN COLONNE ZÉRO, à
+# l'intérieur d'une chaîne `RESULT="…"` multi-lignes — donc « début de ligne »,
+# donc candidat, donc cardinalité 4 au lieu de 3. Le terme 4 l'écarte sans rien
+# coûter : un lancement porte toujours des drapeaux. Fixture N5.
+#
+# Le terme 3 est délibérément une DISJONCTION (le wrapper *ou* la position de
+# commande) et non le wrapper seul : un site futur qui appellerait le binaire
+# sans passer par `_run_pilot_sandboxed` échapperait à un prédicat ancré sur le
+# wrapper — et ce site-là est aussi celui qui perdrait le confinement réseau
+# (mika#2049), donc il doit rougir ici plutôt que passer. Fixture N4.
+
+# L'allowlist est **livrée vide**. Quand ce scan tire, la résolution est d'ARMER
+# le site, jamais de l'allowlister : doctrine mika#2201, « on déclare, on
+# n'allowliste pas ». Un site de lancement qu'on ne veut pas armer est un site
+# qu'il faut supprimer.
+MIKA2496_LAUNCH_EXCEPTIONS=()
+
+# Rend une invocation logique par ligne : commentaires retirés, continuations
+# recollées. Le `sed` est l'idiome standard de recollement (`N` + `ta`).
+_mika2496_logical_invocations() {
+    grep -vE '^[[:space:]]*#' "$1" | sed -e :a -e '/\\$/N; s/\\\n/ /; ta'
+}
+
+# Les invocations logiques qui LANCENT claude-pilot (termes 3 et 4).
+_mika2496_launch_candidates() {
+    _mika2496_logical_invocations "$1" \
+        | grep -E '(^|[;|&(){}]|_run_pilot_sandboxed)[[:space:]]*claude-pilot[[:space:]]+-' \
+        || true
+}
+
+# Celles qui le lancent SANS plafond — la population que le scan refuse.
+_mika2496_unbounded_launches() {
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local skip=""
+        local exc
+        for exc in "${MIKA2496_LAUNCH_EXCEPTIONS[@]+"${MIKA2496_LAUNCH_EXCEPTIONS[@]}"}"; do
+            case "$line" in *"$exc"*) skip=1 ;; esac
+        done
+        [ -n "$skip" ] && continue
+        case "$line" in *--max-turns*) ;; *) printf '%s\n' "$line" ;; esac
+    done < <(_mika2496_launch_candidates "$1")
+}
+
+# Terme 5 — la cardinalité. Anti-vacuité : un scan qui ne trouve PERSONNE se lit
+# exactement comme un scan propre.
+assert_eq "mika#2496: le scan voit exactement les trois sites de lancement" "3" \
+    "$(_mika2496_launch_candidates "$DISPATCH_LIB" | wc -l | tr -d ' ')"
+
+# L'assertion elle-même : aucun lancement sans son plafond.
+assert_eq "mika#2496: aucun site de lancement ne part sans --max-turns" "" \
+    "$(_mika2496_unbounded_launches "$DISPATCH_LIB" | cut -c1-100)"
+
+assert_eq "mika#2496: l'allowlist des lancements non bornés est livrée vide" "0" \
+    "${#MIKA2496_LAUNCH_EXCEPTIONS[@]}"
+
+# --- Contrôles négatifs N1–N5, sur les formes d'appel RÉELLEMENT présentes ---
+#
+# Un scan vert par vacuité sur les formes qu'il ne reconnaît pas est
+# indistinguable d'un scan qui couvre (mika#2205). Chaque fixture est donc
+# calquée sur une forme qui existe dans `dispatch-lib.sh`, jamais inventée, et
+# chacune est vue rouge ou vue verte explicitement.
+MIKA2496_FIXDIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2496-fixtures.XXXXXX")
+
+# N1 — mono-ligne, la forme du dispatch principal, sans le drapeau. ROUGE.
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" --command "$C" -- "$P"' \
+    > "$MIKA2496_FIXDIR/n1"
+
+# N2 — multi-lignes avec continuations, la forme des deux pilotes de revise,
+# sans le drapeau. ROUGE — atteste le recollement du terme 1.
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" \' \
+    '        --command "/mika-revise-plan" $CWD_ARGS \' \
+    '        -- "@$F"' \
+    > "$MIKA2496_FIXDIR/n2"
+
+# N3 — même forme, drapeau présent mais SUR UNE LIGNE DE CONTINUATION. VERT.
+# Le miroir de N2 : sans lui, « le scan lit l'invocation » ne se distingue pas
+# de « le scan rougit sur tout multi-ligne ».
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" \' \
+    '        --max-turns 120 \' \
+    '        --command "/mika-revise-plan" $CWD_ARGS' \
+    > "$MIKA2496_FIXDIR/n3"
+
+# N4 — appel direct, SANS `_run_pilot_sandboxed`, sans le drapeau. ROUGE —
+# atteste la disjonction du terme 3.
+printf '%s\n' \
+    '    claude-pilot --verbose --log-dir "$D" --task-id "$I" --command "$C"' \
+    > "$MIKA2496_FIXDIR/n4"
+
+# N5 — bonne foi : un commentaire, un chemin bindé, la config du relais, et la
+# prose `RESULT=` en colonne zéro. VERT — sans quoi le scan serait rouge en
+# permanence, donc désarmé.
+printf '%s\n' \
+    '# on lancera claude-pilot --verbose ici un jour' \
+    '            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \' \
+    '            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$X" \' \
+    '        CWD_ARGS="$CWD_ARGS --relay-config $W/.claude/claude-pilot.json"' \
+    '    command -v claude-pilot >/dev/null 2>&1 || exit 1' \
+    '    if ! timeout 15 claude-pilot --help >/dev/null 2>&9; then' \
+    'claude-pilot FAILED (exit code ${PILOT_EXIT}).' \
+    > "$MIKA2496_FIXDIR/n5"
+
+for _mika2496_red in n1 n2 n4; do
+    assert_eq "mika#2496: fixture $_mika2496_red est VUE ROUGE (lancement sans plafond)" "1" \
+        "$(_mika2496_unbounded_launches "$MIKA2496_FIXDIR/$_mika2496_red" | wc -l | tr -d ' ')"
+done
+assert_eq "mika#2496: fixture n3 est VUE VERTE (drapeau sur une continuation)" "0" \
+    "$(_mika2496_unbounded_launches "$MIKA2496_FIXDIR/n3" | wc -l | tr -d ' ')"
+assert_eq "mika#2496: fixture n3 EST bien un candidat (le vert n'est pas de la vacuité)" "1" \
+    "$(_mika2496_launch_candidates "$MIKA2496_FIXDIR/n3" | wc -l | tr -d ' ')"
+assert_eq "mika#2496: fixture n5 (bonne foi) n'est candidate à rien" "0" \
+    "$(_mika2496_launch_candidates "$MIKA2496_FIXDIR/n5" | wc -l | tr -d ' ')"
+
+rm -rf "$MIKA2496_FIXDIR"
+
+# --- CO-LOCATION, le coût de l'accesseur assignant, refermé structurellement ---
+#
+# Même mécanisme et même raison que pour `$_PILOT_LOG_DIR` (mika#2165) : un
+# accesseur qui ASSIGNE peut être lu périmé, et un site de lancement qui lirait
+# `$_PILOT_MAX_TURNS` sans appeler `_pilot_max_turns` juste avant hériterait du
+# plafond d'un appel précédent — ou de rien, c'est-à-dire d'un dispatch non
+# borné qui se lirait comme borné.
+# La co-location se lit sur l'INVOCATION LOGIQUE, pas sur la ligne physique —
+# même unité d'analyse que le scan ci-dessus, et pour la même raison : deux des
+# trois sites portent le drapeau sur une ligne de continuation, donc la lecture
+# de `$_PILOT_MAX_TURNS` et l'appel du résolveur y vivent sur des lignes
+# physiques différentes tout en appartenant à la même commande. Un prédicat à la
+# ligne les accuserait toutes les deux.
+MIKA2496_UNCOLOCATED=$(_mika2496_logical_invocations "$DISPATCH_LIB" \
+    | grep -E '\$\{?_PILOT_MAX_TURNS\b' \
+    | grep -vE '_pilot_max_turns' \
+    || true)
+assert_eq "mika#2496: chaque lecture de \$_PILOT_MAX_TURNS appelle le résolveur sur la même ligne" "" \
+    "$MIKA2496_UNCOLOCATED"
+
+# Le résolveur ASSIGNE, il n'imprime pas — collision mika#2039, identique à
+# celle que `_pilot_log_dir` documente : un accesseur imprimant se lirait
+# `$(_pilot_max_turns)` et poserait `++ printf %s <valeur>` dans la trace
+# `set -x`, forme qu'aucun scrubber ne couvre.
+MIKA2496_RESOLVER_SRC=$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2496: _pilot_max_turns a bien été trouvée (guards the guard)" "yes" \
+    "$(if [ -n "$MIKA2496_RESOLVER_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "mika#2496 × mika#2039: le résolveur n'imprime pas" "0" \
+    "$(printf '%s\n' "$MIKA2496_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "mika#2496 × mika#2039: aucune substitution \$(_pilot_max_turns) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_pilot_max_turns)' || true)"
+
+# --- AC7 : rien n'annonce un budget dollars qui n'existe pas ---
+#
+# `--max-budget` serait accepté, validé, résolu, porté jusqu'à
+# `_sdk_guardrail_kwargs` — et ignoré (son `if config.maxBudgetUsd > 0:` se
+# termine sur `pass`). Le passer ferait paraître le budget fermé dans l'argv.
+assert_eq "mika#2496 (AC7): aucun site ne passe --max-budget" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF -- '--max-budget' || true)"
+
+# --- V4 : le comportement du résolveur, les trois paliers ---
+_mika2496_resolve_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns
+        printf '%s|%s|%s' "$_PILOT_MAX_TURNS" "$_PILOT_MAX_TURNS_SOURCE" "$_PILOT_MAX_TURNS_INVALID"
+    )
+}
+assert_eq "mika#2496: sans surcharge, le défaut de flotte est DÉSARMÉ (V2 non fournie)" \
+    "|default|" "$(_mika2496_resolve_probe __UNSET__)"
+assert_eq "mika#2496: une valeur entière est honorée, provenance env" \
+    "120|env|" "$(_mika2496_resolve_probe 120)"
+# Contrôle négatif du rollback (AC4) : `0` omet le drapeau, ce qui rend le
+# comportement d'avant mika#2496 — claude-pilot retombe sur maxTurns=200.
+assert_eq "mika#2496 (AC4): PILOT_MAX_TURNS=0 est le ROLLBACK, pas une borne" \
+    "|env|" "$(_mika2496_resolve_probe 0)"
+assert_eq "mika#2496 (AC4): une valeur vide vaut rollback" \
+    "|env|" "$(_mika2496_resolve_probe '')"
+# Un désarmement par coquille sur un frein de coût serait la panne silencieuse
+# que tout ceci ferme : il retombe au défaut ET il est DIT.
+assert_eq "mika#2496: une valeur illisible retombe au défaut et est nommée" \
+    "|default|abc" "$(_mika2496_resolve_probe abc)"
+assert_eq "mika#2496: une valeur négative retombe au défaut et est nommée" \
+    "|default|-5" "$(_mika2496_resolve_probe '-5')"
+
+# --- V4 : le drapeau atteint l'argv, avec la valeur résolue ---
+#
+# C'est LE contrat côté mika. « Le budget tue avant 120 tours » est exécuté par
+# le SDK, dans un autre processus, avec un vrai fournisseur — la moitié
+# comportementale est la sonde S2, pas ce harnais.
+_mika2496_argv_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns
+        # shellcheck disable=SC2086
+        printf '%s' "claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika"
+    )
+}
+assert_contains "mika#2496 (AC1): armé, l'argv porte --max-turns avec la valeur résolue" \
+    '--max-turns 120' "$(_mika2496_argv_probe 120)"
+assert_not_contains "mika#2496 (AC4): désarmé, l'argv ne porte AUCUN --max-turns" \
+    '--max-turns' "$(_mika2496_argv_probe __UNSET__)"
+
+# --- U2/AC2 : le budget en vigueur est dit, et la ligne lit l'ARGV ---
+_mika2496_budget_line() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns
+        # shellcheck disable=SC2086
+        _emit_pilot_budget_line claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika 2>&1
+    )
+}
+assert_contains "mika#2496 (AC2): armé par l'env, la ligne dit la valeur et sa provenance" \
+    'pilot_budget_armed max_turns=120 source=env cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 120)"
+assert_contains "mika#2496 (AC2): désarmé, la ligne dit max_turns=none — jamais une borne inventée" \
+    'pilot_budget_armed max_turns=none source=default cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line __UNSET__)"
+assert_contains "mika#2496: une coquille est nommée entre guillemets" \
+    'pilot_budget_invalid PILOT_MAX_TURNS="oops"' \
+    "$(_mika2496_budget_line oops)"
+# AC7 : la ligne REFUSE d'annoncer un budget dollars, parce qu'il n'en existe
+# aucun en amont. Elle nomme l'absence au lieu de la taire.
+assert_not_contains "mika#2496 (AC7): la ligne n'annonce jamais un budget dollars" \
+    'cost_bound=40' "$(_mika2496_budget_line 120)"
+# Ancrage obligatoire à la lecture (mika#2050) : le `.stderr` porte aussi la
+# prose du pilote, et une session discutant du signal s'est déjà lue comme une
+# émission.
+assert_contains "mika#2496: la ligne est ancrable sur '^dispatch-lib: '" \
+    'dispatch-lib: pilot_budget_armed' "$(_mika2496_budget_line 120)"
+
+# La ligne est émise depuis `_run_pilot_sandboxed`, donc SOUS la redirection
+# `2>"$STDERR_FILE"` du site de lancement — donc dans le sillon forensique
+# per-dispatch. L'émettre avant la ligne de lancement l'enverrait sur le stderr
+# propre de dispatch-lib, que l'exécuteur ne lit QUE sur `if !status.success()` :
+# sur un dispatch qui réussit, le tuyau est jeté sans être lu (Signal M,
+# mesuré par mika#2050). Cette assertion est ce qui empêche un futur
+# contributeur de « simplifier » en déplaçant l'appel sur la ligne de lancement.
+assert_eq "mika#2496: la ligne est émise depuis _run_pilot_sandboxed, pas avant le lancement" "1" \
+    "$(sed -n '/^_run_pilot_sandboxed()/,/^}/p' "$DISPATCH_LIB" | grep -cF '_emit_pilot_budget_line' || true)"
+# Un seul APPEL en production — la définition est exclue par sa parenthèse, pas
+# par son indentation : un appel écrit en colonne zéro resterait compté.
+assert_eq "mika#2496: et depuis nulle part ailleurs" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -E '_emit_pilot_budget_line' | grep -cvE '_emit_pilot_budget_line\(\)' || true)"
+
 # --- mika#2296: un `.content` vide et un `session_id` absent ne se lisent plus pareil ---
 #
 # Avant ce ticket, les deux échouaient sur un seul message nommant un champ JSON

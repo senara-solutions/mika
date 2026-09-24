@@ -247,6 +247,171 @@ _pilot_log_dir() {
     _PILOT_LOG_DIR="${PILOT_LOG_DIR:-/var/log/claude-pilot}"
 }
 
+# ---------------------------------------------------------------------------
+# mika#2496 — le plafond de tours du pilote, armé à la source
+# ---------------------------------------------------------------------------
+#
+# claude-pilot expose un plafond de tours SDK-NATIF depuis toujours : le drapeau
+# `--max-turns` (cli.py:69), validé >= 1 (cli.py:85-87), mappé sur
+# `GuardrailConfig.maxTurns` (cli.py:157-158) et remis au SDK en clair
+# (agent.py:1194-1195), qui termine alors le run sur un `ResultMessage`
+# authentique de sous-type `error_max_turns`. Ce fichier ne le passait à AUCUN
+# de ses trois sites de lancement, donc chaque dispatch tournait sous le défaut
+# amont `maxTurns=200` (types.py:77).
+#
+# C'est ce qui explique les deux emballements de référence : #2484 à 201 tours
+# est `maxTurns=200` qui A MORDU (le mécanisme marche de bout en bout, il est
+# réglé à 200 parce que rien en aval ne l'a jamais réglé), et #2425 à 142 tours
+# est simplement passé dessous. La règle « kill à 120 tours » était donc
+# applicable en vol depuis le début — et mieux que par un compteur lu de
+# l'extérieur, qui ne pourrait tuer que par signal au groupe de processus et
+# perdrait au passage le JSON de sortie, le `Turns:`/`Cost:` du callback et
+# toute la chaîne de récupération post-vol.
+#
+# LE FREIN EN DOLLARS, LUI, N'EXISTE PAS EN AMONT. `--max-budget` est parsé,
+# validé, résolu, porté jusqu'à `_sdk_guardrail_kwargs` — et la branche
+# `if config.maxBudgetUsd > 0:` s'y termine sur un `pass` (agent.py:1198-1201).
+# Le sous-type `error_max_budget_usd` est déclaré et classé en aval : un
+# vocabulaire de terminaison pour un mécanisme que rien ne peut produire. Le
+# commentaire qui l'autorise — « application-level guardrails still apply » —
+# est faux sur cet axe précis : `stallThreshold`, `emptyResponseThreshold`,
+# `idleTimeoutMs`, `toolWaitCeilingMs` et `modelWaitCeilingMs` mesurent tous du
+# TEMPS ou de la PRODUCTIVITÉ, aucun ne mesure des dollars. Aucun site ici ne
+# passe donc `--max-budget` : il serait accepté, validé, porté et ignoré, et le
+# poser ferait paraître le budget fermé dans l'argv, dans la ligne
+# `pilot_budget_armed` ci-dessous et dans la lecture de quiconque ouvrirait ce
+# fichier. Une borne annoncée et inerte est pire que pas de borne — elle éteint
+# la question. Suivi : `senara-solutions/claude-pilot`.
+#
+# UNE FONCTION, pas une variable assignée au chargement, et elle ASSIGNE au
+# lieu d'imprimer : les deux contraintes sont celles de `_pilot_log_dir`
+# ci-dessus et elles valent ici pour les mêmes raisons (une surcharge lue une
+# seule fois répond le défaut à tout appelant qui la pose après le `source` ; un
+# accesseur imprimant se lirait `$(_pilot_max_turns)` et poserait `++ printf`
+# dans la trace `set -x`, forme qu'aucun scrubber ne couvre — garde mika#2039).
+# Le coût est le même aussi : tout lecteur de `$_PILOT_MAX_TURNS` doit appeler
+# `_pilot_max_turns` sur la MÊME ligne, et test-dispatch-lib.sh refuse toute
+# lecture non co-localisée.
+#
+# LE DÉFAUT EST LIVRÉ À 0, C'EST-À-DIRE DÉSARMÉ — et ce n'est pas la valeur que
+# le plan de mika#2496 propose. Son § 5.1 fait de la distribution mesurée des
+# tours des runs ABOUTIS une vérification bloquante (V2) préalable à l'armement,
+# précisément parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une
+# borne qui coupe la population saine déplace le défaut au lieu de le fermer.
+# Cette mesure se lit sur `~/.mika/data/mika.db`, que le bac à sable de dispatch
+# ne monte pas — c'est un geste opérateur sur l'hôte, et le plan écrit lui-même
+# la conduite quand il n'est pas fourni : « U1 est livré DÉSARMÉ
+# (`PILOT_MAX_TURNS=0` par défaut) et la raison est écrite dans le corps de la
+# PR ». Armer est alors d'un geste et sans redéploiement :
+# `PILOT_MAX_TURNS=120` sur l'environnement du service ; ou porter ce défaut à
+# 120 une fois V2 rapportée sur le ticket.
+#
+# Trois paliers, et le `0` n'est pas une valeur invalide mais LE ROLLBACK :
+#
+#   non défini  -> le défaut ci-dessous
+#   ""  ou "0"  -> le drapeau n'est PAS passé ; claude-pilot retombe sur son
+#                  propre `maxTurns=200`, soit le comportement d'avant
+#                  mika#2496 à l'octet près
+#   entier > 0  -> ce plafond, `source=env`
+#   autre       -> le défaut, PLUS une ligne `pilot_budget_invalid` nommant la
+#                  valeur fautive entre guillemets. Un désarmement par coquille
+#                  sur un frein de coût serait la panne silencieuse que tout
+#                  ceci ferme.
+#
+# `_PILOT_MAX_TURNS` porte « la borne, ou rien » : vide quand désarmé, les
+# chiffres sinon. C'est ce qui rend `${_PILOT_MAX_TURNS:+--max-turns …}` juste
+# aux sites de lancement — le drapeau littéral y reste visible (le scan de
+# source l'exige) tout en disparaissant de l'argv quand la borne est absente.
+_pilot_max_turns() {
+    # LE défaut de flotte, un seul site. Vide = désarmé ; pour armer, écrire le
+    # plafond ici (`local _default=120`) une fois V2 rapportée sur le ticket.
+    local _default=""
+
+    _PILOT_MAX_TURNS_SOURCE="default"
+    _PILOT_MAX_TURNS_INVALID=""
+
+    if [ -z "${PILOT_MAX_TURNS+set}" ]; then
+        # Non défini : le défaut de flotte.
+        _PILOT_MAX_TURNS="$_default"
+    elif [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; then
+        # Le ROLLBACK, explicite : le drapeau ne sera pas passé.
+        _PILOT_MAX_TURNS=""
+        _PILOT_MAX_TURNS_SOURCE="env"
+    elif grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+        _PILOT_MAX_TURNS="$PILOT_MAX_TURNS"
+        _PILOT_MAX_TURNS_SOURCE="env"
+    else
+        # Illisible ou négatif : on retombe au défaut, et on le DIT.
+        _PILOT_MAX_TURNS="$_default"
+        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
+    fi
+
+    # Le résolveur ne RELIT jamais `$_PILOT_MAX_TURNS` : chaque branche l'écrit
+    # une fois et une seule. Une relecture ferait de lui son propre lecteur, et
+    # la garde de co-location ne peut pas distinguer ce lecteur-là d'un site de
+    # lancement qui aurait oublié d'appeler le résolveur.
+    return 0
+}
+
+# mika#2496 (U2) — le budget en vigueur est DIT à chaque lancement.
+#
+# Doctrine mika#2293, citée parce qu'elle décrit ce ticket mot pour mot : *un
+# réglage qu'on ne peut pas observer n'est pas un réglage, c'est un espoir.* Le
+# `240/900` donné à mika-arch le 06/09 a échoué en silence jusqu'au 11/09 faute
+# d'une ligne disant quel couple était réellement en vigueur.
+#
+# ELLE LIT L'ARGV, JAMAIS L'INTENTION DU RÉSOLVEUR. C'est la seule façon qu'elle
+# ne puisse pas annoncer une borne qui n'a pas été passée — le défaut que
+# mika#2304 nomme : « un champ qui affirme, avec autorité, l'override qui n'a
+# pas eu lieu ». `source=` vient du résolveur parce que l'argv ne porte pas la
+# provenance, et `source=unset` dit qu'aucun résolveur n'a tourné (co-location
+# rompue) au lieu de rapporter une provenance inventée.
+#
+# `max_turns=none` est la lecture honnête d'un dispatch désarmé : aucun plafond
+# n'est passé, claude-pilot tourne sous son `maxTurns=200`. Le nom de
+# l'événement est conservé tel quel malgré cette valeur, parce que le contrôle
+# positif publié dans CLAUDE.md compte les dispatches qui ont RÉSOLU un budget —
+# et que zéro `error_max_turns` avec zéro `pilot_budget_armed` ne dit rien du
+# tout, quand zéro avec un compte d'armements non nul dit que la flotte ne
+# s'emballe pas (classe mika#2205).
+#
+# `cost_bound=absent_upstream` est posé EN DUR et c'est le point : cette ligne
+# refuse d'annoncer un budget dollars, parce qu'il n'en existe aucun (voir le
+# `pass` de `_sdk_guardrail_kwargs` ci-dessus). Elle nomme l'absence au lieu de
+# la taire ; le jour où le suivi cpp aboutit, c'est cette valeur qui change.
+#
+# SINK : appelée depuis `_run_pilot_sandboxed`, donc sous la redirection
+# `2>"$STDERR_FILE"` du site de lancement, donc — pour le dispatch nominal —
+# dans `$PILOT_LOG_DIR/<task-id>.stderr` après `_scrub_secrets_from_output`.
+# C'est le sillon forensique per-dispatch que le Signal S lit déjà. L'émettre
+# avant la ligne de lancement l'enverrait sur le stderr propre de dispatch-lib,
+# que l'exécuteur ne lit QUE sur `if !status.success()` : sur un dispatch qui
+# réussit, le tuyau est jeté sans être lu et la ligne n'atterrit dans aucun
+# fichier — c'est très exactement le Signal M, mesuré par mika#2050. Limite
+# héritée et non refermée ici : les deux pilotes de revise redirigent vers un
+# `mktemp` qu'ils suppriment quelques lignes plus bas, donc leur ligne n'est
+# persistée nulle part (Signal S, § « Limit — the revise path captures nothing »).
+#
+# À l'ancrage : lire `^dispatch-lib: `, jamais le jeton nu. Ce `.stderr` porte
+# aussi la prose du pilote, et mika#2050 a mesuré le faux positif — une session
+# discutant du signal se lisait comme une émission.
+_emit_pilot_budget_line() {
+    local _mt="none" _prev="" _arg
+    for _arg in "$@"; do
+        if [ "$_prev" = "--max-turns" ]; then
+            _mt="$_arg"
+            break
+        fi
+        _prev="$_arg"
+    done
+
+    if [ -n "${_PILOT_MAX_TURNS_INVALID:-}" ]; then
+        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, retour au défaut" >&2
+    fi
+
+    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset} cost_bound=absent_upstream" >&2
+}
+
 # mika#2165: make that directory visible — and writable — from INSIDE.
 #
 # Narrow on purpose: this directory, never /var/log. /var/log/mika holds the
@@ -1088,6 +1253,14 @@ _pilot_gitdir_bind_args() {
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
     # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
+    #
+    # mika#2496 (U2): the budget line is emitted HERE, and from nowhere else.
+    # This is the one function all three launch sites traverse, and its stderr
+    # is the per-dispatch forensic sink (the caller's `2>"$STDERR_FILE"`) — the
+    # same placement, for the same reason, as `_ensure_pilot_egress_proxy`
+    # (mika#2041) and the mika#2039 sandbox-secret prologue. Before the
+    # sandbox-enabled branch so a direct-exec dispatch is reported too.
+    _emit_pilot_budget_line "$@"
     if ! _pilot_sandbox_enabled; then
         "$@"
         return $?
@@ -3057,7 +3230,9 @@ _run_claude_pilot() {
     # mika#2165: --log-dir is VALUED, not bare. Bare, it fell through to
     # claude-pilot's own Python `const`, which no override here could move and
     # which the bind could therefore never be guaranteed to cover.
-    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    # mika#2496: `--max-turns` is resolved on THIS line (co-location, as for
+    # `--log-dir`) and expands to nothing when the budget is disarmed.
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -3928,7 +4103,18 @@ _rescue_dirty_worktree() {
     # commit. Handles the edge case where the pilot wrote ONLY to scaffold
     # paths (mika#1288, mika#1419).
     if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
+        # mika#2503: name what was ACTUALLY excluded, not a hardcoded list. The
+        # message used to read "contained only scaffold paths
+        # (.claude/commands/, .claude/claude-pilot.json)" whatever the worktree
+        # held, so an operator reading it after a pilot wrote 28 files of build
+        # artefacts went looking in the wrong place.
+        #
+        # `--untracked-files=all`, not DIRTY_FILES: the probe above collapses a
+        # wholly-untracked directory to a single `?? .claude/` entry, which is
+        # true but names no file an operator can go and look at. The index is
+        # empty at this point, so everything listed here was excluded. Re-reading
+        # status costs one local call on a branch that is already rare.
+        echo "NOTE: nothing left to stage after exclusions — no pilot content to rescue. Excluded: $(git -C "$WORKTREE_DIR" status --porcelain --untracked-files=all 2>/dev/null | head -20 | tr '\n' '|')" >&2
         RESCUED_DIRTY_WORKTREE=0
     else
         # Compute accurate rescued-files list for the rescue note.
@@ -6166,7 +6352,8 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
         >"$revise_stdout" 2>"$revise_stderr"
@@ -6285,7 +6472,8 @@ Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${fd_findings_file}" \
         >"$fd_stdout" 2>"$fd_stderr"
@@ -7224,6 +7412,114 @@ _rescue_diff_carries_work() {
             *) return 0 ;;
         esac
     done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _rescue_touches_tracked_tree — would this PR publish anything the repo knows?
+#
+# mika#2503. PR #2502 (impl of #2497) carried 28 files — `.v1probe/Cargo.toml`,
+# `.v1probe/src/lib.rs` and the whole of `.v1probe/target/` — and zero
+# implementation: a scratch probe crate the pilot built, auto-committed by the
+# mika#1282 rescue and opened as a draft PR. QA blocked it 7/7. #2486 was the
+# same mechanism the day before.
+#
+# THE QUESTION, and there is exactly one: does the content this PR would publish
+# touch at least one place the repository already knows about? Take the FIRST
+# SEGMENT of every path in the diff; if any of them exists in the reference
+# tree's top level, answer yes.
+#
+#   .v1probe/Cargo.toml, .v1probe/src/lib.rs  -> `.v1probe`, absent  -> NO
+#   crates/mika-agent/src/foo.rs              -> `crates`,   present -> yes
+#   crates/mika-newthing/src/lib.rs (new)     -> `crates`,   present -> yes
+#   docs/plans/...-plan.md                    -> `docs`,     present -> yes
+#
+# THE REFERENCE TREE IS origin/main, NEVER HEAD — and this is the one detail
+# that decides whether the fix works at all. This predicate is consulted AFTER
+# the rescue commit, so `git ls-tree --name-only HEAD` CONTAINS `.v1probe`: the
+# rescue itself just put it there. Measured 2026-09-23 on the founding case: the
+# HEAD form answers "yes" and the whole fix is INERT while passing every local
+# test. Same base as the diff, which is also what keeps the two halves of the
+# measurement consistent. The merge-base was considered and rejected: a
+# first-level directory born on main after this branch left (`site/`, say) would
+# be unknown to it, and a pilot legitimately working there would be refused.
+#
+# WHY PER-SEGMENT AND NOT "a crate not declared in the workspace". That second
+# formulation is true of #2502 but Cargo-specific, and dispatch-lib is deployed
+# in four repos not all of which are Rust workspaces. It is also more fragile: a
+# pilot that writes a legitimate crate and forgets to declare it would have its
+# implementation refused. Asking only "is this first segment known" requires no
+# language knowledge, which is what lets this half travel where the `.gitignore`
+# half cannot.
+#
+# FAIL-OPEN, WHICH IS THE INVERSE OF ITS IMMEDIATE NEIGHBOUR ABOVE, DELIBERATELY.
+# `_rescue_diff_carries_work` is fail-CLOSED because its expensive error is an
+# automatic ticket closure nobody measures. This one's expensive error is
+# blocking the loop's NOMINAL path — `no-shipping-tail` (mika#2492) goes through
+# the same `if` — and, worse, the asymmetry of the underlying loss:
+#   * refusing real content is an IRREVERSIBLE loss of implementation (it exists
+#     in one place only, and `_set_up_worktree` force-removes the worktree on the
+#     next dispatch). That is the defect mika#1282 exists to prevent.
+#   * rescuing scratch is a phantom PR: QA blocks it, an operator closes it.
+#     Reversible, and it is the state of the world today.
+# Two neighbouring predicates, two polarities; each states its own reason at its
+# own site, or a reviewer "harmonizes" whichever one they are moving.
+#
+# It does NOT compose with `_rescue_diff_carries_work`'s incident list
+# (`.claude/groom-verdict-trail.log`, `.iterate/`, `docs/plans/`, ...). One
+# question per predicate; and on the measured case no incident path is in play,
+# so composing would change nothing while making the two inseparable.
+#
+# Args: $1 — worktree dir
+# Returns: 0 (open the PR) when at least one first segment is known to the
+#          reference tree, AND in every case the answer cannot be measured:
+#          empty/unreadable worktree, no fetched origin/main, empty reference
+#          tree, empty diff.
+#          1 (refuse) only on a positive measurement that nothing is known.
+_rescue_touches_tracked_tree() {
+    local wt_dir="${1-}" f seg
+
+    # Same guard, same reason, as `_rescue_diff_carries_work`: `git -C ""`
+    # silently operates on the dispatch process CWD — a live checkout — so an
+    # empty $wt_dir would measure the WRONG tree. There it must fail closed;
+    # here it must fail open. Same hazard, opposite safe answer.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # The reference tree's top level. Unreadable or empty (no fetched
+    # origin/main, degenerate empty-tree commit) => nothing can ever match =>
+    # open, rather than refuse every PR in the repo.
+    local _tree
+    _tree=$(git -C "$wt_dir" ls-tree --name-only origin/main 2>/dev/null) || return 0
+    [ -n "$_tree" ] || return 0
+
+    # `core.quotePath=false` + `-z` for the reason written on
+    # `_rescue_diff_carries_work`: under git's default, any path holding a
+    # non-ASCII byte comes back quoted with octal escapes, and this repo's plans
+    # and tickets are written in French every day. (Process substitution rather
+    # than `$(...)`: bash drops NUL bytes inside command substitution, which
+    # would splice every path into one blob.)
+    local _measured=0
+    while IFS= read -r -d '' f; do
+        [ -n "$f" ] || continue
+        _measured=1
+        seg="${f%%/*}"
+        # A file at the repo root has itself as its first segment.
+        # Here-string, never `printf … | grep -q` (mika#2055): `grep -q` exits at
+        # the first match and closes the pipe, the producer takes SIGPIPE and
+        # exits 141, and under the `pipefail` this library is sourced into that
+        # 141 becomes the pipeline's status — so a segment that IS known would
+        # read as unknown, which is the exact direction that refuses a real
+        # implementation. A here-string has no pipeline and no SIGPIPE.
+        if grep -qxF -- "$seg" <<<"$_tree"; then
+            return 0
+        fi
+    done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+
+    # An empty diff is not a positive measurement that the content is scratch —
+    # there is no content. Open (and the gate's other terms decide).
+    [ "$_measured" = "1" ] || return 0
     return 1
 }
 
@@ -8255,7 +8551,64 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
         RECOVERY_CLASS="commit-pushed-no-pr"
     fi
 
+    # The four conditions that make a recovery PR due, evaluated ONCE. They used
+    # to live directly on the opening `if`; mika#2503 needed to insert a refusal
+    # ahead of that `if` without either re-indenting its ~120-line body or
+    # restating the four terms in two branches, which is a divergence waiting for
+    # the first editor who changes one of them.
+    local _recovery_pr_due=0
     if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
+        _recovery_pr_due=1
+    fi
+
+    # mika#2503: refuse to open a PR whose whole content is pilot scratch — a
+    # probe crate and its build artefacts, touching nothing the repo knows about.
+    #
+    # THE REFUSAL IS HERE, AFTER RECOVERY_CLASS IS COMPUTED, AND THAT PLACEMENT
+    # IS THE FIX. Not setting RESCUED_DIRTY_WORKTREE=1 would NOT have been
+    # enough: the rescue commit advances POST_RUN_HEAD, so
+    # `PRE_RUN_HEAD != POST_RUN_HEAD` becomes true and the `commit-pushed-no-pr`
+    # branch above opens the PR anyway. A fix placed at the flag site alone would
+    # pass every local test and change NOTHING in production. Clearing
+    # `_recovery_pr_due` covers all THREE classes by construction — which is also
+    # the right perimeter, the predicate being about content and never about class.
+    #
+    # NOTHING IS DESTROYED BY THIS REFUSAL, and that is what makes it safe to put
+    # on the nominal gate: the `wip()` commit is made, POST_RUN_HEAD is advanced,
+    # `_push_branch` has already published the branch. Only the draft PR is
+    # withheld, and the operator opens it with one command (named in RESULT).
+    # Contrast the staging half in `.gitignore`, which is destructive in practice
+    # and is therefore reserved to what is certainly regenerable — a cargo
+    # `target/`.
+    if [ "$_recovery_pr_due" = "1" ] && ! _rescue_touches_tracked_tree "$WORKTREE_DIR"; then
+        _recovery_pr_due=0
+        # The operator surface is RESULT — the callback body, which lands in
+        # `tasks.result` — never a log line. Unit 2 runs at
+        # `dispatch_claude_pilot` level, in the same regime as
+        # `_check_pilot_force_push`: its stderr is `spawn_long_running_exec`'s
+        # `Stdio::piped()` handle, which the executor reads ONLY inside
+        # `if !status.success()`. On a dispatch that succeeds the pipe is dropped
+        # unread — that is Signal M, and the mika#2050 class corrected three
+        # times over on Signal S. So no grep is announced for this refusal; the
+        # `echo` below is a convenience, deliberately NOT presented as a probe.
+        echo "rescue_scratch_refused: content touches no tracked top-level directory — draft PR withheld (branch=$BRANCH, mika#2503)" >&2
+        # The prose goes on its own lines, and the canonical status line through
+        # `_set_pr_status_line` (mika#2121). Both halves are load-bearing: that
+        # helper strips any prior `PR:`/`NO_PR:` so the delivered callback carries
+        # EXACTLY ONE status line — site 2 in `_post_flight_recovery` has already
+        # written one by the time we get here — and the reason must be a bare
+        # snake_case token because the consumer is strict:
+        # `dispatcher.rs::RE_NO_PR` is `(?m)^NO_PR:\s+([a-z_]+)`, declared class B
+        # in `scripts/canonical-tokens.tsv`. Prose on that line would have had the
+        # parser record the reason as the first lowercase word of the sentence.
+        RESULT="${RESULT}
+Draft PR withheld (mika#2503): the rescued content touches no top-level directory this repo tracks, so it is pilot scratch (a probe crate and/or its build artefacts) rather than an implementation.
+Nothing was lost — the commit exists and branch ${BRANCH} is pushed.
+To publish it anyway: gh pr create --repo senara-solutions/${REPO} --head ${BRANCH} --base main --draft"
+        _set_pr_status_line "NO_PR: rescue_scratch_only"
+    fi
+
+    if [ "$_recovery_pr_due" = "1" ]; then
         # Recovery-class-specific PR title + unified body template (mika#1618)
         local _rescue_title
         local _rescue_class_fact
