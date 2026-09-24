@@ -4731,38 +4731,32 @@ branch refs/heads/fix/live/x
     /// `target/debug/.cargo-lock` est libre et `target/release/.cargo-lock` est
     /// tenu : un prédicat qui devinerait `debug` raterait le build `--release`,
     /// c'est-à-dire échouerait exactement sur le cas qu'on veut voir.
+    ///
+    /// La dernière moitié passe par [`release_lock_file`] et **non** par un
+    /// `drop` nu : celui-ci s'en remettait à la fermeture du descripteur, que le
+    /// `fork` d'un sous-processus concurrent peut retarder le temps d'un
+    /// `execve` — voir le helper, qui porte la mesure. C'est la forme qui a
+    /// flaké en CI le 2026-09-24, et la barrière est un appel système dont le
+    /// succès est asserté, jamais une temporisation.
     #[cfg(target_os = "linux")]
     #[test]
     fn mika2497_v3b_le_verrou_est_decouvert_pas_devine() {
-        use std::os::fd::AsRawFd;
-
         let tmp = tempfile::tempdir().unwrap();
         let wt = fake_worktree(tmp.path(), "fix-2497-x");
         let target = fake_target(&wt);
-        std::fs::create_dir_all(target.join("release")).unwrap();
-        std::fs::write(target.join("debug/.cargo-lock"), b"").unwrap();
-        let held_path = target.join("release/.cargo-lock");
-        std::fs::write(&held_path, b"").unwrap();
+        free_cargo_lock(&target, "debug");
 
         // Contrôle positif : tant que rien n'est tenu, le terme est satisfait.
         assert_eq!(cargo_build_lock_is_free(&target), LockProbe::Free);
 
-        let holder = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&held_path)
-            .unwrap();
-        // SAFETY: descripteur valide que ce test possède ; `LOCK_NB` ne bloque pas.
-        let rc = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(rc, 0, "le verrou de test doit être acquis");
-
+        let held = hold_cargo_lock(&target, "release");
         assert_eq!(
             cargo_build_lock_is_free(&target),
             LockProbe::Held,
             "un seul verrou tenu suffit à refuser, quel que soit le profil"
         );
 
-        drop(holder);
+        release_lock_file(held);
         assert_eq!(
             cargo_build_lock_is_free(&target),
             LockProbe::Free,
@@ -5310,6 +5304,45 @@ branch refs/heads/fix/live/x
         hold_lock_file(&target.join(profile).join(".cargo-lock"))
     }
 
+    /// Relâche un verrou de test **avant** de fermer le descripteur, et
+    /// l'atteste.
+    ///
+    /// # Pourquoi un `drop` nu ne suffit pas — ce n'est pas une précaution de
+    /// # style, c'est le flake mesuré
+    ///
+    /// `flock(2)` porte sur l'*open file description*, pas sur le descripteur :
+    /// la fermeture ne le relâche qu'au **dernier** descripteur qui référence
+    /// cette OFD. Or ce binaire de test exécute ses cas en parallèle et le
+    /// crate lance des sous-processus à une cinquantaine de sites
+    /// (`Command::new`). `std::process::Command` fait `fork` puis `execve` :
+    /// Rust ouvre ses fichiers en `O_CLOEXEC`, donc l'enfant perd le
+    /// descripteur à l'`exec` — mais **entre le `fork` et l'`exec` il le
+    /// partage**, et l'OFD survit alors à la fermeture côté parent pendant
+    /// toute cette fenêtre. Un `drop(file)` suivi d'une re-sonde immédiate peut
+    /// donc lire `Held` sur un verrou que le test croit avoir relâché, d'autant
+    /// plus souvent que la machine est chargée — la forme intermittente
+    /// observée en CI, et absente en local.
+    ///
+    /// `LOCK_UN` n'a pas cette faiblesse : il agit sur l'OFD elle-même, donc
+    /// pour tous ses descripteurs à la fois, quel que soit le nombre de
+    /// processus qui la partagent à cet instant — et son succès est
+    /// **observable**, là où `File::drop` jette le code de retour de `close`.
+    /// C'est l'invariant que la production tient déjà à ses deux sites
+    /// (`CargoBuildLockGuard`'s `Drop` et `probe_one_cargo_lock`) ; il manquait
+    /// aux tests.
+    ///
+    /// **Ne pas transporter ce helper sur un `CargoBuildLockGuard`** : son
+    /// `Drop` fait ce `LOCK_UN` lui-même, et c'est précisément la propriété que
+    /// `mika2511_v4_le_garde_tient_reellement_le_verrou` existe pour exercer.
+    #[cfg(target_os = "linux")]
+    fn release_lock_file(file: std::fs::File) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: descripteur valide possédé par le test, encore ouvert.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        assert_eq!(rc, 0, "le relâchement du verrou de test doit réussir");
+        drop(file);
+    }
+
     /// Un `.cargo-lock` **libre** dans un profil.
     fn free_cargo_lock(target: &Path, profile: &str) {
         let dir = target.join(profile);
@@ -5371,6 +5404,13 @@ branch refs/heads/fix/live/x
     /// C'est la propriété que la fenêtre TOCTOU laissait ouverte — la sonde
     /// prenait le verrou et le relâchait aussitôt, donc rien n'empêchait un
     /// `cargo` de démarrer entre elle et le `remove_dir_all`.
+    ///
+    /// **Le `drop(guard)` est ici déterministe, et il doit le rester tel quel :**
+    /// l'`impl Drop` de [`CargoBuildLockGuard`] pose un `LOCK_UN` explicite
+    /// avant que les descripteurs ne soient fermés, ce qui est exactement la
+    /// barrière que [`release_lock_file`] apporte aux verrous *de test*. Le
+    /// remplacer par ce helper retirerait au test son objet — que le `Drop` de
+    /// production relâche — et le laisserait vert en n'exerçant plus rien.
     #[cfg(target_os = "linux")]
     #[test]
     fn mika2511_v4_le_garde_tient_reellement_le_verrou() {
@@ -5464,7 +5504,7 @@ branch refs/heads/fix/live/x
             "le premier profil a été acquis puis l'acquisition a été annulée : \
              son verrou doit avoir été relâché"
         );
-        drop(held);
+        release_lock_file(held);
     }
 
     /// **V7 / AC2** — bout en bout : un `target/` dont le verrou est tenu n'est
