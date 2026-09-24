@@ -1,19 +1,10 @@
-# mika#2357 — le dormeur des callbacks muets sous glm-5.3 a un site d'inscription, et sa condition de réveil doit être vérifiable
+# mika#2357 — le dormeur est inscrit, et sa condition de réveil ne peut pas détecter son propre réveil
 
-**Ticket :** `mika issue#2357` · **Type :** chore (registre + documentation) · **Date :** 2026-09-21
+**Ticket :** `mika issue#2357` · **Type :** chore (registre) · **Plan initial :** 2026-09-21 · **Révisé :** 2026-09-24
 
 ---
 
 ## Ce que le ticket demande
-
-Le corps décrit une classe mesurée les 2026-09-16 et 2026-09-17 : neuf tours
-`callback-*` de mika-dev partis en `stop_reason: error`, `input_tokens: 0`,
-latence ~420 s ou ~480 s, **tous sous glm-5.3, zéro sous glm-5.2**. Le
-contournement retenu par Vincent le 17/09 est le retour de mika-dev à glm-5.2
-pour les callbacks (65 tours / 0 erreur / max 108 s). Le commentaire 1 déclare
-le ticket **DORMEUR**, porteur de la **racine** — *pourquoi glm-5.3 rend zéro
-sur les tours callback* — que le contournement masque sans résoudre, avec deux
-conditions de réveil écrites.
 
 Le commentaire 2, du 2026-09-21, pose la question à trancher :
 
@@ -21,323 +12,237 @@ Le commentaire 2, du 2026-09-21, pose la question à trancher :
 > substrat non parqué, aucune PR ouverte. **Le grooming moteur dira s'il est
 > encore d'actualité** depuis le passage des agents sur glm-5.2 via OpenRouter.
 
+Le corps décrit une classe mesurée les 16 et 17/09 : neuf tours `callback-*` de
+mika-dev partis en `stop_reason: error`, `input_tokens: 0`, latence ~420 s ou
+~480 s, **tous sous glm-5.3, zéro sous glm-5.2**. Le contournement retenu par
+Vincent le 17/09 est le retour de mika-dev à glm-5.2 (65 tours / 0 erreur /
+max 108 s). Le commentaire 1 déclare le ticket **DORMEUR**, porteur de la
+**racine** que le contournement masque sans résoudre.
+
 ---
 
-## Ce que la lecture du dépôt a déplacé
+## Ce que la lecture du dépôt a déplacé depuis le plan du 21/09
 
-Quatre faits, chacun mesuré dans le dépôt, déplacent le travail. Ils sont le
-premier livrable : sans eux, la pente naturelle est de rejouer la comparaison
-5.2/5.3 et de reproduire le trou.
+**Ce plan a déjà été écrit une fois, et il a été partiellement consommé
+trois heures plus tard.** Les cinq mesures ci-dessous sont le premier livrable :
+sans elles, la pente est de rejouer le plan du 21/09, dont la mesure centrale
+est aujourd'hui fausse.
 
-### M1 — Le dormeur est déclaré dans un commentaire et **absent du registre**. C'est la cause directe de la promotion parasite.
+### M1 — Le dormeur EST inscrit. U1 du plan initial est consommé, par une autre main.
 
-`docs/dormeurs.md` est le registre ratifié le 2026-09-03 : *« la visibilité
-change de support : le registre versionné remplace le ticket ouvert »*. Il
-compte dix entrées ; **`grep 2357 docs/dormeurs.md` rend zéro ligne.**
+Le plan du 21/09 posait, comme cause directe de la promotion parasite :
+*« `grep 2357 docs/dormeurs.md` rend zéro ligne »*. C'était vrai à 02:08:24.
 
-La garde d'alimentation n'a donc rien fait d'anormal : elle a vu un ticket
-ouvert, p1, non parqué, dans un bassin vide, et l'a promu. La condition de
-réveil écrite dans le corps d'un commentaire n'est lisible par aucun mécanisme
-— ni par la garde, ni par `is_feeder_excluded`, ni par un opérateur qui ne
-déroule pas les commentaires.
+`acd7ac2f` (« docs(dormeurs): inscrire #2357 (callback muets glm-5.3) au
+registre », PR #2447) a inscrit la ligne à **05:00:17 le 21/09** — environ trois
+heures après le commit du plan. `grep -c 2357 docs/dormeurs.md` rend **1**.
 
-**Conséquence, et c'est le défaut à fermer :** tant que #2357 reste un ticket
-ouvert sans ligne au registre, il sera re-promu à chaque bassin vide, consommera
-un créneau `groom`, et produira à chaque fois un plan dont la conclusion sera
-celle-ci. Le coût n'est pas théorique — ce grooming en est la première
-occurrence.
+Le corps du ticket porte désormais l'encart *« Dormeur visible (inscrit
+2026-09-21) … Inscrit aussi au registre `docs/dormeurs.md` »*.
 
-### M2 — La géométrie que le ticket invoque n'est pas celle que le dépôt déclare, et sa provenance n'a jamais été lue.
+**Ce qui reste dû n'est donc plus de créer la ligne, mais de la corriger** — et
+M2 établit que la correction est réelle, pas cosmétique.
 
-Le ticket raisonne sur « 2 tentatives × 240 s depuis le flip 240/600 de
-mika#2331 » et en tire *« 480 s = 2 × 240 »*. Deux faits contredisent la
-prémisse :
+### M2 — La condition de réveil inscrite est structurellement incapable de détecter le réveil qu'elle décrit.
 
-- **mika#2331 ne flippe aucune valeur.** Son entrée au `CLAUDE.md` dit
-  l'inverse en toutes lettres (« Aucune valeur de réglage n'a bougé »), et c'est
-  mika#2342 qui porte cette phrase.
-- **`MIKA_DEV_CONFIG` (`crates/mika-agent/src/well_known_agents.rs:181`) ne
-  déclare ni `llm_http_timeout_secs` ni `agent_total_timeout_secs`** — donc les
-  défauts de flotte, **120/300**. Le figeage mika#2280
-  (`mika2280_the_three_shipped_geometries_and_their_verdict`) l'inscrit
-  explicitement : mika-dev = `http_timeout_secs: 120, max_tokens: 8_192`.
+La ligne 48 de `docs/dormeurs.md` porte :
 
-Si le runtime tourne bien à 240/600, cette géométrie vient d'une **variable
-d'environnement de service** qui écrase le per-agent — exactement la cascade que
-mika#2293 a rendue lisible, et le cas que mika#2342 a déjà dû nommer pour
-mika-arch (« si c'est exact, le 240/900 posé à mika-arch par mika#2189 est
-**écrasé** par une variable de service »). Même classe, deuxième agent.
+> quand le modèle actif de mika-dev redevient `glm-5.3` (essai relancé) —
+> **vérifiable via `config.toml`/`turn_usage`** ; aujourd'hui `glm-5.2`
+> (possédé, quality-first), donc dormant
 
-**Ce que cela invalide :** le calcul « 480 = 2 × 240 » repose sur un plafond dont
-la provenance n'a pas été établie. Il peut être juste ; il n'est pas *démontré*.
-La lecture qui le trancherait existe depuis mika#2293 et n'a pas été faite :
+`config.toml` est précisément la lecture que ce dépôt établit comme trompeuse,
+et il le fait **dans le doc-comment de la constante concernée**
+(`crates/mika-agent/src/well_known_agents.rs:165-192`) :
 
-```bash
-grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \
-  | jq 'select(.agent_id == "mika-dev")
-        | {model, model_source, http_timeout_secs, agent_total_timeout_secs,
-           http_source, total_source, max_attempts, effective_max_attempts}'
-```
+> *this constant's source has DRIFTED from its runtime. It declares
+> `z-ai/glm-5.2` while the plans of mika#2179 and mika#2189 measure mika-dev on
+> `z-ai/glm-5.3`*
 
-### M3 — Les instruments qui trancheraient la racine ont été mergés **le jour même** des mesures. La classe n'a donc jamais été observée avec eux.
+Et `MIKA_DEV_CONFIG` déclare `openrouter_model = "z-ai/glm-5.2"` **depuis le
+2026-06-29** (`25a8ef4b`, mika#1633) — c'est-à-dire **pendant toute la fenêtre
+où le défaut a été mesuré**. La leçon est celle de mika#2328, mesurée sur
+mika-qa : *« le 5.3 qui a produit l'incident était une édition hors dépôt »*.
 
-| instrument | ce qu'il dit | merge |
-|---|---|---|
-| mika#2331 — `request_bytes` / `system_prompt_bytes` sur `turn_usage`, **y compris sur le bras `Err`** | la taille du brief d'un tour qui a échoué, là où `input_tokens` vaut 0 | 2026-09-17 |
-| mika#2342 — `llm_call_attempt` (avant chaque `send_once`) + `llm_call_watchdog` | combien de tentatives, de quelle durée, et si reqwest a borné | 2026-09-17 |
-| mika#2362 — `retrying` honnête, `deadline_abort` distinct | si une tentative a réellement tourné | 2026-09-17 |
-| mika#2280 — `cap_exhausted` sur `llm_call_attempt` | si la coupure est **au plafond** (le modèle générait encore) ou n'importe quand | postérieur |
+**Conséquence, et c'est le défaut à fermer :** un opérateur qui exécute la
+condition de réveil telle qu'écrite lit `glm-5.2`, conclut « dormant », et
+conclura **exactement la même chose le jour où mika-dev tournera glm-5.3**. La
+condition ne peut pas être remplie. *Une condition de réveil fausse est pire
+qu'absente : elle sera exécutée, elle rendra une réponse, et la réponse sera
+fausse dans le sens rassurant.*
 
-Les neuf tours du ticket sont datés du 16/09 et du 17/09 à 09:41–09:59Z ; le
-contournement est posé à **10:05Z**. Aucun de ces instruments ne tournait
-alors. **`input_tokens: 0` — la preuve centrale du ticket — est précisément la
-ligne que mika#2331 a corrigée** : le bras `Err` écrivait des zéros littéraux et
-ne disait rien de la taille du brief qui avait hangué.
+Deux défauts mineurs s'y ajoutent. *« (essai relancé) »* nomme une **intention**,
+que le contrat du fichier refuse explicitement (« plus tard », « si ça revient » :
+non). Et la **branche (b) du commentaire 1 est absente** du registre — la
+régression du contournement (un callback en erreur sous glm-5.2) n'y figure nulle
+part, alors que c'est la moitié qui protège contre un réveil silencieux.
 
-**Conséquence :** la classe n'a jamais été mesurée par ce qui la trancherait. Et
-depuis le 17/09 le contournement tient, donc **les instruments n'ont pas de
-population à mesurer**. C'est la structure de mika#2272 : *zéro était l'absence
-de mesure, pas la présence de prudence.*
+### M3 — Le remède que le plan du 21/09 nommait en « ticket de suivi » est livré.
 
-### M4 — La corrélation structurelle candidate est **fausse sur l'axe skills** pour mika-dev, et l'hypothèse « historique » tombe aussi.
+Le plan initial renvoyait la dérive constante↔runtime à un suivi, et posait en
+risque assumé : *« la condition de réveil (a) est vérifiable mais passive.
+Personne n'exécute cette commande chaque jour. »* **Les deux sont périmés.**
 
-L'entrée `CLAUDE.md` § *Lire un hang LLM « 420 s sans octet »* (mika#2331) nomme
-la seule chose qui sépare structurellement la population callback : le tour
-callback sélectionne ses skills par `callback_safe_skills()` — `always_on` **plus
-les dépendances transitives** — injecté sans plafond global. Mesuré ici pour
-mika-dev, depuis les manifestes livrés et l'allowlist de `MIKA_DEV_IDENTITY` :
+| livré depuis | ce que ça donne |
+|---|---|
+| **mika#2457** (`mika agents budget --agent mika-dev`) | le couple `(provider, modèle)` que l'agent fait **tourner**, attesté par mika-spirit, avec sa provenance et son `resolved_at`. Serveur injoignable ou 404 ⇒ *« non attesté »*, **aucune valeur locale affichée** |
+| **mika#2473** (`well_known_model_drift`) | une ligne WARN **par agent et par `init_agent`** quand le modèle résolu diffère du déclaré — donc la dérive est **poussée**, elle ne s'interroge plus |
 
-| skill | rôle | octets |
-|---|---|---|
-| `self-dev` | seul `always_on` de l'allowlist mika-dev | 62 790 |
-| `build-mika`, `deploy-mika`, `dev-pilot`, `dev-groom`, `resolve-pr-conflicts`, `browser-control` | dépendances déclarées de `self-dev` | 13 814 |
-| **total** | | **76 604** |
+Le doc-comment de `MIKA_DEV_CONFIG` pointe d'ailleurs déjà la commande, dans un
+bloc dédié. **La condition de réveil (a) cesse d'être passive** : un retour de
+mika-dev à glm-5.3 hors dépôt s'annonce désormais au démarrage suivant.
 
-Deux observations en découlent, de sens opposé :
+### M4 — La procédure de mesure du réveil existe déjà, ailleurs, et n'a pas à être réécrite.
 
-- **Ce n'est pas un écart callback-vs-conversation.** `self-dev` est `always_on`,
-  et `match_skills()` résout les dépendances par le même BFS (le doc-comment de
-  `callback_safe_skills` le dit : *« same algorithm as `match_skills()` »*). Un
-  tour conversationnel de mika-dev porte donc la **même** masse. L'axe skills ne
-  peut pas expliquer une défaillance propre aux callbacks.
-- **L'axe historique ne le peut pas non plus.** `rebuild_context` n'a **qu'un
-  seul site de production**, `run_agent_inner` (`agent_loop/mod.rs:4571`) — le
-  chemin conversation. `run_silent_agent` ne reconstruit aucune fenêtre
-  conversationnelle. La fuite `HistoryScope::Agent` que mika#2295/#2330 ont
-  fermée pour mika-arch **ne s'applique pas** à un tour callback. *(Cette
-  hypothèse a été formée puis écartée en cours de grooming ; elle est écrite
-  ici pour qu'elle ne soit pas reformée au réveil.)*
+U2 du plan initial voulait porter au corps du ticket une procédure « mesurer
+avant de remédier ». Elle est **déjà écrite**, dans le `CLAUDE.md` racine,
+§ *Lire un hang LLM « 420 s sans octet »* (mika#2331) : établir la géométrie et
+sa provenance d'abord, compter les tentatives avec le garde `.event ==
+"llm_call_attempt"`, mesurer `request_bytes` / `system_prompt_bytes` sur les
+tours en échec, puis trancher par une table à quatre branches — critère de halte
+compris.
 
-Reste donc, pour expliquer les ~47 000 `input_tokens` d'un callback sain :
-76,6 KB de skills (~19 k tokens), la core memory (≤ 2 500 tokens), le framing, et
-le résultat de callback (capé à 10 240 B par `format_callback_framing`). **Le
-compte n'y est pas**, et c'est `request_bytes` / `system_prompt_bytes` qui le
-feront — pas un raisonnement.
+Ce qui reste utile est un **pointeur**, parce que le point que le réveil doit
+savoir est contre-intuitif : les instruments qui trancheraient cette classe
+(mika#2331, #2342, #2362) ont été **mergés le 17/09**, c'est-à-dire le jour même
+des mesures et avant le contournement de 10:05Z. `input_tokens: 0` — la preuve
+centrale du ticket — **est la ligne que mika#2331 a corrigée**. La classe n'a
+donc jamais été observée par ce qui la trancherait, et un réveil qui rejouerait
+la comparaison 5.2/5.3 reproduirait le trou.
 
-**Observation annexe, à porter au réveil :** un tour callback de mika-dev
-embarque les 62,8 KB de `self-dev` (l'orchestrateur) et **n'embarque pas**
-`self-dev-callback` (14 482 B), le skill qui prolonge précisément ce tour —
-`callback_safe_skills()` ne suit que les arêtes **sortantes**, et
-`self-dev-callback` déclare `dependencies = ["self-dev"]`, pas l'inverse. C'est
-l'exception nommée `CALLBACK_REACHABILITY_EXCEPTION` du test
-`mika2355_every_bundled_callback_handler_is_reachable_on_a_callback_turn`, dont
-le tracker est **mika#2356**. Ce n'est pas la racine de #2357, mais c'est la même
-zone, et le remède candidat ci-dessous la traverse.
+### M5 — Trois des quatre unités du plan initial n'étaient pas livrables par une PR.
+
+U2 et U3 prescrivaient d'éditer le **corps du ticket** ; U4 de le **fermer**. Un
+pilote d'implémentation travaille dans un worktree et livre une PR : `gh issue
+edit` n'est pas versionné, n'est pas revu, et n'est pas ce qu'une PR contient.
+U4 est par ailleurs **déjà tranché dans l'autre sens** — le ticket est resté
+ouvert *et* inscrit, ce qui est la disposition que l'opérateur a retenue le
+21/09 en posant l'encart dormeur dans le corps.
+
+Ce plan ne livre donc que ce qu'une PR peut livrer : **un fichier versionné.**
 
 ---
 
 ## La réponse à la question posée
 
-**Le ticket est encore dû, et il n'est pas actionnable.** Les deux moitiés
-comptent :
+**Le ticket est encore dû, il n'est pas actionnable, et il est désormais
+correctement classé — mais sa condition de réveil est fausse, et c'est le
+travail.**
 
-- *Encore dû* — la racine n'est pas résolue. Le contournement 5.2 la masque,
-  c'est ce que le commentaire 1 dit et rien ne l'a démenti.
+- *Encore dû* — la racine n'est pas résolue. Le contournement glm-5.2 la masque ;
+  rien depuis le 17/09 ne l'a démentie.
 - *Pas actionnable* — la population à mesurer n'existe plus par construction
-  (glm-5.2 en vigueur), les instruments qui la trancheraient n'ont jamais eu
-  cette population, et **aucun remède ne peut être choisi sans cette mesure**.
-  Poser un remède ici serait poser un correctif sur une cause non établie.
+  (glm-5.2 en vigueur, et le `CLAUDE.md` racine enregistre mika-dev **en phase**
+  au 22/09). Aucun remède ne peut être choisi sans cette mesure ; en poser un
+  serait corriger une cause non établie.
+- *Le résidu réel est petit, et il est réel* — M2. Une condition de réveil qui
+  lit `config.toml` répondra « dormant » y compris au réveil.
 
-C'est la définition littérale d'un dormeur au sens de `docs/dormeurs.md` : *« un
-travail réellement dû dont la condition d'exécution n'est pas remplie
-aujourd'hui »*. Le travail consiste donc à **l'inscrire correctement**, pas à le
-résoudre ni à le fermer en silence.
-
-**Ce plan ne livre aucun code.** C'est un résultat, énoncé comme tel : les
-quatre mesures ci-dessus établissent qu'il n'y a rien à corriger dans le moteur
-aujourd'hui, et que le geste dû est un geste de registre. Un plan qui
-inventerait un livrable de code pour ne pas rendre un plan court produirait un
+**Ce plan ne livre aucun code, et c'est un résultat, pas une facilité.** Les cinq
+mesures établissent qu'il n'y a rien à corriger dans le moteur aujourd'hui.
+Inventer un livrable de code pour ne pas rendre un plan court produirait un
 correctif sur une cause non démontrée.
 
 ---
 
 ## Requirements
 
-- **R1** — Inscrire #2357 au registre `docs/dormeurs.md` avec une condition de
-  réveil satisfaisant le contrat du fichier : *« un lecteur peut dire, **sans
+- **R1** — Rectifier la condition de réveil de #2357 dans `docs/dormeurs.md` pour
+  qu'elle interroge le modèle **en service**, jamais celui que le dépôt déclare.
+- **R2** — Y porter les **deux** branches du commentaire 1 : le retour à glm-5.3
+  (a) *et* la régression du contournement (b), aujourd'hui absente du registre.
+- **R3** — Remplacer la formulation d'intention (« essai relancé ») par un état
+  vérifiable, per le contrat du fichier : *« un lecteur peut dire, **sans
   contexte**, si elle est remplie »*.
-- **R2** — La condition de réveil du commentaire 1 est à **reformuler**, pas à
-  recopier. Sa branche 2 — *« Vincent décide de re-tenter glm-5.3 »* — est du
-  type que le contrat refuse explicitement (« si ça revient », « plus tard ») :
-  elle nomme une intention, pas un état vérifiable.
-- **R3** — Porter au ticket la **procédure de mesure** à suivre au réveil, avec
-  les instruments d'aujourd'hui et non ceux du 17/09. Sans cela, le réveil
-  rejouera la comparaison 5.2/5.3 et reproduira le trou de M3.
-- **R4** — Nommer le **remède candidat** et sa condition, pour que le réveil
-  n'ait pas à le redécouvrir — sans le livrer ni le préjuger.
-- **R5** — Ne modifier aucune valeur de configuration : ni modèle, ni plafond,
-  ni enveloppe, ni `llm_max_tokens`. Le contournement en vigueur est une
-  décision opérateur du 17/09 et n'est pas le sujet de ce ticket.
-- **R6** — Ne pas ajouter d'instrument. M3 établit que les instruments existent
-  et que c'est la population qui manque ; en ajouter un serait construire un
-  second silence à côté du premier.
+- **R4** — Porter un pointeur vers la procédure de mesure du réveil (M4), pour
+  que le réveil n'applique pas les instruments du 17/09.
+- **R5** — Ne modifier aucune valeur de configuration : ni modèle, ni provider,
+  ni plafond, ni enveloppe, ni `llm_max_tokens`. Le contournement est une
+  décision opérateur du 17/09 et n'est pas le sujet.
+- **R6** — N'ajouter aucun instrument. M3 établit qu'ils existent ; en ajouter un
+  serait construire un second silence à côté du premier.
+- **R7** — Ne toucher qu'à `docs/`.
 
 ---
 
 ## Unités de travail
 
-### U1 — Inscrire #2357 au registre des dormeurs (R1, R2)
+### U1 — Rectifier la ligne #2357 du registre (R1–R4)
 
-Ajouter une ligne au tableau `## Registre` de `docs/dormeurs.md`, dans la forme
-des dix existantes :
+Remplacer la ligne 48 de `docs/dormeurs.md`. Forme cible (le tableau existant a
+trois colonnes : ticket, sujet, condition de réveil) :
 
-| ticket | sujet | condition de réveil |
-|---|---|---|
-| [#2357](https://github.com/senara-solutions/mika/issues/2357) | racine des tours callback muets de mika-dev sous glm-5.3 (`input_tokens: 0`, `stop_reason: error`, muet à 240 s comme à 420 s) | l'une des deux : **(a)** `grep llm_budget_resolved "$MIKA_SPIRIT_LOG_FILE" \| jq -r 'select(.agent_id=="mika-dev") \| .model' \| tail -1` rend autre chose que `glm-5.2` — c'est-à-dire qu'un modèle autre est **effectivement** en service pour mika-dev ; **ou (b)** `grep turn_usage "$MIKA_SPIRIT_LOG_FILE" \| jq 'select((.session_id//"")\|startswith("callback-")) \| select(.model=="glm-5.2" and .status=="error")'` rend **au moins une ligne** — la régression du contournement |
+- **Colonne « sujet »** — la racine, plus la clause de M4 :
+  racine des tours callback muets de mika-dev sous glm-5.3 (`stop_reason: error`,
+  `input_tokens: 0`, muet à 240 s comme à 420 s) ; le contournement glm-5.2 la
+  masque. Au réveil, mesurer avec les instruments d'aujourd'hui — `CLAUDE.md`
+  § *Lire un hang LLM « 420 s sans octet »* — et **non** avec `input_tokens: 0`,
+  qui est la ligne que mika#2331 a corrigée le jour même des mesures.
 
-**Pourquoi cette reformulation de (a).** Le commentaire 1 écrit « Vincent décide
-de re-tenter glm-5.3 » : une intention, que personne ne peut vérifier depuis le
-dépôt. La forme retenue teste l'**état observable** qui en résulte — et elle le
-teste sur `llm_budget_resolved`, c'est-à-dire sur le **modèle réellement en
-service avec sa provenance** (mika#2328 U2), jamais sur `MIKA_DEV_CONFIG`. Cette
-distinction est la leçon de mika#2328, mesurée : *« `zai_model = "glm-5.2"` est
-la seule ligne de modèle que ce fichier ait jamais déclarée pour mika-qa […] le
-5.3 qui a produit l'incident était une édition **hors dépôt** »*. Le doc-comment
-de `MIKA_DEV_CONFIG` porte le même avertissement pour mika-dev, en toutes
-lettres : *« this constant's source has DRIFTED from its runtime »*. Une
-condition de réveil qui lirait la constante serait donc vérifiable **et fausse**.
+- **Colonne « condition de réveil »** — l'une des deux :
+  - **(a)** `mika agents budget --agent mika-dev` rend un `model` qui n'est pas
+    un `glm-5.2` — **quel que soit le préfixe de rail** (`z-ai/`, `zai/`,
+    `openrouter/z-ai/` : mika#2328 a mesuré que le rail bouge sans que le modèle
+    change). C'est le modèle que mika-dev fait **tourner**, attesté par
+    mika-spirit (mika#2457), jamais celui que le dépôt déclare. Le même fait est
+    **poussé** au démarrage par `well_known_model_drift` (mika#2473).
+  - **(b)** `grep turn_usage "$MIKA_SPIRIT_LOG_FILE" | jq 'select((.session_id//"")|startswith("callback-")) | select(.model=="glm-5.2" and .status=="error")'`
+    rend **au moins une ligne** — la régression du contournement.
 
-**(b) est conservée telle quelle** : elle était déjà vérifiable sans contexte, et
-c'est la moitié qui protège contre la régression silencieuse du contournement.
+**Pourquoi (a) est reformulée ainsi.** Le commentaire 1 écrit « Vincent décide de
+re-tenter glm-5.3 » : une intention que personne ne peut vérifier. La forme
+retenue teste l'**état observable** qui en résulte, et elle le teste sur la
+surface que mika#2457 a créée pour cette question exacte — le record figé à
+l'`init_agent`, jamais une résolution locale, qui lirait le `process_env` du
+process lecteur et « affirmerait avec autorité un réglage qui n'est pas en
+vigueur ». Une condition qui lirait `config.toml` serait vérifiable **et fausse**
+(M2).
 
-### U2 — Porter au corps du ticket la procédure de mesure du réveil (R3)
+**Pourquoi (b) est ajoutée telle quelle.** Elle était déjà vérifiable sans
+contexte dans le commentaire 1, et c'est la seule moitié qui protège contre une
+régression silencieuse du contournement. Son absence du registre est un trou,
+pas un choix : le registre remplace le ticket ouvert comme support de
+visibilité, donc une condition qui ne vit que dans un commentaire n'est lisible
+par personne.
 
-Le ticket porte aujourd'hui une « Sonde de reproduction » qui compte des
-callbacks par modèle. C'était la bonne sonde le 17/09 ; elle est insuffisante
-aujourd'hui, parce qu'elle ne peut dire ni la taille du brief, ni le nombre de
-tentatives, ni si la coupure est au plafond. Ajouter au corps une section
-**« Au réveil : mesurer avant de remédier »** portant :
-
-1. **Établir la géométrie et sa provenance d'abord** (M2) — `llm_budget_resolved`
-   pour mika-dev. `http_source: process_env` signifie qu'une variable de service
-   écrase le per-agent, et le remède est de la **retirer**, pas de toucher une
-   constante. C'est l'étape 0 de la procédure mika#2331, et elle peut clore le
-   sujet sans une ligne de code.
-2. **Compter les tentatives** — `llm_call_attempt` avec le garde
-   `.event == "llm_call_attempt"` (le garde est nécessaire : sans lui le grep
-   capte l'homonyme de mika#2342 et les corps DEBUG).
-3. **Mesurer le brief des tours en échec** — `turn_usage` filtré sur
-   `.status == "error"`, champs `request_bytes` / `system_prompt_bytes`. **C'est
-   l'instrument qui n'existait pas le 17/09**, et c'est lui qui remplace
-   `input_tokens: 0`.
-4. **Trancher par la table à quatre branches** de `CLAUDE.md` § *Lire un hang LLM
-   « 420 s sans octet »*, sans en réécrire une nouvelle.
-
-**Halte explicite à écrire dans le ticket :** si les tours muets suivants ne
-portent **aucune** ligne `llm_call_attempt`, la panne est **en amont de l'appel
-HTTP** et toute la lignée « retry / borne de prompt » est hors sujet. C'est un
-résultat, pas un échec de l'instrument.
-
-### U3 — Nommer le remède candidat et sa condition (R4)
-
-Ajouter au corps du ticket, sous la procédure, le remède candidat **avec sa
-condition**, pour qu'il ne soit ni redécouvert ni appliqué prématurément :
-
-> **Remède candidat — borner le brief du tour callback.** Un tour callback de
-> mika-dev porte **76 604 octets** de prompt de skills (`self-dev` 62 790 + six
-> dépendances), soit l'intégralité du prompt d'orchestration, alors que le
-> contrat du tour est porté par `format_callback_framing`. Le mécanisme de
-> restriction existe déjà et est **strictement soustractif** :
-> `SkillRegistry::apply_only_skills` (mika#2363), livré pour la même raison sur
-> mika-arch — où il a retiré 23,5 KB sur 59,8 KB.
->
-> **Condition d'application :** la branche 2 de la table mika#2331 — `request_bytes`
-> des tours en échec **nettement supérieur** à celui des tours sains du même
-> agent. Tant que cette mesure n'est pas faite, ce remède est une hypothèse.
->
-> **Deux pièges à connaître avant d'y toucher.** (i) L'axe skills est
-> **identique** entre un tour callback et un tour conversationnel de mika-dev
-> (`self-dev` est `always_on`) : restreindre le callback ne réduit donc pas un
-> écart, il réduit une masse commune — le gain est réel, la causalité ne l'est
-> pas. (ii) `self-dev-callback` (14 482 o), le skill qui prolonge ce tour,
-> n'est **pas** atteignable aujourd'hui (mika#2356) ; toute restriction du tour
-> callback devra composer avec ce ticket, sous peine de figer l'exception.
-
-### U4 — Fermer le ticket au profit du registre (R1)
-
-Le contrat du registre est explicite sur les deux moitiés : *« le registre
-versionné **remplace le ticket ouvert** »*, et la clause **Réveil** dit
-*« **rouvrir** le ticket GitHub cité (il conserve tout son historique) et retirer
-la ligne d'ici »* — un ticket inscrit est donc un ticket fermé.
-
-Fermer #2357 avec un commentaire final renvoyant à la ligne du registre et à la
-procédure d'U2.
-
-**Ceci est une décision opérateur, pas un geste de pilote**, et le plan la pose
-comme telle : fermer un p1 portant une racine non résolue engage plus qu'une
-étape d'implémentation. Deux arguments la soutiennent, et un coût est à peser :
-
-- **Pour** — c'est le geste que le contrat prescrit, et il est la seule chose qui
-  ferme la boucle de promotion parasite de M1. Sans lui, U1 à U3 sont écrits et
-  le ticket sera re-promu au prochain bassin vide.
-- **Pour** — le registre a été ratifié précisément pour que *« le compte d'issues
-  cesse de mélanger ce qui reste à faire avec ce qui attend le monde
-  extérieur »*. #2357 attend une décision de modèle : c'est la seconde catégorie.
-- **Coût nommé** — un p1 fermé sort des tableaux de bord qui comptent les p1
-  ouverts. Le registre est versionné et relu, mais il n'est pas un tableau de
-  bord. Si l'opérateur juge que cette racine doit rester visible dans le compte
-  des p1, **U4 est à ne pas exécuter** et U1–U3 valent seuls — auquel cas il
-  faut poser un label de parcage (`operator-review` ou `blocked`), sans quoi M1
-  reste ouvert et la promotion se rejouera.
+**Échappement :** les `|` des deux commandes doivent être échappés `\|` dans la
+cellule markdown, comme le fait déjà la cellule de #2119.
 
 ---
 
 ## Verification contract
 
-Aucun test automatisé n'est ajouté ni modifié : le livrable est documentaire et
-les quatre mesures établissent qu'il n'y a pas de comportement moteur à figer.
-La vérification est faite par relecture, sur quatre points vérifiables :
+Aucun test n'est ajouté ni modifié : le livrable est une ligne de documentation,
+et les cinq mesures établissent qu'aucun comportement moteur n'est à figer. La
+vérification est une relecture, sur cinq points vérifiables :
 
-1. **`grep 2357 docs/dormeurs.md`** rend la nouvelle ligne.
-2. **Les deux branches de la condition de réveil sont des commandes** rendant un
-   résultat interprétable sans contexte — critère du § *Contrat d'une entrée*.
-   Ni « plus tard », ni « si ça revient », ni « quand Vincent décidera ».
-3. **La condition (a) lit `llm_budget_resolved`, jamais `MIKA_DEV_CONFIG`** —
-   sans quoi elle serait vérifiable et fausse (M1 de mika#2328, et le
-   doc-comment de `MIKA_DEV_CONFIG` lui-même).
-4. **`git diff --stat` ne touche que `docs/`.** Aucun fichier sous `crates/`,
-   `skills/` ou `.github/` n'est modifié — c'est la traduction mécanique de R5
-   et R6.
+1. `grep -c 2357 docs/dormeurs.md` rend **1** — une ligne, pas deux (la ligne est
+   rectifiée, pas ajoutée à côté de l'ancienne).
+2. La ligne ne contient plus la chaîne `config.toml`.
+3. La ligne contient `mika agents budget` et `turn_usage`.
+4. La ligne ne contient aucune formule d'intention (« essai relancé », « plus
+   tard », « si ça revient »).
+5. `git diff --stat` ne touche que `docs/dormeurs.md` — traduction mécanique de
+   R5, R6 et R7.
 
 `make lint` / `make test` restent verts par construction (aucun fichier Rust
-touché) ; ils seront exécutés par la CI de la PR.
+touché) ; la CI de la PR les exécute. Le `canonical-tokens-lint` (mika#2201)
+s'applique au fichier modifié : la ligne n'écrit aucun label en instruction et ne
+pose aucune clé de callout, donc elle est hors de ses cinq règles.
 
 ---
 
 ## Definition of Done
 
-- [ ] `docs/dormeurs.md` porte une ligne #2357 conforme au contrat du fichier.
-- [ ] Le corps du ticket #2357 porte la section « Au réveil : mesurer avant de
-      remédier » (U2) et le remède candidat avec sa condition (U3).
-- [ ] La rectification M2 (la géométrie 240/600 n'est pas déclarée par le dépôt)
-      est écrite au ticket, de sorte que le réveil ne reparte pas du calcul
-      « 480 = 2 × 240 » comme d'un acquis.
-- [ ] La rectification M4 (l'axe skills est identique callback/conversation ;
-      l'axe historique ne s'applique pas au tour silencieux) est écrite, de
-      sorte que ces deux hypothèses ne soient pas reformées.
-- [ ] Le diff ne touche que `docs/`.
-- [ ] La décision d'U4 (fermeture au profit du registre, ou parcage par label)
-      est prise par l'opérateur et exécutée.
+- [ ] La ligne #2357 de `docs/dormeurs.md` porte les deux branches (a) et (b),
+      chacune exécutable telle quelle.
+- [ ] La branche (a) interroge `mika agents budget`, et `config.toml` a disparu
+      de la ligne.
+- [ ] La colonne « sujet » porte le pointeur vers la procédure de mesure et la
+      raison de ne pas repartir de `input_tokens: 0`.
+- [ ] Le registre compte toujours le même nombre d'entrées (rectification, pas
+      ajout).
+- [ ] Le diff ne touche que `docs/dormeurs.md`.
 
 ---
 
@@ -346,75 +251,93 @@ touché) ; ils seront exécutés par la CI de la PR.
 *Le ticket ne porte pas de section `## Acceptance criteria` ; les critères
 ci-dessous sont dérivés des Requirements et du Verification contract.*
 
-- **AC1** — `grep -c 2357 docs/dormeurs.md` rend au moins 1, et la ligne est
-  dans le tableau `## Registre`, à la forme des dix entrées existantes
-  (ticket lié, sujet, condition de réveil).
-- **AC2** — Les deux branches de la condition de réveil sont exécutables telles
-  quelles et rendent un résultat qu'un lecteur interprète sans contexte : (a)
-  une valeur de modèle, (b) un compte de lignes. Aucune ne contient de formule
-  d'intention.
-- **AC3** — La branche (a) interroge `llm_budget_resolved` et non
-  `MIKA_DEV_CONFIG` ni `well_known_agents.rs`.
-- **AC4** — Le corps de #2357 porte les quatre étapes de mesure d'U2, dont
-  l'étape 0 (géométrie et **provenance** via `llm_budget_resolved`) en premier,
-  et la halte « aucune ligne `llm_call_attempt` ⇒ la panne est en amont de
-  l'appel HTTP, la lignée retry/borne est hors sujet ».
-- **AC5** — Le corps de #2357 porte le remède candidat, sa condition
-  d'application (branche 2 de la table mika#2331) et les deux pièges d'U3.
-- **AC6** — Aucun fichier hors `docs/` n'est modifié. En particulier :
-  `MIKA_DEV_CONFIG` est inchangé (modèle, `llm_max_tokens`, absence de plafond
-  et d'enveloppe), et `mika2280_the_three_shipped_geometries_and_their_verdict`
-  n'est pas touché.
-- **AC7** — Aucun événement de journal, compteur ou ligne `audit_events`
-  nouveau n'est introduit (R6).
+- **AC1** — `docs/dormeurs.md` contient exactement une ligne #2357, dans le
+  tableau `## Registre`, à la forme des onze entrées existantes.
+- **AC2** — Les deux branches sont exécutables telles quelles et rendent un
+  résultat qu'un lecteur interprète sans contexte : (a) une valeur de modèle,
+  (b) un compte de lignes. Aucune ne contient de formule d'intention.
+- **AC3** — La branche (a) interroge le modèle **en service** via
+  `mika agents budget` ; ni `config.toml`, ni `well_known_agents.rs`, ni la
+  constante `MIKA_DEV_CONFIG` n'y sont prescrits comme source.
+- **AC4** — La branche (a) est robuste au préfixe de rail : elle ne repose pas
+  sur une égalité stricte avec `z-ai/glm-5.2`.
+- **AC5** — La branche (b) — la régression du contournement — figure au
+  registre, ce qui n'était pas le cas avant ce travail.
+- **AC6** — La colonne « sujet » nomme la procédure de mesure à suivre au réveil
+  et dit pourquoi `input_tokens: 0` n'est plus la bonne preuve.
+- **AC7** — Aucun fichier hors `docs/` n'est modifié. En particulier
+  `MIKA_DEV_CONFIG` est inchangé (provider, modèle, `llm_max_tokens`, absence de
+  plafond et d'enveloppe).
+- **AC8** — Aucun événement de journal, compteur ou ligne `audit_events` nouveau
+  n'est introduit (R6).
 
 ---
 
 ## Hors périmètre, délibérément
 
+- **Tout détecteur.** Ce plan n'en livre aucun — pas de test, pas d'assertion,
+  pas de règle de lint, pas de garde CI, pas de scan structurel, pas de garde
+  EndTurn — donc aucun chemin de succès du type « aucune violation trouvée »
+  n'est créé, et la section `## Fire-Disposition` est sans objet (gate N/A).
+  Un détecteur a bien été envisagé puis **écarté** : un test qui vérifierait que
+  chaque entrée du registre porte une condition exécutable déborderait le ticket
+  (onze entrées, dont plusieurs légitimement sans commande — #2139 attend un
+  alignement de versions amont, #1812 une décision opérateur, #1913 une date),
+  et « condition exécutable » n'est pas mécaniquement décidable. Le livrer
+  serait inventer un livrable.
+
 - **Le retour de mika-dev à glm-5.3.** Décision opérateur, et c'est la branche
   (a) de la condition de réveil — pas un livrable.
 - **La cause côté fournisseur** (pourquoi glm-5.3 rend un corps vide sur une
-  fraction des requêtes). Non atteignable depuis ce dépôt ; ce travail rend la
-  classe mesurable au réveil, il ne la fait pas disparaître.
-- **Borner le brief du tour callback.** Nommé en U3 avec sa condition ;
-  conditionné à une mesure qui ne peut pas être faite aujourd'hui.
+  fraction des requêtes). Non atteignable depuis ce dépôt.
+- **Borner le brief du tour callback** via `apply_only_skills` (mika#2363), le
+  remède candidat que le plan initial nommait. Il reste conditionné à une mesure
+  impossible aujourd'hui, **et le plan initial a lui-même établi qu'il
+  n'expliquerait pas la classe** : `self-dev` est `always_on`, donc un tour
+  conversationnel de mika-dev porte la même masse de skills qu'un tour callback,
+  et l'axe skills ne peut pas expliquer une défaillance propre aux callbacks. La
+  note est conservée ici pour qu'elle ne soit pas reformée au réveil, pas comme
+  une piste.
+- **L'axe historique.** `rebuild_context` n'a qu'un site de production,
+  `run_agent_inner` — le chemin conversation ; `run_silent_agent` ne reconstruit
+  aucune fenêtre conversationnelle. La fuite `HistoryScope::Agent` fermée par
+  mika#2295/#2330 **ne touche pas** les tours callback. Écrit ici pour la même
+  raison.
 - **mika#2356** (`self-dev-callback` inatteignable sur un tour de callback).
-  Défaut réel, même zone, ticket distinct qui porte déjà son tracker et son
-  test auto-nettoyant.
-- **La divergence constante/runtime de `MIKA_DEV_CONFIG`** (le doc-comment dit
-  que la constante déclare 5.2 pendant que les plans de mika#2179 et mika#2189
-  mesuraient mika-dev sur 5.3). Réconcilier cette dérive exige une calibration
-  passante sur le modèle réellement en service (mika#1190) ; le doc-comment la
-  désigne déjà comme « its own piece of work ». **Ticket de suivi** — et noter
-  que la branche (a) d'U1 mesure cette dérive au passage.
-- **Le bornage de la fenêtre d'historique de mika-dev** (`[context.history]`
-  absent, donc `HistoryScope::Agent` sans `max_tokens`). Réel, et hors sujet
-  ici : M4 établit que le chemin silencieux ne reconstruit aucune fenêtre
-  conversationnelle, donc ce défaut ne touche pas les tours callback. Il touche
-  les tours **conversationnels** de mika-dev — **ticket de suivi**, dont le
-  préalable est une mesure `context_window_assembled` sur cet agent.
+  Défaut réel, même zone, ticket distinct portant déjà son tracker et son test
+  auto-nettoyant.
+- **La réconciliation de la dérive `MIKA_DEV_CONFIG`.** Elle exige une
+  calibration passante sur le modèle réellement en service (mika#1190) ; son
+  doc-comment la désigne déjà comme « its own piece of work ». **Ticket de
+  suivi** — et noter que la branche (a) la mesure au passage.
+- **Fermer #2357 au profit du registre.** Déjà tranché dans l'autre sens le
+  21/09 (ouvert *et* inscrit). Décision opérateur, pas un livrable de PR (M5).
 
 ---
 
 ## Risques et haltes
 
-- **Halte 1 — un tour callback repart en erreur sous glm-5.2 avant que ce plan
-  ne soit livré.** La branche (b) est alors déjà remplie : le ticket n'est pas
-  un dormeur, il est **actif**. Ne pas l'inscrire au registre ; suivre la
-  procédure d'U2 sur la population qui vient d'apparaître.
-- **Halte 2 — la mesure de géométrie rend `http_source: agent_config` à 240.**
-  Alors M2 est faux, le dépôt a bougé depuis ce grooming, et l'arithmétique du
-  ticket doit être refaite avant toute conclusion. Ne pas livrer U1 sans
-  corriger M2.
-- **Halte 3 — `llm_budget_resolved` ne rend aucune ligne pour mika-dev.** Le
-  binaire déployé est antérieur à mika#2293 : c'est **le déploiement** qu'il
-  faut établir avant de conclure quoi que ce soit sur la configuration (classe
-  mika#2340). Ne jamais lire ce silence comme « la configuration est celle du
-  dépôt ».
-- **Risque assumé — la condition de réveil (a) est vérifiable mais passive.**
-  Personne n'exécute cette commande chaque jour. C'est la limite propre à tout
-  le registre, écrite dans son contrat, et elle est acceptée : le registre est
-  relu, pas surveillé. Le réveil réel viendra de la décision opérateur qui
-  change le modèle — la commande sert à ce que ce réveil soit **vérifiable**,
-  pas à le déclencher.
+- **Halte 1 — un tour callback repart en erreur sous glm-5.2 avant la
+  livraison.** La branche (b) est alors déjà remplie : le ticket n'est pas un
+  dormeur, il est **actif**. Ne pas livrer la rectification comme si de rien
+  n'était ; suivre la procédure de M4 sur la population qui vient d'apparaître.
+- **Halte 2 — `mika agents budget --agent mika-dev` rend *« non attesté »*.** Ce
+  n'est pas un réveil et ce n'est pas un échec de la condition : c'est un serveur
+  injoignable, un 404, ou un binaire antérieur à mika#2457 (classe mika#2340).
+  Établir le déploiement **avant** toute conclusion sur le modèle. La commande
+  est conçue pour n'afficher **aucune** valeur locale dans ce cas, précisément
+  pour que ce silence ne se lise pas comme une réponse.
+- **Halte 3 — la ligne rend un `model` autre que `glm-5.2` dès la première
+  exécution.** Le réveil est **déjà** rempli : mika-dev tourne autre chose que ce
+  que le corps du ticket suppose. Ne pas livrer la ligne en l'état comme
+  « dormant » — c'est un résultat à porter au ticket, et le dormeur se réveille.
+  Le `CLAUDE.md` racine enregistre mika-dev **en phase** au 2026-09-22, donc
+  l'attendu est `glm-5.2` ; un écart est une mesure, pas une panne.
+- **Risque assumé, réduit mais non nul.** La condition (a) reste une commande que
+  personne n'exécute chaque jour — limite propre à tout le registre, écrite dans
+  son contrat. Elle est désormais **doublée** par un signal poussé
+  (`well_known_model_drift` au démarrage, mika#2473), ce qui n'était pas le cas
+  le 21/09 ; mais ce signal ne nomme pas #2357, et rien ne relie automatiquement
+  l'un à l'autre. Le réveil réel viendra de la décision opérateur qui change le
+  modèle ; la commande sert à ce que ce réveil soit **vérifiable**, pas à le
+  déclencher.
