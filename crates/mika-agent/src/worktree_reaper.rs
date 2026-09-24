@@ -5513,12 +5513,10 @@ branch refs/heads/fix/live/x
     /// Le motif observé ici est `build_lock_held`, celui du **filtre amont** :
     /// `purge_stale_target_dirs` sonde elle-même avant de disposer, donc un
     /// verrou pris *avant* l'appel est intercepté là et la re-sonde n'est jamais
-    /// atteinte. Fabriquer un `build_lock_raced` de bout en bout demanderait un
-    /// point d'injection dans la fonction de production, c'est-à-dire d'ajouter
-    /// au substrat un crochet dont le seul consommateur serait un test (§ 5.2 du
-    /// plan). Ce qui est attesté à la place : l'unité (V1-V6), le
-    /// **conservatisme** ici, et le scan structurel du § 6 — la seule garde
-    /// capable de voir « quelqu'un a retiré l'acquisition ».
+    /// atteinte. Ce test atteste donc le **conservatisme** du premier étage ;
+    /// le second — `build_lock_raced`, le motif que ce ticket ajoute — est
+    /// exercé par
+    /// [`mika2511_v7b_une_divergence_filtre_acquisition_ecrit_build_lock_raced`].
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn mika2511_v7_un_target_verrouille_nest_pas_supprime() {
@@ -5561,6 +5559,120 @@ branch refs/heads/fix/live/x
         assert_eq!(
             row.after_value.as_deref(),
             Some(PURGE_REASON_BUILD_LOCK_HELD)
+        );
+    }
+
+    /// **V7b / AC2 — le motif `build_lock_raced` est EXERCÉ**, pas seulement
+    /// déclaré : le filtre amont rend `Free`, l'acquisition rend `Held`, et la
+    /// disposition conserve l'arbre en écrivant **ce** motif, distinct de
+    /// `build_lock_held`.
+    ///
+    /// # Le dispositif, et pourquoi il ne peut pas être « tenir le verrou entre
+    /// # les deux étages »
+    ///
+    /// Les deux étages vivent **dans** `purge_stale_target_dirs` : elle sonde
+    /// tous les candidats, fige la sélection, puis dispose. Aucun code de test
+    /// ne s'exécute entre les deux. Un fil qui prendrait le verrou pendant la
+    /// disposition du candidat précédent serait une **course**, donc un test
+    /// intermittent — exactement ce que le commentaire opérateur de mika#2511
+    /// demande d'éliminer après le flake de `mika2497_v3b`.
+    ///
+    /// Le dispositif retenu fait diverger les deux étages **sans horloge** :
+    /// deux `.cargo-lock` de profils distincts pointant sur **un seul inode**
+    /// (lien physique). `flock(2)` porte sur l'*open file description*, donc
+    ///
+    /// - le **filtre** relâche après chaque sonde ([`probe_one_cargo_lock`] fait
+    ///   son `LOCK_UN`), donc les deux sondes réussissent ⇒ `Free` ;
+    /// - l'**acquisition** retient cumulativement, donc la seconde ouverture
+    ///   entre en collision avec la première ⇒ `EWOULDBLOCK` ⇒ `Held`.
+    ///
+    /// Déterministe, indépendant de l'ordre de `read_dir` (quel que soit le
+    /// profil énuméré en premier, c'est le second qui collisionne), et bâti sur
+    /// la propriété que [`hold_lock_file`] documente déjà pour les verrous de
+    /// test.
+    ///
+    /// # Ce qui est artificiel, et ce qui ne l'est pas
+    ///
+    /// Le lien physique est un **artifice** : en production la divergence vient
+    /// du temps qui passe — un `cargo` démarré entre la sonde et la suppression,
+    /// ce que R1 du plan situe à ~2 s pour le premier candidat d'un tick et à
+    /// une suppression entière pour le second. Ce qui est exercé, en revanche,
+    /// est le **vrai chemin** : la même fonction de production, le même bras
+    /// `LockAcquisition::Held`, la même écriture de refus, le même budget.
+    ///
+    /// # Dépendance à connaître avant d'y toucher
+    ///
+    /// Le dispositif tient parce que [`cargo_lock_paths`] rend **un chemin par
+    /// entrée de répertoire**, jamais un par inode. Si quelqu'un dédoublonne cet
+    /// énumérateur par inode, ce test rougit : la résolution est de lui trouver
+    /// un autre dispositif, **jamais** de retirer l'assertion — le motif
+    /// `build_lock_raced` redeviendrait alors déclaré et non exercé.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn mika2511_v7b_une_divergence_filtre_acquisition_ecrit_build_lock_raced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2511-raced");
+        let target = fake_target(&wt);
+
+        free_cargo_lock(&target, "debug");
+        std::fs::create_dir_all(target.join("release")).unwrap();
+        std::fs::hard_link(
+            target.join("debug/.cargo-lock"),
+            target.join("release/.cargo-lock"),
+        )
+        .unwrap();
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        // Préconditions assertées : sans elles, un échec plus bas serait
+        // ambigu entre « le dispositif ne diverge plus » et « la disposition
+        // écrit le mauvais motif ».
+        assert!(
+            matches!(cargo_build_lock_is_free(&target), LockProbe::Free),
+            "le filtre amont doit laisser passer — sinon c'est `build_lock_held` \
+             qui serait écrit, et le second étage ne serait pas atteint"
+        );
+        assert!(
+            matches!(acquire_cargo_build_locks(&target), LockAcquisition::Held),
+            "l'acquisition doit diverger du filtre — c'est tout le dispositif"
+        );
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2511-v7b",
+            "trace-v7b",
+            &[pr_open_refusal(&wt, "fix/2511/raced")],
+            &index(vec![open_pr(2511, "fix/2511/raced")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "la course conserve, elle ne supprime pas");
+        assert_eq!(stats.would_purge, 0);
+        assert!(target.exists(), "`target/` doit être intact");
+        assert!(target.join("debug/deps/libfoo.rlib").exists());
+        assert_eq!(stats.refused, 1, "un refus, et un seul");
+        assert_eq!(budget, 2, "un refus tardif n'écrit rien : il ne débite pas");
+
+        let events = db.get_audit_events("session-2511-v7b").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("une ligne de refus doit exister");
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some(PURGE_REASON_BUILD_LOCK_RACED),
+            "le motif doit être celui de la course, jamais `{}` — fusionner les \
+             deux populations rendrait incomptable la mesure de la fenêtre que \
+             mika#2511 ferme",
+            PURGE_REASON_BUILD_LOCK_HELD
         );
     }
 
@@ -5687,6 +5799,21 @@ branch refs/heads/fix/live/x
     /// fonctions fautives. Les lignes de commentaire sont retirées avant
     /// l'analyse, sur le motif mesuré de mika#2050 : la prose de ce fichier cite
     /// les jetons qu'elle décrit.
+    ///
+    /// # Deux termes, pas un
+    ///
+    /// 1. l'acquisition **précède** la suppression, dans la même fonction ;
+    /// 2. **aucun `drop(` entre les deux**.
+    ///
+    /// Le second n'est pas une redondance du premier : un garde relâché avant la
+    /// suppression rouvre la fenêtre TOCTOU **sans déplacer l'acquisition d'une
+    /// ligne**, donc le terme 1 seul laisserait passer la régression la plus
+    /// plausible — celle d'un relecteur qui « range » un `drop` explicite plus
+    /// haut pour rendre la portée plus étroite. Le prédicat est délibérément
+    /// large (tout `drop(`, pas seulement celui du garde) : la seule chose qu'on
+    /// ait légitimement à relâcher là est le garde, et la résolution quand il
+    /// tire est de déplacer le `drop` **après** la suppression, jamais
+    /// d'assouplir le terme.
     fn scan_remove_dir_all_sites(src: &str, allowed: &[&str]) -> Result<usize, Vec<String>> {
         let removal = format!("remove_dir{}", "_all");
         let acquisition = format!("acquire_cargo{}", "_build_locks");
@@ -5740,7 +5867,13 @@ branch refs/heads/fix/live/x
                 continue;
             }
             match body.find(acquisition.as_str()) {
-                Some(acq) if acq < rm => {}
+                // L'acquisition précède — reste à vérifier qu'elle tient
+                // toujours au moment de la suppression.
+                Some(acq) if acq < rm => {
+                    if body[acq..rm].contains("drop(") {
+                        offenders.push(name.clone());
+                    }
+                }
                 _ => offenders.push(name.clone()),
             }
         }
@@ -5785,8 +5918,12 @@ branch refs/heads/fix/live/x
                  exécutable — le scan ne vérifie plus rien"
             ),
             Err(offenders) => panic!(
-                "mika#2511 — une suppression n'est pas précédée de l'acquisition \
-                 du verrou de build, dans: {}. La fenêtre TOCTOU est rouverte.",
+                "mika#2511 — une suppression n'est pas couverte par une \
+                 acquisition du verrou de build **tenue jusqu'à elle**, dans: \
+                 {}. Soit l'acquisition manque ou la suit, soit un `drop(` la \
+                 relâche entre les deux. La fenêtre TOCTOU est rouverte ; la \
+                 résolution est de rendre le site conforme (relâcher APRÈS la \
+                 suppression), jamais de l'allowlister.",
                 offenders.join(", ")
             ),
         }
@@ -5839,6 +5976,28 @@ branch refs/heads/fix/live/x
             "}\n"
         );
         assert!(scan_remove_dir_all_sites(fixture, &[]).is_err());
+    }
+
+    /// **Contrôle négatif du second terme, vu rouge.** L'acquisition précède
+    /// bien la suppression — et ne protège rien, parce que le garde est relâché
+    /// avant. Sans ce contrôle, « le scan lit la séquence » serait
+    /// indistinguable de « le scan lit seulement l'ordre des deux appels », et
+    /// la régression la plus plausible passerait avec tous les tests au vert.
+    #[test]
+    fn mika2511_le_scan_rougit_si_le_garde_est_relache_avant_la_suppression() {
+        let fixture = concat!(
+            "fn purge_quelque_chose(t: &Path) {\n",
+            "    let g = acquire_cargo",
+            "_build_locks(t);\n",
+            "    drop(g);\n",
+            "    let _ = std::fs::remove_dir",
+            "_all(t);\n",
+            "}\n"
+        );
+        assert_eq!(
+            scan_remove_dir_all_sites(fixture, &[]),
+            Err(vec!["purge_quelque_chose".to_string()])
+        );
     }
 
     /// Les clés d'audit sont préfixées `target:` — distinctes de celles du
