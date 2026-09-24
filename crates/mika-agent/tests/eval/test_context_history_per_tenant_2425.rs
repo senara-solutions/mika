@@ -139,10 +139,16 @@ fn window_text(trace: &super::trace::AgentTrace) -> String {
 }
 
 /// Seed one message belonging to another ticket, in its own session.
+///
+/// The agent is read off the harness rather than written as `"mika"`: a test
+/// that isolates itself on its own agent (see `EvalHarnessBuilder::agent_id`)
+/// would otherwise seed the neighbouring session under a *different* agent, and
+/// the agent-scoped window would legitimately never contain it — a negative
+/// control that passes for the wrong reason.
 async fn seed_another_tickets_plan(harness: &EvalHarness) {
     harness
         .db
-        .create_session("other-ticket-session", "mika", "test")
+        .create_session("other-ticket-session", &harness.db.agent_id, "test")
         .await
         .unwrap();
     harness
@@ -316,17 +322,31 @@ scope = "session"
 /// every turn, which is what makes a per-tenant knob usable at all on a daemon
 /// shared by a fleet.
 ///
-/// **The two turns are what makes this test order-independent**, and that is
-/// deliberate rather than incidental. `context_history_resolved` is deduplicated
-/// on the resolved state in a process-global map keyed by agent, and every eval
-/// test in this binary runs as agent `mika`. A test asserting the event on a
-/// single default turn would pass or fail on whichever sibling ran first — a
-/// test that fails once in a hundred runs passes in CI, which is the class
-/// mika#2073 had to close with a source scan. Turn 1 puts a known state in the
-/// map; turn 2 necessarily differs from it, so the announcement is guaranteed.
+/// **The two turns plus the dedicated agent are what make this test
+/// order-independent**, and neither half is sufficient alone.
+/// `context_history_resolved` is deduplicated on the resolved state in a
+/// process-global map keyed by agent. Two turns guarantee a *state change* —
+/// turn 1 puts `session` in the map, turn 2 asks for `agent` — but they
+/// guarantee nothing while the key is shared: every other eval test in this
+/// binary runs as agent `mika` and resolves the default `(agent, default)`,
+/// which is precisely the state turn 2 resolves. A sibling landing between the
+/// two turns writes that state first, turn 2 then matches it, the announcement
+/// is deduplicated away and the assertion below fails on a system that is
+/// working. That is not a hypothesis: it is how this test failed once main
+/// added enough eval tests to make the window likely (mika#2425, 2026-09-24),
+/// while passing in isolation every time.
+///
+/// The agent is therefore the fix, because the agent is the dedup key. Under
+/// `tenant-2425-neutral` no sibling can write this map entry, so turn 2's
+/// re-announcement is guaranteed by construction rather than by luck. The
+/// captured event is filtered on the same agent for the same reason — the
+/// capture is thread-local, but reading "the last `context_history_resolved`"
+/// without checking whose it is would be the same class of accident one layer up.
 #[tokio::test]
 async fn mika2425_posing_the_neutral_cancels_the_narrowing_and_says_so() {
+    let agent = "tenant-2425-neutral";
     let harness = EvalHarness::builder()
+        .agent_id(agent)
         .responses(vec![text_response("Narrowed."), text_response("Widened.")])
         .build()
         .await
@@ -366,7 +386,10 @@ async fn mika2425_posing_the_neutral_cancels_the_narrowing_and_says_so() {
     let resolved = captured
         .iter()
         .rev()
-        .find(|(_, f)| f.get("event").map(String::as_str) == Some("context_history_resolved"))
+        .find(|(_, f)| {
+            f.get("event").map(String::as_str) == Some("context_history_resolved")
+                && f.get("agent_id").map(String::as_str) == Some(agent)
+        })
         .map(|(_, f)| f.clone())
         .expect("a state CHANGE must be re-announced — dedup silences repetition, not change");
 
