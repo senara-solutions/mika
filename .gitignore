@@ -1,5 +1,34 @@
 # Rust
-/target/
+#
+# `**/target/`, not `/target/` (mika#2503). In a Cargo workspace every crate
+# shares the root `target/`, so the anchored form was correct for the build —
+# and it is the artefacts a PILOT leaves behind that it did not cover. PR #2502
+# carried 28 files, 26 of them `.v1probe/target/**` (rlib, `incremental/`,
+# fingerprints) from a scratch probe crate the pilot built at a non-root path;
+# `/target/` never matched it, the mika#1282 rescue's `git add -A` obeyed
+# .gitignore exactly and had been told nothing about that path, and QA blocked
+# the result 7/7 for zero implementation. Same mechanism as #2486 the day before.
+#
+# MEASURED before changing it (2026-09-23): `git ls-files | grep -E '(^|/)target/'`
+# returns ZERO paths across 3694 tracked files, so this rule cannot swallow
+# anything that is tracked — it can only ever match an artefact.
+#
+# THE EFFECT SOUGHT IS ON THE PROBE, not just on the commit, and it is the same
+# mechanism already written below for `/pr-body.md`: `git status --porcelain` —
+# which is what `_rescue_dirty_worktree` interrogates to decide a worktree is
+# dirty — DOES NOT REPORT IGNORED FILES. So a pilot that leaves only build
+# artefacts behind no longer triggers a rescue at all, and `git add -A` is
+# repaired without being touched, along with all five sites that consume
+# RESCUE_EXCLUDE_PATHSPEC.
+#
+# DO NOT express this rule as a git pathspec instead — that is the form the next
+# editor will reach for first, and it is silently destructive. Measured on this
+# repo: `':(glob)!**/src/**'` leaves 0 of 3694 files (it excludes EVERYTHING,
+# which would throw away the pilot's content), and `':!*src/*'` leaves 3203
+# because `*` traverses slashes and so over-matches `docs/target/`, `mytarget/`,
+# `retarget/`. Only .gitignore gives `**/` the "match in all directories"
+# semantics the spec defines and this rule needs.
+**/target/
 **/*.rs.bk
 
 # Environment variables

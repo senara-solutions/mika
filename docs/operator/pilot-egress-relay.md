@@ -153,6 +153,51 @@ tail -50 /tmp/mika-pilot-egress-proxy.log
 **Les deux chemins sont nommés délibérément.** Ne chercher que le premier est la
 façon dont on conclut « pas de journal, donc rien n'a tourné ».
 
+#### Q3.1 — lire ce journal : la table des signatures
+
+`tail` montre les lignes ; il ne dit pas ce qu'elles veulent dire. Le lecteur :
+
+```bash
+grep -E 'pilot_egress_startup|host-unix listening on' \
+    "${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log"
+```
+
+Trois lignes possibles par lancement, et c'est leur **combinaison** qui tranche :
+
+| Ce qu'on lit pour **un** lancement | Lecture |
+|---|---|
+| `.begin` **puis** `host-unix listening on` | sain — ce proxy a bindé |
+| `.begin`, **pas** de `.signalled`, **pas** de `listening` | mort dans la fenêtre pré-bind par un signal **non rattrapable** — SIGKILL ou OOM-kill |
+| `.begin` **puis** `.signalled <SIG>` (sortie `3`) | un SIGTERM/SIGINT a atterri pendant le démarrage — **le signal est nommé sur la ligne** |
+| **aucune** ligne `.begin` pour ce lancement | mort **avant** que Python ne tourne — échec d'`exec`, interpréteur, dépendance manquante |
+
+Trois points, sans lesquels la table conduit à la mauvaise conclusion :
+
+- **La quatrième branche est une information, pas un silence.** `.begin` est la
+  **première** ligne du processus, émise avant `bind()` et juste après l'armement
+  des handlers — contrat tenu par
+  `scripts/test-pilot-egress-proxy-status.py::test_startup_emits_a_begin_breadcrumb_before_bind`.
+  Son absence pour un lancement donné dit donc quelque chose de précis. **À ne
+  pas confondre avec un journal *absent***, qui est le cas « binaire jamais
+  déployé » que la Q1 traite déjà (classe mika#2340). Le jour où `.begin` cesse
+  d'être la première ligne, c'est ce test qui rougit, pas cette table qui dérive.
+- **La jointure se fait par le pid, pas par l'horodatage.** Le journal du proxy
+  est **cumulatif** ; le `.stderr` du dispatch est **par dispatch**. Le pid que
+  porte `pilot_egress_guard.unreachable … (pid N)` côté dispatch est le même que
+  celui du `pid=N` de la ligne `.begin` côté proxy. Corréler à la montre — ce
+  qu'il fallait faire avant mika#2051 — est ce qui a rendu le diagnostic du
+  2026-08-29 coûteux.
+- **C'est un geste *hôte*.** Un pilote dispatché ne voit pas `/var/log/mika/` :
+  le bac à sable `bwrap` ne le monte pas (classe mika#2165). **L'absence de ce
+  fichier depuis une session de dispatch n'est pas un résultat** et ne doit
+  jamais être lue comme « aucune récurrence ».
+
+**Ce que cette table ne dit pas, et ne prétend pas dire : *qui* a envoyé le
+signal.** Guardrail, timeout, démantèlement de groupe de processus, OOM — la
+mesure est hors dépôt. mika#2051 livre de quoi **attribuer** la prochaine
+occurrence, pas une cause ; si aucune récurrence n'est mesurée, la conclusion
+est « instrumenté, sans récurrence », jamais « cause identifiée ».
+
 ## 4. Les gestes
 
 ### 4.1 Relais mort — le relancer
