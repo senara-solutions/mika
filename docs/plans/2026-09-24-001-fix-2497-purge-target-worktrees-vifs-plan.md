@@ -98,6 +98,32 @@ lui. Quatre raisons, dans l'ordre de leur poids :
 Cadence inchangée : `WORKTREE_REAP_CRON = "0 */10 * * * *"`. Aucun nouveau
 `PeriodicScan`, aucune nouvelle row récurrente, aucune migration de schéma.
 
+### Ancrages vérifiés dans l'arbre — ce plan n'invente aucune API
+
+Relevé sur la branche de grooming, par lecture du dépôt seul. Un plan qui prescrit un
+point de branchement inexistant ne se découvre qu'à l'implémentation, quand le coût est
+déjà payé.
+
+| ce que le plan prescrit | symbole | site |
+|---|---|---|
+| le module hôte | `reap_terminal_worktrees` | `worktree_reaper.rs:1267` |
+| la population, **littéralement en mémoire** | `ReapSelection { candidates, refusals }`, `ReapRefusal { path, branch, reason }` | `worktree_reaper.rs:657` |
+| le motif qui la sélectionne | `REASON_PR_OPEN`, 1ʳᵉ entrée de `ALL_REFUSAL_REASONS` | `worktree_reaper.rs:176` |
+| la garde syntaxique | `is_managed_worktree_path` | `worktree_reaper.rs:673` |
+| la garde après symlink | `canonical_path_is_managed` | `worktree_reaper.rs:696` |
+| le segment gardé | `MANAGED_WORKTREE_SEGMENT = "/.claude/worktrees/"` | `worktree_reaper.rs:128` |
+| la mesure de taille best-effort | `measure_tree_size` | `worktree_reaper.rs:935` |
+| l'énumération `/proc` | `LiveCwds` | `worktree_reaper.rs:616` |
+| le modèle du pin de format de fil | `mika2420_les_motifs_sont_un_format_de_fil` | `worktree_reaper.rs:2235` |
+| la cadence | `WORKTREE_REAP_CRON` | `server/mod.rs:119` |
+| le nom SOLE WRITER à ne pas réutiliser | `REAPED_TOOL = "worktree_reaped"` | `worktree_reaper.rs` |
+| `flock` sans crate nouvelle | `libc.workspace = true` | `crates/mika-agent/Cargo.toml:76` |
+| les tests en tmpdir | `tempfile.workspace = true` (dev-dep) | `crates/mika-agent/Cargo.toml:80` |
+
+Conséquence directe pour U2 : la population n'est pas à recalculer. C'est
+`selection.refusals.iter().filter(|r| r.reason == REASON_PR_OPEN)` — chaque entrée
+portant déjà son chemin et sa branche.
+
 ## Le prédicat — cinq termes conjonctifs, tous fail-safe vers *conserver*
 
 Sur chaque worktree refusé `pr_open` par le reaper du même tick :
@@ -129,6 +155,29 @@ P4 et P5 ne sont pas redondants et leur ordre est le motif de maison de mika#218
 **le proxy filtre d'abord** (P4, quelques `stat`, écarte la quasi-totalité de la
 population), **la mesure directe tranche ensuite** (P5, juste avant la suppression, sur
 le seul candidat retenu — le dernier point où le refus est encore gratuit).
+
+### P5 : le mécanisme, nommé — et il n'ajoute aucune dépendance
+
+`flock(2)` n'est pas exposé par `std`, donc ce terme pourrait exiger une crate nouvelle.
+**Il n'en exige aucune** : `libc` est déjà une dépendance de `crates/mika-agent`
+(`libc.workspace = true`, `Cargo.toml:76`), et `libc::flock(fd, LOCK_EX | LOCK_NB)`
+suffit — acquisition **non bloquante**, relâchée immédiatement, jamais une attente à
+l'intérieur d'un tick.
+
+Le fichier verrouillé est **découvert, jamais deviné** : cargo pose son verrou de build
+sur `<target>/<profil>/.cargo-lock`, et le profil est une donnée de l'invocation (`debug`,
+`release`, un profil nommé). Le terme énumère donc les enfants directs de `target/` et
+sonde chaque `.cargo-lock` trouvé ; **un seul verrou tenu suffit à refuser**. Deviner
+`target/debug/.cargo-lock` raterait un build `--release`, c'est-à-dire échouerait
+exactement sur le cas qu'on veut voir.
+
+**L'absence de tout `.cargo-lock` satisfait le terme** — elle ne le rend pas
+`build_lock_unreadable`. Cargo ne retire pas ce fichier après un build : son absence dit
+que cargo n'a jamais construit ici, pas qu'on n'a pas pu regarder. Lire l'absence comme
+« illisible » rendrait le bras **inerte sur toute une population saine** tout en se
+lisant comme un disque en bonne santé — la classe mika#2205 que la Halte 4 nomme déjà.
+`build_lock_unreadable` est réservé à ce qui l'est vraiment : un `open` refusé, un
+`flock` qui échoue sur autre chose que `EWOULDBLOCK`.
 
 ### P4 : un mtime borné, jamais une marche complète
 
@@ -291,6 +340,14 @@ constante »** : un `target/` récent **d'une seconde** à l'intérieur de la fe
 conservé ; le même à une seconde au-delà est purgé. Sans cette paire, un prédicat
 toujours-faux passerait V2 en entier.
 
+**V3b — l'absence de verrou n'est pas un verrou illisible.** Un `target/` sans aucun
+`.cargo-lock` est **purgé** ; un `target/release/.cargo-lock` tenu par un autre
+descripteur est **refusé** alors que `target/debug/.cargo-lock` est libre. Le premier
+cas est ce qui sépare « le terme est fail-safe » de « le terme est toujours faux » —
+sans lui, une implémentation qui traiterait l'absence comme `build_lock_unreadable`
+passerait tous les autres tests en ne purgeant jamais rien. Le second atteste que le
+fichier est **découvert** et non deviné sur le profil `debug`.
+
 **V4 — les gardes de chemin** : un `target` qui est un lien symbolique vers un arbre
 voisin est refusé, et **la cible existe toujours** après le tick (l'assertion porte sur
 la cible, pas sur le refus — c'est le seul faux positif irréversible de ce livrable).
@@ -418,8 +475,11 @@ disque serait un autre mécanisme, avec sa propre population.
    build est libre, voit son `target/` retiré ; le reste du worktree est intact.
 2. **AC2 — les cinq refus tiennent.** Chacun de P1–P5 conserve le `target/` quand il est
    faux, et chacun est vu rouge par un test dédié.
-3. **AC3 — l'illisible conserve.** Un mtime, un verrou ou une énumération `/proc`
-   illisibles sortent le worktree de la population ; ils ne l'y font jamais entrer.
+3. **AC3 — l'illisible conserve, l'absent ne bloque pas.** Un mtime, un verrou ou une
+   énumération `/proc` **illisibles** sortent le worktree de la population ; ils ne l'y
+   font jamais entrer. Symétriquement, l'**absence** de tout `.cargo-lock` satisfait P5
+   au lieu de le rendre illisible — sans quoi le bras serait inerte tout en se lisant
+   comme sain (classe mika#2205).
 4. **AC4 — disjonction avec mika#2420.** Les deux populations ne s'intersectent pas, et
    aucun comportement du reaper terminal ne change.
 5. **AC5 — `observe` ne supprime rien** et écrit `target_purge_would_dispose`, jamais
@@ -432,6 +492,8 @@ disque serait un autre mécanisme, avec sa propre population.
    allowlist vide portant son assertion auto-nettoyante.
 9. **AC9 — les tests ne sortent pas de leur tmpdir**, y compris sur les chemins d'échec.
 10. **AC10 — zéro deny hors bac à sable** pendant la session d'implémentation.
+11. **AC11 — aucune dépendance nouvelle.** `Cargo.toml` est inchangé : P5 s'appuie sur
+    `libc`, déjà présent dans `crates/mika-agent`.
 
 ## Hors périmètre, délibérément
 
