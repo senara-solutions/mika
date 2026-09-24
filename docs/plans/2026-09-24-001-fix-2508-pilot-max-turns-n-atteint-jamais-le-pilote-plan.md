@@ -616,7 +616,7 @@ reste la seule borne tant que ce correctif n'est pas déployé**.
 
 ---
 
-## 9. Acceptance criteria
+## Acceptance criteria
 
 1. **AC1** — Au 1er dispatch après déploiement, avec `PILOT_MAX_TURNS=150` sur
    l'environnement du service : la ligne `pilot_budget_armed` porte
