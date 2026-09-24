@@ -90,6 +90,53 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
     })
 }
 
+/// Retire d'une source Rust les lignes qui sont des commentaires, et rend le
+/// reste.
+///
+/// **Le lecteur unique de ce prédicat.** Il vivait inline dans [`fn_bodies`] ;
+/// mika#2495 l'a extrait parce qu'une seconde garde en a besoin sans avoir
+/// besoin du découpage par fonction — un scan par corps de fonction raterait un
+/// `const BOGUS: &str = "…"` à portée de module. Extrait plutôt que recopié :
+/// c'est la règle écrite de ce module (« un seul lecteur, pas une copie par
+/// garde »), et la classe que `grooming_marker` a dû graver une fois (mika#2158,
+/// une regex copiée dont le commentaire disait « Mirrors … » et qui a ensuite
+/// raté deux élargissements).
+///
+/// **Ce que ça achète à une garde.** Une prose qui *décrit* le motif interdit
+/// cesse de se lire comme une violation de celui-ci. Ce n'est pas une
+/// hypothèse : c'est ce que la première exécution de la garde de mika#2323 a
+/// rapporté, et c'est exactement le faux positif que le doc-comment de
+/// `probe_executor_health_returns_none_on_unreachable_endpoint` produirait — il
+/// nomme l'adresse de documentation pour expliquer pourquoi on ne s'en sert
+/// plus.
+///
+/// **Ce que ça n'achète PAS** — le prédicat est *à la ligne*, jamais lexical :
+/// un commentaire de fin de ligne (`let x = 1; // …`) reste dans la sortie, et
+/// l'intérieur d'un bloc `/* … */` dont les lignes de continuation ne
+/// commencent pas par `*` y reste aussi. Une garde bâtie là-dessus accuse donc
+/// encore ces deux formes ; c'est un faux positif réparable en déplaçant le
+/// commentaire, pas un trou de détection.
+///
+/// # Une ligne qui commence par `*` n'est pas forcément un commentaire
+///
+/// `*guard = x;` et la continuation d'une multiplication sont du Rust valide
+/// commençant par `*`. Les retirer aveuglément rendrait **invisible** au scan
+/// toute lecture écrite sur une telle ligne : la garde resterait verte pendant
+/// que la divergence qu'elle existe pour refuser reviendrait. La continuation
+/// d'un bloc `/* … */` s'écrit `* ` ou `*/`, jamais `*identifiant` — c'est ce
+/// que le prédicat ci-dessous distingue.
+pub(crate) fn strip_comment_lines(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            let block_continuation =
+                t == "*" || t.starts_with("* ") || t.starts_with("*/") || t.starts_with("*\t");
+            !(t.starts_with("//") || t.starts_with("/*") || block_continuation)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Découpe une source Rust en `(nom de fonction, corps)`, commentaires retirés.
 ///
 /// Les gardes structurelles de ce crate posent toutes la même question — *quelle
@@ -99,8 +146,9 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
 /// copiée dont le commentaire disait « Mirrors … » et qui a ensuite raté deux
 /// élargissements).
 ///
-/// **Les commentaires sont retirés d'abord**, et c'est porteur : sans ça le
-/// corps d'une fonction avale le doc-comment de la suivante, et une prose qui
+/// **Les commentaires sont retirés d'abord** — par [`strip_comment_lines`], dont
+/// le doc-comment porte le prédicat et ses bornes — et c'est porteur : sans ça
+/// le corps d'une fonction avale le doc-comment de la suivante, et une prose qui
 /// *décrit* le motif interdit se lit comme une violation de celui-ci. Ce n'est
 /// pas une hypothèse — c'est ce que la première exécution de la garde de
 /// mika#2323 a rapporté.
@@ -112,26 +160,8 @@ pub(crate) fn is_test_source_path(path: &Path) -> bool {
 /// Cette fonction ne tronque pas le code de test : c'est à l'appelant de
 /// décider de sa moitié de production, les gardes n'ayant pas toutes la même
 /// borne.
-///
-/// # Une ligne qui commence par `*` n'est pas forcément un commentaire
-///
-/// `*guard = x;` et la continuation d'une multiplication sont du Rust valide
-/// commençant par `*`. Les retirer aveuglément rendrait **invisible** au scan
-/// toute lecture écrite sur une telle ligne : la garde resterait verte pendant
-/// que la divergence qu'elle existe pour refuser reviendrait. La continuation
-/// d'un bloc `/* … */` s'écrit `* ` ou `*/`, jamais `*identifiant` — c'est ce
-/// que le prédicat ci-dessous distingue.
 pub(crate) fn fn_bodies(src: &str) -> Vec<(String, String)> {
-    let stripped: String = src
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            let block_continuation =
-                t == "*" || t.starts_with("* ") || t.starts_with("*/") || t.starts_with("*\t");
-            !(t.starts_with("//") || t.starts_with("/*") || block_continuation)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let stripped = strip_comment_lines(src);
 
     let mut out = Vec::new();
     let mut cursor = 0usize;

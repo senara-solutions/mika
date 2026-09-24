@@ -1096,7 +1096,78 @@ STOP). What makes that acceptable is the **visibility**, not the reasoning: the
 operator sees the effect in ≤ 10 min. If the reader ever becomes fallible in a way
 the operator cannot observe (DB, network), redo the trade-off rather than transport it.
 
-**Scope: `auto_pull`, then `worktree_reap` (mika#2420).** `is_stopped`/`stop_file_path`
+**`AUTO_PULL_SCAN` is the loop's NEW-DISPATCH BRAKE, not a scan's private switch
+(mika#2498).** Its name says a scan; its scope is wider, and reading the name as
+the scope cost an incident. On 2026-09-23 the sentinel posted at 05:38 did
+short-circuit the feeder tick — and an implement fired anyway at 06:11:39Z
+(`ff694ec0`, 103 turns, 17.86 USD), because a converged groom chains straight
+into its implementation through the **engine auto-fire**
+(`try_dispatch_pilot_after_groom_success`, mika#1614), which goes through no
+tick. The operator could only cancel it in reaction.
+
+**Widened in its documented sense, never duplicated.** mika#2420's criterion is
+*a distinct decision deserves a distinct file* — but the two routes have the
+**same output** (a fresh dev-pilot dispatch) reached by two paths: the feeder
+promotes `ready` then dispatches in-process (mika#2470), the auto-fire dispatches
+directly. An operator who stops one and not the other has stopped nothing, which
+is exactly the incident. A second sentinel (`groom-implement-stop`) was refused
+for that reason: it splits one operator decision into two gestures, and the
+gesture of muscle memory — posting the file of the incident — would then yield
+today's behaviour while looking like a stop.
+
+**The criterion for a future consumer**, and it is not "am I a scan?": *does it
+start **new** pilot work?* If yes, read this sentinel, whatever the entry door.
+If no, it needs its own scan name (mika#2420's criterion). That is what
+deliberately leaves out `verdict_handler` (`block[ac]` / `block[ci]` repair an
+open PR — a **continuation**, not new work) and a `ready` posted by hand during a
+STOP (whether a file outranks the gesture an operator just made is a product
+decision, not substrate).
+
+**The refusal is convergent, never terminal**, which is what makes the widening
+acceptable: it does not cancel the groom, does not lose the plan (committed and
+pushed by `_push_branch`), creates no row, and leaves the parent `in_progress` /
+`groom` — one more refusal in a groove the function's existing skip paths (no
+token, tool absent from the registry, handler not long-running, flip impossible,
+readiness refused, callback creation failed, handler script missing) had already
+dug, which is what keeps the change small. On release,
+the stuck-ready reconciler re-drives the ticket; and since no tick runs during
+the STOP, **no point of the re-drive budget is spent** (mika#2020). Useful side
+effect, and it answers the "groom-only" half of the ticket without introducing
+any new state: under STOP the in-flight grooms converge, commit their plan, and
+do not chain.
+
+**Placement is the whole of the surface's meaning.** The guard sits after step 3
+(the predicate establishing that a dispatch *will* happen — groom class,
+`Outcome: PLAN_GROOMED`, parent with a parseable issue URL) and **before step 5c**
+(the parent's `dispatch_class` flip groom→implement). At the head of the
+function its line would have meant "a callback arrived during a STOP", a fact
+with no associated conduct, dozens of times a day; after 5c it would leave a
+parent labelled `implement` with no implement in flight and the next legitimate
+dispatch counted on the wrong slot (#1001). It is also before step 4 (the token):
+a STOP is an **operator decision**, a missing token an **environment fact** — the
+operator must see the line of the gesture they made, including on a host with no
+token. `dispatcher::tests::mika2498_le_refus_ne_bascule_pas_le_dispatch_class_du_parent`
+exists for that placement and nothing else.
+
+**Surfaces:** INFO `groom_pilot_autofire_stopped` (fields `parent_task_id`,
+`callback_task_id`, `repo`, `issue`, `stop_file` — rendered by `stop_file_path`,
+never a literal) and an `audit_events` row under the **same `tool_name` as the
+nominal path** (`task_engine_groom_pilot_dispatcher`) with
+`after_value = 'stopped_by_sentinel'` against the nominal `'implement_dispatched'`.
+One name, the outcome in `after_value`, so a `GROUP BY after_value` yields both
+counts in one query, subtractable — the `ready_label_outcome` motif (mika#2323),
+and deliberately not the two-names motif of `phantom_aged_out` /
+`phantom_sweep_spared`, which applies when each name carries its own cause. Named
+and dated cost: a bare `SELECT count(*) WHERE tool_name = …` changes meaning at
+this deploy; `WHERE after_value = 'implement_dispatched'` stays exact on both
+sides and is the query to write. The three values are pinned as a wire format by
+`mika2498_les_valeurs_daudit_sont_un_format_de_fil`, and the log name has a
+single production writer (`mika2498_le_nom_du_refus_a_un_seul_ecrivain`,
+allowlist shipped empty).
+
+**Which scans get a file of their own: `auto_pull`, then `worktree_reap`
+(mika#2420).** Distinct question from the paragraph above, which is about how far
+*one* sentinel reaches. `is_stopped`/`stop_file_path`
 are parameterized by scan name, and mika#2329 shipped that parameterization while
 explicitly refusing to use it twice, for want of a measured need: *"stopping QA review
 is not the same decision as stopping the feeder."* **A destructive operation is
@@ -1182,6 +1253,91 @@ test green. All seven terms were mutated one at a time and each was observed red
 **Config, the eleven motifs, the four halts and the named residual risk** (an absent
 `refs/remotes/origin/<branch>` reads `Clean`, not `Unreadable`): root `CLAUDE.md`
 § *Optional (terminal-worktree reaper — mika#2420)*.
+
+#### The `target/` of a live-but-idle worktree (mika#2497)
+
+A **third arm of the same tick**, after the reaper, in the same module. Its
+population is **exactly** the reaper's `pr_open` refusals of that tick — the
+worktrees T4 turns away because their PR is open, and whose `target/` therefore
+lives as long as the PR (15 to 50 Go per pilot; +90 Go in 8 h on the night of
+2026-09-22, `/data` at 83 %). It is the *HALT-2 follow-up* mika#2420 names in
+its own body, and the two populations are **disjoint by construction**: T4 is
+"no open PR", this one is "open PR".
+
+**The ordering is necessary, not tidy.** What the reaper has just removed no
+longer exists; considering it for a purge would be a no-op at best and a race at
+worst. Everything else is already paid for at that point — `git worktree list`,
+the one `gh pr list` per repo, the `/proc` enumeration, the STOP sentinel, the
+refusal dedup — so the arm costs no extra query, no `PeriodicScan` variant, no
+recurring row, no migration.
+
+**The asymmetry is INVERSE to the reaper's, and that is what licenses touching a
+live worktree.** *The reaper removes potential work; this arm removes pure
+derivative.* A `target/` carries none: it is wholly reconstructible by
+`cargo build`, so a false positive costs **rebuild time, never a loss** — the
+exact inverse of *"a false positive destroys hours of work, irreversibly"*. **What
+the asymmetry does NOT license:** removing `target/` **during** a `cargo build`
+breaks that build. The danger is not data loss, it is **concurrency**, and the
+whole predicate is about that and nothing else.
+
+**Five conjunctive terms, all fail-safe towards *keep*.** `screen_target_purges`
+(P1 managed path, P2 `target/` exists and is a directory, P3 no live cwd inside,
+P4 idle past the window) then `apply_lock_probes` (P5 the cargo build lock is
+free) — the same two-stage idiom as `screen_worktrees` / `apply_work_states`, and
+for the same reason: P5 costs an `open` + a `flock` per profile and is only paid
+on the survivors (mika#2184's motif — *the proxy filters first, the direct
+measure decides last*).
+
+**P5 is what T4 used to supply.** P3 is **known to be holed** and mika#2420 says
+so itself: a process can work in a worktree without its cwd being there. At the
+reaper that hole was covered **by the conjunction** — such a process works on a
+branch whose PR is open (excluded by T4) or leaves uncommitted changes (excluded
+by T7). **Here that cover is gone: the PR is open by definition of the
+population.** P5 answers "is a cargo working in this directory", independent of
+cwd and of any delay.
+
+**The lock file is discovered, never guessed**, and the two absences it can meet
+have **opposite** dispositions — the point the words confuse most easily:
+
+| what is missing | reading | disposition |
+|---|---|---|
+| no `.cargo-lock` under `target/` | cargo never built here | `LockProbe::Free` → purge allowed |
+| the `flock` call (non-Linux) | we cannot look | `LockProbe::Unevaluable` → keep |
+
+Treating the first as the second makes the arm **inert over a healthy
+population** while reading exactly like a healthy disk (class mika#2205);
+treating the second as the first purges blind. Hence three variants, never a
+bool. `libc` is already a dependency but sits under
+`[target.'cfg(target_os = "linux")'.dependencies]`, so the call follows
+`process_liveness::is_same_process_alive`: a `#[cfg(target_os = "linux")]` block
+with an **explicit non-Linux fallback that keeps**. Rendering "free" there would
+purge on the one platform where a running build cannot be seen.
+
+**P4 walks a bounded, declared set** — `target/`, its direct children, and their
+children (depth 2) — and deliberately **not** `measure_tree_size`, whose 400 000
+entry / 2 s budget a 40 Go `target/` exceeds: a truncated walk would report an
+mtime **wrong in the dangerous direction** (under-estimating recency, i.e.
+purging a live tree). Any unreadable entry yields `None`, which keeps.
+
+**SOLE WRITER** of `target_purged` (armed) and `target_purge_would_dispose`
+(observe), pinned by a source scan whose allowlist ships empty and which carries
+its own **self-cleaning assertion** — it fails if the name is written *nowhere*,
+because a scan aiming at a dead name verifies zero things and reads exactly like
+a clean one. Refusals go under `target_purge_skipped` with `target:`-prefixed
+keys, deliberately distinct from the reaper's `worktree:` so the two populations
+stay subtractable. `ALL_PURGE_REFUSAL_REASONS` is likewise a **separate** wire
+format from `ALL_REFUSAL_REASONS`.
+
+**Every term was seen red by mutation, not by reasoning** — and one of those
+mutations paid for itself: the symlink test was **decorative**, its link pointing
+at a directory named otherwise, which guard 1 (`ends_with("/target")`) already
+refused. It is now built on the only shape that traverses guards 1 and 2 — a link
+to the `target/` of **another managed worktree**, which is exactly what guard 3
+exists to close.
+
+Config, the operator surfaces, the four probes (starting with *run in `observe`
+first*) and the four halts: root `CLAUDE.md` § *Optional (purge du `target/` d'un
+worktree vif — mika#2497)*.
 
 ### Unknown-Trigger Veto Lift (mika#2337)
 
@@ -2476,6 +2632,14 @@ indicator.
 
 **Engine-level callback metadata extraction (#376):** `try_extract_callback_metadata()` parses structured fields from callback results and persists to parent task. `extract_callback_fields()` extracts `session_id`, `turns`, `cost_usd`, `duration_ms`, and `pr_url` from claude-pilot output into the `claude_pilot` metadata object. The `pr_url` field (#871 R4) is parsed from `^PR:\s+<url>` lines emitted by `skills/bundled/_shared/dispatch-lib.sh` (shared handler for dev-pilot and dev-groom, #893); the reaper (below) keys off its presence/absence.
 
+**Cost overruns are measured on those same fields, and prevented nowhere (mika#2496 U4).** `try_report_pilot_cost_overrun()` runs immediately after `try_extract_callback_metadata()` on the `is_callback` branch of `dispatch_resume_agent` — i.e. **before** the silent agent turn, on the same parsed fields, so the measurement survives a turn that then errors or exhausts its step budget. It re-reads `claude_pilot.cost_usd` / `.turns`, and **stops nothing**. That is not timidity: the dollar half of the *« 120 turns / 40 USD »* rule has **no enforcement point upstream** — `claude-pilot`'s `_sdk_guardrail_kwargs` carries `if config.maxBudgetUsd > 0:` and ends on `pass`, and none of its application-level guardrails (`stallThreshold`, `emptyResponseThreshold`, `idleTimeoutMs`, `toolWaitCeilingMs`, `modelWaitCeilingMs`) measures dollars. So the subtype `error_max_budget_usd` is a termination vocabulary nothing can emit, and this site counts and dates a population instead of pretending to bound it. The turn half **is** enforced, at the source rather than here — `--max-turns` armed by `dispatch-lib.sh` (root `CLAUDE.md`, § *pilot turn budget*) — and the two do not substitute for one another: at the measured 0.43 USD/turn, 120 turns ≈ 51 USD, above the 40 USD threshold.
+- **Threshold:** `Settings::effective_pilot_cost_alert_usd()` → `pilot_cost_alert_usd` / `MIKA_PILOT_COST_ALERT_USD`, default `DEFAULT_PILOT_COST_ALERT_USD` = 40. Prefixed, unlike its `PILOT_MAX_TURNS` sibling, because this one is read by **mika-spirit** through the config-rs `MIKA_` cascade, whose process env nothing clears; the sibling is bare-and-relayed because the pilot dispatch child clears its env (`sandboxed_pilot_env` = `env_clear()` + the positive allowlist `is_sandbox_env_allowed`) and admits neither a `MIKA_*` name nor a bare one, so it travels only through the explicit `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`), never by surviving a scrub (mika#2508).
+- **Two absences that are never zeros.** An absent `cost_usd` emits nothing (mika#2331: *`null` is never `0`*) — an unmeasured dispatch is not a free one, and reporting it at zero would seed the very population this exists to size with a false member. The comparison is `partial_cmp(&threshold) != Some(Greater)` rather than `<= threshold`, and the difference is load-bearing: the two diverge on an incomparable value and they diverge the wrong way — a NaN cost is *unmeasured*, so it must fall **out** of the population, which `<=` would silently invert into a reported overrun carrying a garbage figure.
+- **Coordinates are downgraded, never suppressive.** `repo`/`issue` live on the **parent**'s `reference_url`; the callback child carries a pgid and no reference (the two-row topology mika#2279 and mika#2335 had to name). An unresolvable parent yields `repo=unknown` on the line and `?` in `reasoning` — an overrun on a dispatch whose parent cannot be read is still an overrun, and dropping it would silently shrink the count.
+- **Fire-and-forget**, like its four siblings: a failed audit write warns and returns. Measuring a cost must not be able to break delivery of the callback that carries it.
+- **`PILOT_COST_OVERRUN_TOOL` is SOLE WRITER**, pinned by the source scan `canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer` (allowlist shipped empty, and `…_the_sole_writer_allowlist_is_empty` keeps it that way — an allowlist born empty is a place to drop the next infraction, mika#2323). The property is what makes the operator's `SELECT count(*), round(avg(CAST(after_value AS REAL)), 2) FROM audit_events WHERE tool_name = 'pilot_cost_overrun';` an **exact** count rather than a number two writers can disagree about — and that count is the explicit precondition of the follow-up ticket on `senara-solutions/claude-pilot`, which has to size the missing dollar brake. A second writer would make no decision wrong; it would make that count inexact, which is invisible to every behavioural test, hence a source scan. The scan carries its own anti-vacuity assertion (it fails if the name is written nowhere in `dispatcher.rs`), because a scan aiming at a dead name reads exactly like a clean one (mika#2103 / mika#2205). **When it fires, remove the second site — do not allowlist it.**
+- **Row shape:** `tool_name = 'pilot_cost_overrun'`, `target_key = 'task:<callback-id>'`, `after_value` = the cost **and nothing else** (it is what the operator averages), `reasoning` = `repo:… issue:… turns:… threshold_usd:…` as free text. Log side: a `pilot_cost_overrun` WARN in `$MIKA_SPIRIT_LOG_FILE`, expected regime **non-empty**. Its halt: a nil count while runs are known to exceed 40 USD means `Cost:` parsing returns nothing on that population — check `extract_callback_fields` against a real `status: terminated` before concluding the fleet is under threshold. Tests: `mika2496_a_cost_above_the_threshold_is_counted`, `…_below_… is_not_counted`, `…_the_threshold_is_what_decides`, `…_an_absent_cost_is_not_a_zero_cost`, `…_an_orphan_dispatch_still_counts`.
+
 **Callback process liveness watchdog (#959):** `check_callback_process_liveness()` runs every 60-tick cycle and detects when a long-running subprocess (e.g., `run_claude_pilot`) has crashed without delivering its callback result. Detection: queries `in_progress` callback tasks with `process_id IS NOT NULL`, checks PID liveness via `kill(pid, 0)` + `/proc/<pid>/stat` field 22 (process start time) comparison to guard against PID reuse. On first detection of a dead process, records `first_dead_at` in task metadata; after `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` (default 120s) elapses, re-checks task status (race guard) then marks the task `failed` with `error_reason = "subprocess_exited_without_delivery"`. Process start time is stored in callback task metadata at spawn time by `spawn_long_running_exec()`. The watchdog detects death in ~60s (one tick) + 120s grace = ~3 minutes total, vs the previous 6-hour `timeout_at` fallback. Platform: Linux only (`/proc` filesystem). The existing `timeout_at` mechanism serves as a panic-fallback for edge cases where PID tracking fails.
 
 **Pilot silent-stall reaper (mika#2249, predicate corrected in mika#2277):** `reap_silently_stalled_pilots()` runs every 60-tick cycle **immediately after** `check_callback_process_liveness`, and the two are exact mirrors: the watchdog owns the dispatch whose process is **dead**, this one owns the dispatch whose process is **alive** and has gone silent on **every** observable surface. Nothing owned that second population before — every other reaper fires on task state — which is why `fb355061` sat `in_progress` for 2 h 18 with a live PID, an empty `result` and no terminal marker. The two select disjoint sets by construction, so the ordering costs nothing.
@@ -2490,7 +2654,7 @@ indicator.
 
 **Evaluation order is cost, not semantics.** The two single-file `stat`s run before the bounded worktree walk and an active one short-circuits it, so a live pilot no longer pays for a directory walk on every scan. The conjunction is unchanged — a surface found active ends the question either way.
 
-**The pilot-log path is the one derived path, and that is safe here specifically.** `dispatch-lib.sh` sets `LOG_ID="$TASK_ID"` and launches `claude-pilot --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID"`, so the file is `<pilot_log_dir>/<callback-task-id>.log` — verified empirically against the two mika#2277 false positives. The two halves read **different** environment variables (`PILOT_LOG_DIR` in the shell, `MIKA_PILOT_LOG_DIR` in the engine, because `scrub_mika_env_vars` strips every `MIKA_*` from the dispatch child), so their **defaults** are the only place they agree without an operator — both `/var/log/claude-pilot`, pinned by `config::tests::pilot_log_dir_defaults_to_the_dispatch_lib_path`. A disagreement makes the file absent, which is `Unavailable`, which takes the dispatch out of the population: a wrong derivation can only buy inertia, never a false positive. That is why deriving is acceptable here and not for the worktree.
+**The pilot-log path is the one derived path, and that is safe here specifically.** `dispatch-lib.sh` sets `LOG_ID="$TASK_ID"` and launches `claude-pilot --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID"`, so the file is `<pilot_log_dir>/<callback-task-id>.log` — verified empirically against the two mika#2277 false positives. The two halves read **different** environment variables (`PILOT_LOG_DIR` in the shell, `MIKA_PILOT_LOG_DIR` in the engine; the shell's bare `PILOT_LOG_DIR` reaches `dispatch-lib.sh` only through the explicit `inject_pilot_dispatch_env` relay, because the pilot dispatch child is built by `sandboxed_pilot_env` — `env_clear()` + the positive allowlist `is_sandbox_env_allowed` — which admits no bare `PILOT_*` any more than a `MIKA_*`, mika#2508), so their **defaults** are the only place they agree without an operator — both `/var/log/claude-pilot`, pinned by `config::tests::pilot_log_dir_defaults_to_the_dispatch_lib_path`. A disagreement makes the file absent, which is `Unavailable`, which takes the dispatch out of the population: a wrong derivation can only buy inertia, never a false positive. That is why deriving is acceptable here and not for the worktree.
 
 **The worktree path is declared, never derived.** `dispatch-lib.sh` is the sole holder (it calls `scripts/derive-worktree-path`); re-deriving it in Rust is the duplication mika-platform#58 closed, and `db.rs` states in prose why `worktree_claims` is keyed `(repo, issue_number)` with no path column. `skills/executor.rs::inject_dispatch_worktree_env` injects `MIKA_DISPATCH_WORKTREE_FILE` after the env sandbox (like `GH_TOKEN`) and stamps the path on the task once the spawn succeeded — the same trajectory and the same fire-and-forget discipline as mika#2040's transcript stamp, for the same reason: an unstamped dispatch must be invisible to the detector, never a blocked dispatch. The channel does not cross bubblewrap — bwrap wraps only the claude-pilot invocation, and the `git worktree add` runs outside it.
 

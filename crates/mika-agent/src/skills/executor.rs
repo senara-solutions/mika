@@ -312,6 +312,32 @@ const RESCUE_VERIFY_ENV: &[&str] = &[
 /// test of the shell half could see.
 const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETRY_DELAY_SECS"];
 
+/// Les deux réglages opérateur du canal pilote que `dispatch-lib.sh` lit
+/// (mika#2508) : le plafond de tours (mika#2496) et le puits de journal
+/// (mika#2249).
+///
+/// **Non préfixés, et ce n'est PAS ce qui les fait traverser.** Les deux ont
+/// été nommés nus sur un diagnostic faux — « `scrub_mika_env_vars` retire tout
+/// `MIKA_*` du child de dispatch, donc un nom nu survit ». Le child de dispatch
+/// n'est pas scrubbé : [`sandboxed_pilot_env`] fait `env_clear()` puis recopie
+/// une allowlist **positive**, donc **aucun** nom ne traverse par héritage,
+/// préfixé ou non. Mesuré le 2026-09-24 : `PILOT_MAX_TURNS=150` posé sur le
+/// service, absent du child, pilote lancé sans `--max-turns`.
+///
+/// Les noms restent nus parce qu'ils sont un **format de fil** pour l'opérateur
+/// (`PILOT_MAX_TURNS=150` est déjà posé dans `~/.mika/.env`, et
+/// `PILOT_LOG_DIR` est publié dans les commandes des Signaux Q et S), jamais
+/// parce que la forme nue achèterait quoi que ce soit. Les renommer est une
+/// dette de vocabulaire, pas un correctif — voir § *Hors périmètre* de
+/// mika#2508.
+///
+/// Même contrat de placement que [`RESCUE_VERIFY_ENV`] : relayées APRÈS
+/// [`sandboxed_pilot_env`], et **jamais** ajoutées à l'allowlist — mika#2354
+/// AC9(b), tenu par `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`
+/// et étendu à ces deux noms par
+/// `mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist`.
+const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR"];
+
 /// Decide which of `keys` to set on the child, given a reader of the spirit
 /// process environment.
 ///
@@ -339,6 +365,38 @@ where
             }
             Some((*key, value))
         })
+        .collect()
+}
+
+/// Comme [`relayed_env_pairs`], mais **préserve la valeur vide** (mika#2508).
+///
+/// La différence est portante et elle est du côté du **lecteur**, pas de
+/// l'écrivain. `_pilot_max_turns` (`dispatch-lib.sh`) distingue trois paliers
+/// avec `${PILOT_MAX_TURNS+set}`, et son palier « défini mais vide » est le
+/// ROLLBACK explicite : le drapeau `--max-turns` n'est pas passé et
+/// claude-pilot retombe sur son propre `maxTurns=200`. Omettre le vide le
+/// replierait sur le palier « non défini », c'est-à-dire sur le défaut de
+/// flotte.
+///
+/// Aujourd'hui les deux coïncident (le défaut de flotte est vide), donc le
+/// piège est **programmé et non hypothétique** : le résolveur prescrit
+/// lui-même `local _default=120` une fois la V2 de mika#2496 rapportée, et ce
+/// jour-là un rollback par `""` deviendrait silencieusement un plafond à 120.
+///
+/// La règle inverse de [`relayed_env_pairs`] — « An absence must therefore stay
+/// an absence » — reste juste pour ses deux familles d'origine, où
+/// `MIKA_ARCH_ASK_RETRY_DELAY_SECS=""` est la forme d'une demi-ligne `.env` mal
+/// écrite et non un palier documenté. Elle n'est pas élargie : deux populations,
+/// deux helpers, chacun testé pour lui-même.
+fn relayed_env_pairs_preserving_empty<F>(
+    keys: &[&'static str],
+    read: F,
+) -> Vec<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    keys.iter()
+        .filter_map(|key| read(key).map(|value| (*key, value)))
         .collect()
 }
 
@@ -373,6 +431,25 @@ fn inject_rescue_verify_env(cmd: &mut tokio::process::Command) {
 /// dispatch.
 fn inject_arch_ask_retry_env(cmd: &mut tokio::process::Command) {
     for (key, value) in relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Relaie les deux réglages du canal pilote à `dispatch-lib.sh` (mika#2508).
+///
+/// Même contrat de placement que [`inject_rescue_verify_env`] — il DOIT tourner
+/// après [`sandboxed_pilot_env`], dont l'`env_clear()` effacerait sinon les
+/// variables — et **via [`relayed_env_pairs_preserving_empty`]**, parce que la
+/// valeur vide est ici un palier documenté (le rollback) et non l'absence d'un
+/// réglage.
+///
+/// Best-effort et silencieux, comme ses trois siblings : un dispatch qui ne
+/// porte pas les réglages retombe sur les défauts du shell (désarmé,
+/// `/var/log/claude-pilot`), jamais un dispatch bloqué.
+fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in
+        relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| std::env::var(k).ok())
+    {
         cmd.env(key, value);
     }
 }
@@ -4014,6 +4091,11 @@ pub(crate) fn spawn_long_running_exec(
         // mika#2278: relay the architect-retry settings the grooming loop reads.
         // Same placement rationale as the three lines above.
         inject_arch_ask_retry_env(&mut cmd);
+        // mika#2508: relay the two pilot-channel settings `dispatch-lib.sh`
+        // reads — the turn ceiling (mika#2496) and the log sink (mika#2249).
+        // Same placement rationale as the four lines above: naming them
+        // unprefixed never made them traverse, the explicit relay does.
+        inject_pilot_dispatch_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -4479,6 +4561,440 @@ mod tests {
                 "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
             );
         }
+    }
+
+    /// mika#2508 : les deux réglages du canal pilote atteignent
+    /// `dispatch-lib.sh` par injection explicite, et JAMAIS par héritage.
+    ///
+    /// Extension de la population de
+    /// `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`, et
+    /// l'inverse exact de l'assertion que le DoD du ticket demandait :
+    /// « `PILOT_MAX_TURNS` est admise par `is_sandbox_env_allowed` ». Ce remède
+    /// a été **refusé et la divergence ratifiée** (opérateur, 2026-09-24
+    /// 08:10Z) — l'allowlist est la garde de confinement du pilote, pas la
+    /// poubelle des réglages. La propriété finale attestée est la même : la
+    /// variable atteint le child.
+    #[test]
+    fn mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist() {
+        for key in PILOT_DISPATCH_ENV {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
+    }
+
+    /// mika#2508 : le relais préserve le ROLLBACK.
+    ///
+    /// `PILOT_MAX_TURNS=""` doit arriver sur le child comme une variable
+    /// **DÉFINIE et vide** — `_pilot_max_turns` la lit avec
+    /// `${PILOT_MAX_TURNS+set}` et en fait le rollback (drapeau non passé,
+    /// `source=env`), pas le défaut de flotte. L'omettre replierait le palier
+    /// « défini vide » sur le palier « non défini », deux états que le shell a
+    /// délibérément construits distincts.
+    #[test]
+    fn mika2508_an_empty_pilot_knob_is_relayed_not_dropped() {
+        let rollback = relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| {
+            (k == "PILOT_MAX_TURNS").then(String::new)
+        });
+        assert_eq!(
+            rollback,
+            vec![("PILOT_MAX_TURNS", String::new())],
+            "an empty value is the documented rollback and must be posed on the \
+             child as a DEFINED-and-empty variable"
+        );
+
+        // Et le contrôle qui rend l'assertion ci-dessus signifiante : le helper
+        // d'origine, lui, laisse tomber cette même valeur. Les deux populations
+        // divergent sur le vide, à dessein.
+        assert!(
+            relayed_env_pairs(PILOT_DISPATCH_ENV, |k| {
+                (k == "PILOT_MAX_TURNS").then(String::new)
+            })
+            .is_empty(),
+            "relayed_env_pairs must keep dropping the empty value for its own \
+             two families — the divergence is the point, not an oversight"
+        );
+    }
+
+    /// mika#2508 : le pendant absent/présent du relais.
+    ///
+    /// Une variable non posée sur le service n'est pas posée sur le child : le
+    /// shell garde ses propres défauts (désarmé, `/var/log/claude-pilot`) au
+    /// lieu d'en hériter un.
+    #[test]
+    fn mika2508_an_absent_pilot_knob_is_not_posed_on_the_child() {
+        assert!(
+            relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |_| None).is_empty(),
+            "an unset setting must not be posed on the child"
+        );
+
+        let both = relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| match k {
+            "PILOT_MAX_TURNS" => Some("150".to_string()),
+            "PILOT_LOG_DIR" => Some("/var/log/claude-pilot".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("PILOT_MAX_TURNS", "150".to_string()),
+                ("PILOT_LOG_DIR", "/var/log/claude-pilot".to_string()),
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2508 R4/R5 — le scan de classe.
+    //
+    // Toute variable posée sur l'environnement du service, lue par
+    // `dispatch-lib.sh`, et ni allowlistée ni relayée, est INERTE. Le défaut
+    // mesuré (`PILOT_MAX_TURNS`) est un membre de cette classe ; le scan la rend
+    // détectable au lieu de laisser le prochain réglage la rejouer.
+    // ---------------------------------------------------------------------
+
+    /// Noms internes au shell, ou fournis par l'environnement d'exécution sans
+    /// jamais être un réglage de dispatch. Liste **explicite et commentée**,
+    /// jamais devinée : plusieurs de ces noms sont par ailleurs dans
+    /// [`SANDBOX_ENV_CORE_ALLOWLIST`] et y passeraient le terme 6 sans rien
+    /// attester, ce qui rendrait le scan vert pour la mauvaise raison.
+    const SHELL_BUILTIN_NAMES: &[&str] = &[
+        // Positionnels et internes de bash.
+        "IFS",
+        "RANDOM",
+        "SECONDS",
+        "LINENO",
+        "FUNCNAME",
+        "BASHPID",
+        "BASH_SOURCE",
+        "BASH_VERSION",
+        "BASH_XTRACEFD",
+        "OPTARG",
+        "OPTIND",
+        "REPLY",
+        "PPID",
+        "UID",
+        "EUID",
+        "SHLVL",
+        "PS1",
+        "PS4",
+        "PWD",
+        "OLDPWD",
+        // Fournis par l'environnement d'exécution, déjà couverts par
+        // l'allowlist ou sans rapport avec un réglage de dispatch.
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "HOSTNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "TZ",
+        "COLUMNS",
+        "LINES",
+        "EDITOR",
+        "GIT_DIR",
+        "SSH_AUTH_SOCK",
+    ];
+
+    fn dispatch_lib_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/bundled/_shared/dispatch-lib.sh")
+    }
+
+    /// Découpe une ligne en segments de commande sur `;`, `&&`, `||`, `{`, `|`.
+    ///
+    /// Le découpage EST le terme 4 : une écriture ne compte que si elle est en
+    /// tête de segment, ce qui est exactement « en début de ligne ou après un
+    /// séparateur ». Il rend aussi le terme 4bis décidable sans ambiguïté — la
+    /// self-référence se lit dans la partie droite de CE segment, pas quelque
+    /// part sur la ligne.
+    fn command_segments(line: &str) -> Vec<String> {
+        // `${` est MASQUÉ avant le découpage, et ce masque est le détail qui
+        // décide de tout : `{` est un séparateur de commande légitime
+        // (`{ FOO=1; }`), mais il ouvre aussi chaque lecture `${VAR}`. Découper
+        // dessus naïvement coupe la ligne entre le `$` et le nom, et le scan ne
+        // voit plus AUCUNE lecture braces — mesuré : la population tombait de
+        // dix-huit à trois membres, sans que rien ne le dise.
+        const MASK: &str = "\u{0}";
+        let masked = line.replace("${", MASK);
+        let sep = regex::Regex::new(r"[;{}()&|]").unwrap();
+        sep.split(&masked).map(|s| s.replace(MASK, "${")).collect()
+    }
+
+    /// Les lectures de variables d'environnement d'un segment (terme 3).
+    ///
+    /// Majuscule initiale obligatoire : la convention du fichier réserve
+    /// `_PILOT_*` / `_ARCH_*` aux variables internes, qui sont de toute façon
+    /// écrites (terme 4).
+    fn env_reads_in(segment: &str) -> Vec<String> {
+        let read = regex::Regex::new(r"\$\{?([A-Z][A-Z0-9_]*)").unwrap();
+        read.captures_iter(segment)
+            .map(|c| c[1].to_string())
+            .collect()
+    }
+
+    /// L'écriture en tête de segment, si elle existe, et sa partie droite.
+    fn env_write_in(segment: &str) -> Option<(String, String)> {
+        let assign = regex::Regex::new(
+            r"^\s*(?:export\s+|local\s+|declare\s+(?:-[a-zA-Z]+\s+)?|readonly\s+)?([A-Z][A-Z0-9_]*)\+?=(.*)$",
+        )
+        .unwrap();
+        if let Some(c) = assign.captures(segment) {
+            return Some((c[1].to_string(), c[2].to_string()));
+        }
+        // `read … VAR` et `for VAR in` : des écritures sans partie droite, donc
+        // jamais self-référentielles.
+        let bound =
+            regex::Regex::new(r"^\s*(?:read\s+(?:-[a-zA-Z]+\s+)*|for\s+)([A-Z][A-Z0-9_]*)\b")
+                .unwrap();
+        bound
+            .captures(segment)
+            .map(|c| (c[1].to_string(), String::new()))
+    }
+
+    /// Le prédicat, figé en six termes (mika#2508 § 5.3).
+    ///
+    /// Un scan approximatif sur ce fichier est faux dans les deux sens — c'est
+    /// ce que mika#2496 U3 a mesuré sur un prédicat voisin.
+    fn external_env_reads(script: &str) -> std::collections::BTreeSet<String> {
+        let mut read_names = std::collections::BTreeSet::new();
+        let mut written_names = std::collections::BTreeSet::new();
+
+        for raw in script.lines() {
+            // Terme 1 : les commentaires sont retirés AVANT toute extraction.
+            if raw.trim_start().starts_with('#') {
+                continue;
+            }
+            // Terme 2 : les `$` échappés sont retirés avant extraction. C'est le
+            // faux positif `\$MIKA_SPIRIT_LOG_FILE` d'une chaîne de prose
+            // destinée à un corps de PR — classe mika#2050 / mika#2201.
+            let line = raw.replace("\\$", "");
+
+            for segment in command_segments(&line) {
+                let reads = env_reads_in(&segment);
+                let write = env_write_in(&segment);
+
+                if let Some((name, rhs)) = write {
+                    // Terme 4bis : une écriture dont la partie droite référence
+                    // la variable écrite ne l'évince PAS — c'est l'idiome
+                    // canonique d'un knob opérateur avec défaut
+                    // (`export VAR="${VAR:-défaut}"`), pas une variable interne.
+                    let self_referential = env_reads_in(&rhs).contains(&name);
+                    if !self_referential {
+                        // Terme 4 : l'écriture évince.
+                        written_names.insert(name);
+                    }
+                }
+
+                read_names.extend(reads);
+            }
+        }
+
+        // Terme 6 : population = lues − (écrites non self-référentielles) − builtins.
+        read_names
+            .into_iter()
+            .filter(|n| !written_names.contains(n))
+            .filter(|n| !SHELL_BUILTIN_NAMES.contains(&n.as_str()))
+            .collect()
+    }
+
+    /// Tous les noms qui traversent le child de dispatch, quel que soit le
+    /// mécanisme : l'allowlist positive, ou l'un des relais explicites.
+    ///
+    /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
+    /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
+    /// `DISPATCH_WORKTREE_ENV` et `PILOT_TRANSCRIPT_ENV` sont des **scalaires**,
+    /// et `GH_TOKEN` est un littéral injecté en clair dans
+    /// [`spawn_long_running_exec`]. Un `.iter().chain(…)` naïf sur les cinq ne
+    /// compile pas.
+    fn reaches_dispatch_child(name: &str) -> bool {
+        if is_sandbox_env_allowed(name) {
+            return true;
+        }
+        PILOT_DISPATCH_ENV.contains(&name)
+            || RESCUE_VERIFY_ENV.contains(&name)
+            || ARCH_ASK_RETRY_ENV.contains(&name)
+            || name == DISPATCH_WORKTREE_ENV
+            || name == PILOT_TRANSCRIPT_ENV
+            || name == "GH_TOKEN"
+    }
+
+    /// Variables lues par `dispatch-lib.sh` qui ne traversent PAS le child de
+    /// dispatch et dont l'inertie est connue, datée et suivie (mika#2508 § 2).
+    ///
+    /// **Ce n'est pas une liste d'exemptions permanentes.** Chaque entrée est
+    /// une inertie mesurée, dont la résolution est une décision de canal que
+    /// mika#2508 n'a pas prise — l'une d'elles, `MIKA_PILOT_SANDBOX`, donnerait
+    /// à l'environnement du service un levier pour **désarmer le confinement
+    /// bwrap**, ce qui est un arbitrage de sûreté qui appartient à un ticket
+    /// qui le pèse, jamais à un effet de bord. Suivi porté par l'umbrella
+    /// mika#2491.
+    ///
+    /// Quand une entrée est tranchée, on la RELAIE et on retire sa ligne — on
+    /// n'élargit pas la liste.
+    const DISPATCH_ENV_KNOWN_INERT: &[(&str, &str)] = &[
+        (
+            "MIKA_PILOT_SANDBOX",
+            "mika#2491 — kill-switch du confinement bwrap ; le relayer donnerait \
+             à l'env du service un levier de désarmement : décision de sûreté, \
+             pas de canal",
+        ),
+        (
+            "MIKA_PILOT_EGRESS_LOG_DIR",
+            "mika#2491 — puits du journal du relais d'egress",
+        ),
+        ("MIKA_PLATFORM_DIR", "mika#2491 — racine plateforme"),
+        (
+            "MIKA_HOME",
+            "mika#2491 — l'epoch mika#2026 s'écrit sous $HOME/.mika",
+        ),
+        ("CLAUDE_PILOT_MIN_TOOL_CALLS", "mika#2491 — seuil figé à 3"),
+    ];
+
+    /// mika#2508 R4 — l'angle mort de classe est rendu détectable.
+    ///
+    /// Toute variable opérateur lue par `dispatch-lib.sh` doit être admise par
+    /// [`is_sandbox_env_allowed`], couverte par un relais, ou porter une
+    /// exception nommée dans [`DISPATCH_ENV_KNOWN_INERT`].
+    ///
+    /// **Quand ce test tire, on RELAIE la variable ou on la nomme — on n'élargit
+    /// pas l'allowlist du bac à sable** (mika#2354 AC9(b) : l'allowlist est la
+    /// garde de confinement, pas la poubelle des réglages).
+    #[test]
+    fn mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named() {
+        let path = dispatch_lib_path();
+
+        // R5 — anti-vacuité, AVANT toute autre assertion. Un scan dont le
+        // chemin pourrit, ou dont le prédicat se resserre trop, passe en
+        // regardant zéro ligne et se lit exactement comme un scan propre
+        // (mika#2103, mika#2205).
+        assert!(
+            path.is_file(),
+            "dispatch-lib.sh introuvable à {} — ce scan ne regarde rien",
+            path.display()
+        );
+        let script = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            script.len() > 100_000,
+            "dispatch-lib.sh fait {} octets : trop petit pour être le vrai \
+             fichier, le scan ne regarde rien",
+            script.len()
+        );
+        let population = external_env_reads(&script);
+        assert!(
+            population.len() >= 8,
+            "population extraite = {} membres ({population:?}) : le prédicat \
+             s'est resserré et le scan ne couvre plus la classe",
+            population.len()
+        );
+
+        let named: std::collections::BTreeSet<&str> =
+            DISPATCH_ENV_KNOWN_INERT.iter().map(|(n, _)| *n).collect();
+
+        let orphans: Vec<&String> = population
+            .iter()
+            .filter(|n| !reaches_dispatch_child(n) && !named.contains(n.as_str()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "ces variables sont lues par dispatch-lib.sh et n'atteignent pas le \
+             child de dispatch : {orphans:?}. Elles sont INERTES. Relayez-les \
+             (PILOT_DISPATCH_ENV / un injecteur dédié) ou nommez l'inertie dans \
+             DISPATCH_ENV_KNOWN_INERT avec sa raison et son suivi — n'ajoutez \
+             PAS de nom à SANDBOX_ENV_CORE_ALLOWLIST."
+        );
+
+        // Assertion auto-nettoyante : une exception qui n'a plus d'objet —
+        // variable retirée de `dispatch-lib.sh`, ou devenue relayée /
+        // allowlistée — fait rougir. C'est ce qui empêche l'allowlist de
+        // survivre à sa raison d'être, et ce qui rend le jour de la réparation
+        // visible au lieu de silencieux.
+        for (name, reason) in DISPATCH_ENV_KNOWN_INERT {
+            assert!(
+                population.contains(*name),
+                "retirer cette ligne de DISPATCH_ENV_KNOWN_INERT : {name} n'est \
+                 plus lue par dispatch-lib.sh ({reason})"
+            );
+            assert!(
+                !reaches_dispatch_child(name),
+                "retirer cette ligne de DISPATCH_ENV_KNOWN_INERT : {name} \
+                 atteint désormais le child, l'exception n'a plus d'objet \
+                 ({reason})"
+            );
+        }
+    }
+
+    /// mika#2508 R4 — les six contrôles négatifs du prédicat.
+    ///
+    /// Construits sur les formes **réellement présentes** dans
+    /// `dispatch-lib.sh`, jamais sur le vrai fichier (qui changera). N1, N3, N4
+    /// et N6 ont été vus ROUGES en retirant leur terme respectif avant d'être
+    /// déclarés verts : un contrôle négatif jamais vu rouge n'atteste rien.
+    #[test]
+    fn mika2508_the_six_terms_of_the_predicate_each_have_a_negative_control() {
+        let has = |script: &str, name: &str| external_env_reads(script).contains(name);
+
+        // N1 — le cas nominal : un knob opérateur avec défaut.
+        assert!(
+            has(r#"foo="${OPERATOR_KNOB:-x}""#, "OPERATOR_KNOB"),
+            "N1 : une lecture nue doit entrer dans la population"
+        );
+
+        // N2 — terme 4 : l'écriture évince. La variable n'attend rien de
+        // l'extérieur, elle est interne au script.
+        assert!(
+            !has(r#"OPERATOR_KNOB=3; echo "$OPERATOR_KNOB""#, "OPERATOR_KNOB"),
+            "N2 : une variable écrite dans le fichier sort de la population"
+        );
+
+        // N3 — terme 1 : le commentaire est retiré avant extraction.
+        assert!(
+            !has(r#"# echo "$OPERATOR_KNOB""#, "OPERATOR_KNOB"),
+            "N3 : un commentaire n'est pas une lecture"
+        );
+
+        // N4 — terme 2 : la prose échappée. C'est le faux positif
+        // `\$MIKA_SPIRIT_LOG_FILE` d'une chaîne destinée à un corps de PR —
+        // classe mika#2050 (le Signal S) et mika#2201.
+        assert!(
+            !has(r#"printf 'grep x \$OPERATOR_KNOB'"#, "OPERATOR_KNOB"),
+            "N4 : un `$` échappé dans de la prose n'est pas une lecture"
+        );
+
+        // N5 — terme 3 : la convention interne du fichier (`_PILOT_*`,
+        // `_ARCH_*`) est hors population.
+        assert!(
+            external_env_reads(r#"echo "$_INTERNAL""#).is_empty(),
+            "N5 : une variable interne (préfixe `_`) n'est pas un réglage opérateur"
+        );
+
+        // N6 — terme 4bis, et le plus important des six : l'écriture
+        // self-référentielle n'évince PAS. Sans ce terme, le scan serait rouge
+        // au premier `cargo test` sur `CLAUDE_PILOT_MIN_TOOL_CALLS`
+        // (`export CLAUDE_PILOT_MIN_TOOL_CALLS="${CLAUDE_PILOT_MIN_TOOL_CALLS:-3}"`,
+        // dispatch-lib.sh) — et de la pire façon : l'assertion auto-nettoyante
+        // aurait alors accusé l'entrée de DISPATCH_ENV_KNOWN_INERT de ne
+        // correspondre à rien, rendant le plan contradictoire avec son propre
+        // prédicat.
+        assert!(
+            has(r#"export KNOB="${KNOB:-3}""#, "KNOB"),
+            "N6 : `export VAR=\"${{VAR:-défaut}}\"` est l'idiome canonique d'un \
+             knob opérateur avec défaut, pas une variable interne"
+        );
     }
 
     /// Write a script file and make it executable, with fsync to avoid races.

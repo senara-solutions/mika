@@ -118,6 +118,11 @@ mod eval {
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
     mod test_image_disposition_1784;
+    // mika#1910 — le tour de continuation dit ce qu'il a produit. Les trois
+    // valeurs que `response_chars` peut prendre y sont les trois populations que
+    // R5 refuse de confondre : `Some(n)` produit, `Some(0)` LA classe, `None`
+    // rien à mesurer.
+    mod test_continuation_response_chars_1910;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
@@ -159,6 +164,11 @@ mod eval {
     // `pending` sémée par le chemin de production, pilote authentiquement
     // vivant, harness multi-agents pour l'attribution.
     mod test_pr_review_idempotency;
+
+    // mika#2455 — un `pass` ne peut plus affirmer ce qu'un check requis rouge
+    // contredit : les deux têtes mesurées, l'issue laissée ouverte sous
+    // mika#2237, et les six abstentions nommées.
+    mod test_qa_ci_coherence_2455;
 
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.

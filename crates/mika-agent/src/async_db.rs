@@ -726,6 +726,17 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Async wrapper for [`Database::stamp_task_fired_at_if_null`] (mika#2133).
+    ///
+    /// No `TaskEventFrame` emission: the status is untouched, so there is no
+    /// lifecycle transition for a subscriber to observe.
+    pub async fn stamp_task_fired_at_if_null(&self, task_id: &str) -> Result<()> {
+        let a = self.agent_id.clone();
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.stamp_task_fired_at_if_null(&i, &a))
+            .await
+    }
+
     pub async fn list_manual_tasks(
         &self,
         status_filter: Option<&str>,

@@ -146,6 +146,326 @@ fn mika2321_the_dispatch_stamp_guard_still_catches_a_production_site() {
     }
 }
 
+// ── mika#2133 AC4: l'acte d'estampiller `fired_at` a UNE définition ──
+
+/// Aucun chemin de production n'écrit `fired_at` en littéral hors du registre
+/// [`FIRED_AT_LITERAL_WRITERS`] — les autres interpolent
+/// [`crate::db::tasks::FIRED_AT_STAMP_IF_NULL`].
+///
+/// **Pourquoi un scan de source et pas un test comportemental.** La régression
+/// que cette garde attrape ne rend aucune décision fausse sur les chemins
+/// couverts : elle ajoute un *cinquième* écrivain, avec sa propre définition de
+/// « déclenchée », pendant que toutes les assertions existantes restent vertes.
+/// Même famille que sa voisine mika#2335 juste au-dessus.
+///
+/// **Comparaison DOUBLE SENS (mika#2092).** Une entrée de registre dont le site
+/// ne porte plus d'écriture littérale fait rougir la garde, au même titre qu'un
+/// site non déclaré. Sans cette moitié, la suppression de `claim_and_fire_task`
+/// laisserait une entrée morte qui exempterait silencieusement un futur
+/// homonyme — et l'assertion auto-nettoyante est ce qui fait rougir le jour de
+/// la réparation plutôt que des mois après.
+///
+/// **Disposition d'un cinquième site : halte-et-remontée**, mot pour mot comme
+/// la garde sœur. Pas d'entrée posée en passant, pas de `#[ignore]`. La question
+/// ne se pré-tranche pas ici : ce site démarre-t-il un travail — il interpole
+/// alors la constante et il était un nouveau visage du défaut — ou non, et c'est
+/// la garde qu'il faut affiner ?
+///
+/// **Coût assumé, nommé.** La portée du prédicat est lexicale sur `fired_at` +
+/// `=`. Un futur site qui construirait son `UPDATE` par concaténation dynamique
+/// passerait dessous — même limite que la garde mika#2335 documente pour
+/// elle-même, et un scan sémantique demanderait une analyse de flot que cette
+/// famille de gardes n'a pas.
+///
+/// **Seconde limite, de nature différente et plus coûteuse : la garde voit des
+/// écritures, jamais des absences.** Un chemin qui aurait dû appeler
+/// `stamp_task_fired_at_if_null` et ne l'appelle pas la laisse verte. Le cas
+/// concret est nommé au site : la branche `else` de `dispatch_resume_agent` est
+/// un fourre-tout (`Reminder path`), donc un nouveau `trigger_type` y tomberait
+/// silencieusement — et une population non estampillée n'est pas seulement
+/// invisible aux sondes, elle est invisible aux faucheurs qui filtrent
+/// `fired_at IS NULL` (la classe que mika#2263 a mesurée).
+#[test]
+fn mika2133_fired_at_has_a_single_literal_definition() {
+    let scanner =
+        mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+    let mut violations: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut scanned = 0usize;
+
+    scanner.for_each(|path, production| {
+        scanned += 1;
+        // Les DEUX sens lisent la même liste : le premier en retire les sites
+        // déclarés, le second y cherche chaque entrée du registre. Un second
+        // recensement pourrait répondre « le symbole existe » quand la question
+        // est « le symbole écrit ».
+        for (rel, item, line) in fired_at_literal_sites(path, production) {
+            if FIRED_AT_LITERAL_WRITERS
+                .iter()
+                .any(|(f, sym, _)| *f == rel && *sym == item)
+            {
+                seen.insert((rel, item));
+            } else {
+                violations.push(format!("{rel}:{line} ({item})"));
+            }
+        }
+    });
+
+    assert!(
+        scanned > 0,
+        "la garde n'a scanné aucun fichier — chemin cassé"
+    );
+    assert!(
+        violations.is_empty(),
+        "mika#2133 AC4 — ces sites de production écrivent `fired_at` en \
+         littéral sans figurer au registre : {violations:?}\n\
+         Si le site démarre un travail, il doit interpoler \
+         `db::tasks::FIRED_AT_STAMP_IF_NULL`. Sinon, c'est la garde qu'il faut \
+         affiner — et dans les deux cas c'est une décision à prendre \
+         explicitement, pas une exemption à poser en passant."
+    );
+
+    let dead: Vec<&str> = FIRED_AT_LITERAL_WRITERS
+        .iter()
+        .filter(|(f, sym, _)| !seen.contains(&((*f).to_string(), (*sym).to_string())))
+        .map(|(_, sym, _)| *sym)
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "mika#2133 — entrées de registre dont le site n'existe plus : {dead:?}. \
+         Une entrée morte exempte silencieusement un futur homonyme ; retirez-la."
+    );
+}
+
+/// **Contrôle négatif de la garde ci-dessus.**
+///
+/// Une réparation de classification trop large la rendrait *vacuous* sans rien
+/// casser : verte parce qu'elle ne regarde plus rien. C'est la moitié que
+/// mika#2321 et mika#2398 ont mesurée à 14 043 lignes de production sorties du
+/// champ d'une garde restée verte.
+///
+/// Prouve quatre choses sur la même source : un site de production fautif est
+/// attrapé, un site **déclaré** ne l'est pas, une **lecture** de la colonne ne
+/// l'est pas, et un chemin de test est écarté entièrement.
+#[test]
+fn mika2133_the_fired_at_guard_still_catches_a_production_site() {
+    let production = std::path::Path::new("/repo/crates/mika-agent/src/server/new_path.rs");
+
+    let offending = r#"
+            pub fn dispatch_something(&self, id: &str) -> Result<()> {
+                self.conn.execute(
+                    "UPDATE tasks SET fired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            }
+        "#;
+    let hits = fired_at_write_violations(production, offending);
+    assert_eq!(
+        hits.len(),
+        1,
+        "la garde ne détecte plus un écrivain de production non déclaré — elle \
+         est devenue vacuous, ce qui ne casse rien et ne protège plus rien"
+    );
+    assert!(
+        hits[0].contains("dispatch_something"),
+        "la garde doit NOMMER le site fautif, sinon elle envoie chercher : {hits:?}"
+    );
+
+    // Neutralisé par un commentaire : la prose doit pouvoir citer la clause.
+    let commented = "// UPDATE tasks SET fired_at = strftime('…') WHERE id = ?1";
+    assert!(fired_at_write_violations(production, commented).is_empty());
+
+    // Une LECTURE n'est pas une écriture. Une garde qui refuserait
+    // `fired_at IS NULL` rendrait le champ illisible pour interdire de
+    // l'écrire — et c'est ce prédicat que les faucheurs emploient.
+    let reading = r#"
+            pub fn find_stalled(&self) -> Result<()> {
+                self.conn.prepare(
+                    "SELECT id FROM tasks WHERE fired_at IS NOT NULL AND fired_at < ?1
+                     ORDER BY fired_at ASC",
+                )?;
+                Ok(())
+            }
+        "#;
+    assert!(
+        fired_at_write_violations(production, reading).is_empty(),
+        "la garde refuse une lecture de `fired_at` — elle est trop large"
+    );
+
+    // Un site DÉCLARÉ, au fichier du registre, n'est pas une violation.
+    let declared = r#"
+            pub fn claim_and_fire_task(&self, id: &str) -> Result<bool> {
+                self.conn.execute(
+                    "UPDATE tasks SET fired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(true)
+            }
+        "#;
+    assert!(
+        fired_at_write_violations(
+            std::path::Path::new("/repo/crates/mika-agent/src/db/tasks.rs"),
+            declared
+        )
+        .is_empty(),
+        "un écrivain déclaré au registre ne doit pas rougir"
+    );
+
+    // La même source fautive, à un chemin de test, est écartée entièrement.
+    for test_path in [
+        "/repo/crates/mika-agent/src/db/tests/tasks.rs",
+        "/repo/crates/mika-agent/src/perimeter/tests.rs",
+    ] {
+        assert!(
+            fired_at_write_violations(std::path::Path::new(test_path), offending).is_empty(),
+            "{test_path} est scanné comme de la production"
+        );
+    }
+}
+
+/// Antidate `fired_at` à une valeur reconnaissable. Vit ici, et pas comme un
+/// `backdate_task_fired_at` à côté de ses trois cousins de `db/tasks.rs`, parce
+/// qu'un helper de production écrirait `fired_at` en littéral et devrait donc
+/// figurer au registre — une entrée qui ne nommerait pas un acte d'estampillage
+/// mais un outil de test, et qui affaiblirait le registre pour la commodité
+/// d'un seul fichier.
+const ANCIENT_FIRED_AT: &str = "2020-01-01T00:00:00Z";
+
+fn backdate_fired_at(db: &Database, task_id: &str) {
+    db.conn
+        .execute(
+            "UPDATE tasks SET fired_at = ?1 WHERE id = ?2",
+            params![ANCIENT_FIRED_AT, task_id],
+        )
+        .unwrap();
+}
+
+fn fired_at_of(db: &Database, task_id: &str) -> Option<String> {
+    db.conn
+        .query_row(
+            "SELECT fired_at FROM tasks WHERE id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// T5 (mika#2133 R4/D3) — **les quatre écrivains NULL-only ne réécrivent jamais
+/// une estampille existante**, et le test le prouve avec une valeur antidatée
+/// plutôt qu'avec une égalité prise dans la même seconde.
+///
+/// Sans l'antidatage, deux appels consécutifs produisent le même horodatage à la
+/// seconde près et l'assertion `first == second` est vraie quelle que soit
+/// l'implémentation : elle mesurerait la résolution de l'horloge, pas la clause.
+///
+/// **Pourquoi c'est portant.** Le tour de livraison d'un callback est
+/// explicitement ré-essayé par le backoff de mika#2179. Sans la clause, un
+/// callback en quarantaine verrait son `fired_at` avancer d'une heure à chaque
+/// tentative — et les faucheurs qui mesurent l'âge d'un dispatch depuis ce champ
+/// (`MIKA_PILOT_STALL_REAP_AGE_SECONDS`, le balayage phantom, le watchdog #959)
+/// ne verraient jamais vieillir la ligne.
+///
+/// Rouge-avant : remplacer le `CASE` de `FIRED_AT_STAMP_IF_NULL` par un
+/// `strftime(…)` nu.
+#[test]
+fn mika2133_the_four_null_only_writers_never_overwrite_an_existing_stamp() {
+    // (a) `mark_parent_dispatched`
+    let db = db();
+    let parent = db
+        .create_task(&{
+            let mut t = make_task("parent");
+            t.trigger_type = "manual".to_string();
+            t.action_type = "none".to_string();
+            t
+        })
+        .unwrap();
+    backdate_fired_at(&db, &parent);
+    db.mark_parent_dispatched(&parent, "mika").unwrap();
+    assert_eq!(
+        fired_at_of(&db, &parent).as_deref(),
+        Some(ANCIENT_FIRED_AT),
+        "mark_parent_dispatched a réécrit une estampille existante"
+    );
+
+    // (b) `set_task_process_id`
+    let child = db.create_task(&make_task("child")).unwrap();
+    backdate_fired_at(&db, &child);
+    db.set_task_process_id(&child, Some(4242)).unwrap();
+    assert_eq!(
+        fired_at_of(&db, &child).as_deref(),
+        Some(ANCIENT_FIRED_AT),
+        "set_task_process_id a réécrit une estampille existante"
+    );
+
+    // (c) `stamp_task_fired_at_if_null` — le tour de livraison ré-essayé
+    let cb = db.create_task(&make_task("callback")).unwrap();
+    backdate_fired_at(&db, &cb);
+    db.stamp_task_fired_at_if_null(&cb, "mika").unwrap();
+    db.stamp_task_fired_at_if_null(&cb, "mika").unwrap();
+    assert_eq!(
+        fired_at_of(&db, &cb).as_deref(),
+        Some(ANCIENT_FIRED_AT),
+        "un réessai de livraison (mika#2179) a fait avancer fired_at"
+    );
+
+    // (d) `a2a_update_task_state` — une seconde transition `working`
+    db.a2a_create_task("a2a-nulls", "mika", None, None).unwrap();
+    let a2a_id: String = db
+        .conn
+        .query_row(
+            "SELECT task_id FROM a2a_task_map WHERE a2a_task_id = 'a2a-nulls'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    backdate_fired_at(&db, &a2a_id);
+    db.a2a_update_task_state("a2a-nulls", "working").unwrap();
+    assert_eq!(
+        fired_at_of(&db, &a2a_id).as_deref(),
+        Some(ANCIENT_FIRED_AT),
+        "a2a_update_task_state a réécrit une estampille existante"
+    );
+}
+
+/// T7 (mika#2133 D4) — **contrôle négatif de la décision D4** :
+/// [`Database::claim_and_fire_task`] écrase **délibérément**.
+///
+/// Pour une tâche `recurring`, l'estampille dit « dernier tir », pas « premier
+/// tir » — c'est la seule population qui fonctionnait avant ce ticket (56/64), et
+/// l'uniformiser vers NULL-only la figerait sur son tir inaugural, cassant la
+/// seule lecture qui marchait. Ce test dit que l'asymétrie est **voulue** : il
+/// rougit le jour où quelqu'un « harmonise » les quatre sites.
+#[test]
+fn mika2133_claim_and_fire_task_deliberately_overwrites_its_stamp() {
+    let db = db();
+    let id = db
+        .create_task(&{
+            let mut t = make_task("recurring-heartbeat");
+            t.trigger_type = "recurring".to_string();
+            t
+        })
+        .unwrap();
+
+    backdate_fired_at(&db, &id);
+    // `claim_and_fire_task` n'accepte que `pending` / `recurring_active` : une
+    // récurrente revient à `recurring_active` entre deux tirs.
+    db.update_task_status(&id, "recurring_active").unwrap();
+
+    assert!(db.claim_and_fire_task(&id, "mika").unwrap());
+    let after = fired_at_of(&db, &id);
+    assert!(after.is_some());
+    assert_ne!(
+        after.as_deref(),
+        Some(ANCIENT_FIRED_AT),
+        "D4 VIOLÉE : le tir d'une récurrente n'a pas avancé son estampille. \
+         `claim_and_fire_task` doit écraser — l'estampille y dit « dernier tir ». \
+         Si ce test rougit, quelqu'un a migré ce site vers \
+         FIRED_AT_STAMP_IF_NULL en croyant unifier ; c'est la lecture des 56/64 \
+         récurrentes qui est cassée."
+    );
+}
+
 // ── mika#1948 Porte 2: exec-slot arbitration ──
 
 /// A fresh DB must carry the v51 surface without any migration running —
