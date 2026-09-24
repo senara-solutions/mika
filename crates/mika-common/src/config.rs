@@ -1061,10 +1061,15 @@ pub struct Settings {
     /// overrun (mika#2496).
     ///
     /// Env override: `MIKA_PILOT_COST_ALERT_USD`. Note the `MIKA_` prefix,
-    /// where the sibling turn-ceiling knob is the bare `PILOT_MAX_TURNS`: the
-    /// unprefixed form exists because `scrub_mika_env_vars` strips every
-    /// `MIKA_*` from the **dispatch child**, and that scrub does not run in
-    /// mika-spirit, which is the process that reads this one.
+    /// where the sibling turn-ceiling knob is the bare `PILOT_MAX_TURNS`: this
+    /// key is read by mika-spirit through the config-rs `MIKA_` cascade, whose
+    /// process env nothing clears. The sibling is bare-and-relayed because the
+    /// pilot dispatch child is built by `sandboxed_pilot_env` (`env_clear()` +
+    /// the positive allowlist `is_sandbox_env_allowed`, `skills/executor.rs`),
+    /// which admits neither a `MIKA_*` name nor a bare one, so `PILOT_MAX_TURNS`
+    /// reaches `dispatch-lib.sh` only through the explicit
+    /// `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`), never by
+    /// surviving a scrub (mika#2508).
     ///
     /// Default: [`DEFAULT_PILOT_COST_ALERT_USD`] (40 — the rule).
     #[serde(default)]
@@ -1371,8 +1376,14 @@ pub const DEFAULT_PILOT_STALL_REAP_ENABLED: bool = true;
 /// # Why a divergence here is bounded, and in which direction
 ///
 /// The two halves read *different* variables — the shell honours `PILOT_LOG_DIR`
-/// and the engine `MIKA_PILOT_LOG_DIR`, because `scrub_mika_env_vars` strips
-/// every `MIKA_*` from the dispatch child. mika#2165 documented what an override
+/// and the engine `MIKA_PILOT_LOG_DIR`. The shell's bare `PILOT_LOG_DIR` does
+/// not survive on its own: the pilot dispatch child is built by
+/// `sandboxed_pilot_env` (`env_clear()` + the positive allowlist
+/// `is_sandbox_env_allowed`), which admits no bare `PILOT_*` any more than a
+/// `MIKA_*`, so it reaches `dispatch-lib.sh` only through the explicit
+/// `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`); the engine reads
+/// `MIKA_PILOT_LOG_DIR` from its own unscrubbed process env (mika#2508).
+/// mika#2165 documented what an override
 /// only the readers honour costs; here that cost has a floor. If the engine
 /// looks in the wrong directory the derived file is simply **absent**, the
 /// signal is unavailable, and the dispatch falls **out** of the reaper's
