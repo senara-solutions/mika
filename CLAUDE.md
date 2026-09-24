@@ -2303,6 +2303,127 @@ grep target_purge_tick "$MIKA_SPIRIT_LOG_FILE" | tail
 - **Un déclencheur par pression disque** (`df` sous seuil) — autre mécanisme, autre population, aucune mesure ne le demande aujourd'hui.
 - **La purge du `target/` du checkout principal** — ce n'est pas un worktree managé, et P1 l'exclut par construction.
 
+### Le verrou est tenu pendant la suppression, et les deux budgets sont découplés (mika#2511, 2026-09-24)
+
+**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
+déplacée.** Cette entrée est ici parce que l'opérateur qui lit un
+`target_purge_skipped` inattendu, ou qui compare un compte `purged` de part et
+d'autre du déploiement, cherche dans ce voisinage.
+
+- **Le défaut que ça ferme.** Le filtre P5 sondait le `.cargo-lock` et le
+  **relâchait aussitôt** ; la suppression venait plus tard, sans re-sonde. Entre
+  les deux : des points `.await`, une mesure d'arbre, et — avec
+  `MIKA_TARGET_PURGE_MAX_PER_TICK = 2` — la suppression complète du candidat
+  précédent. Un `cargo build` démarré dans cette fenêtre voyait son `target/`
+  disparaître sous lui. Désormais l'acquisition **retient** le `flock` de chaque
+  `.cargo-lock` pendant le `remove_dir_all` et ne le relâche qu'après.
+
+- **La borne exacte de la protection, et il faut la lire avant de la croire
+  totale.** `flock(2)` porte sur une *open file description*, donc sur l'inode —
+  et le `remove_dir_all` supprime `<target>/<profil>/.cargo-lock` en cours de
+  route.
+
+  | fenêtre | avant | après |
+  |---|---|---|
+  | sonde → début de la suppression | **non protégée** | protégée |
+  | début de la suppression → unlink du `.cargo-lock` | non protégée | protégée |
+  | unlink → fin de la suppression | non protégée | **toujours non protégée** |
+
+  **Résidu supplémentaire, qu'aucune ligne de ce ticket ne ferme : seuls les
+  `.cargo-lock` qui EXISTENT à l'acquisition sont tenus.** Un premier
+  `cargo build --release` sur un `target/` ne portant que `debug/` crée
+  `release/.cargo-lock` — un inode neuf, à un chemin que l'énumération n'avait
+  pas vu — et prend son verrou sans jamais rencontrer le nôtre. Le résidu est
+  acceptable pour la raison qui fonde tout le bras (mika#2497) : *un faux positif
+  coûte du temps de rebuild, jamais une perte*, et un `cargo` qui démarre dans la
+  seconde moitié d'un `remove_dir_all` est un build de quelques secondes.
+  Un `rename(target, target.mika-purge-<n>)` ramènerait ces trois résidus à
+  quelques microsecondes et est **refusé** : le répertoire renommé n'est couvert
+  par aucun `.gitignore`, donc `git status --porcelain` le liste `??`, donc T7 du
+  faucheur mika#2420 lit le worktree `dirty` et refuse de le retirer — un
+  orphelin de 40 Go dans un worktree devenu non-retirable, soit le problème que
+  ce bras existe pour résoudre, aggravé. **Suivi nommé**, précondition : que la
+  sonde S5 ci-dessous montre une population `build_lock_raced` non négligeable.
+
+- **Nouveau motif de refus : `build_lock_raced`, en queue de
+  `ALL_PURGE_REFUSAL_REASONS`.** **Ajout, jamais renommage** — aucune population
+  existante ne change de nom ni de sens, et les `GROUP BY` publiés plus haut
+  restent exacts. Il est **distinct de `build_lock_held`** et c'est tout son
+  objet : chaque ligne dit « le verrou était libre à la sonde et tenu à
+  l'acquisition », c'est-à-dire une suppression que l'état d'avant mika#2511
+  aurait laissé passer sur un arbre en cours de build — donc **la mesure de la
+  fenêtre que ce ticket ferme**. Les fusionner rendrait cette mesure
+  incomptable. `build_lock_unreadable` est en revanche **réutilisé** pour une
+  acquisition inévaluable : le remède opérateur est identique aux deux étages
+  (« pourquoi ce `target/` n'est-il pas lisible ? »). Décision, pas oubli.
+  **Régime attendu : non vide et faible.**
+
+- **Les deux budgets sont découplés.** La boucle des dépôts cassait sur le budget
+  du **faucheur** seul, donc un faucheur épuisé privait de purge tous les dépôts
+  suivants — en contradiction avec le « budget distinct » que le code revendique.
+  Elle ne cesse plus que lorsque **les deux** bras sont épuisés (ou le faucheur
+  épuisé et la purge désarmée). **Effet collatéral à nommer plutôt qu'à cacher :
+  ça restaure aussi `probe_main_checkout` (la sonde de saleté mika#2449) sur les
+  dépôts suivants** — le `break` était en tête de corps de boucle et sautait tout
+  ce qui suit, y compris elle. Ne se manifeste qu'avec plusieurs dépôts
+  (`MIKA_WORKTREE_REAP_REPO_DIRS` ; le défaut est mono-dépôt).
+
+- **`would_purge` compte la population `observe`, et `purged` CHANGE DE SENS au
+  déploiement.** Le bras incrémentait `purged` dans les deux dispositions, donc
+  l'agrégat `target_purge_tick` revendiquait des suppressions en dry-run. Un
+  compteur par disposition désormais, et `target_purge_tick` porte le champ
+  `would_purge`. **Conséquence pour la lecture : un compte `purged` qui enjambe
+  le déploiement compare deux vocabulaires** — avant, il incluait les
+  observations ; après, il ne compte que les suppressions effectives. La requête
+  juste est celle sur `audit_events`, dont les deux `tool_name` étaient **déjà**
+  séparés (`target_purged` / `target_purge_would_dispose`, mika#2469) et ne
+  bougent pas :
+
+  ```sql
+  SELECT tool_name, count(*) FROM audit_events
+   WHERE tool_name IN ('target_purged', 'target_purge_would_dispose')
+   GROUP BY 1;
+  ```
+
+  **Le piège que ça a failli créer :** la condition d'émission de l'agrégat était
+  `purged > 0 || failed > 0`. Corriger le compteur **seul** aurait rendu
+  `target_purge_tick` muet dans le mode même que la sonde S0 prescrit d'utiliser
+  en premier — une régression d'observabilité introduite par un correctif
+  d'observabilité. Elle lit désormais aussi `would_purge`.
+
+- **Sondes, et leurs haltes.** **S5 — la fenêtre est mesurée (30 jours) :**
+  `SELECT count(*) FROM audit_events WHERE tool_name = 'target_purge_skipped'
+  AND after_value = 'build_lock_raced';`. **Halte —** un compte qui porte du
+  trafic nominal (plusieurs par jour, sur des worktrees différents) ne veut
+  **pas** dire que le prédicat est trop large : il veut dire que des builds
+  démarrent couramment dans les fenêtres résiduelles ci-dessus, et c'est **là**
+  que le suivi `rename`-avant-suppression s'ouvre, avec ce compte comme
+  précondition. Ne pas raccourcir `MIKA_TARGET_PURGE_IDLE_SECS` par réflexe —
+  ce serait purger le cache de travail en cours pour un problème de course.
+  **S6 — contrôle négatif du zéro :** un compte **nul** ne prouve **pas** que le
+  défaut n'existait pas ; il faut qu'un `cargo` démarre pile dans la fenêtre, et
+  celle du premier candidat d'un tick est de l'ordre de 2 s (`measure_tree_size`
+  est budgété à 400 000 entrées / 2 000 ms). Avant de conclure, établir le
+  contrôle positif — que le bras a réellement purgé quelque chose :
+  `SELECT count(*) FROM audit_events WHERE tool_name = 'target_purged';`.
+  **Zéro des deux ne prouve rien** (classe mika#2205). **S7 — le découplage mord
+  (un tick, multi-dépôts) :** poser `MIKA_WORKTREE_REAP_REPO_DIRS` sur deux
+  checkouts et `MIKA_WORKTREE_REAP_MAX_PER_TICK=1` avec deux worktrees terminaux
+  dans le premier ; attendu, une activité `target_purge_tick` sur le **second**
+  dépôt et `main_checkout_dirty` consultable pour lui. **Halte —** rien sur le
+  second alors que le premier a consommé son budget : vérifier d'abord que le
+  binaire servi porte le correctif (classe mika#2340) **avant** de toucher au
+  prédicat d'arrêt.
+
+- **Ce que ce travail n'achète pas.** Aucun compteur nouveau côté journal, aucune
+  ligne INFO nouvelle : le seul instrument ajouté est le motif d'audit ci-dessus,
+  et **son silence ne prouve rien tant que le contrôle positif n'est pas
+  établi**. La garde qui empêcherait qu'on retire l'acquisition est un **scan de
+  source** (`mika2511_toute_suppression_est_precedee_de_lacquisition`, allowlist
+  livrée vide), pas un test comportemental — retirer l'acquisition ne rend
+  **aucune décision fausse** le jour où on l'écrit : la purge continue de purger,
+  toute la suite reste verte, et seule la fenêtre se rouvre, en silence.
+
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
 **Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
