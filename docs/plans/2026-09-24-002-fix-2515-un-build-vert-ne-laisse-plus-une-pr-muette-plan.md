@@ -502,6 +502,17 @@ implémenteur qui arrive après un autre correctif trouvera du code étranger à
 `agent_loop/mod.rs` à la conception (HEAD `8f844ffb`) ; l'implémenteur les
 re-vérifie avant d'éditer plutôt que de se fier aux numéros.
 
+**Et la dérive est déjà commencée, ce qui est la démonstration de la règle plutôt
+qu'une objection contre elle.** Re-relevé à HEAD `b1b7e7b6` : les six ancres sont
+toujours **présentes et uniques**, mais chaque numéro a glissé — `1433`→`1431`,
+`3912`→`3896`, `4108`→`4112`, `4155`→`4150`, `4297`→`4276`, `4314`→`4312`. Les
+sites de lecture en aval ont bougé de même (`run_silent_agent` : `6480`, `6525`,
+`6570` ; `post_callback_verdict_net` : `824`). Les deux sites mika#2368 (`3900`,
+`4096`), les deux `AgentBusy` (`724`, `1003`) et le commentaire mika#2136
+(`4230`) sont, eux, inchangés. Les numéros de tout ce plan sont donc à lire comme
+**des repères de lecture, jamais comme des adresses** : la table ci-dessus est ce
+qui fait foi.
+
 | ligne | sortie | ancre `grep` (unique) |
 |---|---|---|
 | `1433` | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
