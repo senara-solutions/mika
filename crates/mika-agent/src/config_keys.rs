@@ -35,6 +35,21 @@ use tracing::warn;
 /// `enum` and its description from it, so adding a key here makes it
 /// discoverable by the model without a line of prompt — which is why mika#2358
 /// adds no new tool (KTD2).
+///
+/// # The omission is the gesture (mika#2425 refus 2)
+///
+/// [`CONTEXT_HISTORY_SCOPE_KEY`] and [`CONTEXT_HISTORY_MAX_TOKENS_KEY`] are
+/// **deliberately absent**. Because this constant *is* the surface, keeping a
+/// key out of it requires writing nothing — and the refusal has a measurement
+/// behind it: the only population mika#2425 measured is an **operator** need
+/// (L8, 2026-09-19), not a user request. Inferring a conversational amnesia
+/// from an ordinary sentence (« oublie ce qu'on a dit ») is a failure mode
+/// nobody has measured, and the house rule is to measure before instructing.
+/// Exposing them is a follow-up whose precondition is a measured user request
+/// plus a green S2 probe on the population concerned.
+///
+/// The absence is a decision rather than an oversight, so it is asserted:
+/// `mika2425_the_db_half_is_absent_from_the_tool_surface`.
 pub const SETTABLE_CONFIG_KEYS: &[&str] = &[
     "chat_id",
     "timezone",
@@ -416,6 +431,128 @@ pub fn resolve_proactive_pause(
     }
 }
 
+// -- mika#2425: the per-tenant half of `[context.history]` ------------------
+
+/// Per-tenant conversation-window scope — `agent` (neutral) or `session`.
+///
+/// # Why a DB key and not the `identity.toml` verb mika#2425 asked for
+///
+/// The ticket prescribed « un verbe CLI/console qui écrit la section nested
+/// `[context.history]` de l'`identity.toml` ». That is the *means*, and three
+/// measurements refused it:
+///
+/// 1. **No backend writes `identity.toml`.** `ConfigBackend::File` targets
+///    `config.toml` and `write_config_toml` only poses **flat** keys. A nested
+///    writer would have to be built whole — atomicity, permissions, and its
+///    interaction with the fail-closed parse of `prompt::load_identity`, where
+///    mika#2027 established that a corrupted `identity.toml` evicts *every*
+///    skill of the agent. A buggy writer there costs the agent, not the setting.
+/// 2. **The reconciler touches no tenant.** `WELL_KNOWN_AGENTS` is the four
+///    engineering agents and `provision_well_known_agents` loops over that
+///    constant alone, so `reconcile_well_known_identity` has never run against
+///    a customer agent. The ticket's requirement #2 describes a population the
+///    L8 measurement is not about — and satisfying it for the four well-known
+///    agents would **invert** mika#2330, which wrote down in as many words that
+///    a hand edit inside a code-owned section is now overwritten at the next
+///    startup so that the loss is legible rather than silent.
+/// 3. **`customer_config` is the site the house already chose for this class**,
+///    with its reason written at the head of this module: *nothing rewrites it
+///    at startup*. And `agent_loop::load_agent_context` already reads this table
+///    twice, one line from `prompt::load_identity_async` — so the reader lands
+///    where it belongs without a new access path.
+///
+/// # Narrowing only, and it is structural rather than conventional
+///
+/// The identity declares a **role floor**; this key may only make the window
+/// narrower. `session` always wins, `agent` is the neutral and never releases a
+/// `session` declared in identity. The same asymmetry is already written one
+/// file over for mika#1951, on this exact field: *"The caller may narrow this
+/// turn's scope to its own session; it may never widen it."*
+///
+/// It buys four things at once: mika#2295 cannot be reopened from the database
+/// (nobody can put mika-arch back on `scope = agent`); reversal is free, which
+/// matters because `delete_customer_config` **does not exist** — posing the
+/// neutral *is* the cancellation; and the day these keys become model-settable,
+/// a model cannot widen its own window.
+///
+/// Named cost: an operator cannot widen mika-arch's window from the database.
+/// That is refused **and said** (`context_history_widening_refused`), and the
+/// remedy is an edit to `well_known_agents.rs` — which is correct, since the
+/// code declares that bound as a property of the role.
+pub const CONTEXT_HISTORY_SCOPE_KEY: &str = "context_history_scope";
+
+/// Per-tenant conversation-window token ceiling — `none` or an integer
+/// `>= CONTEXT_HISTORY_MAX_TOKENS_FLOOR`.
+///
+/// The effective ceiling is the **narrower** of this and the identity's, with
+/// `None` meaning "no ceiling". See [`CONTEXT_HISTORY_SCOPE_KEY`] for why the
+/// cascade can only narrow.
+pub const CONTEXT_HISTORY_MAX_TOKENS_KEY: &str = "context_history_max_tokens";
+
+/// The neutral value of [`CONTEXT_HISTORY_SCOPE_KEY`] — the whole-agent window,
+/// i.e. today's default and the value that cancels a narrowing.
+pub const CONTEXT_HISTORY_SCOPE_AGENT: &str = "agent";
+
+/// The narrowing value of [`CONTEXT_HISTORY_SCOPE_KEY`] — the turn's own session.
+pub const CONTEXT_HISTORY_SCOPE_SESSION: &str = "session";
+
+/// The neutral value of [`CONTEXT_HISTORY_MAX_TOKENS_KEY`] — no ceiling.
+///
+/// Chosen over an empty string for [`PROACTIVE_PAUSE_NONE`]'s reason:
+/// `set_config` refuses an empty `value` before validation ever runs.
+pub const CONTEXT_HISTORY_MAX_TOKENS_NONE: &str = "none";
+
+/// Smallest ceiling this key accepts.
+///
+/// **`0` is refused here, and that is a decision rather than a range check.**
+/// `Some(0)` is the omission sentinel of
+/// `prompt::ContextHistoryConfig::max_tokens`: it empties the history entirely.
+/// That is a **role** decision, carried by the identity, not a tenant
+/// preference — and a `0` typed by mistake is, in the words
+/// `deserialize_history_max_tokens` already carries, *a context wipe wearing a
+/// configuration's clothes*. The floor sits well above the few hundred bytes a
+/// single exchange costs, so a value that parses is a value that leaves a window.
+pub const CONTEXT_HISTORY_MAX_TOKENS_FLOOR: usize = 500;
+
+/// Read a raw [`CONTEXT_HISTORY_SCOPE_KEY`] value, `None` when unreadable.
+///
+/// Case-insensitive and trimmed, the house convention. Lives here rather than
+/// in the resolver so the door (`validate_config_value`) and the reader
+/// (`agent_loop::context_history`) share **one** definition of what the key
+/// accepts — two spellings of a wire vocabulary is the class
+/// `grooming_marker` had to close once (mika#2158).
+#[must_use]
+pub fn parse_context_history_scope(raw: &str) -> Option<crate::prompt::HistoryScope> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case(CONTEXT_HISTORY_SCOPE_AGENT) {
+        Some(crate::prompt::HistoryScope::Agent)
+    } else if value.eq_ignore_ascii_case(CONTEXT_HISTORY_SCOPE_SESSION) {
+        Some(crate::prompt::HistoryScope::Session)
+    } else {
+        None
+    }
+}
+
+/// Read a raw [`CONTEXT_HISTORY_MAX_TOKENS_KEY`] value, `None` when unreadable.
+///
+/// `Some(None)` is the neutral (`none` — no ceiling); `Some(Some(n))` is a
+/// ceiling of `n` tokens. The outer `None` means the value could not be read —
+/// which includes `0` and anything under
+/// [`CONTEXT_HISTORY_MAX_TOKENS_FLOOR`], refused for the reason written on that
+/// constant.
+#[must_use]
+pub fn parse_context_history_max_tokens(raw: &str) -> Option<Option<usize>> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case(CONTEXT_HISTORY_MAX_TOKENS_NONE) {
+        return Some(None);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= CONTEXT_HISTORY_MAX_TOKENS_FLOOR)
+        .map(Some)
+}
+
 /// Validate a config value for the given key.
 ///
 /// Returns `Ok(())` if the value is valid, or `Err(message)` describing what
@@ -465,6 +602,30 @@ pub fn validate_config_value(key: &str, value: &str) -> Result<(), String> {
                     "Invalid {TENANT_LANGUAGE_KEY}: {value}\nAllowed values: `fr` or `en`. \
                      Leaving this unset keeps today's behaviour — no language is posed and \
                      none is enforced."
+                ));
+            }
+        }
+        CONTEXT_HISTORY_SCOPE_KEY => {
+            if parse_context_history_scope(value).is_none() {
+                return Err(format!(
+                    "Invalid {CONTEXT_HISTORY_SCOPE_KEY}: {value}\nAllowed values: \
+                     `{CONTEXT_HISTORY_SCOPE_SESSION}` (the window sees only this \
+                     turn's session) or `{CONTEXT_HISTORY_SCOPE_AGENT}` (every session \
+                     of this agent — the neutral, and how you cancel a narrowing). \
+                     This setting can only narrow what identity.toml declares; it \
+                     never widens it."
+                ));
+            }
+        }
+        CONTEXT_HISTORY_MAX_TOKENS_KEY => {
+            if parse_context_history_max_tokens(value).is_none() {
+                return Err(format!(
+                    "Invalid {CONTEXT_HISTORY_MAX_TOKENS_KEY}: {value}\nAllowed values: \
+                     `{CONTEXT_HISTORY_MAX_TOKENS_NONE}` (no ceiling — the neutral, and \
+                     how you cancel a narrowing) or a whole number of at least \
+                     {CONTEXT_HISTORY_MAX_TOKENS_FLOOR}. `0` is refused on purpose: it \
+                     is the omission sentinel that empties the history, which is a role \
+                     decision carried by identity.toml, not a tenant preference."
                 ));
             }
         }
@@ -758,5 +919,132 @@ mod tests {
             "unreadable is its own verdict: the caller fails open, but a pause that \
              is not biting must stay distinguishable from one never armed"
         );
+    }
+
+    // -- mika#2425: the per-tenant half of `[context.history]` --------------
+
+    /// **D4** — the two keys are NOT reachable by the model.
+    ///
+    /// [`SETTABLE_CONFIG_KEYS`] is the `set_config` schema, so this absence is
+    /// the entirety of mika#2425's refus 2. Without an assertion, a later
+    /// addition would be invisible — a decision undone by a one-line diff that
+    /// reads like a completion.
+    #[test]
+    fn mika2425_the_db_half_is_absent_from_the_tool_surface() {
+        for key in [CONTEXT_HISTORY_SCOPE_KEY, CONTEXT_HISTORY_MAX_TOKENS_KEY] {
+            assert!(
+                !is_settable_key(key),
+                "mika#2425 refus 2 — `{key}` must not be in SETTABLE_CONFIG_KEYS: that \
+                 constant IS the `set_config` tool surface, so adding it there makes the \
+                 key model-settable. The only measured population is an operator need \
+                 (L8, 2026-09-19); exposing it needs a measured user request and a green \
+                 S2 probe first. If you are landing that follow-up, delete this test in \
+                 the same commit and say so."
+            );
+        }
+    }
+
+    /// The two keys are declared in `mika_common::config::CONFIG_KEYS`, on the
+    /// `Database` backend.
+    ///
+    /// The key literal is written twice — here as a constant, there as a string
+    /// — because `mika-common` cannot depend on this crate. That duplication is
+    /// exactly what `lookup_config_key` resolves against, so a divergence would
+    /// make `mika config set context_history_scope …` answer *Unknown config
+    /// key* while every test in this file stayed green. Same shape and same
+    /// reason as `mika2267_every_manager_env_const_is_declared_in_env_example`.
+    #[test]
+    fn mika2425_both_keys_are_declared_as_database_backed() {
+        for key in [CONTEXT_HISTORY_SCOPE_KEY, CONTEXT_HISTORY_MAX_TOKENS_KEY] {
+            let info = mika_common::config::lookup_config_key(key).unwrap_or_else(|| {
+                panic!(
+                    "mika#2425 — `{key}` is not declared in CONFIG_KEYS, so `mika config \
+                     set {key}` answers \"Unknown config key\" whatever this module does"
+                )
+            });
+            assert_eq!(
+                info.backend,
+                mika_common::config::ConfigBackend::Database,
+                "mika#2425 — `{key}` must be Database-backed: the whole point of the site \
+                 is that nothing rewrites `customer_config` at startup"
+            );
+            assert!(
+                info.env_var.is_none(),
+                "mika#2425 — `{key}` must have no env var: a fleet-wide variable would \
+                 shadow the per-tenant setting, which is the defect mika#2293 measured \
+                 for the timeout pair"
+            );
+        }
+    }
+
+    /// **V7** — `0` is refused at the door, `none` and the floor accepted.
+    #[test]
+    fn mika2425_max_tokens_refuses_zero_and_floors_at_500() {
+        for accepted in ["none", "NONE", " none ", "500", "8000", "  8000"] {
+            assert!(
+                validate_config_value(CONTEXT_HISTORY_MAX_TOKENS_KEY, accepted).is_ok(),
+                "{accepted:?} should be accepted"
+            );
+        }
+
+        for rejected in [
+            "0",
+            "1",
+            "499",
+            "-1",
+            "8000.5",
+            "",
+            "huit mille",
+            "none please",
+        ] {
+            let err = validate_config_value(CONTEXT_HISTORY_MAX_TOKENS_KEY, rejected)
+                .expect_err("{rejected:?} should be refused");
+            assert!(
+                err.contains(CONTEXT_HISTORY_MAX_TOKENS_NONE),
+                "the refusal must name the neutral — an operator who meets it while \
+                 mistyping is the operator who needs to know how to cancel: {err}"
+            );
+        }
+
+        assert_eq!(
+            parse_context_history_max_tokens("0"),
+            None,
+            "`Some(0)` is the omission sentinel that empties the history — a role \
+             decision carried by identity.toml, never a tenant preference"
+        );
+        assert_eq!(parse_context_history_max_tokens("none"), Some(None));
+        assert_eq!(parse_context_history_max_tokens("500"), Some(Some(500)));
+    }
+
+    /// The scope key accepts exactly the two names, and its refusal names the
+    /// neutral.
+    #[test]
+    fn mika2425_scope_accepts_two_names_and_names_the_neutral() {
+        for accepted in ["agent", "session", "AGENT", "Session", " session "] {
+            assert!(
+                validate_config_value(CONTEXT_HISTORY_SCOPE_KEY, accepted).is_ok(),
+                "{accepted:?} should be accepted"
+            );
+        }
+
+        for rejected in ["", "sesion", "channel", "none", "0", "agent session"] {
+            let err = validate_config_value(CONTEXT_HISTORY_SCOPE_KEY, rejected)
+                .expect_err("{rejected:?} should be refused");
+            assert!(
+                err.contains(CONTEXT_HISTORY_SCOPE_AGENT),
+                "the refusal must name the neutral, which is how a narrowing is \
+                 cancelled — `delete_customer_config` does not exist: {err}"
+            );
+        }
+
+        assert_eq!(
+            parse_context_history_scope("SESSION"),
+            Some(crate::prompt::HistoryScope::Session)
+        );
+        assert_eq!(
+            parse_context_history_scope(" agent "),
+            Some(crate::prompt::HistoryScope::Agent)
+        );
+        assert_eq!(parse_context_history_scope("channel"), None);
     }
 }
