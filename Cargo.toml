@@ -51,10 +51,13 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-appender = "0.2"
 
 # OpenTelemetry (optional per-crate via "telemetry" feature)
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["http-proto"] }
-tracing-opentelemetry = "0.32"
+# Les QUATRE montent ensemble : tracing-opentelemetry <N> exige opentelemetry ^<N-1>
+# (0.34 → ^0.33). Un bump partiel produit deux copies dans le graphe, que cargo
+# résout sans erreur et que seul `--features telemetry` refuse — mika#2523.
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["http-proto"] }
+tracing-opentelemetry = "0.34"
 
 # Error handling
 anyhow = "1.0.103"
