@@ -140,18 +140,48 @@ if [[ -n "$PLAN" ]]; then
   # Take the first plan file if multiple exist
   PLAN_FILE=$(echo "$PLAN" | head -1)
   if [[ -f "$PLAN_FILE" ]]; then
-    # Check for ## Acceptance criteria heading (case-insensitive: the autonomous
-    # groom command instructs lowercase, but the LLM frequently title-cases the
-    # noun phrase — mika#1639. `grep -qi` / sed start-address `I` flag (both GNU)
-    # fold case so `## Acceptance Criteria` is accepted.)
-    if ! grep -qi '^## Acceptance criteria' "$PLAN_FILE"; then
+    # mika#2516 — DETECTION pattern for the AC heading. Single site: it is
+    # interpolated into BOTH matchers below, and that co-mutation is the point.
+    # Written once because the two were written twice and drifted: mika#1639 had
+    # to fix both together for case, and nothing was left holding them together.
+    #
+    # Permissive by design (doctrine: permissive detection, strict decision):
+    #   - case folded by `-i` / the sed address `I` flag. The groom command
+    #     instructs lowercase, but the LLM title-cases the noun phrase out of
+    #     habit — mika#1639, n=2 of the class.
+    #   - optional numbering prefix: `/ce:plan` numbers its section headings, so
+    #     the heading arrives as `## 11. Acceptance criteria` — mika#2516, n=3.
+    #     Bounded to `<digits>[.]`, the form actually measured. `## 1.1 …` and
+    #     `## Phase 3 — …` are NOT covered: widening on a guess is what the
+    #     "when NOT to over-widen" rule refuses. Such a form reddens this check
+    #     visibly, with the right message, and is an n=4 to measure first.
+    #   - NO `$` anchor: `## Acceptance criteria (revised)` matches today and
+    #     must keep matching. Anchoring the end would tighten the gate while
+    #     claiming to loosen it.
+    #   - the heading text stays anchored right after the optional prefix, so
+    #     `## Notes on Acceptance criteria` is still refused.
+    #
+    # The DECISION stays strict: an absent section, or a present but empty one,
+    # still FAILs — here exactly as before. Do not re-spell this pattern
+    # anywhere else; a single-reader guard in scripts/verify-pipeline-test.sh
+    # (mika#2516) reddens on a third literal spelling in command position.
+    #
+    # Defined in single quotes, interpolated in double quotes. Both matchers
+    # therefore need their ERE flag (`grep -qiE`, `sed -nE`): without it the
+    # quantifiers `+`, `?` and the group `( … )` are literals, the pattern
+    # matches nothing, and the check is silently disarmed.
+    AC_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Acceptance criteria'
+    if ! grep -qiE "$AC_HEADING_RE" "$PLAN_FILE"; then
       echo "FAIL: Plan '$PLAN_FILE' missing '## Acceptance criteria' section. See mika#1600." >&2
       ERRORS=$((ERRORS + 1))
     else
       # Check for at least one non-blank line after the heading. Only the start
       # address needs the `I` flag; the end address `/^## /` and inner `/^## /d`
-      # already match any `## ` heading prefix case-agnostically.
-      AC_CONTENT=$(sed -n '/^## Acceptance criteria/I,/^## /{ /^## /d; /^[[:space:]]*$/d; p; }' "$PLAN_FILE")
+      # already match any `## ` heading prefix — numbered ones included, since
+      # the `## ` prefix itself is unchanged there.
+      # The `$` of the blank-line address is escaped: this expression moved from
+      # single to double quotes to allow the interpolation above.
+      AC_CONTENT=$(sed -nE "/$AC_HEADING_RE/I,/^## /{ /^## /d; /^[[:space:]]*\$/d; p; }" "$PLAN_FILE")
       if [[ -z "$AC_CONTENT" ]]; then
         echo "FAIL: Plan '$PLAN_FILE' has empty '## Acceptance criteria' section. See mika#1600." >&2
         ERRORS=$((ERRORS + 1))
