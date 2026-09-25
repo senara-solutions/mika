@@ -70,6 +70,13 @@ mod eval {
     // asserts the window; this one asserts what the instrument says about it.
     mod test_context_scope_observability_2305;
 
+    // mika#2425 — the per-tenant half. Its neighbour above covers the
+    // identity-declared scope; this one covers a `customer_config` narrowing
+    // reaching the real window, the refusal of a widening, and the unchanged
+    // default. No source predicate can see a decision site that reads the right
+    // field and simply never consults the database.
+    mod test_context_history_per_tenant_2425;
+
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
@@ -84,7 +91,14 @@ mod eval {
     // mika#2276 AC2 — la porte : `deadline dépassé ⇒ verdict posté`. Chaîne
     // complète, du vrai agent loop au POST, avec le poster injecté.
     mod test_deadline_verdict_2276;
+
     mod test_deferred_dispatch_idempotent_ack;
+
+    // mika#2242 — fermer une PR umbrella sans merge dé-groome ses sous-tickets,
+    // et rien ne nommait la cause. Le producteur estampille à la fermeture, le
+    // lecteur relit au routage ; les deux contrôles négatifs (fermeture mergée,
+    // premier grooming) sont les tests porteurs.
+    mod test_degroom_attribution_2242;
     mod test_di_builders;
     mod test_dispatch_fired_at_stamped;
     mod test_dispatch_no_grooming_marker_guard;
@@ -104,6 +118,11 @@ mod eval {
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
     mod test_image_disposition_1784;
+    // mika#1910 — le tour de continuation dit ce qu'il a produit. Les trois
+    // valeurs que `response_chars` peut prendre y sont les trois populations que
+    // R5 refuse de confondre : `Some(n)` produit, `Some(0)` LA classe, `None`
+    // rien à mesurer.
+    mod test_continuation_response_chars_1910;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
@@ -113,6 +132,11 @@ mod eval {
     // lent mais borné ne l'est pas.
     mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
+    // mika#2281 — la frontière de secret du canal MCP, mesurée sur un serveur
+    // stdio factice : les noms traversent, la valeur non — et le contrôle
+    // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui
+    // est le chemin réellement exposé.
+    mod test_mcp_secret_boundary_2281;
     mod test_merge_identity_2248;
     // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.
@@ -140,6 +164,11 @@ mod eval {
     // `pending` sémée par le chemin de production, pilote authentiquement
     // vivant, harness multi-agents pour l'attribution.
     mod test_pr_review_idempotency;
+
+    // mika#2455 — un `pass` ne peut plus affirmer ce qu'un check requis rouge
+    // contredit : les deux têtes mesurées, l'issue laissée ouverte sous
+    // mika#2237, et les six abstentions nommées.
+    mod test_qa_ci_coherence_2455;
 
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.

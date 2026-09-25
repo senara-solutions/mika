@@ -100,6 +100,41 @@ run_verify() {
   return $exit_code
 }
 
+# --- mika#2419: synthetic GitHub Actions event payloads ---
+#
+# The automated-author exemption reads `.pull_request.user.login` from
+# $GITHUB_EVENT_PATH. `run_verify` above deliberately does NOT set that variable
+# (it is the fail-closed baseline — see F3), so the author cases need their own
+# runner.
+
+# Write an event payload carrying a PR author login. Shape mirrors both what
+# GitHub Actions provides on `pull_request` events and what qa-review's Step 2B
+# synthesizes.
+write_event_with_author() {
+  local login="$1"
+  printf '{"pull_request":{"number":1,"labels":[],"user":{"login":"%s"}}}' "$login" \
+    > "$TEST_DIR/event.json"
+}
+
+# Write a TRUNCATED (invalid) JSON event file. F7's subject: under
+# `set -euo pipefail`, a naive `jq` call on this would abort the script with
+# jq's own exit code, turning a PR that passes today into a non-zero exit that
+# qa-review reads without judgment as `block[pipeline]`.
+write_malformed_event() {
+  printf '{"pull_request":{"user":{"login":' > "$TEST_DIR/event.json"
+}
+
+run_verify_with_event() {
+  local pr_body="${1:-}"
+  local exit_code=0
+  local output
+  output=$(PATH="$TEST_DIR:$PATH" GITHUB_PR_BODY="$pr_body" \
+    GITHUB_EVENT_PATH="$TEST_DIR/event.json" \
+    bash scripts/verify-pipeline.sh main 2>&1) || exit_code=$?
+  echo "$output"
+  return $exit_code
+}
+
 assert_pass() {
   local test_name="$1"
   local exit_code="$2"
@@ -473,6 +508,129 @@ write_mock_gh ""
 output="" ; exit_code=0
 output=$(run_verify "") || exit_code=$?
 assert_pass "AC check: title-case '## Acceptance Criteria' → PASS" "$exit_code" "$output" "Pipeline verification passed"
+cleanup_test_repo
+
+# =========================================================================
+# Automated-author exemption (mika#2419)
+#
+# F1 is the measured case: PR mika#2415, a dependabot Cargo.lock-only bump, was
+# verdicted `block[pipeline]` by qa-review. `Cargo.lock` is not under `docs/`,
+# `.github/` or `.claude/worktrees/`, so it lands in SOURCE_BUCKET and the PR is
+# code-only — a class no label exempts, by design (the docs-only/code-only
+# asymmetry protects mika-platform#17). The exemption is therefore on the
+# AUTHOR, mirroring `ci.yml`'s branch exclusion on the pipeline-artifacts job.
+#
+# F2/F6 are the negative controls: without them F1 could pass simply because
+# the code-only gate was disarmed for everyone. F5 pins the scope: the
+# exemption covers the two bucket rejections and NOT the mika#1600 AC check.
+# =========================================================================
+
+echo ""
+echo "=== F1: dependabot + Cargo.lock-only → PASS (the mika#2415 case) ==="
+setup_test_repo
+git checkout -b dependabot/cargo/serde-1.0.0 -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde from 1.0.0 to 1.0.1"
+write_mock_gh ""
+write_event_with_author "dependabot[bot]"
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+assert_pass "F1: dependabot + Cargo.lock-only → PASS" "$exit_code" "$output" "[pipeline-exempt: automated-author]"
+cleanup_test_repo
+
+echo ""
+echo "=== F2: human author + Cargo.lock-only → FAIL (negative control) ==="
+setup_test_repo
+git checkout -b feat/test -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde by hand"
+write_mock_gh ""
+write_event_with_author "samidarko"
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+assert_fail "F2: human author + Cargo.lock-only → FAIL" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
+cleanup_test_repo
+
+echo ""
+echo "=== F3: no GITHUB_EVENT_PATH + code-only → FAIL (fail-closed) ==="
+setup_test_repo
+git checkout -b dependabot/cargo/serde-1.0.0 -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde from 1.0.0 to 1.0.1"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_fail "F3: no event file → no exemption (a local run never exempts)" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
+cleanup_test_repo
+
+echo ""
+echo "=== F4: app/dependabot recognized as well → PASS ==="
+setup_test_repo
+git checkout -b dependabot/cargo/serde-1.0.0 -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde from 1.0.0 to 1.0.1"
+write_mock_gh ""
+write_event_with_author "app/dependabot"
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+assert_pass "F4: app/dependabot → PASS" "$exit_code" "$output" "[pipeline-exempt: automated-author]"
+cleanup_test_repo
+
+echo ""
+echo "=== F5: automated author + plan without AC section → FAIL (mika#1600 survives) ==="
+setup_test_repo
+git checkout -b dependabot/cargo/serde-1.0.0 -q
+mkdir -p docs/plans
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## Definition of Done
+
+- [ ] Something done
+PLANEOF
+echo "# lockfile" > Cargo.lock
+git add docs/plans/test-plan.md Cargo.lock
+git commit -q -m "chore(deps): bump with a plan that has no AC section"
+write_mock_gh ""
+write_event_with_author "dependabot[bot]"
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+assert_fail "F5: exemption covers the bucket checks only, not mika#1600" "$exit_code" "$output" "missing '## Acceptance criteria' section"
+cleanup_test_repo
+
+echo ""
+echo "=== F6: substring is not a match → FAIL (negative control) ==="
+setup_test_repo
+git checkout -b feat/test -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde"
+write_mock_gh ""
+write_event_with_author "not-dependabot[bot]"
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+assert_fail "F6: 'not-dependabot[bot]' is not 'dependabot[bot]'" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
+cleanup_test_repo
+
+echo ""
+echo "=== F7: malformed event JSON → FAIL with the code-only reject, never a jq abort ==="
+setup_test_repo
+git checkout -b feat/test -q
+echo "# lockfile" > Cargo.lock
+git add Cargo.lock
+git commit -q -m "chore(deps): bump serde"
+write_mock_gh ""
+write_malformed_event
+output="" ; exit_code=0
+output=$(run_verify_with_event "") || exit_code=$?
+# The assertion is on the REJECT line, not merely on a non-zero exit: under
+# `set -euo pipefail` an aborting `jq` also exits non-zero, so "exit != 0" alone
+# would pass while the script had in fact died before reaching any check.
+assert_fail "F7: malformed event → fail-closed means CONTINUE without exempting" "$exit_code" "$output" "[pipeline-exempt: none] REJECT: code-only PR"
 cleanup_test_repo
 
 # =========================================================================

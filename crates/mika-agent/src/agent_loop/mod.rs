@@ -22,10 +22,12 @@ use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
-    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    RESPONSE_LANGUAGE_DRIFT_LABEL, TIME_OF_DAY_GREETING_LABEL, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
+    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
+    asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
+    detect_response_language_drift, detect_time_of_day_greeting_mismatch,
     detect_unactioned_frequency_promise, detect_unverified_callback_state_claim,
     equivalence_claim_satisfied, undelivered_send_correction, undelivered_sends,
 };
@@ -49,6 +51,7 @@ use mika_common::llm::ProviderKind;
 
 /// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
 /// prompt-injection helpers. Co-located with the loop that reads them.
+pub mod context_history;
 pub mod review_anchor;
 pub mod skill_nudge;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
@@ -84,6 +87,21 @@ pub const EMPTY_RESPONSE_FALLBACK: &str = "Done.";
 
 /// Fallback message used when a failed callback task has no error details in its result.
 pub const FAILED_TASK_FALLBACK: &str = "Task failed with no error details.";
+
+/// `response_chars` for a call site that has **no response to measure** — an
+/// error arm, a transport timeout, a deadline abort (mika#1910 U1).
+///
+/// `null`, never `0`: the rule mika#2331 wrote on `request_bytes` one struct
+/// away. `0` says *"measured, and the model produced nothing"* — which is the
+/// entire class mika#1910 exists to count. Writing it where no call returned
+/// would put a readable lie in the one column the measurement reads.
+///
+/// **This constant is the guard's predicate, not decoration.** A grep cannot
+/// decide *"is this line inside an `Err` arm?"* — the approximations fail in
+/// both directions. It can decide exactly *"did the author write the token that
+/// says **I know this site measures nothing**?"*. See
+/// [`tests::mika1910_every_unmeasured_site_declares_itself`].
+const RESPONSE_CHARS_UNMEASURED: Option<i64> = None;
 
 /// Slack added to a rail's declared worst case before the `run_loop` watchdog
 /// cuts an LLM call (mika#2342 D3).
@@ -462,6 +480,23 @@ struct AgentContext {
     identity: prompt::Identity,
     core_memory: Vec<crate::db::CoreMemoryEntry>,
     timezone: Option<String>,
+    /// The tenant's declared thread language (mika#2247 AC2). Read from
+    /// `customer_config` beside `timezone` — one line, at the site that already
+    /// reads its exact neighbour. `None` is the third state: nothing is posed in
+    /// `## Runtime` and the drift guard does not arm.
+    language: Option<crate::config_keys::TenantLanguage>,
+    /// Raw per-tenant conversation-window narrowing (mika#2425), carried
+    /// **unparsed** to the decision site.
+    ///
+    /// The values travel raw on purpose: the resolver and the consumer must not
+    /// be separated by a function boundary, or the resolved pair becomes a
+    /// second thing somebody can compute differently. Read fail-open like every
+    /// other `customer_config` read here — a DB error resolves to "no narrowing
+    /// posed", which is today's behaviour, rather than failing a turn over a
+    /// window setting.
+    db_history_scope: Option<String>,
+    /// Same, for the token ceiling. See [`Self::db_history_scope`].
+    db_history_max_tokens: Option<String>,
     /// Active `stop_topic_*` preferences (mika#1813). Loaded fail-open — a query
     /// error here must not block the turn; the `<stopped-topics>` block simply
     /// stays empty.
@@ -469,12 +504,63 @@ struct AgentContext {
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
+    // mika#2473 D2 — the disk may have moved since this process froze its budget
+    // record at `init_agent` (boot freeze, mika#1962 / mika#2457 U2: the record
+    // reports what the agent RUNS UNDER, never what the file carries now). One
+    // `stat` per turn against the mtime noted at boot; one re-resolution per
+    // distinct mtime (R9). This is the single call site — `load_agent_context`
+    // is the funnel of all three loops (conversation, silent, team), so a guard
+    // posed in one loop body would be blind to the other two (KTD5), and a
+    // second call here would split the per-mtime dedup across two callers.
+    // It REPORTS and never REFUSES (KTD1): no `?`, no new failure path — a
+    // detector that cannot read anything simply says nothing.
+    if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {
+        mika_common::llm::report_config_change(&finding);
+    }
+
     let soul_content = tokio::fs::read_to_string(home_dir.join("soul.md"))
         .await
         .unwrap_or_default();
     let identity = prompt::load_identity_async(home_dir).await;
     let core_memory = db.get_all_core_memory().await?;
     let timezone = db.get_customer_config("timezone").await?;
+    // mika#2247 AC2 — the language axis rides the trajectory `timezone` already
+    // traces: same table, same call site, same struct. That is the whole reason
+    // `customer_config` was chosen over a process variable (see
+    // `config_keys::TENANT_LANGUAGE_KEY` for the four measurements).
+    //
+    // Fail-open like every other read here: a DB error resolves to the third
+    // state (nothing posed, nothing guarded), which is today's behaviour, rather
+    // than failing the turn over a register setting.
+    let language_raw = read_optional_customer_config(
+        db,
+        crate::config_keys::TENANT_LANGUAGE_KEY,
+        "tenant_language_load_failed",
+    )
+    .await;
+    let language = report_resolved_tenant_language(db.agent_id(), language_raw.as_deref());
+    // mika#2425 — the per-tenant half of `[context.history]`, riding the exact
+    // trajectory `timezone` and `language` already trace: same table, same call
+    // site, same struct. That neighbourhood is the whole reason `customer_config`
+    // was chosen over an `identity.toml` writer (see
+    // `config_keys::CONTEXT_HISTORY_SCOPE_KEY` for the three measurements).
+    //
+    // Fail-open, and note the asymmetry with the `timezone` line above, which
+    // uses `?`: a window setting that cannot be read must cost the turn nothing.
+    // The resolver then applies what identity.toml declares, exactly as if no
+    // key were posed.
+    let db_history_scope = read_optional_customer_config(
+        db,
+        crate::config_keys::CONTEXT_HISTORY_SCOPE_KEY,
+        "context_history_scope_load_failed",
+    )
+    .await;
+    let db_history_max_tokens = read_optional_customer_config(
+        db,
+        crate::config_keys::CONTEXT_HISTORY_MAX_TOKENS_KEY,
+        "context_history_max_tokens_load_failed",
+    )
+    .await;
     // mika#1813: load stop-signal preferences for injection into every turn.
     //
     // Fail-open by design (per AgentContext::stopped_topics doc). Log the error
@@ -499,8 +585,90 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
         identity,
         core_memory,
         timezone,
+        language,
+        db_history_scope,
+        db_history_max_tokens,
         stopped_topics,
     })
+}
+
+/// Read one `customer_config` key, fail-open, naming the failure under `event`.
+///
+/// A distinct event name per key rather than a shared one, for the reason
+/// mika#2205 had to write down about `auto_pull_no_token` / `wip_rescue_no_token`:
+/// two populations under one name are not subtractable, and the grep that
+/// answers "is this setting being read at all?" must name the setting.
+///
+/// **`timezone` deliberately does not go through here.** That read uses `?` and
+/// fails the turn; the three that use this helper resolve to "nothing posed",
+/// which is the pre-existing behaviour for each of them. The asymmetry is the
+/// contract, not an oversight — converting `timezone` would change when a turn
+/// dies.
+async fn read_optional_customer_config(
+    db: &AsyncDatabase,
+    key: &str,
+    event: &'static str,
+) -> Option<String> {
+    db.get_customer_config(key).await.unwrap_or_else(|e| {
+        warn!(error = %e, key = %key, event = event, "customer_config read failed");
+        None
+    })
+}
+
+/// Last `tenant_language_resolved` couple this process announced, per agent.
+///
+/// Deduplication, not gating: an identical repetition is silent, a **change** is
+/// re-emitted — which is what makes "the user asked for English mid-thread"
+/// readable on one line. Keyed by agent because one `mika-spirit` serves them
+/// all from this one free function.
+static TENANT_LANGUAGE_REPORTED: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, crate::config_keys::ResolvedTenantLanguage>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Resolve the tenant language and announce the resolved couple once (mika#2247).
+///
+/// **The event is the half the first pass of the plan nearly missed.** mika#2358
+/// ships *two* surfaces for a key of this shape — the "unreadable value" WARN
+/// *and* the provenance INFO — and they answer different questions: « did
+/// somebody write an out-of-domain value? » against « which language is actually
+/// in force for this tenant? ». It is the second that separates the two causes
+/// of a surviving symptom, and its doc-comment quotes mika#2293 word for word on
+/// why: *a setting one cannot observe is not a setting, it is a hope.*
+///
+/// Ungated by any telemetry switch, for that constant's reason: this is a
+/// **configuration** event, and it has to stay readable precisely when call
+/// telemetry was cut to reduce noise.
+fn report_resolved_tenant_language(
+    agent_id: &str,
+    raw: Option<&str>,
+) -> Option<crate::config_keys::TenantLanguage> {
+    let resolved = crate::config_keys::resolve_tenant_language(raw);
+
+    let changed = match TENANT_LANGUAGE_REPORTED.lock() {
+        Ok(mut last) => match last.get(agent_id) {
+            Some(previous) if *previous == resolved => false,
+            _ => {
+                last.insert(agent_id.to_string(), resolved);
+                true
+            }
+        },
+        // A poisoned mutex must not silence the announcement: reporting the same
+        // couple twice is noise, never reporting it is a blind spot (mika#2358).
+        Err(_) => true,
+    };
+
+    if changed {
+        info!(
+            target: "mika::otel",
+            agent_id = %agent_id,
+            language = resolved.language_label(),
+            source = resolved.source.as_str(),
+            event = "tenant_language_resolved",
+            "tenant thread language resolved"
+        );
+    }
+
+    resolved.language
 }
 
 /// Parameterizes behavioral differences between the three agent loop variants.
@@ -607,6 +775,11 @@ async fn attempt_continuation_turn(
     trace_id: &str,
     store_llm_calls: bool,
     prompt_variant: Option<&str>,
+    // mika#2247 AC1 — the persona register of the tenant this summary is for.
+    // The continuation turn is the third output site: it produces user-facing
+    // text that no other path normalises, so leaving it out would make AC1 hold
+    // "except when the turn ran out of tool steps".
+    persona: mika_common::home::PersonaProfile,
 ) -> ContinuationResult {
     // `label` (may be an operational trigger name like "heartbeat"/"callback")
     // is preserved for the existing warn! diagnostics. `mode_label` is the
@@ -667,9 +840,38 @@ async fn attempt_continuation_turn(
 
     match continuation {
         Ok(Ok(resp)) => {
-            let t = mika_common::llm::strip_internal_tags(&resp.text());
+            // mika#2247 AC1 — same order as the two sibling sites: normalise
+            // immediately after the tag strip, so the summary that is returned,
+            // persisted and delivered is one and the same text.
+            let t = mika_common::text::normalize_typography_for_persona(
+                mika_common::llm::strip_internal_tags(&resp.text()),
+                persona,
+            );
             let stop = format!("{:?}", resp.stop_reason);
             let usage = resp.usage;
+            // mika#1910 U1/U2 — what this turn produced, by the canonical
+            // serializer (the one that feeds `llm_calls.response_text`), so the
+            // count on the log and the text in the DB describe one object.
+            //
+            // Tools are disabled on this turn (`request.tools = None` above),
+            // so the serializer sees text blocks only: here, and only here, is
+            // `response_chars` unambiguously a count of text. That is also
+            // exactly where the mika#1910 symptom lands — `max_steps` burnt,
+            // then a final message that is empty.
+            let response_text = mika_common::llm::serialize_response_text(
+                &resp.content,
+                mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+            );
+            let reasoning_text = resp.reasoning.as_deref().map(|r| {
+                mika_common::llm::truncate_chars(r, mika_common::llm::MAX_RESPONSE_TEXT_CHARS)
+            });
+            // `Some(0)` on an empty response, never `None`: the call returned,
+            // so it was measured. See the sibling site in `run_loop`.
+            let response_chars = Some(
+                response_text
+                    .as_deref()
+                    .map_or(0, |t| t.chars().count() as i64),
+            );
             // Always call — `save_continuation_llm_call` emits the ungated
             // `turn_usage` log (mika#1889 R2/D2) and internally gates the DB
             // write on `store_llm_calls`.
@@ -688,6 +890,9 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                response_text.as_deref(),
+                reasoning_text.as_deref(),
+                response_chars,
                 store_llm_calls,
             )
             .await;
@@ -725,6 +930,11 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                None,
+                None,
+                // The provider errored: no response exists to measure
+                // (mika#1910 R5, population (b)).
+                RESPONSE_CHARS_UNMEASURED,
                 store_llm_calls,
             )
             .await;
@@ -758,6 +968,11 @@ async fn attempt_continuation_turn(
                 prompt_variant,
                 Some(system_prompt_original_len as i64),
                 request_bytes,
+                None,
+                None,
+                // The deadline clamp cut the call: nothing came back to
+                // measure (mika#1910 R5, population (b)).
+                RESPONSE_CHARS_UNMEASURED,
                 store_llm_calls,
             )
             .await;
@@ -787,6 +1002,22 @@ async fn attempt_continuation_turn(
 /// `tool_use_in_turn` is always `false` here: the continuation turn is
 /// text-only (see `attempt_continuation_turn` which sets `request.tools = None`
 /// before the call), so no observable tool_use can ever occur.
+///
+/// # What this function used to refuse to say (mika#1910)
+///
+/// Until mika#1910 it passed `None, None` to `save_llm_call` at the
+/// `response_text` / `reasoning` positions **on every branch, success
+/// included**, and its `turn_usage` line carried no measure of produced text at
+/// all. So on the continuation turn — the one place in this engine where the
+/// mika#1910 symptom lands (`max_steps` burnt, tools off, final message empty)
+/// — `response_text IS NULL` was true **100 % of the time**, whether the turn
+/// had produced a summary or nothing.
+///
+/// The column that would have carried the emptiness was unconditionally null on
+/// the only row that mattered, and the log carried no count. Neither surface
+/// could measure the class. Both now can: the count on the **ungated** log
+/// (the measurement), the text in the **gated** DB row (the diagnosis — read
+/// one occurrence once the count signals one).
 #[allow(clippy::too_many_arguments)]
 async fn save_continuation_llm_call(
     db: &AsyncDatabase,
@@ -803,6 +1034,15 @@ async fn save_continuation_llm_call(
     prompt_variant: Option<&str>,
     system_prompt_bytes: Option<i64>,
     request_bytes: Option<i64>,
+    // mika#1910 U2 — the serialized response and its extended-thinking text,
+    // for the gated DB row.
+    response_text: Option<&str>,
+    reasoning: Option<&str>,
+    // mika#1910 U1 — the count, for the ungated log. Passed rather than derived
+    // from `response_text`: `None` there is ambiguous between "the call
+    // errored" and "the call returned an empty response", and those two are
+    // precisely the populations R5 forbids merging.
+    response_chars: Option<i64>,
     store_llm_calls: bool,
 ) {
     // Emit turn_usage log FIRST and unconditionally (R2/D2 — decoupled from
@@ -822,6 +1062,7 @@ async fn save_continuation_llm_call(
         latency_ms,
         request_bytes,
         system_prompt_bytes,
+        response_chars,
     );
     emit_turn_usage(
         db.agent_id(),
@@ -864,8 +1105,10 @@ async fn save_continuation_llm_call(
             error,
             u32::MAX,
             prompt_variant,
-            None,
-            None,
+            // mika#1910 U2 — these two positions carried a literal `None` on
+            // every branch, success included. That is the lacuna.
+            response_text,
+            reasoning,
             system_prompt_bytes,
             request_bytes,
         )
@@ -1047,6 +1290,27 @@ async fn run_loop(
     // (build-callback message AND `qa-review` loaded) and therefore cannot be
     // an `INTENT_GUARDS` entry (`fn(&str) -> bool` sees the message alone).
     loaded_skill_names: &[String],
+    // mika#2247 AC2 — the tenant's declared thread language, resolved from
+    // `customer_config` in `load_agent_context` and threaded here for the
+    // `response_language_drift` guard (5f). `None` is the third state: no
+    // declaration, no ground truth, no guard — today's behaviour for every
+    // agent that declares nothing, which is every engineering agent.
+    //
+    // A parameter on the model of `loaded_skill_names` rather than a field on
+    // `ToolContext`: this is a *turn* fact read by one guard, not a capability
+    // the tools need.
+    tenant_language: Option<crate::config_keys::TenantLanguage>,
+    // mika#2247 AC3 — the part of the day at the tenant's local time, computed
+    // once per turn by `prompt::resolve_local_part_of_day` from the same instant
+    // and the same timezone the `## Current Time` section renders. `None` when no
+    // usable timezone is declared, which is what makes the greeting guard (5g)
+    // fail open: with no local hour there is nothing for a greeting to
+    // contradict.
+    //
+    // Threaded rather than recomputed here so the prompt and the guard can never
+    // disagree about what "evening" means — a second parse would be free to
+    // refuse the very greeting the prompt asked for.
+    local_part_of_day: Option<&str>,
     // mika#2368 — out-param : posé quand le tour sort sur un EndTurn accepté
     // alors qu'un verdict était dû, que le budget de re-prompt de la garde
     // `qa_build_callback_verdict` est épuisé et qu'aucune revue n'a été postée.
@@ -1368,16 +1632,29 @@ async fn run_loop(
         };
         let llm_call_latency_ms = llm_call_start.elapsed().as_millis() as u64;
 
+        // Serialize response content: text blocks + tool call summaries.
+        //
+        // mika#1910 U1 — hoisted OUT of the `store_llm_calls` gate below, and
+        // the placement is the unit's whole point. `turn_usage` is the ungated
+        // measurement channel (D2/R2: *the log stream is the primary-outcome
+        // channel and MUST NOT be silenced by the DB-persistence flag*), so a
+        // count computed inside the gate would make the mika#1910 measurement
+        // disappear the day an operator turned DB persistence off to cut noise.
+        // The DB write below reads the same value, so the two surfaces cannot
+        // diverge — which is the property, not an optimisation.
+        let response_text = match &llm_result {
+            Ok(resp) => mika_common::llm::serialize_response_text(
+                &resp.content,
+                mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
+            ),
+            Err(_) => None,
+        };
+
         // Record the LLM call in the database (success or error)
         let llm_call_id = if store_llm_calls {
             let id = uuid::Uuid::new_v4().to_string();
             match &llm_result {
                 Ok(resp) => {
-                    // Serialize response content: text blocks + tool call summaries
-                    let response_text = mika_common::llm::serialize_response_text(
-                        &resp.content,
-                        mika_common::llm::MAX_RESPONSE_TEXT_CHARS,
-                    );
                     let reasoning_text = resp.reasoning.as_deref().map(|r| {
                         mika_common::llm::truncate_chars(
                             r,
@@ -1464,6 +1741,17 @@ async fn run_loop(
                     llm_call_latency_ms,
                     request_bytes,
                     Some(system_prompt_len as i64),
+                    // mika#1910 U1 — `Some(0)`, never `None`, when the
+                    // serializer returned nothing: this call DID return, so the
+                    // response WAS measured and it measured zero. That is the
+                    // mika#1910 class itself. Collapsing it to `null` would put
+                    // the very population the ticket counts into the
+                    // "not measured" bucket, which is the R5 trap one arm down.
+                    Some(
+                        response_text
+                            .as_deref()
+                            .map_or(0, |t| t.chars().count() as i64),
+                    ),
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -1489,6 +1777,10 @@ async fn run_loop(
                     llm_call_latency_ms,
                     request_bytes,
                     Some(system_prompt_len as i64),
+                    // No response exists on this arm, so there is nothing to
+                    // measure and `0` would be a readable lie (mika#1910 R5,
+                    // population (b)).
+                    RESPONSE_CHARS_UNMEASURED,
                 );
                 emit_turn_usage(
                     db.agent_id(),
@@ -1580,7 +1872,19 @@ async fn run_loop(
 
                 // `mut`: the mika#2037 review-anchor guard withholds an unattested
                 // disposition from the final text rather than accepting it (fail-closed).
-                let mut text = mika_common::llm::strip_internal_tags(&response.text());
+                //
+                // mika#2247 AC1 — the typographic normalisation is applied here,
+                // immediately after `strip_internal_tags` and **before** the
+                // guards, so a single text reaches everything downstream: the
+                // guards that read it, the persistence, and the delivery. Doing
+                // it later (in `server::handlers`, the mika#2136 site) would let
+                // the database and the delivered message diverge, and the
+                // compaction summary would then re-teach the em-dash on the very
+                // next turn.
+                let mut text = mika_common::text::normalize_typography_for_persona(
+                    mika_common::llm::strip_internal_tags(&response.text()),
+                    tool_ctx.tier.persona_profile(),
+                );
 
                 // mika#2296 — a turn that ended on MaxTokens with nothing visible
                 // to show for it names itself, and names its remedy. See
@@ -2455,6 +2759,202 @@ async fn run_loop(
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise_uncorrected",
                             "Unactioned frequency-promise guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5f. Response language-drift guard (mika#2247 AC2) — refuse
+                    // a turn answering in a language other than the one this
+                    // tenant declared.
+                    //
+                    // **The measured defect.** The 2026-09-06 thread on the
+                    // general-public tenant flipped EN↔FR inside one
+                    // conversation: « So — who are you… », « All good », then
+                    // « Bonjour ! Je suis Mika… ». The persona already
+                    // prescribes French twice, once in bold, and that is exactly
+                    // why a third sentence would not have helped: the class
+                    // `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
+                    // bounds. What was missing was a **declared** axis (U1, the
+                    // `language` key) and a structural half that refuses a
+                    // drifted turn — this one.
+                    //
+                    // Applies uniformly across modes: a heartbeat that opens in
+                    // the wrong language is exactly as wrong, and it is the turn
+                    // that *starts* the exchange. Not skipped by
+                    // `skip_remaining_guards` (#1178) — a posted PR review does
+                    // not license answering in the wrong language, the same
+                    // literal reason as 5c/5d/5e.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(RESPONSE_LANGUAGE_DRIFT_LABEL)
+                        && let Some(drift) = detect_response_language_drift(&text, tenant_language)
+                    {
+                        intent_guard_retries.insert(RESPONSE_LANGUAGE_DRIFT_LABEL);
+                        let corr_id =
+                            format!("{}:{}:response_language_drift", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "response_language_drift",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            expected_language = %drift.expected,
+                            detected_language = %drift.detected,
+                            detected_hits = drift.detected_hits,
+                            expected_hits = drift.expected_hits,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.response_language_drift",
+                            "Response language-drift guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] This conversation's language is `{expected}`, \
+                             declared for this tenant, and your response is in \
+                             `{detected}`. A thread holds one language: an incoming \
+                             message written in another language does not change it.\n\n\
+                             Rewrite your response in `{expected}` now. Keep the \
+                             substance exactly as it is; change only the language.\n\n\
+                             If the person explicitly asked you to switch, do not just \
+                             switch: call `set_config` with `{key}` = `{detected}` \
+                             first, then answer in the new language.",
+                            expected = drift.expected,
+                            detected = drift.detected,
+                            key = crate::config_keys::TENANT_LANGUAGE_KEY,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2247 — the residue of 5f's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d's and 5e's: the budget
+                    // is spent, the answer goes out drifted, and without this
+                    // event that population would be indistinguishable from a
+                    // healthy turn. It is **not** a second correction — the
+                    // family grants one re-prompt — it is what turns AC2 from a
+                    // claim into a measurement: `guard.response_language_drift`
+                    // counts the turns caught, this one counts the turns the
+                    // guard did not close. Expected regime: zero.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(RESPONSE_LANGUAGE_DRIFT_LABEL)
+                        && let Some(drift) = detect_response_language_drift(&text, tenant_language)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            expected_language = %drift.expected,
+                            detected_language = %drift.detected,
+                            label = mode.label(),
+                            event = "guard.response_language_drift_uncorrected",
+                            "Response language-drift guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5g. Time-of-day greeting guard (mika#2247 AC3) — refuse a
+                    // greeting that names a part of the day the tenant is not in.
+                    //
+                    // **The measured defect** is a « belle journée » sent in the
+                    // evening. Its cause was not a missing instruction but a
+                    // missing *fact*: the prompt posed UTC and left two untooled
+                    // inferences to the model. The intent half (U7) now computes
+                    // and poses the local hour, so this guard is a **net**, not
+                    // the mechanism — which is why its lexicon is a closed, narrow
+                    // list where 5f's is a measurement.
+                    //
+                    // Fail-open on an unknown hour: with no local time there is
+                    // nothing for a greeting to contradict, and the prompt has
+                    // already forbidden a time-stamped greeting on that path.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(TIME_OF_DAY_GREETING_LABEL)
+                        && let Some(mismatch) =
+                            detect_time_of_day_greeting_mismatch(&text, local_part_of_day)
+                    {
+                        intent_guard_retries.insert(TIME_OF_DAY_GREETING_LABEL);
+                        let corr_id = format!(
+                            "{}:{}:time_of_day_greeting_mismatch",
+                            tool_ctx.trace_id, step
+                        );
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "time_of_day_greeting_mismatch",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            greeting = %mismatch.greeting,
+                            implied_part = %mismatch.implied,
+                            actual_part = %mismatch.actual,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.time_of_day_greeting_mismatch",
+                            "Time-of-day greeting guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        let correction = format!(
+                            "[mika-engine] Your response greets the person with \
+                             `{greeting}`, which names the {implied}. It is currently \
+                             the {actual} where they are — the `Local time` line of \
+                             your `## Current Time` section is the ground truth, and \
+                             it is computed, not inferred.\n\n\
+                             Rewrite your response with a greeting that matches the \
+                             {actual}, or with one that names no part of the day at \
+                             all. Keep everything else as it is.",
+                            greeting = mismatch.greeting,
+                            implied = mismatch.implied,
+                            actual = mismatch.actual,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#2247 — the residue of 5g's single-retry budget, named.
+                    // Same gesture and same reason as 5d/5e/5f above.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(TIME_OF_DAY_GREETING_LABEL)
+                        && let Some(mismatch) =
+                            detect_time_of_day_greeting_mismatch(&text, local_part_of_day)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            greeting = %mismatch.greeting,
+                            implied_part = %mismatch.implied,
+                            actual_part = %mismatch.actual,
+                            label = mode.label(),
+                            event = "guard.time_of_day_greeting_mismatch_uncorrected",
+                            "Time-of-day greeting guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
                     }
@@ -4333,12 +4833,17 @@ async fn run_agent_inner(
     // drift on the "which model am I?" answer.
     let runtime_provider = llm.provider_name();
     let runtime_model = llm.model_name();
+    // mika#2247 AC3 — one instant and one timezone read, shared by the prompt
+    // section and by the greeting guard. Computing the guard's side separately
+    // would let the two disagree about what "evening" means.
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         is_onboarding: params.is_onboarding,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         global_home_dir: params.global_home_dir,
         channel_type: Some(params.channel_type),
@@ -4356,6 +4861,9 @@ async fn run_agent_inner(
         // mika#2290 — the register of the hosting line follows the persona axis
         // of the cached tier, never the hosting axis and never the locale.
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — `None` renders no line at all, which is today's
+        // behaviour for every agent that declares nothing.
+        tenant_language: ctx.language,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -4551,17 +5059,34 @@ async fn run_agent_inner(
     let image_disposition = crate::image_disposition::decide(params.user_images, effective_llm);
     record_withheld_images(db, session_id, trace_id, scope_task_id, &image_disposition).await;
 
-    let history_config = &ctx.identity.context.history;
+    // mika#2425 — the identity declares a ROLE FLOOR; `customer_config` may
+    // narrow it per tenant and never widen it. This is the single production
+    // reader of `identity.context.history`, held by
+    // `mika2425_identity_context_history_has_a_single_reader`: a second one
+    // would apply the floor without the narrowing, silently, with every
+    // behavioural assertion still green.
+    let resolved_history = context_history::resolve(
+        &ctx.identity.context.history,
+        ctx.db_history_scope.as_deref(),
+        ctx.db_history_max_tokens.as_deref(),
+        context_history::SessionMinting::of(&ctx.identity),
+    );
+    context_history::report_resolved(&db.agent_id, &resolved_history);
+
     // mika#1951, read site 2 of 2. The caller may narrow this turn's scope to its
     // own session; it may never widen it. The branch only ever *replaces* a
     // declared scope with the narrower one, so an agent already declaring
     // `session` (mika-arch) cannot be pushed back to `agent` from the network
     // whatever a caller sends. That asymmetry is why the wire key is a bool: the
     // widening request has no spelling.
+    //
+    // mika#2425 composes upstream and in the SAME direction: the caller narrows
+    // what the cascade already resolved, so the two asymmetries never have to be
+    // arbitrated against each other.
     let effective_scope = if params.session_isolated {
         prompt::HistoryScope::Session
     } else {
-        history_config.scope
+        resolved_history.scope
     };
     let scoped_session_id = match effective_scope {
         prompt::HistoryScope::Session => Some(session_id),
@@ -4570,7 +5095,11 @@ async fn run_agent_inner(
     let mut history = db
         .rebuild_context(scoped_session_id, scope_task_id, 20)
         .await?;
-    let truncation = match history_config.max_tokens {
+    // mika#2425 — the RESOLVED ceiling, not the declared one. Reading
+    // `ctx.identity.context.history.max_tokens` here would apply the role's floor
+    // and drop the tenant's narrowing on this axis alone, which is the half-wired
+    // shape `mika2425_identity_context_history_has_a_single_reader` refuses.
+    let truncation = match resolved_history.max_tokens {
         Some(max_tokens) => truncate_history_to_token_budget(&mut history, max_tokens),
         None => HistoryTruncation::default(),
     };
@@ -4889,6 +5418,8 @@ async fn run_agent_inner(
         &enabled_tool_names,
         is_verdict_producer,
         &loaded_skill_names,
+        ctx.language,      // mika#2247: `None` = undeclared = nothing guarded
+        local_part_of_day, // mika#2247 AC3: `None` = unknown hour = guard fails open
         // mika#2368 : un callback de build est toujours un tour silencieux, donc
         // ce mode n'a pas de population pour le filet.
         None,
@@ -4985,6 +5516,7 @@ async fn run_agent_inner(
                 trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -5575,13 +6107,17 @@ async fn run_silent_inner(
     // uniform across conversation and silent paths.
     let silent_runtime_provider = llm.provider_name();
     let silent_runtime_model = llm.model_name();
+    // mika#2247 AC3 — see the conversation path: one instant, one read, two
+    // consumers. A proactive turn is the one that greets unprompted (R3b).
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let silent_ctx = prompt::SilentPromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         pending_commitments: &pending_commitments,
         trigger_context: &trigger_context,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         telegram_configured: chat_id.is_some(),
         has_message_sender: params.message_sender.is_some(),
@@ -5595,6 +6131,9 @@ async fn run_silent_inner(
         runtime_model: silent_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — a proactive turn opens the exchange, so it is the one
+        // that most needs to know which language to open it in (R3b).
+        tenant_language: ctx.language,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -5960,6 +6499,8 @@ async fn run_silent_inner(
         &enabled_tool_names,
         false, // silent mode: mode.is_conversation() gate handles callback turns (#1254)
         &loaded_skill_names, // mika#2355: callback_safe_skills() — where qa-review is or isn't
+        ctx.language, // mika#2247: a proactive turn opens the exchange (R3b)
+        local_part_of_day, // mika#2247 AC3
         Some(&qa_verdict_unmet), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
@@ -6032,6 +6573,7 @@ async fn run_silent_inner(
                 &trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -6259,12 +6801,15 @@ async fn run_team_agent_inner_impl(
     // share the same Self-Identity Discipline contract as conversation-mode.
     let team_runtime_provider = llm.provider_name();
     let team_runtime_model = llm.model_name();
+    // mika#2247 AC3 — same single read as the two sibling paths.
+    let turn_utc = chrono::Utc::now();
+    let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
         core_memory: &ctx.core_memory,
         is_onboarding: false,
-        current_utc: chrono::Utc::now(),
+        current_utc: turn_utc,
         timezone: ctx.timezone,
         global_home_dir: None, // Team agents don't need team discovery in their prompt
         channel_type: None,
@@ -6278,6 +6823,10 @@ async fn run_team_agent_inner_impl(
         runtime_model: team_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
+        // mika#2247 AC2 — the team child reads its OWN agent's declaration, the
+        // same rule mika#1926 settled for `stopped_topics`: `ctx` here is the
+        // child's context, not the orchestrator's.
+        tenant_language: ctx.language,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -6525,6 +7074,8 @@ async fn run_team_agent_inner_impl(
         &enabled_tool_names,
         has_verdict_producer_skill(params.skills.skills()),
         &skill_names_of(&matched_entries), // mika#2355
+        ctx.language,                      // mika#2247: the child agent's own declaration
+        local_part_of_day,                 // mika#2247 AC3
         None,                              // mika#2368 : pas de callback de build en mode équipe
         store_llm,
         store_tools,
@@ -6617,6 +7168,7 @@ async fn run_team_agent_inner_impl(
                 &trace_id,
                 store_llm,
                 prompt_variant.as_deref(),
+                params.tier.persona_profile(),
             )
             .await;
 
@@ -8067,6 +8619,36 @@ struct TurnUsageFields {
     request_bytes: Option<i64>,
     /// Bytes of the assembled system prompt for this turn (mika#2331 AC1).
     system_prompt_bytes: Option<i64>,
+    /// Characters of the text this call produced (mika#1910 U1).
+    ///
+    /// **A count, therefore a RAW dimension** — never `is_empty`, never a
+    /// `phase`, never a `role`. The threshold that turns a count into a class
+    /// is the offline analyzer's (`scripts/measure-empty-turns`), per the Prime
+    /// hard condition #1 stated above and Signal O's doctrine: *the boundary is
+    /// defined by the analyzer, not baked into the thermometer*.
+    ///
+    /// **Source of truth:** the character count of
+    /// [`mika_common::llm::serialize_response_text`]'s output — **the same
+    /// serializer that feeds `llm_calls.response_text`**. Two measurements of
+    /// "the response" free to diverge would be a second reader; the identity of
+    /// source is the property, not an implementation detail.
+    ///
+    /// Two consequences of that choice, which the analyzer must know:
+    ///
+    /// - The serializer **includes tool calls**, as `[Tool Call: name(args)]`.
+    ///   On an in-loop turn `response_chars > 0` therefore does **not** mean
+    ///   "text was produced", and the count must be read together with
+    ///   `tool_use_in_turn`. On the **continuation** turn tools are disabled
+    ///   (`attempt_continuation_turn` sets `request.tools = None`), so there the
+    ///   measure is text alone — and that is exactly where the mika#1910 class
+    ///   lives, so that is where the semantics are unambiguous.
+    /// - It applies `strip_internal_tags` and returns `None` when the result is
+    ///   empty, so a response made **only** of internal tags counts `0`. A real,
+    ///   bounded false positive, named here and isolable from the analyzer's
+    ///   output rather than absorbed into its predicate.
+    ///
+    /// `null` is not `0` — see [`RESPONSE_CHARS_UNMEASURED`].
+    response_chars: Option<i64>,
 }
 
 /// Pure builder: maps a per-turn observation into `TurnUsageFields` (mika#1889).
@@ -8099,6 +8681,7 @@ fn build_turn_usage_fields(
     latency_ms: u64,
     request_bytes: Option<i64>,
     system_prompt_bytes: Option<i64>,
+    response_chars: Option<i64>,
 ) -> TurnUsageFields {
     let (input, output, cache_read, cache_write) = match usage {
         Some(u) => (
@@ -8121,6 +8704,7 @@ fn build_turn_usage_fields(
         status: status.to_string(),
         request_bytes,
         system_prompt_bytes,
+        response_chars,
     }
 }
 
@@ -8166,6 +8750,10 @@ fn emit_turn_usage(
         // distinction the two fields exist to carry (mika#2331 D6).
         request_bytes = ?fields.request_bytes,
         system_prompt_bytes = ?fields.system_prompt_bytes,
+        // mika#1910 U1 — same `?` and the same reason: on the continuation
+        // line, `0` and `null` are the two answers the whole measurement turns
+        // on, and a field that flattened them would restore the defect.
+        response_chars = ?fields.response_chars,
         "turn usage"
     );
 }
@@ -9343,6 +9931,501 @@ mod tests {
             "        // llm.send_message_with_deadline(request, None) is wrapped below\n";
         assert!(
             unwrapped_deadline_call_sites(commented).is_empty(),
+            "prose naming the call must not be a violation, or the guard forbids documenting itself"
+        );
+    }
+
+    // ===========================================================================
+    // mika#1910 — every `turn_usage` emission says what its turn produced
+    // ===========================================================================
+
+    /// The index of the closing paren matching the `(` at `open`.
+    ///
+    /// Depth-counting, string-literal aware. It cannot parse Rust — a `(` inside
+    /// a char literal or a raw string would fool it — and that is acceptable for
+    /// what it bounds: the argument list of one named call, whose real shapes are
+    /// in this file and carry neither.
+    fn matching_paren(src: &str, open: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split an argument list on its **top-level** commas, dropping the empty
+    /// tail a trailing comma leaves behind.
+    fn top_level_args(list: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut cur = String::new();
+        for c in list.chars() {
+            if in_str {
+                cur.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    cur.push(c);
+                }
+                '(' | '[' | '{' | '<' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' | '}' | '>' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ',' if depth == 0 => {
+                    out.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            }
+        }
+        let tail = cur.trim();
+        if !tail.is_empty() {
+            out.push(tail.to_string());
+        }
+        out.retain(|a| !a.is_empty());
+        out
+    }
+
+    /// Every invocation of the `turn_usage` field builder found in `src`, as
+    /// `(1-based line, last argument)`.
+    ///
+    /// The last argument **is** the `response_chars` position: that parameter is
+    /// declared last on `build_turn_usage_fields`, which is the one funnel all
+    /// three emission sites traverse (`save_continuation_llm_call` reaches it
+    /// through its own wrapper). So "did this site declare what it measured?"
+    /// reduces to reading one argument, which a scan can do exactly.
+    fn turn_usage_emitter_sites(src: &str) -> Vec<(usize, String)> {
+        // In halves: this function's body lives inside the file the guard scans,
+        // so writing the token whole would make the gate its own first offender
+        // — the `unwrapped_deadline_call_sites` motif one block up, and the
+        // mika#2201 class (a lint that reddens on its own prose).
+        let emitter = concat!("build_turn_usage", "_fields");
+
+        // Comments are how this ticket explains itself, and the constant's own
+        // doc-comment contains the word `None`. Strip line comments first,
+        // preserving the line structure so reported numbers stay those of `src`.
+        let cleaned: String = src
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut sites = Vec::new();
+        let mut from = 0usize;
+
+        while let Some(rel) = cleaned[from..].find(emitter) {
+            let start = from + rel;
+            from = start + emitter.len();
+
+            // A definition (`fn build_turn_usage_fields(`) is not a call site.
+            if cleaned[..start].trim_end().ends_with("fn") {
+                continue;
+            }
+            // Only whitespace may sit between the token and its `(`, or this is
+            // a mention rather than an invocation.
+            let rest = &cleaned[start + emitter.len()..];
+            let Some(open_rel) = rest.find('(') else {
+                continue;
+            };
+            if !rest[..open_rel].trim().is_empty() {
+                continue;
+            }
+
+            let open = start + emitter.len() + open_rel;
+            let Some(close) = matching_paren(&cleaned, open) else {
+                continue;
+            };
+            let args = top_level_args(&cleaned[open + 1..close]);
+            let Some(last) = args.last() else {
+                continue;
+            };
+            let line = cleaned[..start].matches('\n').count() + 1;
+            sites.push((line, last.clone()));
+        }
+
+        sites
+    }
+
+    /// The detector behind [`mika1910_every_unmeasured_site_declares_itself`],
+    /// split out so the guard can be exercised on a fabricated string rather
+    /// than by breaking the real source (mika#1910 verification contract §7).
+    ///
+    /// # Why the criterion is the DECLARATION and not the error arm
+    ///
+    /// The natural predicate — *"is this `None` inside an `Err` arm?"* — is not
+    /// one a grep can settle, and both approximations fail in **both**
+    /// directions: a lookback for `Err(` misses an error site written otherwise
+    /// (`match … { e @ LlmError::… =>`, a `?` bubbling up, a helper), and it
+    /// accepts any `None` that happens to sit under a neighbouring `Err`. So the
+    /// question is moved from the context to the declaration: *"did the author
+    /// write the token that says **I know this site measures nothing**?"* — which
+    /// a scan answers exactly, and which documents the site into the bargain.
+    fn undeclared_unmeasured_sites(src: &str) -> Vec<String> {
+        turn_usage_emitter_sites(src)
+            .into_iter()
+            .filter(|(_, last)| last == "None")
+            .map(|(line, _)| format!("{line}: passes a bare `None` for `response_chars`"))
+            .collect()
+    }
+
+    /// Every `turn_usage` emission site must declare what it measured — either a
+    /// real count, or [`RESPONSE_CHARS_UNMEASURED`] (mika#1910 U1).
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// Removing the measure breaks **no assertion**. The loop keeps working,
+    /// every existing test stays green, and the only change is that the line goes
+    /// mute again — which is the entire defect of mika#1910: the continuation
+    /// turn recorded `response_text = NULL` unconditionally, successes included,
+    /// so the one row that carries the class could not distinguish "produced a
+    /// summary" from "produced nothing". A regression that makes nothing false,
+    /// only something invisible, is the class this house guards by scanning
+    /// source (`mika2342_every_llm_call_is_wrapped_in_a_timeout` one block up,
+    /// `policy::no_bare_agent_timeout_constant_remains`,
+    /// `grooming_marker::no_grooming_regex_outside_this_module`).
+    ///
+    /// # Scope, and what a fourth site means
+    ///
+    /// This file only, and the inventory is closed at **three** sites — the loop's
+    /// `Ok` arm, the loop's `Err` arm, and the continuation turn. Per the plan's
+    /// Fire-Disposition there is **no allowlist**: an allowlist born empty is
+    /// just a place to put the next violation instead of measuring it. A fourth
+    /// site is **halt and surface** — whether it has a response to measure is a
+    /// question this guard cannot settle for its author.
+    #[test]
+    fn mika1910_every_unmeasured_site_declares_itself() {
+        // The scan reads the production half only: the test code below writes a
+        // bare `None` on purpose. The boundary comes from
+        // `mika_common::source_guard` (mika#2398) rather than a local
+        // `split_once("#[cfg(test)]")`, whose premise stopped being true at
+        // mika#2310 (an extracted test module carries no such literal).
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+
+        let offenders = undeclared_unmeasured_sites(&production);
+        assert!(
+            offenders.is_empty(),
+            "mika#1910: {} `turn_usage` emission site(s) in `agent_loop/mod.rs` pass a bare \
+             `None` for `response_chars`.\n{}\n\n\
+             WHY THIS MATTERS: `response_chars` is the ONLY surface on which the mika#1910 class \
+             is countable. `null` there means \"not measured\"; `0` means \"measured, and the \
+             model produced nothing\" — which IS the class. A bare `None` collapses the two, and \
+             the offline analyzer (`scripts/measure-empty-turns`) then classes the turn \
+             `undetermined` instead of `empty_response`: the measurement silently loses exactly \
+             the population the ticket exists to count.\n\
+             FIX: pass the count when the call returned (`Some(0)` on an empty response, never \
+             `None`), or the named constant RESPONSE_CHARS_UNMEASURED when no call returned. \
+             Do NOT pass `0` on an error arm — nothing was measured there, and `0` would be a \
+             readable lie (the mika#2331 rule on `request_bytes`, one struct away).",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// The inventory is closed at three emission sites (mika#1910 U1).
+    ///
+    /// Without this, a guard grown too narrow — a renamed builder, a changed
+    /// argument order — would pass by looking at nothing, and a green scan would
+    /// be indistinguishable from a healthy one (the mika#2205 class).
+    #[test]
+    fn mika1910_the_inventory_of_emission_sites_is_closed() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+
+        let sites = turn_usage_emitter_sites(&production);
+        assert_eq!(
+            sites.len(),
+            3,
+            "mika#1910: expected exactly 3 `turn_usage` emission sites (loop Ok arm, loop Err \
+             arm, continuation turn), found {}: {:?}.\n\
+             A FOURTH SITE IS HALT-AND-SURFACE, not an allowlist entry: whether it has a \
+             response to measure is a question this guard cannot settle for its author.\n\
+             ZERO SITES means the scan stopped seeing the builder at all — repair the scan \
+             before trusting its sibling's green.",
+            sites.len(),
+            sites
+        );
+    }
+
+    /// The guard's positive and negative controls, on fabricated snippets.
+    ///
+    /// Exercising it by breaking the real source is refused: the guard would
+    /// become untestable without reddening the repository.
+    #[test]
+    fn mika1910_guard_fires_on_a_bare_none() {
+        let emitter = concat!("build_turn_usage", "_fields");
+        let declared = concat!("RESPONSE_CHARS_", "UNMEASURED");
+
+        // Positive control — the named constant is a declaration, not a violation.
+        let good = format!(
+            "            let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               {declared},\n\
+             \x20           );\n"
+        );
+        assert!(
+            undeclared_unmeasured_sites(&good).is_empty(),
+            "the named constant must be accepted, or the guard forbids the fix itself"
+        );
+
+        // Negative control 1 — a bare `None` at the `response_chars` position.
+        let bare = format!(
+            "            let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               None,\n\
+             \x20           );\n"
+        );
+        assert_eq!(
+            undeclared_unmeasured_sites(&bare).len(),
+            1,
+            "the guard must flag a bare `None` — it is the exact shape mika#1910 removed"
+        );
+
+        // Negative control 2 — the SAME bare `None`, under a line containing
+        // `Err(`. It must STILL be flagged: this is the control that separates
+        // "the guard reads the declaration" from "the guard reads the
+        // neighbourhood". Without it, a lookback grown by accident would pass.
+        let under_err = format!(
+            "            Err(e) => {{\n\
+             \x20           let fields = {emitter}(\n\
+             \x20               step,\n\
+             \x20               usage,\n\
+             \x20               &stop,\n\
+             \x20               false,\n\
+             \x20               \"error\",\n\
+             \x20               latency,\n\
+             \x20               request_bytes,\n\
+             \x20               None,\n\
+             \x20               None,\n\
+             \x20           );\n\
+             \x20       }}\n"
+        );
+        assert_eq!(
+            undeclared_unmeasured_sites(&under_err).len(),
+            1,
+            "a bare `None` under an `Err(` line must still be flagged — the criterion is the \
+             DECLARATION, never the neighbourhood. A grep cannot decide whether a line sits in \
+             an error arm; it can decide whether its author wrote the token."
+        );
+
+        // Good faith — prose naming the shape must not be a violation, or the
+        // guard forbids documenting itself (mika#2201, mika#2050).
+        let commented = format!("            // {emitter}(.., None) was the pre-fix shape\n");
+        assert!(
+            undeclared_unmeasured_sites(&commented).is_empty(),
+            "prose naming the call must not be a violation, or the guard forbids documenting \
+             itself"
+        );
+    }
+
+    // ===========================================================================
+    // mika#2247 — every user-facing output site normalises its typography
+    // ===========================================================================
+
+    /// How many lines above the tag-strip the normaliser may sit.
+    ///
+    /// Two covers the single-line form and the three-line composition all three
+    /// real sites use. Deliberately *not* wider, for the sibling guard's reason:
+    /// a normaliser five lines up is more likely to belong to something else,
+    /// and a gate that accepts an unrelated wrapper passes the regression it
+    /// exists to catch.
+    const TYPOGRAPHY_GUARD_LOOKBACK_LINES: usize = 2;
+
+    /// The detector behind
+    /// [`mika2247_every_output_site_normalises_its_typography`], split out so
+    /// the guard can be exercised on a fabricated string rather than by
+    /// breaking the real source.
+    ///
+    /// Lexical, and says so: it finds the tag-strip call and then looks for the
+    /// normaliser within the preceding [`TYPOGRAPHY_GUARD_LOOKBACK_LINES`]. It
+    /// cannot parse Rust. That is acceptable for what it defends — not a subtle
+    /// behaviour, but a **new output site** added without the normalisation,
+    /// which is what a hurried feature does.
+    fn unnormalised_output_sites(label: &str, src: &str) -> Vec<String> {
+        // Both tokens in halves: this function lives inside the crate the guard
+        // scans, so writing either one whole would make the gate its own first
+        // offender (the `mika2342_*` motif above).
+        let strip_token = concat!("strip_internal_", "tags(");
+        let normalise_token = concat!("normalize_typography_", "for_persona(");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let mut offenders = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            // Prose naming the call is how this ticket explains itself; scanning
+            // it would make the explanation the violation.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !line.contains(strip_token) {
+                continue;
+            }
+            let from = i.saturating_sub(TYPOGRAPHY_GUARD_LOOKBACK_LINES);
+            if !lines[from..=i].iter().any(|l| l.contains(normalise_token)) {
+                offenders.push(format!("{label}:{}: {trimmed}", i + 1));
+            }
+        }
+
+        offenders
+    }
+
+    /// Every production site of this crate that produces user-facing text must
+    /// compose the tag strip with the mika#2247 normaliser.
+    ///
+    /// # Why a source scan and not a behavioural test
+    ///
+    /// A fourth output site added without the normalisation breaks **no
+    /// assertion**. Every existing test stays green; the only change is that one
+    /// path starts emitting em-dashes to a family tenant again. A regression
+    /// that makes nothing false, only something un-normalised on one path, is
+    /// the class this house guards by scanning source
+    /// (`mika2342_every_llm_call_is_wrapped_in_a_timeout` two blocks up,
+    /// `grooming_marker::no_grooming_regex_outside_this_module`).
+    ///
+    /// # Scope, and what a fourth site means
+    ///
+    /// The whole `mika-agent` crate, production half only. The inventory is
+    /// closed at **three** sites — the EndTurn extraction, the continuation
+    /// turn, and the `send_message` tool — and there is **no allowlist**: an
+    /// allowlist born empty is just a place to put the next violation instead
+    /// of normalising it. A fourth site means either the inventory was wrong or
+    /// an output path was added: **halt and surface**, do not adjust the guard.
+    ///
+    /// `mika-common`'s own `serialize_response_text` is deliberately outside the
+    /// perimeter: it feeds `llm_calls.response_text`, an observability sink, not
+    /// a user channel.
+    #[test]
+    fn mika2247_every_output_site_normalises_its_typography() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        let mut sites = 0usize;
+        scanner.for_each(|path, production| {
+            let label = path
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            sites += production
+                .lines()
+                .filter(|l| {
+                    !l.trim_start().starts_with("//")
+                        && l.contains(concat!("strip_internal_", "tags("))
+                })
+                .count();
+            offenders.extend(unnormalised_output_sites(&label, production));
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2247: {} output site(s) strip internal tags without normalising the \
+             typography.\n{}\n\n\
+             WHY THIS MATTERS: the family persona prescribes simple ASCII punctuation, and \
+             glm-5.2 emits em-dashes by style. An un-normalised site re-opens AC1 on that path \
+             alone, silently — no test goes red, the tenant simply reads « … connaître — tu me \
+             parles » again.\n\
+             FIX: compose as the three existing sites do —\n  \
+             mika_common::text::normalize_typography_for_persona(\n    \
+             mika_common::llm::strip_internal_tags(…),\n    <persona>,\n  )\n\
+             and normalise BEFORE the text is captured, persisted or measured, so the database, \
+             the guards and the delivered message never diverge (mika#2136).",
+            offenders.len(),
+            offenders.join("\n")
+        );
+
+        assert_eq!(
+            sites, 3,
+            "mika#2247: the inventory is closed at three output sites (EndTurn extraction, \
+             continuation turn, `send_message`). Found {sites}. A fourth site is halt-and-surface, \
+             not an allowlist entry — decide whether it produces user-facing text, normalise it if \
+             it does, and update this count with its reason."
+        );
+    }
+
+    /// The guard's positive control: it must actually fire on a bare call.
+    ///
+    /// Written against a fabricated snippet rather than by editing the real
+    /// source — a guard verified only by its own green is a guard verified by
+    /// nothing.
+    #[test]
+    fn mika2247_typography_guard_fires_on_an_unnormalised_site() {
+        let bare = "        let cleaned = mika_common::llm::strip_internal_tags(text);\n";
+        assert_eq!(
+            unnormalised_output_sites("fixture.rs", bare).len(),
+            1,
+            "the guard must flag a bare tag strip — it is the exact shape mika#2247 replaced"
+        );
+
+        let composed = "        let cleaned = mika_common::text::normalize_typography_for_persona(\n\
+                        \x20           mika_common::llm::strip_internal_tags(text),\n\
+                        \x20           ctx.tier.persona_profile(),\n\
+                        \x20       );\n";
+        assert!(
+            unnormalised_output_sites("fixture.rs", composed).is_empty(),
+            "the guard must accept the composed shape, or it would forbid the fix"
+        );
+
+        let commented = "        // strip_internal_tags(text) is normalised just below\n";
+        assert!(
+            unnormalised_output_sites("fixture.rs", commented).is_empty(),
             "prose naming the call must not be a violation, or the guard forbids documenting itself"
         );
     }
@@ -14386,7 +15469,17 @@ mod tests {
     #[test]
     fn build_turn_usage_success_with_cache_passes_through_tokens() {
         let u = usage_with_cache();
-        let f = build_turn_usage_fields(3, Some(&u), "ToolUse", true, "success", 250, None, None);
+        let f = build_turn_usage_fields(
+            3,
+            Some(&u),
+            "ToolUse",
+            true,
+            "success",
+            250,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.step, 3);
         assert_eq!(f.input_tokens, 1234);
         assert_eq!(f.output_tokens, 567);
@@ -14407,7 +15500,17 @@ mod tests {
         // still be jq-parseable unconditionally — `None` → `0`, never a missing
         // field. This is the load-bearing analyzer-shape invariant.
         let u = usage_without_cache();
-        let f = build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
+        let f = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.input_tokens, 10);
         assert_eq!(f.output_tokens, 20);
         assert_eq!(f.cache_read_tokens, 0);
@@ -14421,7 +15524,7 @@ mod tests {
         // Error/timeout arms have no `LlmUsage`. R3 mandates the event still
         // fires so the covariable "turns" count is not silently undercounted —
         // the tokens roll to zero but the row exists.
-        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None);
+        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None, None);
         assert_eq!(f.step, 7);
         assert_eq!(f.input_tokens, 0);
         assert_eq!(f.output_tokens, 0);
@@ -14451,6 +15554,7 @@ mod tests {
             100,
             None,
             None,
+            None,
         );
         assert_eq!(f.step, u32::MAX);
     }
@@ -14464,9 +15568,18 @@ mod tests {
         // otherwise-identical inputs.
         let u = usage_without_cache();
         let f_true =
-            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None);
-        let f_false =
-            build_turn_usage_fields(1, Some(&u), "EndTurn", false, "success", 0, None, None);
+            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None, None);
+        let f_false = build_turn_usage_fields(
+            1,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert!(f_true.tool_use_in_turn);
         assert!(!f_false.tool_use_in_turn);
         // No `phase`/`is_planning`/`role` field exists on the struct — D1/R5
@@ -14480,8 +15593,17 @@ mod tests {
         // measurement (wall-clock of the HTTP call), not an estimand
         // component. Verified here as a pure pass-through.
         let u = usage_without_cache();
-        let f =
-            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 12345, None, None);
+        let f = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            12345,
+            None,
+            None,
+            None,
+        );
         assert_eq!(f.latency_ms, 12345);
     }
 
@@ -14504,12 +15626,22 @@ mod tests {
             0,
             Some(59_812),
             Some(48_000),
+            None,
         );
         assert_eq!(measured.request_bytes, Some(59_812));
         assert_eq!(measured.system_prompt_bytes, Some(48_000));
 
-        let unmeasured =
-            build_turn_usage_fields(0, Some(&u), "EndTurn", false, "success", 0, None, None);
+        let unmeasured = build_turn_usage_fields(
+            0,
+            Some(&u),
+            "EndTurn",
+            false,
+            "success",
+            0,
+            None,
+            None,
+            None,
+        );
         assert_eq!(unmeasured.request_bytes, None);
         assert_eq!(unmeasured.system_prompt_bytes, None);
         assert_ne!(unmeasured.request_bytes, Some(0));
@@ -14530,6 +15662,7 @@ mod tests {
             420_000,
             Some(59_812),
             Some(48_000),
+            None,
         );
         assert_eq!(f.input_tokens, 0, "no usage on the error arm — unchanged");
         assert_eq!(
@@ -15125,6 +16258,214 @@ mod tests {
         );
     }
 
+    /// One `detect_config_change(` call site, with everything the AC7 assertion
+    /// needs to name it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Mika2473Site {
+        /// Path relative to the crate's `src/`, e.g. `agent_loop/mod.rs`.
+        file: String,
+        /// 1-based line inside that file.
+        line: usize,
+        /// The `fn` the call sits in.
+        enclosing: String,
+        /// The trimmed source line, so a failure reads without opening the file.
+        text: String,
+    }
+
+    impl std::fmt::Display for Mika2473Site {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self {
+                file,
+                line,
+                enclosing,
+                text,
+            } = self;
+            write!(f, "{file}:{line} (in `{enclosing}`): {text}")
+        }
+    }
+
+    /// Every `detect_config_change(` call site in one Rust source, tagged with
+    /// the file it was found in.
+    ///
+    /// **Prose is not a call site.** A line whose content starts with `//`
+    /// *names* the primitive without calling it; flagging those would make the
+    /// only way to keep the guard green to stop naming the contract in comments,
+    /// which is how a structural guard gets disarmed by the people it serves.
+    /// `server/mod.rs` names it in exactly that way, one line above
+    /// `note_config_at_boot`.
+    fn mika2473_freshness_check_sites(file: &str, src: &str) -> Vec<Mika2473Site> {
+        let mut enclosing = String::from("<no enclosing fn>");
+        let mut sites = Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let text = line.trim();
+            if let Some(name) = mika2473_declared_fn_name(text) {
+                enclosing = name;
+            }
+            if text.starts_with("//") {
+                continue;
+            }
+            if text.contains("detect_config_change(") {
+                sites.push(Mika2473Site {
+                    file: file.to_string(),
+                    line: i + 1,
+                    enclosing: enclosing.clone(),
+                    text: text.to_string(),
+                });
+            }
+        }
+        sites
+    }
+
+    /// `fn f(` / `async fn f(` / `pub(crate) async fn f(` → `f`; anything else
+    /// that merely mentions `fn ` (a doc comment, a `let` binding) → `None`.
+    fn mika2473_declared_fn_name(trimmed: &str) -> Option<String> {
+        let (head, rest) = trimmed.split_once("fn ")?;
+        let is_declaration = head.split_whitespace().all(|token| {
+            matches!(
+                token,
+                "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe" | "extern"
+            )
+        });
+        if !is_declaration {
+            return None;
+        }
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// **AC7 (mika#2473)** — the config-freshness check has exactly one call
+    /// site **in the whole crate**, and that site is the funnel.
+    ///
+    /// `load_agent_context` is the single entry point of the three loops —
+    /// conversation (`run_agent`), silent, and team (`run_team_agent_inner_impl`)
+    /// — so one call there evaluates every turn that runs on this process
+    /// (KTD5). A second call, added by an author who did not know the funnel
+    /// existed, costs a second `stat` per turn and — the real damage — splits
+    /// the "one report per distinct mtime" contract (R9/KTD4) across two callers
+    /// of a dedup map keyed by `agent_id`, not by call site: whichever site ran
+    /// first would silence the other, and which one that is would depend on the
+    /// loop.
+    ///
+    /// # Why the whole crate and not `agent_loop/mod.rs`
+    ///
+    /// Because the damage does not care which file the second site lives in, and
+    /// a scan of one file is *most* blind exactly where a stranger to this
+    /// contract would write: `server/`, `teams/`, `task_engine/`. A guard that
+    /// green-lights the case it exists to refuse is worse than none — it reads
+    /// as coverage. The one-file form shipped that way and its companion control
+    /// only ever injected a second site into the *same* file, which is the case
+    /// the scan did cover.
+    ///
+    /// Shipped with **no allowlist**, and the population at HEAD is **one**. So
+    /// the first entry anyone would want to add here is exactly the second site
+    /// this scan exists to refuse. Conduct when it fires: **remove the second
+    /// call site**, never allowlist it. The same rule
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` states for its
+    /// own empty list, one module over.
+    #[test]
+    fn mika2473_the_freshness_check_sits_in_the_one_funnel() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<Mika2473Site> = Vec::new();
+        scanner.for_each(|path, production| {
+            let label = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            sites.extend(mika2473_freshness_check_sites(&label, production));
+        });
+
+        let rendered = sites
+            .iter()
+            .map(Mika2473Site::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#2473 AC7 — `detect_config_change` must be called exactly once \
+             in this crate. Remove the extra call site; do not allowlist it — two \
+             sites share one dedup key and silence each other:\n{rendered}"
+        );
+        assert_eq!(
+            sites[0].enclosing, "load_agent_context",
+            "mika#2473 KTD5 — the one call must sit in `load_agent_context`, the \
+             funnel of the three loops. A guard in a single loop is blind to the \
+             other two:\n{rendered}"
+        );
+        assert_eq!(
+            sites[0].file,
+            std::path::Path::new("agent_loop")
+                .join("mod.rs")
+                .display()
+                .to_string(),
+            "mika#2473 KTD5 — and `load_agent_context` lives in `agent_loop/mod.rs`. \
+             A same-named fn elsewhere is not the funnel:\n{rendered}"
+        );
+    }
+
+    /// Good-faith control for the scan above: it catches the shape it claims to,
+    /// rather than being a predicate that matches nothing.
+    ///
+    /// The second site is injected into a **different file**, which is the case
+    /// the one-file form of this guard could not see: it is the whole reason the
+    /// scan became a crate walk.
+    #[test]
+    fn mika2473_the_funnel_scan_catches_a_second_site() {
+        let funnel = "async fn load_agent_context(db: &AsyncDatabase) -> Result<AgentContext> {\n    \
+             if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {}\n}\n";
+        let one = mika2473_freshness_check_sites("agent_loop/mod.rs", funnel);
+        assert_eq!(one.len(), 1, "the legal shape is one site");
+        assert_eq!(
+            one[0].enclosing, "load_agent_context",
+            "and it is attributed to the funnel"
+        );
+        assert_eq!(one[0].file, "agent_loop/mod.rs", "and to its file");
+
+        let same_file = format!(
+            "{funnel}\nasync fn run_team_agent_inner_impl() {{\n    \
+             let _ = mika_common::llm::detect_config_change(\"mika-arch\");\n}}\n"
+        );
+        let both = mika2473_freshness_check_sites("agent_loop/mod.rs", &same_file);
+        assert_eq!(
+            both.len(),
+            2,
+            "a second call site in the same file is caught"
+        );
+        assert_eq!(
+            both[1].enclosing, "run_team_agent_inner_impl",
+            "and named by the fn that added it"
+        );
+
+        // The case the one-file scan was blind to: a stranger to this contract
+        // writes the second call where the turn passes through *their* module.
+        let elsewhere = "pub async fn init_agent(agent_name: &str) {\n    \
+             let _ = mika_common::llm::detect_config_change(agent_name);\n}\n";
+        let mut across = one.clone();
+        across.extend(mika2473_freshness_check_sites("server/mod.rs", elsewhere));
+        assert_eq!(
+            across.len(),
+            2,
+            "a second call site in ANOTHER file must be caught — this is the \
+             population the crate walk exists for"
+        );
+        assert_eq!(across[1].file, "server/mod.rs", "and named by its file");
+        assert_eq!(across[1].enclosing, "init_agent");
+
+        let prose = "/// The funnel calls `detect_config_change(` once.\nfn f() {}\n";
+        assert!(
+            mika2473_freshness_check_sites("server/mod.rs", prose).is_empty(),
+            "naming the primitive in a comment is not calling it — flagging \
+             prose is how this guard would get disarmed"
+        );
+    }
+
     /// **T5** — the scope has one decisional reader, and it is
     /// `run_agent`'s `scoped_session_id`.
     ///
@@ -15133,11 +16474,24 @@ mod tests {
     /// `grooming_marker` had to engrave once (mika#2158: a copied regex whose own
     /// comment said "Mirrors …" and then missed two widenings).
     ///
-    /// Exactly **two** sites are expected, both in `agent_loop/mod.rs`: the
-    /// decision (`scoped_session_id`) and the rendering (`history_scope_label`).
-    /// A third is halt-and-surface, not an allowlist entry — whether it is a
-    /// legitimate rendering or a second decision is a question this guard cannot
-    /// answer for you.
+    /// Exactly **three** sites are expected, all under `agent_loop/`: the
+    /// cascade (`context_history::resolve`, mika#2425), the decision
+    /// (`scoped_session_id`) and the rendering (`history_scope_label`). A fourth
+    /// is halt-and-surface, not an allowlist entry — whether it is a legitimate
+    /// rendering or a second decision is a question this guard cannot answer for
+    /// you.
+    ///
+    /// **mika#2425 amended this guard rather than excepting itself from it**, and
+    /// the difference matters. What the guard protects is written in its own
+    /// message: *two answers to "which rows may this window draw from?" can drift
+    /// apart without breaking anything visible.* `context_history::resolve` is
+    /// not a second answer — it **produces** the single answer `scoped_session_id`
+    /// consumes, and `mika2425_identity_context_history_has_a_single_reader`
+    /// guarantees that consumer reads nothing else. Two grep-visible gestures:
+    /// the count goes `2 → 3` and names the third site, and the path constraint
+    /// relaxes from `agent_loop/mod.rs` to `agent_loop/` — the invariant as
+    /// written is *the readers live in the loop*, and the resolver is in the loop.
+    /// The constraint is not relaxed beyond that directory.
     ///
     /// **The production half is read by [`mika_common::source_guard`]
     /// (mika#2398).** Truncating at the first `#[cfg(test)]`, as this guard did,
@@ -15160,21 +16514,24 @@ mod tests {
 
         assert_eq!(
             sites.len(),
-            2,
-            "mika#2305 — expected exactly two readers of `HistoryScope` outside \
-             deserialization: the decision in `run_agent` (`scoped_session_id`) and \
-             the rendering in `history_scope_label`. Found {}:\n{}\n\nIf you added \
-             a second *decision*, route it through `scoped_session_id` instead — \
-             two answers to \"which rows may this window draw from?\" can drift \
-             apart without breaking anything visible.",
+            3,
+            "mika#2305 (count amended by mika#2425) — expected exactly three readers of \
+             `HistoryScope` outside deserialization: the cascade in \
+             `context_history::resolve`, the decision in `run_agent` \
+             (`scoped_session_id`) and the rendering in `history_scope_label`. \
+             Found {}:\n{}\n\nIf you added a second *decision*, route it through \
+             `scoped_session_id` instead — two answers to \"which rows may this window \
+             draw from?\" can drift apart without breaking anything visible. If a \
+             rustfmt reflow split the resolver's `match` into two sites, put its arms \
+             back on one line each rather than raising this number.",
             sites.len(),
             sites.join("\n")
         );
         assert!(
-            sites.iter().all(
-                |s| s.starts_with("agent_loop/mod.rs:") || s.starts_with("agent_loop\\mod.rs:")
-            ),
-            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/mod.rs`:\n{}",
+            sites
+                .iter()
+                .all(|s| s.starts_with("agent_loop/") || s.starts_with("agent_loop\\")),
+            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/`:\n{}",
             sites.join("\n")
         );
     }
@@ -15250,6 +16607,193 @@ fn prod(scope: HistoryScope) -> usize {
             1,
             "a decisional match AFTER a module-level test helper must still be seen — \
              the truncating rule this guard used to apply would have missed it"
+        );
+    }
+
+    // -- mika#2425: the declared floor has ONE reader -----------------------
+
+    /// Production sites exempted from [`mika2425_identity_context_history_has_a_single_reader`].
+    ///
+    /// **Shipped empty, and the resolution when the scan fires is to REMOVE the
+    /// second reader, never to add an entry here.** Same contract as
+    /// `ACTOR_READING_PREDICATES_ALLOWED` (mika#2323) and the empty allowlist of
+    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` — a list born
+    /// empty is a slot for the next lapse, so its emptiness is itself asserted.
+    ///
+    /// If an exception is ever genuinely warranted, the entry must name its
+    /// follow-up ticket (`mika#NNNN`), which the self-cleaning assertion below
+    /// enforces.
+    const CONTEXT_HISTORY_READERS_ALLOWED: &[&str] = &[];
+
+    /// Production lines reading the declared `[context.history]` block off an
+    /// identity, as `(1-based line, trimmed text)`.
+    ///
+    /// The needle is the **dotted field path** (`.context.history`), not the
+    /// TOML section header `[context.history]`: the second names the block in a
+    /// doc comment, a template literal or a `CODE_OWNED_IDENTITY_SECTIONS`
+    /// entry without reading it, and sweeping those in would make the guard
+    /// unusable on the very files that legitimately describe the section.
+    ///
+    /// A **comment line is not a reader**, and that exclusion is load-bearing
+    /// rather than cosmetic. This guard's own decision site carries three
+    /// paragraphs naming the field to say why it must be read exactly once, and
+    /// an unanchored predicate accused them — the same shape as the mika#2050
+    /// Signal S false positive, where a grep matched prose a pilot had written
+    /// *about* the signal. Anchoring on comments is what keeps the guard
+    /// readable enough to be trusted; an in-line trailing comment does not
+    /// exempt the code preceding it, since the line no longer *starts* with the
+    /// marker.
+    ///
+    /// Two further exclusions compose, in this order and for the reasons
+    /// [`scope_reader_sites`] states: a file whose **path** is test code has no
+    /// production half (mika#2321); anywhere else the test regions are masked
+    /// (mika#2398), which keeps the file's own line numbers.
+    fn identity_history_reader_sites(path: &std::path::Path, src: &str) -> Vec<(usize, String)> {
+        if crate::source_scan::is_test_source_path(path) {
+            return Vec::new();
+        }
+        mika_common::source_guard::mask_test_regions(src)
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line.trim().to_string()))
+            .filter(|(_, line)| {
+                line.contains(".context.history")
+                    && !line.starts_with("//")
+                    && !line.starts_with('*')
+            })
+            .collect()
+    }
+
+    /// **D3** — the identity's declared window has exactly one production reader.
+    ///
+    /// The whole mika#2425 cascade rests on that number being one: the declared
+    /// value is a **floor** that the `customer_config` half may only narrow, and
+    /// a second site reading `identity.context.history` directly would apply the
+    /// floor without the narrowing — silently, with every behavioural assertion
+    /// still green, because both answers are individually plausible. That is the
+    /// class `grooming_marker` had to close once (mika#2158), where promotion
+    /// and dispatch routing answered the same question differently for months.
+    #[test]
+    fn mika2425_identity_context_history_has_a_single_reader() {
+        assert!(
+            CONTEXT_HISTORY_READERS_ALLOWED
+                .iter()
+                .all(|entry| entry.contains("mika#")),
+            "mika#2425 — every entry of CONTEXT_HISTORY_READERS_ALLOWED must name the \
+             follow-up ticket that will remove it. An exemption nobody owns is how a \
+             guard stops guarding. Current list: {CONTEXT_HISTORY_READERS_ALLOWED:?}"
+        );
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut sites: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if CONTEXT_HISTORY_READERS_ALLOWED
+                .iter()
+                .any(|allowed| rel.contains(allowed))
+            {
+                return;
+            }
+            for (line, text) in identity_history_reader_sites(path, production) {
+                sites.push(format!("{rel}:{line}: {text}"));
+            }
+        });
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#2425 — expected exactly ONE production reader of the identity's \
+             `[context.history]`: the site that feeds `context_history::resolve`. \
+             Found {}:\n{}\n\nIf you added a second one, route it through the resolver \
+             instead of allowlisting it — a site reading the declared value directly \
+             applies the role's floor WITHOUT the per-tenant narrowing, and nothing \
+             visible breaks.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites[0].starts_with("agent_loop/mod.rs:")
+                || sites[0].starts_with("agent_loop\\mod.rs:"),
+            "mika#2425 — the one reader must be the decision site in `agent_loop/mod.rs`, \
+             where the resolved scope is consumed:\n{}",
+            sites[0]
+        );
+    }
+
+    /// **D3b — good-faith control for D3.**
+    ///
+    /// D3 could be green because it looks at nothing, which is the exact failure
+    /// mode D3 exists to make visible. So the predicate is shown to redden on a
+    /// reader added elsewhere, and to stay silent on the four shapes that name
+    /// the block without reading it.
+    #[test]
+    fn mika2425_the_reader_scan_reddens_on_a_second_reader() {
+        let prod = std::path::Path::new("src/somewhere.rs");
+
+        let offending = "fn elsewhere(identity: &Identity) -> HistoryScope {\n    \
+             identity.context.history.scope\n}\n";
+        assert_eq!(
+            identity_history_reader_sites(prod, offending).len(),
+            1,
+            "the scan must see a reader added outside the decision site"
+        );
+
+        // 1. The TOML section header in a doc comment or a template literal.
+        let header = "/// `[context.history]` bounds the window.\n\
+             const IDENTITY: &str = \"[context.history]\\nscope = \\\"session\\\"\\n\";\n";
+        assert!(
+            identity_history_reader_sites(prod, header).is_empty(),
+            "naming the TOML section is not reading the field"
+        );
+
+        // 2. The section path as data (CODE_OWNED_IDENTITY_SECTIONS).
+        let as_data = "const CODE_OWNED: &[&str] = &[\"context.history\", \"context.summary\"];\n";
+        assert!(
+            identity_history_reader_sites(prod, as_data).is_empty(),
+            "the section path as a string datum is not a field read"
+        );
+
+        // 3. A read inside a masked test region.
+        let in_tests = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
+             assert_eq!(identity.context.history.scope, HistoryScope::Agent);\n}\n";
+        assert!(
+            identity_history_reader_sites(prod, in_tests).is_empty(),
+            "a test region is masked before scanning"
+        );
+
+        // 4. A file whose path is test code has no production half at all.
+        let test_path = std::path::Path::new("src/db/tests/harnais.rs");
+        assert!(
+            identity_history_reader_sites(test_path, offending).is_empty(),
+            "mika#2321 — a file under `tests/` is test code whatever its contents"
+        );
+
+        // 5. Prose ABOUT the field — the shape that accused this guard's own
+        // decision site, and the mika#2050 Signal S class. A comment cannot read.
+        let prose = "\
+// This is the single production reader of `identity.context.history`.
+/// Reading `ctx.identity.context.history.max_tokens` here would drop the narrowing.
+ * `identity.context.history` is the role floor.
+";
+        assert!(
+            identity_history_reader_sites(prod, prose).is_empty(),
+            "prose naming the field is not a read — an unanchored predicate accuses \
+             the very comments that explain why the field has one reader"
+        );
+
+        // …but a trailing comment does not exempt the code before it.
+        let trailing = "    let h = &ctx.identity.context.history; // the role floor\n";
+        assert_eq!(
+            identity_history_reader_sites(prod, trailing).len(),
+            1,
+            "only a line that STARTS with a comment marker is prose"
         );
     }
 

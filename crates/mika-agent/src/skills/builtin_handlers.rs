@@ -355,9 +355,19 @@ struct SearchResultWire {
 /// actionable remediation rather than opaque status text.
 fn map_substrate_error(status: u16, label: &str) -> String {
     match (status, label) {
+        // mika#2118 extension B — same class as the ticket's own defect, one site
+        // away: this used to say a key was missing where it is the *selector* that
+        // is absent. `crates/mika-gateway/CLAUDE.md` § Search Substrate states the
+        // asymmetry mika#2407 measured: without `MIKA_SEARCH_UPSTREAM` the endpoint
+        // answers 404 whatever the key is worth, "and the repairing gesture is the
+        // opposite of the obvious one: add the selector, not another key". Naming a
+        // missing key here sends the operator to the one place that cannot help.
         (404, "search_upstream_not_configured") => {
-            "Search substrate is not configured on the gateway. \
-             Ask the operator to set MIKA_BRAVE_API_KEY on mika-gateway."
+            "Search substrate is not configured on the gateway: no upstream is \
+             selected. Ask the operator to set MIKA_SEARCH_UPSTREAM on mika-gateway \
+             (and the matching upstream key, e.g. MIKA_BRAVE_API_KEY for \
+             MIKA_SEARCH_UPSTREAM=brave). Without the selector the endpoint answers \
+             404 whatever the key is worth, so adding a key alone changes nothing."
                 .to_string()
         }
         (502, "not_implemented") => {
@@ -3097,6 +3107,273 @@ async fn validate_pr_review_flag_coherence(
     Err(ToolOutput::error(body.to_string()))
 }
 
+/// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
+/// check is red on the PR's head (mika#2455).
+///
+/// Third member of the pre-subprocess family, after
+/// `validate_destructive_action_grounding` (mika#1646) and
+/// `validate_pr_review_flag_coherence` (mika#2237). Same placement and the same
+/// reason: the defect is the call — by the time an EndTurn arm ran, `pass` /
+/// APPROVED would be on GitHub and only another review could contradict it.
+/// See `evidence::guards`'s mika#2455 section for the four design points; this
+/// function is their application.
+///
+/// # What it gates on, and what it deliberately does not
+///
+/// The **verdict**, never the flag. A gate on `--approve` would compose with
+/// mika#2237 into a deadlock — `--approve` refused here, `--comment` refused
+/// there for want of a recevable attempt, and no review postable at all. The
+/// output this refusal names (`block[ci]` or `hold[review]`, posted with
+/// `--comment`) is reachable whatever the turn's history, which is what makes
+/// R8 structural rather than hoped for.
+///
+/// It runs **after** mika#2237 for two reasons: it is the only link of the
+/// `run_gh` chain that makes a network call, so it must not be spent on a
+/// review mika#2237 is going to refuse anyway; and the ordering makes the
+/// composition legible — a `pass` posted as `--comment` with no attempt is
+/// refused upstream and never reaches here.
+///
+/// # Which way it fails
+///
+/// Fail-OPEN throughout, the inverse of mika#1646, and the asymmetry is
+/// computed rather than felt. A false negative leaves the misleading signal
+/// standing — the original defect, already today's regime — while the merge
+/// itself stays closed by `pr_merge_with_gate`'s own CI gate. A false positive
+/// forces the review to be rewritten and, if the model digs in, kills the turn
+/// with no review posted. So every unreadable term abstains: no PR target, no
+/// repo, no token, `gh` failing, the read timing out, unparseable output. Each
+/// abstention is **said** (`qa_ci_coherence_abstained`), never silent — an
+/// inert guard reads exactly like a healthy one (mika#2205).
+async fn validate_qa_ci_coherence(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_qa_ci_coherence_with_reader(args, repo, ctx, |pr, repo, token| async move {
+        crate::tools::pr_merge_with_gate::run_gh_checks_raw(pr, &repo, &token).await
+    })
+    .await
+}
+
+/// The mika#2455 gate with its CI reader injected.
+///
+/// **Why the seam is the subprocess and not the classification.** The
+/// production reader is `gh pr checks --required` and cannot run in a test (no
+/// network, no token), so something has to be substitutable. Putting the seam
+/// at the *parsed* checks would leave the parser and the classifier untested on
+/// the production path; putting it at the **raw stdout** means a test exercises
+/// the real parser (`parse_gh_checks`), the real classifier
+/// (`classify_ci_coherence` → `classify_checks`) and the real wiring inside
+/// `run_gh` — everything except the one thing it cannot have, the network.
+///
+/// Public because `tests/eval/` is a separate crate. It has exactly one
+/// production caller, [`validate_qa_ci_coherence`].
+pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+    read_checks: F,
+) -> Result<(), ToolOutput>
+where
+    F: FnOnce(u64, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    use crate::evidence::guards::pr_review_target;
+    use crate::evidence::guards::{
+        CiAbstention, CiCoherenceOutcome, QA_CI_COHERENCE_AUDIT_TOOL, QA_CI_READ_TIMEOUT_SECS,
+        classify_ci_coherence, qa_ci_coherence_gate_enabled,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+    use crate::tools::pr_merge_with_gate::{GH_CHECKS_PARSE_ERROR_PREFIX, parse_gh_checks};
+
+    // -- Recognition, fail-open, in increasing order of cost --
+
+    if !qa_ci_coherence_gate_enabled() {
+        return Ok(());
+    }
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+    // The discriminator is the verdict itself, never the flag (D1). Every other
+    // classified verdict — `hold[review]`, `block[ac]`, `block[ci]`,
+    // `block[dependency]`, `block[security]`, `block[pipeline]` — and a body
+    // with no `VERDICT:` line at all pass untouched (R3).
+    if !matches!(parse_verdict(&body), Verdict::Pass) {
+        return Ok(());
+    }
+
+    // Audit writes are warn-and-continue throughout: losing the ledger row must
+    // never change the guard's verdict, in either direction (mika#2237 motif).
+    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                QA_CI_COHERENCE_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(outcome),
+                Some(reasoning),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write qa-ci-coherence audit row");
+        }
+    }
+
+    let target = pr_review_target(args);
+    let target_key = format!(
+        "pr_review:{}#{}",
+        repo.unwrap_or("__default__"),
+        target.as_deref().unwrap_or("unknown")
+    );
+
+    async fn abstain(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) {
+        tracing::warn!(
+            event = "qa_ci_coherence_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2455: could not read the head's required checks — a pass verdict is let \
+             through rather than refused on an unobservable term"
+        );
+        audit(ctx, target_key, "abstained", reason).await;
+    }
+
+    // A PR identifier that is not a number cannot address `gh pr checks`, and
+    // the guard does not guess a target.
+    let Some(pr_number) = target.as_deref().and_then(|t| t.parse::<u64>().ok()) else {
+        abstain(ctx, &target_key, CiAbstention::NO_PR_TARGET).await;
+        return Ok(());
+    };
+    let Some(repo) = repo else {
+        abstain(ctx, &target_key, CiAbstention::NO_REPO).await;
+        return Ok(());
+    };
+    let Some(token) = ctx.github_token else {
+        abstain(ctx, &target_key, CiAbstention::NO_TOKEN).await;
+        return Ok(());
+    };
+
+    // -- Read, bounded --
+
+    let read = read_checks(pr_number, repo.to_string(), token.to_string());
+    let raw = match tokio::time::timeout(
+        std::time::Duration::from_secs(QA_CI_READ_TIMEOUT_SECS),
+        read,
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            abstain(ctx, &target_key, CiAbstention::GH_TIMEOUT).await;
+            return Ok(());
+        }
+        Ok(Err(_e)) => {
+            abstain(ctx, &target_key, CiAbstention::GH_FAILED).await;
+            return Ok(());
+        }
+        Ok(Ok(raw)) => raw,
+    };
+
+    let checks = match parse_gh_checks(&raw) {
+        Ok(checks) => checks,
+        Err(e) => {
+            // The discrimination goes through the shared constant, never a
+            // literal typed twice — see `GH_CHECKS_PARSE_ERROR_PREFIX`.
+            let reason = if e.starts_with(GH_CHECKS_PARSE_ERROR_PREFIX) {
+                CiAbstention::UNPARSEABLE
+            } else {
+                CiAbstention::GH_FAILED
+            };
+            abstain(ctx, &target_key, reason).await;
+            return Ok(());
+        }
+    };
+
+    // -- Decide --
+
+    let failing = match classify_ci_coherence(&checks) {
+        // R9/AC8: the nominal decision is written down. Without it, "zero
+        // refusals" would not tell a healthy fleet from an inert guard — the
+        // exact failure mika#2205 had to name for its two scans.
+        CiCoherenceOutcome::AllowedGreen => {
+            audit(
+                ctx,
+                &target_key,
+                "allowed_green",
+                "every required check on the head is green",
+            )
+            .await;
+            return Ok(());
+        }
+        // R6/AC3: a pending check refuses nothing. The review can legitimately
+        // start before the CI has concluded — `pull_request.opened` routes to
+        // mika-qa with no CI term at all — so refusing here would refuse the
+        // nominal case.
+        CiCoherenceOutcome::AllowedPending => {
+            audit(
+                ctx,
+                &target_key,
+                "allowed_pending",
+                "at least one required check is still pending, none is red",
+            )
+            .await;
+            return Ok(());
+        }
+        CiCoherenceOutcome::Refused { failing } => failing,
+    };
+
+    let failing_list = failing.join(", ");
+    tracing::warn!(
+        event = "qa_ci_coherence_refused",
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        target = %target_key,
+        pr = pr_number,
+        failing_checks = %failing_list,
+        "mika#2455: refused a pass verdict contradicted by a red required check on the head"
+    );
+    audit(
+        ctx,
+        &target_key,
+        "refused",
+        &format!("required checks failing on the head: {failing_list}"),
+    )
+    .await;
+
+    // The remedy names BOTH correct outputs and leaves the choice to the model
+    // (D3). Prescribing `block[ci]` would spend a dispatch slot on a CI failure
+    // no pilot can repair — the guard has no way to tell a red lint from a
+    // broken infra. It also names `--comment` so the rewrite does not walk into
+    // mika#2237's refusal.
+    //
+    // **No line of this body may START with `VERDICT:`** — `VERDICT_RE` is
+    // anchored on that line prefix and a stray one would be read as a verdict.
+    // The tokens themselves are named in clear, inside a sentence, and that is
+    // safe: neither reader can capture a bare token outside a line prefix
+    // (`validate_tool_arg_suffixes` looks for the complete line in
+    // `pr_review_body` and never reads a `ToolOutput::error`). Do not
+    // generalise the reasoning — it holds because both readers were read.
+    let body = serde_json::json!({
+        "error": "qa_ci_coherence_violation",
+        "doctrine": "mika#2455",
+        "target": target_key,
+        "failing_checks": failing,
+        "remedy": format!(
+            "This body carries a `pass` verdict, but {} required check(s) are failing on this \
+             PR's head: {failing_list}. A `pass` cannot assert what the CI contradicts. Re-emit \
+             this call with `--comment` and a rewritten verdict line: use `block[ci]` if the \
+             failure looks repairable by a code fix (it dispatches a bounded CI-fix pilot), or \
+             `hold[review]` if it does not (broken infrastructure, a flake, an unrelated \
+             failure) — that one only notifies the operator. Do not keep the `pass` verdict.",
+            failing.len()
+        ),
+    });
+    Err(ToolOutput::error(body.to_string()))
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -3229,6 +3506,21 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     if let Err(err) =
         validate_pr_review_flag_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await
     {
+        return err;
+    }
+
+    // CI↔verdict coherence (mika#2455): refuse a `pr review` whose body says
+    // `pass` while a required check is red on the PR's head. Placed immediately
+    // after mika#2237, and last in the chain, for two reasons. (a) It is the
+    // only link that makes a network call, and the chain runs from the most
+    // local to the most committing — spending a `gh pr checks` on a review
+    // mika#2237 is about to refuse would be paying for a decision already
+    // taken. (b) The order makes the composition legible: a `pass` posted as
+    // `--comment` with no attempt is refused upstream and never reaches here;
+    // a `pass` posted as `--approve` gets through, and it is here that the CI
+    // decides. Like its two siblings, it is NOT gated on
+    // `required_tool_arg_suffixes`: its subject is the body itself.
+    if let Err(err) = validate_qa_ci_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await {
         return err;
     }
 
@@ -3593,6 +3885,141 @@ fn is_gws_auth_error(content: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('\n'))
 }
 
+/// State of the `gws` credentials on THIS host, as `gws auth status` reports it.
+///
+/// Telling the two apart is the whole of mika#2118: an exit 2 does not say *why*
+/// there is no authentication. Before this, both states were narrated with the
+/// vocabulary of a link that stopped working — so a cloud tenant, which has no
+/// credentials **by design**, was told its Google account had expired. A design
+/// limit presented as a breakage.
+///
+/// Axis orthogonal to `(Deployment, AgentTier)` (mika#2024), which answers "who
+/// can act, from where" and never "what is missing". The two compose; neither
+/// subsumes the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GwsCredentialState {
+    /// No credential was ever configured here. The **by-design** state of every
+    /// cloud tenant: Google credentials are local and are not provisioned
+    /// remotely. Also the state of a local workstation that never signed in —
+    /// hence a discriminator on the *credentials*, never on the nature of the
+    /// host. `MIKA_AGENT_TIER=family` names a persona and not a deployment, and
+    /// a cloud tenant in tier `default` has the same problem with no marker.
+    NeverConfigured,
+    /// Credentials exist and the call was refused (expiry, scope, revocation).
+    /// The only case the prompt ever knew how to narrate.
+    ConfiguredButRejected,
+    /// The probe returned nothing usable. Treated **as
+    /// `ConfiguredButRejected`**: in doubt we keep the historical message rather
+    /// than announce an unverified design limit.
+    Unknown,
+}
+
+/// Classify `gws auth status`' stdout. Pure — which is what makes AC1 testable
+/// without a process.
+///
+/// **The rule is a conjunction**, and the conjunction is the fail-safe: a single
+/// field renamed in a future `gws` falls back to [`GwsCredentialState::Unknown`],
+/// therefore to the historical message — never to a false announcement of design.
+///
+/// **Prefix tolerance.** `gws auth status` may prefix its JSON with a courtesy
+/// line (`Using keyring backend: keyring`, observed on the configured host), so
+/// the parse starts at the first `{` and stops at the first complete object,
+/// which also tolerates prose *after* it. Do not assume the output starts with
+/// `{`, nor that it ends there.
+fn classify_gws_auth_status(stdout: &str) -> GwsCredentialState {
+    let Some(first_brace) = stdout.find('{') else {
+        return GwsCredentialState::Unknown;
+    };
+
+    let mut objects =
+        serde_json::Deserializer::from_str(&stdout[first_brace..]).into_iter::<serde_json::Value>();
+    let Some(Ok(value)) = objects.next() else {
+        return GwsCredentialState::Unknown;
+    };
+
+    let source = value.get("credential_source").and_then(|v| v.as_str());
+    let encrypted = value
+        .get("encrypted_credentials_exists")
+        .and_then(|v| v.as_bool());
+    let plain = value
+        .get("plain_credentials_exists")
+        .and_then(|v| v.as_bool());
+
+    match (source, encrypted, plain) {
+        // Every one of the three has to be readable AND say "nothing here".
+        (Some(source), Some(false), Some(false)) if source.eq_ignore_ascii_case("none") => {
+            GwsCredentialState::NeverConfigured
+        }
+        // All three readable, but at least one says something exists.
+        (Some(_), Some(_), Some(_)) => GwsCredentialState::ConfiguredButRejected,
+        // A field missing, null, or of the wrong type: we cannot tell.
+        _ => GwsCredentialState::Unknown,
+    }
+}
+
+/// Wall-clock bound on the credential probe.
+///
+/// Deliberately independent of the manifest's `timeout_secs = 45`, which covers
+/// the useful call and this probe *together*: a probe that hung would eat the
+/// useful call's budget and turn a legible authentication error into an opaque
+/// timeout.
+const GWS_AUTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ask `gws auth status`. Called **only** after an exit 2 — the happy path pays
+/// nothing.
+///
+/// Exit 0 in both credential states and no network call (measured 2026-09-01),
+/// which is what makes it a machine discriminator rather than a second chance to
+/// fail. Spawn failure, timeout, or a non-zero exit all yield
+/// [`GwsCredentialState::Unknown`]: a non-zero exit must **never** be read as
+/// `NeverConfigured`, which would manufacture a design limit out of a breakage —
+/// the mirror image of the defect being fixed.
+///
+/// **Not a bypass of [`GWS_ALLOWED_SUBCOMMANDS`].** That allowlist forbids `auth`
+/// in the command array **supplied by the model** — a guard on untrusted input.
+/// This is a fixed command built by the engine, carrying no fragment of model
+/// input. The two coexist without contradiction; do not "harmonise" one with the
+/// other.
+async fn probe_gws_auth_state() -> GwsCredentialState {
+    let mut cmd = tokio::process::Command::new("gws");
+    cmd.args(["auth", "status"]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    super::executor::scrub_mika_env_vars(&mut cmd);
+
+    let output = match tokio::time::timeout(GWS_AUTH_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                event = "gws_auth_probe_failed",
+                error = %e,
+                "could not run `gws auth status`; keeping the historical remediation"
+            );
+            return GwsCredentialState::Unknown;
+        }
+        Err(_) => {
+            tracing::warn!(
+                event = "gws_auth_probe_timeout",
+                timeout_secs = GWS_AUTH_PROBE_TIMEOUT.as_secs(),
+                "`gws auth status` did not return in time; keeping the historical remediation"
+            );
+            return GwsCredentialState::Unknown;
+        }
+    };
+
+    if !output.status.success() {
+        tracing::warn!(
+            event = "gws_auth_probe_nonzero_exit",
+            code = output.status.code().unwrap_or(-1),
+            "`gws auth status` exited non-zero; the discriminator does not hold, \
+             keeping the historical remediation"
+        );
+        return GwsCredentialState::Unknown;
+    }
+
+    classify_gws_auth_status(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// The remediation for a `gws` authentication failure, chosen by the substrate the
 /// agent actually runs on (mika#2024).
 ///
@@ -3680,15 +4107,187 @@ fn gws_auth_remediation(
     }
 }
 
+/// What to say when no Google credential was ever configured on this host
+/// (mika#2118) — the sister of [`gws_auth_remediation`], which stays untouched
+/// because AC4 requires the "credentials present but refused" path to be
+/// byte-identical.
+///
+/// **The rule this applies, stated once and applied per site:** *a state that
+/// was never configured is never narrated with the vocabulary of a state that
+/// stopped working. The first names the design; the second names a repair.*
+///
+/// **No `gws auth login`, on any arm — including `(Local, Default)`.** Every arm
+/// here is the never-configured case, and AC2 forbids proposing that gesture in
+/// that case. The local operator arm may still name the initial setup, which is
+/// a *first* sign-in and not a *re*-connection.
+///
+/// **The crossing is exhaustive with no `_ =>` arm**, on the model of its sister
+/// and of `crate::tools::dispatch_substrate_diagnostic`: a future tier or a
+/// future deployment state must decide, not inherit a decision nobody took for
+/// it. `Cloud` and `Unknown` converge today and are still separated — the day
+/// the provisioner emits `MIKA_DEPLOYMENT`, giving `Cloud` a console link
+/// without giving it to `Unknown` is a one-arm diff.
+///
+/// **The register follows the persona axis** (mika#2290, mika#2292). `FAMILY_SOUL`
+/// forbids any mention of the underlying infrastructure; "local-only",
+/// "provisioned" and "deployment" are of that family. Two formulations, one fact.
+fn gws_credentials_absent_message(
+    deployment: mika_common::home::Deployment,
+    tier: mika_common::home::AgentTier,
+) -> &'static str {
+    use mika_common::home::{AgentTier, Deployment};
+
+    match (deployment, tier) {
+        // Operator register, declared-local host: the only crossing where the
+        // absence is repairable by the user themselves, and the only one that may
+        // name a terminal gesture (mika#2024's constraint, preserved). It
+        // prescribes an INITIAL setup, never a reconnection.
+        (Deployment::Local, AgentTier::Default) => {
+            "Google Workspace access is not available: no Google credentials have ever \
+             been configured on this host. This instance is declared as running on the \
+             user's own machine, so they can set them up themselves with the Google \
+             Workspace CLI's first-time sign-in. This is an initial setup, not a \
+             renewal — nothing here has stopped working."
+        }
+        // NOTE (inherited from the 2026-09-02 ticket comment, do not undo). These
+        // formulations deliberately avoid the substrings `outage`, `expired` and
+        // `gws auth login`. Do NOT restore a negative form such as "this is not an
+        // *outage* and nothing has *expired*, do NOT suggest `gws auth login`": it
+        // carries the same meaning and makes the AC3 test fail, whose assertions
+        // are on the substrings. Authority is AC > plan > implementer, and the
+        // test *is* the proof of AC3.
+        (Deployment::Cloud, AgentTier::Default) => {
+            "Google Workspace access is not available on this host: no Google credentials \
+             have ever been configured here. On cloud deployments this is by design — \
+             Google credentials are local-only and are not provisioned remotely. Nothing \
+             here has stopped working and no credential needs renewing. Tell the user \
+             this capability is not available on this deployment. Propose no sign-in \
+             step; none can be run here."
+        }
+        (Deployment::Unknown, AgentTier::Default) => {
+            "Google Workspace access is not available on this host: no Google credentials \
+             have ever been configured here. This environment does not declare where this \
+             instance runs, so you cannot assume the user has access to the machine it \
+             runs on; on a remote deployment this state is by design, Google credentials \
+             being local-only and not provisioned remotely. Nothing here has stopped \
+             working and no credential needs renewing. Tell the user this capability is \
+             not available here. Propose no sign-in step; none can be run here."
+        }
+        // Family register — the same fact with no technical noun. The three
+        // deployments converge: a family member can act on none of them, and the
+        // distinction between them is exactly the infrastructure vocabulary
+        // FAMILY_SOUL forbids. Named per arm rather than merged, so a future
+        // divergence is a decision.
+        (Deployment::Local, AgentTier::Family | AgentTier::Champion) => {
+            "This has never been set up for this person, and it is not something you or \
+             they can set up from here. Tell them simply that you cannot reach their \
+             calendar and files, that nothing is broken, and that the person who set you \
+             up is the one who would have to arrange it. Name no technical step."
+        }
+        (Deployment::Cloud, AgentTier::Family | AgentTier::Champion) => {
+            "This has never been set up for this person, and it is not something you or \
+             they can set up from here. Tell them simply that you cannot reach their \
+             calendar and files, that nothing is broken, and that the person who set you \
+             up is the one who would have to arrange it. Name no technical step."
+        }
+        (Deployment::Unknown, AgentTier::Family | AgentTier::Champion) => {
+            "This has never been set up for this person, and it is not something you or \
+             they can set up from here. Tell them simply that you cannot reach their \
+             calendar and files, that nothing is broken, and that the person who set you \
+             up is the one who would have to arrange it. Name no technical step."
+        }
+    }
+}
+
+/// Operator-shaped detail for the never-configured case (mika#1783 channel).
+///
+/// Never reaches the model on family/champion tier — `dispatch_substrate_diagnostic`
+/// routes it to `audit_events` there. On operator tier it is folded back into the
+/// content, because the operator IS its reader. It names the discriminator and
+/// what it returned, so the decision can be replayed without re-running the probe.
+const GWS_CREDENTIALS_ABSENT_DIAGNOSTIC: &str = "Operator detail (mika#2118): `gws auth status` reported `credential_source: none` \
+     with `encrypted_credentials_exists: false` and `plain_credentials_exists: false` — \
+     no Google credential store exists under this host's config directory \
+     ($XDG_CONFIG_HOME, default ~/.config). Google credentials are configured per host \
+     and are never shipped to a remote deployment, so a cloud tenant has none by design.";
+
+/// Annex or replace, according to the credential state — and the asymmetry IS the
+/// two acceptance criteria (mika#2118).
+///
+/// - *Rejected* (and *Unknown*) → **annex**, byte for byte as before. AC4 requires
+///   this path to be unchanged; any transformation would violate it.
+/// - *NeverConfigured* → **replacement** via `ToolOutput::substrate_unavailable`.
+///   Without it AC3 is unreachable: `spawn_and_collect`'s content is
+///   `"Exit code: 2\n{stderr}{stdout}"`, and `gws`' own stdout literally contains
+///   ``Run `gws auth login` ``. Annexing would leave `gws`' prescription in what
+///   the model reads, and relying on the prompt to contradict it would be
+///   prompt-enforcement on loop substrate. Replacing **covers** `gws`' output
+///   instead of relaying it; the raw detail goes to the operator diagnostic.
+///
+/// Split out of `run_gws` so the two contracts above are assertable without
+/// spawning `gws`: AC4's byte-identity and mika#1783's non-leak (the
+/// `dispatch_substrate_diagnostic` call below is the single line whose omission
+/// silently sends operator detail to a family tenant).
+async fn apply_gws_credential_state(
+    mut output: ToolOutput,
+    state: GwsCredentialState,
+    ctx: &ToolContext<'_>,
+) -> ToolOutput {
+    match state {
+        GwsCredentialState::ConfiguredButRejected | GwsCredentialState::Unknown => {
+            // Blank-line separator, the same shape `dispatch_substrate_diagnostic` uses
+            // when it folds a diagnostic back into the content. `is_error` is deliberately
+            // untouched: this appends information, it does not reclassify the outcome.
+            output.content.push_str("\n\n");
+            output
+                .content
+                .push_str(gws_auth_remediation(ctx.deployment, ctx.tier));
+
+            // R7 — the population has to be countable. Deployment and tier only: nothing
+            // here may carry a Google account identifier.
+            tracing::info!(
+                event = "gws_auth_remediation_annexed",
+                deployment = ?ctx.deployment,
+                tier = ?ctx.tier,
+                "Appended a runtime-conditioned remediation to a gws authentication error"
+            );
+            output
+        }
+        GwsCredentialState::NeverConfigured => {
+            let mut out = ToolOutput::substrate_unavailable(
+                gws_credentials_absent_message(ctx.deployment, ctx.tier),
+                GWS_CREDENTIALS_ABSENT_DIAGNOSTIC,
+            );
+
+            // R7, again: deployment, tier and agent only — never a Google account
+            // identifier. Expected regime: non-empty on cloud tenants the first time
+            // a user asks for Drive or Calendar. That population had no measurement
+            // at all before this.
+            tracing::info!(
+                event = "gws_credentials_absent",
+                deployment = ?ctx.deployment,
+                tier = ?ctx.tier,
+                agent_id = %ctx.db.agent_id(),
+                "gws has no credentials on this host; served the design-limit message"
+            );
+
+            crate::tools::dispatch_substrate_diagnostic(&mut out, "run_gws", ctx).await;
+            out
+        }
+    }
+}
+
 /// Execute a Google Workspace CLI (`gws`) command with safe argument passing.
 ///
 /// Input: `{"command": ["gmail", "messages", "list", "--params", "{\"maxResults\": 5}"]}`
 ///
 /// Uses `gws`'s native keyring-based authentication.
 ///
-/// On exit code 2 (authentication failure) the result carries an appended
-/// remediation chosen by `(ctx.deployment, ctx.tier)` — see [`gws_auth_remediation`]
-/// (mika#2024). Every other outcome is returned byte for byte as before.
+/// On exit code 2 (authentication failure) the engine probes the credential state
+/// of this host (mika#2118) and branches: credentials present but refused keeps the
+/// mika#2024 appended remediation, byte for byte; credentials never configured gets
+/// its content **replaced** by the design-limit message. Every other outcome is
+/// returned byte for byte as before — the happy path runs no probe.
 async fn run_gws(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput {
     let args = match validate_gws_input(input) {
         Ok(args) => args,
@@ -3709,22 +4308,10 @@ async fn run_gws(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
     .await;
 
     if is_gws_auth_error(&output.content) {
-        // Blank-line separator, the same shape `dispatch_substrate_diagnostic` uses
-        // when it folds a diagnostic back into the content. `is_error` is deliberately
-        // untouched: this appends information, it does not reclassify the outcome.
-        output.content.push_str("\n\n");
-        output
-            .content
-            .push_str(gws_auth_remediation(ctx.deployment, ctx.tier));
-
-        // R7 — the population has to be countable. Deployment and tier only: nothing
-        // here may carry a Google account identifier.
-        tracing::info!(
-            event = "gws_auth_remediation_annexed",
-            deployment = ?ctx.deployment,
-            tier = ?ctx.tier,
-            "Appended a runtime-conditioned remediation to a gws authentication error"
-        );
+        // The probe runs here and only here: on an authentication failure, never
+        // after a successful call and never on another exit code.
+        let state = probe_gws_auth_state().await;
+        output = apply_gws_credential_state(output, state, ctx).await;
     }
 
     output
@@ -4190,6 +4777,37 @@ mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
     use std::sync::Arc;
+
+    /// **V9 (mika#2423)** — pin d'une décision, pas d'un comportement.
+    ///
+    /// mika#2423 a examiné la piste « la QA lit le log du job CI `Check` pour y
+    /// chercher `test <chemin>::<nom> ... ok` » et l'a **refusée**, sur trois
+    /// faits vérifiés. Le premier porte le reste : la porte de merge exige déjà
+    /// la CI verte, un cran en aval du verdict et sans limite de 30 s —
+    /// `server::verdict_handler` rend `Passthrough` (et ne merge pas) dès que
+    /// `classify_checks` donne `CheckClassification::HasFailures`. Faire lire la
+    /// CI à la QA dupliquerait cette porte, et une duplication de porte est une
+    /// porte qui peut diverger de l'autre (leçon `grooming_marker`, mika#2158).
+    ///
+    /// Ouvrir la voie demanderait d'élargir **deux** barrages, celui-ci et la
+    /// règle de prompt correspondante. Ce test rend le premier élargissement
+    /// délibéré : un futur éditeur qui ajoute `("run", "view")` doit d'abord
+    /// faire rougir ce test, donc lire cette raison.
+    #[test]
+    fn mika2423_the_gh_scope_for_qa_review_is_unchanged() {
+        assert_eq!(
+            QA_REVIEW_GH_ALLOWED,
+            &[
+                ("pr", "review"),
+                ("pr", "diff"),
+                ("pr", "list"),
+                ("issue", "view"),
+            ],
+            "mika#2423 examined and refused CI-log reading for qa-review: \
+             `gh run view` must stay out of this scope. Reopening it is a \
+             decision, not a detail — see the doc comment above."
+        );
+    }
 
     #[tokio::test]
     async fn test_get_documentation_all_embedded_topics() {
@@ -4675,9 +5293,12 @@ mod tests {
         // Every taxonomy label from crates/mika-gateway/src/egress_search/mod.rs
         // must produce an actionable, LLM-facing message. Grep for the label
         // strings here if the substrate taxonomy is extended.
+        // mika#2118 extension B: the 404 names the absent *selector*. The key is
+        // still mentioned as the companion setting, never as the thing that is
+        // missing — see `mika2118_substrate_404_names_the_selector_not_a_key`.
         assert!(
             map_substrate_error(404, "search_upstream_not_configured")
-                .contains("MIKA_BRAVE_API_KEY on mika-gateway")
+                .contains("MIKA_SEARCH_UPSTREAM on mika-gateway")
         );
         assert!(map_substrate_error(502, "unauthorized").contains("rotate MIKA_BRAVE_API_KEY"));
         assert!(map_substrate_error(502, "upstream_error").contains("upstream returned an error"));
@@ -4862,10 +5483,13 @@ mod tests {
 
         let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
         assert!(output.is_error);
+        // mika#2118 extension B: a 404 means no upstream is SELECTED. It used to
+        // name a missing key, which is the one gesture that cannot lift the 404
+        // (mika#2407). The key is still named as the companion setting.
         assert!(
             output
                 .content
-                .contains("MIKA_BRAVE_API_KEY on mika-gateway"),
+                .contains("MIKA_SEARCH_UPSTREAM on mika-gateway"),
             "unexpected error message: {}",
             output.content
         );
@@ -5815,8 +6439,14 @@ mod tests {
         let start = source
             .find("fn gws_auth_remediation(")
             .expect("gws_auth_remediation not found — rename it here too");
+        // The end marker is the function's own closing brace at column 0, not the
+        // doc comment of whatever item follows. mika#2118 inserted two functions
+        // between this one and `run_gws`, and the old marker (`\n/// Execute a Google
+        // Workspace CLI`) silently widened the slice over them — the guard failed on
+        // a doc comment that merely *quotes* `_ =>`. A slice bounded by the item
+        // itself cannot be widened by a neighbour.
         let end = source[start..]
-            .find("\n/// Execute a Google Workspace CLI")
+            .find("\n}\n")
             .map(|offset| start + offset)
             .expect("could not delimit gws_auth_remediation's body");
         let body = &source[start..end];
@@ -5876,6 +6506,507 @@ mod tests {
             assert!(
                 !is_gws_auth_error(content),
                 "{content:?} was read as an authentication error"
+            );
+        }
+    }
+
+    // -- mika#2118: never-configured credentials are not broken credentials --
+
+    /// Provenance of the two fixtures below, stated rather than implied.
+    ///
+    /// The **field set** is verified against the `gws` binary actually installed on
+    /// the build host: `credential_source`, `encrypted_credentials_exists`,
+    /// `plain_credentials_exists`, `has_refresh_token` and `auth_method` are all
+    /// present in its serde metadata, so the conjunction of § 3.1 reads fields that
+    /// exist in the shipped version.
+    ///
+    /// The **values** come from the measurement of 2026-09-01 recorded on
+    /// mika#2118 (virgin host: `credential_source: "none"`,
+    /// `encrypted_credentials_exists: false`, exit 0; configured host:
+    /// `auth_method: "oauth2"`, `has_refresh_token: true`, exit 0). That
+    /// measurement could **not be replayed at implementation time** — the session's
+    /// permission policy refuses every `gws` invocation — so these payloads are
+    /// reconstructed from the measured fields, not captured verbatim. The cost is
+    /// named and bounded: if the real payload differs in a way the conjunction
+    /// cannot read, `classify_gws_auth_status` returns `Unknown` and the historical
+    /// message is served, which is the fail-safe direction, never a false
+    /// announcement of design.
+    const MIKA2118_STATUS_NEVER_CONFIGURED: &str = r#"{
+  "encrypted_credentials_exists": false,
+  "plain_credentials_exists": false,
+  "token_cache_exists": false,
+  "client_config_exists": false,
+  "credential_source": "none",
+  "has_refresh_token": false
+}"#;
+
+    const MIKA2118_STATUS_CONFIGURED: &str = r#"{
+  "encrypted_credentials_exists": true,
+  "plain_credentials_exists": false,
+  "token_cache_exists": true,
+  "client_config_exists": true,
+  "credential_source": "encrypted_credentials",
+  "auth_method": "oauth2",
+  "has_refresh_token": true
+}"#;
+
+    /// 5.1 / AC1 — the state this ticket exists to make distinguishable.
+    #[test]
+    fn mika2118_classify_never_configured() {
+        assert_eq!(
+            classify_gws_auth_status(MIKA2118_STATUS_NEVER_CONFIGURED),
+            GwsCredentialState::NeverConfigured
+        );
+    }
+
+    /// 5.1 bis — the courtesy line `gws` prints before its JSON on a host whose
+    /// keyring backend is resolved, plus prose after it. The parser must not assume
+    /// the output starts with `{`, nor that it ends there.
+    #[test]
+    fn mika2118_classify_tolerates_prefix_and_suffix_prose() {
+        let wrapped = format!(
+            "Using keyring backend: keyring\n{MIKA2118_STATUS_NEVER_CONFIGURED}\nRun `gws auth login` first.\n"
+        );
+        assert_eq!(
+            classify_gws_auth_status(&wrapped),
+            GwsCredentialState::NeverConfigured,
+            "a courtesy line or a trailing sentence must not defeat the parse"
+        );
+    }
+
+    /// 5.2 / AC1 + AC4 — the other half of the pair. Without this the classifier
+    /// could answer `NeverConfigured` to everything and 5.1 would still be green.
+    #[test]
+    fn mika2118_classify_configured_but_rejected() {
+        assert_eq!(
+            classify_gws_auth_status(MIKA2118_STATUS_CONFIGURED),
+            GwsCredentialState::ConfiguredButRejected
+        );
+    }
+
+    /// 5.2 bis — the conjunction, proven term by term.
+    ///
+    /// Three separate cases and not one: a conjunction of three terms is not proven
+    /// by neutralising all three at once. Each field is removed **on its own**, the
+    /// two others left saying "nothing here", so a classifier that read only two of
+    /// them would still answer `NeverConfigured` and be caught.
+    #[test]
+    fn mika2118_classify_unknown_on_garbage() {
+        for (label, payload) in [
+            ("empty", ""),
+            ("no json", "Using keyring backend: keyring\n"),
+            ("truncated json", "{\"credential_source\": \"none\""),
+            (
+                "missing credential_source",
+                r#"{"encrypted_credentials_exists": false, "plain_credentials_exists": false}"#,
+            ),
+            (
+                "missing encrypted_credentials_exists",
+                r#"{"credential_source": "none", "plain_credentials_exists": false}"#,
+            ),
+            (
+                "missing plain_credentials_exists",
+                r#"{"credential_source": "none", "encrypted_credentials_exists": false}"#,
+            ),
+            (
+                "null credential_source",
+                r#"{"credential_source": null, "encrypted_credentials_exists": false, "plain_credentials_exists": false}"#,
+            ),
+            (
+                "renamed field (future gws)",
+                r#"{"credential_origin": "none", "encrypted_credentials_exists": false, "plain_credentials_exists": false}"#,
+            ),
+        ] {
+            assert_eq!(
+                classify_gws_auth_status(payload),
+                GwsCredentialState::Unknown,
+                "{label}: an unreadable probe must fall back to the historical \
+                 message, never announce a design limit it could not verify"
+            );
+        }
+    }
+
+    /// 5.2 ter — a store that exists still reads as "refused", even when the source
+    /// says nothing useful. The `NeverConfigured` arm needs all three to agree.
+    #[test]
+    fn mika2118_classify_one_store_present_is_not_never_configured() {
+        for payload in [
+            r#"{"credential_source": "none", "encrypted_credentials_exists": true, "plain_credentials_exists": false}"#,
+            r#"{"credential_source": "none", "encrypted_credentials_exists": false, "plain_credentials_exists": true}"#,
+            r#"{"credential_source": "environment_variables", "encrypted_credentials_exists": false, "plain_credentials_exists": false}"#,
+        ] {
+            assert_eq!(
+                classify_gws_auth_status(payload),
+                GwsCredentialState::ConfiguredButRejected,
+                "{payload}: something exists here, so the absence-by-design message \
+                 would be a false statement"
+            );
+        }
+    }
+
+    /// 5.3 / AC3 — the message names the design, never a breakage.
+    ///
+    /// Negative assertions on **all six** crossings; positive ones only on the
+    /// operator register, deliberately: requiring `local-only` on the family arm
+    /// would contradict `FAMILY_SOUL` and make the test and the doctrine mutually
+    /// inapplicable.
+    #[test]
+    fn mika2118_absent_message_names_design_not_outage() {
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for &tier in MIKA2024_TIERS {
+                let text = gws_credentials_absent_message(deployment, tier);
+                assert!(
+                    !text.trim().is_empty(),
+                    "({deployment:?}, {tier:?}) says nothing"
+                );
+                let lowered = text.to_ascii_lowercase();
+                for needle in ["outage", "expired", "gws auth login"] {
+                    assert!(
+                        !lowered.contains(needle),
+                        "({deployment:?}, {tier:?}) contains {needle:?} — credentials \
+                         that never existed have not expired, nothing is down, and no \
+                         sign-in gesture is reachable here: {text}"
+                    );
+                }
+            }
+        }
+
+        for deployment in [
+            mika_common::home::Deployment::Cloud,
+            mika_common::home::Deployment::Unknown,
+        ] {
+            let text =
+                gws_credentials_absent_message(deployment, mika_common::home::AgentTier::Default);
+            for needle in ["by design", "local-only"] {
+                assert!(
+                    text.contains(needle),
+                    "({deployment:?}, Default) does not contain {needle:?} — the \
+                     operator register must name the design, not merely avoid naming \
+                     a breakage: {text}"
+                );
+            }
+        }
+    }
+
+    /// 5.4 / AC3 — `FAMILY_SOUL` forbids any mention of the underlying
+    /// infrastructure. Modelled on
+    /// `mika2024_family_and_champion_remediations_carry_no_infrastructure_jargon`.
+    #[test]
+    fn mika2118_family_absent_message_carries_no_infrastructure_jargon() {
+        const JARGON: &[&str] = &[
+            "deployment",
+            "cloud",
+            "credential",
+            "provision",
+            "local-only",
+            "cli",
+            "terminal",
+            "host",
+            "remote",
+        ];
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for tier in [
+                mika_common::home::AgentTier::Family,
+                mika_common::home::AgentTier::Champion,
+            ] {
+                let text = gws_credentials_absent_message(deployment, tier).to_ascii_lowercase();
+                for needle in JARGON {
+                    assert!(
+                        !text.contains(needle),
+                        "({deployment:?}, {tier:?}) uses the infrastructure term \
+                         {needle:?}, which FAMILY_SOUL forbids: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The champion tier rides on the family register today, like its mika#2024
+    /// sibling. Pinned so that the day `CHAMPION_PERSONA_PLACEHOLDER` is replaced,
+    /// this surface is named as having a decision of its own to take (mika#2247).
+    #[test]
+    fn mika2118_champion_absent_message_reads_as_family() {
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            assert_eq!(
+                gws_credentials_absent_message(deployment, mika_common::home::AgentTier::Champion),
+                gws_credentials_absent_message(deployment, mika_common::home::AgentTier::Family),
+                "champion diverged from family on {deployment:?} — if that is \
+                 intended, update this test; it exists so the divergence is a \
+                 decision and not a surprise"
+            );
+        }
+    }
+
+    /// The exit-2 content `spawn_and_collect` actually produces, `gws`' own
+    /// prescription included — which is precisely why the `NeverConfigured` branch
+    /// has to **replace** rather than append.
+    const MIKA2118_EXIT2_CONTENT: &str = "Exit code: 2\n\
+         {\"error\":{\"code\":401,\"message\":\"Request had invalid authentication \
+         credentials.\",\"status\":\"UNAUTHENTICATED\",\"reason\":\"authError\"}}\n\
+         No encrypted credentials found. Run 'gws auth login' first.\n";
+
+    fn mika2118_exit2_output() -> ToolOutput {
+        ToolOutput::success(MIKA2118_EXIT2_CONTENT)
+    }
+
+    /// 5.5 / AC4 — the negative control, and the one test that fails if someone
+    /// "harmonises" the two families of message.
+    ///
+    /// For `ConfiguredButRejected` **and** `Unknown`, over the six crossings, the
+    /// rendered output must be byte-identical to what the pre-mika#2118 code
+    /// produced: the raw content, a blank line, and `gws_auth_remediation`. It must
+    /// also pass on `main`, which is what proves the control controls something.
+    #[tokio::test]
+    async fn mika2118_rejected_path_is_byte_identical() {
+        let harness = TestHarness::new();
+        for &deployment in MIKA2024_DEPLOYMENTS {
+            for &tier in MIKA2024_TIERS {
+                for state in [
+                    GwsCredentialState::ConfiguredButRejected,
+                    GwsCredentialState::Unknown,
+                ] {
+                    let mut ctx = harness.ctx_with_tier(tier);
+                    ctx.deployment = deployment;
+
+                    let out =
+                        apply_gws_credential_state(mika2118_exit2_output(), state, &ctx).await;
+
+                    let expected = format!(
+                        "{MIKA2118_EXIT2_CONTENT}\n\n{}",
+                        gws_auth_remediation(deployment, tier)
+                    );
+                    assert_eq!(
+                        out.content, expected,
+                        "({deployment:?}, {tier:?}, {state:?}) diverged from the \
+                         historical path. AC4 is a negative control: two identical \
+                         messages would have repaired nothing."
+                    );
+                    assert!(
+                        !out.is_error,
+                        "({deployment:?}, {tier:?}, {state:?}) reclassified the \
+                         outcome — annexing information must not turn a result into \
+                         an error"
+                    );
+                    assert!(
+                        out.substrate_diagnostic.is_none(),
+                        "({deployment:?}, {tier:?}, {state:?}) opened a substrate \
+                         channel on the historical path"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 5.3 bis / AC3 — the branch that carries the ticket: on `NeverConfigured` the
+    /// content is REPLACED, so `gws`' own `Run 'gws auth login' first.` no longer
+    /// reaches the model. Appending could not achieve this, and asking the prompt to
+    /// contradict the tool result would be prompt-enforcement on loop substrate.
+    #[tokio::test]
+    async fn mika2118_never_configured_replaces_the_gws_prescription() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_tier(mika_common::home::AgentTier::Default);
+        ctx.deployment = mika_common::home::Deployment::Cloud;
+
+        let out = apply_gws_credential_state(
+            mika2118_exit2_output(),
+            GwsCredentialState::NeverConfigured,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            !out.content.contains("gws auth login"),
+            "the raw gws prescription survived into what the model reads: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("Exit code: 2"),
+            "the raw exit-2 body survived: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("by design") && out.content.contains("local-only"),
+            "the design-limit message is not what was served: {}",
+            out.content
+        );
+    }
+
+    /// 5.7 / mika#1783 — the single line whose omission sends operator detail to a
+    /// family tenant. Same shape as `web_search_family_tier_diagnostic_gated`.
+    #[tokio::test]
+    async fn mika2118_substrate_diagnostic_is_dispatched() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_tier(mika_common::home::AgentTier::Family);
+        ctx.deployment = mika_common::home::Deployment::Cloud;
+
+        let out = apply_gws_credential_state(
+            mika2118_exit2_output(),
+            GwsCredentialState::NeverConfigured,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            out.substrate_diagnostic.is_none(),
+            "dispatch_substrate_diagnostic was not called at the emission site — \
+             the operator detail would be serialized to the model"
+        );
+        assert!(
+            !out.content.contains("gws auth status"),
+            "the operator diagnostic leaked into the family-tier content: {}",
+            out.content
+        );
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events should succeed");
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == "substrate_unavailable" && e.target_key == "run_gws")
+            .collect();
+        assert_eq!(
+            routed.len(),
+            1,
+            "expected exactly one substrate_unavailable audit row for run_gws, got \
+             {routed:?}"
+        );
+    }
+
+    /// 5.7 bis — the operator IS the reader on default tier, so the diagnostic is
+    /// folded back into the content and no audit row is written. Without this, the
+    /// test above would be satisfied by a handler that simply dropped the detail.
+    #[tokio::test]
+    async fn mika2118_default_tier_sees_the_operator_diagnostic() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx_with_tier(mika_common::home::AgentTier::Default);
+        ctx.deployment = mika_common::home::Deployment::Cloud;
+
+        let out = apply_gws_credential_state(
+            mika2118_exit2_output(),
+            GwsCredentialState::NeverConfigured,
+            &ctx,
+        )
+        .await;
+
+        assert!(
+            out.content.contains("gws auth status"),
+            "the operator lost the actionable detail: {}",
+            out.content
+        );
+        assert!(out.substrate_diagnostic.is_none());
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events should succeed");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "default tier must not write a substrate_unavailable audit row: {events:?}"
+        );
+    }
+
+    /// 5.8 — structural control: the crossing must stay exhaustive.
+    ///
+    /// A behavioural test cannot see this class. A `_ =>` arm makes no assertion
+    /// above fail the day it is written; it makes a future tier inherit, in silence,
+    /// a decision nobody took for it.
+    #[test]
+    fn mika2118_the_absent_message_match_has_no_wildcard_arm() {
+        let source = include_str!("builtin_handlers.rs");
+        let start = source
+            .find("fn gws_credentials_absent_message(")
+            .expect("gws_credentials_absent_message not found — rename it here too");
+        // Bounded by the function's own closing brace at column 0 — see the sibling
+        // guard above for why a neighbour's doc comment is the wrong marker.
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("could not delimit gws_credentials_absent_message's body");
+        let body = &source[start..end];
+
+        // Good-faith control: the slice really is the function we mean.
+        assert!(
+            body.contains("Deployment::Unknown, AgentTier::Default"),
+            "the extracted slice does not look like gws_credentials_absent_message's \
+             body — fix the delimiters before trusting the assertion below"
+        );
+        assert!(
+            !body.contains("_ =>"),
+            "gws_credentials_absent_message grew a wildcard arm. Name the new variant \
+             instead: a catch-all decides for every future tier and deployment state \
+             without anyone having taken that decision."
+        );
+    }
+
+    /// 5.9 — the probe runs on an authentication failure and nowhere else.
+    ///
+    /// Structural rather than behavioural: the guarantee is "there is no other call
+    /// site", which no amount of exercising `run_gws` can establish. The happy path
+    /// and every non-2 exit code are already outside `is_gws_auth_error` (pinned by
+    /// `mika2024_other_outcomes_are_untouched`), so what remains to prove is that
+    /// the probe is reached through that predicate alone.
+    #[test]
+    fn mika2118_probe_runs_only_on_auth_error() {
+        let source = include_str!("builtin_handlers.rs");
+        // Split on the test MODULE, not on the first `#[cfg(test)]`: this file
+        // carries a `#[cfg(test)]` / `#[cfg(not(test))]` pair on
+        // `PROGRESS_TICKER_INTERVAL` around line 590, so the naive split truncates
+        // production at that point and the scan reads an empty set — green for the
+        // wrong reason.
+        let cut = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module marker moved — this scan is looking at nothing");
+        let production = &source[..cut];
+        assert!(
+            production.contains("async fn run_gws("),
+            "the production slice does not contain run_gws — fix the split before \
+             trusting the count below"
+        );
+
+        let call_sites: Vec<_> = production
+            .match_indices("probe_gws_auth_state().await")
+            .collect();
+        assert_eq!(
+            call_sites.len(),
+            1,
+            "expected exactly one call site for the credential probe, found {}. A \
+             second one is how the probe starts running on the happy path.",
+            call_sites.len()
+        );
+
+        let (at, _) = call_sites[0];
+        let guard = production[..at]
+            .rfind("if is_gws_auth_error(")
+            .expect("the probe's call site is not guarded by is_gws_auth_error");
+        assert!(
+            !production[guard..at].contains('}'),
+            "the probe call site left the `if is_gws_auth_error(...)` block — it \
+             would then run after a successful call, which the plan forbids"
+        );
+    }
+
+    /// 5.10 (extension B) — same class as this ticket's own defect, one site away.
+    ///
+    /// `MIKA_SEARCH_UPSTREAM` absent means the substrate is disabled and the endpoint
+    /// answers 404 whatever the key is worth (mika#2407). Naming a missing key sends
+    /// the operator to the one place that cannot help.
+    #[test]
+    fn mika2118_substrate_404_names_the_selector_not_a_key() {
+        let message = map_substrate_error(404, "search_upstream_not_configured");
+        assert!(
+            message.contains("MIKA_SEARCH_UPSTREAM"),
+            "the 404 message does not name the selector: {message}"
+        );
+        let lowered = message.to_ascii_lowercase();
+        for needle in ["key is missing", "missing key", "no api key", "set the key"] {
+            assert!(
+                !lowered.contains(needle),
+                "the 404 message still blames a missing key ({needle:?}): {message}"
             );
         }
     }

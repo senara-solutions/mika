@@ -239,8 +239,12 @@ pub struct AskArgs {
     #[arg(long, conflicts_with = "team")]
     pub model: Option<String>,
 
-    /// The message to send (use "-" to read from stdin)
-    pub message: String,
+    /// The message to send. Three doors, and they resolve in this order
+    /// (mika#1982): the argument wins when present; the "-" sentinel always
+    /// reads the standard input, terminal or not; and an absent argument reads
+    /// the standard input when it is not a terminal. Absent on a terminal is a
+    /// usage error, never a silent wait.
+    pub message: Option<String>,
     /// Correlate this message with a task for observability. Without --task-complete,
     /// only records the task-id in session/trace metadata. With --task-complete, marks
     /// the callback task as completed.
@@ -438,6 +442,20 @@ pub enum AgentsCommand {
         /// Skip confirmation prompt
         #[arg(long, short)]
         yes: bool,
+    },
+    /// Show the LLM budget and model an agent is running under, with provenance
+    ///
+    /// Reads the record mika-spirit resolved when it initialized the agent. It
+    /// is deliberately NOT computed here: this process's environment is not the
+    /// server's, so a local resolution could report a setting that is not in
+    /// force, with the authority of a measurement (mika#2457).
+    Budget {
+        /// Agent to report on (defaults to --agent, then the active agent)
+        #[arg(long)]
+        agent: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
     },
     /// Re-apply the authoritative identity.toml and soul.md for an existing agent
     Reprovision {
@@ -887,6 +905,17 @@ pub enum TaskCommand {
         /// this task (mika#2335). Required in non-interactive contexts.
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+    /// Re-arm a dead recurring task without waiting out the 24 h zombie-veto
+    /// window and without editing the database (mika#2446).
+    ///
+    /// Refuses when the label has no dead row (a rearm never creates a
+    /// recurrence), when it is already armed, and when its trigger is not
+    /// routable by this binary. The act is recorded in `audit_events`
+    /// (`tool_name = 'recurring_operator_rearm'`).
+    Rearm {
+        /// Recurring task label (e.g. `worktree_reap`)
+        label: String,
     },
     /// Force-promote the next pending deferred dispatch wrapper for a class.
     /// Fails if the per-class dispatch slot is occupied, unless --override is set.

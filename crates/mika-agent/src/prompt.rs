@@ -1,3 +1,4 @@
+use crate::config_keys::TenantLanguage;
 use crate::db::{
     Commitment, CoreMemoryEntry, Preference, TaskHealthSummary, core_memory_section_names,
 };
@@ -228,7 +229,7 @@ pub fn filter_stop_topic_preferences(prefs: Vec<Preference>) -> Vec<Preference> 
         .filter(|p| p.category.starts_with(STOP_TOPIC_PREFIX))
         .collect()
 }
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use mika_common::{agent, team};
 use serde::Deserialize;
 use std::fmt::Write;
@@ -1030,6 +1031,11 @@ pub struct PromptContext<'a> {
     /// gets the same fact without infrastructure vocabulary, because
     /// `FAMILY_SOUL` forbids it. See `hosting_ground_truth_line`.
     pub persona_profile: PersonaProfile,
+    /// The tenant's declared thread language (mika#2247 AC2). `None` is the
+    /// third state and renders **nothing** — see `write_thread_language_line`.
+    /// Resolved from `customer_config` in `agent_loop::load_agent_context`,
+    /// beside `timezone`.
+    pub tenant_language: Option<TenantLanguage>,
 }
 
 fn onboarding_prompt() -> String {
@@ -1084,6 +1090,7 @@ fn write_runtime_section(
     model: &str,
     deployment: Deployment,
     persona: PersonaProfile,
+    tenant_language: Option<TenantLanguage>,
 ) {
     prompt.push_str("## Runtime\n");
     writeln!(
@@ -1097,7 +1104,52 @@ fn write_runtime_section(
          If a user asks which model you use, quote this line verbatim.\n",
     );
     prompt.push_str(hosting_ground_truth_line(deployment, persona));
+    write_thread_language_line(prompt, tenant_language);
     prompt.push('\n');
+}
+
+/// The thread-language half of the `## Runtime` ground truth (mika#2247 AC2).
+///
+/// **A fact posed, not a rule repeated.** `FAMILY_SOUL` already prescribes
+/// French twice, once in bold, and the measured thread drifted to English
+/// anyway. A third formulation of an instruction that failed twice is the class
+/// `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` bounds
+/// (mika#2120: nine recurrences under prompt enforcement against zero when the
+/// fact is posed by code). So this line does two things a persona sentence
+/// cannot: it names the **declared** language of *this tenant* rather than a
+/// language the persona happens to be written in, and it names the tool that
+/// changes it — which is what makes « parle-moi en anglais » executable instead
+/// of a promise (the mika#2358 failure shape).
+///
+/// **`None` renders nothing, deliberately.** An undeclared tenant keeps today's
+/// behaviour exactly: no line here, no guard armed. Making absence an implicit
+/// French would write mika#2023's anglophone-champion defect at a second site;
+/// deriving it from the account locale is the product choice Prime ruled out on
+/// 2026-09-09. See `config_keys::resolve_tenant_language`.
+///
+/// One register for both personas, unlike the hosting line above: naming a
+/// language carries no infrastructure vocabulary, so `FAMILY_SOUL`'s prohibition
+/// has nothing to bite on here.
+///
+/// Written in plain ASCII punctuation, and that is not incidental: mika#2247's
+/// first measurement is that an em-dash living in a prompt gets copied verbatim
+/// into what the tenant reads.
+fn write_thread_language_line(prompt: &mut String, tenant_language: Option<TenantLanguage>) {
+    let Some(language) = tenant_language else {
+        return;
+    };
+    writeln!(
+        prompt,
+        "The language of this conversation is {name} (`{code}`). Hold it for the \
+         whole thread, whatever language a single incoming message happens to be \
+         in: do not switch part-way through. If the person explicitly asks you to \
+         change it, set `{key}` with `set_config` (values `fr` or `en`) and then \
+         answer in the new language.",
+        name = language.display_name(),
+        code = language.as_str(),
+        key = crate::config_keys::TENANT_LANGUAGE_KEY,
+    )
+    .unwrap();
 }
 
 /// The hosting half of the `## Runtime` ground truth (mika#2290).
@@ -1394,12 +1446,134 @@ const _: () = assert!(
     "STOP_SIGNAL_CONSULT_PREAMBLE_COMPACT exceeds 300-byte budget — see mika#1925 plan"
 );
 
+/// Boundaries of the four parts of the day, by local hour (mika#2247 AC3).
+///
+/// A parameter of the fix, so it is **named** rather than diluted into a `match`
+/// nobody can find again: `morning` 05-11, `afternoon` 12-17, `evening` 18-22,
+/// `night` 23-04. The measured symptom is a « belle journée » sent in the
+/// evening, i.e. an error of exactly one of these boundaries.
+fn part_of_day(hour: u32) -> &'static str {
+    match hour {
+        5..=11 => "morning",
+        12..=17 => "afternoon",
+        18..=22 => "evening",
+        _ => "night",
+    }
+}
+
+/// Render the local time and the part of the day, when the timezone resolves.
+///
+/// Parsed in **two steps because two forms circulate**: an IANA name
+/// (`Asia/Singapore`), which is what `validate_config_value` accepts today, and
+/// a fixed offset (`+08:00`), which it refuses at the door but which older rows
+/// and this module's own test fixtures still carry. Reading only the first would
+/// make the AC3 fix silently inert on exactly the rows that predate the
+/// validation.
+///
+/// Returns `None` when the string parses as neither — the caller then says so
+/// rather than staying silent.
+///
+/// One parse site, read by two consumers: the prompt line below and
+/// [`resolve_local_part_of_day`], which arms the AC3 guard. Two parsers would be
+/// free to disagree about what "evening" means, and the guard would then refuse
+/// the very greeting the prompt asked for.
+fn local_moment(current_utc: DateTime<Utc>, timezone: &str) -> Option<(String, &'static str)> {
+    let tz = timezone.trim();
+    if tz.is_empty() {
+        return None;
+    }
+
+    let render = |stamp: String, weekday: String, hour: u32| {
+        let part = part_of_day(hour);
+        (format!("{stamp} / {weekday} {part}"), part)
+    };
+
+    if let Ok(zone) = tz.parse::<chrono_tz::Tz>() {
+        let local = current_utc.with_timezone(&zone);
+        return Some(render(
+            local.format("%Y-%m-%d %H:%M").to_string(),
+            local.format("%A").to_string(),
+            local.hour(),
+        ));
+    }
+
+    if let Ok(offset) = tz.parse::<chrono::FixedOffset>() {
+        let local = current_utc.with_timezone(&offset);
+        return Some(render(
+            local.format("%Y-%m-%d %H:%M").to_string(),
+            local.format("%A").to_string(),
+            local.hour(),
+        ));
+    }
+
+    None
+}
+
+fn local_time_line(current_utc: DateTime<Utc>, timezone: &str) -> Option<String> {
+    let (rendered, _) = local_moment(current_utc, timezone)?;
+    Some(format!("Local time ({}): {rendered}", timezone.trim()))
+}
+
+/// The part of the day at the tenant's local time, or `None` when no usable
+/// timezone is declared (mika#2247 AC3).
+///
+/// Read by the agent loop to arm the `time_of_day_greeting_mismatch` guard.
+/// `None` is what makes that guard fail-open: with no local hour there is
+/// nothing for a greeting to contradict.
+pub(crate) fn resolve_local_part_of_day(
+    current_utc: DateTime<Utc>,
+    timezone: Option<&str>,
+) -> Option<&'static str> {
+    local_moment(current_utc, timezone?).map(|(_, part)| part)
+}
+
 /// Write the current time section with optional timezone.
+///
+/// # mika#2247 AC3 — the local hour is computed, never inferred
+///
+/// This section used to pose UTC and, when declared, the name of a timezone. To
+/// say « bonsoir » rather than « belle journée » the model then had to make
+/// **two** untooled inferences: convert UTC into that zone, then derive a part
+/// of the day from the result. There was no instruction defect here — there was
+/// **no fact posed**, which is the exact shape mika#2290 had to name for
+/// hosting: *"there was nothing to condition: there was a fact to pose and a
+/// fabrication to prevent."*
+///
+/// The separator is ASCII on purpose (`/`, not an em-dash): see AC1 — a
+/// typographic example living in a prompt is copied verbatim into what the
+/// tenant reads.
+///
+/// # An absent or unreadable timezone is SAID, not passed over in silence
+///
+/// Leaving the void is what produced the measured symptom: the model answered on
+/// its prior because no section said the hour. So the section states the
+/// ignorance and forbids a time-stamped greeting — which is **true**, where a
+/// guess is a coin toss.
 fn write_time_section(prompt: &mut String, current_utc: DateTime<Utc>, timezone: Option<&str>) {
     prompt.push_str("## Current Time\n");
     writeln!(prompt, "UTC: {}", current_utc.format("%Y-%m-%dT%H:%M:%SZ")).unwrap();
     if let Some(tz) = timezone {
         writeln!(prompt, "User timezone: {tz}").unwrap();
+    }
+    match timezone.and_then(|tz| local_time_line(current_utc, tz)) {
+        Some(line) => {
+            prompt.push_str(&line);
+            prompt.push('\n');
+            prompt.push_str(
+                "That local time is ground truth: use it for any greeting or any \
+                 reference to the time of day, and do not compute one from the UTC \
+                 line above.\n",
+            );
+        }
+        None => {
+            prompt.push_str(
+                "No usable timezone is declared for this user, so you do NOT know \
+                 their local time. Do not guess it from the UTC line above, and do \
+                 not use a greeting that names a part of the day (good morning, \
+                 bonsoir, have a lovely day, and so on). Greet them without \
+                 naming a time.\n",
+            );
+        }
     }
     prompt.push('\n');
 }
@@ -1483,13 +1657,16 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // Self-Identity Discipline section below quotes this data as ground truth.
     // mika#2290 extends "what am I running on" to "where am I running": the
     // block was already the right home for it, already declared ground truth,
-    // and already ahead of Time/Channel/core-memory.
+    // and already ahead of Time/Channel/core-memory. mika#2247 adds the thread
+    // language to the same block, for the same structural reason: it is a fact
+    // about *this tenant's run*, not a rule about style.
     write_runtime_section(
         &mut prompt,
         ctx.runtime_provider,
         ctx.runtime_model,
         ctx.deployment,
         ctx.persona_profile,
+        ctx.tenant_language,
     );
     write_self_identity_discipline_section(&mut prompt);
     // mika#1798: non-transit doctrine — rendered BEFORE time / channel /
@@ -2056,6 +2233,11 @@ pub struct SilentPromptContext<'a> {
     /// Persona register of the hosting line (mika#2290). See
     /// `PromptContext::persona_profile`.
     pub persona_profile: PersonaProfile,
+    /// The tenant's declared thread language (mika#2247 AC2). Silent turns carry
+    /// it for the same reason they carry the hosting line: a heartbeat that
+    /// opens in the wrong language is exactly as wrong as a conversational turn,
+    /// and the compacted history hands it to the next one.
+    pub tenant_language: Option<TenantLanguage>,
 }
 
 /// Sanitize a label for prompt injection prevention: truncate to 200 chars, strip angle brackets
@@ -2108,6 +2290,7 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
         ctx.runtime_model,
         ctx.deployment,
         ctx.persona_profile,
+        ctx.tenant_language,
     );
     write_self_identity_discipline_section(&mut prompt);
     // mika#1798: non-transit doctrine — rendered on silent turns too so the
@@ -2421,6 +2604,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2501,6 +2685,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2541,6 +2726,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2567,6 +2753,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2594,6 +2781,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2767,6 +2955,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -2814,6 +3003,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -2861,6 +3051,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -2895,6 +3086,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -2945,6 +3137,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
 
@@ -2992,6 +3185,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3024,6 +3218,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3064,6 +3259,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3091,6 +3287,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3120,6 +3317,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3147,6 +3345,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3186,6 +3385,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3226,6 +3426,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3257,6 +3458,7 @@ emoji = "✦"
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3311,6 +3513,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3360,6 +3563,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3396,6 +3600,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3423,6 +3628,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3449,6 +3655,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3475,6 +3682,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3503,6 +3711,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3531,6 +3740,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3557,6 +3767,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3590,6 +3801,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -3622,6 +3834,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3651,6 +3864,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3680,6 +3894,7 @@ max_iterations = 3
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3852,6 +4067,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3884,6 +4100,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3960,6 +4177,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -3997,6 +4215,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4032,6 +4251,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_silent_prompt(&ctx);
@@ -4097,6 +4317,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("store_fact(category=\"person\")"));
@@ -4122,6 +4343,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Callback Result Turn"));
@@ -4148,6 +4370,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Callback Result Turn"));
@@ -4173,6 +4396,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4200,6 +4424,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4227,6 +4452,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4254,6 +4480,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4283,6 +4510,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4318,6 +4546,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4359,6 +4588,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_system_prompt(&ctx);
@@ -4409,6 +4639,7 @@ enabled = true
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let compact = build_compact_system_prompt(&ctx);
@@ -4832,6 +5063,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -4906,6 +5138,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
 
         let prompt = build_compact_system_prompt(&ctx);
@@ -4986,6 +5219,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         assert!(
@@ -5030,6 +5264,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Check for block-unique prose (silent-mode block description) — the
@@ -5077,6 +5312,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // The literal `<script>` fragment inside the category value must be
@@ -5116,6 +5352,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -5146,6 +5383,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         // The "Respect stop signals (consult)" rule mentions `## Stopped
@@ -5182,6 +5420,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -5226,6 +5465,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("Respect stop signals (consult)"));
@@ -5267,6 +5507,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // AC1 (state): the specific stopped topic Al refused is present.
@@ -5331,6 +5572,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Both blocks present.
@@ -5442,6 +5684,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -5509,6 +5752,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -5562,6 +5806,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
 
@@ -5584,6 +5829,309 @@ inject = false
     // Discipline sections that fix the "Mika confabule son propre modèle"
     // failure (Al testeur, 2026-07-20). Each is written to fail if the
     // ground-truth channel drifts from what the tool + prompt promise.
+
+    // -- mika#2247: the local hour is computed, and the language is declared --
+
+    /// The four boundaries the fix turns on. The measured symptom is a
+    /// « belle journée » sent in the evening, i.e. an error of exactly one of
+    /// them, so they are asserted rather than trusted.
+    #[test]
+    fn mika2247_part_of_day_boundaries() {
+        for (hour, expected) in [
+            (4, "night"),
+            (5, "morning"),
+            (11, "morning"),
+            (12, "afternoon"),
+            (17, "afternoon"),
+            (18, "evening"),
+            (22, "evening"),
+            (23, "night"),
+            (0, "night"),
+        ] {
+            assert_eq!(part_of_day(hour), expected, "hour {hour}");
+        }
+    }
+
+    /// AC3 — the local hour and the part of the day are POSED, not left to two
+    /// untooled inferences (convert UTC, then derive a moment of day).
+    #[test]
+    fn mika2247_local_time_is_computed_not_inferred() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        // 12:00 UTC is 20:00 in Singapore: the evening, which is the side of the
+        // boundary the measured symptom got wrong.
+        let ctx = PromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: Some("Asia/Singapore".to_string()),
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
+        };
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("Local time (Asia/Singapore): 2026-02-24 20:00"),
+            "the local instant must be computed, not left as UTC + a zone name"
+        );
+        assert!(
+            prompt.contains("Tuesday evening"),
+            "the part of the day is the fact the greeting actually needs"
+        );
+        assert!(
+            !prompt.contains("do NOT know"),
+            "a resolved timezone must not also declare ignorance"
+        );
+    }
+
+    /// The fixed-offset form still circulates in rows written before
+    /// `validate_config_value` refused it. Reading only the IANA form would make
+    /// AC3 silently inert on exactly those tenants.
+    #[test]
+    fn mika2247_a_fixed_offset_timezone_is_read_too() {
+        let line = local_time_line(test_time(), "+08:00").expect("`+08:00` must parse");
+        assert!(line.contains("2026-02-24 20:00"), "got: {line}");
+        assert!(line.contains("evening"), "got: {line}");
+    }
+
+    /// AC3, the other half — an absent or unreadable timezone is SAID.
+    ///
+    /// One case per shape rather than one for both (mika#2277 lesson): a single
+    /// assertion would pass on a predicate that only reads `Option::is_none`.
+    #[test]
+    fn mika2247_unknown_timezone_says_so() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        for tz in [
+            None,
+            Some("Nowhere/Atlantis".to_string()),
+            Some(" ".to_string()),
+        ] {
+            let label = format!("{tz:?}");
+            let ctx = PromptContext {
+                soul_content: "",
+                identity: &identity,
+                core_memory: &memory,
+                is_onboarding: false,
+                current_utc: test_time(),
+                timezone: tz,
+                global_home_dir: None,
+                channel_type: None,
+                telegram_configured: false,
+                home_dir: None,
+                callback_context: None,
+                stopped_topics: &[],
+                runtime_provider: "test-provider",
+                runtime_model: "test-model",
+                deployment: Deployment::Unknown,
+                persona_profile: PersonaProfile::Operator,
+                tenant_language: None,
+            };
+            let prompt = build_system_prompt(&ctx);
+            assert!(
+                prompt.contains("you do NOT know"),
+                "{label}: the ignorance must be stated — leaving the void is what \
+                 produced « belle journée » in the evening"
+            );
+            assert!(
+                !prompt.contains("Local time ("),
+                "{label}: no local time may be posed when none could be computed"
+            );
+        }
+    }
+
+    /// R3b — the silent assembler carries the line too, and it is the path that
+    /// most needs it: a heartbeat is the only one of the three that greets
+    /// without having been spoken to, which makes it the likeliest producer of
+    /// the measured « belle journée ».
+    #[test]
+    fn mika2247_silent_prompt_carries_the_local_time_line() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: Some("Asia/Singapore".to_string()),
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Unknown,
+            persona_profile: PersonaProfile::Family,
+            tenant_language: None,
+        };
+        let prompt = build_silent_prompt(&ctx);
+        assert!(
+            prompt.contains("Local time (Asia/Singapore): 2026-02-24 20:00"),
+            "a proactive turn must know the hour it is opening at"
+        );
+        assert!(prompt.contains("Tuesday evening"));
+    }
+
+    /// **A decision, not an omission** — the compact builder does not render the
+    /// local-time line, and mika#2247 follows the mika#2290 carve-out rather
+    /// than diverging from it.
+    ///
+    /// Three facts refuse the divergence, and only the third settles it:
+    /// 1. `test_build_compact_system_prompt_size_bound` explicitly refuses
+    ///    `## Current Time`, and the section-count assertion above it enumerates
+    ///    the admitted sections in a comment that now carries, in writing,
+    ///    *"Raising it again means naming the section, its ticket, and what it
+    ///    guarantees"*. Rendering the line means editing **two pinned
+    ///    decisions**.
+    /// 2. The mika#2290 carve-out is written at the site with its reasoning:
+    ///    *"it withholds the intent half from this path, never the protection:
+    ///    the 5d guard reads outgoing text, not the prompt."*
+    /// 3. **That reasoning applies here word for word.** The AC3 guard reads
+    ///    outgoing text, so it protects the compact path whether or not the line
+    ///    is rendered. The divergence would cost two pinned decisions for a
+    ///    benefit the structural half already supplies.
+    ///
+    /// Named cost, real and accepted: on MikaModel the model does not have the
+    /// fact posed, so the guard works alone there, without the intent half.
+    /// Exactly the regime mika#2290 accepted for hosting, joined to the same
+    /// follow-up (mika#1925).
+    #[test]
+    fn mika2247_compact_prompt_omits_the_local_time_line() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = PromptContext {
+            soul_content: "# Mika - Compagnon personnel (famille)",
+            identity: &identity,
+            core_memory: &memory,
+            is_onboarding: false,
+            current_utc: test_time(),
+            timezone: Some("Asia/Singapore".to_string()),
+            global_home_dir: None,
+            channel_type: None,
+            telegram_configured: false,
+            home_dir: None,
+            callback_context: None,
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Cloud,
+            persona_profile: PersonaProfile::Family,
+            tenant_language: Some(TenantLanguage::French),
+        };
+        let compact = build_compact_system_prompt(&ctx);
+        assert!(
+            !compact.contains("Local time ("),
+            "mika#2247 follows the mika#2290 carve-out: the intent half is withheld \
+             on the MikaModel path, never the protection. Rendering it here means \
+             editing two pinned decisions — read this test's doc comment before \
+             doing so."
+        );
+        assert!(!compact.contains("## Current Time"));
+        // The full builder, same context, does carry it — so this test pins a
+        // carve-out and not a broken feature.
+        assert!(build_system_prompt(&ctx).contains("Local time (Asia/Singapore)"));
+    }
+
+    /// AC2 intent half — the declared language is posed in `## Runtime`, and
+    /// absence poses **nothing**.
+    #[test]
+    fn mika2247_the_declared_language_is_posed_and_absence_poses_nothing() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let make = |language: Option<TenantLanguage>| {
+            let ctx = PromptContext {
+                soul_content: "",
+                identity: &identity,
+                core_memory: &memory,
+                is_onboarding: false,
+                current_utc: test_time(),
+                timezone: None,
+                global_home_dir: None,
+                channel_type: None,
+                telegram_configured: false,
+                home_dir: None,
+                callback_context: None,
+                stopped_topics: &[],
+                runtime_provider: "test-provider",
+                runtime_model: "test-model",
+                deployment: Deployment::Cloud,
+                persona_profile: PersonaProfile::Family,
+                tenant_language: language,
+            };
+            build_system_prompt(&ctx)
+        };
+
+        let fr = make(Some(TenantLanguage::French));
+        assert!(fr.contains("The language of this conversation is French (`fr`)"));
+        assert!(
+            fr.contains("do not switch part-way through"),
+            "the rule a thread holds one language must travel with the fact"
+        );
+        assert!(
+            fr.contains(crate::config_keys::TENANT_LANGUAGE_KEY),
+            "the line must name the key that changes it — that is what makes \
+             « parle-moi en anglais » executable instead of a promise (mika#2358)"
+        );
+
+        let en = make(Some(TenantLanguage::English));
+        assert!(en.contains("The language of this conversation is English (`en`)"));
+
+        let none = make(None);
+        assert!(
+            !none.contains("The language of this conversation is"),
+            "absence must pose NOTHING: no line, and the drift guard unarmed. \
+             Making it an implicit French would write mika#2023's \
+             anglophone-champion defect at a second site."
+        );
+    }
+
+    /// The same fact on the silent path, for the reason that makes a proactive
+    /// turn the one that opens the exchange.
+    #[test]
+    fn mika2247_the_silent_prompt_carries_the_declared_language() {
+        let identity = test_identity();
+        let ctx = SilentPromptContext {
+            soul_content: "",
+            identity: &identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Cloud,
+            persona_profile: PersonaProfile::Family,
+            tenant_language: Some(TenantLanguage::French),
+        };
+        assert!(
+            build_silent_prompt(&ctx)
+                .contains("The language of this conversation is French (`fr`)")
+        );
+    }
 
     // -- mika#2290: the hosting fact is posed in `## Runtime` --
 
@@ -5613,6 +6161,7 @@ inject = false
             runtime_model: "test-model",
             deployment,
             persona_profile,
+            tenant_language: None,
         }
     }
 
@@ -5828,6 +6377,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Cloud,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
 
@@ -6316,6 +6866,7 @@ inject = false
             runtime_model: "test-model",
             deployment: Deployment::Cloud,
             persona_profile: persona,
+            tenant_language: None,
         }
     }
 
@@ -6340,6 +6891,7 @@ inject = false
             runtime_model: "glm-5.2",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         assert!(
@@ -6386,6 +6938,7 @@ inject = false
             runtime_model: "claude-sonnet-4-6",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_system_prompt(&ctx);
         // mika#2292 — anchor on the heading at line start; see the sibling note
@@ -6449,6 +7002,7 @@ inject = false
             runtime_model: "wizzard-v1",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_compact_system_prompt(&ctx);
         assert!(
@@ -6496,6 +7050,7 @@ inject = false
             runtime_model: "glm-5.2",
             deployment: Deployment::Unknown,
             persona_profile: PersonaProfile::Operator,
+            tenant_language: None,
         };
         let prompt = build_silent_prompt(&ctx);
         // Silent mode carries the same ground-truth block as conversation

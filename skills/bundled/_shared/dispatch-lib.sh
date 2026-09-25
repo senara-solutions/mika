@@ -247,6 +247,171 @@ _pilot_log_dir() {
     _PILOT_LOG_DIR="${PILOT_LOG_DIR:-/var/log/claude-pilot}"
 }
 
+# ---------------------------------------------------------------------------
+# mika#2496 — le plafond de tours du pilote, armé à la source
+# ---------------------------------------------------------------------------
+#
+# claude-pilot expose un plafond de tours SDK-NATIF depuis toujours : le drapeau
+# `--max-turns` (cli.py:69), validé >= 1 (cli.py:85-87), mappé sur
+# `GuardrailConfig.maxTurns` (cli.py:157-158) et remis au SDK en clair
+# (agent.py:1194-1195), qui termine alors le run sur un `ResultMessage`
+# authentique de sous-type `error_max_turns`. Ce fichier ne le passait à AUCUN
+# de ses trois sites de lancement, donc chaque dispatch tournait sous le défaut
+# amont `maxTurns=200` (types.py:77).
+#
+# C'est ce qui explique les deux emballements de référence : #2484 à 201 tours
+# est `maxTurns=200` qui A MORDU (le mécanisme marche de bout en bout, il est
+# réglé à 200 parce que rien en aval ne l'a jamais réglé), et #2425 à 142 tours
+# est simplement passé dessous. La règle « kill à 120 tours » était donc
+# applicable en vol depuis le début — et mieux que par un compteur lu de
+# l'extérieur, qui ne pourrait tuer que par signal au groupe de processus et
+# perdrait au passage le JSON de sortie, le `Turns:`/`Cost:` du callback et
+# toute la chaîne de récupération post-vol.
+#
+# LE FREIN EN DOLLARS, LUI, N'EXISTE PAS EN AMONT. `--max-budget` est parsé,
+# validé, résolu, porté jusqu'à `_sdk_guardrail_kwargs` — et la branche
+# `if config.maxBudgetUsd > 0:` s'y termine sur un `pass` (agent.py:1198-1201).
+# Le sous-type `error_max_budget_usd` est déclaré et classé en aval : un
+# vocabulaire de terminaison pour un mécanisme que rien ne peut produire. Le
+# commentaire qui l'autorise — « application-level guardrails still apply » —
+# est faux sur cet axe précis : `stallThreshold`, `emptyResponseThreshold`,
+# `idleTimeoutMs`, `toolWaitCeilingMs` et `modelWaitCeilingMs` mesurent tous du
+# TEMPS ou de la PRODUCTIVITÉ, aucun ne mesure des dollars. Aucun site ici ne
+# passe donc `--max-budget` : il serait accepté, validé, porté et ignoré, et le
+# poser ferait paraître le budget fermé dans l'argv, dans la ligne
+# `pilot_budget_armed` ci-dessous et dans la lecture de quiconque ouvrirait ce
+# fichier. Une borne annoncée et inerte est pire que pas de borne — elle éteint
+# la question. Suivi : `senara-solutions/claude-pilot`.
+#
+# UNE FONCTION, pas une variable assignée au chargement, et elle ASSIGNE au
+# lieu d'imprimer : les deux contraintes sont celles de `_pilot_log_dir`
+# ci-dessus et elles valent ici pour les mêmes raisons (une surcharge lue une
+# seule fois répond le défaut à tout appelant qui la pose après le `source` ; un
+# accesseur imprimant se lirait `$(_pilot_max_turns)` et poserait `++ printf`
+# dans la trace `set -x`, forme qu'aucun scrubber ne couvre — garde mika#2039).
+# Le coût est le même aussi : tout lecteur de `$_PILOT_MAX_TURNS` doit appeler
+# `_pilot_max_turns` sur la MÊME ligne, et test-dispatch-lib.sh refuse toute
+# lecture non co-localisée.
+#
+# LE DÉFAUT EST LIVRÉ À 0, C'EST-À-DIRE DÉSARMÉ — et ce n'est pas la valeur que
+# le plan de mika#2496 propose. Son § 5.1 fait de la distribution mesurée des
+# tours des runs ABOUTIS une vérification bloquante (V2) préalable à l'armement,
+# précisément parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une
+# borne qui coupe la population saine déplace le défaut au lieu de le fermer.
+# Cette mesure se lit sur `~/.mika/data/mika.db`, que le bac à sable de dispatch
+# ne monte pas — c'est un geste opérateur sur l'hôte, et le plan écrit lui-même
+# la conduite quand il n'est pas fourni : « U1 est livré DÉSARMÉ
+# (`PILOT_MAX_TURNS=0` par défaut) et la raison est écrite dans le corps de la
+# PR ». Armer est alors d'un geste et sans redéploiement :
+# `PILOT_MAX_TURNS=120` sur l'environnement du service ; ou porter ce défaut à
+# 120 une fois V2 rapportée sur le ticket.
+#
+# Trois paliers, et le `0` n'est pas une valeur invalide mais LE ROLLBACK :
+#
+#   non défini  -> le défaut ci-dessous
+#   ""  ou "0"  -> le drapeau n'est PAS passé ; claude-pilot retombe sur son
+#                  propre `maxTurns=200`, soit le comportement d'avant
+#                  mika#2496 à l'octet près
+#   entier > 0  -> ce plafond, `source=env`
+#   autre       -> le défaut, PLUS une ligne `pilot_budget_invalid` nommant la
+#                  valeur fautive entre guillemets. Un désarmement par coquille
+#                  sur un frein de coût serait la panne silencieuse que tout
+#                  ceci ferme.
+#
+# `_PILOT_MAX_TURNS` porte « la borne, ou rien » : vide quand désarmé, les
+# chiffres sinon. C'est ce qui rend `${_PILOT_MAX_TURNS:+--max-turns …}` juste
+# aux sites de lancement — le drapeau littéral y reste visible (le scan de
+# source l'exige) tout en disparaissant de l'argv quand la borne est absente.
+_pilot_max_turns() {
+    # LE défaut de flotte, un seul site. Vide = désarmé ; pour armer, écrire le
+    # plafond ici (`local _default=120`) une fois V2 rapportée sur le ticket.
+    local _default=""
+
+    _PILOT_MAX_TURNS_SOURCE="default"
+    _PILOT_MAX_TURNS_INVALID=""
+
+    if [ -z "${PILOT_MAX_TURNS+set}" ]; then
+        # Non défini : le défaut de flotte.
+        _PILOT_MAX_TURNS="$_default"
+    elif [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; then
+        # Le ROLLBACK, explicite : le drapeau ne sera pas passé.
+        _PILOT_MAX_TURNS=""
+        _PILOT_MAX_TURNS_SOURCE="env"
+    elif grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+        _PILOT_MAX_TURNS="$PILOT_MAX_TURNS"
+        _PILOT_MAX_TURNS_SOURCE="env"
+    else
+        # Illisible ou négatif : on retombe au défaut, et on le DIT.
+        _PILOT_MAX_TURNS="$_default"
+        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
+    fi
+
+    # Le résolveur ne RELIT jamais `$_PILOT_MAX_TURNS` : chaque branche l'écrit
+    # une fois et une seule. Une relecture ferait de lui son propre lecteur, et
+    # la garde de co-location ne peut pas distinguer ce lecteur-là d'un site de
+    # lancement qui aurait oublié d'appeler le résolveur.
+    return 0
+}
+
+# mika#2496 (U2) — le budget en vigueur est DIT à chaque lancement.
+#
+# Doctrine mika#2293, citée parce qu'elle décrit ce ticket mot pour mot : *un
+# réglage qu'on ne peut pas observer n'est pas un réglage, c'est un espoir.* Le
+# `240/900` donné à mika-arch le 06/09 a échoué en silence jusqu'au 11/09 faute
+# d'une ligne disant quel couple était réellement en vigueur.
+#
+# ELLE LIT L'ARGV, JAMAIS L'INTENTION DU RÉSOLVEUR. C'est la seule façon qu'elle
+# ne puisse pas annoncer une borne qui n'a pas été passée — le défaut que
+# mika#2304 nomme : « un champ qui affirme, avec autorité, l'override qui n'a
+# pas eu lieu ». `source=` vient du résolveur parce que l'argv ne porte pas la
+# provenance, et `source=unset` dit qu'aucun résolveur n'a tourné (co-location
+# rompue) au lieu de rapporter une provenance inventée.
+#
+# `max_turns=none` est la lecture honnête d'un dispatch désarmé : aucun plafond
+# n'est passé, claude-pilot tourne sous son `maxTurns=200`. Le nom de
+# l'événement est conservé tel quel malgré cette valeur, parce que le contrôle
+# positif publié dans CLAUDE.md compte les dispatches qui ont RÉSOLU un budget —
+# et que zéro `error_max_turns` avec zéro `pilot_budget_armed` ne dit rien du
+# tout, quand zéro avec un compte d'armements non nul dit que la flotte ne
+# s'emballe pas (classe mika#2205).
+#
+# `cost_bound=absent_upstream` est posé EN DUR et c'est le point : cette ligne
+# refuse d'annoncer un budget dollars, parce qu'il n'en existe aucun (voir le
+# `pass` de `_sdk_guardrail_kwargs` ci-dessus). Elle nomme l'absence au lieu de
+# la taire ; le jour où le suivi cpp aboutit, c'est cette valeur qui change.
+#
+# SINK : appelée depuis `_run_pilot_sandboxed`, donc sous la redirection
+# `2>"$STDERR_FILE"` du site de lancement, donc — pour le dispatch nominal —
+# dans `$PILOT_LOG_DIR/<task-id>.stderr` après `_scrub_secrets_from_output`.
+# C'est le sillon forensique per-dispatch que le Signal S lit déjà. L'émettre
+# avant la ligne de lancement l'enverrait sur le stderr propre de dispatch-lib,
+# que l'exécuteur ne lit QUE sur `if !status.success()` : sur un dispatch qui
+# réussit, le tuyau est jeté sans être lu et la ligne n'atterrit dans aucun
+# fichier — c'est très exactement le Signal M, mesuré par mika#2050. Limite
+# héritée et non refermée ici : les deux pilotes de revise redirigent vers un
+# `mktemp` qu'ils suppriment quelques lignes plus bas, donc leur ligne n'est
+# persistée nulle part (Signal S, § « Limit — the revise path captures nothing »).
+#
+# À l'ancrage : lire `^dispatch-lib: `, jamais le jeton nu. Ce `.stderr` porte
+# aussi la prose du pilote, et mika#2050 a mesuré le faux positif — une session
+# discutant du signal se lisait comme une émission.
+_emit_pilot_budget_line() {
+    local _mt="none" _prev="" _arg
+    for _arg in "$@"; do
+        if [ "$_prev" = "--max-turns" ]; then
+            _mt="$_arg"
+            break
+        fi
+        _prev="$_arg"
+    done
+
+    if [ -n "${_PILOT_MAX_TURNS_INVALID:-}" ]; then
+        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, retour au défaut" >&2
+    fi
+
+    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset} cost_bound=absent_upstream" >&2
+}
+
 # mika#2165: make that directory visible — and writable — from INSIDE.
 #
 # Narrow on purpose: this directory, never /var/log. /var/log/mika holds the
@@ -285,6 +450,33 @@ _pilot_log_bind_args() {
 _PILOT_EGRESS_SOCK="/tmp/mika-pilot-egress.sock"
 _PILOT_EGRESS_TCP_PORT="8891"
 _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
+
+# mika#2049: the relay-down stamp. Written HERE (shell), read by the engine
+# (Rust) — the first file under `state/` to cross that boundary in this
+# direction, so the convention is posed here rather than inherited.
+#
+# `$HOME/.mika` IS WRITTEN IN FULL, DELIBERATELY. Do NOT "harmonise" this on the
+# `${MIKA_HOME:-$HOME/.mika}` pattern used by `MIKA_PR_ORIGIN_EPOCH_FILE` a few
+# thousand lines below: `scrub_mika_env_vars` (crates/mika-agent/src/skills/
+# executor.rs) strips EVERY `MIKA_*` variable from the dispatch child, `MIKA_HOME`
+# included, so that `:-` has already fallen back by the time the line runs. It is
+# code that looks like it handles the case and does not — and here the mistake is
+# not cosmetic: the engine resolves the same path through `global_home_dir`, which
+# DOES honour `MIKA_HOME`, so on an installation that sets it the two ends would
+# name two different files. The stamp would be written in one place and looked for
+# in another; gardes A and B, fail-open by construction, would read "no outage" and
+# let every dispatch through — R5 false in production with a green test suite.
+#
+# Reader (sole): crates/mika-agent/src/pilot_egress_stamp.rs. The invariant is
+# written at both ends and held by the source scan in test-dispatch-lib.sh.
+_PILOT_EGRESS_DOWN_STAMP="$HOME/.mika/state/pilot-egress-down"
+
+# Closed vocabulary of refusal motives, one per failure cause. Kept apart
+# because the remedies differ — deploy the binary vs restart the relay — and the
+# two populations must stay countable separately (precedent: `below_threshold`
+# vs `no_ready_label_event`, mika#2131).
+_PILOT_EGRESS_MOTIF_BINARY_MISSING="egress_binary_missing"
+_PILOT_EGRESS_MOTIF_BIND_TIMEOUT="egress_bind_timeout"
 
 # Helper daemon for anthropic api chain (2026-08-05).
 # Addon path = installed alongside the proxy binary in ~/.local/bin/ (see
@@ -485,12 +677,46 @@ except OSError:
 }
 
 # Idempotent host-side egress proxy launcher. Runs once per host; on subsequent
-# calls, verifies the daemon is alive and returns. Fail-open on missing binary
-# (Phase 2b not yet deployed) — sandbox falls back to Phase 2a (fs cut only,
-# network open) so the pilot still functions during the deploy window.
+# calls, verifies the daemon is alive and returns.
+#
+# POSTURE: FAIL-CLOSED (mika#2049, operator decision of 2026-09-20 — option 1,
+# taken by Vincent after a bearing from Prime). Egress unavailable ⇒ the dispatch
+# is refused; the pilot never leaves without its network cut. The escape-hatch
+# variant (option 2) was ruled out in writing: « it recreates the fail-open under
+# another name, and a WARN under load is read by nobody. » There is therefore NO
+# environment variable that lifts the refusal.
+#
+# Until 2026-09-20 this returned 1 on every cause and the caller read that 1 as
+# "launch in Phase 2a" — filesystem cut kept, NETWORK OPEN. The written
+# justification was #1894's deploy window, closed long since; the posture was
+# inherited rather than decided. What is being protected is a hostname allowlist
+# applied to an autonomous agent executing code it wrote itself, so "failing
+# open" means the control is lifted at the exact moment it cannot start.
+#
+# THIS FUNCTION DOES NOT DECIDE — it reports. The return code is unchanged (0 =
+# the relay serves, 1 = it does not; `scripts/canary-pilot-containment
+# --ensure-relay` depends on it) and the cause is posted in
+# `$_PILOT_EGRESS_ABORT`, on the exact model of `$_PILOT_GITDIR_BIND_ABORT`. The
+# refusal itself belongs to `_run_pilot_sandboxed`, which is the only place that
+# knows a pilot was about to be launched.
 _ensure_pilot_egress_proxy() {
+    # NOT `local`: bash `local` is invisible to the caller, and the caller is
+    # where the operator-facing refusal is built (same reasoning, same shape as
+    # `_PILOT_SANDBOX_REFUSAL`). Cleared on entry so a stale value from an
+    # earlier call in the same shell can never be read as this call's verdict.
+    _PILOT_EGRESS_ABORT=""
     if [ ! -x "$_PILOT_EGRESS_PROXY_BIN" ]; then
-        echo "dispatch-lib: mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — Phase 2b network cut disabled (falling back to fs-only)" >&2
+        _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BINARY_MISSING"
+        # mika#2049: the message no longer says "falling back to fs-only" —
+        # nothing falls back any more, and Signal S (mika#2050) greps that exact
+        # string to count dispatches that ran WITHOUT the network cut. Leaving it
+        # would make an instrument report a population that can no longer exist.
+        # Each cause now carries its own stable token, which is the half
+        # mika#2050 had to document as missing: `pilot_egress_guard.unreachable`
+        # covered the bind timeout alone, so an operator using it as the
+        # predicate read a nominal regime on a fleet whose proxy binary was never
+        # deployed.
+        echo "dispatch-lib: pilot_egress_guard.binary_missing mika-pilot-egress-proxy not found at $_PILOT_EGRESS_PROXY_BIN — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
     # Liveness probe: is anyone actually listening?
@@ -511,6 +737,13 @@ _ensure_pilot_egress_proxy() {
     fi
     nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix --socket "$_PILOT_EGRESS_SOCK" \
         >>"$log_file" 2>&1 </dev/null &
+    # mika#2051: captured HERE, not read from `$!` further down, because the
+    # failure path below needs it -- and that path is the only one this ticket
+    # exists to diagnose. `$!` still holds this pid at both later sites (nothing
+    # backgrounds in between: the connectability probe runs python3 in the
+    # FOREGROUND), so this is not a bug fix; it is the value being needed
+    # earlier than it was read.
+    local proxy_pid=$!
     disown 2>/dev/null || true
     # Wait for the proxy to actually accept a connection (bounded). Testing
     # for the socket FILE here is what made the fallback below unreachable in
@@ -528,11 +761,119 @@ _ensure_pilot_egress_proxy() {
         sleep 0.1
     done
     if ! _pilot_egress_sock_connectable "$_PILOT_EGRESS_SOCK" 0.25; then
-        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s — falling back to fs-only" >&2
+        _PILOT_EGRESS_ABORT="$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT"
+        # See the sibling message above on why "falling back to fs-only" is gone.
+        #
+        # mika#2051: the pid is the JOINT. The proxy stamps its own pid on its
+        # first line (`pilot_egress_startup.begin pid=<pid>`, mika#2086), so the
+        # key already existed on one side and was simply not printed on the
+        # other -- leaving the operator to join a per-dispatch `.stderr` to a
+        # cumulative proxy log by timestamp. That is the friction that made the
+        # 2026-08-29 diagnosis expensive. No new correlation id: inventing one
+        # would be a second vocabulary for a join the pid already makes, and it
+        # would have to survive `nohup`.
+        #
+        # Placed BEFORE the em dash on purpose: the dash separates the finding
+        # (this identified proxy did not bind) from its consequence (the
+        # dispatch is refused). The pid qualifies the finding. The published
+        # predicates bite on the `^dispatch-lib: ` anchor and the contiguous
+        # token, both untouched -- see `_egress_guard_line` in the test suite,
+        # which asserts the invariant and deliberately not this position.
+        echo "dispatch-lib: pilot_egress_guard.unreachable pilot-egress-proxy failed to bind $_PILOT_EGRESS_SOCK within 3s (pid $proxy_pid) — refusing the dispatch (mika#2049)" >&2
         return 1
     fi
-    echo "dispatch-lib: pilot-egress-proxy launched (pid $!, log $log_file)" >&2
+    echo "dispatch-lib: pilot-egress-proxy launched (pid $proxy_pid, log $log_file)" >&2
     return 0
+}
+
+# --- mika#2049: the refusal, its stamp, and its escalation -------------------
+
+# The remedy sentence for one motive. The refusal text has to name BOTH the cause
+# and the gesture (R2): an operator reading `CONTAINMENT REFUSAL` at 3am needs to
+# know which organ to repair, and the two causes call for opposite gestures.
+_pilot_egress_remedy() {
+    case "$1" in
+        "$_PILOT_EGRESS_MOTIF_BINARY_MISSING")
+            printf '%s' "The egress relay binary is absent from $_PILOT_EGRESS_PROXY_BIN. Deploy it with \`make install\` on the dispatch host, then re-dispatch."
+            ;;
+        "$_PILOT_EGRESS_MOTIF_BIND_TIMEOUT")
+            printf '%s' "The egress relay did not bind $_PILOT_EGRESS_SOCK within 3s. Restart it with \`scripts/canary-pilot-containment --restart-relay\`, read \${MIKA_PILOT_EGRESS_LOG_DIR:-/var/log/mika}/pilot-egress-proxy.log (or /tmp/mika-pilot-egress-proxy.log) for why it died, then re-dispatch."
+            ;;
+        *)
+            # Unreachable through the two motives above, and deliberately not a
+            # silent empty string: a refusal whose remedy is blank sends the
+            # operator looking for a bug in the wrong organ.
+            printf '%s' "Cause unrecognised by \`_pilot_egress_remedy\` — see the dispatch stderr log, then runbook docs/operator/pilot-egress-relay.md."
+            ;;
+    esac
+}
+
+# Escalate on a channel someone actually reads (R3), deterministically — no LLM
+# turn, no prompt instruction (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+#
+# `|| true` EVERYWHERE, and the order is the point: the refusal is the
+# protection, the alert is the information, and an alert that fails must never
+# hand the launch back to the pilot.
+#
+# WHAT THIS CANNOT TELL YOU: `mika notify` returns Ok(()) even when Telegram
+# delivery fails — the failure is caught, printed to its own stderr, and
+# swallowed (crates/mika-cli/src/commands/notify.rs). Only a DB write failure
+# makes it non-zero. So this call site can NEVER know whether the alert reached
+# anyone, and no amount of shell here would change that. What makes the channel
+# real is a DEPLOYMENT-TIME precondition — the `mika` agent must carry a non-null
+# `chat_id` in `customer_config` — checked in the runbook, not on the critical
+# path of every dispatch. The notification is written to the DB BEFORE the send
+# is attempted, so a dead gateway still leaves the line in session
+# 00000000-0000-0000-0000-700000710717; that is what makes halt (c) of the plan
+# decidable.
+_pilot_egress_notify() {
+    local severity="$1" text="$2"
+    if ! command -v mika >/dev/null 2>&1; then
+        echo "dispatch-lib: \`mika\` not on PATH — egress escalation not emitted: $text" >&2
+        return 0
+    fi
+    mika notify --channel telegram --severity "$severity" --text "$text" >/dev/null 2>&1 || true
+    return 0
+}
+
+# Record the outage and escalate ONCE per episode (R4).
+#
+# Deduplication is by the stamp's presence, not by a counter: a proxy outage
+# spanning an hour produces one alert, not one per dispatch. The stamp is also
+# what gardes A and B read to stop consuming tickets' re-drive budget, which is
+# why its CONTENT is read (unlike `auto-pull-stop`, mika#2329, whose content is
+# deliberately never read) — the engine needs the age to decide staleness.
+_pilot_egress_mark_down() {
+    local motif="$1" remedy="$2" was_down=0
+    [ -f "$_PILOT_EGRESS_DOWN_STAMP" ] && was_down=1
+
+    mkdir -p "$(dirname "$_PILOT_EGRESS_DOWN_STAMP")" 2>/dev/null || true
+    # `<RFC3339-UTC> <motif>`, one line. Written on every refusal (refreshing the
+    # timestamp), so the engine's staleness window measures the LAST refusal
+    # rather than the first — without that refresh a long outage would look stale
+    # after one TTL and gardes A/B would stop biting for the rest of it.
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$motif" \
+        > "$_PILOT_EGRESS_DOWN_STAMP" 2>/dev/null \
+        || echo "dispatch-lib: could not write the egress-down stamp at $_PILOT_EGRESS_DOWN_STAMP — the engine will keep consuming tickets' re-drive budget during this outage (mika#2049)" >&2
+
+    if [ "$was_down" -eq 0 ]; then
+        _pilot_egress_notify escalate \
+            "🚨 Egress relay DOWN — pilot dispatch refused (fail-closed, mika#2049). Cause: $motif. $remedy Tickets are NOT being parked; the loop resumes on its own once the relay serves again."
+    fi
+}
+
+# The relay serves. If it did not last time, say so and clear the stamp.
+#
+# An announced resumption is half of R4: a rail that restarts without saying so
+# leaves the operator facing a silence they cannot tell from a persistent outage.
+# Modelled on `auto_pull_stop_armed` / `auto_pull_stop_lifted` (mika#2329) — a
+# transition, never a repeated state.
+_pilot_egress_mark_up() {
+    [ -f "$_PILOT_EGRESS_DOWN_STAMP" ] || return 0
+    rm -f "$_PILOT_EGRESS_DOWN_STAMP" 2>/dev/null || true
+    echo "dispatch-lib: pilot_egress_guard.recovered egress relay is serving again — dispatch resumed (mika#2049)" >&2
+    _pilot_egress_notify info \
+        "✅ Egress relay back up — pilot dispatch resumed (mika#2049). No action needed on tickets."
 }
 
 # Passthrough env allowlist: after `--clearenv`, these vars are re-injected
@@ -912,6 +1253,14 @@ _pilot_gitdir_bind_args() {
 _run_pilot_sandboxed() {
     # Runs "$@" (the full claude-pilot invocation) under bwrap when enabled,
     # or direct-exec otherwise. Preserves stdin/stdout/stderr semantics.
+    #
+    # mika#2496 (U2): the budget line is emitted HERE, and from nowhere else.
+    # This is the one function all three launch sites traverse, and its stderr
+    # is the per-dispatch forensic sink (the caller's `2>"$STDERR_FILE"`) — the
+    # same placement, for the same reason, as `_ensure_pilot_egress_proxy`
+    # (mika#2041) and the mika#2039 sandbox-secret prologue. Before the
+    # sandbox-enabled branch so a direct-exec dispatch is reported too.
+    _emit_pilot_budget_line "$@"
     if ! _pilot_sandbox_enabled; then
         "$@"
         return $?
@@ -940,14 +1289,25 @@ _run_pilot_sandboxed() {
     # to the caller, and the caller is where the operator-facing RESULT is built.
     _PILOT_SANDBOX_REFUSAL=""
     if ! _stage_pilot_gitconfig; then
-        _PILOT_SANDBOX_REFUSAL="the sandbox git config could not be staged at $_PILOT_GITCONFIG_HOST, so the pilot would have had no committer identity and no https remote"
+        # mika#2049: the remedy sentence moved INTO the motive. It used to be a
+        # fixed tail on the RESULT block ("Fix the worktree, then re-dispatch."),
+        # written for these two gitdir causes and therefore wrong for every other
+        # containment refusal — an egress refusal has a healthy worktree and a
+        # broken relay. Carrying the remedy here makes the refusal text entirely
+        # motive-borne, so the next containment refusal needs no edit to that block.
+        _PILOT_SANDBOX_REFUSAL="the sandbox git config could not be staged at $_PILOT_GITCONFIG_HOST, so the pilot would have had no committer identity and no https remote.
+
+Fix the worktree, then re-dispatch."
         echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
         return 78
     fi
     local -a _PILOT_GITDIR_BIND_ARGS=()
     local _PILOT_GITDIR_BIND_ABORT=""
     if ! _pilot_gitdir_bind_args "${WORKTREE_DIR:-}"; then
-        _PILOT_SANDBOX_REFUSAL="$_PILOT_GITDIR_BIND_ABORT"
+        # See the sibling above on why the remedy travels with the motive.
+        _PILOT_SANDBOX_REFUSAL="$_PILOT_GITDIR_BIND_ABORT
+
+Fix the worktree, then re-dispatch."
         echo "dispatch-lib: refusing to launch the pilot — $_PILOT_SANDBOX_REFUSAL (mika#2141)" >&2
         return 78
     fi
@@ -958,19 +1318,71 @@ _run_pilot_sandboxed() {
     local -a _PILOT_LOG_BIND_ARGS=()
     _pilot_log_bind_args
 
-    # Phase 2b: launch host-side egress proxy (idempotent). If it's not
-    # available (binary missing, first deploy), returns non-zero and we run
-    # in Phase 2a mode (fs cut only, network open) — degraded but functional.
+    # Phase 2b: the host-side egress proxy. FAIL-CLOSED since mika#2049 — if the
+    # relay does not serve, the dispatch is refused and no pilot is launched.
     local -a net_bwrap_args=()
     local -a net_setenv_args=()
     local sandbox_entrypoint_prefix=""
+
+    # PLACEMENT: above `_stage_pilot_gh_token` and `_ensure_pilot_helper`, hence
+    # above TWO side effects rather than one.
+    #
+    #   * `_stage_pilot_gh_token` refreshes a host GitHub credential on disk. Not
+    #     a new leak — the file already lives between two dispatches — but a
+    #     credential refreshed for a launch that will not happen.
+    #   * `_ensure_pilot_helper` STARTS A DAEMON. A refusal posted after it would
+    #     leave one helper started behind every refused dispatch, on every
+    #     attempt of an outage.
+    #
+    # House precedent points the same way: gate 2c of mika#2279 is placed "before
+    # step 3, hence with no token resolution".
+    #
+    # ORDERING CONSTRAINT NOT TO BREAK when moving this: the mika#2056 comment
+    # below requires the token to be staged BEFORE the helper, "so the mitmdump
+    # github addon has a fresh credential to inject on its very first request".
+    # Lifting the refusal above the pair preserves that order intact; inserting
+    # it BETWEEN the two would break it.
+    if ! _ensure_pilot_egress_proxy; then
+        local _egress_motif="${_PILOT_EGRESS_ABORT:-egress_unavailable}"
+        local _egress_remedy
+        _egress_remedy="$(_pilot_egress_remedy "$_egress_motif")"
+
+        _PILOT_SANDBOX_REFUSAL="the host egress relay is not serving, so the pilot would have run with filesystem containment only and an OPEN NETWORK — which is the posture mika#2049 closed on 2026-09-20 (operator decision: fail-closed, no escape hatch).
+
+Cause: $_egress_motif
+Remedy: $_egress_remedy"
+
+        echo "dispatch-lib: refusing to launch the pilot — egress relay unavailable ($_egress_motif) (mika#2049)" >&2
+
+        # Stamp + escalate AFTER the refusal text is built and BEFORE returning,
+        # so a failure in either cannot change the verdict. Both are `|| true`
+        # internally: the refusal is the protection, the alert is information.
+        _pilot_egress_mark_down "$_egress_motif" "$_egress_remedy"
+
+        return 78
+    fi
+
+    # The relay serves. If a previous dispatch was refused, this is the
+    # resumption — announce it and clear the stamp (R4).
+    _pilot_egress_mark_up
+
     # mika#2056: stage the token host-side BEFORE the helper daemon is ensured,
     # so the mitmdump github addon has a fresh credential to inject on its very
     # first request.
     _stage_pilot_gh_token
     _ensure_pilot_helper || true
 
-    if _ensure_pilot_egress_proxy; then
+    # Unconditional since mika#2049 — the `if _ensure_pilot_egress_proxy; then`
+    # that used to guard this block is gone, because its `else` (Phase 2a, network
+    # open) no longer exists: the refusal above returns 78 instead.
+    #
+    # Kept as a brace group rather than de-indented, deliberately: this is the
+    # containment shape, and a diff that shows ninety-nine unchanged lines is
+    # worth more to a reviewer here than four columns of whitespace. A brace group
+    # runs in the CURRENT shell — no subshell — so `net_bwrap_args`,
+    # `net_setenv_args` and `sandbox_entrypoint_prefix` are set for the caller
+    # exactly as they were under the `if`.
+    {
         # Full Phase 2b: unshare-net + bind unix socket + wrap with in-sandbox
         # TCP→unix shim + HTTPS_PROXY pointing at shim.
         net_bwrap_args=(
@@ -1068,7 +1480,7 @@ _run_pilot_sandboxed() {
         # CA bundle is assembled and GIT_SSL_CAINFO / SSL_CERT_FILE et al. are
         # exported before the pilot's first `git push` / `gh` call.
         sandbox_entrypoint_prefix="/bin/sh"
-    fi
+    }
 
     local -a setenv_args=()
     local var
@@ -1330,6 +1742,29 @@ _set_pr_status_line() {
 ${1}"
 }
 
+# mika#2492 — the sister of the above, for the `Outcome:` line.
+#
+# Deliberately NOT a reuse of `_set_pr_status_line`: that one knows only
+# `PR:`/`NO_PR:` and has never touched `Outcome:`. This one strips any prior
+# line-anchored `Outcome:` and appends, which makes the "exactly one `Outcome:`
+# line" contract true BY CONSTRUCTION rather than by coincidence of ordering —
+# the same property the comment above claims for its elder.
+#
+# The window it exists for: `_post_flight_recovery` poses an `Outcome:` while
+# still inside `_run_claude_pilot` (mika#940 Unit 3), and Path B may later open
+# a PR that makes a truer one available. $1 is the full line body, e.g.
+# "Outcome: PR_OPENED — <url>".
+_set_outcome_line() {
+    local _body
+    _body="$(printf '%s' "$RESULT" | sed '/^Outcome: /d')"
+    # Trim trailing newlines so the appended block always reads as exactly one
+    # blank separator, whatever the stripped line left behind.
+    while [ "${_body%$'\n'}" != "$_body" ]; do _body="${_body%$'\n'}"; done
+    RESULT="${_body}
+
+${1}"
+}
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -1344,6 +1779,11 @@ _dispatch_lib_term_trap() {
 
 _dispatch_lib_exit_trap() {
     _EXIT_CODE=$?
+    # mika#2155: crash/cancel backstop for the claim — the nominal path already
+    # released in _deliver_callback (and lowered the flag, so this is a no-op
+    # there). Before the CALLBACK_SENT guard on purpose: the nominal path
+    # returns early there, and a failed nominal release still needs this retry.
+    _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     # Cleanup fuzzy-match side-channel tmpfile (mika#1272)
     rm -f "${_DISPOSITION_FUZZY_FILE:-}" 2>/dev/null
     # Cleanup architect-stderr side-channel tmpfile (mika#2278)
@@ -1543,6 +1983,68 @@ _scrub_env() {
     unset MIKA_ANTHROPIC_API_KEY MIKA_INTERNAL_TOKEN MIKA_OPENAI_API_KEY MIKA_BRAVE_API_KEY
 }
 
+# ---------------------------------------------------------------------------
+# mika#1943 — un chemin qu'on ne peut pas PROUVER worktree n'est pas supprimé
+# ---------------------------------------------------------------------------
+#
+# L'incident du 28/07 : un nettoyage automatisé a emporté `/data/workspace/bbytaa`,
+# un répertoire qui n'était protégé par aucune liste — il était protégé par les
+# instantanés btrbk qui l'encadraient. Le ticket prescrivait une **denylist**
+# (`^/data/workspace/[^/]+/?$` refusé). Ce qui est livré ici est l'inverse, et
+# strictement plus fort : une **allowlist positive**, alignée terme pour terme sur
+# `worktree_reaper::is_managed_worktree_path` (mika#2420, `crates/mika-agent/src/`).
+#
+# Trois raisons, dont la troisième décide :
+#
+#   1. Une denylist est fausse le jour où un répertoire précieux n'y figure pas —
+#      c'est-à-dire le jour où elle servirait. `/data/workspace/bbytaa` n'aurait
+#      été dans aucune liste écrite avant lui.
+#   2. Deux sémantiques opposées pour une même question dans un même dépôt est la
+#      divergence programmée que `grooming_marker` (mika#2158) a dû fermer une
+#      fois : deux prédicats répondant différemment à « ce chemin est-il
+#      supprimable ». Le reaper décide par allowlist ; cette garde aussi.
+#   3. `/data/workspace/` est le disque de cette machine, pas une propriété du
+#      système. Coder ce préfixe en dur ne protégerait que gentux et serait muet
+#      partout ailleurs — un garde-fou qui *paraît* poser une règle générale.
+#      `/.claude/worktrees/` est, lui, une propriété structurelle du layout.
+#
+# L'asymétrie qui décide du fail-safe, écrite avant le reste : un faux négatif
+# laisse un worktree résiduel sur le disque — le reaper mika#2420 le ramasse au
+# tick suivant, ou l'opérateur ; coût borné, quelques Go, temporaire. Un faux
+# positif supprime un répertoire qui n'est pas un worktree : irréversible, et
+# c'est l'incident du 28/07. **Donc tout terme illisible conserve**, exactement
+# comme le reaper, délibérément, pour que les deux gardes ne puissent pas se
+# contredire.
+#
+# Une fonction, et pas une garde recopiée à chaque site : il y a cinq sites
+# destructifs dans ce fichier, donc cinq occasions de diverger.
+#
+# Les marqueurs `# mika1943:T<n>` en fin de ligne ne sont pas décoratifs : la
+# suite de tests neutralise **un** terme à la fois par `sed` et vérifie que le
+# refus correspondant disparaît. Renommer un marqueur ou fusionner deux termes
+# fait rougir `MUTATION_ABSENTE` plutôt que de désarmer la vérification en
+# silence. Une conjonction ne se teste pas en désarmant tous ses termes ensemble
+# (leçon mika#2277).
+_MIKA_MANAGED_WORKTREE_SEGMENT='/.claude/worktrees/'
+
+# Émetteur du refus. Séparé de la décision : celle-ci a un lecteur unique, mais
+# dire le refus n'est pas décider. Sans cette ligne, un refus se lirait
+# exactement comme une absence de travail (classe mika#2205).
+_refuse_unsafe_removal() {
+    echo "dispatch_lib_unsafe_removal_refused: site=$1 term=$3 path='$2' (mika#1943)" >&2
+}
+
+# Args: $1 = chemin candidat, $2 = nom du site appelant (pour le diagnostic).
+# Rend 0 si le chemin est un worktree géré supprimable, non-zéro sinon.
+_assert_removable_worktree_path() {
+    local path="${1-}" site="${2:-unknown}"
+    case "$path" in "") _refuse_unsafe_removal "$site" "$path" empty; return 1 ;; esac                                            # mika1943:T1
+    case "$path" in /*) : ;; *) _refuse_unsafe_removal "$site" "$path" not_absolute; return 1 ;; esac                             # mika1943:T2
+    case "$path" in */../*|*/..) _refuse_unsafe_removal "$site" "$path" parent_dir_component; return 1 ;; esac                    # mika1943:T3
+    case "$path" in *"$_MIKA_MANAGED_WORKTREE_SEGMENT"*) : ;; *) _refuse_unsafe_removal "$site" "$path" outside_managed_root; return 1 ;; esac  # mika1943:T4
+    return 0
+}
+
 # mika#1414: Pre-rebase worktree cleanup for the resume path.
 #
 # On a resume dispatch _set_up_worktree() reuses an existing worktree, then
@@ -1607,7 +2109,13 @@ _clean_worktree_for_rebase() {
     # duplicated patterns. They can drift; when you add a path here, add it to
     # the classifier too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
-    rm -rf "$wt/.iterate" 2>/dev/null || true
+    # mika#1943: `$wt` a déjà prouvé qu'il est un dépôt git (garde en tête de
+    # fonction), jamais qu'il est un worktree GÉRÉ — et c'est la seconde moitié
+    # qui manquait. Sur refus on saute ce reset chirurgical : le tier 3
+    # ci-dessous (stash + reset) ramasse le résidu, donc le coût est borné.
+    if _assert_removable_worktree_path "$wt" clean_worktree_for_rebase; then
+        rm -rf "$wt/.iterate" 2>/dev/null || true
+    fi
     git -C "$wt" checkout HEAD -- docs/plans/ 2>/dev/null || true
     git -C "$wt" checkout HEAD -- .claude/commands/ 2>/dev/null || true
 
@@ -1941,6 +2449,56 @@ et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\`
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
 
+# mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
+# de grooming.
+#
+# Le défaut qu'elle ferme : `/ce:plan` est un plugin tiers
+# (`compound-engineering`) qui n'a aucune connaissance de mika#1574, donc un plan
+# neuf livrant un détecteur arrive devant mika-arch sans la section que son
+# Fire-Disposition Gate exige. L'architecte rend alors ITERATE — à juste titre —
+# et l'unique itération de `_iterate_groom_loop` est dépensée sur un motif
+# purement formel, évitable en amont. Au second passage le gate est sans recours
+# (« No ITERATE exists at second pass per the two-pass limit »), donc le ticket
+# ESCALATE et la boucle ne dispatche jamais l'implémentation.
+#
+# C'est exactement la configuration que le Acceptance-Criteria Gate décrit déjà
+# mot pour mot pour sa section sœur : « Grooming is the surface we control
+# between the third-party producer and our validator. » `## Acceptance criteria`
+# a reçu ce traitement (mika#1600/#1627) ; `## Fire-Disposition` ne l'avait
+# jamais reçu.
+#
+# La règle vit ICI et non dans `.claude/commands/mika-groom-plan-only.md` pour la
+# même raison que `_PR_BODY_CONTAINMENT_RULE` ci-dessus : les trois commandes de
+# groom vivent dans `senara-solutions/mika-platform` et sont semées dans le
+# worktree par `_seed_worktree_slash_commands` (mika#1415), donc un ticket ouvert
+# sur `senara-solutions/mika` ne peut pas les éditer. Ce PROMPT est le seul canal
+# que ce dépôt contrôle. La moitié commandes est nommée en suivi, pas simulée.
+#
+# Ce n'est pas le prompt-enforcement que
+# `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` condamne :
+# la leçon de mika#2120 porte sur une consigne qui dépend qu'un opérateur pense à
+# la taper. Une constante injectée par le substrat à chaque dispatch ne dépend
+# d'aucune mémoire — et la moitié structurelle est livrée à côté (le rattrapage
+# de `_launch_revise_pilot`), ce que cette doctrine prescrit justement.
+#
+# Elle cite mika#1574 par référence et nomme ses trois options ; elle ne
+# reformule pas la doctrine, pour que les deux ne puissent pas diverger.
+_FIRE_DISPOSITION_RULE="RÈGLE DE GROOMING (mika#2306) — un plan qui livre un détecteur porte \`## Fire-Disposition\`.
+Détecteur = tout livrable dont la fonction primaire est de signaler une violation : test,
+assertion, règle de lint, garde CI, validateur de schéma, scan structurel, garde EndTurn —
+tout code dont le chemin de succès est « aucune violation trouvée ».
+Si le plan en livre au moins un, il DOIT porter une section \`## Fire-Disposition\` nommant
+l'une des trois options canoniques de mika#1574, avec son détail d'implémentation :
+(a) exception nommée en allowlist (défaut) — chaque violation existante reçoit une entrée
+    grep-visible qui nomme la donnée précise, référence un ticket de suivi, et porte une
+    assertion auto-nettoyante qui rougit quand l'exception devient stale ;
+(b) livrer désarmé — le détecteur atterrit avec \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent,
+    plus un suivi tracké pour l'armer ;
+(c) halte-et-remontée — l'implémentation s'arrête et remonte à l'opérateur pour cadrage.
+Si le plan ne livre AUCUN détecteur, la section n'est pas requise (gate N/A) : ne l'invente pas.
+Sans elle, mika-arch rend ITERATE en première passe et ESCALATE en seconde — et la seconde
+passe est sans recours."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -2209,7 +2767,17 @@ _set_up_worktree() {
                 # it attests.
                 plan_provenance=$(_plan_provenance "$SUB_REPO_DIR" "$BRANCH" "$existing_plan")
                 echo "dispatch_gate_groom_refused: repo=${REPO} issue=${ISSUE_NUM} branch=${BRANCH} plan=${existing_plan} — plan resolves on the branch (${plan_provenance}) and its header does not claim another ticket; re-grooming would loop (mika#2012, provenance mika#2034)" >&2
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+                # mika#2484 U5 — la note ne prescrit plus une route morte.
+                # Elle disait « Dispatch dev-pilot to implement », et depuis
+                # mika#2287 cette moitié mène droit à
+                # `dispatch_grooming_not_verified` : la porte exige un callback
+                # groom terminé portant `Outcome: PLAN_GROOMED`, qu'aucun
+                # `already_groomed` ne frappe — délibérément, une garde qui lit
+                # sa preuve de la revendication ne peut pas la réfuter. Le geste
+                # nommé ici est celui que `groom_provenance_verdict` nomme déjà
+                # dans son champ `recovery`. Un texte de remède qui nomme une
+                # route morte coûte un tour de boucle et une lecture.
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carrying Outcome: PLAN_GROOMED exists, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
@@ -2226,11 +2794,43 @@ _set_up_worktree() {
             fi
         fi
 
+        # mika#2155: claim the ticket for the loop BEFORE the first mutation
+        # below — the fetch, the non-canonical worktree removal, the
+        # `worktree add`. Placed after every no-dispatch exit above (closed
+        # issue, redundant groom) so a dispatch that never happens never claims,
+        # and skipped on a dry run for the same reason. `|| true`: AC2, the
+        # label is a signal, not a barrier. ISSUE_SEAT_CLAIMED is set even when
+        # the stamp failed: it means "this dispatch went past its no-dispatch
+        # exits", not "the write succeeded" — the EXIT trap releases on it.
+        if [ "$DRY_RUN" != "true" ] && [ "$DRY_RUN" != "1" ]; then
+            _stamp_issue_seat "$REPO" "$ISSUE_NUM" "$LABELS" || true
+            ISSUE_SEAT_CLAIMED=1
+        fi
+
         # Sync main before branching to avoid stale worktrees.
         git -C "$SUB_REPO_DIR" fetch origin main 2>/dev/null || true
 
         # Worktree path is centralized in mika-platform/scripts/derive-worktree-path
-        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO")
+        #
+        # mika#1943 — la racine. Le code de sortie n'était pas vérifié, et ce
+        # fichier n'a ni `set -e` ni `set -u` : un script absent (il vit dans
+        # mika-platform, un AUTRE dépôt, donc son absence n'est pas une
+        # hypothèse d'école) ou en échec rendait une chaîne vide qui se
+        # propageait en silence jusqu'à la comparaison d'égalité ci-dessous —
+        # laquelle ÉLIT une cible de suppression — puis jusqu'aux deux
+        # `worktree remove --force`.
+        #
+        # Le `|| WORKTREE_DIR=""` efface délibérément toute sortie produite par
+        # un appel qui a échoué : un script qui sort non-zéro en ayant tout de
+        # même imprimé quelque chose n'a rien prouvé, et c'est le sens sûr.
+        # Abandonner le dispatch est le bon arbitrage — il n'y a rien à faire
+        # sans worktree, et `return 1` est déjà la sortie d'échec de cette
+        # fonction (cf. `worktree_setup_failed` plus bas).
+        WORKTREE_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --repo "$REPO") || WORKTREE_DIR=""
+        if [ -z "$WORKTREE_DIR" ]; then
+            echo "[dispatch-lib] worktree_path_derivation_failed: branch=$BRANCH repo=$REPO script=$PLATFORM_DIR/scripts/derive-worktree-path — aborting rather than propagating an empty path to a removal site (mika#1943)" >&2
+            return 1
+        fi
 
         # --- Pre-flight: detect and clean up non-canonical worktree paths (mika#1472) ---
         # Before the canonical dashed-path collision check below, detect if the target
@@ -2242,7 +2842,13 @@ _set_up_worktree() {
         local existing_wt
         existing_wt=$(git -C "$SUB_REPO_DIR" worktree list --porcelain 2>/dev/null \
             | awk -v b="refs/heads/$BRANCH" '/^worktree / {wt = substr($0, 10)} $0 == "branch " b {print wt; exit}')
-        if [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
+        # mika#1943: `$WORKTREE_DIR` en tête, et non vide. C'est la comparaison
+        # qui ÉLIT la cible du `worktree remove --force` ci-dessous : avec un
+        # côté vide, TOUT worktree existant devient « non canonique ». La racine
+        # ci-dessus rend le cas inatteignable ; on pose quand même le terme,
+        # parce qu'une garde qui dépend d'un seul point de contrôle en amont
+        # n'est pas une garde.
+        if [ -n "$WORKTREE_DIR" ] && [ -n "$existing_wt" ] && [ "$existing_wt" != "$WORKTREE_DIR" ]; then
             echo "[dispatch-lib] pre-flight: branch $BRANCH is checked out at non-canonical path $existing_wt (canonical: $WORKTREE_DIR); cleaning up relic" >&2
             if [ -d "$existing_wt" ]; then
                 local dirty_state
@@ -2253,20 +2859,43 @@ _set_up_worktree() {
                     if git -C "$existing_wt" stash push --include-untracked -m "$stash_name" >/dev/null 2>&1; then
                         local stash_sha
                         stash_sha=$(git -C "$existing_wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $SUB_REPO_DIR stash apply ${stash_sha:-<sha>})" >&2
+                        # mika#2449: the recovery hint names the CANONICAL worktree,
+                        # never `$SUB_REPO_DIR` (the primary/deployment checkout) and
+                        # never `$existing_wt` (removed fourteen lines below, so the
+                        # hint would fail the moment an operator reads it). Applying a
+                        # worktree's uncommitted state in the primary checkout is the
+                        # exact signature of the 2026-09-21 incident (staged+modified
+                        # on main, `pull --ff-only` refused). The stash stack is shared
+                        # repo-wide, so the SHA resolves from any worktree of the repo.
+                        # Held by a source scan in test-dispatch-lib.sh (allowlist empty).
+                        echo "[dispatch-lib] stashed dirty state from $existing_wt as: $stash_name (sha: ${stash_sha:-<unknown>}; recover with: git -C $WORKTREE_DIR stash apply ${stash_sha:-<sha>} — in the canonical worktree, NOT in the primary checkout)" >&2
                     else
                         echo "[dispatch-lib] stash push failed or nothing to stash in $existing_wt; proceeding with remove" >&2
                     fi
                 fi
             fi
-            git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            # mika#1943: le relic vient du registre git, donc `git worktree
+            # remove` le refuserait s'il n'en était pas un — mais c'est git qui
+            # protège, pas dispatch-lib, et un registre porte ce qu'on y a mis.
+            # Sur refus on ne supprime pas : le `worktree add` plus bas échouera
+            # alors bruyamment (`worktree_setup_failed`), ce qui est le bon sens
+            # de l'asymétrie — un worktree résiduel contre une suppression
+            # irréversible.
+            if _assert_removable_worktree_path "$existing_wt" set_up_worktree_relic; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$existing_wt" 2>/dev/null || true
+            fi
         fi
 
         # Reuse existing worktree if valid
         if [ -d "$WORKTREE_DIR" ] && git -C "$WORKTREE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
             git -C "$WORKTREE_DIR" checkout "$BRANCH" 2>/dev/null || true
         else
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            # mika#1943: nettoyage d'une entrée de registre périmée avant le
+            # `worktree add`. Sur refus on saute la suppression et on laisse le
+            # `add` décider : s'il échoue, il le dit (`worktree_setup_failed`).
+            if _assert_removable_worktree_path "$WORKTREE_DIR" set_up_worktree_stale; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
             # mika#1311: when origin/$BRANCH already exists from a prior
             # successful dispatch, base the worktree on it (preserves prior
             # history) rather than creating a fresh local branch from
@@ -2479,6 +3108,23 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
+        # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
+        #
+        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
+        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
+        # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
+        # donc à écrire explicitement, jamais à hériter du voisin : la copier
+        # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
+        #
+        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
+        # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
+        if [ "$SKILL" = "dev-groom" ]; then
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
+        fi
+
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
         # Save pre-run remote HEAD for pilot push guard (mika#1318).
@@ -2504,9 +3150,17 @@ _handle_dry_run() {
                 --arg worktree "$WORKTREE_DIR" --arg prompt "$PROMPT" \
                 --arg entry_command "$ENTRY_COMMAND" \
                 '{dry_run:true, repo:$repo, issue:$issue, branch:$branch, worktree_dir:$worktree, prompt:$prompt, entry_command:$entry_command}'
-            git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
-            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo)
-            rmdir "$PARENT_DIR" 2>/dev/null || true
+            # mika#1943: cinquième site destructif, absent de la table du plan et
+            # trouvé à la lecture. L'invariant du Product Contract porte sur
+            # *tout* site de suppression, pas sur la liste énumérée.
+            if _assert_removable_worktree_path "$WORKTREE_DIR" handle_dry_run; then
+                git -C "$SUB_REPO_DIR" worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true
+            fi
+            # `rmdir` n'est pas gardé, et c'est mesuré plutôt que négligé : il ne
+            # retire qu'un répertoire VIDE, donc il ne peut emporter aucun
+            # contenu — la classe de l'incident du 28/07 lui est inatteignable.
+            PARENT_DIR=$("$PLATFORM_DIR/scripts/derive-worktree-path" --branch "$BRANCH" --no-repo) || PARENT_DIR=""
+            [ -n "$PARENT_DIR" ] && rmdir "$PARENT_DIR" 2>/dev/null || true
         else
             jq -n --arg prompt "$PROMPT" \
                 '{dry_run:true, repo:null, issue:null, branch:null, worktree_dir:null, prompt:$prompt}'
@@ -2576,7 +3230,9 @@ _run_claude_pilot() {
     # mika#2165: --log-dir is VALUED, not bare. Bare, it fell through to
     # claude-pilot's own Python `const`, which no override here could move and
     # which the bind could therefore never be guaranteed to cover.
-    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    # mika#2496: `--max-turns` is resolved on THIS line (co-location, as for
+    # `--log-dir`) and expands to nothing when the budget is disarmed.
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -2614,15 +3270,25 @@ _run_claude_pilot() {
     SESSION_ID=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.session_id // empty' 2>/dev/null)
     TURNS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.turns // empty' 2>/dev/null)
     # mika#1772: `status: terminated` covers TWO populations, and they need
-    # different handling. claude-pilot sets it both for a guardrail abort
-    # (subtype is one of stall_detected / empty_response / idle_timeout,
-    # claude-pilot/src/claude_pilot/types.py:154) and for an SDK limit
-    # (SDK_TERMINATION_SUBTYPES = {error_max_turns, error_max_budget_usd},
-    # agent.py:43). The first kills a session that has usually done nothing;
-    # the second kills one that has often done a great deal. Reading the
-    # subtype is how this file tells them apart instead of guessing.
+    # different handling. claude-pilot sets it both for a guardrail abort and
+    # for an SDK limit. The first kills a session that has usually done
+    # nothing; the second kills one that has often done a great deal. Reading
+    # the subtype is how this file tells them apart instead of guessing.
+    #
+    # mika#2149: the subtype vocabulary is NOT enumerated here. It is owned
+    # upstream by `GuardrailAbortReason.guardrail`
+    # (claude-pilot/src/claude_pilot/types.py) plus `SDK_TERMINATION_SUBTYPES`
+    # and the cpp#187 transport halt in agent.py; downstream it is the `case`
+    # table in `_halt_family` below, whose `*)` arm says out loud when a value
+    # it does not know arrives. A prose list here went stale by five values in
+    # eighteen days (cpp#119, #145, #168, #185, #187) because nothing read it.
     SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
     TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
+    # cpp#54 promised this field to "mika-dev dispatch-lib" as its consumer and
+    # nothing here ever read it (mika#2149 P4). It is a qualifier on the
+    # `Halt:` line, never a second classification axis: cpp#119 sets it only on
+    # a `rate_limited` abort, and it is absent (`exclude_none`) otherwise.
+    API_ERROR_STATUS=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.api_error_status // empty' 2>/dev/null)
     COST=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.cost_usd // empty' 2>/dev/null)
     DURATION=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.duration_ms // empty' 2>/dev/null)
 
@@ -2655,16 +3321,28 @@ ${PILOT_OUTPUT_RAW}"
         # mika#2141: 78 is _run_pilot_sandboxed refusing to launch. No pilot
         # process ever existed, so "FAILED (exit code 78)" with an empty stdout
         # would send the operator hunting for pilot drift that cannot be there.
-        # The reason lives in $_PILOT_GITDIR_BIND_ABORT and on stderr; carry it.
+        # The reason lives in $_PILOT_SANDBOX_REFUSAL and on stderr; carry it.
+        #
+        # mika#2049: the block no longer ends on "Fix the worktree, then
+        # re-dispatch." That sentence was written for the two gitdir causes and
+        # is FALSE for an egress refusal, whose worktree is healthy and whose
+        # broken organ is the relay — a contradiction inside the only text AC2
+        # makes readable, pointing the operator at the wrong organ at exactly the
+        # moment they read fast. The remedy now travels inside the motive (see
+        # the two `_PILOT_SANDBOX_REFUSAL` sites), so the text is entirely
+        # motive-borne and the next containment refusal needs no edit here.
+        #
+        # The sentence that REMAINS is the one true of every cause: this is a
+        # refusal, not drift and not a pipeline failure.
         _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
 CONTAINMENT REFUSAL (exit 78) — the pilot was never launched.
 
-${_PILOT_SANDBOX_REFUSAL:-The sandbox git setup could not be built safely; see the stderr log.}
+${_PILOT_SANDBOX_REFUSAL:-The sandbox could not be built safely; see the stderr log.}
 
 This is not pilot drift and not a pipeline failure: dispatch-lib declined to
-build the sandbox rather than mount something it could not justify (mika#2141).
-Fix the worktree, then re-dispatch."
+build the sandbox rather than launch something it could not contain
+(mika#2141, mika#2049)."
     else
         _pilot_log_dir; RESULT="Log path: $_PILOT_LOG_DIR/${LOG_ID}.log
 
@@ -2990,16 +3668,88 @@ ${_outcome_line}"
 #
 # Reads STATUS, SUBTYPE, TERMINATION_REASON, SESSION_ID, TURNS, DURATION,
 # PRE_RUN_HEAD, POST_RUN_HEAD, LOG_ID, STDERR_FILE. Prints the callback body.
+# mika#2149 (C-1): one halt motif -> `<family>|<hint>|<meaning>` on stdout.
+#
+# This `case` IS the downstream enumeration of claude-pilot's halt vocabulary —
+# the upstream one is `GuardrailAbortReason.guardrail` in
+# claude-pilot/src/claude_pilot/types.py, plus `SDK_TERMINATION_SUBTYPES` and
+# the cpp#187 transport halt in agent.py. test-dispatch-lib.sh's drift guard
+# reads that Literal and refuses any value this table would class `unknown`.
+#
+# The three hints are annotations, not decisions — nothing reads them to
+# decide a retry yet (out of scope, see the ticket):
+#   transient     — the cause is OUTSIDE the session (quota, model mute
+#                   upstream); a re-run has a fair chance of not seeing it again.
+#   deterministic — the cause is IN what the session did; a re-run from the
+#                   same state reproduces it, and what matters is what it left.
+#   investigate   — a re-run teaches nothing until the cause has been read.
+#                   Neither a promise nor a ban: a pointer to the log.
+# Each hint is written to the height of what the upstream comment asserts
+# (source cited per row) and no further; where upstream does not rule —
+# stall_detected, empty_response, idle_timeout — the hint is `investigate`.
+#
+# The `*)` arm is the whole point (R-4): a subtype added upstream is classed
+# `unknown`, hinted `investigate`, and the CALLER (`_classify_terminated_session`)
+# writes the `halt_family.unknown` line into the two sinks that actually
+# persist. Not from here, and not with a bare `>&2`: this function runs inside
+# `dispatch_claude_pilot`, whose fd 2 is `/dev/null` from the moment
+# `exec 9>>"$TRACE_FILE" 2>/dev/null` runs (mika#903), and outside the one
+# `2>"$STDERR_FILE"` redirection that covers the pilot command alone — the
+# Signal M class the root CLAUDE.md documents, found by the mika#2149 review.
+_halt_family() {
+    local subtype="${1:-}"
+    case "$subtype" in
+        rate_limited)
+            printf '%s\n' "quota_throttled|transient|the API refused (429) and the SDK exhausted its backoff; the session did nothing wrong" ;;                       # cpp#119, cpp#133
+        awaiting_model)
+            printf '%s\n' "model_never_resumed|transient|the model never returned the first token of the next turn; the session was waiting, not looping" ;;             # cpp#145
+        awaiting_tool)
+            printf '%s\n' "tool_never_returned|investigate|a tool never returned its result; re-running without reading which one replays it" ;;                       # cpp#145
+        idle_timeout)
+            printf '%s\n' "session_silent|investigate|real silence with nobody outstanding; the cause is in the log, not in a re-run" ;;                                # cpp#54, refined cpp#145
+        stall_detected)
+            printf '%s\n' "model_unproductive|investigate|N turns without a tool call; the starting state leads the model nowhere" ;;                                   # cpp#54
+        empty_response)
+            printf '%s\n' "model_unproductive|investigate|N consecutive empty responses" ;;                                                                              # cpp#54
+        watchdog_error)
+            printf '%s\n' "pilot_bug|investigate|the watchdog itself raised; a claude-pilot defect, not a session one" ;;                                               # cpp#168
+        prompt_cache_dead)
+            printf '%s\n' "substrate|investigate|the prompt cache is no longer read; check the relay (mika#2313/#2316) before any re-run" ;;                              # cpp#185 D1
+        error_max_turns)
+            printf '%s\n' "budget_exhausted|deterministic|SDK turn limit reached; work was produced and the recovery chain carries it" ;;                              # agent.py SDK_TERMINATION_SUBTYPES
+        error_max_budget_usd)
+            printf '%s\n' "budget_exhausted|deterministic|SDK dollar limit reached; work was produced and the recovery chain carries it" ;;                            # agent.py SDK_TERMINATION_SUBTYPES
+        transport_message_too_large)
+            printf '%s\n' "transport|investigate|one NDJSON message exceeded max_buffer_size" ;;                                                                         # cpp#187
+        *)
+            printf '%s\n' "unknown|investigate|subtype outside the downstream table; see _halt_family in dispatch-lib.sh and GuardrailAbortReason in claude-pilot" ;;
+    esac
+}
+
+# The three hints' one-line definitions, rendered after the family so the
+# operator reading the callback does not have to open this file.
+_halt_hint_meaning() {
+    case "${1:-}" in
+        transient)     printf '%s' "the cause is outside the session; a re-run has a fair chance of not seeing it again" ;;
+        deterministic) printf '%s' "the cause is in what the session did; a re-run from the same state reproduces it — what it left behind is what counts" ;;
+        *)             printf '%s' "a re-run teaches nothing until the cause has been read; neither a promise nor a ban" ;;
+    esac
+}
+
 _classify_terminated_session() {
     local mode="${1:-full}"
     local cause guardrail="" stderr_path _candidate
+    local halt_subtype="" halt_row halt_family halt_hint halt_meaning halt_lines
 
     # The halt cause comes from the structured result first. claude-pilot puts
     # the guardrail name in `.subtype` and its detail in `.termination_reason`
     # (agent.py:155-162), which is more reliable than scraping stderr and is the
     # only signal that distinguishes a guardrail abort from an SDK limit.
     if [ -n "${SUBTYPE:-}" ]; then
-        cause="Halt: ${SUBTYPE}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
+        # mika#2149 (C-3): `api_error_status` is a qualifier, inserted only when
+        # the result carried it.
+        cause="Halt: ${SUBTYPE}${API_ERROR_STATUS:+ (HTTP ${API_ERROR_STATUS})}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
+        halt_subtype="$SUBTYPE"
     else
         # Fallback for a result without a subtype: scrape the `[guardrail]` line.
         # Prefer the stderr still in hand; the persisted copy may not exist yet
@@ -3017,10 +3767,37 @@ _classify_terminated_session() {
         done
         if [ -n "$guardrail" ]; then
             cause="Halt: ${guardrail}"
+            # mika#2149 (C-4): the scraped line feeds the same table, so a halt
+            # is never classed `unknown` for having arrived by the other
+            # channel. The ANSI strip above already ran; ui.py:113 writes
+            # `[guardrail] <name>: <detail>`.
+            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
         else
             cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
         fi
     fi
+
+    # mika#2149 (C-2): two stable prefixes after `Halt:`, in both modes — same
+    # contract as `Outcome:` and `RECOVERY_PENDING:` (one line, one prefix,
+    # `grep -m1` suffices). An empty halt_subtype (no JSON subtype, no
+    # [guardrail] line) goes through the `*)` arm and is said as such.
+    halt_row=$(_halt_family "$halt_subtype")
+    halt_family=${halt_row%%|*}
+    halt_hint=${halt_row#*|}; halt_hint=${halt_hint%%|*}
+    halt_meaning=${halt_row##*|}
+    # R-4, the drift line — written where it persists (mika#2149 review, #1).
+    # `$STDERR_FILE` is still on disk here and the callback's 10 KB tail is
+    # built from it a few lines after this function returns; `$PERSISTENT_STDERR`
+    # was already written once, so append — the mika#2165 shape at
+    # `pilot_log_guard.missing`. An EMPTY subtype is "cause not recorded",
+    # already said on the Halt: line and not an upstream drift, so it stays
+    # silent: only a non-empty stranger is worth the grep hit.
+    if [ "$halt_family" = "unknown" ] && [ -n "$halt_subtype" ]; then
+        printf 'dispatch-lib: halt_family.unknown subtype=%s\n' "$halt_subtype" \
+            | tee -a "${STDERR_FILE:-/dev/null}" "${PERSISTENT_STDERR:-/dev/null}" >&2 2>/dev/null || true
+    fi
+    halt_lines="Halt class: ${halt_family} — ${halt_meaning}
+Retry hint: ${halt_hint} — $(_halt_hint_meaning "$halt_hint")"
 
     if [ "$mode" = "banner" ]; then
         printf '%s' "PIPELINE FAILURE: the claude-pilot session was terminated before it finished, but it left work behind. Everything below was produced by an incomplete session — treat it as unvalidated.
@@ -3029,6 +3806,7 @@ Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
 Duration: ${DURATION:-unknown}ms
 ${cause}
+${halt_lines}
 Commits: ${PRE_RUN_HEAD:-unknown}..${POST_RUN_HEAD:-unknown}"
         return 0
     fi
@@ -3039,6 +3817,7 @@ Session: ${SESSION_ID:-unknown}
 Turns: ${TURNS:-unknown}
 Duration: ${DURATION:-unknown}ms
 ${cause}
+${halt_lines}
 
 HEAD did not move and the worktree is clean, so nothing was written to the branch and the architect was never invoked. There is no plan and no verdict to go looking for. The cause is upstream of grooming — the pilot never got far enough to do its work. See the stall lineage on mika#1901 and the note above _run_pilot_sandboxed on the Anthropic 401 / SDK-stall chain that ends in exactly this shape.
 
@@ -3324,7 +4103,18 @@ _rescue_dirty_worktree() {
     # commit. Handles the edge case where the pilot wrote ONLY to scaffold
     # paths (mika#1288, mika#1419).
     if git -C "$WORKTREE_DIR" diff --cached --quiet 2>&9; then
-        echo "NOTE: dirty worktree contained only scaffold paths (.claude/commands/, .claude/claude-pilot.json) — no pilot content to rescue" >&2
+        # mika#2503: name what was ACTUALLY excluded, not a hardcoded list. The
+        # message used to read "contained only scaffold paths
+        # (.claude/commands/, .claude/claude-pilot.json)" whatever the worktree
+        # held, so an operator reading it after a pilot wrote 28 files of build
+        # artefacts went looking in the wrong place.
+        #
+        # `--untracked-files=all`, not DIRTY_FILES: the probe above collapses a
+        # wholly-untracked directory to a single `?? .claude/` entry, which is
+        # true but names no file an operator can go and look at. The index is
+        # empty at this point, so everything listed here was excluded. Re-reading
+        # status costs one local call on a branch that is already rare.
+        echo "NOTE: nothing left to stage after exclusions — no pilot content to rescue. Excluded: $(git -C "$WORKTREE_DIR" status --porcelain --untracked-files=all 2>/dev/null | head -20 | tr '\n' '|')" >&2
         RESCUED_DIRTY_WORKTREE=0
     else
         # Compute accurate rescued-files list for the rescue note.
@@ -3504,6 +4294,225 @@ ${RESULT}"
     fi
 }
 
+# _pilot_had_no_shipping_tail — true when this dispatch launched a pilot whose
+# PERIMETER did not include opening a PR, AND whose session concluded.
+#
+# mika#2492. Two axes, and the crossing is the whole point. The autonomous loop
+# dispatches every groomed ticket under `/ce-work <plan>` (the mika#1074
+# override in `_detect_plan_on_branch`), and `/ce-work` is, in its own words,
+# "implementation and local verification only, without the shipping tail". Such
+# a pilot never opens a PR — that is its scope, not a truncation. Until this
+# ticket the nominal path was therefore classified as a wreck
+# (`commit-pushed-no-pr`), which armed three independent guards against the very
+# PR the loop exists to produce.
+#
+# The stamp is written by its PRODUCER (see the two `PILOT_SHIPPING_TAIL=` sites
+# in `dispatch_claude_pilot` / `_detect_plan_on_branch`), never reconstructed
+# here — same motif as `origin:loop` (mika#2026), `closing_pr_closed_unmerged`
+# (mika#2242) and `qa_review_pr_target` (mika#2368).
+#
+# The `STATUS = success` term is the SECOND axis: a session killed by a
+# guardrail or an SDK limit carries `STATUS = terminated` (see the branch at
+# `_run_claude_pilot`'s terminated guard and `_halt_family`'s
+# `error_max_turns`), never `success`. Truncated work must not be presented as
+# complete just because its perimeter had no shipping tail. This is the same
+# term the mika#940 Unit 1 guard below already uses, read at the same place.
+#
+# Fail-safe (mika#2492 R4): every indeterminacy returns false, which falls back
+# to the pre-ticket behaviour. An unreadable signal is never a satisfied term.
+_pilot_had_no_shipping_tail() {
+    [ "${SKILL:-}" = "dev-pilot" ]            || return 1
+    [ "${PILOT_SHIPPING_TAIL:-}" = "absent" ] || return 1
+    [ "${STATUS:-}" = "success" ]             || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# mika#2493 — reading a policy deny: its LETHALITY and its full EVENT.
+#
+# Two functions, two questions, deliberately separate. The verb "halted" belongs
+# to a deny that ENDED the session; a deny the session survived is a note. Until
+# this ticket both were labelled identically, and that label made an operator
+# AND the orchestrator conclude "failure" on two sessions that had succeeded
+# (mika#2493 M0: sessions 98b60020 and a0886164, seven denies between them,
+# ZERO terminal).
+# ---------------------------------------------------------------------------
+
+# Line cap for the deny-event excerpt below. Bounded because a stderr written
+# before cpp#151 carries no lethality marker ANYWHERE, so a scan that only
+# stopped on the marker would run to end-of-file.
+_POLICY_DENY_EXCERPT_MAX_LINES=12
+
+# _policy_deny_excerpt — read ANSI-stripped stderr on stdin, print the first
+# `[policy:deny]` event in full rather than its first line only (mika#2493 U3).
+#
+# WHY this is not a one-line grep. The rendered deny is
+#   `[policy:deny] <Tool>: <detail>[ [rule-id]] (terminal|non-terminal)`
+# and `<detail>` is multi-line whenever the refused command is. The lethality
+# marker (cpp#151) FOLLOWS the `[rule-id]` at the END of `<detail>`, so on a
+# multi-line deny a `grep -m1` capture loses BOTH. Measured (mika#2493 M2):
+# 62 of the 268 stderr files carrying a deny since cpp#151 — 23 %, and the
+# ticket's own proof `98b60020` is among them — lose their marker to that
+# capture. The message this excerpt lands in tells the operator to "read the
+# halt event's bracketed [rule-id] FIRST"; on those 62 that instruction was
+# structurally inexecutable. Same doctrine point 3 as mika#2312: never truncate
+# the command when reporting it.
+#
+# Three stop conditions, all three needed (mika#2493 D6): the lethality marker
+# (inclusive — it is the end of the event), a line that visibly OPENS another
+# log event (leading `[`, the shape of `[init]` / `[debug]` / `[2026-…]`), and
+# the line cap. Without the cap a pre-cpp#151 file runs to EOF; without the
+# other-event stop a one-line deny followed by `[debug]` noise drags that noise
+# to the cap.
+#
+# Continuation lines are printed INDENTED. Two reasons: the caller interpolates
+# the first line right after `Halt event: `, so leaving it flush keeps that
+# shape byte-identical; and indenting neutralises the two line-ANCHORED
+# reclassification tokens (`^STATUS=CANCELLED`, `^Outcome: PIPELINE_INCOMPLETE`)
+# that a continuation line could otherwise open (mika#2493 D5).
+# COST, named: the three UNANCHORED tokens are not neutralised. A refused
+# command whose text literally contains `PIPELINE FAILURE:` would still
+# reclassify the session. That exposure is pre-existing (the current site
+# already interpolates the raw deny line) and scrubbing the evidence would
+# contradict the non-truncation doctrine this function exists to honour.
+#
+# Reads stdin so the caller keeps its own `sed`-based ANSI strip visible at the
+# site. Never short-circuits its input: the awk program keeps draining stdin
+# after it is done printing, so the upstream `sed` can never take SIGPIPE and
+# be promoted to the pipeline's status under `pipefail` (mika#2055 class).
+_policy_deny_excerpt() {
+    awk -v max="${_POLICY_DENY_EXCERPT_MAX_LINES:-12}" '
+        done_printing { next }
+        !started {
+            if (index($0, "[policy:deny]") > 0) {
+                started = 1
+                n = 1
+                print
+                if ($0 ~ /\((non-)?terminal\)/) done_printing = 1
+            }
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*\[/) { done_printing = 1; next }
+            n++
+            print "    " $0
+            if ($0 ~ /\((non-)?terminal\)/ || n >= max) done_printing = 1
+        }
+    '
+}
+
+# _policy_deny_lethality <stderr_path> — print exactly one of
+# `terminal` | `non-terminal` | `undeclared` (mika#2493 U2, D2).
+#
+# The predicate is on the FILE, never on a captured line. Three measured
+# reasons: the marker sits outside the first line in 23 % of cases (M2); a
+# single session carries several denies (five for `a0886164`), so the useful
+# question is "does a terminal one exist?" rather than "was the first one?";
+# and a terminal deny ENDS its session (M4, verified on `da4aa7ae`: sole deny,
+# terminal, line 160 of 166), which makes "at least one terminal" and "the last
+# one is terminal" coincide while only the former survives truncation.
+#
+# The discrimination is a literal substring test, and it is safe in the one
+# direction that matters: `(non-terminal)` does NOT contain `(terminal)` — the
+# opening parenthesis the latter requires is occupied by the `-`. Getting that
+# backwards would reclassify the 1093 measured non-terminal denies in one go,
+# which is what the negative-control test exists to catch.
+#
+# `undeclared` asserts NOTHING, and that is the only safe reading (D3). The
+# marker does not exist before cpp#151 (2026-09-04), so on that population no
+# lethality can be read: folding it onto `non-terminal` would state the false
+# thing in the other direction, folding it onto `terminal` would reproduce the
+# very defect being repaired. Same house motif as `unknown_provider`
+# (mika#2328) and `pilot_stall_signal_unavailable` (mika#2277) — an unreadable
+# signal is NAMED, never folded onto a readable value.
+#
+# Fail-open: absent, unreadable, or empty file → `undeclared`.
+#
+# COST, named: the scan is on the whole file, so a session whose pilot PROSE
+# contains the literal `(terminal)` reads as terminal. That is the mika#2050
+# Signal-S class (the pilot's own prose shares the file). It is bounded by the
+# U1 guard: the branch this feeds is only reached when NO deliverable was
+# produced, so the worst case is a session that produced nothing being called
+# `halted (terminal)` instead of carrying a non-terminal note.
+_policy_deny_lethality() {
+    local _stderr_path="${1:-}"
+    local _stripped=""
+
+    if [ -n "$_stderr_path" ] && [ -f "$_stderr_path" ] && [ -r "$_stderr_path" ]; then
+        _stripped=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_stderr_path" 2>/dev/null) || _stripped=""
+    fi
+
+    if [ -z "$_stripped" ]; then
+        printf '%s' 'undeclared'
+        return 0
+    fi
+
+    if grep -qF -- '(terminal)' <<<"$_stripped"; then
+        printf '%s' 'terminal'
+    elif grep -qF -- '(non-terminal)' <<<"$_stripped"; then
+        printf '%s' 'non-terminal'
+    else
+        printf '%s' 'undeclared'
+    fi
+}
+
+# Sentinel the note below is keyed on. Both POLICY_DENY sites can fire on one
+# dev-groom dispatch (HEAD unchanged AND the plan-validation chain), so without
+# an idempotence key the same note would be annexed twice.
+_POLICY_DENY_NOTE_SENTINEL="Note: a policy deny was observed and the session continued past it"
+
+# _annex_policy_deny_note <lethality> <excerpt> — append the factual note for a
+# deny that did NOT end the session (mika#2493 U2 step 4, D4).
+#
+# The asymmetry is the conceptual core. A TERMINAL deny *is* the cause, so it
+# replaces the branch's diagnosis, as today. A NON-TERMINAL one is not: the
+# session ran on after it. Replacing a true diagnosis ("no plan found, likely
+# (a) drift (b) a discovery bug") with "halted by policy deny" MOVES the
+# ticket's lie instead of closing it — it substitutes a false cause for a real
+# one under cover of precision. So the branch that applies keeps the floor and
+# the deny is reported in ANNEX, because it may well have hindered the pilot
+# without killing it.
+#
+# Corollary, accepted and deliberate: the note is also written on a SUCCESSFUL
+# session. That is exactly what the ticket asks for — a survived non-terminal
+# deny is a note. It is short, factual and non-alarming.
+#
+# HARD constraint (D5): the note must carry none of the reclassification tokens
+# `dispatch-lib.sh` itself greps for (`PIPELINE FAILURE:`,
+# `STRUCTURAL VIOLATION:`, `HANDLER CRASH`, `^STATUS=CANCELLED`,
+# `^Outcome: PIPELINE_INCOMPLETE`). An informational note that introduced one
+# would reclassify the session as a failure — the repaired defect, rebuilt by
+# its own fix. Held by a test on the PRODUCED TEXT, not by review.
+_annex_policy_deny_note() {
+    local _lethality="${1:-}" _excerpt="${2:-}" _reading=""
+
+    [ "$_lethality" = "non-terminal" ] || [ "$_lethality" = "undeclared" ] || return 0
+    # `if`, not `&& return` — a non-zero `&&` chain is what `set -e` kills.
+    if grep -qF -- "$_POLICY_DENY_NOTE_SENTINEL" <<<"${RESULT:-}"; then
+        return 0
+    fi
+
+    # NOTE ON WORDING: this text must contain neither the reclassification tokens
+    # of D5 nor the word the terminal branch owns. A note that said "not halted"
+    # would still put that word in a `result` an operator greps, which is the
+    # confusion being repaired — and the mika#2493 verification contract asserts
+    # its absence on this population.
+    if [ "$_lethality" = "non-terminal" ]; then
+        _reading="Lethality marker: (non-terminal) — claude-pilot states this refusal did not end the session."
+    else
+        # D3: say WHY nothing is asserted, and say that the missing half is the
+        # pilot build's declaration, not this dispatch's reading.
+        _reading="Lethality marker: undeclared — this session's stderr carries no lethality marker at all, in either of the two forms claude-pilot emits, so its lethality cannot be read. The marker exists from cpp#151 onwards (2026-09-04); an older build declares nothing. Neither reading is asserted."
+    fi
+
+    RESULT="${RESULT}
+
+${_POLICY_DENY_NOTE_SENTINEL} (mika#2493). It is reported for completeness, not as a cause — the diagnosis above stands on its own. A refusal can hinder a pilot without ending its session, and this one did not end it.
+${_reading}
+
+Observed deny: ${_excerpt}"
+}
+
 _post_flight_recovery() {
     # Post-flight recovery (mika#1615): extracted from the if [ -n "$STATUS" ]
     # branch so recovery fires on ALL exit paths — structured JSON output,
@@ -3555,21 +4564,48 @@ _post_flight_recovery() {
             # See: docs/solutions/workflow-issues/
             #      2026-06-14-dev-groom-drift-misdiagnosis-policy-deny-halt.md
             POLICY_DENY=""
+            POLICY_DENY_LETHALITY="undeclared"
             _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
             if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
+                # mika#2493 (U3): the whole deny EVENT, not its first line. A
+                # `grep -m1 '[policy:deny]'` loses the [rule-id] and the
+                # lethality marker on every multi-line deny — 23 % of the
+                # measured population, the ticket's own proof 98b60020 among
+                # them. The ANSI strip stays here, at the site.
                 POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                    | grep -m1 '\[policy:deny\]' || true)
+                    | _policy_deny_excerpt || true)
+                POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
             fi
 
             # mika#1333 Unit 2: For dev-groom re-dispatch, HEAD-unchanged is
             # expected when the plan was already committed in a prior run.
             # The architect pass (_iterate_groom_loop) is what matters — don't
             # poison RESULT with PIPELINE FAILURE for the expected re-dispatch state.
-            if [ -n "$POLICY_DENY" ]; then
+            #
+            # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — a session that DELIVERED
+            # cannot be labelled by a deny, whatever its lethality. Measured
+            # (M5): the three other branches of this chain already ask "was a
+            # plan produced?" before declaring a failure; the deny branch was the
+            # only one that did not, and it is the one in front. So this restores
+            # a local coherence rather than inventing a predicate. For dev-pilot
+            # VALID_PLAN is structurally empty, so the guard is always true and
+            # behaviour here is unchanged.
+            #
+            # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it
+            # by putting the guard first. test-dispatch-lib.sh looks for the
+            # literal substring `if [ -n "$POLICY_DENY" ]` to measure this
+            # branch's position (Test 13, Test 14); leading with the guard would
+            # redden two tests nothing asks us to touch, for an identical result.
+            if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
                 # Class C — policy-deny halt. The pilot tried to do legitimate
                 # work and was prevented by a tier1/policy allow-list gap. NOT
                 # to be confused with LLM drift or genuine dirty-worktree-rescue.
-                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit.
+                #
+                # mika#2493 (U2): reached only for a deny whose marker says
+                # (terminal) — the verb "halted" belongs to a refusal that ended
+                # the session. A non-terminal or undeclared deny is annexed as a
+                # note after this chain instead.
+                RESULT="PIPELINE FAILURE: claude-pilot session halted by policy deny — not generic exit. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -3609,6 +4645,15 @@ ${RESULT}"
                 RESULT="PIPELINE FAILURE: claude-pilot exited ${PILOT_EXIT:-unknown} (status ${STATUS:-unknown}) but HEAD unchanged (pre: ${PRE_RUN_HEAD}, post: ${POST_RUN_HEAD}). Zero new commits produced.
 
 ${RESULT}"
+            fi
+
+            # mika#2493 (U2 step 4, D4): a deny the session survived is annexed
+            # AFTER the chain, never in place of it. The branch that applies keeps
+            # the floor; the deny is reported because it may have hindered the
+            # pilot without killing it. No-op for a terminal deny (already said
+            # above) and for no deny at all.
+            if [ -n "$POLICY_DENY" ]; then
+                _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
             fi
         fi
 
@@ -3748,25 +4793,52 @@ dispatch-lib (mika#1383): rescued trailing dirty content into wip() commit; PR c
         # Fail-open: if stderr is unavailable, fall through to the
         # existing drift messages.
         POLICY_DENY=""
+        POLICY_DENY_LETHALITY="undeclared"
         _pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
         if [ -f "$PERSISTENT_STDERR_PATH" ] && [ -r "$PERSISTENT_STDERR_PATH" ]; then
-            # Strip ANSI color codes, then extract the first [policy:deny] line.
+            # Strip ANSI color codes, then extract the first [policy:deny] event.
             # The line shape is
             #   `[policy:deny] <Tool>: <detail>[ \[rule-id\]] (terminal|non-terminal)`
             # mika#2312: the trailing lethality marker (cpp#151) FOLLOWS the
             # rule-id tag, so the rule-id is the last *bracketed* token, not the
             # last token. An absent tag means `rule_id=None` — the policy default
             # deny (no rule matched), NOT a non-deterministic refusal.
+            # mika#2493 (U3): the EVENT, not just its first line — `<detail>` is
+            # multi-line whenever the refused command is, and both the rule-id and
+            # the marker sit at its END. The ANSI strip stays here, at the site.
             POLICY_DENY=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$PERSISTENT_STDERR_PATH" 2>/dev/null \
-                | grep -m1 '\[policy:deny\]' || true)
+                | _policy_deny_excerpt || true)
+            POLICY_DENY_LETHALITY=$(_policy_deny_lethality "$PERSISTENT_STDERR_PATH")
         fi
 
-        if [ -n "$POLICY_DENY" ]; then
+        # mika#2493 (U1): `[ -z "$VALID_PLAN" ]` — this is the branch that
+        # produced the ticket. It tested POLICY_DENY at the head of the chain with
+        # NO condition, so a dev-groom that had written its plan, committed it and
+        # succeeded was labelled a pipeline failure the moment any refusal sat in
+        # its stderr (M0: sessions 98b60020 and a0886164, seven denies, zero
+        # terminal, both `status: success`). The correct intent is written three
+        # lines above, in the comment this branch has always carried:
+        # "Disambiguate by reading the persistent stderr ... BEFORE DECLARING
+        # DRIFT" — the deny was meant to disambiguate a failure already
+        # established, and was implemented as a priority diagnosis. There is
+        # nothing to disambiguate once the session has delivered.
+        #
+        # THE ORDER OF THE CONJUNCTS IS LOAD-BEARING — do not "normalise" it by
+        # putting the guard first. test-dispatch-lib.sh looks for the literal
+        # substring `if [ -n "$POLICY_DENY" ]` to measure this branch's position
+        # against the drift message (Test 13); leading with the guard would redden
+        # a test nothing asks us to touch, for an identical result. What the fix
+        # changes is WHEN both conditions apply, never their relative order.
+        if [ -n "$POLICY_DENY" ] && [ -z "$VALID_PLAN" ] && [ "$POLICY_DENY_LETHALITY" = "terminal" ]; then
             # Class C — policy-deny-induced early halt. The pilot made a
             # legitimate research request that hit a tier1/policy allow-list
             # gap. This is NOT LLM drift; the operator should investigate
             # the deny rule, not the pilot's reasoning.
-            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift.
+            #
+            # mika#2493 (U2): reached only for a deny whose marker says
+            # (terminal). A non-terminal or undeclared deny is annexed as a note
+            # after this chain, so the branch that really applies keeps the floor.
+            RESULT="PIPELINE FAILURE: dev-groom session halted by claude-pilot policy deny — not LLM drift. The deny's lethality marker says (terminal): it ended the session.
 
 Halt event: ${POLICY_DENY}
 
@@ -3806,6 +4878,14 @@ ${RESULT}"
             # plan, not the gate itself.
             echo "Note: dev-groom produced a plan file ($VALID_PLAN) without explicit /ce:plan invocation. Plan-file existence is the operative gate." >&2
         fi
+
+        # mika#2493 (U2 step 4, D4): annexed AFTER the chain, never in place of
+        # it. Corollary accepted deliberately — this also fires on a SUCCESSFUL
+        # dev-groom, which is exactly what the ticket asks for: a survived
+        # non-terminal deny is a note. No-op for a terminal deny and for no deny.
+        if [ -n "$POLICY_DENY" ]; then
+            _annex_policy_deny_note "$POLICY_DENY_LETHALITY" "$POLICY_DENY"
+        fi
     fi
 
     # Issue #138: Discover actual PR URL from the branch
@@ -3844,7 +4924,12 @@ ${RESULT}"
     #   - $PR_URL empty: PR-discovery above found nothing.
     #   - $PRE_RUN_HEAD != $POST_RUN_HEAD: commits exist. If HEAD unchanged,
     #     the zero-commit check earlier in this block already fires.
-    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ]; then
+    #   - ! _pilot_had_no_shipping_tail (mika#2492): the sentence this block
+    #     writes — "Pipeline truncated before git push + gh pr create" — is
+    #     FALSE for a pilot whose perimeter never had that step. Without this
+    #     term the nominal `/ce-work` path takes a `PIPELINE FAILURE:` and the
+    #     Unit 3 cascade below mechanically falls to PIPELINE_INCOMPLETE.
+    if [ "$STATUS" = "success" ] && [ "$SKILL" = "dev-pilot" ] && [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && ! _pilot_had_no_shipping_tail; then
         RESULT="PIPELINE FAILURE: claude-pilot produced commits (${PRE_RUN_HEAD}..${POST_RUN_HEAD}) but no PR was opened on branch '${BRANCH}'. Pipeline truncated before git push + gh pr create.
 
 ${RESULT}"
@@ -3871,6 +4956,24 @@ Outcome: PR_OPENED — ${PR_URL}"
         RESULT="${RESULT}
 
 Outcome: PLAN_COMMITTED — ${VALID_PLAN}"
+    elif _pilot_had_no_shipping_tail; then
+        # mika#2492. This value is TRANSITORY on the nominal path: Path B, a few
+        # hundred lines below in `dispatch_claude_pilot`, opens the draft PR and
+        # rewrites this line to `PR_OPENED` via `_set_outcome_line`. Nobody reads
+        # `^Outcome: ` in between — the only two readers are
+        # `_measure_cycle_output` and `_gate_non_empty_cycle`, reached from
+        # `_deliver_callback` (after Path B) and from the EXIT trap.
+        #
+        # The EXIT trap is the one intermediate reader, and it is exactly why
+        # this arm exists rather than falling through to the `UNKNOWN — inspect
+        # worktree manually.` default: on the population where dispatch-lib dies
+        # between here and Path B, this sentence is TRUE at the instant it is
+        # read (no PR was opened, the work waits in the worktree) and it is at
+        # least as actionable as the `PIPELINE_INCOMPLETE — manual recovery
+        # needed` that population receives today, with a named motive on top.
+        RESULT="${RESULT}
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation."
     else
         RESULT="${RESULT}
 
@@ -5209,9 +6312,17 @@ _launch_revise_pilot() {
     # detect revision via sha256 of the plan file before-and-after. Identical
     # content = "no revision happened" = caller falls through.
     #
-    # Args: $1 = absolute path to findings file
+    # Args: $1 = absolute path to findings file — le findings-file de PREMIÈRE
+    #            passe (`$WORKTREE_DIR/.iterate/findings-1.md`, écrit par
+    #            `_iterate_groom_loop` depuis la sortie architecte). C'est la
+    #            source UNIQUE du premier terme du prédicat mika#2306 ci-dessous.
     # Returns: 0 if plan content changed, 1 otherwise (missing args, no plan
     #          found, pilot failed to revise).
+
+    # mika#2306 — compteur de garde du rattrapage Fire-Disposition, remis à zéro
+    # à CHAQUE entrée. Global à dessein (pas de `local`) : la terminaison doit
+    # être lisible sans dérouler le flot de contrôle, et le test T10 la lit.
+    _FD_REVISE_RETRIED=0
 
     local findings_file="$1"
     [ -r "$findings_file" ] || {
@@ -5241,7 +6352,8 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
         >"$revise_stdout" 2>"$revise_stderr"
@@ -5254,11 +6366,138 @@ _launch_revise_pilot() {
 
     if [ "$pre_hash" != "$post_hash" ]; then
         echo "_launch_revise_pilot: plan revised (sha changed from ${pre_hash:0:12} to ${post_hash:0:12})" >&2
+        _fd_retry_if_section_still_missing "$findings_file" "$plan_path"
         return 0
     else
         echo "WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)" >&2
         return 1
     fi
+}
+
+# mika#2306 — le rattrapage Fire-Disposition, greffé sur la branche `sha256`
+# RÉUSSIE de `_launch_revise_pilot`.
+#
+# Le défaut qu'il ferme : le critère de convergence du revise est « le contenu a
+# changé », jamais « le finding a été traité ». Un revise qui corrige une virgule
+# sans ajouter la section réclamée est, pour la boucle, indistinguable d'un
+# revise réussi ; elle enchaîne sur le second passage, qui ESCALATE, et l'unique
+# itération a été dépensée pour rien.
+#
+# Le prédicat est une CONJONCTION DE DEUX `grep`, jamais un jugement :
+#   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
+#      contient la chaîne `Fire-Disposition` (le vocabulaire imposé par son
+#      propre gate) ;
+#   2. la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
+#
+# La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
+# `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
+# findings ciblé que cette fonction écrit elle-même (`findings-1-fd.md`) est
+# INTERDIT comme source : il contient nécessairement la chaîne `Fire-Disposition`
+# puisque c'est son objet, donc un prédicat qui le relirait serait vrai par
+# construction — la garde relancerait même quand l'architecte n'a rien demandé,
+# et le test de relance-unique resterait vert sur une garde qui ne regarde plus
+# la sortie architecte. Le compteur casserait la boucle infinie ; il ne rendrait
+# pas le défaut visible. Même raison pour l'absence de récursion sur
+# `_launch_revise_pilot` : elle ferait de `findings-1-fd.md` le `$1` du second
+# tour, c'est-à-dire exactement la confusion de source interdite.
+#
+# Si l'un des deux termes est faux, RIEN ne se passe : comportement d'avant le
+# correctif, bit pour bit. Un plan sans détecteur ne paie rien, un revise qui a
+# fait son travail ne paie rien. Un findings-file illisible sort le dispatch de
+# la population plutôt que de l'y faire entrer.
+#
+# Le BUDGET ARCHITECTE est inchangé : aucun appel `_arch_ask` sur ce chemin. Ce
+# qui est élargi est le budget du *revise*, qui n'est le contrat de personne —
+# et d'une seule tentative. Cette fonction ne REFUSE jamais rien : elle réessaie,
+# puis laisse passer en journalisant. Un échec dur ici aurait déplacé l'ESCALATE
+# d'une porte au lieu de le lever.
+#
+# Args: $1 = findings-file de première passe (source du terme 1)
+#       $2 = chemin du plan révisé (sujet du terme 2)
+# Returns: toujours 0 — l'appelant a déjà décidé que le plan a changé.
+_fd_retry_if_section_still_missing() {
+    local first_pass_findings="$1" plan_path="$2"
+
+    # Budget : une seule relance par invocation de `_launch_revise_pilot`.
+    [ "${_FD_REVISE_RETRIED:-0}" -eq 0 ] || return 0
+    # Fail-safe : une information illisible SORT de la population.
+    [ -r "$first_pass_findings" ] || return 0
+    [ -r "$plan_path" ] || return 0
+
+    # Terme 1 — l'architecte a réclamé la section.
+    grep -qF -- 'Fire-Disposition' "$first_pass_findings" 2>/dev/null || return 0
+    # Terme 2 — le plan révisé ne la porte toujours pas.
+    ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0
+
+    # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
+    _FD_REVISE_RETRIED=1
+
+    local fd_findings_file="${first_pass_findings%/*}/findings-1-fd.md"
+    printf '%s\n' "FINDING SYNTHÉTIQUE — émis par dispatch-lib (mika#2306), pas par l'architecte.
+
+F-FD [BLOQUANT] — la section \`## Fire-Disposition\` que la première passe
+architecte a réclamée est TOUJOURS ABSENTE du plan révisé.
+
+Le plan a bien été modifié, mais le finding n'a pas été traité. En l'état il part
+au second passage architecte, où le Fire-Disposition Gate est SANS RECOURS
+(« No ITERATE exists at second pass per the two-pass limit ») : le verdict sera
+ESCALATE et le ticket ne sera jamais implémenté.
+
+Action demandée, et elle seule : ajouter au plan une section \`## Fire-Disposition\`
+nommant l'une des trois options canoniques de mika#1574, avec son détail
+d'implémentation —
+  (a) exception nommée en allowlist (défaut) : chaque violation existante reçoit
+      une entrée grep-visible qui nomme la donnée précise, référence un ticket de
+      suivi, et porte une assertion auto-nettoyante ;
+  (b) livrer désarmé : \`#[ignore]\` / \`#[cfg(skip)]\` ou équivalent, plus un suivi
+      tracké pour l'armer ;
+  (c) halte-et-remontée : l'implémentation s'arrête et remonte à l'opérateur.
+
+Si — et seulement si — le plan ne livre réellement AUCUN détecteur (test,
+assertion, lint, garde CI, validateur, scan structurel, garde EndTurn), dis-le
+explicitement dans la section plutôt que d'inventer une disposition : le gate est
+alors N/A et cette phrase est ce qui le rend lisible.
+
+Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
+        echo "WARN: fire_disposition_retry_findings_unwritable: cannot write $fd_findings_file — skipping retry" >&2
+        return 0
+    }
+
+    echo "fire_disposition_revise_retried: ${REPO:-?}#${ISSUE_NUM:-?} — section absente du plan révisé alors que les findings de première passe la réclamaient ; relance unique du pilote de revise avec $(basename "$fd_findings_file")" >&2
+
+    local fd_log_id="${LOG_ID:-unknown}-revise-fd-$(date +%s)"
+    local fd_stdout; fd_stdout=$(mktemp /tmp/revise-fd-stdout-XXXXXX)
+    local fd_stderr; fd_stderr=$(mktemp /tmp/revise-fd-stderr-XXXXXX)
+
+    set +e
+    # CWD_ARGS is intentionally word-split (multiple flags)
+    # shellcheck disable=SC2086
+    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
+        --command "/mika-revise-plan" $CWD_ARGS \
+        -- "@${fd_findings_file}" \
+        >"$fd_stdout" 2>"$fd_stderr"
+    set -e
+    rm -f "$fd_stdout" "$fd_stderr"
+
+    # La section est re-testée POUR JOURNALISER, jamais pour reboucler : le
+    # compteur est déjà armé, donc aucun chemin ne réarme le lancement. C'est ce
+    # qui réconcilie « une seule relance » et « l'événement doit savoir si la
+    # section manque encore » — le prédicat est évalué deux fois, il n'autorise
+    # l'action qu'une.
+    #
+    # Les deux événements sont de l'OBSERVABILITÉ PURE : consommés par
+    # l'opérateur et par l'analyse de logs (mika#2205), relus par aucune branche
+    # de ce fichier, sans effet sur le flot de la boucle. Régime attendu :
+    # `fire_disposition_revise_retried` rare, `fire_disposition_still_missing_after_retry`
+    # à zéro. Une occurrence soutenue du second dit que le pilote de revise ne
+    # sait pas écrire la section — donc que le correctif est côté
+    # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
+    if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then
+        echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
+    fi
+
+    return 0
 }
 
 _cleanup_iterate_findings() {
@@ -5270,6 +6509,10 @@ _cleanup_iterate_findings() {
     [ -n "$WORKTREE_DIR" ] && [ -d "$WORKTREE_DIR" ] || return 0
     local findings_dir="$WORKTREE_DIR/.iterate"
     [ -d "$findings_dir" ] || return 0
+    # mika#1943: le `[ -d ]` ci-dessus prouve que le chemin existe, jamais qu'il
+    # est à nous. Sur refus on conserve — les findings sont de toute façon un
+    # artefact forensique dont la préservation est le défaut sur ESCALATE.
+    _assert_removable_worktree_path "$findings_dir" cleanup_iterate_findings || return 0
     rm -rf "$findings_dir" 2>/dev/null || true
     echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
 }
@@ -5913,6 +7156,118 @@ _record_pr_origin_epoch() {
     return 0
 }
 
+# _stamp_issue_seat <repo> <issue_num> <labels_csv> — claim the issue for the loop.
+#
+# Symmetric to _stamp_pr_origin (mika#2026), carried by the ISSUE and not the PR:
+# the loop is a dispatch seat like ssc and mpc (webhook_dispatch.rs
+# CURRENT_DISPATCH_SEAT), and until mika#2155 it was the only seat that never
+# said so. `origin:loop` on the PR answers "who produced this artefact?" and is
+# permanent; `dispatch:loop` on the issue answers "who is writing on this branch
+# right now?" and lives exactly as long as the dispatch — see _release_issue_seat.
+#
+# `labels_csv` is the snapshot _set_up_worktree already fetched for its own
+# #2012 gate — one `gh issue view` per dispatch (mika#2178), no second read
+# inside this function. The engine's seat gate read GitHub separately and
+# earlier, in Rust (executor.rs fetch_issue_labels_unless_pull_request), before
+# it spawned this handler: a `dispatch:*` posed between that read and this one
+# shows up here as owned_by_other. Passing the snapshot in also makes the
+# function testable with the three label populations injected directly.
+#
+# Three outcomes, on that snapshot:
+#   another dispatch:* present  → dispatch_seat.owned_by_other, NO write (AC3)
+#   dispatch:loop present       → dispatch_seat.already_owned,  NO write (AC2)
+#   no dispatch:* at all        → gh issue edit --add-label dispatch:loop
+#
+# This is NOT a second classifier. classify_dispatch_seat (Rust) knows the seat
+# list, the empty seat, the multiple-seat case; this function answers one binary
+# question — "may I write dispatch:loop here without covering someone's claim?"
+# — and an unknown seat, an empty seat, or two seats all answer "no" for the
+# same reason. Refusing the DISPATCH stays the engine's job (mika#2084, three
+# sites upstream of dispatch-lib); a fourth refusal in shell is the drift #2084
+# built one pure function to avoid.
+#
+# No `gh label create` fallback, unlike _stamp_pr_origin: dispatch:loop is a
+# SEAT label whose vocabulary is guarded Rust↔YAML on mika (mika#2092). Creating
+# it on the fly on mika-cloud / mika-skills / mika-platform would fabricate a
+# seat outside that guard. On those repos the edit fails, `stamp_failed` says
+# so, and the dispatch proceeds — the ticket puts other repos out of scope.
+#
+# The label is written as a literal, not `dispatch:${SEAT}`: rule L5 in
+# scripts/check-canonical-tokens.sh ignores any label containing `$`, and the
+# literal is what lets it confront this write with .github/labels.yml. That is
+# a third copy of the word "loop" (Rust, YAML, shell) — Rust↔YAML is guarded by
+# check-dispatch-seats-declared.sh, shell↔YAML by L5; transitivity holds.
+#
+# Returns 0 when the issue carries the label, 1 when it could not be applied —
+# with a named line on stderr. Callers MUST invoke with `|| true`: the label is
+# a signal for the other seats, not a barrier for this one (AC2).
+_stamp_issue_seat() {
+    local repo="$1" issue="$2" labels_csv="$3" seat_labels
+    [ -n "$repo" ] && [ -n "$issue" ] || return 0
+
+    seat_labels=$(printf '%s\n' "$labels_csv" | tr ',' '\n' | sed 's/^ *//;s/ *$//' \
+        | tr '[:upper:]' '[:lower:]' | grep '^dispatch:' || true)
+
+    if [ -n "$seat_labels" ]; then
+        if [ "$seat_labels" = "dispatch:loop" ]; then
+            echo "dispatch_seat.already_owned: ${repo}#${issue} already carries dispatch:loop; not re-stamping" >&2
+            return 0
+        fi
+        echo "dispatch_seat.owned_by_other: ${repo}#${issue} carries '$(printf '%s\n' "$seat_labels" | paste -sd, -)'; refusing to stamp dispatch:loop — the engine's seat gate (mika#2084) is the authority on whether this dispatch may proceed" >&2
+        return 1
+    fi
+
+    # Bounded: a hanging GitHub API must not hold the dispatch it merely announces.
+    if timeout 15 gh issue edit "$issue" --repo "senara-solutions/${repo}" --add-label dispatch:loop >/dev/null 2>&1; then
+        echo "dispatch_seat.stamped: ${repo}#${issue} labeled dispatch:loop" >&2
+        return 0
+    fi
+    echo "dispatch_seat.stamp_failed: could not apply dispatch:loop to ${repo}#${issue} — other seats will not see this claim; dispatch proceeds" >&2
+    return 1
+}
+
+# _release_issue_seat <repo> <issue_num> — end the loop's live claim (AC4).
+#
+# Decision (mika#2155 C-4): dispatch:loop is retired BEFORE the callback that
+# lets mika-dev start the next dispatch on this ticket (`_deliver_callback`,
+# ahead of `mika ask --task-complete`), and again at the head of the EXIT trap
+# as the crash/cancel backstop. Two sites, one claim: the first successful
+# release drops ISSUE_SEAT_CLAIMED, the second is then a no-op. Releasing after
+# the callback instead would leave a window where the next dispatch reads a
+# label its predecessor is about to remove, does not stamp (already_owned), and
+# then runs unclaimed for its whole life — the seat gate disarmed by the very
+# mechanism meant to arm it (review finding #2). Kept past the exit it would answer "who
+# is writing on this branch?" with a name when nobody is: between a groom and
+# its implement, between an open PR and its review, a human seat may take the
+# branch, and a `dispatch:mpc` posed beside a stale `dispatch:loop` reads
+# `multiple_seat_labels` and is refused — fail-closed, but one manual gesture
+# per ticket for everyone. The permanent provenance is `origin:loop` on the PR.
+#
+# Unconditional once the dispatch went past its no-dispatch exits
+# (ISSUE_SEAT_CLAIMED=1), whether or not THIS run's stamp succeeded: a
+# dispatch:loop left by an earlier run that died without its EXIT trap
+# (SIGKILL, host reboot) is stale, and this is where it heals — gating on
+# "I stamped it" would keep that residue forever (the next run reads
+# already_owned, does not stamp, and would therefore never release).
+# dispatch:loop is the loop's label — nothing else writes it, so nothing else
+# is being undone here. Never names any other dispatch:* label. Bounded: this
+# runs in the exit trap, whose job is to get RESULT back to mika-dev.
+_release_issue_seat() {
+    local repo="$1" issue="$2"
+    [ "${ISSUE_SEAT_CLAIMED:-0}" = "1" ] || return 0
+    [ -n "$repo" ] && [ -n "$issue" ] || return 0
+    if timeout 15 gh issue edit "$issue" --repo "senara-solutions/${repo}" --remove-label dispatch:loop >/dev/null 2>&1; then
+        # The claim is over: the second site (callback, then exit trap) becomes
+        # a no-op instead of a second, idempotent-but-pointless API call. On
+        # failure the flag stays up so that later site retries once more.
+        ISSUE_SEAT_CLAIMED=0
+        echo "dispatch_seat.released: ${repo}#${issue} no longer carries dispatch:loop" >&2
+        return 0
+    fi
+    echo "dispatch_seat.release_failed: could not remove dispatch:loop from ${repo}#${issue} — the claim outlives this dispatch until the next one on this ticket exits" >&2
+    return 1
+}
+
 # _derive_recovery_pr_title — Compute a conventional-commit PR title for
 # recovery-class PRs. Called by the recovery block (mika#1282 + mika#1396).
 #
@@ -5936,7 +7291,11 @@ _derive_recovery_pr_title() {
     local labels="$5"
     local issue_title="$6"
 
-    if [ "$recovery_class" = "commit-pushed-no-pr" ]; then
+    # mika#2492 widens this arm to `no-shipping-tail`: both classes reach here
+    # with the pilot's own implementation commit at the branch tip, so its
+    # subject is the right title for either. The other two callers (dirty-worktree,
+    # and any fallback) are untouched.
+    if [ "$recovery_class" = "commit-pushed-no-pr" ] || [ "$recovery_class" = "no-shipping-tail" ]; then
         local impl_subject
         impl_subject=$(git -C "$wt_dir" log -1 --format='%s' HEAD 2>/dev/null)
         if [ -n "$impl_subject" ]; then
@@ -6053,6 +7412,114 @@ _rescue_diff_carries_work() {
             *) return 0 ;;
         esac
     done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _rescue_touches_tracked_tree — would this PR publish anything the repo knows?
+#
+# mika#2503. PR #2502 (impl of #2497) carried 28 files — `.v1probe/Cargo.toml`,
+# `.v1probe/src/lib.rs` and the whole of `.v1probe/target/` — and zero
+# implementation: a scratch probe crate the pilot built, auto-committed by the
+# mika#1282 rescue and opened as a draft PR. QA blocked it 7/7. #2486 was the
+# same mechanism the day before.
+#
+# THE QUESTION, and there is exactly one: does the content this PR would publish
+# touch at least one place the repository already knows about? Take the FIRST
+# SEGMENT of every path in the diff; if any of them exists in the reference
+# tree's top level, answer yes.
+#
+#   .v1probe/Cargo.toml, .v1probe/src/lib.rs  -> `.v1probe`, absent  -> NO
+#   crates/mika-agent/src/foo.rs              -> `crates`,   present -> yes
+#   crates/mika-newthing/src/lib.rs (new)     -> `crates`,   present -> yes
+#   docs/plans/...-plan.md                    -> `docs`,     present -> yes
+#
+# THE REFERENCE TREE IS origin/main, NEVER HEAD — and this is the one detail
+# that decides whether the fix works at all. This predicate is consulted AFTER
+# the rescue commit, so `git ls-tree --name-only HEAD` CONTAINS `.v1probe`: the
+# rescue itself just put it there. Measured 2026-09-23 on the founding case: the
+# HEAD form answers "yes" and the whole fix is INERT while passing every local
+# test. Same base as the diff, which is also what keeps the two halves of the
+# measurement consistent. The merge-base was considered and rejected: a
+# first-level directory born on main after this branch left (`site/`, say) would
+# be unknown to it, and a pilot legitimately working there would be refused.
+#
+# WHY PER-SEGMENT AND NOT "a crate not declared in the workspace". That second
+# formulation is true of #2502 but Cargo-specific, and dispatch-lib is deployed
+# in four repos not all of which are Rust workspaces. It is also more fragile: a
+# pilot that writes a legitimate crate and forgets to declare it would have its
+# implementation refused. Asking only "is this first segment known" requires no
+# language knowledge, which is what lets this half travel where the `.gitignore`
+# half cannot.
+#
+# FAIL-OPEN, WHICH IS THE INVERSE OF ITS IMMEDIATE NEIGHBOUR ABOVE, DELIBERATELY.
+# `_rescue_diff_carries_work` is fail-CLOSED because its expensive error is an
+# automatic ticket closure nobody measures. This one's expensive error is
+# blocking the loop's NOMINAL path — `no-shipping-tail` (mika#2492) goes through
+# the same `if` — and, worse, the asymmetry of the underlying loss:
+#   * refusing real content is an IRREVERSIBLE loss of implementation (it exists
+#     in one place only, and `_set_up_worktree` force-removes the worktree on the
+#     next dispatch). That is the defect mika#1282 exists to prevent.
+#   * rescuing scratch is a phantom PR: QA blocks it, an operator closes it.
+#     Reversible, and it is the state of the world today.
+# Two neighbouring predicates, two polarities; each states its own reason at its
+# own site, or a reviewer "harmonizes" whichever one they are moving.
+#
+# It does NOT compose with `_rescue_diff_carries_work`'s incident list
+# (`.claude/groom-verdict-trail.log`, `.iterate/`, `docs/plans/`, ...). One
+# question per predicate; and on the measured case no incident path is in play,
+# so composing would change nothing while making the two inseparable.
+#
+# Args: $1 — worktree dir
+# Returns: 0 (open the PR) when at least one first segment is known to the
+#          reference tree, AND in every case the answer cannot be measured:
+#          empty/unreadable worktree, no fetched origin/main, empty reference
+#          tree, empty diff.
+#          1 (refuse) only on a positive measurement that nothing is known.
+_rescue_touches_tracked_tree() {
+    local wt_dir="${1-}" f seg
+
+    # Same guard, same reason, as `_rescue_diff_carries_work`: `git -C ""`
+    # silently operates on the dispatch process CWD — a live checkout — so an
+    # empty $wt_dir would measure the WRONG tree. There it must fail closed;
+    # here it must fail open. Same hazard, opposite safe answer.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # The reference tree's top level. Unreadable or empty (no fetched
+    # origin/main, degenerate empty-tree commit) => nothing can ever match =>
+    # open, rather than refuse every PR in the repo.
+    local _tree
+    _tree=$(git -C "$wt_dir" ls-tree --name-only origin/main 2>/dev/null) || return 0
+    [ -n "$_tree" ] || return 0
+
+    # `core.quotePath=false` + `-z` for the reason written on
+    # `_rescue_diff_carries_work`: under git's default, any path holding a
+    # non-ASCII byte comes back quoted with octal escapes, and this repo's plans
+    # and tickets are written in French every day. (Process substitution rather
+    # than `$(...)`: bash drops NUL bytes inside command substitution, which
+    # would splice every path into one blob.)
+    local _measured=0
+    while IFS= read -r -d '' f; do
+        [ -n "$f" ] || continue
+        _measured=1
+        seg="${f%%/*}"
+        # A file at the repo root has itself as its first segment.
+        # Here-string, never `printf … | grep -q` (mika#2055): `grep -q` exits at
+        # the first match and closes the pipe, the producer takes SIGPIPE and
+        # exits 141, and under the `pipefail` this library is sourced into that
+        # 141 becomes the pipeline's status — so a segment that IS known would
+        # read as unknown, which is the exact direction that refuses a real
+        # implementation. A here-string has no pipeline and no SIGPIPE.
+        if grep -qxF -- "$seg" <<<"$_tree"; then
+            return 0
+        fi
+    done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+
+    # An empty diff is not a positive measurement that the content is scratch —
+    # there is no content. Open (and the gate's other terms decide).
+    [ "$_measured" = "1" ] || return 0
     return 1
 }
 
@@ -6412,6 +7879,10 @@ _deliver_callback() {
     # a callback does not arrive. Its own failure is announced rather than
     # swallowed — a silent gate is the defect this ticket exists to remove.
     _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the callback unchanged" >&2
+    # mika#2155: end the loop's live claim BEFORE the message that can start
+    # the next dispatch on this ticket. No-op unless _set_up_worktree claimed
+    # (ISSUE_SEAT_CLAIMED=1); the EXIT trap repeats it only if this one failed.
+    _release_issue_seat "$REPO" "$ISSUE_NUM" || true
     set +e
     if [ -n "$AGENT" ]; then
         mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"
@@ -6509,6 +7980,12 @@ _detect_plan_on_branch() {
         # form or claude-pilot exits 7ms with `[error] pipeline_incomplete:` (no
         # API call). See mika#1345.
         ENTRY_COMMAND="/ce-work $PLAN_PATH"
+        # mika#2492: `/ce-work` is "implementation and local verification only,
+        # without the shipping tail" — this pilot will not open a PR, and that
+        # is its perimeter, not a truncation. Stamped HERE, on the line that
+        # takes the decision, so the fact travels from its producer instead of
+        # being reconstructed downstream. Read by `_pilot_had_no_shipping_tail`.
+        PILOT_SHIPPING_TAIL="absent"
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
@@ -6856,6 +8333,9 @@ EOF
 
     # Initialize callback guard
     CALLBACK_SENT=0
+    # mika#2155: the EXIT trap reads this; it must exist even when
+    # _set_up_worktree was never reached.
+    ISSUE_SEAT_CLAIMED=0
 
     _parse_input_json
 
@@ -6885,6 +8365,12 @@ EOF
     case "$SKILL" in
       dev-pilot)
         ENTRY_COMMAND="/mika"
+        # mika#2492: declare the pilot's shipping perimeter at the site that
+        # decides it. `/mika` carries plan → work → review → … → git push +
+        # gh pr create, so this pilot is expected to open its own PR and a
+        # commit-without-PR really is a truncation. `_detect_plan_on_branch`
+        # overwrites this with `absent` when it overrides the entry command.
+        PILOT_SHIPPING_TAIL="present"
         # mika#940: signal claude-pilot to fail the session if `gh pr create`
         # is never invoked. Caught by the source-level pipeline_incomplete
         # detection in claude-pilot-py (Unit 2). Defense-in-depth against the
@@ -7049,21 +8535,93 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
     #   commit on origin; PR was never opened. dispatch-lib opens it.
     #
     # Runs after _push_branch (lines 558-564) and before _deliver_callback.
+    # - "no-shipping-tail" (mika#2492): the pilot's perimeter never included
+    #   opening a PR (`/ce-work`), and its session concluded. dispatch-lib opens
+    #   the PR because that has been its job since mika#1271 — this is the
+    #   NOMINAL path of the autonomous loop, not a wreck, so it carries neither
+    #   the RECOVERY_PENDING marker nor the wip(mika#1383) marker commit.
     local RECOVERY_CLASS=""
     if [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then
         RECOVERY_CLASS="dirty-worktree"
+    elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
+         && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && _pilot_had_no_shipping_tail; then
+        RECOVERY_CLASS="no-shipping-tail"
     elif [ -z "$PR_URL" ] && [ -n "$PRE_RUN_HEAD" ] && [ -n "$POST_RUN_HEAD" ] \
          && [ "$PRE_RUN_HEAD" != "$POST_RUN_HEAD" ] && [ "$SKILL" = "dev-pilot" ]; then
         RECOVERY_CLASS="commit-pushed-no-pr"
     fi
 
+    # The four conditions that make a recovery PR due, evaluated ONCE. They used
+    # to live directly on the opening `if`; mika#2503 needed to insert a refusal
+    # ahead of that `if` without either re-indenting its ~120-line body or
+    # restating the four terms in two branches, which is a divergence waiting for
+    # the first editor who changes one of them.
+    local _recovery_pr_due=0
     if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
+        _recovery_pr_due=1
+    fi
+
+    # mika#2503: refuse to open a PR whose whole content is pilot scratch — a
+    # probe crate and its build artefacts, touching nothing the repo knows about.
+    #
+    # THE REFUSAL IS HERE, AFTER RECOVERY_CLASS IS COMPUTED, AND THAT PLACEMENT
+    # IS THE FIX. Not setting RESCUED_DIRTY_WORKTREE=1 would NOT have been
+    # enough: the rescue commit advances POST_RUN_HEAD, so
+    # `PRE_RUN_HEAD != POST_RUN_HEAD` becomes true and the `commit-pushed-no-pr`
+    # branch above opens the PR anyway. A fix placed at the flag site alone would
+    # pass every local test and change NOTHING in production. Clearing
+    # `_recovery_pr_due` covers all THREE classes by construction — which is also
+    # the right perimeter, the predicate being about content and never about class.
+    #
+    # NOTHING IS DESTROYED BY THIS REFUSAL, and that is what makes it safe to put
+    # on the nominal gate: the `wip()` commit is made, POST_RUN_HEAD is advanced,
+    # `_push_branch` has already published the branch. Only the draft PR is
+    # withheld, and the operator opens it with one command (named in RESULT).
+    # Contrast the staging half in `.gitignore`, which is destructive in practice
+    # and is therefore reserved to what is certainly regenerable — a cargo
+    # `target/`.
+    if [ "$_recovery_pr_due" = "1" ] && ! _rescue_touches_tracked_tree "$WORKTREE_DIR"; then
+        _recovery_pr_due=0
+        # The operator surface is RESULT — the callback body, which lands in
+        # `tasks.result` — never a log line. Unit 2 runs at
+        # `dispatch_claude_pilot` level, in the same regime as
+        # `_check_pilot_force_push`: its stderr is `spawn_long_running_exec`'s
+        # `Stdio::piped()` handle, which the executor reads ONLY inside
+        # `if !status.success()`. On a dispatch that succeeds the pipe is dropped
+        # unread — that is Signal M, and the mika#2050 class corrected three
+        # times over on Signal S. So no grep is announced for this refusal; the
+        # `echo` below is a convenience, deliberately NOT presented as a probe.
+        echo "rescue_scratch_refused: content touches no tracked top-level directory — draft PR withheld (branch=$BRANCH, mika#2503)" >&2
+        # The prose goes on its own lines, and the canonical status line through
+        # `_set_pr_status_line` (mika#2121). Both halves are load-bearing: that
+        # helper strips any prior `PR:`/`NO_PR:` so the delivered callback carries
+        # EXACTLY ONE status line — site 2 in `_post_flight_recovery` has already
+        # written one by the time we get here — and the reason must be a bare
+        # snake_case token because the consumer is strict:
+        # `dispatcher.rs::RE_NO_PR` is `(?m)^NO_PR:\s+([a-z_]+)`, declared class B
+        # in `scripts/canonical-tokens.tsv`. Prose on that line would have had the
+        # parser record the reason as the first lowercase word of the sentence.
+        RESULT="${RESULT}
+Draft PR withheld (mika#2503): the rescued content touches no top-level directory this repo tracks, so it is pilot scratch (a probe crate and/or its build artefacts) rather than an implementation.
+Nothing was lost — the commit exists and branch ${BRANCH} is pushed.
+To publish it anyway: gh pr create --repo senara-solutions/${REPO} --head ${BRANCH} --base main --draft"
+        _set_pr_status_line "NO_PR: rescue_scratch_only"
+    fi
+
+    if [ "$_recovery_pr_due" = "1" ]; then
         # Recovery-class-specific PR title + unified body template (mika#1618)
         local _rescue_title
         local _rescue_class_fact
         if [ "$RECOVERY_CLASS" = "dirty-worktree" ]; then
             _rescue_title=$(_derive_recovery_pr_title "dirty-worktree" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session wrote file changes but never committed. dispatch-lib auto-committed with \`wip()\` prefix."
+        elif [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+            # mika#2492: the truth of this class, and it is not a wreck. The
+            # title comes from the pilot's real head commit, exactly as for
+            # commit-pushed-no-pr — both classes share the topology "the pilot
+            # committed", they differ only on whether that was its whole job.
+            _rescue_title=$(_derive_recovery_pr_title "no-shipping-tail" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
+            _rescue_class_fact="The pilot ran under \`/ce-work <plan>\` (mika#1074 plan-on-branch override), whose perimeter is implementation and local verification only — without the shipping tail. It committed the plan's work and concluded; opening the PR is dispatch-lib's job (mika#1271), not a step it truncated before. This PR is draft because its review has not happened yet — never because its content is in doubt."
         else
             _rescue_title=$(_derive_recovery_pr_title "commit-pushed-no-pr" "$WORKTREE_DIR" "$REPO" "$ISSUE_NUM" "$LABELS" "$ISSUE_TITLE")
             _rescue_class_fact="The pilot session committed and pushed but did not open a PR (\`gh pr create\` failed, or the pilot ended its turn before invoking it — mika#1383). dispatch-lib opened this PR from the existing branch."
@@ -7160,10 +8718,27 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             # parent task false-fails as `callback_delivered_without_pr_url`
             # despite the rescued PR being open and reviewable. See mika#871
             # R4 for the canonical contract.
-            RESULT="${RESULT}
+            if [ "$RECOVERY_CLASS" = "no-shipping-tail" ]; then
+                # mika#2492: the nominal path. No `RECOVERY_PENDING: true` —
+                # that marker is what makes self-dev-callback write
+                # `unpushed_recovery_pending` into tasks.metadata, which makes
+                # the qa-webhook Guard 1 skip the autonomous review and escalate
+                # to the operator. A pilot that did exactly what its perimeter
+                # asked has nothing pending.
+                RESULT="${RESULT}
+Draft PR (opened by dispatch-lib): ${PR_URL}
+PR: ${PR_URL}"
+                # The `Outcome:` posed inside _post_flight_recovery named this
+                # very window ("did not reach PR creation"); it is now false, and
+                # the sister of _set_pr_status_line replaces it in one line so
+                # the one-Outcome-line contract holds by construction.
+                _set_outcome_line "Outcome: PR_OPENED — ${PR_URL}"
+            else
+                RESULT="${RESULT}
 Draft PR (dispatch-lib recovery): ${PR_URL}
 PR: ${PR_URL}
 RECOVERY_PENDING: true"
+            fi
             # mika#1613: structured marker parsed by self-dev-callback, which
             # writes `unpushed_recovery_pending: true` into tasks.metadata. That
             # flag makes the qa-webhook recovery-skip guard fire so this rescue

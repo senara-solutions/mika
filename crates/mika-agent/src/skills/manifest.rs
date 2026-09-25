@@ -396,6 +396,16 @@ pub enum ToolHandler {
         long_running: bool,
         #[serde(default)]
         estimated_duration_secs: Option<u64>,
+        /// Le handler remet `input.command` à un runtime détaché (session
+        /// tmux, lanceur d'application) et rend la main aussitôt : le budget
+        /// de l'outil ne borne pas l'exécution de cette commande. La garde
+        /// « commande de build sous un budget qui ne peut pas la contenir »
+        /// (mika#2423, `executor::refuse_uncontainable_build`) ne s'applique
+        /// donc pas — c'est une propriété du modèle d'exécution du handler,
+        /// pas de l'appelant. Défaut `false` : la garde couvre tout handler
+        /// synchrone, et une exception se déclare.
+        #[serde(default)]
+        detaches_command: bool,
     },
     Http {
         url: String,
@@ -721,6 +731,7 @@ mod tests {
                 command,
                 long_running,
                 estimated_duration_secs,
+                ..
             } => {
                 assert_eq!(command, "./analyze.sh");
                 assert!(long_running);
@@ -773,6 +784,7 @@ mod tests {
                 command,
                 long_running,
                 estimated_duration_secs,
+                ..
             } => {
                 assert_eq!(command, "./handler.sh");
                 assert!(!long_running);

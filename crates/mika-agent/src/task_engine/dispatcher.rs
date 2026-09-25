@@ -44,6 +44,106 @@ use crate::tools::ToolRegistry;
 
 use super::types::action_type;
 
+/// Les triggers `run_skill` que **ce binaire** sait router (mika#2446).
+///
+/// **Projection du `match`, jamais son remplaçant.** La vérité d'exécution
+/// reste le `match trigger_name` de [`TaskDispatcher::dispatch_run_skill`] : on
+/// ne le remplace pas par une table de dispatch dynamique, ce qui déplacerait
+/// la décision dans une donnée — et une donnée périmée ne fait rougir aucun
+/// compilateur. Cette constante est un **inventaire**, et son honnêteté est
+/// tenue par une garde de source
+/// (`mika2446_l_inventaire_est_la_projection_exacte_du_match`, dans
+/// `tests/eval/test_recurring_trigger_wiring_2337.rs`) qui parse le bloc `match`
+/// et asserte l'égalité ensembliste. Un inventaire qui mentirait serait
+/// strictement pire que pas d'inventaire.
+///
+/// Il existe parce que la ligne de mort par trigger inconnu
+/// ([`DispatchError::UnknownTrigger`]) **affirmait sa cause sans la porter** :
+/// elle prescrivait « établir la version du binaire en exécution » sans fournir
+/// l'instrument pour le faire. Un opérateur a dû recourir à `/proc/<pid>/exe`,
+/// `strings | grep -c` et `mika --version` — puis a formulé une hypothèse qu'un
+/// seul champ de la ligne aurait réfutée immédiatement.
+///
+/// Deux lecteurs : le champ `routable_triggers` de l'événement
+/// `recurring_unknown_trigger` (`engine.rs`) et de l'attestation de démarrage
+/// `task_engine_trigger_registry` (`server/mod.rs`), et le refus de
+/// `mika tasks rearm` sur un label dont le trigger n'est pas routable ici.
+///
+/// **Refusé : dériver l'inventaire au runtime.** Il n'y a pas de réflexion sur
+/// un `match` en Rust, et toute dérivation serait une seconde liste écrite à la
+/// main — c'est-à-dire le problème, avec une étape de plus.
+pub const ROUTABLE_TRIGGERS: &[&str] = &[
+    "heartbeat",
+    "reflection",
+    "auto_pull_groomed",
+    "wip_rescue",
+    "qa_review_reconcile",
+    "worktree_reap",
+    "curator_review",
+];
+
+/// L'inventaire sous une forme prête à journaliser : `"a,b,c"`.
+///
+/// Un site unique parce que trois émetteurs le rendent (la ligne de mort, son
+/// audit, l'attestation de démarrage) et qu'un séparateur qui diverge entre
+/// deux d'entre eux coupe une population en deux sans le dire.
+pub fn routable_triggers_csv() -> String {
+    ROUTABLE_TRIGGERS.join(",")
+}
+
+/// Ce binaire sait-il router ce trigger ? Lecteur unique de [`ROUTABLE_TRIGGERS`]
+/// pour les prédicats (le CLI `mika tasks rearm`, mika#2446 R-5).
+pub fn is_routable_trigger(trigger: &str) -> bool {
+    ROUTABLE_TRIGGERS.contains(&trigger)
+}
+
+/// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
+///
+/// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
+/// être lisible **seule** — sans `strings`, sans `/proc`, sans `mika --version`
+/// lancé quatre heures plus tard sur un processus qui n'existe plus.
+///
+/// **Ce que ça n'atteste pas, dit ici plutôt que découvert :** la version du
+/// binaire qui *refuse*, jamais celle qui a *enregistré* la récurrente. Les deux
+/// peuvent différer — c'est précisément l'hypothèse de mika#2446 — et poser un
+/// tampon à l'enregistrement serait une seconde écriture sur un chemin nominal
+/// pour une population pathologique. L'inventaire du refusant suffit à trancher.
+pub struct BinaryAttribution {
+    /// Version sémantique servie.
+    pub version: &'static str,
+    /// Empreinte git, **rapportée telle quelle**. `"unknown"` (build hors
+    /// checkout, couche Docker) est une réponse — « ce binaire ne peut pas
+    /// énoncer sa provenance » — et non une absence de réponse : jamais corrigé,
+    /// jamais masqué. C'est le champ décisif : si c'est le commit qui porte le
+    /// bras, le décalage de version est réfuté et la cause est ailleurs.
+    pub git_hash: &'static str,
+    /// Quel processus a refusé.
+    pub process_id: u32,
+    /// `mika-spirit` ou `mika` — sépare le démon d'un `mika chat` qui tire les
+    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet, et
+    /// `cli_mode` ne court-circuite jamais le dispatch `run_skill`).
+    pub process_name: String,
+    /// L'inventaire **de ce binaire**, à comparer au trigger refusé.
+    pub routable_triggers: String,
+}
+
+/// L'attribution du processus courant. Trois émetteurs la rendent : la ligne de
+/// mort, sa ligne `audit_events`, et l'attestation de démarrage.
+pub fn binary_attribution() -> BinaryAttribution {
+    BinaryAttribution {
+        version: mika_common::build_info::VERSION,
+        git_hash: mika_common::build_info::GIT_HASH,
+        process_id: std::process::id(),
+        // Un exécutable illisible rend `"unknown"` : le champ dit alors qu'il ne
+        // sait pas, ce qui reste une information — la même règle que `git_hash`.
+        process_name: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "unknown".to_string()),
+        routable_triggers: routable_triggers_csv(),
+    }
+}
+
 /// Les scans périodiques qui résolvent leur token GitHub via
 /// [`resolve_periodic_scan_token`] (mika#2205).
 ///
@@ -54,6 +154,7 @@ enum PeriodicScan {
     AutoPull,
     WipRescue,
     QaReviewReconcile,
+    WorktreeReap,
 }
 
 impl PeriodicScan {
@@ -63,6 +164,7 @@ impl PeriodicScan {
             Self::AutoPull => "auto_pull_no_token",
             Self::WipRescue => "wip_rescue_no_token",
             Self::QaReviewReconcile => "qa_review_reconcile_no_token",
+            Self::WorktreeReap => "worktree_reap_no_token",
         }
     }
 
@@ -72,6 +174,10 @@ impl PeriodicScan {
             Self::AutoPull => "aucune sélection de ticket groomé ne s'exécute",
             Self::WipRescue => "aucun brouillon wip-rescue n'est repris",
             Self::QaReviewReconcile => "aucune PR ouverte sans revue n'est rattrapée (mika#2334)",
+            Self::WorktreeReap => {
+                "aucun worktree de PR terminale n'est retiré, et le disque continue \
+                 de se remplir (mika#2420)"
+            }
         }
     }
 }
@@ -98,6 +204,9 @@ impl PeriodicScan {
 /// - `auto_pull` — bascule du label `ready` (`gh issue edit`), lectures `gh`.
 /// - `wip_rescue` — rebase, push sur une branche de brouillon, `gh pr ready`,
 ///   commentaire de PR.
+/// - `worktree_reap` — **lecture seule côté forge** (`gh pr list`) ; tout le
+///   reste est local (`git worktree remove`). Aucune écriture GitHub, donc
+///   aucun auteur à lire (mika#2420).
 ///
 /// L'identité bot de l'App est donc acceptable en repli ici. Les chemins qui
 /// **exigent** l'identité machine (revue/merge de PR) ne passent pas par cette
@@ -415,6 +524,14 @@ pub struct TaskDispatcher {
     /// une transition si le STOP est armé au premier tick — même raisonnement que
     /// le jeu de déduplication mika#2131.
     pub auto_pull_stop_armed: AtomicBool,
+    /// Dernier état connu de l'interrupteur STOP du reaper de worktrees
+    /// (mika#2420). Même contrat que [`Self::auto_pull_stop_armed`] ci-dessus —
+    /// détection de transition seulement, état perdu au redémarrage.
+    ///
+    /// Un champ distinct et non un partage : les deux STOP sont deux décisions
+    /// distinctes (arrêter le feeder n'est pas arrêter le reaper), et un état
+    /// partagé écrirait une transition sur le mauvais scan.
+    pub worktree_reap_stop_armed: AtomicBool,
     /// Last `proactive_budget_resolved` couple this process announced (mika#2358).
     ///
     /// Deduplication only, on the same doctrine as `auto_pull_stop_armed` above
@@ -576,6 +693,7 @@ impl TaskDispatcher {
             "auto_pull_groomed" => Ok(self.dispatch_auto_pull_groomed(task).await?),
             "wip_rescue" => Ok(self.dispatch_wip_rescue(task).await?),
             "qa_review_reconcile" => Ok(self.dispatch_qa_review_reconcile(task).await?),
+            "worktree_reap" => Ok(self.dispatch_worktree_reap(task).await?),
             "curator_review" => Ok(self.dispatch_curator_review(task).await?),
             // mika#2337 — a dedicated variant, not `anyhow!`. The caller needs to
             // tell "this binary does not know that trigger" from "the dispatch
@@ -913,7 +1031,45 @@ impl TaskDispatcher {
         // This guarantees at minimum session_id, cost_usd, duration_ms, and turns
         // are captured even if the agent exhausts its step budget.
         if is_callback {
+            // mika#2133 R2 — le tour de livraison EST le travail du moteur sous
+            // cette ligne, et jusqu'ici rien ne le marquait. Une ligne callback
+            // qui porte un pilote a déjà son `fired_at` (posé au spawn par
+            // `set_task_process_id`, mika#2263) et la clause NULL-only ne la
+            // réécrit pas ; celle qui n'en porte pas — wrapper différé,
+            // rendez-vous de build — n'en avait aucun, donc se lisait « jamais
+            // firée » pendant tout le temps où elle tenait le verrou d'agent.
+            //
+            // Les reminders sont exclus : ils passent par `fire_task` →
+            // `claim_and_fire_task`, déjà estampillés, avec la sémantique
+            // d'écrasement « dernier tir » (mika#2133 D4) qu'un appel ici
+            // contredirait.
+            //
+            // Le statut n'est pas touché — voir `stamp_task_fired_at_if_null`
+            // pour pourquoi poser `in_progress` ici est un autre ticket.
+            //
+            // `warn!`-et-continue comme les trois sites de dispatch existants :
+            // le stamp est de l'observabilité et ne doit jamais faire échouer un
+            // tour.
+            if let Err(e) = self.db.stamp_task_fired_at_if_null(&task.id).await {
+                warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "failed to stamp fired_at on callback delivery turn"
+                );
+            }
+
             try_extract_callback_metadata(&self.db, task).await;
+            // mika#2496 U4: the cost half of the "120 turns / 40 USD" rule has
+            // no enforcement point upstream (`_sdk_guardrail_kwargs` ends on
+            // `pass`), so this MEASURES the population instead of pretending to
+            // bound it. Runs right after the metadata write, on the same parsed
+            // fields, and stops nothing.
+            try_report_pilot_cost_overrun(
+                &self.db,
+                task,
+                self.settings.effective_pilot_cost_alert_usd(),
+            )
+            .await;
             // mika#965: Write a human-readable callback summary to task_messages
             // so the dispatch session's next rebuild_context() includes it.
             try_write_callback_summary(&self.db, task).await;
@@ -941,11 +1097,16 @@ impl TaskDispatcher {
             // ready_label_handler engine-side path, mika#1572) — no `gh` label
             // round-trip, no LLM-mediated turn, so it fires every time. The
             // prompt-level path in self-dev-callback remains as defense-in-depth.
+            //
+            // mika#2498 : `global_home_dir` porte le frein de dispatch de la
+            // boucle — le même champ que le court-circuit d'`auto_pull` lit déjà
+            // (aucune plomberie nouvelle).
             try_dispatch_pilot_after_groom_success(
                 &self.db,
                 task,
                 self.github_token.as_deref(),
                 &self.skills,
+                &self.global_home_dir,
             )
             .await;
         }
@@ -1459,24 +1620,44 @@ impl TaskDispatcher {
     /// fire-and-forget : un échec d'audit ne doit pas changer le verdict du
     /// court-circuit — l'interrupteur mord même si la table est illisible.
     async fn record_auto_pull_stop_transition(&self, task: &Task, state: &str) {
+        self.record_stop_transition(
+            task,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+            "auto_pull_stop",
+            "scan:auto_pull_groomed",
+            state,
+        )
+        .await;
+    }
+
+    /// Une transition du STOP d'un scan, écrite en `audit_events`.
+    ///
+    /// Paramétré par scan depuis mika#2420 : le reaper de worktrees a son propre
+    /// interrupteur, et un second corps copié aurait dérivé du premier. Le
+    /// `tool_name` reste **distinct par scan** — c'est ce qui laisse l'opérateur
+    /// compter deux populations séparément.
+    async fn record_stop_transition(
+        &self,
+        task: &Task,
+        scan: &str,
+        tool_name: &str,
+        target_key: &str,
+        state: &str,
+    ) {
         if let Err(e) = self
             .db
             .log_audit_event(
                 // Underscores, comme le `tool_name` et le nom d'événement — et
                 // surtout pas le littéral du chemin du fichier, que la garde
                 // structurelle T7 réserve à `auto_pull_stop.rs`.
-                &format!("auto_pull_stop-{}", task.id),
-                "auto_pull_stop",
-                "scan:auto_pull_groomed",
+                &format!("{tool_name}-{}", task.id),
+                tool_name,
+                target_key,
                 None,
                 Some(state),
                 Some(&format!(
                     "fichier sentinelle : {}",
-                    crate::auto_pull_stop::stop_file_path(
-                        &self.global_home_dir,
-                        crate::auto_pull_stop::AUTO_PULL_SCAN,
-                    )
-                    .display()
+                    crate::auto_pull_stop::stop_file_path(&self.global_home_dir, scan).display()
                 )),
                 None,
             )
@@ -1484,9 +1665,10 @@ impl TaskDispatcher {
         {
             warn!(
                 task_id = %task.id,
+                tool_name = %tool_name,
                 state = %state,
                 error = %e,
-                "failed to record auto_pull_stop transition"
+                "failed to record stop transition"
             );
         }
     }
@@ -1616,12 +1798,49 @@ impl TaskDispatcher {
             "auto_pull: running groomed ticket selection"
         );
 
+        // mika#2049 — is the host egress relay down? Resolved ONCE per tick,
+        // here, because this is the type that holds the global home the shell
+        // guard stamps under (same trajectory as mika#2329's hot STOP, and the
+        // reason `auto_pull` takes this as a parameter rather than reading it).
+        //
+        // Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+        // "serving". That cannot open the network — the protection is the shell
+        // guard, which probes the socket on every dispatch and reads no stamp.
+        // The worst a false "serving" buys is one refused dispatch.
+        let egress_verdict = crate::pilot_egress_stamp::relay_verdict(
+            &self.global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        );
+        if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } = &egress_verdict {
+            // One line per tick, not per ticket: the per-ticket record is the
+            // exclusion ledger's `egress_relay_down` rows (mika#2131 doctrine —
+            // detail in `audit_events`, shape in one INFO line).
+            info!(
+                event = "auto_pull_egress_relay_down",
+                motif = %motif,
+                age_secs,
+                trace_id = %trace_id,
+                "auto_pull: host egress relay is down — tickets are skipped, not \
+                 re-driven, so none is parked by the outage (mika#2049)"
+            );
+        }
+
+        // mika#2470 — what Phase 2 needs to dispatch a rescued ticket by a
+        // direct, in-process call of the ready-label handler instead of
+        // re-applying the label and waiting for a webhook that the outage it
+        // covers may never deliver.
+        let direct_dispatch = crate::auto_pull::DirectDispatchCtx {
+            skills: self.skills.as_ref(),
+            global_home_dir: &self.global_home_dir,
+        };
         let result = crate::auto_pull::auto_pull_groomed_ticket(
             &self.db,
             github_token,
             &label_auth,
             &trace_id,
             &session_id,
+            egress_verdict.is_down(),
+            &direct_dispatch,
         )
         .await;
 
@@ -1783,6 +2002,130 @@ impl TaskDispatcher {
                     task_id = %task.id,
                     trace_id = %trace_id,
                     "qa_review_reconcile: no action taken"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retire les worktrees de dispatch dont la PR est terminale (mika#2420).
+    ///
+    /// Cinquième scan périodique, fond-de-file comme ses voisins : ni tour
+    /// silencieux, ni LLM, ni session pilote. Il lit le registre git et l'état
+    /// des PR, puis retire les worktrees que plus rien ne réclame — avec leur
+    /// `target/`, qui est le consommateur de 25 à 44 Go que le ticket mesure.
+    ///
+    /// **C'est le seul scan de la famille dont l'action est destructive et
+    /// irréversible.** Trois choses en découlent et se lisent dans cet ordre
+    /// dans le corps : le court-circuit STOP est **en tête**, avant toute
+    /// résolution de token ; la disposition est gardée séparément de la
+    /// détection (`MIKA_WORKTREE_REAP_DISPOSITION=observe`) ; et tous les termes
+    /// du prédicat sont fail-safe vers *conserver*, ce qui est documenté au site
+    /// de la décision, dans [`crate::worktree_reaper`].
+    ///
+    /// Aucune écriture GitHub, donc pas de
+    /// `resolve_periodic_scan_label_token` : le seul appel à la forge est un
+    /// `gh pr list`.
+    async fn dispatch_worktree_reap(&self, task: &Task) -> Result<()> {
+        // mika#2420 / mika#2329 — court-circuit STOP en TÊTE, avant la
+        // résolution de token (potentiellement un échange GitHub App sur le
+        // réseau) et avant tout `git`. Même placement et même raisonnement que
+        // le STOP d'`auto_pull`, avec une raison de plus : pendant un incident,
+        // ce qu'on veut arrêter le plus vite est ce qui supprime.
+        //
+        // La row récurrente n'est **jamais** touchée — ni annulée, ni marquée,
+        // ni reprogrammée. La réversibilité est l'absence de machinerie.
+        if crate::auto_pull_stop::is_stopped(
+            &self.global_home_dir,
+            crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+        ) {
+            let was_armed = self.worktree_reap_stop_armed.swap(true, Ordering::Relaxed);
+            // INFO à chaque tick : pour un interrupteur, la vivacité EST
+            // l'information (même doctrine que mika#2329, Signal P de mika#2156).
+            info!(
+                task_id = %task.id,
+                stop_file = %crate::auto_pull_stop::stop_file_path(
+                    &self.global_home_dir,
+                    crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                ).display(),
+                event = "worktree_reap_stop_armed",
+                "worktree_reap: STOP armé — tick court-circuité, aucun worktree touché"
+            );
+            if !was_armed {
+                self.record_stop_transition(
+                    task,
+                    crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                    "worktree_reap_stop",
+                    "scan:worktree_reap",
+                    "armed",
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        if self.worktree_reap_stop_armed.swap(false, Ordering::Relaxed) {
+            info!(
+                task_id = %task.id,
+                event = "worktree_reap_stop_lifted",
+                "worktree_reap: STOP levé — reprise du reaper"
+            );
+            self.record_stop_transition(
+                task,
+                crate::auto_pull_stop::WORKTREE_REAP_SCAN,
+                "worktree_reap_stop",
+                "scan:worktree_reap",
+                "lifted",
+            )
+            .await;
+        }
+
+        // mika#2205 — PAT d'abord, App en repli. Lire l'état d'une PR n'est pas
+        // une opération dont GitHub lit l'auteur au sens d'ADR-008, et ce scan
+        // n'écrit rien sur la forge : le repli App est légitime.
+        let resolved = resolve_periodic_scan_token(
+            &self.settings,
+            self.github_app.as_deref(),
+            &task.id,
+            PeriodicScan::WorktreeReap,
+        )
+        .await;
+        let github_token = match resolved.as_deref() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let session_id = format!("worktree-reap-{}", uuid::Uuid::new_v4());
+
+        debug!(
+            task_id = %task.id,
+            trace_id = %trace_id,
+            "worktree_reap: running terminal-worktree scan"
+        );
+
+        let result = crate::worktree_reaper::reap_terminal_worktrees(
+            &self.db,
+            github_token,
+            &trace_id,
+            &session_id,
+        )
+        .await;
+
+        match result {
+            Some(count) => {
+                info!(
+                    task_id = %task.id,
+                    reaped = count,
+                    trace_id = %trace_id,
+                    "worktree_reap: scan complete"
+                );
+            }
+            None => {
+                debug!(
+                    task_id = %task.id,
+                    trace_id = %trace_id,
+                    "worktree_reap: no action taken"
                 );
             }
         }
@@ -3526,6 +3869,34 @@ fn is_team_child_callback(task: &Task) -> bool {
     task.team_run_id.is_some() && task.parent_task_id.is_some()
 }
 
+/// Le `tool_name` que porte **toute** issue de l'auto-fire post-grooming.
+///
+/// Un seul nom pour les deux issues, et c'est une décision (mika#2498). La
+/// doctrine maison impose deux noms quand deux populations doivent rester
+/// soustractibles **et que chaque nom porte sa propre cause** — `phantom_aged_out`
+/// / `phantom_sweep_spared` (mika#2156), `qa_deadline_verdict` /
+/// `qa_callback_verdict` (mika#2368). Ici les deux issues appartiennent au **même
+/// dispatcheur**, sur la **même population** (les callbacks de groom qui ont
+/// convergé) : `after_value` porte déjà l'issue, et l'y ajouter garde le nom vrai.
+/// Un `GROUP BY after_value` rend alors les deux comptes d'une requête,
+/// soustractibles. Précédent exact : `ready_label_outcome` (mika#2323), un
+/// `tool_name`, la porte dans `after_value`.
+///
+/// **Coût nommé et daté :** un `SELECT count(*) WHERE tool_name = …` nu change de
+/// sens au déploiement de mika#2498. `WHERE after_value = 'implement_dispatched'`
+/// reste exact de part et d'autre, et c'est la requête à écrire.
+const GROOM_PILOT_DISPATCHER_TOOL: &str = "task_engine_groom_pilot_dispatcher";
+
+/// L'état d'où partent les deux issues : le groom vient d'être livré.
+const GROOM_PILOT_BEFORE_VALUE: &str = "groom_delivered";
+
+/// L'issue nominale : le dispatch implement est parti.
+const GROOM_PILOT_DISPATCHED_VALUE: &str = "implement_dispatched";
+
+/// L'issue mika#2498 : le frein de dispatch de la boucle était armé, rien n'est
+/// parti et rien n'a été écrit.
+const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
+
 /// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
 /// in its result text, re-add the `ready` label on the GitHub issue so the
 /// ready-label webhook handler dispatches dev-pilot. This is the structural
@@ -3564,13 +3935,16 @@ fn is_team_child_callback(task: &Task) -> bool {
 /// rejection, handler missing) the function logs a WARN and returns. The
 /// prompt-level path in `self-dev-callback` remains as defense-in-depth.
 ///
-/// Audit event written under `tool_name='task_engine_groom_pilot_dispatcher'`
-/// with `after_value='implement_dispatched'` for traceability.
+/// Audit event written under [`GROOM_PILOT_DISPATCHER_TOOL`] with
+/// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
+/// mika#2498, [`GROOM_PILOT_STOPPED_VALUE`] on the branch where the loop's
+/// dispatch brake refused the auto-fire.
 async fn try_dispatch_pilot_after_groom_success(
     db: &AsyncDatabase,
     task: &Task,
     github_token: Option<&str>,
     skills: &SkillRegistry,
+    global_home: &std::path::Path,
 ) {
     // 1. Groom-class callbacks only.
     if task.dispatch_class.as_deref() != Some("groom") {
@@ -3600,6 +3974,75 @@ async fn try_dispatch_pilot_after_groom_success(
         Some(parsed) => parsed,
         None => return,
     };
+
+    // 3bis. Le frein de dispatch de la boucle (mika#2498).
+    //
+    //    **Placement.** Les étapes 1–3 sont le *prédicat* qui décide qu'un
+    //    dispatch aura lieu — classe `groom`, marqueur de convergence, parent
+    //    avec URL d'issue parsable — et rien n'a encore été écrit. Une ligne
+    //    émise ici signifie donc « le STOP a refusé un dispatch », la seule
+    //    lecture actionnable ; émise en tête de fonction elle aurait signifié
+    //    « un callback est arrivé pendant un STOP », un fait sans conduite
+    //    associée, des dizaines de fois par jour.
+    //
+    //    Avant l'étape 4 (jeton) : le STOP est une **décision de l'opérateur**,
+    //    l'absence de jeton un **fait d'environnement** — l'opérateur doit voir
+    //    la ligne du geste qu'il a posé, y compris sur un hôte sans jeton.
+    //
+    //    Impérativement avant l'étape 5c, qui bascule le `dispatch_class` du
+    //    parent groom→implement : une garde placée après laisserait un parent
+    //    étiqueté `implement` sans aucun implement en vol, et le prochain
+    //    dispatch légitime serait compté sur le mauvais slot (#1001).
+    //
+    //    **Le refus ne touche rien** — pas d'annulation du groom, pas de plan
+    //    perdu (il est committé et poussé), aucune row créée. Le parent reste
+    //    `in_progress` / `groom` et sera fauché par `reap_orphaned_parent_tasks`
+    //    (#871) comme il l'est déjà par les cinq chemins de saut voisins. À la
+    //    levée du STOP, le réconciliateur stuck-ready le re-drive : *le refus est
+    //    convergent, pas terminal*.
+    //
+    //    Le chemin du fichier n'est jamais recomposé — il passe par le lecteur
+    //    unique de `auto_pull_stop` (garde mika#2329).
+    if crate::auto_pull_stop::is_stopped(global_home, crate::auto_pull_stop::AUTO_PULL_SCAN) {
+        let stop_file = crate::auto_pull_stop::stop_file_path(
+            global_home,
+            crate::auto_pull_stop::AUTO_PULL_SCAN,
+        );
+        let trace_id = mika_common::trace::generate_trace_id();
+        info!(
+            event = "groom_pilot_autofire_stopped",
+            parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            repo = %repo,
+            issue = issue_num,
+            stop_file = %stop_file.display(),
+            trace_id = %trace_id,
+            "engine: groom-pilot auto-fire refused — the loop's dispatch brake is \
+             armed (mika#2498); the groom is kept, nothing was dispatched"
+        );
+
+        let system_session = format!("system-{}", parent.agent_id);
+        let reason = format!("groom_pilot_autofire_stopped (issue: {repo}#{issue_num})");
+        if let Err(e) = db
+            .log_audit_event(
+                &system_session,
+                GROOM_PILOT_DISPATCHER_TOOL,
+                &parent_id,
+                Some(GROOM_PILOT_BEFORE_VALUE),
+                Some(GROOM_PILOT_STOPPED_VALUE),
+                Some(&reason),
+                Some(&trace_id),
+            )
+            .await
+        {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to write groom-pilot-dispatcher stop audit event"
+            );
+        }
+        return;
+    }
 
     // 4. GitHub token required (the grooming-marker readiness check fetches the
     //    issue body; without a token it fails-open, but the dispatch is
@@ -3653,6 +4096,7 @@ async fn try_dispatch_pilot_after_groom_success(
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(
@@ -3809,10 +4253,10 @@ async fn try_dispatch_pilot_after_groom_success(
     if let Err(e) = db
         .log_audit_event(
             &system_session,
-            "task_engine_groom_pilot_dispatcher",
+            GROOM_PILOT_DISPATCHER_TOOL,
             &parent_id,
-            Some("groom_delivered"),
-            Some("implement_dispatched"),
+            Some(GROOM_PILOT_BEFORE_VALUE),
+            Some(GROOM_PILOT_DISPATCHED_VALUE),
             Some(&reason),
             Some(&trace_id),
         )
@@ -3822,6 +4266,134 @@ async fn try_dispatch_pilot_after_groom_success(
             parent_task_id = %parent_id,
             error = %e,
             "engine: failed to write groom-pilot-dispatcher audit event"
+        );
+    }
+}
+
+/// Audit `tool_name` under which a pilot cost overrun is recorded (mika#2496).
+///
+/// **SOLE WRITER.** This module is the only production site that writes it, and
+/// `canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer`
+/// refuses a second one. The property is what makes the operator's
+/// `SELECT count(*), avg(after_value) … WHERE tool_name = 'pilot_cost_overrun'`
+/// an exact count of the population the follow-up ticket has to size, instead
+/// of a number two writers can disagree about.
+pub(crate) const PILOT_COST_OVERRUN_TOOL: &str = "pilot_cost_overrun";
+
+/// Report — never prevent — a finished pilot dispatch whose cost crossed the
+/// alert threshold (mika#2496 U4).
+///
+/// **Retrospective by construction, and that is the whole of what this can be.**
+/// The dollar half of the rule ("kill at 120 turns / 40 USD") has no enforcement
+/// point anywhere: `claude-pilot`'s `_sdk_guardrail_kwargs` carries
+/// `if config.maxBudgetUsd > 0:` and ends on `pass`, and none of its
+/// application-level guardrails (`stallThreshold`, `emptyResponseThreshold`,
+/// `idleTimeoutMs`, `toolWaitCeilingMs`, `modelWaitCeilingMs`) measures dollars
+/// — they all measure time or productivity. So this counts and dates a
+/// population; it stops nothing, and the PR that ships it says so rather than
+/// letting the row read as a brake.
+///
+/// That count is the **explicit precondition** of the follow-up ticket on
+/// `senara-solutions/claude-pilot`: without it, that ticket opens on an
+/// intuition. It is also what tells the two readings of a quiet fleet apart —
+/// see the halt in the root `CLAUDE.md` (probe S4): a mute measurement and a
+/// fleet under the threshold produce the same silence, so a zero count while
+/// runs are known to exceed 40 USD means `extract_callback_fields` is not
+/// parsing `Cost:` on this population, never that all is well.
+///
+/// **An absent `cost_usd` emits nothing, and is never read as `0`** (mika#2331:
+/// `null` is never `0`). A dispatch whose callback carries no cost line is not
+/// a free dispatch; it is an unmeasured one, and reporting it at zero would put
+/// a false member into the very population this exists to size.
+///
+/// Best-effort and fire-and-forget, like its four siblings above: an audit
+/// write that fails warns and returns. Measuring a cost must not be able to
+/// break the delivery of the callback that carries it.
+async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshold_usd: f64) {
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let extracted = extract_callback_fields(result);
+    if extracted.is_null() {
+        return;
+    }
+    let pilot = &extracted["claude_pilot"];
+
+    // Absent → nothing. See the `null` is never `0` note above.
+    let cost_usd = match pilot.get("cost_usd").and_then(|v| v.as_f64()) {
+        Some(c) => c,
+        None => return,
+    };
+    // `partial_cmp` rather than `cost_usd <= threshold_usd`: the two differ on an
+    // incomparable value, and the difference runs the wrong way. A NaN cost is an
+    // UNMEASURED dispatch, so it must fall OUT of the population — which is what
+    // `!= Some(Greater)` says, and what `<=` would silently invert into a reported
+    // overrun carrying a garbage figure. Same rule as the absent `cost_usd` above.
+    if cost_usd.partial_cmp(&threshold_usd) != Some(std::cmp::Ordering::Greater) {
+        return;
+    }
+
+    let turns = pilot.get("turns").and_then(|v| v.as_u64());
+
+    // The ticket coordinates live on the PARENT's `reference_url` — the
+    // callback child carries a pgid and never a reference (the same two-row
+    // topology mika#2279 and mika#2335 had to name). Unresolvable coordinates
+    // downgrade the line, they never suppress it: a cost overrun on a dispatch
+    // whose parent cannot be read is still an overrun, and dropping it would
+    // silently shrink the population.
+    let mut repo = None;
+    let mut issue = None;
+    if let Some(parent_id) = &task.parent_task_id
+        && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
+        && let Some(url) = parent.reference_url.as_deref()
+        && let Some((r, n)) = parse_repo_issue_from_url(url)
+    {
+        repo = Some(r);
+        issue = Some(n);
+    }
+
+    warn!(
+        event = "pilot_cost_overrun",
+        repo = repo.as_deref().unwrap_or("unknown"),
+        issue = issue,
+        task_id = %task.id,
+        cost_usd = cost_usd,
+        turns = turns,
+        threshold_usd = threshold_usd,
+        "engine: pilot dispatch cost crossed the alert threshold (measured, not prevented — \
+         no dollar brake exists upstream)"
+    );
+
+    // `after_value` carries the cost and nothing else: it is what the operator
+    // averages. Repo/issue/turns ride in `reasoning`, which is free text.
+    let reasoning = format!(
+        "repo:{} issue:{} turns:{} threshold_usd:{threshold_usd}",
+        repo.as_deref().unwrap_or("unknown"),
+        issue.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+        turns.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+    );
+    let session_id = task
+        .created_by_session
+        .clone()
+        .unwrap_or_else(|| format!("callback-{}", task.id));
+    if let Err(e) = db
+        .log_audit_event(
+            &session_id,
+            PILOT_COST_OVERRUN_TOOL,
+            &format!("task:{}", task.id),
+            None,
+            Some(&format!("{cost_usd}")),
+            Some(&reasoning),
+            None,
+        )
+        .await
+    {
+        warn!(
+            task_id = %task.id,
+            error = %e,
+            "engine: failed to write pilot_cost_overrun audit event"
         );
     }
 }
@@ -4043,10 +4615,11 @@ mod tests {
     /// Couplé structurellement à l'énumération par
     /// `mika2334_every_scan_variant_is_covered` : ajouter une variante casse la
     /// compilation de ce test tant qu'elle n'est pas ajoutée ici.
-    const ALL_PERIODIC_SCANS: [PeriodicScan; 3] = [
+    const ALL_PERIODIC_SCANS: [PeriodicScan; 4] = [
         PeriodicScan::AutoPull,
         PeriodicScan::WipRescue,
         PeriodicScan::QaReviewReconcile,
+        PeriodicScan::WorktreeReap,
     ];
 
     /// Le couplage : le `match` exhaustif refuse de compiler quand une variante
@@ -4057,12 +4630,13 @@ mod tests {
             match scan {
                 PeriodicScan::AutoPull
                 | PeriodicScan::WipRescue
-                | PeriodicScan::QaReviewReconcile => {}
+                | PeriodicScan::QaReviewReconcile
+                | PeriodicScan::WorktreeReap => {}
             }
         }
         assert_eq!(
             ALL_PERIODIC_SCANS.len(),
-            3,
+            4,
             "une variante de PeriodicScan a été ajoutée : l'ajouter à \
              ALL_PERIODIC_SCANS, sinon les gardes mika#2205 ne la couvrent pas"
         );
@@ -4172,6 +4746,10 @@ mod tests {
             // mika#2334 — le quatrième scan naît avec la garde, il ne la
             // rejoint pas après une panne.
             "dispatch_qa_review_reconcile",
+            // mika#2420 — idem pour le cinquième, dont l'action est en plus
+            // destructive : un PAT absent tuerait le reaper pendant que le
+            // disque se remplit.
+            "dispatch_worktree_reap",
         ] {
             let sig = format!("async fn {fn_name}(");
             let start = src
@@ -4217,27 +4795,35 @@ mod tests {
         )
         .expect("la garde doit pouvoir lire dispatcher.rs");
 
-        let sig = "async fn dispatch_auto_pull_groomed(";
-        let start = src
-            .find(sig)
-            .expect("dispatch_auto_pull_groomed doit exister");
-        let rest = &src[start + sig.len()..];
-        let end = rest.find("\n    async fn ").unwrap_or(rest.len());
-        let body = &rest[..end];
+        // mika#2420 — le cinquième scan porte le même interrupteur, et la garde
+        // couvre les deux : un STOP posé plus bas que la résolution de token
+        // paierait un échange GitHub App par tick pour ne rien faire, et sur un
+        // scan destructif il retarderait en plus l'arrêt qu'un opérateur
+        // demande en pleine incidence.
+        for fn_name in ["dispatch_auto_pull_groomed", "dispatch_worktree_reap"] {
+            let sig = format!("async fn {fn_name}(");
+            let start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("{fn_name} doit exister"));
+            let rest = &src[start + sig.len()..];
+            let end = rest.find("\n    async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
 
-        let stop_at = body
-            .find("auto_pull_stop::is_stopped")
-            .expect("le court-circuit STOP mika#2329 doit être dans dispatch_auto_pull_groomed");
-        let token_at = body
-            .find("resolve_periodic_scan_token")
-            .expect("la résolution de token doit être dans dispatch_auto_pull_groomed");
+            let stop_at = body
+                .find("auto_pull_stop::is_stopped")
+                .unwrap_or_else(|| panic!("le court-circuit STOP doit être dans {fn_name}"));
+            let token_at = body
+                .find("resolve_periodic_scan_token")
+                .unwrap_or_else(|| panic!("la résolution de token doit être dans {fn_name}"));
 
-        assert!(
-            stop_at < token_at,
-            "mika#2329 — le court-circuit STOP doit précéder toute résolution de \
-             token, sinon un STOP armé paie deux résolutions (dont un échange \
-             GitHub App sur le réseau) à chaque tick pour ne rien faire"
-        );
+            assert!(
+                stop_at < token_at,
+                "mika#2329 — dans {fn_name}, le court-circuit STOP doit précéder \
+                 toute résolution de token, sinon un STOP armé paie une \
+                 résolution (dont un échange GitHub App sur le réseau) à chaque \
+                 tick pour ne rien faire"
+            );
+        }
     }
 
     fn test_db() -> AsyncDatabase {
@@ -4255,6 +4841,13 @@ mod tests {
     /// `/tmp` serait un chemin qu'un opérateur peut créer par mégarde sur sa
     /// machine, et les tests s'en trouveraient couplés à son disque.
     const TEST_GLOBAL_HOME: &str = "/tmp/mika-test-global-home-absent";
+
+    /// Le home global des tests qui ne portent **aucun** frein armé — donc le
+    /// chemin nominal de mika#2498, celui que tous les tests historiques de
+    /// l'auto-fire prennent.
+    fn no_stop_home() -> &'static std::path::Path {
+        std::path::Path::new(TEST_GLOBAL_HOME)
+    }
 
     fn test_dispatcher_with_homes(
         db: AsyncDatabase,
@@ -4285,6 +4878,7 @@ mod tests {
             settings,
             pr_reviews_posted: None,
             auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         }
     }
@@ -4293,12 +4887,7 @@ mod tests {
 
     /// Arme le STOP en posant le fichier sentinelle sous le home global donné.
     fn arm_auto_pull_stop(global_home: &std::path::Path) {
-        let path = crate::auto_pull_stop::stop_file_path(
-            global_home,
-            crate::auto_pull_stop::AUTO_PULL_SCAN,
-        );
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "").unwrap();
+        arm_stop_for(global_home, crate::auto_pull_stop::AUTO_PULL_SCAN);
     }
 
     fn lift_auto_pull_stop(global_home: &std::path::Path) {
@@ -5211,6 +5800,223 @@ mod tests {
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
         // Should not panic or error — just returns early
         try_extract_callback_metadata(&db, &task).await;
+    }
+
+    // ===== try_report_pilot_cost_overrun tests (mika#2496 U4 / V5) =====
+
+    /// Build a parent + its callback child carrying `result`, and return the
+    /// loaded callback task. Mirrors the two-row topology production writes:
+    /// the issue URL lives on the PARENT, the dispatch on the child.
+    async fn mika2496_dispatch_pair(db: &AsyncDatabase, result: &str) -> Task {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#2484".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/2484".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id),
+            depth: 1,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("callback-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some(result))
+            .await
+            .unwrap();
+        db.get_task_unscoped(&callback_id).await.unwrap().unwrap()
+    }
+
+    /// The population the follow-up cpp ticket has to size: #2484's own numbers.
+    const MIKA2496_RUNAWAY: &str = "claude-pilot completed (status: done).\n\
+         Session: runaway\n\
+         Turns: 201\n\
+         Cost: $86.00\n\
+         Duration: 9960000ms";
+
+    #[tokio::test]
+    async fn mika2496_a_cost_above_the_threshold_is_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2496_RUNAWAY).await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "mika#2496 — #2484's 86 USD must land in the population the cpp \
+             follow-up ticket is conditioned on"
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == PILOT_COST_OVERRUN_TOOL)
+            .expect("the audit row must be readable from the callback session");
+        // `after_value` carries the cost and nothing else: it is the column the
+        // operator's `avg()` reads.
+        assert_eq!(row.after_value.as_deref(), Some("86"));
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(reasoning.contains("issue:2484"), "reasoning: {reasoning}");
+        assert!(reasoning.contains("turns:201"), "reasoning: {reasoning}");
+    }
+
+    /// **Contrôle négatif.** Without it, "the measurement decides" would be
+    /// indistinguishable from "the measurement fires on every dispatch" — and a
+    /// row written on every callback would drown the very population it exists
+    /// to size.
+    #[tokio::test]
+    async fn mika2496_a_cost_below_the_threshold_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "claude-pilot completed (status: done).\n\
+             Session: nominal\nTurns: 91\nCost: $7.07\nDuration: 996000ms",
+        )
+        .await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2496 — a nominal dispatch must not enter the overrun population"
+        );
+    }
+
+    /// The threshold is the decision, not a constant baked into the predicate:
+    /// the same run is an overrun at 40 and is not at 100.
+    #[tokio::test]
+    async fn mika2496_the_threshold_is_what_decides() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2496_RUNAWAY).await;
+
+        try_report_pilot_cost_overrun(&db, &task, 100.0).await;
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// **`null` is never `0`** (mika#2331). A callback with no `Cost:` line is
+    /// an UNMEASURED dispatch, not a free one; counting it at zero would put a
+    /// false member into the population — and, at any positive threshold, would
+    /// silently make the measurement report fewer overruns than there are.
+    #[tokio::test]
+    async fn mika2496_an_absent_cost_is_not_a_zero_cost() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "claude-pilot completed (status: done).\nSession: unmeasured\nTurns: 201",
+        )
+        .await;
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2496 — an absent cost must emit nothing, never a zero"
+        );
+    }
+
+    /// Unresolvable ticket coordinates DOWNGRADE the line, they never suppress
+    /// it. An overrun on a dispatch whose parent cannot be read is still an
+    /// overrun, and dropping it would silently shrink the population.
+    #[tokio::test]
+    async fn mika2496_an_orphan_dispatch_still_counts() {
+        let db = test_db();
+        let callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = db.create_task(callback).await.unwrap();
+        db.update_task_completed(&callback_id, Some(MIKA2496_RUNAWAY))
+            .await
+            .unwrap();
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_report_pilot_cost_overrun(&db, &task, 40.0).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PILOT_COST_OVERRUN_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     // ===== try_write_callback_summary tests (mika#965) =====
@@ -6670,6 +7476,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -6692,6 +7499,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -6728,6 +7536,7 @@ mod tests {
             &task,
             None,
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -6752,6 +7561,7 @@ mod tests {
             &task,
             Some("ghp_token"),
             &crate::skills::SkillRegistry::empty(),
+            no_stop_home(),
         )
         .await;
 
@@ -6863,6 +7673,319 @@ mod tests {
         let cb = db.get_task_unscoped(&cb_id).await.unwrap().unwrap();
         assert_eq!(cb.dispatch_class.as_deref(), Some("implement"));
         assert_eq!(cb.parent_task_id.as_deref(), Some(parent_id.as_str()));
+    }
+
+    // ---- mika#2498: la sentinelle borne l'auto-fire groom→implement ----
+
+    /// Les `after_value` écrits sous [`GROOM_PILOT_DISPATCHER_TOOL`] pour ce
+    /// parent, dans l'ordre. C'est la surface opérateur du § 9 du plan — les deux
+    /// issues du même dispatcheur, soustractibles par `GROUP BY after_value`.
+    async fn groom_pilot_audit_outcomes(db: &AsyncDatabase, parent_id: &str) -> Vec<String> {
+        db.get_audit_events("system-mika")
+            .await
+            .expect("la lecture des audit_events ne doit pas échouer")
+            .into_iter()
+            .filter(|e| e.tool_name == GROOM_PILOT_DISPATCHER_TOOL && e.target_key == parent_id)
+            .filter_map(|e| e.after_value)
+            .collect()
+    }
+
+    /// Arme le frein d'un scan donné sous le home global fourni, sans jamais
+    /// recomposer le chemin (garde mika#2329 : `auto_pull_stop` en est le lecteur
+    /// unique, y compris pour les tests).
+    fn arm_stop_for(global_home: &std::path::Path, scan: &str) {
+        let path = crate::auto_pull_stop::stop_file_path(global_home, scan);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+    }
+
+    /// Un registre portant **réellement** `run_claude_pilot` comme handler exec
+    /// long-running — le motif de `verdict_handler`'s `dev_pilot` fixture.
+    ///
+    /// **C'est ce qui empêche T1 et T5 d'être vides.** Avec un
+    /// `SkillRegistry::empty()`, la fonction sort à l'étape 5a (outil absent du
+    /// registre) *avant* la bascule 5c, donc « le `dispatch_class` n'a pas
+    /// bougé » serait trivialement vrai et ne dirait rien du placement de la
+    /// garde. Avec ce registre, une garde descendue sous 5c laisse la bascule se
+    /// produire et T5 rougit — ce pour quoi il existe.
+    ///
+    /// Le `TempDir` est rendu à l'appelant : il doit vivre aussi longtemps que le
+    /// registre, sinon `skill_dir` désigne un répertoire supprimé.
+    fn dev_pilot_registry() -> (tempfile::TempDir, crate::skills::SkillRegistry) {
+        use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+        use crate::skills::manifest::{SkillInfo, SkillManifest, Triggers};
+        use mika_common::claude::ToolDefinition;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("run.sh"), "#!/bin/sh\nexit 0").unwrap();
+
+        let mut dev_pilot = SkillEntry {
+            manifest: SkillManifest {
+                skill: SkillInfo {
+                    name: "dev-pilot".to_string(),
+                    description: "dev-pilot skill".to_string(),
+                    version: String::new(),
+                    always_on: false,
+                    timeout_secs: 30,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                    data_grade: Default::default(),
+                },
+                triggers: Triggers { keywords: vec![] },
+                llm: Default::default(),
+                constraints: Default::default(),
+                output: Default::default(),
+                context: std::collections::HashMap::new(),
+                variants: Default::default(),
+            },
+            dir: tmp.path().to_path_buf(),
+            keywords_lower: vec![],
+            prompt_snippet: String::new(),
+            skill_tools: vec![],
+            enabled: true,
+            has_override: false,
+            provider_overrides: std::collections::HashMap::new(),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
+            model_overrides: std::collections::HashMap::new(),
+        };
+        dev_pilot.skill_tools = vec![ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "dispatch".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(600),
+                detaches_command: false,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        }];
+
+        let registry = crate::skills::SkillRegistry::from_test_entries(vec![dev_pilot]);
+        (tmp, registry)
+    }
+
+    /// **T1 / AC1 + AC6** — le frein armé refuse le dispatch, et le dit.
+    ///
+    /// Trois assertions parce que « rien n'est parti » et « quelque chose l'a
+    /// dit » sont deux faits distincts : sans la row d'audit, un refus serait
+    /// indistinguable d'un auto-fire qui n'a jamais eu lieu (classe mika#2205).
+    #[tokio::test]
+    async fn mika2498_la_sentinelle_refuse_lauto_fire_et_le_dit() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+        // Registre RÉEL : sans lui, « aucune row callback » serait vrai par
+        // l'étape 5a (outil absent) et n'attesterait rien du frein.
+        let (_skill_dir, skills) = dev_pilot_registry();
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(&db, &task, Some("ghp_token"), &skills, tmp.path())
+            .await;
+
+        let children = db.get_child_tasks(&parent_id).await.unwrap();
+        let implement_children: Vec<&Task> = children
+            .iter()
+            .filter(|c| {
+                c.label.starts_with("long_running:run_claude_pilot") && !c.label.contains("_groom")
+            })
+            .collect();
+        assert!(
+            implement_children.is_empty(),
+            "sous frein armé, aucune row callback d'implémentation ne doit naître — \
+             trouvé : {:?}",
+            implement_children
+                .iter()
+                .map(|c| &c.label)
+                .collect::<Vec<_>>()
+        );
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.iter().any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "le refus doit être attribuable : une row `{GROOM_PILOT_STOPPED_VALUE}` \
+             est attendue, trouvé {outcomes:?}"
+        );
+        assert!(
+            !outcomes.iter().any(|o| o == GROOM_PILOT_DISPATCHED_VALUE),
+            "aucun dispatch n'a eu lieu : `{GROOM_PILOT_DISPATCHED_VALUE}` ne doit \
+             pas apparaître, trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T2 / AC2 — contrôle négatif, et il est porteur.**
+    ///
+    /// Sans lui, T1 passerait sur une fonction qui rend la main
+    /// inconditionnellement. Fixture identique, frein **absent** : la fonction
+    /// doit dépasser le contrôle et atteindre son chemin de saut préexistant
+    /// (registre vide ⇒ `run_claude_pilot` introuvable, étape 5a), donc n'écrire
+    /// aucune row d'audit du tout.
+    #[tokio::test]
+    async fn mika2498_sans_sentinelle_le_chemin_preexistant_est_atteint() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        // Rien n'est armé : `state/` n'existe même pas, le cas nominal.
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.is_empty(),
+            "frein absent : la garde ne doit rien écrire, et le saut préexistant \
+             (5a, outil absent du registre) n'écrit rien non plus — trouvé {outcomes:?}"
+        );
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "le saut de l'étape 5a précède la bascule 5c — comportement inchangé"
+        );
+    }
+
+    /// **T3 / AC3** — les scans ne se coupent pas l'un l'autre.
+    ///
+    /// Miroir d'`auto_pull_stop::tests::mika2329_le_chemin_est_parametre_par_le_scan`,
+    /// au site de production cette fois : le frein du reaper de worktrees
+    /// (mika#2420) est une décision distincte et ne doit rien arrêter ici.
+    #[tokio::test]
+    async fn mika2498_le_frein_du_reaper_narrete_pas_lauto_fire() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::WORKTREE_REAP_SCAN);
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            !outcomes.iter().any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "un frein posé sur un autre scan ne doit pas arrêter l'auto-fire — \
+             trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T4 / AC4** — la ligne signifie « un dispatch a été refusé », pas « un
+    /// callback est arrivé pendant un STOP ».
+    ///
+    /// Épingle le placement du § 4 du plan : un callback de groom **non
+    /// convergé** (`PLAN_ITERATE`) sort à l'étape 2, avant la garde. Une garde
+    /// remontée en tête de fonction ferait rougir ce test — et, en production,
+    /// écrirait un fait sans conduite associée des dizaines de fois par jour.
+    #[tokio::test]
+    async fn mika2498_un_callback_non_converge_nemet_aucun_refus() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, false, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &crate::skills::SkillRegistry::empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.is_empty(),
+            "un groom qui n'a pas convergé n'aurait dispatché de toute façon : \
+             la garde ne doit rien écrire — trouvé {outcomes:?}"
+        );
+    }
+
+    /// **T5 / AC5 — et c'est sa seule raison d'être.**
+    ///
+    /// Attrape une garde placée **après** l'étape 5c. Celle-ci bascule le
+    /// `dispatch_class` du parent groom→implement *avant* le contrôle de
+    /// readiness, pour que la garde de slot par classe (#1001) porte sur le bon
+    /// slot. Une garde placée après laisserait un parent étiqueté `implement`
+    /// sans aucun implement en vol, et le prochain dispatch légitime serait
+    /// compté sur le mauvais slot.
+    #[tokio::test]
+    async fn mika2498_le_refus_ne_bascule_pas_le_dispatch_class_du_parent() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+        // Registre RÉEL — c'est ce qui rend ce test sensible au placement : avec
+        // un registre vide, la fonction sortirait à 5a *avant* la bascule et
+        // l'assertion serait trivialement vraie.
+        let (_skill_dir, skills) = dev_pilot_registry();
+
+        let (parent_id, callback_id) =
+            create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(&db, &task, Some("ghp_token"), &skills, tmp.path())
+            .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "le refus n'écrit rien : le parent reste groom-class, sans quoi un slot \
+             `implement` serait compté occupé par un dispatch qui n'existe pas (#1001)"
+        );
+        // Et la garde a bien été *atteinte* — sans cette moitié, une garde
+        // descendue sous 5a passerait le test en sortant plus tôt.
+        assert!(
+            groom_pilot_audit_outcomes(&db, &parent_id)
+                .await
+                .iter()
+                .any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "la garde doit avoir été atteinte et avoir refusé"
+        );
+    }
+
+    /// **T7 / AC7** — les valeurs d'audit sont un format de fil.
+    ///
+    /// Elles atterrissent dans `audit_events.tool_name` / `.after_value` et
+    /// l'opérateur en fait des `GROUP BY` (§ 9 du plan). Deux orthographes d'une
+    /// même issue couperaient une population en deux sans le dire — la leçon que
+    /// mika#2323 a dû engraver.
+    #[test]
+    fn mika2498_les_valeurs_daudit_sont_un_format_de_fil() {
+        assert_eq!(
+            GROOM_PILOT_DISPATCHER_TOOL,
+            "task_engine_groom_pilot_dispatcher"
+        );
+        assert_eq!(GROOM_PILOT_DISPATCHED_VALUE, "implement_dispatched");
+        assert_eq!(GROOM_PILOT_STOPPED_VALUE, "stopped_by_sentinel");
+        // `before_value` n'est pas un discriminant de population, mais il est du
+        // même fil : deux orthographes rendraient une jointure historique fausse.
+        assert_eq!(GROOM_PILOT_BEFORE_VALUE, "groom_delivered");
+        assert_ne!(
+            GROOM_PILOT_DISPATCHED_VALUE, GROOM_PILOT_STOPPED_VALUE,
+            "les deux issues doivent rester soustractibles"
+        );
     }
 
     // ---- mika#2287: the #1620 dispatch gate must survive the #1614 flip ----

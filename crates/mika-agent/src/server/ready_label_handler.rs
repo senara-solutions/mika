@@ -19,6 +19,7 @@
 //! entry: this handler runs **before** the LLM turn; the guard runs **after**
 //! the LLM turn. Two layers, two failure modes.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -112,6 +113,9 @@ pub(crate) enum ReadyLabelGate {
     RepoNotDispatchable,
     /// Gate 2c — a pilot is still running for this issue (mika#2279).
     PilotInFlight,
+    /// Gate 2d — the host egress relay is down, so no pilot can leave contained
+    /// (mika#2049).
+    EgressRelayDown,
     /// Step 3 — no GitHub token resolved.
     NoToken,
     /// Step 4 — `gh issue view` failed.
@@ -146,6 +150,10 @@ impl ReadyLabelGate {
             Self::ParseFailed => "parse_failed",
             Self::RepoNotDispatchable => "repo_not_dispatchable",
             Self::PilotInFlight => "pilot_in_flight",
+            // mika#2049 — the SAME value as `auto_pull`'s `FILTER_EGRESS_DOWN`,
+            // deliberately: one cause, two audit surfaces. Pinned on both sides
+            // by `auto_pull::tests::mika2131_filter_names_are_a_wire_format`.
+            Self::EgressRelayDown => "egress_relay_down",
             Self::NoToken => "no_token",
             Self::BodyFetchFailed => "body_fetch_failed",
             Self::SeatMismatch => "seat_mismatch",
@@ -314,6 +322,337 @@ async fn emit_ready_label_outcome(
     }
 }
 
+/// `audit_events.tool_name` of the mika#2242 dé-groomage attribution.
+///
+/// # SOLE WRITER, and deliberately NOT the producer's name
+///
+/// Two names because the two populations genuinely differ. The producer
+/// (`closing_pr_closed_unmerged`) counts *every* unmerged close × closing ref,
+/// including the harmless ones — a draft PR closed, a PR superseded. This one
+/// counts the sub-set that **actually** fell back to `groom` while carrying the
+/// marker: the defect. The producer's count must dominate this one by a wide
+/// margin; that is the healthy regime, and it is subtractible only while each
+/// name has one writer. Fifth use of the motif after `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156).
+pub const READY_LABEL_DEGROOMED_TOOL: &str = "ready_label_degroomed";
+
+/// What the reader could recover from the producer's row.
+///
+/// The granularity of the fail-soft is load-bearing: the reader's **decision**
+/// rests on the row's *presence* alone, and `head_branch` is an enrichment. An
+/// unusable `reasoning` therefore yields "dé-groomé by pr#N, branch unknown",
+/// never a silence — losing the pointer is a smaller loss than losing the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DegroomMarker {
+    /// The producer's `after_value`, re-emitted verbatim so both halves
+    /// `GROUP BY` the same shape. `None` only if the column was NULL, which the
+    /// producer never writes.
+    pub pr_ref: Option<String>,
+    /// The branch carrying the plan the sub-ticket was groomed under.
+    pub head_branch: Option<String>,
+}
+
+/// Unfold the producer's `clé=valeur` record. Pure — testable without a DB.
+///
+/// Tolerant by construction: an absent, empty or unparseable `reasoning` costs
+/// the branch and nothing else. `head_branch` is read as the token up to the
+/// next space, which is what the producer writes and what a branch name can be.
+pub(crate) fn parse_degroom_marker(
+    after_value: Option<&str>,
+    reasoning: Option<&str>,
+) -> DegroomMarker {
+    let head_branch = reasoning
+        .and_then(|r| r.split_once("head_branch="))
+        .map(|(_, tail)| tail.split_whitespace().next().unwrap_or_default())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+
+    DegroomMarker {
+        pr_ref: after_value.filter(|v| !v.is_empty()).map(str::to_string),
+        head_branch,
+    }
+}
+
+/// Lower bound of the marker lookup: the ledger's own retention.
+///
+/// Derived from [`crate::evidence::audit::AUDIT_RETENTION_DAYS`] rather than
+/// written here, so the window cannot outlive the rows it reads. Named cost: a
+/// ticket untied longer ago than that loses its attribution and reads as "simply
+/// not groomed" — i.e. the pre-mika#2242 behaviour. Fail-open, safe direction.
+fn degroom_marker_lookup_since() -> String {
+    crate::timestamp::now_minus(chrono::Duration::days(
+        crate::evidence::audit::AUDIT_RETENTION_DAYS as i64,
+    ))
+}
+
+/// Name the dé-groomage when the routing falls back to `groom` and the producer
+/// left a marker on this ticket (mika#2242 R3).
+///
+/// # Fail-open on every read (R5)
+///
+/// An unreadable ledger, an absent marker, an unusable `reasoning`: the routing
+/// is identical to today's. The only thing a failure of this path can cost is an
+/// **explanation** — never a fabricated one, and never a changed decision.
+///
+/// # Agent scope is a condition of operation, not a detail
+///
+/// `audit_events` is scoped by `agent_id`, so producer and reader must run on
+/// the same agent. They do: `route_event` returns `mika-dev` for
+/// `pull_request.closed` **and** for `issues.labeled`. Written here because if
+/// that ceased to be true the marker would become invisible **without any test
+/// going red** — same reason `ci_success_handler` carries its own scope note.
+/// Corollary, named: seat resolution (mika#2084) could route a repo's events to
+/// a distinct `dispatch:<seat>`; split across seats, the reader falls back to
+/// today's behaviour — fail-open, never a false attribution.
+async fn note_degroomed_ticket(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    location: &ReadyLabelLocation,
+    missing_markers: &[&'static str],
+) {
+    let owner_repo = location.owner_repo();
+    let target_key =
+        crate::server::upstream_close_handler::degroom_marker_key(&owner_repo, location.number);
+
+    let row = match db
+        .latest_audit_event_for_target(
+            crate::server::upstream_close_handler::CLOSING_PR_CLOSED_UNMERGED_TOOL,
+            &target_key,
+            &degroom_marker_lookup_since(),
+        )
+        .await
+    {
+        // The nominal first grooming: no marker, nothing to say.
+        Ok(None) => return,
+        Ok(Some(row)) => row,
+        Err(e) => {
+            warn!(
+                event = "ready_label_degroom_ledger_unreadable",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: dé-groomage ledger unreadable — routing \
+                 unchanged, attribution lost (mika#2242)"
+            );
+            return;
+        }
+    };
+
+    let (after_value, reasoning, recorded_at) = row;
+    let marker = parse_degroom_marker(after_value.as_deref(), reasoning.as_deref());
+    let pr_ref = marker.pr_ref.unwrap_or_else(|| "pr#unknown".to_string());
+    let head_branch = marker
+        .head_branch
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let missing = missing_markers.join(",");
+
+    info!(
+        event = "ready_label_degroomed",
+        repo = %owner_repo,
+        num = location.number,
+        pr = %pr_ref,
+        head_branch = %head_branch,
+        missing_markers = %missing,
+        recorded_at = %recorded_at,
+        trace_id,
+        "ready_label_handler: ticket routed to `groom` because a closing PR was \
+         closed without merging — its plan lives on that PR's branch (mika#2242)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            READY_LABEL_DEGROOMED_TOOL,
+            &target_key,
+            None,
+            Some(&pr_ref),
+            Some(&format!(
+                "head_branch={head_branch} missing_markers={missing} recorded_at={recorded_at}"
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "ready_label_audit_log_failed",
+            repo = %owner_repo,
+            num = location.number,
+            error = %e,
+            "ready_label_handler: failed to write dé-groomage audit event (non-fatal)"
+        );
+    }
+}
+
+/// `audit_events.tool_name` du bras « callouts présents, aucune preuve »
+/// (mika#2484 R1).
+///
+/// # SOLE WRITER
+///
+/// C'est la **preuve primaire** de R1 : chaque ligne est un ticket qui serait
+/// parti en `implement` sur un grooming que le chemin moteur n'a jamais
+/// vérifié, et qui part en `groom`. Régime attendu **non vide et faible**.
+/// Deux écrivains rendraient le `GROUP BY` de la sonde S1 silencieusement
+/// faux ; épinglé par
+/// `canonical_tokens::tests::mika2484_the_two_routing_audit_names_have_a_single_writer`.
+pub const READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL: &str = "ready_label_markers_without_proof";
+
+/// `audit_events.tool_name` du bras dégradé (mika#2484 R4).
+///
+/// # SOLE WRITER, et délibérément DISTINCT de son voisin
+///
+/// « La base n'a pas répondu » et « la base a répondu qu'il n'y a pas de
+/// preuve » sont deux états de signes opposés : le premier est une **panne**,
+/// le second la population mesurée du ticket. Les fondre rendrait la sonde S1
+/// incomptable et ferait lire une panne DB comme un succès du correctif.
+/// Régime attendu : **vide** (sonde S4).
+pub const READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL: &str = "ready_label_groom_proof_unreadable";
+
+/// Le routage, comme fonction pure de l'état de grooming (mika#2484 D1).
+///
+/// Rend `(target_tool, target_skill, dispatch_class)`.
+///
+/// # `match` exhaustif, aucun bras `_ =>`
+///
+/// Les trois causes qui mènent à `groom` sont nommées une à une, et un
+/// cinquième état de [`crate::skills::executor::GroomedState`] sera une erreur
+/// de compilation ici plutôt qu'un `dev-pilot` par défaut. Épinglé par un scan
+/// de source, parce qu'un `_ =>` ajouté plus tard ne ferait rougir aucune
+/// assertion : il rendrait simplement la décision muette sur un état neuf.
+///
+/// Extraite du corps du handler pour être **testable sans base ni réseau** —
+/// c'est le seul moyen d'attester le bras `ProofUnreadable`, dont la production
+/// suppose une base en panne (qui ferait alors échouer l'étape 7 et l'écriture
+/// d'audit du même coup).
+pub(crate) fn route_for(
+    state: &crate::skills::executor::GroomedState,
+) -> (&'static str, &'static str, &'static str) {
+    use crate::skills::executor::GroomedState;
+    match state {
+        GroomedState::Groomed => ("run_claude_pilot", "dev-pilot", "implement"),
+        // Le cas nominal d'un premier grooming — le comportement d'avant
+        // mika#2484, inchangé.
+        GroomedState::MarkersMissing(_)
+        // Callouts présents, aucune preuve : le défaut que mika#2484 ferme.
+        // Routé `groom` **parce que c'est la seule route qui peut produire la
+        // preuve manquante** ; routé `implement`, il part se faire refuser
+        // `dispatch_grooming_not_verified` à l'étape 9d, sans aucune issue.
+        //
+        // Ce n'est PAS une garantie de convergence, et la nuance est la limite
+        // nommée en D4 : si le plan résout encore sur la branche de dispatch,
+        // le dev-groom répond `already_groomed` (mika#2012) et ne frappe
+        // **aucune** preuve — le ticket repassera au tour suivant. Cette
+        // population-là est bornée ailleurs, par le budget de re-drive de
+        // mika#2020, au même endroit qu'avant ce ticket. Ce que le routage
+        // achète est le cas où le plan n'est plus sur la branche : là le groom
+        // converge et frappe la preuve, là où l'ancien chemin ne le pouvait
+        // jamais. Coût assumé du changement : la tentative consomme désormais
+        // un subprocess et le slot `groom`, là où l'étape 9d la refusait à bon
+        // marché.
+        | GroomedState::MarkersWithoutProof
+        // Preuve illisible : au routage, la direction sûre est le travail le
+        // moins dangereux, pas le plus avancé (R4).
+        | GroomedState::ProofUnreadable(_) => ("run_claude_pilot_groom", "dev-groom", "groom"),
+    }
+}
+
+/// La ligne que le routage doit écrire pour cet état, ou `None` quand il doit
+/// rester muet (mika#2484 R5).
+///
+/// Rend `(tool_name, after_value, reasoning, message)`. Pure et exhaustive,
+/// pour la même raison que [`route_for`] : le bras `ProofUnreadable` n'est pas
+/// atteignable en production sans une base en panne, qui empêcherait justement
+/// l'écriture qu'on veut observer.
+fn routing_note(
+    state: &crate::skills::executor::GroomedState,
+) -> Option<(&'static str, &'static str, String, &'static str)> {
+    use crate::skills::executor::GroomedState;
+    match state {
+        // Le chemin nominal (R5) et le premier grooming, que
+        // `note_degroomed_ticket` couvre déjà sous son propre nom.
+        GroomedState::Groomed | GroomedState::MarkersMissing(_) => None,
+        GroomedState::MarkersWithoutProof => Some((
+            READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL,
+            "routed_groom",
+            "cause=markers_without_proof".to_string(),
+            "ready_label_handler: le corps porte les trois callouts mais aucune \
+             preuve `Outcome: PLAN_GROOMED` n'existe en base — routé vers \
+             dev-groom au lieu de dev-pilot (mika#2484)",
+        )),
+        GroomedState::ProofUnreadable(e) => Some((
+            READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL,
+            "routed_groom",
+            format!("cause=proof_unreadable error={e}"),
+            "ready_label_handler: la preuve de grooming n'a pas pu être lue — \
+             routé vers dev-groom par sûreté (mika#2484 R4)",
+        )),
+    }
+}
+
+/// Nommer la cause quand le routage tombe sur `groom` pour une raison que
+/// mika#2484 **ajoute** (R1, R4, R5).
+///
+/// # Ce bloc ne décide rien
+///
+/// Il lit le verdict de l'étape 5 et n'en change aucun — même `target_skill`,
+/// même `dispatch_class`, même `ReadyLabelGate` que si ces lignes n'existaient
+/// pas. Aucune porte n'est ajoutée, retirée, élargie ni resserrée (R6) : un
+/// ticket callouté-sans-preuve **part** en dispatch, comme avant, seulement
+/// vers l'autre outil.
+///
+/// # Ni dédupliqué, ni silencieux sur zéro
+///
+/// La population est de quelques événements par jour, chacun un fait daté
+/// qu'on veut **compter** — même arbitrage que `ready_label_outcome`
+/// (mika#2323), et l'inverse de la déduplication d'`auto_pull_exclusion`
+/// (mika#2131), dont un tick classe une centaine de tickets. Silencieux sur
+/// `Groomed` (le chemin nominal, R5) et sur `MarkersMissing`, que
+/// `note_degroomed_ticket` couvre déjà sous son propre nom.
+async fn note_groomed_state(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    location: &ReadyLabelLocation,
+    state: &crate::skills::executor::GroomedState,
+) {
+    let Some((tool, after_value, reasoning, message)) = routing_note(state) else {
+        return;
+    };
+
+    let owner_repo = location.owner_repo();
+    info!(
+        event = tool,
+        repo = %owner_repo,
+        num = location.number,
+        reason = %reasoning,
+        trace_id,
+        "{}",
+        message
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            tool,
+            &format!("{}#{}", owner_repo, location.number),
+            None,
+            Some(after_value),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "ready_label_audit_log_failed",
+            repo = %owner_repo,
+            num = location.number,
+            error = %e,
+            "ready_label_handler: failed to write groomed-state routing audit event \
+             (non-fatal)"
+        );
+    }
+}
+
 /// Attempt to handle a `[GitHub] Issue labeled ready on …` webhook structurally
 /// before the LLM turn.
 ///
@@ -325,6 +664,7 @@ async fn emit_ready_label_outcome(
 /// degraded path. Returns `VerdictAction::Passthrough` when the event is not a
 /// ready-label marker, when parsing fails, or when a required precondition
 /// (github token, issue body fetch, task pre-create) cannot be satisfied.
+#[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ready_label_dispatch(
     text: &str,
     db: &AsyncDatabase,
@@ -333,6 +673,7 @@ pub async fn try_handle_ready_label_dispatch(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    global_home_dir: &Path,
 ) -> VerdictAction {
     try_handle_ready_label_dispatch_with_fetcher(
         text,
@@ -342,6 +683,7 @@ pub async fn try_handle_ready_label_dispatch(
         session_id,
         trace_id,
         skills,
+        global_home_dir,
         |owner_repo, number, token| async move {
             fetch_issue_body_and_labels_via_gh(&owner_repo, number, &token).await
         },
@@ -384,6 +726,12 @@ pub async fn try_handle_ready_label_dispatch_with_fetcher<F, Fut>(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    // The **global** home, for the mika#2049 egress-relay gate. Passed rather
+    // than resolved here: the stamp is written by the dispatch child under
+    // `$HOME/.mika`, and the engine must read it under the same home its own
+    // `global_home_dir` resolves — see `pilot_egress_stamp`'s module doc on what
+    // a divergence between the two costs.
+    global_home_dir: &Path,
     fetch_issue: F,
 ) -> VerdictAction
 where
@@ -424,6 +772,7 @@ where
         session_id,
         trace_id,
         skills,
+        global_home_dir,
         fetch_issue,
     )
     .await;
@@ -452,6 +801,8 @@ async fn try_handle_ready_label_dispatch_inner<F, Fut>(
     session_id: &str,
     trace_id: &str,
     skills: &SkillRegistry,
+    // mika#2049 — see the wrapper's note on why this is passed, not resolved.
+    global_home_dir: &Path,
     fetch_issue: F,
 ) -> (VerdictAction, ReadyLabelGate)
 where
@@ -633,6 +984,89 @@ where
         );
     }
 
+    // 2d. Egress-relay gate (mika#2049). The host egress relay is down, so
+    //     `dispatch-lib` would refuse this launch anyway (fail-closed since the
+    //     operator decision of 2026-09-20). Refusing here spends no token, no
+    //     `gh issue view`, creates no tracking row and queues no deferred
+    //     dispatch — the same property the three gates above state.
+    //
+    //     THIS GATE PROTECTS NOTHING, and saying so is what keeps it honest. The
+    //     protection is the shell guard, which probes the socket on every
+    //     dispatch and reads no persistent state. This is an economy: it keeps a
+    //     relay outage from burning tickets' re-drive budget, which is what
+    //     turns « the loop resumes on its own » into a fact rather than a hope.
+    //     Anyone tempted to harden it because it is fail-open should know the
+    //     safety does not rest on it; anyone tempted to make the SHELL guard read
+    //     this stamp would turn the protection into a cache, and a stale cache is
+    //     a fail-open with one more step.
+    //
+    //     Placement mirrors 2c and for the same reasons: after the cheap
+    //     in-memory gates, before step 3's token resolution. Ordering against 2c
+    //     is deliberate — a ticket both in flight and behind a dead relay is
+    //     refused as "in flight", because that pilot started before the outage
+    //     and its own refusal is the more precise statement.
+    //
+    //     Refusal returns `Handled`, never `Passthrough` — for the fifth time in
+    //     this function and for the reason written at each of the other four.
+    //
+    //     Fail-open: an absent, unreadable, unparseable or stale stamp reads as
+    //     "serving" and the dispatch proceeds exactly as before this gate
+    //     existed. None of those readings can open the network.
+    if let crate::pilot_egress_stamp::RelayVerdict::Down { motif, age_secs } =
+        crate::pilot_egress_stamp::relay_verdict(
+            global_home_dir,
+            crate::pilot_egress_stamp::ttl_secs(),
+        )
+    {
+        let owner_repo = location.owner_repo();
+        // WARN, not INFO — unlike 2c, this is not a nominal consequence of how
+        // the feeder and the webhook compose. A `ready` event refused because the
+        // host relay is down means the loop is stopped, which is the cost the
+        // operator accepted in writing and wants to see.
+        warn!(
+            event = "ready_label_egress_relay_down",
+            repo = %owner_repo,
+            num = location.number,
+            motif = %motif,
+            age_secs,
+            "ready_label_handler: `ready` event refused — the host egress relay is \
+             down, so no pilot can leave contained (mika#2049). The ticket keeps \
+             its label and is not parked."
+        );
+
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ready_label_egress_relay_down",
+                &format!("{}#{}", owner_repo, location.number),
+                None,
+                Some("dispatch_refused"),
+                Some(&format!(
+                    "repo={} number={} refused=egress_relay_down motif={} stamp_age_secs={}",
+                    owner_repo, location.number, motif, age_secs
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                event = "ready_label_audit_log_failed",
+                repo = %owner_repo,
+                num = location.number,
+                error = %e,
+                "ready_label_handler: failed to write egress-relay refusal audit event \
+                 (non-fatal)"
+            );
+        }
+
+        return (
+            VerdictAction::Handled {
+                pre_digest: format_egress_relay_down_pre_digest(location, &motif),
+            },
+            ReadyLabelGate::EgressRelayDown,
+        );
+    }
+
     // 3. Need a GitHub token to fetch the issue body. Without it we cannot
     //    determine groomed-state, so degrade to passthrough.
     let token = match github_token {
@@ -805,20 +1239,90 @@ where
         );
     }
 
-    // 5. Determine groomed-state via the canonical predicate. Same code path as
-    //    `validate_dispatch_readiness` gate (#919) — drift between the two
-    //    sites would re-introduce the bug class this handler closes.
-    let missing_markers = crate::skills::executor::check_grooming_markers(&body);
-    let is_groomed = missing_markers.is_empty();
+    // 5. Est-ce qu'un `dev-pilot` peut partir ? Le prédicat est
+    //    `executor::groomed_state`, **lecteur unique** de la preuve de grooming
+    //    (mika#2484 R2), et la porte de l'étape 9d en descend par
+    //    `evaluate_grooming_gate`.
+    //
+    //    LE COMMENTAIRE QUE CETTE LIGNE REMPLACE AFFIRMAIT UNE PARITÉ PERDUE.
+    //    Il disait « Same code path as `validate_dispatch_readiness` gate
+    //    (#919) — drift between the two sites would re-introduce the bug class
+    //    this handler closes », et c'était vrai en #919. Depuis mika#1620 /
+    //    mika#2287 la porte porte **deux** couches — la forme
+    //    (`check_grooming_markers`) *et* la preuve
+    //    (`has_completed_groom_for_issue`) — quand cette étape n'en portait
+    //    qu'une. La divergence vivait donc à l'intérieur du même handler, à
+    //    quatre étapes d'écart : l'étape 5 répondait « groomé », l'étape 9d
+    //    « pas de preuve », et le handler refusait le `dev-pilot` qu'il venait
+    //    de choisir. Laisser la phrase telle quelle après avoir rétabli la
+    //    parité serait garder celle qui a rendu la divergence invisible.
+    //
+    //    Le split ne peut pas échouer — `owner_repo()` délègue à
+    //    `normalize_owner_repo`, qui garantit le séparateur. Le `unwrap_or`
+    //    reconstruit ce que cette fonction aurait rendu plutôt que de
+    //    fabriquer un état de grooming qui n'a pas été mesuré : un faux
+    //    `MarkersMissing` polluerait le `reasoning` de mika#2242 avec un
+    //    pseudo-callout, et un `unwrap()` échangerait une impossibilité contre
+    //    une panique.
+    let owner_repo = location.owner_repo();
+    let (owner, repo) = owner_repo.split_once('/').unwrap_or((
+        crate::webhook_dispatch::DEFAULT_DISPATCH_OWNER,
+        location.repo_ref.as_str(),
+    ));
+    let groomed_state =
+        crate::skills::executor::groomed_state(db, owner, repo, location.number, &body).await;
+
+    // 5b. mika#2242 — name the CAUSE when the routing falls back to `groom`.
+    //
+    //     THIS BLOCK DECIDES NOTHING. It runs after the predicate and before the
+    //     choice below, reads no value the choice reads, and returns no verdict:
+    //     a dé-groomed ticket keeps going to `groom`, with the same
+    //     `target_skill`, the same `dispatch_class` and the same `ReadyLabelGate`
+    //     as before this ticket existed (R4, AC5).
+    //
+    //     Re-grooming a dé-groomed ticket is CORRECT work, not an error: the
+    //     umbrella's plan is unreachable from the sub-ticket, and a groom that
+    //     succeeds restores exactly the callouts that are missing — which is the
+    //     remedy the operator applied by hand on #2131. Halting here would trade
+    //     autonomy for an attribution obtainable without it. *A net, not a path*
+    //     (mika#2334).
+    //
+    //     Silent on the nominal path (`is_groomed`) and silent on a first
+    //     grooming (no marker): an observability that records everyone
+    //     distinguishes no one (mika#2131 AC7).
+    //
+    //     BRANCHÉ SUR LE SEUL BRAS `MarkersMissing`, et c'est délibéré : le
+    //     dé-groomage de mika#2242 est une **absence de callout**, pas une
+    //     absence de preuve. Les fondre rendrait la population de #2242
+    //     incomptable — la raison même pour laquelle mika#2484 a quatre bras et
+    //     pas un booléen.
+    if let crate::skills::executor::GroomedState::MarkersMissing(ref missing_markers) =
+        groomed_state
+    {
+        note_degroomed_ticket(db, session_id, trace_id, location, missing_markers).await;
+    }
+
+    // 5c. mika#2484 — nommer les deux causes que le routage **ajoute** au bras
+    //     `groom`. Ce bloc ne décide rien : il lit le verdict de l'étape 5 et
+    //     n'en change aucun. Silencieux sur le chemin nominal (`Groomed`) et
+    //     sur un premier grooming (`MarkersMissing`, déjà couvert au-dessus par
+    //     son propre nom) — R5.
+    note_groomed_state(db, session_id, trace_id, location, &groomed_state).await;
 
     // 6. Target tool + skill + dispatch class. dev-groom for ungroomed, dev-pilot
     //    for groomed. This mirrors the auto-groom-on-dispatch behavior (mika#996)
     //    that the LLM was supposed to perform.
-    let (target_tool, target_skill, dispatch_class) = if is_groomed {
-        ("run_claude_pilot", "dev-pilot", "implement")
-    } else {
-        ("run_claude_pilot_groom", "dev-groom", "groom")
-    };
+    //
+    //    La décision est `route_for`, une fonction pure exhaustive sans bras
+    //    `_ =>` (mika#2484 D1) — extraite pour que le bras `ProofUnreadable`
+    //    soit attestable sans une base en panne.
+    let (target_tool, target_skill, dispatch_class) = route_for(&groomed_state);
+    // Lu sur l'état, jamais par comparaison au nom du skill : le littéral
+    // ferait dépendre un booléen de la valeur de retour d'une autre fonction.
+    let is_groomed = matches!(
+        groomed_state,
+        crate::skills::executor::GroomedState::Groomed
+    );
 
     // 7. Pre-create the task in DB. The LLM's tool call will reuse this
     //    `task_id` rather than calling `create_task` first — removes one
@@ -971,6 +1475,7 @@ where
             command,
             long_running: true,
             estimated_duration_secs,
+            ..
         } => (command.clone(), *estimated_duration_secs),
         _ => {
             warn!(
@@ -1250,6 +1755,42 @@ fn format_pilot_in_flight_pre_digest(
     )
 }
 
+/// Pre-digest for a `ready` event refused because the host egress relay is down
+/// (mika#2049).
+///
+/// Opens with `<ready_label_handler>` for the same load-bearing reason as its
+/// four neighbours.
+///
+/// Two things it must say and a third it must not. It names **which organ is
+/// broken** (the relay, not the ticket and not the worktree) and **that no
+/// gesture is owed on the ticket** — the loop resumes on its own once the relay
+/// serves, which is the operator's own acceptance criterion. It does NOT
+/// prescribe a remedy on the relay: the model reading this cannot restart a host
+/// daemon, and telling it to try would invite exactly the fabricated-action turn
+/// the house guards against. The remedy travels on the escalation channel and in
+/// the runbook, to a human who can act.
+fn format_egress_relay_down_pre_digest(loc: &ReadyLabelLocation, motif: &str) -> String {
+    let owner_repo = loc.owner_repo();
+    let number = loc.number;
+    format!(
+        "<ready_label_handler>\n\
+         DISPATCH REFUSED — the host egress relay is down ({motif}), so no pilot \
+         can be launched with its network cut (mika#2049).\n\n\
+         {owner_repo}#{number} keeps its `ready` label and is NOT parked. No task \
+         was created, no dispatch was deferred, no re-drive budget was spent. The \
+         loop resumes on its own once the relay serves again — no gesture is owed \
+         on this ticket.\n\n\
+         You MUST NOT:\n\
+         - call `run_claude_pilot` or `run_claude_pilot_groom` for this issue\n\
+         - call `create_task` for this issue\n\
+         - remove, re-add or re-trigger the `ready` label\n\
+         - claim the relay has been restarted, or attempt to restart it\n\n\
+         An operator has already been escalated to on the notification channel. \
+         Acknowledge and end the turn.\n\
+         </ready_label_handler>"
+    )
+}
+
 /// Pre-digest for a `ready` event on a ticket an operator is holding
 /// (mika#2263 défaut (c)).
 ///
@@ -1521,6 +2062,75 @@ mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------
+    // mika#2242 — le dépliage du marqueur de dé-groomage, en fonction pure.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn mika2242_a_complete_record_yields_both_halves() {
+        let marker = parse_degroom_marker(
+            Some("pr#2226"),
+            Some(
+                "pr_url=https://github.com/senara-solutions/mika/pull/2226 \
+                 head_branch=fix/umbrella-auto-pull-exclusion-observability merged=false",
+            ),
+        );
+        assert_eq!(marker.pr_ref.as_deref(), Some("pr#2226"));
+        assert_eq!(
+            marker.head_branch.as_deref(),
+            Some("fix/umbrella-auto-pull-exclusion-observability")
+        );
+    }
+
+    /// **La granularité du fail-soft, et c'est elle qui est porteuse.** La
+    /// *décision* du lecteur ne tient qu'à la présence de la ligne ; la branche
+    /// est un enrichissement. Un `reasoning` absent ou inexploitable doit donc
+    /// rendre « dé-groomé par pr#N, branche inconnue », jamais un silence.
+    #[test]
+    fn mika2242_an_unusable_reasoning_costs_the_branch_and_nothing_else() {
+        for reasoning in [None, Some(""), Some("merged=false"), Some("head_branch=")] {
+            let marker = parse_degroom_marker(Some("pr#2226"), reasoning);
+            assert_eq!(
+                marker.pr_ref.as_deref(),
+                Some("pr#2226"),
+                "le fait doit survivre à un reasoning {reasoning:?}"
+            );
+            assert_eq!(
+                marker.head_branch, None,
+                "une branche illisible est `None`, jamais une chaîne vide"
+            );
+        }
+    }
+
+    /// La colonne `after_value` est nullable ; une NULL ne doit pas se lire
+    /// comme une valeur vide (« `null` n'est jamais `0` », mika#2331).
+    #[test]
+    fn mika2242_an_absent_after_value_is_none_not_empty() {
+        assert_eq!(parse_degroom_marker(None, None).pr_ref, None);
+        assert_eq!(parse_degroom_marker(Some(""), None).pr_ref, None);
+    }
+
+    /// La fenêtre de lecture est **dérivée** de la rétention du registre, jamais
+    /// réécrite. Si les deux divergeaient, le lecteur interrogerait des lignes
+    /// que le purgeur a effacées — une recherche qui cesse de trouver en
+    /// silence, et qui se lit exactement comme un ticket jamais dé-groomé.
+    #[test]
+    fn mika2242_the_lookup_window_is_derived_from_the_ledger_retention() {
+        let since = degroom_marker_lookup_since();
+        let expected = crate::timestamp::now_minus(chrono::Duration::days(
+            crate::evidence::audit::AUDIT_RETENTION_DAYS as i64,
+        ));
+        // Même seconde, ou la précédente si l'horloge a tourné entre les deux.
+        assert!(
+            since <= expected,
+            "fenêtre {since} incohérente avec la rétention {expected}"
+        );
+        assert!(
+            since < crate::timestamp::now(),
+            "la fenêtre est dans le passé"
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // mika#2323 — gate vocabulary, actor readability, and the invariant that
     // the actor decides nothing.
     // ---------------------------------------------------------------------
@@ -1546,6 +2156,7 @@ mod tests {
             Self::ParseFailed,
             Self::RepoNotDispatchable,
             Self::PilotInFlight,
+            Self::EgressRelayDown,
             Self::NoToken,
             Self::BodyFetchFailed,
             Self::SeatMismatch,
@@ -1573,17 +2184,18 @@ mod tests {
                 Self::ParseFailed => 1,
                 Self::RepoNotDispatchable => 2,
                 Self::PilotInFlight => 3,
-                Self::NoToken => 4,
-                Self::BodyFetchFailed => 5,
-                Self::SeatMismatch => 6,
-                Self::OperatorHeld => 7,
-                Self::TaskCreateFailed => 8,
-                Self::ToolNotFound => 9,
-                Self::ToolNotLongRunning => 10,
-                Self::DispatchReadinessFailed => 11,
-                Self::CallbackCreateFailed => 12,
-                Self::HandlerNotFound => 13,
-                Self::Dispatched => 14,
+                Self::EgressRelayDown => 4,
+                Self::NoToken => 5,
+                Self::BodyFetchFailed => 6,
+                Self::SeatMismatch => 7,
+                Self::OperatorHeld => 8,
+                Self::TaskCreateFailed => 9,
+                Self::ToolNotFound => 10,
+                Self::ToolNotLongRunning => 11,
+                Self::DispatchReadinessFailed => 12,
+                Self::CallbackCreateFailed => 13,
+                Self::HandlerNotFound => 14,
+                Self::Dispatched => 15,
             }
         }
     }
@@ -1836,9 +2448,10 @@ mod tests {
         }
         assert_eq!(
             ReadyLabelGate::ALL.len(),
-            15,
-            "the handler has fifteen ways out (mika#2323 M3); if that changed, update the \
-             inventory in CLAUDE.md in the same commit"
+            16,
+            "the handler has sixteen ways out (mika#2323 M3, +1 for the mika#2049 \
+             egress-relay gate); if that changed, update the inventory in CLAUDE.md \
+             in the same commit"
         );
     }
 
@@ -2416,5 +3029,293 @@ mod tests {
             &digest
         ));
         assert!(digest.contains("send_message"));
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2484 — un callout de corps sans preuve en base route vers `groom`.
+    //
+    // # Rouge-avant
+    //
+    // Recette d'injection : remplacer le corps de `route_for` par
+    // `("run_claude_pilot", "dev-pilot", "implement")` pour `MarkersWithoutProof`
+    // — le test 1 rougit, le test 2 reste vert. Remplacer l'appel à
+    // `groomed_state` de l'étape 5 par `check_grooming_markers` seul (l'état
+    // d'avant ce ticket) — le test 1 rougit et le test 2 reste vert, ce qui est
+    // exactement ce qui distingue « la preuve est lue » de « la forme suffit ».
+    // ---------------------------------------------------------------------
+
+    mod mika2484 {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_CALLBACK_PLAN_GROOMED, completed_groom_pair};
+        use crate::messaging::{MessageSender, SendOutcome};
+        use crate::skills::SkillRegistry;
+        use crate::skills::executor::GroomedState;
+
+        const AGENT_ID: &str = "mika";
+        const SESSION: &str = "mika2484-session";
+        const TRACE: &str = "mika2484-trace";
+        const OWNER_REPO: &str = "senara-solutions/mika";
+        const ISSUE: u64 = 2471;
+
+        /// Le corps mesuré sur #2471 : les trois callouts canoniques, posés par
+        /// un re-groom de spawn orchestrateur qui n'a frappé **aucune** preuve.
+        const CALLOUTED_BODY: &str = "> - **Branch:** `fix/2471/x`\n\
+             > - **Plan:** `docs/plans/2026-09-20-001-fix-2471-x-plan.md`\n\
+             > - **Grooming history:** second-pass (GROOMED)\n\nCorps.";
+
+        /// Un corps sans aucun callout — le premier grooming nominal.
+        const UNGROOMED_BODY: &str = "Observation mesurée.\n\nPas de callout ici.";
+
+        struct NoopSender;
+
+        #[async_trait::async_trait]
+        impl MessageSender for NoopSender {
+            async fn send(&self, _text: &str) -> anyhow::Result<SendOutcome> {
+                Ok(SendOutcome::Delivered)
+            }
+        }
+
+        fn issue_url() -> String {
+            format!("https://github.com/{OWNER_REPO}/issues/{ISSUE}")
+        }
+
+        fn ready_label_event() -> String {
+            format!(
+                "[GitHub] Issue labeled ready on {OWNER_REPO}#{ISSUE} — reprise substrat\n\
+                 https://github.com/{OWNER_REPO}/issues/{ISSUE}"
+            )
+        }
+
+        /// Joue le handler sur un corps d'issue donné et rend la
+        /// `dispatch_class` de la row de suivi pré-créée à l'étape 7.
+        ///
+        /// Le `SkillRegistry` est vide, donc l'étape 9a retombe sur le
+        /// pré-digest prescriptif : le routage des étapes 5/6 a déjà eu lieu et
+        /// est lisible sur la row — c'est la conséquence topologique que R1
+        /// nomme.
+        async fn run_and_read_class(db: &AsyncDatabase, body: &'static str) -> Option<String> {
+            let sender: Arc<dyn MessageSender> = Arc::new(NoopSender);
+            let skills = SkillRegistry::empty();
+            // mika#2049 — un home réel sans stamp « relais à terre », pour que
+            // la porte 2d lise « le relais sert » et que l'étape 5 soit atteinte.
+            let home = tempfile::tempdir().expect("temp home");
+            try_handle_ready_label_dispatch_with_fetcher(
+                &ready_label_event(),
+                db,
+                Some("fake-token"),
+                Some(&sender),
+                SESSION,
+                TRACE,
+                &skills,
+                home.path(),
+                move |_owner_repo, _number, _token| async move {
+                    Ok((body.to_string(), Vec::new()))
+                },
+            )
+            .await;
+
+            db.find_active_task_by_ref_url(&issue_url())
+                .await
+                .expect("lookup de la row de suivi")
+                .expect("l'étape 7 pré-crée la row")
+                .dispatch_class
+        }
+
+        async fn audit_tool_names(db: &AsyncDatabase) -> Vec<String> {
+            db.get_audit_events(SESSION)
+                .await
+                .expect("read audit events")
+                .into_iter()
+                .map(|e| e.tool_name)
+                .collect()
+        }
+
+        /// **Test 1 / AC1 — le rouge du ticket.**
+        ///
+        /// Corps portant les trois callouts, **aucune** paire groom en base :
+        /// le routage doit choisir `dev-groom` / `groom`, et l'écrire.
+        #[tokio::test]
+        async fn mika2484_callouts_sans_preuve_routent_vers_groom() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().expect("open in-memory DB"),
+                AGENT_ID,
+            );
+
+            let class = run_and_read_class(&db, CALLOUTED_BODY).await;
+            assert_eq!(
+                class.as_deref(),
+                Some("groom"),
+                "un ticket callouté SANS preuve en base doit partir en dev-groom : \
+                 routé `implement`, il se fait refuser `dispatch_grooming_not_verified` \
+                 à l'étape 9d et le ticket recommence au tour suivant (mika#2484 défaut 1)"
+            );
+
+            let names = audit_tool_names(&db).await;
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL),
+                "la preuve primaire de R1 est la ligne d'audit qui NOMME la cause ; \
+                 sans elle, ce routage est indistinguable d'un premier grooming — {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n == READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL),
+                "la base a répondu : ce n'est pas le bras dégradé — {names:?}"
+            );
+        }
+
+        /// **Test 2 / AC2 / AC6 — le contrôle positif, et il est porteur.**
+        ///
+        /// Même corps, cette fois avec la paire parent+callback portant
+        /// `Outcome: PLAN_GROOMED`, écrite par l'API de production. Sans ce
+        /// test, un prédicat cassé rendant toujours `MarkersWithoutProof`
+        /// passerait le test 1 en entier — et aurait en plus supprimé le seul
+        /// chemin `implement` de la boucle.
+        ///
+        /// Porte aussi AC6 : le chemin nominal n'écrit **aucune** des deux
+        /// lignes nouvelles.
+        #[tokio::test]
+        async fn mika2484_controle_positif_preuve_presente_route_vers_implement() {
+            let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+            // L'API d'écriture de production, jamais un `INSERT` SQL brut : un
+            // fixture SQL peut fabriquer exactement la ligne que la production
+            // ne produit pas, ce qui est la forme même du bug de mika#2287.
+            completed_groom_pair(
+                &sync_db,
+                AGENT_ID,
+                &issue_url(),
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let db = AsyncDatabase::new_with_agent(sync_db, AGENT_ID);
+
+            let class = run_and_read_class(&db, CALLOUTED_BODY).await;
+            assert_eq!(
+                class.as_deref(),
+                Some("implement"),
+                "callouts + preuve = groomé : le dev-pilot doit partir, sinon ce \
+                 ticket aurait supprimé le chemin d'implémentation de la boucle"
+            );
+
+            let names = audit_tool_names(&db).await;
+            for added in [
+                READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL,
+                READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL,
+            ] {
+                assert!(
+                    !names.iter().any(|n| n == added),
+                    "AC6 — le chemin nominal n'écrit aucune ligne nouvelle : une \
+                     observabilité qui enregistre tout le monde ne distingue \
+                     personne (mika#2131 AC7) — {names:?}"
+                );
+            }
+        }
+
+        /// **Test 3 / AC5 — le chemin de mika#2242 est intact.**
+        ///
+        /// Corps sans callout : routage `groom` comme avant, et **aucune** des
+        /// deux lignes de mika#2484. `note_degroomed_ticket` reste branché sur
+        /// le seul bras `MarkersMissing` — les fondre rendrait la population de
+        /// #2242 incomptable.
+        #[tokio::test]
+        async fn mika2484_callouts_absents_restent_le_chemin_de_mika2242() {
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().expect("open in-memory DB"),
+                AGENT_ID,
+            );
+
+            let class = run_and_read_class(&db, UNGROOMED_BODY).await;
+            assert_eq!(class.as_deref(), Some("groom"));
+
+            let names = audit_tool_names(&db).await;
+            for added in [
+                READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL,
+                READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL,
+            ] {
+                assert!(
+                    !names.iter().any(|n| n == added),
+                    "un premier grooming n'est ni un grooming hors moteur ni une \
+                     panne de base — {names:?}"
+                );
+            }
+        }
+
+        /// **Test 4 / AC7 — la preuve illisible route vers `groom`, sous son
+        /// propre nom.**
+        ///
+        /// Trois moitiés, parce que le bras n'est pas atteignable de bout en
+        /// bout : une base en panne ferait aussi échouer l'étape 7 **et**
+        /// l'écriture d'audit qu'on veut observer. D'où l'extraction de
+        /// `route_for` / `routing_note` en fonctions pures.
+        #[tokio::test]
+        async fn mika2484_preuve_illisible_route_vers_groom() {
+            // (a) une base en panne produit bien `ProofUnreadable`, et non
+            //     `MarkersWithoutProof` — c'est la distinction que R4 exige.
+            let db = AsyncDatabase::new_with_agent(
+                crate::db::Database::open_in_memory().expect("open in-memory DB"),
+                AGENT_ID,
+            );
+            db.shutdown();
+            let state = crate::skills::executor::groomed_state(
+                &db,
+                "senara-solutions",
+                "mika",
+                ISSUE,
+                CALLOUTED_BODY,
+            )
+            .await;
+            assert!(
+                matches!(state, GroomedState::ProofUnreadable(_)),
+                "une base injoignable n'est pas une absence de preuve : \
+                 fondre les deux ferait lire une panne comme un succès du \
+                 correctif — {state:?}"
+            );
+
+            // (b) elle route vers le travail le moins dangereux.
+            assert_eq!(
+                route_for(&state),
+                ("run_claude_pilot_groom", "dev-groom", "groom"),
+                "au routage, un signal illisible ne satisfait jamais un terme (R4)"
+            );
+
+            // (c) sous un nom DISTINCT de l'absence de preuve.
+            let (tool, _, reasoning, _) =
+                routing_note(&state).expect("le bras dégradé se journalise");
+            assert_eq!(tool, READY_LABEL_GROOM_PROOF_UNREADABLE_TOOL);
+            assert!(
+                reasoning.contains("cause=proof_unreadable"),
+                "le reasoning nomme la cause : {reasoning}"
+            );
+        }
+
+        /// **Test 13 / structurel — le routage n'a pas de bras joker.**
+        ///
+        /// Aucune assertion comportementale ne peut voir cette classe : un
+        /// `_ =>` ajouté plus tard ne rendrait aucune décision fausse le jour
+        /// où il est écrit, il rendrait seulement muet le cinquième état, et
+        /// tous les tests existants resteraient verts.
+        #[test]
+        fn mika2484_le_routage_n_a_pas_de_bras_joker() {
+            let src = include_str!("ready_label_handler.rs");
+            let production = match src.find("\n#[cfg(test)]\nmod tests {") {
+                Some(i) => &src[..i],
+                None => src,
+            };
+            let bodies = crate::source_scan::fn_bodies(production);
+            for f in ["route_for", "routing_note"] {
+                let (_, body) = bodies
+                    .iter()
+                    .find(|(name, _)| name == f)
+                    .unwrap_or_else(|| panic!("{f} doit exister — sinon ce scan vise un mort"));
+                assert!(
+                    !body.contains("_ =>"),
+                    "{f} porte un bras joker : un cinquième `GroomedState` s'y \
+                     tairait au lieu de faire rougir le compilateur.\n\n\
+                     RÉSOLUTION : énumérer le nouvel état, jamais l'absorber."
+                );
+            }
+        }
     }
 }

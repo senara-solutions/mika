@@ -1035,11 +1035,48 @@ mod tests {
         assert_eq!(probe_executor_health(Some("")).await, None);
     }
 
+    /// mika#2495 — l'injoignabilité d'une fixture est LOCALE, jamais réseau.
+    ///
+    /// **Ne pas remettre une adresse non routable ici**, si tortueux que le
+    /// `bind`/`drop` ci-dessous puisse paraître. La fixture précédente sondait
+    /// `192.0.2.1:1` (RFC 5737) et n'a jamais testé ce qu'elle annonçait dans un
+    /// bac à sable pilote : `HTTP_PROXY` y est posé, `192.0.2.1` n'est pas dans
+    /// `NO_PROXY`, et la détection de proxy par variables d'environnement de
+    /// `reqwest` est active par défaut — donc la requête partait au relais
+    /// d'egress en forme absolue (`GET http://192.0.2.1:1/health HTTP/1.1`),
+    /// forme que le relais ne sert pas. Il rendait `400 Bad Request`, d'où
+    /// `Some(false)` au lieu de `None`, **en 0,03 s**. Trois centièmes de
+    /// seconde sont un aller-retour de boucle locale : c'est la mesure qui
+    /// attribue la cause, une tentative vers une adresse non routable rendant
+    /// `ENETUNREACH` ou consommant le `timeout(5s)` du client. L'adresse n'était
+    /// ni résolue ni composée.
+    ///
+    /// Un port de boucle locale que rien n'écoute rend `ECONNREFUSED` sous proxy
+    /// comme sans, parce que la boucle locale n'est jamais proxifiée — exclue
+    /// par `NO_PROXY=localhost,127.0.0.1` dans le bac à sable, et par l'absence
+    /// de tout proxy sur le CI. Le motif est le classique « bind puis drop » :
+    /// le noyau attribue un port libre, on le libère, la connexion suivante est
+    /// refusée.
+    ///
+    /// Renommé depuis `…_on_bogus_host` : « bogus host » décrivait la prémisse
+    /// écartée (un hôte fantaisiste) ; ce qui est asserté est un point de
+    /// terminaison injoignable.
     #[tokio::test]
-    async fn probe_executor_health_returns_none_on_bogus_host() {
-        // Non-routable RFC 5737 address — connection fails fast, fail-open to None.
-        let res = probe_executor_health(Some("http://192.0.2.1:1/health")).await;
-        assert_eq!(res, None);
+    async fn probe_executor_health_returns_none_on_unreachable_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("la boucle locale doit être bindable");
+        let port = listener
+            .local_addr()
+            .expect("le port attribué doit être lisible")
+            .port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{port}/health");
+        let res = probe_executor_health(Some(&url)).await;
+        assert_eq!(
+            res, None,
+            "une connexion refusée doit fail-open à None (url={url})"
+        );
     }
 
     #[test]

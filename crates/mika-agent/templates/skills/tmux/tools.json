@@ -22,7 +22,8 @@
     },
     "handler": {
       "type": "exec",
-      "command": "handlers/create_session.sh"
+      "command": "handlers/create_session.sh",
+      "detaches_command": true
     }
   },
   {

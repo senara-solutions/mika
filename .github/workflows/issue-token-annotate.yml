@@ -1,0 +1,104 @@
+name: Issue Token Annotation
+
+# Surface S3 of mika#2201 — issue bodies.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# NON-BLOCKING BY CONSTRUCTION, NOT BY CAUTION.
+#
+# AC1 asks for a lint that "refuses" non-canonical machine tokens in callouts
+# and ISSUE BODIES. GitHub offers no gate on an issue: an `issues:` workflow can
+# annotate, never refuse. Shipping this as a "gate" would announce a protection
+# that does not exist — so it is an annotation, and the difference is written
+# here rather than discovered by whoever trusts it.
+#
+# The canonical producer on the autonomous path is ALREADY a machine:
+# `_write_canonical_callout` (dispatch-lib.sh) composes the three forms from a
+# closed `case`. The remaining margin of error is the operator path, which
+# deserves a signal, not a refusal nobody can render.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# BOUNDED BY AN EPOCH.
+#
+# Prime's bearing forbids retroactive migration of prose ("pure cost against
+# zero benefit"), so this fires on `opened` / `edited` ONLY — i.e. from its
+# deployment onward, never on history. An issue nobody touches is never
+# annotated, which is the intent.
+#
+# A COMMENT, NOT A LABEL. An enforcement label undeclared in `.github/labels.yml`
+# is deleted by label-sync (`delete-other-labels: true`) from the repo and from
+# every issue carrying it, with no event and no log — the class this very lint
+# found a fifth occurrence of while being written (`needs-multi-agent-review`).
+# Declaring one just to carry an annotation would add a thing to maintain for a
+# signal a comment already carries.
+#
+# ONE COMMENT PER BODY STATE. The workflow rewrites its own previous comment
+# instead of stacking a new one on every edit: an annotation that accumulates is
+# an annotation people mute, which is § R4 on a surface that has no gate to
+# lose.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS DOES NOT BUY, said plainly: its SILENCE PROVES NOTHING. An
+# annotation nobody reads is a silence with one more line in it. The only
+# measure this ticket offers is the accusation rate on S1 + S2, where a gate
+# exists.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  annotate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Lint the issue body for non-canonical machine tokens
+        id: lint
+        run: |
+          gh issue view "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" --json body --jq .body > /tmp/issue-body.md
+          if bash scripts/check-canonical-tokens.sh --body /tmp/issue-body.md > /tmp/lint-out.txt 2>&1; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The comment names the token, its canonical form and the match site that
+      # will not see it — the three things an author needs in order to fix it
+      # without opening the lint.
+      - name: Annotate, or withdraw a previous annotation
+        run: |
+          MARKER='<!-- canonical-token-annotation (mika#2201) -->'
+          PRIOR=$(gh issue view "${{ github.event.issue.number }}" \
+            --repo "${{ github.repository }}" --json comments \
+            --jq "[.comments[] | select(.body | contains(\"$MARKER\")) | .url] | last // empty")
+
+          if [ "${{ steps.lint.outputs.clean }}" = "true" ]; then
+            # The body was repaired: withdraw rather than leave a stale
+            # accusation standing. A comment that outlives its cause is the
+            # junk-drawer failure on a surface with no gate to lose.
+            if [ -n "$PRIOR" ]; then
+              gh api -X PATCH "${PRIOR/https:\/\/github.com/https:\/\/api.github.com\/repos}" \
+                -f body="$MARKER"$'\n\n_Resolved: the body now carries canonical machine tokens._' \
+                >/dev/null 2>&1 || true
+            fi
+            exit 0
+          fi
+
+          BODY="$MARKER"$'\n\n'"**Non-canonical machine token in this issue body.** This is an annotation, not a gate — GitHub offers no gate on an issue."$'\n\n```\n'"$(cat /tmp/lint-out.txt)"$'\n```\n\n'"The tolerance of every reader is declared in \`scripts/canonical-tokens.tsv\`. If a reader does read this form, the fix is that file, not this body."
+
+          if [ -n "$PRIOR" ]; then
+            gh api -X PATCH "${PRIOR/https:\/\/github.com/https:\/\/api.github.com\/repos}" \
+              -f body="$BODY" >/dev/null 2>&1 || true
+          else
+            gh issue comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" --body "$BODY"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

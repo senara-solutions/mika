@@ -65,15 +65,53 @@
 //! faillible d'une manière que l'opérateur ne peut pas constater (DB, réseau),
 //! cet arbitrage est à refaire, pas à transporter.**
 //!
-//! # Portée : `auto_pull` seul, mécanisme généralisable, non généralisé
+//! # Portée : `auto_pull`, puis `worktree_reap` (mika#2420)
+//!
+//! mika#2329 a livré le mécanisme paramétré par nom de scan tout en refusant de
+//! l'étendre, faute de besoin mesuré : *« arrêter la revue QA n'est pas la même
+//! décision qu'arrêter le feeder »*. **Une opération destructive est précisément
+//! ce besoin.** Pendant un incident, on veut arrêter un reaper qui supprime sans
+//! redémarrer mika-spirit — le redémarrage étant ce qu'on veut le moins faire
+//! avec des dispatches en vol. D'où le second scan, [`WORKTREE_REAP_SCAN`].
 //!
 //! `MIKA_DEV_WIP_RESCUE` et `MIKA_QA_REVIEW_RECONCILE` ont le même défaut
-//! boot-time. Le lecteur est écrit paramétré par le nom du scan pour que
-//! l'extension soit une ligne, mais elle n'est pas faite ici : **chaque scan a une
-//! population et un coût d'arrêt différents** — arrêter la revue QA n'est pas la
-//! même décision qu'arrêter le feeder, et livrer trois interrupteurs dont deux
-//! n'ont jamais été demandés créerait trois gestes à documenter et à tester pour
-//! un besoin mesuré sur un seul.
+//! boot-time et **n'ont toujours pas d'interrupteur** : leur arrêt ne détruit
+//! rien, et livrer des gestes que personne n'a demandés reste du YAGNI.
+//!
+//! # [`AUTO_PULL_SCAN`] est le frein de dispatch de la boucle (mika#2498)
+//!
+//! Son nom dit un scan ; sa **portée** est plus large, et la confondre avec son
+//! nom a coûté un incident. Le 2026-09-23, la sentinelle posée à 05:38 a bien
+//! court-circuité le tick du feeder — et un implement est parti quand même à
+//! 06:11:39Z, parce qu'un groom convergé enchaîne sur son implémentation par
+//! l'**auto-fire moteur** ([`crate::task_engine`], mika#1614), qui ne passe par
+//! aucun tick. L'opérateur croyait avoir arrêté la boucle ; il n'avait arrêté
+//! qu'une de ses deux portes.
+//!
+//! **Ce n'est pas une décision distincte, donc pas un second fichier.** Le
+//! critère de mika#2420 est *« une décision distincte mérite un fichier
+//! distinct »* — or les deux routes ont la **même sortie** (un dispatch
+//! dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis
+//! dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un
+//! opérateur qui arrête l'une et pas l'autre n'a rien arrêté — c'est exactement
+//! l'incident. La sentinelle est donc élargie **dans son sens**, pas dupliquée.
+//! Scinder aurait garanti que le geste de mémoire musculaire — poser le fichier
+//! de l'incident — rende le comportement d'aujourd'hui en ayant l'air d'arrêter.
+//!
+//! **Le critère pour un futur consommateur**, et il n'est pas « suis-je un
+//! scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire
+//! cette sentinelle — quelle que soit la porte d'entrée. Sinon, il faut un nom
+//! de scan à soi (le critère de mika#2420). C'est ce qui laisse dehors, à
+//! dessein, `verdict_handler` (`block[ac]` / `block[ci]` réparent une PR
+//! ouverte : une **continuation**, pas du travail neuf) et un `ready` posé à la
+//! main pendant un STOP (savoir si un fichier prime sur le geste que
+//! l'opérateur vient de poser est une décision produit, pas substrat).
+//!
+//! **Le refus est convergent, jamais terminal**, et c'est ce qui rend
+//! l'élargissement acceptable : il n'annule pas le groom, ne perd pas le plan
+//! (committé et poussé), n'écrit aucune row. À la levée, le réconciliateur
+//! stuck-ready re-drive le ticket — et pendant le STOP aucun tick ne tourne,
+//! donc **aucun point du budget de re-drive n'est consommé** (mika#2020).
 //!
 //! # Un seul lecteur
 //!
@@ -99,6 +137,14 @@ const STOP_DIR: &str = "state";
 /// Passé par les appelants plutôt qu'écrit en dur chez eux : c'est ce qui garde
 /// le littéral complet du chemin dans ce seul fichier.
 pub const AUTO_PULL_SCAN: &str = "auto-pull";
+
+/// Le nom de scan du reaper de worktrees (mika#2420).
+///
+/// Second usage du mécanisme, et le premier sur un scan **destructif** : c'est
+/// le besoin que mika#2329 avait nommé sans le servir. Le fichier est
+/// `~/.mika/state/worktree-reap-stop`, et sa sémantique est identique — son
+/// existence vaut STOP, son contenu n'est jamais lu.
+pub const WORKTREE_REAP_SCAN: &str = "worktree-reap";
 
 /// La variable d'environnement boot-time dont ce module ferme le piège.
 const AUTO_PULL_ENV_KNOB: &str = "MIKA_DEV_AUTO_PULL";
@@ -231,15 +277,21 @@ mod tests {
             PathBuf::from("/home/x/.mika/state/auto-pull-stop")
         );
         assert_eq!(
+            stop_file_path(home, WORKTREE_REAP_SCAN),
+            PathBuf::from("/home/x/.mika/state/worktree-reap-stop")
+        );
+        assert_eq!(
             stop_file_path(home, "wip-rescue"),
             PathBuf::from("/home/x/.mika/state/wip-rescue-stop")
         );
 
-        // Et les deux scans ne se coupent pas l'un l'autre.
+        // Et les scans ne se coupent pas l'un l'autre : arrêter le reaper ne
+        // doit pas arrêter le feeder, et réciproquement (mika#2420 — les deux
+        // décisions sont distinctes, c'est tout l'objet du paramétrage).
         let tmp = tempfile::tempdir().unwrap();
-        arm(tmp.path(), "wip-rescue", "");
+        arm(tmp.path(), WORKTREE_REAP_SCAN, "");
         assert!(!is_stopped(tmp.path(), AUTO_PULL_SCAN));
-        assert!(is_stopped(tmp.path(), "wip-rescue"));
+        assert!(is_stopped(tmp.path(), WORKTREE_REAP_SCAN));
     }
 
     /// T4 — la garde émet quand le `.env` disque contredit le process, sur les
@@ -332,9 +384,14 @@ mod tests {
     /// au `cwd`.
     #[test]
     fn mika2329_le_chemin_du_fichier_sentinelle_a_un_seul_lecteur() {
-        // Écrit en deux morceaux pour que la garde ne se dénonce pas elle-même
-        // lorsqu'un scan de source la lit.
-        let literal = format!("{AUTO_PULL_SCAN}{}", "-stop");
+        // Écrits en deux morceaux pour que la garde ne se dénonce pas elle-même
+        // lorsqu'un scan de source la lit. mika#2420 ajoute le second scan : la
+        // garde doit couvrir **chaque** nom, sinon le nouveau naît hors
+        // protection et la leçon `grooming_marker` se rejoue sur lui.
+        let literals: Vec<String> = [AUTO_PULL_SCAN, WORKTREE_REAP_SCAN]
+            .iter()
+            .map(|scan| format!("{scan}{}", "-stop"))
+            .collect();
 
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this_module = src_root.join("auto_pull_stop.rs");
@@ -360,7 +417,7 @@ mod tests {
                 });
                 scanned += 1;
                 for (n, line) in content.lines().enumerate() {
-                    if line.contains(&literal) {
+                    if literals.iter().any(|lit| line.contains(lit)) {
                         offenders.push(format!(
                             "{}:{}: {}",
                             path.strip_prefix(&src_root).unwrap_or(&path).display(),

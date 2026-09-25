@@ -1340,6 +1340,125 @@ mod tests {
         }
     }
 
+    /// 5.6 / AC2 (mika#2118). The exit-code taxonomy no longer confuses the two
+    /// states, and the never-configured reading carries its prohibition explicitly.
+    ///
+    /// The founding defect was a prompt that *ordered* the agent to narrate
+    /// "credentials may be expired" on every exit 2, including on a cloud tenant
+    /// where nothing was ever stored. The fix is not a softer sentence: it is a
+    /// taxonomy entry that names two readings and tells the model the tool result —
+    /// not the exit code — says which one applies.
+    #[test]
+    fn mika2118_bundled_prompt_carries_both_readings() {
+        let prompt = embedded_file("google-workspace", "system_prompt.md");
+        // Every assertion runs on a whitespace-flattened copy so a reflow of the
+        // markdown cannot silently disarm the guard — the guarantee is on the
+        // sentence, not on its line breaks.
+        let flattened = prompt
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // The two readings are named, and the model is told not to pick one itself.
+        for needle in [
+            "two different states",
+            "were refused",
+            "have ever been configured on this host",
+        ] {
+            assert!(
+                flattened.contains(needle),
+                "the exit-code taxonomy does not carry {needle:?} — a single reading \
+                 of code 2 is what produced the 2026-08-31 false outage report"
+            );
+        }
+        assert!(
+            flattened.contains("must not suggest any sign-in, login or re-authentication command"),
+            "the prompt no longer forbids proposing a sign-in gesture when the \
+             credentials were never configured — that prohibition IS AC2"
+        );
+        assert!(
+            flattened.contains("must not describe the situation as an outage"),
+            "the prompt no longer forbids the vocabulary of breakage on the \
+             never-configured case"
+        );
+
+        // The sentence that used to govern EVERY exit 2 is gone. `expired` may still
+        // appear — it is the correct word for the refused case — but never as an
+        // unconditional statement about the code.
+        assert!(
+            !flattened.contains(
+                "2: authentication error — the stored google credentials are expired or invalid"
+            ),
+            "the unconditional 'credentials are expired or invalid' reading of exit \
+             code 2 is back; it is false on every host that never had credentials"
+        );
+        assert!(
+            !flattened.contains("tell the user their google credentials are expired or invalid"),
+            "the unconditional guideline is back — it is the literal instruction the \
+             agent followed on 2026-08-31"
+        );
+    }
+
+    /// AC5 / extension A (mika#2118). The prompt no longer describes capabilities the
+    /// engine refuses before any subprocess starts, and it says what it cannot do.
+    ///
+    /// `validate_gws_input` has refused Gmail unconditionally since mika#1798, and
+    /// Drive `files get|update|delete` with it. Fixing the exit-2 taxonomy while
+    /// leaving thirty lines of dead instructions in the same file would reproduce, one
+    /// notch upstream, the exact defect this ticket closes: telling the agent it can
+    /// do something the engine forbids, then blaming it for narrating the refusal
+    /// badly.
+    #[test]
+    fn mika2118_bundled_prompt_declares_what_the_engine_refuses() {
+        let prompt = embedded_file("google-workspace", "system_prompt.md");
+        let lowered = prompt.to_ascii_lowercase();
+
+        assert!(
+            lowered.contains("## what this skill cannot do"),
+            "the prompt does not declare the doctrine refusals (mika#1798); an agent \
+             meeting `testimony_grade_forbidden` reads it as a malfunction"
+        );
+        assert!(
+            lowered.contains("testimony_grade_forbidden"),
+            "the prompt does not name the refusal shape, so the agent cannot \
+             recognise it as doctrine rather than as a failure"
+        );
+
+        // The structurally dead sections are gone.
+        assert!(
+            !lowered.contains("## gmail operations"),
+            "the Gmail operations section is back — every one of those calls is \
+             refused before a subprocess is spawned"
+        );
+        for dead in [
+            "[\"gmail\", \"+send\"",
+            "[\"gmail\", \"messages\", \"list\"",
+            "[\"gmail\", \"+triage\"]",
+            "[\"drive\", \"files\", \"get\"",
+            "[\"drive\", \"files\", \"delete\"",
+        ] {
+            assert!(
+                !prompt.contains(dead),
+                "the prompt still shows {dead} as a usable example; the engine \
+                 refuses it unconditionally"
+            );
+        }
+
+        // AC5's decision is readable without opening docs/plans/.
+        let manifest = embedded_file("google-workspace", "skill.toml");
+        assert!(
+            manifest.contains("always_on = true"),
+            "AC5's decision was to KEEP always_on; changing it needs its own ticket \
+             and its own reason"
+        );
+        assert!(
+            manifest.contains("mika#2118"),
+            "the reason for always_on is not written next to the field — a reader \
+             landing on it must find the why without opening a plan"
+        );
+    }
+
     /// R5. Same class, second occurrence found by the AC4 sweep — and unlike
     /// `google-workspace` this half is **prompt-only**: the capability comes from an
     /// MCP server, not from a Rust builtin, so there is no handler to condition.
