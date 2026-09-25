@@ -234,6 +234,11 @@ mod eval {
     // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.
     mod test_qa_callback_verdict_net_2368;
 
+    // mika#2515 — le signal sort des CINQ sorties atteignables, pas de deux : le
+    // « Force EndTurn » de `send_message` (P0, vu rouge avant U1e) et les deux
+    // coupures (deadline, max-steps), avec leurs contrôles négatifs.
+    mod test_qa_cut_off_verdict_2515;
+
     // mika#2358 — la garde 5e sur le chemin de production : une promesse de
     // fréquence sans acteur est refusée, l'aveu d'incapacité passe, et le
     // budget d'un seul re-prompt tient.

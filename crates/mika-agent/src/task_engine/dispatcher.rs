@@ -333,7 +333,7 @@ async fn resolve_periodic_scan_label_token(
 /// `metadata.$.delivery_attempts` — consecutive failed delivery attempts on a
 /// callback (mika#2179). Reset by nothing: a delivery that succeeds ends the
 /// row's life as an undelivered callback, so there is no state to clear.
-const DELIVERY_ATTEMPTS_KEY: &str = "delivery_attempts";
+pub(crate) const DELIVERY_ATTEMPTS_KEY: &str = "delivery_attempts";
 /// `metadata.$.delivery_first_failed_at` — when the run of failures began.
 const DELIVERY_FIRST_FAILED_AT_KEY: &str = "delivery_first_failed_at";
 /// `metadata.$.delivery_last_error_class` — class of the most recent failure.
@@ -341,7 +341,39 @@ const DELIVERY_LAST_ERROR_CLASS_KEY: &str = "delivery_last_error_class";
 /// `metadata.$.delivery_quarantined_at` — when the row crossed the attempt
 /// threshold. Its presence is the visible half of AC3's "mise à l'écart
 /// visible"; the row's `status` deliberately does not move.
-const DELIVERY_QUARANTINED_AT_KEY: &str = "delivery_quarantined_at";
+pub(crate) const DELIVERY_QUARANTINED_AT_KEY: &str = "delivery_quarantined_at";
+
+/// `metadata.$.verdict_delivery_deferrals` — combien de fois le verrou d'agent a
+/// refusé la livraison de ce callback (mika#2515 U3).
+///
+/// # Ce que ce compteur retire : une inférence par absence
+///
+/// Avant lui, la signature de la famine `AgentBusy` était
+/// « [`DELIVERY_ATTEMPTS_KEY`] absent » — c'est-à-dire une **absence**, et la
+/// règle de la maison est qu'une absence n'est pas une preuve : elle est
+/// indistinguable d'une ligne que rien n'a jamais tentée
+/// ([`crate::qa_build_callback::UndeliveredVerdictCause::NeverAttempted`]), dont
+/// le remède n'a aucun rapport. `record_callback_delivery_failure` — la
+/// télémétrie mika#2179, ses compteurs et sa quarantaine — n'est appelée que
+/// dans la branche `Err` de `run_silent_agent`, donc **après** que le tour a
+/// tourné ; un `AgentBusy` refuse **avant** de créer la session, donc
+/// n'incrémentait rien, et la ligne était re-sélectionnée à chaque balayage de
+/// 60 s indéfiniment, sans compteur, sans ligne d'audit, sans ligne de journal.
+///
+/// Écrit par le seul site du `try_lock()` échoué de `dispatch_resume_agent`, et
+/// **borné aux callbacks de build** : un `task.label ==` sur le chemin nominal,
+/// gratuit.
+pub(crate) const VERDICT_DELIVERY_DEFERRALS_KEY: &str = "verdict_delivery_deferrals";
+
+/// `metadata.$.verdict_delivery_first_deferred_at` — la **première** fois où ce
+/// verdict a commencé à attendre (mika#2515 U3).
+///
+/// Écrit **NULL-only**, idiome `FIRED_AT_STAMP_IF_NULL` de mika#2133 : un
+/// instant réécrit à chaque refus dirait « ça attend depuis une minute » d'un
+/// verdict qui attend depuis deux heures, ce qui est l'inverse de la mesure
+/// qu'on cherche.
+pub(crate) const VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY: &str =
+    "verdict_delivery_first_deferred_at";
 
 /// Ceiling on the exponent of the callback-delivery backoff (mika#2179).
 ///
@@ -833,9 +865,32 @@ impl TaskDispatcher {
             maybe_post_deadline_verdict,
         };
 
-        if !outcome.qa_verdict_unmet {
-            return;
-        }
+        // mika#2515 U1d — le motif se choisit sur le **couple**, quatre bras
+        // explicites, aucun bras `_`. Le bras nominal sort ici : pas de lecture
+        // de metadata, pas de résolution de token, pas de ligne de journal — le
+        // filet reste strictement additif.
+        let cut_off_reason = |c: crate::qa_build_callback::CallbackCutOff| {
+            VerdictReason::CallbackCutOffWithoutVerdict {
+                exit: c.exit,
+                steps_completed: c.steps_completed,
+            }
+        };
+        let reason = match (outcome.qa_verdict_unmet, outcome.qa_verdict_cut_off) {
+            // Chemin nominal : le verdict a été posté, ou aucun n'était dû.
+            (false, None) => return,
+            // mika#2368 — le tour a CONCLU sans poster.
+            (true, None) => VerdictReason::CallbackConcludedWithoutVerdict,
+            // mika#2515 — le tour a été COUPÉ avant de poster.
+            (false, Some(c)) => cut_off_reason(c),
+            // Inatteignable par construction — un tour sort de `run_loop` par
+            // exactement un chemin, et les deux moitiés du signal sont posées sur
+            // des chemins disjoints (épinglé par test). **Le plus spécifique
+            // gagne**, jamais un `unreachable!()` : paniquer dans le dispatcher
+            // sur un champ d'observabilité serait le pire des échanges — on
+            // perdrait la livraison du callback pour sauver l'exactitude d'une
+            // ligne de journal.
+            (true, Some(c)) => cut_off_reason(c),
+        };
 
         if !qa_callback_verdict_net_enabled() {
             warn!(
@@ -897,7 +952,7 @@ impl TaskDispatcher {
 
         maybe_post_deadline_verdict(
             DeadlineVerdictInput {
-                reason: VerdictReason::CallbackConcludedWithoutVerdict,
+                reason,
                 target,
                 session_id,
                 trace_id,
@@ -1000,6 +1055,10 @@ impl TaskDispatcher {
                 Ok(guard) => Some(guard),
                 Err(_) => {
                     debug!(task_id = %task.id, "agent busy, deferring resume_agent");
+                    // mika#2515 U3 — ce refus est désormais COMPTÉ. Borné aux
+                    // callbacks de build : un `task.label ==` sur le chemin
+                    // nominal, gratuit.
+                    self.record_verdict_delivery_deferral(task).await;
                     return Err(DispatchError::AgentBusy(task.id.clone()));
                 }
             }
@@ -2801,6 +2860,80 @@ impl TaskDispatcher {
     /// the sequence it belongs to. The return value matters for exactly one of
     /// the four: the attempt counter, which the escalation ladder re-reads. The
     /// other three are pure operator surface and their loss costs a warn.
+    /// mika#2515 U3 — compte et date le refus `AgentBusy` d'un callback de build.
+    ///
+    /// # Ce qu'il retire : une inférence par absence
+    ///
+    /// La signature de la famine était « [`DELIVERY_ATTEMPTS_KEY`] absent », une
+    /// absence, donc indistinguable d'une ligne que rien n'a jamais tentée. Le
+    /// compteur mika#2179 ne pouvait pas servir : il est écrit par
+    /// [`Self::record_callback_delivery_failure`], appelée dans la branche `Err`
+    /// de `run_silent_agent`, c'est-à-dire **après** que le tour a tourné. Un
+    /// `AgentBusy` refuse avant même de créer la session.
+    ///
+    /// # Bornée aux callbacks de build, et c'est le seul terme
+    ///
+    /// Le second site `AgentBusy` du fichier — `dispatch_skill_by_name` — est
+    /// hors population et le reste : il ne livre pas de callback, donc aucun
+    /// verdict n'y attend. Les deux lignes de sortie sont **littéralement
+    /// identiques** (`return Err(DispatchError::AgentBusy(task.id.clone()));` au
+    /// caractère près) ; seul le `debug!` qui les précède les sépare, et c'est
+    /// donc lui qui fait office d'ancre — `agent busy, deferring resume_agent`
+    /// ici, `agent busy, deferring skill run` là-bas.
+    ///
+    /// # U3 est une mesure, pas une décision
+    ///
+    /// Aucun échec d'écriture n'empêche le refus `AgentBusy` de rendre, et aucun
+    /// nouvel événement de journal n'est émis — un WARN par refus serait une
+    /// ligne par minute par PR affamée. Le compteur atterrit dans
+    /// `mika tasks get` et dans la ligne d'U2, qui est déjà bornée.
+    ///
+    /// L'instant est **NULL-only** (idiome `FIRED_AT_STAMP_IF_NULL`, mika#2133) :
+    /// un instant réécrit à chaque refus dirait « ça attend depuis une minute »
+    /// d'un verdict qui attend depuis deux heures.
+    async fn record_verdict_delivery_deferral(&self, task: &Task) {
+        if !crate::qa_build_callback::is_build_callback_label(&task.label) {
+            return;
+        }
+
+        // Une seule lecture du `metadata` pour les deux champs : le compteur
+        // s'incrémente depuis elle, et l'absence de l'instant y est aussi ce qui
+        // rend l'écriture NULL-only.
+        let parsed: serde_json::Value = task
+            .metadata
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .and_then(|m| serde_json::from_str(m).ok())
+            .unwrap_or(serde_json::Value::Null);
+
+        let previous = parsed
+            .get(VERDICT_DELIVERY_DEFERRALS_KEY)
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+            .unwrap_or(0);
+
+        self.set_delivery_metadata(
+            &task.id,
+            VERDICT_DELIVERY_DEFERRALS_KEY,
+            &previous.saturating_add(1).to_string(),
+        )
+        .await;
+
+        let already_dated = parsed
+            .get(VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY)
+            .is_some_and(|v| !v.is_null());
+        if !already_dated {
+            self.set_delivery_metadata(
+                &task.id,
+                VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY,
+                &crate::timestamp::now(),
+            )
+            .await;
+        }
+    }
+
     async fn set_delivery_metadata(&self, task_id: &str, key: &str, value: &str) -> bool {
         match self.db.set_task_metadata_field(task_id, key, value).await {
             Ok(()) => true,
@@ -8480,5 +8613,191 @@ mod tests {
                 "{tier:?}: an empty review emits no proposal either"
             );
         }
+    }
+
+    // ---- mika#2515 U3 — le refus `AgentBusy` devient compté ----------------
+
+    /// Sème un callback portant `label`, `completed` (donc dans la population que
+    /// `dispatch_resume_agent` sert).
+    async fn seed_callback_for_busy_test(db: &AsyncDatabase, label: &str) -> Task {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                // `build_callback_task` écrit du JSON valide — la mise en garde
+                // de `set_delivery_metadata` (`json_set` échoue DUR sur un
+                // `metadata` non-JSON) vaut aussi pour U3.
+                metadata: Some("{}".to_string()),
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("create callback row");
+        db.update_task_completed(&id, Some("Build succeeded"))
+            .await
+            .expect("mark completed");
+        db.get_task(&id).await.unwrap().expect("row exists")
+    }
+
+    /// Un dispatcher dont le verrou d'agent est **déjà tenu** : `try_lock()`
+    /// échoue, et c'est le site d'U3.
+    fn busy_dispatcher(db: AsyncDatabase) -> (TaskDispatcher, tokio::sync::OwnedMutexGuard<()>) {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.clone().try_lock_owned().expect("prendre le verrou");
+        let mut dispatcher = test_dispatcher(db);
+        dispatcher.agent_lock = Some(lock);
+        (dispatcher, held)
+    }
+
+    fn metadata_counter_of(task: &Task, key: &str) -> u64 {
+        crate::qa_build_callback::metadata_counter(task.metadata.as_deref(), key)
+    }
+
+    fn metadata_string_of(task: &Task, key: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(task.metadata.as_deref().unwrap_or("{}"))
+            .ok()?
+            .get(key)?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// **V7** — un refus `AgentBusy` sur un callback de build **compte** et
+    /// **date**, là où mika#2179 n'incrémentait rien (sa télémétrie vit dans la
+    /// branche `Err` de `run_silent_agent`, donc après que le tour a tourné).
+    ///
+    /// C'est ce compteur qui retire l'inférence-par-absence : avant lui, la
+    /// signature de la famine était « `delivery_attempts` absent », indistinguable
+    /// d'une ligne que rien n'a jamais tentée.
+    #[tokio::test]
+    async fn mika2515_an_agent_busy_refusal_counts_and_dates_a_build_callback() {
+        let db = test_db();
+        let (dispatcher, _held) = busy_dispatcher(db.clone());
+        let task =
+            seed_callback_for_busy_test(&db, crate::qa_build_callback::BUILD_CALLBACK_LABEL).await;
+
+        let err = dispatcher
+            .dispatch_resume_agent(&task)
+            .await
+            .expect_err("le verrou est tenu : AgentBusy");
+        assert!(
+            matches!(err, DispatchError::AgentBusy(_)),
+            "le refus reste un AgentBusy — U3 est une mesure, pas une décision"
+        );
+
+        let after = db.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            metadata_counter_of(&after, VERDICT_DELIVERY_DEFERRALS_KEY),
+            1,
+            "le refus est compté"
+        );
+        let first = metadata_string_of(&after, VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY)
+            .expect("le premier refus est daté");
+        assert!(
+            first.ends_with('Z') && first.len() >= 20,
+            "un instant ISO 8601, pas un compteur : {first}"
+        );
+    }
+
+    /// **V7** — le second refus **incrémente sans réécrire l'instant** (NULL-only,
+    /// idiome `FIRED_AT_STAMP_IF_NULL` de mika#2133).
+    ///
+    /// Un instant réécrit à chaque refus dirait « ça attend depuis une minute »
+    /// d'un verdict qui attend depuis deux heures — l'inverse de la mesure qu'on
+    /// cherche.
+    #[tokio::test]
+    async fn mika2515_a_second_refusal_increments_without_rewriting_the_instant() {
+        let db = test_db();
+        let (dispatcher, _held) = busy_dispatcher(db.clone());
+        let task =
+            seed_callback_for_busy_test(&db, crate::qa_build_callback::BUILD_CALLBACK_LABEL).await;
+
+        let _ = dispatcher.dispatch_resume_agent(&task).await;
+        let after_first = db.get_task(&task.id).await.unwrap().unwrap();
+        let first_instant =
+            metadata_string_of(&after_first, VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY).unwrap();
+
+        // Le second refus relit la row telle que le balayage la relit.
+        let _ = dispatcher.dispatch_resume_agent(&after_first).await;
+        let after_second = db.get_task(&task.id).await.unwrap().unwrap();
+
+        assert_eq!(
+            metadata_counter_of(&after_second, VERDICT_DELIVERY_DEFERRALS_KEY),
+            2,
+            "le compteur suit les refus"
+        );
+        assert_eq!(
+            metadata_string_of(&after_second, VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY),
+            Some(first_instant),
+            "NULL-only : l'instant est celui du PREMIER refus, jamais du dernier"
+        );
+    }
+
+    /// **V7 (contrôle négatif)** — un refus sur un callback **pilote** n'écrit
+    /// **rien**.
+    ///
+    /// U3 est borné aux callbacks de build par un `task.label ==` sur le chemin
+    /// nominal. Le second site `AgentBusy` du fichier (`dispatch_skill_by_name`)
+    /// est hors population et le reste : il ne livre pas de callback, donc aucun
+    /// verdict n'y attend. Les deux lignes de sortie sont littéralement
+    /// identiques ; seul le `debug!` qui les précède les sépare.
+    #[tokio::test]
+    async fn mika2515_an_agent_busy_refusal_on_a_pilot_callback_writes_nothing() {
+        let db = test_db();
+        let (dispatcher, _held) = busy_dispatcher(db.clone());
+        let task = seed_callback_for_busy_test(&db, "long_running:run_claude_pilot").await;
+
+        let _ = dispatcher.dispatch_resume_agent(&task).await;
+
+        let after = db.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(
+            metadata_counter_of(&after, VERDICT_DELIVERY_DEFERRALS_KEY),
+            0,
+            "un callback pilote ne doit aucun verdict — le compter y ferait \
+             mentir la cause `agent_busy_starvation` de l'alerte"
+        );
+        assert_eq!(
+            metadata_string_of(&after, VERDICT_DELIVERY_FIRST_DEFERRED_AT_KEY),
+            None
+        );
+    }
+
+    /// **V7** — le compteur d'U3 est ce sur quoi la cause
+    /// `agent_busy_starvation` repose : le classificateur le lit sur la row que
+    /// le refus vient d'écrire.
+    ///
+    /// C'est le raccord entre U3 et U2a. Sans lui, les deux moitiés pourraient
+    /// lire deux clés différentes et passer chacune leurs tests.
+    #[tokio::test]
+    async fn mika2515_the_counter_u3_writes_is_the_one_u2a_classifies_on() {
+        let db = test_db();
+        let (dispatcher, _held) = busy_dispatcher(db.clone());
+        let task =
+            seed_callback_for_busy_test(&db, crate::qa_build_callback::BUILD_CALLBACK_LABEL).await;
+
+        let _ = dispatcher.dispatch_resume_agent(&task).await;
+        let after = db.get_task(&task.id).await.unwrap().unwrap();
+
+        assert_eq!(
+            crate::qa_build_callback::classify_undelivered_verdict(after.metadata.as_deref()),
+            crate::qa_build_callback::UndeliveredVerdictCause::AgentBusyStarvation,
+            "l'attribution est POSITIVE, jamais inférée d'une absence"
+        );
     }
 }
