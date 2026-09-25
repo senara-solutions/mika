@@ -798,6 +798,84 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2522 — le nom d'audit du tour A2A échoué a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// Rien à excepter à la livraison : le nom `a2a_turn_failed` est **neuf**.
+    /// Quand ce scan tire, **on retire le second écrivain**, on ne l'excepte pas
+    /// (doctrine mika#2201).
+    const TURN_FAILURE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom d'audit du tour A2A échoué n'a qu'un écrivain (mika#2522 D1).
+    ///
+    /// C'est ce qui rend
+    /// `SELECT target_key, after_value, count(*) … WHERE tool_name = 'a2a_turn_failed'`
+    /// **exact** plutôt qu'un nombre sur lequel deux sites peuvent diverger — et
+    /// ce `GROUP BY` est le livrable d'AC2 : quel modèle perd des tours, et sur
+    /// quelle classe. Un second écrivain ne rendrait aucune décision fausse ; il
+    /// rendrait ce compte faux, en silence, avec toutes les assertions au vert.
+    /// Aucun test comportemental ne voit cette classe — d'où un scan de source.
+    #[test]
+    fn mika2522_the_turn_failure_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("a2a_turn{}", "_failed");
+        let owner = "crates/mika-agent/src/server/a2a.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if TURN_FAILURE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2522 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2522 — le nom d'audit du tour A2A échoué a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             TURN_FAILURE_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` par modèle que \
+             ce nom existe pour servir n'est exact que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2522_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            TURN_FAILURE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "TURN_FAILURE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2496 — le nom d'audit du dépassement de coût a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 

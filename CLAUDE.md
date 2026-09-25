@@ -1545,6 +1545,151 @@ Lire une coupure au plafond (mika#2280) :
   au-dessus de leur atteignable, portés par une allowlist nommée — et rougit si
   l'un des six nombres bouge sans que l'arithmétique soit refaite.
 
+### Un tour tué par le transport n'est pas un refus du serveur (mika#2522)
+
+**Aucune variable d'environnement, aucun réglage déplacé.** Cette entrée est ici
+parce que l'opérateur qui lit un `first-pass _arch_ask failed` corrélé à une
+coupure OpenRouter cherche dans le voisinage de mika#2189 / mika#2342 / mika#2280.
+
+- **Le défaut, mesuré le 2026-09-24.** 11 coupures
+  `LLM response body read failed mid-stream (retryable transport)` sur le relais
+  OpenRouter, **5 grooms de mika#2515 perdus**. Un retry existe pourtant et
+  couvre la signature (mika#2015 la rend retryable, `openai.rs` la rejoue avec
+  back-off) : ce n'est donc pas la signature qu'il fallait couvrir.
+- **La chaîne, maillon par maillon.** Le groom ne meurt pas d'un back-off trop
+  court, il meurt d'une **classification qui aplatit deux échecs de natures
+  opposées** :
+
+  | # | site | ce qui se passe |
+  |---|---|---|
+  | 1 | `llm/openai.rs` | le corps se coupe → `LlmError::Transport`, **retryable** |
+  | 2 | `llm/openai.rs` | la boucle rejoue `max_attempts` fois, puis rend l'erreur |
+  | 3 | `server/a2a.rs` | `run_agent_for_message` rend `Err` → Task `failed` |
+  | 4 | `server/a2a.rs` | le serveur sert un `success` JSON-RPC portant un Task `failed` **« sans rien à dire »** (mika#2270) |
+  | 5 | `cli/remote_ask.rs` | `terminal_state_class(Failed) = Contract` |
+  | 6 | `cli/remote_ask.rs` | `exit_code_for = 1`, jamais `75` |
+  | 7 | `dispatch-lib.sh` | `_arch_ask_with_retry` ne rejoue que sur `75` → `break` |
+  | 8 | `_iterate_groom_loop` | `first-pass _arch_ask failed` → **groom perdu** |
+
+  Le maillon 4 est le pivot et il est délibéré. Le serveur **sait** que l'échec
+  est du transport — il tient `e` en main — et n'en transmettait rien :
+  *l'information existait et ne traversait pas la frontière.*
+- **La justification écrite du `Contract` était fausse pour cette classe.** Le
+  commentaire remplacé disait *« a turn the server actually ran and ended without
+  an answer ; re-sending the same brief does not change that verdict »* — vrai
+  d'un refus raisonné, **faux d'un tour tué par une coupure** : rien n'a été
+  refusé, et `is_retryable()` dit le contraire du verdict.
+- **Pourquoi PAS d'allongement du back-off, alors que l'AC1 du ticket le
+  proposait (2/4/8 s).** Quatre mesures s'y opposent et la dernière est la plus
+  lourde. (1) La valeur citée (~3,5 s) est celle du *hard cap* ; à la géométrie
+  de mika-arch `max_attempts = 3`, donc le back-off réel est **1,5 s**. (2) Quand
+  la coupure arrive au plafond, la fenêtre inter-tentatives est déjà de ~480 s :
+  +6 s ne change pas d'ordre de grandeur. (3) Quand elle arrive tôt, ça achète
+  4,5 s — contre les **30 s** que `_arch_ask_with_retry` offre déjà, sur une
+  session fraîche et un budget de tour neuf. (4) Surtout, **le back-off consomme
+  l'enveloppe que la garde de deadline mesure** (seuil non-transport =
+  `1,0 × plafond`, mika#2362) : sur une géométrie voisine, le remède proposé
+  **supprime la tentative qu'il prétend protéger.** *Le retry qu'AC1 décrit
+  existe, avec une fenêtre cinq fois plus large que celle qu'AC1 demande ; il ne
+  s'armait simplement jamais sur cette classe.*
+- **Table de lecture du client** (`terminal_state_class`, fail-closed) :
+
+  | attestation | classe | exit | retry `_arch_ask` |
+  |---|---|---|---|
+  | `transport` / `transport_timeout` | `Transport` | `75` | **oui** |
+  | toute autre classe (`parse`, `provider`, `http_4xx`, `other`, …) | `Contract` | `1` | non |
+  | clé absente | `Contract` | `1` | non |
+  | clé illisible (type inattendu, valeur vide) | `Contract` | `1` | non |
+
+  Les trois dernières lignes sont **byte pour byte le comportement d'avant** :
+  un serveur antérieur au correctif produit exactement l'exit d'aujourd'hui.
+  `Canceled` et `Rejected` restent `Contract` **sans consulter l'attestation** —
+  une annulation et un refus sont des décisions, pas des accidents.
+- **Le sens du fail-safe suit le coût déjà écrit dans `FailureClass`** : un faux
+  `Transport` coûte un tour d'architecte payé deux fois ; un faux `Contract`
+  coûte la passe, le créneau de dispatch et un point du budget de re-drive —
+  dont trois abandonnent un ticket sain (mika#2020).
+
+### Surfaces opérateur
+
+```bash
+# 1. Quels tours ont été perdus, sur quel modèle, sur quelle classe ?
+grep a2a_turn_failed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, model, error_class, task_id}'
+
+# 2. CONTRÔLE POSITIF — le retry s'arme-t-il ? (dans le .stderr du dispatch)
+grep -h '^dispatch-lib: .*arch_ask' \
+  "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail
+```
+
+```sql
+-- AC2 — le compteur par modèle, qui n'existait pas
+SELECT target_key AS model, after_value AS class, count(*)
+  FROM audit_events WHERE tool_name = 'a2a_turn_failed'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `a2a_turn_failed` | WARN | **non vide, faible** | chaque ligne est un tour perdu ; sa classe dit si le rail ou le modèle est en cause |
+| `class = transport*` | audit | **décroissant après déploiement** | ces tours-là sont désormais rejoués une fois |
+| `class = parse\|provider\|http_4xx` | audit | inchangé | population d'AC3 : elle ne doit **pas** être rejouée |
+| `a2a_turn_failed_audit_failed` | WARN | **vide** | le WARN est passé, la ligne d'audit non — le compte du `GROUP BY` est alors incomplet |
+
+`a2a_turn_failed` est **SOLE WRITER** de son nom, dans le journal et dans
+`audit_events` (scan de source, allowlist livrée vide) : c'est ce qui rend le
+`GROUP BY` ci-dessus exact plutôt qu'un nombre sur lequel deux sites peuvent
+diverger. `model` vaut `unknown` quand le provider résolu est illisible
+(mika#2328) — ça **dégrade** la ligne, ça ne la supprime pas.
+
+### Sondes, et leurs quatre haltes
+
+1. **S1 — l'attestation traverse (premier tour arch échoué).** Une ligne
+   `a2a_turn_failed` portant `model` et `error_class`.
+   **Halte 1 — aucune ligne alors que des tours arch ont échoué :** ne pas
+   élargir le site d'émission par réflexe. Établir d'abord que le binaire servi
+   porte le correctif (classe mika#2340), puis si le tour est passé par
+   `message/stream` — population nommée hors périmètre ci-dessous.
+2. **S2 — le groom survit (AC4, 7 jours).** Aucun `first-pass _arch_ask failed`
+   corrélé à une coupure `body read failed mid-stream`, **alors que les coupures
+   continuent d'apparaître** dans `llm_call_attempt`. Ce contrôle positif est
+   essentiel : zéro coupure **et** zéro groom perdu ne prouve rien — le blip a
+   cessé, pas le correctif d'avoir pris (classe mika#2205).
+   **Halte 2 — des grooms continuent de mourir avec `a2a_turn_failed` portant
+   une classe transport :** l'attestation est écrite et non lue. **Ne pas toucher
+   au serveur** — vérifier le binaire **CLI** (le `mika` qu'invoque `_arch_ask`
+   est celui du `PATH` du bac à sable, qui peut être en retard sur mika-spirit ;
+   les deux moitiés se déploient ensemble, et c'est la seule asymétrie de
+   déploiement que ce correctif introduit).
+   **Halte 3 — des grooms meurent avec `parse` ou `provider` :** c'est un
+   **résultat**, pas le défaut de ce ticket. Le tour échoue pour une autre raison,
+   que ce correctif refuse délibérément de rejouer (AC3). Ouvrir le suivi **avec
+   la classe et son compte**, jamais élargir `is_transport_class`.
+3. **S3 — contrôle négatif du faux positif (7 jours).** `_arch_ask` ne doit pas
+   rejouer une passe dont l'architecte a rendu un verdict.
+   **Halte 4 —** un retry sur un tour abouti : `MIKA_ARCH_ASK_RETRY=0`
+   **d'abord**, diagnostic ensuite — la sonde que mika#2278 s'est écrite
+   s'applique mot pour mot à ce changement, qui déplace précisément cette ligne.
+4. **S4 — tranche modèle vs transport (AC4, second volet).** La requête SQL
+   groupée par modèle **est** la tranche que le ticket demande : une classe
+   `transport*` répartie sur les deux modèles à charge comparable confirme le
+   diagnostic de Prime ; une concentration sur un modèle le réfute et rouvre la
+   question du modèle — **qui n'est pas la nôtre** (le ticket interdit le swap ;
+   cette mesure le documenterait pour son propre ticket).
+
+**Ce que ce travail n'achète PAS.** Il ne fait pas cesser la coupure : il rend la
+perte **rattrapable et comptable**. Et il ne ferme pas `message/stream`, qui ne
+rend pas de `Task` synchrone à estamper et tombe dans la population « non
+attesté » — bornes héritées de mika#2304 et mika#1883, ni élargies ni modifiées.
+
+**Hors périmètre, délibérément :** allonger le back-off d'`openai.rs` (refusé sur
+les quatre mesures ci-dessus, à rouvrir seulement si S2 montre qu'un blip dépasse
+30 s — le levier serait alors `MIKA_ARCH_ASK_RETRY_DELAY_SECS`, borné à 300 s,
+**sans une ligne de code**) ; la cause OpenRouter (voisin de mika#2313/#2317) ;
+élargir le retry `_arch_ask` à « tout non-zéro », refusé avec sa raison par
+mika#2278 D4 ; rejouer `AGENT_BUSY` (-32000), qui attend déjà côté serveur dans
+une file bornée (mika#2163) ; et le swap de modèle, interdit par le ticket.
+
 Portage de contexte entre passes architecte : la question est tranchée (mika#2305) :
 - **La réponse, par axe — c'est le livrable principal, et le ticket se trompe d'axe.**
   Le **portage intra-invocation** (1ʳᵉ passe → 2ᵉ passe, et retry UNPARSED) est

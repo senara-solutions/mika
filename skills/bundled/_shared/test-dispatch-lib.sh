@@ -6996,6 +6996,37 @@ assert_eq "mika#2278: les quatre WARN d'échec portent le message du CLI (R5)" \
     "4" "$_MIKA2278_SUFFIXED"
 
 # ===========================================================================
+# mika#2522 — les deux moitiés du code de sortie retryable sont le même nombre
+# ===========================================================================
+#
+# Le retry de mika#2278 ne rejoue que sur `75`, et mika#2522 fait arriver un `75`
+# là où arrivait un `1` : la classe `transport` attestée par le serveur devient
+# `FailureClass::Transport` côté CLI, donc `EXIT_TRANSPORT_FAILURE`. Ce ticket ne
+# touche PAS `dispatch-lib.sh` — tout ce que le shell doit garantir, c'est que la
+# constante qu'il lit est bien celle que le CLI écrit.
+#
+# Le côté Rust épingle déjà le littéral (`assert_eq!(EXIT_TRANSPORT_FAILURE, 75)`
+# dans `remote_ask.rs`). Aucun des deux tests ne voit l'autre : deux moitiés
+# épinglées séparément sur deux littéraux peuvent diverger en silence, et le seul
+# symptôme serait un retry qui cesse de s'armer — c'est-à-dire exactement le
+# défaut que mika#2522 ferme, revenu par la porte de derrière. Cette assertion est
+# la jointure.
+_MIKA2522_REMOTE_ASK_RS="$SCRIPT_DIR/../../../crates/mika-cli/src/remote_ask.rs"
+_MIKA2522_CLI_EXIT=$(grep -oE 'pub const EXIT_TRANSPORT_FAILURE: i32 = [0-9]+' \
+    "$_MIKA2522_REMOTE_ASK_RS" 2>/dev/null | grep -oE '[0-9]+$' || true)
+# Anti-vacuité : source déplacée, constante renommée, `grep` qui ne rend rien —
+# chacun donnerait une chaîne vide, et comparer deux vides passerait. Un prédicat
+# qui ne lit rien se lit exactement comme un prédicat sain (classe mika#2205).
+assert_eq "mika#2522: la constante du CLI a bien été extraite de sa source" \
+    "extracted" "$([ -n "$_MIKA2522_CLI_EXIT" ] && echo extracted || echo empty)"
+_MIKA2522_SHELL_EXIT=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; printf '%s' "$_ARCH_ASK_RETRYABLE_EXIT"
+)
+assert_eq "mika#2522: _ARCH_ASK_RETRYABLE_EXIT == EXIT_TRANSPORT_FAILURE du CLI" \
+    "$_MIKA2522_CLI_EXIT" "$_MIKA2522_SHELL_EXIT"
+
+# ===========================================================================
 # mika#1943 — un chemin qu'on ne peut pas prouver worktree n'est pas supprimé
 # ===========================================================================
 #

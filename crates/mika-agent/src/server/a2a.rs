@@ -19,7 +19,7 @@ use mika_a2a::jsonrpc::{
 use mika_a2a::params::{
     CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
     ONLY_SKILLS_KEY, RUN_USAGE_KEY, RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY,
-    TaskIdParams, TaskQueryParams,
+    TURN_FAILURE_CLASS_KEY, TaskIdParams, TaskQueryParams,
 };
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
@@ -256,7 +256,7 @@ async fn run_a2a_agent(
     only_skills: &[String],
     model_override: Option<&Arc<dyn mika_common::llm::LlmProvider>>,
     session_isolated: bool,
-) -> Result<A2aTurn, String> {
+) -> Result<A2aTurn, A2aTurnFailure> {
     // Hot-reload skills if dirty
     let skills = if agent_state.skills_dirty.load(Ordering::Acquire) {
         agent_state.skills_dirty.store(false, Ordering::Release);
@@ -374,7 +374,48 @@ async fn run_a2a_agent(
             // ticket closes, one field further on.
             effective_model: output.effective_model,
         }),
-        Err(e) => Err(e.to_string()),
+        // mika#2522: the classification happens HERE and nowhere downstream.
+        // This `Err(e.to_string())` was the end of the line for the error's
+        // *variant* — after it, `handle_message_send` held a rendered sentence
+        // and could only have classified by `contains()`, which mika#2179 and
+        // mika#2289 both refuse in as many words. So the class is taken while
+        // `e` is still an `anyhow::Error` and travels with the failure.
+        Err(e) => Err(A2aTurnFailure::from_anyhow(&e)),
+    }
+}
+
+/// Why an A2A turn failed: the sentence, and the class behind it (mika#2522).
+///
+/// Replaces the bare `String` this function used to return. `Display` renders
+/// the message alone, so every existing `%e` site — the `message/stream` error
+/// arm included — prints byte for byte what it printed before; only the type
+/// gained a second field. Same shape, and the same reason, as `mika-cli`'s
+/// `TransportClass`: the class travels as a typed marker rather than as
+/// something a reader has to recover from prose.
+struct A2aTurnFailure {
+    message: String,
+    /// One of `mika_common::llm::error_class`'s seven spellings.
+    class: std::borrow::Cow<'static, str>,
+}
+
+impl A2aTurnFailure {
+    /// Read the class off the `anyhow` cause chain, then render the message.
+    ///
+    /// The order matters only in that both must happen here: once the error is
+    /// a `String` the variant is gone. `classify_anyhow_error` (mika#2289)
+    /// `downcast_ref`s the whole chain and answers `other` for anything that is
+    /// not an `LlmError` — a statement, not a fallback.
+    fn from_anyhow(err: &anyhow::Error) -> Self {
+        Self {
+            message: err.to_string(),
+            class: mika_common::llm::error::classify_anyhow_error(err),
+        }
+    }
+}
+
+impl std::fmt::Display for A2aTurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -700,6 +741,105 @@ fn stamp_run_usage(task: &mut Task, run_usage: Option<&mika_common::llm::LlmUsag
         .insert(RUN_USAGE_KEY.to_string(), value);
 }
 
+/// Stamp the **class** of the failure that killed a turn onto the Task the
+/// caller receives (mika#2522).
+///
+/// Fourth sibling of [`stamp_effective_model`], [`stamp_session_isolation`] and
+/// [`stamp_run_usage`], at the same intervention point and for the same reason:
+/// `task` is already `mut` here, `a2a_build_task` is upstream, and nothing
+/// downstream can overwrite the field.
+///
+/// **Written unconditionally on the failure branch, and on no other.** Its
+/// absence therefore means "this server attested nothing" — a binary predating
+/// mika#2522, `message/stream`, `returnImmediately` — and never "the class is
+/// `contract`". Like [`stamp_run_usage`] it is a *measurement* rather than the
+/// answer to a flag, so it carries no value on the success path: a class on a
+/// turn that did not fail would be a statement about a failure that did not
+/// happen.
+fn stamp_turn_failure_class(task: &mut Task, class: &str) {
+    task.metadata
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            TURN_FAILURE_CLASS_KEY.to_string(),
+            serde_json::Value::String(class.to_string()),
+        );
+}
+
+/// The model label a failed turn is counted under (mika#2522 R-3).
+///
+/// `ResolvedBudgetRecord::model` is empty when the provider itself could not be
+/// parsed (`unknown_provider`, mika#2328). That **degrades** the line to
+/// `unknown` rather than suppressing it — the `repo=unknown` motif of mika#2496:
+/// a turn lost on a model we cannot name is still a turn lost, and dropping the
+/// row would silently shrink the very count AC2 exists to produce.
+///
+/// It is also never an empty `target_key`: an empty group in the operator's
+/// `GROUP BY` says nothing about why it is empty, while `unknown` names the one
+/// cause it can have.
+fn audit_model_label(record_model: &str) -> &str {
+    let trimmed = record_model.trim();
+    if trimmed.is_empty() {
+        "unknown"
+    } else {
+        trimmed
+    }
+}
+
+/// Count a failed turn, on the two surfaces one fact owes (mika#2522 R-3).
+///
+/// One fact, one site, two surfaces: the class the client needs in order to
+/// decide (stamped by [`stamp_turn_failure_class`]) and the event plus audit row
+/// an operator needs in order to answer *which model loses turns, and on which
+/// class*. Writing them from one place is what guarantees they cannot diverge.
+///
+/// The class is taken as an argument rather than recomputed: it was read off the
+/// error's **variant** in [`A2aTurnFailure::from_anyhow`], which is the last
+/// point where the variant exists. Reclassifying here would mean classifying a
+/// rendered sentence.
+async fn report_turn_failure(
+    agent_state: &Arc<AgentState>,
+    task_id: &str,
+    session_id: &str,
+    failure: &A2aTurnFailure,
+) {
+    let class = &failure.class;
+
+    // The model is *resolved*, never guessed: `effective_model` is `None` on
+    // this branch (the turn produced no `AgentOutput`), so it comes off the
+    // record frozen at `init_agent` — the same value `llm_budget_resolved`
+    // reports (mika#2328).
+    let model = audit_model_label(&agent_state.budget_record.model);
+
+    warn!(
+        event = "a2a_turn_failed",
+        agent_id = %agent_state.db.agent_id(),
+        task_id = %task_id,
+        session_id = %session_id,
+        model = %model,
+        error_class = %class,
+        "a2a turn failed — attesting the class to the caller (mika#2522)"
+    );
+
+    if let Err(e) = agent_state
+        .db
+        .log_audit_event(
+            session_id,
+            A2A_TURN_FAILED_TOOL,
+            model,
+            None,
+            Some(class.as_ref()),
+            Some(&format!(
+                "task={task_id} class={class} error={}",
+                mika_common::text::safe_truncate(&failure.message, 500)
+            )),
+            Some(task_id),
+        )
+        .await
+    {
+        warn!(error = %e, task_id = %task_id, "a2a_turn_failed_audit_failed");
+    }
+}
+
 /// Refuse a request that could not get the agent lock, and make the refusal
 /// visible (mika#2163 AC8).
 ///
@@ -787,6 +927,18 @@ async fn note_wait(
 /// same" checkable rather than a coincidence between two string literals.
 const COMPLETED_WITHOUT_TEXT: &str = "Task completed.";
 
+/// The `audit_events.tool_name` under which a failed A2A turn is counted
+/// (mika#2522 R-3).
+///
+/// **SOLE WRITER** — [`report_turn_failure`] is the only site that writes this
+/// name, in the log and in `audit_events`, and a source scan
+/// (`canonical_tokens::tests::mika2522_the_turn_failure_name_has_a_single_writer`)
+/// refuses a second. That is what makes
+/// `SELECT target_key, after_value, count(*) … GROUP BY 1, 2` an exact answer to
+/// *which model loses turns, and on which class* rather than a number two
+/// writers can disagree about.
+const A2A_TURN_FAILED_TOOL: &str = "a2a_turn_failed";
+
 /// What the agent loop left in `handle_message_send`'s hand.
 ///
 /// Named rather than an `Option<Option<String>>` because the three states are
@@ -796,8 +948,16 @@ const COMPLETED_WITHOUT_TEXT: &str = "Task completed.";
 enum TurnText {
     /// The loop finished. `Some` when it produced text of its own.
     Produced(Option<String>),
-    /// The loop failed; the task is `failed` and there is no answer to serve.
-    LoopFailed,
+    /// The loop failed; the task is `failed` and there is no answer to serve —
+    /// but there *is* something to say about why (mika#2522).
+    ///
+    /// The class travels **inside** the variant rather than beside it in a
+    /// parallel local: the `match` on `turn_text` below is the only place that
+    /// knows a turn failed, and carrying the class here is what stops a later
+    /// editor from handling that branch without it.
+    LoopFailed {
+        class: std::borrow::Cow<'static, str>,
+    },
 }
 
 /// What `message/send` must do about the Task it has just rebuilt (mika#2270).
@@ -1206,7 +1366,12 @@ async fn handle_message_send(
                         .a2a_update_task_state(&task_id, "failed")
                         .await,
                 );
-                TurnText::LoopFailed
+                // mika#2522: the class was read off the variant in
+                // `run_a2a_agent` and travels on the failure. Count it here —
+                // `agent_state` and `session_id` are in hand — and carry it to
+                // the stamp below.
+                report_turn_failure(agent_state, &task_id, &session_id, &e).await;
+                TurnText::LoopFailed { class: e.class }
             }
         };
 
@@ -1222,14 +1387,24 @@ async fn handle_message_send(
                 // A failed loop is served as `failed` with nothing to say — the
                 // client turns that state into a named error of its own, so the net
                 // has neither a text to serve nor a loss to report.
-                if let TurnText::Produced(text) = &turn_text {
-                    ensure_send_task_carries_text(
-                        agent_state,
-                        &mut task,
-                        text.as_deref(),
-                        &session_id,
-                    )
-                    .await;
+                //
+                // mika#2522: it does now carry **why**. Serving the state alone
+                // made the client class every `failed` as `Contract`, so a turn
+                // an OpenRouter cut had just killed was declared un-retryable
+                // and the groom above it died with it.
+                match &turn_text {
+                    TurnText::Produced(text) => {
+                        ensure_send_task_carries_text(
+                            agent_state,
+                            &mut task,
+                            text.as_deref(),
+                            &session_id,
+                        )
+                        .await;
+                    }
+                    TurnText::LoopFailed { class } => {
+                        stamp_turn_failure_class(&mut task, class);
+                    }
                 }
                 // mika#2304 D3: the mika#2270 intervention point — `task` is
                 // already `mut` here and `a2a_build_task` is upstream, so nothing
@@ -2775,6 +2950,216 @@ mod tests {
         let mut untouched = completed_task(Some(agent_reply("ok")));
         stamp_effective_model(&mut untouched, None);
         assert!(untouched.metadata.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2522 — a turn killed by the transport is not a refusal by the server.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **V1.** The class comes from the error's **variant**, on every class.
+    ///
+    /// `run_a2a_agent` used to end on `Err(e.to_string())`, which is where the
+    /// variant died: after it, the only way to classify was a `contains()` on a
+    /// rendered sentence — the thing mika#2179 and mika#2289 both refuse in as
+    /// many words. So the reading happens while `e` is still an `anyhow::Error`,
+    /// and this test is what pins that it reads the variant rather than the text.
+    ///
+    /// The first case is the founding incident's own error, verbatim from
+    /// `mika-common`'s `INCIDENT_TRANSPORT_TIMEOUT`: the `body read failed
+    /// mid-stream` shape that killed five grooms of mika#2515 on 2026-09-24.
+    #[test]
+    fn mika2522_the_failure_class_is_read_from_the_error_variant() {
+        use mika_common::llm::LlmError;
+
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (
+                anyhow::Error::new(LlmError::Transport(
+                    "failed to read response body: error decoding response body: \
+                     request or response body error: operation timed out"
+                        .into(),
+                )),
+                "transport_timeout",
+            ),
+            (
+                anyhow::Error::new(LlmError::Transport(
+                    "failed to read response body: unexpected EOF during chunked body read".into(),
+                )),
+                "transport",
+            ),
+            // AC3's population — none of these may read as transport, because
+            // none of them is repaired by sending the same brief again.
+            (
+                anyhow::Error::new(LlmError::ParseError("bad json".into())),
+                "parse",
+            ),
+            (
+                anyhow::Error::new(LlmError::ProviderError("upstream said no".into())),
+                "provider",
+            ),
+            (
+                anyhow::Error::new(LlmError::HttpError {
+                    status: 400,
+                    message: "bad request".into(),
+                    retryable: false,
+                }),
+                "http_400",
+            ),
+            // Not an LLM failure at all: `other` is a statement, not a fallback.
+            (anyhow::anyhow!("the database went away"), "other"),
+        ];
+
+        for (err, expected) in cases {
+            let rendered = err.to_string();
+            let failure = A2aTurnFailure::from_anyhow(&err);
+            assert_eq!(
+                failure.class, expected,
+                "class for {rendered:?} should be read off the variant"
+            );
+            // The sentence is unchanged: every existing `%e` site — the
+            // `message/stream` error arm included — must print what it printed
+            // before this ticket.
+            assert_eq!(failure.to_string(), rendered);
+        }
+    }
+
+    /// **V1.** A wrapped cause is still found: the whole `anyhow` chain is
+    /// walked.
+    ///
+    /// The engine adds context as the error climbs, so the `LlmError` is rarely
+    /// the outermost layer by the time it reaches this module. A classifier that
+    /// only inspected the top would answer `other` on the exact population this
+    /// ticket exists for, and the assertion above would still pass.
+    #[test]
+    fn mika2522_a_wrapped_transport_failure_is_still_transport() {
+        use anyhow::Context;
+        use mika_common::llm::LlmError;
+
+        let err = Err::<(), _>(LlmError::Transport("connection reset".into()))
+            .context("LLM call failed at step 3")
+            .context("agent loop failed")
+            .expect_err("built as an error");
+
+        assert_eq!(A2aTurnFailure::from_anyhow(&err).class, "transport");
+    }
+
+    /// **V1.** The class crosses the frontier and reads back through the one
+    /// decoder.
+    ///
+    /// The full server half of mika#2522: variant → class → Task metadata →
+    /// `attested_turn_failure_class`. Asserting the stamp against the raw map
+    /// would leave the reader untested, and the reader is what the client calls.
+    #[test]
+    fn mika2522_the_attested_class_reads_back_through_the_shared_reader() {
+        use mika_common::llm::LlmError;
+
+        let err = anyhow::Error::new(LlmError::Transport("connection reset".into()));
+        let failure = A2aTurnFailure::from_anyhow(&err);
+
+        let mut task = completed_task(None);
+        task.metadata = Some(HashMap::from([(
+            "kept".to_string(),
+            serde_json::Value::String("value".to_string()),
+        )]));
+        stamp_turn_failure_class(&mut task, &failure.class);
+
+        assert_eq!(
+            mika_a2a::params::attested_turn_failure_class(&task),
+            Some("transport")
+        );
+        // The stamp joins the map, it does not replace it — same contract as its
+        // three siblings.
+        let metadata = task.metadata.clone().expect("metadata present");
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata.get("kept").and_then(|v| v.as_str()), Some("value"));
+    }
+
+    /// **V1, negative control.** A turn that did not fail attests nothing.
+    ///
+    /// This is what lets the client read absence as *"this server said nothing"*
+    /// rather than as `contract` — the asymmetry `stamp_turn_failure_class`'s doc
+    /// comment states, and the reason a binary predating mika#2522 keeps its old
+    /// behaviour exactly.
+    #[test]
+    fn mika2522_a_successful_turn_carries_no_failure_class() {
+        let mut task = completed_task(Some(agent_reply("here is your answer")));
+        // The success path stamps the other three and never this one.
+        stamp_effective_model(&mut task, Some("openrouter/moonshotai/kimi-k2.5"));
+        stamp_session_isolation(&mut task, false);
+
+        assert_eq!(mika_a2a::params::attested_turn_failure_class(&task), None);
+        assert!(
+            !task
+                .metadata
+                .as_ref()
+                .expect("the two siblings wrote a map")
+                .contains_key(TURN_FAILURE_CLASS_KEY),
+            "the failure class must be absent from a successful turn, not empty"
+        );
+    }
+
+    /// **V4.** The audit line is degraded by an unreadable model, never
+    /// suppressed by one.
+    ///
+    /// The `target_key` this produces is what an operator groups by. An empty
+    /// key would make the count of turns lost on an unnameable model
+    /// indistinguishable from an absent group — so the whole population AC2
+    /// measures would be short by exactly the rows hardest to explain.
+    #[test]
+    fn mika2522_an_unreadable_model_degrades_the_line_and_never_drops_it() {
+        assert_eq!(
+            audit_model_label("openrouter/moonshotai/kimi-k2.5"),
+            "openrouter/moonshotai/kimi-k2.5"
+        );
+        // `ResolvedBudgetRecord::model` is `""` when the provider itself could
+        // not be parsed (mika#2328's `unknown_provider`).
+        assert_eq!(audit_model_label(""), "unknown");
+        assert_eq!(audit_model_label("   "), "unknown");
+        // Whitespace around a real value is trimmed rather than carried into the
+        // group key: `" kimi"` and `"kimi"` must not become two populations.
+        assert_eq!(audit_model_label("  zai/glm-5.2  "), "zai/glm-5.2");
+    }
+
+    /// **V1, structural.** The stamp has exactly one call site, and it is the
+    /// failure branch.
+    ///
+    /// No behavioural test in this module can see the composition: the `match`
+    /// on `turn_text` is inside an async handler that needs a live server. What
+    /// a scan *can* see is that nobody stamps a class anywhere else — and a
+    /// second site, on the success branch or elsewhere, would make the absence
+    /// of the key stop meaning "this server said nothing", which is the whole
+    /// contract the client rests on.
+    #[test]
+    fn mika2522_the_failure_class_is_stamped_from_one_branch_only() {
+        const CALL_SITE: &str = concat!("stamp_turn_failure", "_class(&mut task");
+        // Scoped to the shipped half of the file, like its mika#2304 neighbour:
+        // the round-trip test above legitimately calls the stamp to walk the
+        // chain, and it is the production code that must have one site.
+        let production = include_str!("a2a.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this module has a test section")
+            .0;
+
+        let sites = production.matches(CALL_SITE).count();
+        assert_eq!(
+            sites, 1,
+            "mika#2522 — expected exactly one call site for the failure-class \
+             stamp, found {sites}. A second one would make an absent key stop \
+             meaning `this server attested nothing`."
+        );
+
+        // And that site is inside the `LoopFailed` arm. Anchored on the arm's
+        // own pattern so a stamp moved to the `Produced` arm goes red.
+        const FAILURE_ARM: &str = concat!(
+            "TurnText::LoopFailed { class } => {\n",
+            "                        stamp_turn_failure",
+            "_class(&mut task, class);\n"
+        );
+        assert!(
+            production.contains(FAILURE_ARM),
+            "mika#2522 — the stamp must sit in the `LoopFailed` arm of the \
+             `turn_text` match; it is what ties the class to the failure that \
+             produced it"
+        );
     }
 
     /// **Both ports refuse the same way (D2, AC3).** `message/send` and
