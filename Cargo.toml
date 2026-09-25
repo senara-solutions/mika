@@ -106,7 +106,7 @@ bytes = "1"
 
 # Clipboard & Image encoding
 arboard = { version = "3", features = ["image-data"] }
-png = "0.17"
+png = "0.18"
 
 # Unicode
 unicode-width = "0.2"
