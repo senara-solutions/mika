@@ -204,7 +204,17 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 [GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::ISSUE_LABELED_RE	exact:line-anchored
 [GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::PR_ACTION_RE	exact:line-anchored
 [GitHub]	B	crates/mika-agent/src/server/webhook_queue_v2.rs::classify_event	exact:prefix
-[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_unauthorized_webhook_dispatch	exact:prefix
+# mika#2517 moved the body of `is_unauthorized_webhook_dispatch` into
+# `is_webhook_fallthrough_domain` — one definition, four consumers (the two
+# refusals of mika#910/#933/#1102, plus the withheld tool and the stood-down
+# guard). The refusal name still exists and still answers the same question, but
+# it no longer READS the prefix, so it is no longer a match site: its row is
+# replaced by the two below rather than kept alongside them. `fallthrough_marker_class`
+# is the second reader, observability-only — its unknown shape falls to `other`
+# instead of being refused, so a reworded prefix costs a class in a `GROUP BY`,
+# never a decision.
+[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::fallthrough_marker_class	exact:prefix
+[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_webhook_fallthrough_domain	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
 
 # ── Gateway body-truncation marker (mika#2242 R6). `truncate_body` appends it

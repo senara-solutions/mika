@@ -148,16 +148,36 @@ async fn guard_fires_only_once() {
     assert_output_contains(&trace, "noted");
 }
 
-/// Guard fires on other GitHub webhook event types (issues, check suites).
+/// Guard does **not** fire on an issue webhook — the Webhook Fallthrough
+/// domain stands it down (mika#2517 U3, AC2).
+///
+/// **This assertion is the inverse of the one it replaces**, and the inversion
+/// is a decision rather than a relaxation. This test used to assert that
+/// `[GitHub] Issue opened:` with zero tool calls gets re-prompted. On exactly
+/// that population the guard's own premise — *"webhook events require action"* —
+/// contradicts the `self-dev` § Webhook Fallthrough HARD GATE, which says the
+/// correct action is to acknowledge and stop. So the engine was re-prompting a
+/// turn that had obeyed, handing it a list of tools to call whose shortest
+/// creates a task — the `pending` phantom mika#2517 was filed about. Keeping
+/// the old assertion would mean this suite asserts both halves of a
+/// contradiction; it is replaced, not carried. Same treatment the unit-level
+/// siblings received (`webhook_zero_tools_trigger_fires_on_new_comment`,
+/// `…_fires_on_non_ready_label`).
+///
+/// **The positive control lives in this same file and must stay green**:
+/// `guard_fires_on_webhook_with_zero_tools` and `guard_fires_only_once` both
+/// run on `[GitHub] PR review (approved)`, which is *outside* the domain. Were
+/// the trigger to start returning `false` on everything, those two would go red
+/// — without them, this test alone would read exactly the same whether the
+/// domain exclusion works or the mika#696 guard has been retired wholesale.
 #[tokio::test]
-async fn guard_fires_on_issue_webhook() {
+async fn guard_stands_down_on_issue_webhook() {
     let harness = EvalHarness::builder()
         .responses(vec![
-            // Step 1: Text-only on issue webhook — rejected
+            // A single text-only turn. Were the guard still armed here, the
+            // mock would be asked for a second response and the step count
+            // below would not hold.
             text_response("A new issue was opened about performance."),
-            // Step 2: Agent acts properly
-            tool_call_response("webhook_action", json!({})),
-            text_response("Checked existing tasks for the new issue."),
         ])
         .tools(tools_with_webhook_action())
         .build()
@@ -170,6 +190,7 @@ async fn guard_fires_on_issue_webhook() {
         .unwrap();
 
     assert_has_output(&trace);
-    // 3 steps: rejected text + tool call + final text
-    assert_exact_steps(&trace, 3);
+    // 1 step: acknowledged and stopped, no re-prompt.
+    assert_exact_steps(&trace, 1);
+    assert_output_contains(&trace, "performance");
 }
