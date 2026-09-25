@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# smoke-webhook-chain — after a deploy, ask the inbound webhook chain whether it
+# is actually wired, by traversing it.
+#
+# THE PROPERTY, not a list of statuses:
+#   The inbound chain has several hops and only the last one lives in this repo.
+#   A gateway that listens perfectly is indistinguishable, from inside the host,
+#   from a chain that reaches it — and a chain that is dead is indistinguishable
+#   from one that is alive until something actually crosses it. The only way to
+#   learn the difference is to send a request at the public URL and read what
+#   comes back.
+#
+# THE FOUNDING INCIDENT is mika#2135. The target this replaces, `check-ngrok`,
+# probed `http://localhost:4040/api/tunnels` — the local API of an ngrok — and on
+# failure printed "ngrok is not running! Telegram webhooks will not reach the
+# gateway. Start ngrok: ngrok http 8080". Every sentence was false: the chain in
+# service is Freebox (port forward) → Synology (reverse proxy) → gentux:8080,
+# with `setWebhook` posted by hand, and ngrok is nowhere in it. On 2026-09-01 the
+# warning produced a false alert published in an orchestration report, claiming
+# Telegram webhooks no longer reached the gateway while a live end-to-end
+# traversal proved otherwise. A warning printed at the end of *every* deploy is
+# read as a substrate signal; when it describes a dead topology it does not
+# merely fail to help — it fabricates a diagnosis at the exact moment someone is
+# looking at the state of the system.
+#
+#   Note the older target never verified the chain at all, even when it passed:
+#   a live ngrok proves an ngrok is alive, never that Telegram reaches anything.
+#   It was a tool-presence check wearing a chain check's clothes.
+#
+# THE CHAIN IS DECLARED, NEVER DERIVED (mika#2135 D2).
+#   The gateway loads its configuration with `dotenvy::dotenv()` from its CWD
+#   ("Load .env from CWD (gateway has no ~/.mika/ home directory)",
+#   crates/mika-gateway/src/main.rs). Under OpenRC that CWD is `/` and the real
+#   configuration comes from the service EnvironmentFile. There is therefore NO
+#   file this script could read to learn the public URL. Three derivations were
+#   refused, each because it would return a *wrong* answer rather than an absent
+#   one: reading a repo `.env` (reconstructs a cascade whose real order is
+#   unknown here — a false provenance is strictly worse than none, mika#2293);
+#   parsing the gateway's startup log (a non-contractual `Debug` render, at a
+#   path that is itself configurable); guessing from the hostname (discriminates
+#   nothing). So the URL comes from an explicit declaration, and its absence is
+#   "nothing was verified" — never "all is well".
+#
+# TWO PROBES OF DIFFERENT PROVENANCE, not a redundancy (the mika#2407 argument:
+# one reads what the host believes, the other what the chain does):
+#   - local terminus  — GET http://localhost:<port>/health, unauthenticated,
+#                       200 iff `state.ready` is up and `SELECT 1` passes.
+#   - public traversal — one request at the declared public URL, which crosses
+#                       every hop in front of the gateway.
+#   Crossing the two is what makes the failure message actionable, and it is the
+#   whole of what this buys over the target it replaces:
+#     local KO           → the gateway is not listening   (rc-service)
+#     local OK, public KO → the gateway listens, the public path misses it
+#                           (Freebox / Synology)
+#     both OK             → silence
+#
+# WHAT IT SENDS, AND WHY IT IS HARMLESS.
+#   A POST with `Content-Type: application/json` and the body `{}`.
+#   `handle_webhook` declares `Json(update): Json<TelegramUpdate>` as an
+#   *extractor*, and Axum runs extractors before the handler body — so extraction
+#   fails before the secret check and before the single-bot-mode guard.
+#   `TelegramUpdate.update_id` is a required i64, so `{}` cannot deserialize.
+#   Corollary worth having: this proves the traversal WITHOUT touching a secret
+#   and WITHOUT injecting an update into the system. Nothing enters the queue.
+#
+# WHAT IT TESTS IS A FAMILY, NEVER A CODE.
+#   The founding measurement was an HTTP 422, and pinning 422 would be a
+#   regression of the very family being repaired: the same route answers 415
+#   without a json Content-Type, 400 on malformed JSON, 401 when the secret check
+#   runs and fails, 404 outside single-bot mode. All of them are answers *the
+#   gateway's own Axum produced*, so all of them prove the traversal. The family
+#   is pinned on the gateway side by a `#[cfg(test)]` guard in
+#   crates/mika-gateway/src/routes.rs, so it cannot drift in silence.
+#
+# WHAT IT NEVER PRINTS.
+#   No secret — none is read or sent. No response body. The public URL IS
+#   printed: it is public by construction, being the one Telegram calls.
+#
+# THE TOPOLOGY IS WRITTEN DOWN: docs/operator/local-webhook-topology.md.
+#   The entire cost of the founding incident came from it existing nowhere but in
+#   the operator's memory.
+#
+# CONFIG (env)
+#   MIKA_WEBHOOK_CHAIN_URL             public webhook URL, probe-specific override
+#   MIKA_TELEGRAM_WEBHOOK_URL          public webhook URL, the gateway's own variable
+#   MIKA_GATEWAY_PORT                  local gateway port          (default 8080)
+#   MIKA_WEBHOOK_CHAIN_LOCAL_TIMEOUT_SECS  bounded poll for readiness (default 15)
+#   MIKA_WEBHOOK_CHAIN_TIMEOUT_SECS    timeout for the traversal   (default 10)
+#
+# EXIT CODES — three verdicts, and the third is the one that matters most.
+#   0  the chain is ALIVE: a request at the declared public URL came back with an
+#      application-level answer from the gateway itself.
+#   1  the chain is BROKEN: the local gateway does not answer, or the public
+#      request does not reach it.
+#   2  NOTHING WAS VERIFIED: no declared URL, no network, or an answer this
+#      script cannot classify. This is not a pass and not a failure. A smoke that
+#      could reach nothing has checked nothing, and saying so is the only honest
+#      output — collapsing it into 0 would make an unwired host look healthy, and
+#      into 1 would send an operator to repair a chain that may be fine.
+
+set -uo pipefail
+
+readonly EXIT_OK=0
+readonly EXIT_CHAIN_BROKEN=1
+readonly EXIT_INDETERMINATE=2
+
+readonly TOPOLOGY_DOC="docs/operator/local-webhook-topology.md"
+
+gateway_port="${MIKA_GATEWAY_PORT:-8080}"
+local_timeout="${MIKA_WEBHOOK_CHAIN_LOCAL_TIMEOUT_SECS:-15}"
+traversal_timeout="${MIKA_WEBHOOK_CHAIN_TIMEOUT_SECS:-10}"
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: smoke-webhook-chain
+
+  Verifies the inbound Telegram webhook chain by traversing it. Takes no
+  argument; the public URL comes from a declaration in the environment
+  (MIKA_WEBHOOK_CHAIN_URL, else MIKA_TELEGRAM_WEBHOOK_URL).
+
+exit 0 = chain alive
+exit 1 = chain broken
+exit 2 = nothing was verified
+USAGE
+}
+
+if [[ $# -gt 0 ]]; then
+    usage
+    exit "$EXIT_INDETERMINATE"
+fi
+
+# ── 1. The declaration ───────────────────────────────────────────────────────
+# Resolved in order, with provenance, so the NOTE can name what to set.
+
+chain_url=""
+chain_url_source=""
+if [[ -n "${MIKA_WEBHOOK_CHAIN_URL:-}" ]]; then
+    chain_url="${MIKA_WEBHOOK_CHAIN_URL}"
+    chain_url_source="MIKA_WEBHOOK_CHAIN_URL"
+elif [[ -n "${MIKA_TELEGRAM_WEBHOOK_URL:-}" ]]; then
+    chain_url="${MIKA_TELEGRAM_WEBHOOK_URL}"
+    chain_url_source="MIKA_TELEGRAM_WEBHOOK_URL"
+fi
+
+if [[ -z "${chain_url//[[:space:]]/}" ]]; then
+    echo "  NOTE: no public webhook URL is declared — the inbound chain was not verified." >&2
+    echo "        Declare MIKA_WEBHOOK_CHAIN_URL (or MIKA_TELEGRAM_WEBHOOK_URL) to have" >&2
+    echo "        this check traverse the chain. See $TOPOLOGY_DOC." >&2
+    exit "$EXIT_INDETERMINATE"
+fi
+
+# ── 2. Local terminus, bounded poll ──────────────────────────────────────────
+# This runs right after `restart` in the deploy chain. A gateway that has not yet
+# raised `state.ready` answers 503 on /health, and shouting at it would reproduce
+# the founding defect in the other direction — a warning on a healthy system.
+# So readiness is *waited for*, within a bound, before any verdict 1.
+# (Same posture and same reason as the bounded poll in smoke-webhook-flood.sh.)
+
+health_url="http://localhost:${gateway_port}/health"
+local_status="000"
+deadline=$(( SECONDS + local_timeout ))
+
+while :; do
+    local_status="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$health_url" 2>/dev/null)" \
+        || local_status="000"
+    [[ "$local_status" == "200" ]] && break
+    (( SECONDS >= deadline )) && break
+    sleep 1
+done
+
+if [[ "$local_status" != "200" ]]; then
+    echo "" >&2
+    echo "  ⚠  WARNING: the inbound webhook chain is broken at its last hop." >&2
+    if [[ "$local_status" == "000" ]]; then
+        echo "  The gateway is not answering on localhost:${gateway_port} (nothing listening)." >&2
+    else
+        echo "  The gateway answers on localhost:${gateway_port} but is not ready" >&2
+        echo "  (GET /health → $local_status after ${local_timeout}s)." >&2
+    fi
+    echo "  Telegram updates reaching the host will be dropped at the door." >&2
+    echo "  Look at:  sudo rc-service mika-gateway status" >&2
+    echo "            /var/log/mika/gateway.log" >&2
+    echo "  Chain and remedies: $TOPOLOGY_DOC" >&2
+    echo "" >&2
+    exit "$EXIT_CHAIN_BROKEN"
+fi
+
+# ── 3. Public traversal ──────────────────────────────────────────────────────
+# One request. `{}` is refused by the extractor before any business logic, so
+# this crosses every hop without entering the system (see the header).
+
+traversal_status="$(curl -sS \
+    --max-time "$traversal_timeout" \
+    -o /dev/null \
+    -w '%{http_code}' \
+    -X POST "$chain_url" \
+    -H 'Content-Type: application/json' \
+    --data '{}' 2>/dev/null)"
+curl_rc=$?
+
+if [[ $curl_rc -ne 0 ]]; then
+    echo "" >&2
+    echo "  ⚠  WARNING: the gateway is listening, but the public path does not reach it." >&2
+    echo "  The request at $chain_url did not come back (curl exit $curl_rc:" >&2
+    echo "  DNS, TLS, refused connection or timeout). The hops in front of the" >&2
+    echo "  gateway are the suspects, not the gateway." >&2
+    echo "  Chain: Freebox (port forward) → Synology (reverse proxy) → localhost:${gateway_port}" >&2
+    echo "  Declared by: $chain_url_source" >&2
+    echo "  Chain and remedies: $TOPOLOGY_DOC" >&2
+    echo "" >&2
+    exit "$EXIT_CHAIN_BROKEN"
+fi
+
+case "$traversal_status" in
+    400 | 401 | 404 | 415 | 422)
+        # The family, never the code. Every one of these was produced by the
+        # gateway's own Axum stack, so the request crossed the whole chain —
+        # which is the entire property being verified.
+        exit "$EXIT_OK"
+        ;;
+    502 | 504)
+        # A reverse proxy that answers for a backend it cannot reach. The hop in
+        # front of the gateway is up; the last leg is not.
+        echo "" >&2
+        echo "  ⚠  WARNING: the gateway is listening, but the public path does not reach it." >&2
+        echo "  $chain_url answered HTTP $traversal_status — a reverse proxy that cannot" >&2
+        echo "  reach its backend. The gateway itself is healthy on localhost:${gateway_port}," >&2
+        echo "  so the broken leg is between Synology and this host." >&2
+        echo "  Declared by: $chain_url_source" >&2
+        echo "  Chain and remedies: $TOPOLOGY_DOC" >&2
+        echo "" >&2
+        exit "$EXIT_CHAIN_BROKEN"
+        ;;
+    *)
+        # 503 lands here deliberately: it is ambiguous between the gateway
+        # shedding load and a Synology in trouble, and a warning that names the
+        # wrong culprit is the defect this whole thing repairs. So do 2xx (no
+        # handler of ours answers `{}` with a success), 3xx, and every other 5xx.
+        echo "  NOTE: the inbound chain answered HTTP $traversal_status at $chain_url," >&2
+        echo "        which this check cannot classify — nothing was verified." >&2
+        echo "        Declared by: $chain_url_source. See $TOPOLOGY_DOC." >&2
+        exit "$EXIT_INDETERMINATE"
+        ;;
+esac
