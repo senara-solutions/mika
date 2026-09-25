@@ -197,6 +197,59 @@ pub const SESSION_ISOLATED_APPLIED_KEY: &str = "mika.session_isolated_applied";
 /// [`MessageSendParams`], so neither side can rename it alone.
 pub const RUN_USAGE_KEY: &str = "mika.run_usage";
 
+/// Response-metadata key carrying the **class** of a turn the server marked
+/// `failed` (mika#2522).
+///
+/// # Why the class has to cross the frontier
+///
+/// `handle_message_send` serves a failed turn as a `failed` Task with nothing to
+/// say (mika#2270) — the right call for rendering, and it throws away the one
+/// piece of information the caller needs in order to decide whether to try
+/// again. The server *holds* the class (`classify_anyhow_error`) and did not
+/// transmit it, so `terminal_state_class` filed every `failed` under
+/// `Contract` — including a turn a transport cut had just killed. Measured
+/// 2026-09-24: 11 `body read failed mid-stream` cuts, **5 grooms of mika#2515
+/// lost**.
+///
+/// # Absence is never `contract`
+///
+/// Written **unconditionally on the failure branch**, never on a success. It is
+/// a measurement, not the answer to a flag: its absence means "this server
+/// attested nothing" — a binary predating the fix, or a path that does not go
+/// through that site — and never "the class is `contract`". Same asymmetry as
+/// [`RUN_USAGE_KEY`] against [`EFFECTIVE_MODEL_KEY`], for the same reason.
+///
+/// # Vocabulary
+///
+/// The values are `mika_common::llm::error_class`'s, verbatim: already the wire
+/// format of `llm_call_attempt`, of `audit_events.callback_delivery_failed`
+/// (mika#2179) and of `qa_deadline_verdict`'s `error_class` field (mika#2289).
+/// A fourth spelling would split a population three surfaces already count
+/// together.
+///
+/// The spelling is the wire contract between `mika-cli` and `mika-agent`, which
+/// share no dependency edge of their own — it lives here, in the crate that owns
+/// [`MessageSendParams`], so neither side can rename it alone.
+pub const TURN_FAILURE_CLASS_KEY: &str = "mika.turn_failure_class";
+
+/// Read the failure class a server attested for a `failed` [`Task`]
+/// (mika#2522).
+///
+/// Fail-soft end to end: key absent, no metadata, `null`, a non-string, or a
+/// blank string all read as *not attested*. This is the **only** reader of that
+/// key — a source scan holds it (see `mika-cli`'s
+/// `mika2522_the_attestation_has_a_single_reader`), for the reason
+/// `mika2220_no_local_reparse_of_the_llm_bodies_env_var` had to engrave once:
+/// two readers of one fact are two truths in waiting.
+pub fn attested_turn_failure_class(task: &Task) -> Option<&str> {
+    task.metadata
+        .as_ref()?
+        .get(TURN_FAILURE_CLASS_KEY)?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// Token usage of one whole turn, as it travels on [`RUN_USAGE_KEY`].
 ///
 /// One object rather than four flat `mika.*` keys: the client renders the four
@@ -365,6 +418,14 @@ mod tests {
     }
 
     #[test]
+    fn turn_failure_class_key_is_the_wire_spelling() {
+        // mika#2522. Fourth response key of the family, same contract: the agent
+        // writes it and the CLI reads it, with no dependency edge between them
+        // for a rename to travel along.
+        assert_eq!(TURN_FAILURE_CLASS_KEY, "mika.turn_failure_class");
+    }
+
+    #[test]
     fn every_key_of_the_family_is_distinct() {
         // A copy-paste that collapsed two of them would make one flag silently
         // carry another's payload, and every per-key test would still pass.
@@ -380,6 +441,7 @@ mod tests {
             SESSION_ISOLATED_KEY,
             SESSION_ISOLATED_APPLIED_KEY,
             RUN_USAGE_KEY,
+            TURN_FAILURE_CLASS_KEY,
         ];
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(
@@ -536,6 +598,42 @@ mod tests {
                 cache_write: None,
             })
         );
+    }
+
+    /// mika#2522 — the class the server attested reads back verbatim.
+    #[test]
+    fn attested_turn_failure_class_reads_the_servers_value() {
+        for declared in ["transport", "transport_timeout", "parse", "http_400"] {
+            let task = task_with_metadata(Some(serde_json::json!({
+                TURN_FAILURE_CLASS_KEY: declared,
+            })));
+            assert_eq!(attested_turn_failure_class(&task), Some(declared));
+        }
+    }
+
+    /// mika#2522 — every unreadable shape is *not attested*, which the client
+    /// must read as `Contract`, i.e. byte for byte the pre-fix behaviour.
+    ///
+    /// Absence is in the list as the load-bearing case: it is what a server
+    /// predating this key produces, and reading it as anything but "nothing was
+    /// attested" would make an older server's `failed` retryable.
+    #[test]
+    fn every_unreadable_turn_failure_class_shape_reads_as_not_attested() {
+        assert_eq!(attested_turn_failure_class(&task_with_metadata(None)), None);
+        for shape in [
+            serde_json::json!({}),
+            serde_json::json!({ TURN_FAILURE_CLASS_KEY: serde_json::Value::Null }),
+            serde_json::json!({ TURN_FAILURE_CLASS_KEY: 42 }),
+            serde_json::json!({ TURN_FAILURE_CLASS_KEY: ["transport"] }),
+            serde_json::json!({ TURN_FAILURE_CLASS_KEY: "" }),
+            serde_json::json!({ TURN_FAILURE_CLASS_KEY: "   " }),
+        ] {
+            assert_eq!(
+                attested_turn_failure_class(&task_with_metadata(Some(shape.clone()))),
+                None,
+                "shape {shape} should read as not attested"
+            );
+        }
     }
 
     /// mika#1951 U3 — every unreadable shape is absence, never the caller's flag.

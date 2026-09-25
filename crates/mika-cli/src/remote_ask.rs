@@ -22,8 +22,8 @@ pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 pub use mika_a2a::{
     CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY, RUN_USAGE_KEY,
-    RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, attested_model,
-    attested_run_usage, attested_session_isolation,
+    RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, TURN_FAILURE_CLASS_KEY,
+    attested_model, attested_run_usage, attested_session_isolation, attested_turn_failure_class,
 };
 use uuid::Uuid;
 
@@ -156,23 +156,64 @@ fn a2a_error_class(err: &A2aError) -> FailureClass {
     }
 }
 
+/// Whether a server-attested failure class is one a second attempt may clear
+/// (mika#2522).
+///
+/// The two spellings are **imported** from `mika-common`, never retyped: they
+/// are the wire format `llm_call_attempt`, `audit_events.callback_delivery_failed`
+/// (mika#2179) and `qa_deadline_verdict` already share, and a copy here would be
+/// the population split `error_class`'s own doc comment exists to prevent.
+fn is_transport_class(class: &str) -> bool {
+    use mika_common::llm::error::error_class;
+    class == error_class::TRANSPORT || class == error_class::TRANSPORT_TIMEOUT
+}
+
 /// Class of a `Task` state that a synchronous `message/send` should not have
 /// returned, or returned as a refusal.
 ///
 /// Exhaustive for the same reason as [`a2a_error_class`].
-fn terminal_state_class(state: TaskState) -> FailureClass {
+///
+/// `attested_class` is the server's own reading of *why* a `failed` turn failed
+/// (mika#2522), taken off the Task via
+/// [`mika_a2a::params::attested_turn_failure_class`]. `None` means the server
+/// attested nothing.
+fn terminal_state_class(state: TaskState, attested_class: Option<&str>) -> FailureClass {
     match state {
         // Async-dispatch states the server owes us no answer in: per A2A v0.3
         // §6 a synchronous send returns a terminal-or-pending state, so seeing
         // one of these is an anomaly of the server's own making — exactly the
         // kind a second attempt clears.
         TaskState::Submitted | TaskState::Working | TaskState::Unknown => FailureClass::Transport,
-        // A turn the server actually ran and ended without an answer. Re-sending
-        // the same brief does not change that verdict. (The *other* `failed` —
-        // the one `startup_recovery` writes on a turn a restart killed — never
-        // reaches here: its exchange died at transport and is read through
-        // `Recovery::Ended` inside the `ClientError` arm above.)
-        TaskState::Failed | TaskState::Canceled | TaskState::Rejected => FailureClass::Contract,
+
+        // mika#2522 — `failed` has two causes of opposite natures, and the
+        // server is the only party that can tell them apart.
+        //
+        // The comment this line replaces read: "A turn the server actually ran
+        // and ended without an answer. Re-sending the same brief does not change
+        // that verdict." True of a reasoned refusal; **false of a turn a
+        // transport cut killed** — nothing was refused, and `LlmError::is_retryable`
+        // says the opposite of that verdict. Measured 2026-09-24: 11 OpenRouter
+        // `body read failed mid-stream` cuts, 5 grooms of mika#2515 lost, every
+        // one of them exiting 1 so `_arch_ask_with_retry` (which replays on 75
+        // alone) never armed. That case is the twin of the exception the
+        // parenthesis below already named.
+        //
+        // Fail-closed: ONLY a positively attested transport class flips. An
+        // absent key (a server predating mika#2522, `message/stream`,
+        // `returnImmediately`), an unreadable one, and any non-transport class
+        // all stay `Contract` — byte for byte the behaviour before this change.
+        TaskState::Failed => match attested_class {
+            Some(c) if is_transport_class(c) => FailureClass::Transport,
+            _ => FailureClass::Contract,
+        },
+
+        // A cancellation and a refusal are decisions, not accidents, so the
+        // attestation is deliberately not consulted here. (The *other* `failed`
+        // — the one `startup_recovery` writes on a turn a restart killed — still
+        // never reaches this site: its exchange died at transport and is read
+        // through `Recovery::Ended` inside the `ClientError` arm above.)
+        TaskState::Canceled | TaskState::Rejected => FailureClass::Contract,
+
         // Not failures at all; listed so that adding a state cannot compile
         // without a decision being taken about it.
         TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {
@@ -515,17 +556,34 @@ pub async fn send_message_to_agent(
     // Completed and the pending-input states carry meaningful text the user needs
     // to see. Surface terminal-bad and async-in-progress states as errors so the
     // shell exit code matches the local `mika ask` contract.
+    // mika#2522: the server's own reading of why a `failed` turn failed. Read
+    // once, here, through the single decoder — `terminal_state_class` decides on
+    // the key, and the operator-facing sentence below merely echoes it.
+    let attested_class = attested_turn_failure_class(&task).map(str::to_string);
+
     match task.status.state {
         TaskState::Completed | TaskState::InputRequired | TaskState::AuthRequired => {}
         state @ (TaskState::Failed | TaskState::Canceled | TaskState::Rejected) => {
+            // Naming the class is what makes the client's decision readable
+            // without opening the server's log: `… ended in state 'failed'
+            // (transport)` says why the retry armed, and the bare form says the
+            // server attested nothing. The decision still reads the key, never
+            // this sentence (mika#2179, mika#2291).
+            let attribution = match attested_class.as_deref() {
+                Some(c) => format!(" ({c})"),
+                None => String::new(),
+            };
             return Err(classified(
-                terminal_state_class(state),
-                format!("remote task {} ended in state '{}'", task.id, state),
+                terminal_state_class(state, attested_class.as_deref()),
+                format!(
+                    "remote task {} ended in state '{}'{attribution}",
+                    task.id, state
+                ),
             ));
         }
         state @ (TaskState::Submitted | TaskState::Working | TaskState::Unknown) => {
             return Err(classified(
-                terminal_state_class(state),
+                terminal_state_class(state, attested_class.as_deref()),
                 format!(
                     "remote task {} is still in state '{state}' — sync dispatch expected a terminal state",
                     task.id
@@ -1309,11 +1367,15 @@ mod tests {
     }
 
     /// The state machine's half of the same split (plan step 3).
+    ///
+    /// Every case passes `None` — no attestation — so this test doubles as
+    /// mika#2522's **non-regression control**: a server predating that key
+    /// produces exactly the classes it produced before.
     #[test]
     fn only_the_async_dispatch_states_are_retryable() {
         for state in [TaskState::Submitted, TaskState::Working, TaskState::Unknown] {
             assert_eq!(
-                terminal_state_class(state),
+                terminal_state_class(state, None),
                 FailureClass::Transport,
                 "{state} is a state a synchronous send should never return"
             );
@@ -1327,11 +1389,83 @@ mod tests {
             TaskState::AuthRequired,
         ] {
             assert_eq!(
-                terminal_state_class(state),
+                terminal_state_class(state, None),
                 FailureClass::Contract,
                 "{state} is a verdict the server reached, not an accident on the way"
             );
         }
+    }
+
+    /// **mika#2522 V2.** The R-2 table, line by line.
+    ///
+    /// Only a positively attested transport class flips `failed` to
+    /// `Transport`; every other reading — including the unreadable ones the
+    /// decoder turns into `None` — stays `Contract`.
+    #[test]
+    fn mika2522_a_failed_turn_is_retryable_only_on_an_attested_transport_class() {
+        for class in ["transport", "transport_timeout"] {
+            assert_eq!(
+                terminal_state_class(TaskState::Failed, Some(class)),
+                FailureClass::Transport,
+                "a turn killed by {class} was not refused — re-sending the same \
+                 brief is exactly what `is_retryable` says to do"
+            );
+        }
+
+        // The negative controls. Without them, a reader that answered
+        // `Transport` on any non-`None` class would pass the loop above.
+        for class in [
+            "parse",
+            "provider",
+            "http_400",
+            "http_429",
+            "unsupported",
+            "other",
+            // Neither a substring nor a prefix of a transport class counts: the
+            // comparison is equality on the shared constants, not a `contains`.
+            "transporter",
+            "TRANSPORT",
+            "",
+        ] {
+            assert_eq!(
+                terminal_state_class(TaskState::Failed, Some(class)),
+                FailureClass::Contract,
+                "{class:?} is not a transport class and must not arm a retry"
+            );
+        }
+    }
+
+    /// **mika#2522 V2.** `Canceled` and `Rejected` do not consult the
+    /// attestation, and a test must say so.
+    ///
+    /// Without this, a later editor wiring those two arms to the class would see
+    /// nothing go red — and a cancellation replayed is a cancellation ignored.
+    #[test]
+    fn mika2522_a_cancellation_is_a_decision_whatever_the_attestation_says() {
+        for state in [TaskState::Canceled, TaskState::Rejected] {
+            assert_eq!(
+                terminal_state_class(state, Some("transport")),
+                FailureClass::Contract,
+                "{state} is a decision, not an accident on the way"
+            );
+        }
+    }
+
+    /// **mika#2522.** The two transport spellings come from `mika-common`, and
+    /// the predicate agrees with them.
+    ///
+    /// Pins the import rather than a pair of local literals: a copy here would
+    /// split the population that `llm_call_attempt` and
+    /// `audit_events.callback_delivery_failed` already count together.
+    #[test]
+    fn mika2522_the_transport_spellings_are_the_shared_wire_format() {
+        use mika_common::llm::error::error_class;
+        assert!(is_transport_class(error_class::TRANSPORT));
+        assert!(is_transport_class(error_class::TRANSPORT_TIMEOUT));
+        assert!(!is_transport_class(error_class::PARSE));
+        assert!(!is_transport_class(error_class::PROVIDER));
+        assert!(!is_transport_class(error_class::OTHER));
+        assert!(!is_transport_class(&error_class::http(429)));
     }
 
     /// **AC1.** The class survives the trip to the process exit code, and the
@@ -1927,5 +2061,84 @@ mod tests {
                  found only: {surfaces_reading:?}"
             );
         }
+    }
+
+    /// The paths this crate's tree sits under, resolved from its own manifest.
+    ///
+    /// `crates/mika-cli/..` rather than a repo-root walk: the two crates D2
+    /// covers are named, and a wider sweep would be a guard whose scope nobody
+    /// can state.
+    fn mika2522_scanned_src_roots() -> Vec<std::path::PathBuf> {
+        let crates_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/mika-cli has a parent")
+            .to_path_buf();
+        vec![
+            crates_dir.join("mika-cli/src"),
+            crates_dir.join("mika-a2a/src"),
+        ]
+    }
+
+    /// **mika#2522 D2.** The failure-class attestation has exactly one reader.
+    ///
+    /// Outside `params.rs`, which defines it, the wire spelling must appear in
+    /// no string literal across `mika-cli` and `mika-a2a`: a second decoder has
+    /// to write the key as a literal to index the metadata map, and two decoders
+    /// of one fact are two truths in waiting — the class
+    /// `mika1883_both_client_surfaces_read_the_one_reader` above already holds
+    /// for its own key.
+    ///
+    /// **Why a source scan and not a behavioural test.** A second reader makes
+    /// **no decision wrong** the day it is written: the client still classes
+    /// correctly, every assertion here stays green, and only the one-truth
+    /// guarantee goes — in silence. That is the failure shape a behavioural test
+    /// cannot see, and the only reason to write a scan.
+    #[test]
+    fn mika2522_the_attestation_has_a_single_reader() {
+        // Assembled at runtime so this file does not accuse itself.
+        let wire_spelling = format!("\"mika.{}\"", "turn_failure_class");
+        let definition_site = "params.rs";
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut definition_carries_it = false;
+
+        for root in mika2522_scanned_src_roots() {
+            let scanner = mika_common::source_guard::ProductionScanner::new(&root);
+            scanner.for_each(|path, production| {
+                let is_definition = path
+                    .file_name()
+                    .is_some_and(|f| f == std::ffi::OsStr::new(definition_site));
+                for (i, line) in production.lines().enumerate() {
+                    if !line.contains(&wire_spelling) {
+                        continue;
+                    }
+                    if is_definition {
+                        definition_carries_it = true;
+                    } else {
+                        let rel = path.strip_prefix(&root).unwrap_or(path).display();
+                        offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                    }
+                }
+            });
+        }
+
+        // Anti-vacuity (the mika#2496 lesson): a scan aimed at a name nobody
+        // writes verifies nothing and reads exactly like a clean scan.
+        assert!(
+            definition_carries_it,
+            "mika#2522 — the wire spelling is written nowhere in {definition_site}: \
+             this scan is aimed at a dead name and attests nothing"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2522 — the wire spelling is written here instead of being read \
+             through `mika_a2a::params::attested_turn_failure_class`. Two decoders \
+             is how a client comes to disagree with itself about whether a failed \
+             turn may be retried:\n{}\n\n\
+             RESOLUTION: remove the second reader. There is no allowlist to add \
+             it to (mika#2201).",
+            offenders.join("\n")
+        );
     }
 }

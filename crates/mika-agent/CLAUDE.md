@@ -1909,6 +1909,63 @@ and deserves identifying) and `a2a_model_override_refused` (WARN — **expected
 regime: zero lines**; each one names a model or a missing API key, i.e. an
 operator typo or an unconfigured agent, not a defect of the channel).
 
+### Per-turn failure-class attestation over A2A (mika#2522)
+
+The **fourth** `mika.*` response key, beside `mika.effective_model` (mika#2304),
+`mika.session_isolated_applied` (mika#1951) and `mika.run_usage` (mika#1883), and
+stamped at the same mika#2270 intervention point by `stamp_turn_failure_class`.
+
+**What it closes.** `handle_message_send` serves a failed turn as a `failed` Task
+"with nothing to say" — correct for rendering, and it threw away the one fact the
+caller needs to decide whether to retry. So `mika ask` classed **every** `failed`
+as `Contract`, exited `1`, and `_arch_ask_with_retry` (which replays on `75`
+alone) never armed. Measured 2026-09-24: 11 OpenRouter `body read failed
+mid-stream` cuts, **5 grooms of mika#2515 lost**. The server *held* the class and
+did not transmit it.
+
+**The class is read where the variant still exists, and nowhere else.**
+`run_a2a_agent` used to end on `Err(e.to_string())` — after that line the
+`LlmError` variant is gone and the only remaining option is a `contains()` on a
+rendered sentence, which mika#2179 and mika#2289 both refuse in as many words.
+`A2aTurnFailure::from_anyhow` therefore reads it through
+`mika_common::llm::error::classify_anyhow_error` (`downcast_ref` over the whole
+cause chain, the function's **third** consumer, no fourth copy of those four
+lines) and the class travels **inside** `TurnText::LoopFailed { class }` rather
+than in a parallel local: the `match` on `turn_text` is the one place that knows
+a turn failed, and carrying it there is what stops a later editor from handling
+that branch without it. `A2aTurnFailure`'s `Display` renders the message alone,
+so every existing `%e` site — the `message/stream` error arm included — prints
+byte for byte what it printed before.
+
+**Written unconditionally on the failure branch, and on no other.** Its absence
+therefore means *"this server attested nothing"* — a binary predating mika#2522,
+`message/stream`, `returnImmediately` — and **never** "the class is `contract`".
+Same asymmetry, and the same reason, as `stamp_run_usage` against its two
+unconditional sisters: this one is a measurement, not the answer to a flag. The
+client reads it fail-closed, so all three of those populations keep the pre-fix
+exit code exactly (`crates/mika-cli/CLAUDE.md` and the root `CLAUDE.md` § *Un tour
+tué par le transport* carry the reading table).
+
+**`message/stream` is out of scope and that is stated rather than implied.** It
+has the same `Err` arm but renders no synchronous `Task` to stamp, and `_arch_ask`
+does not take that door (`mika ask` goes through `send_message_to_agent`, i.e.
+`message/send`). It falls into the "not attested" population already named by
+mika#2304 and mika#1883 — a bound inherited, not widened.
+
+**Operator surfaces.** `a2a_turn_failed` (WARN + an `audit_events` row of the same
+name — `target_key` = the model, `after_value` = the class), written by
+`report_turn_failure` and by nothing else: **SOLE WRITER**, pinned by
+`canonical_tokens::tests::mika2522_the_turn_failure_name_has_a_single_writer`
+with an allowlist shipped empty and an anti-vacuity assertion. That property is
+what makes `GROUP BY target_key, after_value` an exact answer to *which model
+loses turns, and on which class* — the AC2 deliverable — rather than a number two
+writers can disagree about. The model comes off `AgentState.budget_record`
+(`effective_model` is `None` on this branch, the turn produced no `AgentOutput`),
+and an unreadable provider degrades the label to `unknown` rather than dropping
+the row (`repo=unknown` motif, mika#2496): a turn lost on a model we cannot name
+is still a turn lost. Sibling `a2a_turn_failed_audit_failed` (WARN, expected
+empty) marks a WARN that landed while its audit row did not.
+
 **Transient enable/disable overrides (#682):** Two methods handle per-invocation skill overrides, called after `apply_overrides()` (disable first, enable second — matches Phase 0/1 pattern): (1) `SkillRegistry::apply_transient_disable(skill_names)` evicts named skills from the registry entirely for a single invocation. Returns `TransientDisableResult` with `not_found` list. (2) `SkillRegistry::apply_transient_always_on(skill_names)` sets `always_on = true` on named skills. Returns `TransientOverrideResult` with separate `disabled` and `not_found` lists. Cannot resurrect disabled (evicted) or skipped skills. Neither is persisted.
 
 **Who calls them today, and the CLI does not (mika#1727, mika#1883).** This paragraph used to read "Used by `mika ask --disable-skill`" / "`--enable-skill`", and that has been false since `mika ask` became a thin client — those two flags mutate the **CLI process's** registry, which is not where the turn runs. Their arg-level conflict check survives (a skill named in both is still a hard error before any registry op) and mika#1883 makes the inertia audible on stderr, but neither flag reaches these methods. The live caller of `apply_transient_disable` is `apply_only_skills` (mika#2363), server-side, by complement: `--only-skill` is the one selection flag that travels (`mika.only_skills`), and it is **strictly subtractive**, which is why it delegates here and never to `apply_transient_always_on`. That second method stays reachable from the DB-override path only; the additive half of the config channel is deliberately not exposed on `/a2a/{agent}` — it would let any authenticated caller force one of the agent's skills to `always_on`.
