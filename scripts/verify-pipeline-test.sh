@@ -511,6 +511,130 @@ assert_pass "AC check: title-case '## Acceptance Criteria' → PASS" "$exit_code
 cleanup_test_repo
 
 # =========================================================================
+# Numbered AC heading (mika#2516) — n=3 of the recurring class documented in
+# docs/solutions/workflow-issues/verify-pipeline-ac-heading-case-insensitive-2026-06-30.md
+#
+# `/ce:plan` numbers its section headings (`## 0.` … `## 11.`), so the AC heading
+# arrives as `## 11. Acceptance criteria`. Three PRs in one day (#2509, #2514,
+# #2516) needed a one-line hand strip of that number before Pipeline Artifacts
+# would go green.
+#
+# T1 is the load-bearing fixture, and it is the ONLY one that distinguishes a
+# complete fix from a half-applied one. The pattern is matched at TWO sites
+# seven lines apart (presence `grep`, non-emptiness `sed`). With only the `grep`
+# widened, a numbered heading over a FULL section renders
+# "empty '## Acceptance criteria' section" — the false negative is not repaired,
+# it is moved, and its message becomes misleading. T2 cannot play that role:
+# on the same half-applied fix it would PASS, since "empty" is its expected
+# message.
+# =========================================================================
+
+echo ""
+echo "=== T1: numbered AC heading + content → PASS (mika#2516; both matchers moved) ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## 10. Definition of Done
+
+- [ ] Something done
+
+## 11. Acceptance criteria
+
+- [ ] AC1. First criterion
+- [ ] AC2. Second criterion
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with numbered AC heading"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_pass "T1: '## 11. Acceptance criteria' + content → PASS" "$exit_code" "$output" "Pipeline verification passed"
+cleanup_test_repo
+
+echo ""
+echo "=== T2: numbered AC heading + EMPTY section → FAIL (decision stays strict) ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## 10. Definition of Done
+
+- [ ] Something done
+
+## 11. Acceptance criteria
+
+## 12. Next section
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with numbered but empty AC section"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_fail "T2: numbered heading, empty section → FAIL" "$exit_code" "$output" "empty '## Acceptance criteria' section"
+cleanup_test_repo
+
+echo ""
+echo "=== T3: numbered AND title-case → PASS (both permissivity axes compose) ==="
+# The non-numbered title-case case is already pinned seven lines above by the
+# mika#1639 fixture; re-adding it here would be a duplicate regression test.
+# What nothing covered is the COMPOSITION — a numbered heading that is also
+# title-cased, which is the other half of mika#2516 AC5 ("numbered or not").
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## 10. Definition of Done
+
+- [ ] Something done
+
+## 11. Acceptance Criteria
+
+- [ ] AC1. First criterion
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan with numbered title-case AC heading"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_pass "T3: '## 11. Acceptance Criteria' → PASS (mika#1639 × mika#2516)" "$exit_code" "$output" "Pipeline verification passed"
+cleanup_test_repo
+
+echo ""
+echo "=== T4: 'Notes on Acceptance criteria' only → FAIL (tolerance did not swallow the refusal) ==="
+setup_test_repo
+git checkout -b feat/test -q
+mkdir -p docs/plans src
+cat > docs/plans/test-plan.md <<'PLANEOF'
+# Plan: test
+
+## 10. Definition of Done
+
+- [ ] Something done
+
+## 11. Notes on Acceptance criteria
+
+- The heading text stays anchored right after the optional number prefix.
+PLANEOF
+echo "code" > src/main.rs
+git add docs/plans/test-plan.md src/main.rs
+git commit -q -m "feat: plan whose only AC-ish heading is prefixed by other words"
+write_mock_gh ""
+output="" ; exit_code=0
+output=$(run_verify "") || exit_code=$?
+assert_fail "T4: '## 11. Notes on Acceptance criteria' → FAIL (missing)" "$exit_code" "$output" "missing '## Acceptance criteria' section"
+cleanup_test_repo
+
+# =========================================================================
 # Automated-author exemption (mika#2419)
 #
 # F1 is the measured case: PR mika#2415, a dependabot Cargo.lock-only bump, was
