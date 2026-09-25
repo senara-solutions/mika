@@ -10,6 +10,14 @@ pub mod types;
 pub mod worktree_activity;
 
 pub use dispatcher::{DispatchError, TaskDispatcher};
+// mika#2515 U2a — les clés de `metadata` que `classify_undelivered_verdict` lit.
+// Ré-exportées plutôt que recopiées : l'écrivain possède le nom, le lecteur
+// l'importe. Deux orthographes d'une même clé feraient répondre le classificateur
+// et le compteur sur deux champs différents, en silence — la classe que
+// `grooming_marker` a dû refermer une fois (mika#2158).
+pub(crate) use dispatcher::{
+    DELIVERY_ATTEMPTS_KEY, DELIVERY_QUARANTINED_AT_KEY, VERDICT_DELIVERY_DEFERRALS_KEY,
+};
 pub use engine::{TaskEngine, promoted_wrapper_liveness_secs, stuck_pending_reaper_grace_secs};
 pub use queue::QueuedTask;
 pub use types::{action_type, task_status, trigger_type};

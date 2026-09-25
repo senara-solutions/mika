@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, info_span, warn};
@@ -1311,11 +1311,14 @@ async fn run_loop(
     // disagree about what "evening" means — a second parse would be free to
     // refuse the very greeting the prompt asked for.
     local_part_of_day: Option<&str>,
-    // mika#2368 — out-param : posé quand le tour sort sur un EndTurn accepté
-    // alors qu'un verdict était dû, que le budget de re-prompt de la garde
-    // `qa_build_callback_verdict` est épuisé et qu'aucune revue n'a été postée.
-    // Lu par `run_silent_inner`, qui le rend dans `SilentTurnOutcome`, pour que
-    // le dispatcher puisse armer le filet.
+    // mika#2368 + mika#2515 — out-param : posé quand un verdict était dû sur ce
+    // tour et qu'aucune revue n'a été postée. Deux moitiés, mutuellement
+    // exclusives par construction (un tour sort par exactement un chemin) :
+    // `mark_unmet_after_retry` sur les trois sorties EndTurn (budget de la garde
+    // `qa_build_callback_verdict` épuisé — mika#2368, plus le « Force EndTurn »
+    // de mika#2515 U1e), `mark_cut_off` sur les deux sorties coupées
+    // (mika#2515). Lu par `run_silent_inner`, qui le rend dans
+    // `SilentTurnOutcome`, pour que le dispatcher puisse armer le filet.
     //
     // Un out-param par référence plutôt qu'une variante de `LoopResult` : cet
     // enum sans `#[non_exhaustive]` est un contrat dont l'exhaustivité force les
@@ -1323,7 +1326,13 @@ async fn run_loop(
     // a conclu sans poster » n'est pas un mode de terminaison alternatif — un
     // tour peut être `Done` *et* muet. C'est aussi le motif déjà employé dans ce
     // fichier (`pr_review_posted`, `tool_arg_suffix_rejected`, `skills_dirty`).
-    qa_verdict_unmet: Option<&AtomicBool>,
+    //
+    // Un struct plutôt qu'un second paramètre : l'arité est conservée, donc les
+    // deux appelants qui passent `None` (`run_agent`, `run_team_agent`) changent
+    // d'un type dans une position déjà occupée par `None` — aucun comportement
+    // conversationnel ni d'équipe n'est touché. Voir
+    // [`crate::qa_build_callback::VerdictSignal`].
+    qa_verdict_unmet: Option<&crate::qa_build_callback::VerdictSignal>,
     store_llm_calls: bool,
     store_tool_calls: bool,
     prompt_variant: Option<&str>,
@@ -1489,6 +1498,21 @@ async fn run_loop(
                 mode = mode.label(),
                 "agent deadline exceeded — exiting loop gracefully"
             );
+            // mika#2515 — chemin de coupure 1/2. Le tour n'a PAS conclu : il a
+            // été coupé en tête d'itération, donc la garde
+            // `qa_build_callback_verdict` n'a jamais eu d'EndTurn où s'évaluer et
+            // son budget est nécessairement intact. C'est pourquoi le prédicat
+            // employé ici est `verdict_unmet_at_cut_off` — sans terme de budget —
+            // et non son frère `verdict_unmet_after_retry` : l'exiger rendrait le
+            // filet insatisfiable sur exactement cette population (mika#2272).
+            if let Some(flag) = qa_verdict_unmet
+                && crate::qa_build_callback::verdict_unmet_at_cut_off(
+                    qa_verdict_due,
+                    &all_tool_summaries,
+                )
+            {
+                flag.mark_cut_off(crate::qa_build_callback::CutOffExit::Deadline, step);
+            }
             return Ok(LoopResult::DeadlineExceeded {
                 steps_completed: step,
                 partial_summaries: all_tool_summaries,
@@ -3952,7 +3976,7 @@ async fn run_loop(
                         }
                     }
 
-                    // mika#2368 — chemin de sortie 1/2 (texte non vide). Le
+                    // mika#2368 — chemin de sortie 1/3 (texte non vide). Le
                     // budget de la garde `qa_build_callback_verdict` est
                     // épuisé, l'EndTurn est accepté, et rien n'a été posté : le
                     // filet moteur prend le relais côté dispatcher.
@@ -3963,7 +3987,7 @@ async fn run_loop(
                             &all_tool_summaries,
                         )
                     {
-                        flag.store(true, Ordering::Relaxed);
+                        flag.mark_unmet_after_retry();
                     }
 
                     apply_nudge_turn_end(tool_use_occurred);
@@ -4146,7 +4170,7 @@ async fn run_loop(
                         continue;
                     }
 
-                    // mika#2368 — chemin de sortie 2/2 (texte vide), et c'est
+                    // mika#2368 — chemin de sortie 2/3 (texte vide), et c'est
                     // **le plus probable** : un EndTurn sec est la forme que
                     // prend un tour qui n'a rien à dire, donc le cas nominal de
                     // ce ticket. Le couvrir à moitié produirait un filet
@@ -4159,7 +4183,7 @@ async fn run_loop(
                             &all_tool_summaries,
                         )
                     {
-                        flag.store(true, Ordering::Relaxed);
+                        flag.mark_unmet_after_retry();
                     }
 
                     apply_nudge_turn_end(tool_use_occurred);
@@ -4352,6 +4376,39 @@ async fn run_loop(
                             )
                             .await;
                     }
+
+                    // mika#2515 U1e — chemin de sortie 3/3, et le trou que
+                    // mika#2368 n'a pas suivi. Ce `return` conclut le tour depuis
+                    // la branche `ToolUse`, sans traverser la chaîne de gardes
+                    // EndTurn : mika#2136 l'a nommé ici même comme sa troisième
+                    // glace (« a FOURTH exit from `run_loop` … it does not
+                    // traverse the EndTurn guard chain at all »), et mika#2368 a
+                    // posé ses deux sites ailleurs. Un tour de callback de build
+                    // QA qui envoie un message — « le build a réussi, je note » —
+                    // au lieu de poster sa revue conclut par ici, et le filet
+                    // restait aveugle sur exactement ce chemin.
+                    //
+                    // **Le terme de budget de garde est CONSERVÉ ici**, à
+                    // l'inverse des deux sites de coupure, et c'est la différence
+                    // qui compte : ce site est un EndTurn forcé, donc la garde a
+                    // bien pu firer et dépenser son budget à un step antérieur.
+                    // Population laissée ouverte, et nommée plutôt que cachée :
+                    // un tour qui appelle `send_message` sans jamais avoir produit
+                    // d'EndTurn n'a pas dépensé ce budget, ne pose rien, et
+                    // relève du re-prompt de la garde — pas du filet. La
+                    // remplacer par le prédicat de coupure poserait un
+                    // `hold[review]` sur un tour que la garde n'a jamais
+                    // interrogé (épinglé par V2b).
+                    if let Some(flag) = qa_verdict_unmet
+                        && crate::qa_build_callback::verdict_unmet_after_retry(
+                            qa_verdict_due,
+                            &intent_guard_retries,
+                            &all_tool_summaries,
+                        )
+                    {
+                        flag.mark_unmet_after_retry();
+                    }
+
                     apply_nudge_turn_end(tool_use_occurred);
                     return Ok(LoopResult::Done {
                         text: None,
@@ -4370,6 +4427,17 @@ async fn run_loop(
         label = mode.label(),
         max_steps, "agent exceeded max tool steps"
     );
+    // mika#2515 — chemin de coupure 2/2. Cette sortie est l'**expression finale**
+    // de `run_loop`, sans `return` : un scan de sites ancré sur `return
+    // Ok(LoopResult::` n'en trouve que cinq et laisserait celle-ci muette.
+    // Même prédicat sans terme de budget que la coupure deadline, et pour la
+    // même raison : le budget de steps s'épuise en fin de boucle, hors de tout
+    // EndTurn.
+    if let Some(flag) = qa_verdict_unmet
+        && crate::qa_build_callback::verdict_unmet_at_cut_off(qa_verdict_due, &all_tool_summaries)
+    {
+        flag.mark_cut_off(crate::qa_build_callback::CutOffExit::MaxSteps, max_steps);
+    }
     Ok(LoopResult::MaxStepsExceeded {
         thinking: thinking_text,
         usage: last_usage,
@@ -5850,14 +5918,45 @@ pub struct SilentAgentParams<'a> {
 /// sorte que le dispatcher — le seul endroit d'où le filet peut poster — ne
 /// pouvait pas le savoir.
 ///
-/// Un seul champ pour l'instant, et un struct plutôt qu'un `bool` : le prochain
-/// fait qu'un tour silencieux doit rendre s'ajoute ici sans re-toucher les cinq
-/// appelants.
+/// Un struct plutôt qu'un `bool`, et mika#2515 est la première fois que ça paie :
+/// le fait de coupure s'y ajoute sans re-toucher les cinq appelants.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SilentTurnOutcome {
     /// Un verdict était dû sur ce tour, le budget de re-prompt de la garde
     /// `qa_build_callback_verdict` est épuisé, et aucune revue n'a été postée.
     pub qa_verdict_unmet: bool,
+    /// mika#2515 — un verdict était dû et le tour a été **coupé** avant de le
+    /// poster, par son enveloppe de temps ou par son budget de steps.
+    ///
+    /// Symétrique d'`AgentOutput.deadline_exceeded`, commenté « mika#2276 M2:
+    /// the one place that says "cut off, not concluded" » — dont ce struct
+    /// n'avait jamais reçu l'équivalent. C'était le trou, nommé par sa symétrie :
+    /// mika#2276 couvre *deadline sur tour webhook*, mika#2368 *conclusion muette
+    /// sur tour de callback*, et personne ne couvrait *deadline sur tour de
+    /// callback* — alors que c'est le tour le plus chargé de la chaîne (relire le
+    /// plan, exécuter les ACs, composer la revue, poster).
+    ///
+    /// Mutuellement exclusif avec [`Self::qa_verdict_unmet`] par construction :
+    /// un tour sort de `run_loop` par exactement un chemin.
+    pub qa_verdict_cut_off: Option<crate::qa_build_callback::CallbackCutOff>,
+}
+
+impl SilentTurnOutcome {
+    /// Lit les deux moitiés d'un [`crate::qa_build_callback::VerdictSignal`] en
+    /// une fois (mika#2515 U1b).
+    ///
+    /// **Un seul site de lecture** pour les trois renvois de `run_silent_agent`
+    /// qui consultent le signal. Trois `SilentTurnOutcome { … }` écrits à la main
+    /// divergeraient : un renvoi qui lit une moitié et oublie l'autre laisse une
+    /// population muette **sans qu'aucune assertion ne rougisse** — ce qui est,
+    /// un étage plus haut, exactement le défaut que mika#2515 ferme (`run_loop`
+    /// posait son signal à deux sorties sur six).
+    fn from_signal(signal: &crate::qa_build_callback::VerdictSignal) -> Self {
+        Self {
+            qa_verdict_unmet: signal.unmet_after_retry(),
+            qa_verdict_cut_off: signal.cut_off(),
+        }
+    }
 }
 
 /// Run a silent-mode agent loop for background tasks (heartbeat, reminders).
@@ -6440,6 +6539,27 @@ async fn run_silent_inner(
         }
         // mika#2368 : le tour n'a pas eu lieu. Un tour qui n'a pas conclu ne
         // « conclut pas sans verdict » — le filet ne s'arme pas ici.
+        //
+        // mika#2515 — renvoi 1/4, et **le seul exclu**. Ce raisonnement de
+        // mika#2368 est exactement aussi périmable que celui du bras
+        // `DeadlineExceeded` que ce ticket répare : dans les deux cas une
+        // population a été écartée au motif qu'elle relevait d'un *autre* motif,
+        // et mika#2515 crée le motif « coupé ». Il reste néanmoins **non armable
+        // à ce site**, et la raison est structurelle : `qa_verdict_due` est
+        // calculé DANS `run_loop` depuis `loaded_skill_names`, lui-même calculé
+        // plus bas — le prédicat n'existe pas encore ici. L'armer exigerait de
+        // remonter la correspondance de skills en amont du contrôle de deadline,
+        // c'est-à-dire de faire ce travail précisément après avoir établi qu'il
+        // ne reste plus de temps pour s'en servir.
+        //
+        // Sa population est quasi certainement vide sans l'être par
+        // construction : il faudrait que `load_agent_context` + `list_commitments`
+        // consomment l'enveloppe ENTIÈRE. D'où une exclusion déclarée dans
+        // `SILENT_RETURNS_WITHOUT_VERDICT_READ`, au vocabulaire distinct de celui
+        // de `LOOP_EXITS_WITHOUT_SIGNAL` — ici « le prédicat n'est pas
+        // disponible », jamais « le site est inatteignable ». Suivi mika#2515-a,
+        // précondition écrite : que `grep 'silent agent deadline exceeded during
+        // prelude'` croisé avec `trigger_label = "callback"` soit non vide.
         return Ok(SilentTurnOutcome::default());
     }
 
@@ -6474,9 +6594,12 @@ async fn run_silent_inner(
     // is the WARN and the audit row the guard itself writes, whose correct
     // reader is the operator.
     let mut delivery_log: Vec<DeliveryRecord> = Vec::new();
-    // mika#2368 — le signal que `run_loop` pose sur ses deux chemins de sortie
-    // EndTurn quand un verdict était dû et n'a pas été posté après le re-prompt.
-    let qa_verdict_unmet = AtomicBool::new(false);
+    // mika#2368 + mika#2515 — le signal que `run_loop` pose sur ses **cinq**
+    // sorties atteignables quand un verdict était dû et n'a pas été posté : les
+    // trois sorties EndTurn (moitié « conclu muet ») et les deux sorties coupées
+    // (moitié « coupé »). La sixième, `Done` après follow-up, est
+    // structurellement inatteignable en mode `Silent` et déclarée telle.
+    let verdict_signal = crate::qa_build_callback::VerdictSignal::new();
     let result = run_loop(
         llm,
         tools,
@@ -6501,7 +6624,7 @@ async fn run_silent_inner(
         &loaded_skill_names, // mika#2355: callback_safe_skills() — where qa-review is or isn't
         ctx.language, // mika#2247: a proactive turn opens the exchange (R3b)
         local_part_of_day, // mika#2247 AC3
-        Some(&qa_verdict_unmet), // mika#2368: le seul mode où le filet a une population
+        Some(&verdict_signal), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
         prompt_variant.as_deref(),
@@ -6557,7 +6680,11 @@ async fn run_silent_inner(
                         .record_reflection_run("failed", 0, Some("Timed out"))
                         .await;
                 }
-                return Ok(SilentTurnOutcome::default());
+                // mika#2515 — renvoi 2/4. `run_loop` a posé sa moitié « coupé »
+                // (`MaxSteps`) avant de rendre ; jeter le fait ici le perdrait
+                // sur le chemin le plus chargé de la chaîne. Ce `default()` était
+                // un renvoi prématuré, pas une décision.
+                return Ok(SilentTurnOutcome::from_signal(&verdict_signal));
             }
 
             let cont = attempt_continuation_turn(
@@ -6597,12 +6724,18 @@ async fn run_silent_inner(
                     .record_reflection_run("failed", 0, Some("Timed out"))
                     .await;
             }
-            // mika#2368 — un tour coupé par sa deadline **n'a pas conclu**, et
-            // c'est le périmètre de l'autre motif (`CutOffByDeadline`,
-            // mika#2276), pas de celui-ci. Deux motifs, deux populations : les
-            // confondre ferait compter un dépassement comme une conclusion
-            // muette, et le nom d'événement mentirait sur la cause.
-            return Ok(SilentTurnOutcome::default());
+            // mika#2515 — renvoi 3/4, et la réparation la plus directe de ce
+            // ticket. Le raisonnement de mika#2368 reste juste — un tour coupé
+            // n'a pas conclu, et le compter comme une conclusion muette ferait
+            // mentir le nom d'événement — mais le motif auquel il renvoyait
+            // (`CutOffByDeadline`, mika#2276) est **câblé au call-site webhook**
+            // via `deadline_verdict_target` : pour un callback, ce renvoi ne
+            // menait nulle part. Le fait était donc **explicitement jeté**.
+            //
+            // mika#2515 crée le motif `CallbackCutOffWithoutVerdict`, qui porte
+            // sa propre `cause` sur la population callback. Le fait remonte
+            // désormais ; c'est le dispatcher qui choisit le motif.
+            return Ok(SilentTurnOutcome::from_signal(&verdict_signal));
         }
     }
 
@@ -6647,9 +6780,11 @@ async fn run_silent_inner(
         );
     }
 
-    Ok(SilentTurnOutcome {
-        qa_verdict_unmet: qa_verdict_unmet.load(Ordering::Relaxed),
-    })
+    // mika#2515 — renvoi 4/4 : la construction finale, qui lisait déjà le
+    // drapeau mika#2368 et lit désormais les deux moitiés par le lecteur unique.
+    // C'est le renvoi qu'un scan ancré sur `return` ne voit pas — il n'en a pas —
+    // et donc celui dont l'omission serait la plus coûteuse.
+    Ok(SilentTurnOutcome::from_signal(&verdict_signal))
 }
 
 // -- Team Agent Loop --
@@ -10838,6 +10973,354 @@ mod tests {
         assert!(mode.saves_to_db());
         assert_eq!(mode.label(), "silent agent");
         assert_eq!(mode.max_steps(), crate::planning::policy::MAX_TOOL_STEPS);
+    }
+
+    // ── mika#2515 U1 — chaque sortie DÉCIDE du signal de verdict ──────────
+
+    /// Sorties de `run_loop` qui ne posent délibérément **aucun** signal de
+    /// verdict.
+    ///
+    /// Ce n'est **pas** une allowlist d'infractions : chaque entrée nomme une
+    /// sortie **structurellement inatteignable** depuis un tour de callback, avec
+    /// le prédicat qui l'établit. Quand le scan tire, on **arme** le site — on
+    /// n'ajoute une entrée QUE si l'inatteignabilité est démontrable comme
+    /// celle-ci (doctrine mika#2201 : on déclare, on n'allowliste pas).
+    const LOOP_EXITS_WITHOUT_SIGNAL: &[(&str, &str)] = &[(
+        "Done — texte vide APRÈS follow-up",
+        "LoopMode::follow_up_on_empty() est false pour Silent : cette sortie est \
+         inatteignable depuis un tour de callback, qui est toujours Silent. \
+         Propriété BOOLÉENNE et épinglée — voir l'assertion auto-nettoyante de \
+         mika2515_the_excluded_loop_exit_is_still_unreachable.",
+    )];
+
+    /// Renvois de `run_silent_agent` qui ne lisent délibérément **aucun** fait de
+    /// verdict.
+    ///
+    /// **Vocabulaire DISTINCT de [`LOOP_EXITS_WITHOUT_SIGNAL`]** : là l'exclusion
+    /// dit « ce site est inatteignable », ici elle dit « ce site n'a pas le
+    /// prédicat sous la main ». Confondre les deux ferait passer une course
+    /// d'horloge pour une impossibilité — et écrirait une fausseté dans la garde
+    /// même qui existe pour empêcher les faussetés.
+    const SILENT_RETURNS_WITHOUT_VERDICT_READ: &[(&str, &str)] = &[(
+        "contrôle de deadline du prélude (mika#848 F3b)",
+        "`qa_verdict_due` dérive de `loaded_skill_names`, calculé APRÈS ce site : \
+         le prédicat n'existe pas encore. Population bornée par le fait que \
+         l'enveloppe ENTIÈRE devrait s'écouler dans `load_agent_context` + \
+         `list_commitments`. NON inatteignable — suivi mika#2515-a, dont la \
+         précondition écrite est que le WARN de ce site soit observé sur un \
+         trigger de callback.",
+    )];
+
+    /// Les lignes de production du fichier, commentaires exclus.
+    ///
+    /// La prose de doc de ce ticket cite ses propres motifs abondamment (« un
+    /// scan ancré sur `return Ok(LoopResult::` n'en trouve que cinq ») ; sans ce
+    /// filtre le scan compterait sa propre explication comme une sortie. C'est le
+    /// faux positif que mika#2050 a mesuré sur le Signal S, une classe plus tôt.
+    fn production_lines_of_this_module() -> Vec<String> {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
+        production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn count_in_production(needle: &str) -> usize {
+        production_lines_of_this_module()
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    /// **V9 — la cardinalité, le seul terme qu'aucune fixture ne peut voir.**
+    ///
+    /// Un prédicat devenu trop étroit passerait en ne regardant rien
+    /// (mika#2205) ; une sortie ajoutée sans pose de signal ne rendrait **aucune
+    /// décision fausse** et laisserait toutes les assertions vertes, la seule
+    /// conséquence étant une population muette. C'est très exactement le défaut
+    /// que ce ticket ferme : `run_loop` posait son signal à **deux sorties sur
+    /// six**.
+    ///
+    /// # Le motif est `Ok(LoopResult::`, jamais `return Ok(LoopResult::`
+    ///
+    /// La sortie `MaxStepsExceeded` est l'**expression finale** de `run_loop` :
+    /// elle n'a pas de `return`. Un prédicat ancré sur `return` en trouve
+    /// **cinq**, et l'implémenteur a alors deux façons de se tromper — faire
+    /// rougir un scan correct, ou « corriger » la cardinalité à 5 et sortir en
+    /// silence la sortie max-steps de la population. Inversement, `LoopResult::`
+    /// nu rend les motifs de `match` des trois boucles, donc un scan
+    /// perpétuellement rouge, c'est-à-dire désarmé.
+    ///
+    /// **Le scan asserte la cardinalité, JAMAIS les numéros de ligne** : ceux-ci
+    /// ont déjà dérivé de +59 entre deux passes du plan de ce ticket, et un scan
+    /// qui les figerait rougirait à chaque réécriture du fichier sans qu'aucune
+    /// sortie ne soit devenue muette — un détecteur qu'on désarme parce qu'il
+    /// crie à tort.
+    #[test]
+    fn mika2515_every_loop_exit_decides_about_the_verdict_signal() {
+        let exits = count_in_production("Ok(LoopResult::");
+        let armed_concluded = count_in_production("mark_unmet_after_retry()");
+        let armed_cut_off = count_in_production("mark_cut_off(");
+        let declared_excluded = LOOP_EXITS_WITHOUT_SIGNAL.len();
+
+        assert_eq!(
+            exits, 6,
+            "cardinalité des sorties de `run_loop` : relevée contre le fichier, \
+             jamais posée de mémoire (le plan de ce ticket l'a écrite 4 avant que \
+             le relevé ne soit fait). Si une sortie a été ajoutée, elle doit \
+             DÉCIDER : poser le signal, ou être déclarée dans \
+             LOOP_EXITS_WITHOUT_SIGNAL avec son prédicat d'inatteignabilité."
+        );
+        assert_eq!(
+            armed_concluded, 3,
+            "trois sorties EndTurn posent la moitié « conclu muet » : texte non \
+             vide, texte vide (miroir Silent), et le « Force EndTurn » de \
+             `send_message` — ce dernier est le trou de mika#2368 que mika#2515 \
+             ferme, et mika#2136 l'avait nommé ici même"
+        );
+        assert_eq!(
+            armed_cut_off, 2,
+            "deux sorties coupées posent la moitié « coupé » : DeadlineExceeded \
+             et MaxStepsExceeded"
+        );
+        assert_eq!(
+            armed_concluded + armed_cut_off + declared_excluded,
+            exits,
+            "chacune des {exits} sorties doit DÉCIDER : {armed_concluded} posent \
+             « conclu », {armed_cut_off} posent « coupé », {declared_excluded} \
+             sont déclarées exclues. Le compte ne boucle pas — une sortie est \
+             muette sans l'avoir dit."
+        );
+    }
+
+    /// **V9 — l'assertion auto-nettoyante de l'exclusion de `run_loop`.**
+    ///
+    /// Le jour où `follow_up_on_empty()` devient vrai pour `Silent`, l'exclusion
+    /// cesse d'être vraie et **ce test rougit** — au lieu de laisser une sortie
+    /// s'ouvrir en silence derrière une raison morte.
+    #[test]
+    fn mika2515_the_excluded_loop_exit_is_still_unreachable() {
+        let silent = LoopMode::Silent {
+            max_steps: crate::planning::policy::MAX_TOOL_STEPS,
+        };
+        assert!(
+            !silent.follow_up_on_empty(),
+            "l'entrée de LOOP_EXITS_WITHOUT_SIGNAL repose sur cette propriété : \
+             si elle change, la sortie « Done après follow-up » devient \
+             atteignable depuis un tour de callback et doit être ARMÉE, pas \
+             laissée déclarée"
+        );
+        assert_eq!(
+            LOOP_EXITS_WITHOUT_SIGNAL.len(),
+            1,
+            "une seule sortie est exclue, et pour une raison booléenne"
+        );
+        assert!(
+            LOOP_EXITS_WITHOUT_SIGNAL[0]
+                .1
+                .contains("follow_up_on_empty"),
+            "l'exclusion doit NOMMER le prédicat qui l'établit — une exclusion \
+             sans prédicat est une exemption déguisée"
+        );
+    }
+
+    /// **V9 / DoD 1b — les quatre renvois de `run_silent_agent` décident aussi.**
+    ///
+    /// Sans cette moitié, le scan couvrirait la fonction qui **pose** le signal
+    /// et laisserait libre celle qui le **lit** — c'est-à-dire exactement la
+    /// moitié par laquelle le fait se perd. Le plan de ce ticket a compté trois
+    /// renvois sur quatre pendant six passes, et le quatrième est précisément
+    /// celui qui lit le drapeau.
+    ///
+    /// `Ok(SilentTurnOutcome` et non `return Ok(...)` : la construction finale
+    /// n'a pas de `return`, et c'est celle dont l'omission coûterait le plus. Un
+    /// scan ancré sur `return` y compterait **trois** — le même compte que les
+    /// versions fautives du plan, donc un instrument qui **confirmerait** la
+    /// mauvaise cardinalité.
+    #[test]
+    fn mika2515_every_silent_return_decides_about_the_verdict_signal() {
+        let returns = count_in_production("Ok(SilentTurnOutcome");
+        let reading = count_in_production("SilentTurnOutcome::from_signal");
+        let declared_excluded = SILENT_RETURNS_WITHOUT_VERDICT_READ.len();
+
+        assert_eq!(
+            returns, 4,
+            "cardinalité des renvois de `run_silent_agent` — relevée contre le \
+             fichier. Trois lisent le fait, un est déclaré exclu."
+        );
+        assert_eq!(
+            reading, 3,
+            "trois renvois LISENT le fait : la sous-branche « deadline trop \
+             proche », le bras DeadlineExceeded (dont mika#2368 jetait le fait \
+             explicitement), et la construction finale"
+        );
+        assert_eq!(
+            reading + declared_excluded,
+            returns,
+            "chacun des {returns} renvois doit décider : {reading} lisent, \
+             {declared_excluded} sont déclarés exclus"
+        );
+        assert_eq!(
+            count_in_production("SilentTurnOutcome::default()"),
+            declared_excluded,
+            "le seul `default()` restant est celui du renvoi déclaré exclu — un \
+             second serait un fait jeté sans l'avoir dit"
+        );
+    }
+
+    /// **V9 — l'assertion auto-nettoyante de l'exclusion de `run_silent_agent`,
+    /// et elle est ORDINALE, pas booléenne.**
+    ///
+    /// Il n'y a pas de propriété à interroger : l'exclusion repose sur le fait
+    /// que le calcul de `loaded_skill_names` vient **après** le prélude de
+    /// deadline. Le jour où quelqu'un remonte la correspondance de skills, cette
+    /// exclusion cesse d'être vraie et ce test rougit en nommant le site devenu
+    /// armable, au lieu de laisser un renvoi muet derrière une raison morte.
+    #[test]
+    fn mika2515_the_excluded_silent_return_still_lacks_its_predicate() {
+        let lines = production_lines_of_this_module();
+        let index_of = |needle: &str| -> usize {
+            let hits: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains(needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "l'ancre {needle:?} doit être UNIQUE pour servir d'adresse ; \
+                 trouvé {} occurrences",
+                hits.len()
+            );
+            hits[0]
+        };
+
+        let prelude = index_of("silent agent deadline exceeded during prelude");
+        let skills = index_of("let loaded_skill_names = skill_names_of(&matched);");
+
+        assert!(
+            prelude < skills,
+            "l'exclusion du prélude repose sur cet ORDRE : `qa_verdict_due` \
+             dérive de `loaded_skill_names`, calculé après le prélude. Si le \
+             calcul a été remonté, le prédicat existe désormais à ce site et le \
+             renvoi doit être ARMÉ — retirer l'entrée de \
+             SILENT_RETURNS_WITHOUT_VERDICT_READ."
+        );
+        assert_eq!(SILENT_RETURNS_WITHOUT_VERDICT_READ.len(), 1);
+        assert!(
+            SILENT_RETURNS_WITHOUT_VERDICT_READ[0]
+                .1
+                .contains("loaded_skill_names"),
+            "l'exclusion doit nommer le prédicat indisponible"
+        );
+        assert!(
+            !SILENT_RETURNS_WITHOUT_VERDICT_READ[0]
+                .1
+                .to_lowercase()
+                .contains("inatteignable\u{20}depuis"),
+            "vocabulaire DISTINCT de LOOP_EXITS_WITHOUT_SIGNAL : ce site n'est \
+             pas inatteignable, son prédicat est indisponible. Les confondre \
+             ferait passer une course d'horloge pour une impossibilité."
+        );
+    }
+
+    /// **mika#2515 — la prémisse de P0 est RÉFUTÉE, et voici sa moitié
+    /// structurelle.**
+    ///
+    /// Le plan de ce ticket écrit que le site « Force EndTurn » est atteignable
+    /// en mode `Silent` parce qu'« aucun garde de mode ne le protège ». Le site
+    /// en porte **deux**, conjonctifs avec `send_message_boundary_active` :
+    ///
+    /// ```text
+    /// if send_message_boundary_active && mode.is_conversation() && !is_automated_trigger
+    /// ```
+    ///
+    /// `mode.is_conversation()` **est** un garde de mode, et il est faux pour
+    /// `Silent` ; `is_automated_trigger` est vrai dès que le message commence par
+    /// `[callback:`. Le commentaire du site le dit d'ailleurs : *« Only fires when
+    /// ALL of: Conversation mode (**silent/callback modes exempt**) »*.
+    ///
+    /// **Conséquence : la population de P0 est vide aujourd'hui.** U1e est livré
+    /// quand même — le site doit *décider* (DoD 1) et se trouve armé d'avance si
+    /// ces gardes s'élargissaient — mais il ne ferme aucun défaut observable, et
+    /// l'écrire ici est ce qui empêche la prochaine lecture de le recompter comme
+    /// un trou fermé. C'est la leçon mika#2272 que le plan cite pour son propre
+    /// prédicat de coupure, appliquée à lui.
+    ///
+    /// Le jour où `is_conversation()` devient vrai pour `Silent`, ce test rougit
+    /// et U1e cesse d'être un filet sans population.
+    #[test]
+    fn mika2515_the_force_endturn_exit_is_mode_guarded() {
+        let silent = LoopMode::Silent {
+            max_steps: crate::planning::policy::MAX_CALLBACK_TOOL_STEPS,
+        };
+        assert!(
+            !silent.is_conversation(),
+            "premier garde de la frontière #771 : un tour de callback n'est pas \
+             conversationnel, donc le « Force EndTurn » ne peut pas y firer. Si \
+             cette propriété change, la population de P0 devient non vide — et \
+             U1e, déjà armé, devient un correctif réel plutôt qu'un filet sans \
+             population."
+        );
+        assert!(
+            LoopMode::Conversation.is_conversation(),
+            "contrôle de bonne foi : le prédicat n'est pas constamment faux"
+        );
+        // Le second garde, et il tiendrait seul : le marqueur d'un callback de
+        // build est reconnu comme déclencheur automatisé. Reconstruit depuis la
+        // grammaire du moteur plutôt que recopié.
+        let marker = format!(
+            "[callback: {}]",
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL
+        );
+        assert!(marker.starts_with("[callback:"));
+    }
+
+    /// **V9 — contrôle de bonne foi du scan de cardinalité.**
+    ///
+    /// Un scan vérifié seulement par son propre vert est un scan vérifié par
+    /// rien. Celui-ci est exercé sur des extraits fabriqués plutôt qu'en éditant
+    /// le vrai fichier : le motif doit compter l'expression finale sans `return`,
+    /// et ne pas compter les motifs de `match`.
+    #[test]
+    fn mika2515_the_cardinality_predicate_counts_what_it_claims() {
+        let count = |src: &str, needle: &str| {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| l.contains(needle))
+                .count()
+        };
+
+        // L'expression finale, sans `return` — celle qu'un prédicat ancré sur
+        // `return` manquerait.
+        let final_expr = "    Ok(LoopResult::MaxStepsExceeded {\n        usage: None,\n    })\n";
+        assert_eq!(count(final_expr, "Ok(LoopResult::"), 1);
+        assert_eq!(
+            count(final_expr, "return Ok(LoopResult::"),
+            0,
+            "c'est la raison pour laquelle le motif du scan omet `return`"
+        );
+
+        // Un motif de `match` n'est pas une sortie.
+        let match_arm = "        LoopResult::Done { text, .. } => text,\n";
+        assert_eq!(
+            count(match_arm, "Ok(LoopResult::"),
+            0,
+            "ancrer sur `LoopResult::` nu rendrait le scan perpétuellement rouge"
+        );
+
+        // Une ligne de commentaire citant le motif n'est pas une sortie — la
+        // prose de ce ticket en écrit plusieurs.
+        let prose = "    // Un scan ancré sur `Ok(LoopResult::` n'en trouve que cinq.\n";
+        assert_eq!(
+            count(prose, "Ok(LoopResult::"),
+            0,
+            "faux positif mesuré par mika#2050 sur le Signal S, une classe plus tôt"
+        );
     }
 
     #[test]

@@ -234,6 +234,34 @@ pub enum VerdictReason {
     /// mika#2289 — le tour webhook est mort sur une erreur du loop (`run_agent`
     /// a rendu `Err`). `error_class` est reportée, jamais une condition (D4).
     TurnFailed { error_class: String, detail: String },
+    /// mika#2515 — le tour de callback de build QA a été **coupé** avant de
+    /// poster : enveloppe de temps atteinte, ou budget de steps d'outil épuisé.
+    ///
+    /// # Pourquoi ce n'est pas [`Self::CutOffByDeadline`], qui décrit pourtant
+    /// « coupé »
+    ///
+    /// Trois raisons, et chacune suffit :
+    ///
+    /// 1. le `event_name()` de ce motif-là est [`DEADLINE_VERDICT_EVENT`], dont
+    ///    la sonde de contrôle négatif de mika#2355 dit en toutes lettres « le
+    ///    filet mika#2276 ne doit pas se mettre à firer » — y router une
+    ///    population neuve rendrait cette sonde fausse ;
+    /// 2. son corps est **figé octet pour octet** par
+    ///    [`tests::mika2368_the_deadline_body_is_frozen_byte_for_byte`] (AC5c de
+    ///    mika#2368) ;
+    /// 3. son texte dit « a atteint la limite de son enveloppe de temps », ce
+    ///    qui est **faux** d'un `MaxStepsExceeded`.
+    ///
+    /// Il rend donc [`CALLBACK_VERDICT_EVENT`] — c'est une perte du chemin
+    /// callback, elle appartient à cette population — **discriminée par le champ
+    /// `cause`**, exactement le geste que mika#2289 a déjà fait pour
+    /// [`Self::TurnFailed`]. Les lignes mika#2368 existantes ne portent **aucun**
+    /// `cause` et restent identiques : la soustraction opérateur est
+    /// `select(.cause == null)` contre `select(.cause | startswith("cut_off"))`.
+    CallbackCutOffWithoutVerdict {
+        exit: crate::qa_build_callback::CutOffExit,
+        steps_completed: usize,
+    },
 }
 
 impl VerdictReason {
@@ -245,6 +273,30 @@ impl VerdictReason {
             Self::CallbackConcludedWithoutVerdict => CALLBACK_VERDICT_EVENT,
             // mika#2289 : même nom que le motif deadline, distingué par `cause`.
             Self::TurnFailed { .. } => DEADLINE_VERDICT_EVENT,
+            // mika#2515 : perte du chemin callback, donc la population
+            // callback — discriminée par `cause`, jamais par un nom neuf.
+            Self::CallbackCutOffWithoutVerdict { .. } => CALLBACK_VERDICT_EVENT,
+        }
+    }
+
+    /// La valeur du champ `cause` de la ligne postée, ou `None` quand ce motif
+    /// n'en porte pas.
+    ///
+    /// **Format de fil** : `None` pour les deux motifs fondateurs est ce qui
+    /// garde les sondes de mika#2276 et de mika#2368 exactes de part et d'autre
+    /// de ce déploiement. `match` exhaustif **sans bras `_`** : un cinquième
+    /// motif devra décider de son mot, ou de son absence, au lieu d'hériter du
+    /// voisin.
+    pub fn cause(&self) -> Option<&'static str> {
+        match self {
+            // La population mika#2276 ne porte pas de `cause` — AC5c la fige.
+            Self::CutOffByDeadline(_) => None,
+            // La population mika#2368 non plus : lui en donner un la sortirait
+            // de la soustraction `select(.cause == null)` que ses propres sondes
+            // emploient déjà.
+            Self::CallbackConcludedWithoutVerdict => None,
+            Self::TurnFailed { .. } => Some(CAUSE_ERROR),
+            Self::CallbackCutOffWithoutVerdict { exit, .. } => Some(exit.as_cause()),
         }
     }
 }
@@ -480,6 +532,46 @@ fn build_verdict_body(reason: &VerdictReason, trace_id: &str) -> String {
              \n\
              <sub>mika#2289</sub>"
         ),
+        // mika#2515 — nomme **quelle** borne a été franchie et le nombre de
+        // steps, et ne parle ni de « conclusion » (le tour n'a pas conclu) ni de
+        // la garde (elle n'a peut-être jamais firé : sur un tour coupé elle n'a
+        // pas eu d'EndTurn où s'évaluer).
+        VerdictReason::CallbackCutOffWithoutVerdict {
+            exit,
+            steps_completed,
+        } => {
+            let bound = match exit {
+                crate::qa_build_callback::CutOffExit::Deadline => {
+                    "la limite de son enveloppe de temps"
+                }
+                crate::qa_build_callback::CutOffExit::MaxSteps => {
+                    "la limite de son budget de steps d'outil"
+                }
+            };
+            format!(
+                "{DEADLINE_VERDICT_LINE}\n\
+                 \n\
+                 Ce verdict est posté par le moteur, pas par le tour de revue.\n\
+                 \n\
+                 Le tour de callback de build de la revue QA a été **coupé** avant \
+                 d'avoir posté de verdict : il a atteint {bound} après \
+                 {steps_completed} step(s) d'outil. Aucun `run_gh pr review` réussi \
+                 n'apparaît dans son historique d'outils. Aucune conclusion de revue \
+                 n'a été produite — ce `hold[review]` ne dit rien du contenu de la PR, \
+                 seulement que la revue n'a pas abouti.\n\
+                 \n\
+                 Relancer la revue (retirer puis remettre le reviewer) suffit dans le \
+                 cas nominal. Si la coupure se répète sur cette PR, le tour bute sur un \
+                 travail trop long pour un budget de revue — regarder les `run_shell` \
+                 et les `run_gh` du tour avant de relancer une troisième fois.\n\
+                 \n\
+                 Trace : `{trace_id}` — chercher `{CALLBACK_VERDICT_EVENT}` et \
+                 `cause={cause}` dans `$MIKA_SPIRIT_LOG_FILE`.\n\
+                 \n\
+                 <sub>mika#2515</sub>",
+                cause = exit.as_cause(),
+            )
+        }
     }
 }
 
@@ -611,6 +703,25 @@ where
                     outcome = "posted",
                     "tour de revue mort sur une erreur du loop — verdict hold[review] \
                      posté par le moteur"
+                ),
+                // mika#2515 — quatrième `warn!` et non un paramétré, pour la
+                // raison écrite plus haut : `steps_completed` n'existe pas sur
+                // tous les motifs et le rendre `Option` changerait sa forme dans
+                // le JSON (`5` devient `Some(5)`), que les sondes lisent.
+                VerdictReason::CallbackCutOffWithoutVerdict {
+                    exit,
+                    steps_completed,
+                } => warn!(
+                    event,
+                    agent_id = %input.agent_id,
+                    trace_id = %input.trace_id,
+                    repo = %target.repo,
+                    pr = target.pr_number,
+                    cause = exit.as_cause(),
+                    steps_completed = *steps_completed,
+                    outcome = "posted",
+                    "callback de build QA coupé avant d'avoir posté — verdict \
+                     hold[review] posté par le moteur"
                 ),
             }
             DeadlineVerdictOutcome::Posted
@@ -1397,5 +1508,245 @@ mod tests {
         assert!(error_body.contains("<sub>mika#2289</sub>"));
         assert!(!error_body.contains("enveloppe de temps"));
         assert!(!envelope_body.contains("transport_timeout"));
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2515 — le quatrième motif : le tour de callback a été COUPÉ
+    // -----------------------------------------------------------------------
+
+    use crate::qa_build_callback::CutOffExit;
+
+    fn cut_off_reason(exit: CutOffExit, steps: usize) -> VerdictReason {
+        VerdictReason::CallbackCutOffWithoutVerdict {
+            exit,
+            steps_completed: steps,
+        }
+    }
+
+    /// **V3** — le contrat central du motif neuf : exactement un POST, la cible
+    /// estampillée, le corps qui nomme la borne franchie et les steps, **et relu
+    /// par `parse_verdict`** → `Hold("review")`.
+    #[tokio::test]
+    async fn mika2515_a_cut_off_callback_posts_exactly_one_hold() {
+        for (exit, steps, bound) in [
+            (CutOffExit::Deadline, 5, "enveloppe de temps"),
+            (CutOffExit::MaxSteps, 20, "budget de steps"),
+        ] {
+            let registry: DashMap<String, HashSet<String>> = DashMap::new();
+            let captured = Arc::new(std::sync::Mutex::new(None::<PostReviewRequest>));
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let sink = captured.clone();
+            let counter = calls.clone();
+            let outcome = maybe_post_deadline_verdict(
+                DeadlineVerdictInput {
+                    reason: cut_off_reason(exit, steps),
+                    target: requested_target(),
+                    session_id: "callback-session",
+                    trace_id: "trace-2515",
+                    agent_id: "mika-qa",
+                    pr_reviews_posted: Some(&registry),
+                },
+                move |req| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    *sink.lock().unwrap() = Some(req);
+                    async { Ok("ok".to_string()) }
+                },
+            )
+            .await;
+
+            assert_eq!(outcome, DeadlineVerdictOutcome::Posted);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "exactement un POST");
+
+            let req = captured.lock().unwrap().clone().expect("un POST capturé");
+            assert_eq!(req.repo, "senara-solutions/mika");
+            assert_eq!(req.pr_number, 2275);
+            assert!(req.body.starts_with(DEADLINE_VERDICT_LINE));
+            assert!(
+                req.body.contains(bound),
+                "le corps doit nommer la borne franchie ({bound}) : {}",
+                req.body
+            );
+            assert!(
+                req.body.contains(&format!("{steps} step(s)")),
+                "le corps doit nommer les steps : {}",
+                req.body
+            );
+            assert!(req.body.contains("trace-2515"));
+            assert!(req.body.contains(exit.as_cause()));
+            assert!(req.body.contains("<sub>mika#2515</sub>"));
+
+            // AC5b — ce que la machine d'état lira réellement. La constante
+            // seule ne prouve pas cela, et c'est `parse_verdict` qui merge sur
+            // `pass`.
+            let parsed = crate::server::verdict::parse_verdict(&req.body);
+            assert!(
+                matches!(&parsed, crate::server::verdict::Verdict::Hold(k) if k == "review"),
+                "le filet ne peut produire que hold[review], got {parsed:?}"
+            );
+            for forbidden in [
+                "VERDICT: pass",
+                "block[ac]",
+                "block[ci]",
+                "block[security]",
+                "block[pipeline]",
+            ] {
+                assert!(
+                    !req.body.contains(forbidden),
+                    "le corps du filet ne doit jamais contenir {forbidden} — \
+                     `verdict_handler` route `pass` vers un MERGE"
+                );
+            }
+        }
+    }
+
+    /// **V3** — le corps du motif neuf ne mentionne ni la garde (elle n'a
+    /// peut-être jamais firé sur un tour coupé) ni une « conclusion » (le tour
+    /// n'a pas conclu) ; et celui d'une coupure max-steps ne parle **pas**
+    /// d'enveloppe de temps, ce qui serait faux.
+    #[test]
+    fn mika2515_the_cut_off_body_does_not_claim_what_did_not_happen() {
+        let max_steps = build_verdict_body(&cut_off_reason(CutOffExit::MaxSteps, 20), "t");
+        assert!(
+            !max_steps.contains("enveloppe de temps"),
+            "un max-steps n'a pas atteint sa deadline — c'est le mensonge que la \
+             réutilisation de `CutOffByDeadline` aurait produit"
+        );
+        assert!(
+            !max_steps.contains("re-prompt"),
+            "la garde n'a pas eu d'EndTurn où firer sur un tour coupé"
+        );
+        assert!(
+            !max_steps.contains("s'est terminé"),
+            "le tour n'a pas conclu, il a été coupé"
+        );
+
+        let deadline = build_verdict_body(&cut_off_reason(CutOffExit::Deadline, 5), "t");
+        assert!(!deadline.contains("budget de steps"));
+        assert_ne!(
+            deadline, max_steps,
+            "deux bornes, deux corps — les confondre rendrait la ligne inutile"
+        );
+    }
+
+    /// **V4** — `cause` est sur la ligne du motif neuf, et **absent** des deux
+    /// motifs fondateurs.
+    ///
+    /// C'est la propriété dont dépendent les deux sondes opérateur : la
+    /// soustraction est `select(.cause | startswith("cut_off"))` contre
+    /// `select(.cause == null)`. Donner un `cause` à mika#2368 la sortirait de la
+    /// soustraction que ses propres sondes emploient déjà, et ferait passer une
+    /// **réparation** pour une population neuve.
+    #[test]
+    fn mika2515_the_cause_field_keeps_the_populations_subtractable() {
+        // Les deux populations historiques ne portent aucun `cause`.
+        assert_eq!(cut_off(5).cause(), None, "mika#2276 : AC5c la fige");
+        assert_eq!(
+            VerdictReason::CallbackConcludedWithoutVerdict.cause(),
+            None,
+            "mika#2368 : la réparation P0 entre dans cette population"
+        );
+        // mika#2289 garde le sien, hérité.
+        assert_eq!(died_reason("transport_timeout").cause(), Some(CAUSE_ERROR));
+        // mika#2515 porte celui de sa borne.
+        assert_eq!(
+            cut_off_reason(CutOffExit::Deadline, 1).cause(),
+            Some("cut_off_deadline")
+        );
+        assert_eq!(
+            cut_off_reason(CutOffExit::MaxSteps, 1).cause(),
+            Some("cut_off_max_steps")
+        );
+    }
+
+    /// **V4 / AC5** — le motif neuf ne détourne PAS la population mika#2276 :
+    /// son nom d'événement est celui du chemin callback.
+    ///
+    /// Sans cela, la sonde de contrôle négatif de mika#2355
+    /// (`grep qa_deadline_verdict | jq 'select(.outcome == "posted")'`, dont le
+    /// régime attendu est **vide**) deviendrait fausse — et c'est elle qui rend
+    /// les autres lectures fiables.
+    #[test]
+    fn mika2515_the_new_reason_does_not_hijack_the_deadline_event_name() {
+        for exit in [CutOffExit::Deadline, CutOffExit::MaxSteps] {
+            assert_eq!(
+                cut_off_reason(exit, 3).event_name(),
+                CALLBACK_VERDICT_EVENT,
+                "une perte du chemin callback appartient à la population callback"
+            );
+            assert_ne!(cut_off_reason(exit, 3).event_name(), DEADLINE_VERDICT_EVENT);
+        }
+    }
+
+    /// **V3** — les quatre abstentions héritées valent aussi pour le motif neuf,
+    /// et le registre absent s'abstient sur **lui aussi**.
+    ///
+    /// Une conjonction de termes fail-safe n'est pas prouvée en les neutralisant
+    /// tous d'un coup (leçon mika#2277) : les termes de cible sont testés
+    /// séparément côté dispatcher, qui les lit ; ici c'est le terme registre.
+    #[tokio::test]
+    async fn mika2515_no_registry_abstains_on_the_cut_off_reason_too() {
+        for exit in [CutOffExit::Deadline, CutOffExit::MaxSteps] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let outcome = maybe_post_deadline_verdict(
+                DeadlineVerdictInput {
+                    reason: cut_off_reason(exit, 5),
+                    target: requested_target(),
+                    session_id: "s",
+                    trace_id: "trace",
+                    agent_id: "mika-qa",
+                    pr_reviews_posted: None,
+                },
+                move |_req| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(String::new()) }
+                },
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                DeadlineVerdictOutcome::NotApplicable("no_registry")
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// **V3 / AC7** — un tour coupé **après** avoir posté sa revue ne reçoit pas
+    /// un second verdict, pour les deux formes de clé que `run_gh` écrit.
+    #[tokio::test]
+    async fn mika2515_a_cut_off_turn_that_already_reviewed_gets_no_second_verdict() {
+        for key in ["senara-solutions/mika|2275", "__default__|2275"] {
+            let registry: DashMap<String, HashSet<String>> = DashMap::new();
+            registry
+                .entry("callback-session".to_string())
+                .or_default()
+                .insert(key.to_string());
+            let calls = Arc::new(AtomicUsize::new(0));
+
+            let counter = calls.clone();
+            let outcome = maybe_post_deadline_verdict(
+                DeadlineVerdictInput {
+                    reason: cut_off_reason(CutOffExit::Deadline, 5),
+                    target: requested_target(),
+                    session_id: "callback-session",
+                    trace_id: "trace-2515",
+                    agent_id: "mika-qa",
+                    pr_reviews_posted: Some(&registry),
+                },
+                move |_req| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(String::new()) }
+                },
+            )
+            .await;
+
+            assert_eq!(
+                outcome,
+                DeadlineVerdictOutcome::AlreadyReviewed,
+                "clé {key}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "zéro POST ({key})");
+        }
     }
 }

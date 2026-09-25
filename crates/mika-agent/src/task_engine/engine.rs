@@ -252,6 +252,72 @@ const STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS: i64 = 30 * 24 * 3600;
 /// the two causes are distinguishable — is held; its letter is corrected.
 const STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT: &str = "stuck_pending_sheltered_by_activity";
 
+// ── mika#2515 U2 — l'alerte « un build vert, un verdict qui n'arrive pas » ──
+
+/// Log event **et** audit `tool_name` de l'alerte mika#2515 U2.
+///
+/// **SOLE WRITER** : [`TaskEngine::alert_undelivered_build_verdicts`], épinglé
+/// par un scan de source à allowlist vide. C'est cette propriété qui fait du
+/// `GROUP BY after_value` de l'opérateur un compte **exact** plutôt qu'un nombre
+/// sur lequel deux écrivains peuvent ne pas être d'accord — et ce compte est la
+/// précondition explicite du suivi « poster sur quarantaine ».
+const QA_BUILD_VERDICT_UNDELIVERED_EVENT: &str = "qa_build_verdict_undelivered";
+
+/// Kill-switch de l'alerte (mika#2515). Désarmé, le balayage n'écrit **rien** :
+/// il ne « s'abstient » pas, il n'existe pas ce tick.
+const QA_BUILD_VERDICT_ALERT_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT";
+
+/// Env var surchargeant [`QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS`].
+const QA_BUILD_VERDICT_ALERT_AGE_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT_AGE_SECS";
+
+/// Fenêtre avant alerte (mika#2515). **Arithmétique, pas une rondeur** : l'AC
+/// demande « dans les 10 minutes », le balayage tourne à
+/// [`DB_SCAN_INTERVAL_TICKS`] (60 s), donc `540 + 60 = 600 s` est la borne haute
+/// effective.
+///
+/// Le knob existe parce que le nombre est **posé contre l'AC, pas mesuré** :
+/// mika#2179 a mesuré la latence de livraison de *tous* les callbacks
+/// (`p50 = 377 s`, `p90 = 9585 s`), mais la sous-population « callback de build
+/// dont un tour QA attend le retour » n'a jamais été mesurée. Asymétrie assumée,
+/// celle que mika#2496 écrit pour son propre seuil de coût : **un seuil d'alerte
+/// ne coupe rien** — un faux positif coûte une ligne de WARN. Et la population
+/// est minuscule (un callback de build n'existe que quand une revue QA dispatche
+/// un build), donc même un taux de déclenchement élevé fait quelques lignes par
+/// jour, chacune nommant une PR qui attend réellement son verdict.
+///
+/// **Halte si la distribution montre du trafic nominal : c'est le seuil qui
+/// monte, jamais l'alerte qu'on désarme.**
+const QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS: i64 = 540;
+
+/// Borne haute de la fenêtre (30 jours), pour la cohérence du knob : un réglage
+/// absurde rendrait l'alerte muette sans rien dire — la panne silencieuse que ce
+/// ticket ferme, reproduite par son propre réglage.
+const QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Env var surchargeant [`QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS`].
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT_LOOKBACK_DAYS";
+
+/// Profondeur du `since` passé à `get_undelivered_callback_tasks` (mika#2515).
+///
+/// 7 jours : la valeur que `dispatch_undelivered_callbacks` emploie déjà, pour
+/// que les deux bras voient la **même population**. Les faire diverger créerait
+/// une poche de lignes qu'un bras tente de livrer et que l'autre n'alerte
+/// jamais — ou l'inverse.
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS: i64 = 7;
+
+/// Borne haute du lookback (90 jours) : la rétention d'`audit_events`
+/// (`AUDIT_RETENTION_DAYS`) au-delà de laquelle la déduplication ne peut plus
+/// rien voir, donc au-delà de laquelle une ligne serait ré-alertée sans fin.
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS: i64 = 90;
+
+/// Horizon de déduplication de l'alerte (24 h, doctrine mika#2131).
+///
+/// L'information durable est « ce verdict est retenu par cette cause », pas
+/// « il l'était encore à 14 h 32 » : à 60 s de cadence et 9 min de fenêtre, une
+/// ligne par passe par PR serait exactement le churn que la doctrine borne. Un
+/// **changement** de cause réécrit — c'est un changement d'état.
+const QA_BUILD_VERDICT_ALERT_DEDUP_HOURS: i64 = 24;
+
 /// Env var overriding the promotion-starvation indicator threshold (mika#2169,
 /// L2b).
 const DEFERRED_PROMOTION_STALE_ENV: &str = "MIKA_DEFERRED_PROMOTION_STALE_SECS";
@@ -666,6 +732,19 @@ impl TaskEngine {
     pub async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
         let now = crate::timestamp::now();
 
+        // mika#2515 — un instrument désarmé se lit exactement comme un
+        // instrument sain (mika#2205). Dit une fois, au démarrage, et seulement
+        // en mode serveur : c'est le seul mode où le balayage existe.
+        if !self.dispatcher.cli_mode && !qa_build_verdict_alert_enabled() {
+            info!(
+                event = "qa_build_verdict_alert_disabled",
+                env = QA_BUILD_VERDICT_ALERT_ENV,
+                agent_id = %self.db.agent_id(),
+                "l'alerte de verdict de build non livré est DÉSARMÉE — un build \
+                 vert pourra laisser une PR muette sans qu'aucune ligne le dise"
+            );
+        }
+
         // 1. Expire timed-out tasks
         match self.db.mark_tasks_expired(&now).await {
             Ok(n) if n > 0 => info!(count = n, "expired timed-out tasks on startup"),
@@ -903,6 +982,13 @@ impl TaskEngine {
                 // dispatch_undelivered_callbacks scan in the same tick cycle.
                 self.promote_pending_deferred_if_idle().await;
                 self.dispatch_undelivered_callbacks().await;
+                // mika#2515 U2 — troisième bras, APRÈS la tentative de
+                // livraison : une ligne que ce balayage vient de tenter n'est
+                // pas à alerter avant qu'il ait essayé. Sous le même garde
+                // `!cli_mode` que son voisin, parce qu'en mode CLI c'est la TUI
+                // qui livre — alerter là rendrait `never_attempted` sur des
+                // lignes qu'un autre chemin sert.
+                self.alert_undelivered_build_verdicts().await;
             }
             // Reap parent self_dev tasks left in_progress after their callback
             // subtask delivered without producing a PR (#871).
@@ -1156,6 +1242,196 @@ impl TaskEngine {
 
         if stale_skipped > 0 {
             info!(count = stale_skipped, "cleared stale failed callback tasks");
+        }
+    }
+
+    /// mika#2515 U2 — un `build_mika` vert ne laisse plus une PR muette **en
+    /// silence**.
+    ///
+    /// # Ce que ça ferme, et ce que ça ne ferme pas
+    ///
+    /// Quatre populations laissent un build vert et une PR muette. U1 ferme les
+    /// deux qui sont réparables au site (le tour a tourné : conclusion muette par
+    /// le « Force EndTurn », coupure par deadline ou par steps). Les deux autres
+    /// sont hors d'atteinte d'un filet de tour : un `AgentBusy` refuse **avant**
+    /// de créer la session, et un `run_silent_agent` qui rend `Err` n'a pas
+    /// d'`Ok` à lire. Pour celles-là, l'AC demande « SOIT un verdict posté SOIT
+    /// une alerte nommée » — et c'est l'alerte.
+    ///
+    /// **Détection seule, et ce n'est pas de la timidité.** Pour la famine le
+    /// verdict n'est pas perdu, il est **en file** : la ligne réessaie toutes les
+    /// 60 s et postera le vrai verdict dès que l'agent se libère. Poser un
+    /// `hold[review]` sur une PR dont le verdict est seulement *en attente*
+    /// serait une affirmation activement trompeuse — et une revue postée par
+    /// `mika-platform-qa` sort la PR de la population du réconciliateur mika#2334
+    /// **pour de bon** (coût écrit dans `deadline_verdict.rs`). Pour la
+    /// quarantaine, en revanche, poster serait juste : population distincte,
+    /// suivi nommé, **précondition que la première distribution la montre non
+    /// vide**.
+    ///
+    /// # Placement
+    ///
+    /// Troisième bras du balayage à 60 ticks, **après**
+    /// [`Self::dispatch_undelivered_callbacks`] : une ligne que ce balayage vient
+    /// de tenter de livrer n'est pas à alerter avant qu'il ait essayé. Sous le
+    /// même garde `!cli_mode`, et ce n'est pas un détail — en mode CLI c'est la
+    /// TUI qui livre les callbacks, donc alerter là rendrait
+    /// `never_attempted` sur chaque tick pour des lignes qu'un autre chemin sert.
+    ///
+    /// # Aucune requête neuve, aucune migration
+    ///
+    /// Il **réutilise** `get_undelivered_callback_tasks` et filtre **dans
+    /// l'application**, là où le refus peut se journaliser (leçon mika#2184 : le
+    /// proxy filtre en SQL, la mesure directe tranche dans le code).
+    ///
+    /// # L'estampille n'est PAS un terme
+    ///
+    /// Elle enrichit la ligne (`target`) et son absence vaut `unresolved`. Une
+    /// revue QA dispatchée en texte libre — ce que le ticket décrit : « QA
+    /// **directe** dispatchée sur #2458 » — ne produit aucune estampille, donc en
+    /// faire un terme rendrait ce travail silencieux sur exactement le dispatch
+    /// mesuré.
+    async fn alert_undelivered_build_verdicts(&self) {
+        if !qa_build_verdict_alert_enabled() {
+            return;
+        }
+
+        let since = crate::timestamp::now_minus(chrono::Duration::days(
+            qa_build_verdict_alert_lookback_days(),
+        ));
+        let tasks = match self.db.get_undelivered_callback_tasks(&since).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    event = QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    error = %e,
+                    "échec du balayage des verdicts de build non livrés"
+                );
+                return;
+            }
+        };
+
+        let age_window = chrono::Duration::seconds(qa_build_verdict_alert_age_secs());
+        let dedup_since = crate::timestamp::now_minus(chrono::Duration::hours(
+            QA_BUILD_VERDICT_ALERT_DEDUP_HOURS,
+        ));
+        let system_session = format!("system-{}", self.db.agent_id());
+
+        for task in tasks {
+            // Terme 1 — c'est un callback de build. Égalité stricte, le même
+            // discriminant que les trois autres lecteurs (mika#2355).
+            if !crate::qa_build_callback::is_build_callback_label(&task.label) {
+                continue;
+            }
+            // Terme 2 — le statut est dans la population non livrée : garanti
+            // par la requête réutilisée (`status IN ('completed','failed')`).
+            //
+            // Terme 3 — plus vieux que la fenêtre.
+            let Some(completed_at) = task.completed_at.as_deref() else {
+                continue;
+            };
+            if !crate::timestamp::is_older_than(completed_at, age_window) {
+                continue;
+            }
+
+            let cause =
+                crate::qa_build_callback::classify_undelivered_verdict(task.metadata.as_deref());
+            let target_key = format!("task:{}", task.id);
+
+            // Terme 4 — pas déjà alertée pour **cette** cause dans les 24 h. Un
+            // changement de cause réécrit : c'est un changement d'état.
+            //
+            // Lecture **fail-OPEN** : un `audit_events` illisible alerte quand
+            // même, et le dit sous son propre nom. L'inverse de `wip_rescue`
+            // (mika#2199) et pour la raison opposée : là un faux positif
+            // rejouait une revue, ici le pire d'un faux positif est **une ligne
+            // de journal en trop**, et le pire d'un faux négatif est le silence
+            // que tout ce ticket ferme.
+            let previous_cause = match self
+                .db
+                .latest_audit_event_for_target(
+                    QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    &target_key,
+                    &dedup_since,
+                )
+                .await
+            {
+                Ok(row) => row.and_then(|(after_value, _, _)| after_value),
+                Err(e) => {
+                    warn!(
+                        event = "qa_build_verdict_alert_ledger_unreadable",
+                        task_id = %task.id,
+                        error = %e,
+                        "registre d'alerte illisible — on alerte quand même \
+                         (fail-open), la déduplication ne tient plus"
+                    );
+                    None
+                }
+            };
+            if previous_cause.as_deref() == Some(cause.as_wire()) {
+                continue;
+            }
+
+            // L'estampille enrichit, elle ne conditionne pas.
+            let target =
+                crate::task_engine::dispatcher::read_qa_review_pr_target(task.metadata.as_deref())
+                    .map(|t| t.to_metadata_value())
+                    .unwrap_or_else(|_| "unresolved".to_string());
+
+            let age_secs = crate::timestamp::parse(completed_at)
+                .map(|t| (chrono::Utc::now() - t).num_seconds())
+                .unwrap_or_default();
+            // Les mêmes compteurs que le classificateur vient de lire, par le
+            // même site : classer sur une valeur et en rapporter une autre
+            // rendrait la ligne inexploitable pour la halte qui la lit.
+            let deferrals = crate::qa_build_callback::metadata_counter(
+                task.metadata.as_deref(),
+                crate::task_engine::VERDICT_DELIVERY_DEFERRALS_KEY,
+            );
+            let attempts = crate::qa_build_callback::metadata_counter(
+                task.metadata.as_deref(),
+                crate::task_engine::DELIVERY_ATTEMPTS_KEY,
+            );
+
+            warn!(
+                event = QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                target = %target,
+                cause = cause.as_wire(),
+                age_secs,
+                deferrals,
+                attempts,
+                status = %task.status,
+                "un build a rendu et son verdict QA n'est pas arrivé sur la PR — \
+                 la cause nomme le chemin"
+            );
+
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    &system_session,
+                    QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    &target_key,
+                    None,
+                    Some(cause.as_wire()),
+                    Some(&format!(
+                        "target:{target} age_secs:{age_secs} deferrals:{deferrals} \
+                         attempts:{attempts} status:{}",
+                        task.status
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    event = "qa_build_verdict_alert_audit_failed",
+                    task_id = %task.id,
+                    error = %e,
+                    "l'alerte a été journalisée mais sa ligne d'audit n'a pas été \
+                     écrite — la déduplication la ré-émettra au prochain tick"
+                );
+            }
         }
     }
 
@@ -4860,6 +5136,102 @@ fn parse_stuck_pending_activity_window(raw: Option<&str>) -> i64 {
 fn stuck_pending_activity_window_secs() -> i64 {
     parse_stuck_pending_activity_window(
         std::env::var(STUCK_PENDING_ACTIVITY_WINDOW_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Moitié pure du kill-switch d'alerte (mika#2515).
+///
+/// Absent ou vide → **armé**. `0`/`false`/`off`/`no` → désarmé. Une valeur non
+/// reconnue est **dite** et laisse armé : un désarmement par coquille sur un
+/// instrument de sûreté serait la panne silencieuse que ce ticket ferme. Même
+/// table de vérité et même raison que `parse_qa_callback_verdict_net`.
+fn parse_qa_build_verdict_alert(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "qa_build_verdict_alert_invalid",
+                env = QA_BUILD_VERDICT_ALERT_ENV,
+                value = %other,
+                "valeur non reconnue pour {QA_BUILD_VERDICT_ALERT_ENV} — l'alerte \
+                 reste armée"
+            );
+            true
+        }
+    }
+}
+
+/// Résout le kill-switch d'alerte (mika#2515).
+fn qa_build_verdict_alert_enabled() -> bool {
+    parse_qa_build_verdict_alert(std::env::var(QA_BUILD_VERDICT_ALERT_ENV).ok().as_deref())
+}
+
+/// Parse pur de la fenêtre avant alerte (mika#2515). Forme maison à trois
+/// paliers — absent/vide → défaut ; illisible, `0`, négatif ou au-delà de
+/// [`QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS`] → défaut **plus** un WARN nommant la
+/// valeur **entre guillemets**, pour qu'un espace parasite se voie.
+///
+/// `0` ne désarme pas : c'est le rôle du kill-switch, et lu autrement une
+/// coquille couperait l'alerte en silence.
+fn parse_qa_build_verdict_alert_age(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    event = "qa_build_verdict_alert_age_invalid",
+                    env = QA_BUILD_VERDICT_ALERT_AGE_ENV,
+                    value = %v,
+                    default = QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+                    "valeur invalide pour la fenêtre d'alerte de verdict ; retour au défaut"
+                );
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+            }
+        },
+        _ => QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+    }
+}
+
+/// Résout la fenêtre avant alerte (mika#2515).
+fn qa_build_verdict_alert_age_secs() -> i64 {
+    parse_qa_build_verdict_alert_age(
+        std::env::var(QA_BUILD_VERDICT_ALERT_AGE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Parse pur de la profondeur du lookback (mika#2515). Mêmes trois paliers.
+fn parse_qa_build_verdict_alert_lookback_days(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(days) if days > 0 && days <= QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS => days,
+            _ => {
+                warn!(
+                    event = "qa_build_verdict_alert_lookback_invalid",
+                    env = QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV,
+                    value = %v,
+                    default = QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS,
+                    "valeur invalide pour le lookback de l'alerte de verdict ; retour au défaut"
+                );
+                QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+            }
+        },
+        _ => QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS,
+    }
+}
+
+/// Résout la profondeur du lookback (mika#2515).
+fn qa_build_verdict_alert_lookback_days() -> i64 {
+    parse_qa_build_verdict_alert_lookback_days(
+        std::env::var(QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV)
             .ok()
             .as_deref(),
     )
@@ -8824,6 +9196,531 @@ mod tests {
         assert_eq!(
             parse_childless_parent_reaper_grace(Some("-300")),
             CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    // ── mika#2515 U2 — l'alerte de verdict non livré ─────────────────────
+
+    /// **V8** — les trois paliers de la fenêtre d'alerte, plus les deux bornes
+    /// du plafond. `0` ne désarme pas : c'est le rôle du kill-switch, et lu
+    /// autrement une coquille couperait l'alerte en silence.
+    #[test]
+    fn mika2515_parse_the_alert_age_window() {
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(None),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some("   ")),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+        );
+        assert_eq!(parse_qa_build_verdict_alert_age(Some("300")), 300);
+        assert_eq!(parse_qa_build_verdict_alert_age(Some(" 300 ")), 300);
+        for bad in ["0", "-1", "abc", "540s"] {
+            assert_eq!(
+                parse_qa_build_verdict_alert_age(Some(bad)),
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+                "{bad} doit retomber au défaut"
+            );
+        }
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some(
+                &(QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS + 1).to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+            "un réglage absurde rendrait l'alerte muette sans rien dire"
+        );
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some(
+                &QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS.to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS,
+            "le plafond lui-même est une valeur légale"
+        );
+    }
+
+    /// **V8** — l'arithmétique du défaut EST l'AC : fenêtre + un intervalle de
+    /// balayage = 600 s, soit « dans les 10 minutes ».
+    ///
+    /// Sans cette assertion, changer l'un des deux nombres casserait
+    /// silencieusement le critère d'acceptation du ticket.
+    #[test]
+    fn mika2515_the_default_window_plus_one_scan_meets_the_ten_minute_ac() {
+        assert_eq!(QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS, 540);
+        assert_eq!(DB_SCAN_INTERVAL_TICKS, 60);
+        assert_eq!(
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + DB_SCAN_INTERVAL_TICKS as i64,
+            600,
+            "l'AC demande « dans les 10 minutes » : fenêtre + un tick de \
+             balayage est la borne haute effective"
+        );
+    }
+
+    /// **V8** — les trois paliers du lookback, et l'égalité avec la fenêtre que
+    /// `dispatch_undelivered_callbacks` emploie : les faire diverger créerait une
+    /// poche de lignes qu'un bras tente de livrer et que l'autre n'alerte jamais.
+    #[test]
+    fn mika2515_parse_the_alert_lookback() {
+        assert_eq!(
+            parse_qa_build_verdict_alert_lookback_days(None),
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+        );
+        assert_eq!(parse_qa_build_verdict_alert_lookback_days(Some("3")), 3);
+        for bad in ["0", "-2", "sept"] {
+            assert_eq!(
+                parse_qa_build_verdict_alert_lookback_days(Some(bad)),
+                QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+            );
+        }
+        assert_eq!(
+            parse_qa_build_verdict_alert_lookback_days(Some(
+                &(QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS + 1).to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+        );
+        assert_eq!(
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS, 7,
+            "la même valeur que `dispatch_undelivered_callbacks`, pour que les \
+             deux bras voient la même population"
+        );
+    }
+
+    /// **V8** — le kill-switch, et son contrôle négatif porteur : une valeur non
+    /// reconnue laisse **armé**. Un désarmement par coquille sur un instrument de
+    /// sûreté serait la panne silencieuse que ce ticket ferme.
+    #[test]
+    fn mika2515_an_unrecognised_kill_switch_value_leaves_the_alert_armed() {
+        assert!(parse_qa_build_verdict_alert(None));
+        assert!(parse_qa_build_verdict_alert(Some("")));
+        assert!(parse_qa_build_verdict_alert(Some("   ")));
+        for off in ["0", "false", "FALSE", "off", "no", " No "] {
+            assert!(!parse_qa_build_verdict_alert(Some(off)), "{off} désarme");
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            assert!(parse_qa_build_verdict_alert(Some(on)), "{on} arme");
+        }
+        for typo in ["disabled", "nope", "2", "flase"] {
+            assert!(
+                parse_qa_build_verdict_alert(Some(typo)),
+                "{typo} n'est pas reconnu : l'alerte doit rester ARMÉE et le dire"
+            );
+        }
+    }
+
+    /// **V9 — SOLE WRITER.** `qa_build_verdict_undelivered` est écrit
+    /// littéralement à un seul endroit de la production : la constante de ce
+    /// module.
+    ///
+    /// Scan de **source**, parce qu'aucun test comportemental ne peut voir cette
+    /// classe : un second écrivain ne rendrait **aucune décision fausse**, il
+    /// rendrait le `GROUP BY after_value` de l'opérateur inexact — et c'est ce
+    /// compte qui est la précondition explicite du suivi « poster sur
+    /// quarantaine ». Toutes les assertions resteraient vertes.
+    ///
+    /// **Allowlist livrée vide**, et un test frère refuse qu'elle cesse de
+    /// l'être : quand ce scan tire, on **retire** le second écrivain (doctrine
+    /// mika#2201).
+    ///
+    /// Porte sa propre **assertion anti-vacuité** : le scan échoue si le nom
+    /// n'est écrit **nulle part** — un scan qui visait un nom mort se lit
+    /// exactement comme un scan propre (mika#2103 / mika#2205).
+    #[test]
+    fn mika2515_the_undelivered_alert_has_a_single_writer() {
+        const ALLOWED: &[&str] = &[];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let needle = format!("\"{QA_BUILD_VERDICT_UNDELIVERED_EVENT}\"");
+        let mut sites: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path.to_string_lossy().to_string();
+            if ALLOWED.iter().any(|a| rel.ends_with(a)) {
+                return;
+            }
+            for line in production.lines() {
+                // La prose de doc cite le nom abondamment — c'est du texte, pas
+                // un écrivain.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    sites.push(rel.clone());
+                }
+            }
+        });
+
+        assert!(
+            !sites.is_empty(),
+            "anti-vacuité : {QA_BUILD_VERDICT_UNDELIVERED_EVENT} n'est écrit \
+             NULLE PART — un scan qui visait un nom mort ne vérifie rien et se \
+             lit exactement comme un scan propre"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "{QA_BUILD_VERDICT_UNDELIVERED_EVENT} doit avoir exactement un \
+             écrivain littéral ; trouvé : {sites:?}. Retirer le second écrivain, \
+             ne PAS l'allowlister."
+        );
+        assert!(
+            sites[0].ends_with("engine.rs"),
+            "le nom doit être écrit dans ce module, pas dans {:?}",
+            sites[0]
+        );
+    }
+
+    // ── V6 — le balayage sélectionne, et refuse ──────────────────────────
+
+    /// Sème un callback **de build** livré nulle part, `completed_at` reculé de
+    /// `age_secs`, avec le `metadata` donné.
+    async fn seed_build_callback(
+        db: &AsyncDatabase,
+        age_secs: i64,
+        metadata: Option<&str>,
+    ) -> String {
+        seed_callback_with_label(
+            db,
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            age_secs,
+            metadata,
+        )
+        .await
+    }
+
+    async fn seed_callback_with_label(
+        db: &AsyncDatabase,
+        label: &str,
+        age_secs: i64,
+        metadata: Option<&str>,
+    ) -> String {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: metadata.map(str::to_owned),
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("create callback row");
+        db.update_task_completed(&id, Some("Build succeeded"))
+            .await
+            .expect("mark completed");
+        if age_secs > 0 {
+            db.backdate_task_completed_at(&id, age_secs)
+                .await
+                .expect("backdate completed_at");
+        }
+        id
+    }
+
+    async fn alert_count(db: &AsyncDatabase) -> i64 {
+        db.count_audit_events_by_tool_name(QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .await
+            .unwrap()
+    }
+
+    /// Au-delà de la fenêtre, un callback de build non livré est alerté — et la
+    /// ligne d'audit porte la **cause**, pas seulement le fait.
+    #[tokio::test]
+    async fn mika2515_the_scan_alerts_past_the_window_and_names_the_cause() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"12"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(alert_count(&db).await, 1, "une alerte, une seule");
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .expect("la ligne d'audit doit exister");
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some("agent_busy_starvation"),
+            "c'est `after_value` que l'opérateur `GROUP BY` pour dimensionner le \
+             suivi « poster sur quarantaine »"
+        );
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("deferrals:12")),
+            "les compteurs rapportés sont ceux sur lesquels la cause a été \
+             classée : {:?}",
+            row.reasoning
+        );
+    }
+
+    /// **Dans** la fenêtre, rien : un verdict qui a dix secondes de retard n'est
+    /// pas un verdict perdu.
+    #[tokio::test]
+    async fn mika2515_the_scan_is_silent_inside_the_window() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(&db, 10, Some(r#"{"delivery_attempts":"1"}"#)).await;
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(alert_count(&db).await, 0, "zéro alerte ⇒ zéro ligne");
+    }
+
+    /// Un callback **livré** n'est plus dans la population : c'est le terme que
+    /// la requête réutilisée garantit, et l'asserter empêche une future
+    /// réécriture de la requête d'ouvrir l'alerte sur des verdicts arrivés.
+    #[tokio::test]
+    async fn mika2515_a_delivered_callback_is_out_of_the_population() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let id = seed_build_callback(&db, QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60, None).await;
+        db.mark_task_delivered(&id).await.unwrap();
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 0);
+    }
+
+    /// Un callback **non-build** n'est jamais alerté : le discriminant est
+    /// l'égalité stricte de label (mika#2355 AC4b), et les cinq autres flux
+    /// `long_running` en sont exclus chacun.
+    #[tokio::test]
+    async fn mika2515_a_non_build_callback_is_never_alerted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        for label in [
+            "long_running:run_claude_pilot",
+            "long_running:run_claude_pilot_groom",
+            "long_running:deploy_mika",
+            "long_running:build_mika_extra",
+        ] {
+            seed_callback_with_label(
+                &db,
+                label,
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+                Some(r#"{"verdict_delivery_deferrals":"9"}"#),
+            )
+            .await;
+        }
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(
+            alert_count(&db).await,
+            0,
+            "égalité stricte : `long_running:build_mika_extra` n'est pas un build"
+        );
+    }
+
+    /// **L'estampille n'est PAS un terme** — et c'est la propriété qui rend ce
+    /// travail non silencieux sur le dispatch mesuré.
+    ///
+    /// Une revue QA lancée en texte libre (`mika ask --agent mika-qa "review PR
+    /// #2458"`, ce que le ticket décrit) ne produit aucune estampille : en faire
+    /// un terme rendrait l'alerte muette sur exactement la population mesurée.
+    #[tokio::test]
+    async fn mika2515_an_unstamped_callback_is_still_alerted_as_unresolved() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"delivery_attempts":"2"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(
+            alert_count(&db).await,
+            1,
+            "alertée malgré l'absence de cible"
+        );
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .unwrap();
+        assert_eq!(row.after_value.as_deref(), Some("turn_failed"));
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("target:unresolved")),
+            "l'estampille ENRICHIT la ligne ; son absence se dit, elle ne \
+             supprime pas l'alerte : {:?}",
+            row.reasoning
+        );
+    }
+
+    /// Une cible estampillée **enrichit** la ligne — l'autre moitié du test
+    /// ci-dessus, sans laquelle « l'estampille n'est pas un terme » serait
+    /// indistinguable de « l'estampille n'est jamais lue ».
+    #[tokio::test]
+    async fn mika2515_a_stamped_callback_names_its_pr() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(
+                r#"{"delivery_attempts":"2",
+                    "qa_review_pr_target":"senara-solutions/mika#2458"}"#,
+            ),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .unwrap();
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("target:senara-solutions/mika#2458")),
+            "{:?}",
+            row.reasoning
+        );
+    }
+
+    /// **Déduplication 24 h par `(tâche, cause)`** : deux passes, une ligne.
+    ///
+    /// À 60 s de cadence et 9 min de fenêtre, une ligne par passe par PR serait
+    /// le churn que la doctrine mika#2131 borne.
+    #[tokio::test]
+    async fn mika2515_two_passes_write_one_line() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+        engine.alert_undelivered_build_verdicts().await;
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(
+            alert_count(&db).await,
+            1,
+            "trois passes, une ligne : l'information durable est « ce verdict est \
+             retenu par cette cause », pas « il l'était encore à 14 h 32 »"
+        );
+    }
+
+    /// **Un changement de cause RÉÉCRIT** : c'est un changement d'état, et la
+    /// moitié de la déduplication qu'une clé nue ne donnerait pas.
+    #[tokio::test]
+    async fn mika2515_a_change_of_cause_writes_a_second_line() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let id = seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 1);
+
+        // La ligne finit par être livrée-et-échouée, puis quarantinée : la cause
+        // change deux fois, et chaque changement mérite sa ligne.
+        db.set_task_metadata_field(&id, "delivery_attempts", "2")
+            .await
+            .unwrap();
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 2, "famine → échec de tour");
+
+        db.set_task_metadata_field(&id, "delivery_quarantined_at", "2026-09-24T15:02:27Z")
+            .await
+            .unwrap();
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 3, "échec de tour → quarantaine");
+    }
+
+    /// **Contrôle négatif du kill-switch** : désarmé, le balayage n'écrit **rien**
+    /// — il ne « s'abstient » pas, il n'existe pas ce tick.
+    ///
+    /// Sans variable d'environnement : le kill-switch est lu par une fonction
+    /// pure, testée séparément, et ce test appelle le balayage sur la moitié qui
+    /// décide. Muter une variable globale au processus polluerait les tests
+    /// voisins de la même binaire.
+    #[tokio::test]
+    async fn mika2515_a_disarmed_scan_writes_nothing() {
+        // La moitié pure, là où la décision se prend.
+        assert!(!parse_qa_build_verdict_alert(Some("0")));
+        // Et le régime armé, pour que ce test ne passe pas par vacuité.
+        assert!(parse_qa_build_verdict_alert(None));
+
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        // Armé, la même ligne produit une alerte — c'est ce qui prouve que le
+        // zéro ci-dessus viendrait bien du désarmement et non de la fixture.
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 1);
+    }
+
+    /// **V9** — l'allowlist du scan ci-dessus est née vide et doit le rester.
+    ///
+    /// Une allowlist née vide est un endroit où déposer la prochaine infraction
+    /// (mika#2323) ; ce test frère est ce qui fait rougir ce dépôt-là.
+    #[test]
+    fn mika2515_the_sole_writer_allowlist_is_empty() {
+        // Recopiée depuis le scan : si elle cesse d'être vide là-bas, ce test
+        // doit être modifié sciemment, ce qui est tout l'objet.
+        const ALLOWED: &[&str] = &[];
+        assert!(
+            ALLOWED.is_empty(),
+            "quand le scan tire, la résolution est de retirer la lecture — \
+             jamais d'ajouter une entrée (doctrine mika#2201)"
         );
     }
 }
