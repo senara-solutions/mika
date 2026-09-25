@@ -32,8 +32,14 @@ if [ -z "$TASK_ID" ]; then
 fi
 
 # Use provided cwd or default to the main mika repo root (same pattern as build-mika)
+#
+# `PLATFORM_DIR` is relayed by the executor (mika#2532 L4a). It replaces
+# `${MIKA_PLATFORM_DIR:-…}`, a DEAD BRANCH: `sandboxed_pilot_env` rebuilds the
+# child env from a positive allowlist refusing every `MIKA_*` name — and this
+# handler additionally unsets them all at line 22 — so the left-hand side could
+# never be read. The read merely LOOKED like it honoured an operator setting.
 if [ -z "$CWD" ]; then
-    _DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
+    _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
     CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
 fi
 
@@ -65,8 +71,10 @@ exec 9>"$LOCKFILE"
 flock -n 9 || { RESULT="FAILED: another deploy is in progress"; exit 1; }
 
 # --- Path validation ---
-PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+# Self-referential with a default, and that is correct: `PLATFORM_DIR` is the
+# relayed variable (mika#2532 L4a) AND the local that holds its resolved form.
+PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
 
 CWD=$(cd "$CWD" 2>/dev/null && pwd -P) || {
     RESULT="FAILED: path does not exist: $CWD"

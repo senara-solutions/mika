@@ -338,6 +338,34 @@ const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETR
 /// `mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist`.
 const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR"];
 
+/// La racine de la plateforme, relayée à tout handler long-running (mika#2532).
+///
+/// **Non préfixée, pour la raison exacte de [`PILOT_DISPATCH_ENV`], et surtout
+/// PAS parce que la forme nue traverserait.** [`sandboxed_pilot_env`] fait
+/// `env_clear()` puis recopie une allowlist **positive** : aucun nom ne traverse
+/// par héritage, préfixé ou non. Avant mika#2532, quatre handlers lisaient
+/// `${MIKA_PLATFORM_DIR:-…}` — une **branche morte**, qui prenait toujours la
+/// droite et donnait au handler l'apparence de respecter un réglage d'opérateur
+/// qu'il ne pouvait pas lire.
+///
+/// Le nom nu est déjà le format de fil de l'opérateur : `shell-exec`'s
+/// `run.sh` lit `MIKA_PLATFORM_DIR` **avant** son scrub et le passe en argument
+/// à la garde mika#2449, et les prompts qa-review le citent. Ici le relais pose
+/// la valeur sous `PLATFORM_DIR`, **jamais** sous `MIKA_PLATFORM_DIR` : un nom
+/// `MIKA_*` posé après le sandbox serait re-scrubbé par les handlers qui font
+/// leur propre boucle `unset` (deploy-mika l.22), donc il ne survivrait pas
+/// jusqu'à son lecteur.
+///
+/// **Refus raisonné** : ajouter `MIKA_PLATFORM_DIR` à
+/// [`SANDBOX_ENV_CORE_ALLOWLIST`] percerait une garde anti-fuite de secret pour
+/// un confort de chemin, contre un `debug_assert` explicite qui existe pour
+/// empêcher ce geste. Le relais obtient le même résultat sans y toucher — tenu
+/// par `mika2532_the_platform_dir_relay_never_joins_the_sandbox_allowlist`.
+const PLATFORM_DIR_RELAY_KEY: &str = "PLATFORM_DIR";
+
+/// La variable du process spirit d'où [`PLATFORM_DIR_RELAY_KEY`] tire sa valeur.
+const PLATFORM_DIR_SOURCE_KEY: &str = "MIKA_PLATFORM_DIR";
+
 /// Decide which of `keys` to set on the child, given a reader of the spirit
 /// process environment.
 ///
@@ -451,6 +479,117 @@ fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
         relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| std::env::var(k).ok())
     {
         cmd.env(key, value);
+    }
+}
+
+/// Relaie la racine de la plateforme à **tout** handler long-running
+/// (mika#2532 L4a).
+///
+/// Même contrat de placement que ses quatre siblings — il DOIT tourner après
+/// [`sandboxed_pilot_env`] — et la même discipline best-effort : une absence
+/// laisse le handler sur son propre défaut (`$HOME/workspace/mika-platform`),
+/// qui est le comportement d'aujourd'hui, jamais un dispatch bloqué.
+///
+/// **Sans condition de skill**, contrairement à
+/// [`inject_pilot_transcript_env`] : les six sites à réparer sont répartis sur
+/// quatre handlers (`build-mika`, `deploy-mika`, `resolve-pr-conflicts`,
+/// `address-pr-comments`) et `dispatch-lib.sh` en porte un septième. Restreindre
+/// le relais à `dev-pilot`/`dev-groom` laisserait la branche morte vivante là où
+/// elle a été mesurée.
+///
+/// Passe par [`relayed_env_pairs`] et non par sa variante
+/// `_preserving_empty` : ici la valeur vide est la forme d'une demi-ligne `.env`
+/// mal écrite, pas un palier documenté — un `PLATFORM_DIR=""` relayé ferait
+/// composer `"/mika"` à quatre handlers, c'est-à-dire un chemin absolu faux.
+fn inject_platform_dir_env(cmd: &mut tokio::process::Command) {
+    for (_, value) in relayed_env_pairs(&[PLATFORM_DIR_SOURCE_KEY], |k| std::env::var(k).ok()) {
+        cmd.env(PLATFORM_DIR_RELAY_KEY, value);
+    }
+}
+
+/// Le nom sous lequel le stderr d'un handler long-running en échec est reporté
+/// (mika#2532 L1) — événement de journal **et** `tool_name` d'`audit_events`.
+///
+/// **SOLE WRITER**, tenu par
+/// `canonical_tokens::tests::mika2532_the_stderr_name_has_a_single_writer`, dont
+/// l'allowlist est livrée **vide**. Quand ce scan tire, on retire le second
+/// écrivain : un nom à deux écrivains rend le `GROUP BY` de l'opérateur
+/// inexact **sans rien casser**, ce qu'aucun test comportemental ne peut voir.
+const LONG_RUNNING_EXEC_STDERR_TOOL: &str = "long_running_exec_stderr";
+
+/// Reporte le stderr d'un handler long-running sorti non-zéro (mika#2532 L1).
+///
+/// **Le défaut que ça ferme n'est pas « ajouter une capture » : c'est « ne pas
+/// perdre celle qui existe ».** [`spawn_long_running_exec`] pose déjà
+/// `stderr(Stdio::piped())` et **lit réellement** le stderr sur
+/// `!status.success()` — capé à [`MAX_OUTPUT_LEN`] — puis le compose dans
+/// `err_msg` et le passe à `update_task_failed`. Mais tout handler long-running
+/// livre son résultat par callback (c'est le contrat `long_running: true`), donc
+/// la tâche est **déjà terminale** quand le processus sort : `update_task_failed`
+/// rend `Ok(false)` et n'écrit rien. Et aucune des deux branches ne journalisait
+/// `stderr_text` — elles portent le code, jamais le texte. Le stderr était donc
+/// lu en mémoire puis abandonné sans atteindre aucune surface.
+///
+/// Cette course est **la norme, pas l'exception** : six handlers sont concernés
+/// (`build-mika`, `deploy-mika`, `resolve-pr-conflicts`, `address-pr-comments`,
+/// plus `dev-pilot` / `dev-groom` via `dispatch-lib.sh`).
+///
+/// **Émis inconditionnellement**, avant la décision de `update_task_failed` :
+/// c'est précisément la branche `Ok(false)` — la population exacte du défaut —
+/// qui ne doit pas pouvoir le sauter.
+///
+/// **Divergence assumée avec la lettre de l'AC1** (« per-dispatch, comme le sink
+/// forensique du Signal S »). Le stderr est **déjà borné à 10 Ko** : il n'y a pas
+/// de volume à externaliser. Un sink fichier neuf demanderait un répertoire, une
+/// clé de configuration, une rétention — et créerait surtout une surface **dont
+/// l'absence se lit comme un silence**, la panne que ce dépôt a mesurée deux fois
+/// sur exactement cette forme (Signaux M et Q, mika#2050). Le `.stderr` du Signal
+/// S existe parce que `dispatch-lib.sh` redirige lui-même son stderr et qu'il n'y
+/// avait pas d'autre porte ; ici l'exécuteur tient déjà le texte en main et écrit
+/// déjà dans le journal que l'opérateur grep par `task_id`. Résultat :
+/// `grep <task_id> "$MIKA_SPIRIT_LOG_FILE"` rend le stderr, `mika tasks get <id>`
+/// rend le RESULT — deux surfaces déjà connues, aucune neuve.
+///
+/// **Un stderr vide n'est pas une absence de ligne** : la ligne est émise quand
+/// même (« le handler est sorti non-zéro et n'a rien dit » est une information,
+/// et la taire fausserait le compte), mais le `reasoning` de la ligne d'audit
+/// vaut alors `NULL` plutôt que `""` — un vide n'est jamais un zéro (mika#2331).
+async fn report_long_running_exec_stderr(
+    db: &AsyncDatabase,
+    task_id: &str,
+    code_display: &str,
+    stderr_text: &str,
+) {
+    warn!(
+        event = LONG_RUNNING_EXEC_STDERR_TOOL,
+        task_id = %task_id,
+        code_display = %code_display,
+        stderr_empty = stderr_text.is_empty(),
+        stderr = %stderr_text,
+        "mika#2532: long-running handler exited non-zero — its stderr is reported \
+         here because the task is usually already terminal and update_task_failed \
+         then writes nothing"
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            "system",
+            LONG_RUNNING_EXEC_STDERR_TOOL,
+            &format!("task:{task_id}"),
+            None,
+            Some(code_display),
+            (!stderr_text.is_empty()).then_some(stderr_text),
+            None,
+        )
+        .await
+    {
+        // Fire-and-forget, comme partout sur ce chemin : perdre la ligne d'audit
+        // ne doit pas changer ce qui arrive au dispatch. Le WARN ci-dessus est
+        // déjà parti, donc la moitié journal survit à l'échec de la moitié SQL.
+        warn!(
+            task_id = %task_id,
+            error = %e,
+            "mika#2532: failed to write the long-running stderr audit row"
+        );
     }
 }
 
@@ -4096,6 +4235,10 @@ pub(crate) fn spawn_long_running_exec(
         // Same placement rationale as the four lines above: naming them
         // unprefixed never made them traverse, the explicit relay does.
         inject_pilot_dispatch_env(&mut cmd);
+        // mika#2532: relay the platform root. Same placement rationale again —
+        // and the same lesson, paid a second time: four handlers read
+        // `${MIKA_PLATFORM_DIR:-…}` and always took the right-hand branch.
+        inject_platform_dir_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -4248,6 +4391,16 @@ pub(crate) fn spawn_long_running_exec(
                     }
                 }
             };
+            // mika#908 : la copie durable est scrubbée. Une seule fois, et le
+            // même texte alimente les deux surfaces — sans quoi le journal et
+            // `tasks.result` pourraient dire deux choses du même échec, ce qui
+            // est très exactement le défaut que mika#2532 referme.
+            let stderr_text = crate::secret_scrubber::scrub_secrets(&stderr_text).into_owned();
+
+            // mika#2532 L1 — émis AVANT `update_task_failed`, donc hors de la
+            // décision qui, sur la branche `Ok(false)`, n'écrit rien.
+            report_long_running_exec_stderr(&db, &task_id, &code_display, &stderr_text).await;
+
             let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
             match db.update_task_failed(&task_id, &err_msg).await {
                 Ok(true) => warn!(task_id = %task_id, %code_display, "long-running exec failed"),
@@ -4271,6 +4424,206 @@ mod tests {
     use mika_common::claude::ToolDefinition;
     use std::fs;
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // mika#2532 T2 — le stderr d'un long-running en échec atteint une surface
+    // MÊME quand la tâche est déjà terminale.
+    // -----------------------------------------------------------------------
+
+    /// Construit une base en mémoire et une tâche déjà **terminale**.
+    ///
+    /// L'état terminal est la moitié portante du test : c'est la population
+    /// exacte du défaut. Tout handler long-running livre son résultat par
+    /// callback — c'est le contrat `long_running: true` — donc quand le
+    /// processus sort, la tâche est déjà `delivered` et `update_task_failed`
+    /// rend `Ok(false)` sans rien écrire. Un test sur une tâche encore vivante
+    /// passerait sur le code d'AVANT mika#2532 et n'attesterait rien.
+    async fn terminal_task(agent: &str) -> (AsyncDatabase, String) {
+        let db = AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().expect("open in-memory DB"),
+            agent,
+        );
+        let id = db
+            .create_task(crate::db::NewTask {
+                agent_id: agent.to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "long_running:build_mika".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("s".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("create callback task");
+        db.update_task_status(&id, "delivered")
+            .await
+            .expect("make the task terminal");
+        (db, id)
+    }
+
+    /// Attend la ligne d'audit émise par la tâche détachée de
+    /// [`spawn_long_running_exec`], qui ne rend aucun handle à attendre.
+    async fn await_stderr_rows(db: &AsyncDatabase) -> Vec<crate::db::AuditEventRowTuple> {
+        for _ in 0..200 {
+            let rows = db
+                .get_audit_event_rows_by_tool_name(LONG_RUNNING_EXEC_STDERR_TOOL)
+                .await
+                .expect("read audit rows");
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        Vec::new()
+    }
+
+    /// **T2** — le stderr atteint `audit_events` sur la branche `Ok(false)`.
+    ///
+    /// Avant mika#2532, `spawn_long_running_exec` lisait réellement le stderr
+    /// (capé à `MAX_OUTPUT_LEN`), le composait dans `err_msg`, le passait à
+    /// `update_task_failed` — qui rendait `Ok(false)` et n'écrivait rien — et
+    /// journalisait ensuite `code_display` **sans** le texte. Le stderr était
+    /// donc lu en mémoire puis abandonné sans atteindre aucune surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2532_the_stderr_reaches_audit_even_when_the_task_is_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fail.sh");
+        write_script(
+            &script,
+            "#!/bin/sh\necho 'HANDLER CRASH at stage enter_cwd: cwd_not_found /nope' >&2\nexit 1\n",
+        );
+
+        let (db, task_id) = terminal_task("mika-qa").await;
+
+        spawn_long_running_exec(
+            script.clone(),
+            tmp.path().to_path_buf(),
+            serde_json::json!({}),
+            task_id.clone(),
+            db.clone(),
+            None,
+        );
+
+        let rows = await_stderr_rows(&db).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one `{LONG_RUNNING_EXEC_STDERR_TOOL}` row was expected"
+        );
+        let (target_key, _before, after, reasoning) = &rows[0];
+        assert_eq!(target_key, &format!("task:{task_id}"));
+        assert_eq!(
+            after.as_deref(),
+            Some("Exit code: 1"),
+            "the exit code rides on after_value"
+        );
+        assert!(
+            reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("cwd_not_found") && r.contains("/nope")),
+            "the stderr must reach the row verbatim, got: {reasoning:?}"
+        );
+
+        // Contrôle: la tâche est bien restée terminale, donc `update_task_failed`
+        // a bien rendu `Ok(false)` — sans quoi ce test passerait par la branche
+        // `Ok(true)` et n'attesterait pas la population visée.
+        let task = db
+            .get_task(&task_id)
+            .await
+            .expect("read task")
+            .expect("task exists");
+        assert_eq!(
+            task.status, "delivered",
+            "the task must still be terminal — otherwise this test is on the wrong branch"
+        );
+    }
+
+    /// **T2 — contrôle négatif.** Un handler qui sort **zéro** n'écrit rien.
+    ///
+    /// Sans ce contrôle, « le stderr atteint la surface » serait indistinguable
+    /// de « la surface reçoit tous les dispatches », et le régime attendu de la
+    /// sonde S4 (aucune ligne sur un dispatch sain) serait invérifiable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2532_a_clean_exit_writes_no_stderr_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("ok.sh");
+        write_script(&script, "#!/bin/sh\necho 'noise' >&2\nexit 0\n");
+
+        let (db, task_id) = terminal_task("mika-qa").await;
+
+        spawn_long_running_exec(
+            script.clone(),
+            tmp.path().to_path_buf(),
+            serde_json::json!({}),
+            task_id.clone(),
+            db.clone(),
+            None,
+        );
+
+        // Laisse au spawn largement le temps d'aboutir avant de conclure au vide.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let rows = db
+            .get_audit_event_rows_by_tool_name(LONG_RUNNING_EXEC_STDERR_TOOL)
+            .await
+            .expect("read audit rows");
+        assert!(
+            rows.is_empty(),
+            "a clean exit must write nothing — the surface is for failures, got: {rows:?}"
+        );
+    }
+
+    /// **T2 — la copie durable est scrubbée (mika#908).**
+    ///
+    /// Le stderr d'un handler traverse `GH_TOKEN`, que l'exécuteur injecte
+    /// explicitement après le sandbox. Cette surface est neuve, donc elle naît
+    /// avec la discipline que mika#908 a dû rétrofiter sur `tool_calls`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2532_the_persisted_stderr_is_scrubbed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("leak.sh");
+        write_script(
+            &script,
+            "#!/bin/sh\necho 'fatal: bad credentials for ghp_0123456789abcdefghij' >&2\nexit 2\n",
+        );
+
+        let (db, task_id) = terminal_task("mika-qa").await;
+
+        spawn_long_running_exec(
+            script.clone(),
+            tmp.path().to_path_buf(),
+            serde_json::json!({}),
+            task_id.clone(),
+            db.clone(),
+            None,
+        );
+
+        let rows = await_stderr_rows(&db).await;
+        assert_eq!(rows.len(), 1, "expected the failure row");
+        let reasoning = rows[0].3.clone().unwrap_or_default();
+        assert!(
+            !reasoning.contains("ghp_0123456789abcdefghij"),
+            "a token-shaped value must not be persisted verbatim: {reasoning}"
+        );
+        assert!(
+            reasoning.contains("ghp_<REDACTED>") && reasoning.contains("bad credentials"),
+            "the diagnostic must survive the scrub: {reasoning}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // mika#2368 C2 — la cible PR stampée au spawn

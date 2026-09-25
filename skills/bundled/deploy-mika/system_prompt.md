@@ -9,8 +9,9 @@ The `deploy_mika` tool is long-running:
 
 ### Parameters
 
-- `cwd` (optional): Path to the mika repo containing built artifacts.
-  Defaults to `$MIKA_PLATFORM_DIR/mika` (or `~/workspace/mika-platform/mika`) if omitted.
+- `cwd` (optional): Path to the mika repo containing built artifacts. **Must be an
+  already-expanded absolute path** — no environment variable is interpolated on this
+  argument. Omit it to deploy the main checkout, which the handler resolves itself.
 
 ### What it does
 

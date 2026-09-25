@@ -74,8 +74,14 @@ USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
 
 # mika-platform root — base for relay config resolution
 # Resolve symlinks so prefix checks work regardless of which path the caller uses
-PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+#
+# `PLATFORM_DIR` is relayed by the executor (mika#2532 L4a), replacing
+# `${MIKA_PLATFORM_DIR:-…}` — a dead branch, since `sandboxed_pilot_env` rebuilds
+# the child env from a positive allowlist that refuses every `MIKA_*` name. The
+# expression is self-referential with a default, and that is correct: the same
+# name is the relayed variable and the local holding its resolved form.
+PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
 
 if [ -z "$PR_URL" ]; then
     echo "Error: pr_url is required" >&2

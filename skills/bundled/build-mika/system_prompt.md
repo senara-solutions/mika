@@ -16,6 +16,9 @@ Build command (handled by the skill): `cargo build --release --features telemetr
 
 ### Parameters
 
-- `cwd` (optional): Working directory for the build. Use this when building from a worktree
-  (e.g. `$MIKA_PLATFORM_DIR/.claude/worktrees/<branch>/mika/`).
-  Defaults to `$MIKA_PLATFORM_DIR/mika` (or `~/workspace/mika-platform/mika`) if omitted.
+- `cwd` (optional): Working directory for the build. **Must be an already-expanded
+  absolute path** — no environment variable is interpolated on this argument, so a
+  value containing a literal `$` is refused by name (`cwd_unexpanded_variable`).
+  Use it when building from a worktree, e.g.
+  `~/workspace/mika-platform/.claude/worktrees/<branch>/mika/`.
+  Omit it to build the main checkout, which the handler resolves itself.
