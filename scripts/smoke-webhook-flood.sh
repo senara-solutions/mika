@@ -18,7 +18,9 @@
 #   to clear between sends (bounded poll). If the agent never reaches idle it
 #   SKIPS fail-open rather than emit a false regression signal.
 #
-# FAIL-OPEN POSTURE (matches `check-ngrok`)
+# FAIL-OPEN POSTURE (matches `check-webhook-chain`, mika#2135 — this line named
+# `check-ngrok` until that target became a one-line transition alias slated for
+# deletion, so the cross-reference was about to go dead)
 #   Skips cleanly (exit 0) when: MIKA_INTERNAL_TOKEN is unavailable, mika-spirit
 #   is unreachable, or the `smoke-test` agent is not provisioned (404). This is a
 #   tripwire, not a gate — `make deploy` wires it non-fatal so a benign warmup
