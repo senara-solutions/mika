@@ -1672,6 +1672,164 @@ Optional (dispatch concurrency cap — mika#2160):
     `docs/solutions/cross-repo-patterns/pilot-concurrency-shared-resources-2026-09-03.md`.
   - `groom` is out of scope and keeps its cap of one.
 
+### Le pilote de `resolve-pr-conflicts` ne pousse plus (mika#2520)
+
+**Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici
+parce que l'opérateur qui voit un dispatch `resolve-pr-conflicts` ne rien
+publier cherche dans le voisinage des gardes de dispatch.
+
+- **Le défaut, mesuré le 2026-09-24 (P0, nuit).** Le pilote dispatché pour #2435
+  (task `357bb36e`) a **rembobiné `origin/main`** de `24f25e99` (#2489, mergé
+  19:30:25Z) vers `e851d72b` (#2514). Restauré en fast-forward sous GO
+  opérateur. L'étape 6 du prompt du skill était `git push --force-with-lease`
+  **nue** ; l'identité du pilote porte un bypass admin
+  (« Bypassed rule violations for refs/heads/main »), donc un force-push nu est
+  un rembobinage de `main` à un caractère près.
+
+- **La forme nue est cassée sur DEUX axes, et le ticket n'en nomme qu'un.** *Où*
+  ça pousse (pas de refspec) **et** *contre quoi* ça se protège : un
+  `--force-with-lease` sans `=<ref>:<expect>` compare au *remote-tracking ref*
+  local, que l'étape 1 du même prompt (`git fetch origin`) vient de rafraîchir.
+  *Depuis l'instant où l'étape 1 tourne, le bail de l'étape 6 ne protège plus
+  rien.* D'où un bail **pinné sur un SHA littéral capturé avant la session** —
+  strictement plus fort que le `--force-with-lease=$BRANCH:origin/$BRANCH` de
+  `_push_branch`, qu'un `fetch` du pilote viderait.
+
+- **Le remède applique le précédent maison, il ne l'invente pas.** mika#1318 →
+  mika#1407 ont retiré le push du pilote dev-groom après le même accident.
+  `resolve-pr-conflicts` est le skill frère qui ne l'avait jamais reçu. Le push
+  vit désormais dans `skills/bundled/_shared/pr-push-guard.sh`, site unique,
+  hors de la session — **pas** dans un filtre à l'intérieur : ce skill lance
+  claude-pilot **hors bac à sable** (`run.sh` n'appelle pas
+  `_run_pilot_sandboxed`, donc ni `bwrap`, ni coupure réseau, ni relais
+  d'egress), et aucune interception structurelle n'y est disponible.
+
+- **Cinq refus, tous fail-closed, et l'asymétrie est écrite une fois pour les
+  cinq :** *un refus à tort coûte un dispatch — visible, rattrapable, borné ; un
+  passage à tort peut rembobiner une branche protégée — irréversible.* Donc tout
+  signal illisible **refuse**. C'est l'**inverse** de la règle fail-safe du
+  faucheur mika#2420 (où un signal illisible *conserve*), et l'inversion est
+  raisonnée : là-bas l'action détruisait du travail, ici l'action *est*
+  l'écriture distante. **L'arbitrage est local et ne se transporte pas.**
+
+| terme | refuse quand | motif |
+|---|---|---|
+| R1 | `headRefName` vide, illisible, ou `gh` en échec | `unresolved_branch` |
+| R2 | la branche résolue ∈ `{main, master}` | `protected_branch` |
+| R3 | la branche == `baseRefName` de la PR, **ou `baseRefName` illisible** | `branch_is_base` / `unresolved_base` |
+| R4 | `git symbolic-ref --short HEAD` ≠ branche résolue (détaché compris) | `head_mismatch` |
+| R5 | rebase en cours, arbre sale, ou `ls-remote` vide | `not_publishable` |
+
+  R3 est la généralisation que l'AC2 demande entre parenthèses : une PR empilée
+  sur `feat/x` a pour base `feat/x`, qui n'est dans aucune liste statique. La
+  liste `{main, master}` est un **doublon assumé** de
+  `GIT_OPS_PROTECTED_BRANCHES` (`crates/mika-agent/src/skills/builtin_handlers.rs`) :
+  aucun single-source inter-langage n'existe ici, le prix est nommé plutôt que
+  mécanisé. Le refus **précède le spawn** pour R1–R3, ce qui est plus fort que
+  la lettre d'AC3 — aucun tour LLM n'est dépensé.
+
+- **Le chemin `worktree_path` déprécié :** il ne résout ni head ni base, donc le
+  push y est refusé sous `no_pr_url`. La résolution de conflits continue de
+  fonctionner. Population mesurée : zéro appelant.
+
+- **Pas de retry, et le coût est nommé.** Le seul échec légitime de ce push est
+  « quelqu'un a poussé pendant la session » ; re-bailler sur le nouveau SHA
+  écraserait son travail — le défaut refermé sous une forme polie. Un échec
+  réseau transitoire coûte donc un dispatch ; les commits du rebase restent dans
+  le worktree et le callback le dit. Ré-adoption de
+  `_push_with_rebase_retry` conditionnée à une mesure de cette population.
+
+- **Surface opérateur : `tasks.result`, jamais un log.** Le handler est un
+  sous-processus shell sans accès base, et son stderr d'**avant-pilote** est
+  structurellement perdu sur un dispatch qui réussit (classe mika#2050 : il
+  hérite du `Stdio::piped()` de l'exécuteur, que celui-ci ne lit que dans la
+  branche `if !status.success()`). Inventer une surface de log qui ne serait pas
+  lue reproduirait le défaut du Signal M.
+
+  ```bash
+  mika tasks get <task-id>   # le motif est dans `result`, préfixé REFUSED (mika#2520)
+  ```
+  ```sql
+  SELECT id, result FROM tasks
+   WHERE result LIKE 'REFUSED (mika#2520)%' ORDER BY created_at DESC;
+  ```
+
+  | motif | régime attendu | lecture |
+  |---|---|---|
+  | `protected_branch` | **vide** | chaque occurrence est un rembobinage évité — **et** une anomalie amont : pourquoi la PR a-t-elle `main` en head ? |
+  | `branch_is_base` | **vide** | idem |
+  | `head_mismatch` | proche de zéro | le pilote a laissé HEAD ailleurs. Non nul soutenu ⇒ lire le log pilote **avant** de toucher au prédicat |
+  | `no_pr_url` | **vide** | population mesurée vide ; une occurrence nomme un appelant à migrer |
+  | `not_publishable` | faible | rebase avorté ou arbre sale — le travail est dans le worktree |
+
+- **Garde de classe : `scripts/check-pilot-push-sites.sh`** (job CI
+  `pilot-push-lint`, cible `make test-pilot-push-guard`). Aucun `git push` dans
+  `skills/bundled/*/handlers/*.sh`. Le prédicat est **lexical et positionnel**,
+  jamais sémantique : le défaut fondateur était une ligne de *prose de prompt*
+  (`6. Push: git push --force-with-lease`), qui n'est pas en position de
+  commande — une règle positionnelle à la mika#2496 l'aurait ratée. Ce sont
+  `_shared/` (qui porte le site gardé) et `system_prompt.md` (qui porte les
+  *interdictions* de dev-groom) qui sont hors population, et c'est ce qui
+  dispense le scan de distinguer une interdiction d'une prescription.
+  **Quand il tire sur un nouveau site, on route ce site vers l'aide gardée ; on
+  n'ajoute pas de ligne à l'allowlist** (doctrine mika#2201). Allowlist
+  `scripts/pilot-push-allowlist.txt`, comparée **dans les deux sens** — une
+  entrée qui ne matche plus rien fait rougir le build.
+
+- **Résidu allowlisté, une entrée, datée :**
+  `skills/bundled/address-pr-comments/handlers/run.sh` porte un `git push` **nu**
+  dans son prompt. Même classe, un cran moins létal — non forcé, donc il ne peut
+  pas rembobiner ; mais il peut **atterrir** sur une branche protégée, le bypass
+  admin étant mesuré. Ce handler ne résout **aucune** branche, donc le réparer
+  demande d'y brancher la chaîne entière. **Le ticket de suivi n'est pas encore
+  ouvert** et l'allowlist le dit plutôt que de nommer un numéro que personne n'a
+  déposé : le bac à sable de dispatch qui a écrit cette entrée n'a pas de `gh`
+  authentifié. Le périmètre du ticket y est écrit, pour qu'il puisse être déposé
+  sans redériver quoi que ce soit.
+
+- **La butée du prompt est TOPIQUE, jamais énumérative.** Le prompt interdit de
+  publier et de changer où un push atterrirait, **sans citer les commandes** :
+  les énumérer fournirait au modèle le gabarit de commande qu'on veut lui
+  retirer (même règle que mika#2292), et rendrait le scan lexical ci-dessus
+  inapplicable à son propre handler. La moitié qui tient n'est de toute façon
+  pas là : c'est que le prompt ne contient plus aucun push et que le handler
+  possède celui qui a lieu
+  (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+
+- **Sondes, et leurs quatre haltes.** **S1 — le chemin nominal tient** (première
+  PR en conflit après déploiement) : la PR est rebasée et poussée, `result`
+  porte la ligne de push avec la refspec. *Halte 1 — rien n'est poussé et
+  `result` ne porte aucun `REFUSED` :* ne pas retoucher le prédicat, établir
+  d'abord que le binaire servi porte le correctif — `_shared/` est une
+  projection du **binaire**, pas du checkout (`cat ~/.mika/skills/.manifest-writer`,
+  classe mika#2340). **S2 — le pilote ne pousse plus** (48 h, log claude-pilot
+  d'un dispatch) : zéro `git push`. *Halte 2 — il pousse quand même :* c'est la
+  moitié prompt qui ne tient pas, et c'est **attendu comme possible** ; ne pas
+  durcir le prompt par réflexe — le levier structurel est la mise sous bac à
+  sable du skill, et c'est le ticket de suivi à ouvrir avec cette occurrence en
+  précondition. **S3 — contrôle négatif** (7 jours) : `git log --first-parent
+  origin/main` ne porte que des merges de PR. *Halte 3 — une occurrence :*
+  désarmer d'abord (retirer `resolve_pr_conflicts` de l'allowlist de skills de
+  l'agent), puis **lire l'auteur** — si ce n'est pas ce skill, la piste est
+  `address-pr-comments` ou le ticket compagnon ruleset. **S4 — le scan regarde
+  quelque chose :** `bash scripts/check-pilot-push-sites.sh` rend `0` en
+  annonçant **7 scanned, 1 allowlisted**. *Halte 4 — il rend 0 avec une
+  population vide :* il ne regarde plus rien (renommage de répertoire,
+  changement d'extension), et un scan silencieusement inerte se lit exactement
+  comme un arbre propre (classe mika#2205) — le scan refuse déjà ce cas, et
+  c'est ce refus qu'il faut croire plutôt que réparer.
+
+- **Ce que ce travail n'achète PAS.** Aucun compteur, aucun événement de
+  journal : le seul instrument est la lecture de `tasks.result` ci-dessus, et
+  **son silence ne prouve rien tant que personne ne la lance** — sur un skill
+  dispatché quelques fois par semaine, l'absence d'occurrence peut simplement
+  vouloir dire qu'aucun conflit n'a été résolu. Aucune protection non plus
+  contre un `git push` que le pilote taperait de lui-même : ce qui est retiré
+  est l'instruction et le gabarit, pas la capacité. Et le **bypass admin** de
+  l'identité du pilote reste entier — c'est le ticket compagnon
+  « durcissement ruleset no-bypass main », seconde moitié de l'incident, et les
+  deux moitiés tombent séparément.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 

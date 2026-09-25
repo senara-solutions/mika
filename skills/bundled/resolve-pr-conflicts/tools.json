@@ -1,7 +1,7 @@
 [
   {
     "name": "resolve_pr_conflicts",
-    "description": "Resolve merge conflicts on a PR branch by rebasing onto the base branch. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes. Pass pr_url and the handler derives the worktree path automatically — do NOT construct worktree paths manually.",
+    "description": "Resolve merge conflicts on a PR branch by rebasing onto the base branch. Long-running — returns a task ID immediately, results arrive via callback when claude-pilot finishes. Pass pr_url and the handler derives the worktree path automatically — do NOT construct worktree paths manually. The pilot does not push: the handler publishes after the session at a single guarded site, with the target taken from the PR head and a lease captured before the session (mika#2520).",
     "input_schema": {
       "type": "object",
       "properties": {
@@ -15,7 +15,7 @@
         },
         "worktree_path": {
           "type": "string",
-          "description": "DEPRECATED — use pr_url instead. Absolute path to the existing git worktree for the PR branch. If both pr_url and worktree_path are provided, they must resolve to the same path."
+          "description": "DEPRECATED — use pr_url instead. Absolute path to the existing git worktree for the PR branch. If both pr_url and worktree_path are provided, they must resolve to the same path. On this path the PUSH IS REFUSED (reason 'no_pr_url'): with no PR to read, the push target cannot be derived from the PR head. Conflicts are still resolved and the work stays in the worktree."
         }
       },
       "required": ["task_id"]

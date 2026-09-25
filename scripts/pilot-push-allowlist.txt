@@ -1,0 +1,47 @@
+# Allowlist for scripts/check-pilot-push-sites.sh (mika#2520).
+#
+# Format, one per line:
+#
+#     <path-relative-to-repo-root>  # why this push site is not guarded yet
+#
+# The reason is not decoration. It is what a future reader needs in order to
+# re-audit the site, and an entry without one is indistinguishable from a
+# forgotten exemption.
+#
+# COMPARED IN BOTH DIRECTIONS. An entry that no longer matches a real push site
+# fails the build exactly as an unlisted site does. That is the self-cleaning
+# assertion: on the day the site is repaired, the build goes red and the entry
+# must go — not months later.
+#
+# WHEN THE SCAN FIRES ON A NEW SITE, ROUTE THAT SITE TO THE GUARDED HELPER
+# (skills/bundled/_shared/pr-push-guard.sh). Do not add a line here. This list
+# has no free slot: it has one entry, dated, with its ticket. A push site you do
+# not want to guard is a site to delete or to route (mika#2201 doctrine).
+
+# skills/bundled/address-pr-comments/handlers/run.sh
+#   A bare `git push` (~line 236), inside the pilot's PROMPT. Same class as
+#   mika#2520, one notch less lethal: the push is not forced, so it cannot
+#   rewind. It CAN still land, though — the pilot identity carries an admin
+#   bypass, measured in the output of the 2026-09-24 incident
+#   ("Bypassed rule violations for refs/heads/main: Changes must be made through
+#   a pull request.").
+#
+#   Not repaired in mika#2520's PR, deliberately: this handler resolves NO
+#   branch at all (zero `headRefName` in the file), so giving it an explicit
+#   refspec means wiring the whole gh-pr-view -> refuse -> handler-push chain
+#   into a second skill. On a P0 whose acceptance criteria are about
+#   resolve-pr-conflicts, that is a scope expansion that buys a second risk.
+#
+#   FOLLOW-UP TICKET: NOT YET OPEN, and this line says so rather than naming a
+#   number nobody filed. The dispatch sandbox that wrote this entry has no
+#   authenticated `gh` ("You are not logged into any GitHub hosts"), so it could
+#   not open the ticket and refused to invent its number — an entry pointing at
+#   an issue that does not exist is worse than one admitting the gap, because it
+#   reads as tracked.
+#
+#   Scope of that ticket, so it can be filed without re-deriving it: apply
+#   skills/bundled/_shared/pr-push-guard.sh to address-pr-comments — resolve the
+#   target from the PR head, refuse before the spawn, capture a pre-session
+#   lease, strip the push from the prompt, push from the handler. Once it is
+#   filed, replace these lines with `Tracked in: senara-solutions/mika#<N>`.
+skills/bundled/address-pr-comments/handlers/run.sh
