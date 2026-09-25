@@ -117,11 +117,21 @@ distinction décide du câblage d'U1b :
   avec un commentaire mika#2368 qui le motive par « c'est le périmètre de l'autre
   motif (`CutOffByDeadline`, mika#2276) ». Or ce motif est câblé au call-site
   **webhook** : pour un callback, ce renvoi ne mène nulle part.
-- `LoopResult::MaxStepsExceeded` (`mod.rs:6451`) ne rend `default()` que dans sa
-  **sous-branche** « deadline trop proche pour tenter la continuation » ; le
-  chemin nominal **tombe à travers** vers la construction finale
+- `LoopResult::MaxStepsExceeded` (bras à `mod.rs:6531`) ne rend `default()` que
+  dans sa **sous-branche** « deadline trop proche pour tenter la continuation »
+  (`6560`) ; le chemin nominal **tombe à travers** vers la construction finale
   (`mod.rs:6650`), qui **lit** le drapeau. Le fait n'y est donc pas jeté par le
   bras : il est absent parce que `run_loop` ne l'a jamais posé.
+
+  *Ce numéro-ci a été trouvé faux au relevé* : les versions antérieures de ce
+  plan écrivaient `6451`, soit **80 lignes** avant le bras réel, au milieu d'une
+  autre fonction. Troisième repère fautif de ce document — et, à la différence
+  des deux premiers, **ce n'est pas une dérive mais une erreur d'origine** (cf.
+  *Re-localiser les six sites*). Elle est signalée ici plutôt qu'effacée parce
+  qu'elle fonde la table d'ancres de `run_silent_agent` plus bas : la moitié
+  `run_loop` de ce plan avait ses ancres, la moitié `run_silent_agent` n'avait
+  que des numéros nus, et c'est exactement là que la faute a survécu à six
+  passes de relecture.
 
 **Trois sites à toucher, pas deux** — et deux natures différentes : un renvoi
 prématuré à réparer, et une pose manquante en amont. Un correctif qui ne
@@ -442,6 +452,19 @@ reste : il ne livre pas de callback, donc aucun verdict n'y attend. Les deux
 sites sont nommés ici parce qu'un implémenteur qui grep `AgentBusy` en trouve
 deux et doit savoir lequel, sans avoir à trancher lui-même.
 
+**Et il ne peut PAS les discriminer par le grep évident**, ce qui est la raison
+d'être de ce paragraphe : les deux lignes de sortie sont **littéralement
+identiques** — `return Err(DispatchError::AgentBusy(task.id.clone()));` aux deux
+endroits, au caractère près. Seul le `debug!` qui les précède les sépare, et
+c'est donc lui qui fait office d'ancre : `agent busy, deferring resume_agent`
+pour la cible d'U3 (`1002`, écart −1), `agent busy, deferring skill run` pour le
+site hors population (`723`). Exactement le piège déjà relevé pour les deux
+sites de pose mika#2368 dans `agent_loop/mod.rs`, et la même parade : ancrer sur
+ce qui distingue, jamais sur ce qui se répète. Se tromper de site ici ne casse
+rien de visible — le compteur se poserait sur des dispatches de skill, la
+`cause = agent_busy_starvation` d'U2 ne trouverait jamais son compteur, et
+l'attribution redeviendrait l'inférence-par-absence qu'U3 existe pour retirer.
+
 - `verdict_delivery_deferrals` — compteur incrémenté à chaque refus ;
 - `verdict_delivery_first_deferred_at` — instant, écrit **NULL-only**, idiome
   `FIRED_AT_STAMP_IF_NULL` de mika#2133 : la première fois où ce verdict a
@@ -529,7 +552,27 @@ dans `dispatcher.rs` sont, eux, inchangés. Une dérive ne se propage pas d'un
 fichier à l'autre ; il n'y a donc pas un décalage global à appliquer de tête,
 mais un relevé à refaire par fichier.
 
-Ce que la succession des deux erreurs enseigne, et qui vaut mieux que l'une ou
+*La troisième n'est pas une dérive et c'est ce qui la rend instructive* : le
+`6451` corrigé plus haut n'a jamais désigné le bras `MaxStepsExceeded` de
+`run_silent_inner`, qui est à `6531` — 80 lignes plus loin, et le `6451` tombait
+au milieu d'une **autre** fonction. Ce n'est donc pas un numéro qui a vieilli,
+c'est un numéro qui était faux à l'écriture, et aucune re-lecture des six
+premières passes ne l'a vu parce qu'il vivait dans la seule moitié du plan qui
+n'avait pas d'ancres. Une dérive se détecte par l'uniformité de son décalage ;
+une erreur de relevé ne se détecte que par confrontation au fichier.
+
+**Relevé re-vérifié à HEAD `757cde95`** : les six sorties de `run_loop`, les
+quatre renvois de `run_silent_agent`, les deux `AgentBusy` et
+`post_callback_verdict_net` sont **tous inchangés** par rapport au relevé
+`bb198d2e`. Cette stabilité est **expliquée, pas constatée** — et c'est la seule
+forme sous laquelle elle vaut d'être écrite, la version antérieure de ce plan
+ayant déjà vu mourir un « re-relevés, inchangés » posé sans raison :
+`git diff --stat bb198d2e..757cde95` ne touche que `Cargo.toml`, `Cargo.lock` et
+ce plan lui-même, donc **aucun commit de la fenêtre n'a modifié
+`crates/mika-agent/src/`**. Le jour où un commit y touche, cette phrase redevient
+caduque et la table d'ancres reprend seule la charge — ce qui est son rôle.
+
+Ce que la succession des trois erreurs enseigne, et qui vaut mieux que l'une ou
 l'autre : **les écarts ancre↔sortie sont stables, les numéros absolus ne le sont
 pas.** Les six écarts relevés à `bb198d2e` (−2, −16, **+4**, −5, −21, −2) sont
 identiques à ceux relevés à la conception. C'est la colonne « écart » de la table
@@ -562,12 +605,43 @@ commentaire mika#2136 (`4289`) ; dans `dispatcher.rs`, **inchangés**, les deux
 drapeau `836`).
 
 Et, dans `run_silent_agent`, **quatre** sites de renvoi de `SilentTurnOutcome` —
-`6443`, `6560`, `6605`, `6650` — là où les versions antérieures de ce plan n'en
-comptaient que trois. Le quatrième est traité dans sa propre section ci-dessous
-(*Le quatrième renvoi*) ; il est nommé ici parce qu'un implémenteur qui grep
-`SilentTurnOutcome::default()` en trouve **trois** et doit savoir que le compte
-attendu est quatre avec la construction finale, sans avoir à trancher lui-même
-lequel manque.
+là où les versions antérieures de ce plan n'en comptaient que trois. Le
+quatrième est traité dans sa propre section ci-dessous (*Le quatrième renvoi*) ;
+il est nommé ici parce qu'un implémenteur qui grep `SilentTurnOutcome::default()`
+en trouve **trois** et doit savoir que le compte attendu est quatre avec la
+construction finale, sans avoir à trancher lui-même lequel manque.
+
+**Ces quatre-là ont leurs ancres au même titre que les six de `run_loop`**, et
+ce n'était pas le cas des versions antérieures : elles les désignaient par
+numéro nu tout en prêchant l'ancre pour la fonction voisine. L'incohérence n'est
+pas cosmétique — c'est très exactement dans cette moitié non ancrée que le
+troisième repère fautif a survécu à six passes (le `6451` corrigé plus haut,
+faux d'origine et non périmé). La DoD 1b fait de
+`run_silent_agent` une moitié aussi critique que `run_loop` ; elle a droit au
+même invariant.
+
+| renvoi | écart | site | ancre `grep` (unique) |
+|---|---|---|---|
+| `6443` | −2 | prélude de deadline (**exclu**, mika#2515-a) | `mika#2368 : le tour n'a pas eu lieu` |
+| `6560` | −7 | `default()` — sous-branche « deadline trop proche » | `silent agent max-steps exceeded but deadline too close` |
+| `6605` | −4 | `default()` — bras `DeadlineExceeded` | `c'est le périmètre de l'autre motif` |
+| `6650` | 0 | construction finale (**lit** le drapeau) | `Ok(SilentTurnOutcome {` |
+
+Le quatrième est son propre repère : `Ok(SilentTurnOutcome {` est unique dans le
+fichier, donc écart nul — l'ancre **est** le site. C'est le seul des dix repères
+de ce plan dont la colonne « écart » ne sert à rien, et le dire évite qu'un
+lecteur cherche un décalage qui n'existe pas.
+
+**Deux pièges de plus, de la même famille que les deux déjà relevés pour
+`run_loop`.** `max-steps exceeded but deadline too close for continuation`
+**seul** rend **trois** résultats — `run_agent` (`5486`), `run_silent_agent`
+(`6553`) et `run_team_agent` (`7142`), trois fonctions qui portent la même
+phrase à un préfixe près — d'où le `silent agent ` dans l'ancre ci-dessus. Et
+`LoopResult::MaxStepsExceeded {` en rend **quatre** (`4373`, `5469`, `6531`,
+`7129`), donc le bras de `run_silent_inner` n'est **pas** ancrable par ce motif :
+c'est son voisinage `silent agent` qui le discrimine, jamais le nom de la
+variante. Un implémenteur qui ancrerait sur la variante éditerait la boucle
+d'équipe en croyant éditer la boucle silencieuse — et les deux compilent.
 
 Les numéros de tout ce plan restent à lire comme **des repères de lecture, jamais
 comme des adresses** : la table ci-dessous est ce qui fait foi.
@@ -699,6 +773,12 @@ population qui n'existe pas.
 
 ## Unités d'implémentation
 
+**Les numéros de cette table sont des repères de lecture, jamais des adresses.**
+C'est la première table qu'un implémenteur ouvre, et c'est donc celle où la
+mise en garde doit se trouver plutôt que cent lignes plus haut : les ancres de
+*Re-localiser les six sites* et de *U3* font foi, et trois des repères de ce
+plan se sont déjà révélés faux — deux par dérive, un par erreur d'origine.
+
 | U | fichier | contenu |
 |---|---|---|
 | **U1a** | `src/qa_build_callback.rs` | `VerdictSignal`, `CutOffExit` (+ `as_cause()`, `match` sans `_`), `CallbackCutOff`, `verdict_unmet_at_cut_off` |
@@ -742,6 +822,28 @@ prédicat démontrable et assortie de son assertion auto-nettoyante. Détail :
   plan, et un scan qui les figerait rougirait à chaque réécriture du fichier sans
   qu'aucune sortie ne soit devenue muette — un détecteur qu'on désarme parce qu'il
   crie à tort.
+
+  **Le motif du scan est `Ok(LoopResult::`, jamais `return Ok(LoopResult::`, et
+  la nuance décide de la cardinalité.** La sortie `MaxStepsExceeded` (`4373`)
+  est l'**expression finale** de `run_loop` : elle n'a pas de `return`. Un
+  prédicat ancré sur `return` en trouve **cinq**, et l'implémenteur a alors deux
+  façons de se tromper — faire rougir un scan correct, ou « corriger » la
+  cardinalité à 5 et sortir en silence la sortie max-steps de la population que
+  ce plan existe pour fermer. Inversement, ancrer sur `LoopResult::` nu rend
+  **vingt-quatre** résultats (les motifs de `match` des trois boucles), donc un
+  scan permanemment rouge, c'est-à-dire désarmé. Le motif `Ok(LoopResult::` rend
+  exactement les six, sans exception à déclarer : relevé et vérifié.
+
+  **`Ok(SilentTurnOutcome` porte le piège jumeau**, et pour la même raison
+  structurelle : trois renvois sont des `return … ::default()`, le quatrième
+  (`6650`) est la construction finale sans `return` — et c'est précisément celui
+  qui **lit** le drapeau, donc celui dont l'omission serait la plus coûteuse. Un
+  scan ancré sur `return` y compterait trois, et trois est aussi le compte que
+  les versions antérieures de ce plan portaient : le mauvais prédicat aurait
+  **confirmé** la mauvaise cardinalité. C'est la forme d'erreur que deux
+  instruments qui se trompent ensemble produisent, et la seule parade est que la
+  cardinalité soit relevée contre le fichier, jamais dérivée d'un grep qu'on
+  s'est choisi.
 
   Le scan asserte que **chacune des six sorties décide**, au sens où elle est
   soit suivie d'une pose de signal, soit **déclarée exclue avec sa raison** dans
