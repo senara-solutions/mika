@@ -134,7 +134,7 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 url = "2"
 
 # JWT
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 
 # Process management (Linux)
 libc = "0.2"
