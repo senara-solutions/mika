@@ -2002,54 +2002,38 @@ the handler's stderr on `!status.success()` and built
 `AND status NOT IN ('completed', …, 'delivered')`. A handler whose EXIT trap has
 already delivered its callback leaves the row `completed`, so that write matched
 nothing, the branch logged *"… but task already in terminal state"*, and the one
-string naming the cause was dropped on the floor.
-
-Measured 2026-09-25: `build-mika` crashed **4 times out of 4** during the QA of
-PR #2530 (`5624ea27`, `4a877600`, `5078ef8e`, `03a16846`), each attempt
+string naming the cause was dropped on the floor. Measured 2026-09-25:
+`build-mika` crashed **4 times out of 4** during the QA of PR #2530, each attempt
 rendering only `HANDLER CRASH (exit code 1). Script failed before building
-result.` Consequence: the build verification confirmed nothing, QA returned
-**COMMENTED** instead of approving, and an implementation stayed out of merge
-while its GitHub CI was green.
+result.` — so QA returned **COMMENTED** instead of approving and an implementation
+stayed out of merge while its GitHub CI was green.
 
-**Three cases, one broken.** Crash *before* the trap (no `TASK_ID`, missing
-`jq`) exits non-zero on a non-terminal row → `Ok(true)`, the stderr **already**
-reached `tasks.result`. Success → the branch is not taken. Crash *after* the
-trap and before `RESULT` — the `cd` — leaves the row terminal → `Ok(false)`, and
-that is the only case with no surface at all. The trap doing its job correctly is
-what closed the door behind it.
+**Three cases, one broken.** Crash *before* the trap (no `TASK_ID`, missing `jq`)
+leaves the row non-terminal → `Ok(true)`, the stderr **already** reached
+`tasks.result`. Success → the branch is not taken. Crash *after* the trap and
+before `RESULT` — the `cd` — leaves the row terminal → `Ok(false)`, and that is
+the only case with no surface at all. The trap doing its job correctly is what
+closed the door behind it.
 
-**The remedy is engine-side, and that is what makes it a class fix.** Five sites
-carry the `HANDLER CRASH` trap; the three that capture a `STDERR_FILE` capture
-**claude-pilot's** stderr, never their own — the handler's `echo … >&2` goes to
-the inherited fd 2, i.e. to the executor's pipe — and create that file ~200 lines
-*after* the trap, so a crash before it finds `STDERR_FILE=""`. All five shared
-the same hole; one site in Rust covers them and every handler written later.
+**R1 — the remedy is engine-side, and that is what makes it a class fix.** Five
+sites carry the `HANDLER CRASH` trap; the three that capture a `STDERR_FILE`
+capture **claude-pilot's** stderr, never their own (the handler's `echo … >&2`
+goes to the inherited fd 2, i.e. the executor's pipe) and create that file ~200
+lines *after* the trap. All five shared the hole; one site in Rust covers them
+and every handler written later, `_shared/dispatch-lib.sh` included — which is
+why that file is deliberately untouched.
 
-**Written unconditionally, and not on `Ok(false)` alone.** Conditioning on the
-failed write would make observability depend on a concurrent one, when *"what
-did this process put on fd 2"* has nothing to do with the row's status. One
-path, no race, no branch to forget. On the non-terminal case the overlap with
-`tasks.result` is benign — and the metadata copy is the scrubbed one.
-
-**Surface: `tasks.metadata`, never `tasks.result`.**
-[`Database::set_task_handler_failure`] carries no status filter (`WHERE id = ?`),
-and *"`completed` is terminal — the status no longer transitions, the metadata
-still writes"* is an explicit contract since #617. `tasks.result` on that path
-carries the message the callback turn consumes and that `extract_callback_fields`
-/ `parse_verdict` read: overwriting it breaks the callback, appending changes a
-wire format. A per-task `.stderr` **file** was refused too — the house has paid
-three times for a documented sink nothing feeds (Signals M, Q, S).
-
-**One object, one `json_set`.** Two successive `set_task_metadata_field` calls
-are not atomic and could leave a stderr without its exit code. Payload:
-`{"exit": "Exit code: 1", "stderr": "…", "captured_at": "…"}`, with `stderr`
-**omitted** when the process wrote nothing — never `""` (mika#2331: a reader who
-does not find the key knows fd 2 stayed mute, and still finds `exit`).
-Fire-and-forget, like the four stamps beside it: `json_set` raises a hard error —
-not a NULL — on a `metadata` that is not valid JSON (mika#2179), and an
-observability write must not be able to break the delivery it observes. Cap is
-`MAX_OUTPUT_LEN` (the 10 000 bytes `err_msg` already uses and the handlers'
-`tail -c 10000` mirrors); scrub **then** truncate.
+The write is **unconditional**, not gated on the `Ok(false)` arm: *"what did this
+process put on fd 2"* has nothing to do with the row's status. The surface is
+`tasks.metadata` because [`Database::set_task_handler_failure`] carries no status
+filter (`WHERE id = ?`) — *"`completed` is terminal, the metadata still writes"*
+has been an explicit contract since #617, and is exactly the property AC1 asks
+for. `tasks.result` is refused (it carries the message the callback turn consumes
+and that `extract_callback_fields` / `parse_verdict` read), and a per-task
+`.stderr` file too (the house has paid three times for a documented sink nothing
+feeds — Signals M, Q, S). Payload in **one** `json_set`, `stderr` **omitted** when
+fd 2 stayed mute — never `""` (mika#2331) — fire-and-forget, scrubbed then
+truncated at `MAX_OUTPUT_LEN`. Full reasoning at each site's doc-comment.
 
 **R2/R3 — the four handlers name their step.** `_STEP` / `_STEP_DETAIL`, set at
 each site and read by the trap; the `HANDLER CRASH` prefix is **added to**, never
@@ -2062,9 +2046,7 @@ as soon as `TASK_ID` is known — **a real hole on one handler only**: `deploy-m
 resolved its `CWD` before arming, and that block moved after. For the other three
 the gap held only a function definition; the correction is applied to all four
 because it is cheap and makes the property true by construction rather than by
-luck. `_shared/dispatch-lib.sh` is deliberately untouched (it carries a superior
-machinery, and its handler stderr is covered by the engine half like everyone
-else's).
+luck.
 
 **Operator surfaces.**
 
@@ -2098,6 +2080,31 @@ the population is directly countable on the surface itself by the query above, a
 a second population would have to be kept in agreement with this one for ever, for
 a count this query already makes exact.
 
+**Post-deploy probes, and their four halts.**
+
+- **S1 — the surface exists (first real crash).** A long-running handler exiting
+  non-zero leaves `handler_failure` on its row. *Halt 1 — no
+  `long_running_handler_exit_nonzero` line while a crash did happen:* do not
+  widen the predicate by reflex. `~/.mika/skills/` is a projection of the
+  **binary**, not of the checkout — establish the deployment first
+  (`cat ~/.mika/skills/.manifest-writer`, class mika#2340), then that the served
+  `mika-spirit` carries the fix.
+- **S2 — the step is named (48 h).** Every `HANDLER CRASH` the four handlers
+  render carries `at step '<…>'`. *Halt 2 — a bare `HANDLER CRASH` survives:* a
+  fifth site carries the pattern, or `dispatch-lib.sh` served that path (out of
+  scope). Establish **which** before touching the four.
+- **S3 — attribution (30 days).** The SQL query above gives the population of the
+  class; it, and not an intuition, is what conditions opening a follow-up on the
+  remaining root cause. *Halt 3 — the population carries nominal traffic* (several
+  a day, across different handlers): observability is not the subject — the
+  long-running handlers are crashing in series, and **that** is what to treat
+  (mika#2536 for the cwd cause, one ticket per cause after).
+- **S4 — negative control (7 days).** `handler_failure` is **absent** from every
+  row whose handler succeeded. *Halt 4 — one occurrence on a success:* the write
+  predicate has left the `!status.success()` branch. Disarm by revert **before**
+  diagnosis — a cause of failure invented on a healthy row is a lie of the same
+  order as the silence being repaired.
+
 **Guards.** `skills::executor::tests::mika2532::*` — five behavioural tests on a
 real `/bin/sh` subprocess (the measured defect; **the success negative control**,
 without which "we write on failure" is indistinguishable from "we always write";
@@ -2115,11 +2122,11 @@ step a trap could cover — with its own two fixtures proving that check bites.
 
 **What this does NOT buy.** No crash is prevented: the root cause of the measured
 defect (`MIKA_PLATFORM_DIR` scrubbed, so `cd` lands on a path that does not exist)
-belongs to **mika#2536**, and the QA of PR #2530 keeps failing until that closes.
-Nothing is retro-persisted — the four measured crashes will never have their
-stderr, it no longer exists; the probe is the **next** occurrence. And a handler
+belongs to **mika#2536**. Nothing is retro-persisted — the four measured crashes
+will never have their stderr; the probe is the **next** occurrence. A handler
 killed by `SIGKILL` before writing anything leaves `exit` and nothing else, which
-is honest and is the limit.
+is honest and is the limit. And no surveillance: the instruments are the greps and
+the query above, whose **silence proves nothing until someone runs them**.
 
 **Named out of scope, found on the way:** the executor writes the **un-scrubbed**
 stderr into `tasks.result` on the non-terminal case, where the shell has scrubbed

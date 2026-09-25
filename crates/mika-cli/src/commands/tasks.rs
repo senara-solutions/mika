@@ -1191,7 +1191,7 @@ mod tests {
 
         let db = Database::open_in_memory().unwrap();
         let id = db
-            .create_task(NewTask {
+            .create_task(&NewTask {
                 agent_id: "mika".to_string(),
                 team_run_id: None,
                 parent_task_id: None,
