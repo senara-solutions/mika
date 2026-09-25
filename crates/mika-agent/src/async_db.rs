@@ -1466,6 +1466,27 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Record a long-running handler's non-zero exit and its stderr on the
+    /// row, whatever its status (mika#2532 R1).
+    ///
+    /// See [`crate::db::Database::set_task_handler_failure`] for why this
+    /// carries no status filter and why the stderr is omitted rather than
+    /// stored empty.
+    pub async fn set_task_handler_failure(
+        &self,
+        task_id: &str,
+        exit_display: &str,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        let (i, e, s) = (
+            task_id.to_owned(),
+            exit_display.to_owned(),
+            stderr.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.set_task_handler_failure(&i, &e, s.as_deref()))
+            .await
+    }
+
     /// Get a single metadata field from a task's metadata JSON.
     pub async fn get_task_metadata_field(
         &self,

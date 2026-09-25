@@ -39,7 +39,17 @@
 # succeeds those lines land in no file at all (the mika#2050 class).
 # `tasks.result` is the durable surface, readable with `mika tasks get`.
 
+# --- Naming the step that failed (mika#2532 R2/R3) ---
+# `_STEP` tracks where we are; the EXIT trap reports it when it has to invent a
+# crash message. `$STDERR_FILE` below only ever captures claude-pilot's stderr
+# — this handler's OWN stderr goes to the inherited fd 2, i.e. to the
+# executor's pipe, which since mika#2532 persists it on the task row under
+# `$.handler_failure` (`mika tasks get <task-id>`).
+
 set -e
+
+_STEP="deps"
+_STEP_DETAIL=""
 
 # Ensure ~/.local/bin is in PATH (mika CLI needed for callback delivery)
 export PATH="$HOME/.local/bin:$PATH"
@@ -53,6 +63,7 @@ command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is re
 source "$(dirname "$0")/../../_shared/pr-push-guard.sh"
 
 # Read input JSON from stdin
+_STEP="parse_input"
 INPUT=$(cat)
 
 # Parse callback fields injected by the long-running executor
@@ -75,11 +86,21 @@ deliver_callback() {
     _EXIT_CODE=$?
     [ "$CALLBACK_SENT" -eq 1 ] && { [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; return; }
     [ -z "$TASK_ID" ] && { [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"; return; }
-    # Capture stderr tail on crash path BEFORE deleting the file (#104)
+    # The `HANDLER CRASH` prefix is a wire format: `self-dev-callback` documents
+    # it as a discriminant and `dispatch-lib.sh` greps it. The step is ADDED to
+    # it, never substituted for it (mika#2532 D5).
+    _CRASH_HEADLINE="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}'."
+    if [ -n "$_STEP_DETAIL" ]; then
+        _CRASH_HEADLINE="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}': ${_STEP_DETAIL}"
+    fi
+    # Capture stderr tail on crash path BEFORE deleting the file (#104).
+    # NOTE this file holds claude-pilot's stderr, never this handler's own —
+    # a crash before the spawn finds `STDERR_FILE` empty or unset, and its
+    # cause lives on the task row instead (mika#2532 R1).
     if [ -z "$RESULT" ] && [ -n "$STDERR_FILE" ] && [ -f "$STDERR_FILE" ]; then
         _STDERR_TAIL=$(tail -c 10000 "$STDERR_FILE" 2>/dev/null)
         if [ -n "$_STDERR_TAIL" ]; then
-            RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result.
+            RESULT="${_CRASH_HEADLINE}
 
 Stderr (last 10KB):
 ${_STDERR_TAIL}"
@@ -88,7 +109,7 @@ ${_STDERR_TAIL}"
     # Clean up stderr temp file AFTER capture
     [ -n "$STDERR_FILE" ] && rm -f "$STDERR_FILE"
     if [ -z "$RESULT" ]; then
-        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
+        RESULT="${_CRASH_HEADLINE}"
     fi
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
     set +e
@@ -103,6 +124,7 @@ ${_STDERR_TAIL}"
 trap deliver_callback EXIT
 
 # Parse user-provided fields
+_STEP="parse_fields"
 WORKTREE_PATH=$(printf '%s\n' "$INPUT" | jq -r '.worktree_path // empty')
 USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
 PR_URL=$(printf '%s\n' "$INPUT" | jq -r '.pr_url // empty')
@@ -129,6 +151,7 @@ fi
 #
 # The refusal happens BEFORE the spawn, which is stronger than AC3's letter
 # ("refused, not pushed"): no LLM turn is spent at all.
+_STEP="resolve_push_target"
 PUSH_ELIGIBLE=0
 
 if [ -n "$PR_URL" ]; then
@@ -210,6 +233,7 @@ fi
 # `git fetch origin`, which refreshes the remote-tracking ref — a lease resolved
 # after that compares the remote against a snapshot of the remote taken after the
 # fact, which is the second axis of the founding defect.
+_STEP="capture_lease"
 if [ "$PUSH_ELIGIBLE" -eq 1 ]; then
     if ! pr_push_guard_capture_lease "$WORKTREE_PATH"; then
         RESULT="$PR_PUSH_GUARD_REFUSAL"
@@ -304,6 +328,7 @@ LOG_ID="$USER_TASK_ID"
 # ── Step 5: run claude-pilot ─────────────────────────────────────────────────
 # claude-pilot writes structured JSON result to stdout.
 # Streaming text, relay logs, and debug output go to stderr.
+_STEP="spawn_pilot"
 STDERR_FILE=$(mktemp)
 set +e
 # CWD_ARGS is intentionally word-split (multiple flags)
@@ -350,6 +375,8 @@ ${PILOT_OUTPUT_RAW}"
 fi
 
 # ── Steps 6-8: the push, after the session, at the single guarded site ───────
+# shellcheck disable=SC2034  # read by deliver_callback via the EXIT trap
+_STEP="push"
 #
 # `pr_push_guard_push` re-checks the worktree (R4, R5), re-affirms the target on
 # shell variables the pilot cannot touch (R2, R3), and only then pushes with the

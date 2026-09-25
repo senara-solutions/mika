@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
+use mika_agent::task_engine::engine::{HANDLER_FAILURE_METADATA_KEY, HandlerFailure};
 use mika_common::config::Settings;
 use serde_json::{Value, json};
 
@@ -767,7 +768,59 @@ fn print_task_detail(t: &Task, liveness: &PilotLiveness) {
         };
         println!("  Result:        {display}");
     }
+    print_handler_failure(t);
     println!();
+}
+
+/// Render `$.handler_failure` when the row carries one (mika#2532 R1).
+///
+/// The engine writes this whenever a long-running handler exits non-zero —
+/// **including when the task is already terminal**, which is the case the
+/// ticket was filed for: the handler's EXIT trap delivers its callback, the
+/// row goes `completed`, `update_task_failed` matches nothing, and the one
+/// string naming the cause used to be dropped on the floor.
+///
+/// Fail-open on every read: unparseable metadata, an absent key, an unexpected
+/// shape — all render nothing. A crash whose record cannot be read is not
+/// worth breaking `mika tasks get` over, and the JSON output carries the raw
+/// `metadata` for anyone who wants to look closer.
+fn print_handler_failure(t: &Task) {
+    let Some(failure) = read_handler_failure(t.metadata.as_deref()) else {
+        return;
+    };
+
+    println!(
+        "  Handler failure: {} (captured {})",
+        failure.exit,
+        format_ts(&failure.captured_at)
+    );
+    // Absence is a fact, not an empty string: the handler wrote nothing on
+    // fd 2. Saying so beats rendering a blank line that reads like a bug.
+    match failure.stderr.as_deref() {
+        Some(stderr) => {
+            println!("  Handler stderr:");
+            for line in stderr.lines() {
+                println!("    {line}");
+            }
+        }
+        None => println!("  Handler stderr: (the handler wrote nothing)"),
+    }
+}
+
+/// Extract the engine's failure record from a task's raw `metadata` JSON.
+///
+/// Both the key and the payload's shape come from the engine
+/// ([`HandlerFailure`]), never from literals retyped here: two spellings of one
+/// name is the `grooming_marker` class (mika#2158), and this renderer lives in
+/// a different crate from the writer.
+///
+/// Fail-open on every read — unparseable metadata, an absent key, an
+/// unexpected shape all yield `None`. A crash whose record cannot be read is
+/// not worth breaking `mika tasks get` over, and `--format json` carries the
+/// raw `metadata` for anyone who wants to look closer.
+fn read_handler_failure(raw: Option<&str>) -> Option<HandlerFailure> {
+    let map = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw?).ok()?;
+    serde_json::from_value(map.get(HANDLER_FAILURE_METADATA_KEY)?.clone()).ok()
 }
 
 /// Machine-readable shape for `mika tasks stuck` (mika#2045). Kept flat so a
@@ -1121,5 +1174,97 @@ mod tests {
         let output = serde_json::to_string_pretty(&json_tasks).unwrap();
 
         assert_eq!(output, "[]");
+    }
+
+    // -- handler-failure rendering (mika#2532 R1) --
+
+    /// Build the metadata the engine really writes, by going through
+    /// `Database::set_task_handler_failure` on an in-memory row.
+    ///
+    /// The point is the **crossing**: the writer lives in `mika-agent` and this
+    /// reader in `mika-cli`. Asserting the reader against a payload this file
+    /// hand-rolled would prove only that it can read itself. Going through the
+    /// DB is what makes "the operator sees the cause" a fact rather than a
+    /// convention.
+    fn metadata_after_engine_write(stderr: Option<&str>) -> Option<String> {
+        use mika_agent::db::{Database, NewTask};
+
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: "long_running:build_mika".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .unwrap();
+        db.set_task_handler_failure(&id, "Exit code: 1", stderr)
+            .unwrap();
+        db.get_task(&id, "mika").unwrap().unwrap().metadata
+    }
+
+    #[test]
+    fn mika2532_the_cli_reads_what_the_engine_wrote() {
+        let metadata = metadata_after_engine_write(Some("ERROR: could not cd to /nope/mika"));
+        let failure = read_handler_failure(metadata.as_deref())
+            .expect("the renderer must read the record the engine persisted");
+
+        assert_eq!(failure.exit, "Exit code: 1");
+        assert_eq!(
+            failure.stderr.as_deref(),
+            Some("ERROR: could not cd to /nope/mika")
+        );
+        assert!(!failure.captured_at.is_empty());
+    }
+
+    /// A mute handler leaves `exit` and no `stderr` key — the renderer must say
+    /// so rather than print a blank line that reads like a defect.
+    #[test]
+    fn mika2532_a_mute_handler_reads_as_an_absence_not_an_empty_string() {
+        let metadata = metadata_after_engine_write(None);
+        let failure = read_handler_failure(metadata.as_deref()).expect("record present");
+
+        assert_eq!(failure.exit, "Exit code: 1");
+        assert!(
+            failure.stderr.is_none(),
+            "fd 2 stayed mute: the key must be absent, not empty"
+        );
+    }
+
+    /// Fail-open, four ways. `mika tasks get` must never die on a row whose
+    /// metadata it cannot make sense of.
+    #[test]
+    fn mika2532_an_unreadable_record_renders_nothing_rather_than_failing() {
+        assert!(read_handler_failure(None).is_none(), "no metadata at all");
+        assert!(
+            read_handler_failure(Some("not json")).is_none(),
+            "metadata that is not JSON"
+        );
+        assert!(
+            read_handler_failure(Some(r#"{"process_start_time":"123"}"#)).is_none(),
+            "valid metadata carrying no failure record — the nominal case"
+        );
+        assert!(
+            read_handler_failure(Some(r#"{"handler_failure":"a string"}"#)).is_none(),
+            "the key present but not the expected shape"
+        );
     }
 }

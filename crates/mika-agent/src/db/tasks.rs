@@ -3349,6 +3349,57 @@ impl Database {
         Ok(())
     }
 
+    /// Record the exit status and stderr of a long-running handler that exited
+    /// non-zero, on a row of **any** status (mika#2532 R1).
+    ///
+    /// Sibling of [`Self::write_task_dispatch_rejection`] (#1108) — same need,
+    /// *write a reason onto the row without touching its status* — and of
+    /// [`Self::set_task_metadata_field`], whose `WHERE id = ?` it shares. That
+    /// absence of a status filter is the whole point: the defect mika#2532
+    /// closes is a stderr discarded because the row had already gone
+    /// `completed` when its EXIT trap delivered the callback. See
+    /// [`crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY`] for the
+    /// measurement and for why the surface is the metadata and not `result`.
+    ///
+    /// **One object, one `json_set`.** Two successive
+    /// `set_task_metadata_field` calls would not be atomic and could leave a
+    /// stderr without its exit code — a failure record that names no failure.
+    ///
+    /// `stderr` is **omitted** when the process wrote nothing, never stored as
+    /// `""`: a reader who does not find the key knows fd 2 stayed mute, and
+    /// still finds `exit` (mika#2331 — an absence is not a null wearing a
+    /// value's clothes).
+    ///
+    /// The caller is responsible for scrubbing and truncating `stderr`; this
+    /// method writes what it is given.
+    pub fn set_task_handler_failure(
+        &self,
+        task_id: &str,
+        exit_display: &str,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        // The shape travels as a type, never as three literals spelled here and
+        // re-spelled by the CLI renderer (see `HandlerFailure`).
+        let payload = serde_json::to_string(&crate::task_engine::engine::HandlerFailure {
+            exit: exit_display.to_string(),
+            stderr: stderr.map(|s| s.to_string()),
+            captured_at: crate::timestamp::now(),
+        })?;
+
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(COALESCE(metadata, '{}'), '$.' || ?1, json(?2)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?3",
+            params![
+                crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY,
+                payload,
+                task_id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Remove a single field from the task's metadata JSON (#959).
     ///
     /// Uses SQLite's `json_remove()` to delete the key. No-op if the key doesn't exist.
