@@ -142,8 +142,39 @@ pub const REASON_LIVE_PROCESS: &str = "live_process";
 pub const REASON_DIRTY: &str = "dirty";
 /// Commits absents d'`origin/<branche>` (T7) — **doit rester rare**, HALTE 3.
 pub const REASON_UNPUSHED_COMMITS: &str = "unpushed_commits";
-/// Pas de branche attachée (T2) — `detached HEAD`, rare.
+/// Pas de branche attachée **et** pas de SHA exploitable (T2) — rare, anomalie
+/// git.
+///
+/// # Le sens s'est resserré, et la scission est datée (mika#2518 R-3)
+///
+/// Avant mika#2518 ce motif voulait dire « pas de branche attachée », point. Un
+/// worktree détaché est désormais résolu par le SHA de son `HEAD`, donc ce motif
+/// ne couvre plus que le cas où **ce SHA lui-même** est inexploitable : ligne
+/// `HEAD` absente du porcelain, SHA nul (`000…0` — mesuré en production sur le
+/// checkout principal), non hexadécimal, ou de longueur non canonique. La
+/// population « SHA lisible, aucune PR à ce SHA » a reçu son propre nom,
+/// [`REASON_DETACHED_HEAD_PR_UNKNOWN`].
+///
+/// **Coût nommé** (motif mika#2361) : une requête `GROUP BY after_value` qui
+/// enjambe le déploiement compare deux vocabulaires. Les lignes antérieures
+/// gardent `detached_head` et **ne sont pas réécrites** — les réécrire rendrait
+/// faux ce qu'elles ont dit quand elles ont été écrites. Un opérateur qui
+/// compare de part et d'autre doit **sommer les deux noms** (HALTE 3 du
+/// `CLAUDE.md` racine).
 pub const REASON_DETACHED_HEAD: &str = "detached_head";
+/// Worktree détaché, SHA de `HEAD` lisible, **aucune** PR à ce SHA (T3 sur la
+/// clé SHA) — nominal pour un worktree hors boucle (mika#2518).
+///
+/// Délibérément distinct de [`REASON_DETACHED_HEAD`] alors qu'il mène au même
+/// verdict : le premier est une **anomalie git** (remède : inspecter le
+/// worktree), celui-ci est **nominal** — et c'est surtout *la sonde qui dit que
+/// la clé SHA ne mord pas* (sonde S1). Les confondre cacherait un blocage
+/// permanent à l'intérieur d'un état normal.
+///
+/// Distinct aussi de [`REASON_PR_UNKNOWN`], qui pose la même question sur la clé
+/// **branche** : celui-là est fréquent et nominal (« groomé, pas encore
+/// implémenté »), celui-ci est l'attribution de ce ticket.
+pub const REASON_DETACHED_HEAD_PR_UNKNOWN: &str = "detached_head_pr_unknown";
 /// Chemin hors de `.claude/worktrees/` (T1) — **doit rester vide**, HALTE 4.
 pub const REASON_OUTSIDE_MANAGED_ROOT: &str = "outside_managed_root";
 /// `closedAt` absent ou illisible sur la PR terminale (T5).
@@ -185,7 +216,48 @@ pub const ALL_REFUSAL_REASONS: &[&str] = &[
     REASON_PR_CLOSED_AT_UNREADABLE,
     REASON_WORK_STATE_UNREADABLE,
     REASON_PROCESS_SCAN_UNREADABLE,
+    REASON_DETACHED_HEAD_PR_UNKNOWN,
 ];
+
+/// Par quelle clé un worktree a été rattaché à ses PR — **la branche attachée**.
+///
+/// # Format de fil (mika#2518 R3)
+///
+/// Ces valeurs atterrissent en tête de `audit_events.reasoning` et sur le champ
+/// `resolution` de la ligne INFO ; l'opérateur en fait des
+/// `reasoning LIKE 'resolution=detached_sha%'`. Deux orthographes couperaient une
+/// population en deux sans le dire. Épinglé par
+/// [`tests::mika2518_les_resolutions_sont_un_format_de_fil`].
+///
+/// # Pourquoi un champ et non un second `tool_name`
+///
+/// AC4 de mika#2518 demande « un motif distinct (p. ex. `reaped_detached_merged`)
+/// séparable de `worktree_reaped` nominal ». Le « p. ex. » est pris au mot :
+/// créer un second `tool_name` tronquerait **en silence**
+/// `SELECT … WHERE tool_name = 'worktree_reaped'`, c'est-à-dire le garde-fou 3 de
+/// mika#2420 et une requête publiée dans le `CLAUDE.md` racine.
+///
+/// La maison a les deux motifs et les distingue : **deux noms** quand chaque nom
+/// porte sa propre cause et que les populations ne doivent jamais être sommées
+/// (`phantom_aged_out` / `phantom_sweep_spared`, mika#2156 ;
+/// `qa_deadline_verdict` / `qa_callback_verdict`, mika#2368) ; **un nom, le
+/// discriminant dans le champ** quand les deux issues appartiennent au même
+/// dispatcheur et à la même population (`ready_label_outcome`, mika#2323 ;
+/// `task_engine_groom_pilot_dispatcher`, mika#2498). Ici les deux retraits sont
+/// faits par **le même bras**, sous la **même conjonction** de sept termes, avec
+/// la **même létalité** : seule la clé de résolution diffère. C'est le second
+/// motif.
+pub const RESOLUTION_BRANCH: &str = "branch";
+/// Par quelle clé un worktree a été rattaché à ses PR — **le SHA de son `HEAD`
+/// détaché**, apparié au `headRefOid` d'une PR (mika#2518).
+///
+/// `"detached_sha"` et non `"detached_head"` **délibérément** : ce dernier est
+/// déjà un motif de refus ([`REASON_DETACHED_HEAD`]). Deux vocabulaires distincts
+/// qui partageraient une chaîne se liraient mal, même en vivant dans des champs
+/// différents — et le nom retenu dit la clé réellement employée.
+pub const RESOLUTION_DETACHED_SHA: &str = "detached_sha";
+/// Les deux clés de résolution, en un seul lieu.
+pub const ALL_RESOLUTIONS: &[&str] = &[RESOLUTION_BRANCH, RESOLUTION_DETACHED_SHA];
 
 /// `audit_events.tool_name` écrit à chaque retrait **effectif** — et event
 /// tracing de la même ligne : une seule constante sert les deux surfaces.
@@ -587,8 +659,53 @@ pub fn parse_repo_dirs(raw: Option<&str>) -> Vec<PathBuf> {
 pub struct WorktreeEntry {
     pub path: String,
     /// `None` pour un worktree en `detached HEAD` : il n'a pas de ligne
-    /// `branch`, donc il sort de la population (T2).
+    /// `branch`. Depuis mika#2518 ce n'est plus une sortie de population — c'est
+    /// le basculement vers la clé SHA ci-dessous.
     pub branch: Option<String>,
+    /// Le SHA brut de la ligne `HEAD <sha>`, que `git worktree list --porcelain`
+    /// émet pour **toute** entrée, détachée comprise.
+    ///
+    /// Brut : la normalisation est le travail de [`usable_head_sha`], site
+    /// unique. `None` quand la ligne est absente du porcelain.
+    pub head: Option<String>,
+}
+
+/// Le SHA d'un `HEAD` détaché, s'il est exploitable comme clé de résolution.
+///
+/// Refuse : la chaîne vide, le SHA nul (`000…0` — **mesuré** en production, c'est
+/// ce que le porcelain rend pour le checkout principal), et tout ce qui n'est pas
+/// exactement 40 caractères hexadécimaux. Un SHA non exploitable n'est jamais
+/// « aucune PR » : c'est [`REASON_DETACHED_HEAD`] (mika#2518 R-2).
+///
+/// **40 caractères exactement.** `git worktree list --porcelain` rend le SHA
+/// complet ; accepter un préfixe ouvrirait un appariement partiel, c'est-à-dire
+/// une heuristique — exactement ce que R-2 et R-7 refusent.
+///
+/// # Aucun repli heuristique derrière cette clé (R-7)
+///
+/// Si le SHA n'apparie aucune PR, **on conserve**. On ne retombe pas sur une
+/// dérivation du chemin du worktree : ce répertoire est produit par
+/// `scripts/derive-worktree-path` avec `/`→`-` et translittération
+/// (`feat/2425/agent-exposer-le-réglage-…` →
+/// `feat-2425-agent-exposer-le-r-glage-…`), donc l'inverse n'est pas une
+/// fonction, et re-dériver un chemin de worktree est la duplication que
+/// mika-platform#58 a fermée. Surtout, un tel repli se déclencherait très
+/// exactement quand la clé exacte dit *« ce worktree n'est pas à un état
+/// livré »* — c'est-à-dire quand conserver est la bonne réponse.
+///
+/// **Refus explicite d'une garde structurelle sur ce point** : un scan de source
+/// « aucun site ne dérive une PR depuis un chemin de worktree » serait séduisant,
+/// et la classe a **zéro membre** aujourd'hui sans population attendue. Livrer
+/// une garde sans population à mesurer est le smell que la maison nomme.
+pub fn usable_head_sha(raw: &str) -> Option<String> {
+    let sha = raw.trim();
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if sha.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    Some(sha.to_ascii_lowercase())
 }
 
 /// Une PR telle que `gh pr list --json` la rend.
@@ -609,6 +726,26 @@ pub struct PrSnapshot {
     /// **conserve** (T5 ne peut pas s'évaluer).
     #[serde(rename = "closedAt")]
     pub closed_at: Option<String>,
+    /// Le commit de tête de la PR — la clé de résolution d'un worktree détaché
+    /// (mika#2518).
+    ///
+    /// # Ici l'asymétrie est INVERSE de celle de `state` / `headRefName` (R-4)
+    ///
+    /// Ces deux champs n'ont **pas** de `#[serde(default)]`, et c'est porteur :
+    /// leur absence ferait *entrer* un worktree dans la population sur une
+    /// information manquante. Ce champ-ci est **additif**, et un champ additif ne
+    /// doit pas pouvoir éteindre la fonction qu'il enrichit : sans `default`, un
+    /// `headRefOid` absent ferait échouer le parsing, donc [`list_prs`] rendrait
+    /// `Err`, donc **le dépôt entier serait sauté** (`worktree_reap_failed
+    /// stage=pr_list`) — y compris le chemin attaché qui fonctionne aujourd'hui.
+    /// D'où `default`, avec la **chaîne vide traitée comme non résolvable** par
+    /// [`PrIndex::build`] : la dégradation est bornée au nouveau chemin.
+    ///
+    /// Le champ est déjà exercé en production sur exactement cet appel
+    /// (`server/ci_success_handler.rs`, `"number,headRefOid"`) ; ce que la sonde
+    /// V1 du plan établit est sa **survie à la suppression de la branche**.
+    #[serde(rename = "headRefOid", default)]
+    pub head_ref_oid: String,
     #[serde(default)]
     pub url: String,
 }
@@ -616,6 +753,61 @@ pub struct PrSnapshot {
 impl PrSnapshot {
     fn is_open(&self) -> bool {
         self.state.eq_ignore_ascii_case("OPEN")
+    }
+}
+
+/// Les PR d'un dépôt, indexées par les **deux** clés de résolution.
+///
+/// Un struct plutôt qu'un sixième paramètre à [`screen_worktrees`] : les deux
+/// index sont construits de la même liste au même instant, par un **site de
+/// construction unique**, et ne peuvent donc pas se désynchroniser.
+///
+/// Les deux côtés de l'appariement SHA sont mis en minuscules — git et GitHub
+/// rendent tous deux du minuscule, la normalisation est défensive et coûte un
+/// `to_ascii_lowercase` par PR.
+#[derive(Debug, Clone, Default)]
+pub struct PrIndex {
+    by_branch: HashMap<String, Vec<PrSnapshot>>,
+    by_head_sha: HashMap<String, Vec<PrSnapshot>>,
+}
+
+impl PrIndex {
+    /// Le **seul** site qui construit les deux index.
+    pub fn build(prs: Vec<PrSnapshot>) -> Self {
+        let mut by_branch: HashMap<String, Vec<PrSnapshot>> = HashMap::new();
+        let mut by_head_sha: HashMap<String, Vec<PrSnapshot>> = HashMap::new();
+        for pr in prs {
+            // Une chaîne vide (champ absent, R-4) ou un SHA non canonique
+            // n'indexe **rien** : la PR reste résolvable par sa branche, et le
+            // chemin détaché la considère simplement comme inconnue.
+            if let Some(sha) = usable_head_sha(&pr.head_ref_oid) {
+                by_head_sha.entry(sha).or_default().push(pr.clone());
+            }
+            by_branch
+                .entry(pr.head_ref_name.clone())
+                .or_default()
+                .push(pr);
+        }
+        Self {
+            by_branch,
+            by_head_sha,
+        }
+    }
+
+    /// Les PR déclarant cette `headRefName`. `None` quand il n'y en a aucune.
+    pub fn by_branch(&self, branch: &str) -> Option<&[PrSnapshot]> {
+        self.by_branch
+            .get(branch)
+            .map(Vec::as_slice)
+            .filter(|p| !p.is_empty())
+    }
+
+    /// Les PR dont le `headRefOid` est ce SHA. `None` quand il n'y en a aucune.
+    pub fn by_head_sha(&self, sha: &str) -> Option<&[PrSnapshot]> {
+        self.by_head_sha
+            .get(&sha.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .filter(|p| !p.is_empty())
     }
 }
 
@@ -646,10 +838,37 @@ pub enum WorkState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReapCandidate {
     pub path: String,
+    /// Le nom de branche rapporté.
+    ///
+    /// Sur le chemin détaché (mika#2518 R-6) il vient du `headRefName` **de la PR
+    /// appariée** — une donnée déclarée par GitHub, jamais une inversion de slug
+    /// de chemin. Deux conséquences : T7 dispose d'un `origin/<branche>` pour son
+    /// second sous-processus, et la surface opérateur de mika#2497 (qui résout son
+    /// `pr_number` depuis `ReapRefusal.branch`) cesse d'être aveugle sur cette
+    /// population.
     pub branch: String,
     pub pr_number: u64,
     pub pr_state: String,
     pub pr_url: String,
+    /// [`RESOLUTION_BRANCH`] ou [`RESOLUTION_DETACHED_SHA`] — par quelle clé ce
+    /// worktree a été rattaché à ses PR (mika#2518).
+    pub resolution: &'static str,
+    /// `Some(sha)` sur le chemin détaché : la clé de jointure, qui rend la
+    /// décision rejouable depuis la ligne d'audit. `None` sur le chemin attaché.
+    pub head_sha: Option<String>,
+}
+
+/// La branche locale doit-elle être supprimée avec le worktree ?
+///
+/// **Non sur le chemin détaché (mika#2518 R-5).** La branche nommée par la PR n'a
+/// jamais été checked out par ce worktree : la supprimer serait un effet de bord
+/// sans mandat — et, si elle a déjà disparu, un `git branch -D` qui échoue sans
+/// apporter d'information.
+///
+/// Prédicat nommé plutôt qu'un `if` en ligne dans [`remove_worktree`] : il est
+/// alors testable sans toucher au disque, ce que `remove_worktree` ne permet pas.
+pub fn should_delete_local_branch(resolution: &str) -> bool {
+    resolution == RESOLUTION_BRANCH
 }
 
 /// Un worktree conservé, et le motif nommé qui l'a conservé.
@@ -713,16 +932,40 @@ pub fn canonical_path_is_managed(path: &str) -> bool {
 /// | # | terme | source de vérité | illisible ⇒ |
 /// |---|---|---|---|
 /// | T1 | le chemin contient `/.claude/worktrees/` | le chemin lui-même | conserver |
-/// | T2 | le worktree a une branche attachée | `git worktree list --porcelain` | conserver |
-/// | T3 | au moins une PR connue pour cette branche | `gh pr list --state all` | conserver |
-/// | T4 | **aucune** PR ouverte pour cette branche | idem | conserver |
+/// | T2 | **une clé de rattachement est résoluble** — branche attachée, ou SHA du `HEAD` détaché | `git worktree list --porcelain` | conserver |
+/// | T3 | au moins une PR connue pour cette clé | `gh pr list --state all` | conserver |
+/// | T4 | **aucune** PR ouverte parmi celles-là | idem | conserver |
 /// | T5 | la PR la plus récemment close l'est depuis plus que la grâce | `closedAt` | conserver |
 /// | T6 | aucun processus vivant n'a son cwd sous le worktree | `/proc/*/cwd` | conserver |
 ///
 /// **T4 est formulé en négatif à dessein.** Deux PR peuvent partager une même
-/// `headRefName` (une fermée, une rouverte). « Il existe une PR mergée » serait
-/// vrai dans ce cas et conduirait à supprimer un worktree dont une PR est
-/// ouverte. « Aucune PR n'est ouverte » est le prédicat correct.
+/// `headRefName` (une fermée, une rouverte) — et, depuis mika#2518, un même
+/// `headRefOid` (une PR fermée puis rouverte en une nouvelle depuis le même
+/// commit). « Il existe une PR mergée » serait vrai dans ces cas et conduirait à
+/// supprimer un worktree dont une PR est ouverte. « Aucune PR n'est ouverte » est
+/// le prédicat correct, et il s'applique **tel quel** à l'ensemble résolu par
+/// SHA : c'est la conséquence directe de R-1 — *la clé change, le prédicat ne
+/// change pas.*
+///
+/// # T2 est une résolution, jamais un refus de principe (mika#2518)
+///
+/// Avant mika#2518, un `HEAD` détaché sortait de la population. Or à la fermeture
+/// d'une PR la branche distante est supprimée, et trois worktrees de PR mergées
+/// ont conservé **61 Go** de `target/` sous le motif `detached_head`. La clé de
+/// remplacement est l'égalité `HEAD du worktree == headRefOid de la PR`, exacte
+/// là où les deux mécanismes énumérés par AC1 sont heuristiques (§ R2 du plan).
+///
+/// **Et c'est aussi l'argument de sûreté, plus fort que celui du chemin :**
+/// apparier exactement le `headRefOid` d'une PR signifie *ce worktree est à
+/// l'état livré, et pas un commit de plus*. Un worktree portant du travail non
+/// fusionné a un `HEAD` différent et **ne peut pas apparier** — il sort de la
+/// population de lui-même, avant même T7.
+///
+/// **Le chemin attaché est inchangé, y compris sa clé** (R-8) : un worktree
+/// attaché continue d'être résolu par sa branche. Le résoudre aussi par SHA
+/// serait un risque gratuit sur le chemin nominal ; épinglé par un test
+/// d'anti-vacuité, sans lequel « la clé SHA marche » serait indistinguable de
+/// « tout est résolu par SHA ».
 ///
 /// **T6 remplace le `pgrep` du ticket, et le remplace par mieux.** `pgrep`
 /// matche un nom de commande, pas une localisation : un `cargo` appartenant à un
@@ -733,7 +976,7 @@ pub fn canonical_path_is_managed(path: &str) -> bool {
 /// n'existe aucune exception.**
 pub fn screen_worktrees(
     entries: &[WorktreeEntry],
-    prs_by_branch: &HashMap<String, Vec<PrSnapshot>>,
+    prs: &PrIndex,
     live: &LiveCwds,
     now: DateTime<Utc>,
     cfg: &ReapConfig,
@@ -762,21 +1005,63 @@ pub fn screen_worktrees(
             continue;
         }
 
-        // T2 — branche attachée.
-        let Some(branch) = entry.branch.as_deref() else {
-            refuse(&mut out, REASON_DETACHED_HEAD);
-            continue;
+        // T2 — résoudre la clé de rattachement, et T3 avec elle : « aucune PR
+        // connue pour cette clé » est la même question posée d'une clé
+        // différente, et les deux populations restent comptables séparément
+        // (`pr_unknown` est fréquent et nominal — « groomé, pas encore
+        // implémenté » ; `detached_head_pr_unknown` est la sonde d'attribution de
+        // mika#2518).
+        let resolved = match entry.branch.as_deref() {
+            Some(branch) => match prs.by_branch(branch) {
+                Some(matched) => Resolved {
+                    prs: matched,
+                    branch: branch.to_string(),
+                    kind: RESOLUTION_BRANCH,
+                    head_sha: None,
+                },
+                None => {
+                    refuse(&mut out, REASON_PR_UNKNOWN);
+                    continue;
+                }
+            },
+            None => {
+                // R-2 : un SHA inexploitable n'est jamais « aucune PR ».
+                let Some(sha) = entry.head.as_deref().and_then(usable_head_sha) else {
+                    refuse(&mut out, REASON_DETACHED_HEAD);
+                    continue;
+                };
+                match prs.by_head_sha(&sha) {
+                    Some(matched) => Resolved {
+                        // R-6 : le nom de branche vient de la PR, jamais d'une
+                        // inversion de slug de chemin.
+                        branch: matched[0].head_ref_name.clone(),
+                        prs: matched,
+                        kind: RESOLUTION_DETACHED_SHA,
+                        head_sha: Some(sha),
+                    },
+                    None => {
+                        refuse(&mut out, REASON_DETACHED_HEAD_PR_UNKNOWN);
+                        continue;
+                    }
+                }
+            }
         };
 
-        // T3 — au moins une PR connue.
-        let Some(prs) = prs_by_branch.get(branch).filter(|p| !p.is_empty()) else {
-            refuse(&mut out, REASON_PR_UNKNOWN);
-            continue;
+        // Passé la résolution, le nom de branche rapporté est celui de la clé
+        // résolue (R-6) : c'est ce qui rend `pr_open` exploitable par le bras de
+        // purge de mika#2497 sur cette population.
+        let refuse_resolved = |out: &mut ReapSelection, reason: &'static str| {
+            out.refusals.push(ReapRefusal {
+                path: entry.path.clone(),
+                branch: Some(resolved.branch.clone()),
+                reason,
+            });
         };
+        let prs = resolved.prs;
 
         // T4 — aucune PR ouverte.
         if prs.iter().any(PrSnapshot::is_open) {
-            refuse(&mut out, REASON_PR_OPEN);
+            refuse_resolved(&mut out, REASON_PR_OPEN);
             continue;
         }
 
@@ -797,31 +1082,31 @@ pub fn screen_worktrees(
             }
         }
         if closed_at_unreadable {
-            refuse(&mut out, REASON_PR_CLOSED_AT_UNREADABLE);
+            refuse_resolved(&mut out, REASON_PR_CLOSED_AT_UNREADABLE);
             continue;
         }
         let Some(newest_closed) = newest_closed else {
-            refuse(&mut out, REASON_PR_CLOSED_AT_UNREADABLE);
+            refuse_resolved(&mut out, REASON_PR_CLOSED_AT_UNREADABLE);
             continue;
         };
         // Une date dans le futur (dérive d'horloge) donne un âge ramené à 0,
         // donc plus jeune que la grâce : conserver, qui est la direction sûre.
         let closed_for = (now - newest_closed).num_seconds().max(0);
         if closed_for < cfg.grace_secs {
-            refuse(&mut out, REASON_TOO_YOUNG);
+            refuse_resolved(&mut out, REASON_TOO_YOUNG);
             continue;
         }
 
         // T6 — aucun processus vivant dedans.
         match live {
             LiveCwds::Unavailable => {
-                refuse(&mut out, REASON_PROCESS_SCAN_UNREADABLE);
+                refuse_resolved(&mut out, REASON_PROCESS_SCAN_UNREADABLE);
                 continue;
             }
             LiveCwds::Enumerated(cwds) => {
                 let root = Path::new(&entry.path);
                 if cwds.iter().any(|cwd| cwd == root || cwd.starts_with(root)) {
-                    refuse(&mut out, REASON_LIVE_PROCESS);
+                    refuse_resolved(&mut out, REASON_LIVE_PROCESS);
                     continue;
                 }
             }
@@ -835,14 +1120,27 @@ pub fn screen_worktrees(
 
         out.candidates.push(ReapCandidate {
             path: entry.path.clone(),
-            branch: branch.to_string(),
+            branch: resolved.branch.clone(),
             pr_number: pr.number,
             pr_state: pr.state.clone(),
             pr_url: pr.url.clone(),
+            resolution: resolved.kind,
+            head_sha: resolved.head_sha.clone(),
         });
     }
 
     out
+}
+
+/// Ce que T2 a résolu : l'ensemble de PR rattaché, par quelle clé, et sous quel
+/// nom de branche le rapporter.
+struct Resolved<'a> {
+    prs: &'a [PrSnapshot],
+    /// Le `headRefName` — de l'entrée du registre sur le chemin attaché, **de la
+    /// PR appariée** sur le chemin détaché (R-6).
+    branch: String,
+    kind: &'static str,
+    head_sha: Option<String>,
 }
 
 /// T7 — rien de non livré.
@@ -886,13 +1184,13 @@ pub fn apply_work_states(
 /// décision, l'écran étant déterministe.
 pub fn select_worktrees_to_reap(
     entries: &[WorktreeEntry],
-    prs_by_branch: &HashMap<String, Vec<PrSnapshot>>,
+    prs: &PrIndex,
     live: &LiveCwds,
     work_states: &HashMap<String, WorkState>,
     now: DateTime<Utc>,
     cfg: &ReapConfig,
 ) -> ReapSelection {
-    let screened = screen_worktrees(entries, prs_by_branch, live, now, cfg);
+    let screened = screen_worktrees(entries, prs, live, now, cfg);
     let mut final_pass = apply_work_states(screened.candidates, work_states);
     let mut refusals = screened.refusals;
     refusals.append(&mut final_pass.refusals);
@@ -1027,37 +1325,54 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
 ///
 /// Les entrées marquées `prunable` sont **écartées** : elles relèvent de
 /// `git worktree prune`, pas d'un retrait — leur répertoire n'existe déjà plus.
+///
+/// La ligne `HEAD <sha>` est capturée depuis mika#2518 : le porcelain l'émet pour
+/// **toute** entrée, détachée comprise, ce qui en fait la clé de rattachement
+/// d'un worktree dont la branche a disparu. Mesuré sur cet arbre :
+///
+/// ```text
+/// worktree /data/.../feat-2518-.../mika
+/// HEAD c5c4d70f0cebdbfe3e821e65951d53473e8d99d4
+/// branch refs/heads/feat/2518/faucheur-un-worktree-de-pr-merg-e-dont
+/// ```
 pub fn parse_worktree_registry(porcelain: &str) -> Vec<WorktreeEntry> {
     let mut out = Vec::new();
     let mut path: Option<String> = None;
     let mut branch: Option<String> = None;
+    let mut head: Option<String> = None;
     let mut prunable = false;
 
-    let mut flush =
-        |path: &mut Option<String>, branch: &mut Option<String>, prunable: &mut bool| {
-            if let Some(p) = path.take()
-                && !*prunable
-            {
-                out.push(WorktreeEntry {
-                    path: p,
-                    branch: branch.take(),
-                });
-            }
-            *branch = None;
-            *prunable = false;
-        };
+    let mut flush = |path: &mut Option<String>,
+                     branch: &mut Option<String>,
+                     head: &mut Option<String>,
+                     prunable: &mut bool| {
+        if let Some(p) = path.take()
+            && !*prunable
+        {
+            out.push(WorktreeEntry {
+                path: p,
+                branch: branch.take(),
+                head: head.take(),
+            });
+        }
+        *branch = None;
+        *head = None;
+        *prunable = false;
+    };
 
     for line in porcelain.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            flush(&mut path, &mut branch, &mut prunable);
+            flush(&mut path, &mut branch, &mut head, &mut prunable);
             path = Some(p.trim().to_string());
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            head = Some(h.trim().to_string());
         } else if let Some(b) = line.strip_prefix("branch ") {
             branch = b.trim().strip_prefix("refs/heads/").map(str::to_string);
         } else if line.trim() == "prunable" || line.starts_with("prunable ") {
             prunable = true;
         }
     }
-    flush(&mut path, &mut branch, &mut prunable);
+    flush(&mut path, &mut branch, &mut head, &mut prunable);
     out
 }
 
@@ -1179,7 +1494,7 @@ async fn list_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, String> {
             "--state",
             "all",
             "--json",
-            "number,state,headRefName,closedAt,url",
+            "number,state,headRefName,headRefOid,closedAt,url",
             "--limit",
             &limit,
         ],
@@ -1191,15 +1506,6 @@ async fn list_prs(repo: &str, token: &str) -> Result<Vec<PrSnapshot>, String> {
         return Ok(Vec::new());
     }
     serde_json::from_str(trimmed).map_err(|e| format!("parse gh pr list ({repo}): {e}"))
-}
-
-/// Indexe les PR par `headRefName`.
-pub fn index_prs_by_branch(prs: Vec<PrSnapshot>) -> HashMap<String, Vec<PrSnapshot>> {
-    let mut map: HashMap<String, Vec<PrSnapshot>> = HashMap::new();
-    for pr in prs {
-        map.entry(pr.head_ref_name.clone()).or_default().push(pr);
-    }
-    map
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1532,8 @@ struct Removal {
 ///
 /// La suppression de la branche locale est **best-effort et journalisée** : le
 /// worktree est parti de toute façon, et son échec ne doit pas faire échouer le
-/// retrait.
+/// retrait. Elle est **sautée** sur le chemin détaché — voir
+/// [`should_delete_local_branch`] (mika#2518 R-5).
 async fn remove_worktree(repo_dir: &Path, candidate: &ReapCandidate) -> Removal {
     let removed = run_git(
         repo_dir,
@@ -1249,9 +1556,13 @@ async fn remove_worktree(repo_dir: &Path, candidate: &ReapCandidate) -> Removal 
         let _ = run_git(repo_dir, &["worktree", "prune"]).await;
     }
 
-    let branch_deleted = run_git(repo_dir, &["branch", "-D", &candidate.branch])
-        .await
-        .is_some();
+    let branch_deleted = if should_delete_local_branch(candidate.resolution) {
+        run_git(repo_dir, &["branch", "-D", &candidate.branch])
+            .await
+            .is_some()
+    } else {
+        false
+    };
 
     Removal {
         removed,
@@ -1381,11 +1692,11 @@ pub async fn reap_terminal_worktrees(
                 continue;
             }
         };
-        let prs_by_branch = index_prs_by_branch(prs);
+        let pr_index = PrIndex::build(prs);
 
         // T1-T6 d'abord : T7 coûte deux `git` par candidat, et ne se paie que
         // sur les survivants.
-        let screened = screen_worktrees(&entries, &prs_by_branch, &live, now, &cfg);
+        let screened = screen_worktrees(&entries, &pr_index, &live, now, &cfg);
         for refusal in &screened.refusals {
             refused += 1;
             record_refusal(db, session_id, refusal, now, trace_id).await;
@@ -1400,8 +1711,8 @@ pub async fn reap_terminal_worktrees(
         // aussitôt. Tout ce qui **précède** reste inconditionnel —
         // `probe_main_checkout` (la sonde de saleté mika#2449), le registre, le
         // remote, `list_prs`, `screen_worktrees` et l'écriture de ses refus :
-        // `screened.refusals` et `prs_by_branch` sont exactement les deux
-        // entrées dont la purge a besoin.
+        // `screened.refusals` et `pr_index` sont exactement les deux entrées
+        // dont la purge a besoin.
         if budget > 0 {
             let mut work_states = HashMap::new();
             for candidate in &screened.candidates {
@@ -1483,6 +1794,11 @@ pub async fn reap_terminal_worktrees(
                     pr_number = candidate.pr_number,
                     pr_state = %candidate.pr_state,
                     pr_url = %candidate.pr_url,
+                    // mika#2518 AC4 — la clé de résolution est **séparable** sans
+                    // second `tool_name` : `jq 'select(.resolution ==
+                    // "detached_sha")'`.
+                    resolution = candidate.resolution,
+                    head_sha = candidate.head_sha.as_deref(),
                     bytes_reclaimed = size.bytes,
                     bytes_reclaimed_truncated = size.truncated,
                     parent_removed = removal.parent_removed,
@@ -1507,7 +1823,7 @@ pub async fn reap_terminal_worktrees(
             session_id,
             trace_id,
             &screened.refusals,
-            &prs_by_branch,
+            &pr_index,
             &live,
             now,
             &purge_cfg,
@@ -1759,8 +2075,16 @@ async fn record_reaped(
     disposition: Disposition,
     trace_id: &str,
 ) {
+    // mika#2518 — `resolution=` **en tête**, pour qu'un
+    // `reasoning LIKE 'resolution=detached_sha%'` soit ancré et exact plutôt
+    // qu'une sous-chaîne flottante. `head_sha` rend la décision rejouable : sans
+    // lui, une ligne d'audit ne permettrait pas de savoir *quel* commit a été
+    // apparié, ce qui est la première question sur un faux positif (HALTE 1).
     let reasoning = format!(
-        "pr={} state={} url={} branch={} bytes_reclaimed={} truncated={} disposition={}",
+        "resolution={} head_sha={} pr={} state={} url={} branch={} \
+         bytes_reclaimed={} truncated={} disposition={}",
+        candidate.resolution,
+        candidate.head_sha.as_deref().unwrap_or("none"),
         candidate.pr_number,
         candidate.pr_state,
         candidate.pr_url,
@@ -2760,7 +3084,14 @@ struct TargetPurgeStats {
 ///   [`apply_work_states`] ne portent que `dirty` / `unpushed_commits`. Filtrer
 ///   le mauvais vecteur rendrait une population vide, c'est-à-dire un bras qui
 ///   se lit comme sain en ne faisant rien (classe mika#2205).
-/// - `prs_by_branch` — nécessaire au `pr_number` de la surface opérateur.
+/// - l'index des PR — nécessaire au `pr_number` de la surface opérateur. Depuis
+///   mika#2518 il porte aussi la population détachée : un worktree détaché dont
+///   la PR est **ouverte** était refusé `detached_head`, donc son `target/`
+///   n'était purgé **ni** par le faucheur **ni** par ce bras ; il est maintenant
+///   refusé `pr_open` et devient purgeable. Élargissement voulu et **gratuit en
+///   sûreté** — les cinq termes P1–P5 s'appliquent inchangés, verrou de build
+///   compris — et, grâce à R-6, la ligne porte désormais son `pr_number` au lieu
+///   d'un trou.
 /// - le budget — **celui de la purge**, distinct de celui du faucheur.
 #[allow(clippy::too_many_arguments)]
 async fn purge_stale_target_dirs(
@@ -2768,7 +3099,7 @@ async fn purge_stale_target_dirs(
     session_id: &str,
     trace_id: &str,
     reaper_refusals: &[ReapRefusal],
-    prs_by_branch: &HashMap<String, Vec<PrSnapshot>>,
+    prs: &PrIndex,
     live: &LiveCwds,
     now: DateTime<Utc>,
     cfg: &TargetPurgeConfig,
@@ -2910,8 +3241,8 @@ async fn purge_stale_target_dirs(
         let pr_number = candidate
             .branch
             .as_deref()
-            .and_then(|b| prs_by_branch.get(b))
-            .and_then(|prs| prs.iter().find(|p| p.is_open()))
+            .and_then(|b| prs.by_branch(b))
+            .and_then(|matched| matched.iter().find(|p| p.is_open()))
             .map(|p| p.number);
 
         let outcome = purge_outcome_for(cfg.disposition);
@@ -3081,10 +3412,41 @@ mod tests {
 
     const WT: &str = "/data/workspace/mika-platform/.claude/worktrees/fix-2420-x/mika";
 
+    /// Un SHA de 40 caractères hexadécimaux, déterministe et lisible dans un
+    /// message d'échec. **Jamais `0`** : `usable_head_sha` refuse le SHA nul, ce
+    /// qui est exactement la propriété que N3 mesure.
+    fn sha(seed: u64) -> String {
+        assert_ne!(seed, 0, "0 rendrait le SHA nul, que la clé refuse");
+        format!("{seed:040x}")
+    }
+
+    /// Une entrée **attachée** sans ligne `HEAD` — la forme des fixtures de
+    /// mika#2420, conservée telle quelle pour que V3d atteste la non-régression
+    /// du chemin attaché sans toucher à ses appels.
     fn entry(path: &str, branch: Option<&str>) -> WorktreeEntry {
         WorktreeEntry {
             path: path.to_string(),
             branch: branch.map(str::to_string),
+            head: None,
+        }
+    }
+
+    /// Une entrée **détachée** : pas de branche, un `HEAD` brut.
+    fn detached(path: &str, head: &str) -> WorktreeEntry {
+        WorktreeEntry {
+            path: path.to_string(),
+            branch: None,
+            head: Some(head.to_string()),
+        }
+    }
+
+    /// Une entrée **attachée** portant aussi son `HEAD` — la forme réelle du
+    /// porcelain, nécessaire à l'anti-vacuité V3c.
+    fn attached_with_head(path: &str, branch: &str, head: &str) -> WorktreeEntry {
+        WorktreeEntry {
+            path: path.to_string(),
+            branch: Some(branch.to_string()),
+            head: Some(head.to_string()),
         }
     }
 
@@ -3094,12 +3456,13 @@ mod tests {
             state: "MERGED".to_string(),
             head_ref_name: branch.to_string(),
             closed_at: Some(closed_secs_ago(closed_secs)),
+            head_ref_oid: sha(number),
             url: format!("https://github.com/senara-solutions/mika/pull/{number}"),
         }
     }
 
-    fn index(prs: Vec<PrSnapshot>) -> HashMap<String, Vec<PrSnapshot>> {
-        index_prs_by_branch(prs)
+    fn index(prs: Vec<PrSnapshot>) -> PrIndex {
+        PrIndex::build(prs)
     }
 
     fn clean(path: &str) -> HashMap<String, WorkState> {
@@ -3108,7 +3471,7 @@ mod tests {
 
     fn select(
         entries: &[WorktreeEntry],
-        prs: &HashMap<String, Vec<PrSnapshot>>,
+        prs: &PrIndex,
         live: &LiveCwds,
         work: &HashMap<String, WorkState>,
     ) -> ReapSelection {
@@ -3229,7 +3592,7 @@ mod tests {
         let cases: Vec<(
             &str,
             Vec<WorktreeEntry>,
-            HashMap<String, Vec<PrSnapshot>>,
+            PrIndex,
             LiveCwds,
             HashMap<String, WorkState>,
             &str,
@@ -3253,7 +3616,7 @@ mod tests {
             (
                 "T3 — aucune PR connue",
                 base_entries.to_vec(),
-                HashMap::new(),
+                PrIndex::default(),
                 no_processes(),
                 base_work.clone(),
                 REASON_PR_UNKNOWN,
@@ -3433,6 +3796,477 @@ mod tests {
         assert_eq!(only_reason(&s), vec![REASON_PR_OPEN]);
     }
 
+    // -- mika#2518 : un HEAD détaché n'est pas un worktree sans PR -----------
+
+    /// Le worktree détaché du défaut fondateur, reconstitué : `HEAD` = le
+    /// `headRefOid` d'une PR **mergée** close depuis plus que la grâce, arbre
+    /// propre, aucun processus dedans.
+    const DETACHED_WT: &str =
+        "/data/workspace/mika-platform/.claude/worktrees/feat-2425-agent-exposer/mika";
+
+    /// **V3a — contrôle positif.** C'est AC1 : un worktree en HEAD détaché dont
+    /// la PR est MERGED est **fauchable**, et il porte les trois champs qui
+    /// rendent la décision rejouable.
+    #[test]
+    fn mika2518_v3a_un_detache_de_pr_mergee_est_fauchable() {
+        let head = sha(2489);
+        let s = select(
+            &[detached(DETACHED_WT, &head)],
+            &index(vec![merged_pr(2489, "feat/2425/agent-exposer", 7200)]),
+            &no_processes(),
+            &clean(DETACHED_WT),
+        );
+        assert_eq!(
+            s.candidates.len(),
+            1,
+            "le détaché de PR mergée doit être candidat ; refus: {:?}",
+            only_reason(&s)
+        );
+        let c = &s.candidates[0];
+        assert_eq!(c.resolution, RESOLUTION_DETACHED_SHA);
+        assert_eq!(c.head_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(c.pr_number, 2489);
+        assert_eq!(
+            c.branch, "feat/2425/agent-exposer",
+            "R-6 — le nom de branche vient du `headRefName` de la PR, jamais \
+             d'une inversion de slug de chemin"
+        );
+    }
+
+    /// **V3b — les sept contrôles négatifs, un terme neutralisé à la fois.**
+    ///
+    /// Sans eux, V3a passerait aussi contre un prédicat qui fauche tout worktree
+    /// détaché — ce qui est très exactement ce qu'AC2 interdit (*« le HEAD détaché
+    /// seul ne suffit pas à faucher »*). Chaque cas doit **conserver**, et sous
+    /// **son propre motif** : un motif voisin signifierait que le terme a été
+    /// absorbé en aval, donc que le contrôle ne prouve plus rien (leçon V2 de
+    /// mika#2420).
+    ///
+    /// # Les échecs sont ACCUMULÉS, et ce n'est pas du confort
+    ///
+    /// Un `assert!` par cas avorte au premier, ce qui masque les six autres —
+    /// donc une mutation qui casse la conjonction entière (le chemin détaché
+    /// poussant son candidat sans traverser T4–T7) se lirait comme *un* contrôle
+    /// rouge au lieu de quatre. L'accumulation est ce qui rend la preuve de
+    /// mutation complète : le message nomme d'un coup tous les termes non
+    /// traversés.
+    #[test]
+    fn mika2518_v3b_sept_controles_negatifs_sur_le_chemin_detache() {
+        let head = sha(2489);
+        let branch = "feat/2425/agent-exposer";
+        let merged = || merged_pr(2489, branch, 7200);
+        let mut failures: Vec<String> = Vec::new();
+
+        // N1 — PR **ouverte** à ce SHA. AC2 littéral, et la porte d'entrée du
+        // bras de purge de mika#2497 (§ 4.3) : c'est ce motif qui alimente sa
+        // population.
+        let open = {
+            let mut pr = merged();
+            pr.state = "OPEN".to_string();
+            pr.closed_at = None;
+            pr
+        };
+        // N3 — SHA inexploitable. R-2, et le SHA nul n'est pas théorique : c'est
+        // ce que le porcelain rend pour le checkout principal.
+        let null_sha = "0".repeat(40);
+        let non_hex = "z".repeat(40);
+        let truncated = head[..39].to_string();
+        let no_head = WorktreeEntry {
+            path: DETACHED_WT.to_string(),
+            branch: None,
+            head: None,
+        };
+
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            WorktreeEntry,
+            PrIndex,
+            LiveCwds,
+            HashMap<String, WorkState>,
+            &str,
+        )> = vec![
+            (
+                "N1 — T4, une PR ouverte à ce SHA",
+                detached(DETACHED_WT, &head),
+                index(vec![open]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_PR_OPEN,
+            ),
+            (
+                "N2 — T3, aucune PR à ce SHA",
+                detached(DETACHED_WT, &sha(9999)),
+                index(vec![merged()]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD_PR_UNKNOWN,
+            ),
+            (
+                "N3a — T2, ligne HEAD absente",
+                no_head,
+                index(vec![merged()]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD,
+            ),
+            (
+                "N3b — T2, SHA nul (mesuré en production)",
+                detached(DETACHED_WT, &null_sha),
+                index(vec![merged()]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD,
+            ),
+            (
+                "N3c — T2, SHA non hexadécimal",
+                detached(DETACHED_WT, &non_hex),
+                index(vec![merged()]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD,
+            ),
+            (
+                "N3d — T2, SHA tronqué à 39",
+                detached(DETACHED_WT, &truncated),
+                index(vec![merged()]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD,
+            ),
+            (
+                "N4 — T7, worktree dirty",
+                detached(DETACHED_WT, &head),
+                index(vec![merged()]),
+                no_processes(),
+                HashMap::from([(DETACHED_WT.to_string(), WorkState::Dirty)]),
+                REASON_DIRTY,
+            ),
+            (
+                "N5 — T5, PR close depuis moins que la grâce",
+                detached(DETACHED_WT, &head),
+                index(vec![merged_pr(2489, branch, 10)]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_TOO_YOUNG,
+            ),
+            (
+                "N6 — T6, un processus vivant dedans",
+                detached(DETACHED_WT, &head),
+                index(vec![merged()]),
+                LiveCwds::Enumerated(vec![PathBuf::from(format!("{DETACHED_WT}/crates"))]),
+                clean(DETACHED_WT),
+                REASON_LIVE_PROCESS,
+            ),
+            // N7 — AC2 mot pour mot : *« branche existante ailleurs »*. La PR
+            // mergée porte bien la branche, mais son `headRefOid` est ailleurs :
+            // la clé SHA **ne retombe pas** sur la clé branche. Sans ce contrôle,
+            // un repli heuristique (R-7) passerait inaperçu.
+            (
+                "N7 — R-7, branche connue par ailleurs mais SHA sans PR",
+                detached(DETACHED_WT, &sha(9999)),
+                index(vec![merged_pr(2489, branch, 7200)]),
+                no_processes(),
+                clean(DETACHED_WT),
+                REASON_DETACHED_HEAD_PR_UNKNOWN,
+            ),
+        ];
+
+        for (label, e, prs, live, work, expected) in cases {
+            let s = select(&[e], &prs, &live, &work);
+            if !s.candidates.is_empty() {
+                failures.push(format!(
+                    "{label} — le worktree est entré dans la population de \
+                     retrait ; le HEAD détaché seul ne doit jamais suffire (AC2)"
+                ));
+                continue;
+            }
+            let got = only_reason(&s);
+            if got != vec![expected] {
+                failures.push(format!(
+                    "{label} — motif attendu {expected:?}, lu {got:?} ; un motif \
+                     voisin signifie que le terme a été absorbé en aval, donc \
+                     que ce contrôle ne prouve plus rien"
+                ));
+            }
+        }
+
+        // R-6 sur la population que le bras de purge consomme : le refus
+        // `pr_open` doit porter la branche **de la PR**, sinon la surface
+        // opérateur de mika#2497 reste aveugle sur cette population (§ 4.3).
+        let open = {
+            let mut pr = merged();
+            pr.state = "OPEN".to_string();
+            pr.closed_at = None;
+            pr
+        };
+        let s = select(
+            &[detached(DETACHED_WT, &head)],
+            &index(vec![open]),
+            &no_processes(),
+            &clean(DETACHED_WT),
+        );
+        if s.refusals.first().and_then(|r| r.branch.as_deref()) != Some(branch) {
+            failures.push(format!(
+                "R-6 — le refus `pr_open` d'un détaché doit porter {branch:?}, \
+                 lu {:?}",
+                s.refusals.first().and_then(|r| r.branch.as_deref())
+            ));
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// **V3c — anti-vacuité (R-8).** Un worktree **attaché** dont la branche n'a
+    /// aucune PR, mais dont le `HEAD` apparie une PR mergée, est refusé
+    /// `pr_unknown` — **pas** candidat.
+    ///
+    /// Sans ce test, « la clé SHA marche » serait indistinguable de « tout est
+    /// résolu par SHA », et le chemin nominal aurait gagné un risque gratuit.
+    #[test]
+    fn mika2518_v3c_le_chemin_attache_nest_jamais_resolu_par_sha() {
+        let head = sha(2489);
+        let s = select(
+            &[attached_with_head(
+                DETACHED_WT,
+                "feat/une-branche-sans-pr",
+                &head,
+            )],
+            // La PR existe, son `headRefOid` **est** le HEAD du worktree — mais
+            // sa `headRefName` est une autre branche.
+            &index(vec![merged_pr(2489, "feat/2425/agent-exposer", 7200)]),
+            &no_processes(),
+            &clean(DETACHED_WT),
+        );
+        assert!(
+            s.candidates.is_empty(),
+            "R-8 — un worktree attaché est résolu par sa branche, et seulement \
+             par elle"
+        );
+        assert_eq!(only_reason(&s), vec![REASON_PR_UNKNOWN]);
+    }
+
+    /// **V3d — non-régression du chemin attaché.** Le contrôle positif de
+    /// mika#2420 reste vert **sans modification de sa fixture**, et son candidat
+    /// porte `resolution = branch` avec `head_sha = None`.
+    #[test]
+    fn mika2518_v3d_le_chemin_attache_porte_sa_resolution_et_aucun_sha() {
+        let s = select(
+            &[entry(WT, Some("fix/2420/x"))],
+            &index(vec![merged_pr(2411, "fix/2420/x", 7200)]),
+            &no_processes(),
+            &clean(WT),
+        );
+        assert_eq!(s.candidates.len(), 1, "refus: {:?}", only_reason(&s));
+        let c = &s.candidates[0];
+        assert_eq!(c.resolution, RESOLUTION_BRANCH);
+        assert_eq!(
+            c.head_sha, None,
+            "le chemin attaché ne porte pas de SHA de jointure : il n'en a pas \
+             eu besoin pour résoudre"
+        );
+        assert_eq!(c.branch, "fix/2420/x");
+    }
+
+    /// **V3e — aucune suppression de branche locale sur le chemin détaché
+    /// (R-5).** Testé sur le prédicat, pas sur `remove_worktree`, qui touche le
+    /// disque.
+    #[test]
+    fn mika2518_v3e_le_chemin_detache_ne_supprime_aucune_branche_locale() {
+        assert!(should_delete_local_branch(RESOLUTION_BRANCH));
+        assert!(
+            !should_delete_local_branch(RESOLUTION_DETACHED_SHA),
+            "la branche nommée par la PR n'a jamais été checked out par ce \
+             worktree : la supprimer serait un effet de bord sans mandat"
+        );
+    }
+
+    /// **V3f — la surface d'audit.** `tool_name` **inchangé** (R3), `reasoning`
+    /// **commence par** `resolution=detached_sha` — ancré, donc exact pour un
+    /// `LIKE` — et porte `head_sha`. `after_value` reste les octets.
+    #[tokio::test]
+    async fn mika2518_v3f_laudit_porte_la_resolution_sans_second_tool_name() {
+        let head = sha(2489);
+        let candidate = ReapCandidate {
+            path: DETACHED_WT.to_string(),
+            branch: "feat/2425/agent-exposer".to_string(),
+            pr_number: 2489,
+            pr_state: "MERGED".to_string(),
+            pr_url: "https://github.com/senara-solutions/mika/pull/2489".to_string(),
+            resolution: RESOLUTION_DETACHED_SHA,
+            head_sha: Some(head.clone()),
+        };
+        let size = SizeMeasurement {
+            bytes: Some(17_000_000_000),
+            truncated: false,
+        };
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        record_reaped(
+            &db,
+            "session-2518",
+            &candidate,
+            &size,
+            Disposition::Armed,
+            "trace-2518",
+        )
+        .await;
+        let events = db.get_audit_events("session-2518").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == REAPED_TOOL)
+            .expect("le `tool_name` du retrait est inchangé (R3)");
+        assert_eq!(row.target_key, format!("worktree:{DETACHED_WT}"));
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some("17000000000"),
+            "`after_value` reste les octets — c'est ce que l'opérateur somme"
+        );
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(
+            reasoning.starts_with("resolution=detached_sha"),
+            "ancré en tête, pour que `reasoning LIKE 'resolution=detached_sha%'` \
+             soit exact plutôt qu'une sous-chaîne flottante — lu: {reasoning}"
+        );
+        assert!(
+            reasoning.contains(&format!("head_sha={head}")),
+            "le SHA apparié rend la décision rejouable (HALTE 1) — lu: {reasoning}"
+        );
+
+        // Miroir en `observe` : la ligne s'écrit sous `would_dispose`, et
+        // **aucune** ligne `worktree_reaped` (non-régression mika#2469).
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        record_reaped(
+            &db,
+            "session-2518-observe",
+            &candidate,
+            &size,
+            Disposition::Observe,
+            "trace-2518",
+        )
+        .await;
+        let events = db.get_audit_events("session-2518-observe").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == WOULD_DISPOSE_TOOL)
+            .expect("en observe, la ligne est `worktree_reap_would_dispose`");
+        assert!(
+            row.reasoning
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("resolution=detached_sha")
+        );
+        assert!(
+            !events.iter().any(|e| e.tool_name == REAPED_TOOL),
+            "en observe, aucune ligne `worktree_reaped` (mika#2469)"
+        );
+    }
+
+    /// **V4 — `usable_head_sha` à ses bornes.**
+    #[test]
+    fn mika2518_v4_le_sha_est_normalise_a_un_seul_site() {
+        let good = "c5c4d70f0cebdbfe3e821e65951d53473e8d99d4";
+        assert_eq!(usable_head_sha(good).as_deref(), Some(good));
+        // Casse : normalisée en minuscules, les deux côtés de l'appariement
+        // passant par ici.
+        assert_eq!(
+            usable_head_sha(&good.to_ascii_uppercase()).as_deref(),
+            Some(good)
+        );
+        // Espaces autour : le porcelain est trim-é à la lecture.
+        assert_eq!(
+            usable_head_sha(&format!("  {good}\n")).as_deref(),
+            Some(good)
+        );
+
+        for bad in [
+            "",
+            &"0".repeat(40),     // le SHA nul, mesuré en production
+            &good[..39],         // 39
+            &format!("{good}a"), // 41
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", // non hexadécimal
+        ] {
+            assert_eq!(
+                usable_head_sha(bad),
+                None,
+                "un SHA inexploitable ne doit jamais devenir une clé: {bad:?}"
+            );
+        }
+    }
+
+    /// **V4 — `PrIndex` : les deux clés, un seul site de construction.**
+    #[test]
+    fn mika2518_v4_lindex_porte_les_deux_cles() {
+        let idx = index(vec![merged_pr(2489, "feat/a", 7200)]);
+        let head = sha(2489);
+        assert_eq!(idx.by_branch("feat/a").map(<[_]>::len), Some(1));
+        assert_eq!(idx.by_head_sha(&head).map(<[_]>::len), Some(1));
+        // Appariement insensible à la casse des deux côtés.
+        assert_eq!(
+            idx.by_head_sha(&head.to_ascii_uppercase()).map(<[_]>::len),
+            Some(1)
+        );
+        assert!(idx.by_branch("feat/inconnue").is_none());
+        assert!(idx.by_head_sha(&sha(1)).is_none());
+
+        // Deux PR partageant un `headRefOid` (une fermée puis rouverte depuis le
+        // même commit) : les deux sont rendues, et c'est T4 — formulé en négatif —
+        // qui tranche, sans une ligne de plus (§ 2.5).
+        let mut reopened = merged_pr(2490, "feat/b", 60);
+        reopened.state = "OPEN".to_string();
+        reopened.closed_at = None;
+        reopened.head_ref_oid = sha(2489);
+        let idx = index(vec![merged_pr(2489, "feat/a", 7200), reopened]);
+        assert_eq!(idx.by_head_sha(&head).map(<[_]>::len), Some(2));
+        let s = select(
+            &[detached(DETACHED_WT, &head)],
+            &idx,
+            &no_processes(),
+            &clean(DETACHED_WT),
+        );
+        assert!(
+            s.candidates.is_empty(),
+            "deux PR au même SHA dont une ouverte : T4 conserve"
+        );
+        assert_eq!(only_reason(&s), vec![REASON_PR_OPEN]);
+    }
+
+    /// **V4 — R-4 : un payload `gh` SANS `headRefOid` parse quand même**, et
+    /// n'apparie rien.
+    ///
+    /// C'est le test qui garantit que **le chemin attaché survit à l'absence du
+    /// champ** : sans `#[serde(default)]`, `list_prs` rendrait `Err` et le dépôt
+    /// entier serait sauté — un champ additif éteignant la fonction qu'il
+    /// enrichit.
+    #[test]
+    fn mika2518_v4_un_head_ref_oid_absent_degrade_sans_eteindre() {
+        let sans_oid = r#"[{"number":2489,"state":"MERGED",
+            "headRefName":"feat/2425/agent-exposer",
+            "closedAt":"2026-09-24T19:30:25Z",
+            "url":"https://github.com/senara-solutions/mika/pull/2489"}]"#;
+        let prs: Vec<PrSnapshot> = serde_json::from_str(sans_oid)
+            .expect("R-4 — l'absence du champ ne doit pas être fatale");
+        assert_eq!(prs[0].head_ref_oid, "");
+
+        let idx = PrIndex::build(prs);
+        assert_eq!(
+            idx.by_branch("feat/2425/agent-exposer").map(<[_]>::len),
+            Some(1),
+            "le chemin attaché reste résolu"
+        );
+        // La chaîne vide n'indexe rien : la dégradation est bornée au nouveau
+        // chemin, et un détaché retombe sur « conserver ».
+        assert!(idx.by_head_sha("").is_none());
+        let s = select(
+            &[detached(DETACHED_WT, &sha(2489))],
+            &idx,
+            &no_processes(),
+            &clean(DETACHED_WT),
+        );
+        assert!(s.candidates.is_empty());
+        assert_eq!(only_reason(&s), vec![REASON_DETACHED_HEAD_PR_UNKNOWN]);
+    }
+
     // -- V4 : gardes structurelles ------------------------------------------
 
     /// Aucun chemin hors de `.claude/worktrees/` n'atteint la population, y
@@ -3518,6 +4352,9 @@ mod tests {
                 "pr_closed_at_unreadable",
                 "work_state_unreadable",
                 "process_scan_unreadable",
+                // mika#2518 — ajouté en queue, jamais inséré : l'ordre est lu
+                // par un humain qui compare deux versions de ce test.
+                "detached_head_pr_unknown",
             ],
             "renommer un motif est une rupture de format de fil : la dater dans \
              CLAUDE.md, jamais mettre ce test à jour en silence"
@@ -3526,6 +4363,33 @@ mod tests {
         for r in ALL_REFUSAL_REASONS {
             assert!(seen.insert(*r), "motif dupliqué: {r}");
         }
+    }
+
+    /// **Format de fil (mika#2518).** Les clés de résolution atterrissent en tête
+    /// de `audit_events.reasoning` et sur le champ `resolution` de la ligne INFO.
+    /// Même forme que son aînée ci-dessus : liste figée, unicité, et l'assertion
+    /// que les deux valeurs diffèrent.
+    #[test]
+    fn mika2518_les_resolutions_sont_un_format_de_fil() {
+        assert_eq!(
+            ALL_RESOLUTIONS,
+            &["branch", "detached_sha"],
+            "renommer une clé de résolution est une rupture de format de fil : \
+             la dater dans CLAUDE.md, jamais mettre ce test à jour en silence"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for r in ALL_RESOLUTIONS {
+            assert!(seen.insert(*r), "résolution dupliquée: {r}");
+        }
+        assert_ne!(RESOLUTION_BRANCH, RESOLUTION_DETACHED_SHA);
+        // `detached_sha` et non `detached_head` : ce dernier est déjà un motif de
+        // refus, et deux vocabulaires distincts ne doivent pas partager une
+        // chaîne (§ 2.3).
+        assert_ne!(
+            RESOLUTION_DETACHED_SHA, REASON_DETACHED_HEAD,
+            "la clé de résolution et le motif de refus doivent rester deux \
+             chaînes distinctes"
+        );
     }
 
     /// Les `tool_name` d'audit des retraits **et** des observations ont **un
@@ -3596,6 +4460,8 @@ mod tests {
             pr_number: 2469,
             pr_state: "MERGED".to_string(),
             pr_url: "https://github.com/senara-solutions/mika/pull/2469".to_string(),
+            resolution: RESOLUTION_BRANCH,
+            head_sha: None,
         };
         let size = SizeMeasurement {
             bytes: Some(1_000),
@@ -3802,6 +4668,73 @@ detached
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
         assert_eq!(entries[1].branch.as_deref(), Some("fix/2420/x"));
         assert_eq!(entries[2].branch, None, "detached HEAD n'a pas de branche");
+        // mika#2518 — la ligne `HEAD` est capturée **brute**, pour chaque entrée,
+        // détachée comprise. La normalisation est le travail d'`usable_head_sha`.
+        assert_eq!(entries[0].head.as_deref(), Some("abc123"));
+        assert_eq!(entries[1].head.as_deref(), Some("def456"));
+        assert_eq!(
+            entries[2].head.as_deref(),
+            Some("789abc"),
+            "c'est très exactement la ligne qui rend un détaché résolvable"
+        );
+    }
+
+    /// **V4 — la forme réelle du porcelain**, relevée sur cet arbre : SHA
+    /// complet, entrée attachée, entrée détachée, entrée `prunable` écartée, et
+    /// une entrée `bare` (qui n'a ni branche ni `HEAD` exploitable).
+    #[test]
+    fn mika2518_v4_le_registre_reel_porte_le_sha_de_chaque_entree() {
+        let attached = "c5c4d70f0cebdbfe3e821e65951d53473e8d99d4";
+        let detached_sha = "24f25e99a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let porcelain = format!(
+            "\
+worktree /data/workspace/mika-platform/mika
+HEAD 0000000000000000000000000000000000000000
+detached
+
+worktree /data/workspace/mika-platform/.claude/worktrees/feat-2518-x/mika
+HEAD {attached}
+branch refs/heads/feat/2518/x
+
+worktree /data/workspace/mika-platform/.claude/worktrees/feat-2425-agent/mika
+HEAD {detached_sha}
+detached
+
+worktree /data/workspace/mika-platform/.claude/worktrees/gone/mika
+HEAD {attached}
+branch refs/heads/feat/gone/x
+prunable gitdir file points to non-existent location
+
+worktree /data/workspace/mika-platform/mika-bare
+bare
+"
+        );
+        let entries = parse_worktree_registry(&porcelain);
+        assert_eq!(entries.len(), 4, "l'entrée `prunable` est écartée");
+
+        // Le checkout principal : détaché **et** SHA nul — la forme mesurée qui
+        // motive le refus du SHA nul dans `usable_head_sha`.
+        assert_eq!(entries[0].branch, None);
+        assert_eq!(usable_head_sha(entries[0].head.as_deref().unwrap()), None);
+
+        assert_eq!(entries[1].branch.as_deref(), Some("feat/2518/x"));
+        assert_eq!(
+            usable_head_sha(entries[1].head.as_deref().unwrap()).as_deref(),
+            Some(attached)
+        );
+
+        assert_eq!(entries[2].branch, None);
+        assert_eq!(
+            usable_head_sha(entries[2].head.as_deref().unwrap()).as_deref(),
+            Some(detached_sha),
+            "c'est la seule entrée que mika#2518 rend fauchable, et seulement \
+             si une PR porte ce `headRefOid`"
+        );
+
+        // L'entrée `bare` n'a ni branche ni `HEAD` : elle sort par T1 (hors
+        // racine gérée) avant même la question de la clé.
+        assert_eq!(entries[3].branch, None);
+        assert_eq!(entries[3].head, None);
     }
 
     /// Une entrée `prunable` est écartée : son répertoire n'existe déjà plus,
@@ -3945,6 +4878,8 @@ branch refs/heads/fix/live/x
             pr_number: 2411,
             pr_state: "MERGED".to_string(),
             pr_url: "https://github.com/senara-solutions/mika/pull/2411".to_string(),
+            resolution: RESOLUTION_BRANCH,
+            head_sha: None,
         };
         let size = SizeMeasurement {
             bytes: Some(34_000_000_000),
@@ -4396,6 +5331,7 @@ branch refs/heads/fix/live/x
             state: "OPEN".to_string(),
             head_ref_name: branch.to_string(),
             closed_at: None,
+            head_ref_oid: sha(number),
             url: format!("https://github.com/senara-solutions/mika/pull/{number}"),
         }
     }
