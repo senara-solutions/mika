@@ -41,6 +41,33 @@ pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 // as a cross-repo follow-up filed alongside this PR (see PR body §Follow-ups).
 // This annotation covers the in-mika-agent structural gate only.
 pub(crate) fn is_unauthorized_webhook_dispatch(msg: &str) -> bool {
+    is_webhook_fallthrough_domain(msg)
+}
+
+/// True when `msg` is a `[GitHub]` webhook event in the **Webhook Fallthrough**
+/// domain — the complement of (a) the ready-label dispatch marker, (b) PR events
+/// (qa skill territory) and (c) check-suite events (ci skill territory).
+///
+/// **The same set as [`is_unauthorized_webhook_dispatch`], asked as a different
+/// question**, and that is why there are two names for one body. That predicate
+/// answers *"may this turn dispatch a pilot?"* and its two callers are refusals
+/// (the tool-boundary gate 0 of `validate_dispatch_readiness`, the
+/// `webhook_no_unauthorized_dispatch` intent guard); this one answers *"is this
+/// turn in the acknowledge-and-stop domain?"* and its callers withhold a tool
+/// (mika#2517 U2) and stand a guard down (U3). One definition, so the four
+/// consumers cannot drift — the class `grooming_marker` had to engrave once
+/// (mika#2158: a copied regex whose own comment said "Mirrors …" and which then
+/// missed two widenings).
+///
+/// Renaming `is_unauthorized_webhook_dispatch` was refused: ~20 test references
+/// and two refusal sites documented by three tickets (mika#910 / #933 / #1102)
+/// would churn for nothing, on a name that carries its own meaning correctly.
+///
+/// The body is the one that used to live in `is_unauthorized_webhook_dispatch`,
+/// moved and not modified — the eight-row matrix that pinned it there
+/// (`test_is_unauthorized_webhook_dispatch_predicate`) still runs against that
+/// name, which is what attests the move is a move.
+pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
     if !msg.starts_with("[GitHub]") {
         return false;
     }
@@ -57,6 +84,58 @@ pub(crate) fn is_unauthorized_webhook_dispatch(msg: &str) -> bool {
     }
     // Everything else in [GitHub] domain (rows B, C, D, H) is fallthrough.
     true
+}
+
+/// The event class of a Webhook Fallthrough turn, as a **wire format**
+/// (mika#2517 U4).
+///
+/// These five values land in `audit_events.after_value` and an operator writes
+/// `GROUP BY` over them, so two spellings of one class would split a population
+/// without saying so. One definition site, pinned by
+/// `mika2517_marker_class_is_a_wire_format`.
+///
+/// Only meaningful on a message [`is_webhook_fallthrough_domain`] accepts; the
+/// caller establishes that first. `MARKER_CLASS_OTHER` covers the unknown-event
+/// catchall (row H) and anything the gateway starts emitting tomorrow — a class
+/// nobody enumerated is still a class we can count.
+pub(crate) const MARKER_CLASS_ISSUE_LABELED: &str = "issue_labeled";
+pub(crate) const MARKER_CLASS_ISSUE_COMMENT: &str = "issue_comment";
+pub(crate) const MARKER_CLASS_ISSUE_ASSIGNED: &str = "issue_assigned";
+pub(crate) const MARKER_CLASS_ISSUE_CLOSED: &str = "issue_closed";
+pub(crate) const MARKER_CLASS_OTHER: &str = "other";
+
+/// Every value [`fallthrough_marker_class`] can return, for the wire-format pin.
+///
+/// Its only consumer is the pinning test, and it stays in production rather
+/// than behind `#[cfg(test)]` on purpose: the registry of a wire format is what
+/// an operator reads to know what a `GROUP BY` can return, and a registry that
+/// exists only under `cfg(test)` is one a reader of this file cannot find.
+#[allow(dead_code)]
+pub(crate) const ALL_MARKER_CLASSES: &[&str] = &[
+    MARKER_CLASS_ISSUE_LABELED,
+    MARKER_CLASS_ISSUE_COMMENT,
+    MARKER_CLASS_ISSUE_ASSIGNED,
+    MARKER_CLASS_ISSUE_CLOSED,
+    MARKER_CLASS_OTHER,
+];
+
+/// Classify a Webhook Fallthrough message into one of [`ALL_MARKER_CLASSES`].
+///
+/// The prefixes are those `mika_gateway::github::format_event_text` emits. This
+/// is **observability only** — no decision reads it, which is why an unknown
+/// shape falls to `other` rather than being refused.
+pub(crate) fn fallthrough_marker_class(msg: &str) -> &'static str {
+    if msg.starts_with("[GitHub] Issue labeled ") {
+        MARKER_CLASS_ISSUE_LABELED
+    } else if msg.starts_with("[GitHub] New comment on ") {
+        MARKER_CLASS_ISSUE_COMMENT
+    } else if msg.starts_with("[GitHub] Issue assigned") {
+        MARKER_CLASS_ISSUE_ASSIGNED
+    } else if msg.starts_with("[GitHub] Issue closed") {
+        MARKER_CLASS_ISSUE_CLOSED
+    } else {
+        MARKER_CLASS_OTHER
+    }
 }
 
 /// True when the message matches the ready-label dispatch marker prefix.
@@ -625,6 +704,188 @@ mod tests {
             !is_unauthorized_webhook_dispatch("Implement mika#933"),
             "Non-domain: direct mika ask prompt must not be caught"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2517 U1 — one body, two names.
+    // ---------------------------------------------------------------------
+
+    /// The Phase 0 prefix surface, as data, so the two names can be asserted
+    /// against **the same** matrix rather than against two hand-copied ones.
+    ///
+    /// Deliberately a second copy of the rows
+    /// `test_is_unauthorized_webhook_dispatch_predicate` asserts inline: that
+    /// test is left byte-for-byte untouched, because it is what attests the
+    /// mika#2517 move is a move and not a rewrite. Folding it into this table
+    /// would have made it a test edited in the same commit as the code it pins.
+    const PREFIX_SURFACE_MATRIX: &[(&str, bool, &str)] = &[
+        (
+            "[GitHub] Issue labeled ready on senara-solutions/mika#933 — title",
+            false,
+            "Row A — authorized ready-label dispatch",
+        ),
+        (
+            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
+            true,
+            "Row B — non-ready label",
+        ),
+        (
+            "[GitHub] Issue labeled p1-important on senara-solutions/mika#999",
+            true,
+            "Row B — non-ready label",
+        ),
+        (
+            "[GitHub] Issue opened: senara-solutions/mika#100 — title",
+            true,
+            "Row C — issue opened",
+        ),
+        (
+            "[GitHub] Issue assigned: senara-solutions/mika#100 — title",
+            true,
+            "Row C — issue assigned",
+        ),
+        (
+            "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko",
+            true,
+            "Row D — issue comment (the mika#932 incident class)",
+        ),
+        (
+            "[GitHub] PR opened: senara-solutions/mika#1000 — title (branch: foo)",
+            false,
+            "Row E — PR opened (qa skill territory)",
+        ),
+        (
+            "[GitHub] PR closed: senara-solutions/mika#1000 — title (branch: foo)",
+            false,
+            "Row E — PR closed (qa skill territory)",
+        ),
+        (
+            "[GitHub] PR review (approved) on senara-solutions/mika#1000 (title) by @reviewer",
+            false,
+            "Row F — PR review approved (qa skill territory)",
+        ),
+        (
+            "[GitHub] PR review (changes_requested) on senara-solutions/mika#1000 (title) by @reviewer",
+            false,
+            "Row F — PR review changes_requested (qa skill territory)",
+        ),
+        (
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/foo)",
+            false,
+            "Row G — check suite failure (ci skill territory)",
+        ),
+        (
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)",
+            false,
+            "Row G — check suite success (ci skill territory)",
+        ),
+        (
+            "[GitHub] discussion.created on senara-solutions/mika",
+            true,
+            "Row H — unknown event catchall (fail-closed)",
+        ),
+        (
+            "[claude-pilot] callback ...",
+            false,
+            "Non-domain — claude-pilot prefix",
+        ),
+        ("", false, "Non-domain — empty string"),
+        (
+            "Implement mika#933",
+            false,
+            "Non-domain — direct mika ask prompt",
+        ),
+    ];
+
+    /// **V1** — the move is a move: the eight-row matrix holds on the new name
+    /// exactly as it holds on the old one.
+    ///
+    /// Pinning both names separately is what makes a future narrowing of the
+    /// primitive legible. With one test only, an editor who tightened
+    /// `is_webhook_fallthrough_domain` would see a single failure and could read
+    /// it as "the alias is stale" rather than "I changed the domain".
+    #[test]
+    fn mika2517_the_same_matrix_holds_for_the_domain_name() {
+        for (msg, expected, why) in PREFIX_SURFACE_MATRIX {
+            assert_eq!(
+                is_webhook_fallthrough_domain(msg),
+                *expected,
+                "{why}: is_webhook_fallthrough_domain({msg:?})"
+            );
+            assert_eq!(
+                is_unauthorized_webhook_dispatch(msg),
+                *expected,
+                "{why}: is_unauthorized_webhook_dispatch({msg:?}) — the two names \
+                 share one body and must never disagree"
+            );
+        }
+    }
+
+    /// **U4** — `marker_class` is a wire format: every value the classifier can
+    /// return is declared, and every declared value is reachable.
+    ///
+    /// Both directions. Without the second half a value could be declared,
+    /// grouped on by an operator, and produced by nothing — a column of zeros
+    /// that reads like a healthy population.
+    #[test]
+    fn mika2517_marker_class_is_a_wire_format() {
+        let cases = [
+            (
+                "[GitHub] Issue labeled bug on senara-solutions/mika#999",
+                MARKER_CLASS_ISSUE_LABELED,
+            ),
+            (
+                "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko",
+                MARKER_CLASS_ISSUE_COMMENT,
+            ),
+            (
+                "[GitHub] Issue assigned: senara-solutions/mika#100 — title",
+                MARKER_CLASS_ISSUE_ASSIGNED,
+            ),
+            (
+                "[GitHub] Issue closed: senara-solutions/mika#100 — title",
+                MARKER_CLASS_ISSUE_CLOSED,
+            ),
+            (
+                "[GitHub] discussion.created on senara-solutions/mika",
+                MARKER_CLASS_OTHER,
+            ),
+        ];
+
+        for (msg, expected) in cases {
+            assert_eq!(
+                fallthrough_marker_class(msg),
+                expected,
+                "marker class of {msg:?}"
+            );
+            assert!(
+                ALL_MARKER_CLASSES.contains(&expected),
+                "{expected} is produced but not declared"
+            );
+        }
+
+        let produced: Vec<&str> = cases.iter().map(|(_, c)| *c).collect();
+        for declared in ALL_MARKER_CLASSES {
+            assert!(
+                produced.contains(declared),
+                "{declared} is declared but unreachable — an operator would \
+                 GROUP BY a value nothing writes"
+            );
+        }
+    }
+
+    /// The classifier never looks at a message the domain predicate refuses —
+    /// but if a caller ever hands it one, it must not invent a class.
+    #[test]
+    fn mika2517_a_non_domain_message_classifies_as_other() {
+        for msg in [
+            "[GitHub] PR opened: senara-solutions/mika#1000 — title",
+            "[GitHub] Check suite success on senara-solutions/mika (branch: main)",
+            "Implement mika#933",
+            "",
+        ] {
+            assert_eq!(fallthrough_marker_class(msg), MARKER_CLASS_OTHER);
+        }
     }
 
     #[test]
