@@ -133,8 +133,32 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 # URL parsing
 url = "2"
 
-# JWT
-jsonwebtoken = "9"
+# JWT — GitHub App RS256 signing (crates/mika-common/src/github_app.rs).
+#
+# `features = ["aws_lc_rs"]` est LOAD-BEARING, pas cosmétique (mika#2525).
+# jsonwebtoken 11 a retiré `ring` pour une architecture à provider enfichable :
+# son `default` ne porte QUE `use_pem`, donc aucun backend crypto n'est actif
+# par défaut et tout appel à `encode`/`decode` PANIQUE à l'exécution — sur un
+# build parfaitement vert. Exactement une des deux features
+# `rust_crypto`/`aws_lc_rs` doit être active : le `cfg` de
+# `crypto::CryptoProvider::from_crate_features` est une cascade EXCLUSIVE, donc
+# en activer deux en active zéro et rend la même panique.
+#
+# `aws_lc_rs` plutôt que `rust_crypto`, et le décompte est MESURÉ sur
+# `git diff Cargo.lock` (jamais sur `cargo tree`, qui montre le graphe et non les
+# features effectives) : aws-lc-rs 1.18 est déjà dans l'arbre via
+# reqwest -> hyper-rustls -> rustls et via sqlx, mais l'activer ici ajoute quand
+# même DEUX crates — `untrusted 0.7.1` et `zeroize_derive 1.5.0` — parce que
+# rustls déclare aws-lc-rs avec `default-features = false` là où jsonwebtoken le
+# déclare sans. Ce n'est donc pas gratuit ; c'est moins cher que `rust_crypto`,
+# qui ajouterait ed25519-dalek, p256 et p384. La toolchain native d'aws-lc-sys
+# est déjà satisfaite partout où mika se construit, puisque sqlx active
+# `tls-rustls-aws-lc-rs`.
+#
+# NE PAS poser `default-features = false` : ça retire `use_pem`, donc
+# `EncodingKey::from_rsa_pem`, appelé à trois sites de PRODUCTION
+# (github_app.rs:95, :131, mika-cli/src/commands/doctor.rs:536).
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Process management (Linux)
 libc = "0.2"
