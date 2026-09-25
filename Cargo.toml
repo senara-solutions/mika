@@ -101,7 +101,7 @@ tui-textarea = { version = "0.9", package = "ratatui-textarea", features = ["cro
 crossterm = "0.29"
 
 # Encoding
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 
 # Clipboard & Image encoding

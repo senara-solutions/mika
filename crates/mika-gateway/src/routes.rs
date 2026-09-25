@@ -4585,4 +4585,91 @@ mod tests {
             assert!(literal_argument_sites(commented).is_empty());
         }
     }
+
+    // ── mika#2135 — the status FAMILY `scripts/smoke-webhook-chain` decides on ──
+
+    /// Consumer: `scripts/smoke-webhook-chain`, called by `make check-webhook-chain`
+    /// at the end of `make deploy`.
+    ///
+    /// That probe traverses the public webhook chain (Freebox → Synology →
+    /// gentux:8080) with an unauthenticated `POST {}` and reads *the chain is
+    /// alive* off the status that comes back. It deliberately accepts a **family**
+    /// — `{400, 401, 404, 415, 422}` — rather than the `422` the founding incident
+    /// happened to measure, because all of them are answers the gateway's own Axum
+    /// stack produced, and pinning one code would make the probe shout the day an
+    /// extractor detail moved.
+    ///
+    /// The property that makes the family safe is the one asserted here: this route
+    /// **never answers 2xx to an unauthenticated `{}`**. If it ever did, the probe
+    /// would classify the answer as *nothing verified* (a 2xx is not evidence of
+    /// traversal) and a genuinely wired chain would start reporting `NOTE:` — or,
+    /// worse, a future widening of the family would turn the probe into a false
+    /// green with no behavioural test moving. The chain-side half of the contract
+    /// is pinned by `scripts/test-smoke-webhook-chain.sh`; this is the gateway half.
+    mod mika2135 {
+        use super::super::*;
+        use super::mika2360::state;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        /// The family the probe reads as "the chain was traversed".
+        const TRAVERSAL_FAMILY: [u16; 5] = [400, 401, 404, 415, 422];
+
+        async fn post_webhook(content_type: Option<&str>, body: &'static str) -> StatusCode {
+            let app = build_router(state(None, None));
+            let mut req = Request::builder().method("POST").uri("/webhook/telegram");
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            app.oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+
+        /// What the probe actually sends: `Content-Type: application/json`, body `{}`.
+        ///
+        /// `TelegramUpdate.update_id` is a required `i64`, and `Json<_>` is an
+        /// *extractor* — Axum runs it before the handler body, so this fails before
+        /// the secret check and before the single-bot-mode guard. That is also why
+        /// the probe needs no secret and injects no update.
+        #[tokio::test]
+        async fn the_probes_own_request_lands_in_the_traversal_family() {
+            let status = post_webhook(Some("application/json"), "{}").await;
+            assert!(
+                TRAVERSAL_FAMILY.contains(&status.as_u16()),
+                "POST /webhook/telegram with `{{}}` answered {status}, which is outside the \
+                 family scripts/smoke-webhook-chain reads as a live chain ({TRAVERSAL_FAMILY:?}). \
+                 The probe would now report `NOTE: … cannot classify` on a healthy chain."
+            );
+        }
+
+        /// The load-bearing half, and the one a behavioural test of the probe cannot
+        /// see: a 2xx here would make the probe's *silence* unreachable and its
+        /// family meaningless.
+        #[tokio::test]
+        async fn an_unauthenticated_webhook_post_is_never_a_success() {
+            for (ct, body) in [
+                (Some("application/json"), "{}"),
+                (Some("application/json"), "not json at all"),
+                (Some("text/plain"), "{}"),
+                (None, "{}"),
+            ] {
+                let status = post_webhook(ct, body).await;
+                assert!(
+                    !status.is_success(),
+                    "POST /webhook/telegram (content-type {ct:?}) answered {status} — a success \
+                     to an unauthenticated request. scripts/smoke-webhook-chain treats a 2xx as \
+                     unclassifiable, so this turns a wired chain into a permanent `NOTE:`."
+                );
+                assert!(
+                    TRAVERSAL_FAMILY.contains(&status.as_u16()),
+                    "POST /webhook/telegram (content-type {ct:?}) answered {status}, outside \
+                     {TRAVERSAL_FAMILY:?}. Either widen the family in BOTH this test and the \
+                     probe's `case` statement, or the probe stops recognising a live chain."
+                );
+            }
+        }
+    }
 }
