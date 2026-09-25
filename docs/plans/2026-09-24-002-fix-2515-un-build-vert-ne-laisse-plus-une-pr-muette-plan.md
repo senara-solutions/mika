@@ -41,30 +41,34 @@ vrai. **Le déclencheur n'est pas le défaut.**
 `post_callback_verdict_net` (`task_engine/dispatcher.rs:836`) lit
 `SilentTurnOutcome.qa_verdict_unmet`, que `run_silent_agent` ne rend que sur la
 branche `Ok`. Et `run_loop` ne **pose** ce drapeau qu'à deux sites
-(`agent_loop/mod.rs:3900` et `:4096`) — alors qu'il a **six** sorties.
+(`agent_loop/mod.rs:3959` et `:4155`) — alors qu'il a **six** sorties.
 
 #### Les six sorties de `run_loop`, et qui les couvre
 
+Numéros relevés à HEAD `bb198d2e`, et **à re-vérifier par ancre avant d'éditer** —
+ils ont déjà dérivé une fois entre deux passes de ce plan (cf. *Re-localiser les
+six sites*).
+
 | ligne | sortie | atteignable en `Silent` ? | signal posé aujourd'hui |
 |---|---|---|---|
-| `3912` | `Done` — texte non vide | oui | ✅ mika#2368 (site 1/2) |
-| `4108` | `Done` — texte vide, **`Silent` uniquement** | oui | ✅ mika#2368 (site 2/2) |
-| `4155` | `Done` — texte vide **après follow-up** | **non** | — (hors population, voir ci-dessous) |
-| `4297` | `Done` — **« Force EndTurn » après `send_message`** | **oui** | ❌ **trou de mika#2368** |
-| `1433` | `DeadlineExceeded` | oui | ❌ périmètre mika#2515 |
-| `4314` | `MaxStepsExceeded` | oui | ❌ périmètre mika#2515 |
+| `3971` | `Done` — texte non vide | oui | ✅ mika#2368 (site 1/2) |
+| `4167` | `Done` — texte vide, **`Silent` uniquement** | oui | ✅ mika#2368 (site 2/2) |
+| `4214` | `Done` — texte vide **après follow-up** | **non** | — (hors population, voir ci-dessous) |
+| `4356` | `Done` — **« Force EndTurn » après `send_message`** | **oui** | ❌ **trou de mika#2368** |
+| `1492` | `DeadlineExceeded` | oui | ❌ périmètre mika#2515 |
+| `4373` | `MaxStepsExceeded` | oui | ❌ périmètre mika#2515 |
 
-`4155` sort de la population **par construction, pas par chance** :
+`4214` sort de la population **par construction, pas par chance** :
 `LoopMode::follow_up_on_empty()` rend `true` pour `Conversation | Team`
-seulement, et un tour de callback est `Silent`. Le commentaire du site `4108` le
+seulement, et un tour de callback est `Silent`. Le commentaire du site `4167` le
 dit déjà (« Silent-mode-only exit (`!follow_up_on_empty`) »), et
 `test_loop_mode_silent_properties` l'épingle. Une sortie exclue **pour une
 raison lisible** n'est pas une sortie oubliée — mais l'exclusion doit être
 écrite, sans quoi la prochaine lecture la recompte.
 
-#### Le trou de mika#2368 découvert au grooming — `4297`
+#### Le trou de mika#2368 découvert au grooming — `4356`
 
-Le site `4297` est un `return Ok(LoopResult::Done)` pris depuis la branche
+Le site `4356` est un `return Ok(LoopResult::Done)` pris depuis la branche
 `LlmStopReason::ToolUse`, quand un `send_message` a été livré : le tour est
 **conclu** sans que le modèle ait jamais émis d'EndTurn. Il est atteignable en
 mode `Silent` (aucun garde de mode ne le protège), donc un tour de callback de
@@ -108,7 +112,7 @@ indéfiniment, sans compteur, sans ligne d'audit, sans ligne de journal.
 Le fait est perdu, mais **pas par le même mécanisme sur les deux bras**, et la
 distinction décide du câblage d'U1b :
 
-- `LoopResult::DeadlineExceeded` (`mod.rs:6509`) termine par
+- `LoopResult::DeadlineExceeded` (`mod.rs:6605`) termine par
   `return Ok(SilentTurnOutcome::default())` — le fait est **explicitement jeté**,
   avec un commentaire mika#2368 qui le motive par « c'est le périmètre de l'autre
   motif (`CutOffByDeadline`, mika#2276) ». Or ce motif est câblé au call-site
@@ -116,7 +120,7 @@ distinction décide du câblage d'U1b :
 - `LoopResult::MaxStepsExceeded` (`mod.rs:6451`) ne rend `default()` que dans sa
   **sous-branche** « deadline trop proche pour tenter la continuation » ; le
   chemin nominal **tombe à travers** vers la construction finale
-  (`mod.rs:6571`), qui **lit** le drapeau. Le fait n'y est donc pas jeté par le
+  (`mod.rs:6650`), qui **lit** le drapeau. Le fait n'y est donc pas jeté par le
   bras : il est absent parce que `run_loop` ne l'a jamais posé.
 
 **Trois sites à toucher, pas deux** — et deux natures différentes : un renvoi
@@ -156,7 +160,7 @@ Ce n'est pas un retard, c'est un cul-de-sac.
 
 | # | population | tour tourne ? | filet fire ? | télémétrie aujourd'hui |
 |---|---|---|---|---|
-| P0 | tour **conclu** par le « Force EndTurn » de `send_message` (`mod.rs:4297`) | **oui** | **non** (site jamais instrumenté) | rien — indistinguable d'un tour sain |
+| P0 | tour **conclu** par le « Force EndTurn » de `send_message` (`mod.rs:4356`) | **oui** | **non** (site jamais instrumenté) | rien — indistinguable d'un tour sain |
 | P1 | `AgentBusy` : le verrou d'agent n'est jamais gagné | **non** | non (exige `Ok`) | **rien du tout** (`debug!` non collecté, WARN supprimé, compteur mika#2179 non incrémenté) |
 | P2 | `run_silent_agent` rend `Err` | partiellement | non (exige `Ok`) | mika#2179 (`callback_delivery_failed`, quarantaine) — ne dit rien d'une PR muette |
 | P3 | tour coupé (`DeadlineExceeded` / `MaxStepsExceeded`) | **oui** | **non** (drapeau posé aux seules sorties EndTurn) | `agent deadline exceeded` — ne dit rien d'une PR muette |
@@ -328,7 +332,7 @@ PAT-first (ADR-008), registre, 422 idempotent, « ne jamais rendre d'erreur ».
 
 ### U1e — P0 : le troisième miroir de mika#2368
 
-Au site `mod.rs:4297`, **le même `if let` que les deux sites mika#2368
+Au site `mod.rs:4356`, **le même `if let` que les deux sites mika#2368
 existants**, appelant `verdict_unmet_after_retry` — et non le prédicat de
 coupure :
 
@@ -498,21 +502,50 @@ lecture. **Un numéro de ligne pourrit en silence** — c'est très exactement c
 mika#2201 refuse pour son TSV de jetons (« jamais un numéro de ligne, qui pourrit
 en silence ») — et `agent_loop/mod.rs` fait plus de dix mille lignes, donc un
 implémenteur qui arrive après un autre correctif trouvera du code étranger à
-`4297`. Chaque ancre ci-dessous a été **relevée et vérifiée unique** dans
-`agent_loop/mod.rs` à la conception (HEAD `8f844ffb`) ; l'implémenteur les
-re-vérifie avant d'éditer plutôt que de se fier aux numéros.
+`4356`. Chaque ancre ci-dessous a été **relevée et vérifiée unique** dans
+`agent_loop/mod.rs`, au dernier relevé à HEAD `bb198d2e` ; l'implémenteur les
+re-vérifie avant d'éditer plutôt que de se fier aux numéros. **Ce plan a déjà vu
+ses numéros pourrir une fois entre deux passes de grooming** — la suite de cette
+section est le récit de cette péremption, gardé parce qu'il vaut plus que les
+numéros qu'il corrige.
 
-**Une version antérieure de ce plan annonçait ici une dérive des numéros, et
-cette annonce était fausse — la rectification est conservée plutôt qu'effacée,
-parce que le piège qui l'a produite attend le prochain lecteur.** Re-relevé à
-HEAD `719ab535` : les six `Ok(LoopResult::…)` sont **toujours** à `1433`, `3912`,
-`4108`, `4155`, `4297`, `4314`, inchangés. Les numéros présentés comme
-« glissés » (`1431`, `3896`, `4112`, `4150`, `4276`, `4312`) sont ceux des
-**ancres** — les commentaires et les logs qui annoncent ces sorties — jamais des
-sorties elles-mêmes. L'arithmétique suffit à le trancher sans rouvrir le
-fichier : une dérive décale tout dans le **même sens**, or `4108`→`4112` monte de
-quatre pendant que les cinq autres descendent. Deux objets distincts, mesurés
-puis soustraits l'un de l'autre.
+**Deux erreurs opposées se sont succédé ici, et les deux sont conservées plutôt
+qu'effacées, parce que chacune attend le prochain lecteur.**
+
+*La première* : une version antérieure annonçait une dérive qui n'existait pas.
+Elle avait comparé les numéros des **sorties** à ceux des **ancres** — les
+commentaires et les logs qui annoncent ces sorties — et lu l'écart entre deux
+objets distincts comme le déplacement d'un seul. L'arithmétique suffisait à la
+trancher sans rouvrir le fichier : une dérive décale tout dans le **même sens**,
+or l'un des six écarts est positif quand les cinq autres sont négatifs.
+
+*La seconde, à l'inverse* : la version suivante a corrigé en affirmant les
+numéros « re-relevés, inchangés ». **Cette affirmation est morte.** Re-relevé à
+HEAD `bb198d2e`, les six `Ok(LoopResult::…)` sont à `1492`, `3971`, `4167`,
+`4214`, `4356`, `4373` — **+59 sur chacun**, dérive uniforme, donc réelle cette
+fois. Et la dérive est **locale à `agent_loop/mod.rs`** : les deux `AgentBusy`
+(`724`, `1003`) et `post_callback_verdict_net` (`824`, lecture du drapeau `836`)
+dans `dispatcher.rs` sont, eux, inchangés. Une dérive ne se propage pas d'un
+fichier à l'autre ; il n'y a donc pas un décalage global à appliquer de tête,
+mais un relevé à refaire par fichier.
+
+Ce que la succession des deux erreurs enseigne, et qui vaut mieux que l'une ou
+l'autre : **les écarts ancre↔sortie sont stables, les numéros absolus ne le sont
+pas.** Les six écarts relevés à `bb198d2e` (−2, −16, **+4**, −5, −21, −2) sont
+identiques à ceux relevés à la conception. C'est la colonne « écart » de la table
+ci-dessous qui survit aux réécritures du fichier, et la colonne « sortie » qui
+pourrit — ce qui est exactement pourquoi la table fait foi par ses **ancres** et
+non par ses numéros.
+
+**Le piège que cette dérive a armé, à connaître avant d'éditer quoi que ce soit :
+un numéro périmé ne désigne pas du vide, il désigne autre chose.** La sortie que
+les versions antérieures de ce plan appelaient `4155` porte aujourd'hui, à ce
+numéro exact, **l'un des deux sites de pose de signal de mika#2368**
+(`if let Some(flag) = qa_verdict_unmet`). Un implémenteur qui ouvrirait `4155` en
+croyant y trouver une sortie à instrumenter y trouverait du code mika#2368
+plausible, déjà armé, et pourrait le prendre pour sa cible ou le croire
+redondant. C'est la forme la plus coûteuse de la péremption : non pas une adresse
+qui ne résout plus, mais une adresse qui résout vers un voisin crédible.
 
 **Ce que le piège coûte à l'implémenteur, et c'est la raison d'être de ce
 paragraphe :** `grep -n '<ancre>'` ne rend **pas** la ligne du `return`, il rend
@@ -522,16 +555,24 @@ commentaire suit son `return` au lieu de le précéder. On ancre pour **retrouve
 le site**, puis on lit le voisinage pour trouver la sortie ; on ne convertit
 jamais une ligne d'ancre en adresse d'édition.
 
-Relevés inchangés à ce même HEAD : les deux sites mika#2368 (`3900`, `4096`), les
-deux `AgentBusy` (`724`, `1003`), `post_callback_verdict_net` (`824`), le
-commentaire mika#2136 (`4230`), et les trois sites de lecture de
-`run_silent_agent` — le `default()` de la sous-branche « deadline trop proche »,
-celui du bras `DeadlineExceeded` (dont le commentaire mika#2368 motive le renvoi
-mot pour mot) et la construction finale. Les numéros de tout ce plan restent à
-lire comme **des repères de lecture, jamais comme des adresses** : la table
-ci-dessous est ce qui fait foi.
+Autres relevés au même HEAD, **par fichier** puisque la dérive ne se propage pas :
+dans `agent_loop/mod.rs`, les deux sites de pose mika#2368 (`3959`, `4155`) et le
+commentaire mika#2136 (`4289`) ; dans `dispatcher.rs`, **inchangés**, les deux
+`AgentBusy` (`724`, `1003`) et `post_callback_verdict_net` (`824`, sa lecture du
+drapeau `836`).
 
-**Un dernier écart de vocabulaire, à connaître avant d'éditer le site `4297` :**
+Et, dans `run_silent_agent`, **quatre** sites de renvoi de `SilentTurnOutcome` —
+`6443`, `6560`, `6605`, `6650` — là où les versions antérieures de ce plan n'en
+comptaient que trois. Le quatrième est traité dans sa propre section ci-dessous
+(*Le quatrième renvoi*) ; il est nommé ici parce qu'un implémenteur qui grep
+`SilentTurnOutcome::default()` en trouve **trois** et doit savoir que le compte
+attendu est quatre avec la construction finale, sans avoir à trancher lui-même
+lequel manque.
+
+Les numéros de tout ce plan restent à lire comme **des repères de lecture, jamais
+comme des adresses** : la table ci-dessous est ce qui fait foi.
+
+**Un dernier écart de vocabulaire, à connaître avant d'éditer le site `4356` :**
 le commentaire mika#2136 qui s'y trouve l'appelle *« a FOURTH exit from
 `run_loop` »* là où ce plan en compte **six**. Les deux sont justes et ne
 comptent pas la même chose — mika#2136 numérotait les sorties qu'il avait à
@@ -542,37 +583,129 @@ Les deux colonnes de numéros sont données **séparément** et leur écart est
 explicite : c'est ce que la version antérieure avait confondu, et l'écart signé
 est ce qui rend la confusion impossible à refaire.
 
+Numéros relevés à HEAD `bb198d2e`. **La colonne « écart » est le seul invariant ;
+les deux colonnes de numéros sont un confort de lecture, l'ancre est l'adresse.**
+
 | sortie (`return`) | ancre | écart | sortie | ancre `grep` (unique) |
 |---|---|---|---|---|
-| `1433` | `1431` | −2 | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
-| `3912` | `3896` | −16 | `Done` — texte non vide | `mika#2368 — chemin de sortie 1/2 (texte non vide)` |
-| `4108` | `4112` | **+4** | `Done` — texte vide, `Silent` | `Silent-mode-only exit` |
-| `4155` | `4150` | −5 | `Done` — après follow-up (**exclu**) | `agent returned empty text after follow-up` |
-| `4297` | `4276` | −21 | `Done` — Force EndTurn (**P0**) | `Force EndTurn — return Done directly` |
-| `4314` | `4312` | −2 | `MaxStepsExceeded` | `max_steps, "agent exceeded max tool steps"` |
+| `1492` | `1490` | −2 | `DeadlineExceeded` | `agent deadline exceeded — exiting loop gracefully` |
+| `3971` | `3955` | −16 | `Done` — texte non vide | `mika#2368 — chemin de sortie 1/2` |
+| `4167` | `4171` | **+4** | `Done` — texte vide, `Silent` | `Silent-mode-only exit` |
+| `4214` | `4209` | −5 | `Done` — après follow-up (**exclu**) | `agent returned empty text after follow-up` |
+| `4356` | `4335` | −21 | `Done` — Force EndTurn (**P0**) | `Force EndTurn — return Done directly` |
+| `4373` | `4371` | −2 | `MaxStepsExceeded` | `max_steps, "agent exceeded max tool steps"` |
 
-La ligne `4108` est celle qui porte la démonstration : son ancre **suit** son
+La ligne `4167` est celle qui porte la démonstration : son ancre **suit** son
 `return`. Un implémenteur qui traiterait la colonne « ancre » comme une adresse
 éditerait, à ce site précis, du code situé **après** la sortie qu'il visait.
 
+Les six ancres ont été re-vérifiées **uniques** (`grep -c` = 1 chacune) à ce même
+HEAD. C'est la propriété qui autorise à les traiter comme des adresses ; elle est
+à re-vérifier, pas à supposer, et son coût est une commande.
+
 Deux pièges relevés au passage, qui coûteraient chacun une mauvaise édition.
 `agent exceeded max tool steps` **seul** rend trois résultats — un doc-comment de
-`attempt_continuation_turn`, le site `4314`, et le `silent agent exceeded max tool
+`attempt_continuation_turn`, le site `4373`, et le `silent agent exceeded max tool
 steps` de `run_silent_agent` — d'où le préfixe `max_steps,` dans l'ancre. Et le
 `if let Some(flag) = qa_verdict_unmet` des deux sites mika#2368 est
 **littéralement identique** aux deux endroits : seuls les commentaires qui les
 précèdent les distinguent, ce qui est aussi la raison pour laquelle U1e doit
 recopier le **bon** prédicat plutôt que le bloc d'à côté (cf. V2b).
 
+## Le quatrième renvoi — et pourquoi il est exclu d'une AUTRE manière
+
+Trouvé en re-vérifiant ce plan contre le code : `run_silent_agent` a **quatre**
+sites de renvoi, et les versions antérieures n'en décidaient que trois. Le
+quatrième est le **prélude de deadline** (`6443`, mika#848 F3b) — un
+`return Ok(SilentTurnOutcome::default())` pris **avant** `run_loop`, quand la
+deadline est déjà dépassée à l'entrée.
+
+**Un plan qui compte trois sites sur quatre reproduit d'un cran le défaut qu'il
+ferme.** Tout ce travail part de « `run_loop` pose son signal à deux sorties sur
+six » ; laisser un renvoi non décidé dans la fonction qui *lit* ce signal serait
+la même faute, un étage plus haut, et elle serait invisible pour exactement la
+même raison — aucune décision ne devient fausse, une population devient muette.
+
+Son commentaire mika#2368 y motive le renvoi en propres termes : *« le tour n'a
+pas eu lieu. Un tour qui n'a pas conclu ne "conclut pas sans verdict" — le filet
+ne s'arme pas ici. »* **Ce raisonnement est juste, et il est exactement aussi
+périmable que celui du bras `DeadlineExceeded`** que ce plan répare déjà (`6605`,
+dont le commentaire renvoie au motif `CutOffByDeadline` de mika#2276, câblé
+webhook, qui ne mène nulle part pour un callback). Dans les deux cas mika#2368 a
+écarté une population au motif qu'elle relevait d'un *autre* motif ; dans les
+deux cas mika#2515 crée le motif « coupé » et rend l'écart caduc. La symétrie est
+le point, et c'est elle qui interdit de laisser ce site sans décision.
+
+**Il n'est pourtant pas armable à son site, et la raison est structurelle.**
+`qa_verdict_due` est calculé **dans** `run_loop` (`1472`) depuis
+`loaded_skill_names`, lui-même calculé à `6471` — soit **après** le prélude.
+L'armer exigerait de remonter la correspondance de skills en amont du contrôle de
+deadline, ce qui est à la fois un changement d'ordre des effets et une absurdité
+lisible : faire le travail de correspondance précisément après avoir établi qu'il
+ne reste plus de temps pour s'en servir.
+
+**Et sa population est quasi certainement vide, sans l'être par construction.**
+`run_silent_agent` pose `deadline = Instant::now() + enveloppe` puis
+`run_silent_inner` teste `Instant::now() >= deadline` après seulement deux appels
+de base (`load_agent_context`, `list_commitments`) : il faudrait que ces deux
+appels consomment l'enveloppe **entière** (300 s au défaut de flotte). Improbable,
+pas impossible.
+
+**C'est cette nuance qui décide la forme de l'exclusion, et elle interdit la
+solution évidente.** Ce site ne peut **pas** entrer dans
+`LOOP_EXITS_WITHOUT_SIGNAL`, dont le doc-comment exige « structurellement
+inatteignable depuis un tour de callback » — ce qui est vrai de `4214`
+(`follow_up_on_empty()` est faux pour `Silent`, propriété *booléenne* et épinglée)
+et **faux** d'un site qui dépend d'une course entre une horloge et deux requêtes.
+Y déposer une entrée en la déclarant inatteignable écrirait une fausseté **dans la
+garde même qui existe pour empêcher les faussetés** — et c'est précisément le
+geste que la doctrine mika#2201 refuse (« on déclare, on n'allowliste pas » : une
+déclaration doit être vraie, sans quoi elle est une exemption déguisée).
+
+Donc une table **sœur et distincte**, dans le scan d'U1, avec son vocabulaire
+propre — l'exclusion y est motivée par l'**indisponibilité du prédicat au site**,
+jamais par l'inatteignabilité du site :
+
+```rust
+/// Renvois de `run_silent_agent` qui ne lisent délibérément aucun fait de
+/// verdict. Vocabulaire DISTINCT de `LOOP_EXITS_WITHOUT_SIGNAL` : là l'exclusion
+/// dit « ce site est inatteignable », ici elle dit « ce site n'a pas le prédicat
+/// sous la main ». Confondre les deux ferait passer une course d'horloge pour une
+/// impossibilité (mika#2515).
+const SILENT_RETURNS_WITHOUT_VERDICT_READ: &[(&str, &str)] = &[(
+    "prelude deadline check (mika#848 F3b)",
+    "`qa_verdict_due` dérive de `loaded_skill_names`, calculé APRÈS ce site : \
+     le prédicat n'existe pas encore. Population bornée par le fait que \
+     l'enveloppe entière devrait s'écouler dans `load_agent_context` + \
+     `list_commitments`. NON inatteignable — suivi mika#2515-a.",
+)];
+```
+
+Son **assertion auto-nettoyante** ne peut pas être booléenne comme celle de sa
+sœur (il n'y a pas de propriété à interroger) : c'est un scan d'**ordre** — le
+calcul de `loaded_skill_names` doit rester **après** le prélude dans
+`run_silent_inner`. Le jour où quelqu'un remonte la correspondance de skills,
+l'exclusion cesse d'être vraie et le test rougit en nommant le site devenu
+armable, au lieu de laisser un renvoi muet derrière une raison morte.
+
+**Suivi nommé (mika#2515-a), précondition écrite :** armer ce site en remontant
+le prédicat. À n'ouvrir **que** si une mesure montre la population non vide —
+`grep 'silent agent deadline exceeded during prelude' "$MIKA_SPIRIT_LOG_FILE"`
+croisé avec un `trigger_label = "callback"`. Le WARN existe déjà à ce site, donc
+la mesure est disponible **sans rien livrer** : c'est la raison pour laquelle ce
+plan peut se contenter de déclarer l'exclusion au lieu de la deviner. Zéro ligne
+sur ce grep ⇒ **ne pas ouvrir le suivi**, ce serait un site armé pour une
+population qui n'existe pas.
+
 ## Unités d'implémentation
 
 | U | fichier | contenu |
 |---|---|---|
 | **U1a** | `src/qa_build_callback.rs` | `VerdictSignal`, `CutOffExit` (+ `as_cause()`, `match` sans `_`), `CallbackCutOff`, `verdict_unmet_at_cut_off` |
-| **U1b** | `src/agent_loop/mod.rs` | paramètre `run_loop` → `Option<&VerdictSignal>` ; pose de la moitié **coupure** aux sorties `1433` et `4314` ; `SilentTurnOutcome` gagne `qa_verdict_cut_off: Option<CallbackCutOff>` (symétrique de `AgentOutput.deadline_exceeded`) ; **trois** sites de lecture dans `run_silent_agent` — le `default()` de la sous-branche « deadline trop proche » (`~6480`), le `default()` du bras `DeadlineExceeded` (`6509`), et la construction finale (`6571`) qui lit déjà le drapeau et doit lire le nouveau champ |
+| **U1b** | `src/agent_loop/mod.rs` | paramètre `run_loop` → `Option<&VerdictSignal>` ; pose de la moitié **coupure** aux sorties `1492` et `4373` ; `SilentTurnOutcome` gagne `qa_verdict_cut_off: Option<CallbackCutOff>` (symétrique de `AgentOutput.deadline_exceeded`) ; **quatre** renvois dans `run_silent_agent`, dont **trois à câbler** — le `default()` de la sous-branche « deadline trop proche » (`6560`), le `default()` du bras `DeadlineExceeded` (`6605`), la construction finale (`6650`) qui lit déjà le drapeau et doit lire le nouveau champ — **plus un à déclarer exclu**, le prélude de deadline (`6443`), cf. *Le quatrième renvoi* |
 | **U1c** | `src/server/deadline_verdict.rs` | variante `CallbackCutOffWithoutVerdict`, son corps, `event_name()`, le champ `cause` sur la ligne postée |
 | **U1d** | `src/task_engine/dispatcher.rs` | sélection du motif dans `post_callback_verdict_net` (match à quatre bras) |
-| **U1e** | `src/agent_loop/mod.rs` | P0 : troisième miroir mika#2368 au site `4297`, `verdict_unmet_after_retry` (terme de budget **conservé**), aucun `cause` |
+| **U1e** | `src/agent_loop/mod.rs` | P0 : troisième miroir mika#2368 au site `4356`, `verdict_unmet_after_retry` (terme de budget **conservé**), aucun `cause` |
 | **U2a** | `src/qa_build_callback.rs` | `UndeliveredVerdictCause` (4 variantes, format de fil), `classify_undelivered_verdict(metadata) -> UndeliveredVerdictCause` — **fonction pure**, testable aux bornes sans base |
 | **U2b** | `src/task_engine/engine.rs` | `alert_undelivered_build_verdicts()` dans le bloc à 60 ticks, après `dispatch_undelivered_callbacks` ; dédup 24 h ; WARN + ligne `audit_events` |
 | **U3** | `src/task_engine/dispatcher.rs` | compteur + instant NULL-only au site `AgentBusy`, borné aux callbacks de build |
@@ -599,12 +732,16 @@ prédicat démontrable et assortie de son assertion auto-nettoyante. Détail :
   (mika#2103 / mika#2205).
 - `mika2515_every_loop_exit_decides_about_the_verdict_signal` — scan de source sur
   `agent_loop/mod.rs`. **Cardinalité assertée à 6** — c'est le nombre de
-  `return Ok(LoopResult::…)` / `Ok(LoopResult::…)` du corps de `run_loop` relevé
-  à la conception (`1433`, `3912`, `4108`, `4155`, `4297`, `4314`), et le plan
+  `return Ok(LoopResult::…)` / `Ok(LoopResult::…)` du corps de `run_loop`, relevé
+  à HEAD `bb198d2e` (`1492`, `3971`, `4167`, `4214`, `4356`, `4373`), et le plan
   l'a écrit **4** avant que le relevé ne soit fait : une cardinalité posée de
   mémoire est exactement ce que ce scan existe pour empêcher. La cardinalité est
   le seul terme qu'aucune fixture ne peut voir — un prédicat devenu trop étroit
-  passerait en ne regardant rien (mika#2205).
+  passerait en ne regardant rien (mika#2205). **Le scan asserte la cardinalité,
+  jamais les numéros** : ceux-ci ont déjà dérivé de +59 entre deux passes de ce
+  plan, et un scan qui les figerait rougirait à chaque réécriture du fichier sans
+  qu'aucune sortie ne soit devenue muette — un détecteur qu'on désarme parce qu'il
+  crie à tort.
 
   Le scan asserte que **chacune des six sorties décide**, au sens où elle est
   soit suivie d'une pose de signal, soit **déclarée exclue avec sa raison** dans
@@ -627,6 +764,16 @@ prédicat démontrable et assortie de son assertion auto-nettoyante. Détail :
   L'entrée porte son **assertion auto-nettoyante** : un test frère asserte
   `!LoopMode::Silent{..}.follow_up_on_empty()`, donc le jour où cette propriété
   change, l'exclusion rougit au lieu de laisser une sortie s'ouvrir en silence.
+
+  **Le même scan couvre les quatre renvois de `run_silent_agent`** — cardinalité
+  assertée à **4** — via la table sœur `SILENT_RETURNS_WITHOUT_VERDICT_READ` d'une
+  entrée, dont le vocabulaire est **délibérément distinct** (indisponibilité du
+  prédicat, jamais inatteignabilité du site : cf. *Le quatrième renvoi*). Son
+  assertion auto-nettoyante n'est pas booléenne mais **ordinale** : le calcul de
+  `loaded_skill_names` doit rester **après** le prélude dans `run_silent_inner`.
+  Sans cette moitié, le scan couvrirait la fonction qui *pose* le signal et
+  laisserait libre celle qui le *lit* — c'est-à-dire exactement la moitié par
+  laquelle le fait se perd.
 - `mika2515_the_cause_values_are_a_wire_format` — fige les valeurs de `cause`
   (`cut_off_deadline`, `cut_off_max_steps`, `error`) et les quatre valeurs de
   `UndeliveredVerdictCause`. Pas d'allowlist (ce n'est pas un scan de sites).
@@ -664,7 +811,7 @@ injecté).
   sa revue puis sort par le Force EndTurn ne pose rien ; un tour de callback
   **non-build** (`run_claude_pilot`) ne pose rien.
 - **V2b — le prédicat de P0 est bien le frère, pas celui de la coupure.** Sur le
-  site `4297`, un tour dont la garde n'a **jamais** firé (budget non dépensé) ne
+  site `4356`, un tour dont la garde n'a **jamais** firé (budget non dépensé) ne
   pose **rien** — c'est le contrôle qui distingue U1e d'U1a et qui rougirait si
   quelqu'un « harmonisait » les deux sites sur un seul prédicat.
 - **V3 — le filet poste sur le motif neuf.** Exactement un POST, cible = la
@@ -699,7 +846,13 @@ injecté).
   kill-switch : désarmé, le balayage n'écrit ni WARN ni ligne d'audit.
 - **V9 — les scans de source** de la section *Fire-Disposition*, avec leur
   contrôle de bonne foi (un second écrivain planté fait rougir ; le scan est vu
-  rouge avant que le code existe, par anti-vacuité).
+  rouge avant que le code existe, par anti-vacuité). Y compris les **deux**
+  cardinalités (6 sorties de `run_loop`, 4 renvois de `run_silent_agent`) et
+  l'assertion **ordinale** du quatrième renvoi : un `loaded_skill_names` déplacé
+  avant le prélude fait rougir l'exclusion. Contrôle de bonne foi de cette
+  moitié-là : le déplacement est simulé sur une fixture, vu rouge, puis défait —
+  sans quoi « le scan asserte l'ordre » est indistinguable de « le scan lit un
+  fichier qui se trouve être dans le bon ordre ».
 
 **Le voisin à lire avant d'écrire V7 :**
 `crates/mika-agent/tests/eval/test_callback_delivery_starvation.rs` couvre
@@ -851,8 +1004,13 @@ tout ce que ce travail défend. La sonde est la **prochaine** occurrence.
    verdict-dû-non-posté : cinq le posent (les deux de mika#2368, le Force
    EndTurn de P0, les deux coupures), la sixième est déclarée exclue avec son
    prédicat d'inatteignabilité. `SilentTurnOutcome` porte le fait de coupure,
-   symétriquement d'`AgentOutput.deadline_exceeded` ; les **trois** sites de
-   `run_silent_agent` le lisent au lieu de le jeter.
+   symétriquement d'`AgentOutput.deadline_exceeded`.
+1b. **Chacun des quatre renvois de `run_silent_agent` décide** aussi : trois
+   lisent le fait au lieu de le jeter, le quatrième (prélude de deadline) est
+   déclaré exclu dans une table **au vocabulaire distinct** — indisponibilité du
+   prédicat, non inatteignabilité — avec son assertion d'ordre. Couvrir la
+   fonction qui pose le signal sans couvrir celle qui le lit laisserait ouverte
+   la moitié par laquelle le fait se perd.
 2. `post_callback_verdict_net` poste un `hold[review]` sur le motif de coupure,
    avec un corps qui nomme la borne franchie, sous `qa_callback_verdict` +
    `cause`, sans toucher une ligne de la population mika#2368 ni de mika#2276.
@@ -927,6 +1085,15 @@ Transcrits du ticket, et complétés là où le ticket n'énumère qu'un critèr
   chemin, **rayon d'action très différent** (élargir cette population change qui
   marque une tâche `failed` — périmètre que mika#2272 a déjà borné par écrit).
   **Suivi**, précondition : que S1 montre `agent_busy_starvation` dominant.
+- **Le prélude de deadline de `run_silent_agent`** (mika#2515-a). Quatrième renvoi,
+  déclaré exclu avec son assertion d'ordre plutôt qu'armé : le prédicat n'existe
+  pas encore à ce site, et sa population exigerait que l'enveloppe entière
+  s'écoule dans deux appels de base. **Précondition explicite :**
+  `grep 'silent agent deadline exceeded during prelude' "$MIKA_SPIRIT_LOG_FILE"`
+  croisé avec `trigger_label = "callback"` doit être **non vide**. Le WARN existe
+  déjà, donc la mesure ne coûte rien à produire — et zéro ligne signifie **ne pas
+  ouvrir le suivi**, un site armé pour une population vide étant une garde sans
+  population (mika#2272).
 - **Le trou de l'estampille.** Élargir `parse_pr_target` au texte libre est
   refusé (seconde grammaire de fil, classe mika#2158 ; et elle ne résoudrait pas
   le dépôt). **Suivi**, et le remède est côté **appelant** — faire porter au
