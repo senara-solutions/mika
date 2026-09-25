@@ -218,6 +218,13 @@ mod eval {
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
 
+    // mika#2517 — un tour du domaine Webhook Fallthrough ne se voit pas servir
+    // `create_task`. Les deux contrôles négatifs (ready-label, tour ordinaire)
+    // sont porteurs : le test principal seul serait satisfait par un filtre qui
+    // retire l'outil à TOUS les tours, c'est-à-dire par un correctif qui casse
+    // la boucle en ayant l'air de fermer le ticket.
+    mod test_webhook_fallthrough_no_task_2517;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 

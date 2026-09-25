@@ -4560,6 +4560,82 @@ async fn record_withheld_images(
     }
 }
 
+/// The audit `tool_name` under which a Webhook Fallthrough turn is counted
+/// (mika#2517 U4).
+///
+/// **SOLE WRITER** is [`record_webhook_fallthrough_turn`], pinned by
+/// `canonical_tokens::tests::mika2517_the_fallthrough_turn_event_has_a_single_writer`.
+/// That property is what makes the operator's
+/// `SELECT after_value, count(*) … GROUP BY 1` an exact distribution rather
+/// than a number two sites can disagree about.
+pub(crate) const WEBHOOK_FALLTHROUGH_TURN_EVENT: &str = "webhook_fallthrough_turn";
+
+/// Record that a **Webhook Fallthrough** turn ran, and what it was not handed
+/// (mika#2517 U4). No-op on every other turn.
+///
+/// # Why this line and not a line on the refusal
+///
+/// The tool is *hidden*, so there is no refusal to count. The only observable
+/// fact is *"a fallthrough turn ran, and here is the list it did not receive"* —
+/// which makes this line **both the measurement and the positive control**: the
+/// ticket's acceptance is an absence (zero phantom `pending`), and without a
+/// count of the turns that could have produced one, zero phantoms reads exactly
+/// like zero turns (mika#2205).
+///
+/// # Not deduplicated, deliberately
+///
+/// This is not a tick classifying a population (the mika#2131 doctrine) but a
+/// dated, distinct event an operator wants to **count** — the same arbitration,
+/// for the same reason, as `ready_label_outcome` (mika#2323). Expected volume:
+/// tens per day.
+///
+/// Fail-open on both writes: losing the trace is an observability defect,
+/// losing the turn would be the defect this ticket exists to remove.
+async fn record_webhook_fallthrough_turn(
+    db: &AsyncDatabase,
+    user_message: &str,
+    session_id: &str,
+    trace_id: &str,
+) {
+    if !crate::webhook_dispatch::is_webhook_fallthrough_domain(user_message) {
+        return;
+    }
+
+    let marker_class = crate::webhook_dispatch::fallthrough_marker_class(user_message);
+    let withheld = FALLTHROUGH_WITHHELD_TOOLS.join(",");
+
+    info!(
+        target: "mika::otel",
+        event = WEBHOOK_FALLTHROUGH_TURN_EVENT,
+        agent_id = %db.agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        marker_class = %marker_class,
+        withheld_tools = %withheld,
+        "Webhook Fallthrough turn — tools withheld (mika#2517)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            WEBHOOK_FALLTHROUGH_TURN_EVENT,
+            &format!("agent:{}", db.agent_id),
+            None,
+            Some(marker_class),
+            Some(&format!("withheld={withheld}")),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "webhook_fallthrough_turn_audit_failed",
+            error = %e,
+            marker_class = %marker_class,
+            "the WARN landed but its audit row did not; the GROUP BY is incomplete"
+        );
+    }
+}
+
 /// After onboarding, extract the user's name from user_summary and create
 /// a people record. This guarantees the user exists in the people table
 /// regardless of whether the agent called store_fact.
@@ -5023,6 +5099,11 @@ async fn run_agent_inner(
     // never on `llm`, the one handed in. Both values are already read for the
     // request and for `turn_usage`, so this adds a format, not a computation.
     let effective_model_attestation = Some(attest_effective_model(effective_llm));
+    // mika#2517 U2 — on a Webhook Fallthrough turn the identity denylist is
+    // widened so `create_task` never reaches the model's tool array. Off the
+    // domain this is the identity slice, untouched.
+    let effective_disabled =
+        effective_disabled_tools(&ctx.identity.tools.disabled, params.user_message);
     let (mut skill_tool_defs, prompt_variant, per_skill_bytes) = inject_skills_and_resolve_tools(
         &matched_entries,
         tools,
@@ -5030,9 +5111,14 @@ async fn run_agent_inner(
         provider,
         model,
         &resolved_context,
-        &ctx.identity.tools.disabled,
+        &effective_disabled,
         is_compact_provider,
     );
+    // mika#2517 U4 — the measurement AND the positive control, in one line.
+    // The tool is *hidden*, so there is no refusal to count: the only observable
+    // fact is "a fallthrough turn ran, and here is what it was not handed".
+    // Without it, zero phantoms would read exactly like zero turns (mika#2205).
+    record_webhook_fallthrough_turn(db, params.user_message, session_id, trace_id).await;
     let _ = emit_system_prompt_assembled(
         &system,
         &per_skill_bytes,
@@ -8162,6 +8248,60 @@ pub(crate) fn apply_agent_tool_visibility(
     }
 }
 
+/// The tools a **Webhook Fallthrough** turn must not be handed (mika#2517 U2).
+///
+/// `create_task` and nothing else. The asymmetry with `run_claude_pilot` is
+/// deliberate and is explained at the call site: a tool is withheld because
+/// *nothing guards it*; `run_claude_pilot` stays served because **its guard is
+/// the measurement** — gate 0 of `validate_dispatch_readiness` is what says the
+/// model tried, and hiding the tool would delete that signal.
+pub(crate) const FALLTHROUGH_WITHHELD_TOOLS: &[&str] = &["create_task"];
+
+/// The effective tool denylist for one **conversation** turn: the agent's
+/// identity denylist, widened on a Webhook Fallthrough turn (mika#2517 U2).
+///
+/// # Why withhold the tool rather than refuse the call
+///
+/// Two routes give "zero task created". Refusing at the tool boundary would
+/// need `ToolContext` to carry `originating_message`, which it does not — that
+/// is a new field threaded to four construction sites. Withholding is one site
+/// and no new field, and it is also **stronger**: mika#811 already wrote it for
+/// the identity denylist — *"the model never sees disabled tools, cannot call
+/// them, cannot be prompt-injected into trying."* It composes with guard 6c
+/// (`asserted_unavailability`), which reads `enabled_tool_names`: the tool
+/// being genuinely absent, a model that says "I do not have `create_task`" says
+/// something **true** and the guard stays silent.
+///
+/// # `Cow`, so the nominal path allocates nothing
+///
+/// A turn outside the domain hands the identity slice through untouched, byte
+/// for byte — which is what makes "no regression off the domain" a property of
+/// the type rather than of a test.
+///
+/// # Bound: conversation mode only, and that is structural
+///
+/// The silent and team callers of `inject_skills_and_resolve_tools` are not
+/// touched. A webhook arrives through `POST /message` → `run_agent` → this
+/// mode; a silent turn has no webhook message (`originating_message` is `None`
+/// there since mika#933) and a team turn reads `TeamAgentParams`. A future path
+/// serving a webhook in silent mode would escape this filter — that is the
+/// bound, and probe S3 of the ticket is what measures it.
+fn effective_disabled_tools<'a>(
+    identity_disabled: &'a [String],
+    user_message: &str,
+) -> std::borrow::Cow<'a, [String]> {
+    if !crate::webhook_dispatch::is_webhook_fallthrough_domain(user_message) {
+        return std::borrow::Cow::Borrowed(identity_disabled);
+    }
+    let mut widened = identity_disabled.to_vec();
+    for tool in FALLTHROUGH_WITHHELD_TOOLS {
+        if !widened.iter().any(|d| d.eq_ignore_ascii_case(tool)) {
+            widened.push((*tool).to_string());
+        }
+    }
+    std::borrow::Cow::Owned(widened)
+}
+
 /// The builtin tools whose `evidence` field is required **at runtime** in
 /// reflection mode by [`crate::tools::check_reflection_evidence`].
 ///
@@ -9599,10 +9739,39 @@ fn webhook_zero_tools_trigger(msg: &str) -> bool {
         return false;
     }
     // Skip: always-informational event classes (mika#1469).
+    //
+    // The three literals stay. `Check suite success` and `PR closed:` are NOT
+    // in the fallthrough domain (check-suite and PR are excluded from it), so
+    // they remain load-bearing. `discussion.` becomes redundant with the domain
+    // check below and is kept **on purpose**: removing it would make the
+    // exclusion of discussions depend on the correctness of the domain
+    // predicate, and a future narrowing of that predicate would silently re-arm
+    // this guard on them.
     if msg.starts_with("[GitHub] Check suite success on")
         || msg.starts_with("[GitHub] PR closed:")
         || msg.starts_with("[GitHub] discussion.")
     {
+        return false;
+    }
+    // mika#2517 U3 — the Webhook Fallthrough domain is the long tail mika#1469
+    // deferred. That ticket narrowed this trigger after "25+ documented
+    // misfires … where the guard pressured the agent to call a tool just to
+    // satisfy the precondition", and left "correlation-aware filtering for the
+    // remaining long-tail misfires" to a follow-up. This is it.
+    //
+    // NOT a relaxation: on this domain the guard's own premise — "webhook
+    // events require action" — is FALSE by contract. `self-dev`'s § Webhook
+    // Fallthrough carries a HARD GATE saying the correct action is to
+    // acknowledge and stop, so the guard and the prompt beside it contradicted
+    // each other on exactly this population, and the guard was re-prompting a
+    // turn that had obeyed — with a list of tools to call, the shortest of
+    // which creates a task.
+    //
+    // What this does NOT relax: `webhook_no_unauthorized_dispatch` (the
+    // post-hoc dispatch guard) and gate 0 of `validate_dispatch_readiness` (the
+    // tool boundary) are untouched. What disappears is the injunction to call a
+    // tool, never the protection against dispatching.
+    if crate::webhook_dispatch::is_webhook_fallthrough_domain(msg) {
         return false;
     }
     true
@@ -15452,23 +15621,155 @@ mod tests {
     }
 
     #[test]
-    fn webhook_zero_tools_trigger_fires_on_new_comment() {
-        assert!(webhook_zero_tools_trigger(
-            "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_fires_on_non_ready_label() {
-        assert!(webhook_zero_tools_trigger(
-            "[GitHub] Issue labeled bug on senara-solutions/mika#999"
-        ));
-    }
-
-    #[test]
     fn webhook_zero_tools_trigger_skips_non_github() {
         assert!(!webhook_zero_tools_trigger("[Slack] message"));
         assert!(!webhook_zero_tools_trigger(""));
+    }
+
+    // -- mika#2517 U3 — the fallthrough domain no longer arms this guard --
+
+    /// **V4** — the five shapes of the Webhook Fallthrough domain stand the
+    /// guard down; the three shapes outside it still arm it.
+    ///
+    /// **This inverts two assertions mika#1469 shipped.** `fires_on_new_comment`
+    /// and `fires_on_non_ready_label` asserted that a comment and a non-`ready`
+    /// label re-prompt a turn with zero tool calls. On exactly that population
+    /// the guard's premise — *"webhook events require action"* — contradicts the
+    /// `self-dev` HARD GATE, which says the correct action is to acknowledge and
+    /// stop. The old assertions were pinning the conflict, so they are replaced
+    /// here rather than carried: keeping them would mean the suite asserts both
+    /// halves of a contradiction.
+    ///
+    /// The positive half is what makes this non-vacuous. A trigger that returned
+    /// `false` on everything would satisfy the negative half alone — and would
+    /// silently retire the mika#696 guard for the CI, PR-review and ready-label
+    /// paths, where it is still load-bearing.
+    #[test]
+    fn mika2517_the_fallthrough_domain_stands_the_zero_tools_guard_down() {
+        for msg in [
+            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
+            "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko",
+            "[GitHub] Issue assigned: senara-solutions/mika#100 — title",
+            "[GitHub] Issue closed: senara-solutions/mika#100 — title",
+            "[GitHub] discussion.created on senara-solutions/mika",
+        ] {
+            assert!(
+                !webhook_zero_tools_trigger(msg),
+                "{msg:?} is Webhook Fallthrough: its prompt contract is to \
+                 acknowledge and stop, so re-prompting it for calling no tool is \
+                 the engine contradicting itself (mika#2517 AC2)"
+            );
+        }
+    }
+
+    /// **V4, positive half** — outside the domain the guard is untouched.
+    #[test]
+    fn mika2517_the_zero_tools_guard_still_fires_outside_the_domain() {
+        for msg in [
+            // Ready-label: the dispatch path, where a turn with zero tools is a
+            // dispatch that did not happen.
+            "[GitHub] Issue labeled ready on senara-solutions/mika#933 — title",
+            // qa skill territory.
+            "[GitHub] PR review (approved) on senara-solutions/mika#1000 (title) by @reviewer",
+            // ci skill territory — and note its *success* sibling is still
+            // excluded by the mika#1469 literal, which is why that literal stays.
+            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/foo)",
+        ] {
+            assert!(
+                webhook_zero_tools_trigger(msg),
+                "{msg:?} is outside the fallthrough domain — mika#2517 must not \
+                 retire the mika#696 guard there"
+            );
+        }
+    }
+
+    // -- mika#2517 U2 — the tool the fallthrough turn is not handed --
+
+    /// **V3** — the domain widens the denylist; off the domain the slice is
+    /// handed through **identically**.
+    ///
+    /// The `Cow::Borrowed` assertion is the load-bearing half: it is what makes
+    /// "no regression outside the domain" a property of the type rather than of
+    /// a comparison that could pass on a fresh allocation with the same content.
+    #[test]
+    fn mika2517_effective_disabled_tools_widens_only_on_the_domain() {
+        let identity = vec!["run_team".to_string()];
+
+        let off_domain = effective_disabled_tools(&identity, "implement mika#2517");
+        assert!(
+            matches!(off_domain, std::borrow::Cow::Borrowed(_)),
+            "a turn outside the domain must hand the identity slice through \
+             untouched — an owned clone here means the nominal path allocates"
+        );
+        assert_eq!(&*off_domain, identity.as_slice());
+
+        let on_domain = effective_disabled_tools(
+            &identity,
+            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
+        );
+        assert!(
+            on_domain.iter().any(|t| t == "run_team"),
+            "the identity denylist must survive the widening"
+        );
+        assert!(
+            on_domain.iter().any(|t| t == "create_task"),
+            "a fallthrough turn must not be handed create_task (mika#2517 AC1)"
+        );
+    }
+
+    /// The widening is idempotent: an identity that already denies the tool
+    /// does not end up denying it twice.
+    #[test]
+    fn mika2517_the_widening_does_not_duplicate_an_existing_entry() {
+        let identity = vec!["Create_Task".to_string()];
+        let widened = effective_disabled_tools(
+            &identity,
+            "[GitHub] New comment on senara-solutions/mika#933 by @samidarko",
+        );
+        assert_eq!(
+            widened.len(),
+            1,
+            "the match is case-insensitive downstream, so re-adding the name \
+             would be a duplicate with no effect and a misleading log line: {widened:?}"
+        );
+    }
+
+    /// The withheld list and the filter agree on the name (mika#2517).
+    ///
+    /// `apply_agent_tool_visibility` matches case-insensitively, so this pins
+    /// the end-to-end path rather than the constant alone: the tool the
+    /// constant names must be the tool the filter removes.
+    #[test]
+    fn mika2517_the_withheld_tool_is_actually_evicted_by_the_filter() {
+        let mut defs = vec![
+            mika_common::claude::ToolDefinition {
+                name: "create_task".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+            mika_common::claude::ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let disabled = effective_disabled_tools(
+            &[],
+            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
+        );
+        apply_agent_tool_visibility(&mut defs, &disabled);
+
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"create_task"),
+            "left in the array: {names:?}"
+        );
+        assert!(
+            names.contains(&"run_claude_pilot"),
+            "run_claude_pilot stays SERVED on purpose — its gate 0 refusal is the \
+             measurement that the model tried, and hiding the tool would delete \
+             that signal (mika#2517 § 3.3 (b)): {names:?}"
+        );
     }
 
     // -- #910 webhook_no_unauthorized_dispatch trigger tests --

@@ -955,6 +955,184 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2517 — une définition du domaine Webhook Fallthrough, un écrivain
+    // du nom de son événement.
+    //
+    // Les deux gardes vivent ici plutôt que dans `agent_loop::tests`, où le
+    // plan les nommait : c'est le module des scans de nom, il porte déjà
+    // `production_sources()` et `string_literals()`, et garder les deux gardes
+    // d'un même ticket côte à côte est ce qui rend leur paire lisible. Les
+    // NOMS de test du plan sont conservés — ils apparaissent dans les messages
+    // de CI et sont, eux, une surface.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Population mesurée : **un** site (`webhook_dispatch.rs`). Il n'y a donc
+    /// rien à excepter, ni de case où déposer la prochaine infraction
+    /// (mika#2323). Quand le scan tire, **on retire le second corps**, on ne
+    /// l'allowliste pas (doctrine mika#2201).
+    const FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED: &[&str] = &[];
+
+    /// Les deux littéraux dont la **conjonction** définit le domaine.
+    ///
+    /// L'appariement est **exact**, jamais par sous-chaîne, et c'est ce qui
+    /// sépare une reconstruction d'un voisin légitime :
+    /// `webhook_zero_tools_trigger` porte `"[GitHub] PR closed:"` et
+    /// `"[GitHub] Check suite success on"` — deux littéraux qui *contiennent*
+    /// les aiguilles ci-dessous sans les être. Un prédicat par sous-chaîne
+    /// l'accuserait, et une garde qui rougit sur du code sain est une garde
+    /// qu'on désarme.
+    ///
+    /// Le prix, écrit plutôt que découvert : ce scan attrape la **copie** du
+    /// corps (la forme d'un second lecteur, qui copie les `starts_with`) et
+    /// rate une paraphrase qui écrirait les mêmes préfixes autrement. C'est le
+    /// bon arbitrage — la classe mika#2158 est née d'une regex copiée, pas
+    /// d'une regex ré-écrite.
+    fn fallthrough_domain_needles() -> [String; 2] {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        [
+            format!("[GitHub] PR{}", " "),
+            format!("[GitHub] Check suite{}", " "),
+        ]
+    }
+
+    /// **Un seul corps définit le domaine Webhook Fallthrough (mika#2517 U5).**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second corps ne
+    /// rend **aucune décision fausse le jour où il est écrit**. Il diverge plus
+    /// tard, en silence, avec toutes les assertions vertes — exactement la
+    /// leçon mika#2158 (une regex copiée dont le commentaire disait
+    /// « Mirrors … » et qui a ensuite raté deux élargissements). Le domaine a
+    /// désormais **quatre** consommateurs (les deux refus de mika#910/#933/#1102,
+    /// plus U2 et U3), donc quatre occasions de diverger.
+    #[test]
+    fn mika2517_the_fallthrough_domain_has_a_single_definition() {
+        let needles = fallthrough_domain_needles();
+        let owner = "crates/mika-agent/src/webhook_dispatch.rs";
+
+        let mut definers = Vec::new();
+        for (rel, content) in production_sources() {
+            if FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let literals: Vec<String> = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .flat_map(string_literals)
+                .collect();
+            let defines = needles
+                .iter()
+                .all(|needle| literals.iter().any(|lit| lit == needle));
+            if defines {
+                definers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205). Si le corps est réécrit sans
+        // ces littéraux, ce scan cesse de viser quoi que ce soit et doit le dire.
+        assert!(
+            definers.iter().any(|d| d == owner),
+            "mika#2517 — la conjonction {needles:?} n'est écrite nulle part dans \
+             {owner} : ce scan vise un corps mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = definers.iter().filter(|d| *d != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2517 — le domaine Webhook Fallthrough a une seconde définition : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second corps et appeler \
+             `webhook_dispatch::is_webhook_fallthrough_domain`. Ne PAS l'ajouter à \
+             FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED — quatre consommateurs lisent ce \
+             domaine, et deux corps ne rendent aucune décision fausse le jour où le \
+             second est écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2517_the_domain_definition_allowlist_is_empty() {
+        assert!(
+            FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED.is_empty(),
+            "FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second corps. Une allowlist \
+             née vide est un emplacement où déposer la prochaine infraction \
+             (mika#2323)."
+        );
+    }
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    const FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Un seul écrivain du nom d'événement `webhook_fallthrough_turn`
+    /// (mika#2517 U5).**
+    ///
+    /// La propriété est porteuse pour une raison précise : cette ligne **est**
+    /// le contrôle positif de l'acceptation du ticket. L'AC est une *absence*
+    /// (zéro phantom `pending`), et sans un compte des tours qui auraient pu en
+    /// produire un, zéro phantom se lit exactement comme zéro tour (mika#2205).
+    /// Un second écrivain ne rendrait aucune décision fausse ; il rendrait ce
+    /// compte inexact — invisible à tout test comportemental, d'où un scan.
+    #[test]
+    fn mika2517_the_fallthrough_turn_event_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("webhook_fallthrough{}", "_turn");
+        let owner = "crates/mika-agent/src/agent_loop/mod.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2517 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2517 — le nom d'événement du tour fallthrough a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` qui mesure la \
+             population du défaut n'est exact que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2517_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "FALLTHROUGH_TURN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait
