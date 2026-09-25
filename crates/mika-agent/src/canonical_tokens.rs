@@ -1133,6 +1133,91 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2532 — le nom du stderr d'un handler long-running a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est **établi** plutôt que souhaité :
+    /// `long_running_exec_stderr` est un nom **neuf**, donc aucun second
+    /// écrivain ne peut exister au moment où ce scan est posé. Quand il tire,
+    /// **on retire le second écrivain** (doctrine mika#2201).
+    const LONG_RUNNING_STDERR_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom du stderr d'un handler long-running n'a qu'un écrivain
+    /// (mika#2532 T3).
+    ///
+    /// C'est ce qui rend
+    /// `SELECT target_key, count(*) … WHERE tool_name = 'long_running_exec_stderr'`
+    /// **exact** plutôt qu'un nombre sur lequel deux sites peuvent diverger — et
+    /// ce `GROUP BY` est le livrable de l'AC1 : quel handler sort non-zéro après
+    /// avoir livré son callback, et à quelle fréquence. C'est aussi la sonde S2
+    /// du plan, dont la halte 2 dit qu'un zéro ne prouve rien tant que le compte
+    /// n'est pas attribuable.
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** ; il rendrait
+    /// ce compte faux, en silence, avec toutes les assertions au vert. Aucun test
+    /// comportemental ne voit cette classe — d'où un scan de source.
+    #[test]
+    fn mika2532_the_stderr_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("long_running_exec{}", "_stderr");
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if LONG_RUNNING_STDERR_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2532 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2532 — le nom du stderr d'un handler long-running a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             LONG_RUNNING_STDERR_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` que ce nom \
+             existe pour servir n'est exact que tant qu'un seul site l'écrit, et \
+             c'est lui qui rend la sonde S2 attribuable."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2532_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            LONG_RUNNING_STDERR_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "LONG_RUNNING_STDERR_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait

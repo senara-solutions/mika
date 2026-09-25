@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard test-pilot-push-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard test-pilot-push-guard test-build-mika-handler verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -170,6 +170,9 @@ test: ## Run all tests
 	@bash scripts/test-check-image-tags-immutable.sh
 	@bash scripts/check-dispatch-seats-declared.sh
 	@bash scripts/test-check-dispatch-seats-declared.sh
+	@bash scripts/test-build-mika-handler.sh
+	@bash scripts/check-sandboxed-handler-env.sh
+	@bash scripts/test-check-sandboxed-handler-env.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
 	@python3 -B scripts/test-pilot-egress-keepalive.py
 
@@ -219,6 +222,11 @@ test-sandbox-git-usable: ## Verify git works inside the pilot sandbox and contai
 test-shared-checkout-guard: ## Pin the shared-checkout guard (both modes) and its run_shell wiring, negative control included (mika#2107 / mika#2449)
 	@bash scripts/test-guard-shared-checkout.sh
 	@bash scripts/test-shell-exec-guard.sh
+
+test-build-mika-handler: ## Pin the build-mika handler's stage naming + cwd refusals, and refuse dead MIKA_* reads in sandboxed handlers (mika#2532)
+	@bash scripts/test-build-mika-handler.sh
+	@bash scripts/check-sandboxed-handler-env.sh
+	@bash scripts/test-check-sandboxed-handler-env.sh
 
 verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
 	@bash scripts/verify-no-secret-in-setenv.sh
