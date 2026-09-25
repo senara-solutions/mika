@@ -88,13 +88,24 @@ with open(port_file, "w") as fh:
 srv.serve_forever()
 PY
 
-# start_server <status> -> sets the global PORT.
+# start_server <status> -> sets the global PORT. Call it as a STATEMENT, then
+# read $PORT:
 #
-# Deliberately NOT `port="$(start_server 200)"`: a command substitution waits for
-# every writer of its pipe to close, and a server launched inside one inherits
-# that pipe as stdout — so the substitution would hang for the server's whole
-# lifetime. Its `$!` would also be lost to the subshell, leaving the cleanup trap
-# with nothing to kill.
+#     start_server 200; HEALTH_OK_PORT="$PORT"
+#
+# Never `HEALTH_OK_PORT="$(start_server 200)"`. A command substitution runs in a
+# subshell, so both of this function's outputs die with it: `PORT` is assigned in
+# the child and the parent never sees it, and `$!` is the child's notion of the
+# background job, so `SERVER_PIDS` comes back empty and the cleanup trap has
+# nothing to kill. The failure is silent and it is not a hang — the server is
+# started, the substitution returns the empty string, and every call site then
+# holds a port that is `""`. A probe handed an empty port falls back to the
+# *real* gateway on the default 8080 for the health check and builds
+# `http://127.0.0.1:/webhook/telegram` for the traversal, so the suite passes a
+# check it never made and then fails 22 assertions on a curl exit 7. This comment
+# already said "deliberately NOT" while every call site did exactly that
+# (mika#2135, caught by QA on PR #2435) — the shape is pinned below by
+# `mika2135_no_call_site_uses_command_substitution`.
 start_server() {
   local status="$1"
   local port_file
@@ -158,9 +169,9 @@ assert_not_contains() {
 
 echo "== smoke-webhook-chain =="
 
-HEALTH_OK_PORT="$(start_server 200)"
-HEALTH_503_PORT="$(start_server 503)"
-DEAD_PORT="$(dead_port)"
+start_server 200; HEALTH_OK_PORT="$PORT"
+start_server 503; HEALTH_503_PORT="$PORT"
+DEAD_PORT="$(dead_port)"   # `dead_port` genuinely echoes; a substitution is right here.
 
 # ---------------------------------------------------------------------------
 # 1. THE NEGATIVE CONTROL (AC3). Healthy chain ⇒ empty output, exit 0.
@@ -168,7 +179,7 @@ DEAD_PORT="$(dead_port)"
 #    traversal family must produce it — not just the 422 that was measured.
 # ---------------------------------------------------------------------------
 for status in 400 401 404 415 422; do
-  port="$(start_server "$status")"
+  start_server "$status"; port="$PORT"
   run_probe "$HEALTH_OK_PORT" "http://127.0.0.1:$port/webhook/telegram"
   assert_rc 0 "traversal $status ⇒ chain alive"
   if [ -z "$OUT" ]; then
@@ -183,7 +194,7 @@ done
 #    blames the hops in front of the gateway rather than the gateway.
 # ---------------------------------------------------------------------------
 for status in 502 504; do
-  port="$(start_server "$status")"
+  start_server "$status"; port="$PORT"
   run_probe "$HEALTH_OK_PORT" "http://127.0.0.1:$port/webhook/telegram"
   assert_rc 1 "traversal $status ⇒ chain broken"
   assert_contains "WARNING" "traversal $status ⇒ warns"
@@ -195,7 +206,7 @@ done
 #    a Synology in trouble, and a warning that names the wrong culprit is the
 #    defect being repaired. NOTE, never WARNING.
 # ---------------------------------------------------------------------------
-port="$(start_server 503)"
+start_server 503; port="$PORT"
 run_probe "$HEALTH_OK_PORT" "http://127.0.0.1:$port/webhook/telegram"
 assert_rc 2 "traversal 503 ⇒ nothing verified"
 assert_contains "NOTE:" "traversal 503 ⇒ a NOTE"
@@ -205,7 +216,7 @@ assert_not_contains "WARNING" "traversal 503 ⇒ never a warning"
 # 4. An unexpected 2xx is not a pass: no handler of ours answers `{}` with a
 #    success, so this is an answer the probe cannot attribute.
 # ---------------------------------------------------------------------------
-port="$(start_server 200)"
+start_server 200; port="$PORT"
 run_probe "$HEALTH_OK_PORT" "http://127.0.0.1:$port/webhook/telegram"
 assert_rc 2 "traversal 200 ⇒ nothing verified (a 2xx is not evidence of traversal)"
 assert_not_contains "WARNING" "traversal 200 ⇒ never a warning"
@@ -224,7 +235,7 @@ assert_contains "Freebox" "unreachable public URL ⇒ names the real chain"
 #    without ever crossing the public URL. The public server here answers 422,
 #    so a probe that skipped the local check would wrongly report success.
 # ---------------------------------------------------------------------------
-port="$(start_server 422)"
+start_server 422; port="$PORT"
 run_probe "$DEAD_PORT" "http://127.0.0.1:$port/webhook/telegram"
 assert_rc 1 "local gateway absent ⇒ chain broken"
 assert_contains "not answering on localhost" "local gateway absent ⇒ names the gateway"
@@ -237,7 +248,7 @@ assert_contains "rc-service mika-gateway" "local gateway absent ⇒ gives the op
 #    The bounded poll (2s here) is also what stops a gateway still warming up
 #    after `restart` from producing a warning on a healthy system.
 # ---------------------------------------------------------------------------
-port="$(start_server 422)"
+start_server 422; port="$PORT"
 run_probe "$HEALTH_503_PORT" "http://127.0.0.1:$port/webhook/telegram"
 assert_rc 1 "local gateway not ready ⇒ chain broken"
 assert_contains "is not ready" "local gateway not ready ⇒ distinguished from absent"
@@ -262,7 +273,7 @@ assert_contains "docs/operator/local-webhook-topology.md" "no declared URL ⇒ n
 # 9. The fallback declaration: the gateway's own variable is accepted when the
 #    probe-specific override is absent.
 # ---------------------------------------------------------------------------
-port="$(start_server 422)"
+start_server 422; port="$PORT"
 OUT="$(
   env -u MIKA_WEBHOOK_CHAIN_URL \
     MIKA_TELEGRAM_WEBHOOK_URL="http://127.0.0.1:$port/webhook/telegram" \
@@ -284,6 +295,35 @@ if grep -nE '^[^#]*ngrok' "$PROBE" >/dev/null 2>&1; then
   bad "AC2 — the probe names ngrok outside a comment: $(grep -nE '^[^#]*ngrok' "$PROBE")"
 else
   ok "AC2 — no executable line of the probe names ngrok"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. mika2135_no_call_site_uses_command_substitution — a source scan over this
+#     very file, because the class it guards is invisible to every assertion
+#     above. `port="$(start_server 422)"` makes no decision wrong: the server is
+#     started, `$port` is the empty string, the probe silently falls back to the
+#     real gateway on 8080 for its health check, and the suite then fails on a
+#     curl exit 7 — twenty-two assertions blaming the probe for a defect in its
+#     harness. That is what QA measured on PR #2435, under a comment that already
+#     forbade the shape. A comment is not a guard.
+#
+#     The anti-vacuity half is load-bearing: a scan that finds no call site at
+#     all reads exactly like a clean one, so the count is asserted rather than
+#     assumed (class mika#2205).
+# ---------------------------------------------------------------------------
+SELF="$SCRIPT_DIR/$(basename "$0")"
+substituted="$(grep -nE '\$\([[:space:]]*start_server\b' "$SELF" | grep -v '^[0-9]*:#' || true)"
+if [ -n "$substituted" ]; then
+  bad "mika2135 — start_server is called in a command substitution, so \$PORT is lost: $substituted"
+else
+  ok "mika2135 — no call site of start_server uses a command substitution"
+fi
+
+call_sites="$(grep -cE '^[[:space:]]*start_server[[:space:]]' "$SELF" || true)"
+if [ "${call_sites:-0}" -ge 9 ]; then
+  ok "mika2135 — the scan has a population ($call_sites statement call sites)"
+else
+  bad "mika2135 — only $call_sites statement call sites found; the scan above is looking at nothing"
 fi
 
 echo
