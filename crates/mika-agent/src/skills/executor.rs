@@ -1855,6 +1855,129 @@ pub(crate) async fn groomed_state(
     }
 }
 
+/// Le jeton de refus de la garde d'ESCALATE terminal (mika#2545).
+///
+/// # FORMAT DE FIL
+///
+/// Il atterrit dans `tasks.result` et un opérateur le `grep` — même raison que
+/// [`GROOMING_INTENT_MISMATCH_ERROR`] et que `ReadyLabelGate::wire_name` : deux
+/// orthographes d'un même refus couperaient une population en deux sans le dire.
+pub(crate) const GROOM_ESCALATED_ERROR: &str = "dispatch_groom_escalated";
+
+/// `audit_events.tool_name` et nom d'événement de journal du refus mika#2545.
+///
+/// **SOLE WRITER** : ce module est le seul site de production qui écrit ce nom,
+/// dans le journal comme dans `audit_events`. C'est ce qui rend
+/// `SELECT target_key, count(*) … GROUP BY 1` exact plutôt qu'un nombre sur
+/// lequel deux écrivains peuvent divergir, et donc soustractible de la
+/// population du producteur (`Outcome: ESCALATE` dans `tasks.result`). Tenu par
+/// un scan de source à allowlist vide — motif `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156),
+/// `closing_pr_closed_unmerged` / `ready_label_degroomed` (mika#2242).
+pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch_refused";
+
+/// Le marqueur que `_escalate_groom` pose sur le `result` d'un callback de groom
+/// escaladé (mika#2545, `skills/bundled/_shared/dispatch-lib.sh`).
+///
+/// L'écrivain vit dans le shell ; garder ce littéral identique à celui qu'il
+/// émet — même contrat que [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`],
+/// dont il est le pendant d'échec.
+pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
+
+/// Le champ `verdict` du refus mika#2545 : un **format de fil**.
+///
+/// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
+/// `tasks.result`, et l'opérateur en fait des `GROUP BY` — deux orthographes d'un
+/// même motif couperaient une population en deux sans le dire. Constantes
+/// nommées plutôt que littéraux au site de refus, motif
+/// `ALL_ITERATE_REFUSAL_REASONS` (mika#2506) et `ALL_PURGE_REFUSAL_REASONS`
+/// (mika#2497).
+///
+/// Les deux valeurs sont délibérément distinctes : « ce ticket a escaladé » et
+/// « on n'a pas pu le savoir » appellent la même disposition et **deux lectures
+/// opérateur différentes** — la première est le régime attendu non vide, la
+/// seconde doit rester vide.
+pub(crate) const GROOM_ESCALATE_VERDICT_ESCALATED: &str = "escalated";
+pub(crate) const GROOM_ESCALATE_VERDICT_UNREADABLE: &str = "unreadable";
+
+/// Les deux motifs, à un seul site, pour que leur cardinalité soit assertable.
+/// `pub` comme ses aînées [`crate::server::iterate_dispatch::ALL_ITERATE_REFUSAL_REASONS`]
+/// et `worktree_reaper::ALL_PURGE_REFUSAL_REASONS` : un format de fil déclaré est
+/// une surface, pas un détail d'implémentation.
+pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
+    GROOM_ESCALATE_VERDICT_ESCALATED,
+    GROOM_ESCALATE_VERDICT_UNREADABLE,
+];
+
+/// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
+/// (mika#2545)
+///
+/// Trois états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
+/// peut pas le savoir » appellent la même disposition (refuser) mais deux
+/// lectures opérateur différentes, et fondre les deux rendrait la population du
+/// fail-closed incomptable. Motif [`GroomedState`] (mika#2484 D1) : le
+/// consommateur fait un `match` **exhaustif sans bras `_ =>`**, donc un
+/// quatrième état devra être décidé par le compilateur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroomVerdictState {
+    /// Le dernier callback de groom porte [`GROOM_ESCALATE_MARKER`]. Un
+    /// re-dispatch automatique de groom est refusé.
+    Escalated,
+    /// Aucun groom terminal, ou le dernier n'a pas escaladé. Le cas nominal.
+    NotEscalated,
+    /// La preuve n'a pas pu être lue (erreur base, ou callback terminal dont le
+    /// `result` est NULL). Porte le motif pour le JSON de refus.
+    Unreadable(String),
+}
+
+/// Le verdict, dérivé du `result` brut. **Fonction pure**, testable aux bornes
+/// sans base (mika#2545 R2).
+///
+/// Le prédicat est **ancré sur la ligne**, jamais un `contains` : le `result`
+/// d'un callback porte la prose du pilote, qui peut citer `Outcome: ESCALATE` en
+/// parlant d'un autre ticket ou de ce mécanisme même — c'est le faux positif que
+/// mika#2050 a mesuré sur le Signal S. `_set_outcome_line` (mika#2492) garantit
+/// que la vraie disposition est en début de ligne, donc l'ancrage ne perd rien.
+///
+/// `None` (colonne `result` NULL sur un callback terminal) rend `Unreadable` :
+/// on ne peut pas prouver l'absence d'escalade à partir d'une absence de texte,
+/// et un callback terminal sans `result` est anormal — le chemin de complétion
+/// en écrit toujours un. La population est donc quasi vide, et son coût est
+/// convergent (voir le site de la garde).
+pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictState {
+    match result {
+        Some(text) => {
+            if text
+                .lines()
+                .any(|line| line.starts_with(GROOM_ESCALATE_MARKER))
+            {
+                GroomVerdictState::Escalated
+            } else {
+                GroomVerdictState::NotEscalated
+            }
+        }
+        None => GroomVerdictState::Unreadable(
+            "the latest groom callback for this issue carries no `result` text".to_string(),
+        ),
+    }
+}
+
+/// Le lecteur **unique** du verdict de groom pour la garde mika#2545 : de l'URL
+/// d'issue à l'état, base comprise.
+///
+/// `Ok(None)` de la base — aucun callback de groom terminal — est traduit en
+/// [`GroomVerdictState::NotEscalated`] **ici et non dans la fonction pure** :
+/// c'est le cas nominal du tout premier grooming, et le fondre avec le `result`
+/// NULL le ferait tomber en `Unreadable`, donc en refus, donc aucun ticket ne
+/// pourrait plus être groomé.
+pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> GroomVerdictState {
+    match db.latest_groom_verdict_for_issue(issue_url).await {
+        Ok(None) => GroomVerdictState::NotEscalated,
+        Ok(Some(result)) => groom_escalate_verdict(result),
+        Err(e) => GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    }
+}
+
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
 ///
 /// This is the segment of `validate_dispatch_readiness` that follows
@@ -2190,6 +2313,142 @@ pub(crate) async fn validate_dispatch_readiness(
                 "reason": format!("Failed to check active dispatches for task: {e}")
             })
             .to_string());
+        }
+    }
+
+    // mika#2545 — Tool-boundary gate: an ESCALATE of grooming is TERMINAL, so no
+    // automatic re-dispatch of grooming goes out for that ticket.
+    //
+    // Placed HERE for the reason the seat gate below already had to write down:
+    // the per-class guards enqueue a deferred callback when a slot is busy
+    // (mika#1011), and a refusal that landed after that enqueue would be re-armed
+    // and re-refused on every replay, burning one wrapper per turn on a ticket
+    // that cannot go out. Before the queue, not after it — and before the seat
+    // gate too, since this one reads the database and the seat gate spends `gh`
+    // round trips.
+    //
+    // THREE CONJUNCTIVE TERMS, and each one is a decision:
+    //
+    // 1. The dispatch class is `groom`. A `dev-pilot` on an escalated ticket is
+    //    already refused by the provenance gate below (no `Outcome:
+    //    PLAN_GROOMED`), and widening this one to cover it would duplicate an
+    //    existing refusal under a second name.
+    // 2. `originating_message.is_none()` — THE RE-ARM DISCRIMINATOR. The house
+    //    already owns it, and its justification is written a few lines down in
+    //    this very function (mika#2484): the pipeline retry of
+    //    `self-dev-callback` is a silent turn and carries none, while
+    //    `ready_label_handler` carries the webhook marker and `mika ask` carries
+    //    the operator's message. So the two canonical recovery gestures —
+    //    re-posting `ready` as remove→add (mika#2323: GitHub only emits
+    //    `labeled` on a transition) and `mika ask --agent mika-dev "groom …"` —
+    //    traverse this gate BY CONSTRUCTION. Re-arming costs no stamp, no
+    //    window, no cleanup.
+    // 3. The last groom of this ticket escalated.
+    //
+    // The ticket is resolved from the dispatch PROMPT, which is what
+    // `dispatch-lib.sh` itself reads to build the worktree. A prompt with no
+    // readable reference leaves the population: the term is unsatisfied and the
+    // gate does not bite.
+    //
+    // ONE subject, deliberately — and the seat gate below does the opposite, so
+    // the difference is worth naming rather than leaving a reader to wonder. That
+    // gate consults BOTH `reference_url` and the prompt because its question is
+    // *"could this dispatch put a second writer on a branch another seat owns?"*,
+    // and either subject naming a foreign seat is enough to refuse. This gate's
+    // question is *"did the grooming of the ticket this dispatch will actually
+    // groom end on a halt?"* — a question about one ticket, the one the pilot
+    // will work on. Adding `reference_url` here would refuse a dispatch because a
+    // DIFFERENT ticket escalated, which is a false positive on the exact axis
+    // where a false positive blocks the operator's recovery.
+    //
+    // FAIL-CLOSED on the unreadable, and the neighbour decides: the provenance
+    // gate is already fail-closed on this same door, with its reason written. The
+    // cost is named — on a DB error a legitimate automatic re-groom is refused
+    // and the ticket waits — and it is CONVERGENT (`stuck_ready_reconcile`
+    // re-drives it under the mika#2020 budget) where a wrongful pass IS the
+    // eight-dispatch loop this ticket closes.
+    if originating_message.is_none()
+        && derive_dispatch_class(tool_input.and_then(extract_skill_from_input)) == "groom"
+        && let Some((repo_ref, number)) = tool_input
+            .and_then(|input| input.get("prompt"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    {
+        let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+        let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
+        let verdict = groom_verdict_state(db, &issue_url).await;
+        // `match` exhaustif, aucun bras `_ =>` : un quatrième état de
+        // `GroomVerdictState` doit être décidé ici par le compilateur.
+        let refusal = match verdict {
+            GroomVerdictState::NotEscalated => None,
+            GroomVerdictState::Escalated => Some((
+                GROOM_ESCALATE_VERDICT_ESCALATED,
+                format!(
+                    "The last grooming of `{owner_repo}#{number}` returned \
+                     `Verdict: ESCALATE`, which is a TERMINAL grooming verdict — the \
+                     exit contract of `/mika-groom-ticket` halts for a human. Replaying \
+                     it burns a dispatch slot without changing the verdict (mika#2545: \
+                     eight replays measured on one ticket, 2026-09-26). The architect's \
+                     findings are preserved under the worktree's `.iterate/`."
+                ),
+            )),
+            GroomVerdictState::Unreadable(reason) => Some((
+                GROOM_ESCALATE_VERDICT_UNREADABLE,
+                format!(
+                    "Could not establish whether the last grooming of \
+                     `{owner_repo}#{number}` escalated ({reason}). This gate refuses \
+                     when it cannot read its proof, like the grooming-provenance \
+                     cross-check on this same door (mika#2287): a wrongful pass is the \
+                     replay loop mika#2545 closes, a wrongful refusal makes the ticket \
+                     wait and is re-driven by the stuck-ready reconciler."
+                ),
+            )),
+        };
+        if let Some((outcome, reason)) = refusal {
+            let rejection = serde_json::json!({
+                "error": GROOM_ESCALATED_ERROR,
+                "task_id": task_id,
+                "issue": format!("{owner_repo}#{number}"),
+                "verdict": outcome,
+                "reason": reason,
+                // Les deux gestes de reprise, nommés : un refus qui ne nomme pas
+                // sa levée est un refus qu'on contourne au jugé.
+                "recovery": "This halt is for an operator, not for a retry. Either fix the \
+                             plan and re-post the `ready` label as remove→add (GitHub only \
+                             emits `labeled` on a transition — mika#2323), or run \
+                             `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`. Both \
+                             carry an originating message and traverse this gate."
+            });
+            warn!(
+                event = GROOM_ESCALATE_REFUSED_EVENT,
+                task_id = task_id,
+                repo = %owner_repo,
+                issue = number,
+                verdict = outcome,
+                "tool-boundary: groom re-dispatch refused — the last grooming escalated (mika#2545)"
+            );
+            if let Err(e) = db
+                .log_audit_event(
+                    // No session id reaches this gate; the task id is the stable
+                    // identifier of the refused dispatch, as for the seat gate.
+                    task_id,
+                    GROOM_ESCALATE_REFUSED_EVENT,
+                    &format!("{owner_repo}#{number}"),
+                    None,
+                    Some(outcome),
+                    Some(&format!("issue={owner_repo}#{number} verdict={outcome}")),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    event = "groom_escalate_refused_audit_failed",
+                    error = %e,
+                    "failed to write the mika#2545 audit event (non-fatal)"
+                );
+            }
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
         }
     }
 
@@ -10742,6 +11001,360 @@ Harness ticket.
                 !rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
                 "« grooming report » n'est pas une intention de grooming : {rejection}"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2545 — un ESCALATE de groom est terminal
+    // -----------------------------------------------------------------------
+
+    mod mika2545_escalate_terminal {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent};
+
+        /// Le `result` que `_escalate_groom` écrit depuis mika#2545.
+        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+             GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
+             Verdict: ESCALATE — human review required.\n\
+             \n\
+             Outcome: ESCALATE — first-pass";
+
+        fn dispatch_input(skill: &str, prompt: &str) -> serde_json::Value {
+            serde_json::json!({ "skill": skill, "prompt": prompt, "task_id": "t-2545" })
+        }
+
+        // --- La fonction pure -------------------------------------------------
+
+        #[test]
+        fn mika2545_an_escalate_line_reads_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(ESCALATED.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        #[test]
+        fn mika2545_a_groomed_result_reads_not_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(
+                    "claude-pilot completed.\nOutcome: PLAN_GROOMED".to_string()
+                )),
+                GroomVerdictState::NotEscalated
+            );
+        }
+
+        #[test]
+        fn mika2545_an_absent_result_reads_unreadable() {
+            assert!(matches!(
+                groom_escalate_verdict(None),
+                GroomVerdictState::Unreadable(_)
+            ));
+        }
+
+        /// **Le contrôle porteur de l'ancrage.** Le `result` d'un callback porte
+        /// la prose du pilote, qui peut citer le marqueur en parlant d'un autre
+        /// ticket — ou de ce mécanisme même. C'est le faux positif que mika#2050
+        /// a mesuré sur le Signal S, et le prédicat doit être ancré sur la ligne.
+        #[test]
+        fn mika2545_a_quoted_marker_mid_line_is_not_a_verdict() {
+            let quoted = "claude-pilot completed.\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.\n\
+                 Outcome: PLAN_GROOMED";
+            assert_eq!(
+                groom_escalate_verdict(Some(quoted.to_string())),
+                GroomVerdictState::NotEscalated,
+                "une mention indentée ou en milieu de ligne est de la prose, pas \
+                 la disposition du cycle"
+            );
+        }
+
+        /// Et le contrôle de bonne foi de l'ancrage : la vraie disposition, que
+        /// `_set_outcome_line` place en début de ligne, est bien reconnue même
+        /// quand la prose en parle aussi.
+        #[test]
+        fn mika2545_a_real_disposition_is_read_even_next_to_prose_about_it() {
+            let both = "claude-pilot completed.\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.\n\
+                 Outcome: ESCALATE — second-pass-after-iterate";
+            assert_eq!(
+                groom_escalate_verdict(Some(both.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        /// Un `result` vide n'est pas une escalade — il est *lisible* et ne porte
+        /// pas le marqueur. À distinguer de `None`, qui est l'absence de texte.
+        #[test]
+        fn mika2545_an_empty_result_is_readable_and_not_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(String::new())),
+                GroomVerdictState::NotEscalated
+            );
+        }
+
+        // --- La porte ---------------------------------------------------------
+
+        /// Monte la forme que la production écrit : un parent `in_progress`
+        /// portant l'URL, et son callback de groom terminal portant `result`.
+        fn seeded(result: &str) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let callback_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&callback_id, "mika", Some(result))
+                    .unwrap()
+            );
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        /// **Le rouge du défaut.** Le re-dispatch automatique du groom — un tour
+        /// de callback, donc sans `originating_message` — est refusé à la porte.
+        #[tokio::test]
+        async fn mika2545_an_automatic_groom_redispatch_is_refused() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("un ESCALATE est terminal");
+
+            assert!(
+                rejection.contains(GROOM_ESCALATED_ERROR),
+                "le jeton de refus est un format de fil que l'opérateur grep : {rejection}"
+            );
+            assert!(
+                rejection.contains("senara-solutions/mika#123"),
+                "le refus nomme le ticket : {rejection}"
+            );
+            assert!(
+                rejection.contains("remove→add"),
+                "et il nomme LES DEUX gestes de reprise — un refus qui ne nomme \
+                 pas sa levée est un refus qu'on contourne au jugé : {rejection}"
+            );
+            assert!(
+                rejection.contains("mika ask --agent mika-dev"),
+                "le second geste de reprise est nommé aussi : {rejection}"
+            );
+        }
+
+        /// **Contrôle négatif du ré-armement.** Le geste opérateur porte un
+        /// message, donc il traverse. Sans ce contrôle, « la garde mord » ne se
+        /// distingue pas de « la garde bloque toute reprise » — et une garde qui
+        /// bloque la reprise est pire que la boucle qu'elle remplace, puisqu'elle
+        /// n'a pas de contournement.
+        #[tokio::test]
+        async fn mika2545_an_operator_regroom_traverses_the_gate() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                Some("groom mika issue#123"),
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un re-groom demandé par un opérateur doit traverser cette \
+                     garde : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif de classe : un `dev-pilot` n'est pas la population de
+        /// cette garde. Il est déjà refusé par la porte de preuve (aucun
+        /// `Outcome: PLAN_GROOMED`), et élargir ici dupliquerait ce refus sous un
+        /// second nom.
+        #[tokio::test]
+        async fn mika2545_a_dev_pilot_is_not_this_gates_population() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-pilot", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "la garde ne doit pas mordre sur dev-pilot : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif du prédicat de ticket : un prompt sans référence
+        /// lisible SORT de la population, il n'y entre pas.
+        #[tokio::test]
+        async fn mika2545_a_prompt_without_a_readable_reference_leaves_the_population() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "please groom the thing")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "sans référence lisible le terme n'est pas satisfait : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif du verdict : le chemin nominal (dernier groom
+        /// convergé) traverse. Sans lui, « la garde refuse un ESCALATE » ne se
+        /// distingue pas de « la garde refuse tout groom ».
+        #[tokio::test]
+        async fn mika2545_a_converged_groom_traverses_the_gate() {
+            let (db, parent_id) = seeded("claude-pilot completed.\nOutcome: PLAN_GROOMED");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un groom convergé n'a pas escaladé : {rejection}"
+                ),
+            }
+        }
+
+        /// Et le tout premier grooming d'un ticket — aucun callback en base —
+        /// traverse aussi. C'est le cas le plus fréquent de la flotte, et le
+        /// confondre avec « illisible » refuserait tout grooming.
+        #[tokio::test]
+        async fn mika2545_a_first_ever_groom_traverses_the_gate() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un premier grooming n'a jamais escaladé : {rejection}"
+                ),
+            }
+        }
+
+        /// Fail-closed sur l'illisible : un callback terminal sans `result`
+        /// refuse, et le refus le DIT (`verdict: "unreadable"`) plutôt que de se
+        /// faire passer pour une escalade — les deux appellent la même
+        /// disposition et deux lectures opérateur différentes.
+        #[tokio::test]
+        async fn mika2545_an_unreadable_verdict_is_refused_and_says_so() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let callback_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&callback_id, "mika", None)
+                    .unwrap()
+            );
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("un verdict illisible refuse (fail-closed)");
+
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "unreadable",
+                "le refus distingue « illisible » de « escaladé » : {rejection}"
+            );
+        }
+
+        /// **Placement (AC1).** Le refus précède l'enregistrement d'un wrapper
+        /// différé : un refus placé après la file serait ré-armé et re-refusé à
+        /// chaque replay, brûlant un wrapper par tour sur un ticket qui ne peut
+        /// pas partir. La preuve est l'absence de row `:deferred` après le refus.
+        #[tokio::test]
+        async fn mika2545_the_refusal_precedes_any_deferred_wrapper() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let _ = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("refusé");
+
+            assert_eq!(
+                db.count_pending_deferred_callbacks().await.unwrap(),
+                0,
+                "aucun wrapper différé ne doit naître d'un refus terminal"
+            );
+        }
+
+        /// Et le refus laisse sa trace sur `tasks.result`, la surface que
+        /// `mika tasks get` et le dashboard lisent (#1108).
+        #[tokio::test]
+        async fn mika2545_the_refusal_is_recorded_on_the_task() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let _ = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("refusé");
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            let result = task.result.expect("le refus est écrit sur la tâche");
+            assert!(result.contains(GROOM_ESCALATED_ERROR), "{result}");
         }
     }
 

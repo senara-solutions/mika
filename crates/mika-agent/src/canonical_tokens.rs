@@ -1636,6 +1636,159 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2545 — le nom du refus d'un re-dispatch sur ESCALATE a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est vérifiable : le nom
+    /// `groom_escalate_redispatch_refused` est **neuf**. Quand ce scan tire,
+    /// **on retire le second écrivain**, on ne l'excepte pas (doctrine
+    /// mika#2201) — une allowlist née vide est un emplacement où déposer la
+    /// prochaine infraction (mika#2323).
+    const GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom sert de nom d'événement de journal **et** de `tool_name` d'audit.
+    /// C'est ce qui rend soustractibles les deux populations de mika#2545 — le
+    /// producteur (`Outcome: ESCALATE` dans `tasks.result`) et le lecteur (les
+    /// rejeux interceptés) — et donc ce qui rend la table de lecture de §7
+    /// exacte plutôt qu'un nombre sur lequel deux sites peuvent divergir.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rend **aucune** décision fausse le jour où il est écrit, il rend le
+    /// compte inexact, en silence.
+    #[test]
+    fn mika2545_the_escalate_refusal_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("groom_escalate{}", "_redispatch_refused");
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2545 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2545 — le nom du refus a un second écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS — les deux populations de \
+             mika#2545 ne sont soustractibles que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2545_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// Les deux motifs de refus sont un **format de fil** : ils atterrissent dans
+    /// `audit_events.after_value` et dans le JSON de `tasks.result`, et
+    /// l'opérateur en fait des `GROUP BY`. Un motif ajouté ou retiré est une
+    /// RUPTURE à dater dans `CLAUDE.md`, jamais une mise à jour de ce nombre en
+    /// silence — même contrat que `ALL_ITERATE_REFUSAL_REASONS` (mika#2506).
+    #[test]
+    fn mika2545_the_two_refusal_verdicts_are_a_wire_format() {
+        use crate::skills::executor::ALL_GROOM_ESCALATE_VERDICTS;
+
+        assert_eq!(
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            2,
+            "mika#2545 — deux motifs : « ce ticket a escaladé » et « on n'a pas \
+             pu le savoir ». Ils appellent la même disposition et DEUX lectures \
+             opérateur différentes (le premier est le régime attendu non vide, le \
+             second doit rester vide), donc les fondre rendrait la seconde \
+             population incomptable."
+        );
+        let mut sorted = ALL_GROOM_ESCALATE_VERDICTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            "deux motifs portent la même valeur de fil : une population serait \
+             coupée en deux sans le dire"
+        );
+    }
+
+    /// Le `match` sur [`crate::skills::executor::GroomVerdictState`] n'a **aucun
+    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un quatrième état
+    /// devra être décidé par le compilateur, jamais absorbé par un `_ =>` qui le
+    /// ferait tomber du côté « laisser passer » en silence.
+    ///
+    /// Scan de source plutôt que test comportemental : un joker ajouté ne rend
+    /// fausse aucune des décisions couvertes aujourd'hui.
+    #[test]
+    fn mika2545_the_verdict_match_has_no_wildcard_arm() {
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+        let content = production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == owner)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("mika#2545 — {owner} introuvable : le scan ne lit rien"));
+
+        // La plage du `match`, bornée sur la ligne qui le porte — composée à
+        // l'exécution pour la même raison que le needle ci-dessus.
+        let opener = format!("let refusal = match {}", "verdict {");
+        let start = content.find(opener.as_str()).unwrap_or_else(|| {
+            panic!(
+                "mika#2545 — le `match` du verdict est introuvable dans {owner} : \
+                 ce scan vise une forme morte"
+            )
+        });
+        let body: String = content[start..]
+            .lines()
+            .take(30)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body.contains("GroomVerdictState::NotEscalated")
+                && body.contains("GroomVerdictState::Escalated")
+                && body.contains("GroomVerdictState::Unreadable"),
+            "bonne foi : la plage extraite doit bien porter les trois bras — {body}"
+        );
+        for wildcard in ["_ =>", "_=>"] {
+            assert!(
+                !body.contains(wildcard),
+                "mika#2545 — le `match` du verdict porte un bras joker (`{wildcard}`) : \
+                 un quatrième état y tomberait sans décision. RÉSOLUTION : \
+                 énumérer l'état, ne pas l'absorber."
+            );
+        }
+    }
+
     /// Le vocabulaire de refus est un **format de fil** à site unique, et cette
     /// garde vit ici — avec les autres scans de nom — plutôt que dans le module,
     /// parce que c'est la valeur telle qu'elle atterrit dans `audit_events` qui

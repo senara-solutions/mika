@@ -3727,7 +3727,17 @@ Measurement: cycle output undetermined — ${CYCLE_OUTPUT_EVIDENCE}. This is NOT
     # name a cause this gate could only describe as an absence. `STATUS=CANCELLED*`
     # additionally has to lead the callback for mika-dev's parser, which a
     # prefixed banner would break.
-    if grep -qE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE)' <<<"${RESULT:-}"; then
+    #
+    # mika#2545 — `^Outcome: ESCALATE` joins the alternation, and this is the
+    # FRAGILE half of that ticket rather than a courtesy. `PIPELINE FAILURE:` was
+    # also what took an escalated groom out of the `empty_completion` population;
+    # dropping it from `_escalate_groom` without compensating here would expose a
+    # deliberate terminal disposition to a false red — exactly what this gate's
+    # own comment says it exists to avoid. P4 already recognises `ESCALATE` as a
+    # motivated disposition, but only UNDER `CYCLE_TOOL_CALLS >= 1`; an escalated
+    # groom whose stderr copy is absent or unreadable has no measured count and
+    # would land here. Both terms are needed; neither is redundant.
+    if grep -qE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE|^Outcome: ESCALATE)' <<<"${RESULT:-}"; then
         echo "cycle_output.empty.banner_skipped: callback already carries a terminal classification — not stacking a second diagnosis" >&2
         return 0
     fi
@@ -6796,13 +6806,41 @@ _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
     # architect's escalation rationale to $WORKTREE_DIR/.iterate/escalate-<stage>.md
-    # for operator forensic access, and appends a structured PIPELINE FAILURE
-    # marker to RESULT so the callback delivers an actionable error rather than
-    # a generic "no PR" message.
+    # for operator forensic access, and stamps its own terminal disposition on
+    # RESULT so the callback delivers an actionable halt rather than a generic
+    # "no PR" message.
     #
     # Findings are PRESERVED on ESCALATE — never swept. Worktree TTL handles
     # eventual cleanup. The findings file is the operator's primary forensic
     # artifact when deciding whether to retry, refactor, or kill the plan.
+    #
+    # mika#2545 — THE PRODUCER STAMPS ITS OWN FACT, and the class of the marker
+    # is the whole change.
+    #
+    # This function used to write `PIPELINE FAILURE:`. That marker is what puts a
+    # turn into `self-dev-callback`'s RETRYABLE population (§ *On pipeline
+    # failure*), so an ESCALATE — a TERMINAL grooming verdict by the exit
+    # contract of `/mika-groom-ticket` — was auto-replayed. Measured on the groom
+    # of mika#2542, 2026-09-26: eight dispatches between 13:06:14Z and 13:20:54Z,
+    # each ESCALATE on the same cause, each consuming the `groom` slot. The
+    # `pipeline_retry_count >= 2` budget the prompt poses could never bound it —
+    # no engine code reads it, the write it prescribes lands on a task whose
+    # `trigger_type = 'callback'` (which `update_task_status` refuses), and each
+    # replay is born with fresh metadata. Class mika#2158: *a counter zeroed by
+    # the action it counts bounds nothing.*
+    #
+    # So the marker becomes `GROOM ESCALATED (terminal):` — same substance,
+    # another class — and the disposition line becomes `Outcome: ESCALATE`, which
+    # `_measure_cycle_output`'s P4 predicate has enumerated all along while
+    # NOTHING ever wrote it (class mika#2205: a predicate on an empty population
+    # reads exactly like a healthy one). The house had already decided this was
+    # the name of the fact; all that was left was to write it.
+    #
+    # `_set_outcome_line` (mika#2492) rather than a concatenation: it strips any
+    # prior line-anchored `Outcome:` and appends, which makes "exactly one
+    # `Outcome:` line" true BY CONSTRUCTION rather than by ordering luck — the
+    # plan-validation block may already have posed one by the time we get here.
+    # Called LAST so the engine-reason block below stays inside the body.
     #
     # Args:
     #   $1: stage label — "first-pass" | "second-pass-after-ready" | "second-pass-after-iterate"
@@ -6815,10 +6853,10 @@ _escalate_groom() {
     local findings_file="$findings_dir/escalate-${stage}.md"
     printf '%s\n' "$content" > "$findings_file" 2>/dev/null || true
 
-    echo "iterate_groom_loop: ESCALATE at ${stage} — failing loudly per mika#1033 (findings at ${findings_file})" >&2
+    echo "iterate_groom_loop: ESCALATE at ${stage} — terminal, no auto-replay (mika#2545; findings at ${findings_file})" >&2
 
     RESULT="${RESULT}
-PIPELINE FAILURE: groom escalated by mika-arch ${stage}.
+GROOM ESCALATED (terminal): mika-arch escalated at ${stage}.
 Verdict: ESCALATE — human review required.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
@@ -6837,6 +6875,8 @@ Architect findings preserved at: ${findings_file}"
 Engine reason: ${engine_line}"
         GROOM_LOOP_FAILURE_REASON="engine ESCALATE (${stage}): review-anchor attestation withheld"
     fi
+
+    _set_outcome_line "Outcome: ESCALATE — ${stage}"
 }
 
 _write_canonical_callout() {
@@ -8736,6 +8776,22 @@ ${RESULT}"
 
 Outcome: PLAN_GROOMED"
             fi
+        elif grep -qE '^Outcome: ESCALATE' <<<"$RESULT"; then
+            # mika#2545 — an ESCALATE is already fully stamped by its producer
+            # (`_escalate_groom`): the terminal marker, the verdict, the session,
+            # the findings path and its own `Outcome:` line. Nothing to add, and
+            # two things NOT to do.
+            #
+            # (a) Do not rewrite the `Outcome:` line. The `sed` below matches ANY
+            #     `Outcome: .*`, so it would replace the terminal disposition with
+            #     `PIPELINE_INCOMPLETE` — silently undoing the whole ticket one
+            #     branch away from the fix.
+            # (b) Do not prepend `PIPELINE FAILURE: grooming did not converge`.
+            #     That sentence stays true for this branch's seventeen other
+            #     exits; it is FALSE for an ESCALATE, which *did* converge — on a
+            #     halt verdict — and its marker is what put a terminal verdict
+            #     into the retryable population in the first place.
+            echo "dispatch_claude_pilot: groom escalated (terminal) — preserving the producer's disposition, no retryable marker (mika#2545)" >&2
         else
             # mika#1333: propagate architect-convergence failure into RESULT.
             # Replaces the silent-tolerance pattern that caused mid-flow

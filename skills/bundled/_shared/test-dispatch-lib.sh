@@ -798,7 +798,14 @@ if [ -r "$ESC_TMP/.iterate/escalate-first-pass.md" ]; then
 else
     assert_eq "_escalate_groom writes findings file under .iterate/" "ok" "missing"
 fi
-assert_contains "_escalate_groom appends PIPELINE FAILURE to RESULT" "PIPELINE FAILURE: groom escalated by mika-arch first-pass" "$RESULT"
+# mika#2545: the marker changed CLASS, not substance. `PIPELINE FAILURE:` is what
+# put a terminal grooming verdict into `self-dev-callback`'s retryable population
+# and got the groom of mika#2542 replayed eight times; the producer now stamps its
+# own terminal fact instead. The negative control below is the half that matters —
+# without it, "the terminal marker is written" would not say the retryable one is
+# gone.
+assert_contains "_escalate_groom stamps the terminal marker on RESULT (mika#2545)" "GROOM ESCALATED (terminal): mika-arch escalated at first-pass" "$RESULT"
+assert_not_contains "_escalate_groom no longer writes the retryable marker (mika#2545)" "PIPELINE FAILURE:" "$RESULT"
 assert_contains "_escalate_groom RESULT includes Verdict: ESCALATE" "Verdict: ESCALATE" "$RESULT"
 assert_contains "_escalate_groom RESULT includes session_id" "Session: session-esc-1" "$RESULT"
 assert_contains "_escalate_groom RESULT references findings file path" "Architect findings preserved at:" "$RESULT"
@@ -875,7 +882,9 @@ assert_eq "_iterate_groom_loop still has 2 cleanup calls (GROOMED-only; ESCALATE
 # marker is the mandatory product).
 RESULT=""
 WORKTREE_DIR="" _escalate_groom "first-pass" "content" "sess-x" 2>/dev/null
-assert_contains "_escalate_groom populates RESULT even when WORKTREE_DIR unset" "PIPELINE FAILURE" "$RESULT"
+assert_contains "_escalate_groom populates RESULT even when WORKTREE_DIR unset" "GROOM ESCALATED (terminal)" "$RESULT"
+assert_contains "_escalate_groom stamps its Outcome line even when WORKTREE_DIR unset (mika#2545)" \
+    "Outcome: ESCALATE — first-pass" "$RESULT"
 
 # ----------------------------------------------------------------------------
 # Phase D — canonical body-callout writer (mika#1271 sub-PR 6)
@@ -8104,8 +8113,19 @@ assert_eq "U3b: le bras no-shipping-tail précède le bras commit-pushed-no-pr" 
 T2492_MARKER_GUARD=$(printf '%s\n' "$PATHB_2492" | sed -n '/RECOVERY_CLASS" = "commit-pushed-no-pr"/,/^        RESCUED_PR_URL=/p')
 assert_not_contains "U3c: le commit marqueur wip(mika#1383) n'atteint pas la classe nouvelle" \
     "no-shipping-tail" "$T2492_MARKER_GUARD"
-assert_eq "U3c: _set_outcome_line n'est appelée qu'au seul bras de la classe nouvelle" \
-    "1" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+# L'intention de cette assertion est que la réécriture en PR_OPENED n'ait qu'un
+# site — c'est la valeur, non l'helper, qui doit être unique. Le prédicat comptait
+# sur le fichier entier parce qu'il n'existait alors qu'un seul appel ; mika#2545
+# en a ajouté un second, pour `Outcome: ESCALATE`. Les deux valeurs sont donc
+# nommées et chacune comptée à un site, ce qui est plus fort que l'ancien compte
+# global : une troisième valeur écrite par un helper partagé fait rougir la
+# cardinalité ci-dessous au lieu de passer inaperçue.
+assert_eq "U3c: la réécriture Outcome: PR_OPENED n'est appelée qu'au seul bras de la classe nouvelle" \
+    "1" "$(grep -c '_set_outcome_line "Outcome: PR_OPENED' "$DISPATCH_LIB" || true)"
+assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
+    "1" "$(grep -c '_set_outcome_line "Outcome: ESCALATE' "$DISPATCH_LIB" || true)"
+assert_eq "U3c: et _set_outcome_line n'a que ces deux valeurs déclarées" \
+    "2" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
 
 # --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
 assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
@@ -8636,6 +8656,193 @@ assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
     "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
 assert_eq "Herméticité: aucune invocation de forge en substitution" \
     "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+
+# ============================================================================
+# mika#2545 — un ESCALATE de groom est TERMINAL, et son producteur l'estampille
+# ============================================================================
+#
+# Le défaut mesuré : `_escalate_groom` écrivait `PIPELINE FAILURE:`, marqueur
+# qui fait entrer le tour dans la population RETRYABLE de `self-dev-callback`.
+# Un verdict de halte — terminal par contrat de `/mika-groom-ticket` — était
+# donc rejoué : huit dispatches sur mika#2542 le 2026-09-26, chacun ESCALATE
+# sur la même cause.
+#
+# Le producteur pose désormais son propre fait : `Outcome: ESCALATE — <stage>`,
+# écrit par `_set_outcome_line` (mika#2492) donc unique par construction, et le
+# marqueur retryable disparaît. Les assertions ci-dessous couvrent les trois
+# stages, la non-régression de la population retryable LÉGITIME, et la
+# non-régression du gate mika#1996 — dont le terme de reclassement est la part
+# fragile de ce correctif : `PIPELINE FAILURE:` était aussi ce qui sortait le
+# cycle de `empty_completion`.
+
+echo ""
+echo "Test: un ESCALATE de groom est terminal (mika#2545)"
+echo "-------------------------------------------------------------------"
+
+# Sonde comportementale : `_escalate_groom` est appelable hors contexte — elle
+# ne lit que WORKTREE_DIR, RESULT et ses trois arguments.
+_t2545_escalate_probe() {
+    local stage="$1" content="$2" result_in="${3:-}"
+    local base wt
+    base=$(mktemp -d "${TMPDIR:-/tmp}/mika-2545-test.XXXXXX")
+    wt="$base/wt"; mkdir -p "$wt"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        WORKTREE_DIR="$wt"
+        RESULT="$result_in"
+        _escalate_groom "$stage" "$content" "sess-2545" 2>/dev/null
+        printf '%s' "$RESULT"
+    )
+    rm -rf "$base"
+}
+
+T2545_BASE_RESULT="claude-pilot completed (status: success).
+Session: sess-2545
+Turns: 12"
+
+# --- Les trois stages : le fait est posé, le marqueur retryable a disparu ----
+for _t2545_stage in first-pass second-pass-after-ready second-pass-after-iterate; do
+    T2545_OUT=$(_t2545_escalate_probe "$_t2545_stage" "F1: le plan ne cite rien." "$T2545_BASE_RESULT")
+    assert_eq "AC3 ($_t2545_stage): exactement une ligne Outcome: ESCALATE" \
+        "1" "$(printf '%s\n' "$T2545_OUT" | grep -c "^Outcome: ESCALATE" || true)"
+    assert_eq "AC3 ($_t2545_stage): exactement une ligne Outcome, toutes valeurs confondues" \
+        "1" "$(printf '%s\n' "$T2545_OUT" | grep -c '^Outcome: ' || true)"
+    assert_not_contains "AC3 ($_t2545_stage): plus aucun marqueur de la population retryable" \
+        "PIPELINE FAILURE:" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): la ligne Outcome nomme le stage" \
+        "Outcome: ESCALATE — $_t2545_stage" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): le corps nomme sa classe terminale" \
+        "GROOM ESCALATED (terminal):" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): la session reste lisible" \
+        "Session: sess-2545" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): le verdict reste lisible" \
+        "Verdict: ESCALATE" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): le chemin des findings est nommé" \
+        "escalate-${_t2545_stage}.md" "$T2545_OUT"
+    assert_contains "AC3 ($_t2545_stage): le corps du RESULT antérieur est préservé" \
+        "Turns: 12" "$T2545_OUT"
+done
+
+# Une ligne `Outcome:` déjà posée par la validation de plan est REMPLACÉE, pas
+# doublée — c'est la propriété que `_set_outcome_line` garantit par construction
+# et la seule raison de ne pas concaténer à la main ici.
+T2545_OVERWRITE=$(_t2545_escalate_probe first-pass "F1: rien." "$T2545_BASE_RESULT
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation.")
+assert_eq "AC3: une ligne Outcome préexistante est remplacée, jamais doublée" \
+    "1" "$(printf '%s\n' "$T2545_OVERWRITE" | grep -c '^Outcome: ' || true)"
+assert_contains "AC3: et c'est l'ESCALATE qui reste" \
+    "Outcome: ESCALATE — first-pass" "$T2545_OVERWRITE"
+
+# La cause moteur de mika#2338 voyage toujours : ce ticket change la CLASSE du
+# marqueur, pas la substance transmise.
+T2545_ENGINE=$(_t2545_escalate_probe first-pass \
+    "F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld after the corrective re-prompt." \
+    "$T2545_BASE_RESULT")
+assert_contains "mika#2338 (non-régression): la cause moteur voyage toujours dans RESULT" \
+    "Engine reason:" "$T2545_ENGINE"
+
+# --- Cardinalité : un seul site d'écriture du fait --------------------------
+#
+# Sans cette assertion, un prédicat devenu trop étroit passerait en ne regardant
+# rien (classe mika#2205). Elle est aussi ce qui refuse un second écrivain : le
+# fait doit être posé par son producteur, et par lui seul.
+T2545_OUTCOME_WRITERS_ALLOWED=""   # mika#2545: livrée VIDE, et l'assertion suivante le tient
+assert_eq "allowlist des écrivains de Outcome: ESCALATE — zero entries" \
+    "" "$T2545_OUTCOME_WRITERS_ALLOWED"
+assert_eq "exactement un site d'écriture de Outcome: ESCALATE dans dispatch-lib" \
+    "1" "$(grep -c '_set_outcome_line "Outcome: ESCALATE' "$DISPATCH_LIB" || true)"
+# Les commentaires sont retirés avant le scan : la prose de cette fonction nomme
+# légitimement le marqueur qu'elle n'écrit plus — c'est le faux positif que
+# mika#2050 a mesuré sur le Signal S, et le même geste que GATE_CODE au test 15.
+T2545_ESCALATE_FN=$(sed -n '/^_escalate_groom() {$/,/^}$/p' "$DISPATCH_LIB" | grep -v '^[[:space:]]*#')
+assert_contains "et ce site est _escalate_groom elle-même" \
+    '_set_outcome_line "Outcome: ESCALATE' "$T2545_ESCALATE_FN"
+assert_not_contains "_escalate_groom n'écrit plus le marqueur de la population retryable" \
+    "PIPELINE FAILURE:" "$T2545_ESCALATE_FN"
+assert_contains "bonne foi: l'extraction du corps de _escalate_groom a bien trouvé son code" \
+    "GROOM ESCALATED (terminal):" "$T2545_ESCALATE_FN"
+
+# --- Le gate mika#1996 ne reclasse PAS un ESCALATE en cycle vide ------------
+#
+# La part fragile du correctif. `PIPELINE FAILURE:` sortait le cycle de
+# `empty_completion` ; le retirer exposerait un ESCALATE à un faux rouge sur une
+# sortie délibérée. Deux termes le couvrent et il faut les DEUX — le second cas
+# ci-dessous (compte d'appels d'outils NON MESURÉ) est celui que P4 ne peut pas
+# rattraper, puisque sa conjonction exige `CYCLE_TOOL_CALLS >= 1`.
+T2545_ESCALATE_RESULT="claude-pilot completed (status: success).
+GROOM ESCALATED (terminal): mika-arch escalated at first-pass.
+Verdict: ESCALATE — human review required.
+
+Outcome: ESCALATE — first-pass"
+
+T2545_GATE_UNMEASURED=$(_gate_probe result no none "" none "$T2545_ESCALATE_RESULT")
+assert_not_contains "AC7: un ESCALATE dont le compte d'outils n'est pas mesuré n'est pas reclassé vide" \
+    "PIPELINE FAILURE: empty_completion" "$T2545_GATE_UNMEASURED"
+assert_contains "AC7: et il garde sa propre disposition" \
+    "Outcome: ESCALATE — first-pass" "$T2545_GATE_UNMEASURED"
+
+T2545_GATE_ZERO=$(_gate_probe result no none "" 0 "$T2545_ESCALATE_RESULT")
+assert_not_contains "AC7: un ESCALATE mesuré à zéro appel d'outil n'est pas reclassé vide non plus" \
+    "PIPELINE FAILURE: empty_completion" "$T2545_GATE_ZERO"
+
+# Contrôle POSITIF du gate : P4 continue de reconnaître l'ESCALATE comme une
+# disposition motivée quand le compte est mesuré. Sans ce contrôle, « le terme
+# ajouté mord » ne se distingue pas de « P4 ne voit plus rien ».
+T2545_GATE_VERDICT=$(_gate_probe verdict no none "" 3 "$T2545_ESCALATE_RESULT")
+assert_eq "AC7 (contrôle positif): un ESCALATE avec des appels d'outils est 'produced' par P4" \
+    "produced" "$T2545_GATE_VERDICT"
+
+# Contrôle NÉGATIF du gate : la population `empty_completion` existe toujours.
+T2545_GATE_STILL_EMPTY=$(_gate_probe result no none "" 0 "claude-pilot completed (status: success).")
+assert_contains "AC7 (contrôle négatif): un cycle réellement vide est toujours banni" \
+    "PIPELINE FAILURE: empty_completion" "$T2545_GATE_STILL_EMPTY"
+
+# --- Non-régression : la population retryable LÉGITIME est intacte ----------
+T2545_REAL_FAILURE="PIPELINE FAILURE: the claude-pilot session was terminated before it produced any work.
+
+Outcome: PIPELINE_INCOMPLETE — pilot session terminated by claude-pilot before producing work."
+T2545_GATE_REAL=$(_gate_probe result no none "" 0 "$T2545_REAL_FAILURE")
+assert_contains "AC6: un PIPELINE FAILURE authentique garde son marqueur" \
+    "PIPELINE FAILURE: the claude-pilot session was terminated" "$T2545_GATE_REAL"
+assert_contains "AC6: et son Outcome: PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE — pilot session terminated" "$T2545_GATE_REAL"
+assert_eq "AC6: sans bannière empilée" \
+    "1" "$(printf '%s\n' "$T2545_GATE_REAL" | grep -c 'PIPELINE FAILURE:' || true)"
+
+# --- La branche `else` de dispatch_claude_pilot PRÉSERVE un ESCALATE --------
+#
+# Son texte — « grooming did not converge » — reste juste pour ses dix-sept
+# autres sorties ; il est FAUX pour un ESCALATE, qui a convergé, sur un verdict
+# de halte. Scan de source : ce bras n'est pas atteignable hors d'un dispatch
+# complet (worktree, pilote, architecte).
+T2545_CONVERGENCE_BLOCK=$(sed -n '/^        if _iterate_groom_loop; then$/,/^    fi$/p' "$DISPATCH_LIB")
+assert_eq "AC3 (bonne foi): le bloc de convergence de dispatch_claude_pilot a été extrait" \
+    "yes" "$(if [ -n "$T2545_CONVERGENCE_BLOCK" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "AC3: un bras consulte la ligne Outcome: ESCALATE avant toute réécriture" \
+    "elif grep -qE '^Outcome: ESCALATE'" "$T2545_CONVERGENCE_BLOCK"
+assert_contains "AC3: et l'écriture PIPELINE FAILURE reste présente pour les autres sorties" \
+    "PIPELINE FAILURE: grooming did not converge" "$T2545_CONVERGENCE_BLOCK"
+# L'ordre est porteur : le bras ESCALATE doit précéder celui qui réécrit
+# `Outcome: .*` au sed, sinon il n'est jamais atteint.
+T2545_ESC_POS=$(printf '%s\n' "$T2545_CONVERGENCE_BLOCK" | grep -n "elif grep -qE '\^Outcome: ESCALATE'" | head -1 | cut -d: -f1)
+T2545_SED_POS=$(printf '%s\n' "$T2545_CONVERGENCE_BLOCK" | grep -n 's/Outcome: .\*/Outcome: PIPELINE_INCOMPLETE' | head -1 | cut -d: -f1)
+assert_eq "AC3: le bras ESCALATE précède la réécriture sed de la ligne Outcome" "yes" \
+    "$([ -n "$T2545_ESC_POS" ] && [ -n "$T2545_SED_POS" ] && [ "$T2545_ESC_POS" -lt "$T2545_SED_POS" ] && echo yes || echo "non ($T2545_ESC_POS vs $T2545_SED_POS)")"
+
+# Le chemin GROOMED est inchangé à l'octet près — c'est la moitié qui garantit
+# que ce ticket n'a pas déplacé le succès en même temps que l'échec.
+T2545_GROOMED_ARM=$(sed -n '/mika#1394: Architect converged on GROOMED/,/^        elif grep -qE/p' "$DISPATCH_LIB")
+assert_contains "AC6: le chemin GROOMED écrit toujours Outcome: PLAN_GROOMED" \
+    "Outcome: PLAN_GROOMED" "$T2545_GROOMED_ARM"
+assert_contains "AC6: et strippe toujours les marqueurs PIPELINE FAILURE périmés" \
+    "sed '/^PIPELINE FAILURE:/d'" "$T2545_GROOMED_ARM"
+
+# --- dispatch-lib parse toujours -------------------------------------------
+T2545_RC=0
+bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
+assert_eq "dispatch-lib.sh passe bash -n" "0" "$T2545_RC"
 
 # --- Summary ---
 
