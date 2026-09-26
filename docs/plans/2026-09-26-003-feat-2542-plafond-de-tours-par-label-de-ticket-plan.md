@@ -571,29 +571,29 @@ les tickets le portant le portent encore.
 
 *Transcrits de l'attendu du ticket, plus les critères que R1/R2 rendent nécessaires.*
 
-- **AC1** — Un dispatch d'un ticket portant `loop-substrate` lance claude-pilot avec
+- [ ] **AC1** — Un dispatch d'un ticket portant `loop-substrate` lance claude-pilot avec
   `--max-turns 200`, et sa ligne `pilot_budget_armed` porte `max_turns=200 source=label`.
-- **AC2** — Un dispatch d'un ticket **sans** ce label est borné à `150` et sa ligne porte
+- [ ] **AC2** — Un dispatch d'un ticket **sans** ce label est borné à `150` et sa ligne porte
   `source=default` (ou `source=env` si la variable est posée sur le service). Aucun champ
   `label=` n'est émis.
-- **AC3** — **Le palier label prime sur `PILOT_MAX_TURNS` entier** : sur l'hôte de production,
+- [ ] **AC3** — **Le palier label prime sur `PILOT_MAX_TURNS` entier** : sur l'hôte de production,
   où `PILOT_MAX_TURNS=150` est posé, un ticket `loop-substrate` reçoit bien 200. *Sans AC3 le
   ticket est inerte (R1-bis).*
-- **AC4** — Le rollback mika#2496 est **préservé** : `PILOT_MAX_TURNS=0` ou vide n'émet pas
+- [ ] **AC4** — Le rollback mika#2496 est **préservé** : `PILOT_MAX_TURNS=0` ou vide n'émet pas
   `--max-turns`, **y compris** sur un ticket `loop-substrate`.
-- **AC5** — Le mapping label→plafond vit à **un seul site nommé**
+- [ ] **AC5** — Le mapping label→plafond vit à **un seul site nommé**
   (`PILOT_LABEL_TURN_CEILINGS`), et aucun second lecteur de label ne décide d'un plafond.
-- **AC6** — L'appariement est **exact sur un élément du CSV** : `not-loop-substrate`,
+- [ ] **AC6** — L'appariement est **exact sur un élément du CSV** : `not-loop-substrate`,
   `loop-substrate-v2` et leurs variantes ne relèvent rien.
-- **AC7** — `loop-substrate` est **déclaré dans `.github/labels.yml`**, et une garde CI refuse
+- [ ] **AC7** — `loop-substrate` est **déclaré dans `.github/labels.yml`**, et une garde CI refuse
   toute clé de la table non déclarée (exit 3 si la table ne se parse pas).
-- **AC8** — Les gardes mika#2496 sont **intactes** : les trois sites portent toujours
+- [ ] **AC8** — Les gardes mika#2496 sont **intactes** : les trois sites portent toujours
   `--max-turns`, l'allowlist des lancements non bornés reste vide, la co-localisation tient, le
   résolveur n'imprime pas, aucun site ne passe `--max-budget`.
-- **AC9** — Le défaut in-file de `_pilot_max_turns` vaut `150` et est pinné par une assertion
+- [ ] **AC9** — Le défaut in-file de `_pilot_max_turns` vaut `150` et est pinné par une assertion
   (D2) ; si l'architecte exclut D2, le repli documenté au § D2 s'applique et AC2 devient une
   propriété de l'environnement, écrite comme telle dans le corps de PR.
-- **AC10** — Les trois sites de lancement passent les labels au résolveur, cardinalité assertée
+- [ ] **AC10** — Les trois sites de lancement passent les labels au résolveur, cardinalité assertée
   à 3.
 
 ---
