@@ -3284,6 +3284,13 @@ _run_claude_pilot() {
     # eighteen days (cpp#119, #145, #168, #185, #187) because nothing read it.
     SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
     TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
+    # mika#2539: `_resolve_halt_subtype`'s memo is reset HERE, at the site that
+    # reads a new session's subtype, rather than at either of its two callers.
+    # The memo exists so the rescue commit and the callback banner cannot say
+    # different words about the same halt; resetting it next to `SUBTYPE` makes
+    # "one session, one answer" a property of the construction instead of
+    # something the next editor has to remember.
+    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE
     # cpp#54 promised this field to "mika-dev dispatch-lib" as its consumer and
     # nothing here ever read it (mika#2149 P4). It is a qualifier on the
     # `Halt:` line, never a second classification axis: cpp#119 sets it only on
@@ -3736,45 +3743,111 @@ _halt_hint_meaning() {
     esac
 }
 
+# Resolve THE halt subtype of this session, once, for every consumer (mika#2539).
+#
+# WHY THIS IS A FUNCTION AND NOT A `$SUBTYPE` READ. Two sites now ask what halted
+# the session: the callback banner (`_classify_terminated_session`) and the
+# rescue commit subject (`_rescue_cause_token`). The answer is NOT `$SUBTYPE`,
+# because a `terminated` result does not always carry one — the mika#2149 (C-4)
+# fallback scrapes the `[guardrail]` line out of stderr and derives the subtype
+# from it. A second site reading `$SUBTYPE` raw would therefore diverge from the
+# banner on exactly that population: the banner would say
+# `Halt class: session_silent` while the commit said `rescue no_halt_signal`.
+# Two contradictory statements about one session, one of them carved into git
+# history for good — the mika#2539 defect reproduced by its own fix.
+#
+# IT PUBLISHES VARIABLES AND WRITES NOTHING TO STDOUT, deliberately. A caller
+# doing `x=$(_resolve_halt_subtype)` runs it in a SUBSHELL, so both the memo and
+# `_HALT_GUARDRAIL_LINE` would die with that subshell — measured: the first draft
+# returned the subtype on stdout, and `_classify_terminated_session` rendered
+# `Halt: ` with an empty scraped line, reddening two pre-existing tests of the
+# fallback path (U2, T4). Read the variables after calling it as a command.
+#
+# MEMOISED per shell context. Reset lives at the `SUBTYPE` assignment site, not
+# here, so one session yields one answer by construction rather than by the next
+# editor remembering. What the memo buys is idempotence and one scrape instead of
+# two; what guarantees the two consumers AGREE is that there is only one resolver
+# (pinned by a scan in test-dispatch-lib.sh) fed by inputs that do not change
+# between them — not the memo, which a subshell boundary can still discard.
+#
+# COST, NAMED: the memo is process-scoped and dispatch-lib is sourced once per
+# dispatch, for one session — so the scope is right. A future caller handling two
+# sessions in one process would read the first session's answer; hence the
+# explicit name and this note.
+#
+# `_HALT_GUARDRAIL_LINE` carries the whole scraped line because the caller needs
+# it for PRESENTATION (`Halt: <line>`), and re-scraping stderr there would put a
+# second reader of the same bytes back into this file — the divergence above with
+# extra steps.
+#
+# Reads: SUBTYPE, STDERR_FILE, LOG_ID. Writes: _HALT_SUBTYPE_RESOLVED (the
+#        subtype, empty when the session left no halt signal at all),
+#        _HALT_GUARDRAIL_LINE.
+_resolve_halt_subtype() {
+    local stderr_path _candidate
+    # `+x` and not `:-`: an EMPTY resolution is a resolution — "this session
+    # left no halt signal" — and must not be recomputed as though unasked.
+    [ -n "${_HALT_SUBTYPE_RESOLVED+x}" ] && return 0
+    _HALT_GUARDRAIL_LINE=""
+
+    # The structured result first. claude-pilot puts the guardrail name in
+    # `.subtype` and its detail in `.termination_reason` (agent.py:155-162),
+    # which is more reliable than scraping stderr and is the only signal that
+    # distinguishes a guardrail abort from an SDK limit. This precedence is the
+    # pre-existing one, moved here unchanged.
+    if [ -n "${SUBTYPE:-}" ]; then
+        _HALT_SUBTYPE_RESOLVED="$SUBTYPE"
+        return 0
+    fi
+
+    # Fallback for a result without a subtype: scrape the `[guardrail]` line.
+    # Prefer the stderr still in hand; the persisted copy may not exist yet
+    # if the mkdir/scrub at the top of this run failed.
+    # KTD3: stderr only enriches. STATUS is the classification, so a missing
+    # or unreadable copy degrades the text and never the verdict — both
+    # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
+    # would have hidden the entire class.
+    _pilot_log_dir; stderr_path="$_PILOT_LOG_DIR/${LOG_ID:-}.stderr"
+    for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
+        [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
+        _HALT_GUARDRAIL_LINE=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
+            | grep -m1 '\[guardrail\]' || true)
+        [ -n "$_HALT_GUARDRAIL_LINE" ] && break
+    done
+    # mika#2149 (C-4): the scraped line feeds the same table, so a halt is never
+    # classed `unknown` for having arrived by the other channel. The ANSI strip
+    # above already ran; ui.py:113 writes `[guardrail] <name>: <detail>`.
+    if [ -n "$_HALT_GUARDRAIL_LINE" ]; then
+        _HALT_SUBTYPE_RESOLVED=$(printf '%s\n' "$_HALT_GUARDRAIL_LINE" \
+            | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
+    else
+        _HALT_SUBTYPE_RESOLVED=""
+    fi
+}
+
 _classify_terminated_session() {
     local mode="${1:-full}"
-    local cause guardrail="" stderr_path _candidate
+    local cause guardrail=""
     local halt_subtype="" halt_row halt_family halt_hint halt_meaning halt_lines
 
-    # The halt cause comes from the structured result first. claude-pilot puts
-    # the guardrail name in `.subtype` and its detail in `.termination_reason`
-    # (agent.py:155-162), which is more reliable than scraping stderr and is the
-    # only signal that distinguishes a guardrail abort from an SDK limit.
+    # mika#2539: the subtype comes from the one resolver, so this banner and the
+    # rescue commit subject cannot disagree about the same halt. Called as a
+    # command and read out of its variables — NOT `$(...)`, which would run it in
+    # a subshell and lose the scraped line the `Halt:` rendering below needs. The
+    # `Halt:` PRESENTATION stays here: it is this function's business, and the two
+    # branches below render the two channels differently on purpose.
+    _resolve_halt_subtype
+    halt_subtype="${_HALT_SUBTYPE_RESOLVED:-}"
+    guardrail="${_HALT_GUARDRAIL_LINE:-}"
+
     if [ -n "${SUBTYPE:-}" ]; then
         # mika#2149 (C-3): `api_error_status` is a qualifier, inserted only when
         # the result carried it.
         cause="Halt: ${SUBTYPE}${API_ERROR_STATUS:+ (HTTP ${API_ERROR_STATUS})}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
-        halt_subtype="$SUBTYPE"
+    elif [ -n "$guardrail" ]; then
+        cause="Halt: ${guardrail}"
     else
-        # Fallback for a result without a subtype: scrape the `[guardrail]` line.
-        # Prefer the stderr still in hand; the persisted copy may not exist yet
-        # if the mkdir/scrub at the top of this run failed.
-        # KTD3: stderr only enriches. STATUS is the classification, so a missing
-        # or unreadable copy degrades the text and never the verdict — both
-        # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
-        # would have hidden the entire class.
-        _pilot_log_dir; stderr_path="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
-        for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
-            [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
-            guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
-                | grep -m1 '\[guardrail\]' || true)
-            [ -n "$guardrail" ] && break
-        done
-        if [ -n "$guardrail" ]; then
-            cause="Halt: ${guardrail}"
-            # mika#2149 (C-4): the scraped line feeds the same table, so a halt
-            # is never classed `unknown` for having arrived by the other
-            # channel. The ANSI strip above already ran; ui.py:113 writes
-            # `[guardrail] <name>: <detail>`.
-            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
-        else
-            cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
-        fi
+        cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
     fi
 
     # mika#2149 (C-2): two stable prefixes after `Halt:`, in both modes — same
@@ -4038,6 +4111,98 @@ to this branch's own diff (mika#2348 D3)." --no-verify 2>&9; then
     fi
 }
 
+# Name WHY the pilot left a dirty worktree without committing (mika#2539).
+#
+# THE DEFECT THIS CLOSES. Both rescue commits below used to carry one generic
+# subject, so git history could not tell apart two sessions whose causes were
+# opposite: #2532 was stopped by a terminal classifier deny at turn 62, #2536 hit
+# the 150-turn ceiling. Same words, different organ to go and repair. Since the
+# 150-turn ceiling stays and iterate-from-wip is the nominal R-class route
+# (Prime + Vincent, 2026-09-26), the cause is the thing the history has to carry.
+#
+# DERIVED, NOT REDECLARED — this is the whole design. The four tokens the ticket
+# proposed would have been a SECOND classification of a signal `_halt_family`
+# already classifies, and a second table is a dated debt: it would sit outside
+# test-dispatch-lib.sh's T6 drift guard, so a subtype added upstream would redden
+# `_halt_family` and pass SILENTLY here. mika#2158 measured that exact shape —
+# `auto_pull.rs` carried a regex commented "Mirrors GROOMED_VERDICT_RE" that
+# followed neither of the two widenings after it, and promotion and dispatch
+# routing answered the same question differently for months. So this function
+# enumerates only the two cases that are NOT halt families and delegates
+# everything else; T6 covers the token because the token IS `_halt_family`'s
+# output. A scan in test-dispatch-lib.sh refuses any upstream subtype name in
+# this body, because that is the one form a second table would take.
+#
+# THE POPULATION IS PARTITIONED, and that is not scope creep. `_halt_family`
+# distinguishes nine families; the ticket's four tokens had room for three, and
+# the other six would have landed in a token the ticket glosses "cause NOT
+# identified" — of sessions whose cause is identified and named. That is the
+# mika#2304 shape (a field that asserts, with authority, what did not happen),
+# i.e. this ticket's own defect moved one notch. The ticket writes "distinguishing
+# AT LEAST", so the licence to go wider is in its letter.
+#
+# RANK 1 IS A PRECEDENCE THIS FILE ALREADY SETTLED. #2532 carries TWO signals:
+# a terminal deny AND a silent session. The deny is the CAUSE (the pilot was
+# prevented), the silence its CONSEQUENCE (it then went mute), so reporting the
+# halt family would send the operator to the wrong organ. `_post_flight_recovery`
+# already ranks these the same way — its Class C branch puts the deny ahead of
+# the drift message, under a comment saying THE ORDER OF THE CONJUNCTS IS
+# LOAD-BEARING and with two tests measuring its position. Taken as-is, not
+# invented here.
+#
+# Lethality is REQUIRED at rank 1, for the same reason Class C requires it: a
+# non-terminal deny is annexed as a note, never treated as the cause. Without the
+# condition, a session that SURVIVED a deny and then hit the turn ceiling would
+# read `policy_deny` — false, and false on the commonest case (mika#2493 measured
+# 1093 non-terminal denies against 62 terminal).
+#
+# Rank 1 deliberately does NOT carry Class C's third conjunct `[ -z "$VALID_PLAN" ]`.
+# There it guards a verdict about the SESSION ("one that delivered cannot be
+# labelled by a deny"); here the question is why the pilot did not COMMIT, and a
+# terminal deny is that answer even when a plan was written to disk. Worse, the
+# uncommitted-plan-on-disk case is precisely the dev-groom population this rescue
+# exists for — `_find_issue_plan` walks the filesystem — so importing the conjunct
+# would disarm rank 1 on exactly the sessions it is meant to explain.
+#
+# Reads: POLICY_DENY, POLICY_DENY_LETHALITY (both set by _post_flight_recovery's
+#        policy-deny pre-check, which always runs before the rescue: the rescue's
+#        own PRE=POST guard is strictly narrower than that block's condition).
+# Prints one snake_case token on stdout. Casing follows `_halt_family` — mixing
+# kebab- and snake_case would split one population in two at read time, which is
+# what scripts/canonical-tokens.tsv (mika#2201) exists to prevent.
+_rescue_cause_token() {
+    local _subtype _family
+
+    # Rank 1 — the deny is the cause; whatever halt followed is its consequence.
+    if [ -n "${POLICY_DENY:-}" ] && [ "${POLICY_DENY_LETHALITY:-}" = "terminal" ]; then
+        printf '%s' "policy_deny"
+        return 0
+    fi
+
+    # Called as a command, read out of its variable — see the resolver's own note
+    # on why it publishes rather than prints.
+    _resolve_halt_subtype
+    _subtype="${_HALT_SUBTYPE_RESOLVED:-}"
+
+    # Rank 4 — no halt signal at all: the session did not halt. Distinct from
+    # rank 3 below, and keeping them apart IS the partition above made
+    # executable: merged, "halted for a reason outside our table" and "never
+    # halted" become one word, which is the very confusion this ticket closes.
+    if [ -z "$_subtype" ]; then
+        printf '%s' "no_halt_signal"
+        return 0
+    fi
+
+    # Ranks 2 and 3 — one table, consulted, never copied. The discriminant is the
+    # one `_classify_terminated_session` already uses for its drift line.
+    _family=$(_halt_family "$_subtype"); _family=${_family%%|*}
+    if [ -z "$_family" ] || [ "$_family" = "unknown" ]; then
+        printf '%s' "halt_unmapped"
+        return 0
+    fi
+    printf '%s' "$_family"
+}
+
 # Preserve a zero-commit session's uncommitted content, then let the caller
 # unblock on it (mika#1282; opened to dev-groom by mika#2031).
 #
@@ -4083,14 +4248,26 @@ _rescue_dirty_worktree() {
     DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
     [ -n "$DIRTY_FILES" ] || return 0
 
-    # Commit subject names what was salvaged. The `commit -m "wip(` literal on
-    # both sites below is load-bearing for test_rescue_commit_no_verify.sh's
-    # static guard — keep the interpolation after it, not around it.
-    local _rescue_what
+    # Commit subject names what was salvaged, and WHY the pilot never committed
+    # it (mika#2539). The `commit -m "wip(` literal on both sites below is
+    # load-bearing for test_rescue_commit_no_verify.sh's static guard — keep the
+    # interpolation after it, not around it.
+    #
+    # mika#2539: the cause token is inserted BETWEEN the `wip(<repo>#<n>): `
+    # prefix and the existing tail, and that placement carries three properties.
+    # It is visible in `git log --oneline` before any truncation, which is the
+    # point of the ticket; the tail is left word-for-word, so every downstream
+    # consumer of this subject is untouched (the `^wip\(` anchor in
+    # self-dev-webhook-qa, the three `commit -m "wip(` sites the static guard
+    # counts); and test_dev_groom_dirty_rescue.sh's two `assert_contains` on that
+    # tail stay green unmodified, which makes them the non-regression control of
+    # the placement rather than tests to go and edit.
+    local _rescue_what _rescue_cause
+    _rescue_cause=$(_rescue_cause_token)
     if [ "$SKILL" = "dev-groom" ]; then
-        _rescue_what="plan staged by post-flight recovery (mika#2031)"
+        _rescue_what="rescue ${_rescue_cause} — plan staged by post-flight recovery (mika#2031)"
     else
-        _rescue_what="impl staged by post-flight recovery (mika#1282)"
+        _rescue_what="rescue ${_rescue_cause} — impl staged by post-flight recovery (mika#1282)"
     fi
 
     # Stage all dirty files EXCEPT the worktree-scaffold paths copied by

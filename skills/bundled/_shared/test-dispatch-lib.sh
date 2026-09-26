@@ -8302,6 +8302,128 @@ assert_eq "Herméticité: aucune invocation de forge en substitution" \
 
 rm -rf "$T2493_FIXTURE_DIR"
 
+# ============================================================================
+# mika#2539 — le jeton de cause DÉRIVE de _halt_family, il ne la redéclare pas
+#
+# Ces scans sont structurels et non comportementaux, et c'est une nécessité :
+# une seconde table de classification ne rendrait AUCUNE décision fausse le jour
+# où on l'écrit. Elle rendrait `_rescue_cause_token` juste, et la laisserait
+# dériver silencieusement ensuite — un sous-type ajouté en amont ferait rougir le
+# drift guard T6 et passerait sans un mot dans le message de sauvetage. C'est la
+# panne que mika#2158 a mesurée sur `auto_pull.rs` : une regex commentée
+# « Mirrors GROOMED_VERDICT_RE » qui n'a suivi aucun des deux élargissements
+# suivants, et promotion et routage ont répondu différemment à la même question
+# pendant des mois. Aucune suite comportementale ne voit cette classe.
+#
+# T6 n'est ni touché ni dupliqué : il couvre déjà le jeton par construction,
+# puisque le jeton EST la sortie de `_halt_family`.
+# ============================================================================
+echo ""
+echo "mika#2539: le jeton de cause du sauvetage dérive de la table de halte"
+echo "---------------------------------------------------------------------"
+
+T2539_TOKEN_FN=$(sed -n '/^_rescue_cause_token() {$/,/^}$/p' "$DISPATCH_LIB")
+T2539_RESOLVER_FN=$(sed -n '/^_resolve_halt_subtype() {$/,/^}$/p' "$DISPATCH_LIB")
+
+# S3 (anti-vacuité) — AVANT tout le reste. Un scan qui regarde une fonction
+# disparue ou vide se lit exactement comme un arbre propre (classe mika#2205),
+# et les scans S1/S2 ci-dessous seraient vacuement verts sur une chaîne vide.
+assert_eq "S3 (anti-vacuité): _rescue_cause_token existe et son corps est non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_TOKEN_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "S3 (anti-vacuité): _resolve_halt_subtype existe et son corps est non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_RESOLVER_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# S1 — la délégation, mesurée. Sans cet appel, le jeton porte une table à soi.
+assert_contains "S1: _rescue_cause_token consulte _halt_family" \
+    "_halt_family" "$T2539_TOKEN_FN"
+assert_contains "S1: et il en tire la famille (premier champ de la ligne)" \
+    '%%|*' "$T2539_TOKEN_FN"
+
+# S2 — aucun nom de sous-type amont dans le corps. C'est R-3 rendu exécutable :
+# la seule forme que prendrait une seconde table.
+#
+# La population des sous-types interdits est DÉRIVÉE de `_halt_family` elle-même,
+# jamais recopiée ici. Une liste en dur aurait exactement le défaut qu'elle
+# prétend interdire : elle cesserait de couvrir le prochain sous-type ajouté à la
+# table, donc le scan rétrécirait en silence pendant que l'arbre reste vert.
+T2539_SUBTYPES=$(sed -n '/^_halt_family() {$/,/^}$/p' "$DISPATCH_LIB" \
+    | grep -oE '^        [a-z][a-z0-9_]*\)' | tr -d ' )' || true)
+# Anti-vacuité de la dérivation : la table en compte onze aujourd'hui. Si
+# l'extraction en rend une poignée, l'ancre `case` ne matche plus et S2 ne
+# regarde plus rien.
+assert_eq "S2 (anti-vacuité): la population de sous-types est dérivée de la table" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_SUBTYPES" | grep -c .)" -ge 11 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Une entrée = un site qui énumère un sous-type de halte hors de _halt_family,
+# au format `<sous-type>|<raison + ticket de suivi>`. LIVRÉE VIDE : les deux
+# fonctions scannées sont créées par mika#2539, donc aucune violation
+# préexistante ne peut exister.
+#
+# QUAND CE SCAN TIRE, LA RÉSOLUTION EST DE ROUTER LE SITE VERS _halt_family —
+# JAMAIS d'ajouter une ligne ici (doctrine mika#2201). Un site qu'on ne veut pas
+# router est un site à supprimer.
+RESCUE_CAUSE_SUBTYPE_ALLOWED=()
+
+T2539_LEAKED=""
+for _t2539_st in $T2539_SUBTYPES; do
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" || continue
+    _t2539_excused=no
+    for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
+        [ "${_t2539_entry%%|*}" = "$_t2539_st" ] && _t2539_excused=yes && break
+    done
+    [ "$_t2539_excused" = "yes" ] || T2539_LEAKED="${T2539_LEAKED}${_t2539_st} "
+done
+assert_eq "S2: aucun sous-type amont énuméré dans _rescue_cause_token" "" \
+    "$(printf '%s' "$T2539_LEAKED" | sed 's/ *$//')"
+
+# Le double sens — l'assertion auto-nettoyante. Une entrée qui ne matche plus
+# rien fait rougir le build le jour de la réparation, pas des mois après.
+T2539_STALE=""
+for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
+    _t2539_st="${_t2539_entry%%|*}"
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" \
+        || T2539_STALE="${T2539_STALE}${_t2539_st} "
+done
+assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
+    "$(printf '%s' "$T2539_STALE" | sed 's/ *$//')"
+
+# S4 — un seul résolveur. Un troisième site qui résoudrait le sous-type à la
+# main rouvrirait la divergence que `_resolve_halt_subtype` existe pour fermer :
+# la bannière du callback dirait `Halt class: session_silent` pendant que le
+# commit dirait `rescue no_halt_signal`, pour une même session, l'un des deux
+# gravé dans l'historique git pour toujours.
+#
+# Le compte est fait hors définition et hors commentaire — seuls les appels.
+T2539_RESOLVER_CALLS=$(grep -n '_resolve_halt_subtype' "$DISPATCH_LIB" \
+    | grep -v '_resolve_halt_subtype() {' \
+    | grep -vE ':[[:space:]]*#' | grep -c . || true)
+assert_eq "S4: _resolve_halt_subtype a exactement deux appelants de production" "2" \
+    "$T2539_RESOLVER_CALLS"
+assert_contains "S4: l'un est la bannière du callback" \
+    '_resolve_halt_subtype' "$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")"
+assert_contains "S4: l'autre est le compositeur du sujet de sauvetage" \
+    '_resolve_halt_subtype' "$T2539_TOKEN_FN"
+
+# Le mémo est réinitialisé au site qui lit le sous-type d'une NOUVELLE session,
+# et pas chez l'un des deux appelants : « une session, une réponse » est ainsi
+# une propriété de la construction et non de la mémoire du prochain éditeur.
+assert_eq "S4: le mémo est réinitialisé exactement une fois, au site de SUBTYPE" "1" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$DISPATCH_LIB")"
+
+# S5 — dispatch-lib parse toujours.
+T2539_RC=0
+bash -n "$DISPATCH_LIB" 2>/dev/null || T2539_RC=$?
+assert_eq "S5: dispatch-lib.sh passe bash -n" "0" "$T2539_RC"
+
+# --- Herméticité de cette section (patron mika#2178 T9 / mika#2493) ---------
+T2539_SECTION=$(sed -n '/^# mika#2539 — le jeton de cause DÉRIVE de _halt_family/,$p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2539 a trouvé la section" \
+    "yes" "$(if [ -n "$T2539_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+
 # --- Summary ---
 
 echo ""
