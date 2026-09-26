@@ -1460,4 +1460,206 @@ mod tests {
              qui est la panne que mika#2495 a payée 6,95 USD."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2506 — le dispatch pilote a un recensement fermé, et le nom
+    // d'audit du geste opérateur a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les sites de production qui **composent** un spawn de pilote.
+    ///
+    /// # Ce n'est PAS une allowlist, et la différence est de fond
+    ///
+    /// Une allowlist est un endroit où déposer la prochaine infraction
+    /// (mika#2323). Ceci est un **recensement fermé**, comparé **dans les deux
+    /// sens** — motif `FIRED_AT_LITERAL_WRITERS` (mika#2133) : une entrée qui ne
+    /// correspond plus à aucun site fait rougir, sans quoi elle exempterait
+    /// silencieusement un futur homonyme.
+    ///
+    /// # Correction mesurée du plan mika#2506
+    ///
+    /// Sa Fire-Disposition annonce une cardinalité de **2** et « aucune
+    /// violation existante à excepter ». La mesure en donne **quatre** : les
+    /// deux handlers de `server/` composent leur propre dispatch depuis
+    /// mika#1572 / mika#1630, ce que mika#2335 a déjà dû nommer par écrit
+    /// (« the last two exist because the first was copied, and say so in their
+    /// own comments »), et `task_engine/dispatcher.rs` en est un quatrième. Une
+    /// garde figée à 2 serait **rouge à la naissance**, et un lint rouge à la
+    /// naissance se fait désarmer.
+    ///
+    /// Ce que la garde tient donc, et qui est vrai et vérifiable : **mika#2506
+    /// n'ajoute aucun site.** Son appelant passe par
+    /// `verdict_handler::try_engine_dispatch_for`, qui est l'un des quatre.
+    /// Un **cinquième** est refusé.
+    ///
+    /// Unifier les quatre est un travail réel, avec un rayon d'action sur toute
+    /// la boucle — **suivi**, précondition : que ce recensement cesse de
+    /// décroître de lui-même.
+    const ENGINE_PILOT_DISPATCH_SITES: &[&str] = &[
+        "crates/mika-agent/src/skills/executor.rs",
+        "crates/mika-agent/src/server/verdict_handler.rs",
+        "crates/mika-agent/src/server/ready_label_handler.rs",
+        "crates/mika-agent/src/task_engine/dispatcher.rs",
+    ];
+
+    /// Un cinquième site de dispatch pilote ne rendrait **aucune décision
+    /// fausse le jour où il est écrit** — il dispatcherait, tous les tests
+    /// resteraient verts — et divergerait plus tard en silence sur
+    /// `mark_parent_dispatched` (le défaut que mika#2335 a dû fermer après trois
+    /// copies), sur le bras `Deferred`, ou sur l'estampille `fired_at`. C'est la
+    /// classe que seul un scan de source voit.
+    #[test]
+    fn mika2506_le_dispatch_deterministe_a_un_recensement_ferme() {
+        // Composé à l'exécution pour que CE fichier ne se recense pas lui-même.
+        let needle = format!("spawn_long_running{}", "_exec");
+
+        let mut sites: Vec<String> = Vec::new();
+        for (rel, content) in production_sources() {
+            let calls = content.lines().any(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") || t.starts_with('*') {
+                    return false;
+                }
+                // Le SITE D'APPEL, jamais la déclaration ni un `use`.
+                l.contains(&format!("{needle}(")) && !t.starts_with("pub(crate) fn")
+            });
+            if calls {
+                sites.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve personne se lit exactement comme
+        // un arbre propre (mika#2103 / mika#2205).
+        assert!(
+            !sites.is_empty(),
+            "mika#2506 — aucun site de dispatch pilote trouvé : ce scan vise un \
+             symbole mort, il ne vérifie rien"
+        );
+
+        let newcomers: Vec<&String> = sites
+            .iter()
+            .filter(|s| !ENGINE_PILOT_DISPATCH_SITES.contains(&s.as_str()))
+            .collect();
+        assert!(
+            newcomers.is_empty(),
+            "mika#2506 — un site de dispatch pilote hors recensement : \
+             {newcomers:?}\n\n\
+             RÉSOLUTION : router ce site vers \
+             `verdict_handler::try_engine_dispatch_for`, qui compose déjà la \
+             chaîne complète (résolution d'outil, readiness, row callback, \
+             `mark_parent_dispatched`, spawn). Ne PAS ajouter de ligne au \
+             recensement : un cinquième site divergera en silence."
+        );
+
+        // Le sens inverse — une entrée périmée exempterait un futur homonyme.
+        let stale: Vec<&&str> = ENGINE_PILOT_DISPATCH_SITES
+            .iter()
+            .filter(|declared| !sites.iter().any(|s| s == *declared))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "mika#2506 — le recensement nomme des sites qui ne dispatchent plus : \
+             {stale:?}. Les retirer — un recensement périmé est une exemption \
+             silencieuse."
+        );
+    }
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : `operator_iterate_dispatch`
+    /// est un nom **neuf**. Il n'y a donc rien à excepter, ni de case où déposer
+    /// la prochaine infraction (mika#2323).
+    const OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// mika#2506 AC8 — le nom d'audit du geste opérateur a **un seul** écrivain.
+    ///
+    /// C'est ce qui rend
+    /// `SELECT after_value, count(*) … WHERE tool_name = 'operator_iterate_dispatch'
+    /// GROUP BY 1` exact plutôt qu'un nombre sur lequel deux sites peuvent
+    /// diverger — et cette requête est la sonde S3 du plan, le **contrôle
+    /// positif** sans lequel le silence de S1/S2 ne prouve rien.
+    ///
+    /// Assertion auto-nettoyante incluse : un scan visant un nom mort se lit
+    /// exactement comme un scan propre.
+    #[test]
+    fn mika2506_le_nom_daudit_a_un_seul_ecrivain() {
+        let needle = format!("operator_iterate{}", "_dispatch");
+        let owner = "crates/mika-agent/src/server/iterate_dispatch.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2506 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2506 — le nom d'audit du geste d'itération a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `server::iterate_dispatch::OPERATOR_ITERATE_AUDIT_NAME`. Ne PAS \
+             l'ajouter à OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS — la sonde S3 \
+             n'est exacte que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2506_l_allowlist_du_nom_daudit_est_vide() {
+        assert!(
+            OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain \
+             (doctrine mika#2201)."
+        );
+    }
+
+    /// Le vocabulaire de refus est un **format de fil** à site unique, et cette
+    /// garde vit ici — avec les autres scans de nom — plutôt que dans le module,
+    /// parce que c'est la valeur telle qu'elle atterrit dans `audit_events` qui
+    /// compte, pas la forme de l'`enum`.
+    #[test]
+    fn mika2506_les_motifs_de_refus_sont_declares_une_fois() {
+        use crate::server::iterate_dispatch::ALL_ITERATE_REFUSAL_REASONS;
+
+        assert_eq!(
+            ALL_ITERATE_REFUSAL_REASONS.len(),
+            7,
+            "mika#2506 — sept motifs, pas six : la divergence avec l'AC3 du plan \
+             est datée sur `IterateRefusal::EngineRefused`. Un motif ajouté ou \
+             retiré est une RUPTURE de format de fil, à dater dans CLAUDE.md — \
+             jamais une mise à jour de ce nombre en silence."
+        );
+        let mut sorted = ALL_ITERATE_REFUSAL_REASONS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALL_ITERATE_REFUSAL_REASONS.len(),
+            "deux motifs portent la même valeur de fil : une population serait \
+             coupée en deux sans le dire"
+        );
+    }
 }
