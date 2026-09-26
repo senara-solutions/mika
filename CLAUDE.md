@@ -684,6 +684,206 @@ Optional (pilot turn budget, armed at the source — mika#2496):
 - **Out of scope, deliberately:** the missing dollar brake itself (`_sdk_guardrail_kwargs`'s `pass`) and the real-time per-boundary turn count, both follow-ups on `senara-solutions/claude-pilot` — this repo cannot create either; the V2 measurement, an operator gesture on the host that gates the default's value; and the revise path's stderr, whose line is persisted nowhere (inherited from Signal S).
 
 
+### `MIKA_PLATFORM_DIR` traverse enfin, et un `cwd` incomposable est refusé en le nommant (mika#2536)
+
+- `MIKA_PLATFORM_DIR` — racine de la plateforme, posée par l'opérateur sur
+  l'environnement du **service**. Défaut `$HOME/workspace/mika-platform`.
+  **Le nom ne change pas ; ce qui change est qu'il est désormais lu.**
+
+- **Le défaut, mesuré le 2026-09-25.** Le handler `build-mika` a crashé **quatre
+  fois** sur la QA de PR #2530, chaque tentative, avec le même `tasks.result` :
+  `HANDLER CRASH (exit code 1). Script failed before building result.` Le crash
+  est `cd "$CWD"`, seul `exit 1` littéral entre l'installation du trap et la
+  première assignation de `RESULT` ; son diagnostic part sur un stderr que le
+  chemin long-running jette. Quatre crashs identiques, quatre résultats
+  identiques et muets.
+
+- **La branche `${MIKA_*:-…}` était MORTE, sur les dix sites.** Le child de
+  dispatch est construit par `sandboxed_pilot_env` — `env_clear()` puis une
+  allowlist **positive** qui refuse tout `MIKA_*` — et le chemin exec non
+  long-running passe par `scrub_mika_env_vars`, une denylist sur le même
+  préfixe. Donc `${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}` ne pouvait
+  **que** prendre son repli, et si le worktree réel n'était pas là, `cd`
+  échouait à coup sûr. Le réglage existait, était documenté, et n'était lu par
+  personne.
+
+- **Le relais TRADUIT le nom, et c'est le cœur du correctif.**
+  `inject_platform_dir_env` (`crates/mika-agent/src/skills/executor.rs`) lit
+  `MIKA_PLATFORM_DIR` **côté spirit** — où il n'est pas scrubbé, le scrub étant
+  une propriété de l'environnement du *child* — et pose `PLATFORM_DIR`
+  (`PLATFORM_DIR_RELAY_KEY`) côté child. Un relais à l'identique, le motif de
+  `inject_pilot_dispatch_env`, aurait exigé que l'opérateur renomme sa variable
+  sans que rien ne le lui dise : c'est très exactement la panne que ce ticket
+  ferme, déplacée d'un cran. Motif suivi : `inject_pilot_transcript_env`, qui lit
+  `MIKA_LOG_PILOT_TRANSCRIPTS` et pose `ANTHROPIC_LOG_FILE`. **Aucun opérateur
+  n'a de variable à renommer.**
+
+  **Trois raisons pour le nom nu, la troisième étant spécifique à un
+  consommateur :** l'allowlist refuse tout `MIKA_*` ; un `debug_assert` existe
+  pour empêcher qu'on l'y ajoute ; et `deploy-mika/handlers/run.sh` fait
+  `for _var in $(env | grep -o '^MIKA_[^=]*'); do unset "$_var"; done` **avant**
+  de lire sa racine — même autorisé en amont, ce handler-là l'aurait retiré
+  lui-même. Ajouter `MIKA_PLATFORM_DIR` à `SANDBOX_ENV_CORE_ALLOWLIST` est le
+  geste tentant et il est **refusé** : percer une garde anti-fuite de secret pour
+  un confort de chemin.
+
+  L'entrée `("MIKA_PLATFORM_DIR", "mika#2491 — racine plateforme")` a quitté
+  `DISPATCH_ENV_KNOWN_INERT`, qui **décroît pour la première fois** — l'effet que
+  son doc-comment annonce (« quand une entrée est tranchée, on la RELAIE et on
+  retire sa ligne »). Ce retrait n'était pas optionnel : l'assertion
+  auto-nettoyante du test mika#2508 l'exigeait dès que `dispatch-lib.sh` a cessé
+  de lire le nom préfixé.
+
+- **Quatre refus nommés, et leur ORDRE est un livrable.**
+  `skills/bundled/_shared/cwd-guard.sh` (POSIX `sh`, sourcé par `build-mika` et
+  `deploy-mika` — motif `_shared/pr-push-guard.sh`, mika#2520) valide et
+  **nomme** ; il ne canonicalise pas, chaque handler gardant son `pwd -P` et
+  composant son propre `RESULT`.
+
+  | # | motif | test | pourquoi à ce rang |
+  |---|---|---|---|
+  | 1 | `unexpanded_variable` | `case "$CWD" in *'$'*)` | un `cwd` valant `$MIKA_PLATFORM_DIR/.claude/…` est **aussi** non-absolu et **aussi** inexistant : les trois énoncés sont vrais, seul le premier désigne le prompt fautif |
+  | 2 | `not_absolute` | `case "$CWD" in /*)` | distingue un chemin relatif d'un chemin absent |
+  | 3 | `does_not_exist` | `[ -e "$CWD" ]` | le cas que `deploy-mika` couvrait déjà seul |
+  | 4 | `not_a_directory` | `[ -d "$CWD" ]` | `cd` sur un fichier échoue avec un message qu'aucune surface ne relaie |
+
+  Sans cet ordre, la faute de prompt serait rapportée « inexistant » : vrai, et
+  **strictement moins utile** — c'est un refus qui envoie l'opérateur créer un
+  répertoire au lieu de corriger un prompt. `deploy-mika` **conserve** son `case`
+  de préfixe autorisé : la garde partagée s'ajoute, elle ne remplace pas, et
+  affaiblir un périmètre de sûreté serait un effet de bord d'un ticket
+  d'observabilité.
+
+  La garde est sourcée **après** l'installation du trap, et son absence est
+  **fail-closed et nommée** : un `RESULT` qui dit quoi reconstruire, plutôt que
+  le `HANDLER CRASH` que tout ceci retire. `skills/bundled/_shared/` est une
+  projection du **binaire**, donc handler et garde sont seedés ensemble.
+
+- **Les prompts cessent de prescrire l'indéveloppable.** Cinq lignes
+  (`qa-review:568`, `qa-review-build-callback:30`, `build-mika:20-21`,
+  `deploy-mika:13`) nomment désormais la racine **littéralement**. Les deux
+  premières étaient les dangereuses : elles donnaient au modèle une *formule de
+  composition* qu'il recopie dans un argument `cwd`. **Et la moitié qui tient
+  n'est pas celle-là** — par
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, un
+  correctif de prompt seul ne tient pas au substrat de la boucle : le prompt
+  exprime l'intention, le refus la tient.
+
+### Surface opérateur, et il n'y en a qu'une
+
+```bash
+mika tasks get <task-id>   # le motif est dans `result`, préfixé REFUSED (cwd-guard, mika#2536)
+```
+```sql
+SELECT id, result FROM tasks
+ WHERE result LIKE 'REFUSED (cwd-guard, mika#2536)%' ORDER BY created_at DESC;
+```
+
+| motif | régime attendu | lecture |
+|---|---|---|
+| `unexpanded_variable` | **vide** | chaque occurrence est une formule de prompt recopiée dans un `cwd` — c'est le **prompt** qu'il faut lire, pas la garde |
+| `not_absolute` | **vide** | un appelant compose un chemin relatif |
+| `does_not_exist` | faible | worktree fauché (mika#2420) ou absent de cet hôte |
+| `not_a_directory` | **vide** | un appelant passe un fichier |
+
+Le handler est un sous-processus shell sans accès base, et son stderr d'avant-
+pilote est structurellement perdu sur un dispatch qui **réussit** (classe
+mika#2050 : il hérite du `Stdio::piped()` de l'exécuteur, que celui-ci ne lit que
+dans la branche `if !status.success()`). Inventer une surface de journal qui ne
+serait pas lue reproduirait le défaut du Signal M.
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir — **sans cette vérification, chacune des sondes ci-dessous
+> rend un résultat qui décrit le binaire d'hier.**
+
+**S1 — le défaut fondateur (première QA de PR après déploiement).** Le callback
+`build_mika` rend « Build succeeded » ou « Build FAILED », jamais « HANDLER
+CRASH » ni un refus de `cwd`.
+**Halte 1 — un refus de `cwd` apparaît.** Ce n'est **pas** une panne : c'est R6
+qui mord, et le motif dit lequel des quatre remèdes s'applique. Un
+`unexpanded_variable` signifie que la moitié prompt n'a pas atteint ce chemin —
+**vérifier le seed du prompt avant de toucher à la garde**. Un `does_not_exist`
+sur un worktree qui existe signifie que le relais ne traverse pas : c'est S2.
+
+**S2 — le relais traverse (contrôle POSITIF, obligatoire).** Poser
+`MIKA_PLATFORM_DIR=/chemin/de/test` sur l'environnement du **service**,
+redémarrer, lancer un dispatch, et lire le `cwd` résolu dans le RESULT du
+callback — `build-mika` le cite déjà (`Build succeeded (cwd: …)`).
+**Halte 2 — le `cwd` reste `$HOME/workspace/mika-platform/mika`.** Le relais ne
+traverse pas. **Ne pas élargir `SANDBOX_ENV_CORE_ALLOWLIST`** — c'est le geste
+que le test mika#2508 refuse en majuscules. Établir d'abord si l'injecteur est
+appelé (placement **après** `sandboxed_pilot_env`) et si la variable est posée sur
+l'environnement du service et non dans un shell interactif.
+**Sans cette sonde, « le `cwd` par défaut convient sur cet hôte » et « le relais
+est inerte » rendent des bytes identiques** — classe mika#2205 appliquée au
+correctif lui-même.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus de `cwd` sur un
+dispatch nominal, `build-mika` comme `deploy-mika`.
+**Halte 3 — un refus sur un dispatch sain.** Faux positif, et il coûte un
+dispatch entier. **Désarmer d'abord** (retirer le `.` de la garde dans le handler
+concerné), diagnostiquer ensuite — un `cwd` légitime refusé est un arbitrage de
+prédicat, pas un seuil à régler.
+
+**S4 — l'inertie est retirée pour de bon.** `grep -n MIKA_PLATFORM_DIR
+crates/mika-agent/src/skills/executor.rs` ne doit plus rendre de ligne de
+`DISPATCH_ENV_KNOWN_INERT`, et le test mika#2508 doit passer.
+**Halte 4 — le test rougit sur l'anti-vacuité (`population.len() >= 8`).** Le
+seuil est ce qui empêche un scan devenu aveugle de se lire comme un arbre propre :
+**ne pas le baisser pour faire passer le build** — établir quelle autre variable a
+quitté la population.
+
+### Ce que ce travail n'achète PAS
+
+Il ne fait pas réussir un build qui échoue, et il ne rejoue pas les quatre crashs
+du 2026-09-25 : leur worktree est fauché et leur `tool_calls` hors d'atteinte du
+bac à sable. Il ferme **deux causes structurelles établies par lecture** — la
+branche morte et la variable que rien ne développe — et rend la **prochaine**
+occurrence auto-diagnostique.
+
+Il n'ajoute **aucun compteur et aucun événement de journal** : le seul instrument
+neuf est le motif de refus dans `tasks.result`, et **son silence ne prouve rien
+tant que personne n'exécute S1 et S2** — sur un handler dispatché quelques fois
+par jour, l'absence de refus peut simplement vouloir dire qu'aucun `cwd` n'a été
+composé de travers.
+
+Enfin, il rend le réglage **effectif**, il ne le rend pas **surveillé** : rien
+n'émet le chemin résolu au démarrage, donc « quel `cwd` ce dispatch a-t-il
+réellement utilisé ? » reste une question qu'on pose au RESULT d'un callback,
+jamais à un grep. C'est l'inverse de la doctrine mika#2293 (*un réglage qu'on ne
+peut pas observer n'est pas un réglage, c'est un espoir*), assumé pour un chemin
+dont le RESULT cite déjà la valeur — mais ça mériterait une ligne
+`platform_dir_resolved` le jour où une mesure montre qu'on la cherche.
+
+### Hors périmètre, délibérément
+
+- **R1–R3 (observabilité)** — le stderr jeté par `spawn_long_running_exec`, la
+  variable `STAGE`, le trap installé plus tôt. Ils restent au parent **mika#2532**.
+  Aucune ligne de ce travail ne touche `deliver_callback` ni la branche
+  `!status.success()` de l'exécuteur : c'est ce qui rend les deux tickets
+  mergeables dans n'importe quel ordre.
+- **Les quatre commandes `run_shell` de `qa-review`** (l.12, 205, 279, prose l.9).
+  Même variable, même inertie, **autre chemin d'exécution** — `run_shell` passe par
+  `scrub_mika_env_vars` et `shell-exec/handlers/run.sh` possède déjà son propre
+  relais vers un *argument* (garde mika#2449). **Le relais livré ici ne les répare
+  pas**, et c'est à dire explicitement plutôt qu'à laisser croire. **Ticket de
+  suivi**, précondition : une mesure montrant qu'un `run_shell` de qa-review a
+  réellement échoué sur un chemin vide.
+- **Étendre R6 à `resolve-pr-conflicts` et `address-pr-comments`** : ils ne
+  prennent **aucun `cwd` du modèle** (ils dérivent `WORKTREE_PATH` d'une PR) et
+  n'ont aucun `cd` nu. Armer une garde sur une population vide produirait un
+  détecteur dont le silence ne prouve rien.
+- **Rendre le chemin configurable par l'entrée JSON de l'outil** plutôt que par
+  l'environnement — plus propre en principe, mais ça change le schéma de quatre
+  outils pour un besoin que personne n'a mesuré.
+- **Les quatre autres entrées de `DISPATCH_ENV_KNOWN_INERT`**, dont
+  `MIKA_PILOT_SANDBOX` donnerait à l'environnement du service un levier pour
+  **désarmer le confinement bwrap** — arbitrage de sûreté qui appartient à un
+  ticket qui le pèse. Suivi porté par l'umbrella mika#2491.
+
 Optional (callback delivery bounds — mika#2179):
 - **The failure this bounds.** A `resume_agent` turn that errors on a callback used to write a `warn!` and nothing else: no counter, no audit event, no `next_fire_at`. The row stayed `status='completed'`, so `get_undelivered_callback_tasks` re-selected it on the very next 60s scan (`DB_SCAN_INTERVAL_TICKS`), and each attempt held the agent lock for up to `AGENT_TOTAL_TIMEOUT_SECS` (300s). The only stop condition was the LLM eventually succeeding. Measured on the night of 2026-09-03/04: 19 transport timeouts in four hours against callback `800d739f`, delivered **5 h 06** after it completed — an hour after its own parent (`ready-label: mika#2140`) had already died `phantom_aged_out` waiting for that return.
 - `MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS` — latency (seconds) above which a *successful* delivery is additionally warned about (default `3600`). **The measurement is unconditional and this variable does not gate it**: every delivery writes a `callback_delivered` audit event carrying `wait_secs` whatever the threshold. The value is chosen against a measurement rather than a feeling — over the 1628 callbacks delivered since 2026-08-01, `p50 = 377 s`, `p90 = 9585 s`; the ticket's proposed 900 s would have alerted on **33,7 %** of all deliveries, and a threshold that fires on a third of the population gets muted rather than acted on. 3600 s still fires on ~18 %, deliberately: that 18 % *is* the starvation. It is a threshold on a sick population, so if the provider-side cause is ever fixed this wants lowering.

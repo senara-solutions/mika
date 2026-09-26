@@ -229,6 +229,30 @@ jobs:
       - name: Pin the PR-branch push guard
         run: bash skills/bundled/_shared/tests/test_pr_push_guard.sh
 
+  cwd-guard-lint:
+    name: Cwd Guard Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # `build-mika` crashed four times on the QA of PR #2530 with the same
+      # uninformative `tasks.result`: "HANDLER CRASH (exit code 1)". The crash
+      # was `cd "$CWD"`, whose stderr the long-running path discards. An
+      # uncomposable cwd is now refused BY NAME, in the callback body, and the
+      # ORDER of the four refusals is itself asserted — a variable-literal cwd
+      # reported as "does_not_exist" sends an operator to create a directory
+      # instead of fixing a prompt (mika#2536).
+      # The suite carries its own THREE negative controls, in the behavioural-suite
+      # idiom of `test_pr_push_guard.sh` N1–N3 rather than as a second script: V3
+      # runs a FROZEN pre-fix fixture of the handler (which delivers the generic
+      # crash, so the named-refusal assertion is seen red on the code this ticket
+      # supersedes), and N1/N2 mutate a copy of the guard in a subshell. Without
+      # them, "the guard refuses" is indistinguishable from "the harness asserts
+      # something always true" — the discipline byte-slice-lint and
+      # pilot-push-lint above state as a separate step because their subject is a
+      # source scan, not a behaviour (mika#2103).
+      - name: Pin the four named cwd refusals, their order, and their negative controls (mika#2536)
+        run: bash scripts/test-cwd-guard.sh
+
   canonical-tokens-lint:
     name: Canonical Token Lint
     runs-on: ubuntu-22.04

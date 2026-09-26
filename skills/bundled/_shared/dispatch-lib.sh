@@ -8326,9 +8326,19 @@ EOF
         exit 1
     fi
 
-    # mika-platform root — base for sub-repo resolution
-    PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-    PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    # mika-platform root — base for sub-repo resolution.
+    #
+    # `PLATFORM_DIR` is the name the dispatch child receives, relayed from the
+    # operator's `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536).
+    # The prefixed form was a DEAD branch: `sandboxed_pilot_env` does
+    # `env_clear()` then copies back a positive allowlist that refuses every
+    # `MIKA_*`, so `${MIKA_PLATFORM_DIR:-…}` could only ever take its fallback.
+    # Self-referential assignment with a default IS the canonical operator-knob
+    # shape, and it is what the mika#2508 scan's term 4bis recognizes — the read
+    # is not evicted by the write, so the name stays in the population the relay
+    # has to cover.
+    PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
     PLATFORM_REPO_NAME=$(basename "$PLATFORM_DIR")
 
     # Initialize callback guard

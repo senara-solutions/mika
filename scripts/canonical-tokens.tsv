@@ -251,6 +251,20 @@ UNPARSEABLE TIMESTAMP	B	crates/mika-agent/src/server/handlers.rs::FAILED_SEND_UN
 # single-column list would lose.
 rescue-pipeline-verified	B	crates/mika-agent/src/wip_rescue.rs::PIPELINE_VERIFIED_KEY	exact:literal
 
+# ── Platform-root relay key (mika#2536). The name the dispatch child receives,
+# translated from the operator's `MIKA_PLATFORM_DIR`.
+#
+# Class B, and the reader is the argument for it: `std::env::var` on the child
+# side compares the name BYTE FOR BYTE. A case variant is not mis-read loudly —
+# it is not read at all, and the shell falls back on its default, which is the
+# silent-setting failure mika#2536 exists to close. Hence `exact:literal`.
+#
+# Declared here rather than allowlisted (§ D5/D6): this is the row whose absence
+# reddened `Canonical Token Lint` on the first, over-scoped implementation
+# (PR #2535, closed). The constant is NEW in this ticket, so there was nothing to
+# declare before it existed — creating it and declaring it belong to one commit.
+PLATFORM_DIR	B	crates/mika-agent/src/skills/executor.rs::PLATFORM_DIR_RELAY_KEY	exact:literal
+
 # ═══ Labels. Out of the survey's perimeter (not source), so never compared.
 #
 # Their own exhaustiveness guards are `scripts/check-dispatch-seats-declared.sh`

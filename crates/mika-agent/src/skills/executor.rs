@@ -454,6 +454,88 @@ fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Le nom que le child de dispatch porte pour la racine plateforme (mika#2536).
+///
+/// **Délibérément NON préfixé `MIKA_`**, et ce n'est pas une préférence de
+/// vocabulaire : [`is_sandbox_env_allowed`] refuse **tout** `MIKA_*` (allowlist
+/// positive + `debug_assert`), donc un nom préfixé ne traverserait pas. C'est
+/// la mesure de mika#2508 — *nommer une variable ne la fait pas traverser ; le
+/// relais explicite si.*
+///
+/// Une **troisième** raison, spécifique à un consommateur : le handler
+/// `deploy-mika` fait `for _var in $(env | grep -o '^MIKA_[^=]*'); do unset …`
+/// AVANT de lire sa racine. Même si l'allowlist admettait un `MIKA_*`, ce
+/// handler-là l'aurait retiré lui-même.
+///
+/// Ajouter `MIKA_PLATFORM_DIR` à [`SANDBOX_ENV_CORE_ALLOWLIST`] est le geste
+/// tentant et il est **refusé** : ce serait percer une garde anti-fuite de
+/// secret pour un confort de chemin, contre un `debug_assert` qui existe pour
+/// empêcher précisément ce geste. Le relais obtient le même résultat sans
+/// toucher la garde.
+const PLATFORM_DIR_RELAY_KEY: &str = "PLATFORM_DIR";
+
+/// Le nom sous lequel l'**opérateur** pose la racine plateforme (mika#2491).
+///
+/// Lu côté spirit, où il n'est pas scrubbé — le scrub est une propriété de
+/// l'environnement du *child*, jamais du nôtre.
+const PLATFORM_DIR_OPERATOR_ENV: &str = "MIKA_PLATFORM_DIR";
+
+/// Décide la paire à poser sur le child, étant donné un lecteur de
+/// l'environnement du process spirit.
+///
+/// Extraite en fonction pure pour la raison de [`relayed_env_pairs`] : la
+/// **traduction de nom** est la propriété porteuse de ce relais, et elle doit
+/// être vérifiable sans spawner de subprocess ni muter l'env du process.
+///
+/// **Pourquoi ni l'un ni l'autre des deux helpers existants.** Les deux mappent
+/// `key → (key, value)` : ils relaient un nom **à l'identique**, ce qui est
+/// exactement ce que ce relais ne doit pas faire (F4). `relayed_env_pairs` ne
+/// peut donc pas exprimer la traduction, et l'y forcer — une passe sur un
+/// tableau d'un élément suivie d'un renommage de clé — serait plus de code pour
+/// moins de lisibilité.
+///
+/// La règle sur le vide est en revanche bien celle de [`relayed_env_pairs`] et
+/// non celle de [`relayed_env_pairs_preserving_empty`], parce que le shell n'a
+/// ici **aucun palier documenté pour le vide** : ses dix sites écrivent
+/// `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où une valeur vide et une
+/// absence rendent le même défaut. Poser un vide ne changerait donc rien au
+/// child tout en rendant « réglage absent » et « réglage posé vide »
+/// indistinguables côté spirit.
+fn relayed_platform_dir_pair<F>(read: F) -> Option<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = read(PLATFORM_DIR_OPERATOR_ENV)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some((PLATFORM_DIR_RELAY_KEY, value))
+}
+
+/// Relaie la racine plateforme au child de dispatch (mika#2536).
+///
+/// **Il TRADUIT le nom, et c'est le cœur du relais.** L'opérateur pose
+/// `MIKA_PLATFORM_DIR` sur l'environnement du service — c'est le nom que
+/// mika#2491 documente et celui que `DISPATCH_ENV_KNOWN_INERT` nommait jusqu'à
+/// ce correctif. Un relais à l'identique (le motif de
+/// [`inject_pilot_dispatch_env`], qui reprend le nom du knob) exigerait que
+/// l'opérateur renomme sa variable sans que rien ne le lui dise, et un réglage
+/// qui cesse d'être lu **sans erreur** est très exactement la panne que
+/// mika#2536 ferme. Le motif suivi est donc celui de
+/// [`inject_pilot_transcript_env`], qui lit `MIKA_LOG_PILOT_TRANSCRIPTS` et
+/// pose `ANTHROPIC_LOG_FILE`.
+///
+/// Même contrat de placement que ses quatre siblings : DOIT tourner **après**
+/// [`sandboxed_pilot_env`], dont l'`env_clear()` l'effacerait.
+///
+/// Best-effort et silencieux : absence ou valeur vide ⇒ no-op, le child retombe
+/// sur son propre défaut — jamais un dispatch bloqué.
+fn inject_platform_dir_env(cmd: &mut tokio::process::Command) {
+    if let Some((key, value)) = relayed_platform_dir_pair(|k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
 /// Maximum raw image file size (5 MB).
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -4096,6 +4178,14 @@ pub(crate) fn spawn_long_running_exec(
         // Same placement rationale as the four lines above: naming them
         // unprefixed never made them traverse, the explicit relay does.
         inject_pilot_dispatch_env(&mut cmd);
+        // mika#2536: relay the platform root the four long-running handlers and
+        // `dispatch-lib.sh` read. Same placement rationale as the five lines
+        // above — and this one TRANSLATES the name (`MIKA_PLATFORM_DIR` spirit
+        // side, `PLATFORM_DIR` child side) so the operator's variable keeps its
+        // documented name. Before this, the `${MIKA_PLATFORM_DIR:-…}` branch in
+        // those scripts could never receive a value: it was a dead branch whose
+        // fallback was the only reachable arm.
+        inject_platform_dir_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -4711,8 +4801,17 @@ mod tests {
     ];
 
     fn dispatch_lib_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills/bundled/_shared/dispatch-lib.sh")
+        bundled_skills_dir().join("_shared/dispatch-lib.sh")
+    }
+
+    /// `skills/bundled/`, résolu depuis le manifeste du crate.
+    ///
+    /// Un seul site, sur le modèle de [`dispatch_lib_path`] : quatre scans
+    /// composent désormais ce chemin, et quatre littéraux dérivent en silence le
+    /// jour où l'arborescence bouge — chacun se lisant alors comme un scan propre
+    /// qui ne regarde rien.
+    fn bundled_skills_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bundled")
     }
 
     /// Découpe une ligne en segments de commande sur `;`, `&&`, `||`, `{`, `|`.
@@ -4817,10 +4916,16 @@ mod tests {
     ///
     /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
     /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
-    /// `DISPATCH_WORKTREE_ENV` et `PILOT_TRANSCRIPT_ENV` sont des **scalaires**,
-    /// et `GH_TOKEN` est un littéral injecté en clair dans
-    /// [`spawn_long_running_exec`]. Un `.iter().chain(…)` naïf sur les cinq ne
-    /// compile pas.
+    /// `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV` et
+    /// `PLATFORM_DIR_RELAY_KEY` sont des **scalaires**, et `GH_TOKEN` est un
+    /// littéral injecté en clair dans [`spawn_long_running_exec`]. Un
+    /// `.iter().chain(…)` naïf sur les six ne compile pas.
+    ///
+    /// `PLATFORM_DIR_RELAY_KEY` (mika#2536) est ici pour une raison précise :
+    /// `dispatch-lib.sh` le lit sous la forme self-référentielle
+    /// `PLATFORM_DIR="${PLATFORM_DIR:-…}"`, donc il **entre** dans la population
+    /// par le terme 4bis du prédicat. Sans cette ligne il apparaîtrait comme un
+    /// orphelin et ferait rougir le test alors même qu'il traverse.
     fn reaches_dispatch_child(name: &str) -> bool {
         if is_sandbox_env_allowed(name) {
             return true;
@@ -4830,6 +4935,7 @@ mod tests {
             || ARCH_ASK_RETRY_ENV.contains(&name)
             || name == DISPATCH_WORKTREE_ENV
             || name == PILOT_TRANSCRIPT_ENV
+            || name == PLATFORM_DIR_RELAY_KEY
             || name == "GH_TOKEN"
     }
 
@@ -4846,6 +4952,13 @@ mod tests {
     ///
     /// Quand une entrée est tranchée, on la RELAIE et on retire sa ligne — on
     /// n'élargit pas la liste.
+    ///
+    /// **Elle a décru une fois, et c'est l'effet que son doc-comment annonçait.**
+    /// mika#2536 a tranché `MIKA_PLATFORM_DIR` : la variable est désormais
+    /// relayée sous le nom `PLATFORM_DIR` ([`inject_platform_dir_env`]) et sa
+    /// ligne est partie. Ce retrait n'était pas un nettoyage opportuniste —
+    /// l'assertion auto-nettoyante plus bas l'**exigeait** dès que
+    /// `dispatch-lib.sh` a cessé de lire le nom préfixé.
     const DISPATCH_ENV_KNOWN_INERT: &[(&str, &str)] = &[
         (
             "MIKA_PILOT_SANDBOX",
@@ -4857,7 +4970,6 @@ mod tests {
             "MIKA_PILOT_EGRESS_LOG_DIR",
             "mika#2491 — puits du journal du relais d'egress",
         ),
-        ("MIKA_PLATFORM_DIR", "mika#2491 — racine plateforme"),
         (
             "MIKA_HOME",
             "mika#2491 — l'epoch mika#2026 s'écrit sous $HOME/.mika",
@@ -4994,6 +5106,441 @@ mod tests {
             has(r#"export KNOB="${KNOB:-3}""#, "KNOB"),
             "N6 : `export VAR=\"${{VAR:-défaut}}\"` est l'idiome canonique d'un \
              knob opérateur avec défaut, pas une variable interne"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // mika#2536 — le relais de la racine plateforme, et les deux scans de classe
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// V8 — le relais **traduit** le nom. C'est la propriété porteuse, et un
+    /// test sur le nom du child seul ne la verrait pas.
+    #[test]
+    fn mika2536_the_relay_translates_the_name() {
+        let pair = relayed_platform_dir_pair(|k| {
+            assert_eq!(
+                k, "MIKA_PLATFORM_DIR",
+                "le relais doit lire le nom que l'OPÉRATEUR pose (mika#2491), \
+                 jamais celui que le child reçoit — sinon l'opérateur devrait \
+                 renommer sa variable sans que rien ne le lui dise"
+            );
+            Some("/srv/plateforme".to_string())
+        });
+        assert_eq!(
+            pair,
+            Some(("PLATFORM_DIR", "/srv/plateforme".to_string())),
+            "le child doit recevoir le nom NON préfixé : `is_sandbox_env_allowed` \
+             refuse tout `MIKA_*`, donc un nom préfixé ne traverserait pas"
+        );
+    }
+
+    /// V8 — absence et valeur vide sont toutes deux des no-op.
+    ///
+    /// Le shell n'a **aucun palier documenté pour le vide** : ses dix sites
+    /// écrivent `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où vide et
+    /// absent rendent le même défaut. C'est ce qui distingue ce relais de
+    /// `PILOT_DISPATCH_ENV`, dont le vide EST le rollback (mika#2508).
+    #[test]
+    fn mika2536_an_absent_or_empty_setting_is_a_no_op() {
+        assert!(
+            relayed_platform_dir_pair(|_| None).is_none(),
+            "absence ⇒ no-op, le child garde son propre défaut"
+        );
+        assert!(
+            relayed_platform_dir_pair(|_| Some(String::new())).is_none(),
+            "valeur vide ⇒ no-op : le shell rendrait le même défaut, donc poser \
+             le vide ne changerait rien au child tout en rendant « réglage \
+             absent » et « réglage posé vide » indistinguables côté spirit"
+        );
+    }
+
+    /// Le relais est appelé APRÈS [`sandboxed_pilot_env`].
+    ///
+    /// Scan de source, et il n'est pas décoratif : l'`env_clear()` du bac à
+    /// sable efface tout ce qui est injecté avant lui. Un appel déplacé au-dessus
+    /// **ne casse aucune assertion** — le dispatch continue de tourner, la
+    /// variable retombe simplement sur son défaut, en silence. C'est exactement
+    /// la classe que ce ticket ferme, reproduite un cran plus haut.
+    #[test]
+    fn mika2536_the_relay_runs_after_the_env_sandbox() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("skills")
+            .join("executor.rs");
+        let whole = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", path.display()));
+
+        // Tronqué au premier `#[cfg(test)]` — motif `production_sources`
+        // (mika#2201). Sans ça le scan se compte lui-même : les deux aiguilles
+        // ci-dessous sont des littéraux de CE test, et le compte rendrait 2.
+        let cut = whole
+            .find("#[cfg(test)]")
+            .expect("executor.rs porte un module de test : sans lui, le scan se compte lui-même");
+        let src = &whole[..cut];
+
+        let sandbox = "sandboxed_pilot_env(&mut cmd);";
+        let relay = "inject_platform_dir_env(&mut cmd);";
+
+        // Anti-vacuité AVANT l'ordre : un scan dont les deux aiguilles ont
+        // disparu passerait en ne regardant rien (mika#2103, mika#2205).
+        assert_eq!(
+            src.matches(sandbox).count(),
+            1,
+            "un seul site doit appeler `{sandbox}` — si ce compte bouge, l'ordre \
+             ci-dessous ne décide plus de rien"
+        );
+        assert_eq!(
+            src.matches(relay).count(),
+            1,
+            "un seul site doit appeler `{relay}` ; s'il a disparu, le réglage \
+             `MIKA_PLATFORM_DIR` est redevenu inerte et RIEN ne le dirait"
+        );
+
+        assert!(
+            src.find(sandbox) < src.find(relay),
+            "`{relay}` doit venir APRÈS `{sandbox}` : l'`env_clear()` du bac à \
+             sable efface toute injection antérieure, et le dispatch resterait \
+             vert en retombant sur le défaut du shell"
+        );
+    }
+
+    /// La bibliothèque partagée que T1 ne concatène PAS, et c'est un
+    /// **PÉRIMÈTRE**, jamais une allowlist de sites.
+    ///
+    /// `_shared/dispatch-lib.sh` a son propre scan
+    /// ([`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`])
+    /// et sa propre liste d'inerties **nommées et documentées**
+    /// ([`DISPATCH_ENV_KNOWN_INERT`], trois décisions de canal que mika#2508 n'a
+    /// pas prises). La concaténer ici ferait remonter ces trois inerties dans T1,
+    /// dont l'allowlist est vide par contrat — T1 naîtrait rouge, et un lint
+    /// rouge à sa naissance se fait désarmer. Les deux scans **partitionnent** la
+    /// population : les handlers et leurs bibliothèques ici, `dispatch-lib.sh` là.
+    ///
+    /// La distinction périmètre/allowlist est celle que
+    /// `scripts/canonical-tokens-survey.sh` écrit pour ses `SOURCE_SCANNERS`, et
+    /// elle est vérifiée dans les deux sens : un périmètre qui survit à son
+    /// fichier est un tiroir.
+    const T1_PERIMETER_EXCLUDED_SHARED: &[&str] = &["dispatch-lib.sh"];
+
+    /// Les scripts de handler des skills bundled, **concaténés avec les
+    /// bibliothèques `_shared/` qu'ils sourcent**.
+    ///
+    /// Population **intentionnellement tous les handlers**, pas seulement les
+    /// long-running : les deux chemins d'exécution retirent les `MIKA_*` du
+    /// child — `sandboxed_pilot_env` par allowlist positive, `scrub_mika_env_vars`
+    /// par denylist de préfixe — donc un `${MIKA_…:-…}` y est une branche morte
+    /// dans les deux cas.
+    ///
+    /// **La concaténation n'est pas un raffinement, c'est une condition de
+    /// justesse, et elle a été trouvée par mesure.** [`external_env_reads`] ne
+    /// suit les écritures qu'à l'intérieur d'un fichier, donc une variable
+    /// **écrite par une bibliothèque sourcée** et lue par le handler passe pour
+    /// externe. Premier `cargo test` de T1 : six faux positifs — `CWD_REFUSAL`
+    /// (écrit par `_shared/cwd-guard.sh`) et les quatre `PR_PUSH_GUARD_*` (écrits
+    /// par `_shared/pr-push-guard.sh`). Le remède est structurel — scanner le
+    /// script **tel qu'il s'exécute** — jamais une entrée d'allowlist.
+    fn bundled_handler_scripts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let shared_ref = regex::Regex::new(r"_shared/([A-Za-z0-9._-]+\.sh)").unwrap();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let handlers = dir.join("handlers");
+            let Ok(files) = std::fs::read_dir(&handlers) else {
+                continue;
+            };
+            for file in files {
+                let path = file.expect("entrée de répertoire lisible").path();
+                if path.extension().is_none_or(|e| e != "sh") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&base)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                // Le script TEL QU'IL S'EXÉCUTE : son texte plus celui des
+                // bibliothèques partagées qu'il nomme.
+                let mut unit = content.clone();
+                let mut seen = std::collections::BTreeSet::new();
+                for cap in shared_ref.captures_iter(&content) {
+                    let lib = cap[1].to_string();
+                    if T1_PERIMETER_EXCLUDED_SHARED.contains(&lib.as_str())
+                        || !seen.insert(lib.clone())
+                    {
+                        continue;
+                    }
+                    if let Ok(lib_src) = std::fs::read_to_string(base.join("_shared").join(&lib)) {
+                        unit.push('\n');
+                        unit.push_str(&lib_src);
+                    }
+                }
+                out.push((rel, unit));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Les lectures orphelines d'un ensemble de scripts : lues, n'atteignant pas
+    /// le child, non nommées.
+    ///
+    /// Réutilise [`external_env_reads`] — le prédicat figé en six termes de
+    /// mika#2508 — plutôt qu'un second, parce qu'un second prédicat répondant à
+    /// la même question est la divergence que `grooming_marker` a dû graver une
+    /// fois (mika#2158).
+    fn orphan_env_reads(
+        scripts: &[(String, String)],
+        named: &std::collections::BTreeSet<&str>,
+    ) -> Vec<String> {
+        let mut orphans = Vec::new();
+        for (rel, content) in scripts {
+            for name in external_env_reads(content) {
+                if reaches_dispatch_child(&name) || named.contains(name.as_str()) {
+                    continue;
+                }
+                orphans.push(format!("{rel}: {name}"));
+            }
+        }
+        orphans
+    }
+
+    /// **Livrée vide, et elle le reste.** Quand le scan tire, on ROUTE le site
+    /// vers le relais `PLATFORM_DIR` ; on n'ajoute pas de ligne ici. Un handler
+    /// qui a besoin d'un `MIKA_*` a besoin d'un relais, pas d'une dérogation
+    /// (mika#2201 § D5/D6), et `DISPATCH_ENV_KNOWN_INERT` reste le seul endroit
+    /// où une inertie peut être **nommée**, avec sa raison et son suivi.
+    const HANDLER_ENV_KNOWN_INERT: &[(&str, &str)] = &[];
+
+    /// mika#2536 R4/R7 — T1 : aucun handler ne lit une variable qui ne peut pas
+    /// l'atteindre.
+    ///
+    /// C'est la classe F4 du plan : **une variable qui ne peut pas traverser,
+    /// lue comme si elle pouvait**. Un test comportemental ne peut pas la voir —
+    /// la branche morte ne rend AUCUNE décision fausse, elle rend un réglage
+    /// inopérant en silence, et toutes les assertions existantes restent vertes.
+    ///
+    /// Le pendant de ce scan pour `_shared/dispatch-lib.sh` est
+    /// [`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`],
+    /// dont l'allowlist est **non vide et documentée** (trois décisions de canal
+    /// que mika#2508 n'a pas prises). Les deux moitiés couvrent les dix sites que
+    /// mika#2536 a corrigés : huit ici, deux là.
+    #[test]
+    fn mika2536_no_handler_reads_a_variable_that_cannot_reach_it() {
+        let scripts = bundled_handler_scripts();
+
+        // Anti-vacuité AVANT toute autre assertion (mika#2103, mika#2205).
+        // Sept à `d4514180` : les six `*/handlers/run.sh` (address-pr-comments,
+        // build-mika, deploy-mika, dev-groom, dev-pilot, resolve-pr-conflicts)
+        // plus `qa-review/handlers/qa_pr_view.sh`.
+        assert!(
+            scripts.len() >= 7,
+            "seulement {} handler(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            scripts.len()
+        );
+        let total: usize = scripts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 20_000,
+            "{total} octets de handlers au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let named: std::collections::BTreeSet<&str> =
+            HANDLER_ENV_KNOWN_INERT.iter().map(|(n, _)| *n).collect();
+        let orphans = orphan_env_reads(&scripts, &named);
+
+        assert!(
+            orphans.is_empty(),
+            "ces variables sont lues par un handler de skill et n'atteignent PAS \
+             le child : {orphans:?}. Elles sont INERTES — l'environnement du child \
+             est reconstruit par `sandboxed_pilot_env` (allowlist positive) ou \
+             dépouillé par `scrub_mika_env_vars` (denylist `MIKA_*`), donc la \
+             branche `${{VAR:-défaut}}` ne peut QUE prendre son défaut.\n\
+             RÉSOLUTION : relayer la variable sous un nom non préfixé \
+             (`inject_platform_dir_env` est le modèle) et faire lire ce nom au \
+             handler. N'ajoutez PAS de nom à SANDBOX_ENV_CORE_ALLOWLIST, et \
+             n'allowlistez pas le site."
+        );
+    }
+
+    /// Le périmètre de T1 ne survit pas à son fichier.
+    ///
+    /// Comparaison dans les deux sens, motif `check_perimeter_entries` du survey
+    /// mika#2201 : une exclusion qui ne nomme plus rien est un tiroir, et elle
+    /// masquerait en silence la population qu'elle prétendait déléguer.
+    #[test]
+    fn mika2536_the_t1_perimeter_names_only_files_that_exist() {
+        let shared = bundled_skills_dir().join("_shared");
+        assert!(
+            !T1_PERIMETER_EXCLUDED_SHARED.is_empty(),
+            "le périmètre est vide : la délégation à mika#2508 n'existe plus"
+        );
+        for lib in T1_PERIMETER_EXCLUDED_SHARED {
+            assert!(
+                shared.join(lib).is_file(),
+                "T1_PERIMETER_EXCLUDED_SHARED nomme `{lib}`, qui n'existe pas sous \
+                 {} — retirez l'entrée ou réparez le chemin",
+                shared.display()
+            );
+        }
+    }
+
+    /// R7 — l'allowlist de T1 est livrée vide et le reste.
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323) ; cette assertion est ce qui rend le dépôt visible.
+    #[test]
+    fn mika2536_the_handler_inert_allowlist_is_empty() {
+        assert!(
+            HANDLER_ENV_KNOWN_INERT.is_empty(),
+            "HANDLER_ENV_KNOWN_INERT n'est plus vide : {:?}. La résolution d'un \
+             site qui tire est de le ROUTER vers le relais, jamais de l'exempter \
+             (mika#2201 § D5/D6). Si une inertie doit vraiment être nommée, sa \
+             place est DISPATCH_ENV_KNOWN_INERT, avec sa raison et son suivi.",
+            HANDLER_ENV_KNOWN_INERT
+        );
+    }
+
+    /// V5 — **contrôle négatif de T1, à voir rouge.**
+    ///
+    /// Sans lui, « le scan détecte la branche morte » est indistinguable de « le
+    /// scan ne regarde rien ». La fixture est construite sur la forme
+    /// **réellement mesurée** dans l'arbre avant ce correctif, jamais sur le vrai
+    /// fichier (qui change).
+    #[test]
+    fn mika2536_the_handler_scan_reddens_on_a_reintroduced_dead_branch() {
+        let named = std::collections::BTreeSet::new();
+
+        // La forme exacte des huit sites corrigés par L1c.
+        let dead = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        let orphans = orphan_env_reads(&dead, &named);
+        assert_eq!(
+            orphans,
+            vec!["build-mika/handlers/run.sh: MIKA_PLATFORM_DIR".to_string()],
+            "T1 doit accuser une branche `${{MIKA_*:-…}}` réintroduite dans un \
+             handler — c'est la forme des huit sites que L1c a corrigés"
+        );
+
+        // Contrôle de bonne foi : la forme CORRIGÉE ne doit pas être accusée,
+        // sans quoi le scan serait rouge le jour de sa naissance et se ferait
+        // désarmer (mika#2201, avertissement en tête du TSV).
+        let alive = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        assert!(
+            orphan_env_reads(&alive, &named).is_empty(),
+            "la forme relayée `${{PLATFORM_DIR:-…}}` traverse : l'accuser rendrait \
+             le scan rouge à sa naissance"
+        );
+    }
+
+    /// Les prompts système des skills bundled.
+    fn bundled_system_prompts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let prompt = dir.join("system_prompt.md");
+            let Ok(content) = std::fs::read_to_string(&prompt) else {
+                continue;
+            };
+            let rel = prompt
+                .strip_prefix(&base)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| prompt.to_string_lossy().to_string());
+            out.push((rel, content));
+        }
+        out.sort();
+        out
+    }
+
+    /// La formule de composition de worktree que T3 refuse.
+    ///
+    /// **Prédicat étroit à dessein.** Un scan sur `$MIKA_PLATFORM_DIR` tout court
+    /// rougirait sur les quatre commandes `run_shell` de `qa-review` et deux
+    /// lignes de prose, toutes **hors périmètre** (§9 du plan : autre chemin
+    /// d'exécution, ticket de suivi). Il naîtrait donc rouge, exigerait une
+    /// allowlist de six entrées — c'est-à-dire déposerait six infractions dans un
+    /// emplacement neuf — et *un lint rouge le jour de sa naissance se fait
+    /// désarmer*. Le prédicat porte donc sur la **formule de composition d'un
+    /// worktree**, la seule forme que le modèle recopie dans un argument `cwd`.
+    const WORKTREE_FORMULA_NEEDLE: &str = "$MIKA_PLATFORM_DIR/.claude/worktrees";
+
+    /// mika#2536 R5/R7 — T3 : aucun prompt ne prescrit la formule de composition.
+    #[test]
+    fn mika2536_no_prompt_prescribes_the_worktree_composition_formula() {
+        let prompts = bundled_system_prompts();
+
+        // Anti-vacuité AVANT toute autre assertion.
+        assert!(
+            prompts.len() >= 15,
+            "seulement {} prompt(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            prompts.len()
+        );
+        let total: usize = prompts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 100_000,
+            "{total} octets de prompts au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let offenders: Vec<&String> = prompts
+            .iter()
+            .filter(|(_, c)| c.contains(WORKTREE_FORMULA_NEEDLE))
+            .map(|(rel, _)| rel)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "ces prompts prescrivent au modèle de composer un chemin de worktree \
+             depuis `$MIKA_PLATFORM_DIR` : {offenders:?}. Cette variable n'est \
+             développée par AUCUN des deux environnements — le modèle recopie la \
+             formule dans un argument `cwd`, et le handler reçoit un chemin \
+             portant un `$` littéral.\n\
+             RÉSOLUTION : nommer la racine LITTÉRALEMENT \
+             (`~/workspace/mika-platform/…`). La moitié qui tient n'est de toute \
+             façon pas celle-là mais la garde `_shared/cwd-guard.sh`, qui refuse \
+             le `cwd` en le nommant (mika#2120 : neuf récurrences sous \
+             enforcement de prompt contre zéro écrit à la main)."
+        );
+    }
+
+    /// **Contrôle négatif de T3, à voir rouge.**
+    #[test]
+    fn mika2536_the_prompt_scan_reddens_on_a_reintroduced_formula() {
+        let carries = |s: &str| s.contains(WORKTREE_FORMULA_NEEDLE);
+
+        // La forme exacte de `qa-review:568` avant ce correctif.
+        assert!(
+            carries("worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/"),
+            "T3 doit accuser la formule réintroduite"
+        );
+
+        // Bonne foi : la forme littérale passe, et la mention de la variable
+        // HORS formule de worktree aussi — c'est la population que §9 met
+        // explicitement hors périmètre, et l'accuser ferait naître T3 rouge.
+        assert!(
+            !carries("worktree = ~/workspace/mika-platform/.claude/worktrees/${b}/mika/"),
+            "la forme littérale ne doit pas être accusée"
+        );
+        assert!(
+            !carries("sed -n '1,80p' $MIKA_PLATFORM_DIR/claude-pilot/README.md"),
+            "une commande `run_shell` citant la variable est hors périmètre (§9) : \
+             l'accuser ferait naître T3 rouge, et un lint rouge à sa naissance se \
+             fait désarmer"
         );
     }
 
