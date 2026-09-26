@@ -1,0 +1,1840 @@
+mod a2a_call;
+mod add_team_member;
+mod cancel_reminder;
+mod cancel_task;
+mod check_already_served;
+mod check_task;
+pub mod classification;
+pub(crate) use check_task::{GitHubRef, parse_github_ref};
+mod complete_task;
+mod create_agent;
+mod create_reminder;
+mod create_scheduled_task;
+pub mod create_skill;
+mod create_task;
+mod create_team;
+mod delegate_task;
+mod delete_skill;
+mod delete_team;
+mod get_active_llm;
+mod get_config;
+mod get_session_messages;
+mod get_task;
+mod get_team_history;
+mod get_team_status;
+mod list_agent_files;
+mod list_agents;
+mod list_audit_events;
+mod list_reminders;
+mod list_scheduled_tasks;
+mod list_skills;
+mod list_tasks;
+mod list_teams;
+mod list_workspace;
+pub(crate) mod post_action_hooks;
+pub(crate) mod pr_merge_with_gate;
+mod promote_deferred_callback;
+mod query_knowledge_graph;
+mod query_timeline;
+mod read_agent_file;
+mod read_workspace;
+mod record_served_content;
+mod remove_team_member;
+mod resolve_issue_order;
+mod run_team;
+mod search_memory;
+mod search_tool_history;
+mod send_message;
+mod set_config;
+mod skill_manage;
+mod store_fact;
+mod toggle_skill;
+mod update_core_memory;
+mod update_fact;
+mod update_skill;
+pub mod update_task_status;
+mod update_team;
+mod write_agent_file;
+mod write_workspace;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use mika_common::claude::ToolDefinition;
+use mika_common::config::Settings;
+use serde_json::Value;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use uuid::Uuid;
+
+use crate::async_db::AsyncDatabase;
+use crate::messaging::MessageSender;
+use dashmap::DashMap;
+use mika_common::agent::DEFAULT_AGENT;
+use mika_common::embedding::EmbeddingClient;
+use mika_common::team;
+
+/// Maximum length (in characters) allowed for control fields (path, name, query, etc.).
+/// File body fields ("payload" fields like `content`) use [`MAX_PAYLOAD_BYTES`] instead.
+pub const MAX_INPUT_LEN: usize = 10_000;
+
+/// Maximum length (in bytes) allowed for file-body payload fields such as the
+/// `content` parameter on `write_agent_file` and `write_workspace`.
+///
+/// Distinct from [`MAX_INPUT_LEN`] (which guards control fields like paths and
+/// queries) so that the agent can write reasonably sized documents and
+/// model-tuned skill prompts without truncation. Control fields keep the 10K cap.
+pub const MAX_PAYLOAD_BYTES: usize = 200 * 1024;
+
+/// Info about an active skill prompt that is already injected into the system prompt.
+/// Used by read tools to detect redundant fetches.
+#[derive(Debug, Clone)]
+pub struct SkillPathInfo {
+    /// Skill name (e.g., "self-dev").
+    pub skill_name: String,
+    /// Path relative to agent home (e.g., "skills/self-dev/system_prompt.md").
+    pub prompt_relative_path: String,
+}
+
+/// Context available to every tool during execution.
+pub struct ToolContext<'a> {
+    pub db: &'a AsyncDatabase,
+    pub session_id: &'a str,
+    pub trace_id: &'a str,
+    pub home_dir: &'a Path,
+    /// Global Mika home directory (e.g. `~/.mika/`), used for cross-agent file access.
+    /// `None` for team agents, delegates, and contexts where cross-agent access is blocked.
+    pub global_home_dir: Option<&'a Path>,
+    /// Agent tier — controls tier-conditional tool behavior. `Family` gates
+    /// substrate-config errors so the LLM never sees operator-shaped diagnostic
+    /// content; `Default` (operator tier) preserves the original behavior. See
+    /// mika#1783 and `ToolOutput::substrate_unavailable`. Resolved from
+    /// `MIKA_AGENT_TIER` at ToolContext construction time.
+    pub tier: mika_common::home::AgentTier,
+    /// Where this instance runs (mika#2290). Sibling of `tier` in every
+    /// respect: resolved once at `server::init_agent` from `MIKA_DEPLOYMENT`,
+    /// cached on `AgentState`, threaded through the params structs, never
+    /// re-read from the environment per turn. Read by the EndTurn guard 5d,
+    /// which refuses an assertion of local hosting on any non-`Local` value.
+    pub deployment: mika_common::home::Deployment,
+    pub core_memory_edit_count: &'a AtomicU32,
+    pub is_onboarding: bool,
+    pub message_sender: Option<Arc<dyn MessageSender>>,
+    pub embedding_client: Option<&'a EmbeddingClient>,
+    pub brave_api_key: Option<&'a str>,
+    pub github_token: Option<&'a str>,
+    /// Gateway base URL for builtins that call substrate endpoints on
+    /// the gateway (mika#1969 — `fetch_url` calls
+    /// `POST /internal/fetch`). Populated from `settings.routing_url`
+    /// in production; `None` in tests and CLI contexts where no
+    /// gateway is reachable — dependent builtins return a
+    /// configuration error rather than falling back to direct egress
+    /// (fail-closed matches the substrate invariant).
+    pub gateway_url: Option<&'a str>,
+    /// Shared bearer token authenticating agent-to-gateway calls to
+    /// internal substrate endpoints. Companion to `gateway_url`.
+    /// Populated from `settings.internal_token` in production.
+    pub internal_token: Option<&'a str>,
+    /// Shared flag: set to `true` by skill-modifying tools after successful writes.
+    /// The agent loop coordinator checks this before each turn and rebuilds the
+    /// SkillRegistry if set, enabling hot-reload without restart.
+    pub skills_dirty: &'a AtomicBool,
+    /// True when running in reflection mode (daily memory review).
+    /// Memory tools require an `evidence` field and use a higher edit cap.
+    pub is_reflection: bool,
+    /// True when running within a task context (callback, delegation, team agent).
+    /// Blocks top-level task creation (Guard 1).
+    pub is_task_context: bool,
+    /// True when running in a callback turn (Guard 3 — blocks ALL task creation).
+    pub is_callback_turn: bool,
+    /// Current LLM provider name (e.g., "anthropic", "openrouter").
+    /// Used by builtin handlers that need to know the agent's active provider.
+    pub provider_name: &'a str,
+    /// Current LLM model name (e.g., "claude-sonnet-4-6", "anthropic/claude-sonnet-4").
+    /// Used by builtin handlers that need to know the agent's active model.
+    pub model_name: &'a str,
+    /// Active skill prompts already injected into the system prompt.
+    /// Used by read tools (e.g., `read_agent_file`) to detect redundant fetches.
+    /// Empty in silent mode and tests by default.
+    pub active_skill_paths: &'a [SkillPathInfo],
+    /// Maximum agent-created tasks per session (configurable, default 25).
+    pub max_tasks_per_session: i64,
+    /// Per-turn flag: set to `true` after a successful `gh pr review` call.
+    /// Used by `run_gh` to reject duplicate PR review submissions within the
+    /// same turn — prevents duplicate webhooks. See #695.
+    pub pr_review_posted: &'a AtomicBool,
+    /// Session-scoped PR review dedup map (#821). Outer key: session_id,
+    /// inner set: PR dedup keys (repo|positional). Prevents duplicate reviews
+    /// across turns within the same session (e.g., when a required-tools gate
+    /// forces a retry into a new turn). `None` in CLI/test contexts where
+    /// session-scoped dedup is not needed — falls back to per-turn AtomicBool.
+    pub pr_reviews_posted: Option<&'a Arc<DashMap<String, HashSet<String>>>>,
+    /// The callback task ID, if this turn is processing a callback result.
+    /// Used by the executor gate to register deferred dispatches from callback
+    /// context (mika#1058). Set from `SilentTrigger::Callback { task_id, .. }`.
+    /// `None` for non-callback contexts.
+    pub callback_task_id: Option<&'a str>,
+    /// Tool-argument suffix constraints from active matched skills (mika#899).
+    /// Collected at turn-start alongside `required_suffix_lines`. Used by
+    /// `run_gh` to validate `--body` arguments before subprocess spawn.
+    pub required_tool_arg_suffixes: &'a [crate::skills::manifest::RequiredToolArgSuffix],
+    /// Per-turn flag: set to `true` after a tool-arg suffix validation rejects
+    /// a tool call. On second rejection in the same turn, the handler escalates
+    /// instead of retrying. Mirrors `pr_review_posted` pattern. See mika#899.
+    pub tool_arg_suffix_rejected: &'a std::sync::atomic::AtomicBool,
+    /// Resolved scope-root task ID for the parallel narrative double-write (mika#974).
+    /// When `Some`, outbound `send_message` calls also write to `task_messages`.
+    /// Resolved once at turn start and cached as turn-local.
+    pub scope_task_id: Option<&'a str>,
+}
+
+/// A tool that the agent can invoke via Claude's tool_use.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// Unique tool name (must match what Claude sees in the tool definition).
+    fn name(&self) -> &str;
+
+    /// Tool definition sent to Claude in the request.
+    fn definition(&self) -> ToolDefinition;
+
+    /// Execute the tool with the given JSON input.
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput>;
+
+    /// Optional per-tool timeout override (in seconds).
+    /// Returns `None` to use the default agent tool timeout.
+    fn timeout_secs(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Image data produced by a tool, ready for inclusion in a Claude API tool_result.
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    /// MIME type: "image/jpeg", "image/png", "image/gif", or "image/webp".
+    pub media_type: String,
+    /// Base64-encoded image bytes.
+    pub data: String,
+}
+
+/// Result of a tool execution.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
+    /// Images to include alongside text in the tool result.
+    /// When non-empty, the tool result is sent as a multi-block content array.
+    pub images: Vec<ImageData>,
+    /// Substrate diagnostic — when present, this string is the operator-shaped
+    /// detail of a substrate-config unavailability (e.g., missing API key,
+    /// upstream quota exhausted). It is **never** returned to the LLM; the
+    /// emission-site check routes it to `audit_events` instead. `content` on
+    /// this variant carries the neutral tier-appropriate user-facing fallback.
+    ///
+    /// Constructed exclusively via [`ToolOutput::substrate_unavailable`] so the
+    /// discipline is enforced at the type layer — a handler cannot accidentally
+    /// leak operator instructions into `content`. See mika#1783.
+    pub substrate_diagnostic: Option<String>,
+    /// Delivery verdict — when present, this is `send_message`'s structured
+    /// statement of what happened to a user-facing message (mika#2136). Like
+    /// [`Self::substrate_diagnostic`] it is a tool→engine channel and is
+    /// **never** serialized to the LLM; `content` carries the model-facing
+    /// prose independently.
+    ///
+    /// `None` everywhere except the six `send_message` exits that attempt (or
+    /// refuse) a delivery. The engine reads it in `process_tool_calls` to build
+    /// the turn's `DeliveryRecord` sequence, which the EndTurn guard 6f then
+    /// statues on. The reason it exists rather than re-reading the error prose:
+    /// the three `is_error` exits of `send_message` do not describe the same
+    /// damage (a length refusal is repaired by splitting, a transport death by
+    /// resending the same text), and telling them apart by parsing an English
+    /// sentence would make a message meant for the model into a wire format.
+    ///
+    /// Constructed exclusively via [`ToolOutput::delivery`] so no call site can
+    /// state a verdict without saying which text it is about.
+    ///
+    /// **Boxed on purpose.** `ToolOutput` is the `Err` variant of a dozen
+    /// validation helpers across `skills::builtin_handlers`, so its inline size
+    /// is paid by every one of them; an unboxed `DeliveryVerdict` (a `String`
+    /// plus an enum carrying another `String`) pushes the struct past clippy's
+    /// `result_large_err` threshold and makes a dozen unrelated signatures
+    /// lint-fail. The indirection costs one allocation, and only on the
+    /// `send_message` path that actually states a verdict.
+    pub delivery: Option<Box<DeliveryVerdict>>,
+}
+
+/// What `send_message` did with one outbound message (mika#2136).
+///
+/// Carries the text **as it was measured and sent** — `cleaned`, after
+/// `strip_internal_tags` — and never the raw tool argument. That is not a
+/// portability detail: the engine's repair predicate compares a dead message's
+/// text to a later successful one, `send_message` is the only holder of
+/// `cleaned`, and the raw argument is a different register (the tool measures
+/// and sends `cleaned`; the LLM may have echoed internal tags into the raw
+/// value). A record built from `arguments["text"]` would fail to recognize a
+/// legitimate retry and make the engine annex a loss that did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryVerdict {
+    /// The cleaned text this verdict is about. Full, never truncated.
+    pub text: String,
+    /// What became of it.
+    pub outcome: DeliveryOutcome,
+}
+
+/// The fate of one `send_message` attempt (mika#2136).
+///
+/// Five variants for six exits: `SendOutcome::Failed` and the sender's `Err`
+/// share [`Self::Failed`] deliberately — the guard predicate and the engine's
+/// factual annex do nothing with the difference (in both cases the content is
+/// lost and the repair is resending the same text), so separating them would
+/// cost a variant no reader exploits. What does separate them — one populates
+/// `failed_sends`, the other guarantees nothing — stays readable in `reason`.
+///
+/// [`Self::NoChannel`] and [`Self::NoSender`] are **in the enum but outside the
+/// guard predicate**: both are real "delivery claimed, nothing delivered"
+/// populations, but both return `ToolOutput::success` on purpose (#650,
+/// regression-guarded by mika#1090) because they are permanent session
+/// conditions and an error there loops the LLM. Enumerating them costs two
+/// variants and makes that population countable the day it gets its own ticket;
+/// omitting them would mean reopening this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The gateway accepted it.
+    Delivered,
+    /// Refused by the tool's own length guard (mika#2134) — nothing was
+    /// persisted, nothing reached the transport, the user received nothing.
+    RefusedTooLong {
+        /// Measured length of `cleaned`, in UTF-16 units (how Telegram counts).
+        len_utf16: usize,
+        /// The ceiling it exceeded.
+        limit: usize,
+    },
+    /// It left and died: the transport refused it, or the sender itself errored.
+    Failed {
+        /// The sender's own prose. Keeps the `failed_sends`-populated case
+        /// distinguishable from the infrastructure-error case.
+        reason: String,
+    },
+    /// No reply channel for this session (`chat_id == 0`).
+    NoChannel,
+    /// No outbound sender is configured at all.
+    NoSender,
+}
+
+impl ToolOutput {
+    pub fn success(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images: vec![],
+            substrate_diagnostic: None,
+            delivery: None,
+        }
+    }
+
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            images: vec![],
+            substrate_diagnostic: None,
+            delivery: None,
+        }
+    }
+
+    pub fn success_with_images(content: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images,
+            substrate_diagnostic: None,
+            delivery: None,
+        }
+    }
+
+    /// Construct a tool result carrying a delivery verdict (mika#2136).
+    ///
+    /// `text` is a constructor parameter rather than something the engine
+    /// recovers later, precisely so a call site cannot state an outcome without
+    /// saying which text it concerns — the raw tool argument is a different
+    /// register from what was measured and sent, and rebuilding the record from
+    /// it is the failure mode this signature forbids.
+    pub fn delivery(
+        content: impl Into<String>,
+        is_error: bool,
+        text: impl Into<String>,
+        outcome: DeliveryOutcome,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            is_error,
+            images: vec![],
+            substrate_diagnostic: None,
+            delivery: Some(Box::new(DeliveryVerdict {
+                text: text.into(),
+                outcome,
+            })),
+        }
+    }
+
+    /// Construct a substrate-unavailability tool result (mika#1783).
+    ///
+    /// `user_facing_fallback` becomes the tool-result `content` the LLM sees —
+    /// it must be neutral (no service name, no operator name, no config path,
+    /// no URL). `diagnostic` is the operator-shaped detail (service, missing
+    /// key, config location) that goes to the substrate telemetry sink; it
+    /// **never** enters `content`.
+    ///
+    /// The emission-site check (`dispatch_substrate_diagnostic`) routes the
+    /// diagnostic to `audit_events` on family-tier and, on default-tier, folds
+    /// it back into `content` so the operator (the reader on that tier) still
+    /// sees the actionable detail. The tier check does not live here — it
+    /// lives at the emission site — so this constructor's discipline is:
+    /// content must be safe to show to a sealed being, always.
+    pub fn substrate_unavailable(
+        user_facing_fallback: impl Into<String>,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: user_facing_fallback.into(),
+            is_error: true,
+            images: vec![],
+            substrate_diagnostic: Some(diagnostic.into()),
+            delivery: None,
+        }
+    }
+}
+
+/// Route a substrate diagnostic to the appropriate channel by agent tier
+/// (mika#1783). Called at the tool-result emission site — mutates `output`
+/// in place so downstream serialization sees a normal `ToolOutput` regardless
+/// of tier.
+///
+/// - **Family tier:** the LLM sees only `output.content` (the neutral
+///   fallback). The diagnostic is written to `audit_events` with
+///   `tool_name = "substrate_unavailable"` and `target_key = <tool>`.
+/// - **Default (operator) tier:** the diagnostic is folded back into
+///   `output.content` (appended, separated by a blank line) so the operator
+///   still sees the actionable detail. No audit event is written on default
+///   tier — the operator IS the reader, and the LLM-visible content is
+///   already the diagnostic.
+///
+/// Best-effort: audit-event write failures log at warn and never propagate,
+/// so a substrate-diagnostic loss (monitoring concern) never blocks the
+/// being's response to the user.
+///
+/// Idempotent: if `output.substrate_diagnostic` is `None`, this is a no-op.
+pub async fn dispatch_substrate_diagnostic(
+    output: &mut ToolOutput,
+    tool_name: &str,
+    ctx: &ToolContext<'_>,
+) {
+    let Some(diagnostic) = output.substrate_diagnostic.take() else {
+        return;
+    };
+    match ctx.tier {
+        // Champion routes with Family, and the arm names it rather than hiding
+        // behind a `_ =>` (mika#2023 AC5): an external tester is not the reader
+        // of a substrate diagnostic any more than a family member is, and a
+        // catch-all would have silently absorbed every future tier into that
+        // judgement. With the arm explicit, the compiler — not a `warn!` — is
+        // what stops the next variant from inheriting a decision nobody made
+        // for it.
+        mika_common::home::AgentTier::Family | mika_common::home::AgentTier::Champion => {
+            // Route diagnostic to audit_events; LLM sees only the neutral fallback
+            // already in output.content. Fire-and-forget on error — a monitoring
+            // gap is not worth blocking the being's turn.
+            //
+            // The reasoning names the tier that was actually resolved rather than
+            // the literal "family-tier" it carried before mika#2023 — two tiers
+            // reach this arm now, and a row that named the wrong one would send an
+            // operator looking at the wrong tenant.
+            let reason = format!(
+                "{tier:?} tier: substrate diagnostic gated from LLM",
+                tier = ctx.tier
+            );
+            if let Err(e) = ctx
+                .db
+                .log_audit_event(
+                    ctx.session_id,
+                    "substrate_unavailable",
+                    tool_name,
+                    None,
+                    Some(&diagnostic),
+                    Some(&reason),
+                    Some(ctx.trace_id),
+                )
+                .await
+            {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "failed to persist substrate diagnostic to audit_events"
+                );
+            }
+        }
+        mika_common::home::AgentTier::Default => {
+            // Operator IS the reader — fold the diagnostic back into content
+            // so the substrate detail reaches them. Blank-line separator so
+            // the fallback stays legible above the operator-shaped detail.
+            if output.content.is_empty() {
+                output.content = diagnostic;
+            } else {
+                output.content.push_str("\n\n");
+                output.content.push_str(&diagnostic);
+            }
+        }
+    }
+}
+
+/// Index a fact into the search system (FTS5 + optional vector embedding).
+///
+/// Best-effort: logs warnings on failure but never propagates errors,
+/// since search indexing should not block tool responses.
+pub(crate) async fn index_fact(
+    ctx: &ToolContext<'_>,
+    source_type: &str,
+    source_id: i64,
+    content: &str,
+) {
+    // Delete any existing index entry for this source (handles upserts)
+    let _ = ctx.db.delete_search_content(source_type, source_id).await;
+
+    // Index into FTS5
+    let content_id = match ctx
+        .db
+        .index_content(source_type, Some(source_id), content)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(source_type, source_id, error = %e, "failed to index content for search");
+            return;
+        }
+    };
+
+    // Generate and store embedding if client is available
+    if let Some(client) = ctx.embedding_client {
+        match client.embed(content).await {
+            Ok(embedding) => {
+                if let Err(e) = ctx.db.index_embedding(content_id, embedding).await {
+                    tracing::warn!(source_type, source_id, error = %e, "failed to index embedding");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(source_type, source_id, error = %e, "failed to generate embedding");
+            }
+        }
+    }
+}
+
+/// The `evidence` field description served in the JSON schema of every tool
+/// guarded by [`check_reflection_evidence`] (mika#1952 AC1 / D5).
+///
+/// **Sole site** where this text is written. The three guarded tools used to
+/// carry three neighbouring paraphrases, one of which had already drifted:
+/// `update_core_memory` opened with "**Only** required in reflection mode",
+/// minimising exactly where the other two asserted. Three copies of one
+/// sentence is the shape `docs/solutions/prompt-engineering/2026-09-06-un-prompt-qui-reimplemente-une-garde-executable-derive.md`
+/// documents, seen from the declarative side.
+///
+/// The text is the one mika#1952 AC1 imposes, verbatim. It is written for
+/// reflection mode and served unchanged in conversation mode too: a
+/// mode-conditional fourth text would be a fourth thing to keep in step with
+/// the guard below, for no measured gain (D5).
+pub(crate) const REFLECTION_EVIDENCE_FIELD_DESCRIPTION: &str = "REQUIRED IN REFLECTION MODE. \
+     Format: \"[YYYY-MM-DDTHH:MM:SSZ] <one-sentence citation of the conversation content that \
+     justifies this change>\". Missing or empty evidence in reflection mode ALWAYS returns an \
+     error — no exceptions. Example: \"[2026-07-28T13:00:00Z] Reflection search found id=22 \
+     duplicate of id=25, both pending, no actionable meaning.\"";
+
+/// Check that the `evidence` field is present and non-empty when running in reflection mode.
+/// Returns `Some(ToolOutput::error(...))` if evidence is missing, `None` if valid.
+///
+/// This is the **hard** barrier, and it stays one even though mika#1952 made
+/// the served schema declare `evidence` in its `required` array: Mika does not
+/// emit `strict: true` on its tool definitions, and neither the Anthropic API
+/// nor the OpenAI-compatible rails refuse a call missing a `required` key
+/// server-side. `required` *orients* the model; it does not constrain it. And
+/// `"evidence": ""` satisfies `required` while failing this check — see
+/// `mika1952_the_runtime_guard_is_still_the_hard_barrier` before removing this
+/// function as redundant.
+///
+/// The list of tools that call it is mirrored by
+/// [`crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS`], and
+/// `mika1952_gated_tools_match_the_reflection_contract_constant` fails if the
+/// two diverge in either direction.
+pub(crate) fn check_reflection_evidence(
+    ctx: &ToolContext<'_>,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    if ctx.is_reflection {
+        let evidence = input["evidence"].as_str().unwrap_or("").trim();
+        if evidence.is_empty() {
+            return Some(ToolOutput::error(
+                "Reflection mode requires an evidence field citing specific conversation content.",
+            ));
+        }
+    }
+    None
+}
+
+/// Validate that a string is a well-formed UUID.
+///
+/// Returns `Ok(Uuid)` on success or `Err(ToolOutput::error(...))` with a structured
+/// JSON error on failure. The error includes the field name and the received value
+/// (truncated to 50 chars) so the LLM can self-correct.
+///
+/// # Example
+/// ```ignore
+/// let uuid = validate_uuid("task_id", id)?;
+/// // If Err, the ToolOutput is ready to return via Ok(tool_output)
+/// ```
+pub(crate) fn validate_uuid(
+    field_name: &str,
+    value: &str,
+) -> std::result::Result<Uuid, ToolOutput> {
+    // Truncate for error display — prevent long garbage from consuming LLM context.
+    // Use char_indices to find a safe char boundary (avoids panic on multi-byte UTF-8).
+    let display_value = if value.len() > 50 {
+        let boundary = value
+            .char_indices()
+            .nth(50)
+            .map(|(i, _)| i)
+            .unwrap_or(value.len());
+        format!("{}...", &value[..boundary])
+    } else {
+        value.to_string()
+    };
+
+    Uuid::parse_str(value).map_err(|_| {
+        ToolOutput::error(
+            serde_json::json!({
+                "error": "invalid_uuid",
+                "field": field_name,
+                "received": display_value,
+                "reason": "string is not a well-formed UUID (expected 8-4-4-4-12 hex segments)"
+            })
+            .to_string(),
+        )
+    })
+}
+
+/// A task UUID that has been validated as format-correct AND obtained inside an
+/// agent-tool context. The [`validate_task_exists`] function takes only this type,
+/// so non-agent-scoped paths (CLI correlation, raw introspection) physically
+/// cannot pass it raw `&str`s — they must use `db.get_task_unscoped` instead.
+///
+/// Constructor is `pub(crate)` and requires a [`ToolContext`], encoding the
+/// invariant: this type only exists in agent-tool execution paths.
+///
+/// See mika#755 for the structural rationale; mika#752 for the original bug.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentScopedTaskId(String);
+
+impl AgentScopedTaskId {
+    /// Construct from a raw string inside a tool's `execute` body.
+    ///
+    /// The `_ctx` parameter is unused at runtime but is the structural anchor —
+    /// you cannot call this function without a `ToolContext` in scope, which
+    /// means you cannot get an `AgentScopedTaskId` from a non-tool context.
+    pub(crate) fn from_tool_context(
+        _ctx: &ToolContext<'_>,
+        raw: &str,
+    ) -> std::result::Result<Self, ToolOutput> {
+        validate_uuid("task_id", raw)?;
+        Ok(Self(raw.to_string()))
+    }
+
+    /// Construct from a raw string in any agent-scoped execution path (e.g.,
+    /// long-running skill executor). The `_db` parameter proves agent-scope
+    /// context exists — `AsyncDatabase` carries the agent_id.
+    pub(crate) fn from_agent_context(
+        _db: &crate::async_db::AsyncDatabase,
+        raw: &str,
+    ) -> std::result::Result<Self, ToolOutput> {
+        validate_uuid("task_id", raw)?;
+        Ok(Self(raw.to_string()))
+    }
+
+    /// Read-only access to the underlying UUID string for query construction.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Agent-scoped task lookup — for intra-agent state mutation only.
+///
+/// Takes [`AgentScopedTaskId`] to make the ownership invariant compile-checked
+/// (mika#755). Compare with [`crate::db::Database::get_task_unscoped`] for
+/// raw-id correlation paths that intentionally cross agent boundaries (e.g.,
+/// CLI introspection, internal queries).
+///
+/// Returns `Ok(Task)` on success, or `Err(ToolOutput)` with structured JSON:
+/// - Not found / wrong agent: `{"error": "task_not_found", "field": ..., "task_id": ..., "reason": ...}`
+/// - DB error: `{"error": "db_error", "field": ..., "reason": ...}` (fail-closed)
+///
+/// # Example
+/// ```ignore
+/// let scoped = AgentScopedTaskId::from_tool_context(ctx, id)?;
+/// let task = validate_task_exists(ctx.db, "task_id", &scoped).await
+///     .map_err(|e| return Ok(e))?;
+/// ```
+pub(crate) async fn validate_task_exists(
+    db: &crate::async_db::AsyncDatabase,
+    field_name: &str,
+    task_id: &AgentScopedTaskId,
+) -> std::result::Result<crate::db::Task, ToolOutput> {
+    let value = task_id.as_str();
+
+    // DB existence + agent-scope check (format already validated in constructor)
+    match db.get_task(value).await {
+        Ok(Some(task)) => Ok(task),
+        Ok(None) => {
+            // value is a valid UUID (36 chars) — no truncation needed
+            Err(ToolOutput::error(
+                serde_json::json!({
+                    "error": "task_not_found",
+                    "field": field_name,
+                    "task_id": value,
+                    "reason": "no task with this ID exists for the current agent"
+                })
+                .to_string(),
+            ))
+        }
+        Err(e) => {
+            // Fail closed: DB errors reject the call rather than passing through
+            Err(ToolOutput::error(
+                serde_json::json!({
+                    "error": "db_error",
+                    "field": field_name,
+                    "reason": format!("failed to look up task: {e}")
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
+/// Validate that a `task_id` references an active manual task.
+/// Returns `Some(error_message)` if validation fails, `None` if valid.
+pub(crate) async fn validate_task(
+    db: &crate::async_db::AsyncDatabase,
+    task_id: &AgentScopedTaskId,
+) -> Option<String> {
+    if task_id.as_str().is_empty() {
+        return Some(
+            "You must create a task first using create_task, then pass its ID here. \
+             No delegation without tracking."
+                .to_string(),
+        );
+    }
+    // Layer 1+2: format validation + DB existence via shared helper
+    let task = match validate_task_exists(db, "task_id", task_id).await {
+        Ok(t) => t,
+        Err(tool_output) => return Some(tool_output.content),
+    };
+    // Layer 3: business-rule checks (trigger_type + active status)
+    if task.trigger_type == "manual"
+        && matches!(task.status.as_str(), "pending" | "in_progress" | "blocked")
+    {
+        None
+    } else {
+        Some(format!(
+            "Task '{}' is not an active task. \
+             It must be a manual task with status pending, in_progress, or blocked.",
+            task_id.as_str()
+        ))
+    }
+}
+
+/// Check if the given agent is an orchestrator (default agent or listed as orchestrator in any team).
+pub(crate) fn is_orchestrator(home_dir: &Path, agent_id: &str) -> bool {
+    if agent_id == DEFAULT_AGENT {
+        return true;
+    }
+    for team_name in team::list_teams(home_dir) {
+        if let Ok(def) = team::load_team(home_dir, &team_name)
+            && def.team.orchestrator == agent_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve the base directory for file operations, optionally targeting another agent.
+///
+/// When `agent_param` is `None` or empty, returns `ctx.home_dir` (current agent).
+/// When provided, validates the agent exists and that the caller is an orchestrator,
+/// then returns the target agent's home directory.
+///
+/// Returns `Ok(PathBuf)` on success or `Err(ToolOutput)` with a descriptive error.
+pub(crate) async fn resolve_agent_home(
+    agent_param: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> std::result::Result<PathBuf, ToolOutput> {
+    let agent_name = match agent_param {
+        None | Some("") => return Ok(ctx.home_dir.to_path_buf()),
+        Some(name) => name.trim(),
+    };
+
+    // Require global_home_dir for cross-agent access
+    let global_home = match ctx.global_home_dir {
+        Some(home) => home,
+        None => {
+            return Err(ToolOutput::error(
+                "Cross-agent file access is not available in this context.",
+            ));
+        }
+    };
+
+    // Check if targeting self (short-circuit to avoid unnecessary orchestrator check)
+    let current_agent = ctx.db.agent_id();
+    if agent_name == current_agent {
+        return Ok(ctx.home_dir.to_path_buf());
+    }
+
+    // Orchestrator guard: only orchestrators can access other agents' files
+    if !is_orchestrator(global_home, current_agent) {
+        return Err(ToolOutput::error(
+            "Only orchestrator agents can access other agents' files.",
+        ));
+    }
+
+    // Validate agent exists (also serves as path traversal protection —
+    // agent_exists checks for config.toml in the resolved directory)
+    if !mika_common::agent::agent_exists(global_home, agent_name) {
+        let agents = mika_common::agent::list_agents(global_home);
+        return Err(ToolOutput::error(format!(
+            "Agent '{}' not found. Available agents: {}",
+            agent_name,
+            agents.join(", ")
+        )));
+    }
+
+    Ok(mika_common::agent::agent_dir(global_home, agent_name))
+}
+
+/// Validate a relative path and resolve it to a full path within `base_dir`.
+///
+/// Performs the following security checks:
+/// 1. Non-empty path
+/// 2. Path length within `MAX_INPUT_LEN`
+/// 3. Absolute paths rejected
+/// 4. Path traversal components (`..`, root, prefix) rejected
+/// 5. Parent directories created only when `create_parents` is `true`
+/// 6. Parent directory symlink check (when parent exists)
+/// 7. Canonicalize containment check (resolved parent must be within `base_dir`, when parent exists)
+///
+/// `create_parents` should be `true` for write operations and `false` for read-only operations
+/// to avoid creating directories as a side effect of reading.
+///
+/// Returns `Ok(full_path)` on success or `Err(ToolOutput::error(...))` on failure.
+pub(crate) async fn validate_and_resolve_path(
+    path: &str,
+    base_dir: &Path,
+    create_parents: bool,
+) -> std::result::Result<PathBuf, ToolOutput> {
+    // Expand ~ to base_dir (the tool's sandboxed "home")
+    // Reject ~username syntax (e.g. ~root/file) — only bare ~ and ~/ are valid
+    let path = if path == "~" {
+        ""
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        rest
+    } else if path.starts_with('~') {
+        return Err(ToolOutput::error(
+            "Only '~/' (your home directory) is supported. '~username' paths are not allowed.",
+        ));
+    } else {
+        path
+    };
+
+    if path.is_empty() {
+        return Err(ToolOutput::error("'path' is required and cannot be empty."));
+    }
+    if path.len() > MAX_INPUT_LEN {
+        return Err(ToolOutput::error(format!(
+            "Path exceeds maximum length of {MAX_INPUT_LEN} characters."
+        )));
+    }
+
+    // Reject absolute paths
+    if Path::new(path).is_absolute() {
+        return Err(ToolOutput::error(
+            "Absolute paths are not allowed. Use a relative path within the directory.",
+        ));
+    }
+
+    // Prevent path traversal using component inspection
+    for component in Path::new(path).components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolOutput::error(
+                    "Path traversal components ('..', root, or prefix) are not allowed.",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let full_path = base_dir.join(path);
+
+    if let Some(parent) = full_path.parent() {
+        // Create parent directories only for write operations
+        if create_parents && let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return Err(ToolOutput::error(format!(
+                "Failed to create parent directories: {e}"
+            )));
+        }
+
+        // Check for symlinks in the parent chain (only when parent exists)
+        match tokio::fs::symlink_metadata(parent).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(ToolOutput::error(
+                        "Symbolic links are not allowed in the path.",
+                    ));
+                }
+
+                // Verify containment using canonicalize (parent exists)
+                let canonical_parent = match parent.canonicalize() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Err(ToolOutput::error(format!(
+                            "Failed to resolve parent directory: {e}"
+                        )));
+                    }
+                };
+                let base_canonical = match base_dir.canonicalize() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(ToolOutput::error("Base directory does not exist."));
+                    }
+                };
+                if !canonical_parent.starts_with(&base_canonical) {
+                    return Err(ToolOutput::error(
+                        "Path resolves outside the base directory.",
+                    ));
+                }
+            }
+            Err(_) => {
+                // Parent does not exist — only an error for write operations (create_parents would
+                // have already failed above). For read operations, the file-not-found error will
+                // be returned by the caller when it tries to open the file.
+                if create_parents {
+                    return Err(ToolOutput::error("Failed to verify parent directory."));
+                }
+            }
+        }
+    }
+
+    Ok(full_path)
+}
+
+/// Registry of available tools.
+pub struct ToolRegistry {
+    tools: Vec<Box<dyn Tool>>,
+    cached_defs: Vec<ToolDefinition>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        Self {
+            tools: Vec::new(),
+            cached_defs: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.cached_defs.push(tool.definition());
+        self.tools.push(tool);
+    }
+
+    /// Remove a tool (and its cached definition) by name.
+    ///
+    /// Returns `true` if a tool was removed. Used by the team engine to drop
+    /// `a2a_call` from its private registry so the orchestrator never sees a
+    /// cross-container reach tool for local team members (mika#1653). Local
+    /// siblings are routed by name via the decompose→spawn→resume cycle, not by
+    /// `a2a_call`, which is URL-addressed and 503s on local targets.
+    pub fn remove(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.tools.iter().position(|t| t.name() == name) {
+            self.tools.remove(pos);
+            self.cached_defs.retain(|d| d.name != name);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn definitions(&self) -> &[ToolDefinition] {
+        &self.cached_defs
+    }
+
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
+    }
+
+    /// Look up a cached tool definition by name.
+    pub fn definition_by_name(&self, name: &str) -> Option<&ToolDefinition> {
+        self.tools
+            .iter()
+            .zip(self.cached_defs.iter())
+            .find(|(tool, _)| tool.name() == name)
+            .map(|(_, def)| def)
+    }
+}
+
+/// Create a registry with workspace tools for team execution.
+///
+/// `reference_dir` is an optional read-only workspace from a previous run
+/// (provided when `--run-id` is used). When set, `read_workspace` can fall
+/// back to reading from it, and `list_workspace` shows files from both.
+pub fn team_tools(workspace_dir: &Path, reference_dir: Option<&Path>) -> Vec<Box<dyn Tool>> {
+    let ref_dir = reference_dir.map(|p| p.to_path_buf());
+    vec![
+        Box::new(read_workspace::ReadWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+            reference_dir: ref_dir.clone(),
+        }),
+        Box::new(write_workspace::WriteWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+        }),
+        Box::new(list_workspace::ListWorkspaceTool {
+            workspace_dir: workspace_dir.to_path_buf(),
+            reference_dir: ref_dir,
+        }),
+    ]
+}
+
+/// Create a registry with all built-in tools.
+/// Names of all engine-registered builtin tools (default + management +
+/// handler-builtin) used by the skill validator to suppress false-positive
+/// `[constraints] required_tools` warnings (mika#1217 F4).
+///
+/// Parity with `default_tools()` + `management_tools_if_needed()` (the
+/// engine tools added to `ToolRegistry`) plus `skills::builtin_handlers::
+/// KNOWN_BUILTINS` (handler-builtins dispatched by name) is enforced by the
+/// `test_builtin_tool_names_parity` unit test below.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    // default_tools() — registered for every agent
+    "a2a_call",
+    "update_core_memory",
+    "store_fact",
+    "search_memory",
+    "update_fact",
+    "create_reminder",
+    "list_reminders",
+    "cancel_reminder",
+    "cancel_task",
+    "complete_task",
+    "get_task",
+    "send_message",
+    "create_skill",
+    "delete_skill",
+    "list_skills",
+    "toggle_skill",
+    "update_skill",
+    "skill_manage",
+    "get_config",
+    "get_active_llm",
+    "set_config",
+    "write_agent_file",
+    "read_agent_file",
+    "list_agent_files",
+    "list_scheduled_tasks",
+    "list_tasks",
+    "check_task",
+    "pr_merge_with_gate",
+    "resolve_issue_order",
+    "query_knowledge_graph",
+    "query_timeline",
+    "get_session_messages",
+    "list_audit_events",
+    "search_tool_history",
+    "promote_deferred_callback",
+    // Content-serve ledger tools (mika#1867)
+    "record_served_content",
+    "check_already_served",
+    // management_tools_if_needed() — always-added management tools
+    "create_agent",
+    "create_team",
+    "list_agents",
+    // management_tools_if_needed() — conditionally-added (N>1 agents or teams)
+    "list_teams",
+    "run_team",
+    "delegate_task",
+    "get_team_status",
+    "get_team_history",
+    "delete_team",
+    "update_team",
+    "add_team_member",
+    "remove_team_member",
+    "create_task",
+    "update_task_status",
+    // skills::builtin_handlers::KNOWN_BUILTINS — handler-builtins
+    "fetch_url",
+    "get_documentation",
+    "gh_read",
+    "git_ops",
+    "review_skill",
+    "run_gh",
+    "run_gws",
+    "web_search",
+];
+
+pub fn default_tools() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(a2a_call::A2aCallTool));
+    registry.register(Box::new(update_core_memory::UpdateCoreMemoryTool));
+    registry.register(Box::new(store_fact::StoreFactTool));
+    registry.register(Box::new(search_memory::SearchMemoryTool));
+    registry.register(Box::new(update_fact::UpdateFactTool));
+    registry.register(Box::new(create_reminder::CreateReminderTool));
+    registry.register(Box::new(list_reminders::ListRemindersTool));
+    registry.register(Box::new(cancel_reminder::CancelReminderTool));
+    registry.register(Box::new(cancel_task::CancelTaskTool));
+    registry.register(Box::new(
+        promote_deferred_callback::PromoteDeferredCallbackTool,
+    ));
+    registry.register(Box::new(complete_task::CompleteTaskTool));
+    registry.register(Box::new(get_task::GetTaskTool));
+    registry.register(Box::new(send_message::SendMessageTool));
+    registry.register(Box::new(create_skill::CreateSkillTool));
+    registry.register(Box::new(delete_skill::DeleteSkillTool));
+    registry.register(Box::new(list_skills::ListSkillsTool));
+    registry.register(Box::new(toggle_skill::ToggleSkillTool));
+    registry.register(Box::new(update_skill::UpdateSkillTool));
+    registry.register(Box::new(skill_manage::SkillManageTool));
+    registry.register(Box::new(get_config::GetConfigTool));
+    // Runtime LLM identity introspection (mika#1815) — on-demand ground truth
+    // for "which model / LLM are you?" so the agent can VERIFY instead of
+    // INFER. Companion to the `## Runtime` prompt section.
+    registry.register(Box::new(get_active_llm::GetActiveLlmTool));
+    registry.register(Box::new(set_config::SetConfigTool));
+    registry.register(Box::new(write_agent_file::WriteAgentFileTool));
+    registry.register(Box::new(read_agent_file::ReadAgentFileTool));
+    registry.register(Box::new(list_agent_files::ListAgentFilesTool));
+    registry.register(Box::new(list_scheduled_tasks::ListScheduledTasksTool));
+    // Task read-only tools — available to all agents (including delegates)
+    registry.register(Box::new(list_tasks::ListTasksTool));
+    registry.register(Box::new(check_task::CheckTaskTool));
+    // PR merge with CI gate — structural backstop against merging with failing checks.
+    // Intentionally in default_tools() (not management_tools_if_needed) so delegates
+    // spawned via claude-pilot are also gated. The tool itself never merges with failing
+    // required checks regardless of caller. See #490.
+    registry.register(Box::new(pr_merge_with_gate::PrMergeWithGateTool));
+    registry.register(Box::new(resolve_issue_order::ResolveIssueOrderTool));
+    registry.register(Box::new(query_knowledge_graph::QueryKnowledgeGraphTool));
+    registry.register(Box::new(query_timeline::QueryTimelineTool));
+    registry.register(Box::new(get_session_messages::GetSessionMessagesTool));
+    registry.register(Box::new(list_audit_events::ListAuditEventsTool));
+    registry.register(Box::new(search_tool_history::SearchToolHistoryTool));
+    // Content-serve ledger tools (mika#1867). Engine-level (all agents) —
+    // a fidelity gate is engine, not skill.
+    registry.register(Box::new(record_served_content::RecordServedContentTool));
+    registry.register(Box::new(check_already_served::CheckAlreadyServedTool));
+    registry
+}
+
+/// Return management tools based on the current agent/team configuration.
+///
+/// `create_agent` and `list_agents` are always available so the agent can
+/// create new agents even from a single-agent setup. Delegation and team
+/// tools (`delegate_task`, `run_team`, etc.) are only added when multiple
+/// agents or teams exist.
+pub fn management_tools_if_needed(
+    home_dir: &Path,
+    settings: &Settings,
+    http_client: reqwest::Client,
+    github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools: Vec<Box<dyn Tool>> = vec![
+        Box::new(create_agent::CreateAgentTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
+        Box::new(create_team::CreateTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
+        Box::new(list_agents::ListAgentsTool {
+            home_dir: home_dir.to_path_buf(),
+        }),
+    ];
+
+    let agents = mika_common::agent::list_agents(home_dir);
+    let teams = mika_common::team::list_teams(home_dir);
+    if agents.len() > 1 || !teams.is_empty() {
+        tools.push(Box::new(list_teams::ListTeamsTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(run_team::RunTeamTool {
+            home_dir: home_dir.to_path_buf(),
+            settings: settings.clone(),
+            github_app: github_app.clone(),
+        }));
+        tools.push(Box::new(delegate_task::DelegateTaskTool {
+            home_dir: home_dir.to_path_buf(),
+            settings: settings.clone(),
+            http_client,
+            github_app,
+        }));
+        tools.push(Box::new(get_team_status::GetTeamStatusTool));
+        tools.push(Box::new(get_team_history::GetTeamHistoryTool));
+        tools.push(Box::new(delete_team::DeleteTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(update_team::UpdateTeamTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(add_team_member::AddTeamMemberTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        tools.push(Box::new(remove_team_member::RemoveTeamMemberTool {
+            home_dir: home_dir.to_path_buf(),
+        }));
+        // Task write tools — orchestrator-only (delegates receive
+        // task_id from the orchestrator via delegate_task and never
+        // need to create or update tasks themselves).
+        tools.push(Box::new(create_task::CreateTaskTool));
+        tools.push(Box::new(update_task_status::UpdateTaskStatusTool));
+    }
+
+    tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // -----------------------------------------------------------------------
+    // mika#1952 U4-e — the gated-tool list mirrors the guard's actual callers
+    // -----------------------------------------------------------------------
+
+    /// The tool name a `src/tools/*.rs` file declares, from its
+    /// `fn name(&self) -> &str { "…" }`.
+    ///
+    /// Positional rather than lexical: the literal must sit inside the body of
+    /// that signature, so a name mentioned in prose or in an error message is
+    /// not mistaken for a declaration.
+    fn declared_tool_names(src: &str) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut names = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("fn name(&self) -> &str") {
+                continue;
+            }
+            // The literal is on this line (one-liner form) or on the next
+            // non-empty one (`cargo fmt`'s usual shape).
+            let tail = line.split_once("-> &str").map(|(_, t)| t).unwrap_or("");
+            let candidate = if tail.contains('"') {
+                Some(tail)
+            } else {
+                lines.get(i + 1).copied()
+            };
+            if let Some(c) = candidate
+                && let Some(start) = c.find('"')
+                && let Some(len) = c[start + 1..].find('"')
+            {
+                names.push(c[start + 1..start + 1 + len].to_string());
+            }
+        }
+        names
+    }
+
+    /// **U4-e / R1** — the tools that call [`check_reflection_evidence`] are
+    /// exactly the tools named in
+    /// [`crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS`].
+    ///
+    /// Divergence is caught in **both** directions, and each direction is a
+    /// different defect. A fourth tool that adopts the runtime guard without
+    /// joining the constant keeps a schema that lies — the exact mika#1952
+    /// defect, re-opened under another name. An entry in the constant with no
+    /// caller means the reflection-mode schema declares `evidence` mandatory
+    /// where nothing enforces it, so the model is told to fill a field the tool
+    /// does not read.
+    ///
+    /// **No behavioural test can see this class.** A new guarded tool would
+    /// work: it would simply mislead. Every assertion about the three existing
+    /// tools stays green while the fourth quietly carries the contradiction.
+    #[test]
+    fn mika1952_gated_tools_match_the_reflection_contract_constant() {
+        let tools_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tools");
+
+        let mut callers: HashSet<String> = HashSet::new();
+        let mut unnamed: Vec<String> = Vec::new();
+
+        for entry in std::fs::read_dir(&tools_dir).expect("src/tools is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if crate::source_scan::is_test_source_path(&path) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("readable source file");
+            let production = mika_common::source_guard::mask_test_regions(&src);
+
+            // The definition site is not a caller, and neither is a doc comment
+            // that merely names the function.
+            let calls_guard = production.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && line.contains("check_reflection_evidence(")
+                    && !line.contains("fn check_reflection_evidence(")
+            });
+            if !calls_guard {
+                continue;
+            }
+
+            let names = declared_tool_names(&production);
+            match names.len() {
+                1 => {
+                    callers.insert(names[0].clone());
+                }
+                _ => unnamed.push(format!(
+                    "{}: {} tool name(s) declared — {names:?}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    names.len()
+                )),
+            }
+        }
+
+        assert!(
+            unnamed.is_empty(),
+            "mika#1952 — a file calling `check_reflection_evidence` must declare exactly one \
+             tool name via `fn name(&self) -> &str`, so this guard can attribute the call. \
+             Could not attribute:\n  {}",
+            unnamed.join("\n  ")
+        );
+
+        let declared: HashSet<String> = crate::agent_loop::REFLECTION_EVIDENCE_GATED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut missing: Vec<&String> = callers.difference(&declared).collect();
+        let mut extra: Vec<&String> = declared.difference(&callers).collect();
+        missing.sort();
+        extra.sort();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "mika#1952 R1 — `REFLECTION_EVIDENCE_GATED_TOOLS` must mirror the callers of \
+             `check_reflection_evidence`, exactly.\n\
+             \n\
+             Calls the guard but is NOT in the constant: {missing:?}\n\
+             → its reflection-mode schema still declares `evidence` optional while the engine \
+             refuses the call. Add the name to `REFLECTION_EVIDENCE_GATED_TOOLS` \
+             (crates/mika-agent/src/agent_loop/mod.rs) and give the field the shared \
+             `REFLECTION_EVIDENCE_FIELD_DESCRIPTION`.\n\
+             \n\
+             In the constant but does NOT call the guard: {extra:?}\n\
+             → its reflection-mode schema demands a field nothing enforces. Either restore the \
+             `check_reflection_evidence` call, or remove the name from the constant."
+        );
+
+        assert_eq!(
+            callers.len(),
+            3,
+            "mika#1952 — three guarded tools were measured (update_fact, store_fact, \
+             update_core_memory). A fourth is not an allowlist entry: decide whether its \
+             declared schema, its field description and the reflection prompt say the same \
+             thing, then update this count. Found: {callers:?}"
+        );
+    }
+
+    /// **M5 / U4-d companion** — `required` is not a hard guarantee, so the
+    /// runtime guard is not redundant with mika#1952's schema fix.
+    ///
+    /// `"evidence": ""` satisfies every JSON-Schema `required` array ever
+    /// written and is exactly what this function exists to refuse. Read this
+    /// before deleting `check_reflection_evidence` as superseded.
+    #[test]
+    fn mika1952_required_does_not_cover_the_empty_string() {
+        let schema_satisfying_input = serde_json::json!({
+            "id": 52,
+            "category": "commitment",
+            "updates": {"status": "cancelled"},
+            "evidence": "   "
+        });
+        assert!(
+            schema_satisfying_input["evidence"]
+                .as_str()
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "a blank `evidence` is present for the schema and empty for the guard — \
+             that gap is why the runtime check stays"
+        );
+    }
+
+    /// mika#1653 — `ToolRegistry::remove` drops a tool and its cached
+    /// definition; returns false when the name is absent.
+    #[test]
+    fn test_tool_registry_remove() {
+        let mut registry = default_tools();
+        assert!(
+            registry.definitions().iter().any(|d| d.name == "a2a_call"),
+            "default_tools() should register a2a_call"
+        );
+
+        assert!(
+            registry.remove("a2a_call"),
+            "remove should return true on hit"
+        );
+        assert!(
+            !registry.definitions().iter().any(|d| d.name == "a2a_call"),
+            "a2a_call definition must be gone after remove"
+        );
+        assert!(
+            registry.get("a2a_call").is_none(),
+            "a2a_call tool must be gone after remove"
+        );
+
+        // Idempotent / absent-name case.
+        assert!(!registry.remove("a2a_call"), "second remove returns false");
+        assert!(
+            !registry.remove("nonexistent_tool"),
+            "removing unknown name returns false"
+        );
+    }
+
+    /// mika#1217 F4 — `BUILTIN_TOOL_NAMES` must list every engine-registered
+    /// tool name (default_tools + management_tools_if_needed + KNOWN_BUILTINS).
+    /// The skill validator (`validate_skill` §5b) uses the const to suppress
+    /// false-positive warnings on `[constraints] required_tools` references.
+    /// Drift between this const and the real registries silently mis-handles
+    /// new builtins, so this parity test enforces sync.
+    #[test]
+    fn test_builtin_tool_names_parity() {
+        // Collect default_tools() names.
+        let registry = default_tools();
+        let mut engine_tools: HashSet<String> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+
+        // Add management_tools_if_needed names — both always-added and
+        // conditionally-added. Conditional set fires when N>1 agents or
+        // teams exist; we list both for the const because the validator
+        // does not know agent count at scan time.
+        for name in &[
+            "create_agent",
+            "create_team",
+            "list_agents",
+            "list_teams",
+            "run_team",
+            "delegate_task",
+            "get_team_status",
+            "get_team_history",
+            "delete_team",
+            "update_team",
+            "add_team_member",
+            "remove_team_member",
+            "create_task",
+            "update_task_status",
+        ] {
+            engine_tools.insert((*name).to_string());
+        }
+
+        // Add KNOWN_BUILTINS (handler-builtins dispatched by name in
+        // skills::builtin_handlers::execute).
+        for name in crate::skills::builtin_handlers::KNOWN_BUILTINS {
+            engine_tools.insert((*name).to_string());
+        }
+
+        let const_tools: HashSet<String> = BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        let missing_from_const: Vec<&String> = engine_tools.difference(&const_tools).collect();
+        let extra_in_const: Vec<&String> = const_tools.difference(&engine_tools).collect();
+
+        assert!(
+            missing_from_const.is_empty() && extra_in_const.is_empty(),
+            "BUILTIN_TOOL_NAMES out of sync with engine registries\n  \
+             missing (add to const): {missing_from_const:?}\n  \
+             extra (remove from const): {extra_in_const:?}"
+        );
+    }
+
+    /// Dispatcher skills (skills that forward work to claude-pilot and receive
+    /// verdicts via callback) must NOT declare `[output] required_suffix_lines`.
+    /// That config is for **producer** skills whose LLM emits the verdict text
+    /// directly. Putting it on a dispatcher creates fabrication pressure: the
+    /// suffix-line guard (#864) rejects EndTurn for missing Verdict, the
+    /// corrective re-prompt names the accept-set, and the LLM rationalizes by
+    /// fabricating `Verdict: GROOMED`. See mika#1133.
+    #[test]
+    fn test_dispatcher_skills_dont_declare_required_suffix_lines() {
+        use crate::skills::manifest::SkillManifest;
+
+        let dispatchers = ["self-dev", "dev-pilot", "dev-groom"];
+        let skills_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bundled");
+
+        for name in dispatchers {
+            let manifest_path = skills_dir.join(name).join("skill.toml");
+            assert!(
+                manifest_path.exists(),
+                "Dispatcher skill {} not found at {}",
+                name,
+                manifest_path.display()
+            );
+
+            let content = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", manifest_path.display(), e));
+            let manifest: SkillManifest = toml::from_str(&content)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", manifest_path.display(), e));
+
+            assert!(
+                manifest.output.required_suffix_lines.is_empty(),
+                "Dispatcher skill {} must not declare required_suffix_lines. \
+                 Dispatchers forward to claude-pilot; verdicts arrive via \
+                 callback, not from the dispatcher LLM's turn. See mika#1133.",
+                name
+            );
+        }
+    }
+
+    // === validate_uuid tests ===
+
+    #[test]
+    fn test_validate_uuid_valid_hyphenated() {
+        let result = validate_uuid("task_id", "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_uuid_valid_non_hyphenated() {
+        let result = validate_uuid("task_id", "a1b2c3d4e5f67890abcdef1234567890");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_uuid_empty_string() {
+        let result = validate_uuid("task_id", "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains("task_id"));
+    }
+
+    #[test]
+    fn test_validate_uuid_too_short() {
+        let result = validate_uuid("id", "abc");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains(r#""field":"id""#));
+        assert!(err.content.contains(r#""received":"abc""#));
+    }
+
+    #[test]
+    fn test_validate_uuid_fabricated_suffix() {
+        // The actual fabricated UUID from the incident
+        let result = validate_uuid("task_id", "eda3190e-764c-4b0f-a123456789ab");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+    }
+
+    #[test]
+    fn test_validate_uuid_non_hex_chars() {
+        let result = validate_uuid("id", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_uuid_long_input_truncated() {
+        let long_input = "x".repeat(1000);
+        let result = validate_uuid("task_id", &long_input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // The received field should be truncated to 50 chars + "..."
+        assert!(err.content.contains("..."));
+        // Should NOT contain the full 1000-char string
+        assert!(!err.content.contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn test_validate_uuid_multibyte_utf8_no_panic() {
+        // 51 two-byte chars = 102 bytes; truncation must not panic on char boundary
+        let input = "é".repeat(51);
+        let result = validate_uuid("id", &input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("..."));
+        // The received field should have exactly 50 'é' chars + "..."
+        assert!(err.content.contains("invalid_uuid"));
+    }
+
+    #[test]
+    fn test_validate_uuid_field_name_propagated() {
+        let result = validate_uuid("parent_task_id", "not-a-uuid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("parent_task_id"));
+    }
+
+    #[test]
+    fn test_validate_uuid_returns_parsed_uuid() {
+        let result = validate_uuid("id", "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+        let uuid = result.unwrap();
+        assert_eq!(uuid.to_string(), "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+    }
+
+    // === AgentScopedTaskId + validate_task_exists tests ===
+
+    use crate::db::NewTask;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    async fn create_test_task(harness: &TestHarness, label: &str) -> String {
+        harness
+            .db
+            .create_task(NewTask {
+                agent_id: harness.db.agent_id.clone(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    // === AgentScopedTaskId constructor tests ===
+
+    #[tokio::test]
+    async fn test_agent_scoped_task_id_invalid_format() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = AgentScopedTaskId::from_tool_context(&ctx, "not-a-uuid");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("invalid_uuid"));
+        assert!(err.content.contains("task_id"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_scoped_task_id_empty_string() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = AgentScopedTaskId::from_tool_context(&ctx, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("invalid_uuid"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_scoped_task_id_valid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().as_str(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    // === validate_task_exists tests ===
+
+    #[tokio::test]
+    async fn test_validate_task_exists_valid() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        let id = create_test_task(&harness, "valid task").await;
+
+        let scoped = AgentScopedTaskId::from_tool_context(&ctx, &id).unwrap();
+        let result = validate_task_exists(&harness.db, "task_id", &scoped).await;
+        assert!(result.is_ok());
+        let task = result.unwrap();
+        assert_eq!(task.label, "valid task");
+        assert_eq!(task.id, id);
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_not_in_db() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "task_id", &scoped).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.is_error);
+        assert!(err.content.contains("task_not_found"));
+        assert!(err.content.contains("task_id"));
+        assert!(err.content.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(err.content.contains("no task with this ID exists"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_cross_agent() {
+        // Create a task with agent "agent-a"
+        let harness_a = TestHarness::with_agent("agent-a");
+        let task_id = create_test_task(&harness_a, "agent-a task").await;
+
+        // Try to validate with agent "agent-b" — should get task_not_found (not info disclosure)
+        let harness_b = TestHarness::with_agent("agent-b");
+        let ctx_b = harness_b.ctx();
+        let scoped = AgentScopedTaskId::from_tool_context(&ctx_b, &task_id).unwrap();
+        let result = validate_task_exists(&harness_b.db, "task_id", &scoped).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("task_not_found"));
+        // Must NOT reveal that the task exists for another agent
+        assert!(!err.content.contains("agent-a"));
+        assert!(err.content.contains("no task with this ID exists"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_cross_agent_identical_to_nonexistent() {
+        // Cross-agent error should be structurally identical to non-existent error
+        let harness_a = TestHarness::with_agent("agent-a");
+        let task_id = create_test_task(&harness_a, "agent-a task").await;
+
+        let harness_b = TestHarness::with_agent("agent-b");
+        let ctx_b = harness_b.ctx();
+        let scoped_cross = AgentScopedTaskId::from_tool_context(&ctx_b, &task_id).unwrap();
+        let cross_agent_err = validate_task_exists(&harness_b.db, "task_id", &scoped_cross)
+            .await
+            .unwrap_err();
+
+        let scoped_nonexist =
+            AgentScopedTaskId::from_tool_context(&ctx_b, "00000000-0000-0000-0000-000000000001")
+                .unwrap();
+        let nonexistent_err = validate_task_exists(&harness_b.db, "task_id", &scoped_nonexist)
+            .await
+            .unwrap_err();
+
+        // Parse both as JSON and compare structure (excluding task_id values which differ)
+        let cross: serde_json::Value = serde_json::from_str(&cross_agent_err.content).unwrap();
+        let nonexist: serde_json::Value = serde_json::from_str(&nonexistent_err.content).unwrap();
+
+        assert_eq!(cross["error"], nonexist["error"]);
+        assert_eq!(cross["field"], nonexist["field"]);
+        assert_eq!(cross["reason"], nonexist["reason"]);
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_error_json_parseable() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "my_field", &scoped).await;
+        let err = result.unwrap_err();
+
+        let json: serde_json::Value = serde_json::from_str(&err.content).unwrap();
+        assert_eq!(json["error"], "task_not_found");
+        assert_eq!(json["field"], "my_field");
+        assert!(json["task_id"].is_string());
+        assert!(json["reason"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_validate_task_exists_field_name_propagated() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        // Not found — field propagated through task_not_found
+        let scoped =
+            AgentScopedTaskId::from_tool_context(&ctx, "00000000-0000-0000-0000-000000000000")
+                .unwrap();
+        let result = validate_task_exists(&harness.db, "parent_id", &scoped).await;
+        let err = result.unwrap_err();
+        assert!(err.content.contains("parent_id"));
+    }
+
+    // === validate_and_resolve_path tests ===
+
+    #[tokio::test]
+    async fn test_tilde_expansion_strips_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("notes")).unwrap();
+        std::fs::write(base.join("notes").join("todo.md"), "test").unwrap();
+
+        let result = validate_and_resolve_path("~/notes/todo.md", base, false).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert_eq!(result.unwrap(), base.join("notes/todo.md"));
+    }
+
+    #[tokio::test]
+    async fn test_bare_tilde_returns_empty_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        // Bare ~ maps to empty path, which is an error for file-targeting tools
+        let result = validate_and_resolve_path("~", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("required"));
+    }
+
+    #[tokio::test]
+    async fn test_tilde_username_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let result = validate_and_resolve_path("~root/file.txt", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("~username"));
+    }
+
+    #[tokio::test]
+    async fn test_tilde_with_traversal_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path();
+
+        let result = validate_and_resolve_path("~/../../../etc/passwd", base, false).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.content.contains("traversal"));
+    }
+}

@@ -1,0 +1,259 @@
+# Canonical label definitions for the Mika repository.
+# Synced to GitHub via .github/workflows/labels.yml (EndBug/label-sync).
+# All issue-creation paths (slash commands, investigation panel, agent skills,
+# ad-hoc Claude usage) should reference this file.
+
+# ── Type ──────────────────────────────────────────────────────────────────────
+- name: bug
+  color: "d73a4a"
+  description: Something isn't working
+
+- name: enhancement
+  color: "a2eeef"
+  description: New feature or improvement to existing functionality
+
+- name: documentation
+  color: "0075ca"
+  description: Documentation additions or updates
+
+- name: question
+  color: "d876e3"
+  description: Needs clarification or discussion
+
+- name: duplicate
+  color: "cfd3d7"
+  description: This issue or pull request already exists
+
+- name: invalid
+  color: "e4e669"
+  description: This doesn't seem right
+
+- name: wontfix
+  color: "ffffff"
+  description: This will not be worked on
+
+- name: help wanted
+  color: "008672"
+  description: Extra attention is needed
+
+- name: regression
+  color: "8b0000"
+  description: Functionality that previously worked has broken — distinct from new bugs
+
+# ── Priority ──────────────────────────────────────────────────────────────────
+- name: p0-critical
+  color: "b60205"
+  description: Must fix immediately — system down or data loss
+
+- name: p1-important
+  color: "e99695"
+  description: Should fix soon — significant impact
+
+- name: p2-normal
+  color: "fbca04"
+  description: Normal priority — fix in regular cycle
+
+- name: p3-nice-to-have
+  color: "c5def5"
+  description: Low priority — nice to have
+
+# ── Component ─────────────────────────────────────────────────────────────────
+- name: agent-core
+  color: "1d76db"
+  description: Agent loop, tools, prompt assembly, memory
+
+- name: tui
+  color: "5319e7"
+  description: CLI and TUI (mika-cli)
+
+- name: team-engine
+  color: "0e8a16"
+  description: Multi-agent orchestration and team workflows
+
+- name: skill
+  color: "f9d0c4"
+  description: Skills system and marketplace
+
+- name: gateway
+  color: "006b75"
+  description: Telegram gateway (mika-gateway)
+
+- name: infrastructure
+  color: "bfdadc"
+  description: CI/CD, Docker, deployment, configuration
+
+- name: dashboard
+  color: "7057ff"
+  description: Observability dashboard (React SPA)
+
+- name: kg
+  color: "5C6BC0"
+  description: Knowledge Graph subsystem (extraction, resolution, corpora, schema)
+
+- name: evaluation
+  color: "84cc16"
+  description: Evaluation harness, eval scenarios, provider quality comparisons
+
+- name: observability
+  color: "f59e0b"
+  description: "Logging, tracing, metrics, dashboards \u2014 anything operator-visible"
+
+# ── State ─────────────────────────────────────────────────────────────────────
+- name: ready
+  color: "2ea44f"
+  description: Approved for autonomous dispatch
+
+- name: operator-gated
+  color: "8a2be2"
+  description: "Groomed work requiring operator-host-time. Distinct from parked/blocked. No ready label."
+
+- name: operator-review
+  color: "b60205"
+  description: "Auto-pull gave up; an operator must look. A structural feeder exclusion."
+
+- name: blocked
+  color: "b60205"
+  description: "Not dispatchable until something outside the ticket changes. Feeder exclusion."
+
+- name: pipeline-exempt
+  color: "bfdadc"
+  description: "Docs-only or non-code PR exempt from pipeline gates"
+
+# ── Dispatch / Routing ────────────────────────────────────────────────────────
+#
+# Ces trois étiquettes SONT le vocabulaire de `KNOWN_DISPATCH_SEATS`
+# (crates/mika-agent/src/webhook_dispatch.rs). Les deux listes doivent bouger
+# dans le MÊME commit : `scripts/check-dispatch-seats-declared.sh` échoue en CI
+# dès qu'elles divergent, dans un sens comme dans l'autre.
+#
+# Pourquoi une garde plutôt qu'une note (mika#2092) : le workflow labels.yml
+# synchronise avec `delete-other-labels: true`. Un siège non déclaré ici est
+# donc supprimé du dépôt — et de toutes les issues qui le portent — sans
+# événement `unlabeled` et sans trace. Le 2026-08-30, `dispatch:ssc` et
+# `dispatch:mpc` ont disparu de cette façon à 09:12:51Z, à l'occasion d'un push
+# sans rapport ; la garde de siège s'est désarmée en silence.
+#
+# `dispatch:zorglub` est la fixture de test « siège inconnu » du code Rust :
+# elle ne doit JAMAIS être déclarée ici, sous peine de la rendre atteignable en
+# production.
+- name: "dispatch:loop"
+  color: "1d76db"
+  description: "Routage : ce ticket est pris par la boucle autonome (mika-dev). Posée et retirée par dispatch-lib le temps d'un dispatch (mika#2155). Un seul dispatcher par ticket."
+
+- name: "dispatch:ssc"
+  color: "5319e7"
+  description: "Routage : ce ticket est pris par SSC (senara-solutions-claude). Un seul dispatcher par ticket."
+
+- name: "dispatch:mpc"
+  color: "0e8a16"
+  description: "Routage : ce ticket est pris par MPC (mika-platform-claude). Un seul dispatcher par ticket."
+
+# ── Sprint Hooks ───────────────────────────────────────��─────────────────────
+- name: needs-build
+  color: "d97706"
+  description: "Run build + test after merge, before next ticket in milestone/sprint"
+
+- name: needs-deploy
+  color: "d97706"
+  description: "Run make deploy after merge, before next ticket in milestone/sprint"
+
+# ── Phased Milestones (mika#1153) ───────────────────────────────────────────
+- name: "phase:1"
+  color: "c5def5"
+  description: "Phase 1 of phased milestone"
+
+- name: "phase:2"
+  color: "c5def5"
+  description: "Phase 2 of phased milestone"
+
+- name: "phase:3"
+  color: "c5def5"
+  description: "Phase 3 of phased milestone"
+
+- name: "phase:4"
+  color: "c5def5"
+  description: "Phase 4 of phased milestone"
+
+- name: "phase:5"
+  color: "c5def5"
+  description: "Phase 5 of phased milestone"
+
+- name: "phase:6"
+  color: "c5def5"
+  description: "Phase 6 of phased milestone"
+
+- name: "phase:7"
+  color: "c5def5"
+  description: "Phase 7 of phased milestone"
+
+- name: "phase:8"
+  color: "c5def5"
+  description: "Phase 8 of phased milestone"
+
+# ── Automation ───────────────────────────────────────────────────────────────
+- name: release
+  color: "6e40c9"
+  description: Release PR created by CI (release-pr workflow)
+
+- name: wip-rescue
+  color: "d97706"
+  description: "PR created by dispatch-lib wip-rescue recovery (mika#1282)"
+
+- name: human-review-required
+  color: "d93f0b"
+  description: "wip-rescue: le démon a bailé vers un humain (conflit/erreur), à résoudre à la main"
+
+# Written by `_finalize_pr_gate` (dispatch-lib.sh) when AC7's formal
+# multi-agent review is missing. Undeclared until mika#2201's L5 rule found it:
+# fifth occurrence of the class named in
+# docs/solutions/best-practices/un-label-denforcement-non-declare-echoue-en-silence-2026-09-01.md
+# — and its write is followed by `|| true`, so the failure was silent on both
+# ends. This sync runs with delete-other-labels: true.
+- name: needs-multi-agent-review
+  color: "d93f0b"
+  description: "dispatch-lib _finalize_pr_gate: AC7 formal multi-agent review missing on this PR"
+
+- name: rescue-after-review
+  color: "b60205"
+  description: "rescue net committed after this PR was opened; an earlier approval no longer covers it (mika#2151)"
+
+- name: stale-against-main
+  color: "b60205"
+  description: "PR branch fails clippy after rebase onto current main (mika#1631)"
+
+# ── Eval Calibration ─────────────────────────────────────────────────────────
+- name: eval-calibration
+  color: "c2e0c6"
+  description: "Weekly eval calibration CI run"
+
+- name: drift-detected
+  color: "fbca04"
+  description: "Provider tolerance drift detected in calibration"
+
+- name: calibration-bootstrap
+  color: "0e8a16"
+  description: "Initial baseline bootstrap from first calibration run"
+
+- name: calibration-reset
+  color: "d93f0b"
+  description: "Baseline reset due to judge model deprecation"
+
+# ── Origin (mika#2026) ───────────────────────────────────────────────────────
+# Who produced this PR. Stamped by the producer at the moment of production —
+# never reconstructed after the fact from a branch name, an author, or a time
+# window (all three are indistinguishable between the loop and by-hand work).
+# Only `origin:loop` has a structural producer today: dispatch-lib's
+# `_stamp_pr_origin`. The other two are vocabulary the reader understands and a
+# human or spawn may apply. Absence of every `origin:*` label reads "unknown" —
+# read side: scripts/pr-origin-report.sh.
+- name: "origin:loop"
+  color: "1d76db"
+  description: "PR produced by the autonomous loop — stamped by dispatch-lib at production (mika#2026)"
+
+- name: "origin:spawn"
+  color: "1d76db"
+  description: "PR produced by a spawned tenant session (mika#2026)"
+
+- name: "origin:manual"
+  color: "1d76db"
+  description: "PR opened by hand in an interactive session (mika#2026)"

@@ -1,0 +1,9 @@
+[skill]
+name = "agents-teams"
+description = "Guidance for delegating tasks to agents and running team workflows"
+version = "0.1.0"
+always_on = false
+timeout_secs = 10
+
+[triggers]
+keywords = ["delegate", "delegate task", "run team", "list agents", "list teams", "team workflow", "team status", "team history", "multi-agent"]

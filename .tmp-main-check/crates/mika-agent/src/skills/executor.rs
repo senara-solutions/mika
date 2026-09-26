@@ -1,0 +1,11608 @@
+// READ-ONLY INVARIANT: Skills must never write to their own directory at runtime.
+// This is critical for `--link` mode where the skill directory is a symlink to the
+// author's source directory. Writing back would silently modify the author's source
+// files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use base64::Engine;
+use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, info, warn};
+
+use super::index::ResolvedSkillTool;
+use super::manifest::ToolHandler;
+use crate::async_db::AsyncDatabase;
+use crate::db::{self, NewTask};
+use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
+use crate::task_engine::types::{action_type, trigger_type};
+use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
+
+/// Maximum output size from a skill tool (10,000 characters).
+const MAX_OUTPUT_LEN: usize = 10_000;
+
+/// Plancher sous lequel une commande de build ne peut pas aboutir (mika#2423).
+///
+/// 120 s : très au-dessus de tout budget de skill court (30 s, le défaut de
+/// manifeste et la valeur déclarée par `qa-review`), très en dessous de toute
+/// compilation réelle du workspace `mika-agent` — les deux `cargo test
+/// --release` mesurés sur PR #2275 ont pris 237,9 s et 231,1 s. Entre les deux,
+/// aucune valeur n'est défendable : ce n'est pas un budget, c'est une borne
+/// d'impossibilité.
+const BUILD_FLOOR_SECS: u64 = 120;
+
+/// Famille build v1 — close et énumérée (mika#2423).
+///
+/// Chaque entrée est `(binaire, sous-commandes)`. La reconnaissance est
+/// **ancrée au début d'instruction** : le binaire doit être le premier token
+/// d'une instruction shell (après d'éventuels `VAR=valeur`), et la
+/// sous-commande doit le suivre, flags et sélecteur de toolchain sautés. Une
+/// mention en prose — `grep -rn "cargo test"`, `echo "make test passed"`, un
+/// corps de heredoc qui cite `cargo clippy` — n'est pas une instruction et ne
+/// correspond donc pas. C'est ce qui rend la garde vivable pour l'étape 2 de
+/// `qa-review`, dont l'unique `run_shell` embarque le corps de PR verbatim
+/// dans un heredoc : 31 des 40 derniers corps de PR de `mika` citent une
+/// commande de build.
+const BUILD_COMMAND_FAMILY: &[(&str, &[&str])] = &[
+    ("cargo", &["build", "test", "clippy", "check", "bench"]),
+    ("npm", &["run build", "run test"]),
+    ("npx", &["tsc"]),
+    ("make", &["build", "test"]),
+    ("go", &["build", "test"]),
+];
+
+/// Non-`MIKA_*` env vars that must also be scrubbed from child processes.
+///
+/// `GH_TOKEN` is removed to prevent identity collision: if it leaked from
+/// `~/.mika/.env` via dotenvy, it would override the host's `gh auth` identity
+/// in ALL child processes. `run_gh` explicitly re-injects the correct platform
+/// token AFTER this scrub. See issue #380.
+const EXTRA_SCRUB_VARS: &[&str] = &["GH_TOKEN"];
+
+/// Scrub all `MIKA_*` environment variables (and [`EXTRA_SCRUB_VARS`]) from a
+/// tokio Command (defense-in-depth).
+///
+/// Prevents leaking secrets like `MIKA_ANTHROPIC_API_KEY`, `MIKA_INTERNAL_TOKEN`,
+/// and `MIKA_OPENAI_API_KEY` to child processes.
+pub(crate) fn scrub_mika_env_vars(cmd: &mut tokio::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MIKA_") {
+            cmd.env_remove(&key);
+        }
+    }
+    for key in EXTRA_SCRUB_VARS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Scrub all `MIKA_*` environment variables (and [`EXTRA_SCRUB_VARS`]) from a
+/// std Command (defense-in-depth).
+///
+/// Same as [`scrub_mika_env_vars`] but for synchronous `std::process::Command`.
+pub(crate) fn scrub_mika_env_vars_std(cmd: &mut std::process::Command) {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MIKA_") {
+            cmd.env_remove(&key);
+        }
+    }
+    for key in EXTRA_SCRUB_VARS {
+        cmd.env_remove(key);
+    }
+}
+
+/// Baseline exact-match allowlist for [`is_sandbox_env_allowed`]. Every well-behaved
+/// subprocess needs these — missing `PATH` breaks every exec, missing `HOME` breaks
+/// every `~/.config/…` read. Kept narrow: no key here may start with `MIKA_`.
+const SANDBOX_ENV_CORE_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR", "HOSTNAME",
+];
+
+/// Prefix-match allowlist for [`is_sandbox_env_allowed`]. Wildcard families the
+/// pilot subprocess needs to interoperate with system tooling. Deliberately covers
+/// only NON-secret families — no `AWS_`, no `OPENAI_`, no `NODE_AUTH_`.
+const SANDBOX_ENV_ALLOWED_PREFIXES: &[&str] = &[
+    "LC_",     // locale variants (LC_MESSAGES, LC_NUMERIC, …) — user's shell
+    "XDG_",    // Claude Code plugin cache, gh config, freedesktop paths
+    "NVM_",    // nvm-managed node runtime discovery
+    "CARGO_",  // cargo build cache / config for pilot-invoked builds
+    "RUSTUP_", // rustup toolchain resolution
+];
+
+/// Pure predicate for the [`sandboxed_pilot_env`] allowlist. Extracted for
+/// unit-testing so the shape can be verified without spawning a subprocess or
+/// mutating the process-wide env.
+fn is_sandbox_env_allowed(key: &str) -> bool {
+    // Never allow a MIKA_* key through even if it were listed — defense against
+    // a future refactor that adds one to the core list. Composed with the
+    // debug_assert in `sandboxed_pilot_env` for both dynamic and static checks.
+    if key.starts_with("MIKA_") {
+        return false;
+    }
+    if SANDBOX_ENV_CORE_ALLOWLIST.contains(&key) {
+        return true;
+    }
+    SANDBOX_ENV_ALLOWED_PREFIXES
+        .iter()
+        .any(|p| key.starts_with(p))
+}
+
+/// Positive-allowlist environment for the pilot subprocess — used by
+/// [`spawn_long_running_exec`] which invokes claude-pilot in the highest-untrust
+/// context on the platform (LLM-generated commands running via cpp).
+///
+/// Strictly stronger than [`scrub_mika_env_vars`]: instead of removing MIKA_\*
+/// (negative shape), this clears the entire env and copies only the vars matched
+/// by [`is_sandbox_env_allowed`]. Any operator-injected token not in the allowlist
+/// (`AWS_*`, `OPENAI_*` without the MIKA_ prefix, `NODE_AUTH_TOKEN`, `NPM_TOKEN`,
+/// custom credential vars) cannot leak by inheritance.
+///
+/// Callers still re-inject `GH_TOKEN` and `ANTHROPIC_LOG_FILE` AFTER this call, same
+/// as with the older scrub. See mika#TBD (Phase 1 of dev-pilot containment layer,
+/// coupled to bubblewrap fs+network isolation in Phase 2).
+pub(crate) fn sandboxed_pilot_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+    for (key, value) in std::env::vars() {
+        if is_sandbox_env_allowed(&key) {
+            cmd.env(&key, &value);
+        }
+    }
+    debug_assert!(
+        SANDBOX_ENV_CORE_ALLOWLIST
+            .iter()
+            .all(|k| !k.starts_with("MIKA_")),
+        "SANDBOX_ENV_CORE_ALLOWLIST contains a MIKA_ variable — a secret would leak"
+    );
+}
+
+/// Environment variable claude-pilot-py honors to append a per-LLM-call JSONL
+/// transcript (mika#1705). Deliberately non-`MIKA_*` so it survives the
+/// child-env scrub in [`scrub_mika_env_vars`] and flows through dispatch-lib.sh
+/// into the claude-pilot subprocess.
+const PILOT_TRANSCRIPT_ENV: &str = "ANTHROPIC_LOG_FILE";
+
+/// Read the `MIKA_LOG_PILOT_TRANSCRIPTS` gate from mika-spirit's own environment
+/// (mika#1705 committed position 4 — default ON once shipped, gateable). Reads
+/// the parent process env directly, before the child-command scrub. `0`,
+/// `false`, `no`, `off` (case-insensitive) disable; any other value or absence
+/// enables.
+pub(crate) fn pilot_transcripts_enabled() -> bool {
+    match std::env::var("MIKA_LOG_PILOT_TRANSCRIPTS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Inject `ANTHROPIC_LOG_FILE` for claude-pilot dispatch skills so the
+/// subprocess appends its LLM-call corpus to
+/// `{home}/data/pilot-transcripts/<task-id>.jsonl` (mika#1705). The engine
+/// ingestion tick imports finished files into the `pilot_transcripts` table.
+///
+/// MUST be called AFTER [`scrub_mika_env_vars`] so the injected var is not
+/// stripped. Best-effort: feature-off, non-pilot skill, home resolution failure,
+/// or dir-create failure are all silent no-ops — transcript capture must never
+/// block or fail a dispatch.
+///
+/// Returns the path the variable was set to, or `None` on any of the no-op
+/// paths above. The caller stamps that path on the task once the subprocess is
+/// confirmed started (mika#2040 AC7): the empty-transcript detector's premise
+/// is *"a pilot ran and was asked for a transcript"*, and that premise has to
+/// be a fact recorded by the producer, not one reconstructed later from the
+/// skill name and the current value of `MIKA_LOG_PILOT_TRANSCRIPTS` — that gate
+/// is read per dispatch and can flip in between.
+fn inject_pilot_transcript_env(
+    cmd: &mut tokio::process::Command,
+    skill_dir: &std::path::Path,
+    task_id: &str,
+) -> Option<PathBuf> {
+    if !pilot_transcripts_enabled() {
+        return None;
+    }
+    // Only the two claude-pilot dispatch skills produce subprocess LLM
+    // trajectories worth capturing (both source `_shared/dispatch-lib.sh`).
+    let is_pilot_skill = skill_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "dev-pilot" || n == "dev-groom");
+    if !is_pilot_skill {
+        return None;
+    }
+    let Ok(home) = mika_common::home::resolve_home_dir() else {
+        warn!(task_id = %task_id, "mika#1705: could not resolve home dir; skipping transcript capture");
+        return None;
+    };
+    let dir = home.join("data").join("pilot-transcripts");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(task_id = %task_id, error = %e, "mika#1705: failed to create pilot-transcripts dir; skipping capture");
+        return None;
+    }
+    let path = dir.join(format!("{task_id}.jsonl"));
+    cmd.env(PILOT_TRANSCRIPT_ENV, &path);
+    debug!(task_id = %task_id, path = %path.display(), "mika#1705: pilot transcript capture enabled");
+    Some(path)
+}
+
+/// Environment variable `dispatch-lib.sh` honours to declare the worktree it
+/// created for a dispatch (mika#2249, D1 Phase 1). Deliberately `MIKA_`-prefixed
+/// and injected explicitly AFTER [`sandboxed_pilot_env`], like `GH_TOKEN`: it
+/// carries no secret, is read only by `dispatch-lib.sh` itself (which runs
+/// **outside** the bubblewrap sandbox — bwrap wraps only the claude-pilot
+/// invocation), and must not be inherited by anything else.
+const DISPATCH_WORKTREE_ENV: &str = "MIKA_DISPATCH_WORKTREE_FILE";
+
+/// Inject `MIKA_DISPATCH_WORKTREE_FILE` for claude-pilot dispatch skills so
+/// `dispatch-lib.sh` can declare the worktree it created
+/// (`{home}/data/dispatch-worktrees/<task-id>.path`, mika#2249).
+///
+/// The engine's silent-stall reaper needs one thing the Rust side cannot
+/// compute: **where this dispatch is writing**. Only `dispatch-lib.sh` knows —
+/// it derives the path through `scripts/derive-worktree-path`, and
+/// mika-platform#58 closed the duplication that re-deriving it here would
+/// reopen. So the shell declares and the engine reads, exactly as mika#2040
+/// does for the transcript one function above.
+///
+/// MUST be called AFTER [`sandboxed_pilot_env`] so the injected var survives
+/// the env rebuild. Best-effort: a non-pilot skill, a home-resolution failure
+/// or a dir-create failure are all silent no-ops. An undeclared dispatch is
+/// **invisible to the reaper, never a blocked dispatch** — the same trade the
+/// transcript path makes, and the one the fail-safe in
+/// [`crate::task_engine::engine::DISPATCH_WORKTREE_FILE_KEY`] depends on.
+///
+/// Returns the declaration path, or `None` on any no-op path. The caller
+/// stamps it on the task once the subprocess is confirmed started.
+fn inject_dispatch_worktree_env(
+    cmd: &mut tokio::process::Command,
+    skill_dir: &std::path::Path,
+    task_id: &str,
+) -> Option<PathBuf> {
+    // Same two skills as the transcript: both source `_shared/dispatch-lib.sh`
+    // and both create a worktree.
+    let is_pilot_skill = skill_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "dev-pilot" || n == "dev-groom");
+    if !is_pilot_skill {
+        return None;
+    }
+    let Ok(home) = mika_common::home::resolve_home_dir() else {
+        warn!(task_id = %task_id, "mika#2249: could not resolve home dir; dispatch worktree will not be watched");
+        return None;
+    };
+    let dir = home.join("data").join("dispatch-worktrees");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(task_id = %task_id, error = %e, "mika#2249: failed to create dispatch-worktrees dir; dispatch will not be watched");
+        return None;
+    }
+    let path = dir.join(format!("{task_id}.path"));
+    // A stale file from a previous dispatch reusing this task id would point
+    // the reaper at a worktree this run is not writing to. Remove it rather
+    // than trust `dispatch-lib` to overwrite: the declaration only happens if
+    // the shell gets that far, and a leftover path is worse than no path.
+    let _ = std::fs::remove_file(&path);
+    cmd.env(DISPATCH_WORKTREE_ENV, &path);
+    debug!(task_id = %task_id, path = %path.display(), "mika#2249: dispatch worktree declaration armed");
+    Some(path)
+}
+
+/// The two operator settings `dispatch-lib.sh`'s rescue-pipeline measurement
+/// honours (mika#2354): the kill-switch and the measurement's global budget.
+///
+/// `MIKA_`-prefixed and relayed explicitly, for the reason spelled out on
+/// [`inject_rescue_verify_env`]: [`sandboxed_pilot_env`] rebuilds the child env
+/// from a **positive** allowlist, so no name crosses by inheritance — prefixed
+/// or not. A same-named-but-unprefixed variable would propagate exactly as
+/// little and cost a vocabulary divergence for nothing.
+const RESCUE_VERIFY_ENV: &[&str] = &[
+    "MIKA_RESCUE_VERIFY_ENABLED",
+    "MIKA_RESCUE_VERIFY_BUDGET_SECS",
+];
+
+/// The two operator settings `dispatch-lib.sh`'s architect-call retry honours
+/// (mika#2278): the kill-switch and the delay before the single retry.
+///
+/// Relayed for the same reason and by the same route as [`RESCUE_VERIFY_ENV`].
+/// Without this, `MIKA_ARCH_ASK_RETRY=0` would be a setting only its reader
+/// honours — mika#2165's definition of a decorative setting — and the plan's
+/// R7 ("disarmable without redeploying the binary") would be false in a way no
+/// test of the shell half could see.
+const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETRY_DELAY_SECS"];
+
+/// Les deux réglages opérateur du canal pilote que `dispatch-lib.sh` lit
+/// (mika#2508) : le plafond de tours (mika#2496) et le puits de journal
+/// (mika#2249).
+///
+/// **Non préfixés, et ce n'est PAS ce qui les fait traverser.** Les deux ont
+/// été nommés nus sur un diagnostic faux — « `scrub_mika_env_vars` retire tout
+/// `MIKA_*` du child de dispatch, donc un nom nu survit ». Le child de dispatch
+/// n'est pas scrubbé : [`sandboxed_pilot_env`] fait `env_clear()` puis recopie
+/// une allowlist **positive**, donc **aucun** nom ne traverse par héritage,
+/// préfixé ou non. Mesuré le 2026-09-24 : `PILOT_MAX_TURNS=150` posé sur le
+/// service, absent du child, pilote lancé sans `--max-turns`.
+///
+/// Les noms restent nus parce qu'ils sont un **format de fil** pour l'opérateur
+/// (`PILOT_MAX_TURNS=150` est déjà posé dans `~/.mika/.env`, et
+/// `PILOT_LOG_DIR` est publié dans les commandes des Signaux Q et S), jamais
+/// parce que la forme nue achèterait quoi que ce soit. Les renommer est une
+/// dette de vocabulaire, pas un correctif — voir § *Hors périmètre* de
+/// mika#2508.
+///
+/// Même contrat de placement que [`RESCUE_VERIFY_ENV`] : relayées APRÈS
+/// [`sandboxed_pilot_env`], et **jamais** ajoutées à l'allowlist — mika#2354
+/// AC9(b), tenu par `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`
+/// et étendu à ces deux noms par
+/// `mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist`.
+const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR"];
+
+/// Decide which of `keys` to set on the child, given a reader of the spirit
+/// process environment.
+///
+/// Extracted as a pure function for the same reason [`is_sandbox_env_allowed`]
+/// is: the shape is verifiable without spawning a subprocess or mutating
+/// process-wide env state.
+///
+/// **Only a present, non-empty value is relayed.** This is where this injection
+/// differs from its two siblings ([`inject_pilot_transcript_env`],
+/// [`inject_dispatch_worktree_env`]), and the difference is deliberate: they
+/// relay a path the engine *computed*, this one relays a value the *operator*
+/// set. An absence must therefore stay an absence — the shell keeps its own
+/// default instead of silently inheriting one, which is what keeps "no setting"
+/// and "setting posed at the default value" two states an operator can tell
+/// apart.
+fn relayed_env_pairs<F>(keys: &[&'static str], read: F) -> Vec<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    keys.iter()
+        .filter_map(|key| {
+            let value = read(key)?;
+            if value.is_empty() {
+                return None;
+            }
+            Some((*key, value))
+        })
+        .collect()
+}
+
+/// Comme [`relayed_env_pairs`], mais **préserve la valeur vide** (mika#2508).
+///
+/// La différence est portante et elle est du côté du **lecteur**, pas de
+/// l'écrivain. `_pilot_max_turns` (`dispatch-lib.sh`) distingue trois paliers
+/// avec `${PILOT_MAX_TURNS+set}`, et son palier « défini mais vide » est le
+/// ROLLBACK explicite : le drapeau `--max-turns` n'est pas passé et
+/// claude-pilot retombe sur son propre `maxTurns=200`. Omettre le vide le
+/// replierait sur le palier « non défini », c'est-à-dire sur le défaut de
+/// flotte.
+///
+/// Aujourd'hui les deux coïncident (le défaut de flotte est vide), donc le
+/// piège est **programmé et non hypothétique** : le résolveur prescrit
+/// lui-même `local _default=120` une fois la V2 de mika#2496 rapportée, et ce
+/// jour-là un rollback par `""` deviendrait silencieusement un plafond à 120.
+///
+/// La règle inverse de [`relayed_env_pairs`] — « An absence must therefore stay
+/// an absence » — reste juste pour ses deux familles d'origine, où
+/// `MIKA_ARCH_ASK_RETRY_DELAY_SECS=""` est la forme d'une demi-ligne `.env` mal
+/// écrite et non un palier documenté. Elle n'est pas élargie : deux populations,
+/// deux helpers, chacun testé pour lui-même.
+fn relayed_env_pairs_preserving_empty<F>(
+    keys: &[&'static str],
+    read: F,
+) -> Vec<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    keys.iter()
+        .filter_map(|key| read(key).map(|value| (*key, value)))
+        .collect()
+}
+
+/// Relay the mika#2354 rescue-verification settings to `dispatch-lib.sh`.
+///
+/// MUST be called AFTER [`sandboxed_pilot_env`], like `GH_TOKEN` and the two
+/// sibling injections above it — that function does `env_clear()` and then
+/// copies back only the positive allowlist, so anything injected before it is
+/// erased. Neither name is in that allowlist and neither may be added: the
+/// allowlist stays the guard, this injection stays the named exception
+/// (mika#2354 AC9).
+///
+/// The measurement itself runs in `dispatch-lib.sh`'s rescue tail, which is
+/// **outside** bubblewrap (bwrap wraps only the claude-pilot invocation), so no
+/// `--setenv` allowlist is on this path.
+///
+/// Best-effort and silent: a dispatch that does not carry the settings falls
+/// back to the shell's own defaults (armed, 900 s), which is the shipped
+/// behaviour — never a blocked dispatch.
+fn inject_rescue_verify_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(RESCUE_VERIFY_ENV, |k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Relay the mika#2278 architect-retry settings to `dispatch-lib.sh`.
+///
+/// Same placement contract as [`inject_rescue_verify_env`] — it MUST run after
+/// [`sandboxed_pilot_env`], whose `env_clear()` would otherwise erase it — and
+/// the same best-effort discipline: a dispatch that does not carry the settings
+/// falls back to the shell's own defaults (armed, 30 s), never a blocked
+/// dispatch.
+fn inject_arch_ask_retry_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Relaie les deux réglages du canal pilote à `dispatch-lib.sh` (mika#2508).
+///
+/// Même contrat de placement que [`inject_rescue_verify_env`] — il DOIT tourner
+/// après [`sandboxed_pilot_env`], dont l'`env_clear()` effacerait sinon les
+/// variables — et **via [`relayed_env_pairs_preserving_empty`]**, parce que la
+/// valeur vide est ici un palier documenté (le rollback) et non l'absence d'un
+/// réglage.
+///
+/// Best-effort et silencieux, comme ses trois siblings : un dispatch qui ne
+/// porte pas les réglages retombe sur les défauts du shell (désarmé,
+/// `/var/log/claude-pilot`), jamais un dispatch bloqué.
+fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in
+        relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| std::env::var(k).ok())
+    {
+        cmd.env(key, value);
+    }
+}
+
+/// Le nom que le child de dispatch porte pour la racine plateforme (mika#2536).
+///
+/// **Délibérément NON préfixé `MIKA_`**, et ce n'est pas une préférence de
+/// vocabulaire : [`is_sandbox_env_allowed`] refuse **tout** `MIKA_*` (allowlist
+/// positive + `debug_assert`), donc un nom préfixé ne traverserait pas. C'est
+/// la mesure de mika#2508 — *nommer une variable ne la fait pas traverser ; le
+/// relais explicite si.*
+///
+/// Une **troisième** raison, spécifique à un consommateur : le handler
+/// `deploy-mika` fait `for _var in $(env | grep -o '^MIKA_[^=]*'); do unset …`
+/// AVANT de lire sa racine. Même si l'allowlist admettait un `MIKA_*`, ce
+/// handler-là l'aurait retiré lui-même.
+///
+/// Ajouter `MIKA_PLATFORM_DIR` à [`SANDBOX_ENV_CORE_ALLOWLIST`] est le geste
+/// tentant et il est **refusé** : ce serait percer une garde anti-fuite de
+/// secret pour un confort de chemin, contre un `debug_assert` qui existe pour
+/// empêcher précisément ce geste. Le relais obtient le même résultat sans
+/// toucher la garde.
+const PLATFORM_DIR_RELAY_KEY: &str = "PLATFORM_DIR";
+
+/// Le nom sous lequel l'**opérateur** pose la racine plateforme (mika#2491).
+///
+/// Lu côté spirit, où il n'est pas scrubbé — le scrub est une propriété de
+/// l'environnement du *child*, jamais du nôtre.
+const PLATFORM_DIR_OPERATOR_ENV: &str = "MIKA_PLATFORM_DIR";
+
+/// Décide la paire à poser sur le child, étant donné un lecteur de
+/// l'environnement du process spirit.
+///
+/// Extraite en fonction pure pour la raison de [`relayed_env_pairs`] : la
+/// **traduction de nom** est la propriété porteuse de ce relais, et elle doit
+/// être vérifiable sans spawner de subprocess ni muter l'env du process.
+///
+/// **Pourquoi ni l'un ni l'autre des deux helpers existants.** Les deux mappent
+/// `key → (key, value)` : ils relaient un nom **à l'identique**, ce qui est
+/// exactement ce que ce relais ne doit pas faire (F4). `relayed_env_pairs` ne
+/// peut donc pas exprimer la traduction, et l'y forcer — une passe sur un
+/// tableau d'un élément suivie d'un renommage de clé — serait plus de code pour
+/// moins de lisibilité.
+///
+/// La règle sur le vide est en revanche bien celle de [`relayed_env_pairs`] et
+/// non celle de [`relayed_env_pairs_preserving_empty`], parce que le shell n'a
+/// ici **aucun palier documenté pour le vide** : ses dix sites écrivent
+/// `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où une valeur vide et une
+/// absence rendent le même défaut. Poser un vide ne changerait donc rien au
+/// child tout en rendant « réglage absent » et « réglage posé vide »
+/// indistinguables côté spirit.
+fn relayed_platform_dir_pair<F>(read: F) -> Option<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = read(PLATFORM_DIR_OPERATOR_ENV)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some((PLATFORM_DIR_RELAY_KEY, value))
+}
+
+/// Relaie la racine plateforme au child de dispatch (mika#2536).
+///
+/// **Il TRADUIT le nom, et c'est le cœur du relais.** L'opérateur pose
+/// `MIKA_PLATFORM_DIR` sur l'environnement du service — c'est le nom que
+/// mika#2491 documente et celui que `DISPATCH_ENV_KNOWN_INERT` nommait jusqu'à
+/// ce correctif. Un relais à l'identique (le motif de
+/// [`inject_pilot_dispatch_env`], qui reprend le nom du knob) exigerait que
+/// l'opérateur renomme sa variable sans que rien ne le lui dise, et un réglage
+/// qui cesse d'être lu **sans erreur** est très exactement la panne que
+/// mika#2536 ferme. Le motif suivi est donc celui de
+/// [`inject_pilot_transcript_env`], qui lit `MIKA_LOG_PILOT_TRANSCRIPTS` et
+/// pose `ANTHROPIC_LOG_FILE`.
+///
+/// Même contrat de placement que ses quatre siblings : DOIT tourner **après**
+/// [`sandboxed_pilot_env`], dont l'`env_clear()` l'effacerait.
+///
+/// Best-effort et silencieux : absence ou valeur vide ⇒ no-op, le child retombe
+/// sur son propre défaut — jamais un dispatch bloqué.
+fn inject_platform_dir_env(cmd: &mut tokio::process::Command) {
+    if let Some((key, value)) = relayed_platform_dir_pair(|k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
+/// Maximum raw image file size (5 MB).
+const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
+
+/// Maximum number of images per tool result.
+const MAX_IMAGES_PER_RESULT: usize = 5;
+
+// -- Mika envelope protocol for image-bearing tool results --
+
+/// Top-level JSON envelope output by exec handlers that return images.
+///
+/// Scripts output `{"__mika_v1": {"text": "...", "images": ["/path/to/img.png"]}}`.
+#[derive(Deserialize)]
+struct MikaEnvelope {
+    __mika_v1: MikaOutput,
+}
+
+#[derive(Deserialize)]
+struct MikaOutput {
+    text: String,
+    #[serde(default)]
+    images: Vec<String>,
+}
+
+/// Context for spawning long-running background exec handlers.
+///
+/// When present and the handler has `long_running: true`, the executor creates
+/// a callback task and spawns the subprocess in the background instead of
+/// blocking the agent loop.
+pub struct LongRunningContext {
+    pub db: AsyncDatabase,
+    pub agent_name: String,
+    pub session_id: String,
+    pub trace_id: String,
+    /// Per-turn dispatch counter (#583). Only one long-running dispatch is
+    /// permitted per agent turn. Atomic for interior mutability through `&self`.
+    pub dispatch_count: AtomicU32,
+    /// Originating user-message text for this turn, when available.
+    ///
+    /// Populated in conversation-mode turns (the actual user/webhook input).
+    /// `None` for silent triggers (`SilentTrigger::DeferredDispatch`, callback
+    /// continuation turns) where there is no fresh user input — those paths
+    /// have already passed an upstream gate.
+    pub originating_message: Option<String>,
+}
+
+/// Validate that all required fields declared in a skill tool's input schema are
+/// present and non-null in the supplied input.
+///
+/// Returns `Some(ToolOutput::error(...))` if validation fails, `None` if all
+/// required fields are present (or the schema has no `required` key at all).
+///
+/// Scope: top-level `required` only. Does NOT validate `enum` constraints,
+/// `type` assertions, or nested `properties`.
+///
+/// Post-#984: if `required` exists but is not a JSON array (malformed schema),
+/// returns a structured `malformed_required_schema` error instead of silently passing.
+pub fn validate_required_fields(
+    skill_tool: &ResolvedSkillTool,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    let tool_name = &skill_tool.definition.name;
+    let required_raw = skill_tool.definition.input_schema.get("required").cloned();
+    let input_keys: Vec<&str> = input
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let required_fields: Vec<&str> = required_raw
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+
+    if required_fields.is_empty() {
+        // Check if `required` exists but isn't an array — indicates malformed schema.
+        // Step 3.5 (#984): return a structured error instead of silently passing.
+        if let Some(raw) = &required_raw
+            && !raw.is_array()
+        {
+            warn!(
+                tool = %tool_name,
+                required_raw = ?raw,
+                ?input_keys,
+                "skill_tool_malformed_required_schema: \
+                 'required' field exists but is not a JSON array — rejecting dispatch"
+            );
+            let error = serde_json::json!({
+                "error": "malformed_required_schema",
+                "tool": tool_name,
+                "reason": "The tool's 'required' field in input_schema is not a JSON array. \
+                           This indicates a schema configuration error. The dispatch cannot \
+                           be validated and is rejected as a safety measure.",
+                "required_raw_type": format!("{}", raw)
+            });
+            return Some(ToolOutput::error(error.to_string()));
+        }
+        // No `required` key at all — schema intentionally has no required fields.
+        tracing::debug!(
+            tool = %tool_name,
+            ?input_keys,
+            "validate_required_fields: no required fields declared in schema"
+        );
+        return None;
+    }
+
+    // F5 instrumentation (#984): log the schema and input state for diagnostics.
+    // DEBUG on happy path (silent in production), WARN on any missing field (rare, surfaces immediately).
+    let all_present = {
+        let input_obj = input.as_object();
+        required_fields.iter().all(|field| {
+            input_obj
+                .and_then(|obj| obj.get(*field))
+                .is_some_and(|v| !v.is_null())
+        })
+    };
+
+    if all_present {
+        tracing::debug!(
+            tool = %tool_name,
+            ?input_keys,
+            ?required_fields,
+            "validate_required_fields: all required fields present"
+        );
+    } else {
+        warn!(
+            tool = %tool_name,
+            ?input_keys,
+            ?required_fields,
+            required_raw = ?required_raw,
+            "validate_required_fields: one or more required fields missing — will reject"
+        );
+    }
+
+    let input_obj = input.as_object();
+    for field in &required_fields {
+        let is_present = input_obj
+            .and_then(|obj| obj.get(*field))
+            .is_some_and(|v| !v.is_null());
+
+        if !is_present {
+            warn!(
+                tool = %tool_name,
+                field = %field,
+                "skill_tool_missing_required_field: \
+                 required field not provided in tool call input"
+            );
+
+            // Collect valid_values from the field's `enum` constraint, if any
+            let valid_values: Option<Vec<&str>> = skill_tool
+                .definition
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get(*field))
+                .and_then(|f| f.get("enum"))
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect());
+
+            let mut error = serde_json::json!({
+                "error": "missing_required_field",
+                "tool": skill_tool.definition.name,
+                "field": field,
+                "reason": format!(
+                    "The '{}' field is required by the tool schema but was not provided in the tool call.",
+                    field
+                )
+            });
+
+            if let Some(values) = valid_values {
+                error["valid_values"] = serde_json::json!(values);
+            }
+
+            return Some(ToolOutput::error(error.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Le délimiteur d'un heredoc ouvert sur cette ligne, s'il y en a un.
+///
+/// Reconnaît `<<TAG`, `<<-TAG`, `<<'TAG'` et `<<"TAG"`. Les lignes qui
+/// suivent, jusqu'au délimiteur seul sur sa ligne, sont des **données**, pas
+/// des instructions : [`shell_instructions`] les saute. C'est la forme exacte
+/// de l'étape 2 de `qa-review` (`cat > "$W.body" <<'MIKA_QA_BODY_EOF'`).
+fn heredoc_delimiter(line: &str) -> Option<&str> {
+    let after = &line[line.find("<<")? + 2..];
+    let after = after.strip_prefix('-').unwrap_or(after).trim_start();
+    let (quote, after) = match after.chars().next() {
+        Some(q @ ('\'' | '"')) => (Some(q), &after[1..]),
+        _ => (None, after),
+    };
+    let end = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(after.len());
+    let tag = &after[..end];
+    if tag.is_empty() {
+        return None;
+    }
+    if let Some(q) = quote
+        && !after[end..].starts_with(q)
+    {
+        return None;
+    }
+    Some(tag)
+}
+
+/// Les instructions shell d'une commande, corps de heredoc exclus.
+///
+/// Une instruction est un segment borné par `;`, `|`, `&`, fin de ligne. Les
+/// sous-shells et substitutions (`(cargo test)`, `$(cargo test)`) ne sont pas
+/// découpés : leur premier token porte la parenthèse et ne correspond à aucun
+/// binaire — un **manque** accepté, rattrapé par le kill de groupe de
+/// [`ProcessGroupKillGuard`], là où le découper produirait des faux refus sur
+/// une parenthèse de prose.
+fn shell_instructions(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut lines = command.lines();
+    while let Some(line) = lines.next() {
+        out.extend(line.split([';', '|', '&']));
+        if let Some(tag) = heredoc_delimiter(line) {
+            for body in lines.by_ref() {
+                if body.trim() == tag {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rend le nom de la famille build reconnue dans `command`, ou `None`.
+///
+/// Pour chaque instruction : le premier token (après d'éventuels
+/// `VAR=valeur`) doit être le binaire — nu ou en chemin (`~/.cargo/bin/cargo`)
+/// — et la sous-commande doit suivre, flags (`--release`) et toolchain
+/// (`+nightly`) sautés.
+///
+/// **Ce que ce prédicat ne prétend pas être.** Le scan est lexical, donc
+/// contournable — découpage de token (`car""go test`), assemblage par variable
+/// (`$CARGO test`), `sh -c`, sous-shell. C'est la posture que `run.sh` écrit
+/// déjà pour ses deux scans : *defense-in-depth, NOT a sole gate*. Le dernier
+/// recours est le kill de groupe de [`ProcessGroupKillGuard`] : une commande
+/// qui passe sous le scan et expire est tuée avec sa descendance, donc sans
+/// orphelin. C'est pourquoi les deux moitiés de mika#2423 coexistent — et
+/// pourquoi le scan penche vers le **manque** plutôt que le faux refus : un
+/// manque coûte un timeout rattrapé, un faux refus ferme une porte légitime.
+fn matched_build_family(command: &str) -> Option<String> {
+    for instruction in shell_instructions(command) {
+        let mut tokens = instruction
+            .split_whitespace()
+            .skip_while(|t| is_env_assignment(t));
+        let Some(first) = tokens.next() else {
+            continue;
+        };
+        let binary_name = first.rsplit('/').next().unwrap_or(first);
+        let Some((binary, subcommands)) = BUILD_COMMAND_FAMILY
+            .iter()
+            .find(|(binary, _)| *binary == binary_name)
+        else {
+            continue;
+        };
+        // Les flags et le sélecteur de toolchain (`cargo +nightly test`) se
+        // glissent entre le binaire et sa sous-commande.
+        let rest: Vec<&str> = tokens
+            .filter(|t| !t.starts_with('-') && !t.starts_with('+'))
+            .collect();
+        for sub in *subcommands {
+            let expected: Vec<&str> = sub.split_whitespace().collect();
+            if rest.len() >= expected.len() && rest[..expected.len()] == expected[..] {
+                return Some(format!("{binary} {sub}"));
+            }
+        }
+    }
+    None
+}
+
+/// `FOO=bar` en tête d'instruction : une affectation d'environnement, pas le
+/// binaire.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Refuse une commande de build dont le budget ne peut pas contenir
+/// l'exécution (mika#2423). `None` = pas de refus.
+///
+/// **Le prédicat porte sur la conjonction commande × budget × modèle
+/// d'exécution du handler, jamais sur le nom du skill.** Le discriminant « ce
+/// tour est un tour qa-review » a été écarté : `validate_review_depth_present`
+/// le fait via `!ctx.required_tool_arg_suffixes.is_empty()` et son propre
+/// commentaire mika#2237 nomme la fragilité — la garde « disparaît en silence
+/// le jour où qa-review réorganise son manifeste ». Ce qui est posé ici est
+/// auto-descriptif et universellement vrai : *une commande de la famille
+/// build, remise à un handler qui l'exécute dans le budget de l'outil, sous un
+/// budget inférieur au plancher de build, ne peut pas aboutir — quel que soit
+/// l'agent qui la soumet.*
+///
+/// Deux modèles d'exécution échappent au prédicat par construction, parce que
+/// le budget de l'outil ne borne pas leur commande : les handlers
+/// `long_running` (`build_mika`, `dev-pilot`) rendent la main avant
+/// l'application du timeout ; les handlers qui déclarent `detaches_command`
+/// (`tmux_create_session`) remettent la commande à un runtime détaché et
+/// reviennent en moins d'une seconde. La voie légitime pour compiler reste
+/// ouverte, intacte — c'est même la voie que le prompt `tmux` recommande.
+///
+/// Conséquence voulue : mika-dev soumettant `cargo build` via `run_shell` sous
+/// 30 s est refusée aussi, et c'est correct — elle échouait déjà, en
+/// orphelinant.
+fn refuse_uncontainable_build(
+    skill_tool: &ResolvedSkillTool,
+    input: &serde_json::Value,
+    timeout_secs: u64,
+) -> Option<ToolOutput> {
+    if timeout_secs >= BUILD_FLOOR_SECS {
+        return None;
+    }
+    if let ToolHandler::Exec {
+        long_running: true, ..
+    }
+    | ToolHandler::Exec {
+        detaches_command: true,
+        ..
+    } = &skill_tool.handler
+    {
+        return None;
+    }
+    let tool_name = &skill_tool.definition.name;
+    let command = input.get("command").and_then(serde_json::Value::as_str)?;
+    let family = matched_build_family(command)?;
+
+    // Jamais la commande complète : elle peut porter des chemins de worktree et
+    // n'ajoute rien au diagnostic que la famille ne donne déjà.
+    warn!(
+        event = "build_command_refused_over_budget",
+        tool = %tool_name,
+        timeout_secs,
+        build_floor_secs = BUILD_FLOOR_SECS,
+        matched_family = %family,
+        "refused a build command the tool budget cannot contain"
+    );
+
+    Some(ToolOutput::error(
+        serde_json::json!({
+            "error": "build_command_exceeds_tool_budget",
+            "policy": "refusal",
+            "tool": tool_name,
+            "tool_budget_secs": timeout_secs,
+            "build_floor_secs": BUILD_FLOOR_SECS,
+            "matched_family": family,
+            "detail": "This is a POLICY REFUSAL, not a tool failure. The command was never \
+                       spawned. Do NOT retry, do NOT rewrite the command to evade the scan, \
+                       and do NOT treat this as a failed verification step.",
+            "remedy": "Mark the acceptance criterion `[⏭️] not verifiable within the review \
+                       budget — requires a build` and state so in the verdict. CI runs this \
+                       build without a time limit and the merge gate reads its result.",
+        })
+        .to_string(),
+    ))
+}
+
+/// Execute a skill tool with the appropriate handler.
+///
+/// Applies a per-skill timeout wrapping the inner execution.
+/// If `long_running_ctx` is Some and the handler is `Exec { long_running: true }`,
+/// the subprocess is spawned in the background with a callback task.
+///
+/// `callback_task_id` and `callback_db` enable deferred dispatch registration
+/// from callback turns (mika#1058). When both are `Some`, the executor gate
+/// intercepts long-running tool calls and registers them as deferred dispatches
+/// instead of returning a hard error.
+pub async fn execute_skill_tool(
+    skill_tool: &ResolvedSkillTool,
+    input: serde_json::Value,
+    timeout_secs: u64,
+    long_running_ctx: Option<&LongRunningContext>,
+    github_token: Option<&str>,
+    callback_task_id: Option<&str>,
+    callback_db: Option<&AsyncDatabase>,
+) -> ToolOutput {
+    // Validate required fields from tool schema before any execution (#955).
+    // Catches the bug class where the LLM omits a required field — the subprocess
+    // never spawns, and the LLM gets a structured retry signal in the same turn.
+    if let Some(error) = validate_required_fields(skill_tool, &input) {
+        return error;
+    }
+
+    // mika#2423 — une commande de build sous un budget qui ne peut pas la
+    // contenir est refusée AVANT le spawn. Le prédicat lit lui-même le modèle
+    // d'exécution du handler (`long_running`, `detaches_command`) : il rend
+    // `None` pour ceux que le budget ne borne pas, si bien que sa place par
+    // rapport à la branche `long_running` ci-dessous n'est pas porteuse.
+    if let Some(refusal) = refuse_uncontainable_build(skill_tool, &input, timeout_secs) {
+        return refusal;
+    }
+
+    // Check for long-running exec handler
+    if let ToolHandler::Exec {
+        command,
+        long_running: true,
+        estimated_duration_secs,
+        ..
+    } = &skill_tool.handler
+        && let Some(ctx) = long_running_ctx
+    {
+        return execute_long_running(
+            skill_tool,
+            command,
+            input,
+            *estimated_duration_secs,
+            ctx,
+            github_token,
+        )
+        .await;
+    }
+
+    // Refuse long-running tools when no long-running context is available
+    // (callback turns, silent mode, CLI test). The sync exec path does not
+    // inject __mika_task_id/__mika_agent, so the handler would crash with
+    // a cryptic error. Return an explicit error instead (#537).
+    //
+    // mika#1058: Callback turns with a known task_id can register deferred
+    // dispatches instead of receiving a hard error. The deferred callback fires
+    // as a DeferredDispatch silent turn which HAS long_running_ctx injected.
+    if matches!(
+        &skill_tool.handler,
+        ToolHandler::Exec {
+            long_running: true,
+            ..
+        }
+    ) && long_running_ctx.is_none()
+    {
+        // Callback turns: attempt deferred dispatch registration instead of hard error.
+        if let Some(task_id) = callback_task_id
+            && let Some(db) = callback_db
+        {
+            match check_lineage_cycle(db, task_id, &input).await {
+                Ok(()) => {
+                    if register_deferred_callback(db, task_id, &input).await {
+                        info!(
+                            tool = %skill_tool.definition.name,
+                            task_id,
+                            "callback_deferred_dispatch_registered"
+                        );
+                        return ToolOutput::success(
+                            serde_json::json!({
+                                "status": "deferred",
+                                "message": "Long-running dispatch registered as deferred callback. \
+                                            It will fire automatically when the current dispatch \
+                                            slot is free. Do not retry.",
+                                "deferred": true
+                            })
+                            .to_string(),
+                        );
+                    }
+                    // Fall through to original error if registration failed (cap exceeded / DB error)
+                }
+                Err(cycle_msg) => {
+                    warn!(
+                        tool = %skill_tool.definition.name,
+                        task_id,
+                        "deferred_dispatch_cycle_detected"
+                    );
+                    return ToolOutput::error(
+                        serde_json::json!({
+                            "error": "deferred_dispatch_cycle_detected",
+                            "message": cycle_msg,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+        }
+
+        // Original error for non-callback contexts (heartbeat, reflection, CLI test)
+        warn!(
+            tool = %skill_tool.definition.name,
+            "long-running tool invoked without long_running_ctx"
+        );
+        return ToolOutput::error(format!(
+            "Tool '{}' is declared long_running but cannot run in the current context \
+             (callback turn, silent mode, or CLI test). Long-running tools require a \
+             conversation-mode turn with an active task engine.",
+            skill_tool.definition.name
+        ));
+    }
+
+    let timeout = Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(timeout, execute_inner(skill_tool, input, github_token)).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            warn!(
+                tool = %skill_tool.definition.name,
+                error = %e,
+                "skill tool execution failed"
+            );
+            ToolOutput::error(format!("Skill tool error: {e}"))
+        }
+        Err(_) => {
+            warn!(
+                tool = %skill_tool.definition.name,
+                timeout_secs,
+                "skill tool timed out"
+            );
+            ToolOutput::error(format!(
+                "Skill tool '{}' timed out after {timeout_secs}s",
+                skill_tool.definition.name
+            ))
+        }
+    }
+}
+
+async fn execute_inner(
+    skill_tool: &ResolvedSkillTool,
+    input: serde_json::Value,
+    github_token: Option<&str>,
+) -> Result<ToolOutput> {
+    tracing::info!(
+        tool = %skill_tool.definition.name,
+        input = %input,
+        "executing skill tool"
+    );
+    match &skill_tool.handler {
+        ToolHandler::Exec { command, .. } => {
+            execute_exec(
+                command,
+                &skill_tool.skill_dir,
+                &skill_tool.definition.name,
+                input,
+                github_token,
+            )
+            .await
+        }
+        ToolHandler::Http { url, method } => execute_http(url, method, input).await,
+        ToolHandler::Builtin { .. } => {
+            // Builtin handlers are dispatched directly from agent.rs, not through executor.
+            // This path should never be reached.
+            bail!("Builtin handlers must be dispatched from the agent loop, not the executor")
+        }
+    }
+}
+
+/// Attempt to parse exec handler stdout as a `__mika_v1` image envelope.
+///
+/// Returns `Some(MikaOutput)` if the output is valid JSON with the sentinel key,
+/// `None` otherwise (plain text output — backward compatible).
+fn try_parse_envelope(stdout: &str) -> Option<MikaOutput> {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') || !trimmed.contains(r#""__mika_v1""#) {
+        return None;
+    }
+    serde_json::from_str::<MikaEnvelope>(trimmed)
+        .ok()
+        .map(|e| e.__mika_v1)
+}
+
+/// Read an image file from disk, validate it, and return base64-encoded data.
+///
+/// Security checks:
+/// - Canonicalizes path (resolves symlinks)
+/// - Verifies regular file (rejects devices, sockets, etc.)
+/// - Enforces 5 MB size limit via metadata pre-check AND capped read (TOCTOU-safe)
+/// - Magic-byte validation for supported image types (JPEG, PNG, GIF, WebP)
+async fn read_and_validate_image(path: &str) -> Result<ImageData, String> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::fs;
+        use std::io::Read;
+
+        let canonical = fs::canonicalize(&path)
+            .map_err(|e| format!("cannot resolve image path '{}': {}", path, e))?;
+
+        let metadata = fs::metadata(&canonical)
+            .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
+
+        if !metadata.is_file() {
+            return Err(format!("not a regular file: {}", canonical.display()));
+        }
+
+        if metadata.len() > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "image too large: {} bytes (max {} bytes)",
+                metadata.len(),
+                MAX_IMAGE_SIZE
+            ));
+        }
+
+        // Use capped read to prevent TOCTOU race (file could grow between metadata and read)
+        let file = fs::File::open(&canonical)
+            .map_err(|e| format!("cannot open image '{}': {}", canonical.display(), e))?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_IMAGE_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read image '{}': {}", canonical.display(), e))?;
+
+        if bytes.len() as u64 > MAX_IMAGE_SIZE {
+            return Err(format!(
+                "image too large: {} bytes (max {} bytes)",
+                bytes.len(),
+                MAX_IMAGE_SIZE
+            ));
+        }
+
+        let media_type = detect_image_type(&bytes)
+            .ok_or_else(|| format!("not a supported image type: {}", canonical.display()))?;
+
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        Ok(ImageData {
+            media_type: media_type.to_string(),
+            data,
+        })
+    })
+    .await
+    .map_err(|e| format!("image read task panicked: {e}"))?
+}
+
+/// Detect image type from magic bytes. Returns MIME type or None.
+fn detect_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0x47, 0x49, 0x46, 0x38]) {
+        Some("image/gif")
+    } else if bytes.len() >= 12
+        && bytes[..4] == [0x52, 0x49, 0x46, 0x46]
+        && bytes[8..12] == [0x57, 0x45, 0x42, 0x50]
+    {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Process image file paths from a Mika envelope, returning validated images
+/// and any error notes for paths that couldn't be loaded.
+async fn process_envelope_images(image_paths: &[String]) -> (Vec<ImageData>, Vec<String>) {
+    let mut images = Vec::new();
+    let mut errors = Vec::new();
+
+    for (i, path) in image_paths.iter().enumerate() {
+        if i >= MAX_IMAGES_PER_RESULT {
+            errors.push(format!(
+                "skipped {} image(s): max {} per result",
+                image_paths.len() - MAX_IMAGES_PER_RESULT,
+                MAX_IMAGES_PER_RESULT
+            ));
+            break;
+        }
+        match read_and_validate_image(path).await {
+            Ok(img) => images.push(img),
+            Err(e) => {
+                warn!(path, error = %e, "failed to load envelope image");
+                errors.push(e);
+            }
+        }
+    }
+
+    (images, errors)
+}
+
+/// Tue le groupe de processus de l'enfant quand le futur est abandonné
+/// (mika#2423).
+///
+/// **Ce que `kill_on_drop` ne fait pas.** Il ne signale que le pid **direct**.
+/// Or `templates/skills/shell-exec/handlers/run.sh` finit sur
+/// `eval "$COMMAND" 2>&1` : la vraie commande est un *petit-enfant*. À
+/// l'expiration du `tokio::time::timeout` d'`execute_skill_tool`, le futur est
+/// abandonné, `run.sh` reçoit SIGKILL, et le petit-enfant survit — reparenté à
+/// init, `ppid=1`. C'est le pid 145584 du ticket, tenant le lock `target/` et
+/// garantissant l'échec de toutes les tentatives suivantes : une spirale de
+/// contention, pas une fuite isolée.
+///
+/// **Le groupe est strictement plus étroit que l'existant, pas plus large.**
+/// `process_group(0)` fait de l'enfant son propre chef de groupe, et le groupe
+/// ne contient alors que lui et sa descendance. Avant, l'enfant était dans le
+/// groupe de mika-spirit — c'est-à-dire qu'aucun kill de groupe n'était
+/// *possible* sans toucher le démon. Le motif préexiste dans ce fichier :
+/// `spawn_long_running_exec` pose `.process_group(0)` depuis mika#855.
+///
+/// **Armée après le spawn, désarmée après `wait_with_output`.** Ce désarmement
+/// est ce qui garantit qu'une commande qui finit normalement est inchangée, bit
+/// pour bit : un handler qui laisse volontairement un processus derrière lui
+/// n'est jamais atteint. Sur le chemin d'erreur d'attente, en revanche, la
+/// garde reste armée — le groupe est alors dans un état inconnu et l'abandonner
+/// reproduirait le défaut.
+///
+/// **Ce que le kill de groupe change pour un handler interrompu de
+/// l'extérieur.** Chef de son propre groupe, l'enfant ne reçoit plus le SIGINT
+/// du groupe de premier plan quand un opérateur interrompt `mika skills test`
+/// au clavier ; ce chemin CLI est le seul concerné (mika-spirit sous OpenRC ne
+/// partage pas de terminal), et c'était déjà le régime de
+/// `spawn_long_running_exec` depuis mika#855.
+struct ProcessGroupKillGuard {
+    pgid: i32,
+    disarmed: bool,
+}
+
+impl ProcessGroupKillGuard {
+    fn arm(pgid: i32) -> Self {
+        Self {
+            pgid,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ProcessGroupKillGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // SAFETY: `pgid` vient de `child.id()` d'un spawn réussi avec
+        // `.process_group(0)`, donc il est strictement positif et désigne un
+        // groupe dont l'enfant est le chef — distinct du groupe de mika-spirit
+        // par construction. Le groupe survit à son chef : tant qu'un membre
+        // vit, le pgid ne peut pas être recyclé (POSIX). Sur le chemin
+        // d'abandon, `wait_with_output` a consommé le `Child` et le
+        // moissonneur de tokio peut déjà avoir moissonné le chef quand la
+        // garde part ; `killpg` atteint alors exactement les descendants
+        // encore vivants — le cas du ticket — et rend ESRCH si le groupe est
+        // déjà vide.
+        let rc = unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+        if rc == 0 {
+            debug!(
+                event = "exec_process_group_killed",
+                pgid = self.pgid,
+                "killed the handler's process group on abandon"
+            );
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        // ESRCH = le groupe est déjà vide, le cas nominal d'un handler dont
+        // toute la descendance a suivi le chef. Tout autre errno est un kill
+        // qui n'a pas eu lieu : le journaliser, sinon l'orphelin reviendrait
+        // sans laisser de trace.
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            warn!(
+                event = "exec_process_group_kill_failed",
+                pgid = self.pgid,
+                error = %err,
+                "could not kill the handler's process group on abandon"
+            );
+        }
+    }
+}
+
+/// Execute an exec-type handler by spawning a subprocess.
+///
+/// - Resolves the command path relative to the skill directory
+/// - Pipes input JSON to stdin
+/// - Returns stdout regardless of exit code; prefixes `Exit code: N` on non-zero
+/// - Detects `__mika_v1` envelope for image-bearing results (exit 0 only)
+/// - Le sous-processus est chef de son groupe, et le groupe entier est tué si
+///   le futur est abandonné (mika#2423 — voir [`ProcessGroupKillGuard`])
+async fn execute_exec(
+    command: &str,
+    skill_dir: &std::path::Path,
+    tool_name: &str,
+    input: serde_json::Value,
+    github_token: Option<&str>,
+) -> Result<ToolOutput> {
+    // Resolve command relative to skill directory
+    let cmd_path = skill_dir.join(command);
+    info!(command = %cmd_path.display(), "executing skill command");
+    if !cmd_path.exists() {
+        bail!(
+            "handler command not found: {} (resolved to {})",
+            command,
+            cmd_path.display()
+        );
+    }
+
+    let mut child = loop {
+        let mut cmd = tokio::process::Command::new(&cmd_path);
+        cmd.current_dir(skill_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .kill_on_drop(true)
+            // mika#2423 : chef de groupe, pour que la descendance soit
+            // atteignable par `killpg` à l'abandon. Même motif que
+            // `spawn_long_running_exec` (mika#855) — voir
+            // [`ProcessGroupKillGuard`] pour ce que `kill_on_drop` seul laisse
+            // passer.
+            .process_group(0);
+        scrub_mika_env_vars(&mut cmd);
+        // Re-inject agent's GitHub token for platform identity separation.
+        // Same pattern as builtin run_gh handler (builtin_handlers.rs).
+        if let Some(token) = github_token {
+            cmd.env("GH_TOKEN", token);
+        }
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e) if e.raw_os_error() == Some(26 /* ETXTBSY */) => {
+                // ETXTBSY — another process has the file open for writing.
+                // Retry after a brief yield (common fork+exec race).
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    // mika#2423 — armée ici, aussitôt après un spawn réussi, et désarmée
+    // seulement après un `wait_with_output` réussi. Sur l'abandon du futur, le
+    // pgid reste valide tant qu'un membre du groupe vit — voir la note SAFETY
+    // de [`ProcessGroupKillGuard`].
+    let mut group_guard = child.id().map(|pid| ProcessGroupKillGuard::arm(pid as i32));
+
+    // Write input JSON to stdin and close.
+    // Ignore BrokenPipe — the child may exit without reading stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        let input_bytes = serde_json::to_vec(&input)?;
+        match stdin.write_all(&input_bytes).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(e.into()),
+        }
+        // stdin is dropped here, closing the pipe
+    }
+
+    let output = child.wait_with_output().await?;
+
+    // Le handler a rendu la main : sa descendance ne nous regarde plus. Une
+    // erreur d'attente, en revanche, laisse la garde armée — le groupe est
+    // alors dans un état inconnu.
+    if let Some(guard) = group_guard.as_mut() {
+        guard.disarm();
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Log output for debugging (regardless of exit code)
+    // Use char-boundary-safe slicing to avoid panics on multi-byte UTF-8
+    let stdout_end = {
+        let mut b = stdout.len().min(200);
+        while b > 0 && !stdout.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    };
+    debug!(
+        tool = %tool_name,
+        exit_success = output.status.success(),
+        stdout_len = stdout.len(),
+        stdout_preview = %&stdout[..stdout_end],
+        "skill exec output"
+    );
+    if !stderr.trim().is_empty() {
+        let stderr_end = {
+            let mut b = stderr.len().min(500);
+            while b > 0 && !stderr.is_char_boundary(b) {
+                b -= 1;
+            }
+            b
+        };
+        debug!(
+            tool = %tool_name,
+            stderr = %&stderr[..stderr_end],
+            "skill exec stderr"
+        );
+    }
+
+    if output.status.success() {
+        // Exit 0: parse envelope and return stdout
+        if let Some(envelope) = try_parse_envelope(&stdout) {
+            let (images, errors) = process_envelope_images(&envelope.images).await;
+            let mut text = truncate_output(&envelope.text);
+            if !errors.is_empty() {
+                text.push_str("\n[image errors: ");
+                text.push_str(&errors.join("; "));
+                text.push(']');
+            }
+            if images.is_empty() {
+                Ok(ToolOutput::success(text))
+            } else {
+                Ok(ToolOutput::success_with_images(text, images))
+            }
+        } else {
+            Ok(ToolOutput::success(truncate_output(&stdout)))
+        }
+    } else {
+        // Non-zero exit: return success with exit code prefix.
+        // The agent decides whether the exit code represents a real failure —
+        // many tools (grep, linters, health checks) use non-zero to signal
+        // status, not errors.
+        let code_display = match output.status.code() {
+            Some(code) => format!("Exit code: {code}"),
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    match output.status.signal() {
+                        Some(sig) => format!("Killed by signal: {sig}"),
+                        None => "Exit code: unknown".to_string(),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    "Exit code: unknown".to_string()
+                }
+            }
+        };
+
+        // Combine stdout and stderr. Append stderr only if it has content
+        // not already in stdout (run.sh merges them with 2>&1).
+        let mut combined = stdout.to_string();
+        let stderr_trimmed = stderr.trim();
+        if !stderr_trimmed.is_empty() && stderr_trimmed != stdout.trim() {
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(stderr_trimmed);
+        }
+
+        let truncated = truncate_output(&combined);
+        Ok(ToolOutput::success(format!("{code_display}\n{truncated}")))
+    }
+}
+
+/// Execute an HTTP-type handler by making an HTTP request.
+///
+/// - POST/PUT: sends input as JSON body
+/// - GET: sends input as query parameters
+async fn execute_http(url: &str, method: &str, input: serde_json::Value) -> Result<ToolOutput> {
+    let client = reqwest::Client::new();
+
+    let request = match method.to_uppercase().as_str() {
+        "GET" => {
+            // For GET, serialize input object as query params
+            let mut req = client.get(url);
+            if let serde_json::Value::Object(map) = &input {
+                let params: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        (k.clone(), val)
+                    })
+                    .collect();
+                req = req.query(&params);
+            }
+            req
+        }
+        "POST" => client.post(url).json(&input),
+        "PUT" => client.put(url).json(&input),
+        other => bail!("unsupported HTTP method: {other}"),
+    };
+
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+
+    if status.is_success() {
+        Ok(ToolOutput::success(truncate_output(&body)))
+    } else {
+        Ok(ToolOutput::error(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            truncate_output(&body)
+        )))
+    }
+}
+
+/// Truncate output to at most `MAX_OUTPUT_LEN` **bytes**, floored to a char
+/// boundary (mika#2103 — delegates to the canonical helper rather than
+/// re-deriving the boundary walk locally).
+fn truncate_output(s: &str) -> String {
+    if s.len() <= MAX_OUTPUT_LEN {
+        s.to_string()
+    } else {
+        format!(
+            "{}\n... (truncated at {MAX_OUTPUT_LEN} bytes)",
+            mika_common::text::safe_truncate(s, MAX_OUTPUT_LEN)
+        )
+    }
+}
+
+use crate::github_graphql::{
+    fetch_issue_labels, fetch_issue_milestone_number, fetch_milestone_issues_by_state,
+    fetch_open_blockers, parse_phase_label,
+};
+
+/// Derive the dispatch class from a skill name (#1001).
+///
+/// Used by the per-class dispatch slot split to determine which concurrency
+/// slot a dispatch occupies. `"groom"` class allows grooming to run concurrently
+/// with implementation; all other skills are `"implement"` class.
+// COUPLED PAIR (mika#1175): when adding a new arm here, also update
+// `DISPATCH_CLASSES` in `task_engine/engine.rs` AND the probe-list inside
+// `test_dispatch_classes_universe_matches_derive_fn` (same file). The drift
+// test compares this function's outputs against the slice, so a new class
+// is silently lost from the periodic backstop unless all three sites move
+// together.
+pub(crate) fn derive_dispatch_class(skill: Option<&str>) -> &'static str {
+    match skill {
+        Some("dev-groom") => "groom",
+        _ => "implement", // dev-pilot, deploy_mika, and all others
+    }
+}
+
+/// Default concurrency cap for the `implement` dispatch class (mika#2160).
+///
+/// **1 — and this ticket does not change it.** mika#2160 opens a door; walking
+/// through it is a configuration gesture the operator makes, after the shared
+/// resources of two live pilots are proven isolated (AC1/AC6). Shipping a
+/// default of 2 would decide N in the code, which is exactly what AC6 forbids.
+pub(crate) const MAX_CONCURRENT_IMPLEMENT_DEFAULT: i64 = 1;
+
+/// Env override for the `implement` concurrency cap (mika#2160). The literal
+/// `0` disables the cap entirely, mirroring the disable sentinel of
+/// `MIKA_AUTO_PULL_MAX_BEHIND` and `MIKA_AUTO_PULL_MAX_REDRIVES` (KTD3 — two
+/// sentinel grammars in one repository is a reading debt).
+pub(crate) const MAX_CONCURRENT_IMPLEMENT_ENV: &str = "MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT";
+
+/// Pure parse of the `implement` concurrency cap from an optional env value
+/// (mika#2160). Same three-tier contract as `auto_pull::parse_max_behind`:
+/// absent/empty → default; unparseable/negative → default with a WARN; `0` →
+/// cap disabled.
+///
+/// Split out from the env read so it is unit-testable without mutating the
+/// process environment — the module's tests run in parallel and a `set_var`
+/// there is a race.
+pub(crate) fn parse_max_concurrent_implement(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => {
+                warn!(
+                    value = %v,
+                    default = MAX_CONCURRENT_IMPLEMENT_DEFAULT,
+                    "dispatch: invalid {MAX_CONCURRENT_IMPLEMENT_ENV}, using default"
+                );
+                MAX_CONCURRENT_IMPLEMENT_DEFAULT
+            }
+        },
+        _ => MAX_CONCURRENT_IMPLEMENT_DEFAULT,
+    }
+}
+
+/// Read the `implement` concurrency cap from the environment (mika#2160).
+/// `0` disables the cap.
+pub fn max_concurrent_implement() -> i64 {
+    parse_max_concurrent_implement(std::env::var(MAX_CONCURRENT_IMPLEMENT_ENV).ok().as_deref())
+}
+
+/// The concurrency cap that applies to a dispatch class (mika#2160).
+///
+/// Only `implement` is configurable. `groom` already runs beside implementation
+/// and its own cap of one is out of scope for mika#2160 — widening it here
+/// would change a class the ticket never measured.
+pub fn max_concurrent_for_class(dispatch_class: &str) -> i64 {
+    match dispatch_class {
+        "implement" => max_concurrent_implement(),
+        _ => 1,
+    }
+}
+
+/// Whether a dispatch must be refused, given how many of its class are already
+/// active and what the cap is (mika#2160).
+///
+/// Split out from the guard so the arithmetic is testable without setting
+/// `MIKA_DISPATCH_MAX_CONCURRENT_IMPLEMENT` in the process. That matters more
+/// than it looks: the cap is read inline from the environment, so a test that
+/// mutated it would silently change the verdict of every *other* dispatch test
+/// running in parallel — a flake that would surface as an unrelated guard test
+/// failing once in a while. Keeping the decision pure removes the class.
+///
+/// `cap <= 0` is the explicit disable sentinel: nothing is ever refused.
+pub fn class_cap_reached(active: i64, cap: i64) -> bool {
+    cap > 0 && active >= cap
+}
+
+/// Extract the skill name from a tool input JSON value.
+fn extract_skill_from_input(input: &serde_json::Value) -> Option<&str> {
+    input.get("skill").and_then(|v| v.as_str())
+}
+
+/// Check an issue body for the three canonical grooming-marker signals (#919).
+///
+/// Returns a list of missing signal names. Empty list means all signals present.
+/// The three load-bearing substrings match the canonical `/mika-groom-ticket`
+/// Phase 5 callout shape. Both this function and the prompt-level check at
+/// `skills/bundled/self-dev/system_prompt.md:253` must update together if
+/// the callout shape changes.
+///
+/// The plan callout uses `docs/plans/` as the path-prefix substring rather
+/// than `Plan: docs/plans/` because the canonical callout shape in the issue
+/// body is `> - **Plan:** \`<repo>/docs/plans/<file>\`` — the bold markdown
+/// and backtick-wrapping mean `Plan: docs/plans/` never appears as a
+/// contiguous substring. `docs/plans/` is the essential anchoring directory
+/// prefix.
+///
+/// # Le marqueur de verdict n'est plus lu ici (mika#2158)
+///
+/// Cette fonction portait trois regex locales — `GROOMED_VERDICT_RE` (#1725),
+/// `PARAPHRASED_GROOMED_RE` (#1725) et `SINGLE_PASS_GROOMED_RE` (mika#2012). Elles ont été
+/// supprimées et leur logique absorbée par [`crate::grooming_marker`], qui est désormais la
+/// seule lecture du marqueur de verdict du dépôt. Les trois formes qu'elles reconnaissaient
+/// sont couvertes par le nouveau prédicat et gardées par un test nommé.
+///
+/// La divergence que cela ferme était mesurable : `auto_pull::is_groomed` portait une copie
+/// de la seule première regex et n'a jamais suivi les deux ajouts suivants, donc la
+/// promotion et le routage du dispatch répondaient différemment à la même question.
+///
+/// Les deux conditions `Branch`/`Plan` restent ici et divergent délibérément de celles
+/// d'`auto_pull` (préfixe de dépôt) — leur unification est le correctif de mika#2120, sous
+/// arbitrage opérateur.
+pub fn check_grooming_markers(issue_body: &str) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !issue_body.contains("> - **Branch:**") {
+        missing.push("branch_callout");
+    }
+    if !issue_body.contains("docs/plans/") {
+        missing.push("plan_callout");
+    }
+    if !crate::grooming_marker::has_groomed_verdict(issue_body) {
+        missing.push("groomed_verdict");
+    }
+    missing
+}
+
+/// Best-effort write of a dispatch-rejection reason to `tasks.result` (#1108).
+///
+/// Fire-and-forget: logs a warning on failure but never propagates the error.
+/// This surfaces rejection reasons to operator-visible surfaces (`mika tasks list`,
+/// dashboard task detail) without requiring DB-level inspection.
+/// Turn the grooming-provenance cross-check result (#1620, mika#2287) into a
+/// dispatch verdict. Pure and synchronous so the three arms can be unit-tested
+/// without a GitHub token or a live DB:
+///
+/// - `Ok(true)`  → `Ok(())`: a completed groom callback carrying
+///   `Outcome: PLAN_GROOMED` exists under a task for this issue — proceed.
+/// - `Ok(false)` → `Err(dispatch_grooming_not_verified)`: markers are present
+///   but no proof — pre-stamped by hand, or the proof aged past retention.
+/// - `Err(e)`    → `Err(dispatch_check_failed)`: the gate could not read its
+///   proof. **Fail-closed**: a DB error is a degraded case of the cross-check,
+///   same shape as the global-state and issue-body-fetch failures. Allowing on
+///   error is the inverse of what mika#2287 requires.
+///
+/// The caller records the rejection via `record_dispatch_rejection` and
+/// returns it; this function never touches the DB.
+fn groom_provenance_verdict(
+    result: anyhow::Result<bool>,
+    task_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<(), serde_json::Value> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(serde_json::json!({
+            "error": "dispatch_grooming_not_verified",
+            "task_id": task_id,
+            "issue": format!("{}/{}#{}", owner, repo, number),
+            "predicate": "issue body has grooming markers but no completed groom \
+                          callback carrying 'Outcome: PLAN_GROOMED' exists under a \
+                          task for this issue — markers may be pre-stamped by hand, \
+                          or the proof aged past the 30-day task retention",
+            // mika#2484 — une phrase de ce champ est devenue FAUSSE par l'effet
+            // de ce ticket, et la laisser serait livrer la régression que
+            // mika#2287 a nommée : un texte de remède qui prescrit une route
+            // morte. Elle disait « Re-applying the `ready` label does NOT help
+            // … the handler dispatches dev-pilot and lands here again » — c'est
+            // exactement ce que le routage corrigé ne fait plus. Seule cette
+            // phrase change ; le reste du payload est inchangé à l'octet près.
+            "recovery": "Groom through the autonomous loop: dispatch dev-groom via \
+                         'mika ask --agent mika-dev \"groom <typed-ref>\"'. Re-applying \
+                         the `ready` label also works since mika#2484 — markers without \
+                         proof now route to dev-groom, not dev-pilot. Either way, if the \
+                         plan already resolves on the dispatch branch (hand-groomed \
+                         ticket), dev-groom answers `already_groomed` and mints no proof \
+                         — remove the plan from the branch first so a fresh loop groom \
+                         can run.",
+            "reason": format!(
+                "Cannot dispatch dev-pilot on ticket #{number}: grooming markers are \
+                 present in the issue body but no completed autonomous groom task was \
+                 found. The dispatch-classification gate requires structural proof of \
+                 grooming (mika#1620)."
+            )
+        })),
+        Err(e) => {
+            warn!(
+                task_id = task_id,
+                error = %e,
+                "grooming provenance cross-check failed, rejecting dispatch (fail-closed)"
+            );
+            Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "issue": format!("{}/{}#{}", owner, repo, number),
+                "reason": format!(
+                    "Failed to verify grooming provenance for ticket #{number} \
+                     (DB error: {e}). The dispatch-classification gate refuses when it \
+                     cannot read its proof (mika#2287)."
+                )
+            }))
+        }
+    }
+}
+
+/// Le jeton de refus de la garde d'intention de grooming (mika#2484 U4).
+///
+/// # FORMAT DE FIL
+///
+/// Il atterrit dans `tasks.result` et un opérateur le `grep` — c'est la sonde
+/// S2 du plan. Une constante nommée plutôt qu'un littéral au site de refus,
+/// pour la même raison que `ReadyLabelGate::wire_name` : deux orthographes d'un
+/// même refus couperaient une population en deux sans le dire.
+pub(crate) const GROOMING_INTENT_MISMATCH_ERROR: &str = "dispatch_grooming_intent_mismatch";
+
+/// Est-ce qu'un `dev-pilot` peut partir sur ce ticket ? (mika#2484 D1)
+///
+/// Quatre bras, et **pas un booléen**. Trois causes distinctes mènent au même
+/// outil (`dev-groom`), et elles appellent trois lectures opérateur
+/// différentes : « ce ticket n'a jamais été groomé » (le cas nominal d'un
+/// premier grooming), « il a été groomé hors du moteur » (le défaut que
+/// mika#2484 ferme), « la base ne répond pas » (une panne). Les fondre dans un
+/// `bool` rendrait la population de mika#2484 **incomptable** — exactement le
+/// motif de `below_threshold` / `no_ready_label_event` (mika#2131) et de
+/// `in_flight_self_dev` / `live_pilot_orphaned_parent` (mika#2279).
+///
+/// Les deux sites de consommation (le traducteur [`evaluate_grooming_gate`] et
+/// le routage de `server::ready_label_handler`) font un `match` **exhaustif
+/// sans bras `_ =>`** : le compilateur force un cinquième état à décider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroomedState {
+    /// Callouts présents ET preuve en base. Un `dev-pilot` peut partir.
+    Groomed,
+    /// Un ou plusieurs callouts manquent. Le cas nominal d'un premier grooming.
+    MarkersMissing(Vec<&'static str>),
+    /// Callouts présents, aucune preuve. Grooming hors moteur (spawn
+    /// orchestrateur, geste manuel), ou preuve purgée par la rétention de
+    /// 30 jours (`prune_completed_tasks`).
+    MarkersWithoutProof,
+    /// La preuve n'a pas pu être lue. Porte le message d'erreur pour que le
+    /// traducteur reproduise le JSON `dispatch_check_failed` à l'octet près.
+    ProofUnreadable(String),
+}
+
+/// Le lecteur **unique** de la preuve de grooming (mika#2484 R2).
+///
+/// # Pourquoi cette fonction existe
+///
+/// `ready_label_handler` décidait le routage (`dev-pilot` vs `dev-groom`) sur
+/// `check_grooming_markers` seul, pendant que `validate_dispatch_readiness`
+/// refusait quatre étapes plus loin sur forme **et** preuve. Le handler
+/// choisissait donc `dev-pilot` puis refusait le `dev-pilot` qu'il venait de
+/// choisir — `dispatch_grooming_not_verified` — et le ticket restait `ready`,
+/// re-promu, re-refusé. C'est mot pour mot la classe que mika#2158 a dû fermer
+/// un cran plus haut (« promotion et routage du dispatch répondaient
+/// différemment à la même question »).
+///
+/// Depuis mika#2470 la Phase 2 d'`auto_pull` dispatche in-process en appelant
+/// `try_handle_ready_label_dispatch`, donc **un seul site réparé couvre le
+/// webhook et le filet de sauvetage**.
+///
+/// # `check_grooming_markers` n'est pas touchée, et c'est structurel (D2)
+///
+/// `grooming_marker.rs` porte un test de parité : `auto_pull::is_groomed` et
+/// `check_grooming_markers(..).is_empty()` doivent rendre le **même** verdict
+/// sur un corpus partagé. Y intégrer la preuve casserait ce test — et à
+/// raison : `is_groomed` répond de la **forme** du callout, question à laquelle
+/// la base n'a rien à dire, et que le feeder pose légitimement sans elle. Deux
+/// questions, deux noms : `check_grooming_markers` = « la forme est-elle
+/// là ? », `groomed_state` = « un dev-pilot peut-il partir ? ». La seconde
+/// appelle la première ; l'inverse serait une régression de mika#2120.
+///
+/// # Pas de `task_id` dans la signature
+///
+/// Le routage de l'étape 5 tourne **avant** la pré-création de la parente
+/// (étape 7), et le `task_id` n'est employé par la porte que pour remplir son
+/// JSON de refus. C'est le traducteur qui l'ajoute.
+pub(crate) async fn groomed_state(
+    db: &AsyncDatabase,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    issue_body: &str,
+) -> GroomedState {
+    let missing = check_grooming_markers(issue_body);
+    if !missing.is_empty() {
+        return GroomedState::MarkersMissing(missing);
+    }
+
+    // Grooming provenance cross-check (#1620, mika#2287):
+    // markers are present but may have been pre-stamped by
+    // hand. Proof = a completed groom CALLBACK row carrying
+    // `Outcome: PLAN_GROOMED` under a parent for this issue
+    // (bare URL or legacy `?phase=groom`). The parent row is
+    // not proof — the engine flips it groom→implement
+    // (mika#1614) before it is terminal. Read-only.
+    let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
+    match db.has_completed_groom_for_issue(&issue_url).await {
+        Ok(true) => GroomedState::Groomed,
+        Ok(false) => GroomedState::MarkersWithoutProof,
+        Err(e) => GroomedState::ProofUnreadable(e.to_string()),
+    }
+}
+
+/// The grooming gate, from the issue body to the verdict (mika#2310 D1).
+///
+/// This is the segment of `validate_dispatch_readiness` that follows
+/// `fetch_issue_body`: markers check → rejection `dispatch_no_grooming_marker`
+/// if any is missing, otherwise issue-URL construction →
+/// `has_completed_groom_for_issue` → [`groom_provenance_verdict`].
+///
+/// # Traductrice depuis mika#2484
+///
+/// Le corps est désormais un `match` exhaustif sur [`groomed_state`], qui rend
+/// les **mêmes** quatre sorties qu'avant : les JSON sont déplacés, jamais
+/// réécrits (R3). Aucun appelant ne change, aucune formulation ne bouge, et les
+/// trois tests `test_groom_provenance_verdict_*` restent verts sans
+/// modification — si l'un d'eux doit changer, R3 est violée.
+///
+/// **Extracted so the gate can be exercised end-to-end without a network.**
+/// `fetch_issue_body` (`github_graphql.rs`) writes `https://api.github.com/...`
+/// in the clear with no injectable base URL, and the caller invokes it
+/// unconditionally whenever a token is present — so no `Some`/`None` setting
+/// gives an offline end-to-end run. Taking the issue body as a *parameter* is
+/// the smallest cut that makes case 9 of mika#2288 testable: in production the
+/// body comes from the fetch, in test from a fixture, and the only link left
+/// outside the test is the HTTP transport, which the ticket excludes itself
+/// ("zero network"). The alternative — a configurable base URL on
+/// `github_graphql` — touches ten functions of a shared module and adds a
+/// production configuration point nobody needs, for the benefit of a test.
+///
+/// **This function never touches `tasks.result`.** `record_dispatch_rejection`
+/// stays with the caller, one level up, so the extraction is a move of lines
+/// and not a change of behaviour: same order, same conditions, same JSON
+/// payloads.
+pub(crate) async fn evaluate_grooming_gate(
+    db: &AsyncDatabase,
+    task_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    issue_body: &str,
+) -> Result<(), serde_json::Value> {
+    // `match` exhaustif, aucun bras `_ =>` : un cinquième état de
+    // `GroomedState` doit être décidé ici par le compilateur, jamais absorbé
+    // par un joker (mika#2484 D1).
+    match groomed_state(db, owner, repo, number, issue_body).await {
+        GroomedState::MarkersMissing(missing) => Err(serde_json::json!({
+            "error": "dispatch_no_grooming_marker",
+            "task_id": task_id,
+            "issue": format!("{}/{}#{}", owner, repo, number),
+            "missing_signals": missing,
+            "predicate": "issue body must contain all three substrings: \
+                          '> - **Branch:**', 'docs/plans/', and a second-pass \
+                          marker ('(GROOMED)' or '(READY, paraphrased GROOMED ...)')",
+            "recovery": "Dispatch dev-groom first via \
+                         'mika ask --agent mika-dev \"groom <typed-ref>\"' \
+                         (or re-apply the `ready` label) so the autonomous loop \
+                         produces the canonical callout block.",
+            "reason": format!(
+                "Cannot dispatch dev-pilot on ticket #{number}: issue body is \
+                 missing one or more grooming-marker signals. The grooming-marker \
+                 gate ensures architect-reviewed plans are committed before \
+                 implementation begins (mika#907, mika#919)."
+            )
+        })),
+        // Les trois bras suivants sont la traduction littérale des trois
+        // entrées de `groom_provenance_verdict`, dont la signature et les
+        // formulations sont inchangées — fail-closed sur le cas dégradé, comme
+        // avant mika#2484.
+        GroomedState::Groomed => groom_provenance_verdict(Ok(true), task_id, owner, repo, number),
+        GroomedState::MarkersWithoutProof => {
+            groom_provenance_verdict(Ok(false), task_id, owner, repo, number)
+        }
+        GroomedState::ProofUnreadable(e) => {
+            groom_provenance_verdict(Err(anyhow::anyhow!(e)), task_id, owner, repo, number)
+        }
+    }
+}
+
+async fn record_dispatch_rejection(db: &AsyncDatabase, task_id: &str, reason_json: &str) {
+    if let Err(e) = db.write_task_dispatch_rejection(task_id, reason_json).await {
+        warn!(
+            task_id = task_id,
+            error = %e,
+            "failed to write dispatch-rejection reason to tasks.result"
+        );
+    }
+}
+
+/// The tool-boundary seat refusal, as the JSON the caller records and returns
+/// (mika#2084). `None` when the verdict does not refuse.
+///
+/// Pure, and separated from the `gh` call above so the decision can be tested
+/// without a network or a token — the refusal wording is what an operator and
+/// the LLM both read, so it is worth asserting on directly.
+fn seat_rejection_json(
+    task_id: &str,
+    owner_repo: &str,
+    number: u64,
+    verdict: &crate::webhook_dispatch::SeatVerdict,
+) -> Option<String> {
+    if !verdict.refuses() {
+        return None;
+    }
+    let found = verdict.label().unwrap_or("<none>");
+    let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+    let known = crate::webhook_dispatch::known_dispatch_seats_display();
+    Some(
+        serde_json::json!({
+            "error": "dispatch_seat_mismatch",
+            "task_id": task_id,
+            "issue": format!("{owner_repo}#{number}"),
+            "found_label": found,
+            "current_seat": current,
+            "reason": format!(
+                "`{owner_repo}#{number}` carries the seat label `{found}`, and this \
+                 engine dispatches as seat `{current}`. One dispatcher per ticket: \
+                 another seat already owns this issue, and dispatching would put a \
+                 second writer on its branch. Known seats: {known}. This is a \
+                 structural gate, not a transient failure — retrying will not clear \
+                 it. Only the operator removing or correcting the `dispatch:*` label \
+                 changes this (mika#2084)."
+            )
+        })
+        .to_string(),
+    )
+}
+
+/// Validate that a task is in a dispatchable state for long-running execution.
+///
+/// Stricter than `validate_task()` (which also allows `blocked` for delegation).
+/// Long-running dispatch only permits `pending` and `in_progress`, and rejects if an
+/// active callback child task already exists (double-dispatch prevention).
+///
+/// Returns `Err(json_error_string)` on rejection, `Ok(status)` with the task's
+/// current status if dispatch may proceed. Each rejection site also writes the
+/// structured reason to `tasks.result` (#1108) for operator visibility.
+//
+// DOCTRINE: pre-classifier structural gate (mika#1733 AC2)
+// Applies per crates/mika-agent/docs/permission-decision-protocol-2026-07-06.md §AC2:
+// "This agent structurally cannot do X" applies to pre-classifier engine gates
+// only, NEVER to LLM classifier decisions. This is such a gate — it rejects a
+// dispatch before any LLM classifier runs, based on structural task state
+// (status, callback children, grooming callouts, blockedBy edges) that the
+// classifier is not competent to evaluate.
+//
+// NOTE: The tier1/tier2/tier3 permission classifier code lives in
+// claude-pilot-py; the companion doctrine anchor for those sites is tracked
+// as a cross-repo follow-up filed alongside this PR (see PR body §Follow-ups).
+// This annotation covers the in-mika-agent structural gate only. See mika#1193
+// for the retirement of the in-repo `permission-policy` skill that moved the
+// classifier tiers into claude-pilot-py.
+pub(crate) async fn validate_dispatch_readiness(
+    db: &AsyncDatabase,
+    task_id: &str,
+    github_token: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+    originating_message: Option<&str>,
+) -> Result<String, String> {
+    // #933 — Tool-boundary gate for unauthorized webhook dispatch. Cheapest check
+    // (pure string-prefix match, no DB), runs first. Rejects `run_claude_pilot`
+    // when the originating user message is in the Webhook Fallthrough domain.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_unauthorized_webhook_dispatch(msg)
+    {
+        let rejection = serde_json::json!({
+            "error": "unauthorized_webhook_dispatch",
+            "task_id": task_id,
+            "reason": "This turn was initiated by a [GitHub] webhook event in the \
+                       Webhook Fallthrough domain (issue events, comments, or \
+                       unknown event types). Only `[GitHub] Issue labeled ready on` \
+                       webhooks (authorized dispatch) and PR / Check-suite events \
+                       handled by self-dev-webhook-qa / self-dev-webhook-ci skills \
+                       may dispatch claude-pilot. All other webhook events must use \
+                       Webhook Fallthrough: acknowledge without dispatching \
+                       (mika#841 positive-consent contract, mika#933)."
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // mika#2484 — Tool-boundary gate for an explicit grooming intent.
+    //
+    // Pure string handling on `originating_message` and on the tool input, no
+    // DB access, so it sits with the other two message guards ahead of the task
+    // fetch. L'ordre entre gardes pures est libre ; celui-ci groupe les deux
+    // lectures d'`originating_message`.
+    //
+    // Pre-subprocess et non post-hoc, pour la raison que mika#1646 a déjà dû
+    // écrire : `run_claude_pilot` spawne un processus et crée un worktree, donc
+    // une garde qui ne tire qu'après l'exécution de l'outil *constate* la
+    // violation sans l'empêcher. Ici la violation est un **contournement de la
+    // porte de preuve** — une implémentation sur un grooming que le moteur n'a
+    // jamais vérifié — donc la constater ne sert à rien.
+    //
+    // Ne mord que sur `dev-pilot` : un `run_claude_pilot_groom` sous intention
+    // de grooming est le chemin nominal.
+    //
+    // Le refus porte sur le TOUR ENTIER, pas seulement sur le ticket nommé, et
+    // c'est un arbitrage explicite : dériver le numéro d'issue du message pour
+    // ne refuser que lui ajouterait un second parseur là où le seul cas
+    // légitime — la chaîne dev-groom → dev-pilot — ne passe pas par ce chemin
+    // (son `originating_message` est absent, c'est un tour de callback). Un
+    // tour ouvert par « groom X » qui dispatche un implement sur Y est déjà un
+    // dérapage.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_grooming_intent_message(msg)
+        && tool_input.and_then(extract_skill_from_input) == Some("dev-pilot")
+    {
+        let rejection = serde_json::json!({
+            "error": GROOMING_INTENT_MISMATCH_ERROR,
+            "task_id": task_id,
+            "reason": "This turn was opened by an explicit grooming request \
+                       (the message begins with `groom `), so it may not dispatch \
+                       `run_claude_pilot` / `dev-pilot`. A ticket whose body carries \
+                       the grooming callouts may still be ungroomed as far as the \
+                       engine is concerned: the callouts are a shape, the proof is a \
+                       completed groom callback carrying `Outcome: PLAN_GROOMED`. \
+                       Implementing here would bypass the provenance gate (mika#1620, \
+                       mika#2484).",
+            "recovery": "Call `run_claude_pilot_groom` with `skill: \"dev-groom\"` and \
+                         the same `task_id` and `prompt`. That is the tool this turn \
+                         was asked for; it is available and this refusal does not \
+                         block it."
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // mika#2046 — Tool-boundary gate for the dispatchable-repository allowlist.
+    // Pure string handling, no DB access, so it sits with the other cheap checks
+    // ahead of the task fetch.
+    //
+    // This is the load-bearing layer. `run_claude_pilot` spawns a subprocess and
+    // creates a worktree, so a guard that only fires after the tool has run
+    // detects the violation without preventing it
+    // (docs/solutions/architecture-patterns/post-hoc-vs-tool-boundary-guard-placement-2026-05-13.md).
+    // The pre-LLM ready-label handler refuses the webhook path; this refuses
+    // every path, whatever originated the turn.
+    if let Some(prompt) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        && let Some(repo_ref) = crate::webhook_dispatch::parse_repo_ref_from_dispatch_prompt(prompt)
+        && !crate::webhook_dispatch::is_dispatchable_repo(repo_ref)
+    {
+        let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+        let allowed = crate::webhook_dispatch::dispatchable_repos_display();
+        let rejection = serde_json::json!({
+            "error": "repo_not_dispatchable",
+            "task_id": task_id,
+            "repo": owner_repo,
+            "reason": format!(
+                "`{owner_repo}` is not a repository the autonomous loop may dispatch \
+                 into. Dispatchable repositories: {allowed}. Repositories outside \
+                 this list are Claude Code spawn territory and are never reached by \
+                 the loop; this is a structural gate, not a transient failure, so \
+                 retrying the dispatch will not clear it (mika#2046)."
+            )
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // Re-fetch the task to get the full struct (validate_task confirmed existence)
+    let task = match db.get_task(task_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            // Should not happen after validate_task, but defense-in-depth
+            return Err(serde_json::json!({
+                "error": "task_not_found",
+                "task_id": task_id,
+                "reason": "Task does not exist in the database"
+            })
+            .to_string());
+        }
+        Err(e) => {
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "reason": format!("Failed to fetch task for dispatch check: {e}")
+            })
+            .to_string());
+        }
+    };
+
+    // Only pending and in_progress are dispatchable
+    if !matches!(task.status.as_str(), "pending" | "in_progress") {
+        let pr_url = extract_pr_url(&task.metadata);
+        let rejection = serde_json::json!({
+            "error": "task_not_dispatchable",
+            "task_id": task_id,
+            "current_status": task.status,
+            "pr_url": pr_url,
+            "reason": format!(
+                "Task is in '{}' state and cannot be dispatched. \
+                 Only 'pending' and 'in_progress' tasks can be dispatched.",
+                task.status
+            )
+        });
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // Check for active callback children (double-dispatch prevention)
+    match db.get_child_tasks(task_id).await {
+        Ok(children) => {
+            let active_callback = children.iter().find(|c| {
+                c.trigger_type == "callback"
+                    && matches!(c.status.as_str(), "pending" | "in_progress")
+            });
+            if let Some(child) = active_callback {
+                let pr_url = extract_pr_url(&task.metadata);
+                let rejection = serde_json::json!({
+                    "error": "task_active_dispatch",
+                    "task_id": task_id,
+                    "current_status": task.status,
+                    "active_child_id": child.id,
+                    "active_child_status": child.status,
+                    "pr_url": pr_url,
+                    "reason": format!(
+                        "Task already has an active dispatch (callback task '{}' \
+                         in '{}' status). Wait for it to complete or cancel it before \
+                         dispatching again.",
+                        child.id, child.status
+                    )
+                });
+                record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                return Err(rejection.to_string());
+            }
+        }
+        Err(e) => {
+            // Fail-closed: if we can't check children, reject dispatch
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "reason": format!("Failed to check active dispatches for task: {e}")
+            })
+            .to_string());
+        }
+    }
+
+    // The seat gate runs HERE, ahead of the global/per-class dispatch guards,
+    // and not further down where it first compiled. Those guards enqueue a
+    // deferred callback when a slot is busy (mika#1011); a foreign-seat dispatch
+    // refused only after that enqueue would be re-armed and re-refused on every
+    // replay, burning a wrapper each time on a ticket that can never go out.
+    // Refuse before the queue, not after it.
+    //
+    // `github_ref` is parsed here rather than at its original site further down
+    // so this gate and the grooming check still share one binding.
+    let github_ref = task.reference_url.as_deref().and_then(parse_github_ref);
+
+    // mika#2084 — Tool-boundary gate for the dispatch seat label.
+    //
+    // THIS IS THE LOAD-BEARING LAYER for #2084, and the reason is empirical.
+    // The 2026-08-30 collision (mika#2055 held `dispatch:ssc`, SSC had PR#2082
+    // open, the loop created a second writer on the same branch) came in as a
+    // task with `source: self_dev`, `trigger: manual` — a CI-fix dispatch, NOT
+    // an `issues.labeled` webhook. The pre-LLM gate in
+    // `server/ready_label_handler.rs` would never have seen it. This gate sees
+    // every dispatch path whatever originated the turn, exactly as the #2046
+    // allowlist gate above does.
+    //
+    // Placed here, sharing the `github_ref` binding, for two reasons: it is the
+    // first point where the target issue is known, and every cheap check
+    // (pure predicates, task state, open-PR) has already run — so a dispatch
+    // that was going to be rejected anyway never spends a `gh` call.
+    //
+    // Issue resolution order — `reference_url` first, dispatch prompt second.
+    // `reference_url` is what the engine itself recorded for the task and is
+    // what the incident task carried
+    // (`https://github.com/senara-solutions/mika/issues/2055`); the prompt is
+    // what `dispatch-lib.sh` actually reads to create the worktree.
+    //
+    // BOTH are checked, and they are not redundant. `reference_url` says what
+    // the engine thinks the task is about; the prompt says which branch the
+    // pilot will actually write to. When they disagree — a task referencing
+    // issue A dispatched with `{"prompt": "mika#B"}` — consulting only one of
+    // them leaves the other unguarded, and it is the prompt that determines
+    // where the second writer would land. Any refusal refuses.
+    //
+    // A `reference_url` naming a PULL REQUEST is deliberately not a seat
+    // subject: `gh issue view <n>` silently resolves a PR number and would hand
+    // back the PR's labels, which never carry `dispatch:*` — reading them as an
+    // issue's labels would be a confident wrong answer. `fetch_issue_labels`
+    // detects that and declines to judge (see there).
+    {
+        let mut subjects: Vec<(String, u64)> = Vec::new();
+        if let Some(GitHubRef::Issue {
+            ref owner,
+            ref repo,
+            number,
+        }) = github_ref
+        {
+            subjects.push((format!("{owner}/{repo}"), number));
+        }
+        if let Some((repo_ref, number)) = tool_input
+            .and_then(|input| input.get("prompt"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+        {
+            let from_prompt = (
+                crate::webhook_dispatch::normalize_owner_repo(repo_ref),
+                number,
+            );
+            if !subjects.contains(&from_prompt) {
+                subjects.push(from_prompt);
+            }
+        }
+
+        let token = match github_token {
+            Some(t) => Some(t),
+            None => {
+                if !subjects.is_empty() {
+                    warn!(
+                        event = "dispatch_seat_labels_unavailable",
+                        task_id = task_id,
+                        reason = "no_github_token",
+                        "tool-boundary: no GitHub token — seat gate not applied"
+                    );
+                }
+                None
+            }
+        };
+
+        for (owner_repo, number) in token.map(|_| subjects).unwrap_or_default() {
+            let token = github_token.expect("token presence checked above");
+            let (subject_owner, subject_repo) = match owner_repo.split_once('/') {
+                Some(pair) => pair,
+                None => continue,
+            };
+            match crate::github_graphql::fetch_issue_labels_unless_pull_request(
+                token,
+                subject_owner,
+                subject_repo,
+                number,
+            )
+            .await
+            {
+                Ok(None) => {
+                    // The reference resolves to a pull request, not an issue.
+                    // Seat ownership lives on issues; refusing on a PR's (empty)
+                    // label set would be a guess, so this declines to judge —
+                    // fail-open, and noisy about it.
+                    warn!(
+                        event = "dispatch_seat_subject_is_pull_request",
+                        task_id = task_id,
+                        subject = %format!("{owner_repo}#{number}"),
+                        "tool-boundary: dispatch subject is a PR — seat gate not applied to it"
+                    );
+                }
+                Ok(Some(labels)) => {
+                    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let verdict = crate::webhook_dispatch::classify_dispatch_seat(label_refs);
+                    if let Some(rejection) =
+                        seat_rejection_json(task_id, &owner_repo, number, &verdict)
+                    {
+                        let found = verdict.label().unwrap_or("<none>").to_string();
+                        let why = verdict.refusal_reason().unwrap_or("seat_refused");
+                        let current = crate::webhook_dispatch::CURRENT_DISPATCH_SEAT;
+                        warn!(
+                            event = "dispatch_seat_mismatch",
+                            task_id = task_id,
+                            issue = %format!("{owner_repo}#{number}"),
+                            found_label = %found,
+                            current_seat = current,
+                            reason = why,
+                            "tool-boundary: dispatch refused — issue belongs to another seat"
+                        );
+                        if let Err(e) = db
+                            .log_audit_event(
+                                // No session id reaches this gate; the task id is
+                                // the stable identifier of the refused dispatch and
+                                // is what an operator counts collisions by.
+                                task_id,
+                                "dispatch_seat_mismatch",
+                                &format!("{owner_repo}#{number}"),
+                                None,
+                                Some("dispatch_refused"),
+                                Some(&format!(
+                                    "issue={owner_repo}#{number} found_label={found} \
+                                     current_seat={current} reason={why}"
+                                )),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "dispatch_seat_audit_log_failed",
+                                error = %e,
+                                "failed to write dispatch_seat_mismatch audit event (non-fatal)"
+                            );
+                        }
+                        record_dispatch_rejection(db, task_id, &rejection).await;
+                        return Err(rejection);
+                    }
+                }
+                Err(e) => {
+                    // mika#2084 D2 — fail-OPEN on missing information, which is a
+                    // different case from an unresolvable seat label. A `gh`
+                    // hiccup, an expired token, or a rate limit must not stop the
+                    // loop: turning every transient GitHub failure into a refused
+                    // dispatch would break far more than the defect this gate
+                    // repairs (#2084 AC3). The window is noisy, not silent.
+                    warn!(
+                        event = "dispatch_seat_labels_unavailable",
+                        task_id = task_id,
+                        issue = %format!("{owner_repo}#{number}"),
+                        error = %e,
+                        "tool-boundary: could not read issue labels — seat gate not applied"
+                    );
+                }
+            }
+        }
+    }
+
+    // Per-class dispatch guard (#583, #1001): reject if another task of the
+    // SAME dispatch class has an active callback child. The slot split allows
+    // one 'implement' + one 'groom' dispatch concurrently per agent.
+    let dispatch_class = tool_input.and_then(extract_skill_from_input);
+    let class = derive_dispatch_class(dispatch_class);
+    // mika#2160 — the guard compares a COUNT against a configurable cap rather
+    // than asking "is there at least one". The cap is what makes N>1 reachable
+    // without touching this arbitration again.
+    let cap = max_concurrent_for_class(class);
+    let guard_result = if cap == 0 {
+        // Explicit disable sentinel: no cap, so nothing to compare against.
+        Ok(None)
+    } else if cap == 1 {
+        // The shipped default, and deliberately the ORIGINAL single query. At a
+        // cap of one, "is there at least one" and "are there at least one" are
+        // the same question, so counting first buys nothing and costs a second
+        // round trip on the `AsyncDatabase` actor queue — two messages where
+        // there was one, with room for another writer to land between them. The
+        // state an interleaving could expose is benign (the atomic lease claim
+        // below is the arbiter, not this guard), but the default path should not
+        // acquire a new observable behaviour to pay for a setting nobody turned
+        // on.
+        db.has_active_callback_tasks_excluding(task_id, class).await
+    } else {
+        match db
+            .count_active_callback_tasks_excluding(task_id, class)
+            .await
+        {
+            // The count decides WHETHER to reject; the existing LIMIT 1
+            // predicate decides WHO to name. A rejection has always named one
+            // holder, and enumerating all of them would change its contract.
+            Ok(active) if class_cap_reached(active, cap) => {
+                db.has_active_callback_tasks_excluding(task_id, class).await
+            }
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    match guard_result {
+        Ok(Some(blocking)) => {
+            let crate::db::BlockingDispatch {
+                parent_task_id: blocking_parent_id,
+                callback_task_id: blocking_callback_id,
+                label: blocking_label,
+                dispatcher_source: blocking_dispatcher_source,
+            } = blocking;
+            // mika#1011 — Register a deferred-dispatch callback so the engine
+            // auto-retries when the blocking dispatch completes. The LLM still
+            // sees the rejection (γ composition) and may call send_message;
+            // both paths are independent and validate_dispatch_readiness()
+            // arbitrates any race on the next dispatch attempt.
+            let deferred_registered = if let Some(input) = tool_input {
+                register_deferred_callback(db, task_id, input).await
+            } else {
+                false
+            };
+
+            // Derive blocker_kind from the blocking callback's label (#1172 W3).
+            let blocker_kind = if blocking_label.ends_with(":deferred") {
+                "deferred_wrapper"
+            } else {
+                "real_callback"
+            };
+
+            // mika#1948 — name WHICH dispatcher holds the slot. `None` means the
+            // blocking row predates the column (pre-v51) and is genuinely
+            // unknown; it is passed through as JSON `null` rather than
+            // defaulted, so a consumer cannot mistake "we don't know" for "it
+            // was mika-dev".
+            let blocking_source_display = blocking_dispatcher_source
+                .as_deref()
+                .unwrap_or("unknown (pre-v51 row)");
+            let mut rejection = serde_json::json!({
+                "error": "global_dispatch_active",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "blocking_task_id": blocking_parent_id,
+                "blocking_callback_id": blocking_callback_id,
+                "blocking_label": blocking_label,
+                "blocker_kind": blocker_kind,
+                "blocking_dispatcher_source": blocking_dispatcher_source,
+                "reason": format!(
+                    "Another task ('{}') already has an active {} dispatch \
+                     (callback task '{}', dispatched by {}). Only one long-running \
+                     dispatch per class may be active at a time. Wait for it to \
+                     complete or cancel it before dispatching again.",
+                    blocking_parent_id, class, blocking_callback_id, blocking_source_display
+                )
+            });
+            if deferred_registered {
+                rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+                // W4: audit event for deferred registration (#1172)
+                if let Err(e) = db
+                    .log_audit_event(
+                        "system",
+                        "deferred_dispatch_registered",
+                        &format!("task:{task_id}"),
+                        None,
+                        Some("deferred"),
+                        Some(&format!(
+                            "dispatch_class:{class}, blocking:{blocking_parent_id}"
+                        )),
+                        None,
+                    )
+                    .await
+                {
+                    warn!(error = %e, "failed to write deferred_dispatch_registered audit event");
+                }
+            }
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        Ok(None) => { /* No conflicting dispatch in this class — proceed */ }
+        Err(e) => {
+            // Fail-closed: if we can't check global state, reject dispatch
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "reason": format!("Failed to check global dispatch state: {e}")
+            })
+            .to_string());
+        }
+    }
+
+    // Manual re-dispatch state-awareness guard (mika#920): reject `dev-pilot`
+    // re-dispatch when the task already has an open PR and the caller did not
+    // pass `iteration_context`. The autonomous retry paths (verdict_handler,
+    // ci_failure_handler) supply `iteration_context` and bypass this guard;
+    // engine-initiated recovery (DeferredDispatch) and operator positive-consent
+    // (ready-label webhook) bypass via dedicated predicates.
+    if let Some(rejection) =
+        check_task_has_open_pr(&task, tool_input, originating_message, github_token).await
+    {
+        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+        return Err(rejection.to_string());
+    }
+
+    // Grooming-marker check (#919): reject dev-pilot dispatch when the target
+    // issue body lacks the three canonical grooming callouts (Branch + Plan +
+    // architect verdict). Engine-level gate — all dispatch paths (webhook,
+    // CLI ask, sprint, free-text) funnel through here.
+    //
+    // Coupled pair: the prompt-level check at
+    // `skills/bundled/self-dev/system_prompt.md:253` is defense-in-depth.
+    // Both must update if the canonical `/mika-groom-ticket` Phase 5 callout
+    // shape changes. Load-bearing substrings: `> - **Branch:**`,
+    // `docs/plans/`, and a `second-pass` marker (canonical `(GROOMED)` or
+    // spec-tolerated `(READY, paraphrased GROOMED ...)` per #1108).
+    if let Some(GitHubRef::Issue {
+        ref owner,
+        ref repo,
+        number,
+    }) = github_ref
+    {
+        // Bypass 1: only gate dev-pilot dispatches (dev-groom is the marker
+        // producer; other skills are out of scope for #919)
+        let skill = tool_input.and_then(extract_skill_from_input);
+        let is_dev_pilot = skill == Some("dev-pilot");
+
+        // Bypass 2: milestones/projects don't carry plans on their own bodies
+        let is_issue_type = task.r#type == db::TASK_TYPE_ISSUE;
+
+        // Bypass 4: env var emergency override
+        let bypass_env = std::env::var("MIKA_DISPATCH_BYPASS_GROOMING_CHECK")
+            .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if is_dev_pilot && is_issue_type {
+            if bypass_env {
+                warn!(
+                    task_id = task_id,
+                    owner = %owner,
+                    repo = %repo,
+                    number = number,
+                    "dispatch grooming marker check bypassed via env var"
+                );
+            } else {
+                match github_token {
+                    Some(token) => {
+                        match fetch_issue_body(token, owner, repo, number).await {
+                            Ok(issue_body) => {
+                                // Markers + provenance cross-check live in
+                                // `evaluate_grooming_gate` (mika#2310 D1) so the
+                                // segment can be exercised without the network.
+                                // Recording the rejection stays here: the extracted
+                                // function never touches the DB.
+                                if let Err(rejection) = evaluate_grooming_gate(
+                                    db,
+                                    task_id,
+                                    owner,
+                                    repo,
+                                    number,
+                                    &issue_body,
+                                )
+                                .await
+                                {
+                                    record_dispatch_rejection(db, task_id, &rejection.to_string())
+                                        .await;
+                                    return Err(rejection.to_string());
+                                }
+                            }
+                            Err(e) => {
+                                // Fail-closed: token present but API error
+                                warn!(
+                                    task_id = task_id,
+                                    error = %e,
+                                    "grooming-marker check failed, rejecting dispatch"
+                                );
+                                return Err(serde_json::json!({
+                                    "error": "dispatch_check_failed",
+                                    "task_id": task_id,
+                                    "reason": format!("Failed to fetch issue body for grooming-marker check: {e}")
+                                })
+                                .to_string());
+                            }
+                        }
+                    }
+                    None => {
+                        // Fail-open: no token configured (mirrors blocked-by behavior)
+                        warn!(
+                            task_id = task_id,
+                            "Skipping grooming-marker check: no GitHub token configured"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase guard (mika#1153 E4): reject dispatch when the target issue has a
+    // `phase:N` label (N > 1) and any phase-(N-1) sub-issues in the same
+    // milestone are still OPEN. Defense-in-depth over the `blockedBy` GraphQL guard.
+    // Position: between grooming-marker (check 5) and blocked-by (check 6).
+    // Cost: 1-2 REST API calls (medium), cheaper than GraphQL blocked-by.
+    if let Some(GitHubRef::Issue {
+        ref owner,
+        ref repo,
+        number,
+    }) = github_ref
+    {
+        // Only gate issue-type tasks (matching check #5 pattern).
+        if task.r#type == db::TASK_TYPE_ISSUE {
+            match github_token {
+                Some(token) => {
+                    match fetch_issue_labels(token, owner, repo, number).await {
+                        Ok(labels) => {
+                            if let Some(phase) = parse_phase_label(&labels)
+                                && phase > 1
+                            {
+                                // Fetch the issue's milestone number from the GitHub API.
+                                let milestone_number =
+                                    fetch_issue_milestone_number(token, owner, repo, number)
+                                        .await
+                                        .ok();
+
+                                if let Some(ms_num) = milestone_number {
+                                    // Fetch open issues in the milestone and check for open phase-(N-1) issues.
+                                    match fetch_milestone_issues_by_state(
+                                        token, owner, repo, ms_num, "open",
+                                    )
+                                    .await
+                                    {
+                                        Ok(open_issues) => {
+                                            let prior_phase = phase - 1;
+                                            let open_in_prior_phase: Vec<u64> = open_issues
+                                                .iter()
+                                                .filter(|issue| {
+                                                    parse_phase_label(&issue.labels)
+                                                        == Some(prior_phase)
+                                                })
+                                                .map(|issue| issue.number)
+                                                .collect();
+
+                                            if !open_in_prior_phase.is_empty() {
+                                                let rejection = serde_json::json!({
+                                                    "error": "dispatch_phase_blocked",
+                                                    "task_id": task_id,
+                                                    "phase": phase,
+                                                    "blocking_phase": prior_phase,
+                                                    "open_issues_in_prior_phase": open_in_prior_phase,
+                                                    "reason": format!(
+                                                        "Cannot dispatch phase-{phase} issue #{number}: \
+                                                         {count} phase-{prior_phase} issue(s) are still open \
+                                                         ({issues}). Phase-{prior_phase} must complete before \
+                                                         phase-{phase} can be dispatched.",
+                                                        count = open_in_prior_phase.len(),
+                                                        issues = open_in_prior_phase
+                                                            .iter()
+                                                            .map(|n| format!("#{n}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join(", ")
+                                                    )
+                                                });
+                                                record_dispatch_rejection(
+                                                    db,
+                                                    task_id,
+                                                    &rejection.to_string(),
+                                                )
+                                                .await;
+                                                return Err(rejection.to_string());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Fail-closed: reject dispatch on API error
+                                            warn!(
+                                                task_id = task_id,
+                                                error = %e,
+                                                "phase guard: failed to fetch milestone issues, rejecting dispatch"
+                                            );
+                                            return Err(serde_json::json!({
+                                                "error": "dispatch_check_failed",
+                                                "task_id": task_id,
+                                                "reason": format!(
+                                                    "Failed to fetch milestone issues for phase guard: {e}"
+                                                )
+                                            })
+                                            .to_string());
+                                        }
+                                    }
+                                }
+                                // If we can't determine the milestone number, skip (can't check).
+                            }
+                            // No phase label or phase == 1: bypass guard.
+                        }
+                        Err(e) => {
+                            // Fail-closed: reject dispatch on API error (matching check #6 pattern)
+                            warn!(
+                                task_id = task_id,
+                                error = %e,
+                                "phase guard: failed to fetch issue labels, rejecting dispatch"
+                            );
+                            return Err(serde_json::json!({
+                                "error": "dispatch_check_failed",
+                                "task_id": task_id,
+                                "reason": format!(
+                                    "Failed to fetch issue labels for phase guard: {e}"
+                                )
+                            })
+                            .to_string());
+                        }
+                    }
+                }
+                None => {
+                    // Fail-open: no token configured (matching check #6 pattern)
+                    warn!(
+                        task_id = task_id,
+                        "Skipping phase guard: no GitHub token configured"
+                    );
+                }
+            }
+        }
+    }
+
+    // Blocked-by guard (#713): reject dispatch if the ticket's GitHub blockers
+    // are still open. This is the most expensive check (external API call) so it
+    // runs last, after all cheap DB checks have passed.
+    if let Some(GitHubRef::Issue {
+        owner,
+        repo,
+        number,
+    }) = github_ref
+    {
+        match github_token {
+            Some(token) => match fetch_open_blockers(token, &owner, &repo, number).await {
+                Ok(blockers) if !blockers.is_empty() => {
+                    let rejection = serde_json::json!({
+                        "error": "dispatch_blocked_by",
+                        "task_id": task_id,
+                        "blocking_issues": blockers,
+                        "message": format!(
+                            "ticket #{number} is blocked by {} which {} still open",
+                            blockers.iter().map(|n| format!("#{n}")).collect::<Vec<_>>().join(", "),
+                            if blockers.len() == 1 { "is" } else { "are" }
+                        )
+                    });
+                    record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                    return Err(rejection.to_string());
+                }
+                Ok(_) => { /* No open blockers — proceed */ }
+                Err(e) => {
+                    // Fail-closed: if we can't verify blocker state, reject dispatch
+                    warn!(
+                        task_id = task_id,
+                        error = %e,
+                        "blocked-by check failed, rejecting dispatch"
+                    );
+                    return Err(serde_json::json!({
+                        "error": "dispatch_check_failed",
+                        "task_id": task_id,
+                        "reason": format!("Failed to check blocked-by status: {e}")
+                    })
+                    .to_string());
+                }
+            },
+            None => {
+                warn!(
+                    task_id = task_id,
+                    "Skipping blocked-by check: no GitHub token configured"
+                );
+            }
+        }
+    }
+
+    // mika#1948 (Porte 2) — ATOMIC EXEC-SLOT CLAIM. This is the last gate, and
+    // it is last on purpose.
+    //
+    // Everything above only ever *checked* the slot. The per-class guard is a
+    // bare SELECT: on `None` it proceeds, and the callback row that makes the
+    // slot observably held is written later, by the caller. Between that check
+    // and that row this function performs several GitHub round-trips (issue
+    // body, open-PR, grooming markers — 10s timeout each), and four production
+    // callers enter here (`ready_label_handler`, the tool boundary,
+    // `task_engine::dispatcher`, `verdict_handler`). So two dispatchers could
+    // both read "free", both spend seconds in validation, and both proceed.
+    //
+    // A slot two claimants can simultaneously believe they hold is not
+    // arbitration, it is a convention. The claim below is a FACT: the PRIMARY
+    // KEY on (agent_id, dispatch_class, slot_index) means a second claimant for
+    // the same slot collides rather than races, and exactly one caller leaves
+    // here holding any given slot. `slot_index` joined that key in mika#2160;
+    // at the default cap of 1 exactly one index exists and this reads as it
+    // always did.
+    //
+    // Placed LAST so that no fallible step follows it — every rejection above
+    // returns before a lease is ever taken, which is why no error path needs to
+    // release one. The only thing between this claim and the callback row is
+    // the caller's own dispatch.
+    //
+    // Fail-closed on contention, per the ticket: a missed dispatch is
+    // recoverable (the deferred wrapper re-drives it), two writers on one
+    // branch are not. The bounded TTL is what keeps fail-closed from becoming
+    // loop-breaking — a dispatcher that dies mid-claim stalls its class for one
+    // TTL, not forever.
+    let dispatcher_source = task.dispatcher_source.as_deref();
+    match db
+        .try_acquire_dispatch_slot(
+            class,
+            task_id,
+            dispatcher_source,
+            crate::db::dispatch_slot_lease_ttl_secs(),
+            // mika#2160 — the lease honours the same cap as the guard above.
+            // Both have to move or the setting is decorative: the lease key
+            // was itself a cap of one (KTD1).
+            max_concurrent_for_class(class),
+        )
+        .await
+    {
+        Ok(crate::db::SlotClaim::Acquired) => {
+            debug!(
+                event = "dispatch_slot_acquired",
+                task_id = task_id,
+                dispatch_class = class,
+                dispatcher_source = dispatcher_source.unwrap_or("mika_dev"),
+                "exec slot claimed"
+            );
+        }
+        Ok(crate::db::SlotClaim::Held {
+            holder_task_id,
+            dispatcher_source: holder_source,
+            expires_at,
+        }) => {
+            let holder_source_display = holder_source.as_deref().unwrap_or("unknown (pre-v51 row)");
+            warn!(
+                event = "dispatch_slot_contended",
+                task_id = task_id,
+                dispatch_class = class,
+                holder_task_id = %holder_task_id,
+                holder_dispatcher_source = holder_source_display,
+                "exec slot already claimed by another dispatcher — refusing"
+            );
+
+            // Register a deferred wrapper exactly as the per-class guard does,
+            // so a dispatch that lost the claim is re-driven rather than lost.
+            let deferred_registered = if let Some(input) = tool_input {
+                register_deferred_callback(db, task_id, input).await
+            } else {
+                false
+            };
+
+            let mut rejection = serde_json::json!({
+                "error": "dispatch_slot_contended",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "holder_task_id": holder_task_id,
+                "holder_dispatcher_source": holder_source,
+                "lease_expires_at": expires_at,
+                "reason": format!(
+                    "The `{class}` exec slot is claimed by task '{holder_task_id}' \
+                     (dispatched by {holder_source_display}), whose lease runs to \
+                     {expires_at}. Another dispatcher won the slot while this \
+                     dispatch was being validated. Only one dispatcher may hold a \
+                     class slot at a time — dispatching anyway would put a second \
+                     writer on the same branch (mika#1948)."
+                ),
+            });
+            if deferred_registered {
+                rejection["deferred_dispatch_registered"] = serde_json::json!(true);
+            }
+
+            if let Err(e) = db
+                .log_audit_event(
+                    task_id,
+                    "dispatch_slot_contended",
+                    &format!("class:{class}"),
+                    None,
+                    Some("dispatch_refused"),
+                    Some(&format!(
+                        "holder={holder_task_id} holder_source={holder_source_display} \
+                         expires_at={expires_at}"
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to write dispatch_slot_contended audit event");
+            }
+
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        Err(e) => {
+            // Fail-closed, matching the per-class guard directly above: if we
+            // cannot establish who holds the slot, we do not dispatch. "In
+            // doubt about who holds the slot, don't dispatch" is the whole
+            // discipline — a lease we failed to take is not a lease we hold.
+            warn!(
+                task_id = task_id,
+                dispatch_class = class,
+                error = %e,
+                "exec-slot claim failed — refusing dispatch"
+            );
+            return Err(serde_json::json!({
+                "error": "dispatch_check_failed",
+                "task_id": task_id,
+                "dispatch_class": class,
+                "reason": format!("Failed to claim the {class} exec slot: {e}")
+            })
+            .to_string());
+        }
+    }
+
+    Ok(task.status.clone())
+}
+
+/// Engine-internal sentinel field name (mika#920 F3 bypass).
+///
+/// Injected into `original_call` by `register_deferred_callback()` so that the
+/// `DeferredDispatch` replay turn bypasses the `dispatch_task_has_open_pr`
+/// guard. Without this bypass, deferred recoveries from `global_dispatch_active`
+/// rejections would livelock: deferred fires → guard rejects → re-defer → repeat.
+///
+/// The `__internal_*` prefix marks this as engine-internal — not part of the
+/// public `run_claude_pilot` tool schema. The dev-pilot `tools.json` MUST NOT
+/// advertise this field; correctness depends on the schema's permissive
+/// `additionalProperties` mode (see plan Anchor F).
+pub(crate) const INTERNAL_DEFERRED_DISPATCH_FIELD: &str = "__internal_deferred_dispatch";
+
+/// Build the `dispatch_task_has_open_pr` rejection (mika#920) if all guard
+/// conditions are met, otherwise return `None` to allow dispatch.
+///
+/// Bypass conditions (evaluated in order — any one short-circuits to `None`):
+/// 1. `iteration_context` is present in `tool_input` — explicit operator/handler
+///    re-dispatch with context (autonomous verdict/ci handlers, or manual
+///    operator-with-context invocations).
+/// 2. Skill is not `dev-pilot` — `dev-groom` is fresh grooming, not an
+///    implementation re-run.
+/// 3. Task has no `claude_pilot.pr_url` in metadata — fresh dispatch, no prior
+///    PR to conflict with.
+/// 4. `originating_message` matches the ready-label webhook marker — the
+///    operator's positive-consent signal (mika#841). Coupled pair with the
+///    `[GitHub] Issue labeled ready on` format in
+///    `mika_gateway::github::format_event_text`; changes to either side must
+///    update both.
+/// 5. `tool_input` carries the `__internal_deferred_dispatch` sentinel —
+///    engine-initiated recovery from a prior `global_dispatch_active`
+///    rejection (mika#1011/#1058). Without this bypass the deferred replay
+///    would livelock against this guard.
+///
+/// When no bypass fires, the function attempts a best-effort GitHub REST
+/// enrichment (PR state, latest mika-qa verdict, mergeable_state). API
+/// failures degrade gracefully: the core decision is based on `pr_url`
+/// presence in DB metadata, enrichment only fills out the rejection body.
+async fn check_task_has_open_pr(
+    task: &db::Task,
+    tool_input: Option<&serde_json::Value>,
+    originating_message: Option<&str>,
+    github_token: Option<&str>,
+) -> Option<serde_json::Value> {
+    let input = tool_input?;
+
+    // Bypass 1: explicit iteration_context — caller already supplied state context.
+    if let Some(ctx) = input.get("iteration_context").and_then(|v| v.as_str())
+        && !ctx.is_empty()
+    {
+        return None;
+    }
+
+    // Bypass 5 (F3): engine-initiated deferred-dispatch replay.
+    if input
+        .get(INTERNAL_DEFERRED_DISPATCH_FIELD)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // Bypass 2: only dev-pilot dispatches are in scope.
+    let skill = extract_skill_from_input(input);
+    if skill != Some("dev-pilot") {
+        return None;
+    }
+
+    // Bypass 4 (F2): ready-label webhook is the operator's positive-consent path.
+    if let Some(msg) = originating_message
+        && crate::webhook_dispatch::is_ready_label_dispatch_marker(msg)
+    {
+        return None;
+    }
+
+    // Bypass 3: no prior PR in metadata → fresh dispatch, nothing to conflict with.
+    let pr_url = extract_pr_url(&task.metadata)?;
+
+    // Best-effort GitHub REST enrichment. The rejection decision is already
+    // made (pr_url present + no bypass) — enrichment only fills out detail
+    // fields for the LLM's structured handling.
+    let (owner, repo, pr_number) = match parse_pr_url(&pr_url) {
+        Some(parsed) => parsed,
+        None => {
+            warn!(
+                task_id = task.id.as_str(),
+                pr_url = pr_url.as_str(),
+                "dispatch_task_has_open_pr: could not parse pr_url; rejecting without enrichment"
+            );
+            return Some(build_open_pr_rejection(
+                &task.id, &pr_url, None, None, None, None,
+            ));
+        }
+    };
+
+    let summary = match github_token {
+        Some(token) => match fetch_pr_summary(token, &owner, &repo, pr_number).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!(
+                    task_id = task.id.as_str(),
+                    pr_url = pr_url.as_str(),
+                    error = %e,
+                    "dispatch_task_has_open_pr: PR API enrichment failed; rejecting without enrichment"
+                );
+                None
+            }
+        },
+        None => {
+            warn!(
+                task_id = task.id.as_str(),
+                "dispatch_task_has_open_pr: no GitHub token; rejecting without enrichment"
+            );
+            None
+        }
+    };
+
+    let (pr_state, latest_verdict, merge_state) = match summary {
+        Some(s) => (s.state, s.latest_verdict, s.merge_state),
+        None => (None, None, None),
+    };
+
+    Some(build_open_pr_rejection(
+        &task.id,
+        &pr_url,
+        Some(pr_number),
+        pr_state,
+        latest_verdict,
+        merge_state,
+    ))
+}
+
+/// Build the structured `dispatch_task_has_open_pr` rejection body (mika#920).
+///
+/// Optional fields are omitted when `None`; the `recovery` and `reason`
+/// strings are stable so the self-dev LLM prompt can pattern-match on them.
+fn build_open_pr_rejection(
+    task_id: &str,
+    pr_url: &str,
+    pr_number: Option<u64>,
+    pr_state: Option<String>,
+    latest_verdict: Option<String>,
+    merge_state: Option<String>,
+) -> serde_json::Value {
+    let pr_label = pr_number
+        .map(|n| format!("#{n}"))
+        .unwrap_or_else(|| pr_url.to_string());
+    let verdict_clause = latest_verdict
+        .as_deref()
+        .map(|v| format!(" with QA verdict '{v}'"))
+        .unwrap_or_default();
+    let reason = format!(
+        "Task has an open PR ({pr_label}){verdict_clause}. Re-dispatching without \
+         iteration_context would re-run the full pipeline against a mostly-complete \
+         branch — likely a no-op."
+    );
+    let recovery = "This task already has an open PR. Options: (a) re-dispatch with \
+                    iteration_context to address specific feedback, (b) wait for the \
+                    blocker to resolve, (c) check PR status manually. To bypass: pass \
+                    iteration_context in the run_claude_pilot call.";
+
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "error".to_string(),
+        serde_json::Value::String("dispatch_task_has_open_pr".to_string()),
+    );
+    obj.insert(
+        "task_id".to_string(),
+        serde_json::Value::String(task_id.to_string()),
+    );
+    obj.insert(
+        "pr_url".to_string(),
+        serde_json::Value::String(pr_url.to_string()),
+    );
+    if let Some(n) = pr_number {
+        obj.insert("pr_number".to_string(), serde_json::Value::from(n));
+    }
+    if let Some(s) = pr_state {
+        obj.insert("pr_state".to_string(), serde_json::Value::String(s));
+    }
+    if let Some(v) = latest_verdict {
+        obj.insert(
+            "latest_qa_verdict".to_string(),
+            serde_json::Value::String(v),
+        );
+    }
+    if let Some(m) = merge_state {
+        obj.insert("merge_state".to_string(), serde_json::Value::String(m));
+    }
+    obj.insert(
+        "recovery".to_string(),
+        serde_json::Value::String(recovery.to_string()),
+    );
+    obj.insert("reason".to_string(), serde_json::Value::String(reason));
+    serde_json::Value::Object(obj)
+}
+
+/// Check for cycles in the task lineage before enqueuing a deferred dispatch (mika#1058).
+///
+/// Walks the `parent_task_id` chain (max 4 hops, bounded by `depth ≤ 3` schema CHECK).
+/// Extracts `(repo, issue_number, skill)` from each ancestor's metadata and compares
+/// against the proposed dispatch. Returns `Ok(())` if safe, `Err(message)` if cycle detected.
+///
+/// Fail-open: if metadata extraction fails for an ancestor, that ancestor is skipped.
+/// The `depth ≤ 3` schema CHECK is the structural backstop.
+async fn check_lineage_cycle(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    proposed_input: &serde_json::Value,
+) -> Result<(), String> {
+    let proposed_skill = proposed_input.get("skill").and_then(|v| v.as_str());
+    let proposed_prompt = proposed_input.get("prompt").and_then(|v| v.as_str());
+    let (proposed_repo, proposed_issue) = parse_repo_issue(proposed_prompt);
+
+    // If we can't extract what we're proposing, we can't detect a cycle — fail-open.
+    if proposed_skill.is_none() || proposed_repo.is_none() || proposed_issue.is_none() {
+        return Ok(());
+    }
+
+    // mika#1948 — the dispatch being proposed inherits the source of the task
+    // proposing it. Read once, before the walk, so every ancestor comparison
+    // uses the same subject.
+    let proposed_source = match db.get_task_unscoped(parent_task_id).await {
+        Ok(Some(t)) => t.dispatcher_source,
+        _ => None,
+    };
+
+    let mut current_id = parent_task_id.to_string();
+    for _depth in 0..4 {
+        let task = match db.get_task_unscoped(&current_id).await {
+            Ok(Some(t)) => t,
+            _ => break, // task not found or DB error → stop walking (fail-open)
+        };
+
+        // Extract (repo, issue, skill, source) from this ancestor
+        if let Some((ancestor_repo, ancestor_issue, ancestor_skill, ancestor_source)) =
+            extract_dispatch_tuple_with_source(&task)
+        {
+            // Rule 1 (pre-existing): the exact same (repo, issue, skill) tuple
+            // already appears in the lineage. Checked first and unchanged, so
+            // the mika-dev-only case behaves exactly as it did.
+            if proposed_skill == Some(ancestor_skill.as_str())
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} has same dispatch tuple \
+                     ({}, #{}, skill={}). Refusing to enqueue.",
+                    task.id, ancestor_repo, ancestor_issue, ancestor_skill
+                ));
+            }
+
+            // Rule 2 (mika#1948) — SOURCE ESCALATION, regardless of skill.
+            //
+            // A mika-manager dispatch on (repo, issue) that re-enters
+            // mika-manager on the SAME (repo, issue) further down its own
+            // lineage is the deadlock shape Porte 2 exists to prevent: the
+            // manager would be queueing behind work it started itself, and the
+            // exact-tuple rule above misses it because the skill differs
+            // (dev-pilot → callback → dev-groom).
+            //
+            // Deliberately narrow. It fires only when BOTH sides are explicitly
+            // `mika_manager`, so:
+            //   - NULL on either side (pre-v51 rows) is a no-op — the check
+            //     degrades cleanly to Rule 1, which is the whole
+            //     backward-compatibility contract;
+            //   - mika-dev and operator lineages are untouched. Widening this to
+            //     "any matching source" would refuse the ordinary
+            //     dev-pilot → dev-groom chain, which is legitimate work.
+            let both_manager = proposed_source.as_deref() == Some("mika_manager")
+                && ancestor_source.as_deref() == Some("mika_manager");
+            if both_manager
+                && proposed_repo == Some(ancestor_repo.as_str())
+                && proposed_issue == Some(ancestor_issue)
+            {
+                return Err(format!(
+                    "Cycle detected: ancestor task {} is a mika_manager dispatch on \
+                     the same target ({}, #{}), and this dispatch is also \
+                     mika_manager (skill={} → {}). A manager re-entering its own \
+                     lineage on one ticket would queue behind itself. \
+                     Refusing to enqueue.",
+                    task.id,
+                    ancestor_repo,
+                    ancestor_issue,
+                    ancestor_skill,
+                    proposed_skill.unwrap_or("<unknown>")
+                ));
+            }
+        }
+
+        // Walk up
+        match task.parent_task_id {
+            Some(pid) => current_id = pid,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Parse "repo#number" format from a prompt string.
+///
+/// Handles formats like "mika#159", "mika-skills#42", etc. Returns
+/// `(Some("mika"), Some(159))` on success, `(None, None)` on failure.
+fn parse_repo_issue(prompt: Option<&str>) -> (Option<&str>, Option<i64>) {
+    let prompt = match prompt {
+        Some(p) => p,
+        None => return (None, None),
+    };
+
+    // Search for the "repo#number" pattern anywhere in the prompt.
+    // The repo name is alphanumeric with hyphens, followed by # and digits.
+    for word in prompt.split_whitespace() {
+        if let Some((repo, num_str)) = word.split_once('#')
+            && !repo.is_empty()
+            && repo
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            && let Ok(num) = num_str.parse::<i64>()
+        {
+            return (Some(repo), Some(num));
+        }
+    }
+    (None, None)
+}
+
+/// `(repo, issue, skill, dispatcher_source)` for one task (mika#1948).
+///
+/// Wraps [`extract_dispatch_tuple`] to also report which dispatcher initiated
+/// the task, so the cycle check can reason about a source escalation and not
+/// only an exact tuple repeat.
+fn extract_dispatch_tuple_with_source(
+    task: &crate::db::Task,
+) -> Option<(String, i64, String, Option<String>)> {
+    extract_dispatch_tuple(task).map(|(r, i, s)| (r, i, s, task.dispatcher_source.clone()))
+}
+
+/// Extract `(repo, issue_number, skill)` tuple from a task's metadata/action_config.
+///
+/// Tries multiple extraction strategies in order:
+/// 1. `action_config.original_call` (deferred callbacks store the full tool input)
+/// 2. Task metadata fields (manual tasks from `create_task`)
+/// 3. `reference_url` parsing (GitHub URL → repo#number) + `source` as skill hint
+fn extract_dispatch_tuple(task: &crate::db::Task) -> Option<(String, i64, String)> {
+    // Strategy 1: action_config.original_call (deferred callbacks)
+    if let Ok(config) = serde_json::from_str::<serde_json::Value>(&task.action_config)
+        && let Some(original_call) = config.get("original_call")
+    {
+        let skill = original_call
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let prompt = original_call.get("prompt").and_then(|v| v.as_str());
+        let (repo, issue) = parse_repo_issue(prompt);
+        if let (Some(skill), Some(repo), Some(issue)) = (skill, repo, issue) {
+            return Some((repo.to_string(), issue, skill));
+        }
+    }
+
+    // Strategy 2: Parse from task label (long-running dispatch labels encode the skill)
+    // and reference_url (GitHub issue URL)
+    if let Some(ref_url) = &task.reference_url {
+        // Parse GitHub URL: https://github.com/owner/repo/issues/123
+        let parts: Vec<&str> = ref_url.rsplitn(3, '/').collect();
+        if parts.len() >= 3
+            && let Ok(issue_num) = parts[0].parse::<i64>()
+        {
+            // Extract repo name from URL path
+            let repo = parts[2].rsplit('/').next().unwrap_or(parts[2]).to_string();
+
+            // Use source as skill hint, or parse from label
+            let skill = task.source.as_deref().unwrap_or(&task.label).to_string();
+
+            return Some((repo, issue_num, skill));
+        }
+    }
+
+    None
+}
+
+/// Maximum number of pending deferred-dispatch callbacks per agent (mika#1011).
+/// Prevents unbounded queue growth from buggy or malicious dispatch loops.
+const MAX_PENDING_DEFERRED_CALLBACKS: i64 = 10;
+
+/// Repair budget per parent task (mika#2045).
+///
+/// A deferred wrapper consumed without dispatching leaves its parent orphaned.
+/// Re-arming replaces the wrapper instead of throwing the work away, but a
+/// parent whose turns never dispatch must still terminate: after this many
+/// repairs the reaper expires the task and frees its slot in
+/// `idx_tasks_manual_active_ref_url` so the `ready` sweep can create a fresh one.
+///
+/// The counter is shared by both repair paths — the inline re-arm at wrapper
+/// consumption and the reaper's — so the budget bounds the total, not each path.
+pub(crate) const MAX_STUCK_REARMS: i64 = 2;
+
+/// Register a deferred-dispatch callback when `global_dispatch_active` fires (mika#1011).
+///
+/// Creates a `pending` callback task with `label = "long_running:run_claude_pilot:deferred"`
+/// linked to the requesting parent task. When the blocking dispatch completes, the
+/// dispatcher promotes this to `in_progress` and fires a `SilentTrigger::DeferredDispatch`
+/// turn. Returns `true` if registered, `false` if cap exceeded or DB error (fail-open).
+///
+/// # Precondition (security-load-bearing, mika#1205)
+///
+/// All callers MUST be downstream of the `unauthorized_webhook_dispatch` guard
+/// (`validate_dispatch_readiness` guard 0). The deferred-callback child row
+/// created by this function is later read by `execute_long_running` as proof
+/// that a prior turn was authorized — that read uses the row's existence to
+/// short-circuit duplicate-retry rejection with an idempotent "deferred" success.
+///
+/// Current call sites (both verified downstream of guard 0):
+/// - Callback-turn entry path in `execute_skill_tool` — downstream of
+///   `check_lineage_cycle` on a turn already gated by callback semantics.
+/// - `validate_dispatch_readiness` `global_dispatch_active` branch — downstream
+///   of guards 0, 1, 2.
+///
+/// Adding a new call site that does NOT pass guard 0 first would let
+/// unauthorized dispatches forge authorization. If you add one, document the
+/// guard-0 equivalence at the call site and update this comment.
+pub(crate) async fn register_deferred_callback(
+    db: &AsyncDatabase,
+    task_id: &str,
+    input: &serde_json::Value,
+) -> bool {
+    // Flood-cap check: reject without insert if at capacity
+    match db.count_pending_deferred_callbacks().await {
+        Ok(count) if count >= MAX_PENDING_DEFERRED_CALLBACKS => {
+            warn!(
+                task_id,
+                pending_count = count,
+                cap = MAX_PENDING_DEFERRED_CALLBACKS,
+                "deferred_dispatch_cap_exceeded — not registering deferred callback"
+            );
+            return false;
+        }
+        Err(e) => {
+            warn!(task_id, error = %e, "failed to count deferred callbacks — skipping registration");
+            return false;
+        }
+        _ => {}
+    }
+
+    // Encode the original dispatch arguments so the deferred turn can replay them.
+    // Inject the `__internal_deferred_dispatch` sentinel into the saved
+    // original_call so that when the deferred turn replays this dispatch, the
+    // `dispatch_task_has_open_pr` guard (mika#920) bypasses on F3 condition.
+    // Without the sentinel the deferred replay would livelock against the
+    // open-PR guard.
+    let mut original_call = input.clone();
+    if let Some(obj) = original_call.as_object_mut() {
+        obj.insert(
+            INTERNAL_DEFERRED_DISPATCH_FIELD.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    let action_config = serde_json::json!({
+        "trigger_kind": "deferred_dispatch",
+        "original_call": original_call,
+    })
+    .to_string();
+
+    // Derive dispatch_class from the original call's skill parameter so
+    // the deferred callback occupies the correct slot when it fires (#1001).
+    let skill = extract_skill_from_input(input);
+    let class = derive_dispatch_class(skill);
+
+    let task = NewTask {
+        agent_id: db.agent_id().to_string(),
+        team_run_id: None,
+        parent_task_id: Some(task_id.to_string()),
+        depth: 0,
+        label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config,
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: Some("deferred_dispatch".to_string()),
+        metadata: None,
+        r#type: None,
+        dispatch_class: Some(class.to_string()),
+    };
+
+    match db.create_task(task).await {
+        Ok(deferred_id) => {
+            info!(
+                task_id,
+                deferred_id = %deferred_id,
+                "deferred_dispatch_registered — pending callback created for auto-retry"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(task_id, error = %e, "failed to register deferred callback — LLM fallback only");
+            false
+        }
+    }
+}
+
+/// Result of a repair attempt (mika#2045).
+///
+/// `NotNow` and `Unrepairable` are both refusals, and collapsing them into one
+/// boolean is the bug this enum exists to prevent: the reaper expires a task it
+/// cannot repair, and a full deferred-callback queue is not that. It is a
+/// transient condition that clears on its own, so a task refused for capacity
+/// must be left alone and retried, not destroyed with repair budget still on it.
+///
+/// `#[must_use]` (mika#2169): the doc above named one failure mode — collapsing
+/// the two refusals into a boolean — and successfully prevented it. It did not
+/// imagine the cruder one, which is what actually happened: a call site that
+/// ended in `.await;` and threw **both** away, leaving a `blocked` parent with
+/// no code path that writes anything about it. Prose could not stop that; the
+/// attribute makes it a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "NotNow and Unrepairable demand different handling — discarding the outcome is the mika#2169 defect"]
+pub(crate) enum RearmOutcome {
+    /// A replacement wrapper now exists.
+    Rearmed,
+    /// Refused for a condition that clears by itself — try again next tick.
+    NotNow,
+    /// Refused because the parent is already represented by a live deferred
+    /// wrapper: there is nothing to repair, so nothing to spend (mika#2413).
+    ///
+    /// A fourth variant rather than a third use of `NotNow`, for two reasons
+    /// that are both about what the caller does next. First, this is the
+    /// *nominal* path under slot contention — the others are a full queue or a
+    /// failed read — and it is the one that must leave the consumed wrapper an
+    /// honest terminal record, which `NotNow` must not do (a `NotNow` caused by
+    /// `has_non_deferred_active_callback_child` returning true means the turn
+    /// genuinely dispatched, and writing `expired` there would deny a real
+    /// dispatch). Second, the two reapers treat every non-`Rearmed`,
+    /// non-`NotNow` outcome as grounds to expire the parent, so a variant the
+    /// compiler forces them to name is the only safe way to add one here.
+    AlreadyRepresented,
+    /// Refused for good: the repair budget is spent, or the dispatch cannot be
+    /// reconstructed. Only this warrants expiring the task.
+    Unrepairable,
+}
+
+/// Re-arm a parent whose deferred wrapper was consumed without dispatching
+/// (mika#2045).
+///
+/// `promote_next_deferred_callback` sets the wrapper `completed`, so promotion
+/// is destructive: the wrapper leaves the `pending` queue and nothing brings it
+/// back. When the promoted turn produces no real dispatch — it errored, or it
+/// ran and called no tool — the parent is left `pending` with nothing
+/// representing it, and the partial unique index forbids a replacement.
+///
+/// This inserts a fresh `pending` wrapper and returns. It deliberately does NOT
+/// promote anything inline. That is not timidity about mika#1124's anti-cascade
+/// guard, it is the same discipline: the cascade that guard closed promoted the
+/// *next* wrapper — another task's — N times in one call stack. Re-arming
+/// inserts one row for *this* parent and hands the promotion decision back to
+/// `promote_pending_deferred_if_idle`, which checks the class slot first.
+///
+/// The caller must distinguish the ways a repair can be refused, because only
+/// one of them justifies destroying the task. See [`RearmOutcome`].
+///
+/// # Invariant (mika#2413)
+///
+/// A parent that already carries a live deferred wrapper **is represented**:
+/// there is nothing to repair, and therefore nothing to spend. Such a call
+/// returns [`RearmOutcome::AlreadyRepresented`] without creating a wrapper and
+/// without touching the budget, whatever the `cause`.
+///
+/// That invariant is what breaks the self-sustaining loop mika#2413 measured.
+/// `register_deferred_callback` already posts a wrapper when
+/// `validate_dispatch_readiness` refuses on `global_dispatch_active`; re-arming
+/// on top of it produced a *second* one, and a second pending wrapper makes the
+/// mika#1205 `already_deferred` intercept short-circuit the next turn **before**
+/// it even tests the slot — so the turn after a re-arm is sterile by
+/// construction, is counted as a no-op by R9, and re-arms again. Three rounds,
+/// budget gone, parent `failed`, while the only thing that ever happened was
+/// another groom holding the slot.
+pub(crate) async fn rearm_deferred_callback(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    action_config: &str,
+    dispatch_class: &str,
+    cause: &str,
+    consumed_wrapper_id: Option<&str>,
+) -> RearmOutcome {
+    // Guard: if the parent already has an active non-deferred callback, the
+    // turn did dispatch and there is nothing to repair. Fail-closed on a query
+    // error — a spurious re-arm would double-dispatch, and the reaper is the
+    // backstop either way.
+    match db
+        .has_non_deferred_active_callback_child(parent_task_id)
+        .await
+    {
+        Ok(false) => {}
+        Ok(true) => return RearmOutcome::NotNow, // The turn dispatched — healthy.
+        Err(e) => {
+            warn!(
+                parent_task_id,
+                error = %e,
+                "failed to check for non-deferred callback children — not re-arming"
+            );
+            return RearmOutcome::NotNow;
+        }
+    }
+
+    // mika#2413 — is the parent already represented in the queue?
+    //
+    // Placement is imposed: AFTER the guard above (the turn really dispatched:
+    // nothing to repair) and BEFORE `get_stuck_rearm_count`, so that a parent
+    // that is already represented never makes anyone read, let alone spend, a
+    // budget it has no reason to touch.
+    //
+    // `consumed_wrapper_id` takes the wrapper whose sterility we are treating
+    // out of the population. Without it, the `silent_turn_error` caller would
+    // see the consumed wrapper — still `completed`, `completed_at` fresh —
+    // count itself as live, and no re-arm would ever be possible on that path
+    // again.
+    //
+    // Fail-safe, and it points the OPPOSITE way from the guard just above:
+    // a read we could not make must not be read as "the parent is
+    // represented", because that would leave a parent with nothing in the queue
+    // and nothing to put something back — never repaired, never expired. So on
+    // error we fall through to the nominal path and repair. The asymmetry is
+    // the point: a wrong "I repair" costs one point of budget, a wrong "it is
+    // represented" costs a parent that nothing represents any more.
+    match db
+        .find_live_deferred_wrapper_child(
+            parent_task_id,
+            crate::task_engine::promoted_wrapper_liveness_secs(),
+            consumed_wrapper_id,
+        )
+        .await
+    {
+        Ok(Some(live_wrapper_id)) => {
+            info!(
+                event = "deferred_rearm_skipped_parent_represented",
+                parent_task_id,
+                task_id = consumed_wrapper_id.unwrap_or("-"),
+                live_wrapper_id = %live_wrapper_id,
+                cause,
+                dispatch_class,
+                "parent already represented by a live deferred wrapper — no re-arm, no budget spent"
+            );
+            return RearmOutcome::AlreadyRepresented;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                parent_task_id,
+                error = %e,
+                "failed to check for a live deferred wrapper — repairing on the nominal path"
+            );
+        }
+    }
+
+    match db.get_stuck_rearm_count(parent_task_id).await {
+        Ok(count) if count >= MAX_STUCK_REARMS => {
+            warn!(
+                event = "deferred_dispatch_rearm_budget_exhausted",
+                parent_task_id,
+                rearm_count = count,
+                budget = MAX_STUCK_REARMS,
+                cause,
+                "repair budget exhausted — leaving the task for the reaper to expire"
+            );
+            return RearmOutcome::Unrepairable;
+        }
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to read stuck_rearm_count — not re-arming");
+            return RearmOutcome::NotNow;
+        }
+        _ => {}
+    }
+
+    match db.count_pending_deferred_callbacks().await {
+        Ok(count) if count >= MAX_PENDING_DEFERRED_CALLBACKS => {
+            warn!(
+                parent_task_id,
+                pending_count = count,
+                cap = MAX_PENDING_DEFERRED_CALLBACKS,
+                "deferred_dispatch_cap_exceeded — not re-arming yet"
+            );
+            return RearmOutcome::NotNow;
+        }
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to count deferred callbacks — not re-arming");
+            return RearmOutcome::NotNow;
+        }
+        _ => {}
+    }
+
+    let task = NewTask {
+        agent_id: db.agent_id().to_string(),
+        team_run_id: None,
+        parent_task_id: Some(parent_task_id.to_string()),
+        depth: 0,
+        label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config: action_config.to_string(),
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: Some("deferred_dispatch_rearm".to_string()),
+        metadata: None,
+        r#type: None,
+        dispatch_class: Some(dispatch_class.to_string()),
+    };
+
+    let rearmed_id = match db.create_task(task).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(parent_task_id, error = %e, "failed to re-arm deferred callback");
+            return RearmOutcome::NotNow;
+        }
+    };
+
+    let rearm_count = db
+        .increment_stuck_rearm_count(parent_task_id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(parent_task_id, error = %e, "failed to increment stuck_rearm_count");
+            0
+        });
+
+    info!(
+        event = "deferred_dispatch_rearmed",
+        parent_task_id,
+        rearmed_task_id = %rearmed_id,
+        rearm_count,
+        dispatch_class,
+        cause,
+        "deferred wrapper consumed without dispatching — replacement registered"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            "system",
+            "deferred_dispatch_rearmed",
+            &format!("task:{parent_task_id}"),
+            None,
+            Some("rearmed"),
+            Some(&format!(
+                "cause:{cause}, rearmed:{rearmed_id}, rearm_count:{rearm_count}"
+            )),
+            None,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to write deferred_dispatch_rearmed audit event");
+    }
+
+    RearmOutcome::Rearmed
+}
+
+/// Extract `pr_url` from a task's metadata JSON.
+///
+/// Looks for `claude_pilot.pr_url` (nested) or `pr_url` (top-level).
+fn extract_pr_url(metadata: &Option<String>) -> Option<String> {
+    let meta = metadata.as_deref()?;
+    let parsed: serde_json::Value = serde_json::from_str(meta).ok()?;
+
+    // Try nested claude_pilot.pr_url first
+    if let Some(url) = parsed
+        .get("claude_pilot")
+        .and_then(|cp| cp.get("pr_url"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(url.to_string());
+    }
+
+    // Fallback to top-level pr_url
+    parsed
+        .get("pr_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Execute a long-running exec handler by creating a callback task and spawning
+/// the subprocess in the background. Returns immediately with the task ID.
+/// Build the callback `NewTask` for a long-running dispatch.
+///
+/// Shared by `execute_long_running` (the LLM tool-call path) and the engine-side
+/// ready-label dispatch (mika#1572) so both paths create structurally identical
+/// callback children. The callback/resume contract depends on this exact shape:
+/// `trigger_type=callback`, `action_type=resume_agent`, the `action_config.input`
+/// mirror of dispatch fields (#958), and the per-class `dispatch_class`. Drift
+/// between the two construction sites would re-introduce the callback-shape bug
+/// class this consolidation prevents (plan Risk 1).
+///
+/// `pub` rather than `pub(crate)` since mika#2272: the eval suite seeds
+/// dispatch rows through this builder rather than hand-writing a `NewTask`.
+/// The inert reaper was born of a fixture that wrote a status production never
+/// writes on this row, so the fixture has to come through the production
+/// construction site or it is measuring itself.
+///
+/// `metadata` (mika#2368 C3) carries the row's initial metadata JSON — today,
+/// only the QA-review PR target stamped by `execute_long_running` on a build
+/// dispatch (`deadline_verdict::QA_REVIEW_PR_TARGET_KEY`). It is **a parameter
+/// on the single signature, never a second constructor**: the doc-comment above
+/// forbids drift between construction sites, and a `build_callback_task_with_*`
+/// sibling is exactly how that drift starts. Every other caller passes `None`,
+/// which is what the hard-coded `None` here used to mean.
+///
+/// The eighth parameter crosses clippy's arity threshold, and the `allow` is the
+/// honest answer rather than the lazy one: the two ways out of the lint are a
+/// second constructor — forbidden above, and forbidden for a measured reason —
+/// or a parameter struct, which would rewrite all seven call sites inside a
+/// ticket about a QA verdict net. The arity is a symptom of the callback
+/// contract's own width, not of this change.
+#[allow(clippy::too_many_arguments)]
+pub fn build_callback_task(
+    agent_id: String,
+    parent_task_id: Option<String>,
+    tool_name: &str,
+    input: &serde_json::Value,
+    timeout_secs: u64,
+    session_id: &str,
+    trace_id: &str,
+    metadata: Option<String>,
+) -> NewTask {
+    NewTask {
+        agent_id,
+        team_run_id: None,
+        parent_task_id,
+        depth: 0,
+        label: format!("long_running:{tool_name}"),
+        trigger_type: trigger_type::CALLBACK.to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(
+            timeout_secs as i64,
+        ))),
+        action_type: action_type::RESUME_AGENT.to_string(),
+        action_config: {
+            // Populate action_config.input with dispatch fields so child tasks
+            // are self-describing without a parent join (#958).
+            let mut ac_input = serde_json::Map::new();
+            for key in &["prompt", "skill", "task_id", "branch"] {
+                if let Some(val) = input.get(*key).filter(|v| !v.is_null()) {
+                    ac_input.insert((*key).to_string(), val.clone());
+                }
+            }
+            serde_json::json!({ "input": ac_input }).to_string()
+        },
+        input_context: Some(serde_json::to_string(input).unwrap_or_default()),
+        created_by_session: Some(session_id.to_string()),
+        created_trace_id: Some(trace_id.to_string()),
+        reference_url: None,
+        source: None,
+        metadata,
+        r#type: None,
+        dispatch_class: Some(
+            derive_dispatch_class(input.get("skill").and_then(|v| v.as_str())).to_string(),
+        ),
+    }
+}
+
+/// Le `metadata` JSON initial d'une tâche callback de **build** — la PR que le
+/// filet mika#2368 pourra verdicter si ce dispatch conclut sans verdict.
+///
+/// Trois raisons de rendre `None`, et toutes les trois laissent le filet muet
+/// (AC6 : un signal qu'on ne peut pas lire n'est jamais un terme satisfait) :
+///
+/// 1. l'outil n'est pas `build_mika` — les cinq autres flux `long_running` ne
+///    doivent aucun verdict à personne, et un stamp posé là ferait entrer une
+///    population que le filet n'a pas à couvrir ;
+/// 2. `originating_message` est absent — c'est le cas d'un tour silencieux, qui
+///    n'a pas de message utilisateur frais (mika#933) ;
+/// 3. le texte n'est pas un événement PR lisible par `parse_pr_target`.
+///
+/// **La résolution passe par le lecteur unique de la grammaire**
+/// (`deadline_verdict::parse_pr_target`), jamais par une regex recopiée : une
+/// grammaire de fil dupliquée est ce qui a laissé deux lecteurs diverger dans
+/// mika#2158.
+///
+/// L'abstention est journalisée sur-le-champ, à l'instant où elle est encore
+/// rattachable à un dispatch — c'est toute la différence avec une dérivation
+/// faite plus tard par le filet, dont l'échec ne se journalise nulle part.
+fn resolve_qa_review_pr_target(
+    tool_name: &str,
+    originating_message: Option<&str>,
+    trace_id: &str,
+) -> Option<String> {
+    use crate::server::deadline_verdict::{QA_REVIEW_PR_TARGET_KEY, parse_pr_target};
+
+    if tool_name != crate::qa_build_callback::BUILD_MIKA_TOOL {
+        return None;
+    }
+
+    let Some(message) = originating_message else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "no_originating_message",
+            "mika#2368 : dispatch de build sans message d'origine — le filet ne \
+             pourra pas poser de verdict si ce callback revient muet"
+        );
+        return None;
+    };
+
+    let Some(target) = parse_pr_target(message) else {
+        warn!(
+            event = "qa_review_pr_target_unresolved",
+            trace_id,
+            reason = "not_a_pr_event",
+            "mika#2368 : le message d'origine de ce dispatch de build ne désigne \
+             aucune PR — le filet ne pourra pas poser de verdict si ce callback \
+             revient muet"
+        );
+        return None;
+    };
+
+    let value = target.to_metadata_value();
+    info!(
+        event = "qa_review_pr_target_stamped",
+        trace_id,
+        target = %value,
+        "mika#2368 : cible PR stampée sur la tâche callback de build"
+    );
+    Some(serde_json::json!({ QA_REVIEW_PR_TARGET_KEY: value }).to_string())
+}
+
+async fn execute_long_running(
+    skill_tool: &ResolvedSkillTool,
+    command: &str,
+    input: serde_json::Value,
+    estimated_duration_secs: Option<u64>,
+    ctx: &LongRunningContext,
+    github_token: Option<&str>,
+) -> ToolOutput {
+    // Validate task_id — long-running tasks require tracked tasks.
+    // The agent passes the task UUID via the `task_id` input field.
+    // See mika#596 / mika-skills#151.
+    let task_id = input.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    let scoped = match crate::tools::AgentScopedTaskId::from_agent_context(&ctx.db, task_id) {
+        Ok(s) => s,
+        Err(e) => return ToolOutput::error(e.content),
+    };
+    if let Some(err) = crate::tools::validate_task(&ctx.db, &scoped).await {
+        return ToolOutput::error(err);
+    }
+
+    // mika#1205: Idempotent ack when a deferred-dispatch child is already pending
+    // for this task on this agent.
+    //
+    // When an LLM-conversation turn retries `run_claude_pilot` on a task that has
+    // a pending deferred-callback child (created by a prior turn that hit
+    // `global_dispatch_active`), short-circuit with the same `status: "deferred"`
+    // success that the callback-turn entry path returns when
+    // `register_deferred_callback` succeeds (see top of `execute_skill_tool`).
+    // Without this intercept, guard (0) `unauthorized_webhook_dispatch` can fire
+    // on the retry's fresh originating_message (issue comment, label change), and
+    // the LLM may hallucinate a supervisor → blocked transition (mika#716).
+    //
+    // Security: the deferred-callback child can only exist if a prior turn passed
+    // guard (0) — `register_deferred_callback` is downstream of guard (0) at both
+    // call sites (callback-turn entry path and `validate_dispatch_readiness`).
+    // The per-agent filter (`child.agent_id == self_agent`) prevents cross-agent
+    // authorization leakage in team-task trees where `db::get_child_tasks` returns
+    // children with heterogeneous `agent_id`s.
+    match ctx.db.get_child_tasks(task_id).await {
+        Ok(children) => {
+            let self_agent = ctx.db.agent_id();
+            let pending_deferred = children.iter().find(|c| {
+                c.label == crate::agent::DEFERRED_DISPATCH_LABEL
+                    && c.agent_id == self_agent
+                    && matches!(c.status.as_str(), "pending" | "in_progress")
+            });
+            if let Some(child) = pending_deferred {
+                info!(
+                    task_id,
+                    deferred_callback_id = %child.id,
+                    "deferred_dispatch_idempotent_ack — prior dispatch already queued (mika#1205)"
+                );
+                return ToolOutput::success(
+                    serde_json::json!({
+                        "status": "deferred",
+                        "already_deferred": true,
+                        "deferred_callback_id": child.id,
+                        "deferred_callback_status": child.status,
+                        "message": "Your prior dispatch for this task is queued as a \
+                                    deferred callback and will fire automatically when \
+                                    the dispatch slot is free. Do not retry; do not \
+                                    transition the supervisor task. (mika#1205)"
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        Err(e) => {
+            // Fail-closed on DB error: skip the intercept and let the existing
+            // guards apply. Worst case is reverting to current behavior (the bug
+            // we're fixing), not a security regression — guard (0) still rejects
+            // unauthorized retries.
+            warn!(
+                task_id,
+                error = %e,
+                "deferred_dispatch_intercept_check_failed — falling through to validate_dispatch_readiness"
+            );
+        }
+    }
+
+    // Dispatch-readiness guard (#525): stricter than validate_task() which also
+    // allows `blocked` (needed by delegate_task). Long-running dispatch only permits
+    // `pending` and `in_progress`. Returns the current status on success to avoid
+    // a redundant DB read in the auto-transition below.
+    let wi_status = match validate_dispatch_readiness(
+        &ctx.db,
+        task_id,
+        github_token,
+        Some(&input),
+        ctx.originating_message.as_deref(),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => return ToolOutput::error(err),
+    };
+
+    // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
+    // Check first without incrementing — the actual increment happens right before
+    // spawn to avoid leaving the counter stuck at 1 if create_task or path validation fails.
+    if ctx.dispatch_count.load(Ordering::Relaxed) > 0 {
+        let rejection = serde_json::json!({
+            "error": "dispatch_limit_exceeded",
+            "task_id": task_id,
+            "dispatches_this_turn": ctx.dispatch_count.load(Ordering::Relaxed),
+            "reason": "Only one long-running dispatch is permitted per agent turn. \
+                       A dispatch has already been launched in this turn. Wait for the \
+                       current dispatch to complete via callback before launching another."
+        });
+        record_dispatch_rejection(&ctx.db, task_id, &rejection.to_string()).await;
+        return ToolOutput::error(rejection.to_string());
+    }
+
+    let estimated = estimated_duration_secs.unwrap_or(3600);
+    let timeout_secs = (estimated * 3).clamp(600, 7_776_000); // 10min..90days
+
+    // Auto-transition pending tasks to in_progress on dispatch (#525), and
+    // stamp `fired_at` on the parent (mika#2335) — the transition and the stamp
+    // are one act, so they are one writer.
+    if wi_status == "pending" {
+        if let Err(e) = ctx.db.mark_parent_dispatched(task_id).await {
+            // Non-fatal: the callback child creation provides a secondary guard
+            warn!(
+                task_id,
+                error = %e,
+                "failed to auto-transition task to in_progress"
+            );
+        } else {
+            info!(
+                task_id,
+                "auto-transitioned task from pending to in_progress on dispatch"
+            );
+        }
+    }
+
+    // Link callback task to parent task via parent_task_id for task tree correlation.
+    // Same canonical source as the validation above — agent passes via `task_id`.
+    let parent_task_id = input
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // mika#2413 U3 — kept for the post-spawn budget reset below; the binding
+    // above is moved into `build_callback_task`.
+    let parent_for_budget_reset = parent_task_id.clone();
+
+    // Belt-and-suspenders (#955): validate_required_fields is the runtime guard,
+    // but assert that required fields survived into the dispatch input as a
+    // development-time safety net before the shared builder serializes it.
+    debug_assert!(
+        {
+            let required: Vec<&str> = skill_tool
+                .definition
+                .input_schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            required
+                .iter()
+                .all(|f| input.get(f).is_some_and(|v| !v.is_null()))
+        },
+        "dispatch record serialized without required fields — \
+         validate_required_fields should have caught this"
+    );
+
+    // mika#2368 C2 — la cible PR que le filet moteur pourra verdicter si ce
+    // dispatch revient sans verdict. Résolue ICI, au spawn, depuis le texte de
+    // l'événement d'origine, et stampée sur la row : le filet lira un stamp et
+    // ne parsera rien. Ce qui est condamné, c'est la dérivation tardive — celle
+    // qui se ferait au moment du filet, quand l'échec n'est plus rattrapable et
+    // ne se journalise nulle part.
+    let qa_review_pr_target = resolve_qa_review_pr_target(
+        &skill_tool.definition.name,
+        ctx.originating_message.as_deref(),
+        &ctx.trace_id,
+    );
+
+    let task = build_callback_task(
+        ctx.db.agent_id.clone(),
+        parent_task_id,
+        &skill_tool.definition.name,
+        &input,
+        timeout_secs,
+        &ctx.session_id,
+        &ctx.trace_id,
+        qa_review_pr_target,
+    );
+
+    let task_id = match ctx.db.create_task(task).await {
+        Ok(id) => id,
+        Err(e) => {
+            return ToolOutput::error(format!("Failed to create callback task: {e}"));
+        }
+    };
+
+    let cmd_path = skill_tool.skill_dir.join(command);
+    if !cmd_path.exists() {
+        let _ = ctx
+            .db
+            .update_task_failed(
+                &task_id,
+                &format!("handler not found: {}", cmd_path.display()),
+            )
+            .await;
+        return ToolOutput::error(format!(
+            "handler command not found: {} (resolved to {})",
+            command,
+            cmd_path.display()
+        ));
+    }
+
+    // Inject task metadata into input for the subprocess
+    let mut enriched_input = input;
+    if let serde_json::Value::Object(ref mut map) = enriched_input {
+        map.insert(
+            "__mika_task_id".to_string(),
+            serde_json::Value::String(task_id.clone()),
+        );
+        map.insert(
+            "__mika_agent".to_string(),
+            serde_json::Value::String(ctx.agent_name.clone()),
+        );
+    }
+
+    // Increment dispatch counter right before spawn — after all validation
+    // and task creation succeeded. This ensures the counter stays at 0 if
+    // any early error path returns before we actually launch the subprocess.
+    ctx.dispatch_count.fetch_add(1, Ordering::Relaxed);
+
+    spawn_long_running_exec(
+        cmd_path,
+        skill_tool.skill_dir.clone(),
+        enriched_input,
+        task_id.clone(),
+        ctx.db.clone(),
+        github_token.map(|s| s.to_string()),
+    );
+
+    // mika#2413 U3 — a real dispatch just spawned, so the hypothesis the repair
+    // budget bounds ("this parent's turns never dispatch") is refuted by the
+    // facts. Placed AFTER the spawn on purpose: the discriminant is *having
+    // reached a real dispatch*, not *having started one*. Moving it earlier —
+    // to the readiness check, or to the callback-child creation that can still
+    // be followed by a missing-handler failure — would rebuild mika#2158's
+    // unreachable counter, where the action being counted was also the action
+    // that cleared it. Fire-and-forget: a failed reset costs one point of a
+    // budget of two, never the dispatch that just left.
+    if let Some(parent_id) = parent_for_budget_reset.as_deref() {
+        match ctx.db.reset_stuck_rearm_count(parent_id).await {
+            Ok(true) => {
+                info!(
+                    event = "stuck_rearm_count_reset",
+                    parent_task_id = parent_id,
+                    callback_task_id = %task_id,
+                    skill_tool = %skill_tool.definition.name,
+                    "real dispatch spawned — repair budget reset"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    parent_task_id = parent_id,
+                    error = %e,
+                    "failed to reset stuck_rearm_count after a real dispatch"
+                );
+            }
+        }
+    }
+
+    ToolOutput::success(format!(
+        "Task submitted (long-running). ID: {task_id}\n\
+         The subprocess is running in the background. \
+         Results will be delivered via callback when complete."
+    ))
+}
+
+/// Spawn a monitored background task for a long-running exec handler.
+///
+/// The subprocess runs with `kill_on_drop(false)` so it survives if the
+/// parent agent task ends. A monitor task records the PID and handles
+/// failure (non-zero exit → task marked failed).
+pub(crate) fn spawn_long_running_exec(
+    cmd_path: PathBuf,
+    skill_dir: PathBuf,
+    input: serde_json::Value,
+    task_id: String,
+    db: AsyncDatabase,
+    github_token: Option<String>,
+) {
+    tokio::spawn(async move {
+        let mut cmd = tokio::process::Command::new(&cmd_path);
+        cmd.current_dir(&skill_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .kill_on_drop(false)
+            .process_group(0); // Make child a process group leader (#855)
+        // Positive-allowlist env (Phase 1 of dev-pilot containment). Strictly
+        // stronger than the legacy MIKA_* scrub: any operator token outside
+        // the allowlist (AWS_*, NODE_AUTH_TOKEN, non-MIKA_ OPENAI_/ANTHROPIC_,
+        // etc.) cannot leak by inheritance. Companion to Phase 2 (bubblewrap
+        // fs+network isolation).
+        sandboxed_pilot_env(&mut cmd);
+        if let Some(ref token) = github_token {
+            cmd.env("GH_TOKEN", token);
+        }
+        // mika#1705: enable claude-pilot subprocess LLM-transcript capture.
+        // Injected AFTER the env sandbox so the non-allowlisted var survives.
+        let expected_transcript = inject_pilot_transcript_env(&mut cmd, &skill_dir, &task_id);
+        // mika#2249: arm the worktree declaration channel the silent-stall
+        // reaper reads. Same placement rationale as the line above — injected
+        // after the env sandbox so the var survives.
+        let expected_worktree_file = inject_dispatch_worktree_env(&mut cmd, &skill_dir, &task_id);
+        // mika#2354: relay the rescue-verification settings the rescue tail
+        // reads. Same placement rationale as the two lines above — injected
+        // after the env sandbox so the vars survive its positive allowlist.
+        inject_rescue_verify_env(&mut cmd);
+        // mika#2278: relay the architect-retry settings the grooming loop reads.
+        // Same placement rationale as the three lines above.
+        inject_arch_ask_retry_env(&mut cmd);
+        // mika#2508: relay the two pilot-channel settings `dispatch-lib.sh`
+        // reads — the turn ceiling (mika#2496) and the log sink (mika#2249).
+        // Same placement rationale as the four lines above: naming them
+        // unprefixed never made them traverse, the explicit relay does.
+        inject_pilot_dispatch_env(&mut cmd);
+        // mika#2536: relay the platform root the four long-running handlers and
+        // `dispatch-lib.sh` read. Same placement rationale as the five lines
+        // above — and this one TRANSLATES the name (`MIKA_PLATFORM_DIR` spirit
+        // side, `PLATFORM_DIR` child side) so the operator's variable keeps its
+        // documented name. Before this, the `${MIKA_PLATFORM_DIR:-…}` branch in
+        // those scripts could never receive a value: it was a dead branch whose
+        // fallback was the only reachable arm.
+        inject_platform_dir_env(&mut cmd);
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to spawn long-running exec");
+                if let Err(db_err) = db
+                    .update_task_failed(&task_id, &format!("spawn failed: {e}"))
+                    .await
+                {
+                    warn!(task_id = %task_id, error = %db_err, "failed to mark spawn-failed task in DB");
+                }
+                return;
+            }
+        };
+
+        // mika#2040 AC7: record that this dispatch was asked for a transcript.
+        // Stamped AFTER the spawn succeeded, deliberately: a dispatch whose
+        // spawn failed produced no transcript because no pilot ran, and
+        // reporting it under `pilot_transcript_empty_after_dispatch` would put
+        // a failure the spawn arm already logs into the count of writer
+        // failures — which is the one number the detector exists to keep clean.
+        if let Some(ref path) = expected_transcript
+            && let Err(e) = db
+                .set_task_metadata_field(
+                    &task_id,
+                    crate::task_engine::engine::PILOT_TRANSCRIPT_EXPECTED_KEY,
+                    &path.to_string_lossy(),
+                )
+                .await
+        {
+            // Fire-and-forget, as everywhere on this path: an unstamped
+            // dispatch is invisible to the detector, never a blocked dispatch.
+            warn!(
+                task_id = %task_id,
+                error = %e,
+                "mika#2040: failed to stamp expected transcript path; this dispatch \
+                 will not be watched for an empty transcript"
+            );
+        }
+
+        // mika#2249 D1: stamp the worktree declaration path, same fire-and-forget
+        // discipline and the same reason — an unstamped dispatch is invisible to
+        // the silent-stall reaper, never a blocked dispatch.
+        if let Some(ref path) = expected_worktree_file
+            && let Err(e) = db
+                .set_task_metadata_field(
+                    &task_id,
+                    crate::task_engine::engine::DISPATCH_WORKTREE_FILE_KEY,
+                    &path.to_string_lossy(),
+                )
+                .await
+        {
+            warn!(
+                task_id = %task_id,
+                error = %e,
+                "mika#2249: failed to stamp dispatch worktree declaration path; this \
+                 dispatch will not be watched for a silent stall"
+            );
+        }
+
+        // Record PID and process start time for watchdog (#959)
+        if let Some(pid) = child.id() {
+            if let Err(e) = db.set_task_process_id(&task_id, Some(pid as i64)).await {
+                warn!(task_id = %task_id, error = %e, "failed to record process ID for long-running task");
+            }
+            // Store process start time from /proc/<pid>/stat for PID reuse detection.
+            // On non-Linux this returns None and is silently skipped.
+            if let Some(start_time) =
+                crate::task_engine::process_liveness::read_process_start_time(pid)
+                && let Err(e) = db
+                    .set_task_metadata_field(
+                        &task_id,
+                        "process_start_time",
+                        &start_time.to_string(),
+                    )
+                    .await
+            {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "failed to store process start time in task metadata"
+                );
+            }
+        }
+
+        // Write input JSON to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            let input_bytes = serde_json::to_vec(&input).unwrap_or_default();
+            match stdin.write_all(&input_bytes).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "failed to write stdin to long-running exec");
+                }
+            }
+        }
+
+        // Take stderr handle so we can read it (capped) on failure.
+        let stderr_handle = child.stderr.take();
+
+        // Wait for the subprocess to finish — only handle failure here.
+        // On success, the script itself should call `mika ask --task-id`
+        // to deliver results via the callback mechanism.
+        let status = match child.wait().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to wait on long-running exec");
+                match db
+                    .update_task_failed(&task_id, &format!("wait failed: {e}"))
+                    .await
+                {
+                    Ok(true) => {
+                        warn!(task_id = %task_id, error = %e, "long-running exec wait failed")
+                    }
+                    Ok(false) => {
+                        info!(task_id = %task_id, "long-running exec wait failed but task already in terminal state")
+                    }
+                    Err(db_err) => {
+                        warn!(task_id = %task_id, error = %db_err, "failed to mark wait-failed task in DB")
+                    }
+                }
+                return;
+            }
+        };
+
+        if !status.success() {
+            let mut stderr_text = String::new();
+            if let Some(mut stderr) = stderr_handle {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::with_capacity(MAX_OUTPUT_LEN);
+                AsyncReadExt::take(&mut stderr, MAX_OUTPUT_LEN as u64)
+                    .read_to_end(&mut buf)
+                    .await
+                    .ok();
+                stderr_text = String::from_utf8_lossy(&buf).to_string();
+            }
+            let code_display = match status.code() {
+                Some(code) => format!("Exit code: {code}"),
+                None => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        match status.signal() {
+                            Some(sig) => format!("Killed by signal: {sig}"),
+                            None => "Exit code: unknown".to_string(),
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        "Exit code: unknown".to_string()
+                    }
+                }
+            };
+            // mika#2532 D1 — persist the stderr on the row BEFORE trying to
+            // fail the task, and **without any condition on its status**.
+            //
+            // The reflex would be to write this only on the `Ok(false)` arm,
+            // i.e. only when `update_task_failed` matched nothing. It is
+            // refused: that would make observability depend on a concurrent
+            // write, when "what did this process put on its fd 2" has nothing
+            // to do with the state of the row. Writing unconditionally gives
+            // one path, no race, and no branch anyone can forget. On the
+            // non-terminal case the overlap with `tasks.result` is benign —
+            // and the metadata copy is the scrubbed one.
+            //
+            // Scrub first, truncate second: `scrub_secrets` must see whole
+            // tokens, and `truncate_output` is UTF-8 safe. The cap is
+            // `MAX_OUTPUT_LEN`, the same 10 000 bytes `err_msg` below already
+            // uses and that the handlers' own `tail -c 10000` mirrors — one
+            // number in the house for this one thing.
+            let persisted_stderr = if stderr_text.is_empty() {
+                // Omitted, never stored as `""` (mika#2331): a reader who does
+                // not find the key knows fd 2 stayed mute.
+                None
+            } else {
+                Some(truncate_output(&crate::secret_scrubber::scrub_secrets(
+                    &stderr_text,
+                )))
+            };
+            // Fire-and-forget, like the four stamps above: `json_set` raises a
+            // hard error — not a NULL — on a `metadata` that is not valid JSON
+            // (mika#2179), and an observability write must never be able to
+            // break the delivery it observes.
+            let stderr_persisted = match db
+                .set_task_handler_failure(&task_id, &code_display, persisted_stderr.as_deref())
+                .await
+            {
+                Ok(()) => true,
+                Err(db_err) => {
+                    warn!(
+                        event = "long_running_handler_failure_not_persisted",
+                        task_id = %task_id,
+                        error = %db_err,
+                        "mika#2532: could not persist the handler's stderr on the task row; \
+                         the cause of this crash is lost again"
+                    );
+                    false
+                }
+            };
+            let stderr_bytes = stderr_text.len();
+
+            let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
+            match db.update_task_failed(&task_id, &err_msg).await {
+                Ok(true) => warn!(
+                    event = "long_running_handler_exit_nonzero",
+                    task_id = %task_id,
+                    %code_display,
+                    task_was_terminal = false,
+                    stderr_bytes,
+                    stderr_persisted,
+                    "long-running exec failed"
+                ),
+                Ok(false) => {
+                    // The case mika#2532 was filed for: the handler's EXIT trap
+                    // delivered its callback, so the row is already terminal and
+                    // `err_msg` — which names the cause — reaches nothing. It is
+                    // now on the row's metadata, whatever this arm does.
+                    info!(
+                        event = "long_running_handler_exit_nonzero",
+                        task_id = %task_id,
+                        %code_display,
+                        task_was_terminal = true,
+                        stderr_bytes,
+                        stderr_persisted,
+                        "long-running exec exited but task already in terminal state"
+                    )
+                }
+                Err(db_err) => {
+                    warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB")
+                }
+            }
+        }
+        // If success, the script called `mika ask --task-id` which completes the task.
+        // If the script didn't call it, the task will eventually expire via timeout_at.
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::manifest::ToolHandler;
+    use mika_common::claude::ToolDefinition;
+    use std::fs;
+    use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // mika#2368 C2 — la cible PR stampée au spawn
+    // -----------------------------------------------------------------------
+
+    /// Le texte qu'un webhook `review_requested` produit réellement — la forme
+    /// dont `originating_message` est peuplé sur le tour QA qui lance le build.
+    const REVIEW_REQUESTED: &str = "[GitHub] PR review_requested: senara-solutions/mika#2368 — fix(mika#2355) (branch: fix/2368)\nhttps://github.com/senara-solutions/mika/pull/2368\nRequested reviewer: @mika-platform-qa";
+
+    /// **T5** — l'écrivain et le lecteur du stamp sont épinglés **ensemble**.
+    ///
+    /// Le producteur (`resolve_qa_review_pr_target`, ici) et le consommateur
+    /// (`task_engine::dispatcher::read_qa_review_pr_target`, le filet) sont deux
+    /// moitiés d'une même grammaire de fil. Les tester séparément laisserait
+    /// chacun vert pendant qu'ils cessent de se parler — c'est la classe exacte
+    /// que mika#2158 a dû refermer.
+    ///
+    /// Le test reconstruit aussi la cible attendue par `parse_pr_target` sur un
+    /// texte d'événement réel : si `originating_message` était un jour peuplé
+    /// autrement, c'est ici que ça rougit, plutôt que dans un filet qui se
+    /// désarme en silence.
+    #[test]
+    fn mika2368_the_stamp_written_at_spawn_is_the_one_the_net_reads() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        )
+        .expect("un dispatch de build sur une PR doit produire un stamp");
+
+        let read = crate::task_engine::dispatcher::read_qa_review_pr_target(Some(&stamped))
+            .expect("le filet doit relire ce que le spawn a écrit");
+
+        let expected = crate::server::deadline_verdict::parse_pr_target(REVIEW_REQUESTED)
+            .expect("le lecteur unique de la grammaire doit voir cette PR");
+        assert_eq!(read, expected);
+        assert_eq!(read.repo, "senara-solutions/mika");
+        assert_eq!(read.pr_number, 2368);
+    }
+
+    /// **AC6, côté producteur** — trois raisons de ne rien stamper, chacune
+    /// séparément, et aucune ne produit une cible devinée.
+    #[test]
+    fn mika2368_a_non_build_dispatch_is_never_stamped() {
+        for tool in [
+            "run_claude_pilot",
+            "run_claude_pilot_groom",
+            "deploy_mika",
+            "address_pr_comments",
+            "resolve_pr_conflicts",
+        ] {
+            assert!(
+                resolve_qa_review_pr_target(tool, Some(REVIEW_REQUESTED), "trace").is_none(),
+                "{tool} ne doit aucun verdict — le stamper ferait entrer une \
+                 population que le filet n'a pas à couvrir"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2368_a_build_without_an_originating_message_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(crate::qa_build_callback::BUILD_MIKA_TOOL, None, "trace")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mika2368_a_build_whose_message_names_no_pr_is_not_stamped() {
+        assert!(
+            resolve_qa_review_pr_target(
+                crate::qa_build_callback::BUILD_MIKA_TOOL,
+                Some("Salut, tu peux relancer le build ?"),
+                "trace",
+            )
+            .is_none()
+        );
+    }
+
+    /// Le stamp voyage par la **signature unique** de `build_callback_task`, et
+    /// atterrit sur `NewTask.metadata` — jamais par un second constructeur.
+    #[test]
+    fn mika2368_the_stamp_rides_on_the_single_callback_builder() {
+        let stamped = resolve_qa_review_pr_target(
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            Some(REVIEW_REQUESTED),
+            "trace-2368",
+        );
+        let task = build_callback_task(
+            "mika-qa".to_string(),
+            Some("parent".to_string()),
+            crate::qa_build_callback::BUILD_MIKA_TOOL,
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace-2368",
+            stamped,
+        );
+        assert_eq!(
+            task.label,
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            "le label est ce que le discriminant de mika#2355 lit"
+        );
+        let read =
+            crate::task_engine::dispatcher::read_qa_review_pr_target(task.metadata.as_deref())
+                .expect("la row construite par la production doit porter la cible");
+        assert_eq!(read.pr_number, 2368);
+
+        // Et le contrôle négatif sur la même signature : les autres appelants
+        // passent `None`, et la row ne porte alors aucune cible.
+        let other = build_callback_task(
+            "mika-dev".to_string(),
+            Some("parent".to_string()),
+            "run_claude_pilot",
+            &serde_json::json!({"task_id": "parent"}),
+            600,
+            "session",
+            "trace",
+            None,
+        );
+        assert_eq!(
+            crate::task_engine::dispatcher::read_qa_review_pr_target(other.metadata.as_deref()),
+            Err("no_metadata")
+        );
+    }
+
+    #[test]
+    fn sandbox_env_allows_core_vars() {
+        for key in [
+            "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR",
+        ] {
+            assert!(
+                is_sandbox_env_allowed(key),
+                "core var {key} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_allows_prefix_families() {
+        for key in [
+            "LC_MESSAGES",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "NVM_DIR",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+        ] {
+            assert!(
+                is_sandbox_env_allowed(key),
+                "prefix-family var {key} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_denies_secret_vars() {
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "NODE_AUTH_TOKEN",
+            "NPM_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GH_TOKEN",
+            "MIKA_ANTHROPIC_API_KEY",
+            "MIKA_INTERNAL_TOKEN",
+            "MIKA_GITHUB_APP_PRIVATE_KEY",
+        ] {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "secret-shaped var {key} must NOT be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_env_denies_mika_prefixed_vars_even_if_core_listed() {
+        // Defense against a future refactor accidentally adding a MIKA_ key
+        // to the core allowlist: the MIKA_ prefix check runs first.
+        assert!(!is_sandbox_env_allowed("MIKA_PATH"));
+        assert!(!is_sandbox_env_allowed("MIKA_"));
+    }
+
+    /// mika#2354 AC9(a): an absent or empty setting on the spirit side is not
+    /// posed on the child. The shell keeps its own default rather than
+    /// inheriting one, so "unset" and "set to the default" stay distinguishable.
+    #[test]
+    fn mika2354_rescue_verify_env_relays_only_present_non_empty_values() {
+        let absent = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| None);
+        assert!(
+            absent.is_empty(),
+            "an unset setting must not be posed on the child, got {absent:?}"
+        );
+
+        let empty = relayed_env_pairs(RESCUE_VERIFY_ENV, |_| Some(String::new()));
+        assert!(
+            empty.is_empty(),
+            "an empty setting must not be posed on the child, got {empty:?}"
+        );
+
+        let one = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| {
+            (k == "MIKA_RESCUE_VERIFY_ENABLED").then(|| "0".to_string())
+        });
+        assert_eq!(one, vec![("MIKA_RESCUE_VERIFY_ENABLED", "0".to_string())]);
+
+        let both = relayed_env_pairs(RESCUE_VERIFY_ENV, |k| match k {
+            "MIKA_RESCUE_VERIFY_ENABLED" => Some("1".to_string()),
+            "MIKA_RESCUE_VERIFY_BUDGET_SECS" => Some("300".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("MIKA_RESCUE_VERIFY_ENABLED", "1".to_string()),
+                ("MIKA_RESCUE_VERIFY_BUDGET_SECS", "300".to_string()),
+            ]
+        );
+    }
+
+    /// mika#2278 R7: the retry's kill-switch must actually reach the shell that
+    /// reads it.
+    ///
+    /// `sandboxed_pilot_env` does `env_clear()` then re-adds a **positive**
+    /// allowlist, so nothing `MIKA_*` crosses by inheritance. Without the
+    /// explicit relay, `MIKA_ARCH_ASK_RETRY=0` set on the service would be read
+    /// by nobody and the budget would be undisarmable without a redeploy —
+    /// mika#2165's decorative setting, and a plan requirement silently false.
+    ///
+    /// The "present and non-empty only" rule matters here as much as for its
+    /// sibling: `MIKA_ARCH_ASK_RETRY_DELAY_SECS=""` is the shape a half-written
+    /// `.env` line takes, and relaying it would make the shell's three-tier
+    /// reader warn about a value the operator never set.
+    #[test]
+    fn mika2278_arch_ask_retry_env_relays_only_present_non_empty_values() {
+        assert!(relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| None).is_empty());
+        assert!(
+            relayed_env_pairs(ARCH_ASK_RETRY_ENV, |_| Some(String::new())).is_empty(),
+            "an empty setting must stay an absence on the child"
+        );
+
+        let disarmed = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| {
+            (k == "MIKA_ARCH_ASK_RETRY").then(|| "0".to_string())
+        });
+        assert_eq!(disarmed, vec![("MIKA_ARCH_ASK_RETRY", "0".to_string())]);
+
+        let both = relayed_env_pairs(ARCH_ASK_RETRY_ENV, |k| match k {
+            "MIKA_ARCH_ASK_RETRY" => Some("1".to_string()),
+            "MIKA_ARCH_ASK_RETRY_DELAY_SECS" => Some("45".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("MIKA_ARCH_ASK_RETRY", "1".to_string()),
+                ("MIKA_ARCH_ASK_RETRY_DELAY_SECS", "45".to_string()),
+            ]
+        );
+    }
+
+    /// mika#2354 AC9(b): the positive allowlist stays the guard and the explicit
+    /// injection stays the named exception. Adding either name to
+    /// [`SANDBOX_ENV_CORE_ALLOWLIST`] — or covering it with a new entry in
+    /// [`SANDBOX_ENV_ALLOWED_PREFIXES`] — would make the settings arrive by
+    /// inheritance, which is the shape mika#2165 named a decorative setting:
+    /// the channel would then differ from the one this ticket documented, and
+    /// nothing would say so.
+    ///
+    /// mika#2278 joins [`ARCH_ASK_RETRY_ENV`] to the same population: it reaches
+    /// `dispatch-lib.sh` by the same named exception and must stay outside the
+    /// allowlist for the same reason.
+    #[test]
+    fn mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist() {
+        for key in RESCUE_VERIFY_ENV.iter().chain(ARCH_ASK_RETRY_ENV.iter()) {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
+    }
+
+    /// mika#2508 : les deux réglages du canal pilote atteignent
+    /// `dispatch-lib.sh` par injection explicite, et JAMAIS par héritage.
+    ///
+    /// Extension de la population de
+    /// `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`, et
+    /// l'inverse exact de l'assertion que le DoD du ticket demandait :
+    /// « `PILOT_MAX_TURNS` est admise par `is_sandbox_env_allowed` ». Ce remède
+    /// a été **refusé et la divergence ratifiée** (opérateur, 2026-09-24
+    /// 08:10Z) — l'allowlist est la garde de confinement du pilote, pas la
+    /// poubelle des réglages. La propriété finale attestée est la même : la
+    /// variable atteint le child.
+    #[test]
+    fn mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist() {
+        for key in PILOT_DISPATCH_ENV {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
+    }
+
+    /// mika#2508 : le relais préserve le ROLLBACK.
+    ///
+    /// `PILOT_MAX_TURNS=""` doit arriver sur le child comme une variable
+    /// **DÉFINIE et vide** — `_pilot_max_turns` la lit avec
+    /// `${PILOT_MAX_TURNS+set}` et en fait le rollback (drapeau non passé,
+    /// `source=env`), pas le défaut de flotte. L'omettre replierait le palier
+    /// « défini vide » sur le palier « non défini », deux états que le shell a
+    /// délibérément construits distincts.
+    #[test]
+    fn mika2508_an_empty_pilot_knob_is_relayed_not_dropped() {
+        let rollback = relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| {
+            (k == "PILOT_MAX_TURNS").then(String::new)
+        });
+        assert_eq!(
+            rollback,
+            vec![("PILOT_MAX_TURNS", String::new())],
+            "an empty value is the documented rollback and must be posed on the \
+             child as a DEFINED-and-empty variable"
+        );
+
+        // Et le contrôle qui rend l'assertion ci-dessus signifiante : le helper
+        // d'origine, lui, laisse tomber cette même valeur. Les deux populations
+        // divergent sur le vide, à dessein.
+        assert!(
+            relayed_env_pairs(PILOT_DISPATCH_ENV, |k| {
+                (k == "PILOT_MAX_TURNS").then(String::new)
+            })
+            .is_empty(),
+            "relayed_env_pairs must keep dropping the empty value for its own \
+             two families — the divergence is the point, not an oversight"
+        );
+    }
+
+    /// mika#2508 : le pendant absent/présent du relais.
+    ///
+    /// Une variable non posée sur le service n'est pas posée sur le child : le
+    /// shell garde ses propres défauts (désarmé, `/var/log/claude-pilot`) au
+    /// lieu d'en hériter un.
+    #[test]
+    fn mika2508_an_absent_pilot_knob_is_not_posed_on_the_child() {
+        assert!(
+            relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |_| None).is_empty(),
+            "an unset setting must not be posed on the child"
+        );
+
+        let both = relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| match k {
+            "PILOT_MAX_TURNS" => Some("150".to_string()),
+            "PILOT_LOG_DIR" => Some("/var/log/claude-pilot".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            vec![
+                ("PILOT_MAX_TURNS", "150".to_string()),
+                ("PILOT_LOG_DIR", "/var/log/claude-pilot".to_string()),
+            ]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2508 R4/R5 — le scan de classe.
+    //
+    // Toute variable posée sur l'environnement du service, lue par
+    // `dispatch-lib.sh`, et ni allowlistée ni relayée, est INERTE. Le défaut
+    // mesuré (`PILOT_MAX_TURNS`) est un membre de cette classe ; le scan la rend
+    // détectable au lieu de laisser le prochain réglage la rejouer.
+    // ---------------------------------------------------------------------
+
+    /// Noms internes au shell, ou fournis par l'environnement d'exécution sans
+    /// jamais être un réglage de dispatch. Liste **explicite et commentée**,
+    /// jamais devinée : plusieurs de ces noms sont par ailleurs dans
+    /// [`SANDBOX_ENV_CORE_ALLOWLIST`] et y passeraient le terme 6 sans rien
+    /// attester, ce qui rendrait le scan vert pour la mauvaise raison.
+    const SHELL_BUILTIN_NAMES: &[&str] = &[
+        // Positionnels et internes de bash.
+        "IFS",
+        "RANDOM",
+        "SECONDS",
+        "LINENO",
+        "FUNCNAME",
+        "BASHPID",
+        "BASH_SOURCE",
+        "BASH_VERSION",
+        "BASH_XTRACEFD",
+        "OPTARG",
+        "OPTIND",
+        "REPLY",
+        "PPID",
+        "UID",
+        "EUID",
+        "SHLVL",
+        "PS1",
+        "PS4",
+        "PWD",
+        "OLDPWD",
+        // Fournis par l'environnement d'exécution, déjà couverts par
+        // l'allowlist ou sans rapport avec un réglage de dispatch.
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "HOSTNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "TZ",
+        "COLUMNS",
+        "LINES",
+        "EDITOR",
+        "GIT_DIR",
+        "SSH_AUTH_SOCK",
+    ];
+
+    fn dispatch_lib_path() -> std::path::PathBuf {
+        bundled_skills_dir().join("_shared/dispatch-lib.sh")
+    }
+
+    /// `skills/bundled/`, résolu depuis le manifeste du crate.
+    ///
+    /// Un seul site, sur le modèle de [`dispatch_lib_path`] : quatre scans
+    /// composent désormais ce chemin, et quatre littéraux dérivent en silence le
+    /// jour où l'arborescence bouge — chacun se lisant alors comme un scan propre
+    /// qui ne regarde rien.
+    fn bundled_skills_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bundled")
+    }
+
+    /// Découpe une ligne en segments de commande sur `;`, `&&`, `||`, `{`, `|`.
+    ///
+    /// Le découpage EST le terme 4 : une écriture ne compte que si elle est en
+    /// tête de segment, ce qui est exactement « en début de ligne ou après un
+    /// séparateur ». Il rend aussi le terme 4bis décidable sans ambiguïté — la
+    /// self-référence se lit dans la partie droite de CE segment, pas quelque
+    /// part sur la ligne.
+    fn command_segments(line: &str) -> Vec<String> {
+        // `${` est MASQUÉ avant le découpage, et ce masque est le détail qui
+        // décide de tout : `{` est un séparateur de commande légitime
+        // (`{ FOO=1; }`), mais il ouvre aussi chaque lecture `${VAR}`. Découper
+        // dessus naïvement coupe la ligne entre le `$` et le nom, et le scan ne
+        // voit plus AUCUNE lecture braces — mesuré : la population tombait de
+        // dix-huit à trois membres, sans que rien ne le dise.
+        const MASK: &str = "\u{0}";
+        let masked = line.replace("${", MASK);
+        let sep = regex::Regex::new(r"[;{}()&|]").unwrap();
+        sep.split(&masked).map(|s| s.replace(MASK, "${")).collect()
+    }
+
+    /// Les lectures de variables d'environnement d'un segment (terme 3).
+    ///
+    /// Majuscule initiale obligatoire : la convention du fichier réserve
+    /// `_PILOT_*` / `_ARCH_*` aux variables internes, qui sont de toute façon
+    /// écrites (terme 4).
+    fn env_reads_in(segment: &str) -> Vec<String> {
+        let read = regex::Regex::new(r"\$\{?([A-Z][A-Z0-9_]*)").unwrap();
+        read.captures_iter(segment)
+            .map(|c| c[1].to_string())
+            .collect()
+    }
+
+    /// L'écriture en tête de segment, si elle existe, et sa partie droite.
+    fn env_write_in(segment: &str) -> Option<(String, String)> {
+        let assign = regex::Regex::new(
+            r"^\s*(?:export\s+|local\s+|declare\s+(?:-[a-zA-Z]+\s+)?|readonly\s+)?([A-Z][A-Z0-9_]*)\+?=(.*)$",
+        )
+        .unwrap();
+        if let Some(c) = assign.captures(segment) {
+            return Some((c[1].to_string(), c[2].to_string()));
+        }
+        // `read … VAR` et `for VAR in` : des écritures sans partie droite, donc
+        // jamais self-référentielles.
+        let bound =
+            regex::Regex::new(r"^\s*(?:read\s+(?:-[a-zA-Z]+\s+)*|for\s+)([A-Z][A-Z0-9_]*)\b")
+                .unwrap();
+        bound
+            .captures(segment)
+            .map(|c| (c[1].to_string(), String::new()))
+    }
+
+    /// Le prédicat, figé en six termes (mika#2508 § 5.3).
+    ///
+    /// Un scan approximatif sur ce fichier est faux dans les deux sens — c'est
+    /// ce que mika#2496 U3 a mesuré sur un prédicat voisin.
+    fn external_env_reads(script: &str) -> std::collections::BTreeSet<String> {
+        let mut read_names = std::collections::BTreeSet::new();
+        let mut written_names = std::collections::BTreeSet::new();
+
+        for raw in script.lines() {
+            // Terme 1 : les commentaires sont retirés AVANT toute extraction.
+            if raw.trim_start().starts_with('#') {
+                continue;
+            }
+            // Terme 2 : les `$` échappés sont retirés avant extraction. C'est le
+            // faux positif `\$MIKA_SPIRIT_LOG_FILE` d'une chaîne de prose
+            // destinée à un corps de PR — classe mika#2050 / mika#2201.
+            let line = raw.replace("\\$", "");
+
+            for segment in command_segments(&line) {
+                let reads = env_reads_in(&segment);
+                let write = env_write_in(&segment);
+
+                if let Some((name, rhs)) = write {
+                    // Terme 4bis : une écriture dont la partie droite référence
+                    // la variable écrite ne l'évince PAS — c'est l'idiome
+                    // canonique d'un knob opérateur avec défaut
+                    // (`export VAR="${VAR:-défaut}"`), pas une variable interne.
+                    let self_referential = env_reads_in(&rhs).contains(&name);
+                    if !self_referential {
+                        // Terme 4 : l'écriture évince.
+                        written_names.insert(name);
+                    }
+                }
+
+                read_names.extend(reads);
+            }
+        }
+
+        // Terme 6 : population = lues − (écrites non self-référentielles) − builtins.
+        read_names
+            .into_iter()
+            .filter(|n| !written_names.contains(n))
+            .filter(|n| !SHELL_BUILTIN_NAMES.contains(&n.as_str()))
+            .collect()
+    }
+
+    /// Tous les noms qui traversent le child de dispatch, quel que soit le
+    /// mécanisme : l'allowlist positive, ou l'un des relais explicites.
+    ///
+    /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
+    /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
+    /// `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV` et
+    /// `PLATFORM_DIR_RELAY_KEY` sont des **scalaires**, et `GH_TOKEN` est un
+    /// littéral injecté en clair dans [`spawn_long_running_exec`]. Un
+    /// `.iter().chain(…)` naïf sur les six ne compile pas.
+    ///
+    /// `PLATFORM_DIR_RELAY_KEY` (mika#2536) est ici pour une raison précise :
+    /// `dispatch-lib.sh` le lit sous la forme self-référentielle
+    /// `PLATFORM_DIR="${PLATFORM_DIR:-…}"`, donc il **entre** dans la population
+    /// par le terme 4bis du prédicat. Sans cette ligne il apparaîtrait comme un
+    /// orphelin et ferait rougir le test alors même qu'il traverse.
+    fn reaches_dispatch_child(name: &str) -> bool {
+        if is_sandbox_env_allowed(name) {
+            return true;
+        }
+        PILOT_DISPATCH_ENV.contains(&name)
+            || RESCUE_VERIFY_ENV.contains(&name)
+            || ARCH_ASK_RETRY_ENV.contains(&name)
+            || name == DISPATCH_WORKTREE_ENV
+            || name == PILOT_TRANSCRIPT_ENV
+            || name == PLATFORM_DIR_RELAY_KEY
+            || name == "GH_TOKEN"
+    }
+
+    /// Variables lues par `dispatch-lib.sh` qui ne traversent PAS le child de
+    /// dispatch et dont l'inertie est connue, datée et suivie (mika#2508 § 2).
+    ///
+    /// **Ce n'est pas une liste d'exemptions permanentes.** Chaque entrée est
+    /// une inertie mesurée, dont la résolution est une décision de canal que
+    /// mika#2508 n'a pas prise — l'une d'elles, `MIKA_PILOT_SANDBOX`, donnerait
+    /// à l'environnement du service un levier pour **désarmer le confinement
+    /// bwrap**, ce qui est un arbitrage de sûreté qui appartient à un ticket
+    /// qui le pèse, jamais à un effet de bord. Suivi porté par l'umbrella
+    /// mika#2491.
+    ///
+    /// Quand une entrée est tranchée, on la RELAIE et on retire sa ligne — on
+    /// n'élargit pas la liste.
+    ///
+    /// **Elle a décru une fois, et c'est l'effet que son doc-comment annonçait.**
+    /// mika#2536 a tranché `MIKA_PLATFORM_DIR` : la variable est désormais
+    /// relayée sous le nom `PLATFORM_DIR` ([`inject_platform_dir_env`]) et sa
+    /// ligne est partie. Ce retrait n'était pas un nettoyage opportuniste —
+    /// l'assertion auto-nettoyante plus bas l'**exigeait** dès que
+    /// `dispatch-lib.sh` a cessé de lire le nom préfixé.
+    const DISPATCH_ENV_KNOWN_INERT: &[(&str, &str)] = &[
+        (
+            "MIKA_PILOT_SANDBOX",
+            "mika#2491 — kill-switch du confinement bwrap ; le relayer donnerait \
+             à l'env du service un levier de désarmement : décision de sûreté, \
+             pas de canal",
+        ),
+        (
+            "MIKA_PILOT_EGRESS_LOG_DIR",
+            "mika#2491 — puits du journal du relais d'egress",
+        ),
+        (
+            "MIKA_HOME",
+            "mika#2491 — l'epoch mika#2026 s'écrit sous $HOME/.mika",
+        ),
+        ("CLAUDE_PILOT_MIN_TOOL_CALLS", "mika#2491 — seuil figé à 3"),
+    ];
+
+    /// mika#2508 R4 — l'angle mort de classe est rendu détectable.
+    ///
+    /// Toute variable opérateur lue par `dispatch-lib.sh` doit être admise par
+    /// [`is_sandbox_env_allowed`], couverte par un relais, ou porter une
+    /// exception nommée dans [`DISPATCH_ENV_KNOWN_INERT`].
+    ///
+    /// **Quand ce test tire, on RELAIE la variable ou on la nomme — on n'élargit
+    /// pas l'allowlist du bac à sable** (mika#2354 AC9(b) : l'allowlist est la
+    /// garde de confinement, pas la poubelle des réglages).
+    #[test]
+    fn mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named() {
+        let path = dispatch_lib_path();
+
+        // R5 — anti-vacuité, AVANT toute autre assertion. Un scan dont le
+        // chemin pourrit, ou dont le prédicat se resserre trop, passe en
+        // regardant zéro ligne et se lit exactement comme un scan propre
+        // (mika#2103, mika#2205).
+        assert!(
+            path.is_file(),
+            "dispatch-lib.sh introuvable à {} — ce scan ne regarde rien",
+            path.display()
+        );
+        let script = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            script.len() > 100_000,
+            "dispatch-lib.sh fait {} octets : trop petit pour être le vrai \
+             fichier, le scan ne regarde rien",
+            script.len()
+        );
+        let population = external_env_reads(&script);
+        assert!(
+            population.len() >= 8,
+            "population extraite = {} membres ({population:?}) : le prédicat \
+             s'est resserré et le scan ne couvre plus la classe",
+            population.len()
+        );
+
+        let named: std::collections::BTreeSet<&str> =
+            DISPATCH_ENV_KNOWN_INERT.iter().map(|(n, _)| *n).collect();
+
+        let orphans: Vec<&String> = population
+            .iter()
+            .filter(|n| !reaches_dispatch_child(n) && !named.contains(n.as_str()))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "ces variables sont lues par dispatch-lib.sh et n'atteignent pas le \
+             child de dispatch : {orphans:?}. Elles sont INERTES. Relayez-les \
+             (PILOT_DISPATCH_ENV / un injecteur dédié) ou nommez l'inertie dans \
+             DISPATCH_ENV_KNOWN_INERT avec sa raison et son suivi — n'ajoutez \
+             PAS de nom à SANDBOX_ENV_CORE_ALLOWLIST."
+        );
+
+        // Assertion auto-nettoyante : une exception qui n'a plus d'objet —
+        // variable retirée de `dispatch-lib.sh`, ou devenue relayée /
+        // allowlistée — fait rougir. C'est ce qui empêche l'allowlist de
+        // survivre à sa raison d'être, et ce qui rend le jour de la réparation
+        // visible au lieu de silencieux.
+        for (name, reason) in DISPATCH_ENV_KNOWN_INERT {
+            assert!(
+                population.contains(*name),
+                "retirer cette ligne de DISPATCH_ENV_KNOWN_INERT : {name} n'est \
+                 plus lue par dispatch-lib.sh ({reason})"
+            );
+            assert!(
+                !reaches_dispatch_child(name),
+                "retirer cette ligne de DISPATCH_ENV_KNOWN_INERT : {name} \
+                 atteint désormais le child, l'exception n'a plus d'objet \
+                 ({reason})"
+            );
+        }
+    }
+
+    /// mika#2508 R4 — les six contrôles négatifs du prédicat.
+    ///
+    /// Construits sur les formes **réellement présentes** dans
+    /// `dispatch-lib.sh`, jamais sur le vrai fichier (qui changera). N1, N3, N4
+    /// et N6 ont été vus ROUGES en retirant leur terme respectif avant d'être
+    /// déclarés verts : un contrôle négatif jamais vu rouge n'atteste rien.
+    #[test]
+    fn mika2508_the_six_terms_of_the_predicate_each_have_a_negative_control() {
+        let has = |script: &str, name: &str| external_env_reads(script).contains(name);
+
+        // N1 — le cas nominal : un knob opérateur avec défaut.
+        assert!(
+            has(r#"foo="${OPERATOR_KNOB:-x}""#, "OPERATOR_KNOB"),
+            "N1 : une lecture nue doit entrer dans la population"
+        );
+
+        // N2 — terme 4 : l'écriture évince. La variable n'attend rien de
+        // l'extérieur, elle est interne au script.
+        assert!(
+            !has(r#"OPERATOR_KNOB=3; echo "$OPERATOR_KNOB""#, "OPERATOR_KNOB"),
+            "N2 : une variable écrite dans le fichier sort de la population"
+        );
+
+        // N3 — terme 1 : le commentaire est retiré avant extraction.
+        assert!(
+            !has(r#"# echo "$OPERATOR_KNOB""#, "OPERATOR_KNOB"),
+            "N3 : un commentaire n'est pas une lecture"
+        );
+
+        // N4 — terme 2 : la prose échappée. C'est le faux positif
+        // `\$MIKA_SPIRIT_LOG_FILE` d'une chaîne destinée à un corps de PR —
+        // classe mika#2050 (le Signal S) et mika#2201.
+        assert!(
+            !has(r#"printf 'grep x \$OPERATOR_KNOB'"#, "OPERATOR_KNOB"),
+            "N4 : un `$` échappé dans de la prose n'est pas une lecture"
+        );
+
+        // N5 — terme 3 : la convention interne du fichier (`_PILOT_*`,
+        // `_ARCH_*`) est hors population.
+        assert!(
+            external_env_reads(r#"echo "$_INTERNAL""#).is_empty(),
+            "N5 : une variable interne (préfixe `_`) n'est pas un réglage opérateur"
+        );
+
+        // N6 — terme 4bis, et le plus important des six : l'écriture
+        // self-référentielle n'évince PAS. Sans ce terme, le scan serait rouge
+        // au premier `cargo test` sur `CLAUDE_PILOT_MIN_TOOL_CALLS`
+        // (`export CLAUDE_PILOT_MIN_TOOL_CALLS="${CLAUDE_PILOT_MIN_TOOL_CALLS:-3}"`,
+        // dispatch-lib.sh) — et de la pire façon : l'assertion auto-nettoyante
+        // aurait alors accusé l'entrée de DISPATCH_ENV_KNOWN_INERT de ne
+        // correspondre à rien, rendant le plan contradictoire avec son propre
+        // prédicat.
+        assert!(
+            has(r#"export KNOB="${KNOB:-3}""#, "KNOB"),
+            "N6 : `export VAR=\"${{VAR:-défaut}}\"` est l'idiome canonique d'un \
+             knob opérateur avec défaut, pas une variable interne"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // mika#2536 — le relais de la racine plateforme, et les deux scans de classe
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// V8 — le relais **traduit** le nom. C'est la propriété porteuse, et un
+    /// test sur le nom du child seul ne la verrait pas.
+    #[test]
+    fn mika2536_the_relay_translates_the_name() {
+        let pair = relayed_platform_dir_pair(|k| {
+            assert_eq!(
+                k, "MIKA_PLATFORM_DIR",
+                "le relais doit lire le nom que l'OPÉRATEUR pose (mika#2491), \
+                 jamais celui que le child reçoit — sinon l'opérateur devrait \
+                 renommer sa variable sans que rien ne le lui dise"
+            );
+            Some("/srv/plateforme".to_string())
+        });
+        assert_eq!(
+            pair,
+            Some(("PLATFORM_DIR", "/srv/plateforme".to_string())),
+            "le child doit recevoir le nom NON préfixé : `is_sandbox_env_allowed` \
+             refuse tout `MIKA_*`, donc un nom préfixé ne traverserait pas"
+        );
+    }
+
+    /// V8 — absence et valeur vide sont toutes deux des no-op.
+    ///
+    /// Le shell n'a **aucun palier documenté pour le vide** : ses dix sites
+    /// écrivent `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où vide et
+    /// absent rendent le même défaut. C'est ce qui distingue ce relais de
+    /// `PILOT_DISPATCH_ENV`, dont le vide EST le rollback (mika#2508).
+    #[test]
+    fn mika2536_an_absent_or_empty_setting_is_a_no_op() {
+        assert!(
+            relayed_platform_dir_pair(|_| None).is_none(),
+            "absence ⇒ no-op, le child garde son propre défaut"
+        );
+        assert!(
+            relayed_platform_dir_pair(|_| Some(String::new())).is_none(),
+            "valeur vide ⇒ no-op : le shell rendrait le même défaut, donc poser \
+             le vide ne changerait rien au child tout en rendant « réglage \
+             absent » et « réglage posé vide » indistinguables côté spirit"
+        );
+    }
+
+    /// Le relais est appelé APRÈS [`sandboxed_pilot_env`].
+    ///
+    /// Scan de source, et il n'est pas décoratif : l'`env_clear()` du bac à
+    /// sable efface tout ce qui est injecté avant lui. Un appel déplacé au-dessus
+    /// **ne casse aucune assertion** — le dispatch continue de tourner, la
+    /// variable retombe simplement sur son défaut, en silence. C'est exactement
+    /// la classe que ce ticket ferme, reproduite un cran plus haut.
+    #[test]
+    fn mika2536_the_relay_runs_after_the_env_sandbox() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("skills")
+            .join("executor.rs");
+        let whole = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", path.display()));
+
+        // Tronqué au premier `#[cfg(test)]` — motif `production_sources`
+        // (mika#2201). Sans ça le scan se compte lui-même : les deux aiguilles
+        // ci-dessous sont des littéraux de CE test, et le compte rendrait 2.
+        let cut = whole
+            .find("#[cfg(test)]")
+            .expect("executor.rs porte un module de test : sans lui, le scan se compte lui-même");
+        let src = &whole[..cut];
+
+        let sandbox = "sandboxed_pilot_env(&mut cmd);";
+        let relay = "inject_platform_dir_env(&mut cmd);";
+
+        // Anti-vacuité AVANT l'ordre : un scan dont les deux aiguilles ont
+        // disparu passerait en ne regardant rien (mika#2103, mika#2205).
+        assert_eq!(
+            src.matches(sandbox).count(),
+            1,
+            "un seul site doit appeler `{sandbox}` — si ce compte bouge, l'ordre \
+             ci-dessous ne décide plus de rien"
+        );
+        assert_eq!(
+            src.matches(relay).count(),
+            1,
+            "un seul site doit appeler `{relay}` ; s'il a disparu, le réglage \
+             `MIKA_PLATFORM_DIR` est redevenu inerte et RIEN ne le dirait"
+        );
+
+        assert!(
+            src.find(sandbox) < src.find(relay),
+            "`{relay}` doit venir APRÈS `{sandbox}` : l'`env_clear()` du bac à \
+             sable efface toute injection antérieure, et le dispatch resterait \
+             vert en retombant sur le défaut du shell"
+        );
+    }
+
+    /// La bibliothèque partagée que T1 ne concatène PAS, et c'est un
+    /// **PÉRIMÈTRE**, jamais une allowlist de sites.
+    ///
+    /// `_shared/dispatch-lib.sh` a son propre scan
+    /// ([`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`])
+    /// et sa propre liste d'inerties **nommées et documentées**
+    /// ([`DISPATCH_ENV_KNOWN_INERT`], trois décisions de canal que mika#2508 n'a
+    /// pas prises). La concaténer ici ferait remonter ces trois inerties dans T1,
+    /// dont l'allowlist est vide par contrat — T1 naîtrait rouge, et un lint
+    /// rouge à sa naissance se fait désarmer. Les deux scans **partitionnent** la
+    /// population : les handlers et leurs bibliothèques ici, `dispatch-lib.sh` là.
+    ///
+    /// La distinction périmètre/allowlist est celle que
+    /// `scripts/canonical-tokens-survey.sh` écrit pour ses `SOURCE_SCANNERS`, et
+    /// elle est vérifiée dans les deux sens : un périmètre qui survit à son
+    /// fichier est un tiroir.
+    const T1_PERIMETER_EXCLUDED_SHARED: &[&str] = &["dispatch-lib.sh"];
+
+    /// Les scripts de handler des skills bundled, **concaténés avec les
+    /// bibliothèques `_shared/` qu'ils sourcent**.
+    ///
+    /// Population **intentionnellement tous les handlers**, pas seulement les
+    /// long-running : les deux chemins d'exécution retirent les `MIKA_*` du
+    /// child — `sandboxed_pilot_env` par allowlist positive, `scrub_mika_env_vars`
+    /// par denylist de préfixe — donc un `${MIKA_…:-…}` y est une branche morte
+    /// dans les deux cas.
+    ///
+    /// **La concaténation n'est pas un raffinement, c'est une condition de
+    /// justesse, et elle a été trouvée par mesure.** [`external_env_reads`] ne
+    /// suit les écritures qu'à l'intérieur d'un fichier, donc une variable
+    /// **écrite par une bibliothèque sourcée** et lue par le handler passe pour
+    /// externe. Premier `cargo test` de T1 : six faux positifs — `CWD_REFUSAL`
+    /// (écrit par `_shared/cwd-guard.sh`) et les quatre `PR_PUSH_GUARD_*` (écrits
+    /// par `_shared/pr-push-guard.sh`). Le remède est structurel — scanner le
+    /// script **tel qu'il s'exécute** — jamais une entrée d'allowlist.
+    fn bundled_handler_scripts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let shared_ref = regex::Regex::new(r"_shared/([A-Za-z0-9._-]+\.sh)").unwrap();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let handlers = dir.join("handlers");
+            let Ok(files) = std::fs::read_dir(&handlers) else {
+                continue;
+            };
+            for file in files {
+                let path = file.expect("entrée de répertoire lisible").path();
+                if path.extension().is_none_or(|e| e != "sh") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&base)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                // Le script TEL QU'IL S'EXÉCUTE : son texte plus celui des
+                // bibliothèques partagées qu'il nomme.
+                let mut unit = content.clone();
+                let mut seen = std::collections::BTreeSet::new();
+                for cap in shared_ref.captures_iter(&content) {
+                    let lib = cap[1].to_string();
+                    if T1_PERIMETER_EXCLUDED_SHARED.contains(&lib.as_str())
+                        || !seen.insert(lib.clone())
+                    {
+                        continue;
+                    }
+                    if let Ok(lib_src) = std::fs::read_to_string(base.join("_shared").join(&lib)) {
+                        unit.push('\n');
+                        unit.push_str(&lib_src);
+                    }
+                }
+                out.push((rel, unit));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Les lectures orphelines d'un ensemble de scripts : lues, n'atteignant pas
+    /// le child, non nommées.
+    ///
+    /// Réutilise [`external_env_reads`] — le prédicat figé en six termes de
+    /// mika#2508 — plutôt qu'un second, parce qu'un second prédicat répondant à
+    /// la même question est la divergence que `grooming_marker` a dû graver une
+    /// fois (mika#2158).
+    fn orphan_env_reads(
+        scripts: &[(String, String)],
+        named: &std::collections::BTreeSet<&str>,
+    ) -> Vec<String> {
+        let mut orphans = Vec::new();
+        for (rel, content) in scripts {
+            for name in external_env_reads(content) {
+                if reaches_dispatch_child(&name) || named.contains(name.as_str()) {
+                    continue;
+                }
+                orphans.push(format!("{rel}: {name}"));
+            }
+        }
+        orphans
+    }
+
+    /// **Livrée vide, et elle le reste.** Quand le scan tire, on ROUTE le site
+    /// vers le relais `PLATFORM_DIR` ; on n'ajoute pas de ligne ici. Un handler
+    /// qui a besoin d'un `MIKA_*` a besoin d'un relais, pas d'une dérogation
+    /// (mika#2201 § D5/D6), et `DISPATCH_ENV_KNOWN_INERT` reste le seul endroit
+    /// où une inertie peut être **nommée**, avec sa raison et son suivi.
+    const HANDLER_ENV_KNOWN_INERT: &[(&str, &str)] = &[];
+
+    /// mika#2536 R4/R7 — T1 : aucun handler ne lit une variable qui ne peut pas
+    /// l'atteindre.
+    ///
+    /// C'est la classe F4 du plan : **une variable qui ne peut pas traverser,
+    /// lue comme si elle pouvait**. Un test comportemental ne peut pas la voir —
+    /// la branche morte ne rend AUCUNE décision fausse, elle rend un réglage
+    /// inopérant en silence, et toutes les assertions existantes restent vertes.
+    ///
+    /// Le pendant de ce scan pour `_shared/dispatch-lib.sh` est
+    /// [`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`],
+    /// dont l'allowlist est **non vide et documentée** (trois décisions de canal
+    /// que mika#2508 n'a pas prises). Les deux moitiés couvrent les dix sites que
+    /// mika#2536 a corrigés : huit ici, deux là.
+    #[test]
+    fn mika2536_no_handler_reads_a_variable_that_cannot_reach_it() {
+        let scripts = bundled_handler_scripts();
+
+        // Anti-vacuité AVANT toute autre assertion (mika#2103, mika#2205).
+        // Sept à `d4514180` : les six `*/handlers/run.sh` (address-pr-comments,
+        // build-mika, deploy-mika, dev-groom, dev-pilot, resolve-pr-conflicts)
+        // plus `qa-review/handlers/qa_pr_view.sh`.
+        assert!(
+            scripts.len() >= 7,
+            "seulement {} handler(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            scripts.len()
+        );
+        let total: usize = scripts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 20_000,
+            "{total} octets de handlers au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let named: std::collections::BTreeSet<&str> =
+            HANDLER_ENV_KNOWN_INERT.iter().map(|(n, _)| *n).collect();
+        let orphans = orphan_env_reads(&scripts, &named);
+
+        assert!(
+            orphans.is_empty(),
+            "ces variables sont lues par un handler de skill et n'atteignent PAS \
+             le child : {orphans:?}. Elles sont INERTES — l'environnement du child \
+             est reconstruit par `sandboxed_pilot_env` (allowlist positive) ou \
+             dépouillé par `scrub_mika_env_vars` (denylist `MIKA_*`), donc la \
+             branche `${{VAR:-défaut}}` ne peut QUE prendre son défaut.\n\
+             RÉSOLUTION : relayer la variable sous un nom non préfixé \
+             (`inject_platform_dir_env` est le modèle) et faire lire ce nom au \
+             handler. N'ajoutez PAS de nom à SANDBOX_ENV_CORE_ALLOWLIST, et \
+             n'allowlistez pas le site."
+        );
+    }
+
+    /// Le périmètre de T1 ne survit pas à son fichier.
+    ///
+    /// Comparaison dans les deux sens, motif `check_perimeter_entries` du survey
+    /// mika#2201 : une exclusion qui ne nomme plus rien est un tiroir, et elle
+    /// masquerait en silence la population qu'elle prétendait déléguer.
+    #[test]
+    fn mika2536_the_t1_perimeter_names_only_files_that_exist() {
+        let shared = bundled_skills_dir().join("_shared");
+        assert!(
+            !T1_PERIMETER_EXCLUDED_SHARED.is_empty(),
+            "le périmètre est vide : la délégation à mika#2508 n'existe plus"
+        );
+        for lib in T1_PERIMETER_EXCLUDED_SHARED {
+            assert!(
+                shared.join(lib).is_file(),
+                "T1_PERIMETER_EXCLUDED_SHARED nomme `{lib}`, qui n'existe pas sous \
+                 {} — retirez l'entrée ou réparez le chemin",
+                shared.display()
+            );
+        }
+    }
+
+    /// R7 — l'allowlist de T1 est livrée vide et le reste.
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323) ; cette assertion est ce qui rend le dépôt visible.
+    #[test]
+    fn mika2536_the_handler_inert_allowlist_is_empty() {
+        assert!(
+            HANDLER_ENV_KNOWN_INERT.is_empty(),
+            "HANDLER_ENV_KNOWN_INERT n'est plus vide : {:?}. La résolution d'un \
+             site qui tire est de le ROUTER vers le relais, jamais de l'exempter \
+             (mika#2201 § D5/D6). Si une inertie doit vraiment être nommée, sa \
+             place est DISPATCH_ENV_KNOWN_INERT, avec sa raison et son suivi.",
+            HANDLER_ENV_KNOWN_INERT
+        );
+    }
+
+    /// V5 — **contrôle négatif de T1, à voir rouge.**
+    ///
+    /// Sans lui, « le scan détecte la branche morte » est indistinguable de « le
+    /// scan ne regarde rien ». La fixture est construite sur la forme
+    /// **réellement mesurée** dans l'arbre avant ce correctif, jamais sur le vrai
+    /// fichier (qui change).
+    #[test]
+    fn mika2536_the_handler_scan_reddens_on_a_reintroduced_dead_branch() {
+        let named = std::collections::BTreeSet::new();
+
+        // La forme exacte des huit sites corrigés par L1c.
+        let dead = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        let orphans = orphan_env_reads(&dead, &named);
+        assert_eq!(
+            orphans,
+            vec!["build-mika/handlers/run.sh: MIKA_PLATFORM_DIR".to_string()],
+            "T1 doit accuser une branche `${{MIKA_*:-…}}` réintroduite dans un \
+             handler — c'est la forme des huit sites que L1c a corrigés"
+        );
+
+        // Contrôle de bonne foi : la forme CORRIGÉE ne doit pas être accusée,
+        // sans quoi le scan serait rouge le jour de sa naissance et se ferait
+        // désarmer (mika#2201, avertissement en tête du TSV).
+        let alive = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        assert!(
+            orphan_env_reads(&alive, &named).is_empty(),
+            "la forme relayée `${{PLATFORM_DIR:-…}}` traverse : l'accuser rendrait \
+             le scan rouge à sa naissance"
+        );
+    }
+
+    /// Les prompts système des skills bundled.
+    fn bundled_system_prompts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let prompt = dir.join("system_prompt.md");
+            let Ok(content) = std::fs::read_to_string(&prompt) else {
+                continue;
+            };
+            let rel = prompt
+                .strip_prefix(&base)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| prompt.to_string_lossy().to_string());
+            out.push((rel, content));
+        }
+        out.sort();
+        out
+    }
+
+    /// La formule de composition de worktree que T3 refuse.
+    ///
+    /// **Prédicat étroit à dessein.** Un scan sur `$MIKA_PLATFORM_DIR` tout court
+    /// rougirait sur les quatre commandes `run_shell` de `qa-review` et deux
+    /// lignes de prose, toutes **hors périmètre** (§9 du plan : autre chemin
+    /// d'exécution, ticket de suivi). Il naîtrait donc rouge, exigerait une
+    /// allowlist de six entrées — c'est-à-dire déposerait six infractions dans un
+    /// emplacement neuf — et *un lint rouge le jour de sa naissance se fait
+    /// désarmer*. Le prédicat porte donc sur la **formule de composition d'un
+    /// worktree**, la seule forme que le modèle recopie dans un argument `cwd`.
+    const WORKTREE_FORMULA_NEEDLE: &str = "$MIKA_PLATFORM_DIR/.claude/worktrees";
+
+    /// mika#2536 R5/R7 — T3 : aucun prompt ne prescrit la formule de composition.
+    #[test]
+    fn mika2536_no_prompt_prescribes_the_worktree_composition_formula() {
+        let prompts = bundled_system_prompts();
+
+        // Anti-vacuité AVANT toute autre assertion.
+        assert!(
+            prompts.len() >= 15,
+            "seulement {} prompt(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            prompts.len()
+        );
+        let total: usize = prompts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 100_000,
+            "{total} octets de prompts au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let offenders: Vec<&String> = prompts
+            .iter()
+            .filter(|(_, c)| c.contains(WORKTREE_FORMULA_NEEDLE))
+            .map(|(rel, _)| rel)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "ces prompts prescrivent au modèle de composer un chemin de worktree \
+             depuis `$MIKA_PLATFORM_DIR` : {offenders:?}. Cette variable n'est \
+             développée par AUCUN des deux environnements — le modèle recopie la \
+             formule dans un argument `cwd`, et le handler reçoit un chemin \
+             portant un `$` littéral.\n\
+             RÉSOLUTION : nommer la racine LITTÉRALEMENT \
+             (`~/workspace/mika-platform/…`). La moitié qui tient n'est de toute \
+             façon pas celle-là mais la garde `_shared/cwd-guard.sh`, qui refuse \
+             le `cwd` en le nommant (mika#2120 : neuf récurrences sous \
+             enforcement de prompt contre zéro écrit à la main)."
+        );
+    }
+
+    /// **Contrôle négatif de T3, à voir rouge.**
+    #[test]
+    fn mika2536_the_prompt_scan_reddens_on_a_reintroduced_formula() {
+        let carries = |s: &str| s.contains(WORKTREE_FORMULA_NEEDLE);
+
+        // La forme exacte de `qa-review:568` avant ce correctif.
+        assert!(
+            carries("worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/"),
+            "T3 doit accuser la formule réintroduite"
+        );
+
+        // Bonne foi : la forme littérale passe, et la mention de la variable
+        // HORS formule de worktree aussi — c'est la population que §9 met
+        // explicitement hors périmètre, et l'accuser ferait naître T3 rouge.
+        assert!(
+            !carries("worktree = ~/workspace/mika-platform/.claude/worktrees/${b}/mika/"),
+            "la forme littérale ne doit pas être accusée"
+        );
+        assert!(
+            !carries("sed -n '1,80p' $MIKA_PLATFORM_DIR/claude-pilot/README.md"),
+            "une commande `run_shell` citant la variable est hors périmètre (§9) : \
+             l'accuser ferait naître T3 rouge, et un lint rouge à sa naissance se \
+             fait désarmer"
+        );
+    }
+
+    /// Write a script file and make it executable, with fsync to avoid races.
+    fn write_script(path: &std::path::Path, content: &str) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(content.as_bytes()).unwrap();
+        let file = writer.into_inner().unwrap();
+        file.sync_all().unwrap();
+        drop(file); // Explicitly close before chmod
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn make_exec_tool(skill_dir: &std::path::Path, command: &str) -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "Test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: command.to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: skill_dir.to_path_buf(),
+        }
+    }
+
+    // --- validate_required_fields tests (#955) ---
+
+    #[test]
+    fn test_validate_required_fields_missing_field_returns_error() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "enum": ["dev-pilot"]
+                        },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(3600),
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        // Missing `skill` field entirely
+        let input = serde_json::json!({"prompt": "mika#928", "task_id": "abc-123"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_some(),
+            "expected error for missing required field"
+        );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("missing_required_field"));
+        assert!(output.content.contains("skill"));
+        assert!(output.content.contains("dev-pilot"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_null_field_returns_error() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill"],
+                    "properties": {
+                        "skill": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        // `skill` present but null
+        let input = serde_json::json!({"skill": null});
+        let result = validate_required_fields(&tool, &input);
+        assert!(result.is_some(), "expected error for null required field");
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("missing_required_field"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_all_present_passes() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt"],
+                    "properties": {
+                        "skill": { "type": "string" },
+                        "prompt": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({"skill": "dev-pilot", "prompt": "mika#928"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_none(),
+            "expected no error when all required fields present"
+        );
+    }
+
+    #[test]
+    fn test_validate_required_fields_no_required_key_passes() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "Test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({"anything": "goes"});
+        let result = validate_required_fields(&tool, &input);
+        assert!(result.is_none(), "no required fields = no validation error");
+    }
+
+    #[test]
+    fn test_validate_required_fields_malformed_schema_returns_error() {
+        // `required` is a string, not an array — malformed.
+        // Post-#984: this must return an error, not silently pass.
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "bad_tool".to_string(),
+                description: "Tool with bad schema".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": "skill"
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({});
+        let result = validate_required_fields(&tool, &input);
+        assert!(
+            result.is_some(),
+            "malformed schema must return an error, not silently pass"
+        );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("malformed_required_schema"));
+    }
+
+    #[test]
+    fn test_validate_required_fields_malformed_schema_null_returns_error() {
+        // `required` is null — malformed
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "bad_tool".to_string(),
+                description: "Tool with bad schema".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": null
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+
+        let input = serde_json::json!({});
+        let result = validate_required_fields(&tool, &input);
+        // null is not an array — should reject
+        assert!(
+            result.is_some(),
+            "null 'required' must return an error, not silently pass"
+        );
+        let output = result.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("malformed_required_schema"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_skill_tool_rejects_missing_required_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("handler.sh"),
+            "#!/bin/sh\necho 'should not run'",
+        );
+
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Dispatch claude-pilot".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": {
+                            "type": "string",
+                            "enum": ["dev-pilot"]
+                        },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        // Call with missing `skill` — should get rejected before the handler runs
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"prompt": "mika#928", "task_id": "abc-123"}),
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "expected error: {}", output.content);
+        assert!(
+            output.content.contains("missing_required_field"),
+            "expected structured error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("skill"),
+            "error should name the missing field"
+        );
+        // The handler should NOT have run
+        assert!(
+            !output.content.contains("should not run"),
+            "handler should not execute when required field is missing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler_dir = tmp.path().join("handlers");
+        fs::create_dir_all(&handler_dir).unwrap();
+        write_script(
+            &handler_dir.join("handler.sh"),
+            "#!/bin/sh\necho 'hello from handler'",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "handlers/handler.sh");
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test"}),
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(output.content.contains("hello from handler"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_returns_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("fail.sh"),
+            "#!/bin/sh\necho 'error msg' >&2\nexit 1",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "fail.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        // Non-zero exit is NOT a tool error — the process ran to completion
+        assert!(!output.is_error, "non-zero exit should not be is_error");
+        assert!(
+            output.content.contains("Exit code: 1"),
+            "should contain exit code, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("error msg"),
+            "should contain stderr output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_with_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("status.sh"),
+            "#!/bin/sh\necho 'CRITICAL: disk usage 95%'\nexit 2",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "status.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(
+            !output.is_error,
+            "non-zero exit should not be is_error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("Exit code: 2"),
+            "should contain exit code 2, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("CRITICAL: disk usage 95%"),
+            "should contain stdout, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_empty_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("silent_fail.sh"), "#!/bin/sh\nexit 3");
+
+        let tool = make_exec_tool(tmp.path(), "silent_fail.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error, "non-zero exit should not be is_error");
+        assert!(
+            output.content.contains("Exit code: 3"),
+            "should contain exit code 3, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_via_run_sh() {
+        // Regression test for the double problem: run.sh merges stderr into stdout
+        // via 2>&1, so on non-zero exit the executor must read stdout (not stderr).
+        let (_tmp, tool) = setup_shell_exec_handler();
+        let input = serde_json::json!({"command": "echo 'health check output' && exit 2"});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(
+            !output.is_error,
+            "non-zero exit via run.sh should not be is_error, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("Exit code: 2"),
+            "should contain exit code 2, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("health check output"),
+            "should contain stdout from run.sh, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_exit_zero_unchanged() {
+        // Exit 0 should NOT have an exit code prefix
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("ok.sh"), "#!/bin/sh\necho 'all good'");
+
+        let tool = make_exec_tool(tmp.path(), "ok.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error);
+        assert!(
+            !output.content.contains("Exit code:"),
+            "exit 0 should not have exit code prefix, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("all good"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_nonzero_exit_stdout_and_stderr() {
+        // When stdout and stderr have different content, both should appear
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("both.sh"),
+            "#!/bin/sh\necho 'stdout line'\necho 'stderr line' >&2\nexit 1",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "both.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("Exit code: 1"));
+        assert!(
+            output.content.contains("stdout line"),
+            "should contain stdout, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("stderr line"),
+            "should contain stderr, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_handler_missing_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = make_exec_tool(tmp.path(), "nonexistent.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("slow.sh"),
+            "#!/bin/sh\nsleep 60\necho done",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "slow.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 2, None, None, None, None).await;
+        assert!(
+            output.is_error,
+            "expected timeout error, got: {}",
+            output.content
+        );
+        assert!(output.content.contains("timed out"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_reads_stdin() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("echo_input.sh"), "#!/bin/sh\ncat");
+
+        let tool = make_exec_tool(tmp.path(), "echo_input.sh");
+        let input = serde_json::json!({"query": "hello world"});
+        let output = execute_skill_tool(&tool, input.clone(), 30, None, None, None, None).await;
+        assert!(!output.is_error);
+        // The output should contain the JSON input
+        let parsed: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(parsed, input);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_command_with_quotes() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        let input = serde_json::json!({"command": "echo \"hello world\""});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("hello world"),
+            "expected 'hello world' in output, got: {}",
+            output.content
+        );
+    }
+
+    /// Helper to create a temp dir with the real shell-exec handler script.
+    fn setup_shell_exec_handler() -> (tempfile::TempDir, ResolvedSkillTool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handler_dir = tmp.path().join("handlers");
+        fs::create_dir_all(&handler_dir).unwrap();
+        write_script(
+            &handler_dir.join("run.sh"),
+            include_str!("../../templates/skills/shell-exec/handlers/run.sh"),
+        );
+        let tool = make_exec_tool(tmp.path(), "handlers/run.sh");
+        (tmp, tool)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_css_hash_chars() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // CSS selectors and hex colors contain # which must survive JSON → jq → eval
+        let input = serde_json::json!({"command": "echo '#custom-relay { color: #a6e3a1; }'"});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("#custom-relay"),
+            "expected CSS selector in output, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("#a6e3a1"),
+            "expected hex color in output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_heredoc_multiline() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // Multi-line command with heredoc: \n in JSON must become real newlines
+        let input = serde_json::json!({
+            "command": "cat << 'EOF'\n#selector { color: #fff; }\nEOF"
+        });
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("#selector"),
+            "expected CSS selector from heredoc, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("#fff"),
+            "expected hex color from heredoc, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_sed_with_hash() {
+        let (tmp, tool) = setup_shell_exec_handler();
+        // Create a temp CSS file, then use sed to replace a selector with #
+        let css_file = tmp.path().join("test.css");
+        fs::write(&css_file, "#old-selector { color: red; }\n").unwrap();
+        let cmd = format!(
+            "sed 's/#old-selector/#new-selector/' '{}' && echo done",
+            css_file.display()
+        );
+        let input = serde_json::json!({"command": cmd});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("#new-selector"),
+            "expected sed replacement with # in output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_backslash_in_printf() {
+        let (_tmp, tool) = setup_shell_exec_handler();
+        // printf with \n format specifiers: backslashes must survive JSON → jq → eval → printf
+        let input = serde_json::json!({"command": "printf 'line1\\nline2\\n'"});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("line1"),
+            "expected line1 in output, got: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("line2"),
+            "expected line2 in output, got: {}",
+            output.content
+        );
+    }
+
+    #[test]
+    fn test_truncate_output() {
+        assert_eq!(truncate_output("short"), "short");
+
+        let long = "x".repeat(MAX_OUTPUT_LEN + 100);
+        let truncated = truncate_output(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_http_handler_unsupported_method() {
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "test_tool".to_string(),
+                description: "Test".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Http {
+                url: "http://localhost:9999".to_string(),
+                method: "DELETE".to_string(),
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        };
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 5, None, None, None, None).await;
+        assert!(output.is_error);
+        assert!(output.content.contains("unsupported HTTP method"));
+    }
+
+    // -- Envelope protocol tests --
+
+    #[test]
+    fn test_try_parse_envelope_valid() {
+        let json = r#"{"__mika_v1": {"text": "Screenshot taken.", "images": ["/tmp/shot.png"]}}"#;
+        let env = try_parse_envelope(json).unwrap();
+        assert_eq!(env.text, "Screenshot taken.");
+        assert_eq!(env.images, vec!["/tmp/shot.png"]);
+    }
+
+    #[test]
+    fn test_try_parse_envelope_no_images() {
+        let json = r#"{"__mika_v1": {"text": "Done."}}"#;
+        let env = try_parse_envelope(json).unwrap();
+        assert_eq!(env.text, "Done.");
+        assert!(env.images.is_empty());
+    }
+
+    #[test]
+    fn test_try_parse_envelope_plain_text() {
+        assert!(try_parse_envelope("hello world").is_none());
+    }
+
+    #[test]
+    fn test_try_parse_envelope_pretty_printed() {
+        // jq without -c produces pretty-printed JSON — must still parse
+        let json = "{\n  \"__mika_v1\": {\n    \"text\": \"Image file: /tmp/shot.png (image/png)\",\n    \"images\": [\n      \"/tmp/shot.png\"\n    ]\n  }\n}";
+        let env = try_parse_envelope(json).unwrap();
+        assert_eq!(env.text, "Image file: /tmp/shot.png (image/png)");
+        assert_eq!(env.images, vec!["/tmp/shot.png"]);
+    }
+
+    #[test]
+    fn test_try_parse_envelope_other_json() {
+        // JSON without sentinel key — treated as plain text
+        assert!(try_parse_envelope(r#"{"result": "ok"}"#).is_none());
+    }
+
+    #[test]
+    fn test_try_parse_envelope_invalid_json() {
+        assert!(try_parse_envelope("{invalid").is_none());
+    }
+
+    // -- Magic byte detection tests --
+
+    #[test]
+    fn test_detect_image_type_jpeg() {
+        assert_eq!(
+            detect_image_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+            Some("image/jpeg")
+        );
+    }
+
+    #[test]
+    fn test_detect_image_type_png() {
+        assert_eq!(
+            detect_image_type(&[0x89, 0x50, 0x4E, 0x47, 0x0D]),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn test_detect_image_type_gif() {
+        assert_eq!(
+            detect_image_type(&[0x47, 0x49, 0x46, 0x38, 0x39]),
+            Some("image/gif")
+        );
+    }
+
+    #[test]
+    fn test_detect_image_type_webp() {
+        let mut bytes = vec![0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x57, 0x45, 0x42, 0x50]);
+        assert_eq!(detect_image_type(&bytes), Some("image/webp"));
+    }
+
+    #[test]
+    fn test_detect_image_type_unknown() {
+        assert_eq!(detect_image_type(&[0x00, 0x01, 0x02, 0x03]), None);
+    }
+
+    #[test]
+    fn test_detect_image_type_too_short() {
+        assert_eq!(detect_image_type(&[0xFF, 0xD8]), None);
+    }
+
+    // -- Image file validation tests --
+
+    #[tokio::test]
+    async fn test_read_and_validate_image_nonexistent() {
+        let err = read_and_validate_image("/tmp/nonexistent_abc123.png")
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot resolve"));
+    }
+
+    #[tokio::test]
+    async fn test_read_and_validate_image_not_image() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"this is plain text").unwrap();
+        let err = read_and_validate_image(tmp.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a supported image type"));
+    }
+
+    #[tokio::test]
+    async fn test_read_and_validate_image_valid_png() {
+        let tmp = tempfile::NamedTempFile::with_suffix(".png").unwrap();
+        // Minimal valid PNG header + IHDR
+        let png_bytes = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, // IHDR length
+            0x49, 0x48, 0x44, 0x52, // IHDR
+        ];
+        std::fs::write(tmp.path(), png_bytes).unwrap();
+        let img = read_and_validate_image(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(img.media_type, "image/png");
+        assert!(!img.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_envelope_images_respects_max() {
+        // Create 7 temp PNG files — only 5 should be processed
+        let dir = tempfile::tempdir().unwrap();
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut paths = Vec::new();
+        for i in 0..7 {
+            let p = dir.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_header).unwrap();
+            paths.push(p.to_str().unwrap().to_string());
+        }
+        let (images, errors) = process_envelope_images(&paths).await;
+        assert_eq!(images.len(), 5);
+        assert!(!errors.is_empty());
+        assert!(errors.last().unwrap().contains("skipped"));
+    }
+
+    // -- Exec handler with envelope integration test --
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_with_image_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a fake PNG image
+        let img_path = tmp.path().join("screenshot.png");
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        std::fs::write(&img_path, png_header).unwrap();
+
+        // Script that outputs a Mika envelope
+        let script = format!(
+            "#!/bin/sh\nprintf '{{\"__mika_v1\":{{\"text\":\"Screenshot taken.\",\"images\":[\"{}\"]}}}}'\n",
+            img_path.display()
+        );
+        let handler_dir = tmp.path().join("handlers");
+        fs::create_dir_all(&handler_dir).unwrap();
+        write_script(&handler_dir.join("screenshot.sh"), &script);
+
+        let tool = make_exec_tool(tmp.path(), "handlers/screenshot.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(output.content.contains("Screenshot taken."));
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].media_type, "image/png");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_plain_text_backward_compat() {
+        // Plain text output should still work as before (no envelope)
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("plain.sh"),
+            "#!/bin/sh\necho 'just plain text'",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "plain.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error);
+        assert!(output.content.contains("just plain text"));
+        assert!(output.images.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_strips_tmux_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Script that prints the TMUX env var (empty if stripped)
+        write_script(
+            &tmp.path().join("check_env.sh"),
+            "#!/bin/sh\nprintf 'TMUX=%s TMUX_PANE=%s' \"$TMUX\" \"$TMUX_PANE\"",
+        );
+
+        // Set TMUX in the current process environment
+        // Safety: we're in a test with controlled env access
+        unsafe {
+            std::env::set_var("TMUX", "/tmp/tmux-1000/default,12345,0");
+            std::env::set_var("TMUX_PANE", "%0");
+        }
+
+        let tool = make_exec_tool(tmp.path(), "check_env.sh");
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        // Both vars should be empty because env_remove strips them
+        assert_eq!(output.content.trim(), "TMUX= TMUX_PANE=");
+
+        // Clean up env
+        unsafe {
+            std::env::remove_var("TMUX");
+            std::env::remove_var("TMUX_PANE");
+        }
+    }
+
+    // -- Long-running exec tests --
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_missing_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let ctx = LongRunningContext {
+            db: async_db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("invalid_uuid"),
+            "expected UUID validation error, got: {}",
+            output.content
+        );
+    }
+
+    use crate::test_utils::test_helpers::create_test_task;
+
+    fn make_long_running_tool(skill_dir: &std::path::Path, command: &str) -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "long_test".to_string(),
+                description: "Long-running test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: command.to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(60),
+                detaches_command: false,
+            },
+            skill_dir: skill_dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_creates_callback_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("Task submitted"),
+            "expected task submission message, got: {}",
+            output.content
+        );
+
+        // Verify a callback task was created (2 tasks total: parent task + callback)
+        let tasks = async_db
+            .get_tasks_by_status(vec!["pending".to_string()])
+            .await
+            .unwrap();
+        // Task is pending, callback task is also pending
+        let callback_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.trigger_type == "callback")
+            .collect();
+        assert_eq!(callback_tasks.len(), 1);
+        assert_eq!(callback_tasks[0].action_type, "resume_agent");
+        assert!(callback_tasks[0].label.starts_with("long_running:"));
+        assert!(callback_tasks[0].timeout_at.is_some());
+        assert_eq!(
+            callback_tasks[0].parent_task_id.as_deref(),
+            Some(wi_id.as_str()),
+            "callback task should link to parent task via parent_task_id"
+        );
+    }
+
+    /// U3 (mika#2413) — a real dispatch refutes the hypothesis the repair budget
+    /// bounds, so the counter goes back to zero.
+    ///
+    /// Why it matters beyond tidiness: `increment_stuck_rearm_count` was the only
+    /// writer, and mika#1614 task reuse flips the same row from `groom` to
+    /// `implement`. Two contentions suffered while grooming therefore condemned
+    /// the implementation before it started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2413_a_real_dispatch_resets_the_repair_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+
+        // Two contentions suffered earlier, through the production writer.
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+        assert_eq!(async_db.get_stuck_rearm_count(&wi_id).await.unwrap(), 2);
+
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        assert_eq!(
+            async_db.get_stuck_rearm_count(&wi_id).await.unwrap(),
+            0,
+            "a spawned non-deferred dispatch is proof the parent's turns do dispatch"
+        );
+    }
+
+    /// V5 (mika#2413) — the line that separates this reset from the one mika#2158
+    /// had to remove.
+    ///
+    /// That one fired on *having started* — the very action the counter counted —
+    /// which made the counter unreachable (31 re-drives reading 1). This one
+    /// fires on *having reached a real dispatch*. A dispatch attempt that is
+    /// **refused** must therefore leave the budget exactly where it was; if this
+    /// test ever goes green with the reset moved earlier, the regression is back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mika2413_a_refused_dispatch_does_not_reset_the_repair_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("analyze.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "analyze.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+        async_db.increment_stuck_rearm_count(&wi_id).await.unwrap();
+
+        // The per-turn cap (#583): a dispatch already left in this turn, so this
+        // attempt is refused before anything spawns.
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(1),
+            originating_message: None,
+        };
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"query": "test", "task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            output.is_error,
+            "the per-turn cap must refuse this dispatch"
+        );
+        assert!(output.content.contains("dispatch_limit_exceeded"));
+
+        assert_eq!(
+            async_db.get_stuck_rearm_count(&wi_id).await.unwrap(),
+            1,
+            "a refused attempt is not a dispatch — resetting here is the mika#2158 regression"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_false_blocks_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("handler.sh"),
+            "#!/bin/sh\necho 'sync result'",
+        );
+
+        // long_running: false — should execute synchronously even with LongRunningContext
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "sync_test".to_string(),
+                description: "Sync test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: false,
+                estimated_duration_secs: None,
+                detaches_command: false,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let ctx = LongRunningContext {
+            db: async_db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("sync result"),
+            "expected sync output, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_long_running_failure_marks_task_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("fail.sh"),
+            "#!/bin/sh\necho 'error msg' >&2\nexit 1",
+        );
+
+        let tool = make_long_running_tool(tmp.path(), "fail.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+        let ctx = LongRunningContext {
+            db: async_db.clone(),
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        };
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Should return success immediately (task submitted)
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Wait briefly for the background monitor to detect the failure
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let tasks = async_db
+            .get_tasks_by_status(vec!["failed".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "expected 1 failed task, got {}",
+            tasks.len()
+        );
+        let result_text = tasks[0].result.as_ref().unwrap();
+        assert!(
+            result_text.contains("Exit code: 1"),
+            "expected 'Exit code: 1' in result, got: {result_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_exec_handler_receives_gh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(
+            &tmp.path().join("check_token.sh"),
+            "#!/bin/sh\necho \"GH_TOKEN=$GH_TOKEN\"",
+        );
+
+        let tool = make_exec_tool(tmp.path(), "check_token.sh");
+
+        // With github_token provided — should appear in child env
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({}),
+            30,
+            None,
+            Some("ghp_test_token_123"),
+            None,
+            None,
+        )
+        .await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            output.content.contains("GH_TOKEN=ghp_test_token_123"),
+            "expected GH_TOKEN to be injected, got: {}",
+            output.content
+        );
+
+        // Without github_token — GH_TOKEN should be absent (scrubbed)
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+        assert!(
+            !output.content.contains("GH_TOKEN=ghp_"),
+            "expected GH_TOKEN to not contain a token when github_token is None, got: {}",
+            output.content
+        );
+    }
+
+    /// Regression test for #537: a long_running tool with no long_running_ctx
+    /// must return an explicit error instead of silently falling through to
+    /// the sync exec path (which lacks __mika_task_id injection).
+    #[tokio::test]
+    async fn test_long_running_tool_without_context_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Long-running test tool".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            handler: ToolHandler::Exec {
+                command: "./handlers/run.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(300),
+                detaches_command: false,
+            },
+            skill_dir: tmp.path().to_path_buf(),
+        };
+
+        // Pass None for long_running_ctx — simulates callback turn / silent mode / CLI test
+        let output =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+
+        assert!(output.is_error, "expected error, got: {}", output.content);
+        assert!(
+            output.content.contains("run_claude_pilot"),
+            "error should name the tool: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("long_running"),
+            "error should mention long_running: {}",
+            output.content
+        );
+        assert!(
+            output.content.contains("cannot run in the current context"),
+            "error should explain the context restriction: {}",
+            output.content
+        );
+    }
+
+    // -- Dispatch-readiness guard tests (#525) --
+
+    /// Helper: create a task and transition it to the given status.
+    async fn create_task_with_status(db: &crate::async_db::AsyncDatabase, status: &str) -> String {
+        let wi_id = create_test_task(db).await;
+        if status != "pending" {
+            // pending -> blocked or in_progress are valid transitions;
+            // pending -> completed or cancelled are also valid.
+            db.update_manual_task_status(&wi_id, status).await.unwrap();
+        }
+        wi_id
+    }
+
+    /// Helper: create a callback child task under a parent task.
+    async fn create_callback_child(
+        db: &crate::async_db::AsyncDatabase,
+        parent_task_id: &str,
+        status: &str,
+    ) -> String {
+        use crate::task_engine::types::{action_type, trigger_type};
+        let task = crate::db::NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_task_id.to_string()),
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            // Transition the child to the requested status via direct DB update
+            db.update_task_status(&child_id, status).await.unwrap();
+        }
+        child_id
+    }
+
+    fn make_lr_ctx(db: crate::async_db::AsyncDatabase) -> LongRunningContext {
+        LongRunningContext {
+            db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_blocked_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "blocked").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_not_dispatchable");
+        assert_eq!(parsed["current_status"], "blocked");
+        assert_eq!(parsed["task_id"], wi_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_completed_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "completed").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Caught by validate_task() (first-pass) — not a JSON error
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not an active task"),
+            "expected validate_task rejection, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_cancelled_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "cancelled").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Caught by validate_task() (first-pass)
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not an active task"),
+            "expected validate_task rejection, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_nonexistent_task_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": "00000000-0000-0000-0000-000000000000"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("task_not_found"),
+            "expected task_not_found error for valid-format-but-nonexistent UUID, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_active_callback_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        let child_id = create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+        assert_eq!(parsed["active_child_id"], child_id);
+        assert_eq!(parsed["task_id"], wi_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_rejects_in_progress_callback_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        let _child_id = create_callback_child(&async_db, &wi_id, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_allows_with_only_completed_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        // Create completed and failed callback children — should not block
+        create_callback_child(&async_db, &wi_id, "completed").await;
+        create_callback_child(&async_db, &wi_id, "failed").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Should proceed to dispatch — guard must not reject.
+        // If is_error, verify it's NOT a dispatch guard rejection.
+        if output.is_error {
+            assert!(
+                !output.content.contains("task_not_dispatchable")
+                    && !output.content.contains("task_active_dispatch"),
+                "dispatch guard should not reject, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_allows_cancelled_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        // Cancelled callback child — should not block re-dispatch
+        create_callback_child(&async_db, &wi_id, "cancelled").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        if output.is_error {
+            assert!(
+                !output.content.contains("task_not_dispatchable")
+                    && !output.content.contains("task_active_dispatch"),
+                "dispatch guard should not reject for cancelled child, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_ignores_non_callback_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Create a non-callback child (e.g., resume_agent with manual trigger)
+        let non_callback = crate::db::NewTask {
+            agent_id: async_db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(wi_id.clone()),
+            depth: 0,
+            label: "delegate:some-agent".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        async_db.create_task(non_callback).await.unwrap();
+
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Should proceed — non-callback children don't block
+        if output.is_error {
+            assert!(
+                !output.content.contains("task_not_dispatchable")
+                    && !output.content.contains("task_active_dispatch"),
+                "dispatch guard should not reject for non-callback children, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_mixed_children_one_active_rejects() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        // One completed, one still pending — should block
+        create_callback_child(&async_db, &wi_id, "completed").await;
+        create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_auto_transitions_pending_to_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+
+        // Verify starts as pending
+        let task_before = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task_before.status, "pending");
+
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Verify task transitioned to in_progress
+        let task_after = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(
+            task_after.status, "in_progress",
+            "task should auto-transition to in_progress on dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_no_transition_for_already_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!output.is_error, "unexpected error: {}", output.content);
+
+        // Should still be in_progress (no redundant transition)
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "in_progress");
+    }
+
+    // -- Integration test: PR #522 race scenario replay (#525) --
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_active_dispatch_with_pr_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Create in_progress task with PR URL in metadata
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        let metadata = serde_json::json!({
+            "claude_pilot": {
+                "pr_url": "https://github.com/senara-solutions/mika/pull/522",
+                "branch": "feat/522/some-feature"
+            }
+        });
+        async_db
+            .update_task_metadata(&wi_id, &metadata.to_string())
+            .await
+            .unwrap();
+
+        // Simulate active claude-pilot session (pending callback child)
+        create_callback_child(&async_db, &wi_id, "pending").await;
+
+        // Count tasks before attempted dispatch
+        let tasks_before = async_db.get_child_tasks(&wi_id).await.unwrap().len();
+
+        let ctx = make_lr_ctx(async_db.clone());
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Should be rejected
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+        assert_eq!(
+            parsed["pr_url"],
+            "https://github.com/senara-solutions/mika/pull/522"
+        );
+
+        // Verify no new callback task was created
+        let tasks_after = async_db.get_child_tasks(&wi_id).await.unwrap().len();
+        assert_eq!(
+            tasks_before, tasks_after,
+            "no new callback task should be created when dispatch is rejected"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_no_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_id, "pending").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+        assert!(
+            parsed["pr_url"].is_null(),
+            "pr_url should be null when no metadata"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pr522_replay_retry_after_child_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+        let child_id = create_callback_child(&async_db, &wi_id, "pending").await;
+
+        // First attempt: should be rejected
+        let ctx = make_lr_ctx(async_db.clone());
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(output.is_error);
+
+        // Complete the child task
+        async_db
+            .update_task_status(&child_id, "completed")
+            .await
+            .unwrap();
+
+        // Retry: should succeed now
+        let ctx = make_lr_ctx(async_db.clone());
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            !output.is_error,
+            "retry after child completion should succeed, got: {}",
+            output.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_guard_double_dispatch_pending_item() {
+        // Regression: two sequential dispatches to a pending task.
+        // First should succeed (and auto-transition to in_progress + create callback).
+        // Second should be rejected by active-child check.
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_test_task(&async_db).await;
+
+        // First dispatch: should succeed
+        let ctx = make_lr_ctx(async_db.clone());
+        let output1 = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !output1.is_error,
+            "first dispatch should succeed: {}",
+            output1.content
+        );
+
+        // Verify first dispatch created exactly one callback child
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let callback_children: Vec<_> = children
+            .iter()
+            .filter(|c| c.trigger_type == "callback")
+            .collect();
+        assert_eq!(
+            callback_children.len(),
+            1,
+            "first dispatch must create exactly one callback child"
+        );
+
+        // Second dispatch: should be rejected (active callback child from first dispatch)
+        let ctx = make_lr_ctx(async_db.clone());
+        let output2 = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(output2.is_error, "second dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&output2.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output2.content));
+        assert_eq!(parsed["error"], "task_active_dispatch");
+
+        // Verify task is in_progress (auto-transitioned by first dispatch)
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "in_progress");
+    }
+
+    // ---- Global dispatch guard tests (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_rejects_when_other_task_has_active_callback() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Create task A with an active callback child
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        let _callback_a = create_callback_child(&async_db, &wi_a, "pending").await;
+
+        // Create task B — attempting to dispatch on this should be blocked
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "global_dispatch_active");
+        assert_eq!(parsed["blocking_task_id"], wi_a);
+        assert_eq!(parsed["task_id"], wi_b);
+    }
+
+    // ---- mika#2160: the implement cap becomes choosable ----
+
+    /// AC3 / Phase 3a. The three-tier contract of the setting, tested through
+    /// the pure parse so no environment is mutated and the module's tests keep
+    /// running in parallel.
+    #[test]
+    fn test_parse_max_concurrent_implement_three_tiers() {
+        // Tier 1 — absent or empty falls back to the default.
+        assert_eq!(parse_max_concurrent_implement(None), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("   ")), 1);
+
+        // Tier 2 — unreadable or negative falls back to the default (with WARN).
+        assert_eq!(parse_max_concurrent_implement(Some("deux")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("-1")), 1);
+        assert_eq!(parse_max_concurrent_implement(Some("2.5")), 1);
+
+        // Tier 3 — a readable value is honoured; `0` is the disable sentinel,
+        // NOT "zero dispatches" (KTD3, the grammar of MIKA_AUTO_PULL_MAX_BEHIND).
+        assert_eq!(parse_max_concurrent_implement(Some("2")), 2);
+        assert_eq!(parse_max_concurrent_implement(Some(" 4 ")), 4);
+        assert_eq!(parse_max_concurrent_implement(Some("0")), 0);
+    }
+
+    /// The default is 1 and this ticket does not move it (KTD2/AC3).
+    #[test]
+    fn test_max_concurrent_implement_default_is_one() {
+        assert_eq!(MAX_CONCURRENT_IMPLEMENT_DEFAULT, 1);
+    }
+
+    /// AC4, guard half — the arithmetic that makes the cap real, tested without
+    /// touching the process environment.
+    ///
+    /// The cap is read inline from the environment (the shape
+    /// `dispatch_slot_lease_ttl_secs()` already uses for the lease TTL), so an
+    /// integration test at N=2 would have to `set_var` and would then change
+    /// the verdict of every other dispatch test running in parallel. The
+    /// arithmetic is asserted here instead; the *wiring* is asserted by
+    /// `test_default_cap_refuses_second_dispatch_and_registers_the_deferral`,
+    /// which goes through the real guard at the real default; and the two
+    /// simultaneous acquisitions AC4 asks for are asserted at the lease, where
+    /// the cap is a parameter, in
+    /// `db::tests::test_two_implement_claims_each_take_a_lease_at_cap_two`.
+    #[test]
+    fn test_class_cap_reached_admits_a_second_dispatch_at_two_and_refuses_a_third() {
+        // Cap 1 — today's behaviour: one active dispatch already fills it.
+        assert!(
+            !class_cap_reached(0, 1),
+            "an idle class must admit a dispatch"
+        );
+        assert!(
+            class_cap_reached(1, 1),
+            "one active dispatch fills a cap of one"
+        );
+
+        // Cap 2 — the second is admitted, the third is refused.
+        assert!(!class_cap_reached(0, 2));
+        assert!(
+            !class_cap_reached(1, 2),
+            "at a cap of two a second dispatch must be admitted — a cap that \
+             only ever refuses is the decorative-setting regression of KTD1"
+        );
+        assert!(
+            class_cap_reached(2, 2),
+            "the third is refused at a cap of two"
+        );
+        assert!(class_cap_reached(3, 2), "and so is anything beyond it");
+
+        // Cap 0 — the disable sentinel refuses nothing, ever (KTD3).
+        assert!(!class_cap_reached(0, 0));
+        assert!(
+            !class_cap_reached(7, 0),
+            "`0` lifts the cap, it is not `no dispatch`"
+        );
+    }
+
+    /// Only `implement` is configurable — `groom` is out of scope and keeps its
+    /// cap of one whatever the variable says.
+    #[test]
+    fn test_groom_class_cap_is_not_configurable() {
+        assert_eq!(max_concurrent_for_class("groom"), 1);
+    }
+
+    /// The count companion must count *dispatches*, not callback rows. A parent
+    /// carrying two callback children of the same class is one dispatch; if it
+    /// counted rows it would fill a cap of two on its own and re-serialize the
+    /// class behind the operator's back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_count_active_callbacks_counts_dispatches_not_rows() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "pending").await;
+        create_callback_child(&async_db, &wi_a, "in_progress").await;
+
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_b, "implement")
+                .await
+                .unwrap(),
+            1,
+            "two callback rows under ONE parent are one dispatch"
+        );
+
+        // A second parent is a second dispatch.
+        let wi_c = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_c, "pending").await;
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_b, "implement")
+                .await
+                .unwrap(),
+            2
+        );
+
+        // The excluded parent never counts against itself.
+        assert_eq!(
+            async_db
+                .count_active_callback_tasks_excluding(&wi_a, "implement")
+                .await
+                .unwrap(),
+            1,
+            "the caller's own dispatch is excluded"
+        );
+    }
+
+    /// AC5 — non-regression at the default cap of 1. This is the scene measured
+    /// on 2026-09-03: a second `implement` dispatch is refused with
+    /// `global_dispatch_active`, **and its deferred callback is registered**.
+    ///
+    /// The deferral assertion is the load-bearing half. A test that checked the
+    /// error code alone would stay green through a regression that breaks the
+    /// automatic re-drive (mika#1011) — the loop would then not merely slow
+    /// down, it would stop, which is the mika#2169 shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_default_cap_refuses_second_dispatch_and_registers_the_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "pending").await;
+
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "second dispatch must be refused at cap 1");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "global_dispatch_active");
+        assert_eq!(parsed["blocking_task_id"], wi_a);
+        assert_eq!(
+            parsed["deferred_dispatch_registered"],
+            serde_json::json!(true),
+            "the refusal must still register the deferred re-drive (mika#1011) — \
+             without it the loop stops instead of slowing down"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_allows_when_no_other_active_callbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Task A has only completed callbacks
+        let wi_a = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi_a, "completed").await;
+
+        // Dispatch on task B should succeed
+        let wi_b = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_b}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // Should NOT be a global_dispatch_active error
+        if output.is_error {
+            assert!(
+                !output.content.contains("global_dispatch_active"),
+                "global dispatch guard should not reject when other callbacks are completed, got: {}",
+                output.content
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_global_dispatch_guard_allows_same_task_callback() {
+        // The global guard should NOT block dispatch on the same task —
+        // that's already handled by the per-task guard.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi, "pending").await;
+
+        // Check the DB method directly — should return None since the only
+        // active callback belongs to the excluded parent
+        let result = async_db
+            .has_active_callback_tasks_excluding(&wi, "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "should not find active callbacks for the same task"
+        );
+    }
+
+    // ---- Per-turn dispatch counter tests (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_turn_dispatch_counter_rejects_second_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+        let ctx = make_lr_ctx(async_db);
+
+        // Simulate that a dispatch already happened this turn by setting the counter
+        ctx.dispatch_count.store(1, Ordering::Relaxed);
+
+        // Second dispatch should be rejected by the per-turn counter
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(output.is_error, "second dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "dispatch_limit_exceeded");
+        // Counter should still be 1 (not incremented on rejection)
+        assert_eq!(ctx.dispatch_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_turn_dispatch_counter_resets_with_new_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // First context with counter at 1
+        let ctx1 = make_lr_ctx(async_db.clone());
+        ctx1.dispatch_count.store(1, Ordering::Relaxed);
+        assert_eq!(ctx1.dispatch_count.load(Ordering::Relaxed), 1);
+
+        // New context should start at 0
+        let ctx2 = make_lr_ctx(async_db);
+        assert_eq!(ctx2.dispatch_count.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- DB method tests for has_active_callback_tasks_excluding (#583) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_returns_none_when_empty() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("nonexistent", "implement")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_ignores_terminal_states() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child(&async_db, &wi, "completed").await;
+        create_callback_child(&async_db, &wi, "failed").await;
+        create_callback_child(&async_db, &wi, "cancelled").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "should not detect terminal-state callbacks as active"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_has_active_callback_excluding_finds_active_for_different_parent() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+        let callback_id = create_callback_child(&async_db, &wi, "pending").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("different-parent", "implement")
+            .await
+            .unwrap();
+        assert!(result.is_some());
+        let blocking = result.unwrap();
+        let (parent_id, found_callback_id) = (blocking.parent_task_id, blocking.callback_task_id);
+        assert_eq!(parent_id, wi);
+        assert_eq!(found_callback_id, callback_id);
+    }
+
+    // ---- Per-class dispatch slot split tests (#1001) ----
+
+    /// Helper: create a callback child task with a specific dispatch_class.
+    async fn create_callback_child_with_class(
+        db: &crate::async_db::AsyncDatabase,
+        parent_id: &str,
+        status: &str,
+        dispatch_class: &str,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 0,
+            label: format!("long_running:run_claude_pilot:{dispatch_class}"),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some(dispatch_class.to_string()),
+        };
+        let id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_manual_task_status(&id, status).await.unwrap();
+        }
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_allows_different_class_concurrent() {
+        // An active 'implement' callback should NOT block a 'groom' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child_with_class(&async_db, &wi1, "pending", "implement").await;
+
+        // Querying for 'groom' class should find no blocking dispatch
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "groom dispatch should not be blocked by active implement dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_blocks_same_class() {
+        // An active 'implement' callback SHOULD block another 'implement' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        let callback_id =
+            create_callback_child_with_class(&async_db, &wi1, "pending", "implement").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(result.is_some(), "same-class dispatch should be blocked");
+        let blocking = result.unwrap();
+        let (parent_id, found_id) = (blocking.parent_task_id, blocking.callback_task_id);
+        assert_eq!(parent_id, wi1);
+        assert_eq!(found_id, callback_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_groom_blocks_groom() {
+        // An active 'groom' callback should block another 'groom' dispatch
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        create_callback_child_with_class(&async_db, &wi1, "pending", "groom").await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(result.is_some(), "groom-vs-groom should be blocked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pre_v34_null_dispatch_class_treated_as_implement() {
+        // Pre-v34 tasks have dispatch_class IS NULL — they should be treated
+        // as 'implement' via COALESCE in the SQL query.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi1 = create_task_with_status(&async_db, "in_progress").await;
+        // Create a callback child WITHOUT dispatch_class (simulating pre-v34)
+        create_callback_child(&async_db, &wi1, "pending").await;
+
+        // Should block 'implement' queries (NULL → 'implement' via COALESCE)
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "NULL dispatch_class should be treated as 'implement'"
+        );
+
+        // Should NOT block 'groom' queries
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "groom")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "NULL dispatch_class should not block groom dispatches"
+        );
+    }
+
+    /// Helper: create a deferred-wrapper callback child (mika#1163 regression coverage).
+    /// Mirrors `register_deferred_callback`'s output shape — label suffix `:deferred`,
+    /// trigger_type=`callback`, action_type=`resume_agent`, dispatch_class as supplied.
+    async fn create_deferred_wrapper_child(
+        db: &crate::async_db::AsyncDatabase,
+        parent_id: &str,
+        dispatch_class: Option<&str>,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 0,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        db.create_task(task).await.unwrap()
+    }
+
+    /// mika#1163 — Per-class slot guard MUST NOT block on pending deferred wrappers.
+    ///
+    /// Reproduces the multi-wrapper deadlock observed 2026-05-17: when two parents
+    /// each hold a pending `:deferred` wrapper, the per-class predicate (used by
+    /// `validate_dispatch_readiness`) used to see the OTHER parent's wrapper as an
+    /// active dispatch and register yet another wrapper. With the fix in place,
+    /// neither wrapper blocks the other; only real (non-deferred) callbacks count
+    /// as slot-occupying.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_does_not_block_on_deferred_wrappers() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        // Two in-progress parents, each with a pending `:deferred` wrapper.
+        let parent_a = create_task_with_status(&async_db, "in_progress").await;
+        let parent_b = create_task_with_status(&async_db, "in_progress").await;
+        create_deferred_wrapper_child(&async_db, &parent_a, Some("implement")).await;
+        create_deferred_wrapper_child(&async_db, &parent_b, Some("implement")).await;
+
+        // A's dispatch attempt: must NOT see B's wrapper as an active dispatch.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_a, "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Parent A's dispatch must not be blocked by Parent B's pending deferred wrapper \
+             (mika#1163 deadlock — wrappers are pending markers, not active dispatches)"
+        );
+
+        // Symmetric: B's dispatch attempt must not see A's wrapper either.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_b, "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Parent B's dispatch must not be blocked by Parent A's pending deferred wrapper"
+        );
+
+        // Add Parent C with a REAL (non-deferred) pending callback. This IS an
+        // active dispatch and MUST still be detected — exclusion is narrowly
+        // scoped to `:deferred` rows.
+        let parent_c = create_task_with_status(&async_db, "in_progress").await;
+        let real_c =
+            create_callback_child_with_class(&async_db, &parent_c, "pending", "implement").await;
+
+        // Parent A's dispatch attempt now: should be blocked by C's real callback,
+        // not by B's wrapper.
+        let result = async_db
+            .has_active_callback_tasks_excluding(&parent_a, "implement")
+            .await
+            .unwrap();
+        let blocking = result.expect(
+            "real pending callback MUST still block — only :deferred wrappers are excluded",
+        );
+        assert_eq!(
+            blocking.parent_task_id, parent_c,
+            "real dispatch is the blocker"
+        );
+        assert_eq!(blocking.callback_task_id, real_c);
+    }
+
+    /// mika#1163 — Pre-v34 NULL dispatch_class deferred wrapper must also be
+    /// excluded from the slot check. COALESCE+label clauses both apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_per_class_slot_ignores_null_class_deferred_wrapper() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let parent_a = create_task_with_status(&async_db, "in_progress").await;
+        // dispatch_class=None → COALESCE → 'implement' for the slot query
+        create_deferred_wrapper_child(&async_db, &parent_a, None).await;
+
+        let result = async_db
+            .has_active_callback_tasks_excluding("other-task", "implement")
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "Pre-v34 NULL-class deferred wrapper must be excluded — the :deferred \
+             filter runs alongside the COALESCE class match"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_derive_dispatch_class_values() {
+        assert_eq!(derive_dispatch_class(Some("dev-groom")), "groom");
+        assert_eq!(derive_dispatch_class(Some("dev-pilot")), "implement");
+        assert_eq!(derive_dispatch_class(Some("deploy_mika")), "implement");
+        assert_eq!(derive_dispatch_class(None), "implement");
+        assert_eq!(derive_dispatch_class(Some("unknown-skill")), "implement");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_update_task_dispatch_class() {
+        // Verify that dispatch_class can be flipped on a task
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let wi = create_task_with_status(&async_db, "in_progress").await;
+
+        // Initially no dispatch_class
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert!(task.dispatch_class.is_none());
+
+        // Set to 'groom'
+        let updated = async_db
+            .update_task_dispatch_class(&wi, "groom")
+            .await
+            .unwrap();
+        assert!(updated);
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert_eq!(task.dispatch_class.as_deref(), Some("groom"));
+
+        // Flip to 'implement'
+        let updated = async_db
+            .update_task_dispatch_class(&wi, "implement")
+            .await
+            .unwrap();
+        assert!(updated);
+        let task = async_db.get_task(&wi).await.unwrap().unwrap();
+        assert_eq!(task.dispatch_class.as_deref(), Some("implement"));
+    }
+
+    // -- Blocked-by guard tests (#713) --
+
+    /// Helper: create a task with `reference_url` set and transition to a given status.
+    async fn create_task_with_ref_url(
+        db: &crate::async_db::AsyncDatabase,
+        status: &str,
+        reference_url: Option<&str>,
+    ) -> String {
+        use crate::db::NewTask;
+        use crate::task_engine::types::{action_type, trigger_type};
+
+        let task = NewTask {
+            agent_id: db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "test task with ref".to_string(),
+            trigger_type: trigger_type::MANUAL.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::NONE.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: reference_url.map(|u| u.to_string()),
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+        if status != "pending" {
+            db.update_manual_task_status(&id, status).await.unwrap();
+        }
+        id
+    }
+
+    // -- mika#1948: the exec-slot claim at the real dispatch boundary --
+
+    /// The load-bearing test for this ticket. Two dispatchers validate the same
+    /// class; exactly ONE may leave holding the slot.
+    ///
+    /// Before this change both calls returned `Ok` — the per-class guard is a
+    /// bare SELECT and neither task had yet created the callback row that would
+    /// have made the slot look busy to the other. That is the 2026-08-30 shape:
+    /// two writers, one branch.
+    #[tokio::test]
+    async fn test_second_dispatcher_cannot_also_claim_the_slot() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let first = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let second = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &first, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "the first dispatcher must be allowed: {a:?}");
+
+        let b =
+            validate_dispatch_readiness(&async_db, &second, Some("fake-token"), None, None).await;
+        let err = b.expect_err(
+            "the second dispatcher must be refused — a slot two claimants can \
+             both believe they hold is not arbitration",
+        );
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(
+            v["error"], "dispatch_slot_contended",
+            "the refusal must name slot contention, not a generic failure: {err}"
+        );
+        assert_eq!(
+            v["holder_task_id"], first,
+            "the refusal must name WHO holds the slot"
+        );
+    }
+
+    /// Anti-vacuity twin. A guard that refused every second dispatch would
+    /// satisfy the test above; this pins that the OTHER class is still free, so
+    /// the per-class slot split (mika#1001) survives the new claim.
+    #[tokio::test]
+    async fn test_slot_claim_leaves_the_other_class_dispatchable() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let implementer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let groomer = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a =
+            validate_dispatch_readiness(&async_db, &implementer, Some("fake-token"), None, None)
+                .await;
+        assert!(a.is_ok(), "implement dispatch must be allowed: {a:?}");
+
+        // `dev-groom` derives the `groom` class, which is a different slot.
+        let groom_input = serde_json::json!({ "skill": "dev-groom" });
+        let b = validate_dispatch_readiness(
+            &async_db,
+            &groomer,
+            Some("fake-token"),
+            Some(&groom_input),
+            None,
+        )
+        .await;
+        assert!(
+            b.is_ok(),
+            "the groom slot is independent — claiming implement must not close \
+             it, or the mika#1001 split is undone: {b:?}"
+        );
+    }
+
+    /// A dispatcher re-validating its own task must not be refused by its own
+    /// lease. Without re-entrancy, any retry after a transient failure would be
+    /// permanently locked out by the claim it made itself.
+    #[tokio::test]
+    async fn test_same_task_revalidating_is_not_blocked_by_its_own_lease() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let a = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(a.is_ok(), "first validation: {a:?}");
+        let b = validate_dispatch_readiness(&async_db, &wi, Some("fake-token"), None, None).await;
+        assert!(
+            b.is_ok(),
+            "a task must be able to re-validate against the lease it holds: {b:?}"
+        );
+    }
+
+    /// AC2 — when a REAL active callback holds the class, the rejection names
+    /// which dispatcher owns it. The per-class guard fires before the lease, so
+    /// this exercises the `global_dispatch_active` payload specifically.
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_names_blocking_dispatcher_source() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        async_db
+            .set_task_dispatcher_source(&blocker, "operator")
+            .await
+            .unwrap();
+        let mut cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        cb.dispatch_class = Some("implement".to_string());
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(v["error"], "global_dispatch_active");
+        assert_eq!(
+            v["blocking_dispatcher_source"], "operator",
+            "the rejection must name which dispatcher holds the slot: {err}"
+        );
+    }
+
+    /// And a pre-v51 blocker must report JSON `null`, not a fabricated
+    /// "mika_dev". A consumer must be able to tell "unknown" from "observed".
+    #[tokio::test]
+    async fn test_global_dispatch_rejection_reports_null_source_as_null() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let blocker = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let cb = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(blocker.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        async_db.create_task(cb).await.unwrap();
+
+        let contender = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        let err =
+            validate_dispatch_readiness(&async_db, &contender, Some("fake-token"), None, None)
+                .await
+                .expect_err("an active callback in the class must block");
+        let v: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            v["blocking_dispatcher_source"].is_null(),
+            "an unset source must stay null, never be defaulted: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_no_reference_url() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // No reference_url → blocked-by check skipped, dispatch proceeds
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_reference_is_pr() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(
+            &async_db,
+            "in_progress",
+            Some("https://github.com/senara-solutions/mika/pull/100"),
+        )
+        .await;
+
+        // PR reference → blocked-by check skipped (only issues have blockedBy)
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_blocked_by_guard_skips_when_no_github_token() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(
+            &async_db,
+            "in_progress",
+            Some("https://github.com/senara-solutions/mika/issues/713"),
+        )
+        .await;
+
+        // No token → blocked-by check skipped (fail-open), dispatch proceeds
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, None, None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // ===================================================================
+    // Unauthorized webhook dispatch guard tests (mika#933)
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_dispatch_guard_rejects_unauthorized_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        // Create an in_progress task that would otherwise pass all checks
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            Some("fake-token"),
+            None,
+            Some("[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko"),
+        )
+        .await;
+
+        assert!(result.is_err(), "expected Err, got: {result:?}");
+        let err: serde_json::Value = serde_json::from_str(&result.unwrap_err()).unwrap();
+        assert_eq!(err["error"], "unauthorized_webhook_dispatch");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_guard_allows_ready_label_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // Ready-label event should NOT be rejected by the webhook gate
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            Some("fake-token"),
+            None,
+            Some("[GitHub] Issue labeled ready on senara-solutions/mika#933 — title"),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_guard_allows_no_originating_message() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        // None originating_message (callback continuation / silent trigger)
+        let result =
+            validate_dispatch_readiness(&async_db, &wi_id, Some("fake-token"), None, None).await;
+
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // ===================================================================
+    // dispatch_task_has_open_pr guard tests (mika#920)
+    // ===================================================================
+
+    /// Helper: write a `claude_pilot.pr_url` field into the task's metadata.
+    async fn set_task_pr_url(db: &crate::async_db::AsyncDatabase, task_id: &str, pr_url: &str) {
+        let metadata = serde_json::json!({
+            "claude_pilot": { "pr_url": pr_url }
+        })
+        .to_string();
+        db.update_task_metadata(task_id, &metadata).await.unwrap();
+    }
+
+    /// Build a `run_claude_pilot` tool input with the given fields.
+    fn pilot_input(skill: &str, prompt: &str, task_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "skill": skill,
+            "prompt": prompt,
+            "task_id": task_id,
+        })
+    }
+
+    // ---- mika#2046: the dispatchable-repository allowlist, tool-boundary layer ----
+
+    /// A spawn-CC-only repository is refused before the subprocess can spawn,
+    /// with the named error and the allowlist quoted, and the refusal is written
+    /// to `tasks.result` for operator visibility.
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_control_monitor() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let input = pilot_input("dev-pilot", "control-monitor#159", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("control-monitor must be refused");
+        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(parsed["error"], "repo_not_dispatchable");
+        assert_eq!(parsed["repo"], "senara-solutions/control-monitor");
+        assert_eq!(parsed["task_id"], wi_id);
+        let reason = parsed["reason"].as_str().unwrap();
+        for repo in crate::webhook_dispatch::DISPATCHABLE_REPOS {
+            assert!(reason.contains(repo), "refusal must quote {repo}");
+        }
+
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        let stored = task
+            .result
+            .expect("rejection should be written to tasks.result");
+        assert!(stored.contains("repo_not_dispatchable"));
+    }
+
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_claude_pilot_and_foreign_owner() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in ["claude-pilot#119", "another-org/mika#1"] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            let err = result.expect_err("{prompt} must be refused");
+            assert!(
+                err.contains("repo_not_dispatchable"),
+                "{prompt} should hit the allowlist gate, got: {err}"
+            );
+        }
+    }
+
+    /// The positive half. These must not be refused *by this gate* — they may
+    /// still be rejected downstream for unrelated reasons, so the assertion is
+    /// specifically about `repo_not_dispatchable`.
+    #[tokio::test]
+    async fn test_repo_allowlist_lets_the_loop_repos_through() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in [
+            "mika#2046",
+            "mika-cloud#50",
+            "mika-skills#8",
+            "mika-platform#58",
+            "senara-solutions/mika#2046",
+        ] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            if let Err(err) = result {
+                assert!(
+                    !err.contains("repo_not_dispatchable"),
+                    "{prompt} must not be caught by the allowlist gate, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// A free-text dispatch resolves no repository, so the gate has nothing to
+    /// judge and must not refuse it — including free text containing a `#`.
+    #[tokio::test]
+    async fn test_repo_allowlist_ignores_free_text_prompts() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        for prompt in [
+            "fix the ready-label handler",
+            "please look at control-monitor#159 when you get a chance",
+        ] {
+            let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+            let input = pilot_input("dev-pilot", prompt, &wi_id);
+            let result =
+                validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+            if let Err(err) = result {
+                assert!(
+                    !err.contains("repo_not_dispatchable"),
+                    "free text must not hit the allowlist gate, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// Regression for the review finding on mika#2046: `dispatch-lib.sh:769`
+    /// reads the prompt through command substitution, which strips the trailing
+    /// newline — so this string reaches the shell as `control-monitor#159` and
+    /// creates a worktree there. The gate must refuse it too.
+    #[tokio::test]
+    async fn test_repo_allowlist_refuses_a_trailing_newline_prompt() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+
+        let input = pilot_input("dev-pilot", "control-monitor#159\n", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("a trailing newline must not bypass the gate");
+        assert!(err.contains("repo_not_dispatchable"), "got: {err}");
+    }
+
+    /// Locks the check ordering: the allowlist gate runs before the task fetch,
+    /// so it does not silently become dependent on task existence. A refactor
+    /// that moved it below `get_task` would surface here as `task_not_found`.
+    #[tokio::test]
+    async fn test_repo_allowlist_runs_before_the_task_fetch() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+
+        let input = pilot_input("dev-pilot", "control-monitor#159", "no-such-task-id");
+        let result =
+            validate_dispatch_readiness(&async_db, "no-such-task-id", None, Some(&input), None)
+                .await;
+
+        let err = result.expect_err("must be refused");
+        assert!(
+            err.contains("repo_not_dispatchable"),
+            "the allowlist gate must fire before the task fetch, got: {err}"
+        );
+    }
+
+    /// Scenario 1: Re-dispatch with open PR and no `iteration_context` → rejection.
+    #[tokio::test]
+    async fn test_open_pr_guard_rejects_re_dispatch_without_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        let err = result.expect_err("dispatch should be rejected");
+        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert_eq!(parsed["error"], "dispatch_task_has_open_pr");
+        assert_eq!(
+            parsed["pr_url"],
+            "https://github.com/senara-solutions/mika/pull/915"
+        );
+        assert_eq!(parsed["pr_number"], 915);
+        assert_eq!(parsed["task_id"], wi_id);
+        assert!(
+            parsed["recovery"]
+                .as_str()
+                .unwrap()
+                .contains("iteration_context")
+        );
+        assert!(parsed["reason"].as_str().unwrap().contains("open PR"));
+
+        // Rejection JSON is also written to tasks.result for operator visibility (#1108).
+        let task = async_db.get_task(&wi_id).await.unwrap().unwrap();
+        let stored = task
+            .result
+            .expect("rejection should be written to tasks.result");
+        assert!(stored.contains("dispatch_task_has_open_pr"));
+    }
+
+    /// Scenario 2: Re-dispatch with open PR AND `iteration_context` → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_with_iteration_context() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let mut input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        input["iteration_context"] = serde_json::json!("Fix the failing AC on Unit 5");
+
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "iteration_context bypass should allow dispatch, got: {result:?}"
+        );
+    }
+
+    /// Scenario 3: Fresh dispatch (no `pr_url` in metadata) → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_when_no_pr_url() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        // No metadata write — task has no claude_pilot.pr_url field.
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "fresh dispatch without pr_url should proceed, got: {result:?}"
+        );
+    }
+
+    /// Scenario 4 (F2 regression): Ready-label webhook with open PR → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_ready_label_webhook() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(
+            &async_db,
+            &wi_id,
+            None,
+            Some(&input),
+            Some("[GitHub] Issue labeled ready on senara-solutions/mika#920 — title"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "ready-label webhook should bypass open-PR guard (operator positive consent), got: {result:?}"
+        );
+    }
+
+    /// Scenario 5 (F3 regression): DeferredDispatch sentinel with open PR → bypass.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_deferred_dispatch_sentinel() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let mut input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        input[INTERNAL_DEFERRED_DISPATCH_FIELD] = serde_json::json!(true);
+
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "deferred-dispatch sentinel should bypass open-PR guard (engine recovery), got: {result:?}"
+        );
+    }
+
+    /// Bypass via skill: `dev-groom` is fresh grooming, not implementation re-run.
+    #[tokio::test]
+    async fn test_open_pr_guard_bypasses_dev_groom_skill() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_ref_url(&async_db, "in_progress", None).await;
+        set_task_pr_url(
+            &async_db,
+            &wi_id,
+            "https://github.com/senara-solutions/mika/pull/915",
+        )
+        .await;
+
+        let input = pilot_input("dev-groom", "mika#920", &wi_id);
+        let result = validate_dispatch_readiness(&async_db, &wi_id, None, Some(&input), None).await;
+
+        assert!(
+            result.is_ok(),
+            "dev-groom dispatch should bypass open-PR guard, got: {result:?}"
+        );
+    }
+
+    /// Sentinel-on-input survives the register_deferred_callback → replay round-trip.
+    #[tokio::test]
+    async fn test_register_deferred_callback_injects_sentinel() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        let input = pilot_input("dev-pilot", "mika#920", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered, "deferred callback should register");
+
+        // Walk the child tasks to find the deferred one and inspect its action_config.
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let deferred = children
+            .iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("deferred callback should be a child of the parent");
+
+        let config: serde_json::Value = serde_json::from_str(&deferred.action_config).unwrap();
+        let original_call = config
+            .get("original_call")
+            .expect("action_config should contain original_call");
+        assert_eq!(
+            original_call.get(INTERNAL_DEFERRED_DISPATCH_FIELD),
+            Some(&serde_json::Value::Bool(true)),
+            "register_deferred_callback must inject the __internal_deferred_dispatch sentinel"
+        );
+        // Original fields must be preserved alongside the sentinel.
+        assert_eq!(
+            original_call.get("skill"),
+            Some(&serde_json::json!("dev-pilot"))
+        );
+        assert_eq!(
+            original_call.get("prompt"),
+            Some(&serde_json::json!("mika#920"))
+        );
+    }
+
+    // ===================================================================
+    // Idempotent-deferred intercept tests (mika#1205)
+    // ===================================================================
+    //
+    // These tests exercise the intercept inserted in `execute_long_running`
+    // between `validate_task` and `validate_dispatch_readiness`. The intercept
+    // short-circuits with `status: "deferred", already_deferred: true` when a
+    // per-agent pending deferred-callback child exists, so the LLM does not see
+    // the `unauthorized_webhook_dispatch` guard (0) rejection that triggers
+    // mika#716's hallucinated supervisor → blocked transition.
+
+    /// Helper: construct a LongRunningContext with an explicit originating_message.
+    fn make_lr_ctx_with_msg(
+        db: crate::async_db::AsyncDatabase,
+        originating_message: Option<String>,
+    ) -> LongRunningContext {
+        LongRunningContext {
+            db,
+            agent_name: "mika".to_string(),
+            session_id: "test-session".to_string(),
+            trace_id: "00000000000000000000000000000000".to_string(),
+            dispatch_count: AtomicU32::new(0),
+            originating_message,
+        }
+    }
+
+    /// AC1: When the LLM retries `run_claude_pilot` on a task that has a pending
+    /// deferred-callback child for the same agent AND the originating_message is
+    /// unauthorized, the intercept returns `ToolOutput::success` with
+    /// `status: "deferred"` and `already_deferred: true`. No
+    /// `unauthorized_webhook_dispatch` error reaches the LLM.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_idempotent_ack_on_pending_deferred() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Seed a pending deferred-callback child for the same agent.
+        let input = pilot_input("dev-pilot", "mika#1205", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered, "deferred callback should register");
+
+        // Unauthorized originating_message (Webhook Fallthrough domain) — would
+        // normally trip guard (0). The intercept must fire BEFORE guard (0).
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            !output.is_error,
+            "intercept should return success, got error: {}",
+            output.content
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON success, got: {}", output.content));
+        assert_eq!(parsed["status"], "deferred");
+        assert_eq!(parsed["already_deferred"], true);
+        assert!(
+            !output.content.contains("unauthorized_webhook_dispatch"),
+            "intercept must not surface guard (0) rejection: {}",
+            output.content
+        );
+    }
+
+    /// AC2: When no pending deferred-callback child exists, `execute_long_running`
+    /// falls through to `validate_dispatch_readiness`. With an unauthorized
+    /// originating_message, guard (0) rejects with `unauthorized_webhook_dispatch`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_no_intercept_when_no_deferred_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // No deferred-callback child seeded.
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(output.is_error, "guard (0) should reject the dispatch");
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
+    }
+
+    /// AC3: When a pending deferred-callback child exists but belongs to a
+    /// different `agent_id`, the intercept does not fire (per-agent isolation).
+    /// Falls through to `validate_dispatch_readiness` which rejects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_intercept_scopes_per_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Register the foreign agent so the FK constraint on tasks.agent_id holds.
+        async_db
+            .register_agent("other-agent", "Other Agent", "")
+            .await
+            .unwrap();
+
+        // Seed a deferred-callback child but with a DIFFERENT agent_id.
+        let foreign_child = crate::db::NewTask {
+            agent_id: "other-agent".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(wi_id.clone()),
+            depth: 0,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        async_db.create_task(foreign_child).await.unwrap();
+
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            output.is_error,
+            "intercept must not match across agents; guard (0) should reject"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
+    }
+
+    /// AC4: When a deferred-callback child has completed (or failed), the
+    /// intercept does not fire. Falls through to guard (0) which rejects.
+    /// Proves fail-closed after DeferredDispatch resumes and the child completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_long_running_intercept_skips_completed_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_script(&tmp.path().join("run.sh"), "#!/bin/sh\necho done");
+        let tool = make_long_running_tool(tmp.path(), "run.sh");
+
+        let db = crate::db::Database::open_in_memory().unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+        let wi_id = create_task_with_status(&async_db, "in_progress").await;
+
+        // Seed a deferred-callback child, then transition it to completed.
+        let input = pilot_input("dev-pilot", "mika#1205", &wi_id);
+        let registered = register_deferred_callback(&async_db, &wi_id, &input).await;
+        assert!(registered);
+        let children = async_db.get_child_tasks(&wi_id).await.unwrap();
+        let deferred = children
+            .iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("deferred callback should exist");
+        async_db
+            .update_task_status(&deferred.id, "completed")
+            .await
+            .unwrap();
+
+        let ctx = make_lr_ctx_with_msg(
+            async_db,
+            Some("[GitHub] New comment on issue#789".to_string()),
+        );
+
+        let output = execute_skill_tool(
+            &tool,
+            serde_json::json!({"task_id": wi_id, "skill": "dev-pilot", "prompt": "mika#1205"}),
+            30,
+            Some(&ctx),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            output.is_error,
+            "completed deferred child must not authorize retry"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON error, got: {}", output.content));
+        assert_eq!(parsed["error"], "unauthorized_webhook_dispatch");
+    }
+
+    // ===================================================================
+    // Cycle detection and callback deferred dispatch tests (mika#1058)
+    // ===================================================================
+
+    #[test]
+    fn test_parse_repo_issue_valid() {
+        let (repo, issue) = parse_repo_issue(Some("mika#159"));
+        assert_eq!(repo, Some("mika"));
+        assert_eq!(issue, Some(159));
+    }
+
+    #[test]
+    fn test_parse_repo_issue_with_prefix() {
+        let (repo, issue) = parse_repo_issue(Some("Fix bug in mika-skills#42 please"));
+        assert_eq!(repo, Some("mika-skills"));
+        assert_eq!(issue, Some(42));
+    }
+
+    #[test]
+    fn test_parse_repo_issue_none() {
+        let (repo, issue) = parse_repo_issue(None);
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_issue_no_match() {
+        let (repo, issue) = parse_repo_issue(Some("just some text without issue ref"));
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_parse_repo_issue_bare_hash() {
+        // "#42" — no repo name
+        let (repo, issue) = parse_repo_issue(Some("#42"));
+        assert!(repo.is_none());
+        assert!(issue.is_none());
+    }
+
+    #[test]
+    fn test_extract_dispatch_tuple_from_action_config() {
+        let task = crate::db::Task {
+            id: "task-1".to_string(),
+            agent_id: "mika-dev".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "parent-1"
+                }
+            })
+            .to_string(),
+            status: "pending".to_string(),
+            process_id: None,
+            input_context: None,
+            result: None,
+            created_by_session: None,
+            created_trace_id: None,
+            execution_trace_id: None,
+            created_at: "2026-05-10T00:00:00Z".to_string(),
+            updated_at: "2026-05-10T00:00:00Z".to_string(),
+            fired_at: None,
+            completed_at: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: "issue".to_string(),
+            dispatch_class: Some("groom".to_string()),
+            dispatcher_source: None,
+        };
+
+        let result = extract_dispatch_tuple(&task);
+        assert!(result.is_some(), "expected Some, got None");
+        let (repo, issue, skill) = result.unwrap();
+        assert_eq!(repo, "mika");
+        assert_eq!(issue, 159);
+        assert_eq!(skill, "dev-groom");
+    }
+
+    // -- dispatcher-source axis on the cycle check (mika#1948 AC4) --
+
+    /// Build a lineage of two tasks on the same `(repo, issue)` but DIFFERENT
+    /// skills, with the given dispatcher sources. Returns the child id, which
+    /// is what a proposed dispatch would hang off.
+    async fn seed_source_lineage(
+        async_db: &crate::async_db::AsyncDatabase,
+        ancestor_skill: &str,
+        ancestor_source: Option<&str>,
+        child_source: Option<&str>,
+    ) -> String {
+        let ancestor = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": { "skill": ancestor_skill, "prompt": "mika#159" }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let ancestor_id = async_db.create_task(ancestor).await.unwrap();
+        if let Some(src) = ancestor_source {
+            async_db
+                .set_task_dispatcher_source(&ancestor_id, src)
+                .await
+                .unwrap();
+        }
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(ancestor_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = async_db.create_task(child).await.unwrap();
+        if let Some(src) = child_source {
+            async_db
+                .set_task_dispatcher_source(&child_id, src)
+                .await
+                .unwrap();
+        }
+        child_id
+    }
+
+    async fn cycle_test_db() -> crate::async_db::AsyncDatabase {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        crate::async_db::AsyncDatabase::new(db)
+    }
+
+    /// AC4 — a manager re-entering its own lineage on the same ticket is
+    /// refused even though the skill differs, which is exactly what the
+    /// exact-tuple rule cannot see.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_rejects_mika_manager_source_escalation() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Different skill, same (repo, issue) — Rule 1 does not fire.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_err(),
+            "a mika_manager dispatch re-entering a mika_manager lineage on the \
+             same ticket must be refused"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mika_manager"),
+            "the refusal must name the source escalation — got: {err}"
+        );
+    }
+
+    /// AC4 fail-open — pre-v51 rows carry NULL on both sides. The new rule must
+    /// be a no-op there, degrading cleanly to the pre-existing exact-tuple
+    /// behaviour. This is the backward-compatibility contract.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_null_dispatcher_source_fail_open() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(&async_db, "dev-pilot", None, None).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "NULL sources on both sides must not trip the new rule — a pre-v51 \
+             dev-pilot → dev-groom chain is legitimate work"
+        );
+    }
+
+    /// The rule is narrow on purpose: it must NOT fire for the autonomous loop.
+    /// Widening it to "any matching source" would refuse the ordinary
+    /// dev-pilot → dev-groom chain that the loop runs constantly.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_for_mika_dev_lineage() {
+        let async_db = cycle_test_db().await;
+        let child_id =
+            seed_source_lineage(&async_db, "dev-pilot", Some("mika_dev"), Some("mika_dev")).await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a mika_dev dev-pilot → dev-groom chain is the loop's normal shape \
+             and must not be refused"
+        );
+    }
+
+    /// Mixed sources must not trip either — only a manager re-entering its own
+    /// lineage is the deadlock shape.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_does_not_fire_on_mixed_sources() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_dev"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#159" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "a manager dispatch following a mika_dev ancestor is an escalation \
+             the loop is allowed to make"
+        );
+    }
+
+    /// Source escalation is target-scoped: a manager lineage on a DIFFERENT
+    /// ticket must not block.
+    #[tokio::test]
+    async fn test_check_lineage_cycle_source_rule_is_target_scoped() {
+        let async_db = cycle_test_db().await;
+        let child_id = seed_source_lineage(
+            &async_db,
+            "dev-pilot",
+            Some("mika_manager"),
+            Some("mika_manager"),
+        )
+        .await;
+
+        // Same sources, different issue.
+        let proposed = serde_json::json!({ "skill": "dev-groom", "prompt": "mika#777" });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(
+            result.is_ok(),
+            "the manager may dispatch a different ticket within the same lineage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection_rejects_same_tuple() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Create parent task with action_config containing (mika, 159, dev-groom)
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "grandparent-1"
+                }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Create child callback task
+        let child_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let child_id = async_db.create_task(child_task).await.unwrap();
+
+        // Propose same (mika, 159, dev-groom) — should be rejected
+        let proposed = serde_json::json!({
+            "skill": "dev-groom",
+            "prompt": "mika#159",
+            "task_id": &child_id
+        });
+        let result = check_lineage_cycle(&async_db, &child_id, &proposed).await;
+        assert!(result.is_err(), "expected cycle detection to reject");
+        assert!(
+            result.unwrap_err().contains("Cycle detected"),
+            "expected cycle message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cycle_detection_allows_cross_skill() {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Parent with (mika, 159, dev-groom)
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: serde_json::json!({
+                "trigger_kind": "deferred_dispatch",
+                "original_call": {
+                    "skill": "dev-groom",
+                    "prompt": "mika#159",
+                    "task_id": "grandparent-1"
+                }
+            })
+            .to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("deferred_dispatch".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Propose DIFFERENT skill (mika, 159, dev-pilot) — should be allowed
+        let proposed = serde_json::json!({
+            "skill": "dev-pilot",
+            "prompt": "mika#159",
+            "task_id": &parent_id
+        });
+        let result = check_lineage_cycle(&async_db, &parent_id, &proposed).await;
+        assert!(result.is_ok(), "cross-skill chain should be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_gate_preserved_for_non_callback() {
+        // Non-callback context: long_running tool with no long_running_ctx and
+        // no callback_task_id should return the original error message.
+        let tool = make_deferred_dispatch_tool();
+        let input =
+            serde_json::json!({"skill": "dev-pilot", "prompt": "mika#42", "task_id": "abc"});
+        let output = execute_skill_tool(&tool, input, 30, None, None, None, None).await;
+        assert!(output.is_error, "expected error for non-callback context");
+        assert!(
+            output.content.contains("cannot run in the current context"),
+            "expected original gate error, got: {}",
+            output.content
+        );
+    }
+
+    // -- rearm_deferred_callback tests (mika#2045) --
+
+    /// A `pending` self_dev issue parent plus a consumed deferred wrapper —
+    /// the shape left behind when promotion fires and the turn never dispatches.
+    async fn rearm_fixture() -> (crate::async_db::AsyncDatabase, String, String) {
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        let mut parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: x/y#2045".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/x/y/issues/2045".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        parent.depth = 0;
+        let parent_id = async_db.create_task(parent).await.unwrap();
+
+        let action_config = serde_json::json!({
+            "trigger_kind": "deferred_dispatch",
+            "original_call": {
+                "skill": "dev-pilot",
+                "prompt": "mika#2045",
+                "task_id": parent_id,
+                INTERNAL_DEFERRED_DISPATCH_FIELD: true,
+            }
+        })
+        .to_string();
+
+        (async_db, parent_id, action_config)
+    }
+
+    async fn pending_wrappers_of(db: &crate::async_db::AsyncDatabase, parent_id: &str) -> usize {
+        db.get_child_tasks(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL && c.status == "pending")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_rearm_registers_replacement_wrapper() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::Rearmed,
+            "re-arm must succeed with budget available"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+    }
+
+    /// The replacement replays the same dispatch — including the sentinel that
+    /// keeps the open-PR guard (mika#920) from livelocking the replay.
+    #[tokio::test]
+    async fn test_rearm_preserves_action_config_and_class() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        assert_eq!(
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "groom",
+                "silent_turn_error",
+                None
+            )
+            .await,
+            RearmOutcome::Rearmed
+        );
+
+        let wrapper = db
+            .get_child_tasks(&parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .expect("replacement wrapper");
+
+        assert_eq!(wrapper.action_config, action_config);
+        assert_eq!(wrapper.dispatch_class.as_deref(), Some("groom"));
+        assert!(
+            wrapper
+                .action_config
+                .contains(INTERNAL_DEFERRED_DISPATCH_FIELD)
+        );
+        assert_eq!(
+            wrapper.reference_url, None,
+            "wrappers must not take the index slot"
+        );
+    }
+
+    /// V3 (mika#2413) — non-regression on mika#2045: the budget still bounds the
+    /// total repairs, so a parent whose turns *really* never dispatch stops
+    /// being re-armed and falls to the reaper. mika#2413 must not widen that
+    /// population by an inch.
+    ///
+    /// The consumption below marks each wrapper `delivered`, which is what the
+    /// engine does (`mark_task_delivered` runs before the R9 re-arm) and is the
+    /// only honest simulation now that liveness is a term of the decision.
+    /// Before mika#2413 the loop left them `completed`, which the engine only
+    /// ever does on the `silent_turn_error` path — and the new guard is
+    /// deliberately meant to refuse a re-arm in that state.
+    #[tokio::test]
+    async fn test_rearm_refuses_once_budget_is_exhausted() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        for _ in 0..MAX_STUCK_REARMS {
+            assert_eq!(
+                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                    .await,
+                RearmOutcome::Rearmed
+            );
+            // Consume the wrapper the way the engine does: promotion writes
+            // `completed`, delivery writes `delivered`.
+            for child in db.get_child_tasks(&parent_id).await.unwrap() {
+                if child.label == crate::agent::DEFERRED_DISPATCH_LABEL && child.status == "pending"
+                {
+                    db.update_task_status(&child.id, "completed").await.unwrap();
+                    db.mark_task_delivered(&child.id).await.unwrap();
+                }
+            }
+        }
+
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            MAX_STUCK_REARMS
+        );
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
+            RearmOutcome::Unrepairable,
+            "budget exhausted is terminal — the reaper may expire the task"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+    }
+
+    /// A full deferred-callback queue is a passing condition, not a verdict on
+    /// this task. Reporting it as terminal would let the reaper destroy a task
+    /// that still had repair budget left.
+    #[tokio::test]
+    async fn test_rearm_reports_flood_cap_as_transient_not_terminal() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        for i in 0..MAX_PENDING_DEFERRED_CALLBACKS {
+            let other = NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+                trigger_type: trigger_type::CALLBACK.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: action_type::RESUME_AGENT.to_string(),
+                action_config: format!("{{\"n\":{i}}}"),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            };
+            db.create_task(other).await.unwrap();
+        }
+
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
+            RearmOutcome::NotNow,
+            "a full queue clears on its own — the task must survive to be retried"
+        );
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "a refusal for capacity must not spend repair budget"
+        );
+    }
+
+    /// Anti-vacuity: the turn DID dispatch. Re-arming here would double-dispatch.
+    #[tokio::test]
+    async fn test_rearm_declines_when_parent_already_dispatched() {
+        let (db, parent_id, action_config) = rearm_fixture().await;
+
+        let real_callback = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        db.create_task(real_callback).await.unwrap();
+
+        assert_eq!(
+            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
+                .await,
+            RearmOutcome::NotNow,
+            "a live dispatch means nothing to repair — and nothing to expire either"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_callback_deferred_dispatch_registered() {
+        // Callback context with callback_task_id and db should register a
+        // deferred dispatch instead of returning a hard error.
+        let db = crate::db::Database::open_in_memory().unwrap();
+        db.create_session("test-session", "mika", "cli").unwrap();
+        let async_db = crate::async_db::AsyncDatabase::new(db);
+
+        // Create a parent manual task
+        let parent_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "implement mika#42".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = async_db.create_task(parent_task).await.unwrap();
+
+        // Create callback task (child of parent)
+        let callback_task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "callback".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let callback_id = async_db.create_task(callback_task).await.unwrap();
+
+        let tool = make_deferred_dispatch_tool();
+        let input = serde_json::json!({
+            "skill": "dev-pilot",
+            "prompt": "mika#42",
+            "task_id": &parent_id
+        });
+        let output = execute_skill_tool(
+            &tool,
+            input,
+            30,
+            None,
+            None,
+            Some(&callback_id),
+            Some(&async_db),
+        )
+        .await;
+
+        // Should succeed with deferred status, not error
+        assert!(
+            !output.is_error,
+            "expected deferred success, got error: {}",
+            output.content
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&output.content)
+            .unwrap_or_else(|_| panic!("expected JSON, got: {}", output.content));
+        assert_eq!(parsed["status"], "deferred");
+        assert_eq!(parsed["deferred"], true);
+
+        // Verify a deferred callback was created in the DB
+        let count = async_db.count_pending_deferred_callbacks().await.unwrap();
+        assert_eq!(count, 1, "expected one deferred callback to be registered");
+    }
+
+    /// Helper: create a long_running tool fixture for deferred dispatch tests (mika#1058).
+    fn make_deferred_dispatch_tool() -> ResolvedSkillTool {
+        ResolvedSkillTool {
+            definition: ToolDefinition {
+                name: "run_claude_pilot".to_string(),
+                description: "Test long-running tool".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["skill", "prompt", "task_id"],
+                    "properties": {
+                        "skill": { "type": "string" },
+                        "prompt": { "type": "string" },
+                        "task_id": { "type": "string" }
+                    }
+                }),
+            },
+            handler: ToolHandler::Exec {
+                command: "handler.sh".to_string(),
+                long_running: true,
+                estimated_duration_secs: Some(3600),
+                detaches_command: false,
+            },
+            skill_dir: PathBuf::from("/tmp"),
+        }
+    }
+
+    // --- check_grooming_markers tests (#919) ---
+
+    /// Fully groomed issue body — all three signals present.
+    #[test]
+    fn test_grooming_markers_all_present() {
+        let body = r#"
+> - **Branch:** `fix/919/self-dev-agent-operator-cli-dispatch`
+> - **Plan:** `mika/docs/plans/2026-05-13-001-fix-dispatch-grooming-marker-engine-guard-plan.md` (committed on branch @ `3f99625a`)
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+
+## Symptom
+Some issue body text here.
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "expected no missing signals, got: {missing:?}"
+        );
+    }
+
+    /// Completely ungroomed — missing all three signals.
+    #[test]
+    fn test_grooming_markers_all_missing() {
+        let body = "## Some Issue\n\nJust a plain issue body with no grooming markers.";
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["branch_callout", "plan_callout", "groomed_verdict"]
+        );
+    }
+
+    /// Partially groomed — has Plan but missing Branch and verdict.
+    #[test]
+    fn test_grooming_markers_partial_missing() {
+        let body = r#"
+Some text here.
+
+Plan: docs/plans/some-plan.md is referenced.
+
+No branch callout and no second-pass line.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["branch_callout", "groomed_verdict"]);
+    }
+
+    /// Has Branch and Plan but missing the architect verdict.
+    #[test]
+    fn test_grooming_markers_missing_verdict_only() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `mika/docs/plans/some-plan.md` (committed on branch @ `abc123`)
+
+Plan: docs/plans/some-plan.md is also in the body.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["groomed_verdict"]);
+    }
+
+    /// Has verdict text but not the exact canonical shape — must fail.
+    #[test]
+    fn test_grooming_markers_wrong_verdict_shape() {
+        let body = r#"
+> - **Branch:** `feat/something`
+Plan: docs/plans/foo.md
+Verdict: GROOMED
+"#;
+        // "Verdict: GROOMED" is NOT the canonical shape. The canonical shape
+        // is "second-pass (GROOMED)" from the grooming history line.
+        let missing = check_grooming_markers(body);
+        assert_eq!(missing, vec!["groomed_verdict"]);
+    }
+
+    /// Empty body — all signals missing.
+    #[test]
+    fn test_grooming_markers_empty_body() {
+        let missing = check_grooming_markers("");
+        assert_eq!(
+            missing,
+            vec!["branch_callout", "plan_callout", "groomed_verdict"]
+        );
+    }
+
+    // --- check_grooming_markers #1725 parameterized verdict widening ---
+
+    /// mika#1723 dispatch failure shape: orchestrator-CC produced
+    /// `second-pass (GROOMED, session fd4c1a14)` — the comma broke the strict
+    /// substring match, gate rejected with `dispatch_no_grooming_marker`.
+    #[test]
+    fn test_grooming_markers_accepts_comma_parameter() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED, session fd4c1a14)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "comma-parameterized GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// Em-dash-annotated form (canonical orchestrator-CC session-id shape).
+    #[test]
+    fn test_grooming_markers_accepts_em_dash_annotation() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED — session-id: fd4c1a14)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "em-dash-annotated GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// Period-terminated form: `second-pass (GROOMED. Full ratification.)`.
+    #[test]
+    fn test_grooming_markers_accepts_period_terminator() {
+        let body = r#"
+> - **Branch:** `fix/1725/loop-substrate`
+> - **Plan:** `docs/plans/2026-07-04-001-fix-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED. Full ratification.)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "period-terminated GROOMED must pass, got: {missing:?}"
+        );
+    }
+
+    /// False-positive guard: prose `"the ticket was GROOMED yesterday"` must
+    /// NOT satisfy the check. The `second-pass (` prefix anchor blocks it.
+    #[test]
+    fn test_grooming_markers_rejects_prose_groomed_without_prefix() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+
+Discussion: the ticket was GROOMED yesterday but never actually reviewed.
+GROOMED status pending in another ticket.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "prose GROOMED without `second-pass (` prefix must not match"
+        );
+    }
+
+    /// False-positive guard: `second-pass (GROOMEDLY)` — letter-continuation
+    /// after GROOMED must be rejected by the character class discriminator.
+    #[test]
+    fn test_grooming_markers_rejects_letter_continuation() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMEDLY reviewed) — bogus
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "letter-continuation after GROOMED must not match"
+        );
+    }
+
+    /// **Inversé par mika#2158.** Ce test exigeait auparavant que
+    /// `first-pass (GROOMED)` soit refusé, au motif que seul `second-pass (` pouvait
+    /// précéder un verdict.
+    ///
+    /// Ce motif est précisément celui que mika#2158 supprime : le producteur qui précède
+    /// `GROOMED` ne décide plus rien, parce que l'AC3 exige de reconnaître
+    /// `… (ESCALATE …) → arbitrage → mika-arch (GROOMED)`, où le producteur n'est aucune
+    /// passe. Un prédicat qui accepte `mika-arch (GROOMED)` et refuse
+    /// `first-pass (GROOMED)` mesurerait à nouveau une formulation.
+    #[test]
+    fn test_grooming_markers_accepts_groomed_from_any_producer() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (GROOMED) — verdict rendu dès la première passe
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "un GROOMED est un GROOMED quel que soit le producteur (mika#2158 AC3), got: {missing:?}"
+        );
+    }
+
+    // --- check_grooming_markers recovery callout tests (#1123) ---
+
+    /// Recovery callout written by dispatch-lib.sh post-flight (mika#1123)
+    /// intentionally does NOT pass the gate — it surfaces drift without
+    /// fabricating an architect verdict.
+    #[test]
+    fn test_check_grooming_markers_recovery_callout_does_not_pass() {
+        let body = r#"> - **Branch:** `fix/794/agent-pr-merge`
+> - **Plan:** `docs/plans/2026-05-15-001-fix-plan.md` (committed on branch @ `abc1234`)
+> - **Grooming history:** body callout recovered by post-flight (mika#1123) — architect verdict not verified, operator dispatch required
+
+## Symptom
+..."#;
+        let missing = check_grooming_markers(body);
+        // Branch and plan callouts pass, but groomed_verdict is correctly missing
+        assert!(
+            !missing.contains(&"branch_callout"),
+            "Recovery callout should pass branch_callout check"
+        );
+        assert!(
+            !missing.contains(&"plan_callout"),
+            "Recovery callout should pass plan_callout check"
+        );
+        assert!(
+            missing.contains(&"groomed_verdict"),
+            "Recovery callout must NOT pass the groomed_verdict check — \
+             it doesn't fabricate an architect verdict"
+        );
+    }
+
+    /// Organic callout written by the LLM in dev-groom step 18 — all three
+    /// signals present, should pass the gate completely.
+    #[test]
+    fn test_check_grooming_markers_organic_callout_passes() {
+        let body = r#"> - **Branch:** `fix/794/agent-pr-merge`
+> - **Plan:** `docs/plans/2026-05-15-001-fix-plan.md` (committed on branch @ `abc1234`)
+> - **Grooming history:** /ce:plan -> mika-arch first-pass (ITERATE) -> revisions -> mika-arch second-pass (GROOMED)
+
+## Symptom
+..."#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "Organic callout with all three signals should pass: {missing:?}"
+        );
+    }
+
+    // --- check_grooming_markers single-pass verdict tests (mika#2012) ---
+
+    /// The exact line `write_canonical_callout`'s `ready-single-pass` stage
+    /// emits. Before mika#2012 this body had no recognized verdict, so the
+    /// ticket stayed invisible to the gate and was re-dispatched as `dev-groom`
+    /// forever.
+    #[test]
+    fn test_grooming_markers_accepts_single_pass_ready() {
+        let body = r#"
+> - **Branch:** `fix/2012/dispatch-le-loop-re-groome-des-tickets-d`
+> - **Plan:** `docs/plans/2026-08-27-001-fix-2012-regroom-loop-verdict-gate-plan.md` (committed on branch @ `d2bd0ed2`)
+> - **Grooming history:** first-pass (READY, single-pass GROOMED) — no second pass required — session-id: 66811de9
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "single-pass READY grooming exit must pass, got: {missing:?}"
+        );
+    }
+
+    /// **Inversé par mika#2158 (AC1), et l'objection d'origine est conservée ici parce
+    /// qu'elle est réelle.**
+    ///
+    /// Ce test exigeait qu'un `first-pass (READY)` nu échoue, au motif que c'est la
+    /// disposition que l'architecte émet *au milieu* du grooming, avant que
+    /// `write_canonical_callout` ait committé le plan — l'accepter dispatcherait un ticket
+    /// dont le plan n'est pas sur la branche.
+    ///
+    /// L'objection est fondée mais elle vise le mauvais garde-fou. Elle demandait au
+    /// prédicat de prose de deviner si un fichier existe sur une branche ; c'est
+    /// `_committed_plan_on_branch` (`_shared/dispatch-lib.sh`) qui mesure cet artefact, et
+    /// il est déjà le garde du dispatch. Le coût de l'ancienne position était mesuré :
+    /// #2108 porte `first-pass (READY) → aucune révision requise` — le chemin que
+    /// `/mika-groom-ticket` phase 3 étape 10 **prescrit** quand le plan est sain du premier
+    /// coup — et restait invisible, re-dispatché en grooming toutes les dix minutes.
+    ///
+    /// Ce qui protège encore ici : la condition `Plan`/`Branch` de cette même fonction, et
+    /// le fait qu'une marque de seconde passe désarme la règle AC1 (voir
+    /// `grooming_marker::grooming_verdict`).
+    #[test]
+    fn test_grooming_markers_accepts_bare_first_pass_ready() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (READY) — aucune révision requise
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "le chemin prescrit première-passe-READY doit passer (mika#2158 AC1), got: {missing:?}"
+        );
+    }
+
+    /// False-positive guard: prose mentioning the annotation without the
+    /// `first-pass (` prefix anchor must not match.
+    #[test]
+    fn test_grooming_markers_rejects_prose_single_pass_groomed() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+
+Discussion: this one was a single-pass GROOMED case, unlike the others.
+"#;
+        let missing = check_grooming_markers(body);
+        assert_eq!(
+            missing,
+            vec!["groomed_verdict"],
+            "prose `single-pass GROOMED` without the first-pass anchor must not match"
+        );
+    }
+
+    /// Non-regression: the spec-tolerated paraphrase (#1108) still passes after
+    /// the mika#2012 widening.
+    #[test]
+    fn test_grooming_markers_paraphrased_still_passes() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (ITERATE) → second-pass (READY, paraphrased GROOMED — plan sound)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "paraphrased GROOMED must still pass after #2012, got: {missing:?}"
+        );
+    }
+
+    /// Non-regression: the canonical two-pass verdict is unaffected by the
+    /// added alternative.
+    #[test]
+    fn test_grooming_markers_two_pass_still_passes_after_2012() {
+        let body = r#"
+> - **Branch:** `feat/something`
+> - **Plan:** `docs/plans/some-plan.md`
+> - **Grooming history:** first-pass (ITERATE) → revisions → second-pass (GROOMED — session-id: abc123)
+"#;
+        let missing = check_grooming_markers(body);
+        assert!(
+            missing.is_empty(),
+            "canonical two-pass GROOMED must still pass, got: {missing:?}"
+        );
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns correct skill.
+    #[test]
+    fn test_extract_skill_dev_pilot() {
+        let input = serde_json::json!({"skill": "dev-pilot", "prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), Some("dev-pilot"));
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns dev-groom.
+    #[test]
+    fn test_extract_skill_dev_groom() {
+        let input = serde_json::json!({"skill": "dev-groom", "prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), Some("dev-groom"));
+    }
+
+    /// Bypass predicate: extract_skill_from_input returns None for missing skill.
+    #[test]
+    fn test_extract_skill_missing() {
+        let input = serde_json::json!({"prompt": "mika#919"});
+        assert_eq!(extract_skill_from_input(&input), None);
+    }
+
+    // ─────────── Dispatch seat gate, tool boundary (mika#2084) ───────────
+    //
+    // This is the layer that would have stopped the 2026-08-30 collision: the
+    // task that raced SSC on mika#2055 arrived as `source: self_dev`,
+    // `trigger: manual`, so the ready-label handler never saw it.
+    //
+    // The `gh` call that reads the labels needs a network and a token, so what
+    // is asserted here is the decision and its wording — the part an operator
+    // and the LLM actually read. Both directions, as everywhere in this fix.
+
+    /// AC1 + AC5 — a refused dispatch says which issue, which label, which seat.
+    #[test]
+    fn test_seat_rejection_names_issue_label_and_seat() {
+        let verdict = crate::webhook_dispatch::classify_dispatch_seat(["dispatch:ssc"]);
+        let rejection = seat_rejection_json("task-abc", "senara-solutions/mika", 2055, &verdict)
+            .expect("a foreign seat must be refused");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rejection).expect("rejection must be valid JSON");
+        assert_eq!(parsed["error"], "dispatch_seat_mismatch");
+        assert_eq!(parsed["task_id"], "task-abc");
+        assert_eq!(parsed["issue"], "senara-solutions/mika#2055");
+        assert_eq!(parsed["found_label"], "dispatch:ssc");
+        assert_eq!(
+            parsed["current_seat"],
+            crate::webhook_dispatch::CURRENT_DISPATCH_SEAT
+        );
+
+        let reason = parsed["reason"].as_str().expect("reason is a string");
+        // Structural, not transient — an LLM that reads this must not retry.
+        assert!(reason.contains("structural gate"));
+        assert!(reason.contains("retrying will not clear it"));
+        assert!(reason.contains("2084"));
+    }
+
+    /// AC2 — an unresolvable seat refuses too, and says so in its own terms.
+    #[test]
+    fn test_seat_rejection_covers_unresolvable_seats() {
+        for labels in [
+            vec!["dispatch:zorglub"],
+            vec!["dispatch:"],
+            vec!["dispatch:ssc", "dispatch:mpc"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 1, &verdict).is_some(),
+                "{labels:?} must be refused — an unidentifiable seat is not an authorization"
+            );
+        }
+    }
+
+    /// AC3 + AC4 positive half — the test that catches a gate that over-reaches.
+    ///
+    /// Delete the `verdict.refuses()` early-return in `seat_rejection_json` and
+    /// this goes red while the two tests above stay green; that asymmetry is
+    /// the whole point of keeping it.
+    #[test]
+    fn test_no_seat_label_produces_no_rejection() {
+        for labels in [
+            vec!["bug", "p1-important", "ready"],
+            vec![],
+            vec!["dispatched", "dispatch-ready"],
+            vec!["dispatch:loop"],
+        ] {
+            let verdict = crate::webhook_dispatch::classify_dispatch_seat(labels.clone());
+            assert!(
+                seat_rejection_json("t", "senara-solutions/mika", 2055, &verdict).is_none(),
+                "{labels:?} must still dispatch — refusing it would stop the loop"
+            );
+        }
+    }
+
+    // ---- mika#2287: grooming-provenance verdict, all three arms ----
+
+    /// Proof present → the cross-check lets the dispatch proceed.
+    #[test]
+    fn test_groom_provenance_verdict_proof_present_allows() {
+        assert!(groom_provenance_verdict(Ok(true), "t", "senara-solutions", "mika", 2287).is_ok());
+    }
+
+    /// No proof → `dispatch_grooming_not_verified`, and the recovery text names
+    /// only routes that can actually mint proof (no bypass flag, no `ready`
+    /// re-label that would land in this same refusal).
+    #[test]
+    fn test_groom_provenance_verdict_no_proof_refuses() {
+        let rejection = groom_provenance_verdict(Ok(false), "t", "senara-solutions", "mika", 2287)
+            .expect_err("no proof must refuse");
+        assert_eq!(rejection["error"], "dispatch_grooming_not_verified");
+        assert_eq!(rejection["issue"], "senara-solutions/mika#2287");
+        let recovery = rejection["recovery"].as_str().unwrap();
+        assert!(recovery.contains("groom <typed-ref>"));
+        assert!(recovery.contains("already_groomed"));
+        assert!(
+            !recovery.contains("MIKA_DISPATCH_BYPASS_GROOMING_CHECK"),
+            "the removed bypass must not be offered as recovery"
+        );
+    }
+
+    /// DB error → FAIL-CLOSED. This is the one behavioural change of
+    /// mika#2287's caller fix: the pre-fix arm allowed the dispatch with a
+    /// warning. Deleting the `Err(e) => Err(...)` arm (or making it `Ok(())`)
+    /// turns this test red.
+    #[test]
+    fn test_groom_provenance_verdict_db_error_fails_closed() {
+        let rejection = groom_provenance_verdict(
+            Err(anyhow::anyhow!("database has been shut down")),
+            "t",
+            "senara-solutions",
+            "mika",
+            2287,
+        )
+        .expect_err("a DB error must refuse, never allow");
+        assert_eq!(rejection["error"], "dispatch_check_failed");
+        assert_eq!(rejection["task_id"], "t");
+        let reason = rejection["reason"].as_str().unwrap();
+        assert!(reason.contains("database has been shut down"));
+        assert!(reason.contains("#2287"));
+    }
+
+    /// mika#2310 — isolated harness for the mika#1620 / mika#2287 gate, dispatch
+    /// path level. Cases 4 and 8 (predicate level) live in
+    /// `db::tests::harnais_porte`; this submodule carries the two the gate never
+    /// had: the end-to-end run the campaign (mika#2288) only ever obtained from a
+    /// live groom, and its negative twin.
+    ///
+    /// The name is the campaign's, not the mechanism's: it is what the ticket's
+    /// exit criterion interrogates (`cargo test -p mika-agent harnais_porte`).
+    mod harnais_porte {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_CALLBACK_PLAN_GROOMED, completed_groom_pair, db};
+
+        /// Owner / repo / number that `evaluate_grooming_gate` folds into the
+        /// issue URL — they MUST reproduce `db::tests::GROOM_ISSUE_URL`
+        /// (`https://github.com/senara-solutions/mika/issues/123`), because the
+        /// proof row is keyed on the bare URL the ready-label handler writes.
+        const OWNER: &str = "senara-solutions";
+        const REPO: &str = "mika";
+        const NUMBER: u64 = 123;
+
+        /// Issue body carrying the three canonical grooming markers, as the
+        /// autonomous loop stamps them (mika#907, mika#919). A fixture, not
+        /// GitHub: the only link outside this test is the HTTP transport, which
+        /// the ticket excludes itself ("zero network").
+        const GROOMED_ISSUE_BODY: &str = "\
+## Summary
+
+Harness ticket.
+
+> - **Branch:** `feat/123/harnais-porte`
+> - **Plan:** `docs/plans/2026-09-15-001-test-123-harnais-porte-plan.md`
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+";
+
+        /// Case 9 — end to end, on the real dispatch path.
+        ///
+        /// Before mika#2310 the segment `check_grooming_markers` → issue-URL →
+        /// `has_completed_groom_for_issue` → `groom_provenance_verdict` was
+        /// exercised by no test: `test_dispatch_no_grooming_marker_guard.rs`
+        /// stops at the markers because `fetch_issue_body` is not mockable, and
+        /// the `db.rs` tests know nothing of the call site. That is why live
+        /// grooms were the gate's only proof. Here: a temporary `AsyncDatabase`
+        /// carrying the nominal parent+child pair (built through the production
+        /// write API by `completed_groom_pair`), the markers in a fixture, and
+        /// the extracted segment called as `validate_dispatch_readiness` calls it.
+        ///
+        /// Read together with `harnais_porte_cas9b_…` below — an assertion of
+        /// absence also passes when the path evaluates nothing.
+        #[tokio::test]
+        async fn harnais_porte_cas9_groomed_issue_with_proof_passes_gate() {
+            let sync_db = db();
+            let (_parent_id, _callback_id) = completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2310",
+                OWNER,
+                REPO,
+                NUMBER,
+                GROOMED_ISSUE_BODY,
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "a groomed issue whose proof row exists must pass the gate with \
+                 no rejection at all (neither `dispatch_no_grooming_marker` nor \
+                 `dispatch_grooming_not_verified`); got: {outcome:?}"
+            );
+        }
+
+        /// Case 9b — the negative twin of case 9 (mika#2310 D2).
+        ///
+        /// Same path, same temporary DB, same markers in the fixture, but
+        /// **without** the parent+child pair. An `evaluate_grooming_gate` that
+        /// returned `Ok(())` without reading anything would satisfy case 9 in
+        /// full; this test is what makes the pair attest the gate. The expected
+        /// rejection is exactly `dispatch_grooming_not_verified` — not
+        /// `dispatch_no_grooming_marker` (the markers ARE present) and not
+        /// `dispatch_check_failed` (the DB is readable, the proof is merely
+        /// absent).
+        #[tokio::test]
+        async fn harnais_porte_cas9b_groomed_issue_without_proof_is_refused() {
+            let async_db = AsyncDatabase::new_with_agent(db(), "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2310",
+                OWNER,
+                REPO,
+                NUMBER,
+                GROOMED_ISSUE_BODY,
+            )
+            .await
+            .expect_err("markers present but no proof row must refuse the dispatch");
+
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "markers are present and the DB is readable: the only admissible \
+                 refusal is the provenance one; got: {rejection}"
+            );
+            assert_eq!(rejection["task_id"], "task-2310");
+            assert_eq!(rejection["issue"], "senara-solutions/mika#123");
+        }
+
+        /// **Test 5 / AC3 — les quatre verdicts de la porte sont inchangés.**
+        ///
+        /// mika#2484 déplace une décision ; il n'en change aucune formulation
+        /// (R3). Les trois `test_groom_provenance_verdict_*` au-dessus restent
+        /// verts sans modification — ce test-ci couvre la moitié qu'ils ne
+        /// voient pas : que la **traductrice** rend bien ces quatre sorties
+        /// après être passée par `groomed_state`.
+        #[tokio::test]
+        async fn mika2484_les_quatre_verdicts_de_la_porte_sont_inchanges() {
+            // (1) `Ok` — callouts + preuve.
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let ok_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+            assert!(
+                evaluate_grooming_gate(&ok_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .is_ok()
+            );
+
+            // (2) `dispatch_no_grooming_marker` — aucun callout.
+            let empty_db = AsyncDatabase::new_with_agent(db(), "mika");
+            let missing =
+                evaluate_grooming_gate(&empty_db, "t", OWNER, REPO, NUMBER, "aucun callout")
+                    .await
+                    .expect_err("un corps sans callout refuse");
+            assert_eq!(missing["error"], "dispatch_no_grooming_marker");
+            assert!(
+                missing["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("'> - **Branch:**', 'docs/plans/'"),
+                "la formulation du prédicat est déplacée, jamais réécrite : {missing}"
+            );
+            assert!(
+                missing["missing_signals"]
+                    .as_array()
+                    .expect("missing_signals est un tableau")
+                    .len()
+                    == 3,
+                "les trois signaux manquants sont nommés : {missing}"
+            );
+
+            // (3) `dispatch_grooming_not_verified` — callouts, pas de preuve.
+            let no_proof =
+                evaluate_grooming_gate(&empty_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .expect_err("callouts sans preuve refusent");
+            assert_eq!(no_proof["error"], "dispatch_grooming_not_verified");
+            let recovery = no_proof["recovery"].as_str().expect("recovery présent");
+            assert!(
+                recovery.contains("already_groomed"),
+                "le champ `recovery` est déplacé à l'identique : {no_proof}"
+            );
+            // La seule phrase de ce payload que mika#2484 change, et elle
+            // change parce que ce ticket la rend fausse : la laisser serait
+            // prescrire une route morte, la régression que mika#2287 a nommée.
+            assert!(
+                !recovery.contains("does NOT help"),
+                "le `recovery` prescrit encore que re-poser `ready` ne sert à \
+                 rien — c'est ce que le routage corrigé a cessé d'être vrai : \
+                 {recovery}"
+            );
+            assert!(
+                recovery.contains("route to dev-groom, not dev-pilot"),
+                "le `recovery` doit nommer la route qui marche : {recovery}"
+            );
+
+            // (4) `dispatch_check_failed` — base injoignable, FAIL-CLOSED.
+            let dead_db = AsyncDatabase::new_with_agent(db(), "mika");
+            dead_db.shutdown();
+            let unreadable =
+                evaluate_grooming_gate(&dead_db, "t", OWNER, REPO, NUMBER, GROOMED_ISSUE_BODY)
+                    .await
+                    .expect_err("une base injoignable refuse, jamais n'autorise");
+            assert_eq!(unreadable["error"], "dispatch_check_failed");
+            assert!(
+                unreadable["reason"]
+                    .as_str()
+                    .expect("reason présent")
+                    .contains("shut down"),
+                "le message d'erreur original traverse `ProofUnreadable` sans être \
+                 réécrit — c'est ce qui rend le JSON identique à l'octet près : {unreadable}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2484 — une intention de grooming ne peut pas dispatcher un implement
+    // -----------------------------------------------------------------------
+
+    mod mika2484_intention {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::db;
+
+        fn dispatch_input(skill: &str) -> serde_json::Value {
+            serde_json::json!({
+                "skill": skill,
+                "prompt": "mika#2471",
+                "task_id": "t-2484",
+            })
+        }
+
+        /// **Test 6 / AC4 — le rouge du défaut 2.**
+        ///
+        /// `mika ask --agent mika-dev "groom mika issue#2471"` sur un ticket
+        /// callouté a produit un callback **implement** qui a ouvert une PR :
+        /// une implémentation sur un grooming que le chemin moteur n'a jamais
+        /// vérifié. La garde refuse avant tout fetch de tâche, donc la base n'a
+        /// même pas besoin de porter la tâche.
+        #[tokio::test]
+        async fn mika2484_une_intention_de_grooming_refuse_un_dev_pilot() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let rejection = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-pilot")),
+                Some("groom mika issue#2471"),
+            )
+            .await
+            .expect_err("une intention de grooming ne peut pas dispatcher un implement");
+
+            assert!(
+                rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "le jeton de refus est un format de fil que l'opérateur grep : {rejection}"
+            );
+            assert!(
+                rejection.contains("run_claude_pilot_groom"),
+                "le refus nomme l'outil correct et est actionnable dans le même \
+                 tour (R7) : {rejection}"
+            );
+        }
+
+        /// **Test 7 — et il laisse passer le chemin nominal.**
+        ///
+        /// Sans ce contrôle, une garde qui refuserait *tout* sous intention de
+        /// grooming passerait le test 6 en supprimant le grooming lui-même.
+        /// L'erreur attendue ici est `task_not_found` : la garde a laissé
+        /// passer et le refus vient du fetch de tâche, quatre étapes plus loin.
+        #[tokio::test]
+        async fn mika2484_la_meme_intention_laisse_passer_un_dev_groom() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-groom")),
+                Some("groom mika issue#2471"),
+            )
+            .await;
+
+            let rejection = outcome.expect_err("la tâche n'existe pas dans cette base");
+            assert!(
+                !rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "un `run_claude_pilot_groom` sous intention de grooming EST le \
+                 chemin nominal : {rejection}"
+            );
+            assert!(
+                rejection.contains("task_not_found"),
+                "le refus doit venir du fetch de tâche, donc d'APRÈS la garde : \
+                 {rejection}"
+            );
+        }
+
+        /// Le contrôle négatif du mot, au niveau de la garde branchée — et non
+        /// plus seulement du prédicat. Une demande de *rapport* de grooming ne
+        /// doit pas refuser un dispatch.
+        #[tokio::test]
+        async fn mika2484_grooming_report_ne_refuse_pas_un_dev_pilot() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            let rejection = validate_dispatch_readiness(
+                &db,
+                "t-2484",
+                None,
+                Some(&dispatch_input("dev-pilot")),
+                Some("grooming report for mika#2471, then implement it"),
+            )
+            .await
+            .expect_err("la tâche n'existe pas dans cette base");
+
+            assert!(
+                !rejection.contains(GROOMING_INTENT_MISMATCH_ERROR),
+                "« grooming report » n'est pas une intention de grooming : {rejection}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2423 — un AC comportemental non exécutable dans le budget n'est plus
+    // un `hold[review]`
+    // -----------------------------------------------------------------------
+
+    /// **V1** — le refus, et le fait qu'il précède le spawn.
+    ///
+    /// Le handler dort 10 s. Si la garde mord, l'appel revient immédiatement :
+    /// c'est la seule preuve disponible que *rien n'a été lancé*, donc qu'aucun
+    /// orphelin ne peut naître de cette tentative.
+    #[tokio::test]
+    async fn mika2423_a_build_command_under_a_short_budget_is_refused_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("handler.sh");
+        write_script(&script, "#!/bin/sh\nsleep 10\n");
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let started = std::time::Instant::now();
+        let out = execute_skill_tool(
+            &tool,
+            serde_json::json!({ "command": "cargo test --release" }),
+            30,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(out.is_error, "a refusal is returned as an error output");
+        let body: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(body["error"], "build_command_exceeds_tool_budget");
+        assert_eq!(body["policy"], "refusal");
+        assert_eq!(body["tool_budget_secs"], 30);
+        assert_eq!(body["matched_family"], "cargo test");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "the refusal must precede the spawn; took {elapsed:?}"
+        );
+    }
+
+    /// Un outil exec synchrone, de la forme de `run_shell` : le budget borne
+    /// l'exécution de `input.command`.
+    fn sync_shell_tool() -> ResolvedSkillTool {
+        make_exec_tool(std::path::Path::new("/nonexistent"), "handler.sh")
+    }
+
+    /// Le même outil, déclarant remettre sa commande à un runtime détaché —
+    /// la forme de `tmux_create_session`.
+    fn detached_shell_tool() -> ResolvedSkillTool {
+        let mut tool = sync_shell_tool();
+        tool.handler = ToolHandler::Exec {
+            command: "handlers/create_session.sh".to_string(),
+            long_running: false,
+            estimated_duration_secs: None,
+            detaches_command: true,
+        };
+        tool
+    }
+
+    /// Le même outil, `long_running` — la forme de `build_mika`.
+    fn long_running_tool() -> ResolvedSkillTool {
+        let mut tool = sync_shell_tool();
+        tool.handler = ToolHandler::Exec {
+            command: "handlers/build.sh".to_string(),
+            long_running: true,
+            estimated_duration_secs: Some(300),
+            detaches_command: false,
+        };
+        tool
+    }
+
+    /// **V2 — contrôle négatif.** La même commande sous un budget de build
+    /// n'est pas refusée.
+    ///
+    /// Sans lui, « refuse les builds sous budget court » serait indistinguable
+    /// de « refuse les builds », et la voie légitime pour compiler serait
+    /// fermée sans que rien ne rougisse.
+    #[test]
+    fn mika2423_the_same_command_under_a_build_budget_is_not_refused() {
+        let input = serde_json::json!({ "command": "cargo test --release" });
+        assert!(
+            refuse_uncontainable_build(&sync_shell_tool(), &input, 600).is_none(),
+            "a build budget contains a build"
+        );
+        assert!(
+            refuse_uncontainable_build(&sync_shell_tool(), &input, BUILD_FLOOR_SECS).is_none(),
+            "le plancher lui-même n'est pas un refus — le prédicat est `<`"
+        );
+        assert!(
+            refuse_uncontainable_build(&sync_shell_tool(), &input, BUILD_FLOOR_SECS - 1).is_some(),
+            "un cran sous le plancher, en revanche, refuse"
+        );
+    }
+
+    /// **V3 — contrôle négatif.** Une commande ordinaire n'est jamais refusée,
+    /// et la borne par identifiant est réelle.
+    ///
+    /// Les trois entrées `cargo.log` / `make-believe` / `libcargo-dev` sont les
+    /// cas que `run.sh` nomme déjà pour ses propres scans : un match par
+    /// sous-chaîne les prendrait tous les trois et rendrait la garde
+    /// inutilisable.
+    #[test]
+    fn mika2423_an_ordinary_command_is_never_refused() {
+        for ordinary in [
+            "git status",
+            "grep -r foo crates/",
+            "cat Cargo.toml",
+            "ls -la target/",
+            // Borne par identifiant — `.` et `-` ne sont pas des frontières.
+            "cat cargo.log",
+            "./make-believe test",
+            "apt list libcargo-dev",
+            // La sous-commande doit suivre le binaire, pas traîner ailleurs.
+            "cargo metadata --format-version 1 | grep test",
+            "git log --oneline | grep cargo",
+            // Une famille sans sa sous-commande n'est pas un build.
+            "cargo --version",
+            "npm ci",
+            // Une mention en prose n'est pas une instruction (mika#2438,
+            // revue) : le binaire n'est pas en tête d'instruction.
+            "grep -rn 'cargo test ' docs/",
+            "git commit -m \"cargo test passes\"",
+            "echo \"make test passed\" >> notes.md",
+            "git log --grep='cargo clippy --all-targets'",
+            // Un sous-shell n'est pas découpé : manque accepté, pas un refus.
+            "(cargo test)",
+        ] {
+            let input = serde_json::json!({ "command": ordinary });
+            assert!(
+                refuse_uncontainable_build(&sync_shell_tool(), &input, 30).is_none(),
+                "`{ordinary}` is not a build command and must not be refused"
+            );
+        }
+    }
+
+    /// **V3b — contrôle négatif, la forme exacte de l'étape 2 de qa-review.**
+    ///
+    /// L'unique `run_shell` de l'étape 2 embarque le corps de PR verbatim dans
+    /// un heredoc quoté, sous un budget de 30 s. 31 des 40 derniers corps de
+    /// PR de `mika` citent une commande de build — en prose, et parfois en
+    /// début de ligne dans un bloc de code. Sans ce contrôle, la garde refusait
+    /// les guards du dépôt sur la majorité des PR, et la ligne 40 du prompt
+    /// disait ensuite au modèle de « continuer » : un faux vert silencieux,
+    /// exactement la classe que mika#2423 corrige (revue de PR #2438, P0).
+    #[test]
+    fn mika2423_the_qa_review_step_2_heredoc_is_not_a_build_command() {
+        let step_2 = "R=\"$MIKA_PLATFORM_DIR/mika\"; W=$(mktemp -d); trap 'rm -rf \"$W\"' EXIT\n\
+            cat > \"$W.body\" <<'MIKA_QA_BODY_EOF'\n\
+            ## Summary\n\
+            - [x] `cargo clippy --all-targets -- -D warnings` clean\n\
+            - [x] `npm run build --prefix dashboard` verified\n\
+            ```\n\
+            cargo test -p mika-agent --lib mika2423\n\
+            make test\n\
+            ```\n\
+            MIKA_QA_BODY_EOF\n\
+            git -C \"$R\" worktree add --detach \"$W\" \"origin/fix/2423\" >/dev/null 2>&1\n\
+            for g in scripts/verify-pipeline.sh scripts/plan-doc-check.sh; do\n\
+              out=$(cd \"$W\" && GITHUB_PR_BODY=\"$(cat \"$W.body\")\" bash \"$W/$g\" \"origin/main\" 2>&1); rc=$?\n\
+              echo \"GUARD: $g exit=$rc\"; echo \"$out\"\n\
+            done";
+        assert_eq!(
+            matched_build_family(step_2),
+            None,
+            "a PR body inside the Step 2 heredoc must never be read as a build command"
+        );
+        let input = serde_json::json!({ "command": step_2 });
+        assert!(
+            refuse_uncontainable_build(&sync_shell_tool(), &input, 30).is_none(),
+            "the repo guards must run under the 30 s qa-review budget"
+        );
+
+        // Contrôle positif du même mécanisme : la même commande de build,
+        // APRÈS le délimiteur, est bien une instruction.
+        let after_heredoc = "cat > body <<'EOF'\nprose about cargo test\nEOF\ncargo test --release";
+        assert_eq!(
+            matched_build_family(after_heredoc).as_deref(),
+            Some("cargo test"),
+            "an instruction after the heredoc terminator is still recognized"
+        );
+    }
+
+    /// **V3c — contrôle négatif, modèle d'exécution.** Un handler qui remet sa
+    /// commande à un runtime détaché (`tmux_create_session`) ou qui est
+    /// `long_running` (`build_mika`) n'est jamais refusé : le budget de l'outil
+    /// ne borne pas sa commande. C'est la voie légitime pour compiler sous un
+    /// budget court — celle que le prompt `tmux` recommande (revue de PR
+    /// #2438, P1).
+    #[test]
+    fn mika2423_a_detached_or_long_running_handler_is_never_refused() {
+        let input = serde_json::json!({ "command": "cargo build" });
+        assert!(
+            refuse_uncontainable_build(&sync_shell_tool(), &input, 30).is_some(),
+            "contrôle : le même input sur un handler synchrone EST refusé"
+        );
+        assert!(
+            refuse_uncontainable_build(&detached_shell_tool(), &input, 30).is_none(),
+            "a handler that detaches its command is not bounded by the tool budget"
+        );
+        assert!(
+            refuse_uncontainable_build(&long_running_tool(), &input, 30).is_none(),
+            "a long_running handler returns before the timeout applies"
+        );
+    }
+
+    /// Le manifeste `tmux` déclare bien le modèle d'exécution que V3c suppose :
+    /// sans cette ligne, le test précédent vérifierait un outil que personne
+    /// n'a.
+    #[test]
+    fn mika2423_tmux_create_session_declares_a_detached_command() {
+        let tools: Vec<crate::skills::manifest::SkillToolDef> = serde_json::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("templates/skills/tmux/tools.json"),
+            )
+            .expect("tmux tools.json must be readable"),
+        )
+        .expect("tmux tools.json must parse");
+        let create = tools
+            .iter()
+            .find(|t| t.name == "tmux_create_session")
+            .expect("tmux_create_session must exist");
+        assert!(
+            matches!(
+                create.handler,
+                ToolHandler::Exec {
+                    detaches_command: true,
+                    ..
+                }
+            ),
+            "tmux_create_session hands `command` to a detached session and must say so"
+        );
+    }
+
+    /// La famille v1 est reconnue en entier, flags et toolchain sautés.
+    #[test]
+    fn mika2423_the_declared_build_family_is_recognized() {
+        for (command, expected) in [
+            ("cargo build", "cargo build"),
+            ("cargo +nightly test", "cargo test"),
+            ("cargo clippy --all-targets -- -D warnings", "cargo clippy"),
+            ("cargo check -p mika-agent", "cargo check"),
+            ("cargo bench", "cargo bench"),
+            ("npm run build --prefix dashboard", "npm run build"),
+            ("npm run test", "npm run test"),
+            ("npx tsc --noEmit", "npx tsc"),
+            ("make build", "make build"),
+            ("make test", "make test"),
+            ("go build ./...", "go build"),
+            ("go test ./...", "go test"),
+            // Une instruction précédente ne masque pas le build qui suit.
+            ("cd dashboard && npm run build", "npm run build"),
+            // Ni une affectation d'environnement, ni un chemin, ni un pipe.
+            ("RUST_LOG=debug cargo test", "cargo test"),
+            ("~/.cargo/bin/cargo test", "cargo test"),
+            ("cargo test 2>&1 | tail -20", "cargo test"),
+        ] {
+            assert_eq!(
+                matched_build_family(command).as_deref(),
+                Some(expected),
+                "`{command}` should match `{expected}`"
+            );
+        }
+    }
+
+    /// **V6** — le joint entre la moitié moteur et la moitié prompt.
+    ///
+    /// Le corps du refus porte `"policy": "refusal"` et la chaîne exacte que la
+    /// règle 2.5.3 du prompt qa-review prescrit. Sans ce test, U1 et U3 peuvent
+    /// diverger en silence : le moteur nommerait une classification que le
+    /// prompt ne connaît pas, et le modèle retomberait sur la ligne 40.
+    #[test]
+    fn mika2423_the_refusal_names_the_skip_classification_and_denies_being_a_failure() {
+        let input = serde_json::json!({ "command": "cargo test --release" });
+        let out =
+            refuse_uncontainable_build(&sync_shell_tool(), &input, 30).expect("refusal expected");
+        let body: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+
+        assert_eq!(body["policy"], "refusal");
+
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("POLICY REFUSAL, not a tool failure"),
+            "the refusal must deny being a tool failure — that denial is what \
+             breaks the line-40 `hold[review]` ceiling: {detail}"
+        );
+        assert!(
+            detail.contains("never spawned"),
+            "the refusal must say no subprocess ran: {detail}"
+        );
+        assert!(
+            detail.contains("do NOT rewrite the command to evade the scan"),
+            "same posture as the mika#1196 shell-exec refusal: {detail}"
+        );
+
+        let remedy = body["remedy"].as_str().unwrap();
+        let classification = "[⏭️] not verifiable within the review budget — requires a build";
+        assert!(
+            remedy.contains(classification),
+            "the engine must name the exact classification the prompt prescribes \
+             (`qa-review/system_prompt.md`, 2.5.3); got: {remedy}"
+        );
+
+        // Le joint, lu sur le prompt lui-même plutôt que sur une copie.
+        let prompt = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../skills/bundled/qa-review/system_prompt.md"),
+        )
+        .expect("qa-review prompt must be readable from the workspace");
+        assert!(
+            prompt.contains(classification),
+            "the classification named by the engine must exist verbatim in the \
+             prompt that is supposed to act on it"
+        );
+    }
+
+    /// **V7 — U3, un test de forme.** Le prompt porte les trois phrases qui
+    /// résolvent la contradiction entre la ligne 40 (« un outil qui échoue
+    /// plafonne à `hold[review]` ») et la ligne 293 (« marque `[⏭️]` »).
+    ///
+    /// Un test de forme, parce que la régression ici est une **suppression**
+    /// que rien d'autre ne rend rouge : V6 vérifie que la classification existe
+    /// dans le prompt, pas que le prompt sait qu'un refus n'est pas un échec,
+    /// ni sous quelle condition `[⏭️]` est légitime, ni pourquoi la CI reste
+    /// hors de portée. Retirer l'une des trois ne casse aucun autre test.
+    #[test]
+    fn mika2423_the_qa_prompt_resolves_the_integrity_contradiction() {
+        let prompt = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../skills/bundled/qa-review/system_prompt.md"),
+        )
+        .expect("qa-review prompt must be readable from the workspace");
+
+        // U3a — la ligne 40 exclut le refus de politique du plafond.
+        let integrity_line = prompt
+            .lines()
+            .find(|l| l.contains("the maximum verdict is `hold[review]`"))
+            .expect("the Data Integrity ceiling line must exist");
+        assert!(
+            integrity_line.contains("`\"policy\": \"refusal\"`")
+                && integrity_line.contains("is **not** a tool failure")
+                && integrity_line.contains("does **not** cap the verdict"),
+            "U3a: the ceiling line must exclude a declared-policy refusal, on the \
+             SAME line as the ceiling it qualifies: {integrity_line}"
+        );
+
+        // U3b — la condition de `[⏭️]` est lue sur le diff, et les deux trous
+        // restent des `block[ac]`.
+        let skip = "`[⏭️] not verifiable within the review budget — requires a build`";
+        let never_compile = prompt
+            .find("Never compile inside the review turn")
+            .expect("the 2.5.3 never-compile rule must exist");
+        // Borné sur le contenu, pas sur un compte d'octets : la fenêtre porte
+        // des caractères multi-octets (`⏭️`, `—`) et un décalage d'édition
+        // transformerait un slice fixe en panique de frontière de caractère.
+        let rule = &prompt[never_compile..];
+        let rule = &rule[..rule.find("- **Structural**").unwrap_or(rule.len())];
+        assert!(
+            rule.contains("`build_command_exceeds_tool_budget`"),
+            "U3b: the rule must name the engine refusal it now receives instead \
+             of a timeout"
+        );
+        assert!(
+            rule.contains("present and not excluded from CI") && rule.contains(skip),
+            "U3b: `[⏭️]` must be conditioned on the test being present in the \
+             diff and not excluded from CI"
+        );
+        assert!(
+            rule.contains("`#[ignore]`") && rule.contains("no test for this AC in the diff"),
+            "U3b: an ignored, feature-gated or absent test must stay a hole"
+        );
+        assert_eq!(
+            rule.matches("`block[ac]`").count(),
+            2,
+            "U3b: the two holes each map to `block[ac]`"
+        );
+        assert!(
+            rule.contains("deferring execution here does not defer the gate"),
+            "U3b: the reason the first row is safe must be written on the spot"
+        );
+
+        // U3c — la frontière CI est maintenue ET motivée sur sa propre ligne.
+        let ci_line = prompt
+            .lines()
+            .find(|l| l.contains("Do NOT fetch or reason about GitHub CI status"))
+            .expect("the CI-boundary line must exist");
+        assert!(
+            ci_line.contains("not a tooling limitation")
+                && ci_line.contains("belongs to the merge gate")
+                && ci_line.contains("`CheckClassification::HasFailures`"),
+            "U3c: the CI boundary must carry its reason, or a future editor \
+             reading U3b will conclude a CI read is missing and reopen it: {ci_line}"
+        );
+    }
+
+    // --- U2 : le groupe de processus meurt avec le timeout ------------------
+
+    /// `true` tant que le pid désigne un processus vivant et non-zombie.
+    ///
+    /// `/proc/<pid>` survit brièvement à la mort sous la forme d'un zombie, le
+    /// temps que le parent — ici init, l'orphelin ayant été reparenté — le
+    /// moissonne. Lire l'état évite de compter ce sursis comme une survie.
+    #[cfg(unix)]
+    fn pid_is_alive(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // Champ 3 (état), après le `comm` entre parenthèses — qui peut
+                // lui-même contenir des espaces.
+                let after_comm = stat.rsplit_once(") ").map(|(_, rest)| rest).unwrap_or("");
+                !after_comm.starts_with('Z')
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Attend au plus `limit` que `pid` meure. Rend `true` s'il est mort.
+    #[cfg(unix)]
+    async fn wait_for_death(pid: u32, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if !pid_is_alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        !pid_is_alive(pid)
+    }
+
+    /// Attend au plus `limit` que `path` apparaisse et porte un pid lisible.
+    #[cfg(unix)]
+    async fn read_pidfile(path: &std::path::Path, limit: std::time::Duration) -> Option<u32> {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                return Some(pid);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// **V4 — le test central du corollaire du ticket.**
+    ///
+    /// Le handler lance un petit-enfant et attend. À l'expiration,
+    /// `kill_on_drop(true)` ne signale que l'enfant **direct** ; `run.sh`
+    /// finissant sur `eval "$COMMAND"`, la vraie commande est un petit-enfant,
+    /// qui survit et se fait reparenter à init — c'est exactement le pid 145584
+    /// du ticket, `ppid=1`, tenant le lock `target/`.
+    ///
+    /// **Vérifié rouge avant U2** : sans `process_group(0)` + `killpg`, le
+    /// petit-enfant survit à cette assertion. Un test de fuite de processus qui
+    /// n'a jamais été vu rouge ne prouve pas qu'il détecte la fuite — il peut
+    /// ne mesurer que le pid direct, qui mourait déjà.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mika2423_a_timed_out_handler_leaves_no_orphan_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script = dir.path().join("handler.sh");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 sleep 300 >/dev/null 2>&1 &\n\
+                 echo $! > {}\n\
+                 wait\n",
+                pidfile.display()
+            ),
+        );
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let call = execute_skill_tool(&tool, serde_json::json!({}), 2, None, None, None, None);
+        let pid_probe = read_pidfile(&pidfile, std::time::Duration::from_secs(5));
+        let (out, grandchild) = tokio::join!(call, pid_probe);
+
+        let grandchild = grandchild.expect("the handler must have recorded its grandchild's pid");
+        assert!(
+            out.is_error,
+            "the call must have timed out: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("timed out"),
+            "expected a timeout, got: {}",
+            out.content
+        );
+
+        assert!(
+            wait_for_death(grandchild, std::time::Duration::from_secs(5)).await,
+            "grandchild pid {grandchild} survived the timeout — this is the \
+             mika#2423 orphan leak: it now holds the `target/` lock with ppid=1 \
+             and guarantees the failure of every subsequent attempt"
+        );
+    }
+
+    /// **V5 — contrôle négatif.** Le kill est sur la branche d'expiration
+    /// seule ; un handler qui rend la main normalement ne tue rien.
+    ///
+    /// Deux cas, du plus strict au risque nommé. (a) Un processus d'arrière-plan
+    /// **resté dans le groupe** : il survit, donc le kill de groupe est bien
+    /// désarmé sur le chemin nominal — sans ce cas, « le groupe meurt à
+    /// l'expiration » serait indistinguable de « le groupe meurt toujours ».
+    /// (b) Un démon détaché par `setsid`, le risque que le plan nomme (un
+    /// handler du genre `tmux new-session -d`) : il quitte le groupe et n'est
+    /// donc atteignable par aucun `killpg`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mika2423_a_normally_completing_handler_is_not_group_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_group = dir.path().join("in_group.pid");
+        let detached = dir.path().join("detached.pid");
+        let script = dir.path().join("handler.sh");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 sh -c 'echo $$ > {ig}; exec sleep 60' >/dev/null 2>&1 &\n\
+                 setsid sh -c 'echo $$ > {det}; exec sleep 60' >/dev/null 2>&1 &\n\
+                 # Laisser les deux enfants écrire leur pid avant de rendre la main.\n\
+                 while [ ! -s {ig} ] || [ ! -s {det} ]; do sleep 0.05; done\n\
+                 echo done\n",
+                ig = in_group.display(),
+                det = detached.display()
+            ),
+        );
+        let tool = make_exec_tool(dir.path(), "handler.sh");
+
+        let out =
+            execute_skill_tool(&tool, serde_json::json!({}), 30, None, None, None, None).await;
+        assert!(
+            !out.is_error,
+            "the handler completes normally: {}",
+            out.content
+        );
+
+        let in_group_pid = read_pidfile(&in_group, std::time::Duration::from_secs(5))
+            .await
+            .expect("in-group child pid");
+        let detached_pid = read_pidfile(&detached, std::time::Duration::from_secs(5))
+            .await
+            .expect("detached daemon pid");
+
+        // Laisser au kill le temps de survenir, s'il devait survenir.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let in_group_alive = pid_is_alive(in_group_pid);
+        let detached_alive = pid_is_alive(detached_pid);
+
+        // Nettoyage avant assertion — un test qui échoue ne doit pas laisser
+        // derrière lui les processus dont il dénonce la survie.
+        for pid in [in_group_pid, detached_pid] {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        }
+
+        assert!(
+            in_group_alive,
+            "an in-group background process must survive a NORMAL completion — \
+             otherwise the group kill is not scoped to the expiry branch"
+        );
+        assert!(
+            detached_alive,
+            "a setsid-detached daemon must survive: it left the group and no \
+             killpg can reach it (the `tmux new-session -d` risk)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2532 — the stderr of a failed long-running handler survives a
+    // terminal task
+    // -----------------------------------------------------------------------
+
+    /// # Why these tests live in-crate rather than under `tests/eval/`
+    ///
+    /// The mika#2532 plan places them at
+    /// `crates/mika-agent/tests/eval/test_handler_stderr_persisted_2532.rs`,
+    /// on the premise that `spawn_long_running_exec` is "callable directly
+    /// (`pub(crate)`)". The two halves of that sentence contradict each other:
+    /// `tests/eval/` is a **separate crate**, so `pub(crate)` is exactly the
+    /// visibility it cannot reach. The available options were to widen a
+    /// production function to `pub` for the sake of a test file's location, or
+    /// to put the test where the function lives. The second is taken.
+    ///
+    /// Nothing else about the contract moves: the same five cases, the same
+    /// real `/bin/sh` subprocess, no network, no external binary, no server.
+    ///
+    /// # Fire-Disposition
+    ///
+    /// **(c) halt-and-surface, blocking CI gate.** A red here means either the
+    /// cause of a pre-result crash is being discarded again (the defect), or
+    /// that a failure record is being invented on a healthy row (halt 4 of the
+    /// post-deploy probes, which asks for a revert *before* diagnosis).
+    mod mika2532 {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
+
+        /// Long enough that a green run says something, short enough that a red
+        /// one does not hang CI. T1/T3/T5 land in well under 100 ms on this
+        /// harness; the margin is for a loaded machine.
+        const SETTLE_MS: u64 = 4_000;
+
+        fn db() -> AsyncDatabase {
+            AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
+        }
+
+        /// A callback row built through [`build_callback_task`] — the
+        /// production write path, deliberately, rather than a hand-assembled
+        /// `NewTask`. A fixture that manufactures the shape the code knows how
+        /// to read is a fixture and the code agreeing with each other
+        /// (mika#2272's lesson, paid once already on this very file).
+        async fn callback_row(db: &AsyncDatabase) -> String {
+            let task = build_callback_task(
+                "mika".to_string(),
+                None,
+                "build_mika",
+                &serde_json::json!({}),
+                600,
+                "session-2532",
+                "trace-2532",
+                None,
+            );
+            db.create_task(task).await.unwrap()
+        }
+
+        fn handler(dir: &std::path::Path, body: &str) -> PathBuf {
+            let path = dir.join("handler.sh");
+            write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+            path
+        }
+
+        /// Poll until `$.handler_failure` appears, or give up after
+        /// [`SETTLE_MS`]. Returns `None` when it never appeared — which is the
+        /// assertion the negative controls make, not a test failure per se.
+        async fn await_handler_failure(
+            db: &AsyncDatabase,
+            task_id: &str,
+        ) -> Option<serde_json::Value> {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                let task = db.get_task(task_id).await.unwrap().expect("row exists");
+                if let Some(raw) = task.metadata.as_deref()
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(raw)
+                    && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
+                {
+                    return Some(found.clone());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **T1 — the measured defect.** A handler that crashes *after* its EXIT
+        /// trap delivered the callback leaves the row `completed`, so
+        /// `update_task_failed` matches nothing and the `err_msg` naming the
+        /// cause used to be dropped on the floor. The stderr must now be on the
+        /// row, and `tasks.result` must be untouched — it carries the message
+        /// the callback turn consumes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_stderr_of_a_crash_on_a_terminal_row_is_persisted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            // What the handler's trap does before the process exits non-zero.
+            db.update_task_completed(&task_id, Some("callback delivered by the trap"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo \"ERROR: could not cd to /nope/mika\" >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id)
+                .await
+                .expect("the cause of a pre-result crash must reach the row");
+
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 1")
+            );
+            let stderr = failure
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("the handler wrote on fd 2, so the key must be there");
+            assert!(
+                stderr.contains("could not cd"),
+                "the persisted stderr must name the failing line, got: {stderr}"
+            );
+            assert!(failure.get("captured_at").is_some());
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.result.as_deref(),
+                Some("callback delivered by the trap"),
+                "`tasks.result` is what the callback turn reads — persisting the \
+                 stderr must not overwrite it"
+            );
+            assert_eq!(
+                task.status, "completed",
+                "the row was terminal and stays terminal; only the metadata moved"
+            );
+        }
+
+        /// **T2 — the negative control.** Without it, "we write on failure" is
+        /// indistinguishable from "we always write", and halt 4 of the
+        /// post-deploy probes (a failure record invented on a healthy row)
+        /// would have no test behind it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_handler_that_succeeds_leaves_no_failure_record() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("all good"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "echo 'noise on stdout'\nexit 0");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert!(
+                await_handler_failure(&db, &task_id).await.is_none(),
+                "a successful handler must leave no `handler_failure`: a cause of \
+                 failure invented on a healthy row is a lie of the same order as \
+                 the silence being repaired"
+            );
+        }
+
+        /// **T3 — non-regression on the case that already worked.** A row still
+        /// `pending` takes the `Ok(true)` arm, so `tasks.result` has always
+        /// carried the error. It must keep doing so, *and* gain the metadata
+        /// copy: the write is unconditional on status by design (D1).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_crash_on_a_live_row_still_reaches_tasks_result() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            let script = handler(tmp.path(), "echo boom >&2\nexit 3");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 3")
+            );
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            let result = task.result.unwrap_or_default();
+            assert!(
+                result.contains("boom"),
+                "the pre-existing surface must keep working, got: {result}"
+            );
+        }
+
+        /// **T4 — the persisted copy is scrubbed.** `tasks.result` on the live
+        /// path is written un-scrubbed (a real, separate hole, named out of
+        /// scope by the plan); this ticket must not add a second unscrubbed
+        /// surface.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_secret_shaped_value_does_not_reach_the_metadata() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo 'auth failed for ghp_0123456789abcdefghij' >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let stderr = failure.get("stderr").and_then(|v| v.as_str()).unwrap();
+            assert!(
+                !stderr.contains("ghp_0123456789abcdefghij"),
+                "the token must not survive the scrub, got: {stderr}"
+            );
+            assert!(
+                stderr.contains("ghp_<REDACTED>"),
+                "the scrub must leave its mark rather than drop the line, got: {stderr}"
+            );
+        }
+
+        /// **T5 — an absence is not an empty string.** A handler killed before
+        /// writing anything leaves `exit` and nothing else, and that is honest
+        /// (mika#2331: `null` is never `0`). A stored `""` would read as "we
+        /// captured something empty", which is a different and false claim.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_mute_handler_carries_its_exit_and_no_stderr_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "exit 4");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 4")
+            );
+            assert!(
+                failure.get("stderr").is_none(),
+                "fd 2 stayed mute, so the key must be ABSENT — never an empty string"
+            );
+        }
+    }
+}

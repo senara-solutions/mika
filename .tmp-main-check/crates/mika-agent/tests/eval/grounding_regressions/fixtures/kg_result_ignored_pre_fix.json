@@ -1,0 +1,16 @@
+{
+  "description": "Pre-fix fixture reproducing #740 D4 class: agent names a fabricated skill from training data despite query_knowledge_graph returning the correct answer ('self-dev').",
+  "incident": "mika#740 D4",
+  "fabrication_class": "kg_result_ignored",
+  "kg_state": {
+    "domain_entity": { "type": "skill", "name": "self-dev" },
+    "subject_entity": { "type": "problem_type", "name": "pr-merge-skill-routing", "confidence": 0.9 },
+    "resolution": { "confidence": 0.85, "outcome": "matched_llm" }
+  },
+  "tool_output": {
+    "tool": "query_knowledge_graph",
+    "output": "Found skill:self-dev — provides pr_merge_with_gate tool for PR merge workflows."
+  },
+  "pre_fix_response": "PR merges are handled by the github-mcp integration, which provides automated merge capabilities through the GitHub API.",
+  "note": "Agent ignored the KG result ('self-dev') and named 'github-mcp' from training data instead."
+}

@@ -1,0 +1,7 @@
+{
+  "description": "Pre-fix fixture reproducing mika-skills#159: agent claims 'R5 section missing' without quoting the searched heading or listing actual section headings found in the PR body.",
+  "incident": "mika-skills#159",
+  "fabrication_class": "ungrounded_absence_claim",
+  "provenance": "Reconstruction of the scan-and-miss failure mode described in qa-review system_prompt.md Step 2.5.5 line 207",
+  "pre_fix_response": "PLAN-AC VERIFICATION:\n\n- [❌] unsatisfied: R5 — Rollback procedure documented in PR body — R5 section missing\n\nVERDICT: block[ac]"
+}

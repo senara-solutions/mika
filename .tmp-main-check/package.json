@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "site",
+    "dashboard"
+  ],
+  "scripts": {
+    "dev:dashboard": "npm run build --workspace=packages/ui && npm run dev --workspace=dashboard"
+  }
+}

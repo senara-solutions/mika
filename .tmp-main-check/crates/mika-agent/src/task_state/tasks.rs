@@ -1,0 +1,473 @@
+//! Task lifecycle types and Database query/write methods.
+
+/// Default value for the `tasks.type` column. New tasks default to `"issue"`
+/// unless the caller explicitly requests `"milestone"` or `"project"`.
+pub const TASK_TYPE_ISSUE: &str = "issue";
+pub const TASK_TYPE_MILESTONE: &str = "milestone";
+pub const TASK_TYPE_PROJECT: &str = "project";
+
+/// All valid values for the `tasks.type` column. Enforced by SQLite CHECK and by
+/// the `create_task` tool boundary. Order is the documented enum order.
+pub const VALID_TASK_TYPES: &[&str] = &[TASK_TYPE_ISSUE, TASK_TYPE_MILESTONE, TASK_TYPE_PROJECT];
+
+// ===== Tracking-row cleanup (mika#1934) =====
+//
+// A dispatch-tracking row (`trigger_type='manual'`, `action_type='none'`,
+// `process_id IS NULL`) is left behind in `blocked` when an escalation fires and
+// the underlying ticket is later resolved out-of-band. These constants back the
+// two cleanup surfaces that terminal-mark such rows: supersede-on-new-dispatch
+// (AC2) and complete-on-upstream-close (AC4). Each `result` string is a
+// stable, greppable discriminator — do not spell them by hand at a call site.
+
+/// The `?phase=groom` URL suffix the LLM-driven grooming path appends to an
+/// issue URL. `.../issues/1574` and `.../issues/1574?phase=groom` are
+/// DIFFERENT `reference_url`s; the cleanup surfaces canonicalize on the base
+/// URL so a fresh dispatch supersedes both variants for the same underlying
+/// issue. The dispatch gate
+/// (`crates/mika-agent/src/db.rs::has_completed_groom_for_issue`) no longer
+/// appends this suffix — since mika#2287 it reads the groom callback row and
+/// accepts the parent URL in either form.
+pub const GROOM_PHASE_SUFFIX: &str = "?phase=groom";
+
+/// The convergence marker dispatch-lib writes into a `dev-groom` callback's
+/// `result` (`skills/bundled/_shared/dispatch-lib.sh`, `Outcome:` line of the
+/// RESULT posted via `POST /tasks/{id}/complete`). Two readers share it and
+/// must never drift apart: the engine-side auto-fire
+/// (`task_engine::dispatcher::try_dispatch_pilot_after_groom_success`) and the
+/// dispatch-classification gate (`db::Database::has_completed_groom_for_issue`,
+/// mika#1620 / mika#2287). Writer lives in shell; keep this literal identical
+/// to the one dispatch-lib emits.
+pub const GROOM_SUCCESS_MARKER: &str = "Outcome: PLAN_GROOMED";
+
+/// `tasks.result` reason written when a phantom tracking row is cancelled
+/// because a fresh dispatch superseded it (mika#1934 AC2). SOLE WRITER:
+/// [`crate::db::Database::cancel_task_superseded`].
+pub const SUPERSEDED_BY_NEW_DISPATCH: &str = "superseded_by_new_dispatch";
+
+/// `tasks.result` reason written when a tracking row is cancelled because its
+/// GitHub issue was closed upstream (mika#1934 AC4, `issues.closed`).
+pub const ISSUE_CLOSED_UPSTREAM: &str = "issue_closed_upstream";
+
+/// `tasks.result` reason written when a tracking row is completed because its
+/// linked PR was merged upstream (mika#1934 AC4, `pull_request.closed` merged).
+pub const UPSTREAM_PR_MERGED: &str = "upstream_pr_merged";
+
+/// `tasks.result` reason written when a tracking row is cancelled because its
+/// linked PR was closed unmerged upstream (mika#1934 AC4, `pull_request.closed`
+/// unmerged).
+pub const UPSTREAM_PR_CLOSED_UNMERGED: &str = "upstream_pr_closed_unmerged";
+
+/// `audit_events.tool_name` emitted per row superseded by a fresh dispatch
+/// (mika#1934 AC2).
+pub const TRACKING_ROW_SUPERSEDED_TOOL: &str = "tracking_row_superseded";
+
+/// `audit_events.tool_name` emitted per row terminal-marked on upstream close
+/// (mika#1934 AC4).
+pub const TRACKING_ROW_UPSTREAM_CLOSED_TOOL: &str = "tracking_row_upstream_closed";
+
+/// Strip the `?phase=groom` suffix from a `reference_url`, returning the
+/// canonical base issue URL. A URL without the suffix is returned unchanged.
+/// Used by both tracking-row cleanup surfaces (mika#1934 AC2.2 / AC4.b) so the
+/// exact-URL and groom-variant rows are both matched from one base URL.
+pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
+    reference_url
+        .strip_suffix(GROOM_PHASE_SUFFIX)
+        .unwrap_or(reference_url)
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub agent_id: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub label: String,
+    pub trigger_type: String,
+    pub cron_expr: Option<String>,
+    pub event_source: Option<String>,
+    pub event_offset_secs: Option<i64>,
+    pub condition_expr: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub timeout_at: Option<String>,
+    pub action_type: String,
+    pub action_config: String,
+    pub status: String,
+    pub process_id: Option<i64>,
+    pub input_context: Option<String>,
+    pub result: Option<String>,
+    pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
+    pub execution_trace_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub fired_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub reference_url: Option<String>,
+    pub source: Option<String>,
+    pub metadata: Option<String>,
+    /// Task kind: `"issue"`, `"milestone"`, or `"project"`. NOT NULL in the DB,
+    /// defaulted to `"issue"` for backward compatibility (added in schema v23). See
+    /// [`VALID_TASK_TYPES`].
+    pub r#type: String,
+    /// Dispatch class for long-running tasks: `"implement"` or `"groom"`. Nullable —
+    /// pre-v34 rows have `NULL` (treated as `"implement"` by the per-class dispatch
+    /// guard via `COALESCE`). Set on callback task creation based on the dispatched
+    /// skill (#1001).
+    pub dispatch_class: Option<String>,
+    /// Which dispatcher inside this engine initiated the task: `"mika_dev"`,
+    /// `"mika_manager"`, or `"operator"` (mika#1948, Porte 2). Nullable — pre-v51
+    /// rows have `NULL` and are read as `"mika_dev"` via `COALESCE`, since the
+    /// autonomous loop was the only dispatcher before the column existed.
+    ///
+    /// Distinct from the `dispatch:*` SEAT label (mika#2084), which says which
+    /// *engine* owns a ticket. This says which *role inside one engine* asked
+    /// for the work.
+    pub dispatcher_source: Option<String>,
+}
+
+/// Result of a force-promote attempt on a deferred dispatch wrapper (mika#1453).
+/// Used by both the CLI verb and agent tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForcePromoteResult {
+    /// The next pending deferred wrapper was promoted for dispatch.
+    Promoted { task_id: String },
+    /// The per-class dispatch slot is occupied by a non-deferred callback;
+    /// promotion is refused (fail-closed). The `blocking_label` identifies
+    /// the occupying task for operator diagnostics.
+    RejectedSlotBusy { blocking_label: String },
+    /// No pending deferred wrapper exists for the given dispatch class.
+    NoPendingWrapper,
+}
+
+/// Split counts of active background callback tasks. `executing` = subprocess alive
+/// (`process_id IS NOT NULL`), `queued` = waiting for dispatch slot (`process_id IS NULL`).
+/// Used by TUI footer badge to distinguish `[1 running, 2 queued]` (#1057).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTaskCounts {
+    pub executing: usize,
+    pub queued: usize,
+}
+
+/// A parent self_dev task left `in_progress` after its callback subtask
+/// delivered without producing a PR. Used by the task engine reaper (#871).
+#[derive(Debug, Clone)]
+pub struct OrphanedParentTask {
+    pub id: String,
+    pub agent_id: String,
+    pub callback_task_id: String,
+    pub created_at: String,
+}
+
+/// A `manual` tracking row whose dispatch is over: every callback child has
+/// reached a terminal status and the last of them stopped moving longer ago
+/// than the grace window. Returned by
+/// `Database::find_settleable_dispatch_parents` and consumed by the dispatch
+/// parent settler (mika#2405).
+///
+/// `last_child_at` is `MAX(child.updated_at)` — the moment the *last* child
+/// moved, never the parent's own `created_at`: a parent reused across
+/// dispatches (mika#920) is old by construction. `child_count` is carried for
+/// the operator line only; no decision reads it.
+#[derive(Debug, Clone)]
+pub struct SettleableDispatchParent {
+    pub id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub last_child_at: String,
+    pub child_count: i64,
+}
+
+/// A phantom tracking task row: `action_type='none'`, `process_id IS NULL`,
+/// `status IN ('in_progress','blocked')`, aged past the sweep grace window.
+/// Used by the NULL-PID phantom sweep (mika#1712) in both AC3 (watchdog tick)
+/// and AC5 (startup sweep) paths.
+#[derive(Debug, Clone)]
+pub struct PhantomTrackingTask {
+    pub id: String,
+    pub agent_id: String,
+    pub label: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A dispatch child row of a tracking task: a `parent_task_id`-linked task
+/// carrying a non-NULL `process_id`. Returned by
+/// `Database::find_dispatch_children_with_pid` and consumed by the phantom
+/// sweep liveness guard (mika#2156).
+///
+/// `process_start_time` is field 22 of `/proc/<pid>/stat`, lifted out of the
+/// task's `metadata` JSON where the executor stores it as a string
+/// (`skills/executor.rs`). `None` means the row predates the metadata write,
+/// carries malformed JSON, or ran on a non-Linux host — in which case the
+/// guard cannot rule out PID reuse and deliberately falls back to sweeping
+/// (plan mika#2156 D-3).
+#[derive(Debug, Clone)]
+pub struct DispatchChild {
+    pub id: String,
+    pub process_id: i64,
+    pub process_start_time: Option<u64>,
+    /// The child's own status (mika#2335). The query still does **not** filter
+    /// on it — mika#2156's D-2 reasoning is unchanged, liveness is the
+    /// discriminator and the caller applies it. This field exists so a second
+    /// caller can apply a *different* rule without a second resolver: the
+    /// supersede disposal skips a terminal child (`delivered`, `cancelled`, …)
+    /// because there is no pilot left to kill and its `process_id` is a stale
+    /// pgid. One join predicate, two filtering decisions, both at their caller.
+    pub status: String,
+}
+
+/// A dispatch child reached from the **issue URL** rather than from a known
+/// parent id, with the parent that carries that URL named alongside it
+/// (mika#2279).
+///
+/// The two fields exist because a dispatch is two rows and neither one alone
+/// answers the question: the **parent** carries `reference_url` and never a
+/// `process_id`, the **child** carries the pgid and never a URL. A caller
+/// asking *"is a pilot alive for this ticket?"* starts from the URL and must be
+/// told both — the child so it can probe liveness, the parent so the refusal it
+/// writes names the row an operator would cancel.
+#[derive(Debug, Clone)]
+pub struct IssueDispatchChild {
+    /// The tracking row carrying the issue URL. Its **status is deliberately
+    /// not constrained** by the query: a `cancelled` parent is precisely the
+    /// state mika#2279 exists to see.
+    pub parent_task_id: String,
+    pub child: DispatchChild,
+}
+
+/// Statuses on which a task no longer has a pilot to kill (mika#2335).
+///
+/// Deliberately a positive list of terminal states rather than `!= pending &&
+/// != in_progress`: an unknown status must read as *not terminal*, so a state
+/// added later is still disposed of rather than silently spared.
+///
+/// Lives here, beside [`DispatchChild`], because every caller that filters a
+/// dispatch child on it — the supersession disposal (`tracking_cleanup`), the
+/// operator cancel path (`task_engine::process_kill`) and the live-pilot
+/// predicate (`live_pilot`, mika#2279) — must agree. A second copy of this list
+/// is the shape of defect this ticket exists to remove, which is also why
+/// `find_dispatch_children_for_issue_url` does **not** spell the terminal
+/// statuses into its SQL: that would be a third copy, in a dialect where the
+/// "unknown status is not terminal" rule above cannot be read.
+pub fn is_terminal_task_status(status: &str) -> bool {
+    use crate::task_engine::types::task_status;
+    matches!(
+        status,
+        task_status::DELIVERED
+            | task_status::COMPLETED
+            | task_status::CANCELLED
+            | task_status::FAILED
+            | task_status::EXPIRED
+    )
+}
+
+/// A parent self_dev task left `in_progress` after its callback subtask
+/// delivered WITH a `pr_url` (success indicator). Used by the success-side
+/// engine backstop (mika#1162) — sibling shape to `OrphanedParentTask`.
+/// Returned by `find_completable_parent_tasks_on_pr_url`.
+///
+/// Why this is a separate type from `OrphanedParentTask` despite near-identical
+/// fields: the `pr_url` field is included in the SELECT so the completer can
+/// build its audit-event reason string without a second DB round-trip (see plan
+/// docs/plans/2026-05-17-001-fix-1162-...md, decision D1).
+#[derive(Debug, Clone)]
+pub struct CompletableParentTask {
+    pub id: String,
+    pub agent_id: String,
+    pub callback_task_id: String,
+    pub created_at: String,
+    /// pr_url extracted from `parent.metadata.claude_pilot.pr_url`. Embedded
+    /// in the SELECT so the completer doesn't need a second round-trip to
+    /// build its audit-event reason string.
+    pub pr_url: String,
+}
+
+/// A parent self_dev issue task left `in_progress` with **zero** callback
+/// children, aged past the childless-parent reaper grace window (mika#1687).
+///
+/// This is the zero-child complement of [`OrphanedParentTask`]: the orphan
+/// reaper and parent-completer both INNER-JOIN a delivered callback child, so a
+/// parent that reached `in_progress` without ever spawning a callback child
+/// (silent pilot death — dispatch reached `in_progress` but no callback row was
+/// recorded) falls through both. `find_childless_stuck_parent_tasks` selects
+/// exactly that shape via `NOT EXISTS (SELECT 1 FROM tasks child …)`.
+///
+/// No `callback_task_id` field: by construction there is no child to reference.
+#[derive(Debug, Clone)]
+pub struct ChildlessStuckParent {
+    pub id: String,
+    pub agent_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A `pending` self_dev issue parent that nothing in the dispatch queue
+/// represents any more (mika#2045).
+///
+/// The `ready-label` path pre-creates this parent, then registers a deferred
+/// wrapper child when the per-class dispatch slot is busy. Promotion consumes
+/// that wrapper destructively (`promote_next_deferred_callback` sets it
+/// `completed`), so a wrapper whose silent turn never dispatched leaves the
+/// parent `pending` with nothing representing it — and the partial unique index
+/// `idx_tasks_manual_active_ref_url` then forbids a replacement from being
+/// created for the same issue. The parent is *orphaned*.
+///
+/// Age alone does not identify this shape: a parent waiting behind a busy slot
+/// is also old and still has its wrapper. `find_orphaned_pending_issue_tasks`
+/// therefore requires BOTH the age and the absence of any callback child that
+/// still represents the task.
+#[derive(Debug, Clone)]
+pub struct OrphanedPendingTask {
+    pub id: String,
+    pub reference_url: String,
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// Repairs already attempted for this parent, read from
+    /// `metadata.stuck_rearm_count`. Absent or unreadable metadata reads as 0.
+    pub rearm_count: i64,
+    /// The parent's own dispatch class, `implement` when NULL (matching
+    /// `has_active_callback_tasks_excluding`). A repair must re-enter the class
+    /// the task actually belongs to: re-arming an ungroomed issue as
+    /// `implement` would queue a `dev-pilot` run for work that still needs
+    /// `dev-groom`, and would occupy the wrong slot doing it.
+    pub dispatch_class: String,
+}
+
+/// One deferred wrapper of a parent, as the stuck-pending reaper saw it at
+/// decision time (mika#2181 AC4).
+///
+/// The reaper's verdict is "nothing represents this parent". That verdict is
+/// unreadable after the fact unless the audit says *which* wrappers existed and
+/// *what statuses* produced it — otherwise the next battle starts by rebuilding
+/// the query from the code, which is what mika#2181 cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredWrapperSummary {
+    pub id: String,
+    pub status: String,
+    pub completed_at: Option<String>,
+}
+
+impl DeferredWrapperSummary {
+    /// Compact one-field rendering for an audit `details` string and a `tracing`
+    /// field (mika#2181 AC4):
+    /// `wrappers:f5eebf48:completed@2026-09-04T15:31:03Z,284b0ffe:pending@-`,
+    /// or `wrappers:none` when the parent has no wrapper at all.
+    ///
+    /// Ids are truncated to 8 chars because this line is read next to
+    /// `server.log`, where the dispatcher already prints them short.
+    pub fn render(wrappers: &[DeferredWrapperSummary]) -> String {
+        if wrappers.is_empty() {
+            return "wrappers:none".to_string();
+        }
+        let body = wrappers
+            .iter()
+            .map(|w| {
+                let short: String = w.id.chars().take(8).collect();
+                let at = w.completed_at.as_deref().unwrap_or("-");
+                format!("{short}:{}@{at}", w.status)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("wrappers:{body}")
+    }
+}
+
+/// A `blocked` self_dev issue parent refused on a busy dispatch slot, whose
+/// wrapper never reached consumption (mika#2169, L3b).
+///
+/// Sibling of [`OrphanedPendingTask`], and deliberately a **separate**
+/// population rather than a widening of it. `find_orphaned_pending_issue_tasks`
+/// keys on `parent.status = 'pending'`; relaxing that clause to
+/// `IN ('pending','blocked')` would sweep in the deliberate operator gates —
+/// `blocked` is also what an auto-merge refusal and a QA escalation write. The
+/// discriminant is `result.$.error = 'global_dispatch_active'`: only the
+/// slot-refusal path writes it, so the two queries stay disjoint and each stays
+/// readable on its own.
+#[derive(Debug, Clone)]
+pub struct StaleBlockedTask {
+    pub id: String,
+    pub reference_url: String,
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// Repairs already attempted for this parent, read from
+    /// `metadata.stuck_rearm_count`. Absent or unreadable metadata reads as 0.
+    pub rearm_count: i64,
+    pub dispatch_class: String,
+    /// The callback the refusal named as holding the slot, read from
+    /// `result.$.blocking_callback_id`. `None` when the field is absent or the
+    /// result is not valid JSON — the sweep then treats the blocker as gone,
+    /// which is what a vanished row means.
+    pub blocking_callback_id: Option<String>,
+}
+
+/// Snapshot of a child task for the orphaned-parent reaper's structured log
+/// event (`task_engine_reaper.evaluated`). Captures all children of a candidate
+/// parent at kill time for post-incident diagnosis (mika#1126).
+#[derive(Debug, Clone)]
+pub struct ReaperChildSnapshot {
+    pub id: String,
+    pub dispatch_class: Option<String>,
+    pub status: String,
+    pub trigger_type: String,
+    pub action_type: String,
+    pub updated_at: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTask {
+    pub agent_id: String,
+    pub team_run_id: Option<String>,
+    pub parent_task_id: Option<String>,
+    pub depth: i64,
+    pub label: String,
+    pub trigger_type: String,
+    pub cron_expr: Option<String>,
+    pub event_source: Option<String>,
+    pub event_offset_secs: Option<i64>,
+    pub condition_expr: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub timeout_at: Option<String>,
+    pub action_type: String,
+    pub action_config: String,
+    pub input_context: Option<String>,
+    pub created_by_session: Option<String>,
+    pub created_trace_id: Option<String>,
+    pub reference_url: Option<String>,
+    pub source: Option<String>,
+    pub metadata: Option<String>,
+    /// Task kind. `None` (or an empty string) means "use the SQL default"
+    /// (`"issue"`), preserving backward compatibility for existing callers. Values
+    /// other than those in [`VALID_TASK_TYPES`] are rejected by the DB CHECK
+    /// constraint; prefer validating at the tool boundary before INSERT.
+    pub r#type: Option<String>,
+    /// Dispatch class for per-class slot split (#1001). `None` means NULL in
+    /// the DB (treated as `"implement"` via `COALESCE` by the dispatch guard).
+    /// Set to `Some("groom")` for grooming dispatches.
+    pub dispatch_class: Option<String>,
+}
+
+/// A single anomalous task state detected by the health check.
+#[derive(Debug, Clone)]
+pub struct TaskHealthAnomaly {
+    pub task_id: String,
+    pub label: String,
+    pub trigger_type: String,
+    pub status: String,
+    /// One of: "stuck_callback", "stale_blocked", "failed_recurring", "long_running", "github_linked", "dispatch_failures", "dispatch_stale"
+    pub anomaly_type: String,
+    /// Human-readable age description (e.g., "3h 22m", "5 days").
+    pub age_description: String,
+    pub reference_url: Option<String>,
+}
+
+/// Aggregated task health summary for heartbeat prompt injection.
+#[derive(Debug, Clone, Default)]
+pub struct TaskHealthSummary {
+    /// Active manual tasks (pending/in_progress/blocked).
+    pub active_tasks: Vec<Task>,
+    /// Anomalous task states across all trigger types, capped at [`health_thresholds::MAX_ANOMALIES`].
+    pub anomalies: Vec<TaskHealthAnomaly>,
+}

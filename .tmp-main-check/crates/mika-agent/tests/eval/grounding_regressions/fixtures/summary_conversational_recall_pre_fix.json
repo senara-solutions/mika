@@ -1,0 +1,9 @@
+{
+  "description": "Pre-reform fixture reproducing mika#1024 Axis 2: conversational-shape summary injected as system prompt context causes the LLM to produce first-person conversational-recall patterns ('we discussed', 'as we agreed') in callback responses.",
+  "incident": "mika#1024",
+  "fabrication_class": "conversational_recall_from_summary_shape",
+  "summary_shape": "conversational (pre-reform)",
+  "summary_content": "We discussed the required-tools retry issue in PR #890 targeting `mika-agent`. We agreed that a transport-contract fix was better than a prompt-only approach. After our discussion, we decided to push the branch and request QA review. You mentioned that the `attempt_continuation_turn` path might need the same guard, and I said we should look into it after the current fix lands.",
+  "callback_trigger": "[callback: run_claude_pilot] PR #890 CI completed: all checks passed",
+  "pre_fix_response": "As we discussed regarding PR #890, the transport-contract fix was the right call. In our prior conversation, we agreed on the approach and now CI confirms it works. As you mentioned, the `attempt_continuation_turn` path is still an open question we decided to defer."
+}

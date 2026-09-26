@@ -1,0 +1,9 @@
+[skill]
+name = "browser-control"
+description = "Guide browser automation via Playwright MCP — snapshot-then-act patterns and security"
+version = "0.1.0"
+always_on = false
+timeout_secs = 10
+
+[triggers]
+keywords = ["playwright", "browse to", "web page", "navigate to", "take screenshot", "browser automation", "fill form", "web scraping"]

@@ -1,0 +1,652 @@
+//! EvalHarness — builder for running `run_agent()` with a `MockLlmProvider`.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use anyhow::Result;
+use tempfile::TempDir;
+
+use dashmap::DashMap;
+use mika_agent::agent::{AgentParams, run_agent, run_agent_with_deadline};
+use mika_agent::async_db::AsyncDatabase;
+use mika_agent::db::Database;
+use mika_agent::mcp::McpManager;
+use mika_agent::messaging::MessageSender;
+use mika_agent::skills::SkillRegistry;
+use mika_agent::tools::{ToolRegistry, default_tools};
+use mika_common::config::Settings;
+use mika_common::embedding::EmbeddingClient;
+use mika_common::llm::LlmProvider;
+use mika_common::llm::mock::{MockLlmProvider, MockResponse};
+use tokio::time::Instant;
+
+use super::trace::AgentTrace;
+
+/// Integration test harness for the agent loop.
+///
+/// Wraps `run_agent()` with a `MockLlmProvider`, in-memory SQLite, and sensible defaults.
+/// Use `EvalHarness::builder()` to configure, then `.run("message")` to execute.
+pub struct EvalHarness {
+    pub db: AsyncDatabase,
+    /// Agent tier threaded into every `AgentParams` (mika#1963). `Default`
+    /// unless `.family_tier()` was called on the builder — the family tier
+    /// routes substrate-unavailable diagnostics to `audit_events` instead of
+    /// the LLM-visible tool content (mika#1783).
+    pub tier: mika_common::home::AgentTier,
+    /// Deployment threaded into every `AgentParams` (mika#2290). `Unknown`
+    /// unless `.deployment()` was called on the builder — and `Unknown` is
+    /// deliberately the default, because it is the state every cloud tenant is
+    /// in today and the state the 2026-09-11 incident happened in.
+    pub deployment: mika_common::home::Deployment,
+    /// The LLM provider used for the agent run (mock or real).
+    pub llm: Arc<dyn LlmProvider>,
+    /// The mock provider, if one was created. `None` when using a real provider.
+    /// Used for `captured_requests()` inspection in mock-based tests.
+    pub mock_provider: Option<Arc<MockLlmProvider>>,
+    pub tools: ToolRegistry,
+    pub skills: SkillRegistry,
+    pub home_dir: TempDir,
+    pub session_id: String,
+    pub settings: Settings,
+    pub trace_id: String,
+    skills_dirty: AtomicBool,
+    is_onboarding: bool,
+    is_callback_turn: bool,
+    skip_compaction: bool,
+    internal: bool,
+    message_sender: Option<Arc<dyn MessageSender>>,
+    embedding_client: Option<EmbeddingClient>,
+    brave_api_key: Option<String>,
+    github_token: Option<String>,
+    mcp_manager: Option<McpManager>,
+    /// User-attached images threaded into every `AgentParams` (mika#1784).
+    ///
+    /// Empty unless `.user_images()` was called on the builder, so every
+    /// pre-existing scenario is byte-identical. A field rather than a
+    /// `run_with_images` method: the three run sites must agree on what a turn
+    /// carries, and a fourth entry point is a fourth place to forget.
+    user_images: Vec<mika_common::llm::LlmImage>,
+    /// Whether this turn's caller named the model (mika#2304). `false` unless
+    /// `.caller_model_override(true)` was called on the builder, so every
+    /// pre-existing scenario keeps the #463 per-skill precedence untouched.
+    pub caller_model_override: bool,
+    /// Whether this turn's caller asked to read its own session only
+    /// (mika#1951). `false` unless `.session_isolated(true)` was called, so every
+    /// pre-existing scenario keeps the window it had.
+    pub session_isolated: bool,
+    /// Session-scoped PR review dedup map (#821, #736).
+    /// When `Some`, enables the session-scope dedup guard in the agent loop.
+    pub pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
+    /// Optional A2A streaming context (mika#1757). When `Some`, the harness
+    /// threads it into `AgentParams.stream_ctx` so `process_tool_calls`
+    /// emits `ToolCallStart` / `ToolCallResult` frames on tool dispatch.
+    pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+}
+
+impl EvalHarness {
+    /// Create a new builder.
+    pub fn builder() -> EvalHarnessBuilder {
+        EvalHarnessBuilder::default()
+    }
+
+    /// Get a reference to the mock provider, panicking if using a real provider.
+    ///
+    /// Used by tests that need to call `clear_and_set()` or `captured_requests()`.
+    pub fn mock(&self) -> &MockLlmProvider {
+        self.mock_provider
+            .as_ref()
+            .expect("mock() called on EvalHarness with a real provider")
+    }
+
+    /// Run the agent loop with a user message and return the execution trace.
+    pub async fn run(&self, message: &str) -> Result<AgentTrace> {
+        let params = AgentParams {
+            tier: self.tier,
+            deployment: self.deployment,
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            user_message: message,
+            channel_type: "test",
+            session_id: &self.session_id,
+            home_dir: self.home_dir.path(),
+            is_onboarding: self.is_onboarding,
+            message_sender: self.message_sender.clone(),
+            skip_compaction: self.skip_compaction,
+            embedding_client: self.embedding_client.as_ref(),
+            thinking: None,
+            user_images: &self.user_images,
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: &self.skills_dirty,
+            skill_nudge: None,
+            mcp_manager: self.mcp_manager.as_ref(),
+            global_home_dir: None,
+            is_callback_turn: self.is_callback_turn,
+            settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
+            // mika#1951: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to ask for
+            // isolation, so every pre-existing scenario keeps its window.
+            session_isolated: self.session_isolated,
+            trace_id: Some(self.trace_id.clone()),
+            correlated_task_id: None,
+            internal: self.internal,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_ctx: self.stream_ctx.clone(),
+        };
+
+        let output = run_agent(&params).await?;
+        AgentTrace::from_run(
+            &self.db,
+            &self.trace_id,
+            self.mock_provider.as_deref(),
+            output,
+        )
+        .await
+    }
+
+    /// Run the agent with an explicit deadline, exercising the deadline-exceeded
+    /// code path without waiting for the production 5-minute budget.
+    ///
+    /// Pair with `tokio::time::pause()` and `delayed_response` mock entries to
+    /// simulate slow provider calls under virtual time. See mika#848 and the
+    /// `deadline_in_flight_llm_call` eval scenario for the canonical pattern.
+    pub async fn run_with_deadline(&self, message: &str, deadline: Instant) -> Result<AgentTrace> {
+        let params = AgentParams {
+            tier: self.tier,
+            deployment: self.deployment,
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            user_message: message,
+            channel_type: "test",
+            session_id: &self.session_id,
+            home_dir: self.home_dir.path(),
+            is_onboarding: self.is_onboarding,
+            message_sender: self.message_sender.clone(),
+            skip_compaction: self.skip_compaction,
+            embedding_client: self.embedding_client.as_ref(),
+            thinking: None,
+            user_images: &self.user_images,
+            brave_api_key: self.brave_api_key.as_deref(),
+            github_token: self.github_token.as_deref(),
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: &self.skills_dirty,
+            skill_nudge: None,
+            mcp_manager: self.mcp_manager.as_ref(),
+            global_home_dir: None,
+            is_callback_turn: self.is_callback_turn,
+            settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
+            // mika#1951: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to ask for
+            // isolation, so every pre-existing scenario keeps its window.
+            session_isolated: self.session_isolated,
+            trace_id: Some(self.trace_id.clone()),
+            correlated_task_id: None,
+            internal: self.internal,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_ctx: self.stream_ctx.clone(),
+        };
+
+        let output = run_agent_with_deadline(&params, deadline).await?;
+        AgentTrace::from_run(
+            &self.db,
+            &self.trace_id,
+            self.mock_provider.as_deref(),
+            output,
+        )
+        .await
+    }
+
+    /// Run a subsequent turn on the same session with fresh mock responses.
+    ///
+    /// Uses `MockLlmProvider::clear_and_set()` to replace the response sequence.
+    /// Panics if the harness was created with a real provider (no mock to reset).
+    pub async fn run_turn(
+        &self,
+        message: &str,
+        responses: Vec<MockResponse>,
+    ) -> Result<AgentTrace> {
+        let mock = self
+            .mock_provider
+            .as_ref()
+            .expect("run_turn requires a mock provider — cannot be used with real providers");
+        mock.clear_and_set(responses);
+
+        // Generate a new trace_id for the new turn so DB queries are scoped
+        let turn_trace_id = uuid::Uuid::new_v4().as_simple().to_string();
+
+        let params = AgentParams {
+            tier: self.tier,
+            deployment: self.deployment,
+            db: &self.db,
+            llm: self.llm.as_ref(),
+            tools: &self.tools,
+            skills: &self.skills,
+            user_message: message,
+            channel_type: "test",
+            session_id: &self.session_id,
+            home_dir: self.home_dir.path(),
+            is_onboarding: false,
+            message_sender: self.message_sender.clone(),
+            skip_compaction: self.skip_compaction,
+            embedding_client: None,
+            thinking: None,
+            user_images: &self.user_images,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: &self.skills_dirty,
+            skill_nudge: None,
+            mcp_manager: None,
+            global_home_dir: None,
+            is_callback_turn: false,
+            settings: Some(&self.settings),
+            // mika#2304: `false` unless the builder was told otherwise — the
+            // harness drives the loop directly, with no A2A caller to name a
+            // model, so every pre-existing scenario keeps #463's precedence.
+            caller_model_override: self.caller_model_override,
+            // mika#1951: see the identical line on the two sibling run sites.
+            session_isolated: self.session_isolated,
+            trace_id: Some(turn_trace_id.clone()),
+            correlated_task_id: None,
+            internal: self.internal,
+            pr_reviews_posted: self.pr_reviews_posted.as_ref(),
+            stream_ctx: self.stream_ctx.clone(),
+        };
+
+        let output = run_agent(&params).await?;
+        AgentTrace::from_run(&self.db, &turn_trace_id, Some(mock.as_ref()), output).await
+    }
+}
+
+/// Builder for `EvalHarness`.
+pub struct EvalHarnessBuilder {
+    responses: Vec<MockResponse>,
+    tools: Option<ToolRegistry>,
+    skills: Option<SkillRegistry>,
+    session_id: Option<String>,
+    agent_id: Option<String>,
+    is_onboarding: bool,
+    is_callback_turn: bool,
+    skip_compaction: bool,
+    internal: bool,
+    family_tier: bool,
+    deployment: mika_common::home::Deployment,
+    provider_name: Option<String>,
+    model_name: Option<String>,
+    supports_vision: Option<bool>,
+    message_sender: Option<Arc<dyn MessageSender>>,
+    /// When set, uses this real provider instead of creating a MockLlmProvider.
+    real_llm_provider: Option<Arc<dyn LlmProvider>>,
+    embedding_client: Option<EmbeddingClient>,
+    brave_api_key: Option<String>,
+    github_token: Option<String>,
+    mcp_manager: Option<McpManager>,
+    user_images: Vec<mika_common::llm::LlmImage>,
+    caller_model_override: bool,
+    session_isolated: bool,
+    pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
+    stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+}
+
+impl Default for EvalHarnessBuilder {
+    fn default() -> Self {
+        Self {
+            responses: Vec::new(),
+            tools: None,
+            skills: None,
+            session_id: None,
+            agent_id: None,
+            is_onboarding: false,
+            is_callback_turn: false,
+            skip_compaction: true, // Default: skip compaction to simplify mock sequences
+            internal: false,
+            family_tier: false,
+            deployment: mika_common::home::Deployment::Unknown,
+            provider_name: None,
+            model_name: None,
+            supports_vision: None,
+            message_sender: None,
+            real_llm_provider: None,
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            mcp_manager: None,
+            user_images: Vec::new(),
+            caller_model_override: false,
+            session_isolated: false,
+            pr_reviews_posted: None,
+            stream_ctx: None,
+        }
+    }
+}
+
+impl EvalHarnessBuilder {
+    /// Set the mock LLM response sequence (required).
+    pub fn responses(mut self, responses: Vec<MockResponse>) -> Self {
+        self.responses = responses;
+        self
+    }
+
+    /// Set a custom tool registry. Default: `default_tools()`.
+    pub fn tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set a custom skill registry. Default: `SkillRegistry::empty()`.
+    pub fn skills(mut self, skills: SkillRegistry) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// Set a custom session ID. Default: UUID.
+    pub fn session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
+        self
+    }
+
+    /// Set the agent this harness runs as. Default: `"mika"`.
+    ///
+    /// **This is an isolation lever, not a cosmetic one.** Several production
+    /// surfaces deduplicate or accumulate in *process-global* maps keyed by
+    /// agent — `context_history::report_resolved` (mika#2425) is one — and every
+    /// test in this binary otherwise runs as `mika`. A test that asserts such an
+    /// emission is therefore asserting against a map its siblings write to
+    /// concurrently: it passes or fails on whichever ran first, which is a test
+    /// that goes green in CI and red on a busy machine. Giving the test its own
+    /// agent takes it out of the shared key entirely.
+    ///
+    /// The whole harness follows: the DB handle, the session it creates, and
+    /// therefore `customer_config` (scoped by `agent_id`) and the message
+    /// history. A test that seeds sessions of its own must seed them under this
+    /// same agent, or its window will legitimately be empty.
+    pub fn agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
+        self
+    }
+
+    /// Set onboarding mode. Default: `false`.
+    pub fn onboarding(mut self, v: bool) -> Self {
+        self.is_onboarding = v;
+        self
+    }
+
+    /// Set callback turn mode. Default: `false`.
+    pub fn callback_turn(mut self, v: bool) -> Self {
+        self.is_callback_turn = v;
+        self
+    }
+
+    /// Set whether to skip compaction. Default: `true`.
+    pub fn skip_compaction(mut self, v: bool) -> Self {
+        self.skip_compaction = v;
+        self
+    }
+
+    /// Set internal message tagging. Default: `false`.
+    pub fn internal(mut self, v: bool) -> Self {
+        self.internal = v;
+        self
+    }
+
+    /// Provision the harness as a **family-tier** agent (mika#1963).
+    ///
+    /// Threads `AgentTier::Family` into every `AgentParams` and writes
+    /// `FAMILY_SOUL` to the agent's `soul.md` so the assembled system prompt
+    /// carries the sealed-being persona. The load-bearing effect for the
+    /// substrate-doctrine scenario (mika#1783) is the tier value: on family
+    /// tier, `dispatch_substrate_diagnostic` routes the operator-shaped
+    /// diagnostic to `audit_events` and the LLM sees only the neutral
+    /// fallback — on default tier the diagnostic is folded into the tool
+    /// content. Default: `false` (operator tier).
+    pub fn family_tier(mut self) -> Self {
+        self.family_tier = true;
+        self
+    }
+
+    /// Set the resolved deployment for the run (mika#2290). Default:
+    /// `Deployment::Unknown` — the state of every cloud tenant today, and the
+    /// one the measured false privacy claim was made in. Pass `Local` to
+    /// exercise the exemption, `Cloud` to exercise the declared-cloud answer.
+    pub fn deployment(mut self, deployment: mika_common::home::Deployment) -> Self {
+        self.deployment = deployment;
+        self
+    }
+
+    /// Set the mock provider name. Default: `"mock"`.
+    pub fn provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
+        self
+    }
+
+    /// Set the mock model name. Default: `"mock-model"`.
+    pub fn model_name(mut self, name: impl Into<String>) -> Self {
+        self.model_name = Some(name.into());
+        self
+    }
+
+    /// Set whether the mock provider declares vision (mika#1784).
+    ///
+    /// Default: `false`, which is `MockProviderConfig`'s own default and the
+    /// answer the real predicate gives for `ZAi` / `Groq` / `Kimi` / `Qwen` /
+    /// `MiniMax` — the rails a family tenant is most likely to be on.
+    pub fn supports_vision(mut self, supports: bool) -> Self {
+        self.supports_vision = Some(supports);
+        self
+    }
+
+    /// Set a custom message sender. Default: `None`.
+    pub fn message_sender(mut self, sender: Arc<dyn MessageSender>) -> Self {
+        self.message_sender = Some(sender);
+        self
+    }
+
+    /// Use a real LLM provider instead of a mock. When set, `responses()` is ignored.
+    ///
+    /// Use this for real-API matrix tests. `captured_requests()` will be unavailable.
+    pub fn llm_provider(mut self, provider: Arc<dyn LlmProvider>) -> Self {
+        self.real_llm_provider = Some(provider);
+        self
+    }
+
+    /// Set an embedding client for Layer 3 hybrid search testing. Default: `None`.
+    pub fn embedding_client(mut self, client: EmbeddingClient) -> Self {
+        self.embedding_client = Some(client);
+        self
+    }
+
+    /// Set a Brave Search API key for `web_search` tool testing. Default: `None`.
+    pub fn brave_api_key(mut self, key: impl Into<String>) -> Self {
+        self.brave_api_key = Some(key.into());
+        self
+    }
+
+    /// Set a GitHub token for GitHub tool testing. Default: `None`.
+    pub fn github_token(mut self, token: impl Into<String>) -> Self {
+        self.github_token = Some(token.into());
+        self
+    }
+
+    /// Set an MCP manager for MCP tool testing. Default: `None`.
+    pub fn mcp_manager(mut self, mgr: McpManager) -> Self {
+        self.mcp_manager = Some(mgr);
+        self
+    }
+
+    /// Set a session-scoped PR review dedup map (#821, #736). Default: `None`.
+    ///
+    /// When set, enables the session-scope dedup guard in the agent loop,
+    /// which prevents duplicate PR reviews across turns within the same session.
+    pub fn pr_reviews_posted(mut self, map: Arc<DashMap<String, HashSet<String>>>) -> Self {
+        self.pr_reviews_posted = Some(map);
+        self
+    }
+
+    /// Attach an A2A streaming context (mika#1757). When set, the harness
+    /// threads it into every `AgentParams.stream_ctx` so tool-call frames
+    /// broadcast to any subscriber of the underlying `broadcast::Sender`.
+    pub fn stream_ctx(mut self, ctx: Arc<mika_a2a::streaming::ToolCallStreamContext>) -> Self {
+        self.stream_ctx = Some(ctx);
+        self
+    }
+
+    /// Attach user images to every turn this harness runs (mika#1784).
+    ///
+    /// Pair with `MockLlmProviderBuilder::supports_vision(false)` to exercise the
+    /// withheld path — the one Al hit, where the image was dropped in silence and
+    /// the model answered honestly that it could not see it.
+    pub fn user_images(mut self, images: Vec<mika_common::llm::LlmImage>) -> Self {
+        self.user_images = images;
+        self
+    }
+
+    /// Declare that this turn's caller named the model (mika#2304, D7).
+    ///
+    /// In production only `server::a2a` sets this, after honouring a
+    /// `mika.model_override`. Here it is the knob that lets a test exercise the
+    /// precedence: with it on, a matched skill's `[llm]` section stands down.
+    pub fn caller_model_override(mut self, v: bool) -> Self {
+        self.caller_model_override = v;
+        self
+    }
+
+    /// Declare that this turn's caller asked for session isolation (mika#1951).
+    ///
+    /// In production only `server::a2a` sets this, after reading
+    /// `mika.session_isolated`. Here it is the knob that lets a test exercise
+    /// both channels — the window and the compaction summary — on an agent whose
+    /// identity declares neither.
+    pub fn session_isolated(mut self, v: bool) -> Self {
+        self.session_isolated = v;
+        self
+    }
+
+    /// Build the harness, creating the in-memory DB and temp directories.
+    pub async fn build(self) -> Result<EvalHarness> {
+        // Create temp directory with minimal agent structure
+        let home_dir = TempDir::new()?;
+
+        // Create agent home structure
+        let agent_dir = home_dir.path();
+        std::fs::create_dir_all(agent_dir.join("skills"))?;
+        std::fs::create_dir_all(agent_dir.join("data"))?;
+        // Resolve the tier and write the matching soul.md. Family-tier runs get
+        // the real FAMILY_SOUL persona (mika#1963); default-tier runs keep the
+        // empty soul.md that only exists so load_agent_context doesn't fail.
+        let tier = if self.family_tier {
+            mika_common::home::AgentTier::Family
+        } else {
+            mika_common::home::AgentTier::Default
+        };
+        let soul_contents = if self.family_tier {
+            mika_common::home::FAMILY_SOUL
+        } else {
+            ""
+        };
+        std::fs::write(agent_dir.join("soul.md"), soul_contents)?;
+
+        // A provisioned agent home carries an identity.toml. Since mika#2027 its
+        // *absence* is fail-closed (sentinel allowlist, mutational tools denied,
+        // `[context.summary].inject = false`), so a harness without one would
+        // silently exercise a state no real agent is in. The content below parses
+        // to exactly `Identity::default()`, which is what the harness got before —
+        // tests that overwrite this file (e.g. to set `[context.summary]`) are
+        // unaffected, they run after `build()`.
+        std::fs::write(
+            agent_dir.join("identity.toml"),
+            "name = \"Mika\"\nemoji = \"✦\"\n",
+        )?;
+
+        // Create in-memory DB with session
+        let session_id = self
+            .session_id
+            .unwrap_or_else(|| format!("eval-{}", uuid::Uuid::new_v4()));
+        let custom_agent = self.agent_id.is_some();
+        let agent_id = self.agent_id.unwrap_or_else(|| "mika".to_string());
+        let db = Database::open_in_memory()?;
+        // `sessions.agent_id` carries a foreign key onto `agents(id)`, and the
+        // migrations seed exactly one row: `mika`. Any other agent must be
+        // registered first or every write of this harness fails on a FK error.
+        // Done only for an explicitly-posed agent, so the default path stays
+        // byte-for-byte what it was — `register_agent` upserts `name`/`home_dir`,
+        // and quietly rewriting the seeded `mika` row would be a change no test
+        // asked for.
+        if custom_agent {
+            db.register_agent(&agent_id, &agent_id, "")?;
+        }
+        db.create_session(&session_id, &agent_id, "test")?;
+        let async_db = AsyncDatabase::new_with_agent(db, &agent_id);
+
+        // Build provider — either real or mock
+        let (llm, mock_provider): (Arc<dyn LlmProvider>, Option<Arc<MockLlmProvider>>) =
+            if let Some(real_provider) = self.real_llm_provider {
+                (real_provider, None)
+            } else {
+                let mut builder = MockLlmProvider::builder();
+                if let Some(name) = self.provider_name {
+                    builder = builder.provider_name(name);
+                }
+                if let Some(name) = self.model_name {
+                    builder = builder.model_name(name);
+                }
+                if let Some(supports) = self.supports_vision {
+                    builder = builder.supports_vision(supports);
+                }
+                let mock = Arc::new(builder.responses(self.responses).build());
+                (mock.clone() as Arc<dyn LlmProvider>, Some(mock))
+            };
+
+        let trace_id = uuid::Uuid::new_v4().as_simple().to_string();
+
+        let settings = Settings::test_defaults();
+
+        Ok(EvalHarness {
+            db: async_db,
+            tier,
+            deployment: self.deployment,
+            llm,
+            mock_provider,
+            tools: self.tools.unwrap_or_else(default_tools),
+            skills: self.skills.unwrap_or_else(SkillRegistry::empty),
+            home_dir,
+            session_id,
+            settings,
+            trace_id,
+            skills_dirty: AtomicBool::new(false),
+            is_onboarding: self.is_onboarding,
+            is_callback_turn: self.is_callback_turn,
+            skip_compaction: self.skip_compaction,
+            internal: self.internal,
+            message_sender: self.message_sender,
+            embedding_client: self.embedding_client,
+            brave_api_key: self.brave_api_key,
+            github_token: self.github_token,
+            mcp_manager: self.mcp_manager,
+            user_images: self.user_images,
+            caller_model_override: self.caller_model_override,
+            session_isolated: self.session_isolated,
+            pr_reviews_posted: self.pr_reviews_posted,
+            stream_ctx: self.stream_ctx,
+        })
+    }
+}

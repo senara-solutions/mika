@@ -1,0 +1,2034 @@
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use regex::Regex;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::{Instrument, debug, info, info_span, warn};
+
+use super::error::LlmError;
+use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
+use super::types::*;
+use super::{LlmProvider, ProviderKind};
+
+// -- OpenAI wire types --
+
+#[derive(Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<OpenAiMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiTool>>,
+    max_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<OpenAiContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// Chain-of-thought text returned by reasoning-mode models on
+    /// OpenAI-compatible APIs (e.g. Z.AI GLM-5.2) in a dedicated
+    /// `message.reasoning_content` field, distinct from `message.content`.
+    ///
+    /// Response-only field on a struct shared with request serialization:
+    /// `#[serde(default)]` tolerates its absence on every provider that never
+    /// emits it, and `skip_serializing_if = "Option::is_none"` guarantees it is
+    /// never sent back in an outbound request (it is not a valid request field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+}
+
+/// OpenAI content can be a plain string or an array of content parts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum OpenAiContent {
+    Text(String),
+    Parts(Vec<OpenAiContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAiContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OpenAiImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: OpenAiFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenAiFunction {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Serialize)]
+struct OpenAiTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAiFunctionDef,
+}
+
+#[derive(Serialize)]
+struct OpenAiFunctionDef {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+// -- Response types --
+
+#[derive(Debug, Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    /// OpenAI-standard nested cache metrics (`prompt_tokens_details.cached_tokens`).
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+// -- Error response --
+
+#[derive(Deserialize)]
+struct OpenAiErrorResponse {
+    error: OpenAiErrorDetail,
+}
+
+#[derive(Deserialize)]
+struct OpenAiErrorDetail {
+    message: String,
+}
+
+// -- Provider implementation --
+
+/// Attempts this rail's chain permits at most.
+///
+/// Was a module-private `MAX_RETRIES + 1` until mika#2342 moved the ceiling to
+/// [`super::DEFAULT_ATTEMPTS_HARD_CAP`]: a default method on the `LlmProvider`
+/// trait needs it, and a trait method cannot read a constant private to one
+/// rail's module. The alias is kept so the retry loop below still reads in the
+/// vocabulary of the rail it governs.
+use super::DEFAULT_ATTEMPTS_HARD_CAP as MAX_ATTEMPTS_HARD_CAP;
+
+use super::LlmTimeoutBudget;
+use super::budget::output_tokens_per_sec_floor;
+
+/// OpenAI-compatible provider that works with OpenAI, Ollama, vLLM, Groq, etc.
+pub struct OpenAiCompatibleProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: Option<String>,
+    model: String,
+    max_tokens: u32,
+    provider_kind: ProviderKind,
+    /// Per-call plafond + agent envelope this provider was built against
+    /// (mika#2189). The plafond is what `client` was given; the envelope and
+    /// the three derived retry thresholds live here so the retry loop reasons
+    /// about the geometry it actually runs in rather than about 2026-era
+    /// literals.
+    budget: LlmTimeoutBudget,
+    /// When true AND the `telemetry` feature is enabled, attach request/response
+    /// bodies as `gen_ai.prompt` / `gen_ai.completion` span attributes. See #671.
+    #[cfg_attr(not(feature = "telemetry"), allow(dead_code))]
+    log_llm_bodies: bool,
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn new(
+        base_url: String,
+        api_key: Option<String>,
+        model: String,
+        max_tokens: u32,
+        provider_kind: ProviderKind,
+        log_llm_bodies: bool,
+        budget: LlmTimeoutBudget,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(budget.http_timeout_secs()))
+            .build()
+            .expect("failed to build HTTP client");
+
+        // Normalize base_url: strip trailing slash
+        let base_url = base_url.trim_end_matches('/').to_string();
+
+        Self {
+            client,
+            base_url,
+            api_key,
+            model,
+            max_tokens,
+            provider_kind,
+            budget,
+            log_llm_bodies,
+        }
+    }
+
+    fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url)
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.base_url)
+    }
+
+    /// One HTTP round-trip, plus the mika#2280 plafond discriminator.
+    ///
+    /// # Why the error type is a pair
+    ///
+    /// The `bool` is `cap_exhausted`: the body stopped arriving at ≈ the
+    /// per-call plafond, i.e. *the model was still generating*, as opposed to
+    /// stopping at an arbitrary instant, i.e. *the transport died*. Both are
+    /// `LlmError::Transport` and both answer `transport_timeout` to
+    /// `error_class`, so nothing in the error itself can carry the distinction
+    /// — and **nothing in `LlmError` is allowed to move** (mika#2280 D2): the
+    /// class is a wire format grouped on by mika#2179's
+    /// `callback_delivery_failed`, and the retryability of this branch is what
+    /// mika#2015 measured and must not be reopened for an observability need.
+    ///
+    /// Returned by the signature rather than through a `Cell` or a shared
+    /// field: this method is private and has exactly **one** caller, so the pair
+    /// propagates at one site. Side state would cost the same lines while making
+    /// the flag reachable from anywhere.
+    async fn send_once(&self, request: &OpenAiRequest) -> Result<OpenAiResponse, (LlmError, bool)> {
+        // mika#2280 D2: the attempt's own clock. `send_message_inner` measures
+        // one too, around this call, but the discriminator has to compare a
+        // duration with the plafond that bounded *this* request — reading the
+        // outer measure would fold in whatever the caller does around it.
+        let started = Instant::now();
+        // Only a failure ever carries the flag; every early exit is `false`.
+        let plain = |e: LlmError| (e, false);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        if let Some(ref key) = self.api_key {
+            let auth = HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|e| plain(LlmError::ProviderError(format!("invalid API key: {e}"))))?;
+            headers.insert(AUTHORIZATION, auth);
+        }
+
+        // Dev-mode body logging (gated by MIKA_LOG_LLM_BODIES / mika::llm_debug target)
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG)
+            && let Ok(body_json) = serde_json::to_string(request)
+        {
+            debug!(target: "mika::llm_debug", body = %body_json, provider = %self.provider_kind, "llm request body");
+        }
+
+        let response = self
+            .client
+            .post(self.chat_url())
+            .headers(headers)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| plain(LlmError::from(e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let status_code = status.as_u16();
+            // mika#2280 E6/AC5: this `response.text()` is deliberately NOT
+            // instrumented. It reads the body of a non-2xx response and its
+            // error is already swallowed by `unwrap_or_default`. A slow 429 —
+            // whose error body arrives late — would otherwise enter a
+            // population that asserts "the model was still generating", which
+            // is exactly the false attribution the discriminator exists to
+            // avoid.
+            let body = response.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<OpenAiErrorResponse>(&body)
+                .map(|e| e.error.message)
+                .unwrap_or_else(|_| {
+                    let truncated: String = body.chars().take(200).collect();
+                    format!("HTTP {status_code}: {truncated}")
+                });
+            warn!(status = status_code, error_message = %message, "OpenAI-compatible API error");
+            let retryable = matches!(status_code, 429 | 500 | 503);
+            return Err(plain(LlmError::HttpError {
+                status: status_code,
+                message,
+                retryable,
+            }));
+        }
+
+        // Read the body as text before deserializing, so a parse failure can say
+        // WHAT failed to parse (mika#1781).
+        //
+        // `response.json()` consumes the body to deserialize it; when that fails,
+        // reqwest reports only "error decoding response body" and the bytes are
+        // gone. That error has fired 7138 times since 2026-04-06 without ever
+        // leaving behind anything to diagnose, which is why the ticket sat in p2
+        // for four months described as an "upstream flake" — nobody could tell
+        // whether it was a truncated stream, an HTML error page, or a schema the
+        // provider changed.
+        // A failure HERE is a transport failure, not a parse failure: the bytes
+        // never arrived. Within the first hour of #2015's diagnostics being
+        // deployed (2026-08-27 09:52Z), 48 of 48 parse-error occurrences were
+        // body-read failures — the serde branch below never fired once. Mapping
+        // this to ParseError (non-retryable) is what made every mid-body network
+        // hiccup kill a whole pilot cycle for four months; Transport routes it
+        // through the existing fast-retry path (#1744) instead.
+        //
+        // reqwest's Display for this error is the opaque "error decoding
+        // response body" — the cause (unexpected EOF, decompression error,
+        // reset) lives in the source chain, so walk it into the message.
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                let mut chain = e.to_string();
+                let mut src = std::error::Error::source(&e);
+                while let Some(s) = src {
+                    chain.push_str(": ");
+                    chain.push_str(&s.to_string());
+                    src = s.source();
+                }
+                warn!(
+                    target: "mika::llm",
+                    provider = %self.provider_kind,
+                    error = %chain,
+                    "LLM response body read failed mid-stream (retryable transport)"
+                );
+
+                // mika#2280 D2 — the whole point of the ticket. This arm is
+                // already structurally narrow: the status has been read, so a
+                // connection failure or a connect timeout left through the `?`
+                // on `.send()` above and never reaches here. It means, exactly:
+                // *the headers arrived, the body did not finish*. What it does
+                // NOT say is why — and `error_class` answers `transport_timeout`
+                // either way.
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let cap_exhausted = self.budget.is_cap_exhaustion(elapsed_ms);
+                if cap_exhausted {
+                    warn!(
+                        target: "mika::llm",
+                        event = "llm_call_cap_exhausted",
+                        provider = %self.provider_kind,
+                        model = %request.model,
+                        max_tokens = request.max_tokens,
+                        http_timeout_secs = self.budget.http_timeout_secs(),
+                        elapsed_ms,
+                        reachable_output_tokens = self
+                            .budget
+                            .reachable_output_tokens(output_tokens_per_sec_floor()),
+                        // Corroborating, never deciding (D2): reqwest says
+                        // `timed out` for a guillotine and `unexpected EOF` /
+                        // `reset` for a breakdown. A `true` above with a `false`
+                        // here is worth looking at; the elapsed time carries the
+                        // verdict either way.
+                        cause_is_timeout = chain.contains("timed out"),
+                        "LLM call cut at its per-call plafond — the model was still generating \
+                         (mika#2280)"
+                    );
+                }
+
+                return Err((
+                    // The variant, the class and the retryability are UNCHANGED
+                    // (D2 / AC6): mika#2015 moved this branch from `ParseError`
+                    // to `Transport` after measuring 48 of 48 parse errors in
+                    // one hour were cut bodies. Touching it for an observability
+                    // need would reopen that.
+                    LlmError::Transport(format!("failed to read response body: {chain}")),
+                    cap_exhausted,
+                ));
+            }
+        };
+
+        let resp: OpenAiResponse = serde_json::from_str(&body).map_err(|e| {
+            // serde_json names the offending line, column and field — unlike the
+            // reqwest error this replaces. The excerpt is capped and only emitted
+            // on failure: for an OpenAI-compatible response the head is metadata
+            // (`id`, `object`, `model`), and when the body is an error page or an
+            // upstream JSON error it is exactly what needs reading.
+            let excerpt: String = body.chars().take(400).collect();
+            warn!(
+                target: "mika::llm",
+                provider = %self.provider_kind,
+                error = %e,
+                body_len = body.len(),
+                body_excerpt = %excerpt,
+                "LLM response body did not parse"
+            );
+            plain(LlmError::ParseError(format!(
+                "failed to parse response: {e} (body {} bytes, starts: {})",
+                body.len(),
+                excerpt.chars().take(120).collect::<String>()
+            )))
+        })?;
+
+        // Dev-mode body logging
+        if tracing::enabled!(target: "mika::llm_debug", tracing::Level::DEBUG) {
+            debug!(target: "mika::llm_debug", body = ?resp, provider = %self.provider_kind, "llm response body");
+        }
+
+        Ok(resp)
+    }
+
+    /// Inner implementation of send_message with retry logic and optional deadline.
+    async fn send_message_inner(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
+        let openai_request = to_openai_request(request);
+
+        // mika#2342 D4: measured once, before the chain. It is carried on the
+        // per-attempt event because a request that never returns takes its size
+        // with it — `llm_calls.request_bytes` is only written after the call
+        // comes back, which is precisely what a hang prevents.
+        let request_bytes = request.payload_bytes() as u64;
+
+        let mut last_error = None;
+
+        // AC3-b (mika#2189): the failure cost is bounded by the envelope, not
+        // merely trimmed by the remaining-deadline check below.
+        //
+        // A plafond is a plafond — raising it cannot slow a call that already
+        // succeeded. The regression a raised plafond *does* create is that a
+        // FAILING call gets more expensive, and before this the only thing
+        // holding that down was an emergent property of the threshold check: at
+        // 120/300 a third attempt could start at exactly `remaining ==
+        // threshold` and carry the failure to 360 s, past the 300 s envelope.
+        // `max_attempts` makes `attempts × cap ≤ envelope` true by
+        // construction. At the default geometry it is 2 — which is what the
+        // founding measurement shows (171 of 209 failures at exactly 240 s), so
+        // this closes a boundary case rather than changing the common path.
+        //
+        // Only applied when a deadline is present: without one there is no
+        // envelope to overflow, and callers with no deadline visibility keep
+        // the full hard-cap chain they have always had.
+        let max_attempts = if deadline.is_some() {
+            self.budget.max_attempts(MAX_ATTEMPTS_HARD_CAP)
+        } else {
+            MAX_ATTEMPTS_HARD_CAP
+        };
+
+        // mika#2362: the two deadline thresholds, derived once. The three sites
+        // below that ask "will a further attempt run?" — the guard, the outcome
+        // line, and the post-loop error message — now read one predicate over
+        // this one pair instead of three copies of the same arithmetic.
+        let thresholds = RetryThresholds::from_budget(&self.budget);
+
+        // Emitted after `max_attempts` is known (mika#2342 D4): half the
+        // ambiguity of the founding incident was that the chain's width was
+        // invisible, so "one unbounded call" and "N bounded silent ones" read
+        // identically in the log.
+        info!(
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            max_attempts,
+            request_bytes,
+            provider = %self.provider_kind,
+            "llm_call started"
+        );
+
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                // Deadline-aware retry abort: if the remaining time before the
+                // agent deadline cannot fit another LLM call attempt, bail out
+                // instead of wasting time on a doomed retry.
+                //
+                // mika#1744 AC4-primary: transport-class errors (DNS,
+                // connection refused, TLS, socket reset) resolve in seconds,
+                // not the full 120s per-request timeout. Use a smaller
+                // remaining-budget threshold (60s) when the last error was
+                // a transport failure. This is what unblocks mika-qa's
+                // z.ai wedge — the 2026-07-07 kill happened because the
+                // deadline was already ~2min PAST when the transport error
+                // hit, and the 120s abort threshold left no room for the
+                // fast-failing transport retry.
+                if let Some(dl) = deadline {
+                    let remaining = dl.saturating_duration_since(Instant::now());
+                    let last_was_transport = last_error
+                        .as_ref()
+                        .is_some_and(super::error::LlmError::is_transport);
+                    // mika#2189 D3: derived from the effective plafond, not
+                    // from literals calibrated against a 120 s one. At the
+                    // default plafond these reproduce 60 and 90+30 exactly.
+                    // mika#2362: the selection now lives in `retry_gate`, which
+                    // is the same predicate the outcome line below reads — they
+                    // used to be two, and the outcome line ignored the deadline
+                    // entirely.
+                    if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
+                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                    {
+                        warn!(
+                            attempt,
+                            remaining_ms = remaining.as_millis() as u64,
+                            threshold_secs,
+                            last_was_transport,
+                            "aborting retry chain — remaining deadline insufficient for another attempt"
+                        );
+                        // mika#2331 AC2: the attempt that did NOT happen is
+                        // itself the answer to "how many times did it try?".
+                        // `elapsed_ms = 0` here measures nothing — see
+                        // `attempt_outcome::DEADLINE_ABORT`.
+                        super::emit_llm_call_attempt(
+                            &self.provider_kind.to_string(),
+                            &request.model,
+                            attempt,
+                            max_attempts,
+                            0,
+                            super::attempt_outcome::DEADLINE_ABORT,
+                            last_error.as_ref().map(|e| e.error_class()).as_deref(),
+                            self.budget.http_timeout_secs(),
+                            Some(remaining.as_millis() as u64),
+                            openai_request.max_tokens,
+                            // mika#2280 AC7: **absent**, never `false`. No call
+                            // was made, so asserting it was not guillotined
+                            // would assert something about a call that does not
+                            // exist — the same discipline as mika#2342's
+                            // `request_bytes`, which is never `0`.
+                            None,
+                        );
+                        break;
+                    }
+                }
+
+                let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "retrying OpenAI-compatible API call"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            // mika#2342 D4 — the discriminator. Emitted immediately BEFORE the
+            // call, so what follows separates the three readings of the same
+            // silence: N attempts of about a plafond each (the chain is running
+            // and the cause is upstream of the rail); one attempt that outlives
+            // the plafond (reqwest did not bound it); or no attempt at all after
+            // `llm_call started` (the block is before `send_once` — body
+            // serialization, connection acquisition).
+            info!(
+                target: "mika::otel",
+                attempt,
+                max_attempts,
+                request_bytes,
+                provider = %self.provider_kind,
+                model = %request.model,
+                "llm_call_attempt"
+            );
+
+            // mika#2331 AC2: the outcome line, measured around the single
+            // `send_once`, so the per-attempt duration is readable independently
+            // of how many attempts the chain ran. The mika#2342 line above marks
+            // the start of the attempt; this one says how it ended.
+            let attempt_start = Instant::now();
+            // mika#2280: `send_once` returns the plafond verdict beside its
+            // error. Split it here — the single site the pair travels through —
+            // so everything below reasons about an ordinary `Result` and no
+            // `LlmError` variant had to change.
+            let (attempt_result, attempt_cap_exhausted) =
+                match self.send_once(&openai_request).await {
+                    Ok(response) => (Ok(response), false),
+                    Err((e, cap_exhausted)) => (Err(e), cap_exhausted),
+                };
+            let attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64;
+            let deadline_remaining_ms =
+                deadline.map(|dl| dl.saturating_duration_since(Instant::now()).as_millis() as u64);
+            // mika#2362: the same predicate the guard above consults, fed the
+            // margin measured just now. Before this it read the budget and the
+            // error class and **never the deadline**, so it could announce a
+            // retry the guard was about to refuse — which is the whole of the
+            // founding incident.
+            let outcome = match &attempt_result {
+                Ok(_) => super::attempt_outcome::SUCCESS,
+                Err(e) => super::attempt_outcome::outcome_for(&next_attempt_verdict(
+                    attempt,
+                    max_attempts,
+                    Some(e),
+                    deadline_remaining_ms.map(Duration::from_millis),
+                    &thresholds,
+                )),
+            };
+            super::emit_llm_call_attempt(
+                &self.provider_kind.to_string(),
+                &request.model,
+                attempt,
+                max_attempts,
+                attempt_elapsed_ms,
+                outcome,
+                attempt_result
+                    .as_ref()
+                    .err()
+                    .map(LlmError::error_class)
+                    .as_deref(),
+                self.budget.http_timeout_secs(),
+                deadline_remaining_ms,
+                openai_request.max_tokens,
+                // The attempt ran, so the flag is a measurement rather than an
+                // absence — `Some`, both ways (mika#2280 AC7).
+                Some(attempt_cap_exhausted),
+            );
+
+            match attempt_result {
+                Ok(response) => {
+                    let llm_response = from_openai_response(response)?;
+                    info!(
+                        model = %request.model,
+                        input_tokens = llm_response.usage.input_tokens,
+                        output_tokens = llm_response.usage.output_tokens,
+                        cache_read_tokens = llm_response.usage.cache_read_input_tokens,
+                        stop_reason = ?llm_response.stop_reason,
+                        provider = %self.provider_kind,
+                        "llm_call completed"
+                    );
+                    return Ok(llm_response);
+                }
+                Err(e) => {
+                    // `attempt + 1 < max_attempts`, not `attempt < hard cap`:
+                    // the budget may have narrowed the chain below the hard cap
+                    // (AC3-b), and a guard still reading the hard cap would
+                    // return the retryable error one iteration early — or, with
+                    // the loop bound moved, keep looping past the budget.
+                    if attempt + 1 < max_attempts && e.is_retryable() {
+                        warn!(attempt, max_attempts, error = %e, "transient API error");
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Distinguish deadline-abort from normal retry exhaustion for
+        // diagnostics. mika#2362: this used to re-derive the guard's threshold
+        // a third time, with a comment saying it did so "so the two branches
+        // agree" — an agreement obtained by copying. It now reads the same
+        // predicate, so the agreement is structural. The margin is still
+        // measured *here* rather than reused from the guard: this site runs at
+        // a later instant, and its verdict may legitimately differ.
+        let last_was_transport = last_error
+            .as_ref()
+            .is_some_and(super::error::LlmError::is_transport);
+        let deadline_aborted = deadline_verdict(
+            deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
+            last_was_transport,
+            &thresholds,
+        )
+        .is_deadline_insufficient();
+
+        Err(last_error.unwrap_or_else(|| {
+            if deadline_aborted {
+                LlmError::ProviderError("retry chain aborted: deadline budget insufficient".into())
+            } else {
+                LlmError::ProviderError("max retries exceeded".into())
+            }
+        }))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCompatibleProvider {
+    async fn send_message(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.send_message_with_deadline(request, None).await
+    }
+
+    async fn send_message_with_deadline(
+        &self,
+        request: &LlmRequest,
+        deadline: Option<Instant>,
+    ) -> Result<LlmResponse, LlmError> {
+        let span = info_span!(
+            target: "mika::otel",
+            "llm_call",
+            model = %request.model,
+            max_tokens = request.max_tokens,
+            provider = %self.provider_kind,
+        );
+
+        // Set gen_ai semantic convention attributes for Langfuse generation classification
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute("gen_ai.operation.name", "chat");
+            span.set_attribute("gen_ai.provider.name", self.provider_kind.to_string());
+            span.set_attribute("gen_ai.request.model", request.model.clone());
+            span.set_attribute("gen_ai.request.max_tokens", request.max_tokens as i64);
+
+            // Attach request body for Langfuse Generation "Input" (#671)
+            if self.log_llm_bodies {
+                let openai_req = to_openai_request(request);
+                if let Ok(body_json) = serde_json::to_string(&openai_req) {
+                    span.set_attribute(
+                        "gen_ai.prompt",
+                        super::truncate_chars(&body_json, super::MAX_RESPONSE_TEXT_CHARS),
+                    );
+                }
+            }
+        }
+
+        let response = self
+            .send_message_inner(request, deadline)
+            .instrument(span.clone())
+            .await?;
+
+        // Set gen_ai response attributes after successful API call
+        #[cfg(feature = "telemetry")]
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            span.set_attribute(
+                "gen_ai.usage.input_tokens",
+                response.usage.input_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.usage.output_tokens",
+                response.usage.output_tokens as i64,
+            );
+            span.set_attribute(
+                "gen_ai.response.finish_reasons",
+                format!("{:?}", response.stop_reason),
+            );
+
+            // Attach response body for Langfuse Generation "Output" (#671)
+            if self.log_llm_bodies
+                && let Some(text) = super::serialize_response_text(
+                    &response.content,
+                    super::MAX_RESPONSE_TEXT_CHARS,
+                )
+            {
+                span.set_attribute("gen_ai.completion", text);
+            }
+        }
+
+        Ok(response)
+    }
+
+    fn provider_name(&self) -> &str {
+        self.provider_kind.config_prefix()
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
+    /// mika#2189: the budget this provider's `reqwest` client was actually
+    /// built with — not a re-read of the environment, which could have changed
+    /// underneath a long-lived process and would make the agent deadline
+    /// disagree with the transport timeout it is supposed to contain.
+    fn timeout_budget(&self) -> LlmTimeoutBudget {
+        self.budget
+    }
+
+    fn supports_tool_calling(&self) -> bool {
+        true
+    }
+
+    fn supports_vision(&self) -> bool {
+        matches!(
+            self.provider_kind,
+            ProviderKind::OpenAi
+                | ProviderKind::OpenRouter
+                | ProviderKind::Mistral
+                | ProviderKind::Google
+                | ProviderKind::DeepSeek
+        )
+    }
+
+    fn supports_extended_thinking(&self) -> bool {
+        false
+    }
+
+    async fn check_health(&self) -> Result<(), LlmError> {
+        let mut headers = HeaderMap::new();
+        if let Some(ref key) = self.api_key {
+            let auth = HeaderValue::from_str(&format!("Bearer {key}"))
+                .map_err(|e| LlmError::ProviderError(format!("invalid API key: {e}")))?;
+            headers.insert(AUTHORIZATION, auth);
+        }
+
+        let response = self
+            .client
+            .get(self.models_url())
+            .headers(headers)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(LlmError::HttpError {
+                status: response.status().as_u16(),
+                message: "health check failed".into(),
+                retryable: false,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+// -- Translation: LlmRequest → OpenAiRequest --
+
+fn to_openai_request(req: &LlmRequest) -> OpenAiRequest {
+    let mut messages = Vec::new();
+
+    // System prompt goes as a system role message
+    if let Some(ref system) = req.system {
+        messages.push(OpenAiMessage {
+            role: "system".into(),
+            content: Some(OpenAiContent::Text(system.clone())),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
+
+    // Convert conversation messages
+    for msg in &req.messages {
+        messages.extend(to_openai_messages(msg));
+    }
+
+    let tools = req.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .map(|t| OpenAiTool {
+                tool_type: "function".into(),
+                function: OpenAiFunctionDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                },
+            })
+            .collect()
+    });
+
+    OpenAiRequest {
+        model: req.model.clone(),
+        messages,
+        tools,
+        max_tokens: req.max_tokens,
+    }
+}
+
+/// Convert a single `LlmMessage` into one or more `OpenAiMessage`s.
+///
+/// Most messages map 1:1, but tool result messages need special handling:
+/// each `ToolResult` block becomes a separate `role: "tool"` message.
+fn to_openai_messages(msg: &LlmMessage) -> Vec<OpenAiMessage> {
+    match msg.role {
+        LlmRole::User => {
+            vec![OpenAiMessage {
+                role: "user".into(),
+                content: Some(to_openai_content(&msg.content)),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }]
+        }
+        LlmRole::Assistant => {
+            // Check if content has tool calls — they go in the `tool_calls` field
+            match &msg.content {
+                LlmContent::Blocks(blocks) => {
+                    let mut tool_calls = Vec::new();
+                    let mut text_parts = Vec::new();
+
+                    for block in blocks {
+                        match block {
+                            LlmContentBlock::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } => {
+                                tool_calls.push(OpenAiToolCall {
+                                    id: id.clone(),
+                                    call_type: "function".into(),
+                                    function: OpenAiFunction {
+                                        name: name.clone(),
+                                        arguments: serde_json::to_string(arguments)
+                                            .unwrap_or_default(),
+                                    },
+                                });
+                            }
+                            LlmContentBlock::Text(t) => {
+                                text_parts.push(t.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let content = if text_parts.is_empty() {
+                        None
+                    } else {
+                        Some(OpenAiContent::Text(text_parts.join("")))
+                    };
+
+                    let tool_calls = if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    };
+
+                    vec![OpenAiMessage {
+                        role: "assistant".into(),
+                        content,
+                        tool_calls,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }]
+                }
+                LlmContent::Text(t) => {
+                    vec![OpenAiMessage {
+                        role: "assistant".into(),
+                        content: Some(OpenAiContent::Text(t.clone())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }]
+                }
+            }
+        }
+        LlmRole::Tool => {
+            // Each tool result becomes a separate message with role="tool"
+            match &msg.content {
+                LlmContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        LlmContentBlock::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error,
+                            ..
+                        } => {
+                            let mut text = match content {
+                                LlmToolResultContent::Text(t) => t.clone(),
+                                LlmToolResultContent::Blocks(parts) => parts
+                                    .iter()
+                                    .filter_map(|p| match p {
+                                        LlmToolResultBlock::Text(t) => Some(t.as_str()),
+                                        LlmToolResultBlock::Image(_) => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            };
+                            // OpenAI has no first-class is_error field; prefix the
+                            // content so the model knows the tool call failed.
+                            if *is_error {
+                                text = format!("[ERROR] {text}");
+                            }
+                            Some(OpenAiMessage {
+                                role: "tool".into(),
+                                content: Some(OpenAiContent::Text(text)),
+                                tool_calls: None,
+                                tool_call_id: Some(tool_call_id.clone()),
+                                reasoning_content: None,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                LlmContent::Text(t) => {
+                    vec![OpenAiMessage {
+                        role: "tool".into(),
+                        content: Some(OpenAiContent::Text(t.clone())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    }]
+                }
+            }
+        }
+    }
+}
+
+fn to_openai_content(content: &LlmContent) -> OpenAiContent {
+    match content {
+        LlmContent::Text(t) => OpenAiContent::Text(t.clone()),
+        LlmContent::Blocks(blocks) => {
+            let parts: Vec<OpenAiContentPart> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    LlmContentBlock::Text(t) => Some(OpenAiContentPart::Text { text: t.clone() }),
+                    LlmContentBlock::Image(img) => {
+                        let data_uri = format!("data:{};base64,{}", img.media_type, img.data);
+                        Some(OpenAiContentPart::ImageUrl {
+                            image_url: OpenAiImageUrl { url: data_uri },
+                        })
+                    }
+                    // ToolCall/ToolResult blocks are handled separately
+                    _ => None,
+                })
+                .collect();
+
+            if parts.len() == 1
+                && let OpenAiContentPart::Text { ref text } = parts[0]
+            {
+                return OpenAiContent::Text(text.clone());
+            }
+            OpenAiContent::Parts(parts)
+        }
+    }
+}
+
+// -- Translation: OpenAiResponse → LlmResponse --
+
+fn from_openai_response(resp: OpenAiResponse) -> Result<LlmResponse, LlmError> {
+    let choice = resp
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| LlmError::ParseError("no choices in response".into()))?;
+
+    let mut content = Vec::new();
+
+    // Extract text content
+    if let Some(text_content) = choice.message.content {
+        match text_content {
+            OpenAiContent::Text(t) if !t.is_empty() => {
+                content.push(LlmResponseContent::Text(t));
+            }
+            OpenAiContent::Parts(parts) => {
+                for part in parts {
+                    if let OpenAiContentPart::Text { text } = part
+                        && !text.is_empty()
+                    {
+                        content.push(LlmResponseContent::Text(text));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Extract structured tool calls
+    let has_structured_tool_calls = choice
+        .message
+        .tool_calls
+        .as_ref()
+        .is_some_and(|tc| !tc.is_empty());
+    if let Some(tool_calls) = choice.message.tool_calls {
+        for tc in tool_calls {
+            let arguments =
+                serde_json::from_str::<Value>(&tc.function.arguments).unwrap_or_else(|e| {
+                    warn!(
+                        tool = %tc.function.name,
+                        error = %e,
+                        raw = %tc.function.arguments,
+                        "failed to parse tool call arguments as JSON, wrapping as string"
+                    );
+                    Value::String(tc.function.arguments.clone())
+                });
+            content.push(LlmResponseContent::ToolCall {
+                id: tc.id,
+                name: tc.function.name,
+                arguments,
+            });
+        }
+    }
+
+    // Extract XML-formatted tool calls from text content (e.g. <function=name>...</function>).
+    // Only run when no structured tool_calls were returned — prevents duplicates.
+    if !has_structured_tool_calls {
+        let mut new_content = Vec::new();
+        let mut xml_tool_calls = Vec::new();
+        for item in content {
+            if let LlmResponseContent::Text(ref text) = item {
+                let (extracted, remaining) = extract_xml_tool_calls(text);
+                if !extracted.is_empty() {
+                    info!(
+                        extracted_count = extracted.len(),
+                        "extracted XML-formatted tool calls from text response"
+                    );
+                    xml_tool_calls.extend(extracted);
+                    if !remaining.is_empty() {
+                        new_content.push(LlmResponseContent::Text(remaining));
+                    }
+                } else {
+                    new_content.push(item);
+                }
+            } else {
+                new_content.push(item);
+            }
+        }
+        new_content.extend(xml_tool_calls);
+        content = new_content;
+    }
+
+    // Determine stop_reason. If content contains tool calls (structured or XML-extracted)
+    // but finish_reason didn't indicate tool use, override to ToolUse.
+    let has_any_tool_calls = content
+        .iter()
+        .any(|c| matches!(c, LlmResponseContent::ToolCall { .. }));
+    let stop_reason = match choice.finish_reason.as_deref() {
+        Some("tool_calls") => LlmStopReason::ToolUse,
+        Some("length") => LlmStopReason::MaxTokens,
+        Some("content_filter") => LlmStopReason::ContentFilter,
+        _ if has_any_tool_calls => LlmStopReason::ToolUse,
+        _ => LlmStopReason::EndTurn,
+    };
+
+    let usage = resp.usage.map_or_else(LlmUsage::default, |u| {
+        let cache_read = u
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .filter(|&t| t > 0);
+        LlmUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: cache_read,
+        }
+    });
+
+    // Determine reasoning text. The dedicated `reasoning_content` field
+    // (reasoning-mode models on OpenAI-compatible APIs, e.g. Z.AI GLM-5.2) is
+    // authoritative when present; a whitespace-only value is treated as absent
+    // (matching how `extract_think_block` rejects an empty think body). When it
+    // is absent, fall back to `<think>…</think>` extraction from the content
+    // text (DeepSeek-R1, MiniMax) — preserving the prior behaviour byte-for-byte.
+    let reasoning_content = choice
+        .message
+        .reasoning_content
+        .filter(|s| !s.trim().is_empty());
+
+    let reasoning = if let Some(reasoning_content) = reasoning_content {
+        // Structured field wins and short-circuits `<think>` stripping, so a
+        // provider that somehow emits both channels cannot double-capture.
+        Some(reasoning_content)
+    } else {
+        // Fallback: extract <think>…</think> blocks as reasoning.
+        let mut think_reasoning: Option<String> = None;
+        for item in &mut content {
+            if let LlmResponseContent::Text(text) = item
+                && let Some((think_text, stripped)) = extract_think_block(text)
+            {
+                think_reasoning = Some(think_text);
+                *text = stripped;
+            }
+        }
+        think_reasoning
+    };
+    // Remove empty text entries left after stripping
+    content.retain(|c| !matches!(c, LlmResponseContent::Text(t) if t.is_empty()));
+
+    Ok(LlmResponse {
+        content,
+        reasoning,
+        stop_reason,
+        usage,
+    })
+}
+
+/// Extract `<think>…</think>` block from text, returning (thinking, remaining_text).
+/// Returns `None` if no think block is found.
+///
+/// Used by both `OpenAiCompatibleProvider` and `OllamaProvider` for models that
+/// emit reasoning in `<think>` tags (e.g., DeepSeek-R1, MiniMax thinking models).
+pub(crate) fn extract_think_block(text: &str) -> Option<(String, String)> {
+    let start_tag = "<think>";
+    let end_tag = "</think>";
+    let start = text.find(start_tag)?;
+    let end = text.find(end_tag)?;
+    if end <= start {
+        return None;
+    }
+    let think_content = text[start + start_tag.len()..end].trim().to_string();
+    let remaining = format!("{}{}", &text[..start], &text[end + end_tag.len()..])
+        .trim()
+        .to_string();
+    if think_content.is_empty() {
+        return None;
+    }
+    Some((think_content, remaining))
+}
+
+// Regex for `<tool_call>...<function=name>args</function>...</tool_call>` or
+// `<tool_call>{"name":"...","arguments":{...}}</tool_call>`.
+static RE_WRAPPED_TOOL_CALL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)<tool_call>\s*(?:<function=([^>]+)>([\s\S]*?)</function>|(\{[\s\S]*?\}))\s*</tool_call>").unwrap()
+});
+
+// Regex for bare `<function=name>args</function>` (no `<tool_call>` wrapper).
+static RE_BARE_FUNCTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<function=([^>]+)>([\s\S]*?)</function>").unwrap());
+
+/// Extract XML-formatted tool calls from text content.
+///
+/// Some OpenAI-compatible providers emit tool calls as XML text
+/// (e.g. `<function=search>{"query":"test"}</function>`) instead of structured
+/// `tool_calls` in the response. This function extracts those, converts them to
+/// `LlmResponseContent::ToolCall` items, and returns the remaining text with
+/// XML removed.
+///
+/// Returns `(extracted_tool_calls, remaining_text)`.
+fn extract_xml_tool_calls(text: &str) -> (Vec<LlmResponseContent>, String) {
+    if !text.contains('<') {
+        return (vec![], text.to_string());
+    }
+
+    let mut tool_calls = Vec::new();
+    let mut remaining = text.to_string();
+    let mut call_index: usize = 0;
+
+    // Pass 1: Extract wrapped `<tool_call>...</tool_call>` blocks.
+    // Use captures() directly to avoid running the regex twice per iteration.
+    while let Some(caps) = RE_WRAPPED_TOOL_CALL.captures(&remaining) {
+        let full_match = caps.get(0).unwrap();
+        let start = full_match.start();
+        let end = full_match.end();
+
+        // Determine if it's a <function=name>args</function> or bare JSON inside <tool_call>.
+        if let Some(name_match) = caps.get(1) {
+            // <tool_call><function=name>args</function></tool_call>
+            let name = name_match.as_str().to_string();
+            let raw_args = caps.get(2).map_or("", |m| m.as_str()).trim();
+            let arguments = parse_tool_arguments(raw_args);
+            tool_calls.push(LlmResponseContent::ToolCall {
+                id: format!("xml_call_{call_index}"),
+                name,
+                arguments,
+            });
+        } else if let Some(json_match) = caps.get(3) {
+            // <tool_call>{"name":"...","arguments":{...}}</tool_call>
+            if let Some(tc) = parse_json_tool_call(json_match.as_str(), call_index) {
+                tool_calls.push(tc);
+            } else {
+                // Malformed JSON — skip this match by removing it to avoid infinite loop.
+                call_index += 1;
+                remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+                continue;
+            }
+        }
+
+        call_index += 1;
+        remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+    }
+
+    // Pass 2: Extract bare `<function=name>args</function>` (not already consumed).
+    while let Some(caps) = RE_BARE_FUNCTION.captures(&remaining) {
+        let full_match = caps.get(0).unwrap();
+        let start = full_match.start();
+        let end = full_match.end();
+        let name = caps.get(1).unwrap().as_str().to_string();
+        let raw_args = caps.get(2).map_or("", |m| m.as_str()).trim();
+        let arguments = parse_tool_arguments(raw_args);
+        tool_calls.push(LlmResponseContent::ToolCall {
+            id: format!("xml_call_{call_index}"),
+            name,
+            arguments,
+        });
+        call_index += 1;
+        remaining = format!("{}{}", &remaining[..start], &remaining[end..]);
+    }
+
+    // Clean up whitespace left by removals.
+    let remaining = remaining.trim().to_string();
+
+    (tool_calls, remaining)
+}
+
+/// Parse tool call arguments: valid JSON object → Value, empty → empty object,
+/// invalid → Value::String (same fallback as structured tool_calls).
+fn parse_tool_arguments(raw: &str) -> Value {
+    if raw.is_empty() {
+        return Value::Object(serde_json::Map::new());
+    }
+    serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+/// Parse a JSON-formatted tool call: `{"name":"func","arguments":{...}}`.
+fn parse_json_tool_call(json_str: &str, index: usize) -> Option<LlmResponseContent> {
+    let obj: Value = serde_json::from_str(json_str).ok()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    let arguments = obj
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+    Some(LlmResponseContent::ToolCall {
+        id: format!("xml_call_{index}"),
+        name,
+        arguments,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Pins the ceiling the retry chain of this rail runs under (mika#2189
+    /// AC3-b).
+    ///
+    /// Since mika#2342 the value lives in `llm/mod.rs` as
+    /// [`super::super::DEFAULT_ATTEMPTS_HARD_CAP`] and `budget::tests` reads it
+    /// there rather than duplicating `4`, so this test no longer guards a
+    /// duplication — it guards the *behaviour* of `max_attempts` against the
+    /// shared ceiling.
+    ///
+    /// Both halves matter. The hard cap must **bound** a generous envelope (a
+    /// big envelope must not silently widen a provider's retry policy), and it
+    /// must **not raise** a narrow one (the envelope is the tighter constraint
+    /// when it is tighter, which is the whole of AC3-b).
+    #[test]
+    fn max_attempts_respects_provider_hard_cap() {
+        // Generous envelope: arithmetic alone would allow floor(10000/10) =
+        // 1000 attempts. The provider's ceiling wins.
+        let generous = LlmTimeoutBudget::new(10, 10_000).expect("valid geometry");
+        assert_eq!(
+            generous.max_attempts(MAX_ATTEMPTS_HARD_CAP),
+            MAX_ATTEMPTS_HARD_CAP,
+            "a generous envelope must not widen the chain past the provider hard cap"
+        );
+
+        // Narrow envelope: the budget wins, and the worst case stays inside it.
+        let shipped = LlmTimeoutBudget::default();
+        assert_eq!(
+            shipped.max_attempts(MAX_ATTEMPTS_HARD_CAP),
+            2,
+            "the shipped 120/300 geometry allows exactly the two attempts the \
+             mika#2189 measurement shows (171 of 209 failures at exactly 240 s)"
+        );
+        assert!(
+            shipped.worst_case_failure_secs(MAX_ATTEMPTS_HARD_CAP)
+                <= shipped.agent_total_timeout_secs(),
+            "a fully-failing call must not overflow the envelope it runs in"
+        );
+
+        // The shared ceiling, asserted from the rail that runs under it.
+        assert_eq!(
+            MAX_ATTEMPTS_HARD_CAP, 4,
+            "the shared attempt ceiling changed; mika#2342's watchdog is sized \
+             on it via `LlmProvider::worst_case_failure_secs`, so re-read that \
+             margin before accepting a new value"
+        );
+    }
+
+    #[test]
+    fn test_to_openai_request_basic() {
+        let req = LlmRequest {
+            model: "gpt-4o".into(),
+            system: Some("You are helpful.".into()),
+            messages: vec![LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::Text("Hello".into()),
+            }],
+            tools: None,
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let openai = to_openai_request(&req);
+        assert_eq!(openai.model, "gpt-4o");
+        assert_eq!(openai.messages.len(), 2); // system + user
+        assert_eq!(openai.messages[0].role, "system");
+        assert_eq!(openai.messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_to_openai_request_thinking_ignored() {
+        use crate::claude::ThinkingConfig;
+
+        let req = LlmRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![],
+            tools: None,
+            max_tokens: 4096,
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            }),
+        };
+
+        let openai = to_openai_request(&req);
+        // Thinking is silently ignored — not present in OpenAI request
+        let json = serde_json::to_value(&openai).unwrap();
+        assert!(!json.to_string().contains("thinking"));
+    }
+
+    #[test]
+    fn test_to_openai_request_with_tools() {
+        let req = LlmRequest {
+            model: "gpt-4o".into(),
+            system: None,
+            messages: vec![],
+            tools: Some(vec![LlmToolDefinition {
+                name: "search".into(),
+                description: "Search memory".into(),
+                parameters: json!({ "type": "object" }),
+            }]),
+            max_tokens: 4096,
+            thinking: None,
+        };
+
+        let openai = to_openai_request(&req);
+        let tools = openai.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_type, "function");
+        assert_eq!(tools[0].function.name, "search");
+        assert_eq!(tools[0].function.parameters, json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn test_to_openai_assistant_with_tool_calls() {
+        let msg = LlmMessage {
+            role: LlmRole::Assistant,
+            content: LlmContent::Blocks(vec![
+                LlmContentBlock::Text("Let me search.".into()),
+                LlmContentBlock::ToolCall {
+                    id: "call_1".into(),
+                    name: "search".into(),
+                    arguments: json!({"query": "test"}),
+                },
+            ]),
+        };
+
+        let openai_msgs = to_openai_messages(&msg);
+        assert_eq!(openai_msgs.len(), 1);
+        assert_eq!(openai_msgs[0].role, "assistant");
+        // Text goes in content
+        assert!(matches!(
+            &openai_msgs[0].content,
+            Some(OpenAiContent::Text(t)) if t == "Let me search."
+        ));
+        // Tool calls go in tool_calls field
+        let tool_calls = openai_msgs[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function.name, "search");
+        // Arguments are serialized as JSON string
+        assert_eq!(tool_calls[0].function.arguments, r#"{"query":"test"}"#);
+    }
+
+    #[test]
+    fn test_to_openai_tool_result_messages() {
+        let msg = LlmMessage {
+            role: LlmRole::Tool,
+            content: LlmContent::Blocks(vec![
+                LlmContentBlock::ToolResult {
+                    tool_call_id: "call_1".into(),
+                    content: LlmToolResultContent::Text("result 1".into()),
+                    is_error: false,
+                },
+                LlmContentBlock::ToolResult {
+                    tool_call_id: "call_2".into(),
+                    content: LlmToolResultContent::Text("result 2".into()),
+                    is_error: true,
+                },
+            ]),
+        };
+
+        let openai_msgs = to_openai_messages(&msg);
+        // Each tool result becomes a separate message
+        assert_eq!(openai_msgs.len(), 2);
+        assert_eq!(openai_msgs[0].role, "tool");
+        assert_eq!(openai_msgs[0].tool_call_id, Some("call_1".into()));
+        assert_eq!(openai_msgs[1].role, "tool");
+        assert_eq!(openai_msgs[1].tool_call_id, Some("call_2".into()));
+    }
+
+    #[test]
+    fn test_to_openai_image_content() {
+        let msg = LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Blocks(vec![
+                LlmContentBlock::Image(LlmImage {
+                    media_type: "image/png".into(),
+                    data: "iVBOR...".into(),
+                }),
+                LlmContentBlock::Text("What is this?".into()),
+            ]),
+        };
+
+        let openai_msgs = to_openai_messages(&msg);
+        assert_eq!(openai_msgs.len(), 1);
+        match &openai_msgs[0].content {
+            Some(OpenAiContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    OpenAiContentPart::ImageUrl { image_url } => {
+                        assert!(image_url.url.starts_with("data:image/png;base64,"));
+                    }
+                    _ => panic!("expected ImageUrl"),
+                }
+            }
+            _ => panic!("expected Parts content"),
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_text() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                prompt_tokens_details: None,
+            }),
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.text(), "Hello!");
+        assert_eq!(llm.stop_reason, LlmStopReason::EndTurn);
+        assert_eq!(llm.usage.input_tokens, 10);
+        assert_eq!(llm.usage.output_tokens, 5);
+        assert!(llm.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_from_openai_response_tool_calls() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Searching...".into())),
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_abc".into(),
+                        call_type: "function".into(),
+                        function: OpenAiFunction {
+                            name: "search".into(),
+                            arguments: r#"{"query":"test"}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+        assert!(llm.has_tool_calls());
+        assert_eq!(llm.text(), "Searching...");
+
+        match &llm.content[1] {
+            LlmResponseContent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id, "call_abc");
+                assert_eq!(name, "search");
+                assert_eq!(arguments, &json!({"query": "test"}));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_malformed_arguments() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_1".into(),
+                        call_type: "function".into(),
+                        function: OpenAiFunction {
+                            name: "search".into(),
+                            arguments: "not valid json{".into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        };
+
+        // Should not error — malformed arguments are wrapped as a string value
+        let llm = from_openai_response(resp).unwrap();
+        match &llm.content[0] {
+            LlmResponseContent::ToolCall { arguments, .. } => {
+                assert_eq!(arguments, &Value::String("not valid json{".into()));
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_no_choices_fails() {
+        let resp = OpenAiResponse {
+            choices: vec![],
+            usage: None,
+        };
+        assert!(from_openai_response(resp).is_err());
+    }
+
+    #[test]
+    fn test_stop_reason_mapping() {
+        let cases = vec![
+            (Some("stop"), LlmStopReason::EndTurn),
+            (Some("tool_calls"), LlmStopReason::ToolUse),
+            (Some("length"), LlmStopReason::MaxTokens),
+            (Some("content_filter"), LlmStopReason::ContentFilter),
+            (None, LlmStopReason::EndTurn),
+            (Some("unknown"), LlmStopReason::EndTurn),
+        ];
+
+        for (input, expected) in cases {
+            let resp = OpenAiResponse {
+                choices: vec![OpenAiChoice {
+                    message: OpenAiMessage {
+                        role: "assistant".into(),
+                        content: Some(OpenAiContent::Text("hi".into())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: input.map(String::from),
+                }],
+                usage: None,
+            };
+            let llm = from_openai_response(resp).unwrap();
+            assert_eq!(llm.stop_reason, expected, "for input {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_openai_request_serialization() {
+        let req = OpenAiRequest {
+            model: "gpt-4o".into(),
+            messages: vec![OpenAiMessage {
+                role: "user".into(),
+                content: Some(OpenAiContent::Text("Hello".into())),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            }],
+            tools: None,
+            max_tokens: 4096,
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["max_tokens"], 4096);
+        // tools should be omitted when None
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_extract_think_block_basic() {
+        let (thinking, remaining) =
+            extract_think_block("<think>Let me think...</think>Hello!").unwrap();
+        assert_eq!(thinking, "Let me think...");
+        assert_eq!(remaining, "Hello!");
+    }
+
+    #[test]
+    fn test_extract_think_block_with_newlines() {
+        let input = "<think>\nI should respond friendly.\n</think>\n\nHey Vincent!";
+        let (thinking, remaining) = extract_think_block(input).unwrap();
+        assert_eq!(thinking, "I should respond friendly.");
+        assert_eq!(remaining, "Hey Vincent!");
+    }
+
+    #[test]
+    fn test_extract_think_block_no_tags() {
+        assert!(extract_think_block("Just a normal response").is_none());
+    }
+
+    #[test]
+    fn test_extract_think_block_empty_think() {
+        assert!(extract_think_block("<think></think>Hello").is_none());
+    }
+
+    #[test]
+    fn test_from_openai_response_strips_think_tags() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<think>\nLet me think about this.\n</think>\n\nHello!".into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAiUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                prompt_tokens_details: None,
+            }),
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.text(), "Hello!");
+        assert_eq!(llm.reasoning, Some("Let me think about this.".into()));
+    }
+
+    #[test]
+    fn test_from_openai_response_no_think_tags_unchanged() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.text(), "Hello!");
+        assert!(llm.reasoning.is_none());
+    }
+
+    // -- extract_xml_tool_calls tests --
+
+    #[test]
+    fn test_extract_xml_tool_calls_wrapped_function_tag() {
+        let text = r#"<tool_call>
+<function=search_memory>
+{"query": "meetings"}
+</function>
+</tool_call>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            id,
+            name,
+            arguments,
+        } = &calls[0]
+        {
+            assert_eq!(id, "xml_call_0");
+            assert_eq!(name, "search_memory");
+            assert_eq!(arguments, &json!({"query": "meetings"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_bare_function_tag() {
+        let text = r#"<function=list_tasks>
+{"status": "active"}
+</function>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "list_tasks");
+            assert_eq!(arguments, &json!({"status": "active"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_json_in_tool_call() {
+        let text = r#"<tool_call>
+{"name": "search_memory", "arguments": {"query": "test"}}
+</tool_call>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "search_memory");
+            assert_eq!(arguments, &json!({"query": "test"}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_empty_arguments() {
+        let text = "<function=list_tasks></function>";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        if let LlmResponseContent::ToolCall {
+            name, arguments, ..
+        } = &calls[0]
+        {
+            assert_eq!(name, "list_tasks");
+            assert_eq!(arguments, &json!({}));
+        } else {
+            panic!("expected ToolCall");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_multiple() {
+        let text = r#"<function=search_memory>{"query": "a"}</function>
+<function=store_fact>{"text": "b"}</function>"#;
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        if let LlmResponseContent::ToolCall { name, .. } = &calls[0] {
+            assert_eq!(name, "search_memory");
+        }
+        if let LlmResponseContent::ToolCall { name, .. } = &calls[1] {
+            assert_eq!(name, "store_fact");
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_mixed_text() {
+        let text = "Let me search for that.\n<function=search_memory>{\"query\": \"test\"}</function>\nHere are the results.";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert!(remaining.contains("Let me search for that."));
+        assert!(remaining.contains("Here are the results."));
+        assert!(!remaining.contains("<function="));
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_no_xml() {
+        let text = "This is plain text with no tool calls.";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, text);
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_malformed() {
+        // Missing closing tag — should not be extracted.
+        let text = "<function=search_memory>{\"query\": \"test\"}";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(remaining, text);
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_with_think_block() {
+        let text = "<think>I should search</think><function=search_memory>{\"query\": \"test\"}</function>";
+        let (calls, remaining) = extract_xml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        // Think block should remain in the text (handled separately by extract_think_block).
+        assert!(remaining.contains("<think>"));
+    }
+
+    #[test]
+    fn test_from_openai_response_xml_tool_calls() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<function=search_memory>\n{\"query\": \"test\"}\n</function>".into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert!(llm.has_tool_calls());
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+        let tc = llm.tool_calls();
+        assert_eq!(tc.len(), 1);
+        if let LlmResponseContent::ToolCall { name, .. } = tc[0] {
+            assert_eq!(name, "search_memory");
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_xml_skipped_when_structured() {
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<function=search_memory>{\"query\": \"stale\"}</function>".into(),
+                    )),
+                    tool_calls: Some(vec![OpenAiToolCall {
+                        id: "call_123".into(),
+                        call_type: "function".into(),
+                        function: OpenAiFunction {
+                            name: "search_memory".into(),
+                            arguments: "{\"query\": \"real\"}".into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("tool_calls".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        // Should have exactly 1 tool call (the structured one), not 2.
+        let tc = llm.tool_calls();
+        assert_eq!(tc.len(), 1);
+        if let LlmResponseContent::ToolCall { id, .. } = tc[0] {
+            assert_eq!(id, "call_123");
+        }
+        // The text content should still have the XML (it was not extracted).
+        assert_eq!(
+            llm.text(),
+            "<function=search_memory>{\"query\": \"stale\"}</function>"
+        );
+    }
+
+    #[test]
+    fn test_from_openai_response_stop_reason_flip() {
+        // finish_reason is "stop" but XML tool calls are extracted — stop_reason should be ToolUse.
+        let resp = OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text(
+                        "<tool_call>\n<function=list_tasks>\n{}\n</function>\n</tool_call>".into(),
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.stop_reason, LlmStopReason::ToolUse);
+        assert!(llm.has_tool_calls());
+    }
+
+    // -- Cache token parsing tests (#479) --
+
+    fn make_response_with_usage(usage: Option<OpenAiUsage>) -> OpenAiResponse {
+        OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                message: OpenAiMessage {
+                    role: "assistant".into(),
+                    content: Some(OpenAiContent::Text("Hello!".into())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage,
+        }
+    }
+
+    #[test]
+    fn test_from_openai_response_cache_hit() {
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 36000,
+            completion_tokens: 500,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: 8192,
+            }),
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.input_tokens, 36000);
+        assert_eq!(llm.usage.output_tokens, 500);
+        assert_eq!(llm.usage.cache_read_input_tokens, Some(8192));
+        assert_eq!(llm.usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_no_cache_details() {
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            prompt_tokens_details: None,
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, None);
+        assert_eq!(llm.usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_zero_or_default_cached_tokens() {
+        // Zero cached_tokens (explicit or via #[serde(default)] for empty `{}`) maps to None.
+        let resp = make_response_with_usage(Some(OpenAiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 0 }),
+        }));
+
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, None);
+    }
+
+    #[test]
+    fn test_from_openai_response_cache_details_json_deserialization() {
+        // End-to-end: verify serde deserialization from a real OpenRouter-style JSON payload
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 36000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {
+                    "cached_tokens": 8192
+                }
+            }
+        }"#;
+
+        let resp: OpenAiResponse = serde_json::from_str(json).unwrap();
+        let llm = from_openai_response(resp).unwrap();
+        assert_eq!(llm.usage.cache_read_input_tokens, Some(8192));
+    }
+}

@@ -1,0 +1,245 @@
+# Mika Architecture Review Guide
+
+**Status:** Active — peer-reviewable principles document referenced by `mika-arch`'s system prompt.
+**Audience:** Any agent reviewing mika plans or PRs (primary consumer: `mika-arch`); any human or agent authoring code in this codebase.
+**Operating discipline:** Citation or silence. Flag a concern only if you can cite this guide, an ADR, a compound doc, or an existing convention. If the concern is a style preference unmoored from a citation, stay silent.
+
+---
+
+## How to use this guide
+
+This is the principles reference. It defines what SOLID, DRY, YAGNI, KISS, and Orthogonality look like **in this codebase**, with concrete examples from mika code. It is prescriptive on purpose — reviewers should look for these specific shapes, not philosophical interpretations.
+
+Each section has three subsections:
+
+- **What it means here** — the principle restated against mika's actual architecture.
+- **What to flag** — concrete violation shapes worth pushing back on, with at least one cited example from the codebase.
+- **What not to flag** — surface-similar shapes that look like violations but are deliberate. Citation-or-silence applies most aggressively in this column.
+
+Section 6 is the discipline that governs everything: when in doubt, stay silent. Section 7 codifies the self-review boundary for agents reviewing changes to their own operational surface.
+
+---
+
+## 1. Single Responsibility (SOLID)
+
+### What it means here
+
+A module owns one axis of change. When two unrelated forces can both demand edits to the same code, the module is doing two jobs.
+
+The canonical mika failure mode is **state ownership split across compile-time and runtime layers** — seed code in Rust writes rows that operator CLI also writes, and the two compete every restart.
+
+### What to flag
+
+- **Identity facts written from two sources.** If "what skills agent X has" is set both in `well_known_agents.rs` (compile-time) and in a `skill_overrides` row (runtime), restart-time reconciliation drifts. The fix: identity owns identity. See `crates/mika-agent/src/well_known_agents.rs` (post-D2) seeding only identity + soul + base model, with the skill set living in `identity.toml` `[skills].allowlist` and consumed by `apply_overrides` in `crates/mika-agent/src/skills/mod.rs`.
+- **Tool modules that mix transport and policy.** A tool that both invokes a subprocess and decides whether the operation is allowed should split the policy out (allowlist enforcement) from the transport (subprocess invocation). See `crates/mika-agent/src/tools/run_gh.rs` for the pattern: subcommand allowlist enforced at function entry, transport happens after.
+- **Handlers that hold both correlation state and content state.** The agent loop's `ToolContext` carries credentials and identifiers (correlation); tool implementations hold content. A handler that starts caching content in `ToolContext` is leaking layers.
+
+### What not to flag
+
+- A module that is **large** but has one axis of change (e.g., `LlmProvider` trait implementations are necessarily long because they translate one API; that is one job, not many).
+- "Could be split into N files." File count is not a SOC concern. Behavior is.
+
+---
+
+## 2. DRY — Don't Repeat Yourself
+
+### What it means here
+
+Repetition is a problem when changing one site forces a synchronized change elsewhere. Three similar lines that never need to change in lockstep are not a DRY violation; one line duplicated across three files that all must change together is.
+
+In mika, the most expensive DRY violations are **parallel correlation primitives**: a new flag that does what an existing primitive already does, but spelled differently.
+
+### What to flag
+
+- **A new flag or field that duplicates an existing primitive.** The retracted `--grooming-session-id` flag in the mika-arch v1 plan is the canonical example: the existing `--session-id` already correlates calls. Adding a parallel one would mean two primitives expressing the same correlation, drifting independently.
+- **Helper logic re-implemented per call site.** `format_entity_key(kind, name)` in `crates/mika-agent/src/db/kg_schema.rs` exists so no caller rebuilds the canonical `<type>:<name>` format. Flag any new code that builds entity keys with `format!("{}:{}", ...)` instead of the helper.
+- **Duplicated query shapes across audit commands.** If two `mika kg`/audit commands build the same SQL by hand, the abstraction belongs near the schema (`kg_schema.rs`), not at each call site.
+
+### What not to flag
+
+- **Three test fixtures with similar shape.** Tests duplicate by design; premature factoring of test setup hides intent. Flag only when fixtures must change in lockstep.
+- **Two providers with similar adapter code.** `crates/mika-common/src/llm/anthropic.rs` and `openai.rs` look alike because they translate similar APIs. They change independently when each provider changes; that is correct.
+
+---
+
+## 3. YAGNI — You Aren't Gonna Need It
+
+### What it means here
+
+Don't build for a problem you have not observed. The mika codebase's bias is to ship the minimum that solves the current need, then compound the learning. Speculative knobs, configurability for unmet requirements, and infrastructure ahead of demand are the violations.
+
+The plan author's own retractions are the best examples — caught at planning time, before code was written, by exactly the discipline mika-arch is meant to apply.
+
+### What to flag
+
+- **Enforcement for a failure mode never observed at scale.** The retracted R9 (CLI brief-budget hard-fail at `mika ask`) is the prototype: brief bloat does not manifest at realistic sizes; Opus 4.7 context handles the volumes we send; CLI hard-fail is overengineered. The replacement is observability (Unit 8 logs), not enforcement.
+- **Configurability for a hypothetical operator.** The agent loop's max-20-tool-steps cap (see `crates/mika-agent/CLAUDE.md` Architecture Summary) is hardcoded on purpose. A PR adding `MIKA_AGENT_MAX_TOOL_STEPS` env var would be a YAGNI flag unless someone has actually hit the limit and needs a different value.
+- **Dashboard panels before the data has been collected for weeks.** D5 in the mika-arch plan defers cost-monitoring panels to Milestone #13 — log fields land first, dashboard waits until there are 4-6 weeks of real volume to design against. Flag any PR that builds a dashboard for data that does not yet exist.
+
+### What not to flag
+
+- **A feature flag added for a planned migration.** YAGNI applies to speculative work, not to staged rollouts of work that is actually happening (e.g., `MIKA_DISABLE_AGENT_PROVISIONING` for the in-progress identity-toml migration).
+- **Pre-1.0 breaking-change shipping shape.** Mika's convention is to ship breaking changes pre-1.0 without backward-compatibility shims (see `mika/CLAUDE.md` § Versioning). That is not YAGNI in either direction; it is the explicit policy.
+
+---
+
+## 4. KISS — Keep It Simple
+
+### What it means here
+
+Prefer the smallest mechanism that solves the problem. In mika, "small" usually means: a function before a trait, a trait before a framework, an in-memory synthesis before a schema migration, a log line before a service.
+
+### What to flag
+
+- **A new schema migration when an existing field would do.** D2 in the mika-arch v1 plan proposed migration with a per-agent skill-allowlist table; it was rejected in favor of `Identity.skills.allowlist` with in-memory synthesis. New tables have a high bar — they bring CHECK constraints, idempotency markers, FTS indexes, and `kg_schema.rs` documentation overhead. If an identity field, config-toml entry, or computed-in-memory value can carry the load, that is the simpler answer.
+- **A CHECK-constraint enum expansion without rollback-semantics audit.** Any PR that adds a value to a SQLite CHECK enumeration must include a `## Rollback Semantics` section auditing all Rust consumers of the enum string. See `docs/solutions/best-practices/schema-bump-rollback-semantics-2026-05-28.md` for the checklist and worked example. Mirroring a prior migration's DDL shape is necessary but not sufficient — migration correctness and rollback semantics are distinct concerns (ref: mika#874 F8, mika#905).
+- **A framework abstraction over the agent loop.** The agent loop is intentionally a plain Rust async function (see `mika/CLAUDE.md` § Conventions: "No framework"). A PR that introduces an `AgentRuntime` trait, builder pattern, or lifecycle hooks crosses the line. The convention is explicit; flag deviations.
+- **A separate service for what could be a log + script.** D5/D6 in the mika-arch plan: cost monitoring is logs in tracing spans plus a shell script extractor. Flag any PR that proposes a new daemon, sidecar, or HTTP endpoint for what an existing log line plus a 30-line shell extractor can do.
+
+### What not to flag
+
+- **Code that is verbose because the domain is.** Multi-provider LLM adapter code is long. Schema migrations with explicit CHECK constraints are long. Length is not complexity; coupling and indirection are.
+- **A trait that already exists and is being reused.** `LlmProvider` is a framework-shaped abstraction, but it predates the YAGNI horizon and pays for itself across 11 providers. Reusing it is correct; introducing a parallel abstraction is the smell.
+
+---
+
+## 5. Orthogonality
+
+### What it means here
+
+Two concerns are orthogonal when changing one cannot break the other. Mika gets this wrong when a contract surface is split across two artifacts (e.g., labels and plan files; seed code and DB rows; transport metadata and payload content).
+
+### What to flag
+
+- **Two artifacts both claiming to be the contract.** The plan-file-as-contract decision (D3 in mika-arch v1) replaces an earlier shape that used GitHub labels for state. If a PR reintroduces label-driven state alongside the plan file, those will drift. Pick one. Plan file wins per the existing decision.
+- **Issue numbers carried in transport metadata when they belong in the payload.** Architect review pass 2 retraction: the brief payload carries the issue number, not a CLI flag on `mika ask`. The transport (`mika ask --session-id <id>`) carries correlation only; content lives in the package. Flag any PR that puts content into transport flags.
+- **Tools whose error contract leaks transport details.** `gh_read` (mika-arch v1 Unit 2) returns structured errors (`NotFound`, `AuthFailed`, `NetworkError`, `RateLimited`, `MalformedResponse`). Flag any tool that returns raw `gh` exit codes or HTTP status as the error type — that couples the consumer to the transport.
+
+### What not to flag
+
+- **A module that depends on another module's public API.** Dependencies are not coupling; they are the design. Flag implementation coupling (knowing about internals), not interface coupling (using a stable surface).
+- **A workflow that is sequential by design.** The mika-arch v1 plan gates Unit 6 (second-review) on Unit 5 (dogfood). That sequencing is not an orthogonality violation — it is a deliberate dependency captured in the plan.
+
+### Agent self-state vs platform side-effects (a special orthogonality concern)
+
+When auditing what an agent "should be allowed to do," distinguish **mutations of the agent's own self-state** from **mutations of platform state, other agents' state, or external systems**. These are different surfaces with different blast radii and shouldn't be conflated in a single allow/deny decision.
+
+- **Agent self-state:** the agent's own core memory blocks, structured facts (people / preferences / commitments / events scoped to its own `agent_id`), conversation memory. Writes here are *persistence* — the substrate that makes an agent capable of cross-session pattern recognition. Blast radius: this agent's own future context. Recoverable. Not a platform side-effect.
+- **Platform side-effects:** code commits, PR merges, shell exec, infra changes, configs touching shared state. Blast radius: outside the agent. Often irreversible.
+- **Cross-agent state:** other agents' files, shared task state, skill definitions. Blast radius: the broader agent fleet. Should follow the orchestrator-only enforcement pattern (`global_home_dir`, `read_agent_file` with `agent` parameter, etc.).
+
+The principle: **deny by what gets mutated, not by whether something is mutated.** A read-only role definition (e.g., mika-arch's "advisory architect, no code generation, no commits") prohibits the second and third categories. It should not prohibit the first — agent persistence is constitutive of being an agent at all, not a side-effect.
+
+**What to flag:** a denylist or allowlist that bundles agent self-state with platform mutations under a single "no mutations" rule. That's the bundling mistake — it conflates persistence with platform side-effects and starves the agent of the substrate its role assumes. Cite this section + name the specific tools being mis-bundled.
+
+**What not to flag:** a denylist that explicitly distinguishes the two surfaces and denies platform side-effects while permitting self-state writes. That's the rule working as designed.
+
+---
+
+## 6. Citation-or-silence — what NOT to flag
+
+mika-arch's value comes from principle-grounded pushback, not from preferences. The discipline is: a flag without a citation is noise.
+
+A citation is a reference to one of:
+
+1. A section of this review guide (e.g., "§ 4: KISS — A new schema migration when an existing field would do").
+2. An ADR (`mika/docs/adr/<NNN>-*.md`).
+3. A compound doc (`mika/docs/solutions/**/*.md`, `mika-platform/docs/solutions/**/*.md`).
+4. A `CLAUDE.md` convention statement (e.g., `mika/CLAUDE.md` § Conventions: "No framework").
+5. A `feedback_*.md` memory entry that captures a decided rule.
+6. A previously-shipped PR or merged decision that explicitly resolved the same point.
+
+### Stay silent on
+
+- **Naming preferences** that are not violations of an existing convention (e.g., `snake_case` vs `camelCase` is decided in `mika/CLAUDE.md` § Conventions; "could be a better name" is not).
+- **Code you would have structured differently** but that does not violate a citable principle. The plan author's prerogative is to pick a shape; mika-arch's prerogative is to challenge violations, not preferences.
+- **Generic best-practice advice** untied to mika's specific patterns ("consider extracting this into a function", "this could use a builder pattern"). If the citation is "common wisdom," stay silent.
+- **Hypothetical future problems** with no observed signal. If the concern is "what if someone someday needs X" without evidence anyone has needed X yet, that is a YAGNI violation in the review itself — flag it the first time, then drop it.
+
+### Speak up on
+
+- A clear citation **plus** a concrete consequence ("This duplicates `format_entity_key` — flag per § 2: DRY; if the canonical format ever changes, this site won't update with it").
+- A decided convention being reintroduced ("§ 5: Orthogonality — labels-as-state was rejected in mika-arch v1 plan D3; this PR reintroduces it").
+- A retraction the plan already made being un-retracted ("§ 3: YAGNI — R9 brief-budget enforcement was retracted in pass 2 of the mika-arch v1 plan; this PR re-adds it without re-justification").
+
+The bar is principle + cite + consequence. Anything less is silence.
+
+---
+
+## 7. Self-review boundary
+
+### What it means here
+
+When a plan modifies the reviewing agent's own surface — the skills, identity config, or permission surface that the agent reads at runtime — the agent is both reviewer and structural stakeholder in the outcome. That vested-interest position undermines the citation-or-silence discipline: the agent can cite correctly while framing the cited concerns in a direction that benefits itself. External review pierces that bias.
+
+The carve-out fires when **both** conditions hold: (a) the plan modifies the reviewer's surface AND (b) the iteration history shows reviewer-driven reshaping. Outcome-shape alone does not trigger the carve-out — coincidental alignment between an externally-driven decision and reviewer benefit is not vested interest.
+
+The concrete trigger today is mika-arch's bundled skill surface (`skills/bundled/mika-arch-*`) and mika-arch's identity allowlist in `well_known_agents.rs`. The principle generalizes to any reviewing agent whose own operational surface is the change target.
+
+### How to test (iteration-history provenance)
+
+The deterministic test for whether the carve-out fires is **provenance**: trace which party FIRST introduced the position the plan now ratifies.
+
+Read the iteration-history trace top-to-bottom. The first tool/message/comment that asserts the position the final plan ratifies is the **introducer**. Apply these rules:
+
+**Carve-out fires (reviewer-driven):**
+- Reviewer's first-pass critique authored the position that the plan now ratifies.
+- Reviewer emitted pressure (explicit or implicit) to reshape the plan toward the position.
+- Reviewer's persisted memory cited by second-pass, where the persisted position was originally authored by the reviewer (not merely transported through reviewer persistence — see memory-cite transport below).
+
+**Carve-out does NOT fire (externally-driven):**
+- Operator judgment introduced the position (e.g., operator chose a design direction after weighing options).
+- External peer review introduced the position (e.g., a Claude Chat session, a human reviewer, or another agent outside the reviewing agent's identity).
+- Citation of canonical operator workflow documents independent of the reviewer introduced the position (e.g., `mika/CLAUDE.md` § Post-restart safety check, an ADR, a compound doc authored before the current review cycle).
+
+**Memory-cite transport boundary:** when second-pass cites reviewer's persisted memory (`store_fact` rows readable via `search_memory`), trace through the persistence to the original introducer. Reviewer-persisted-but-operator-introduced positions are still operator-introduced — persistence is transport, not position-authoring. Apply the provenance test to the underlying introducer, not the persister.
+
+**§6/§7 division:** reviewer pressure on non-substrate plans is handled by § 6 (citation-or-silence). § 7 specifically defends substrate-reshaping. Both gates (surface-shape AND provenance) must hold for § 7 to fire — non-substrate cases never need § 7 review regardless of reviewer pressure.
+
+### What to flag
+
+- **Second-pass review routed to the agent whose surface is being modified — provided the iteration-history test (above) shows reviewer-driven reshaping.** When both conditions hold and a plan changes `skills/bundled/mika-arch-*` skill manifests or prompts, mika-arch's `identity.toml` blocks (`[tools]`, `[skills]`, `[kg]`), or the mika-arch entry in `well_known_agents.rs`, the second-pass review MUST route to an external reviewer (Vincent or another Claude instance via Claude Chat). The external reviewer preserves audit-trail separation: "external reviewer approved the agent's surface change" requires no further verification, whereas "the agent approved her own surface change" requires re-reading the entire review for biased framing.
+- **Memory-shared coupling between first-pass and second-pass on the same ticket.** mika-arch's two skills (`mika-arch-groom-ticket` Opus 4.7 + `mika-arch-second-review` Sonnet 4.6) share an agent-scoped memory store. Persisted `store_fact` rows from first-pass are readable by second-pass via `search_memory`. The prompt+model split alone does NOT defuse the carve-out as long as memory is shared — second-pass reading first-pass's persisted reasoning IS the recursive-self-review boundary. Memory-shared coupling is what makes the second-pass non-independent, regardless of prompt-and-model diversity. Identity-shared alone (any review by an agent on its own substrate, regardless of memory state) is over-conservative — it fires on cases where prompt-and-memory split eliminates the recursive coupling. Memory-shared captures the actual coupling vector.
+- **First-pass staying with the agent when the change is not purely additive.** First-pass may stay with mika-arch only when the change is purely additive — new skills, new tools, new config blocks with no deprecation or behavioral reduction. If any skill is being deprecated, any behavioral contract is under reduction, or any permission surface is shrinking, first-pass must also route externally.
+- **Any other shape.** ESCALATE on changes that blur the boundary (e.g., a plan that modifies both mika-arch's surface and unrelated code — split the review or route the whole thing externally).
+
+### What not to flag
+
+- **Changes to code mika-arch uses but that don't modify her configuration.** A PR extending `gh_read` with a new operation benefits mika-arch (she uses `gh_read`) but doesn't change her identity, skills, or permission surface. mika-arch reviews normally. See mika#817 (counter-example in the carve-out doc).
+- **Changes to other agents' surfaces.** mika-arch reviewing mika-dev's skill changes is structurally neutral — she has no vested interest in mika-dev's operational capabilities.
+- **Coincidental outcome-shape alignment with no reviewer-driven causation.** When a plan's iteration history shows the reshaping originated in operator judgment, external peer review, or citation of canonical operator workflow documents independent of the reviewer, the carve-out does not fire on outcome-shape grounds alone. Example: mika#874 F4 flip was driven by external peer review + operator decision through Signal C in `mika/CLAUDE.md` (Post-restart safety check #757); reviewer's contribution was a procedural ask (be explicit), not the design choice. F9 does not apply.
+
+**Future work:** if memory-key namespacing between `mika-arch-groom-ticket` and `mika-arch-second-review` skills is introduced (separate ticket), the memory-shared trigger axis would be defused, narrowing the carve-out to agent-identity-shared cases.
+
+### Evidence base
+
+This section codifies the recursive-self-review carve-out established in `docs/solutions/best-practices/recursive-self-review-carve-out-2026-04-26.md`. Three instances triggered codification per that doc's "When to revisit" criteria:
+
+1. **mika#818** — first instance exercising the carve-out (drop memory-write tools from `MIKA_ARCH_DISABLED_TOOLS`).
+2. **mika#868** — second instance (promotion protocol prompts and reflection spec touching mika-arch skills).
+3. **mika#879** — third instance (milestone grooming additions to mika-arch bundled skills); triggered the 3-instance codification threshold.
+4. **mika#874** — worked example demonstrating the sharpened rule (causation vs outcome-shape). Under the provenance test, second-pass F9 ESCALATE was incorrect: the F4 flip was driven by external peer review + operator decision, not by reviewer pressure. Deterministic verdict: F9 does not apply; mika-arch second-pass is appropriate quality gate. See the companion compound doc for the full walk-through.
+
+**Three-state taxonomy:** (1) NEITHER condition holds → review normally; (2) surface-shape only (no reviewer-driven causation) → review normally (carve-out narrowed); (3) BOTH conditions hold → fire carve-out, route external. The pre-sharpening default (surface-shape alone fires) is now case (2).
+
+**Escalation threshold:** if the sharpened rule fails to discriminate (false-positives recur 3 times OR mika#874-class deterministic-verdict cases recur with iteration-history ambiguity), escalate to an engine-layer substrate-adjacency detector.
+
+---
+
+## 8. GROOMED contract — what the verdict guarantees
+
+When mika-arch's second-pass returns `Verdict: GROOMED`, the plan is guaranteed:
+
+1. **Implementable as-written** — no TBDs, no "pick one" choices, no `<version>` or `<path>` placeholders. Every load-bearing design decision is committed in the plan text.
+2. **No load-bearing decisions deferred to the implementer** — the architect ruled on or escalated everything material. The implementer should never need to surface a clarifying question about a design choice.
+3. **Architecturally sound** per Single Responsibility / DRY / YAGNI / KISS / Orthogonality (§1–§5 of this guide).
+
+The implementer can `/ce:work` the plan headlessly without surfacing clarifying questions. If they discover an ambiguity at execution time that grooming couldn't have anticipated, that's an orthogonal operator-question-relay concern — not a grooming failure.
+
+**Enforcement:** The Unresolved-Decision Gate in `mika-arch-groom-ticket` (first pass) and `mika-arch-second-review` (second pass) system prompts explicitly reject plans with unresolved decisions. Calibration fixtures at `tests/eval/calibration_fixtures/mika-arch/groomed_with_tbd_rejected.md` and `groomed_with_placeholder_path_rejected.md` structurally bind this rule — CI fails if the architect produces READY/GROOMED on a TBD-containing plan.
+
+---
+
+## Maintenance
+
+Updates land via normal PR. When a new principle is established (e.g., a compound doc codifies a recurring pattern), add it with a citation and a real-codebase example. When a section's example goes stale, update the citation rather than removing the section. `mika-arch`'s skill prompts reference this guide by path; do not move it without updating those prompts.

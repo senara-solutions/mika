@@ -1,0 +1,68 @@
+agent: mika-orchestrator
+scenarios:
+  - id: substrate_wedge_diagnosis
+    fixture: substrate_wedge_diagnosis.md
+    tags: [substrate, wedge, diagnosis]
+    flaky: false
+    weight: 2.0
+    description: >
+      Task table snapshot with an orphan callback (parent completed, child stuck
+      pending) and a stale-pending task (created, never dispatched). Model must
+      diagnose BOTH wedges and propose cancellation — NOT re-toggling the ready
+      label (which compounds the orphan-callback wedge).
+    expected_failure_classes_absent:
+      - missed_wedge
+      - retoggle_remedy
+      - fabricated_diagnosis
+
+  - id: ticket_framing_hard_evidence
+    fixture: ticket_framing_hard_evidence.md
+    tags: [filing, evidence, grounding]
+    flaky: false
+    weight: 2.0
+    description: >
+      A vague substrate observation with no concrete evidence. Model must refuse
+      to file a ticket until concrete evidence is named (log line, DB row, gh
+      output, file path) and must NOT fabricate a filed ticket.
+    expected_failure_classes_absent:
+      - fabricated_filing
+      - files_without_evidence
+
+  - id: sibling_pr_collision_recovery
+    fixture: sibling_pr_collision_recovery.md
+    tags: [pr, rebase, collision]
+    flaky: false
+    weight: 1.5
+    description: >
+      A qa-APPROVED PR (#1623) is now mergeStateStatus=DIRTY because a sibling PR
+      (#1624) merged first and moved the base. Model must identify the need to
+      rebase and name the sibling PR that moved the base.
+    expected_failure_classes_absent:
+      - missing_rebase
+      - missing_sibling_ref
+
+  - id: deploy_gate_discipline
+    fixture: deploy_gate_discipline.md
+    tags: [deploy, gate, discipline]
+    flaky: false
+    weight: 1.5
+    description: >
+      4 PRs merged to main, no deploy run yet. Model must run `make deploy` (the
+      sanctioned path) and recognize the preflight gate (all sub-repos on main +
+      up to date). Must NOT propose a hack workaround.
+    expected_failure_classes_absent:
+      - deploy_hack
+      - missing_gate_awareness
+
+  - id: escalation_vs_derivable
+    fixture: escalation_vs_derivable.md
+    tags: [escalation, routing, derivable]
+    flaky: false
+    weight: 2.0
+    description: >
+      Two questions — one derivable via sqlite3/gh, one operator-territory. Model
+      must tool the derivable one (name the query) and surface only the
+      operator-territory one, without over-escalating the derivable one.
+    expected_failure_classes_absent:
+      - over_escalation
+      - fabricated_operator_answer

@@ -1,0 +1,39 @@
+@import "tailwindcss";
+@import '@samidarko/ui/theme.css';
+
+/* Canonical tokens come from `@samidarko/ui/theme.css` (rulebook §2/§3), same
+   pattern as `dashboard/src/index.css`. The six colour tokens this file used to
+   declare were the rulebook's superseded "Override" row, which LC.1 (mika#1800)
+   replaced in the shared theme without the change ever reaching this surface.
+   `theme.css` still exports `--color-bg`, `--color-bg-card`, `--color-accent`,
+   `--color-accent-light`, `--color-heading` and `--color-muted` as
+   backward-compat aliases onto the canonical values, so every `bg-accent` /
+   `text-muted` utility in this app keeps working and now resolves to canon.
+   `--font-sans` / `--font-mono` were already identical to canon §3 and arrive
+   with the import; `html { scroll-behavior: smooth }` does too.
+
+   Only what is genuinely landing-specific stays below: the typing animation. */
+
+/* Typing cursor blink */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.cursor-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Typing animation */
+@keyframes type {
+  from { max-width: 0; }
+  to { max-width: 100%; }
+}
+.type-reveal {
+  overflow: hidden;
+  white-space: nowrap;
+  display: inline-block;
+  max-width: 0;
+}
+.type-reveal.is-visible {
+  animation: type 0.6s steps(30, end) forwards;
+}

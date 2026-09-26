@@ -1,0 +1,8 @@
+{
+  "description": "Pre-fix fixture reproducing the mika#788 verdict-ghosting trace shape. The architect's second-pass review emits a multi-paragraph response that acknowledges the first-pass findings and shapes like a verdict, but never actually includes 'Verdict: GROOMED' or 'Verdict: ESCALATE' on its own line. Downstream parsers silently fall through.",
+  "incident": "docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md",
+  "fabrication_class": "verdict_ghosting",
+  "user_message": "second-review: Review the revised plan for mika#864 (required-suffix-line EndTurn guard).",
+  "pre_fix_response": "I've reviewed the revised plan and all seven findings from the first pass have been adequately addressed.\n\n**F1 — Compound-doc forward-pointer specificity:** R8 now states the explicit forward-pointer update protocol with the canonical reference text. Resolved.\n\n**F2-S — Boundary-case test scenarios:** Tests section now includes scenario 3 and scenario 4 for position-3 and position-4 boundary cases. Resolved.\n\n**F3 — N=3/N=5 recalibration sentinel:** Out of scope with named recalibration trigger. Resolved.\n\n**F4 — Guard sequence position:** R3 pinned to end-of-chain. Resolved.\n\n**F5 — Validation severity:** R2 rationale documented for Warn-not-Fail. Resolved.\n\n**F6 — Namespace conformity:** Sentinel filed in out-of-scope. Resolved.\n\n**F7 — Trim semantics:** R3 explicitly chooses read (b) any-of-last-3. Resolved.\n\nAll findings addressed. The plan is ready for implementation.",
+  "note": "The response reads like a GROOMED verdict but never emits the literal 'Verdict: GROOMED' line. Under the pre-fix engine, this end-turns cleanly and the downstream disposition parser falls through to a default path."
+}

@@ -1,0 +1,20 @@
+[
+  {
+    "name": "fetch_url",
+    "description": "Fetch a page from the compile-time gouv.fr allowlist via the mika-gateway substrate. GET-only, no JS/cookies/session/POST, 1 MiB cap, 15s timeout. Returns raw text or HTML. See system prompt for the allowlist hosts.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "Absolute https:// URL. Host must be on the compile-time allowlist."
+        }
+      },
+      "required": ["url"]
+    },
+    "handler": {
+      "type": "builtin",
+      "function": "fetch_url"
+    }
+  }
+]

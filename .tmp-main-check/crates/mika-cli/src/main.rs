@@ -1,0 +1,1042 @@
+mod cli;
+mod commands;
+mod init;
+mod tui;
+mod wizard;
+
+use anyhow::Result;
+use clap::{CommandFactory, Parser};
+use cli::{Cli, Commands};
+use mika_common::agent;
+use mika_common::home;
+use mika_common::logging::LogOutput;
+use mika_common::team;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Lightweight commands: early-exit before agent resolution, logging, and telemetry.
+    // These need only dotenv + Settings + GitHubApp — fast startup for credential helper usage.
+    // When --agent is specified, resolve per-agent home dir for per-agent GitHub App config.
+    match &cli.command {
+        Some(Commands::Token(args)) => {
+            let global_home = home::resolve_home_dir()?;
+            let agent_home = cli
+                .agent
+                .as_deref()
+                .map(|name| home::resolve_agent_home(&global_home, name));
+            // Load per-agent .env first (dotenvy won't override), then global as fallback
+            if let Some(ref ah) = agent_home {
+                mika_common::dotenv::load_dotenv(ah);
+            }
+            mika_common::dotenv::load_dotenv(&global_home);
+            return commands::token::run(&args.command, &global_home, agent_home.as_deref()).await;
+        }
+        Some(Commands::CredentialHelper(args)) => {
+            let global_home = home::resolve_home_dir()?;
+            let agent_home = cli
+                .agent
+                .as_deref()
+                .map(|name| home::resolve_agent_home(&global_home, name));
+            // Load per-agent .env first (dotenvy won't override), then global as fallback
+            if let Some(ref ah) = agent_home {
+                mika_common::dotenv::load_dotenv(ah);
+            }
+            mika_common::dotenv::load_dotenv(&global_home);
+            return commands::credential_helper::run(
+                &args.operation,
+                &global_home,
+                agent_home.as_deref(),
+            )
+            .await;
+        }
+        _ => {}
+    }
+
+    // Team mode: branch early, before agent resolution.
+    // --team is mutually exclusive with --agent (enforced by clap on each level).
+    // Merge top-level and subcommand-level --team flag.
+    let team_override = cli
+        .command
+        .as_ref()
+        .and_then(|c| c.team_override())
+        .or(cli.team.as_deref());
+
+    // Merge top-level and subcommand-level -c/--continue flag.
+    let continue_session =
+        cli.continue_session || cli.command.as_ref().is_some_and(|c| c.continue_override());
+
+    // mika#1982 — the `ask` message is resolved ONCE, here, upstream of the
+    // three branchings that consume it (`--team` just below, then `--remote`
+    // and the local agent in the main dispatch). There is no single point
+    // downstream of all three: the team branch returns before the main `match`
+    // is ever reached.
+    //
+    // The resolution is scoped to `Commands::Ask` and must NOT be hoisted above
+    // it. Eight other subcommands read the standard input for their own account
+    // — `credential-helper` speaks the git credential protocol on it — and a
+    // read at binary startup would steal their input.
+    let ask_message = match cli.command {
+        Some(Commands::Ask(ref args)) => Some(mika_cli::ask_message::resolve_from_process_stdin(
+            args.message.as_deref(),
+        )?),
+        _ => None,
+    };
+
+    if let Some(team_name) = team_override {
+        let team_name = team::normalize_team_name(team_name);
+        team::validate_team_name(&team_name)?;
+        let global_home = home::resolve_home_dir()?;
+        mika_common::dotenv::load_dotenv(&global_home);
+        mika_common::dotenv::check_env_warnings(&global_home);
+
+        if !team::team_exists(&global_home, &team_name) {
+            anyhow::bail!("Team '{team_name}' not found.");
+        }
+
+        match cli.command {
+            // `mika --team` or `mika chat --team`
+            None | Some(Commands::Chat(_)) => {
+                let (explicit_run_id, last_run, inbox) = match cli.command {
+                    Some(Commands::Chat(ref args)) => {
+                        (args.run_id.as_deref(), args.last_run, args.inbox)
+                    }
+                    _ => (None, false, false),
+                };
+
+                if last_run {
+                    eprintln!("Warning: --last-run is deprecated; use -c instead.");
+                }
+
+                let run_id = if last_run || continue_session {
+                    Some(resolve_last_run(&global_home, &team_name)?)
+                } else {
+                    explicit_run_id.map(String::from)
+                };
+
+                // Validate --run-id format before any filesystem/DB use (defense-in-depth)
+                if let Some(ref ref_id) = run_id
+                    && uuid::Uuid::parse_str(ref_id).is_err()
+                {
+                    anyhow::bail!(
+                        "Invalid --run-id format. Expected a UUID (e.g., from a previous team run)."
+                    );
+                }
+
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
+
+                return commands::chat::run_team(
+                    &team_name,
+                    &global_home,
+                    run_id.as_deref(),
+                    inbox,
+                )
+                .await;
+            }
+            // `mika ask --team`
+            Some(Commands::Ask(ref args)) => {
+                if args.last_run {
+                    eprintln!("Warning: --last-run is deprecated; use -c instead.");
+                }
+
+                let run_id = if args.last_run || continue_session {
+                    Some(resolve_last_run(&global_home, &team_name)?)
+                } else {
+                    args.run_id.clone()
+                };
+
+                let (_log_guard, _telemetry_guard) = init_team_logging(&global_home, &team_name);
+
+                // verbose not forwarded — conflicts_with = "team" prevents this combination at parse time
+                //
+                // mika#1982: the goal is the message resolved upstream, never
+                // `args.message`. The `expect` documents the invariant — this
+                // arm is only reachable for `Commands::Ask`, which is exactly
+                // the variant the resolution covers — rather than re-resolving
+                // here, since a second resolution site is a second decision.
+                return commands::ask::run_team_ask(
+                    &team_name,
+                    ask_message
+                        .as_deref()
+                        .expect("mika#1982: resolved for every Commands::Ask"),
+                    run_id.as_deref(),
+                    &args.format,
+                    &global_home,
+                )
+                .await;
+            }
+            Some(_) => {
+                anyhow::bail!(
+                    "--team is only supported with 'chat' and 'ask'. \
+                     Use 'mika ask --team {team_name} \"goal\"' for non-interactive team runs."
+                );
+            }
+        }
+    }
+
+    // Resolve agent name first — needed for correct log directory.
+    // Priority: subcommand --agent flag > top-level --agent flag > active_agent file > "mika"
+    let agent_override = cli
+        .command
+        .as_ref()
+        .and_then(|c| c.agent_override())
+        .or(cli.agent.as_deref());
+
+    let agent_name = match agent_override {
+        Some(name) => {
+            let name = agent::normalize_agent_name(name);
+            agent::validate_agent_name(&name)?;
+            name
+        }
+        None => init::resolve_active_agent()?,
+    };
+
+    // Resolve home dirs and load .env files.
+    // Per-agent .env first (dotenvy won't override), then global as fallback.
+    // This ensures per-agent secrets (e.g., MIKA_GITHUB_APP_*) take precedence.
+    let global_home = home::resolve_home_dir().ok();
+    let agent_home = global_home
+        .as_ref()
+        .map(|h| home::resolve_agent_home(h, &agent_name));
+    if let Some(ref ah) = agent_home {
+        mika_common::dotenv::load_dotenv(ah);
+    }
+    if let Some(ref h) = global_home {
+        mika_common::dotenv::load_dotenv(h);
+        mika_common::dotenv::check_env_warnings(h);
+    }
+    let log_dir = agent_home.as_ref().map(|h| h.join("logs"));
+
+    // Generate CLI reference markdown in the agent home directory.
+    // Used by the self-knowledge skill so the agent can discover its own commands.
+    // Only writes when content changes to avoid unnecessary fs writes.
+    if let Some(ref home) = agent_home {
+        let cmd = Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        let reference_path = home.join("cli-reference.md");
+        let should_write =
+            std::fs::read_to_string(&reference_path).ok().as_deref() != Some(&markdown);
+        if should_write {
+            let _ = std::fs::write(&reference_path, &markdown);
+        }
+    }
+
+    // Read log_level from agent config, falling back to global config.
+    let mut config_paths = Vec::new();
+    if let Some(ref h) = agent_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    if let Some(ref h) = global_home {
+        config_paths.push(h.join("config.toml"));
+    }
+    let log_level = resolve_log_level(&config_paths);
+
+    // Build optional OTel export layer (feature-gated, graceful degradation)
+    let (otel_layer, _telemetry_guard) = global_home
+        .as_ref()
+        .and_then(|h| mika_common::config::Settings::load(h).ok())
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+
+    // Initialize tracing with correct agent-specific directory and configured level.
+    // Use FileOnly in TUI mode — ratatui's EnterAlternateScreen only covers stdout,
+    // so stderr output would corrupt the TUI display.
+    // The _log_guard MUST stay alive until the end of main — dropping it stops file logging.
+    let suppress_stderr = matches!(
+        cli.command,
+        None | Some(Commands::Chat(_)) | Some(Commands::Ask(_))
+    );
+    let log_output = if suppress_stderr {
+        LogOutput::FileOnly
+    } else {
+        LogOutput::PrettyAndFile
+    };
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
+    let _log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        log_dir.as_deref(),
+        log_output,
+        otel_layer,
+        log_llm_bodies.enabled(),
+    );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
+
+    // mika#2220: `mika ask` has not run the agent loop in-process since mika#1727 —
+    // it ships the prompt to mika-spirit over A2A. Arming capture here therefore
+    // captures nothing of the turn, and the resulting empty per-agent log is what
+    // this ticket was filed about. Say so at the one moment the operator is looking.
+    if log_llm_bodies.enabled() && matches!(cli.command, Some(Commands::Ask(_))) {
+        tracing::warn!(
+            event = "llm_body_capture_wrong_process",
+            "`mika ask` dispatches the turn to mika-spirit (mika#1727), so this \
+             process logs no LLM body for it. Arm MIKA_LOG_LLM_BODIES on mika-spirit \
+             and read MIKA_SPIRIT_LOG_FILE instead."
+        );
+    }
+
+    // Validate -c/--continue conflicts with --session-id (can't use clap conflicts_with
+    // across global and subcommand args).
+    if continue_session && cli.session_id.is_some() {
+        anyhow::bail!(
+            "The argument '-c' cannot be used with '--session-id'. \
+             Use -c to resume the last session, or --session-id to target a specific session."
+        );
+    }
+
+    // Resolve -c/--continue to a session ID for solo-mode (non-team) commands.
+    let continue_session_id = if continue_session && team_override.is_none() {
+        let home_dir = home::resolve_home_dir()?;
+        let db = commands::teams::open_container_db(&home_dir)?;
+        match db.get_last_cli_session_for_agent(&agent_name)? {
+            Some(session) => Some(session.id),
+            None => anyhow::bail!(
+                "No previous session found for agent '{agent_name}'. \
+                 Start a chat first before using -c."
+            ),
+        }
+    } else {
+        None
+    };
+
+    // Effective session ID: explicit --session-id > -c resolved > None
+    let effective_session_id = cli.session_id.as_deref().or(continue_session_id.as_deref());
+
+    match cli.command {
+        // Bare `mika` with no subcommand: auto-setup if needed, then chat
+        None => {
+            let home_dir = home::resolve_home_dir()?;
+            if !home::is_initialized(&home_dir) {
+                commands::setup::run(&agent_name, cli::SetupMode::Cli, None).await?;
+            }
+            commands::chat::run(&agent_name, effective_session_id, None, false).await
+        }
+        Some(Commands::Chat(ref args)) => {
+            commands::chat::run(
+                &agent_name,
+                effective_session_id,
+                args.model.as_deref(),
+                args.inbox,
+            )
+            .await
+        }
+        Some(Commands::Setup { mode, api_key }) => {
+            commands::setup::run(&agent_name, mode, api_key.as_deref()).await
+        }
+        Some(Commands::Memory(args)) => commands::memory::run(args, &agent_name).await,
+        Some(Commands::Reminders(args)) => commands::reminders::run(args, &agent_name).await,
+        Some(Commands::Status(ref args)) => commands::status::run(&agent_name, &args.format).await,
+        Some(Commands::Config(args)) => commands::config::run(args, &agent_name).await,
+        Some(Commands::Skills(args)) => commands::skills::run(args, &agent_name).await,
+        Some(Commands::Ask(args)) => {
+            // mika#1982: both doors below take the message resolved upstream.
+            // `--remote` in particular used to pass `args.message` raw, so a
+            // `cat plan.md | mika ask --remote <url> -` sent the literal `"-"`
+            // — one byte — and got back a plausible answer to a question that
+            // was never asked. Same class as mika#2304: a channel that does not
+            // reach the executant, whose no-op is indistinguishable from a
+            // success.
+            let ask_message = ask_message
+                .as_deref()
+                .expect("mika#1982: resolved for every Commands::Ask");
+            // Remote mode (R1, plan 2026-06-09-003): bypass the in-process agent loop and
+            // dispatch to a cloud Mika agent via the gateway's A2A proxy. Flag wins over env.
+            let remote_url = args
+                .remote
+                .clone()
+                .or_else(|| std::env::var("MIKA_REMOTE_AGENT_URL").ok());
+            if let Some(remote_url) = remote_url.as_deref() {
+                let fmt = match args.format {
+                    cli::OutputFormat::Text => mika_cli::remote_ask::OutputFormat::Text,
+                    cli::OutputFormat::Json => mika_cli::remote_ask::OutputFormat::Json,
+                    // remote_ask has its own OutputFormat without Yaml; fall back to Json
+                    cli::OutputFormat::Yaml => mika_cli::remote_ask::OutputFormat::Json,
+                };
+                // mika#2304: `--model` reaches this branch. Before, `args.model`
+                // appeared nowhere in it — the flag was silently dropped on the
+                // path the founding ticket names in its own title. The string
+                // travels raw; the executing agent resolves it against its own
+                // provider (mika#1591 semantics belong to the executing side).
+                // mika#1951: `--isolated` reaches this branch too. It is posted
+                // at the single `build_send_params` site both doors share, so
+                // the split that cost mika#2304 a follow-up cannot recur here —
+                // omitting it would be a deliberate act, not an oversight.
+                return match mika_cli::remote_ask::run_remote(
+                    ask_message,
+                    remote_url,
+                    fmt,
+                    args.verbose,
+                    args.model.as_deref(),
+                    args.isolated,
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // The printed text is unchanged; only the exit code
+                        // distinguishes a transport failure from a broken
+                        // contract (mika#2278). `--remote` shares
+                        // `send_message_to_agent`, so it shares the classification.
+                        eprintln!("Error: {e:#}");
+                        std::process::exit(mika_cli::remote_ask::exit_code_for(&e));
+                    }
+                };
+            }
+            match commands::ask::run(
+                ask_message,
+                &agent_name,
+                args.task_id.as_deref(),
+                args.task_complete,
+                effective_session_id,
+                args.parent_task_id.as_deref(),
+                &args.format,
+                args.model.as_deref(),
+                &args.enable_skill,
+                &args.disable_skill,
+                &args.only_skill,
+                args.isolated,
+                args.verbose,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Same contract as the `--remote` arm above: the message is
+                    // untouched, the exit code carries the class (mika#2278).
+                    // Every failure raised before the A2A send — an empty
+                    // `--session-id`, a session owned by another agent, an
+                    // unknown `--task-id` — is contract-class and still exits 1.
+                    eprintln!("Error: {e}");
+                    std::process::exit(mika_cli::remote_ask::exit_code_for(&e));
+                }
+            }
+        }
+        Some(Commands::Agents(args)) => commands::agents::run(args).await,
+        Some(Commands::Teams(args)) => commands::teams::run(args).await,
+        Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
+        Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
+        Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
+        Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
+        Some(Commands::Provider(args)) => commands::provider::run(args, &agent_name).await,
+        Some(Commands::Model(args)) => commands::model::run(args, &agent_name).await,
+        Some(Commands::Webhook(args)) => commands::webhook::run(args.command, &args.format).await,
+        Some(Commands::Kg(args)) => commands::kg::run(args).await,
+        Some(Commands::Milestone(args)) => commands::milestone::run(args.command).await,
+        Some(Commands::Logs(ref args)) => {
+            let ah = agent_home
+                .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;
+            match &args.command {
+                Some(cli::LogsCommand::Activity(activity_args)) => {
+                    commands::logs::run_activity(activity_args, &agent_name).await
+                }
+                Some(cli::LogsCommand::Paths(paths_args)) => {
+                    commands::logs::run(&agent_name, &ah, &paths_args.format)
+                }
+                None => {
+                    // Bare `mika logs` defaults to paths (backward compat)
+                    commands::logs::run(&agent_name, &ah, &args.format)
+                }
+            }
+        }
+        Some(Commands::Notify(ref args)) => {
+            commands::notify::run(&args.text, &args.channel, &args.severity).await
+        }
+        // Handled by early-exit above — unreachable, but listed for exhaustive match.
+        Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
+    }
+}
+
+/// Resolve `--last-run` by looking up the most recent finished team run.
+fn resolve_last_run(global_home: &std::path::Path, team_name: &str) -> anyhow::Result<String> {
+    let db = commands::teams::open_container_db(global_home)?;
+    match db.get_last_finished_team_run(team_name)? {
+        Some(run) => Ok(run.id),
+        None => anyhow::bail!(
+            "No finished team run found for team '{team_name}'. \
+             Run the team first before using --last-run."
+        ),
+    }
+}
+
+/// Resolve log level from env var or config files (first match wins).
+fn resolve_log_level(config_paths: &[std::path::PathBuf]) -> String {
+    std::env::var("MIKA_LOG_LEVEL")
+        .ok()
+        .filter(|s| {
+            matches!(
+                s.as_str(),
+                "trace" | "debug" | "info" | "warn" | "error" | "off"
+            )
+        })
+        .or_else(|| {
+            config_paths.iter().find_map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_log_level(&content))
+            })
+        })
+        .unwrap_or_else(|| "warn".to_string())
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging; dropping the telemetry guard flushes OTel spans.
+#[cfg(feature = "telemetry")]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (
+    Option<mika_common::logging::LogGuard>,
+    Option<mika_common::telemetry::TelemetryGuard>,
+) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+        log_llm_bodies.enabled(),
+    );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
+    (log_guard, telemetry_guard)
+}
+
+/// Initialize logging and optional telemetry for team-mode branches (chat and ask).
+///
+/// Returns guards that must be held alive for the duration of the team run.
+/// Dropping the log guard stops file logging.
+#[cfg(not(feature = "telemetry"))]
+fn init_team_logging(
+    global_home: &std::path::Path,
+    team_name: &str,
+) -> (Option<mika_common::logging::LogGuard>, Option<()>) {
+    let log_level = resolve_log_level(&[global_home.join("config.toml")]);
+    let (otel_layer, telemetry_guard) = mika_common::config::Settings::load(global_home)
+        .ok()
+        .map(|s| mika_common::telemetry::try_init_otel(&s))
+        .unwrap_or((None, None));
+    let log_dir = team::team_dir(global_home, team_name).join("logs");
+    // mika#2220: one truth table, shared with the daemon's config-rs parse.
+    let log_llm_bodies = mika_common::logging::log_llm_bodies_from_env();
+    let log_guard = mika_common::logging::init_pretty(
+        &log_level,
+        Some(&log_dir),
+        LogOutput::FileOnly,
+        otel_layer,
+        log_llm_bodies.enabled(),
+    );
+    // After init — a warning emitted before the subscriber exists reaches nobody.
+    log_llm_bodies.warn_if_unrecognized();
+    (log_guard, telemetry_guard)
+}
+
+/// Extract `log_level` value from a TOML config string.
+/// Uses the `toml` crate (already a dependency) for correct parsing —
+/// handles comments, sections, and avoids prefix-matching false positives.
+fn parse_log_level(content: &str) -> Option<String> {
+    let table: toml::Table = content.parse().ok()?;
+    let level = table.get("log_level")?.as_str().filter(|s| !s.is_empty())?;
+    // Only accept standard tracing levels to prevent filter directive injection
+    match level {
+        "trace" | "debug" | "info" | "warn" | "error" | "off" => Some(level.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mika_common::home;
+
+    /// Own source, read back for the structural guard below.
+    const THIS_FILE: &str = include_str!("main.rs");
+
+    /// mika#2220 — no call site here may read `MIKA_LOG_LLM_BODIES` itself.
+    ///
+    /// The three that did (`main`, and both `init_team_logging` variants) each
+    /// open-coded `v == "true" || v == "1"`, byte-exact and lowercase-only, while
+    /// the daemon reached the same flag through config-rs and accepted
+    /// `1 / true / on / yes` case-insensitively. So `MIKA_LOG_LLM_BODIES=True`
+    /// armed mika-spirit and was a silent no-op on every `mika` process — the
+    /// reported "works for the daemon, inert for the agent".
+    ///
+    /// A unit test on `parse_log_llm_bodies` cannot see this class: the defect was
+    /// never a wrong parse, it was a caller that did not ask the parser. Hence a
+    /// source scan, matching the `mika2195_*` guards in `mika-common::logging`.
+    ///
+    /// The check is on the *reading* shape — the variable's name closing a string
+    /// literal argument — not on the name itself, so the operator-facing message
+    /// that names the variable in prose stays legal.
+    ///
+    /// The needle is assembled at runtime rather than written as a literal: a
+    /// source scan whose pattern appears in its own source matches itself and
+    /// fails forever. (It did, once, before this line.)
+    #[test]
+    fn mika2220_no_local_reparse_of_the_llm_bodies_env_var() {
+        let read_shape = format!("{}\")", mika_common::logging::LOG_LLM_BODIES_ENV);
+        assert!(
+            !THIS_FILE.contains(&read_shape),
+            "read the flag through mika_common::logging::log_llm_bodies_from_env() — \
+             a second parse here is how the CLI and the daemon came to disagree on \
+             `True` (mika#2220)"
+        );
+    }
+
+    #[test]
+    fn test_parse_log_level_quoted() {
+        assert_eq!(
+            parse_log_level("log_level = \"debug\"\n"),
+            Some("debug".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_log_level_with_other_fields() {
+        let content = "llm_provider = \"anthropic\"\nlog_level = \"info\"\nllm_max_tokens = 4096\n";
+        assert_eq!(parse_log_level(content), Some("info".to_string()));
+    }
+
+    #[test]
+    fn test_parse_log_level_missing() {
+        assert_eq!(parse_log_level("llm_provider = \"anthropic\"\n"), None);
+    }
+
+    #[test]
+    fn test_parse_log_level_empty_value() {
+        assert_eq!(parse_log_level("log_level = \"\"\n"), None);
+    }
+
+    #[test]
+    fn test_parse_log_level_rejects_filter_directive() {
+        // Complex tracing filter directives should be rejected — only simple levels allowed
+        assert_eq!(
+            parse_log_level("log_level = \"mika_agent::server=trace\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_log_dir_multi_agent_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+
+        let log_dir = home::resolve_agent_home(home, "work").join("logs");
+        assert_eq!(log_dir, home.join("agents").join("work").join("logs"));
+    }
+
+    #[test]
+    fn test_log_dir_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // No agents/ dir → legacy layout → resolve_agent_home returns home
+
+        let log_dir = home::resolve_agent_home(home, "mika").join("logs");
+        assert_eq!(log_dir, home.join("logs"));
+    }
+
+    #[test]
+    fn test_env_var_log_level_allowlist() {
+        // Validates the same allowlist used for MIKA_LOG_LEVEL env var
+        let valid = ["trace", "debug", "info", "warn", "error", "off"];
+        for level in valid {
+            assert!(
+                matches!(level, "trace" | "debug" | "info" | "warn" | "error" | "off"),
+                "Expected {level} to match allowlist"
+            );
+        }
+        assert!(!matches!(
+            "mika_agent=trace",
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        ));
+    }
+
+    /// Verify clap-markdown output contains all top-level command names.
+    /// If you add a new top-level command to the `Commands` enum in cli.rs,
+    /// this test will catch it.
+    #[test]
+    fn test_clap_markdown_contains_all_commands() {
+        use clap::CommandFactory;
+        let cmd = crate::cli::Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        for name in [
+            "chat",
+            "setup",
+            "memory",
+            "reminders",
+            "status",
+            "config",
+            "skills",
+            "ask",
+            "agents",
+            "teams",
+            "doctor",
+            "dashboard",
+            "token",
+            "provider",
+            "model",
+            "credential-helper",
+            "kg",
+            "notify",
+            "milestone",
+        ] {
+            assert!(
+                markdown.contains(name),
+                "clap-markdown output missing command: {name}"
+            );
+        }
+    }
+
+    /// --agent and --team are mutually exclusive on the chat subcommand.
+    #[test]
+    fn test_agent_and_team_mutually_exclusive_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "chat", "--agent", "work", "--team", "research",
+        ]);
+        assert!(
+            result.is_err(),
+            "--agent and --team should conflict on chat"
+        );
+    }
+
+    /// --agent and --team are mutually exclusive at the top level.
+    #[test]
+    fn test_agent_and_team_mutually_exclusive_top_level() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "--agent", "work", "--team", "research"]);
+        assert!(
+            result.is_err(),
+            "--agent and --team should conflict at top level"
+        );
+    }
+
+    /// --team alone on chat subcommand should parse successfully.
+    #[test]
+    fn test_team_flag_on_chat_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "research"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(
+            cli.command.as_ref().unwrap().team_override(),
+            Some("research")
+        );
+    }
+
+    /// --team at top level (bare mika) should parse successfully.
+    #[test]
+    fn test_team_flag_top_level_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "--team", "research"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.team.as_deref(), Some("research"));
+    }
+
+    /// --agent on chat subcommand should work.
+    #[test]
+    fn test_agent_flag_on_chat() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --agent at top level (bare mika) should work.
+    #[test]
+    fn test_agent_flag_top_level() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("work"));
+        assert!(cli.command.is_none());
+    }
+
+    /// --agent on ask subcommand should work.
+    #[test]
+    fn test_agent_flag_on_ask() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--agent", "work", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --agent should NOT be accepted on setup subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_setup() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "setup", "--agent", "work"]);
+        assert!(result.is_err(), "--agent should not be accepted on setup");
+    }
+
+    /// --team should be accepted on ask subcommand.
+    #[test]
+    fn test_team_flag_accepted_on_ask() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--team", "research", "hello"]);
+        assert!(result.is_ok(), "--team should be accepted on ask");
+    }
+
+    /// --team and --agent should conflict on ask subcommand.
+    #[test]
+    fn test_team_conflicts_with_agent_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "ask", "--team", "research", "--agent", "mika", "hello",
+        ]);
+        assert!(result.is_err(), "--team and --agent should conflict on ask");
+    }
+
+    /// --run-id requires --team on ask subcommand.
+    #[test]
+    fn test_run_id_requires_team_on_ask() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--run-id", "abc-123", "hello"]);
+        assert!(result.is_err(), "--run-id should require --team");
+    }
+
+    /// --last-run requires --team on ask subcommand.
+    #[test]
+    fn test_last_run_requires_team_on_ask() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "ask", "--last-run", "hello"]);
+        assert!(result.is_err(), "--last-run should require --team");
+    }
+
+    /// --last-run requires --team on chat subcommand.
+    #[test]
+    fn test_last_run_requires_team_on_chat() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "chat", "--last-run"]);
+        assert!(result.is_err(), "--last-run should require --team");
+    }
+
+    /// --last-run and --run-id conflict on chat subcommand.
+    #[test]
+    fn test_last_run_conflicts_with_run_id_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika",
+            "chat",
+            "--team",
+            "foo",
+            "--last-run",
+            "--run-id",
+            "abc",
+        ]);
+        assert!(
+            result.is_err(),
+            "--last-run and --run-id should conflict on chat"
+        );
+    }
+
+    /// --last-run and --run-id conflict on ask subcommand.
+    #[test]
+    fn test_last_run_conflicts_with_run_id_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika",
+            "ask",
+            "--team",
+            "foo",
+            "--last-run",
+            "--run-id",
+            "abc",
+            "hello",
+        ]);
+        assert!(
+            result.is_err(),
+            "--last-run and --run-id should conflict on ask"
+        );
+    }
+
+    /// --last-run with --team on chat should parse successfully.
+    #[test]
+    fn test_last_run_with_team_on_chat_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "chat", "--team", "research", "--last-run"]);
+        assert!(cli.is_ok());
+    }
+
+    /// clap-markdown output should include the --team flag (on chat subcommand).
+    #[test]
+    fn test_clap_markdown_contains_team_flag() {
+        use clap::CommandFactory;
+        let cmd = crate::cli::Cli::command();
+        let markdown = clap_markdown::help_markdown_command(&cmd);
+        assert!(
+            markdown.contains("--team"),
+            "clap-markdown output missing --team flag"
+        );
+    }
+
+    /// `mika setup --api-key <key>` should parse successfully.
+    #[test]
+    fn test_setup_accepts_api_key_flag() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "setup", "--api-key", "sk-test"]);
+        assert!(cli.is_ok());
+    }
+
+    /// --agent on memory subcommand should work.
+    #[test]
+    fn test_agent_flag_on_memory() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "memory", "--agent", "work"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        assert_eq!(cli.command.as_ref().unwrap().agent_override(), Some("work"));
+    }
+
+    /// --format json on ask subcommand should parse successfully.
+    #[test]
+    fn test_format_json_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "json", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Json));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --format text on ask subcommand should parse successfully (explicit default).
+    #[test]
+    fn test_format_text_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "text", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Text));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// ask without --format should default to text.
+    #[test]
+    fn test_format_defaults_to_text_on_ask() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "ask", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert!(matches!(args.format, crate::cli::OutputFormat::Text));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --format with invalid value should fail.
+    #[test]
+    fn test_format_invalid_value_rejected() {
+        let result =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--format", "xml", "hello world"]);
+        assert!(result.is_err());
+    }
+
+    /// --agent should NOT be accepted on doctor subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_doctor() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "doctor", "--agent", "work"]);
+        assert!(result.is_err(), "--agent should not be accepted on doctor");
+    }
+
+    /// --agent should NOT be accepted on teams subcommand.
+    #[test]
+    fn test_agent_flag_rejected_on_teams() {
+        let result = crate::cli::Cli::try_parse_from(["mika", "teams", "--agent", "work", "list"]);
+        assert!(result.is_err(), "--agent should not be accepted on teams");
+    }
+
+    /// --model on ask subcommand should parse successfully.
+    #[test]
+    fn test_model_flag_on_ask_parses() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--model", "sonnet", "hello world"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("sonnet"));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --model on chat subcommand should parse successfully.
+    #[test]
+    fn test_model_flag_on_chat_parses() {
+        let cli = crate::cli::Cli::try_parse_from(["mika", "chat", "--model", "opus"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Chat(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("opus"));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    /// --model with provider-prefixed value should parse.
+    #[test]
+    fn test_model_flag_provider_prefixed() {
+        let cli =
+            crate::cli::Cli::try_parse_from(["mika", "ask", "--model", "openai/gpt-4o", "hello"]);
+        assert!(cli.is_ok());
+        let cli = cli.unwrap();
+        if let Some(Commands::Ask(args)) = cli.command {
+            assert_eq!(args.model.as_deref(), Some("openai/gpt-4o"));
+        } else {
+            panic!("Expected Ask command");
+        }
+    }
+
+    /// --model and --team should conflict on ask subcommand.
+    #[test]
+    fn test_model_conflicts_with_team_on_ask() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "ask", "--model", "sonnet", "--team", "research", "hello",
+        ]);
+        assert!(result.is_err(), "--model and --team should conflict on ask");
+    }
+
+    /// --model and --team should conflict on chat subcommand.
+    #[test]
+    fn test_model_conflicts_with_team_on_chat() {
+        let result = crate::cli::Cli::try_parse_from([
+            "mika", "chat", "--model", "sonnet", "--team", "research",
+        ]);
+        assert!(
+            result.is_err(),
+            "--model and --team should conflict on chat"
+        );
+    }
+
+    /// resolve_model_alias resolves known aliases and passes through unknown values.
+    /// All aliases now include provider prefix for cross-provider correctness.
+    ///
+    /// mika#2304 moved the function to `mika_common::llm::model_override` so the
+    /// server can reach it; the assertions are unchanged, which is what attests
+    /// the move did not alter what the CLI resolves (T8).
+    #[test]
+    fn test_resolve_model_alias() {
+        use mika_common::llm::model_override::resolve_model_alias;
+
+        // Anthropic aliases include provider prefix
+        assert_eq!(resolve_model_alias("sonnet"), "anthropic/claude-sonnet-4-6");
+        assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-6");
+        assert_eq!(resolve_model_alias("haiku"), "anthropic/claude-haiku-4-5");
+        // Case-insensitive
+        assert_eq!(resolve_model_alias("Sonnet"), "anthropic/claude-sonnet-4-6");
+        // Cross-provider aliases already had prefix (unchanged)
+        assert_eq!(resolve_model_alias("openai/gpt-4o"), "openai/gpt-4o");
+        // Unknown values pass through unchanged
+        assert_eq!(
+            resolve_model_alias("some-custom-model"),
+            "some-custom-model"
+        );
+    }
+}

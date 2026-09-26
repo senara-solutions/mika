@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timestamp": "2026-06-29T00:00:00+00:00",
+  "providers": {
+    "mika-dev": {
+      "model": "openrouter/z-ai/glm-5.2",
+      "scenarios": {
+        "contract_dev_groom": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": null
+        },
+        "golden_path_dispatch": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": null
+        },
+        "plan_callout_recognition": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": null
+        },
+        "refusal_regression": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": null
+        },
+        "required_tools_gate": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": null
+        }
+      }
+    }
+  }
+}

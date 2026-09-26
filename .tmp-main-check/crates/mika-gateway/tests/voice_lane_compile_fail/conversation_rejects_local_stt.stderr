@@ -1,0 +1,21 @@
+error[E0271]: type mismatch resolving `<WhisperCppStt as SttProvider>::Lane == ConversationLane`
+  --> tests/voice_lane_compile_fail/conversation_rejects_local_stt.rs:44:33
+   |
+44 |         VoiceRoom::conversation(WhisperCppStt, ElevenLabsTts);
+   |         ----------------------- ^^^^^^^^^^^^^ type mismatch resolving `<WhisperCppStt as SttProvider>::Lane == ConversationLane`
+   |         |
+   |         required by a bound introduced by this call
+   |
+note: expected this to be `ConversationLane`
+  --> tests/voice_lane_compile_fail/conversation_rejects_local_stt.rs:25:17
+   |
+25 |     type Lane = TestimonyLane; // <-- binds to TESTIMONY lane
+   |                 ^^^^^^^^^^^^^
+note: required by a bound in `VoiceRoom::<ConversationLane, S, T>::conversation`
+  --> src/voice/room.rs
+   |
+   |     S: SttProvider<Lane = ConversationLane>,
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `VoiceRoom::<ConversationLane, S, T>::conversation`
+...
+   |     pub fn conversation(stt: S, tts: T) -> Self {
+   |            ------------ required by a bound in this associated function

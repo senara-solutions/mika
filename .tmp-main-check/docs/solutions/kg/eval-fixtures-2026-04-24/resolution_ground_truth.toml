@@ -1,0 +1,539 @@
+# KG Provider Evaluation — Resolution Ground Truth
+# Date: 2026-04-24
+# Purpose: Hand-labeled entity resolution cases for evaluating disambiguation quality.
+#
+# Each case represents a Stage 2 LLM disambiguation scenario where the resolver
+# must pick the correct domain entity from a candidate list, or return null.
+#
+# Categories:
+#   clear_match       — Unambiguous match to a single domain entity (10 cases)
+#   sibling_ambiguous — Close-by-name domain neighbors requiring judgment (10 cases)
+#   no_match          — Entity has no valid domain counterpart (10 cases)
+#
+# Fields:
+#   entity_key        — The extracted subject entity key (from NER output)
+#   entity_confidence — The extraction confidence (0.0-1.0)
+#   chunk_context     — Source prose snippet where the entity was extracted
+#   expected_match    — Ground truth: the correct domain entity_key, or "null"
+#   case_category     — One of: clear_match, sibling_ambiguous, no_match
+#   disputable        — true if reasonable annotators might disagree
+#   rationale         — Why this is the correct label
+#
+# candidates: array of {entity_key, description} representing the domain entities
+# presented to the resolver. These mirror what domain_builder.rs would produce.
+
+# =============================================================================
+# CLEAR MATCH CASES (10)
+# =============================================================================
+
+[[cases]]
+entity_key = "skill:self_dev"
+entity_confidence = 0.85
+chunk_context = "The self-dev skill orchestrates the autonomous development workflow, launching claude-pilot sessions and managing worktrees."
+expected_match = "skill:self-dev"
+case_category = "clear_match"
+disputable = false
+rationale = "Underscore variant of hyphenated skill name — clear match"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev-iterate"
+description = "PR iteration handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:claude-pilot"
+description = "Claude Code integration skill"
+
+[[cases]]
+entity_key = "tool:query_knowledge_graph"
+entity_confidence = 0.92
+chunk_context = "The query_knowledge_graph tool enables graph traversal over the three KG layers using recursive CTEs."
+expected_match = "tool:query_knowledge_graph"
+case_category = "clear_match"
+disputable = false
+rationale = "Exact match to domain tool entity"
+[[cases.candidates]]
+entity_key = "tool:query_knowledge_graph"
+description = "Graph traversal tool for KG queries"
+[[cases.candidates]]
+entity_key = "tool:get_documentation"
+description = "Retrieve documentation files"
+
+[[cases]]
+entity_key = "problem_type:fabrication"
+entity_confidence = 0.88
+chunk_context = "The agent fabricated downstream system state without tool confirmation, violating the grounding rule."
+expected_match = "problem_type:fabrication"
+case_category = "clear_match"
+disputable = false
+rationale = "Direct reference to the fabrication problem type seed"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "problem_type:stale_uuid"
+description = "Stale or invalid UUID reference"
+
+[[cases]]
+entity_key = "tool:create_task"
+entity_confidence = 0.90
+chunk_context = "The create_task tool registers a new work item in the task engine with the specified trigger type and action."
+expected_match = "tool:create_task"
+case_category = "clear_match"
+disputable = false
+rationale = "Exact tool name match"
+[[cases.candidates]]
+entity_key = "tool:create_task"
+description = "Register a new task/work item"
+[[cases.candidates]]
+entity_key = "tool:cancel_task"
+description = "Cancel an active task"
+[[cases.candidates]]
+entity_key = "tool:complete_task"
+description = "Mark a task as completed"
+
+[[cases]]
+entity_key = "skill:qa_review"
+entity_confidence = 0.87
+chunk_context = "The QA review skill runs automated PR review, checking code quality and test coverage before merge."
+expected_match = "skill:qa-review"
+case_category = "clear_match"
+disputable = false
+rationale = "Underscore-to-hyphen normalization, unambiguous"
+[[cases.candidates]]
+entity_key = "skill:qa-review"
+description = "PR review skill"
+[[cases.candidates]]
+entity_key = "skill:qa-review-build-callback"
+description = "Build callback handler for QA review"
+
+[[cases]]
+entity_key = "problem_type:ci_failure"
+entity_confidence = 0.91
+chunk_context = "CI failed on the clippy lint step due to unused imports introduced by the refactor."
+expected_match = "problem_type:ci_failure"
+case_category = "clear_match"
+disputable = false
+rationale = "Direct reference to CI failure problem type"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "problem_type:merge_conflict"
+description = "Git merge conflict"
+
+[[cases]]
+entity_key = "tool:get_documentation"
+entity_confidence = 0.89
+chunk_context = "Use get_documentation to retrieve the full text of any doc in docs/solutions/ for reference lookups."
+expected_match = "tool:get_documentation"
+case_category = "clear_match"
+disputable = false
+rationale = "Exact tool name match"
+[[cases.candidates]]
+entity_key = "tool:get_documentation"
+description = "Retrieve documentation files"
+[[cases.candidates]]
+entity_key = "tool:query_knowledge_graph"
+description = "Graph traversal tool for KG queries"
+
+[[cases]]
+entity_key = "skill:permission_policy"
+entity_confidence = 0.86
+chunk_context = "The permission-policy skill classifies tool permission requests using a haiku-tier model for cost efficiency."
+expected_match = "skill:permission-policy"
+case_category = "clear_match"
+disputable = false
+rationale = "Underscore-to-hyphen normalization"
+[[cases.candidates]]
+entity_key = "skill:permission-policy"
+description = "Permission handler for claude-pilot sessions"
+[[cases.candidates]]
+entity_key = "skill:claude-pilot"
+description = "Claude Code integration skill"
+
+[[cases]]
+entity_key = "problem_type:merge_conflict"
+entity_confidence = 0.93
+chunk_context = "The PR had merge conflicts with main after a concurrent merge, requiring rebase."
+expected_match = "problem_type:merge_conflict"
+case_category = "clear_match"
+disputable = false
+rationale = "Direct match to merge_conflict problem type seed"
+[[cases.candidates]]
+entity_key = "problem_type:merge_conflict"
+description = "Git merge conflict"
+[[cases.candidates]]
+entity_key = "problem_type:duplicate_pr"
+description = "Duplicate pull request"
+
+[[cases]]
+entity_key = "skill:claude_pilot"
+entity_confidence = 0.84
+chunk_context = "The claude-pilot skill manages worktree setup and dispatches headless Claude Code sessions."
+expected_match = "skill:claude-pilot"
+case_category = "clear_match"
+disputable = false
+rationale = "Underscore-to-hyphen normalization, unambiguous"
+[[cases.candidates]]
+entity_key = "skill:claude-pilot"
+description = "Claude Code integration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+
+# =============================================================================
+# SIBLING-AMBIGUOUS CASES (10)
+# =============================================================================
+
+[[cases]]
+entity_key = "skill:self_dev_webhook"
+entity_confidence = 0.78
+chunk_context = "The webhook handler processes CI status updates and triggers the appropriate self-dev response."
+expected_match = "skill:self-dev-webhook-ci"
+case_category = "sibling_ambiguous"
+disputable = true
+rationale = "Context says 'CI status updates' — maps to self-dev-webhook-ci, not self-dev-webhook-qa"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev-iterate"
+description = "PR iteration handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:self-dev-webhook-ci"
+description = "CI webhook handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:self-dev-webhook-qa"
+description = "QA webhook handler for self-dev"
+
+[[cases]]
+entity_key = "skill:qa_review_callback"
+entity_confidence = 0.80
+chunk_context = "When the build finishes, the callback handler checks the CI result and updates the review status."
+expected_match = "skill:qa-review-build-callback"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Context is about build callback — maps to qa-review-build-callback, not qa-review"
+[[cases.candidates]]
+entity_key = "skill:qa-review"
+description = "PR review skill"
+[[cases.candidates]]
+entity_key = "skill:qa-review-build-callback"
+description = "Build callback handler for QA review"
+
+[[cases]]
+entity_key = "skill:self_dev_iterate"
+entity_confidence = 0.82
+chunk_context = "After review comments are posted, the iterate handler picks up the feedback and applies fixes."
+expected_match = "skill:self-dev-iterate"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Context about review iteration — maps to self-dev-iterate, not self-dev"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev-iterate"
+description = "PR iteration handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:self-dev-webhook-ci"
+description = "CI webhook handler for self-dev"
+
+[[cases]]
+entity_key = "skill:dev_webhook_qa"
+entity_confidence = 0.75
+chunk_context = "The QA webhook handler receives review verdicts and processes them for the development workflow."
+expected_match = "skill:self-dev-webhook-qa"
+case_category = "sibling_ambiguous"
+disputable = true
+rationale = "Context says 'QA webhook' — maps to self-dev-webhook-qa. Name is abbreviated."
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:self-dev-webhook-ci"
+description = "CI webhook handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:self-dev-webhook-qa"
+description = "QA webhook handler for self-dev"
+[[cases.candidates]]
+entity_key = "skill:qa-review"
+description = "PR review skill"
+
+[[cases]]
+entity_key = "tool:task_management"
+entity_confidence = 0.72
+chunk_context = "The task management tool allows creating, checking, and canceling scheduled tasks."
+expected_match = "tool:create_task"
+case_category = "sibling_ambiguous"
+disputable = true
+rationale = "Generic reference to task management — closest match is create_task but could be any task tool"
+[[cases.candidates]]
+entity_key = "tool:create_task"
+description = "Register a new task/work item"
+[[cases.candidates]]
+entity_key = "tool:cancel_task"
+description = "Cancel an active task"
+[[cases.candidates]]
+entity_key = "tool:complete_task"
+description = "Mark a task as completed"
+[[cases.candidates]]
+entity_key = "tool:check_work_item"
+description = "Check status of a work item"
+
+[[cases]]
+entity_key = "skill:build_mika"
+entity_confidence = 0.83
+chunk_context = "The build verification skill runs cargo build and checks for compilation errors before deployment."
+expected_match = "skill:build-mika"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Underscore-to-hyphen normalization; sibling deploy-mika exists"
+[[cases.candidates]]
+entity_key = "skill:build-mika"
+description = "Build verification skill"
+[[cases.candidates]]
+entity_key = "skill:deploy-mika"
+description = "Deployment skill"
+[[cases.candidates]]
+entity_key = "skill:self-check"
+description = "Self-check/health verification"
+
+[[cases]]
+entity_key = "skill:address_comments"
+entity_confidence = 0.77
+chunk_context = "The skill that addresses PR review comments parses the feedback and generates fixes."
+expected_match = "skill:address-pr-comments"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Abbreviated name — context about 'PR review comments' disambiguates to address-pr-comments"
+[[cases.candidates]]
+entity_key = "skill:address-pr-comments"
+description = "Address PR review comments"
+[[cases.candidates]]
+entity_key = "skill:resolve-pr-conflicts"
+description = "Rebase + conflict resolution for PRs"
+[[cases.candidates]]
+entity_key = "skill:skill-review"
+description = "Skill review handler"
+
+[[cases]]
+entity_key = "skill:conflict_resolver"
+entity_confidence = 0.76
+chunk_context = "When a PR shows CONFLICTING status, the conflict resolution skill runs rebase and attempts to fix merge issues."
+expected_match = "skill:resolve-pr-conflicts"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Context mentions CONFLICTING status + rebase — maps to resolve-pr-conflicts"
+[[cases.candidates]]
+entity_key = "skill:resolve-pr-conflicts"
+description = "Rebase + conflict resolution for CONFLICTING PRs"
+[[cases.candidates]]
+entity_key = "skill:address-pr-comments"
+description = "Address PR review comments"
+[[cases.candidates]]
+entity_key = "skill:self-dev-iterate"
+description = "PR iteration handler for self-dev"
+
+[[cases]]
+entity_key = "skill:agents_management"
+entity_confidence = 0.74
+chunk_context = "The agent and team management skill handles creating agents, assigning roles, and managing team configurations."
+expected_match = "skill:agents-teams"
+case_category = "sibling_ambiguous"
+disputable = true
+rationale = "Generic name — context includes both 'agents' and 'team' which maps to agents-teams skill"
+[[cases.candidates]]
+entity_key = "skill:agents-teams"
+description = "Agent/team management"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+
+[[cases]]
+entity_key = "problem_type:stale_id"
+entity_confidence = 0.79
+chunk_context = "The work item referenced a stale UUID from a previous session that no longer existed in the database."
+expected_match = "problem_type:stale_uuid"
+case_category = "sibling_ambiguous"
+disputable = false
+rationale = "Context says 'stale UUID' — maps to stale_uuid despite extracted name being 'stale_id'"
+[[cases.candidates]]
+entity_key = "problem_type:stale_uuid"
+description = "Stale or invalid UUID reference"
+[[cases.candidates]]
+entity_key = "problem_type:duplicate_pr"
+description = "Duplicate pull request"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+
+# =============================================================================
+# NO-MATCH CASES (10)
+# =============================================================================
+
+[[cases]]
+entity_key = "pattern:test_first_development"
+entity_confidence = 0.81
+chunk_context = "Following a test-first development approach, the team writes failing tests before implementing features."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "No 'pattern' entities exist in the domain graph — only skill, tool, agent, problem_type"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:qa-review"
+description = "PR review skill"
+
+[[cases]]
+entity_key = "solution_path:use_safe_truncate"
+entity_confidence = 0.85
+chunk_context = "The fix replaced all byte-slicing with safe_truncate() calls to prevent UTF-8 panics."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "solution_path is a discovered type, not a domain type — no domain entities match"
+[[cases.candidates]]
+entity_key = "tool:query_knowledge_graph"
+description = "Graph traversal tool for KG queries"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+
+[[cases]]
+entity_key = "failure_mode:json_parse_error"
+entity_confidence = 0.83
+chunk_context = "The LLM returned malformed JSON with trailing commas, causing serde_json to fail."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "failure_mode is a discovered type, not in domain graph"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"
+
+[[cases]]
+entity_key = "tool:web_search"
+entity_confidence = 0.88
+chunk_context = "The web_search tool uses the Brave Search API to find relevant results."
+expected_match = "null"
+case_category = "no_match"
+disputable = true
+rationale = "web_search may or may not exist in domain graph depending on skill registration. In this eval context, we assume it is not in the candidate list provided."
+[[cases.candidates]]
+entity_key = "tool:query_knowledge_graph"
+description = "Graph traversal tool for KG queries"
+[[cases.candidates]]
+entity_key = "tool:get_documentation"
+description = "Retrieve documentation files"
+[[cases.candidates]]
+entity_key = "tool:create_task"
+description = "Register a new task/work item"
+
+[[cases]]
+entity_key = "agent:production_user"
+entity_confidence = 0.70
+chunk_context = "The production user agent handles real customer conversations in the deployed environment."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "No production_user agent exists in the dev-mode domain graph (only mika-dev, mika-qa, mika-relay)"
+[[cases.candidates]]
+entity_key = "agent:mika-dev"
+description = "Development agent"
+[[cases.candidates]]
+entity_key = "agent:mika-qa"
+description = "QA agent"
+[[cases.candidates]]
+entity_key = "agent:mika-relay"
+description = "Relay agent"
+
+[[cases]]
+entity_key = "skill:email_integration"
+entity_confidence = 0.76
+chunk_context = "The email integration skill forwards messages to the agent via SMTP gateway."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "No email_integration skill exists in the current skill registry"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+[[cases.candidates]]
+entity_key = "skill:claude-pilot"
+description = "Claude Code integration skill"
+
+[[cases]]
+entity_key = "pattern:retry_with_backoff"
+entity_confidence = 0.82
+chunk_context = "The transport retry strategy uses exponential backoff with jitter for rate-limited requests."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "No 'pattern' entities in domain graph"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "skill:self-dev"
+description = "Main self-development orchestration skill"
+
+[[cases]]
+entity_key = "tool:run_gh"
+entity_confidence = 0.86
+chunk_context = "The run_gh builtin tool executes GitHub CLI commands with proper token injection."
+expected_match = "null"
+case_category = "no_match"
+disputable = true
+rationale = "run_gh is a real builtin tool but may not be in the candidates list. Null when not in candidates."
+[[cases.candidates]]
+entity_key = "tool:create_task"
+description = "Register a new task/work item"
+[[cases.candidates]]
+entity_key = "tool:complete_task"
+description = "Mark a task as completed"
+[[cases.candidates]]
+entity_key = "tool:query_knowledge_graph"
+description = "Graph traversal tool for KG queries"
+
+[[cases]]
+entity_key = "solution_path:atomic_transaction"
+entity_confidence = 0.80
+chunk_context = "Wrapping the extraction results and idempotency marker in a single SQLite transaction prevents partial writes."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "solution_path is a discovered type, not in domain graph"
+[[cases.candidates]]
+entity_key = "problem_type:stale_uuid"
+description = "Stale or invalid UUID reference"
+[[cases.candidates]]
+entity_key = "tool:create_task"
+description = "Register a new task/work item"
+
+[[cases]]
+entity_key = "failure_mode:budget_exhaustion"
+entity_confidence = 0.84
+chunk_context = "When the per-batch LLM call budget is exhausted, remaining entities are left pending for the next restart."
+expected_match = "null"
+case_category = "no_match"
+disputable = false
+rationale = "failure_mode is a discovered type, not in domain graph"
+[[cases.candidates]]
+entity_key = "problem_type:ci_failure"
+description = "CI pipeline failure"
+[[cases.candidates]]
+entity_key = "problem_type:stale_uuid"
+description = "Stale or invalid UUID reference"
+[[cases.candidates]]
+entity_key = "problem_type:fabrication"
+description = "Agent fabricates state claims without evidence"

@@ -1,0 +1,34 @@
+[skill]
+name = "google-workspace"
+description = "Interact with Google Calendar and app-scoped Google Drive using the gws CLI (Gmail is refused by doctrine, mika#1798)"
+version = "0.1.2"
+
+# AC5 of mika#2118 — decision: `always_on` STAYS `true`, including on cloud
+# tenants, which have no Google credentials by design and never will.
+#
+# Not admitting the skill does not remove the question, it removes the answer.
+# Asked "put this on my Drive", an agent that never loaded this skill improvises
+# with no anchor at all — strictly worse than the defect this ticket fixes, where
+# the agent knew what it was talking about and said it badly. The cost of keeping
+# it is one paragraph of prompt; in exchange the skill now declares what it
+# cannot do (`## What this skill cannot do`) and the engine tells the model, on an
+# exit 2, whether the credentials were refused or were never configured here.
+#
+# The reason lives here and in `system_prompt.md`, not only in `docs/plans/`: a
+# reader who lands on `always_on = true` must find the why without opening a plan.
+always_on = true
+
+# Covers the useful `gws` call AND, on an authentication failure, the credential
+# probe. The probe carries its own 10s bound (`GWS_AUTH_PROBE_TIMEOUT`) so it can
+# never eat the useful call's budget — see `builtin_handlers::probe_gws_auth_state`.
+timeout_secs = 45
+
+[triggers]
+keywords = [
+    "google", "gmail", "google calendar", "google drive", "gdrive",
+    "email", "emails", "inbox", "send email",
+    "calendar", "meeting", "meetings", "schedule", "agenda", "free", "busy",
+    "drive", "document", "documents", "spreadsheet", "slides",
+    "triage",
+    "gws", "workspace"
+]

@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "timestamp": "2026-05-20T14:41:46.469257697+00:00",
+  "providers": {
+    "mika-dev": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "scenarios": {
+        "contract_dev_groom": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": 217
+        },
+        "golden_path_dispatch": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": 219
+        },
+        "plan_callout_recognition": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": 216
+        },
+        "refusal_regression": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": 608
+        },
+        "required_tools_gate": {
+          "outcome": "fail",
+          "error_class": "unknown",
+          "input_tokens": null,
+          "output_tokens": null,
+          "latency_ms": 218
+        }
+      }
+    }
+  }
+}

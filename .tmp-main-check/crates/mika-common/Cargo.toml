@@ -1,0 +1,74 @@
+[package]
+name = "mika-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shared library for Mika AI assistant"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+config.workspace = true
+dirs.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+dotenvy.workspace = true
+secrecy.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+url.workspace = true
+hex.workspace = true
+regex.workspace = true
+jsonwebtoken.workspace = true
+
+[features]
+telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+test-utils = []
+
+[dependencies.opentelemetry]
+workspace = true
+optional = true
+
+[dependencies.opentelemetry_sdk]
+workspace = true
+optional = true
+
+[dependencies.opentelemetry-otlp]
+workspace = true
+optional = true
+
+[dependencies.tracing-opentelemetry]
+workspace = true
+optional = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+serial_test.workspace = true
+# Self-dependency with `test-utils` enabled (mika#2331 §3.4): an integration
+# test under `tests/` compiles against the library WITHOUT `cfg(test)`, so the
+# feature is the only way it can reach `ClaudeClient::for_test` — without which
+# the Anthropic rail, which posts to a hard-coded URL, is reachable by no test
+# at all. Declared here rather than passed on the command line so a plain
+# `cargo test --workspace` still compiles this file.
+mika-common = { path = ".", features = ["test-utils"] }
+
+[lints]
+workspace = true

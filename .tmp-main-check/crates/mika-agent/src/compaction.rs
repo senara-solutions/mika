@@ -1,0 +1,444 @@
+use anyhow::{Context, Result};
+use mika_common::llm::{LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole};
+use mika_common::text::safe_truncate;
+use tracing::{debug, info, warn};
+
+use crate::async_db::AsyncDatabase;
+use crate::db::SessionMessage;
+
+const COMPACTION_THRESHOLD: usize = 50;
+const CONTEXT_WINDOW: usize = 20;
+const MAX_COMPACTION_BATCH: usize = 100;
+/// Maximum summary size, in **bytes** — `String::len()` is a byte count,
+/// so the budget it is compared against is one too (mika#2103).
+const MAX_SUMMARY_BYTES: usize = 4000;
+const MAX_COMPACTION_INPUT_CHARS: usize = 50_000;
+
+const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
+You are producing a factual record of what HAPPENED in a session, for a future session to read as history.
+The output is a record FOR a future agent, NOT a record OF a conversation. Future readers did not participate in this session.
+
+Format every bullet as a state assertion with one of these prefixes:
+- `Fact:` for objective state (entities, references, timestamps, quantities)
+- `Decision:` for choices made and disposition
+- `Outcome:` for results and state transitions
+- `Open:` for unresolved questions or pending work
+
+Do NOT use:
+- First-person language (we, our, I) or second-person (you, your)
+- Conversational verbs that imply participation (discussed, agreed, decided together, wanted, asked)
+- Process narration (then we, after that, next)
+
+Do:
+- Preserve key decisions, action items, commitments, user preferences, important facts about people
+- Discard pleasantries, small talk, repeated information
+- Keep the record concise (under 500 tokens) and use bullet points
+
+If there is an existing record, merge new factual state into it; do not preserve conversational shape from the prior record.";
+
+/// Check if compaction is needed and perform it if so.
+/// Called after each agent turn completes.
+pub async fn maybe_compact(db: &AsyncDatabase, llm: &dyn LlmProvider) -> Result<()> {
+    let total = db.count_messages().await?;
+    if total <= COMPACTION_THRESHOLD {
+        debug!(
+            total,
+            threshold = COMPACTION_THRESHOLD,
+            "compaction not needed"
+        );
+        return Ok(());
+    }
+
+    let existing_summary = db.load_conversation_summary().await?;
+    let old_messages = db.load_messages_before_window(CONTEXT_WINDOW).await?;
+    if old_messages.is_empty() {
+        debug!("no messages outside context window to compact");
+        return Ok(());
+    }
+
+    // Cap batch size to prevent sending too much to the summarization API
+    let batch = if old_messages.len() > MAX_COMPACTION_BATCH {
+        warn!(
+            total = old_messages.len(),
+            batch = MAX_COMPACTION_BATCH,
+            "capping compaction batch size"
+        );
+        &old_messages[..MAX_COMPACTION_BATCH]
+    } else {
+        &old_messages
+    };
+
+    info!(old_count = batch.len(), total, "compacting conversation");
+
+    let summary_text = summarize_messages(llm, batch, existing_summary.as_ref()).await?;
+
+    let summary_text = cap_summary(summary_text);
+
+    let highest_id = batch.last().map(|m| m.id).unwrap_or(0);
+    db.replace_with_summary(&summary_text, highest_id).await?;
+
+    info!(compacted_through_id = highest_id, "compaction complete");
+    Ok(())
+}
+
+/// Cap a summary at `MAX_SUMMARY_BYTES`, floored to a char boundary.
+///
+/// mika#2103: the guard this replaces called `String::truncate` and *then*
+/// walked back with `pop()`. That walk was unreachable — `truncate` asserts
+/// `is_char_boundary` and panics before any later statement runs — and
+/// vacuous besides, since `s.is_char_boundary(s.len())` is always true for
+/// the end of a `String`. Two defects stacked into the appearance of a
+/// guard. `safe_truncate` floors to a boundary *before* the cut.
+///
+/// Extracted as a pure function so the byte-boundary behaviour is testable
+/// without an LLM or a database.
+fn cap_summary(summary_text: String) -> String {
+    if summary_text.len() <= MAX_SUMMARY_BYTES {
+        return summary_text;
+    }
+    warn!(
+        len = summary_text.len(),
+        max = MAX_SUMMARY_BYTES,
+        "truncating oversized summary"
+    );
+    safe_truncate(&summary_text, MAX_SUMMARY_BYTES).to_string()
+}
+
+/// Call Claude to summarize a batch of old messages, optionally merging with
+/// an existing summary.
+async fn summarize_messages(
+    llm: &dyn LlmProvider,
+    messages: &[SessionMessage],
+    existing_summary: Option<&SessionMessage>,
+) -> Result<String> {
+    let mut user_prompt = String::with_capacity(2048);
+
+    if let Some(summary) = existing_summary {
+        user_prompt.push_str("## Existing Summary\n");
+        user_prompt.push_str(&summary.content);
+        user_prompt.push_str("\n\n");
+    }
+
+    user_prompt.push_str("## Messages to Summarize\n");
+    let mut char_count = 0usize;
+    let mut included = 0usize;
+    for msg in messages {
+        // Append tool names from metadata so summaries mention tool usage
+        let tool_suffix = extract_tool_names(&msg.metadata);
+        let msg_chars = msg.role.len() + 2 + msg.content.len() + tool_suffix.len() + 1;
+        if char_count + msg_chars > MAX_COMPACTION_INPUT_CHARS {
+            break;
+        }
+        char_count += msg_chars;
+        included += 1;
+        user_prompt.push_str(&msg.role);
+        user_prompt.push_str(": ");
+        user_prompt.push_str(&msg.content);
+        if !tool_suffix.is_empty() {
+            user_prompt.push_str(&tool_suffix);
+        }
+        user_prompt.push('\n');
+    }
+    if included < messages.len() {
+        warn!(
+            total = messages.len(),
+            included,
+            char_budget = MAX_COMPACTION_INPUT_CHARS,
+            "truncated compaction input to stay within character budget"
+        );
+    }
+
+    user_prompt.push_str("\nPlease produce a concise bullet-point summary.");
+
+    let request = LlmRequest {
+        model: llm.model_name().to_string(),
+        max_tokens: 1024,
+        system: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(user_prompt),
+        }],
+        tools: None,
+        thinking: None,
+    };
+
+    let response = llm
+        .send_message(&request)
+        .await
+        .context("summarization API call failed")?;
+
+    Ok(response.text())
+}
+
+/// Extract tool names from metadata JSON for inclusion in compaction input.
+/// Returns a short suffix like " [used: search_memory, store_fact]" or empty string.
+fn extract_tool_names(metadata: &Option<String>) -> String {
+    let Some(json) = metadata else {
+        return String::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) else {
+        return String::new();
+    };
+    let Some(calls) = parsed.get("tool_calls").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    if calls.is_empty() {
+        return String::new();
+    }
+    let entries: Vec<String> = calls
+        .iter()
+        .filter_map(|c| {
+            let name = c.get("name").and_then(|n| n.as_str())?;
+            let ok = c.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
+            Some(if ok {
+                name.to_string()
+            } else {
+                format!("{name}(err)")
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<String> = entries
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .collect();
+    format!(" [used: {}]", unique.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::test_helpers::test_db;
+
+    fn test_db_with_session() -> (crate::db::Database, String) {
+        let db = test_db();
+        let sid = "test-session".to_string();
+        db.create_session(&sid, "mika", "cli").unwrap();
+        (db, sid)
+    }
+
+    #[test]
+    fn test_compaction_skips_below_threshold() {
+        let (db, sid) = test_db_with_session();
+        for i in 0..10 {
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
+                .unwrap();
+        }
+        assert!(db.count_messages("mika").unwrap() <= COMPACTION_THRESHOLD);
+    }
+
+    #[test]
+    fn test_compaction_identifies_old_messages() {
+        let (db, sid) = test_db_with_session();
+        for i in 0..(COMPACTION_THRESHOLD + 10) {
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
+                .unwrap();
+        }
+
+        let total = db.count_messages("mika").unwrap();
+        assert!(total > COMPACTION_THRESHOLD);
+
+        let old = db
+            .load_messages_before_window("mika", CONTEXT_WINDOW)
+            .unwrap();
+        assert_eq!(old.len(), total - CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn test_replace_with_summary_preserves_recent() {
+        let (mut db, sid) = test_db_with_session();
+        for i in 0..60 {
+            db.save_message("mika", &sid, "user", &format!("msg {i}"), None)
+                .unwrap();
+        }
+
+        let old = db
+            .load_messages_before_window("mika", CONTEXT_WINDOW)
+            .unwrap();
+        let highest_id = old.last().unwrap().id;
+
+        db.replace_with_summary("mika", "Compacted summary", highest_id)
+            .unwrap();
+
+        let recent = db.load_recent_messages("mika", 30).unwrap();
+        assert_eq!(recent.len(), CONTEXT_WINDOW);
+        assert_eq!(recent[0].content, "msg 40");
+
+        let summary = db.load_conversation_summary("mika").unwrap().unwrap();
+        assert_eq!(summary.content, "Compacted summary");
+    }
+
+    #[test]
+    fn test_incremental_compaction() {
+        let (mut db, sid) = test_db_with_session();
+
+        for i in 0..60 {
+            db.save_message("mika", &sid, "user", &format!("batch1 msg {i}"), None)
+                .unwrap();
+        }
+
+        let old = db
+            .load_messages_before_window("mika", CONTEXT_WINDOW)
+            .unwrap();
+        let highest_id = old.last().unwrap().id;
+        db.replace_with_summary("mika", "First summary", highest_id)
+            .unwrap();
+
+        for i in 0..40 {
+            db.save_message("mika", &sid, "user", &format!("batch2 msg {i}"), None)
+                .unwrap();
+        }
+
+        let total = db.count_messages("mika").unwrap();
+        assert_eq!(total, 60);
+
+        let old = db
+            .load_messages_before_window("mika", CONTEXT_WINDOW)
+            .unwrap();
+        assert_eq!(old.len(), 40);
+        let highest_id = old.last().unwrap().id;
+        db.replace_with_summary("mika", "Merged summary", highest_id)
+            .unwrap();
+
+        let remaining = db.load_recent_messages("mika", 100).unwrap();
+        assert_eq!(remaining.len(), CONTEXT_WINDOW);
+
+        let summary = db.load_conversation_summary("mika").unwrap().unwrap();
+        assert_eq!(summary.content, "Merged summary");
+    }
+
+    #[test]
+    fn extract_tool_names_none_metadata() {
+        assert_eq!(extract_tool_names(&None), "");
+    }
+
+    #[test]
+    fn extract_tool_names_invalid_json() {
+        assert_eq!(extract_tool_names(&Some("not json".to_string())), "");
+    }
+
+    #[test]
+    fn extract_tool_names_empty_calls() {
+        assert_eq!(
+            extract_tool_names(&Some(r#"{"tool_calls":[]}"#.to_string())),
+            ""
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_single_tool() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_deduplicates() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0},{"name":"search_memory","step":1},{"name":"store_fact","step":2}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory, store_fact]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_shows_failure() {
+        let meta = r#"{"tool_calls":[{"name":"write_agent_file","step":0,"success":true},{"name":"read_agent_file","step":1,"success":false}]}"#;
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: write_agent_file, read_agent_file(err)]"
+        );
+    }
+
+    #[test]
+    fn extract_tool_names_deduplicates_with_failure() {
+        let meta = r#"{"tool_calls":[{"name":"search_memory","step":0,"success":true},{"name":"search_memory","step":1,"success":false}]}"#;
+        // First occurrence wins in dedup
+        assert_eq!(
+            extract_tool_names(&Some(meta.to_string())),
+            " [used: search_memory, search_memory(err)]"
+        );
+    }
+
+    #[test]
+    fn summarization_prompt_enforces_factual_shape() {
+        // Load-bearing: forcing-function prefix vocabulary (architectural commitment)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Fact:`"),
+            "load-bearing invariant: Fact: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Decision:`"),
+            "load-bearing invariant: Decision: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Outcome:`"),
+            "load-bearing invariant: Outcome: prefix must be in the prompt"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("`Open:`"),
+            "load-bearing invariant: Open: prefix must be in the prompt"
+        );
+
+        // Load-bearing: anti-conversational framing (meta-task + audience)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("NOT a record OF a conversation"),
+            "load-bearing invariant: meta-task reframe must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("did not participate"),
+            "load-bearing invariant: audience-non-participation framing must be present"
+        );
+
+        // Load-bearing: negative list (header + two of three categories)
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("Do NOT use"),
+            "load-bearing invariant: explicit negative list header must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("First-person"),
+            "load-bearing invariant: first-person prohibition must be present"
+        );
+        assert!(
+            SUMMARIZATION_SYSTEM_PROMPT.contains("Conversational verbs"),
+            "load-bearing invariant: conversational-verbs prohibition must be present"
+        );
+    }
+
+    // ── mika#2103: summary cap floors to a char boundary ──────────────────
+
+    /// AC2-shape — the byte budget lands inside a multi-byte character.
+    #[test]
+    fn cap_summary_multibyte_at_limit_does_not_panic() {
+        let mut s = "x".repeat(MAX_SUMMARY_BYTES - 1);
+        s.push('\u{e9}'); // 2 bytes: byte MAX_SUMMARY_BYTES is its second
+        s.push_str(&"y".repeat(100));
+        assert!(!s.is_char_boundary(MAX_SUMMARY_BYTES));
+
+        let out = cap_summary(s); // panicked before mika#2103
+
+        assert!(out.len() <= MAX_SUMMARY_BYTES);
+        assert!(!out.contains('\u{e9}'));
+    }
+
+    /// AC3-shape (anti-vacuity) — a summary under the cap is returned
+    /// byte-for-byte, so "always truncate to zero" cannot pass.
+    #[test]
+    fn cap_summary_under_limit_left_intact() {
+        let s = "r\u{e9}sum\u{e9} \u{2014} caf\u{e9}".to_string();
+        assert_eq!(cap_summary(s.clone()), s);
+    }
+
+    /// A summary exactly at the cap is left intact.
+    #[test]
+    fn cap_summary_exactly_at_limit_left_intact() {
+        let s = "x".repeat(MAX_SUMMARY_BYTES);
+        assert_eq!(cap_summary(s.clone()), s);
+    }
+}

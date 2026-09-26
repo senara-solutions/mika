@@ -1,0 +1,63 @@
+[skill]
+name = "content-request-fidelity"
+version = "0.1.0"
+description = "Prevent re-serving the same content (proverb, quote, joke, poem, story, recommendation, fact) to the same person. Structural gate via check_already_served + record_served_content ledger. Bilingual FR/EN triggers."
+always_on = false
+
+[triggers]
+# Bare high-signal content nouns (bilingual — Al is francophone).
+# Bare nouns that are *high-collision* in ordinary prose (`fait`, `histoire`,
+# `story`, `joke`, `fact`, `recommendation`, `recommandation`) are kept only in
+# phrase form below to avoid hijacking casual conversation (`c'est fait`,
+# `en fait`, `qu'est-ce que tu as fait`, `once upon a story`, etc.).
+keywords = [
+    "proverbe",
+    "proverb",
+    "citation",
+    "quote",
+    "poème",
+    "poem",
+    "blague",
+    # Partial-phrase triggers for content requests (per architect F3 sharpening
+    # + /ce:review P1-2 collision-audit): keep only phrase forms for high-
+    # collision words so ordinary prose stops activating the required_tools
+    # gate on unrelated turns.
+    "un joke",
+    "une joke",
+    "une histoire",
+    "a story",
+    "une recommandation",
+    "a recommendation",
+    "un fait",
+    "a fact",
+    "story about",
+    "joke about",
+    "quote from",
+    "quote about",
+    "proverb about",
+    "proverbe sur",
+    "blague sur",
+    "citation de",
+    "recommande-moi",
+    "recommend me",
+    "raconte-moi",
+    # Follow-up continuations (adversarial P2-8 — Al's 2-turn pattern where
+    # the second turn is "encore un" / "another one" and carries no bare
+    # content noun).
+    "encore un",
+    "encore une",
+    "un autre",
+    "une autre",
+    "another one",
+    "one more",
+    "give me another",
+    "redis-moi",
+    "redonne-moi",
+]
+
+[constraints]
+# Both halves of the ledger are load-bearing. Prompt-only enforcement of the
+# write half fails at loop substrate (feedback_prompt_enforcement_empirically_
+# confirmed_at_loop_substrate) — structural gate is the only durable
+# protection against a runaway LLM that skips the record step.
+required_tools = ["check_already_served", "record_served_content"]

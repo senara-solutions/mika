@@ -1,0 +1,655 @@
+//! `mika config` — view and manage configuration.
+
+use anyhow::Result;
+use mika_common::claude::is_oauth_token;
+use mika_common::config::{CONFIG_KEYS, ConfigBackend, get_effective_value, lookup_config_key};
+use std::path::Path;
+use std::process::Command;
+
+use crate::cli::{ConfigArgs, ConfigCommand};
+use crate::init;
+
+pub async fn run(args: ConfigArgs, agent_name: &str) -> Result<()> {
+    match args.command {
+        None => run_summary(agent_name).await,
+        Some(ConfigCommand::Edit) => run_edit(agent_name),
+        Some(ConfigCommand::Soul) => run_soul(agent_name),
+        Some(ConfigCommand::Get { key, verbose }) => run_get(agent_name, &key, verbose).await,
+        Some(ConfigCommand::Set { key, value }) => run_set(agent_name, &key, value).await,
+        Some(ConfigCommand::List { verbose, format }) => {
+            run_list(agent_name, verbose, &format).await
+        }
+    }
+}
+
+/// Original `mika config` (no subcommand) behavior — print summary.
+async fn run_summary(agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+
+    let active_config = ctx.settings.active_llm_config();
+    println!();
+    println!("  Mika Configuration");
+    println!("  Home:       {}", ctx.home_dir.display());
+    println!("  Provider:   {}", active_config.provider);
+    println!("  Model:      {}", ctx.settings.active_model_display());
+    println!("  Max tokens: {}", ctx.settings.llm_max_tokens);
+    println!("  Log level:  {}", ctx.settings.log_level);
+    println!("  DB path:    {}", ctx.settings.db_path.display());
+    let auth_display = match &active_config.api_key {
+        Some(key) => {
+            if is_oauth_token(key.trim()) {
+                "OAuth token [REDACTED]"
+            } else {
+                "API key [REDACTED]"
+            }
+        }
+        None => "[NOT SET]",
+    };
+    println!("  Auth:       {}", auth_display);
+    println!();
+
+    Ok(())
+}
+
+fn run_edit(agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let parts: Vec<&str> = editor.split_whitespace().collect();
+    if parts.is_empty() {
+        anyhow::bail!("$EDITOR is empty or whitespace-only");
+    }
+    let identity_path = ctx.home_dir.join("identity.toml");
+    let status = Command::new(parts[0])
+        .args(&parts[1..])
+        .arg(&identity_path)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("{editor} exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_soul(agent_name: &str) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+    let soul_path = ctx.home_dir.join("soul.md");
+    match std::fs::read_to_string(&soul_path) {
+        Ok(content) => print!("{content}"),
+        Err(_) => println!("No soul.md found at {}", soul_path.display()),
+    }
+    Ok(())
+}
+
+async fn run_get(agent_name: &str, key: &str, verbose: bool) -> Result<()> {
+    let info = lookup_config_key(key).ok_or_else(|| {
+        anyhow::anyhow!("Unknown config key: {key}\nRun `mika config list` to see all keys")
+    })?;
+
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+
+    let value = if info.backend == ConfigBackend::Database {
+        // DB keys need async lookup
+        ctx.async_db.get_customer_config(key).await?
+    } else {
+        get_effective_value(key, &ctx.settings)
+    };
+
+    let display_value = format_display_value(&value, info.secret);
+
+    if verbose {
+        let source = resolve_source(key, info, &ctx.home_dir, &ctx.global_home);
+        println!(
+            "{key} = {display_value} (source: {source}, backend: {:?})",
+            info.backend
+        );
+    } else {
+        println!("{display_value}");
+    }
+
+    Ok(())
+}
+
+async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<()> {
+    let info = lookup_config_key(key).ok_or_else(|| {
+        anyhow::anyhow!("Unknown config key: {key}\nRun `mika config list` to see all keys")
+    })?;
+
+    if info.backend == ConfigBackend::ReadOnly {
+        anyhow::bail!("{key} is read-only and cannot be changed");
+    }
+
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+
+    match info.backend {
+        ConfigBackend::File => {
+            let val =
+                value.ok_or_else(|| anyhow::anyhow!("Usage: mika config set {key} <value>"))?;
+            mika_common::validation::validate_file_key(key, &val)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            // Write to agent config.toml (per-agent override)
+            let config_path = ctx.home_dir.join("config.toml");
+            write_config_toml(&config_path, key, &val)?;
+
+            // Warn if env var overrides
+            if let Some(env_var) = info.env_var
+                && std::env::var(env_var).is_ok()
+            {
+                eprintln!(
+                    "Note: {env_var} environment variable is set and takes priority over config.toml"
+                );
+            }
+
+            println!("Set {key} = {val}");
+        }
+        ConfigBackend::Env => {
+            let env_key = info
+                .env_var
+                .ok_or_else(|| anyhow::anyhow!("No env var mapping for {key}"))?;
+
+            if info.secret {
+                // Secret keys: never accept value from CLI args
+                if value.is_some() {
+                    eprintln!("Warning: secret keys should not be passed as CLI arguments.");
+                    eprintln!("The value argument will be ignored. You will be prompted securely.");
+                }
+
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    anyhow::bail!(
+                        "Secret keys require an interactive terminal.\n\
+                         Set {} as an environment variable instead.",
+                        env_key
+                    );
+                }
+
+                let secret = dialoguer::Password::new()
+                    .with_prompt(format!("Enter value for {key}"))
+                    .interact()?;
+
+                if secret.trim().is_empty() {
+                    anyhow::bail!("Value cannot be empty");
+                }
+
+                mika_common::dotenv::set_env_var(&ctx.global_home, env_key, &secret)?;
+            } else {
+                // Non-secret env keys: accept CLI value or prompt with visible input
+                let val = match value {
+                    Some(v) => v,
+                    None => {
+                        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                            anyhow::bail!(
+                                "Usage: mika config set {key} <value>\n\
+                                 Or set {} as an environment variable.",
+                                env_key
+                            );
+                        }
+                        dialoguer::Input::<String>::new()
+                            .with_prompt(format!("Enter value for {key}"))
+                            .interact_text()?
+                    }
+                };
+
+                if val.trim().is_empty() {
+                    anyhow::bail!("Value cannot be empty");
+                }
+
+                mika_common::dotenv::set_env_var(&ctx.global_home, env_key, val.trim())?;
+            }
+
+            println!("Set {key} in ~/.mika/.env");
+        }
+        ConfigBackend::Database => {
+            let val =
+                value.ok_or_else(|| anyhow::anyhow!("Usage: mika config set {key} <value>"))?;
+            mika_agent::config_keys::validate_config_value(key, &val)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            warn_session_scope_on_non_singleton(key, &val, &ctx.home_dir);
+            ctx.async_db.set_customer_config(key, &val).await?;
+            println!("Set {key} = {val}");
+        }
+        ConfigBackend::ReadOnly => unreachable!(),
+    }
+
+    Ok(())
+}
+
+/// Warn — never refuse — when `context_history_scope=session` lands on an agent
+/// that mints a fresh session per inbound message (mika#2425 U6/AC7).
+///
+/// # What the operator would otherwise not learn until it was too late
+///
+/// L8 measured that `scope = session` removes 86–99 % of the window. That
+/// measurement was taken on a population whose sessions carry several messages
+/// (CLI `mika chat`, A2A calls with a stable `--session-id`, singleton agents).
+/// On a Telegram tenant it does not remove 90 %, it **empties**: `MessageRequest`
+/// carries no `session_id`, so the `/message` handler mints a fresh
+/// `Uuid::new_v4()` per inbound message unless the agent declares
+/// `[session] singleton = true` — and neither the default nor the family
+/// identity does. For such an agent a "session" *is* a message, so the window
+/// keeps the current turn and nothing before it.
+///
+/// # Why it warns and does not refuse
+///
+/// An agent driven over CLI or A2A with stable `--session-id`s is a legitimate
+/// population, and refusing would turn this ticket's lever into a prohibition.
+/// The line names the consequence and the probe, so the decision stays the
+/// operator's — with the fact in hand rather than after the fact.
+fn warn_session_scope_on_non_singleton(key: &str, value: &str, agent_home: &Path) {
+    use mika_agent::config_keys::{CONTEXT_HISTORY_SCOPE_KEY, parse_context_history_scope};
+
+    if key != CONTEXT_HISTORY_SCOPE_KEY
+        || parse_context_history_scope(value) != Some(mika_agent::prompt::HistoryScope::Session)
+    {
+        return;
+    }
+    // A fail-closed identity (absent or malformed file) carries `singleton =
+    // false`, so it warns. That is the safe direction: the warning costs a
+    // paragraph, the silence costs a window.
+    if mika_agent::prompt::load_identity(agent_home)
+        .session
+        .singleton
+    {
+        return;
+    }
+
+    eprintln!(
+        "Warning: this agent mints a fresh session per inbound message \
+         (no `[session] singleton = true` in identity.toml)."
+    );
+    eprintln!(
+        "         For such an agent a \"session\" IS a message, so \
+         `{CONTEXT_HISTORY_SCOPE_KEY} = session` does not trim the conversation \
+         window — it empties it. The turn keeps its own message and nothing before it."
+    );
+    eprintln!(
+        "         Core memory, structured facts and the conversation summary are \
+         agent-scoped and survive; the raw history of the last turns does not."
+    );
+    eprintln!(
+        "         Measure before deciding: grep context_window_assembled \
+         \"$MIKA_SPIRIT_LOG_FILE\" | jq '{{message_count, distinct_sessions}}' — \
+         if both are 1 on nearly every line, there is nothing here to trim."
+    );
+    eprintln!("         Cancel with: mika config set {CONTEXT_HISTORY_SCOPE_KEY} agent");
+}
+
+async fn run_list(
+    agent_name: &str,
+    verbose: bool,
+    format: &crate::cli::OutputFormat,
+) -> Result<()> {
+    let ctx = init::init_db_only_for_agent(agent_name)?;
+
+    // Pre-fetch all DB config
+    let db_configs = ctx.async_db.list_customer_config().await?;
+
+    match format {
+        crate::cli::OutputFormat::Json => {
+            let entries: Vec<serde_json::Value> = CONFIG_KEYS
+                .iter()
+                .map(|info| {
+                    let value = if info.backend == ConfigBackend::Database {
+                        db_configs
+                            .iter()
+                            .find(|(k, _)| k == info.key)
+                            .map(|(_, v)| v.clone())
+                    } else {
+                        get_effective_value(info.key, &ctx.settings)
+                    };
+                    let display_value = if info.secret {
+                        value.as_ref().map(|v| {
+                            if v.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String("[REDACTED]".to_string())
+                            }
+                        })
+                    } else {
+                        value.as_ref().map(|v| serde_json::Value::String(v.clone()))
+                    };
+                    serde_json::json!({
+                        "key": info.key,
+                        "value": display_value.unwrap_or(serde_json::Value::Null),
+                        "backend": format!("{:?}", info.backend).to_lowercase(),
+                        "env_var": info.env_var,
+                        "secret": info.secret,
+                        "description": info.description,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        }
+        crate::cli::OutputFormat::Yaml => {
+            let entries: Vec<serde_json::Value> = CONFIG_KEYS
+                .iter()
+                .map(|info| {
+                    let value = if info.backend == ConfigBackend::Database {
+                        db_configs
+                            .iter()
+                            .find(|(k, _)| k == info.key)
+                            .map(|(_, v)| v.clone())
+                    } else {
+                        get_effective_value(info.key, &ctx.settings)
+                    };
+                    let display_value = if info.secret {
+                        value.as_ref().map(|v| {
+                            if v.is_empty() {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String("[REDACTED]".to_string())
+                            }
+                        })
+                    } else {
+                        value.as_ref().map(|v| serde_json::Value::String(v.clone()))
+                    };
+                    serde_json::json!({
+                        "key": info.key,
+                        "value": display_value.unwrap_or(serde_json::Value::Null),
+                        "backend": format!("{:?}", info.backend).to_lowercase(),
+                        "env_var": info.env_var,
+                        "secret": info.secret,
+                        "description": info.description,
+                    })
+                })
+                .collect();
+            print!("{}", serde_yaml::to_string(&entries)?);
+        }
+        crate::cli::OutputFormat::Text => {
+            println!();
+            println!("  Mika Configuration Keys");
+            println!();
+
+            for info in CONFIG_KEYS {
+                let value = if info.backend == ConfigBackend::Database {
+                    db_configs
+                        .iter()
+                        .find(|(k, _)| k == info.key)
+                        .map(|(_, v)| v.clone())
+                } else {
+                    get_effective_value(info.key, &ctx.settings)
+                };
+
+                let display_value = format_display_value(&value, info.secret);
+
+                if verbose {
+                    let source = resolve_source(info.key, info, &ctx.home_dir, &ctx.global_home);
+                    println!(
+                        "  {:<24} {:<30} ({}, {:?})",
+                        info.key, display_value, source, info.backend
+                    );
+                } else {
+                    println!("  {:<24} {}", info.key, display_value);
+                }
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a config value for display, redacting secrets.
+fn format_display_value(value: &Option<String>, secret: bool) -> String {
+    match value {
+        Some(v) if secret => {
+            if v.is_empty() {
+                "[NOT SET]".to_string()
+            } else {
+                "[REDACTED]".to_string()
+            }
+        }
+        Some(v) => v.clone(),
+        None => "[NOT SET]".to_string(),
+    }
+}
+
+/// Determine where the current value is coming from.
+fn resolve_source(
+    key: &str,
+    info: &mika_common::config::ConfigKeyInfo,
+    agent_home: &Path,
+    global_home: &Path,
+) -> String {
+    // mika#2218 — when the agent has a home of its own, its `.env` is the
+    // HIGHEST-priority source and outranks the process env, so it must be
+    // checked first. Reporting "env var" for a value the agent actually reads
+    // from its own `.env` would mislead exactly the operator debugging an
+    // identity mismatch — which is the surface mika#2218 was diagnosed on.
+    // See `Settings::load_for_agent` for the cascade.
+    if agent_home != global_home
+        && let Some(env_var) = info.env_var
+        && env_key_exists(&agent_home.join(".env"), env_var)
+    {
+        return "agent .env".to_string();
+    }
+
+    // Check env var override (highest priority for File/Env backend keys)
+    if let Some(env_var) = info.env_var
+        && std::env::var(env_var).is_ok()
+    {
+        return format!("env var ({env_var})");
+    }
+
+    match info.backend {
+        ConfigBackend::File => {
+            // Check agent config.toml
+            let agent_config = agent_home.join("config.toml");
+            if toml_key_exists(&agent_config, key) {
+                return "agent config.toml".to_string();
+            }
+            // Check global config.toml
+            let global_config = global_home.join("config.toml");
+            if toml_key_exists(&global_config, key) {
+                return "global config.toml".to_string();
+            }
+            "default".to_string()
+        }
+        ConfigBackend::Env => {
+            // Check .env file
+            let env_path = global_home.join(".env");
+            if let Some(env_var) = info.env_var
+                && env_key_exists(&env_path, env_var)
+            {
+                return ".env file".to_string();
+            }
+            "not set".to_string()
+        }
+        ConfigBackend::Database => "database".to_string(),
+        ConfigBackend::ReadOnly => "runtime".to_string(),
+    }
+}
+
+/// Check if a key exists in a TOML file.
+fn toml_key_exists(path: &Path, key: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .is_some_and(|t| t.contains_key(key))
+}
+
+/// Check if a key exists in a .env file.
+fn env_key_exists(path: &Path, key: &str) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|content| {
+        content.lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with('#')
+                && !trimmed.is_empty()
+                && trimmed
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == key)
+        })
+    })
+}
+
+/// Write a key-value pair to a TOML config file using toml_edit to preserve comments.
+/// Creates the file if it doesn't exist. Uses atomic write (temp + rename).
+pub(crate) fn write_config_toml(path: &Path, key: &str, value: &str) -> Result<()> {
+    let content = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?;
+
+    // Set the value with appropriate type
+    let toml_value = match key {
+        "llm_max_tokens" | "spirit_port" | "embedding_dimensions" => {
+            let n: i64 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("{key} must be an integer"))?;
+            toml_edit::value(n)
+        }
+        _ => toml_edit::value(value),
+    };
+    doc[key] = toml_value;
+
+    // Atomic write
+    let tmp_path = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("config.toml")
+    ));
+    std::fs::write(&tmp_path, doc.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_config_toml_creates_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_config_toml(&path, "anthropic_model", "claude-opus-4-6").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("anthropic_model = \"claude-opus-4-6\""));
+    }
+
+    #[test]
+    fn test_write_config_toml_preserves_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "# My comment\nlog_level = \"info\"\n").unwrap();
+
+        write_config_toml(&path, "anthropic_model", "claude-opus-4-6").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("# My comment"));
+        assert!(content.contains("log_level = \"info\""));
+        assert!(content.contains("anthropic_model = \"claude-opus-4-6\""));
+    }
+
+    #[test]
+    fn test_write_config_toml_updates_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "anthropic_model = \"old-model\"\n").unwrap();
+
+        write_config_toml(&path, "anthropic_model", "new-model").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("anthropic_model = \"new-model\""));
+        assert!(!content.contains("old-model"));
+    }
+
+    #[test]
+    fn test_write_config_toml_integer_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        write_config_toml(&path, "llm_max_tokens", "8192").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("llm_max_tokens = 8192"));
+    }
+
+    #[test]
+    fn test_toml_key_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "llm_provider = \"anthropic\"\n").unwrap();
+
+        assert!(toml_key_exists(&path, "llm_provider"));
+        assert!(!toml_key_exists(&path, "log_level"));
+    }
+
+    #[test]
+    fn test_env_key_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".env");
+        std::fs::write(&path, "# comment\nMIKA_ANTHROPIC_API_KEY=\"test\"\n").unwrap();
+
+        assert!(env_key_exists(&path, "MIKA_ANTHROPIC_API_KEY"));
+        assert!(!env_key_exists(&path, "MIKA_OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn test_env_key_exists_ignores_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".env");
+        std::fs::write(&path, "# MIKA_KEY=value\n").unwrap();
+
+        assert!(!env_key_exists(&path, "MIKA_KEY"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_config_toml_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        write_config_toml(&path, "log_level", "debug").unwrap();
+
+        let perms = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(perms, 0o600);
+    }
+
+    #[test]
+    fn test_format_display_value() {
+        assert_eq!(format_display_value(&Some("hello".into()), false), "hello");
+        assert_eq!(
+            format_display_value(&Some("secret".into()), true),
+            "[REDACTED]"
+        );
+        assert_eq!(format_display_value(&Some("".into()), true), "[NOT SET]");
+        assert_eq!(format_display_value(&None, false), "[NOT SET]");
+        assert_eq!(format_display_value(&None, true), "[NOT SET]");
+    }
+
+    #[test]
+    fn test_get_effective_value_covers_all_non_db_non_env_keys() {
+        use mika_common::config::{CONFIG_KEYS, ConfigBackend};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // Create minimal config.toml so Settings::load doesn't fail
+        std::fs::write(home.join("config.toml"), "").unwrap();
+        let settings = mika_common::config::Settings::load(home).unwrap();
+
+        for info in CONFIG_KEYS {
+            match info.backend {
+                ConfigBackend::File | ConfigBackend::ReadOnly => {
+                    // Should not panic — every File/ReadOnly key must have a branch
+                    let _ = get_effective_value(info.key, &settings);
+                }
+                ConfigBackend::Env | ConfigBackend::Database => {
+                    // Env/DB keys are resolved through other paths, skip
+                }
+            }
+        }
+    }
+}

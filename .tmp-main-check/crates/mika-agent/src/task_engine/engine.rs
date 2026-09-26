@@ -1,0 +1,9791 @@
+use anyhow::Result;
+use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
+
+use crate::skills::executor::RearmOutcome;
+
+use crate::async_db::AsyncDatabase;
+use crate::db::NewTask;
+
+use super::cron::{
+    extract_timezone_from_metadata, next_fire_from_cron, next_fire_from_cron_tz, parse_timezone,
+};
+use super::dispatcher::TaskDispatcher;
+use super::liveness::EngineHeartbeat;
+use super::pilot_transcript;
+use super::queue::QueuedTask;
+use super::types::{action_type, task_status, trigger_type};
+
+/// Maximum tasks fired per tick to prevent overrun when many tasks are overdue.
+const MAX_PER_TICK: usize = 10;
+
+/// How many ticks between periodic DB scans for tasks created outside the engine.
+const DB_SCAN_INTERVAL_TICKS: u64 = 60;
+
+/// What the dispatch children of a tracking row say about its liveness.
+///
+/// Three-valued on purpose (mika#2156). A sweep decides whether to write a
+/// destructive `failed`, and "the work is dead" and "we could not ask" are not
+/// the same answer — collapsing them would let an unreadable signal authorise
+/// the transition this ticket exists to prevent.
+#[derive(Debug)]
+enum DispatchLiveness {
+    /// A child's `(pid, start_time)` pair still resolves to a running process.
+    /// Spare the row.
+    Live { child_id: String, pid: i64 },
+    /// There is no child, or every child's process is gone or carries no
+    /// usable start time. Sweep — this is the sweeper's reason to exist.
+    NoneLive { unusable_children: u32 },
+    /// The lookup itself failed. Neither answer is available, so make no
+    /// claim: skip the row and let the next pass ask again.
+    Unknown,
+}
+
+/// What the dispatch-parent settler does with one row (mika#2405, U2 step 1).
+#[derive(Debug, PartialEq, Eq)]
+enum SettleAction<'a> {
+    /// Spare the row and write nothing. `reason` is the value of the
+    /// `dispatch_parent_settle_spared` log field; `child` names the live child
+    /// when there is one to name.
+    Spare {
+        reason: &'static str,
+        child: Option<(&'a str, i64)>,
+    },
+    /// Close the row. `unusable_children` rides on the settle line rather than
+    /// blocking the close — see below for why.
+    Settle { unusable_children: u32 },
+}
+
+/// Decide one row from what its dispatch children say (mika#2405, U2 step 1).
+///
+/// A **pure function** rather than a branch of the settler's loop, and that is
+/// deliberate on two counts. It is the only way to exercise
+/// [`DispatchLiveness::Unknown`], whose producer is a DB error nothing can
+/// inject end to end; and it makes "the three variants are decided separately"
+/// a property of the function, carrying its own test, rather than a shape a
+/// reader has to re-derive from the loop.
+///
+/// The three arms, each for its own reason:
+///
+/// - `Live` → spare. A dispatch is still running under this row.
+/// - `Unknown` → spare. The child lookup itself failed, and **a signal that
+///   cannot be read is never a satisfied term** (mika#2277, mika#2279). The
+///   variant's own doc prescribes exactly this reading: make no claim, let the
+///   next pass ask again.
+/// - `NoneLive` → settle, **including when `unusable_children > 0`**. This is a
+///   deliberate divergence from the phantom sweep, named here rather than
+///   discovered later. A child carrying a PID with no readable
+///   `process_start_time` is indistinguishable from a dead one, so sparing on it
+///   would be *permanent* and would make this closer inert on precisely the
+///   abnormal population it exists to close. The asymmetry leans the right way
+///   **here** because the verdict is `completed` on a correlation token: a false
+///   positive closes a tracking row early and signals **no** process (unlike the
+///   mika#2249 reaper, which kills), whereas inertia reinstates the defect. The
+///   count rides on the settle line so the divergence stays countable.
+fn settle_action(liveness: &DispatchLiveness) -> SettleAction<'_> {
+    match liveness {
+        DispatchLiveness::Live { child_id, pid } => SettleAction::Spare {
+            reason: "live",
+            child: Some((child_id.as_str(), *pid)),
+        },
+        DispatchLiveness::Unknown => SettleAction::Spare {
+            reason: "unknown",
+            child: None,
+        },
+        DispatchLiveness::NoneLive { unusable_children } => SettleAction::Settle {
+            unusable_children: *unusable_children,
+        },
+    }
+}
+
+/// Grace period (seconds) before the reaper transitions an orphaned parent
+/// self_dev task to `failed`. 600s ≈ 3× the upper bound of observed callback
+/// duration (mika#868 audit: 187s LLM latency). Long enough for #870's
+/// re-enter recovery to complete; short enough that the operator's dispatch
+/// queue clears within one tick-cycle after grace expires. See #871.
+const REAPER_GRACE_SECONDS: i64 = 600;
+
+/// Default grace window (seconds) before the childless-parent reaper transitions
+/// a self_dev issue parent left `in_progress` with **zero** callback children to
+/// `failed` (mika#1687). Deliberately far larger than [`REAPER_GRACE_SECONDS`]
+/// (600): a legitimately-dispatching parent is childless only for the sub-second
+/// window between its `pending → in_progress` transition and the callback child
+/// row commit inside `spawn_long_running_exec()`. 30 min removes any plausible
+/// in-flight false positive (the ticket's real cases were 100–180 min old).
+/// Overridable via `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS`.
+const CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS: i64 = 1800;
+
+/// Env var overriding [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`].
+const CHILDLESS_PARENT_REAPER_GRACE_ENV: &str = "MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS";
+
+/// Default grace window (seconds) before the stuck-pending reaper acts on a
+/// `pending` self_dev issue parent that nothing represents any more (mika#2045).
+///
+/// The nominal `pending → failed` transition was measured at 17–25 minutes over
+/// the full history of mika#1887. 45 minutes sits at 1.8x the top of that window
+/// and stays under the hour, so a task that is merely slow is never touched.
+/// Overridable via `MIKA_STUCK_PENDING_REAPER_GRACE_SECS`.
+const STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS: i64 = 2700;
+
+/// Env var overriding [`STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS`].
+const STUCK_PENDING_REAPER_GRACE_ENV: &str = "MIKA_STUCK_PENDING_REAPER_GRACE_SECS";
+
+/// Window (seconds) during which a *promoted* deferred wrapper still counts as
+/// representing its parent for the stuck-pending reaper (mika#2181).
+///
+/// Promotion writes `status = 'completed'` on the wrapper; the silent turn that
+/// consumes it only reaches `delivered` when it returns, several minutes later
+/// under a slow model. A predicate that counts only `pending` wrappers treats
+/// the parent as unrepresented for that whole window, re-arms it every tick, and
+/// burns `MAX_STUCK_REARMS` in two minutes — the mika#2181 trace exactly.
+///
+/// The window is **bounded** on purpose. `completed`-without-`delivered` is not
+/// a guaranteed-transient state: on the silent-turn error path
+/// (`dispatcher.rs`, `is_callback && label == DEFERRED_DISPATCH_LABEL`) the
+/// wrapper is re-armed but never marked `delivered`, so it stays `completed`
+/// forever. An unbounded predicate would turn that corpse into a permanent
+/// shield and leak in the other direction.
+///
+/// 2700 s, measured on `~/.mika/data/mika.db` — elapsed between `completed_at`
+/// (promotion) and the `delivered` transition, deferred wrappers actually
+/// delivered:
+///
+/// | window | n | <=300 s | <=900 s | <=1800 s | <=2700 s |
+/// |---|---|---|---|---|---|
+/// | 30 d | 799 | 417 (52%) | 569 (71%) | 616 (77%) | 660 (**83%**) |
+/// | 7 d | 609 | 320 (53%) | 430 (71%) | 467 (77%) | 506 (**83%**) |
+///
+/// (p50 = 247 s.) **Two honest limits on that 83 %, both measured:**
+///
+/// 1. **The remaining 17 % is not covered by any value of this constant.** 139
+///    of the 799 wrappers delivered past 2700 s; 81 of their parents were
+///    expired with `stuck_pending_no_deferred_wrapper`, and 8 of those were
+///    expired 2820-4996 s after promotion — past any shield this window can
+///    give. Roughly a tenth of the historical false-expiry class survives this
+///    fix. Raising the constant is not the answer: the long tail is server
+///    restarts and `AgentBusy` delays, and a restart-delayed wrapper is a
+///    *healthy* wrapper, so a bigger number buys coverage by blinding the
+///    reaper for longer. Retiring the residue needs a direct liveness measure
+///    (activity-row recency, the shape mika#1652 already uses for team runs),
+///    not a bigger proxy window. Tracked separately.
+/// 2. **The shield is re-armed by the repair ladder.** A re-arm mints a fresh
+///    `pending` wrapper, the next tick promotes it and writes a new
+///    `completed_at`, and the parent is sheltered again for a full window. The
+///    worst case is therefore `grace + (MAX_STUCK_REARMS + 1) * liveness`, not
+///    `grace + liveness`. It stays bounded only because the re-arm budget is
+///    spent and never reset — that budget, not this constant, is what
+///    terminates the ladder.
+///
+/// Equality with [`STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS`] is still the value
+/// worth choosing: one promotion cannot hide a parent for longer than the grace
+/// took to call it stuck. It is a *separate* constant rather than a reuse of the
+/// grace because the two numbers answer two different questions and must be able
+/// to diverge under their env vars.
+/// Overridable via `MIKA_PROMOTED_WRAPPER_LIVENESS_SECS` (clamped, see
+/// [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]).
+const PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS: i64 = 2700;
+
+/// Env var overriding [`PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`].
+const PROMOTED_WRAPPER_LIVENESS_ENV: &str = "MIKA_PROMOTED_WRAPPER_LIVENESS_SECS";
+
+/// Upper clamp on the liveness window (30 days), and it is not cosmetic.
+///
+/// SQLite's `strftime('...', 'now', '-N seconds')` returns **NULL** for an
+/// out-of-range modifier, and `x > NULL` is NULL — so an absurdly large override
+/// does not widen the window, it makes the `completed` arm unsatisfiable and
+/// silently restores the exact mika#2181 predicate this constant exists to
+/// repair. A knob whose extreme setting reverts the fix without a word must
+/// fail closed. The sibling grace var needs no clamp: its modifier feeds a
+/// `parent.created_at <` comparison where NULL merely selects nothing.
+const PROMOTED_WRAPPER_LIVENESS_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Window (seconds) within which an activity row on a deferred wrapper's session
+/// proves the turn is working (mika#2184).
+///
+/// This is the **direct** measure that succeeds mika#2181's proxy window, and
+/// the two coexist deliberately: the proxy filters first, in SQL (R4), and this
+/// one filters afterwards, in the application, where it can log what it saw
+/// (D1/R2).
+///
+/// 600 s = 2× the default per-agent turn envelope (`AGENT_TOTAL_TIMEOUT`, 300 s,
+/// mika#2189). A turn that is working writes one `llm_calls` row per call, and
+/// two consecutive calls are separated by at most the per-call plafond (120 s by
+/// default) plus processing — so 600 s covers a whole turn **and** the interval
+/// to the next, with a factor of 2 of margin. Neighbouring landmark: mika#1652
+/// uses 300 s for team runs; being deliberately twice as generous is the right
+/// direction here, because the expensive error is killing a live turn.
+const STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS: i64 = 600;
+
+/// Env var overriding [`STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS`].
+const STUCK_PENDING_ACTIVITY_WINDOW_ENV: &str = "MIKA_STUCK_PENDING_ACTIVITY_WINDOW_SECS";
+
+/// Upper clamp on the activity window (30 days), and it is **not** the same
+/// mechanism as [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`].
+///
+/// That sibling clamps a value that reaches a SQLite `strftime` modifier, where
+/// an out-of-range setting silently reverts the fix. This threshold never enters
+/// the SQL at all (mika#2184 D1), so no NULL can be produced. The clamp is here
+/// for the coherence of the knob: an absurd setting would spare every parent for
+/// ever, which is exactly what [`WrapperActivity::NotRecorded`] already refuses
+/// on the other axis — better that the knob refuse it too, and say so.
+const STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Log event **and** audit `tool_name` for a parent spared by the direct
+/// activity measure (mika#2184, U4/D6).
+///
+/// SOLE WRITER: `TaskEngine::record_activity_spare`.
+///
+/// **Deliberately distinct from `stuck_pending_sheltered_by_promoted_wrapper`**,
+/// and the letter of AC4 is rectified here rather than followed (D6). That name
+/// *carries its own cause*; routing a spare that has nothing to do with a
+/// promoted wrapper through it would make the name false, and would split in two
+/// the population mika#2181's probe counts to measure whether its debt is being
+/// retired. The house has an established way to keep two populations countable
+/// apart, used three times: `phantom_aged_out` / `phantom_sweep_spared`
+/// (mika#2156), `qa_deadline_verdict` / `qa_callback_verdict` (mika#2368),
+/// `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). AC4's *intent* —
+/// the two causes are distinguishable — is held; its letter is corrected.
+const STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT: &str = "stuck_pending_sheltered_by_activity";
+
+// ── mika#2515 U2 — l'alerte « un build vert, un verdict qui n'arrive pas » ──
+
+/// Log event **et** audit `tool_name` de l'alerte mika#2515 U2.
+///
+/// **SOLE WRITER** : [`TaskEngine::alert_undelivered_build_verdicts`], épinglé
+/// par un scan de source à allowlist vide. C'est cette propriété qui fait du
+/// `GROUP BY after_value` de l'opérateur un compte **exact** plutôt qu'un nombre
+/// sur lequel deux écrivains peuvent ne pas être d'accord — et ce compte est la
+/// précondition explicite du suivi « poster sur quarantaine ».
+const QA_BUILD_VERDICT_UNDELIVERED_EVENT: &str = "qa_build_verdict_undelivered";
+
+/// Kill-switch de l'alerte (mika#2515). Désarmé, le balayage n'écrit **rien** :
+/// il ne « s'abstient » pas, il n'existe pas ce tick.
+const QA_BUILD_VERDICT_ALERT_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT";
+
+/// Env var surchargeant [`QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS`].
+const QA_BUILD_VERDICT_ALERT_AGE_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT_AGE_SECS";
+
+/// Fenêtre avant alerte (mika#2515). **Arithmétique, pas une rondeur** : l'AC
+/// demande « dans les 10 minutes », le balayage tourne à
+/// [`DB_SCAN_INTERVAL_TICKS`] (60 s), donc `540 + 60 = 600 s` est la borne haute
+/// effective.
+///
+/// Le knob existe parce que le nombre est **posé contre l'AC, pas mesuré** :
+/// mika#2179 a mesuré la latence de livraison de *tous* les callbacks
+/// (`p50 = 377 s`, `p90 = 9585 s`), mais la sous-population « callback de build
+/// dont un tour QA attend le retour » n'a jamais été mesurée. Asymétrie assumée,
+/// celle que mika#2496 écrit pour son propre seuil de coût : **un seuil d'alerte
+/// ne coupe rien** — un faux positif coûte une ligne de WARN. Et la population
+/// est minuscule (un callback de build n'existe que quand une revue QA dispatche
+/// un build), donc même un taux de déclenchement élevé fait quelques lignes par
+/// jour, chacune nommant une PR qui attend réellement son verdict.
+///
+/// **Halte si la distribution montre du trafic nominal : c'est le seuil qui
+/// monte, jamais l'alerte qu'on désarme.**
+const QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS: i64 = 540;
+
+/// Borne haute de la fenêtre (30 jours), pour la cohérence du knob : un réglage
+/// absurde rendrait l'alerte muette sans rien dire — la panne silencieuse que ce
+/// ticket ferme, reproduite par son propre réglage.
+const QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Env var surchargeant [`QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS`].
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV: &str = "MIKA_QA_BUILD_VERDICT_ALERT_LOOKBACK_DAYS";
+
+/// Profondeur du `since` passé à `get_undelivered_callback_tasks` (mika#2515).
+///
+/// 7 jours : la valeur que `dispatch_undelivered_callbacks` emploie déjà, pour
+/// que les deux bras voient la **même population**. Les faire diverger créerait
+/// une poche de lignes qu'un bras tente de livrer et que l'autre n'alerte
+/// jamais — ou l'inverse.
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS: i64 = 7;
+
+/// Borne haute du lookback (90 jours) : la rétention d'`audit_events`
+/// (`AUDIT_RETENTION_DAYS`) au-delà de laquelle la déduplication ne peut plus
+/// rien voir, donc au-delà de laquelle une ligne serait ré-alertée sans fin.
+const QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS: i64 = 90;
+
+/// Horizon de déduplication de l'alerte (24 h, doctrine mika#2131).
+///
+/// L'information durable est « ce verdict est retenu par cette cause », pas
+/// « il l'était encore à 14 h 32 » : à 60 s de cadence et 9 min de fenêtre, une
+/// ligne par passe par PR serait exactement le churn que la doctrine borne. Un
+/// **changement** de cause réécrit — c'est un changement d'état.
+const QA_BUILD_VERDICT_ALERT_DEDUP_HOURS: i64 = 24;
+
+/// Env var overriding the promotion-starvation indicator threshold (mika#2169,
+/// L2b).
+const DEFERRED_PROMOTION_STALE_ENV: &str = "MIKA_DEFERRED_PROMOTION_STALE_SECS";
+
+/// Default age past which a promoted-but-untaken wrapper is reported
+/// (mika#2169, L2b). 900 s, on the model of `stuck_pending_reaper_grace_secs`.
+///
+/// This threshold drives a **warning only** — never a mutation. That is the
+/// whole point: the one latency actually measured on this path is 2 h 47 min
+/// (wrapper `f0cd5967`, promoted 00:48:11Z, delivered 03:35:31Z on
+/// 2026-09-04), so a threshold that acted would have destroyed twenty-two
+/// wrappers that were about to be served. We measure first.
+const DEFERRED_PROMOTION_STALE_DEFAULT_SECS: i64 = 900;
+
+/// `schema_meta` key holding the instant L1 first ran in production
+/// (mika#2169, L2b). See `Database::stamp_schema_meta_epoch_if_absent`.
+const DEFERRED_PROMOTION_EPOCH_KEY: &str = "deferred_promotion_epoch";
+
+/// Kill-switch for the dispatch-parent settler (mika#2405, U3).
+const DISPATCH_PARENT_SETTLE_ENABLED_ENV: &str = "MIKA_DISPATCH_PARENT_SETTLE_ENABLED";
+
+/// Env var overriding [`DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS`].
+const DISPATCH_PARENT_SETTLE_GRACE_ENV: &str = "MIKA_DISPATCH_PARENT_SETTLE_GRACE_SECS";
+
+/// Grace window (seconds) before the settler closes a `manual` tracking row
+/// whose every callback child is terminal (mika#2405).
+///
+/// Deliberately **equal** to [`REAPER_GRACE_SECONDS`]: the #871/#1162 pair
+/// bounds the *same* parent↔child transition, and two grammars of grace for one
+/// question is a reading debt. It is nevertheless its own constant rather than a
+/// reuse, for the reason [`PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS`] states: the
+/// two numbers answer two questions and must be able to diverge under their env
+/// vars.
+///
+/// The cost of the window is named rather than hidden: up to one pass of delay
+/// on a row whose only function is dispatch correlation.
+const DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS: i64 = REAPER_GRACE_SECONDS;
+
+/// Upper clamp on the settle grace (30 days), same mechanism and same reason as
+/// [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]: SQLite's
+/// `strftime('...', 'now', '-N seconds')` returns **NULL** for an out-of-range
+/// modifier, and `x < NULL` is NULL — so an absurd override would not widen the
+/// window, it would make the `HAVING` clause unsatisfiable and disarm the
+/// settler without a word.
+const DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Log event **and** audit `tool_name` for a settled dispatch parent
+/// (mika#2405, U2 step 3 / U4).
+///
+/// SOLE WRITER: `TaskEngine::settle_dispatch_parents`. One constant, referenced
+/// from both surfaces, so the source scan
+/// `mika2405_the_settled_event_has_exactly_one_writer_in_production` sees a
+/// single literal. The absence of this name under a symptom is then itself
+/// information — the same reasoning that gave `phantom_aged_out` and
+/// `qa_callback_verdict` their own names.
+const DISPATCH_PARENT_SETTLED_EVENT: &str = "dispatch_parent_settled";
+
+/// Motif written to `tasks.result` on a settled parent.
+///
+/// `completed`, never `failed`: the row is a correlation token demanded by the
+/// Delegation Rule, and its function is discharged the moment its dispatch came
+/// back. Success or failure of the *work* is carried by the child and by the
+/// posted review, never by this token. `failed` would assert a breakage nothing
+/// establishes — which is defect #1 of the phantom sweep as a net for this
+/// population.
+const DISPATCH_PARENT_SETTLE_MOTIF: &str =
+    "dispatch_parent_settled: every callback child reached a terminal status";
+
+/// Ticks between pilot-transcript retention sweeps (mika#1705 AC6). At the 1s
+/// tick cadence, 86_400 ticks ≈ 24h — a daily prune, matching the plan's
+/// "daily tick deletes rows older than N days". Startup also runs one sweep.
+const PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS: u64 = 86_400;
+
+/// Env var overriding the pilot-transcript retention window (mika#1705 AC6).
+const PILOT_TRANSCRIPT_RETENTION_ENV: &str = "MIKA_PILOT_TRANSCRIPT_RETENTION_DAYS";
+
+/// Default pilot-transcript retention window in days (mika#1705 AC6).
+const PILOT_TRANSCRIPT_RETENTION_DEFAULT_DAYS: i64 = 90;
+
+/// The two currently-defined dispatch classes (per `derive_dispatch_class` at
+/// `skills/executor.rs`). Iteration order is `implement` first because pre-v34
+/// NULL-class wrappers fall into this bucket via `COALESCE` — promote those
+/// before grooming wrappers when both classes are idle. Ordering is cosmetic —
+/// both classes process independently in a single tick. The `Test 5` shape
+/// test in this crate pins this slice against `derive_dispatch_class` to catch
+/// drift when a new class is added to the executor (mika#1175).
+const DISPATCH_CLASSES: &[&str] = &["implement", "groom"];
+
+/// Grace period before the empty-transcript detector reports a finished
+/// dispatch that produced nothing (mika#2040 AC7).
+///
+/// The detector runs in the same 60-tick scan as the ingestion and *after* it,
+/// so a file written and ingested in the same pass is never reported. The grace
+/// covers the other direction: a pilot whose last write landed after the scan
+/// read the directory. Five minutes is far longer than that window and far
+/// shorter than the hours a silent capture used to go unnoticed.
+const PILOT_TRANSCRIPT_EMPTY_GRACE_SECS: i64 = 300;
+
+/// Task-metadata key stamped by the executor when it injects
+/// `ANTHROPIC_LOG_FILE` for a dispatch (mika#2040 AC7).
+///
+/// The detector's premise — "this dispatch was supposed to produce a
+/// transcript" — is a **fact stamped by the producer**, not reconstructed
+/// afterwards from the skill name and the current value of
+/// `MIKA_LOG_PILOT_TRANSCRIPTS`. That gate is read per dispatch and can flip
+/// between the dispatch and the check; a reconstruction would then report
+/// dispatches that were never asked for a transcript, and stay silent on the
+/// ones that were.
+pub(crate) const PILOT_TRANSCRIPT_EXPECTED_KEY: &str = "pilot_transcript_expected";
+
+/// Task-metadata key stamped by the executor with the path of the file into
+/// which `dispatch-lib.sh` writes this dispatch's worktree directory
+/// (mika#2249, D1 Phase 1).
+///
+/// The engine does not, and must not, derive the worktree path itself.
+/// `dispatch-lib.sh` is the only place that knows it — it calls
+/// `scripts/derive-worktree-path` — and re-deriving it on the Rust side is
+/// exactly the duplication mika-platform#58 closed. `worktree_claims` is keyed
+/// `(repo, issue_number)` and deliberately does not store the path
+/// (`db.rs:1484-1490` says so in prose), so there is no existing column to
+/// read either. Hence the same trajectory mika#2040 already uses for the
+/// pilot transcript: **the shell declares, the engine reads.**
+///
+/// Absence is not evidence. A dispatch with no stamp, whose declaration file
+/// is missing, empty, or names a path that does not exist, is simply **not a
+/// candidate** for the silent-stall reaper. A free-text dispatch legitimately
+/// has no worktree at all; a dispatch whose declaration was lost is
+/// indistinguishable from one, and a reaper that kills must never fire on an
+/// absence of proof.
+pub(crate) const DISPATCH_WORKTREE_FILE_KEY: &str = "dispatch_worktree_file";
+
+/// Task-metadata key stamped by the detector once it has reported a dispatch
+/// (mika#2040 AC7). Read back in SQL by
+/// [`crate::db::Database::find_dispatches_expecting_transcripts`] so a reported
+/// dispatch is excluded from the next pass — the warning fires once per
+/// dispatch, not once per minute for ever.
+pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_reported";
+
+/// Task-metadata key stamped by the silent-stall reaper the first time a
+/// dispatch leaves its population because a liveness signal could not be read
+/// (mika#2277 AC4).
+///
+/// The reaper passes on every `DB_SCAN_INTERVAL_TICKS`. Without a mark, a
+/// dispatch running with `MIKA_LOG_PILOT_TRANSCRIPTS` disabled would produce
+/// one `warn!` per minute for its whole life. The bound follows the motif
+/// already in place for the empty-transcript detector
+/// ([`PILOT_TRANSCRIPT_REPORTED_KEY`], mika#2040 AC7): a metadata key stamped
+/// after the first report. Its **value** is the comma-joined list of the
+/// surfaces that were unavailable, so the row itself says which one to fix.
+pub(crate) const PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY: &str =
+    "pilot_stall_signal_unavailable_reported";
+
+/// Task-metadata key under which the executor records the exit status and the
+/// stderr of a long-running handler that exited non-zero (mika#2532 R1).
+///
+/// **The stderr was never lost — it was read, formatted, then thrown away.**
+/// `spawn_long_running_exec` has always read the handler's stderr on the
+/// `!status.success()` branch and built `err_msg`, then handed it to
+/// `update_task_failed`, whose `UPDATE` carries
+/// `AND status NOT IN ('completed', …, 'delivered')`. A handler whose EXIT
+/// trap already delivered its callback leaves the row `completed`, so that
+/// write matched nothing, the branch logged `… but task already in terminal
+/// state`, and the one string naming the cause was dropped on the floor.
+///
+/// Measured on 2026-09-25: four consecutive crashes of `build-mika` during the
+/// QA of PR #2530, each one rendering only
+/// `HANDLER CRASH (exit code 1). Script failed before building result.` — a
+/// message with no cause in it, on a defect that was a class rather than a
+/// blip.
+///
+/// The surface is `tasks.metadata` and **not** `tasks.result`, deliberately:
+/// [`crate::db::Database::set_task_metadata_field`] and its sibling
+/// [`crate::db::Database::set_task_handler_failure`] carry **no** status
+/// filter (`WHERE id = ?`), and "`completed` is terminal — the status no
+/// longer transitions, the metadata still writes" is an explicit contract
+/// since #617. That is exactly the property mika#2532's AC1 asks for by
+/// *"including when the task is already terminal"*. `tasks.result`, on that
+/// same path, carries the message the callback turn consumes and that
+/// `extract_callback_fields` / `parse_verdict` read: overwriting it would
+/// break the callback, appending to it would change a wire format.
+///
+/// **`pub`, not `pub(crate)`, and that is what keeps the name honest.** The
+/// `mika tasks get` renderer lives in another crate and has to read this key.
+/// Letting it carry its own `"handler_failure"` literal would put the name in
+/// two places with nothing forcing them to agree — the `grooming_marker` class
+/// (mika#2158), which this house has already paid for twice. One definition,
+/// every consumer through it, and
+/// `canonical_tokens::tests::mika2532_the_handler_failure_key_has_a_single_writer`
+/// refuses a second occurrence of the literal anywhere in production.
+pub const HANDLER_FAILURE_METADATA_KEY: &str = "handler_failure";
+
+/// The payload stored under [`HANDLER_FAILURE_METADATA_KEY`] (mika#2532 R1).
+///
+/// **A type rather than three string literals, and for the reason the constant
+/// above is `pub`.** The engine writes this object and the `mika tasks get`
+/// renderer — another crate — reads it. Spelling `"exit"` / `"stderr"` /
+/// `"captured_at"` at both ends would put the shape in two places with nothing
+/// forcing them to agree; serde makes the agreement structural. Same doctrine
+/// as `operational::types::EvidenceRef`: the Rust type is the only writer of
+/// its JSON.
+///
+/// `stderr` is `Option` and skipped when `None`: a handler that wrote nothing
+/// on fd 2 leaves the key **absent**, never `""` (mika#2331 — an absence is not
+/// a null wearing a value's clothes). A reader that does not find it knows the
+/// process stayed mute, and still finds `exit`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HandlerFailure {
+    /// `"Exit code: 1"`, or `"Killed by signal: 9"` — the display the executor
+    /// already builds for `tasks.result`, so the two surfaces read alike.
+    pub exit: String,
+    /// Scrubbed and truncated by the caller. Absent when fd 2 stayed mute.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stderr: Option<String>,
+    /// When the executor observed the exit — not when the handler crashed.
+    pub captured_at: String,
+}
+
+/// What one liveness surface says about a dispatch (mika#2277).
+///
+/// Three states, not two, and the third is the whole point: "I could not read
+/// this surface" is a different answer from "this surface is silent", and
+/// collapsing them is how a detector starts firing on absence of evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LivenessSignal {
+    /// Written within the window — the pilot is demonstrably alive here.
+    Active,
+    /// Readable, and silent for longer than the window.
+    Silent { idle_secs: u64 },
+    /// No readable evidence at all: key absent, file absent, unreadable, no
+    /// mtime, or an mtime in the future. **Never** a satisfied term.
+    Unavailable,
+}
+
+impl LivenessSignal {
+    /// Classify a measured age against the window. `None` — the shape every
+    /// probe in [`super::worktree_activity`] returns when it has no evidence —
+    /// becomes [`LivenessSignal::Unavailable`], never a large age.
+    fn from_age(age_secs: Option<u64>, max_age_secs: u64) -> Self {
+        match age_secs {
+            None => Self::Unavailable,
+            Some(age) if age <= max_age_secs => Self::Active,
+            Some(age) => Self::Silent { idle_secs: age },
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    fn silent_age(self) -> Option<u64> {
+        match self {
+            Self::Silent { idle_secs } => Some(idle_secs),
+            _ => None,
+        }
+    }
+}
+
+/// What the activity rows of a parent's deferred wrappers say about the turn
+/// consuming them (mika#2184, D3).
+///
+/// Sibling of [`LivenessSignal`], one file apart and one lesson further on. That
+/// enum has three states because *"I could not read this surface"* differs from
+/// *"this surface is silent"*. This one has **four**, because the unreadable case
+/// splits again — and the split is not descriptive, it **decides**:
+///
+/// | state | disposition | why |
+/// |---|---|---|
+/// | [`Active`](Self::Active) | **spare** | R1 — the turn is demonstrably working |
+/// | [`NotYetObservable`](Self::NotYetObservable) | **spare** | the ignorance is **bounded**: it extinguishes itself as soon as uptime exceeds the window |
+/// | [`Silent`](Self::Silent) | reap | R5 — today's behaviour, bit for bit |
+/// | [`NotRecorded`](Self::NotRecorded) | reap + WARN | the ignorance is **permanent**: sparing here would restore the corpse-shield mika#2181 had to bound |
+///
+/// *What cannot extinguish itself cannot spare.* That is the rule the four
+/// states encode, and it is why `NotYetObservable` and `NotRecorded` are two
+/// variants rather than one `Unobservable { reason }`: **a reason that decides is
+/// not a reason, it is a state.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperActivity {
+    /// At least one activity row inside the window — the turn is working.
+    Active { last_seen_secs: i64 },
+    /// Telemetry armed, the window fully lived through, zero rows.
+    Silent,
+    /// The process has not lived through the window: we could not observe.
+    NotYetObservable { uptime_secs: i64 },
+    /// Both `store_llm_calls` and `store_tool_calls` are disarmed.
+    NotRecorded,
+}
+
+/// Classify a measured activity age against the window (mika#2184, D3).
+///
+/// A pure function with a complete signature: **no global state is read inside**
+/// (the 5d/mika#2290 and mika#2277 pattern — the parameter rather than the
+/// caller-side `if`, so the rule carries its own test). In particular
+/// `engine_uptime_secs` is *passed*, never read from `TaskEngine`, because tests
+/// build a fresh engine and would otherwise see a zero uptime and spare
+/// everything — T5 would be green for the wrong reason.
+///
+/// `telemetry_armed` is a setting that is **read**, never inferred from an
+/// absence of rows. Telling "telemetry is off" from "the agent did nothing" is
+/// impossible by observation, and that is precisely the confusion mika#2277
+/// condemns.
+///
+/// The window bound is **inclusive** (`age <= window` is `Active`), matching
+/// [`LivenessSignal::from_age`].
+fn classify_wrapper_activity(
+    last_activity_age_secs: Option<i64>,
+    window_secs: i64,
+    engine_uptime_secs: i64,
+    telemetry_armed: bool,
+) -> WrapperActivity {
+    if let Some(age) = last_activity_age_secs
+        && age <= window_secs
+    {
+        return WrapperActivity::Active {
+            last_seen_secs: age,
+        };
+    }
+
+    // Order matters below, and it is the order of *permanence*. A disarmed
+    // telemetry makes the silence uninformative for ever; a young process makes
+    // it uninformative for a bounded time. Reporting the permanent cause first
+    // is what stops an operator reading "the process just started" on a fleet
+    // that has simply stopped recording.
+    if !telemetry_armed {
+        return WrapperActivity::NotRecorded;
+    }
+    if engine_uptime_secs < window_secs {
+        return WrapperActivity::NotYetObservable {
+            uptime_secs: engine_uptime_secs,
+        };
+    }
+    WrapperActivity::Silent
+}
+
+/// The three idle ages a disposition rests on (mika#2277 AC5).
+///
+/// Carried into the `warn!` and the audit row together. Reporting the worktree
+/// age alone is what made the 2026-09-10 false positives read as nominal on
+/// first inspection: `worktree_idle_secs=2758` is a true statement about a
+/// pilot that was, at that same instant, streaming tool results.
+#[derive(Debug, Clone, Copy)]
+struct PilotStallAges {
+    worktree_idle_secs: u64,
+    transcript_idle_secs: u64,
+    pilot_log_idle_secs: u64,
+}
+
+/// The unified task engine: a min-heap BinaryHeap backed by SQLite, driven by a
+/// 1-second tick loop that fires tasks whose `next_fire_at <= now`.
+///
+/// Replaces `ReminderScheduler`. All proactive behaviors (reminders, heartbeat,
+/// reflection, team delegation) route through this engine.
+///
+/// # Concurrency model
+///
+/// The engine is wrapped in `Arc<Mutex<TaskEngine>>`. The tick loop acquires the
+/// mutex for a short window to drain the heap and call `fire_task()`. Each
+/// `fire_task()` immediately `tokio::spawn`s the heavy dispatch work, releasing
+/// the mutex before any I/O. This prevents the lock from blocking user message
+/// processing.
+/// The two statuses on which a dispatch whose process may still be running can
+/// sit (mika#2272).
+///
+/// `pending` first because that is where it actually sits: a dispatch's
+/// callback child is created without a status, so `create_task` writes
+/// `pending`, and the `pending → in_progress` auto-transition of #525 is
+/// applied to the **parent** manual task. The child keeps `pending` from the
+/// spawn — which is where `set_task_process_id` stamps the PID — until the
+/// callback lands and moves it to `delivered`.
+///
+/// `in_progress` is kept anyway. Nothing pins the state machine to this shape,
+/// and a predicate that silently narrows to whatever the code happens to write
+/// today is the defect mika#2272 is closing.
+///
+/// This mirrors the `status IN (…)` term of
+/// [`crate::db::Database::get_live_dispatch_callback_tasks_with_pid`]. The two
+/// must agree: the SELECT chooses the population and this re-checks it after
+/// the scan's filesystem I/O, so a divergence would let the reaper act on a row
+/// its own query would no longer return.
+const LIVE_DISPATCH_STATUSES: &[&str] = &[task_status::PENDING, task_status::IN_PROGRESS];
+
+/// Whether `status` is one of [`LIVE_DISPATCH_STATUSES`].
+fn is_live_dispatch_status(status: &str) -> bool {
+    LIVE_DISPATCH_STATUSES.contains(&status)
+}
+
+pub struct TaskEngine {
+    db: AsyncDatabase,
+    queue: BinaryHeap<QueuedTask>,
+    /// Task IDs currently in the heap (prevents duplicates on periodic DB scan).
+    queued_ids: HashSet<String>,
+    dispatcher: Arc<TaskDispatcher>,
+    reenqueue_tx: mpsc::Sender<QueuedTask>,
+    reenqueue_rx: mpsc::Receiver<QueuedTask>,
+    /// Tick counter used to trigger periodic DB scans.
+    tick_count: u64,
+    /// Wedge-watchdog heartbeat (mika#1850). Updated at the top of every
+    /// tick; read by [`super::liveness::spawn_engine_wedge_watchdog`]
+    /// on its own cadence to detect wedged tick loops.
+    heartbeat: EngineHeartbeat,
+    /// When this engine was constructed (mika#2184, U3).
+    ///
+    /// Read only to feed [`classify_wrapper_activity`]'s `engine_uptime_secs`
+    /// parameter. A process whose uptime is shorter than the activity window
+    /// **could not have observed** that window, so zero activity rows there is
+    /// not a silence — it is an unavailability, and the parent is spared
+    /// ([`WrapperActivity::NotYetObservable`]). That covers cause C of the
+    /// mika#2184 analysis: a wrapper delayed by a service restart is a *healthy*
+    /// wrapper, which is exactly the one that must not be killed.
+    started_at: std::time::Instant,
+    /// Whether `stuck_pending_activity_not_recorded` has already been warned
+    /// about in this process (mika#2184, U4).
+    ///
+    /// The reaper passes every `DB_SCAN_INTERVAL_TICKS`. Without this, a fleet
+    /// running with both telemetry settings disarmed would emit one WARN per
+    /// minute for ever. Once per process is enough: the condition is a setting,
+    /// not an event.
+    activity_not_recorded_warned: AtomicBool,
+}
+
+impl TaskEngine {
+    pub fn new(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        Self {
+            db,
+            queue: BinaryHeap::new(),
+            queued_ids: HashSet::new(),
+            dispatcher,
+            reenqueue_tx: tx,
+            reenqueue_rx: rx,
+            tick_count: 0,
+            heartbeat: EngineHeartbeat::new(),
+            started_at: std::time::Instant::now(),
+            activity_not_recorded_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Clone the wedge-watchdog heartbeat handle (mika#1850). Cheap — the
+    /// underlying state is an `Arc<AtomicI64>`. Called by the server startup
+    /// after engine construction to hand a shared handle to
+    /// [`super::liveness::spawn_engine_wedge_watchdog`].
+    pub fn heartbeat(&self) -> EngineHeartbeat {
+        self.heartbeat.clone()
+    }
+
+    /// Backdate the engine's construction instant (mika#2184, tests only).
+    ///
+    /// A freshly built engine has an uptime of zero, so
+    /// [`classify_wrapper_activity`] answers
+    /// [`WrapperActivity::NotYetObservable`] and the stuck-pending reaper spares
+    /// **everything**. That is correct in production — a process that has just
+    /// started could not have observed the window — and it is exactly what makes
+    /// a reaper test green for the wrong reason.
+    ///
+    /// So every test that drives the reaper and expects it to *act* declares
+    /// that precondition out loud, rather than inheriting it from the fact that
+    /// `Instant::now()` happens to be old enough. There is no production caller
+    /// and there must not be one: a process cannot honestly claim to have
+    /// observed a window it did not live through.
+    #[cfg(test)]
+    fn with_started_at_secs_ago(mut self, secs: u64) -> Self {
+        self.started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("the test clock is not close enough to the epoch for this to underflow");
+        self
+    }
+
+    /// Called at startup.
+    ///
+    /// 1. Expires tasks past their `timeout_at`.
+    /// 2. Marks orphaned `in_progress` tasks as `failed` (no process survived restart).
+    ///    A2A tasks go first, `pending` ones included, with a reason (mika#2379)
+    ///    — daemon only; skipped when `dispatcher.cli_mode` is set.
+    /// 3. Loads `pending` and `recurring_active` tasks into the `BinaryHeap`.
+    ///
+    /// Returns `(loaded_count, queue_len)` for the caller to aggregate across agents.
+    pub async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
+        let now = crate::timestamp::now();
+
+        // mika#2515 — un instrument désarmé se lit exactement comme un
+        // instrument sain (mika#2205). Dit une fois, au démarrage, et seulement
+        // en mode serveur : c'est le seul mode où le balayage existe.
+        if !self.dispatcher.cli_mode && !qa_build_verdict_alert_enabled() {
+            info!(
+                event = "qa_build_verdict_alert_disabled",
+                env = QA_BUILD_VERDICT_ALERT_ENV,
+                agent_id = %self.db.agent_id(),
+                "l'alerte de verdict de build non livré est DÉSARMÉE — un build \
+                 vert pourra laisser une PR muette sans qu'aucune ligne le dise"
+            );
+        }
+
+        // 1. Expire timed-out tasks
+        match self.db.mark_tasks_expired(&now).await {
+            Ok(n) if n > 0 => info!(count = n, "expired timed-out tasks on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to expire timed-out tasks"),
+        }
+
+        // 1b. Kill orphan processes for newly expired tasks
+        self.kill_orphan_processes().await;
+
+        // 2a. A2A rows first (mika#2379). No A2A turn survives the process that
+        // ran it, and only the daemon's handlers create A2A rows, so at daemon
+        // startup every one still `pending`/`in_progress` belongs to a dead
+        // process. `pending` is included — a `message/stream` turn still waiting
+        // for the agent lock never reached `in_progress` — and the rows get a
+        // reason and a `completed_at`, which the generic loop below writes for
+        // nobody. It runs first so that loop no longer sees them.
+        //
+        // Daemon only. `mika chat` runs this same recovery (`cli_mode: true`)
+        // against the container database it shares with a daemon that may be
+        // serving A2A turns right now; there the "dead process" argument is
+        // false, and sweeping would fail live rows — pending stream turns
+        // included — and raise a false `a2a_orphans_swept`.
+        if !self.dispatcher.cli_mode {
+            match self
+                .db
+                .a2a_sweep_orphans(
+                    "orphaned: the daemon running this A2A turn exited before it finished",
+                )
+                .await
+            {
+                Ok(n) if n > 0 => warn!(
+                    event = "a2a_orphans_swept",
+                    agent = %self.db.agent_id(),
+                    count = n,
+                    "closed A2A turns a previous process left open"
+                ),
+                Ok(_) => {}
+                // The generic loop below still fails the in_progress ones, as before.
+                Err(e) => warn!(error = %e, "failed to sweep orphaned A2A tasks on startup"),
+            }
+        }
+
+        // 2. Recover in_progress tasks (process couldn't have survived container restart)
+        let in_progress = self
+            .db
+            .get_tasks_by_status(vec![task_status::IN_PROGRESS.to_string()])
+            .await
+            .unwrap_or_default();
+
+        for task in in_progress {
+            // Manual (task) tasks represent human work — don't invalidate on restart.
+            //
+            // NARROWED (mika#1712 step 2b, 2026-08-21): the sibling
+            // `sweep_null_pid_phantoms_at_startup()` below DOES transition a
+            // subset of manual tasks — those matching the phantom shape
+            // (`action_type='none'` + `process_id IS NULL` + status in
+            // `('in_progress','blocked')`). That is the leak class from
+            // plan §7 D2 and is intentionally excluded from this
+            // manual-preservation guard. The guard here still protects the
+            // rest of the manual task surface (any manual row with a real
+            // action_type or non-NULL process_id).
+            if task.trigger_type == trigger_type::MANUAL {
+                debug!(task_id = %task.id, "skipping manual task during startup recovery");
+                continue;
+            }
+            debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
+            if let Err(e) = self
+                .db
+                .update_task_status(&task.id, task_status::FAILED)
+                .await
+            {
+                warn!(task_id = %task.id, error = %e, "failed to mark task as failed during recovery");
+            }
+        }
+
+        // 2b. Sweep pre-existing NULL-PID phantom tracking rows (mika#1712 AC5).
+        // Any phantom row present at startup outlived a prior server process —
+        // that is exactly the "startup sweep" AC5 wants. `age_seconds=0`
+        // matches every candidate regardless of freshness (SQLite treats
+        // `strftime('now', '-0 seconds')` as "now", so `updated_at < now`
+        // selects any past row). SOLE WRITER: `phantom_aged_out` audit
+        // tool_name is shared with the AC3 tick sweep in
+        // `sweep_null_pid_phantoms`; the `reasoning` field carries the source
+        // discriminator (`startup_sweep` here).
+        self.sweep_null_pid_phantoms_at_startup().await;
+
+        // 3. Load schedulable tasks into BinaryHeap
+        let schedulable = self.db.get_schedulable_tasks().await.unwrap_or_default();
+        let count = schedulable.len();
+
+        for task in schedulable {
+            self.enqueue_queued_task(
+                &task.id,
+                &task.trigger_type,
+                &task.action_type,
+                task.cron_expr.as_deref(),
+                task.next_fire_at.as_deref(),
+                &now,
+                task.metadata.as_deref(),
+            );
+        }
+
+        // 4. Prune ended system/silent sessions older than 7 days
+        const SEVEN_DAYS_SECS: i64 = 7 * 24 * 60 * 60;
+        match self.db.prune_old_sessions(SEVEN_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old ended sessions on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old sessions"),
+        }
+
+        // 5. Prune LLM call and tool call records older than 30 days
+        const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
+        match self.db.prune_old_llm_calls(THIRTY_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old llm_calls on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old llm_calls"),
+        }
+        match self.db.prune_old_tool_calls(THIRTY_DAYS_SECS).await {
+            Ok(n) if n > 0 => info!(count = n, "pruned old tool_calls on startup"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to prune old tool_calls"),
+        }
+
+        // 6. Prune pilot transcripts past the retention window (mika#1705 AC6).
+        self.prune_old_pilot_transcripts().await;
+
+        debug!(
+            loaded = count,
+            queue_len = self.queue.len(),
+            "task engine startup recovery complete"
+        );
+        Ok((count, self.queue.len()))
+    }
+
+    /// Insert a new task into the DB and enqueue it in the BinaryHeap.
+    ///
+    /// Returns the new task's UUID string ID.
+    pub async fn enqueue(&mut self, task: NewTask) -> Result<String> {
+        let next_fire_at = task.next_fire_at.clone();
+        let trigger_type_val = task.trigger_type.clone();
+        let action_type_val = task.action_type.clone();
+        let cron_expr = task.cron_expr.as_deref().map(str::to_owned);
+
+        let id = self.db.create_task(task).await?;
+
+        if let Some(fire_at) = next_fire_at {
+            self.push_to_heap(QueuedTask {
+                task_id: id.clone(),
+                next_fire_at: fire_at,
+                trigger_type: trigger_type_val,
+                action_type: action_type_val,
+                cron_expr,
+            });
+        }
+
+        Ok(id)
+    }
+
+    /// Cancel a task in the DB.
+    ///
+    /// The task's entry in the BinaryHeap will be skipped gracefully when it
+    /// reaches the top, because `fire_task` checks DB status before marking
+    /// in_progress.
+    pub async fn cancel(&self, task_id: &str) -> Result<bool> {
+        self.db.cancel_task(task_id).await
+    }
+
+    /// Spawn the 1-second tick loop as a background task.
+    ///
+    /// The returned `JoinHandle` can be aborted on shutdown.
+    pub fn spawn_tick_loop(engine: Arc<Mutex<Self>>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                let mut eng = engine.lock().await;
+                eng.tick().await;
+                // Lock released here. Heavy dispatch runs in spawned tasks.
+            }
+        })
+    }
+
+    /// One tick: drain the re-enqueue channel, run periodic DB scan, then fire
+    /// all due tasks (up to MAX_PER_TICK).
+    ///
+    /// Visibility: `pub` so integration tests can drive the tick pipeline
+    /// (e.g. mika#1712's `tests/eval/test_phantom_task_row_sweep.rs` exercises
+    /// the sweep-from-tick wiring end-to-end). Production callers still go
+    /// through [`Self::spawn_tick_loop`].
+    pub async fn tick(&mut self) {
+        // Update wedge-watchdog heartbeat (mika#1850) — MUST be first line of
+        // tick body so a wedge in downstream awaits still tells the watchdog
+        // "the previous tick reached this point at time T". If we placed it
+        // after the DB scans, a hung scan would look like the loop never
+        // ticked at all.
+        self.heartbeat.tick();
+
+        // Drain re-enqueue messages from completed recurring tasks
+        while let Ok(task) = self.reenqueue_rx.try_recv() {
+            self.push_to_heap(task);
+        }
+
+        // Periodic DB scan: pick up tasks created outside the engine (e.g. by tools)
+        // and expire timed-out tasks (long_running callbacks past their deadline).
+        self.tick_count = self.tick_count.wrapping_add(1);
+        if self.tick_count.is_multiple_of(DB_SCAN_INTERVAL_TICKS) {
+            self.expire_timed_out_tasks().await;
+            self.kill_orphan_processes().await;
+            self.check_callback_process_liveness().await;
+            // mika#2249 D1: the mirror of the watchdog above. That one owns the
+            // dispatch whose process is DEAD; this one owns the dispatch whose
+            // process is ALIVE and whose worktree has stopped receiving writes —
+            // a population every state-driven reaper is structurally blind to.
+            // The two select disjoint sets, so this order costs nothing and
+            // keeps the whole repair ladder readable in one place.
+            self.reap_silently_stalled_pilots().await;
+            // mika#1712: sweep NULL-PID phantom tracking rows the callback
+            // watchdog cannot see (its first predicate is
+            // `process_id IS NOT NULL`) and the orphaned-parent reaper does not
+            // match (no `resume_agent` callback child). Runs inside the same
+            // 60-tick cadence — no new interval.
+            self.sweep_null_pid_phantoms().await;
+            self.scan_db_for_new_tasks().await;
+            // In CLI mode, the TUI's poll_callback_tasks() handles callback delivery
+            // (session-scoped, atomic claim). Skip engine dispatch to prevent a race
+            // where the engine steals callbacks and processes them in a context-free
+            // silent turn. See #264.
+            if !self.dispatcher.cli_mode {
+                // mika#1070 — Promote-first ordering: promote deferred wrappers
+                // before scanning for dispatchable callbacks. The promotion DB write
+                // commits synchronously, so a promoted wrapper is visible to the
+                // dispatch_undelivered_callbacks scan in the same tick cycle.
+                self.promote_pending_deferred_if_idle().await;
+                self.dispatch_undelivered_callbacks().await;
+                // mika#2515 U2 — troisième bras, APRÈS la tentative de
+                // livraison : une ligne que ce balayage vient de tenter n'est
+                // pas à alerter avant qu'il ait essayé. Sous le même garde
+                // `!cli_mode` que son voisin, parce qu'en mode CLI c'est la TUI
+                // qui livre — alerter là rendrait `never_attempted` sur des
+                // lignes qu'un autre chemin sert.
+                self.alert_undelivered_build_verdicts().await;
+            }
+            // Reap parent self_dev tasks left in_progress after their callback
+            // subtask delivered without producing a PR (#871).
+            self.reap_orphaned_parent_tasks().await;
+
+            // Auto-complete parent self_dev tasks left in_progress after their
+            // callback subtask delivered WITH a PR url (mika#1162). Success-side
+            // sibling to the reaper: catches crash-recovery cases and pre-deploy
+            // wedges that the inline path in `dispatch_resume_agent` can't reach.
+            self.complete_parent_tasks_on_callback_success().await;
+
+            // Close `manual` tracking rows whose every callback child is
+            // terminal (mika#2405). Placed AFTER the two self_dev reapers so
+            // their population is already resolved when this passes — and it
+            // is the *complement* of that population, not an overlap: its
+            // `COALESCE(parent.source,'') != 'self_dev'` term is what keeps the
+            // richer self_dev verdicts (failed-without-PR / completed-with-PR)
+            // out of this single-verdict closer.
+            self.settle_dispatch_parents().await;
+
+            // Reap parent self_dev issue tasks left in_progress with ZERO
+            // callback children, aged past the childless grace window (mika#1687).
+            // The silent-pilot-death backstop: a parent that reached in_progress
+            // without ever recording a callback child falls through both reapers
+            // above (they INNER-JOIN a delivered child) and the watchdog (it keys
+            // off a callback child's PID). Runs AFTER the completer so any
+            // delivered-child success/failure case resolves first and only
+            // genuinely childless parents reach here.
+            self.reap_childless_stuck_parent_tasks().await;
+
+            // Reap `pending` self_dev issue parents that no callback child
+            // represents any more (mika#2045). Runs AFTER the three
+            // `in_progress` reapers above so any task that can still resolve
+            // through them does; this one owns the population none of them see.
+            self.reap_orphaned_pending_issue_tasks().await;
+
+            // The net for `blocked` parents refused on a busy dispatch slot
+            // (mika#2169, L3b). Placed right after the `pending` reaper: the
+            // two select disjoint populations (`status`, plus the
+            // `global_dispatch_active` discriminant that keeps deliberate
+            // operator gates out of this one), so the order costs nothing and
+            // keeps the whole repair ladder readable in one place.
+            self.reap_stale_blocked_dispatch_tasks().await;
+
+            // Measure promotion starvation — warning only, no mutation
+            // (mika#2169, L2b).
+            self.report_promotion_starvation().await;
+
+            // Reap orphaned team runs left in `status='running'` when no
+            // terminal-state writer ran (mika#1652). Failure-path sibling of
+            // the parent-task reaper above, for the `team_runs` lifecycle:
+            // frees team slots held by runs whose finalizer never executed.
+            crate::teams::engine::reap_orphaned_team_runs(&self.db).await;
+
+            // mika#1705: ingest finished claude-pilot transcript JSONL files
+            // into the pilot_transcripts table (the implementation-reasoning
+            // corpus for the owned-model bet).
+            self.ingest_pilot_transcripts().await;
+
+            // mika#2040 AC7: and say so when a dispatch that was asked for a
+            // transcript produced none. Runs AFTER the ingestion so a file
+            // imported this pass is never reported — the two are one step, in
+            // this order, on purpose.
+            self.detect_empty_pilot_transcripts().await;
+        }
+
+        // mika#1705 AC6: daily pilot-transcript retention sweep.
+        if self
+            .tick_count
+            .is_multiple_of(PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS)
+        {
+            self.prune_old_pilot_transcripts().await;
+        }
+
+        let now = crate::timestamp::now();
+        let mut fired = 0;
+
+        while fired < MAX_PER_TICK {
+            match self.queue.peek() {
+                Some(t) if t.next_fire_at <= now => {
+                    let task = self.pop_from_heap().unwrap();
+                    self.fire_task(task).await;
+                    fired += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if fired > 0 {
+            debug!(fired, "tick fired tasks");
+        }
+    }
+
+    /// Expire tasks past their `timeout_at` deadline.
+    ///
+    /// Runs periodically (every `DB_SCAN_INTERVAL_TICKS` seconds) to catch
+    /// long_running callback tasks that never completed. After expiring, checks
+    /// sibling completion so parent tasks can fire even when a child times out.
+    async fn expire_timed_out_tasks(&mut self) {
+        let now = crate::timestamp::now();
+        match self.db.mark_tasks_expired(&now).await {
+            Ok(n) if n > 0 => {
+                info!(count = n, "expired timed-out tasks in tick loop");
+                // Check if any expired tasks unblock their parent
+                self.check_expired_siblings().await;
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "failed to expire timed-out tasks in tick loop"),
+        }
+    }
+
+    /// After expiring tasks, check if any parent tasks now have all children
+    /// in terminal states (completed/failed/expired/cancelled).
+    async fn check_expired_siblings(&self) {
+        let expired_ids = self
+            .db
+            .get_expired_child_task_ids()
+            .await
+            .unwrap_or_default();
+
+        for task_id in expired_ids {
+            let d = self.dispatcher.clone();
+            let tid = task_id.clone();
+            tokio::spawn(async move {
+                d.check_and_dispatch_parent(&tid).await;
+            });
+        }
+    }
+
+    /// Send SIGTERM to orphan processes for expired tasks that still have a process_id set,
+    /// then clear the process_id to prevent repeated kill attempts.
+    async fn kill_orphan_processes(&self) {
+        match self.db.get_expired_tasks_with_process_id().await {
+            Ok(tasks) => {
+                for (task_id, pid) in tasks {
+                    info!(task_id = %task_id, pid = pid, "killing orphan process for expired task");
+                    // Orphan cleanup: pass `None` for expected_start_time. The
+                    // expired-task query returns (task_id, pid) only; we don't
+                    // wire the metadata extraction here because orphan cleanup
+                    // is best-effort and the existing /proc/<pid>/stat existence
+                    // check is good enough for this path. The PID reuse guard
+                    // (#855) is targeted at the cancel-by-operator path where
+                    // wrong-process-kill consequences are higher.
+                    super::process_kill::kill_process_immediate(pid, None);
+                    // Clear process_id so we don't attempt to kill again on next tick
+                    if let Err(e) = self.db.clear_task_process_id(&task_id).await {
+                        warn!(task_id = %task_id, error = %e, "failed to clear process_id after kill");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to query expired tasks with process_id");
+            }
+        }
+    }
+
+    /// Scan DB for schedulable tasks not already in the heap.
+    /// Called every `DB_SCAN_INTERVAL_TICKS` seconds as a safety net.
+    async fn scan_db_for_new_tasks(&mut self) {
+        let now = crate::timestamp::now();
+        let tasks = match self.db.get_schedulable_tasks().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "periodic task scan failed");
+                return;
+            }
+        };
+        let mut added = 0;
+        for task in tasks {
+            if self.queued_ids.contains(&task.id) {
+                continue;
+            }
+            self.enqueue_queued_task(
+                &task.id,
+                &task.trigger_type,
+                &task.action_type,
+                task.cron_expr.as_deref(),
+                task.next_fire_at.as_deref(),
+                &now,
+                task.metadata.as_deref(),
+            );
+            added += 1;
+        }
+        if added > 0 {
+            debug!(added, "periodic scan added new tasks to engine queue");
+        }
+    }
+
+    /// Dispatch undelivered callback tasks (both completed and failed) directly
+    /// to the agent. In server mode, failed callbacks from the background monitor
+    /// have no external trigger — this periodic scan ensures they are delivered.
+    ///
+    /// Unlike schedulable tasks, callbacks bypass the heap and dispatch immediately
+    /// because they are already in a terminal state waiting for delivery.
+    /// `dispatch_resume_agent` handles the atomic `mark_task_delivered` call internally.
+    async fn dispatch_undelivered_callbacks(&self) {
+        let since = crate::timestamp::now_minus(chrono::Duration::days(7));
+        let tasks = match self.db.get_undelivered_callback_tasks(&since).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "failed to scan for undelivered callback tasks");
+                return;
+            }
+        };
+
+        let stale_threshold =
+            chrono::Duration::minutes(crate::planning::policy::STALE_FAILED_CALLBACK_MINUTES);
+        let mut stale_skipped: usize = 0;
+
+        let now = crate::timestamp::now();
+        for task in tasks {
+            // Retry delay guard: skip tasks whose next_fire_at is in the future.
+            // AgentBusy recovery (mika#1070) keeps status as 'completed' but sets
+            // next_fire_at to enforce a 30s retry delay.
+            if let Some(ref fire_at) = task.next_fire_at
+                && fire_at.as_str() > now.as_str()
+            {
+                continue;
+            }
+
+            // Staleness guard: skip failed callbacks older than the threshold.
+            // Completed callbacks are always delivered — they may carry legitimate results.
+            if task.status == "failed" {
+                let is_stale = task
+                    .completed_at
+                    .as_deref()
+                    .is_some_and(|ts| crate::timestamp::is_older_than(ts, stale_threshold));
+                if is_stale {
+                    if let Ok(true) = self.db.mark_task_delivered(&task.id).await {
+                        stale_skipped += 1;
+                        debug!(
+                            task_id = %task.id,
+                            label = %task.label,
+                            "skipped stale failed callback"
+                        );
+                    }
+                    continue;
+                }
+            }
+
+            let dispatcher = self.dispatcher.clone();
+            tokio::spawn(async move {
+                if let Err(e) = dispatcher.dispatch_resume_agent(&task).await {
+                    // AgentBusy is expected — next scan cycle will retry
+                    if !matches!(e, super::dispatcher::DispatchError::AgentBusy(_)) {
+                        warn!(task_id = %task.id, error = %e, "failed to dispatch undelivered callback");
+                    }
+                }
+            });
+        }
+
+        if stale_skipped > 0 {
+            info!(count = stale_skipped, "cleared stale failed callback tasks");
+        }
+    }
+
+    /// mika#2515 U2 — un `build_mika` vert ne laisse plus une PR muette **en
+    /// silence**.
+    ///
+    /// # Ce que ça ferme, et ce que ça ne ferme pas
+    ///
+    /// Quatre populations laissent un build vert et une PR muette. U1 ferme les
+    /// deux qui sont réparables au site (le tour a tourné : conclusion muette par
+    /// le « Force EndTurn », coupure par deadline ou par steps). Les deux autres
+    /// sont hors d'atteinte d'un filet de tour : un `AgentBusy` refuse **avant**
+    /// de créer la session, et un `run_silent_agent` qui rend `Err` n'a pas
+    /// d'`Ok` à lire. Pour celles-là, l'AC demande « SOIT un verdict posté SOIT
+    /// une alerte nommée » — et c'est l'alerte.
+    ///
+    /// **Détection seule, et ce n'est pas de la timidité.** Pour la famine le
+    /// verdict n'est pas perdu, il est **en file** : la ligne réessaie toutes les
+    /// 60 s et postera le vrai verdict dès que l'agent se libère. Poser un
+    /// `hold[review]` sur une PR dont le verdict est seulement *en attente*
+    /// serait une affirmation activement trompeuse — et une revue postée par
+    /// `mika-platform-qa` sort la PR de la population du réconciliateur mika#2334
+    /// **pour de bon** (coût écrit dans `deadline_verdict.rs`). Pour la
+    /// quarantaine, en revanche, poster serait juste : population distincte,
+    /// suivi nommé, **précondition que la première distribution la montre non
+    /// vide**.
+    ///
+    /// # Placement
+    ///
+    /// Troisième bras du balayage à 60 ticks, **après**
+    /// [`Self::dispatch_undelivered_callbacks`] : une ligne que ce balayage vient
+    /// de tenter de livrer n'est pas à alerter avant qu'il ait essayé. Sous le
+    /// même garde `!cli_mode`, et ce n'est pas un détail — en mode CLI c'est la
+    /// TUI qui livre les callbacks, donc alerter là rendrait
+    /// `never_attempted` sur chaque tick pour des lignes qu'un autre chemin sert.
+    ///
+    /// # Aucune requête neuve, aucune migration
+    ///
+    /// Il **réutilise** `get_undelivered_callback_tasks` et filtre **dans
+    /// l'application**, là où le refus peut se journaliser (leçon mika#2184 : le
+    /// proxy filtre en SQL, la mesure directe tranche dans le code).
+    ///
+    /// # L'estampille n'est PAS un terme
+    ///
+    /// Elle enrichit la ligne (`target`) et son absence vaut `unresolved`. Une
+    /// revue QA dispatchée en texte libre — ce que le ticket décrit : « QA
+    /// **directe** dispatchée sur #2458 » — ne produit aucune estampille, donc en
+    /// faire un terme rendrait ce travail silencieux sur exactement le dispatch
+    /// mesuré.
+    async fn alert_undelivered_build_verdicts(&self) {
+        if !qa_build_verdict_alert_enabled() {
+            return;
+        }
+
+        let since = crate::timestamp::now_minus(chrono::Duration::days(
+            qa_build_verdict_alert_lookback_days(),
+        ));
+        let tasks = match self.db.get_undelivered_callback_tasks(&since).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    event = QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    error = %e,
+                    "échec du balayage des verdicts de build non livrés"
+                );
+                return;
+            }
+        };
+
+        let age_window = chrono::Duration::seconds(qa_build_verdict_alert_age_secs());
+        let dedup_since = crate::timestamp::now_minus(chrono::Duration::hours(
+            QA_BUILD_VERDICT_ALERT_DEDUP_HOURS,
+        ));
+        let system_session = format!("system-{}", self.db.agent_id());
+
+        for task in tasks {
+            // Terme 1 — c'est un callback de build. Égalité stricte, le même
+            // discriminant que les trois autres lecteurs (mika#2355).
+            if !crate::qa_build_callback::is_build_callback_label(&task.label) {
+                continue;
+            }
+            // Terme 2 — le statut est dans la population non livrée : garanti
+            // par la requête réutilisée (`status IN ('completed','failed')`).
+            //
+            // Terme 3 — plus vieux que la fenêtre.
+            let Some(completed_at) = task.completed_at.as_deref() else {
+                continue;
+            };
+            if !crate::timestamp::is_older_than(completed_at, age_window) {
+                continue;
+            }
+
+            let cause =
+                crate::qa_build_callback::classify_undelivered_verdict(task.metadata.as_deref());
+            let target_key = format!("task:{}", task.id);
+
+            // Terme 4 — pas déjà alertée pour **cette** cause dans les 24 h. Un
+            // changement de cause réécrit : c'est un changement d'état.
+            //
+            // Lecture **fail-OPEN** : un `audit_events` illisible alerte quand
+            // même, et le dit sous son propre nom. L'inverse de `wip_rescue`
+            // (mika#2199) et pour la raison opposée : là un faux positif
+            // rejouait une revue, ici le pire d'un faux positif est **une ligne
+            // de journal en trop**, et le pire d'un faux négatif est le silence
+            // que tout ce ticket ferme.
+            let previous_cause = match self
+                .db
+                .latest_audit_event_for_target(
+                    QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    &target_key,
+                    &dedup_since,
+                )
+                .await
+            {
+                Ok(row) => row.and_then(|(after_value, _, _)| after_value),
+                Err(e) => {
+                    warn!(
+                        event = "qa_build_verdict_alert_ledger_unreadable",
+                        task_id = %task.id,
+                        error = %e,
+                        "registre d'alerte illisible — on alerte quand même \
+                         (fail-open), la déduplication ne tient plus"
+                    );
+                    None
+                }
+            };
+            if previous_cause.as_deref() == Some(cause.as_wire()) {
+                continue;
+            }
+
+            // L'estampille enrichit, elle ne conditionne pas.
+            let target =
+                crate::task_engine::dispatcher::read_qa_review_pr_target(task.metadata.as_deref())
+                    .map(|t| t.to_metadata_value())
+                    .unwrap_or_else(|_| "unresolved".to_string());
+
+            let age_secs = crate::timestamp::parse(completed_at)
+                .map(|t| (chrono::Utc::now() - t).num_seconds())
+                .unwrap_or_default();
+            // Les mêmes compteurs que le classificateur vient de lire, par le
+            // même site : classer sur une valeur et en rapporter une autre
+            // rendrait la ligne inexploitable pour la halte qui la lit.
+            let deferrals = crate::qa_build_callback::metadata_counter(
+                task.metadata.as_deref(),
+                crate::task_engine::VERDICT_DELIVERY_DEFERRALS_KEY,
+            );
+            let attempts = crate::qa_build_callback::metadata_counter(
+                task.metadata.as_deref(),
+                crate::task_engine::DELIVERY_ATTEMPTS_KEY,
+            );
+
+            warn!(
+                event = QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                agent_id = %self.db.agent_id(),
+                task_id = %task.id,
+                target = %target,
+                cause = cause.as_wire(),
+                age_secs,
+                deferrals,
+                attempts,
+                status = %task.status,
+                "un build a rendu et son verdict QA n'est pas arrivé sur la PR — \
+                 la cause nomme le chemin"
+            );
+
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    &system_session,
+                    QA_BUILD_VERDICT_UNDELIVERED_EVENT,
+                    &target_key,
+                    None,
+                    Some(cause.as_wire()),
+                    Some(&format!(
+                        "target:{target} age_secs:{age_secs} deferrals:{deferrals} \
+                         attempts:{attempts} status:{}",
+                        task.status
+                    )),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    event = "qa_build_verdict_alert_audit_failed",
+                    task_id = %task.id,
+                    error = %e,
+                    "l'alerte a été journalisée mais sa ligne d'audit n'a pas été \
+                     écrite — la déduplication la ré-émettra au prochain tick"
+                );
+            }
+        }
+    }
+
+    /// mika#2045 — Repair, then expire, `pending` self_dev issue parents that no
+    /// callback child represents any more.
+    ///
+    /// The ladder, in order, and the order is the point:
+    /// 1. the parent still has a **live** deferred wrapper — `pending`, or
+    ///    promoted inside `promoted_wrapper_liveness_secs()` (mika#2181) — or a
+    ///    live real callback -> it is queued or working.
+    ///    `find_orphaned_pending_issue_tasks` never returns it, and nothing here
+    ///    touches it.
+    /// 2. orphaned with repair budget left -> re-arm. A promoted task resumes its
+    ///    work; an expired one loses it, so repair comes first.
+    /// 3. orphaned with the budget spent, or repair refused -> cancel any
+    ///    surviving wrapper, then transition the parent to `failed`. That drops
+    ///    it out of `idx_tasks_manual_active_ref_url` (the index excludes
+    ///    `failed`), and the next `ready` sweep creates a fresh task for the
+    ///    issue.
+    async fn reap_orphaned_pending_issue_tasks(&self) {
+        let grace_seconds = stuck_pending_reaper_grace_secs();
+        let promoted_liveness_seconds = promoted_wrapper_liveness_secs();
+        let candidates = match self
+            .db
+            .find_orphaned_pending_issue_tasks(grace_seconds, promoted_liveness_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to query orphaned pending tasks"
+                );
+                return;
+            }
+        };
+
+        // mika#2181 — the shelter is silent by construction: it lives inside a
+        // SQL `NOT EXISTS`, so a spared parent never becomes a candidate and
+        // nothing below ever sees it. Count it explicitly, or "the reaper acted
+        // on nobody" and "the reaper is holding work back" render identically in
+        // the logs. Emitted BEFORE the empty-candidate return, because the case
+        // that matters most is exactly zero candidates and a non-empty shelter.
+        match self
+            .db
+            .find_parents_sheltered_by_promoted_wrapper(grace_seconds, promoted_liveness_seconds)
+            .await
+        {
+            Ok(sheltered) if !sheltered.is_empty() => {
+                info!(
+                    event = "stuck_pending_sheltered_by_promoted_wrapper",
+                    count = sheltered.len(),
+                    issues = ?sheltered,
+                    promoted_liveness_seconds,
+                    "parents past the grace are held back because a promoted wrapper is still live"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_stuck_pending_reaper: failed to count sheltered parents"
+                );
+            }
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // R9/R10 — break the silence before repairing anything. An issue that is
+        // `ready` and never picked does not cry on its own; this is the event the
+        // watcher counts.
+        warn!(
+            event = "loop_stuck_pending_tasks",
+            count = candidates.len(),
+            issues = ?candidates
+                .iter()
+                .map(|c| c.reference_url.as_str())
+                .collect::<Vec<_>>(),
+            grace_seconds,
+            "issues are `ready` with a pending task nothing represents any more"
+        );
+
+        let activity_window_seconds = stuck_pending_activity_window_secs();
+        // mika#2184 D3 — a setting that is READ, never inferred from an absence
+        // of rows. Both disarmed means no activity row will ever exist, so a
+        // silence there says nothing about the turn.
+        let telemetry_armed =
+            self.dispatcher.settings.store_llm_calls || self.dispatcher.settings.store_tool_calls;
+        let engine_uptime_seconds = self.started_at.elapsed().as_secs() as i64;
+
+        for candidate in candidates {
+            let system_session = format!("system-{}", self.db.agent_id());
+
+            // mika#2184 R1 — the direct measure, ahead of everything the repair
+            // ladder costs. A spared parent pays neither the wrapper inventory
+            // nor the `action_config` reconstruction below.
+            //
+            // A failed read is NOT a silence: it falls through to the proxy
+            // window's verdict, i.e. today's behaviour. Refusing to reap on an
+            // unreadable database would hand any DB hiccup a permanent veto over
+            // the reaper.
+            let activity_age = match self
+                .db
+                .find_deferred_wrapper_activity_age_secs(&candidate.id)
+                .await
+            {
+                Ok(age) => age,
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to read wrapper activity"
+                    );
+                    None
+                }
+            };
+
+            // Exhaustive `match`, no `_ =>` arm (the `hosting_ground_truth_line`
+            // pattern, mika#2290): a fifth state must be forced to decide its own
+            // disposition rather than inherit a fall-through that reaps.
+            match classify_wrapper_activity(
+                activity_age,
+                activity_window_seconds,
+                engine_uptime_seconds,
+                telemetry_armed,
+            ) {
+                WrapperActivity::Active { last_seen_secs } => {
+                    self.record_activity_spare(
+                        &system_session,
+                        &candidate,
+                        "active",
+                        Some(last_seen_secs),
+                        activity_window_seconds,
+                    )
+                    .await;
+                    continue;
+                }
+                WrapperActivity::NotYetObservable { uptime_secs } => {
+                    self.record_activity_spare(
+                        &system_session,
+                        &candidate,
+                        "not_yet_observable",
+                        None,
+                        activity_window_seconds,
+                    )
+                    .await;
+                    debug!(
+                        task_id = %candidate.id,
+                        uptime_secs,
+                        activity_window_seconds,
+                        "stuck-pending reaper: engine has not lived through the activity window"
+                    );
+                    continue;
+                }
+                WrapperActivity::NotRecorded => {
+                    // Once per process: the condition is a setting, not an event.
+                    if !self
+                        .activity_not_recorded_warned
+                        .swap(true, Ordering::SeqCst)
+                    {
+                        warn!(
+                            event = "stuck_pending_activity_not_recorded",
+                            store_llm_calls = self.dispatcher.settings.store_llm_calls,
+                            store_tool_calls = self.dispatcher.settings.store_tool_calls,
+                            agent_id = %self.db.agent_id(),
+                            "stuck-pending reaper is running WITHOUT its direct activity measure: \
+                             MIKA_STORE_LLM_CALLS and MIKA_STORE_TOOL_CALLS are both disabled, so \
+                             no activity row can exist and mika#2184's spare is inert"
+                        );
+                    }
+                    // Fall through and reap. The ignorance is PERMANENT here —
+                    // sparing on it would restore the corpse-shield mika#2181 had
+                    // to bound. What cannot extinguish itself cannot spare.
+                }
+                WrapperActivity::Silent => {
+                    // R5 — today's behaviour, bit for bit.
+                }
+            }
+
+            // AC4 (mika#2181) — read the inventory ONCE, before the decision, so
+            // both terminal events carry the statuses that produced the verdict.
+            // The reaper is the component that judged "absent" via its query, so
+            // it is the reaper's event that must show what it saw. A failed read
+            // degrades the audit, never the repair.
+            let wrappers_seen = match self
+                .db
+                .summarize_deferred_wrappers_of_parent(&candidate.id)
+                .await
+            {
+                Ok(w) => crate::db::DeferredWrapperSummary::render(&w),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to inventory deferred wrappers"
+                    );
+                    "wrappers:unavailable".to_string()
+                }
+            };
+
+            let action_config = match self
+                .db
+                .latest_deferred_wrapper_action_config(&candidate.id)
+                .await
+            {
+                Ok(Some(config)) => Some(config),
+                Ok(None) => rebuild_deferred_action_config(
+                    &candidate.id,
+                    &candidate.reference_url,
+                    &candidate.dispatch_class,
+                ),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to read the last wrapper config"
+                    );
+                    None
+                }
+            };
+
+            let outcome = match action_config {
+                Some(config) => {
+                    crate::skills::executor::rearm_deferred_callback(
+                        &self.db,
+                        &candidate.id,
+                        &config,
+                        &candidate.dispatch_class,
+                        "stuck_pending_reaper",
+                        // mika#2413 — no wrapper is being consumed here: the
+                        // reaper acts on a parent, not on a turn. Nothing to
+                        // take out of the population.
+                        None,
+                    )
+                    .await
+                }
+                // The dispatch cannot be reconstructed at all, so no future tick
+                // will do better. Expiring frees the slot for a fresh task.
+                None => RearmOutcome::Unrepairable,
+            };
+
+            // A `match` rather than the two `if`s this used to be (mika#2413):
+            // the fall-through arm expires the parent, so a variant added to
+            // `RearmOutcome` and forgotten here would destroy tasks instead of
+            // failing to compile.
+            match outcome {
+                RearmOutcome::NotNow => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stuck-pending reaper: repair refused for a transient reason — retrying next tick"
+                    );
+                    continue;
+                }
+                // Unreachable in practice — `find_orphaned_pending_issue_tasks`
+                // clause (1) already excludes a parent with a live wrapper —
+                // but the two predicates are maintained apart, and the safe
+                // reading of a disagreement is "leave it alone".
+                RearmOutcome::AlreadyRepresented => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stuck-pending reaper: parent already represented — nothing to repair"
+                    );
+                    continue;
+                }
+                RearmOutcome::Rearmed => {
+                    info!(
+                        event = "stuck_pending_task_rearmed",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        wrappers_seen = %wrappers_seen,
+                        "orphaned pending task re-armed instead of expired"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stuck_pending_task_rearmed",
+                            &format!("task:{}", candidate.id),
+                            Some("pending"),
+                            Some("pending"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{} {}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count,
+                                wrappers_seen
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stuck_pending_task_rearmed audit event");
+                    }
+                    continue;
+                }
+                RearmOutcome::Unrepairable => {}
+            }
+
+            // Repair is not available any more. Cancel surviving wrappers FIRST:
+            // one promoted after the expiry would replay a dispatch against a
+            // dead parent while the `ready` sweep has already created a live
+            // replacement for the same issue.
+            match self
+                .db
+                .cancel_deferred_wrappers_of_parent(&candidate.id)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    info!(
+                        task_id = %candidate.id,
+                        cancelled_wrappers = n,
+                        "cancelled surviving deferred wrappers before expiring the parent"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to cancel surviving wrappers"
+                    );
+                }
+            }
+
+            match self
+                .db
+                .update_task_failed(&candidate.id, "stuck_pending_no_deferred_wrapper")
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        event = "stuck_pending_task_expired",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        rearm_count = candidate.rearm_count,
+                        wrappers_seen = %wrappers_seen,
+                        "orphaned pending task expired — slot freed for the ready sweep"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stuck_pending_task_expired",
+                            &format!("task:{}", candidate.id),
+                            Some("pending"),
+                            Some("failed"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{} {}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count,
+                                wrappers_seen
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stuck_pending_task_expired audit event");
+                    }
+                }
+                Ok(false) => {
+                    debug!(
+                        task_id = %candidate.id,
+                        "stuck-pending reaper: task left pending state before expiry — no-op"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "task_engine_stuck_pending_reaper: failed to expire the task"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Record that the direct activity measure withheld a stuck-pending expiry
+    /// (mika#2184, U4/R2).
+    ///
+    /// Writes both surfaces, for the reason `record_phantom_spare` states one
+    /// screen above: the `info!` line is what an operator greps while watching a
+    /// dispatch, the `audit_events` row is what survives log rotation.
+    ///
+    /// SOLE WRITER of [`STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT`] — and that
+    /// name is deliberately **not**
+    /// `stuck_pending_sheltered_by_promoted_wrapper`, so the two spare causes
+    /// stay countable apart (R3/D6). `find_parents_sheltered_by_promoted_wrapper`
+    /// is untouched.
+    ///
+    /// `before_value` and `after_value` are both `"pending"`: the point of the
+    /// row is that nothing moved.
+    ///
+    /// The audit write is fire-and-forget. Losing the row costs visibility, never
+    /// the spare — the same discipline as `record_phantom_spare`.
+    async fn record_activity_spare(
+        &self,
+        system_session: &str,
+        candidate: &crate::db::OrphanedPendingTask,
+        cause: &str,
+        last_activity_secs: Option<i64>,
+        activity_window_secs: i64,
+    ) {
+        info!(
+            event = STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+            task_id = %candidate.id,
+            issue = %candidate.reference_url,
+            age_seconds = candidate.age_seconds,
+            last_activity_secs,
+            activity_window_secs,
+            cause,
+            "stuck-pending reaper: parent spared — its deferred turn is demonstrably active"
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+                &format!("task:{}", candidate.id),
+                Some("pending"),
+                Some("pending"),
+                Some(&format!(
+                    "issue:{} age_seconds:{} cause:{} last_activity_secs:{} window:{}",
+                    candidate.reference_url,
+                    candidate.age_seconds,
+                    cause,
+                    last_activity_secs
+                        .map(|s| s.to_string())
+                        // `null`, never `0` (mika#2331): on the
+                        // `not_yet_observable` branch no activity was measured,
+                        // and a zero would read as "measured, one second ago".
+                        .unwrap_or_else(|| "null".to_string()),
+                    activity_window_secs
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(
+                task_id = %candidate.id,
+                error = %e,
+                "failed to write stuck_pending_sheltered_by_activity audit event (parent was still spared)"
+            );
+        }
+    }
+
+    /// L2b (mika#2169) — report promotion starvation, mutate nothing.
+    ///
+    /// Counts deferred wrappers promoted (`completed`) but never taken by the
+    /// engine. After L1 and L2a, `status = 'completed'` on this label means
+    /// exactly one thing — promoted, not yet taken — because delivery writes
+    /// `delivered` and a sterile consumption writes `expired`. That exclusivity
+    /// is what makes the number worth reading.
+    ///
+    /// **No state is mutated, no wrapper is re-armed, no window destroys
+    /// anything.** The threshold drives a warning. The only latency ever
+    /// measured on this path is 2 h 47 min, and a naive 300 s watchdog applied
+    /// to the 2026-09-04 trace would have expired twenty-two wrappers at
+    /// ~00:53Z and permanently failed parents that were served at 03:35Z. A
+    /// window cannot tell starvation from a real orphan; only a state
+    /// discriminant can, and we do not have one yet. So we measure, and a
+    /// separate ticket will decide the action once the distribution is known.
+    ///
+    /// `agent_busy` is what makes the signal interpretable: starvation behind a
+    /// held lock resolves itself, whereas wrappers waiting with a **free** agent
+    /// is the only genuinely anomalous shape.
+    async fn report_promotion_starvation(&self) {
+        // The epoch is stamped on first use rather than compiled in: the day
+        // `completed` becomes exclusive is the day L1 runs in production, not
+        // the day the plan was written. `INSERT OR IGNORE` makes every later
+        // pass a no-op read.
+        let epoch = match self
+            .db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to resolve the deferred-promotion epoch — skipping the starvation report");
+                return;
+            }
+        };
+
+        let stale_seconds = deferred_promotion_stale_secs();
+        let (count, oldest_age_secs) = match self
+            .db
+            .count_promoted_undelivered_wrappers(stale_seconds, &epoch)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to count promoted-undelivered wrappers");
+                return;
+            }
+        };
+
+        if count == 0 {
+            return;
+        }
+
+        let agent_busy = self
+            .dispatcher
+            .agent_lock
+            .as_ref()
+            .is_some_and(|lock| lock.try_lock().is_err());
+
+        warn!(
+            event = "deferred_dispatch_promotion_starved",
+            count,
+            oldest_age_secs,
+            agent_busy,
+            stale_seconds,
+            epoch = %epoch,
+            agent_id = %self.db.agent_id(),
+            "deferred wrappers promoted but not taken — measurement only, nothing mutated"
+        );
+
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                &format!("system-{}", self.db.agent_id()),
+                "deferred_dispatch_promotion_starved",
+                &format!("agent:{}", self.db.agent_id()),
+                None,
+                None,
+                Some(&format!(
+                    "count:{count} oldest_age_secs:{oldest_age_secs} agent_busy:{agent_busy}"
+                )),
+                None,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to write deferred_dispatch_promotion_starved audit event");
+        }
+    }
+
+    /// L3b (mika#2169) — the net: `blocked` parents refused on a busy slot
+    /// whose wrapper never reached consumption.
+    ///
+    /// L3a covers parents whose wrapper **was** consumed. This one owns the
+    /// remainder: refused at registration, or wrapper vanished. Three checks in
+    /// order, and the order is the safety:
+    ///
+    /// 1. **is the named blocker finished?** A live blocker means the
+    ///    serialisation is doing its job — skip (AC5). An absent row means the
+    ///    blocker is gone, which is finished, more strongly.
+    /// 2. **is the lease expired?** `dispatch_slot_lease_holder` already filters
+    ///    `expires_at > now`, so `None` **is** the answer "expired or absent".
+    ///    A held lease means someone is claiming the slot right now — skip
+    ///    (AC5).
+    /// 3. only then, re-arm.
+    ///
+    /// Disjoint from L3a by parent status: L3a writes `failed`, which leaves
+    /// this population. The two are therefore safe in any tick order — not
+    /// because they are sequenced, but because they cannot select the same row.
+    async fn reap_stale_blocked_dispatch_tasks(&self) {
+        let grace_seconds = stuck_pending_reaper_grace_secs();
+        let candidates = match self
+            .db
+            .find_stale_blocked_dispatch_tasks(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "stale_blocked_dispatch: failed to query blocked dispatch tasks");
+                return;
+            }
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let system_session = format!("system-{}", self.db.agent_id());
+
+        for candidate in candidates {
+            // (1) The blocker the refusal named.
+            if let Some(ref blocker_id) = candidate.blocking_callback_id {
+                match self.db.get_task(blocker_id).await {
+                    Ok(Some(blocker))
+                        if blocker.status == task_status::PENDING
+                            || blocker.status == task_status::IN_PROGRESS =>
+                    {
+                        debug!(
+                            task_id = %candidate.id,
+                            blocker_id = %blocker_id,
+                            blocker_status = %blocker.status,
+                            "stale_blocked_dispatch: blocker still live — skipping (AC5)"
+                        );
+                        continue;
+                    }
+                    // Finished, or the row is gone — both mean "no longer
+                    // blocking". Proceed.
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            task_id = %candidate.id,
+                            blocker_id = %blocker_id,
+                            error = %e,
+                            "stale_blocked_dispatch: blocker lookup failed — skipping this pass"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // (2) The lease. `Some` means a live claim on the slot.
+            match self
+                .db
+                .dispatch_slot_lease_holder(&candidate.dispatch_class)
+                .await
+            {
+                Ok(Some((holder_task_id, holder_source))) => {
+                    debug!(
+                        task_id = %candidate.id,
+                        dispatch_class = %candidate.dispatch_class,
+                        holder_task_id = %holder_task_id,
+                        holder_source = ?holder_source,
+                        "stale_blocked_dispatch: dispatch slot lease still held — skipping (AC5)"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "stale_blocked_dispatch: lease lookup failed — skipping this pass"
+                    );
+                    continue;
+                }
+            }
+
+            // (3) Both free — repair.
+            let action_config = match self
+                .db
+                .latest_deferred_wrapper_action_config(&candidate.id)
+                .await
+            {
+                Ok(Some(config)) => Some(config),
+                Ok(None) => rebuild_deferred_action_config(
+                    &candidate.id,
+                    &candidate.reference_url,
+                    &candidate.dispatch_class,
+                ),
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.id,
+                        error = %e,
+                        "stale_blocked_dispatch: failed to read the last wrapper config"
+                    );
+                    None
+                }
+            };
+
+            // Return the parent to `pending` BEFORE re-arming, and the order is
+            // a safety property rather than a preference. Both writes can fail
+            // independently, so pick the failure that lands in covered
+            // territory:
+            //
+            //   status-then-rearm, rearm fails  -> `pending` with no wrapper,
+            //     which is *exactly* the population `find_orphaned_pending_
+            //     issue_tasks` (mika#2045) owns and repairs next tick.
+            //   rearm-then-status, status fails -> `blocked` with a live
+            //     wrapper. That wrapper gets promoted, its turn calls
+            //     `run_claude_pilot`, and check (1) of
+            //     `validate_dispatch_readiness` REFUSES a `blocked` task — so
+            //     it registers another wrapper, and round it goes.
+            //
+            // This sweep feeds the mika#2045 ladder; it does not replace it,
+            // and it should fail into it rather than beside it.
+            if let Err(e) = self
+                .db
+                .update_task_status(&candidate.id, task_status::PENDING)
+                .await
+            {
+                warn!(
+                    task_id = %candidate.id,
+                    error = %e,
+                    "stale_blocked_dispatch: failed to return the parent to pending — skipping this pass"
+                );
+                continue;
+            }
+
+            let outcome = match action_config {
+                Some(config) => {
+                    crate::skills::executor::rearm_deferred_callback(
+                        &self.db,
+                        &candidate.id,
+                        &config,
+                        &candidate.dispatch_class,
+                        "stale_blocked_dispatch",
+                        // mika#2413 — the sweep acts on a parent, not on a
+                        // consumed turn: no wrapper to take out.
+                        None,
+                    )
+                    .await
+                }
+                None => RearmOutcome::Unrepairable,
+            };
+
+            match outcome {
+                RearmOutcome::NotNow => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stale_blocked_dispatch: repair refused for a transient reason — retrying next tick"
+                    );
+                }
+                // mika#2413 — the parent was returned to `pending` just above
+                // and a live wrapper already represents it, so the queue will
+                // carry it on its own. Nothing to repair, nothing to expire.
+                RearmOutcome::AlreadyRepresented => {
+                    debug!(
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        "stale_blocked_dispatch: parent already represented — nothing to repair"
+                    );
+                }
+                RearmOutcome::Rearmed => {
+                    info!(
+                        event = "stale_blocked_dispatch_rearmed",
+                        task_id = %candidate.id,
+                        issue = %candidate.reference_url,
+                        age_seconds = candidate.age_seconds,
+                        previous_rearm_count = candidate.rearm_count,
+                        "blocked dispatch task re-armed — blocker finished, lease expired"
+                    );
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "stale_blocked_dispatch_rearmed",
+                            &format!("task:{}", candidate.id),
+                            Some("blocked"),
+                            Some("pending"),
+                            Some(&format!(
+                                "issue:{} age_seconds:{} rearm_count:{}",
+                                candidate.reference_url,
+                                candidate.age_seconds,
+                                candidate.rearm_count
+                            )),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "failed to write stale_blocked_dispatch_rearmed audit event");
+                    }
+                }
+                RearmOutcome::Unrepairable => {
+                    let reason = format!(
+                        "stale_blocked_dispatch: bloqueur {} terminé, bail expiré, \
+                         budget de re-armement épuisé",
+                        candidate
+                            .blocking_callback_id
+                            .as_deref()
+                            .unwrap_or("absent")
+                    );
+                    match self.db.update_task_failed(&candidate.id, &reason).await {
+                        Ok(true) => {
+                            warn!(
+                                event = "loop_stuck_blocked_tasks",
+                                task_id = %candidate.id,
+                                issue = %candidate.reference_url,
+                                age_seconds = candidate.age_seconds,
+                                rearm_count = candidate.rearm_count,
+                                "blocked dispatch task failed with a reason — the trio is not a stable state"
+                            );
+                            if let Err(e) = self
+                                .db
+                                .log_audit_event(
+                                    &system_session,
+                                    "stale_blocked_dispatch_expired",
+                                    &format!("task:{}", candidate.id),
+                                    // `pending`, not `blocked`: the sweep
+                                    // already returned the parent above, and an
+                                    // audit row must name the state that was
+                                    // actually true at write time. The origin
+                                    // is carried by the tool name and reason.
+                                    Some("pending"),
+                                    Some("failed"),
+                                    Some(&format!(
+                                        "issue:{} age_seconds:{} rearm_count:{}",
+                                        candidate.reference_url,
+                                        candidate.age_seconds,
+                                        candidate.rearm_count
+                                    )),
+                                    None,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "failed to write stale_blocked_dispatch_expired audit event");
+                            }
+                        }
+                        Ok(false) => {
+                            debug!(
+                                task_id = %candidate.id,
+                                "stale_blocked_dispatch: task left blocked state before expiry — no-op"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %candidate.id,
+                                error = %e,
+                                "stale_blocked_dispatch: failed to expire the task"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Engine-level backstop for deferred-dispatch promotion (mika#1070, mika#1175).
+    ///
+    /// Runs every `DB_SCAN_INTERVAL_TICKS`. For each `dispatch_class`, if pending
+    /// deferred wrappers of that class exist AND no active non-deferred callback
+    /// exists in that class, promotes the oldest wrapper of that class. Per-class
+    /// iteration (mika#1175) prevents cross-class throughput halving when wrappers
+    /// from multiple classes are pending. This recovers from any scenario where
+    /// the inline promotion at `dispatch_resume_agent` (dispatcher.rs) fails to fire.
+    async fn promote_pending_deferred_if_idle(&self) {
+        for class in DISPATCH_CLASSES {
+            // mika#2160 — compare a COUNT against the class cap. This used to be
+            // a boolean, which is the shape of a cap of exactly one; left that
+            // way while the dispatch guard learned to count, a cap above 1
+            // would admit new dispatches but make a DEFERRED one wait for the
+            // class to fall back to zero rather than below the cap. That is the
+            // asymmetric-predicate drift mika#1163 already had to name once.
+            let cap = crate::skills::executor::max_concurrent_for_class(class);
+            match self.db.count_active_callbacks_for_class(class).await {
+                Ok(active) if crate::skills::executor::class_cap_reached(active, cap) => continue, // Class at cap — skip
+                Ok(_) => {} // Room in the class — try to promote one wrapper
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dispatch_class = class,
+                        "failed to check active callbacks for deferred promotion"
+                    );
+                    continue; // Fail-closed for this class — try the others
+                }
+            }
+
+            // Operator priority (mika#1948 AC3). Three dispatchers share these
+            // slots — the autonomous loop, the milestone manager, and the
+            // operator — and they are not peers. When the operator has drafted
+            // work in this class, an automatic wrapper promotion must not take
+            // the slot out from under it: the operator cannot see the queue and
+            // would simply find their dispatch refused.
+            //
+            // Ordering is deliberate: this runs AFTER the slot-occupancy check,
+            // so it only ever suppresses a promotion that would otherwise have
+            // happened, and never masks the reason a class is busy.
+            //
+            // Fail-OPEN on error, unlike the check above. The distinction is the
+            // one mika#2084 already had to make: a busy slot is information we
+            // must have (fail-closed), whereas priority is a preference — a
+            // stray DB error must not strand deferred wrappers forever. Losing
+            // the preference costs the operator one contended dispatch;
+            // fail-closing here would cost the loop its recovery path.
+            match self.db.has_pending_operator_task_for_class(class).await {
+                Ok(true) => {
+                    debug!(
+                        dispatch_class = class,
+                        "deferred promotion skipped — an operator task holds priority in this class"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        dispatch_class = class,
+                        "operator-priority check failed — promoting anyway (fail-open)"
+                    );
+                }
+            }
+
+            self.dispatcher
+                .dispatch_next_deferred_callback_for_class(class)
+                .await;
+        }
+    }
+
+    /// Detect dead subprocesses for active callback tasks (#959).
+    ///
+    /// For each `in_progress` callback task with a `process_id`:
+    /// 1. Check if the process is still alive (PID exists AND start time matches)
+    /// 2. If dead, set `first_dead_at` metadata on first detection
+    /// 3. If dead and past grace period, mark the task `failed`
+    /// 4. If alive, clear any stale `first_dead_at` (defensive)
+    ///
+    /// Grace period default: 120s (configurable via `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS`).
+    async fn check_callback_process_liveness(&self) {
+        let tasks = match self.db.get_active_callback_tasks_with_pid().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "callback_watchdog: failed to query active callback tasks");
+                return;
+            }
+        };
+
+        if tasks.is_empty() {
+            return;
+        }
+
+        let grace_period_secs = self
+            .dispatcher
+            .settings
+            .effective_callback_watchdog_grace_period_secs();
+
+        for task in tasks {
+            let pid = match task.process_id {
+                Some(pid) if pid > 0 => pid as u32,
+                _ => continue,
+            };
+
+            // Read stored process_start_time from task metadata
+            let start_time: Option<u64> = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+
+            let process_alive = match start_time {
+                Some(st) => super::process_liveness::is_same_process_alive(pid, st),
+                // No start time stored (pre-#959 task or non-Linux) — fall back to
+                // basic /proc check. Less reliable but better than nothing.
+                None => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        std::path::Path::new(&format!("/proc/{pid}")).exists()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        true // Assume alive on non-Linux — existing timeout_at is the fallback
+                    }
+                }
+            };
+
+            if process_alive {
+                // Process is alive — clear any stale first_dead_at (defensive)
+                let has_first_dead_at = task
+                    .metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| v.get("first_dead_at").cloned())
+                    .is_some();
+
+                if has_first_dead_at {
+                    let _ = self
+                        .db
+                        .remove_task_metadata_field(&task.id, "first_dead_at")
+                        .await;
+                }
+                continue;
+            }
+
+            // Process is dead — check grace period
+            let first_dead_at = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .and_then(|v| v.get("first_dead_at")?.as_str().map(|s| s.to_string()));
+
+            let now = crate::timestamp::now();
+
+            match first_dead_at {
+                None => {
+                    // First detection — record timestamp
+                    debug!(
+                        task_id = %task.id,
+                        pid = pid,
+                        "callback_watchdog: subprocess PID dead, starting grace period"
+                    );
+                    let _ = self
+                        .db
+                        .set_task_metadata_field(&task.id, "first_dead_at", &now)
+                        .await;
+                }
+                Some(first_dead) => {
+                    // Check if grace period has elapsed
+                    let grace_duration = chrono::Duration::seconds(grace_period_secs as i64);
+                    if !crate::timestamp::is_older_than(&first_dead, grace_duration) {
+                        // Still within grace period — wait
+                        debug!(
+                            task_id = %task.id,
+                            pid = pid,
+                            first_dead_at = %first_dead,
+                            grace_period_secs = grace_period_secs,
+                            "callback_watchdog: still within grace period"
+                        );
+                        continue;
+                    }
+
+                    // Grace period elapsed — re-check task status to guard against
+                    // race with in-flight callback delivery
+                    let current_task = match self.db.get_task(&task.id).await {
+                        Ok(Some(t)) => t,
+                        _ => continue,
+                    };
+
+                    if current_task.status != "in_progress" {
+                        // Task already transitioned (callback delivered during grace)
+                        debug!(
+                            task_id = %task.id,
+                            status = %current_task.status,
+                            "callback_watchdog: task already transitioned, skipping"
+                        );
+                        continue;
+                    }
+
+                    // Mark task as failed
+                    match self
+                        .db
+                        .update_task_failed(&task.id, "subprocess_exited_without_delivery")
+                        .await
+                    {
+                        Ok(true) => {
+                            // Clear timeout_at to prevent double-processing by
+                            // expire_timed_out_tasks
+                            let _ = self
+                                .db
+                                .set_task_metadata_field(
+                                    &task.id,
+                                    "watchdog_cleared_timeout",
+                                    "true",
+                                )
+                                .await;
+
+                            warn!(
+                                task_id = %task.id,
+                                parent_task_id = ?task.parent_task_id,
+                                pid = pid,
+                                process_start_time = ?start_time,
+                                first_dead_at = %first_dead,
+                                grace_period_secs = grace_period_secs,
+                                failure_reason = "subprocess_exited_without_delivery",
+                                "callback_watchdog_detected_process_death: \
+                                 subprocess exited without delivering callback, \
+                                 marking task failed to unblock dispatch queue"
+                            );
+                        }
+                        Ok(false) => {
+                            debug!(
+                                task_id = %task.id,
+                                "callback_watchdog: task already in terminal state"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                task_id = %task.id,
+                                error = %e,
+                                "callback_watchdog: failed to mark task as failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reap dispatches whose process is alive but whose worktree has gone
+    /// silent (mika#2249, D1).
+    ///
+    /// # The population nothing else can see
+    ///
+    /// Every existing reaper fires on **task state**: orphan-on-startup, the
+    /// stuck-`pending` reaper, the stale-`blocked` reaper, the two self_dev
+    /// parent reapers. A task that is `in_progress` with a **live** process is
+    /// structurally invisible to all of them — which is why `fb355061` sat for
+    /// 2 h 18 with an empty `result` and no terminal marker. The PID watchdog
+    /// [`Self::check_callback_process_liveness`] is this method's exact mirror:
+    /// it owns the process that is **dead**; nothing owned the process that is
+    /// **alive and mute**.
+    ///
+    /// # Why this lives in the engine and not in claude-pilot
+    ///
+    /// The word is load-bearing: the detector must be **external**. Both
+    /// mika#2246 pilots ran with a working internal watchdog compiled in
+    /// (`toolWaitCeiling=1800s modelWaitCeiling=900s` appear in all three logs,
+    /// fields that only exist post-cpp#145) and neither fired. A watchdog
+    /// starved inside the pilot's own event loop cannot fire on a pilot-side
+    /// timer either, whatever that timer measures. Any detector housed in
+    /// claude-pilot inherits the failure it exists to see.
+    ///
+    /// # The predicate, term by term (AC4)
+    ///
+    /// A conjunction, and each term is pinned by a negative-control test that
+    /// neutralises **only** it:
+    ///
+    /// 1. `trigger_type='callback'`, `status IN ('pending','in_progress')`,
+    ///    `process_id NOT NULL` — the population, straight from
+    ///    [`AsyncDatabase::get_live_dispatch_callback_tasks_with_pid`].
+    ///    **`pending` is where a live dispatch actually sits** (mika#2272): the
+    ///    callback child is created without a status, so it is written
+    ///    `pending`, and #525 transitions the *parent* rather than the child.
+    ///    Scanning `in_progress` alone selected an empty set — 897 rows have
+    ///    carried a `process_id` in production and not one of them was ever
+    ///    `in_progress` — which is why mika#2261 shipped and never fired.
+    /// 2. The process is **alive** (`is_same_process_alive`, PID-reuse safe).
+    ///    A dead one belongs to the watchdog above.
+    /// 3. The **transcript** declared on the row
+    ///    ([`PILOT_TRANSCRIPT_EXPECTED_KEY`]) has not been appended to for
+    ///    longer than the window.
+    /// 4. The **claude-pilot session log**, derived as
+    ///    `<pilot_log_dir>/<task-id>.log`, has not been written for longer
+    ///    than the window.
+    /// 5. A worktree was **declared** ([`DISPATCH_WORKTREE_FILE_KEY`]), the
+    ///    declaration is readable and non-empty, the path exists and yields an
+    ///    mtime, and that mtime is older than the window.
+    /// 6. The task is **still** in one of those two live statuses on re-read —
+    ///    so an in-flight callback, which moves the row to `completed` or
+    ///    `delivered`, wins the race cleanly.
+    ///
+    /// # Why three surfaces and not one (mika#2277)
+    ///
+    /// Terms 3 and 4 exist because term 5 alone is **false**. On 2026-09-10 at
+    /// 07:16:10Z, the first armed deploy of mika#2272 killed the only two
+    /// pilots in flight, both alive and productive: their claude-pilot logs and
+    /// transcripts had been written 3 min 40 s and 3 min 31 s earlier, while
+    /// their worktrees had not moved since `checkout` — 2758 s and 2744 s, past
+    /// the 2700 s window. A pilot in its reading / exploration / planning phase
+    /// touches no file in the worktree while the SDK keeps yielding turns.
+    ///
+    /// The negative control that justified the window is refuted with it: the
+    /// 24-minute inter-write gap of the healthy run `c3f9a2f9` was never the
+    /// upper bound of a healthy gap — the upper bound is the length of a
+    /// reading phase, which has no measured ceiling. **There is no safe window
+    /// for a worktree-only predicate**, so the fix is not a wider window.
+    ///
+    /// The transcript, by contrast, separates: it timestamps every LLM turn,
+    /// and on the two false positives the largest inter-turn gap was 387 s and
+    /// 376 s — a factor of 7 under the window. It is also the *definition* of
+    /// the class D1 targets (mika#1901: the SDK stream goes quiet) rather than
+    /// a proxy for it.
+    ///
+    /// # The fail-safe rule, stated once
+    ///
+    /// > A signal that cannot be read is **never** a satisfied term.
+    ///
+    /// Terms 3, 4 and 5 all obey it: a missing metadata key, an absent or
+    /// unreadable file, no mtime, an mtime in the future — each takes the
+    /// dispatch **out** of the population (`continue`), never into it. A
+    /// free-text dispatch has no worktree at all (`engine.rs`'s mika#1593
+    /// path); a dispatch whose declaration was lost is indistinguishable from
+    /// one; a fleet running with `MIKA_LOG_PILOT_TRANSCRIPTS` disabled has no
+    /// transcript. All are invisible to the reaper rather than fodder for it.
+    ///
+    /// That rule has a cost, and AC4 is what keeps it from being paid in
+    /// silence: turning off an observability feature would otherwise disarm a
+    /// safety mechanism with nothing said. The first time a dispatch drops out
+    /// for an *unavailable* signal, the reaper says so and stamps
+    /// [`PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY`] so it says it once. A
+    /// dispatch dropped because a surface is **active** is nominal and stays
+    /// silent.
+    ///
+    /// # Evaluation order is cost, not semantics
+    ///
+    /// The two single-file `stat`s run before the bounded worktree walk, and an
+    /// active one short-circuits it. The conjunction is unchanged — a surface
+    /// found active ends the question either way — but a live pilot no longer
+    /// pays for a directory walk on every scan.
+    ///
+    /// # Detection is unconditional; disposition is armed (mika#2272)
+    ///
+    /// The audit row is written whenever the predicate holds. The kill and the
+    /// transition happen when `pilot_stall_reap_enabled` is armed, which since
+    /// mika#2272 it is **by default**.
+    ///
+    /// mika#2249 landed it disarmed behind a flip condition — three reviewed
+    /// `pilot_silent_stall` rows with no false positive. That condition counted
+    /// rows produced by a detector whose population was empty, so it could
+    /// never be met: zero rows was the absence of measurement, not evidence of
+    /// caution. What the caution bought is still paid, by the parts that did
+    /// not change — terms 3 and 4 keep any dispatch without a readable,
+    /// existing worktree out of the population entirely, the 2700 s window
+    /// still clears its measured negative control by a factor of two, and
+    /// `MIKA_PILOT_STALL_REAP_ENABLED=0` disarms without a rebuild. See
+    /// [`mika_common::config::DEFAULT_PILOT_STALL_REAP_ENABLED`].
+    async fn reap_silently_stalled_pilots(&self) {
+        let tasks = match self.db.get_live_dispatch_callback_tasks_with_pid().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "pilot_stall_reaper: failed to query active callback tasks");
+                return;
+            }
+        };
+        if tasks.is_empty() {
+            return;
+        }
+
+        let settings = &self.dispatcher.settings;
+        let max_age_secs = settings.effective_pilot_stall_reap_age_seconds();
+        let disposition_armed = settings.effective_pilot_stall_reap_enabled();
+        let pilot_log_dir = settings.effective_pilot_log_dir();
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+
+        for task in tasks {
+            // Term 1: a usable PID.
+            let pid = match task.process_id {
+                Some(pid) if pid > 0 => pid,
+                _ => continue,
+            };
+
+            let metadata: Option<serde_json::Value> = task
+                .metadata
+                .as_deref()
+                .and_then(|m| serde_json::from_str(m).ok());
+
+            let start_time: Option<u64> = metadata
+                .as_ref()
+                .and_then(|v| v.get("process_start_time")?.as_str()?.parse().ok());
+
+            // Term 2: the process must be ALIVE. A dead one is
+            // `check_callback_process_liveness`'s population, not ours — the two
+            // methods select disjoint sets by construction, which is why they
+            // can sit next to each other in the same tick with no ordering
+            // hazard.
+            let process_alive = match (u32::try_from(pid).ok(), start_time) {
+                (Some(p), Some(st)) => super::process_liveness::is_same_process_alive(p, st),
+                // No stored start time (pre-#959 task, or a metadata write that
+                // failed) — the pair that identifies a process *instance* is
+                // incomplete, so a recycled PID would read as alive. Decline
+                // rather than guess: this reaper kills.
+                _ => continue,
+            };
+            if !process_alive {
+                continue;
+            }
+
+            // Terms 3 and 4: the two single-file surfaces, cheapest first. An
+            // active one ends the question — the pilot is demonstrably alive —
+            // and skips the bounded worktree walk below.
+            let transcript_signal = Self::probe_transcript_signal(metadata.as_ref(), max_age_secs);
+            let pilot_log_signal =
+                Self::probe_pilot_log_signal(&pilot_log_dir, &task.id, max_age_secs);
+            if transcript_signal.is_active() || pilot_log_signal.is_active() {
+                continue;
+            }
+
+            // Term 5: the declared worktree. Every failure below is "not a
+            // candidate", never "stale".
+            let worktree = Self::declared_worktree(metadata.as_ref());
+            let worktree_signal = LivenessSignal::from_age(
+                worktree
+                    .as_deref()
+                    .and_then(super::worktree_activity::seconds_since_last_write),
+                max_age_secs,
+            );
+            if worktree_signal.is_active() {
+                continue;
+            }
+
+            // Every surface is either silent or unreadable. Silence on all
+            // three is the only shape that authorises a kill; anything less is
+            // inertia, and AC4 says inertia out loud — once per dispatch.
+            let (
+                Some(transcript_idle_secs),
+                Some(pilot_log_idle_secs),
+                Some(worktree_idle_secs),
+                Some(worktree),
+            ) = (
+                transcript_signal.silent_age(),
+                pilot_log_signal.silent_age(),
+                worktree_signal.silent_age(),
+                worktree,
+            )
+            else {
+                self.report_unavailable_liveness_signal(
+                    &task,
+                    transcript_signal,
+                    pilot_log_signal,
+                    worktree_signal,
+                )
+                .await;
+                continue;
+            };
+            let ages = PilotStallAges {
+                worktree_idle_secs,
+                transcript_idle_secs,
+                pilot_log_idle_secs,
+            };
+
+            // Term 6: still on a live surface. Re-read rather than trust the
+            // snapshot — the scan above did filesystem I/O, and a callback may
+            // have landed meanwhile, moving the row to `completed`/`delivered`.
+            let current = match self.db.get_task(&task.id).await {
+                Ok(Some(t)) => t,
+                _ => continue,
+            };
+            if !is_live_dispatch_status(&current.status) {
+                debug!(
+                    task_id = %task.id,
+                    status = %current.status,
+                    "pilot_stall_reaper: task transitioned during the scan, skipping"
+                );
+                continue;
+            }
+
+            self.dispose_of_silently_stalled_pilot(
+                &task,
+                pid,
+                start_time,
+                &worktree,
+                ages,
+                max_age_secs,
+                disposition_armed,
+                &system_session,
+                &current.status,
+            )
+            .await;
+        }
+    }
+
+    /// The worktree path this dispatch declared, or `None` when nothing
+    /// readable declares one (mika#2249 terms 3–4, unchanged by mika#2277).
+    fn declared_worktree(metadata: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
+        let declaration_file = metadata
+            .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
+            .map(std::path::PathBuf::from)?;
+        let declared = std::fs::read_to_string(&declaration_file).ok()?;
+        let trimmed = declared.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(trimmed))
+    }
+
+    /// Term 3 — the pilot transcript's activity (mika#2277).
+    ///
+    /// The path is **declared, not derived**: `inject_pilot_transcript_env`
+    /// stamps [`PILOT_TRANSCRIPT_EXPECTED_KEY`] on this very row once the
+    /// subprocess is confirmed started (mika#2040 AC7). Reconstructing it here
+    /// from the skill name and the current value of
+    /// `MIKA_LOG_PILOT_TRANSCRIPTS` would read a gate that can flip between
+    /// the dispatch and this scan, and would claim a transcript for dispatches
+    /// that were never asked for one.
+    fn probe_transcript_signal(
+        metadata: Option<&serde_json::Value>,
+        max_age_secs: u64,
+    ) -> LivenessSignal {
+        let Some(path) = metadata
+            .and_then(|v| v.get(PILOT_TRANSCRIPT_EXPECTED_KEY)?.as_str())
+            .map(std::path::PathBuf::from)
+        else {
+            return LivenessSignal::Unavailable;
+        };
+        LivenessSignal::from_age(
+            super::worktree_activity::seconds_since_file_write(&path),
+            max_age_secs,
+        )
+    }
+
+    /// Term 4 — the claude-pilot session log's activity (mika#2277).
+    ///
+    /// This one **is** derived, and it is the only derived path in the
+    /// predicate. `dispatch-lib.sh` sets `LOG_ID="$TASK_ID"` and launches
+    /// `claude-pilot --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID"`, so the
+    /// file is `<pilot_log_dir>/<callback-task-id>.log`; verified empirically
+    /// against the two mika#2277 false positives.
+    ///
+    /// Deriving rather than declaring is acceptable **here specifically**
+    /// because the derivation cannot fail dangerously: the two halves read
+    /// different environment variables (`PILOT_LOG_DIR` in the shell,
+    /// `MIKA_PILOT_LOG_DIR` in the engine, since `MIKA_*` is scrubbed from the
+    /// dispatch child), and a disagreement makes the file **absent** — which
+    /// is `Unavailable`, which takes the dispatch out of the population. A
+    /// wrong derivation can only buy inertia, never a false positive.
+    fn probe_pilot_log_signal(
+        pilot_log_dir: &std::path::Path,
+        task_id: &str,
+        max_age_secs: u64,
+    ) -> LivenessSignal {
+        let path = pilot_log_dir.join(format!("{task_id}.log"));
+        LivenessSignal::from_age(
+            super::worktree_activity::seconds_since_file_write(&path),
+            max_age_secs,
+        )
+    }
+
+    /// Say once, per dispatch, that a liveness signal could not be read
+    /// (mika#2277 AC4).
+    ///
+    /// **Disposition: emit-and-continue.** This is observability. It names the
+    /// dispatch and the surfaces, then the dispatch leaves the population as
+    /// planned. It never blocks the tick, never changes a row's status, and
+    /// never becomes a cause of disposition itself — a safety mechanism that
+    /// halted because it could not measure would be a worse defect than the
+    /// one it reports.
+    ///
+    /// Cadence is bounded by [`PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY`].
+    /// A failed stamp is logged at `debug` and nothing else: re-warning next
+    /// tick is noisier than intended but strictly better than swallowing the
+    /// signal, and the repetition is itself visible.
+    async fn report_unavailable_liveness_signal(
+        &self,
+        task: &crate::db::Task,
+        transcript: LivenessSignal,
+        pilot_log: LivenessSignal,
+        worktree: LivenessSignal,
+    ) {
+        let missing: Vec<&str> = [
+            (transcript, "transcript"),
+            (pilot_log, "pilot_log"),
+            (worktree, "worktree"),
+        ]
+        .into_iter()
+        .filter(|(signal, _)| *signal == LivenessSignal::Unavailable)
+        .map(|(_, name)| name)
+        .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let missing = missing.join(",");
+
+        let already_reported = task
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .is_some_and(|v| v.get(PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY).is_some());
+        if already_reported {
+            return;
+        }
+
+        warn!(
+            event = "pilot_stall_signal_unavailable",
+            task_id = %task.id,
+            parent_task_id = ?task.parent_task_id,
+            missing_surfaces = %missing,
+            "pilot_stall_reaper: a liveness signal could not be read, so this dispatch is \
+             invisible to the silent-stall reaper for its whole life (mika#2277 AC4)"
+        );
+
+        if let Err(e) = self
+            .db
+            .set_task_metadata_field(
+                &task.id,
+                PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY,
+                &missing,
+            )
+            .await
+        {
+            debug!(
+                task_id = %task.id,
+                error = %e,
+                "pilot_stall_reaper: could not stamp the inertia marker; the warning will repeat"
+            );
+        }
+    }
+
+    /// Report — and, when armed, dispose of — one silently stalled dispatch
+    /// (mika#2249, AC1/AC2/AC6/AC8).
+    ///
+    /// Split out of [`Self::reap_silently_stalled_pilots`] so the predicate
+    /// reads as a predicate and the destructive half reads as one action. The
+    /// caller has already established every term; this method only decides
+    /// between *say it* and *say it and act on it*.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispose_of_silently_stalled_pilot(
+        &self,
+        task: &crate::db::Task,
+        pid: i64,
+        start_time: Option<u64>,
+        worktree: &std::path::Path,
+        ages: PilotStallAges,
+        max_age_secs: u64,
+        disposition_armed: bool,
+        system_session: &str,
+        observed_status: &str,
+    ) {
+        // The disposition runs BEFORE the audit write, so `after_value` states
+        // what actually happened rather than what was intended. A kill that
+        // failed and a kill that was never attempted must not produce the same
+        // row — the flip condition in Décision 4 is read off these rows.
+        let mut transitioned = false;
+        if disposition_armed {
+            // Pre-write the discriminator BEFORE the signal (Décision 3, AC6).
+            // Left to itself, `dispatch-lib`'s TERM trap writes
+            // `STATUS=CANCELLED_BY_SIGNAL`, which `self-dev-callback` reads as
+            // an operator cancel and answers with *do NOT retry*. The reaper
+            // would then have killed the pilot AND the retry. The trap only
+            // writes when the file is absent, so this wins the race.
+            super::process_kill::pre_write_cancel_reason(
+                pid,
+                super::process_kill::CANCEL_REASON_PILOT_SILENT_STALL,
+            );
+            let killed = super::process_kill::kill_process_gracefully(pid, start_time).await;
+            if !killed {
+                warn!(
+                    task_id = %task.id,
+                    pid,
+                    "pilot_stall_reaper: kill failed; leaving the task in_progress rather than \
+                     claiming a disposition that did not happen"
+                );
+            } else {
+                // `failed`, not `cancelled`: `cancelled` is the operator's word
+                // and carries "do not retry" downstream. This dispatch is to be
+                // re-driven, by `stuck_ready_reconcile`, once the ticket is back
+                // in the pool.
+                match self
+                    .db
+                    .update_task_failed(&task.id, "pilot_silent_stall")
+                    .await
+                {
+                    Ok(true) => {
+                        transitioned = true;
+                        let _ = self.db.clear_task_process_id(&task.id).await;
+                    }
+                    Ok(false) => {
+                        debug!(
+                            task_id = %task.id,
+                            "pilot_stall_reaper: task reached a terminal state first"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(task_id = %task.id, error = %e, "pilot_stall_reaper: failed to mark task failed");
+                    }
+                }
+            }
+        }
+
+        // `before_value` is the status actually READ off the row, never a
+        // constant. Hard-coding `in_progress` here would have made every audit
+        // row assert the very thing mika#2272 disproved — that a live dispatch
+        // sits in `in_progress` — and the row is the only surface anyone reads
+        // this mechanism through.
+        let after_value = if transitioned {
+            task_status::FAILED
+        } else {
+            observed_status
+        };
+        let PilotStallAges {
+            worktree_idle_secs,
+            transcript_idle_secs,
+            pilot_log_idle_secs,
+        } = ages;
+        warn!(
+            event = "pilot_silent_stall",
+            task_id = %task.id,
+            parent_task_id = ?task.parent_task_id,
+            pid,
+            worktree = %worktree.display(),
+            observed_status,
+            worktree_idle_secs,
+            transcript_idle_secs,
+            pilot_log_idle_secs,
+            threshold_secs = max_age_secs,
+            disposition_armed,
+            transitioned,
+            "pilot_silent_stall: dispatch process is alive but every one of its liveness \
+             surfaces — worktree, transcript, pilot log — has been silent past the \
+             configured window"
+        );
+
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                "pilot_silent_stall",
+                &format!("task:{}", task.id),
+                Some(observed_status),
+                Some(after_value),
+                // AC5: the three ages, not the worktree alone. This row is the
+                // only surface anyone reads this mechanism through, and it has
+                // to let the decision be replayed — a `worktree_idle_secs`
+                // reported by itself is what made the 2026-09-10 false
+                // positives look nominal.
+                Some(&format!(
+                    "worktree {} silent on all surfaces past {max_age_secs}s \
+                     (worktree_idle_secs={worktree_idle_secs}, \
+                     transcript_idle_secs={transcript_idle_secs}, \
+                     pilot_log_idle_secs={pilot_log_idle_secs}), pid {pid} \
+                     alive on a `{observed_status}` row; \
+                     disposition_armed={disposition_armed}, transitioned={transitioned}",
+                    worktree.display()
+                )),
+                None,
+            )
+            .await
+        {
+            // Non-fatal, but worth saying plainly: this row IS the deliverable
+            // while the flag is disarmed, and the flip condition counts these.
+            warn!(
+                task_id = %task.id,
+                error = %e,
+                "pilot_stall_reaper: failed to write the pilot_silent_stall audit event"
+            );
+        }
+    }
+
+    /// Whether a tracking row's dispatch is still alive.
+    ///
+    /// The liveness guard both phantom-sweep callers share (mika#2156, plan
+    /// D-1/D-3). [`AsyncDatabase::find_phantom_tracking_tasks`] selects
+    /// *candidates*: liveness of a PID is not expressible in SQL, so the
+    /// discriminator lives here, between the selection and the destructive
+    /// [`AsyncDatabase::update_task_failed`] write.
+    ///
+    /// The predicate is **measured liveness, never the child's presence**. Of
+    /// the 181 sweeps in production history, 177 had a PID-carrying child
+    /// (plan measure M2) — a guard written on presence would have disarmed
+    /// the sweeper on 98% of its population. `is_same_process_alive` is what
+    /// separates the two, and it takes the `(pid, start_time)` pair because a
+    /// PID alone cannot survive reuse.
+    ///
+    /// # Which way each uncertainty falls
+    ///
+    /// - No child, or every child's process gone → `NoneLive`: sweep. This is
+    ///   the pre-fix behaviour, preserved (AC3).
+    /// - Child with a PID but no usable `process_start_time` → counted in
+    ///   `NoneLive.unusable_children` and **not** spared (plan D-3): without
+    ///   the start time the pair that identifies a process *instance* is
+    ///   incomplete, so a recycled PID would read as alive. The count is
+    ///   surfaced by the caller because this is the one path that silently
+    ///   returns the sweeper to its pre-fix behaviour — the executor's
+    ///   metadata write is best-effort (`skills/executor.rs`), so an absent
+    ///   field is a reachable production state, not a hypothetical.
+    /// - The lookup failed → `Unknown`: **skip the row**, do not sweep. A
+    ///   failed read is not evidence of death, and the sweep re-runs every
+    ///   `DB_SCAN_INTERVAL_TICKS` seconds, so declining costs one pass while
+    ///   guessing costs the incident this ticket documents.
+    ///
+    /// # Known residual, deliberately not addressed here
+    ///
+    /// `process_start_time` is `/proc/<pid>/stat` field 22 — ticks since
+    /// *boot* — so a `(pid, start_time)` pair identifies a process instance
+    /// only within the boot that recorded it. Across a host reboot a stale
+    /// pair could in principle collide with an unrelated process and spare an
+    /// orphan. This is a pre-existing property of `process_liveness` (shared
+    /// with the mika#959 callback watchdog), and it is bounded rather than
+    /// permanent: the recall child carries its own `timeout_at`, and once it
+    /// expires `kill_orphan_processes` clears the child's `process_id`, after
+    /// which the child is invisible to this guard and the row sweeps
+    /// normally.
+    ///
+    /// Likewise, a tracking row still *waiting for a dispatch slot* has no
+    /// PID-carrying child at all — only a deferred wrapper — so this guard
+    /// cannot see it. That window is covered by the grace threshold instead
+    /// (see `DEFAULT_PHANTOM_SWEEP_AGE_SECONDS`), which is a weaker instrument;
+    /// the plan priced it at one queued dispatch ahead.
+    async fn dispatch_liveness(&self, parent_id: &str) -> DispatchLiveness {
+        let children = match self.db.find_dispatch_children_with_pid(parent_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    task_id = %parent_id,
+                    error = %e,
+                    "phantom_sweep: dispatch-child lookup failed — skipping row, \
+                     no claim either way"
+                );
+                return DispatchLiveness::Unknown;
+            }
+        };
+
+        let mut unusable_children: u32 = 0;
+        for child in children {
+            let pid = match u32::try_from(child.process_id) {
+                // `p > 0` is load-bearing, not defensive: `kill(0, 0)` targets
+                // the CALLER's own process group, so a zero PID would read as
+                // alive and spare the row forever.
+                Ok(p) if p > 0 => p,
+                _ => {
+                    unusable_children = unusable_children.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(start_time) = child.process_start_time else {
+                unusable_children = unusable_children.saturating_add(1);
+                continue;
+            };
+            if super::process_liveness::is_same_process_alive(pid, start_time) {
+                return DispatchLiveness::Live {
+                    child_id: child.id,
+                    pid: child.process_id,
+                };
+            }
+        }
+        // Every child examined, none alive. `continue` above rather than an
+        // early return is deliberate: a dead child ordered before a live one
+        // must not stop the scan.
+        DispatchLiveness::NoneLive { unusable_children }
+    }
+
+    /// Record that the liveness guard withheld a `phantom_aged_out`
+    /// transition (mika#2156, AC4).
+    ///
+    /// Writes both surfaces, because they answer different questions. The
+    /// `info!` line is what an operator greps while watching a dispatch; the
+    /// `audit_events` row is what survives log rotation and lets the mika#1934
+    /// cause-racine query correlate spares with sweeps offline.
+    ///
+    /// SOLE WRITER: phantom_sweep_spared — this method serves both sweep
+    /// callers and is the only site that writes this audit tool_name. It is
+    /// deliberately a *distinct* name from `phantom_aged_out` so the AC7 count
+    /// semantics of `SELECT COUNT(*) ... WHERE tool_name='phantom_aged_out'`
+    /// keep meaning "rows actually transitioned" — same reasoning that gave
+    /// `phantom_sweep_db_error` its own name (ADV-3, 2026-08-21).
+    ///
+    /// `before_value` and `after_value` are both the row's unchanged status:
+    /// the point of the row is that nothing moved.
+    async fn record_phantom_spare(
+        &self,
+        system_session: &str,
+        row: &crate::db::PhantomTrackingTask,
+        child_task_id: &str,
+        pid: i64,
+        source: &str,
+        trace_id: &str,
+    ) {
+        info!(
+            event = "phantom_sweep_spared",
+            source,
+            task_id = %row.id,
+            child_task_id = %child_task_id,
+            process_id = pid,
+            updated_at = %row.updated_at,
+            // The row carries its own agent_id — no need to thread the
+            // caller's copy through just to log it.
+            agent_id = %row.agent_id,
+            trace_id = %trace_id,
+            "phantom_sweep: tracking row spared — dispatch child process is alive"
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                system_session,
+                "phantom_sweep_spared",
+                &format!("task:{}", row.id),
+                Some(&row.status),
+                Some(&row.status),
+                Some(&format!(
+                    "{source}: spared — dispatch child {child_task_id} pid {pid} is alive"
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            // Non-fatal: the transition was withheld either way. Losing the
+            // audit row costs visibility, never correctness.
+            warn!(
+                task_id = %row.id,
+                error = %e,
+                "phantom_sweep: failed to write spare audit event (row was still spared)"
+            );
+        }
+    }
+
+    /// Sweep NULL-PID phantom tracking rows (mika#1712, AC3).
+    ///
+    /// Selects rows with `action_type='none'`, `process_id IS NULL`,
+    /// `status IN ('in_progress','blocked')`, and `updated_at` older than the
+    /// configured grace window (`MIKA_PHANTOM_SWEEP_AGE_SECONDS`, default
+    /// 14400s since mika#2156). Transitions each match to `failed` with `error_reason =
+    /// "phantom_aged_out"` via `update_task_failed` (guarded UPDATE — races
+    /// with in-flight operator/agent transitions lose cleanly).
+    ///
+    /// Per-row emits an `audit_events` row with `tool_name='phantom_aged_out'`
+    /// carrying the pre-sweep status in `before_value`, `"failed"` in
+    /// `after_value`, and a source-discriminating `reasoning` field so the
+    /// AC3 (watchdog) and AC5 (startup) branches can be joined offline.
+    ///
+    /// Per-pass emits a `phantom_sweep_complete` INFO log line when at least
+    /// one row was swept, spared, errored, or skipped for an unreadable
+    /// lookup (mika#2156), with `source="watchdog_tick"` and the aggregate
+    /// counts. Since mika#2156 a `count = 0` line carrying `spared_count > 0`
+    /// is the healthy shape while a long dispatch is in flight — it means the
+    /// guard withheld a transition, not that the sweeper found nothing.
+    /// On count > 100 additionally emits `phantom_sweep_large_backlog`
+    /// WARN for operator anomaly visibility. NEVER caps the sweep — the
+    /// telemetry is the point (feeds the mika#1934 cause-racine investigation
+    /// per sami bearing §3 "no silent cap").
+    ///
+    /// SOLE WRITER: phantom_aged_out — this method (AC3 tick source) and the
+    /// startup step 2b inside [`Self::startup_recovery`] (AC5) are the only
+    /// two sites that write the `phantom_aged_out` audit tool_name. The
+    /// `reasoning` field carries the source discriminator; the `tool_name`
+    /// stays constant so the audit-events query surface is a single predicate
+    /// (`WHERE tool_name='phantom_aged_out'`) rather than a two-branch union.
+    ///
+    /// SOLE WRITER: phantom_sweep_db_error — the same two sites also emit the
+    /// distinct `phantom_sweep_db_error` audit tool_name when
+    /// `update_task_failed` returns Err. Keeping the error branch on its own
+    /// tool_name preserves the AC7 count semantics of
+    /// `SELECT COUNT(*) FROM audit_events WHERE tool_name='phantom_aged_out'`
+    /// (successful transitions only) — the sibling
+    /// `SELECT ... WHERE tool_name='phantom_sweep_db_error'` counts failures
+    /// separately. Addresses adversarial-reviewer ADV-3 (2026-08-21).
+    async fn sweep_null_pid_phantoms(&self) {
+        let age_seconds = self
+            .dispatcher
+            .settings
+            .effective_phantom_sweep_age_seconds() as i64;
+        let phantoms = match self.db.find_phantom_tracking_tasks(age_seconds).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "phantom_sweep: failed to query phantom tracking tasks");
+                return;
+            }
+        };
+
+        if phantoms.is_empty() {
+            return;
+        }
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+        let mut swept_count: u32 = 0;
+        let mut error_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut lookup_error_count: u32 = 0;
+        let mut unusable_child_count: u32 = 0;
+
+        for row in phantoms {
+            // ADV-5 (2026-08-21): re-arm heartbeat every row so a large sweep
+            // pass never trips the 300s wedge watchdog. Cheap AtomicI64 store.
+            self.heartbeat.tick();
+
+            // mika#2156: age says how long ago this row was last *written*,
+            // not how long ago the work last showed a sign of life — the
+            // tracking row's `updated_at` is never bumped while its dispatch
+            // runs. Ask the dispatch child before writing the failure.
+            match self.dispatch_liveness(&row.id).await {
+                DispatchLiveness::Live { child_id, pid } => {
+                    spared_count = spared_count.saturating_add(1);
+                    self.record_phantom_spare(
+                        &system_session,
+                        &row,
+                        &child_id,
+                        pid,
+                        "watchdog_tick",
+                        &trace_id,
+                    )
+                    .await;
+                    continue;
+                }
+                DispatchLiveness::Unknown => {
+                    lookup_error_count = lookup_error_count.saturating_add(1);
+                    continue;
+                }
+                DispatchLiveness::NoneLive { unusable_children } => {
+                    unusable_child_count = unusable_child_count.saturating_add(unusable_children);
+                }
+            }
+
+            match self
+                .db
+                .update_task_failed(&row.id, "phantom_aged_out")
+                .await
+            {
+                Ok(true) => {
+                    // ADV-4 (2026-08-21): audit-write FIRST, then increment
+                    // swept_count only on Ok. This aligns the per-pass count in
+                    // the phantom_sweep_complete log with the audit_events row
+                    // count — the two AC7 surfaces stay reconcilable.
+                    match self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "phantom_aged_out",
+                            &format!("task:{}", row.id),
+                            Some(&row.status),
+                            Some("failed"),
+                            Some(
+                                "phantom_aged_out: manual/none row with NULL process_id \
+                                 aged past watchdog grace",
+                            ),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        Ok(()) => swept_count = swept_count.saturating_add(1),
+                        Err(e) => {
+                            error_count = error_count.saturating_add(1);
+                            warn!(
+                                task_id = %row.id,
+                                error = %e,
+                                "phantom_sweep: failed to write audit event (transition succeeded)"
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {
+                    debug!(
+                        task_id = %row.id,
+                        "phantom_sweep: task already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // ADV-3 (2026-08-21): distinct tool_name for the error
+                    // branch so operator SQL counting swept rows via
+                    // `WHERE tool_name='phantom_aged_out'` is not polluted by
+                    // DB failures. Failures are countable separately via
+                    // `WHERE tool_name='phantom_sweep_db_error'`.
+                    error_count = error_count.saturating_add(1);
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "phantom_sweep_db_error",
+                            &format!("task:{}", row.id),
+                            Some(&row.status),
+                            None,
+                            Some(&format!("phantom_sweep_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        task_id = %row.id,
+                        error = %e,
+                        "phantom_sweep: db error during transition"
+                    );
+                }
+            }
+        }
+
+        // R7/ADV-4 (2026-08-21): emit the aggregate line when EITHER
+        // successful sweeps OR errors occurred, so a silent-failure pass
+        // (many rows queried, all update_task_failed Err) still surfaces.
+        if swept_count > 0 || error_count > 0 || spared_count > 0 || lookup_error_count > 0 {
+            info!(
+                event = "phantom_sweep_complete",
+                source = "watchdog_tick",
+                count = swept_count,
+                error_count = error_count,
+                spared_count = spared_count,
+                lookup_error_count = lookup_error_count,
+                unusable_child_count = unusable_child_count,
+                agent_id = %agent_id,
+                trace_id = %trace_id,
+                "phantom_sweep watchdog tick complete"
+            );
+        }
+        if swept_count > 100 {
+            warn!(
+                event = "phantom_sweep_large_backlog",
+                source = "watchdog_tick",
+                count = swept_count,
+                agent_id = %agent_id,
+                "phantom_sweep_large_backlog: single pass swept > 100 rows — anomalous state"
+            );
+        }
+    }
+
+    /// Startup step 2b (mika#1712 AC5): sweep pre-existing NULL-PID phantom
+    /// tracking rows at boot with `age_seconds=0` (matches every candidate
+    /// regardless of freshness — any phantom present at startup outlived a
+    /// prior process by definition). Same per-row transition + audit-event
+    /// shape as [`Self::sweep_null_pid_phantoms`] (AC3); the `reasoning` field
+    /// carries `"startup_sweep"` so the AC7 telemetry can join the two
+    /// branches offline via `SELECT ... WHERE tool_name='phantom_aged_out'`.
+    ///
+    /// SOLE WRITER coupling: this method and `sweep_null_pid_phantoms` are
+    /// the only two writers of the `phantom_aged_out` audit tool_name. The
+    /// per-pass telemetry line uses `source="startup_sweep"` to distinguish
+    /// from the watchdog tick.
+    ///
+    /// **Deliberate divergence from step 2's manual-preservation invariant
+    /// (ADV-1, 2026-08-21).** Step 2 of [`Self::startup_recovery`] explicitly
+    /// skips `trigger_type == MANUAL` in-progress rows with the comment
+    /// "Manual (task) tasks represent human work — don't invalidate on
+    /// restart". This method narrows that invariant: it DOES transition
+    /// manual/none/NULL-PID rows, because they are the phantom shape by
+    /// design — the real process lives on a separate `long_running:*` recall
+    /// row, so the tracking row never carries a `process_id` of its own.
+    ///
+    /// **What justifies age=0 — corrected mika#2156.** This comment used to
+    /// rest on two propositions that measurement contradicts, and they are
+    /// recorded here because a reader is likely to reach for them again:
+    ///
+    /// 1. *"a legitimate long-running tracking row would have `updated_at`
+    ///    bumped while it works"* — it does not. Measure M7 of the mika#2156
+    ///    plan found tracking rows mid-dispatch with `updated_at` frozen one
+    ///    second after creation. Age measures time since the last write to
+    ///    the row, never time since the work last showed a sign of life; the
+    ///    two only coincide once the work is dead.
+    /// 2. *"any phantom-shape row present at startup outlived a prior
+    ///    process"* — it need not have. A pilot is its own process-group
+    ///    leader (`skills/executor.rs`, `.process_group(0)`, mika#855), so a
+    ///    group signal aimed at the engine misses it, `supervise-daemon`
+    ///    restarts the engine from a third group, and the pilot is reparented
+    ///    to PID 1 and keeps working (measure M8).
+    ///
+    /// What actually separates an orphan from live work is therefore
+    /// [`Self::live_dispatch_child`], not the clock — and age=0 is safe here
+    /// precisely because that guard runs first. Aggressive freshness now only
+    /// decides how quickly rows with *no responding process* are cleaned up.
+    /// If a legitimate row is still swept, the operator un-fails it via SQL.
+    async fn sweep_null_pid_phantoms_at_startup(&self) {
+        let phantoms = match self.db.find_phantom_tracking_tasks(0).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "phantom_sweep startup: failed to query phantom tracking tasks"
+                );
+                return;
+            }
+        };
+
+        if phantoms.is_empty() {
+            return;
+        }
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+        let mut swept_count: u32 = 0;
+        let mut error_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut lookup_error_count: u32 = 0;
+        let mut unusable_child_count: u32 = 0;
+
+        for row in phantoms {
+            // ADV-5 (2026-08-21): re-arm heartbeat every row so a large
+            // startup pass never trips the wedge watchdog (300s threshold).
+            // Watchdog isn't spawned yet at this point in startup_recovery,
+            // but the heartbeat.tick() call is cheap AtomicI64 and futureproofs
+            // against re-ordering.
+            self.heartbeat.tick();
+
+            // mika#2156: same guard as the tick path, and it matters *more*
+            // here — at age=0 there is no grace window to absorb the mistake,
+            // so without it every engine restart would mark `failed` the whole
+            // set of dispatches actually in flight. A pilot survives that
+            // restart: it is its own process-group leader
+            // (`skills/executor.rs`, `.process_group(0)`, mika#855), so a
+            // group signal aimed at the engine misses it and it is reparented
+            // to PID 1.
+            match self.dispatch_liveness(&row.id).await {
+                DispatchLiveness::Live { child_id, pid } => {
+                    spared_count = spared_count.saturating_add(1);
+                    self.record_phantom_spare(
+                        &system_session,
+                        &row,
+                        &child_id,
+                        pid,
+                        "startup_sweep",
+                        &trace_id,
+                    )
+                    .await;
+                    continue;
+                }
+                DispatchLiveness::Unknown => {
+                    lookup_error_count = lookup_error_count.saturating_add(1);
+                    continue;
+                }
+                DispatchLiveness::NoneLive { unusable_children } => {
+                    unusable_child_count = unusable_child_count.saturating_add(unusable_children);
+                }
+            }
+
+            match self.db.update_task_failed(&row.id, "startup_sweep").await {
+                Ok(true) => {
+                    // ADV-4 (2026-08-21): audit-write FIRST, then increment on Ok.
+                    match self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "phantom_aged_out",
+                            &format!("task:{}", row.id),
+                            Some(&row.status),
+                            Some("failed"),
+                            Some("startup_sweep: pre-existing phantom found at boot"),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        Ok(()) => swept_count = swept_count.saturating_add(1),
+                        Err(e) => {
+                            error_count = error_count.saturating_add(1);
+                            warn!(
+                                task_id = %row.id,
+                                error = %e,
+                                "phantom_sweep startup: failed to write audit event \
+                                 (transition succeeded)"
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {
+                    debug!(
+                        task_id = %row.id,
+                        "phantom_sweep startup: task already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // ADV-3 (2026-08-21): distinct tool_name for the error branch.
+                    error_count = error_count.saturating_add(1);
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "phantom_sweep_db_error",
+                            &format!("task:{}", row.id),
+                            Some(&row.status),
+                            None,
+                            Some(&format!("phantom_sweep_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        task_id = %row.id,
+                        error = %e,
+                        "phantom_sweep startup: db error during transition"
+                    );
+                }
+            }
+        }
+
+        if swept_count > 0 || error_count > 0 || spared_count > 0 || lookup_error_count > 0 {
+            info!(
+                event = "phantom_sweep_complete",
+                source = "startup_sweep",
+                count = swept_count,
+                error_count = error_count,
+                spared_count = spared_count,
+                lookup_error_count = lookup_error_count,
+                unusable_child_count = unusable_child_count,
+                agent_id = %agent_id,
+                reason = "phantom_signature_null_pid_manual_none",
+                trace_id = %trace_id,
+                "phantom_sweep startup pass complete"
+            );
+        }
+        if swept_count > 100 {
+            warn!(
+                event = "phantom_sweep_large_backlog",
+                source = "startup_sweep",
+                count = swept_count,
+                agent_id = %agent_id,
+                "phantom_sweep_large_backlog: single pass swept > 100 rows — anomalous state"
+            );
+        }
+    }
+
+    /// mika#1705: ingest finished claude-pilot transcript JSONL files into the
+    /// `pilot_transcripts` table, then delete each imported file.
+    ///
+    /// Runs on the periodic DB scan. Files live in a single shared directory
+    /// (`{home}/data/pilot-transcripts/<callback-task-id>.jsonl`); because
+    /// [`AsyncDatabase::get_task`] is agent-scoped, each file resolves to
+    /// exactly one engine (the dispatching agent's), so N engines scanning the
+    /// same directory never double-import — non-owners see `None` and skip.
+    ///
+    /// Race safety (mika#1705 Risk 5): a file is only imported once its owning
+    /// callback task has left `in_progress`/`pending` — by then the pilot
+    /// subprocess has exited (dispatch-lib's EXIT trap completes the task only
+    /// after `claude-pilot` returns), so the JSONL is fully written. Import is
+    /// transactional (all rows or none) and the file is deleted only after a
+    /// successful commit; a pre-existing row count short-circuits to delete,
+    /// giving idempotency when a prior commit succeeded but the unlink failed.
+    async fn ingest_pilot_transcripts(&self) {
+        if !crate::skills::executor::pilot_transcripts_enabled() {
+            return;
+        }
+        let dir = self
+            .dispatcher
+            .settings
+            .home_dir
+            .join("data")
+            .join("pilot-transcripts");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Dir absent = nothing dispatched with capture yet. Not an error.
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(task_id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+                continue;
+            };
+
+            // Agent-scoped lookup routes each file to exactly one engine.
+            let task = match self.db.get_task(&task_id).await {
+                Ok(Some(t)) => t,
+                Ok(None) => continue, // not this agent's task — leave for owner
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: task lookup failed; skipping transcript file");
+                    continue;
+                }
+            };
+
+            // Only import once the pilot subprocess has exited (task no longer
+            // pending/in_progress) so we never read a partially-written file.
+            if matches!(
+                task.status.as_str(),
+                task_status::PENDING | task_status::IN_PROGRESS
+            ) {
+                continue;
+            }
+
+            // Idempotency: rows already present ⇒ a prior import committed but
+            // the unlink failed. Just delete the file and move on.
+            match self
+                .db
+                .count_pilot_transcripts_for_task(task_id.clone())
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(task_id = %task_id, error = %e, "mika#1705: failed to delete already-imported transcript file");
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: transcript count check failed; skipping");
+                    continue;
+                }
+            }
+
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: failed to read transcript file");
+                    continue;
+                }
+            };
+
+            // Two failure shapes, deliberately handled differently
+            // (mika#2040 AC2):
+            //
+            // * A line that is not JSON at all is **skipped**. The common cause
+            //   is a truncated last line from a pilot killed mid-write — and
+            //   the transcript of a pilot that died is precisely the one worth
+            //   keeping (mika#2029). Refusing the file over it would throw away
+            //   the evidence at exactly the moment it matters.
+            // * A line that parses but carries no known `schema_version` is a
+            //   **producer contract violation**, not a truncation artifact. The
+            //   file is refused whole, quarantined next to itself, and named.
+            let mut rows: Vec<crate::db::PilotTranscriptRow> = Vec::new();
+            let mut unparseable_lines: usize = 0;
+            let mut schema_error: Option<String> = None;
+
+            for line in contents.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    unparseable_lines += 1;
+                    continue;
+                };
+                match pilot_transcript::parse_pilot_transcript_line(&value) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => {
+                        schema_error = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(reason) = schema_error {
+                self.quarantine_transcript_file(&path, &task_id, &reason)
+                    .await;
+                continue;
+            }
+
+            if rows.is_empty() {
+                // Empty or all-unparseable file: delete so it doesn't linger.
+                // The AC7 detector reports the dispatch on its next pass — the
+                // *file* is gone, the *silence* is not swallowed.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!(task_id = %task_id, error = %e, "mika#1705: failed to delete empty transcript file");
+                }
+                warn!(
+                    event = "pilot_transcript_file_empty",
+                    task_id = %task_id,
+                    unparseable_lines,
+                    "mika#2040: transcript file carried no ingestible line"
+                );
+                continue;
+            }
+
+            match self
+                .db
+                .insert_pilot_transcripts_batch(task_id.clone(), rows)
+                .await
+            {
+                Ok(imported) => {
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!(task_id = %task_id, error = %e, "mika#1705: import committed but file delete failed (idempotent next tick)");
+                    }
+                    info!(task_id = %task_id, imported, "mika#1705: ingested pilot transcript");
+                }
+                Err(e) => {
+                    // Leave the file in place — retried on the next scan.
+                    warn!(task_id = %task_id, error = %e, "mika#1705: transcript import failed; will retry");
+                }
+            }
+        }
+    }
+
+    /// Set a transcript file aside instead of ingesting or deleting it
+    /// (mika#2040 AC2).
+    ///
+    /// Renaming to `<task-id>.jsonl.rejected` is what makes the refusal
+    /// bounded: the ingestion loop only picks `.jsonl`, so the file stops being
+    /// re-read and re-warned on every 60-tick scan, while the bytes stay on
+    /// disk for whoever has to work out what the writer emitted. Deleting it
+    /// would destroy the only evidence of the format break; leaving it in place
+    /// would turn one contract violation into a warning every minute.
+    ///
+    /// SOLE WRITER of the `pilot_transcript_schema_rejected` audit tool_name.
+    async fn quarantine_transcript_file(
+        &self,
+        path: &std::path::Path,
+        task_id: &str,
+        reason: &str,
+    ) {
+        let quarantined = path.with_extension("jsonl.rejected");
+        let renamed = match std::fs::rename(path, &quarantined) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "mika#2040: failed to quarantine non-conforming transcript file"
+                );
+                false
+            }
+        };
+
+        warn!(
+            event = "pilot_transcript_schema_rejected",
+            task_id = %task_id,
+            reason = %reason,
+            quarantined = renamed,
+            path = %quarantined.display(),
+            "mika#2040: refused a transcript file whose lines do not carry a known \
+             schema_version — nothing was ingested"
+        );
+
+        let agent_id = self.db.agent_id().to_string();
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                &format!("system-{agent_id}"),
+                "pilot_transcript_schema_rejected",
+                &format!("task:{task_id}"),
+                None,
+                Some(reason),
+                Some("mika#2040: transcript file refused on schema_version"),
+                None,
+            )
+            .await
+        {
+            warn!(task_id = %task_id, error = %e, "mika#2040: failed to write schema-rejection audit event");
+        }
+    }
+
+    /// Report a finished dispatch that was asked for a transcript and produced
+    /// none (mika#2040 AC7).
+    ///
+    /// # Why this exists at all
+    ///
+    /// The defect mika#2040 was filed on is **silent by construction**: the
+    /// variable is injected, the directory is mounted, and a writer that never
+    /// runs leaves a state byte-identical to "no session happened". mika#1705's
+    /// ingestion could only ever react to files that arrived, so it had nothing
+    /// to say about the 25+ days in which none did. This is the detector on the
+    /// ingestion side of the repo boundary — the one that would have fired on
+    /// the first dispatch instead of waiting for someone to go looking for a
+    /// transcript and find an empty directory.
+    ///
+    /// Runs after [`Self::ingest_pilot_transcripts`] in the same scan, so a
+    /// transcript ingested this pass is never reported. Reports each dispatch
+    /// once (the metadata stamp is read back in SQL). A file still on disk is
+    /// left alone: ingestion owns it, and its own failure has its own warning.
+    ///
+    /// SOLE WRITER of the `pilot_transcript_empty_after_dispatch` audit
+    /// tool_name — so `SELECT count(*) FROM audit_events WHERE tool_name =
+    /// 'pilot_transcript_empty_after_dispatch'` counts dispatches that produced
+    /// nothing, and nothing else.
+    async fn detect_empty_pilot_transcripts(&self) {
+        if !crate::skills::executor::pilot_transcripts_enabled() {
+            return;
+        }
+
+        let candidates = match self
+            .db
+            .find_dispatches_expecting_transcripts(PILOT_TRANSCRIPT_EMPTY_GRACE_SECS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "mika#2040: failed to query dispatches expecting a transcript");
+                return;
+            }
+        };
+
+        let agent_id = self.db.agent_id().to_string();
+        let system_session = format!("system-{agent_id}");
+
+        for candidate in candidates {
+            self.heartbeat.tick();
+
+            // The file is still there: ingestion owns it and will import it (or
+            // fail loudly on its own). Reporting here would double-count a
+            // transcript that is merely late.
+            if std::path::Path::new(&candidate.expected_path).exists() {
+                continue;
+            }
+
+            match self
+                .db
+                .count_pilot_transcripts_for_task(candidate.task_id.clone())
+                .await
+            {
+                Ok(0) => {}
+                // Ingested: the nominal path. Stamp nothing, say nothing.
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(
+                        task_id = %candidate.task_id,
+                        error = %e,
+                        "mika#2040: transcript count check failed; will retry next scan"
+                    );
+                    continue;
+                }
+            }
+
+            warn!(
+                event = "pilot_transcript_empty_after_dispatch",
+                task_id = %candidate.task_id,
+                status = %candidate.status,
+                expected_path = %candidate.expected_path,
+                agent_id = %agent_id,
+                "mika#2040: dispatch finished with ANTHROPIC_LOG_FILE set but produced \
+                 no ingested transcript — the claude-pilot writer is not running"
+            );
+
+            if let Err(e) = self
+                .db
+                .log_audit_event(
+                    &system_session,
+                    "pilot_transcript_empty_after_dispatch",
+                    &format!("task:{}", candidate.task_id),
+                    Some(&candidate.status),
+                    Some(&candidate.expected_path),
+                    Some(
+                        "mika#2040: ANTHROPIC_LOG_FILE was injected for this dispatch \
+                         and no transcript line was ingested",
+                    ),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    task_id = %candidate.task_id,
+                    error = %e,
+                    "mika#2040: failed to write empty-transcript audit event"
+                );
+            }
+
+            // Stamp last. A stamp written before the report would silence a
+            // dispatch this pass failed to report.
+            if let Err(e) = self
+                .db
+                .set_task_metadata_field(
+                    &candidate.task_id,
+                    PILOT_TRANSCRIPT_REPORTED_KEY,
+                    &crate::timestamp::now(),
+                )
+                .await
+            {
+                warn!(
+                    task_id = %candidate.task_id,
+                    error = %e,
+                    "mika#2040: failed to stamp empty-transcript report (will re-report next scan)"
+                );
+            }
+        }
+    }
+
+    /// mika#1705 AC6: delete `pilot_transcripts` rows older than the retention
+    /// window (`MIKA_PILOT_TRANSCRIPT_RETENTION_DAYS`, default 90). Called at
+    /// startup and once per [`PILOT_TRANSCRIPT_RETENTION_INTERVAL_TICKS`].
+    async fn prune_old_pilot_transcripts(&self) {
+        let days = std::env::var(PILOT_TRANSCRIPT_RETENTION_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|d| *d > 0)
+            .unwrap_or(PILOT_TRANSCRIPT_RETENTION_DEFAULT_DAYS);
+        let retention_secs = days * 24 * 60 * 60;
+        match self.db.prune_old_pilot_transcripts(retention_secs).await {
+            Ok(n) if n > 0 => info!(count = n, days, "mika#1705: pruned old pilot transcripts"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "mika#1705: failed to prune old pilot transcripts"),
+        }
+    }
+
+    /// Reap parent self_dev tasks left `in_progress` after their callback
+    /// subtask delivered without producing a PR (#871).
+    ///
+    /// Transitions matched parents to `failed` with an audit-event trail.
+    /// The `NOT EXISTS` sibling guard defers reaping when #870's correction
+    /// loop has launched a retry via `create_task`.
+    ///
+    /// mika#2121 (U2): the failure motif is now distinguished. When the callback
+    /// child carries an anchored `NO_PR: <reason>` line, the reap writes
+    /// `callback_no_pr_<reason>`; otherwise the generic
+    /// `callback_delivered_without_pr_url` motif is preserved for producers that
+    /// predate U1 (AC-G2). This method is the SOLE PRODUCTION WRITER of both
+    /// motifs to `tasks.result` — a test in `dispatcher.rs` simulates the write,
+    /// so a grep finds two hits, but only this site runs in production. Any new
+    /// production writer must respect the groom-class filter.
+    async fn reap_orphaned_parent_tasks(&self) {
+        let candidates = match self
+            .db
+            .find_orphaned_parent_tasks(REAPER_GRACE_SECONDS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "task_engine_reaper: failed to query orphaned parents");
+                return;
+            }
+        };
+
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+
+            // mika#1126 AC-1: snapshot ALL children at decision time for
+            // post-incident diagnosis of what the reaper saw.
+            let children = match self.db.get_reaper_child_snapshot(&parent.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_reaper: failed to snapshot children"
+                    );
+                    // Continue with the kill — snapshot failure is non-fatal.
+                    // The reaper already decided to reap via the SQL query.
+                    Vec::new()
+                }
+            };
+
+            // mika#1126 AC-1: structured log of what the reaper evaluated
+            info!(
+                parent_id = %parent.id,
+                parent_status = "in_progress",
+                parent_source = "self_dev",
+                callback_task_id = %parent.callback_task_id,
+                children_count = children.len(),
+                children = ?children,
+                "task_engine_reaper.evaluated"
+            );
+
+            // mika#1126 AC-3: defense-in-depth — re-check child dispatch_class
+            // at kill time. The SQL query should have excluded groom-class children,
+            // but if the class was NULL at query time and populated since, this
+            // guard catches the TOCTOU race (H2).
+            if !children.is_empty() {
+                let delivered_callback_children: Vec<_> = children
+                    .iter()
+                    .filter(|c| {
+                        c.trigger_type == "callback"
+                            && c.action_type == "resume_agent"
+                            && c.status == "delivered"
+                    })
+                    .collect();
+
+                if !delivered_callback_children.is_empty() {
+                    let all_non_implement = delivered_callback_children
+                        .iter()
+                        .all(|c| c.dispatch_class.as_deref().unwrap_or("implement") != "implement");
+
+                    if all_non_implement {
+                        warn!(
+                            parent_id = %parent.id,
+                            children = ?children,
+                            "task_engine_reaper: race detected — all delivered callback \
+                             children are non-implement class at kill time; skipping \
+                             reap (mika#1126 guard)"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // mika#2121 (U2): distinguish the muted case. Since U1, the callback
+            // child's result carries an anchored `NO_PR: <reason>` line; parse it
+            // and write `callback_no_pr_<reason>` so the operator can tell a dead
+            // pilot from a `gh` outage. Absent that line — a producer that predates
+            // U1 — the generic `callback_delivered_without_pr_url` motif is written
+            // verbatim (AC-G2 negative control). A failed child lookup also falls
+            // back to the generic motif rather than skipping the reap.
+            let fail_reason = match self.db.get_task_unscoped(&parent.callback_task_id).await {
+                Ok(Some(child)) => child
+                    .result
+                    .as_deref()
+                    .and_then(super::dispatcher::parse_no_pr_reason)
+                    .map(|r| format!("callback_no_pr_{r}"))
+                    .unwrap_or_else(|| "callback_delivered_without_pr_url".to_string()),
+                Ok(None) => "callback_delivered_without_pr_url".to_string(),
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        callback_task_id = %parent.callback_task_id,
+                        error = %e,
+                        "task_engine_reaper: failed to load callback child result; \
+                         using generic motif"
+                    );
+                    "callback_delivered_without_pr_url".to_string()
+                }
+            };
+
+            // SOLE PRODUCTION WRITER of `callback_delivered_without_pr_url` /
+            // `callback_no_pr_*` to `tasks.result` (mika#2121 KTD5). The former
+            // `// SOLE WRITER` line read as if no other reference existed, but
+            // dispatcher.rs's test module simulates this write
+            // (`test_try_complete_parent_on_callback_success_parent_failed_noop`),
+            // so a grep finds two hits — naming the test keeps the next reader
+            // from mistaking it for a second production writer.
+            // Use update_task_failed (guarded UPDATE with terminal-state check)
+            // instead of raw update_task_status to avoid overwriting concurrent
+            // terminal transitions. Returns false when the parent already left
+            // in_progress (race with operator action or duplicate query rows).
+            match self.db.update_task_failed(&parent.id, &fail_reason).await {
+                Ok(true) => {
+                    // Transition succeeded — emit audit event
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("failed"),
+                            Some(&fail_reason),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_reaper: failed to write audit event"
+                        );
+                    }
+
+                    // F6: surface pre-existing leaks reaped from before deploy
+                    let age_hours = compute_reaper_age_hours(&parent.created_at);
+                    if age_hours > 24 {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            age_hours,
+                            "task_engine_reaper: reaping pre-existing orphan \
+                             (possible backfill from before reaper deployment)"
+                        );
+                    } else {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            "task_engine_reaper: transitioned orphaned parent to failed"
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (concurrent operator action or duplicate query row) — skip.
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_reaper: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // F5: audit-event-on-error so operators catch silent-reaper-failure
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("reaper_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_reaper: db error during transition"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Auto-complete parent self_dev tasks whose callback delivered with a
+    /// `pr_url` but were never transitioned by the silent agent turn (mika#1162).
+    ///
+    /// Success-side sibling to `reap_orphaned_parent_tasks`. Same scan cadence
+    /// (every `DB_SCAN_INTERVAL_TICKS`), same agent/source/trigger_type and
+    /// `dispatch_class='implement'` filters, same `REAPER_GRACE_SECONDS` grace
+    /// window — but transitions matching parents to `completed` instead of
+    /// `failed`. Mutually exclusive with the reaper on the `pr_url` predicate
+    /// (reaper requires `IS NULL`, completer requires `IS NOT NULL`), so the
+    /// two queries never select the same row.
+    ///
+    /// Layered with the inline path in `dispatcher::try_complete_parent_on_callback_success`:
+    /// the inline path fires at delivery time and frees the slot fast; this
+    /// periodic backstop catches crash-recovery cases (server died between
+    /// callback delivery and the inline call) and pre-deploy wedges.
+    ///
+    /// SOLE WRITER: this method and the inline counterpart are the only sites
+    /// that write the `parent_completed_from_callback` audit-event transition.
+    async fn complete_parent_tasks_on_callback_success(&self) {
+        let candidates = match self
+            .db
+            .find_completable_parent_tasks_on_pr_url(REAPER_GRACE_SECONDS)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_parent_completer: failed to query completable parents"
+                );
+                return;
+            }
+        };
+
+        // Asymmetry with reaper (mika#1126 AC-3): the reaper performs a kill-time
+        // re-fetch of all children and re-verifies dispatch_class because a
+        // groom-class child masquerading as implement could falsely trigger
+        // `failed`. The completer skips this re-check because the `pr_url IS NOT
+        // NULL` predicate is an independent guard — groom-class callbacks never
+        // emit `PR:` lines, so a parent with pr_url in metadata cannot be in the
+        // class-race scenario mika#1126 protects against. Concurrent operator
+        // races are caught by `update_task_completed`'s `status IN (...)` guard.
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+            let reason = format!(
+                "parent_completed_from_callback_backstop (pr_url: {})",
+                parent.pr_url
+            );
+
+            match self
+                .db
+                .update_task_completed(&parent.id, Some(&reason))
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_parent_completer",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("completed"),
+                            Some(&reason),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_parent_completer: failed to write audit event"
+                        );
+                    }
+
+                    // Surface pre-existing leaks reaped from before deploy
+                    // (mirror reaper's F6 pattern).
+                    let age_hours = compute_reaper_age_hours(&parent.created_at);
+                    if age_hours > 24 {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            pr_url = %parent.pr_url,
+                            age_hours,
+                            "task_engine_parent_completer: auto-completed pre-existing wedged \
+                             parent (possible backfill from before completer deployment)"
+                        );
+                    } else {
+                        info!(
+                            parent_id = %parent.id,
+                            callback_task_id = %parent.callback_task_id,
+                            pr_url = %parent.pr_url,
+                            "task_engine_parent_completer: auto-completed parent task on \
+                             callback success"
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (race with inline path or operator action) — skip.
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_parent_completer: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // Audit-event-on-error so operators catch silent failures
+                    // (mirror reaper's F5 pattern).
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_parent_completer",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("completer_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_parent_completer: db error during transition"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Close `manual` tracking rows whose dispatch is over (mika#2405).
+    ///
+    /// # The population, and why nothing else owns it
+    ///
+    /// The Delegation Rule in `prompt.rs` makes an agent open a `create_task`
+    /// row before **any** long-running dispatch — unconditionally ("you MUST"),
+    /// while the closing gesture it describes a few lines above is conditioned
+    /// on a user asking for it ("Direct update: When the user explicitly
+    /// requests a status change"). A QA build callback has no user asking. So
+    /// the row is opened by the model, on the prompt's injunction, and **no
+    /// code path knows it should be closed, because no code path opened it**.
+    ///
+    /// Every other closer excludes this shape by a named term — thirteen of
+    /// them on `source='self_dev'`, `process_id IS NOT NULL`,
+    /// `trigger_type='callback'`/`'a2a'`, `timeout_at IS NOT NULL`, or an
+    /// explicit `trigger_type == MANUAL → continue`. The one that does see it,
+    /// the phantom sweep (mika#1712/#2156), sees it *badly*: it writes `failed`
+    /// on work that succeeded, waits four hours, and only matches while the row
+    /// carries `action_type='none'`.
+    ///
+    /// # Why a scan rather than nine interceptions
+    ///
+    /// The *right* moment to close a parent is when its child goes terminal —
+    /// which is what `dispatcher.rs`'s three inline backstops do. But the child
+    /// has **nine** terminal paths across five modules (four exits of
+    /// `spawn_long_running_exec`, the callback delivery in `server/handlers.rs`,
+    /// the PID watchdog and the stall reaper here, `mark_tasks_expired` in
+    /// `db/tasks.rs`, and `tracking_cleanup.rs`). Instrumenting all nine is nine
+    /// write sites to keep in step for one question — the duplicated-predicate
+    /// class `grooming_marker` (mika#2158) and `live_pilot` (mika#2279) each had
+    /// to close once already. One scan is one reader, touches no existing path,
+    /// and covers the nine by construction — including a tenth nobody has
+    /// written yet. The price is named: up to one pass of lag.
+    ///
+    /// # Per row
+    ///
+    /// 1. [`Self::dispatch_liveness`], reused rather than reimplemented (the
+    ///    ticket's AC5 asks for "pgrep + mtime"; that function already is the
+    ///    `(pid, process_start_time)` pair, and a second reader of the same
+    ///    question is the class named above). Its three variants are decided
+    ///    **separately** — see the match arms for why `NoneLive` closes even
+    ///    when `unusable_children > 0`, which is a deliberate divergence from
+    ///    the phantom sweep.
+    /// 2. [`AsyncDatabase::update_task_completed`], never `update_task_status`.
+    ///    The neighbouring reaper rejects the raw call in writing at its own
+    ///    write site, and this closer has the same exposure by construction: its
+    ///    grace window guarantees a delay between the `SELECT` and the `UPDATE`,
+    ///    during which an operator may have written `cancelled`. The guarded
+    ///    call's `WHERE status IN ('pending','in_progress')` refuses to overwrite
+    ///    a terminal state, it returns a `bool` to be handled, and it stamps
+    ///    `completed_at` — which a raw status write leaves NULL, i.e. a data
+    ///    inconsistency introduced by the fix itself. Overwriting an operator's
+    ///    `cancelled` would be "reaping the living" by the second path, the one
+    ///    the liveness guard does not cover (it watches processes, not
+    ///    concurrent transitions).
+    /// 3. The audit row, on `Ok(true)` only: a row written on `Ok(false)` would
+    ///    assert a transition that did not happen.
+    ///
+    /// SOLE WRITER of [`DISPATCH_PARENT_SETTLED_EVENT`] on both surfaces.
+    async fn settle_dispatch_parents(&self) {
+        if !dispatch_parent_settle_enabled() {
+            return;
+        }
+
+        let grace_seconds = dispatch_parent_settle_grace_secs();
+        let candidates = match self
+            .db
+            .find_settleable_dispatch_parents(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "dispatch_parent_settle: failed to query settleable parents"
+                );
+                return;
+            }
+        };
+
+        // Zero action, zero line (mika#2131 doctrine). An aggregate emitted on
+        // every idle pass would bury the signal it exists to raise.
+        if candidates.is_empty() {
+            return;
+        }
+
+        let trace_id = mika_common::trace::generate_trace_id();
+        let mut settled_count: u32 = 0;
+        let mut spared_count: u32 = 0;
+        let mut noop_count: u32 = 0;
+        let mut error_count: u32 = 0;
+
+        for row in candidates {
+            // Re-arm the wedge watchdog every row, as the phantom sweep does:
+            // a large pass must not look like a hung loop.
+            self.heartbeat.tick();
+
+            let system_session = format!("system-{}", row.agent_id);
+            let liveness = self.dispatch_liveness(&row.id).await;
+            let unusable_children = match settle_action(&liveness) {
+                SettleAction::Spare { reason, child } => {
+                    spared_count = spared_count.saturating_add(1);
+                    // `child_task_id` / `process_id` exist only on the `live`
+                    // reason; the `unknown` one has no child to name. Emitted as
+                    // empty / -1 rather than omitted, so a field is never
+                    // ambiguous between "absent" and "zero".
+                    let (child_task_id, process_id) = child.unwrap_or(("", -1));
+                    info!(
+                        event = "dispatch_parent_settle_spared",
+                        reason,
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        child_task_id,
+                        process_id,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: row spared, nothing written"
+                    );
+                    continue;
+                }
+                SettleAction::Settle { unusable_children } => unusable_children,
+            };
+
+            match self
+                .db
+                .update_task_completed(&row.id, Some(DISPATCH_PARENT_SETTLE_MOTIF))
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            DISPATCH_PARENT_SETTLED_EVENT,
+                            &format!("task:{}", row.id),
+                            Some("in_progress"),
+                            Some("completed"),
+                            Some(DISPATCH_PARENT_SETTLE_MOTIF),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        error_count = error_count.saturating_add(1);
+                        warn!(
+                            task_id = %row.id,
+                            error = %e,
+                            "dispatch_parent_settle: failed to write audit event \
+                             (transition succeeded)"
+                        );
+                    } else {
+                        settled_count = settled_count.saturating_add(1);
+                    }
+
+                    // `unusable_children` is always emitted, never conditionally
+                    // omitted: an absent field and a zero would be
+                    // indistinguishable, which is the failure mode the spare
+                    // line above exists to avoid. Expected value is 0; the
+                    // operator reads `select(.unusable_children > 0)`.
+                    info!(
+                        event = DISPATCH_PARENT_SETTLED_EVENT,
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        child_count = row.child_count,
+                        idle_secs = compute_settle_idle_secs(&row.last_child_at),
+                        unusable_children,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: dispatch parent settled as completed"
+                    );
+                }
+                Ok(false) => {
+                    // The row left `in_progress` between the SELECT and the
+                    // UPDATE — an operator cancel, most likely. This is the race
+                    // the guarded call renders harmless, and counting it is the
+                    // only way to know it happens. Expected: rare but non-zero.
+                    noop_count = noop_count.saturating_add(1);
+                    info!(
+                        event = "dispatch_parent_settle_noop",
+                        task_id = %row.id,
+                        agent_id = %row.agent_id,
+                        trace_id = %trace_id,
+                        "dispatch_parent_settle: row already left in_progress, no transition"
+                    );
+                }
+                Err(e) => {
+                    error_count = error_count.saturating_add(1);
+                    warn!(
+                        task_id = %row.id,
+                        error = %e,
+                        "dispatch_parent_settle: db error during transition"
+                    );
+                }
+            }
+        }
+
+        info!(
+            event = "dispatch_parent_settle_complete",
+            settled = settled_count,
+            spared = spared_count,
+            noop = noop_count,
+            errors = error_count,
+            grace_seconds,
+            trace_id = %trace_id,
+            "dispatch_parent_settle: pass complete"
+        );
+    }
+
+    /// Reap parent self_dev **issue** tasks left `in_progress` with **zero**
+    /// callback children, aged past the childless grace window (mika#1687).
+    ///
+    /// The deterministic backstop for silent pilot death: a parent that reaches
+    /// `in_progress` but never records a callback child falls through all three
+    /// existing deterministic mechanisms — the orphan reaper (#871) and
+    /// parent-completer (mika#1162) both INNER-JOIN a delivered callback child,
+    /// and the callback watchdog (#959) keys off the callback child's PID. This
+    /// reaper's `NOT EXISTS` predicate is the exact complement of that JOIN, so
+    /// it sees exactly the parents the others cannot.
+    ///
+    /// Its job is **fail-with-telemetry**, not re-drive: it transitions the
+    /// parent to `failed` so the death is visible and terminal (freeing the
+    /// dispatch slot + emitting a greppable signal). Re-driving the still-open
+    /// ticket is mika#1824's job at the auto-pull/label layer (D3).
+    ///
+    /// SOLE WRITER: this method is the only site that writes the
+    /// `stuck_in_progress_no_callback_child` reason to `tasks.result` and the
+    /// only writer of `task_engine_childless_reaper` audit events. Reusing
+    /// either string elsewhere breaks the operator/monitor discriminator (R4,
+    /// D4) — keep this method the single writer.
+    async fn reap_childless_stuck_parent_tasks(&self) {
+        let grace_seconds = childless_parent_reaper_grace_secs();
+        let candidates = match self
+            .db
+            .find_childless_stuck_parent_tasks(grace_seconds)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "task_engine_childless_reaper: failed to query childless stuck parents"
+                );
+                return;
+            }
+        };
+
+        for parent in candidates {
+            let trace_id = mika_common::trace::generate_trace_id();
+            let system_session = format!("system-{}", parent.agent_id);
+
+            // Diagnostic parity with the #1126 reaper snapshot: confirm at
+            // decision time that the parent truly has zero children (the
+            // absence this reaper acts on). Snapshot failure is non-fatal — the
+            // SQL query already decided via `NOT EXISTS`.
+            let children = match self.db.get_reaper_child_snapshot(&parent.id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_childless_reaper: failed to snapshot children"
+                    );
+                    Vec::new()
+                }
+            };
+            info!(
+                parent_id = %parent.id,
+                agent_id = %parent.agent_id,
+                parent_status = "in_progress",
+                parent_source = "self_dev",
+                children_count = children.len(),
+                children = ?children,
+                "task_engine_childless_reaper.evaluated"
+            );
+
+            // SOLE WRITER: stuck_in_progress_no_callback_child. Guarded UPDATE
+            // (terminal-state check) — returns false when the parent already
+            // left in_progress (operator/agent race), true on transition.
+            match self
+                .db
+                .update_task_failed(&parent.id, "stuck_in_progress_no_callback_child")
+                .await
+            {
+                Ok(true) => {
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_childless_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            Some("failed"),
+                            Some("stuck_in_progress_no_callback_child"),
+                            Some(&trace_id),
+                        )
+                        .await
+                    {
+                        warn!(
+                            parent_id = %parent.id,
+                            error = %e,
+                            "task_engine_childless_reaper: failed to write audit event"
+                        );
+                    }
+
+                    let age_minutes = compute_reaper_age_minutes(&parent.created_at);
+                    info!(
+                        parent_id = %parent.id,
+                        agent_id = %parent.agent_id,
+                        created_at = %parent.created_at,
+                        age_minutes,
+                        trace_id = %trace_id,
+                        "task_engine_childless_reaper.reaped"
+                    );
+                }
+                Ok(false) => {
+                    // Parent already transitioned away from in_progress
+                    // (operator/agent race or duplicate query row) — skip (R7).
+                    debug!(
+                        parent_id = %parent.id,
+                        "task_engine_childless_reaper: parent already in terminal state, skipping"
+                    );
+                }
+                Err(e) => {
+                    // Audit-event-on-error so operators catch silent failures
+                    // (mirror the orphan reaper's F5 pattern, R7).
+                    let _ = self
+                        .db
+                        .log_audit_event(
+                            &system_session,
+                            "task_engine_childless_reaper",
+                            &parent.id,
+                            Some("in_progress"),
+                            None,
+                            Some(&format!("reaper_db_error: {e}")),
+                            Some(&trace_id),
+                        )
+                        .await;
+                    warn!(
+                        parent_id = %parent.id,
+                        error = %e,
+                        "task_engine_childless_reaper: db error during transition"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Compute the fire timestamp and push a task onto the heap (used in both
+    /// startup recovery and periodic scan).
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_queued_task(
+        &mut self,
+        task_id: &str,
+        trigger_type_str: &str,
+        action_type_str: &str,
+        cron_expr: Option<&str>,
+        next_fire_at: Option<&str>,
+        now: &str,
+        metadata: Option<&str>,
+    ) {
+        if self.queued_ids.contains(task_id) {
+            return;
+        }
+        // Extract timezone from metadata for timezone-aware cron evaluation
+        let parsed_tz = extract_timezone_from_metadata(metadata)
+            .and_then(|tz_str| parse_timezone(&tz_str).ok());
+
+        let fire_at = if trigger_type_str == trigger_type::RECURRING {
+            match cron_expr {
+                Some(expr) => {
+                    let result = if let Some(ref tz) = parsed_tz {
+                        next_fire_from_cron_tz(expr, now, tz)
+                    } else {
+                        next_fire_from_cron(expr, now)
+                    };
+                    match result {
+                        Ok(ts) => ts,
+                        Err(e) => {
+                            warn!(task_id, error = %e, "failed to compute cron next fire");
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    warn!(task_id, "recurring task missing cron_expr");
+                    return;
+                }
+            }
+        } else {
+            match next_fire_at {
+                Some(ts) => ts.to_string(),
+                None => {
+                    warn!(task_id, "task missing next_fire_at");
+                    return;
+                }
+            }
+        };
+
+        self.push_to_heap(QueuedTask {
+            task_id: task_id.to_owned(),
+            next_fire_at: fire_at,
+            trigger_type: trigger_type_str.to_owned(),
+            action_type: action_type_str.to_owned(),
+            cron_expr: cron_expr.map(str::to_owned),
+        });
+    }
+
+    fn push_to_heap(&mut self, task: QueuedTask) {
+        self.queued_ids.insert(task.task_id.clone());
+        self.queue.push(task);
+    }
+
+    fn pop_from_heap(&mut self) -> Option<QueuedTask> {
+        let task = self.queue.pop()?;
+        self.queued_ids.remove(&task.task_id);
+        Some(task)
+    }
+
+    /// Mark the task `in_progress` in DB, then spawn a task to dispatch it.
+    ///
+    /// Dispatch runs in a spawned task so the engine lock is released immediately.
+    /// Long-running dispatchers (run_skill) can hold the spawned task for up to
+    /// 300s without blocking the tick loop.
+    async fn fire_task(&mut self, queued: QueuedTask) {
+        let task_id = queued.task_id.clone();
+
+        // Atomically claim the task and record fired_at in one DB round-trip
+        match self.db.claim_and_fire_task(&task_id).await {
+            Ok(true) => {} // claimed successfully
+            Ok(false) => {
+                debug!(task_id = %task_id, "task no longer claimable (cancelled/completed/expired), skipping");
+                return;
+            }
+            Err(e) => {
+                warn!(task_id = %task_id, error = %e, "failed to claim task");
+                return;
+            }
+        }
+
+        let dispatcher = self.dispatcher.clone();
+        let db = self.db.clone();
+        let reenqueue_tx = self.reenqueue_tx.clone();
+        let trigger_type_val = queued.trigger_type.clone();
+        let action_type_val = queued.action_type.clone();
+        let cron_expr = queued.cron_expr.clone();
+
+        tokio::spawn(async move {
+            let result = dispatcher.dispatch(&task_id).await;
+            match result {
+                Ok(()) => {
+                    if trigger_type_val == trigger_type::RECURRING {
+                        // Read timezone from task metadata for timezone-aware rescheduling
+                        let parsed_tz = match db.get_task(&task_id).await {
+                            Ok(Some(task)) => {
+                                extract_timezone_from_metadata(task.metadata.as_deref())
+                                    .and_then(|tz_str| parse_timezone(&tz_str).ok())
+                            }
+                            Ok(None) => None,
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "failed to read task for timezone metadata, falling back to UTC");
+                                None
+                            }
+                        };
+
+                        // Recompute next fire time and re-enqueue
+                        let now_str = crate::timestamp::now();
+                        let next = match cron_expr
+                            .as_deref()
+                            .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
+                            .and_then(|e| {
+                                if let Some(ref tz) = parsed_tz {
+                                    next_fire_from_cron_tz(e, &now_str, tz)
+                                } else {
+                                    next_fire_from_cron(e, &now_str)
+                                }
+                            }) {
+                            Ok(ts) => ts,
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "cannot reschedule recurring task, marking failed");
+                                if let Err(db_err) =
+                                    db.update_task_failed(&task_id, &e.to_string()).await
+                                {
+                                    warn!(task_id = %task_id, error = %db_err, "failed to mark recurring task as failed in DB");
+                                }
+                                return;
+                            }
+                        };
+
+                        if let Err(e) = db.update_task_rescheduled(&task_id, &next).await {
+                            warn!(task_id = %task_id, error = %e, "failed to reschedule recurring task after fire");
+                        }
+
+                        // Send back to engine for re-enqueue on next tick
+                        let _ = reenqueue_tx
+                            .send(QueuedTask {
+                                task_id,
+                                next_fire_at: next,
+                                trigger_type: trigger_type_val,
+                                action_type: action_type_val.clone(),
+                                cron_expr,
+                            })
+                            .await;
+                    } else if action_type_val != action_type::INJECT_CONTEXT {
+                        // inject_context stays in_progress until the agent loop consumes it.
+                        // All other one-shot actions are marked completed here.
+                        match db.update_task_completed(&task_id, None).await {
+                            Ok(false) => {
+                                warn!(task_id = %task_id, "task already in terminal state, skipping complete");
+                            }
+                            Err(e) => {
+                                warn!(task_id = %task_id, error = %e, "failed to mark task completed");
+                            }
+                            Ok(true) => {
+                                dispatcher.check_and_dispatch_parent(&task_id).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, super::dispatcher::DispatchError::AgentBusy(_)) {
+                        // Check if the task has expired before re-queuing
+                        let now = crate::timestamp::now();
+                        let is_expired = match db.get_task(&task_id).await {
+                            Ok(Some(t)) => {
+                                t.timeout_at.as_deref().is_some_and(|ts| ts <= now.as_str())
+                            }
+                            _ => false,
+                        };
+
+                        if is_expired {
+                            warn!(task_id = %task_id, "task timed out while waiting for agent, marking failed");
+                            if let Err(db_err) = db
+                                .update_task_failed(
+                                    &task_id,
+                                    "task timed out while waiting for agent",
+                                )
+                                .await
+                            {
+                                warn!(task_id = %task_id, error = %db_err, "failed to mark timed-out task as failed in DB");
+                            }
+                        } else {
+                            // Agent is busy — reset task to pending and re-enqueue for retry
+                            debug!(task_id = %task_id, "agent busy, re-queuing task for retry in 30s");
+                            let retry_at =
+                                crate::timestamp::now_plus(chrono::Duration::seconds(30));
+                            if let Err(e) =
+                                db.update_task_status(&task_id, task_status::PENDING).await
+                            {
+                                warn!(task_id = %task_id, error = %e, "failed to reset task status to pending for retry");
+                            }
+                            if let Err(e) = db.update_task_next_fire_at(&task_id, &retry_at).await {
+                                warn!(task_id = %task_id, error = %e, "failed to update next_fire_at for retry");
+                            }
+                            let _ = reenqueue_tx
+                                .send(QueuedTask {
+                                    task_id,
+                                    next_fire_at: retry_at,
+                                    trigger_type: trigger_type_val,
+                                    action_type: action_type_val,
+                                    cron_expr,
+                                })
+                                .await;
+                        }
+                    } else if let super::dispatcher::DispatchError::UnknownTrigger { ref trigger } =
+                        e
+                    {
+                        // mika#2337 — the running binary does not know this
+                        // trigger. The task still dies (the terminal state is
+                        // correct); what is corrected is the *consequence* on
+                        // re-registration.
+                        //
+                        // There is no spam to stop here: re-enqueue lives only
+                        // in the `Ok` arm above, so a recurring task that fails
+                        // is never rescheduled. The line dies once and goes
+                        // quiet — which is exactly why the outage was hard to
+                        // notice. What kept mika#2334 inert for a full day was
+                        // the mika#1742 veto this death armed, and which no path
+                        // lifted.
+                        let err_msg = e.to_string();
+                        let label = match db.get_task(&task_id).await {
+                            Ok(Some(t)) => t.label,
+                            _ => String::from("<unknown>"),
+                        };
+
+                        if trigger_type_val == trigger_type::RECURRING {
+                            // Stamp BEFORE `update_task_failed`, so the row is
+                            // never an unmarked corpse — not even for the
+                            // instant between the two writes.
+                            if let Err(db_err) = db.mark_recurring_unknown_trigger(&task_id).await {
+                                warn!(
+                                    task_id = %task_id,
+                                    error = %db_err,
+                                    "mika#2337: failed to stamp the unknown-trigger death — \
+                                     the mika#1742 veto will survive this one and a restart \
+                                     will refuse to re-register until the grace window elapses"
+                                );
+                            }
+                        }
+
+                        // mika#2446 — la ligne porte désormais sa preuve.
+                        //
+                        // Elle **affirmait** un décalage de version sans porter
+                        // de quoi l'établir : ni la version du binaire, ni son
+                        // empreinte git, ni son pid, ni l'inventaire des
+                        // triggers qu'il sait router. La surface opérateur de
+                        // mika#2337 prescrivait « établir la version du binaire
+                        // en exécution » sans fournir l'instrument. Le coût est
+                        // mesuré : quatre heures, deux redémarrages, un
+                        // `cargo clean`, et une hypothèse (« objet compilé
+                        // périmé ») qu'un seul de ces champs aurait réfutée sur
+                        // place.
+                        let attribution = super::dispatcher::binary_attribution();
+
+                        // A named event, not the generic `task dispatch failed`
+                        // — which is indistinguishable from a network failure
+                        // and is what made this class unreadable in the log.
+                        warn!(
+                            event = "recurring_unknown_trigger",
+                            task_id = %task_id,
+                            label = %label,
+                            trigger = %trigger,
+                            trigger_type = %trigger_type_val,
+                            binary_version = %attribution.version,
+                            binary_git_hash = %attribution.git_hash,
+                            process_id = attribution.process_id,
+                            process_name = %attribution.process_name,
+                            routable_triggers = %attribution.routable_triggers,
+                            "mika#2337: run_skill trigger registered but not routable by this \
+                             binary — this is a version skew between the merged code and the \
+                             running code, not a defect of the dispatch itself. mika#2446: \
+                             compare `trigger` against `routable_triggers` and read \
+                             `binary_git_hash` — if that commit carries the arm, the skew is \
+                             refuted and the cause is elsewhere."
+                        );
+
+                        if let Err(audit_err) = db
+                            .log_audit_event(
+                                &format!("system-{}", db.agent_id()),
+                                "recurring_unknown_trigger",
+                                &format!("task:{task_id}"),
+                                None,
+                                Some("failed"),
+                                // Les mêmes valeurs dans le `reasoning`, pour que
+                                // la question soit répondable en SQL sans grep sur
+                                // dix-neuf gigaoctets de journal.
+                                Some(&format!(
+                                    "label:{label} trigger:{trigger} \
+                                     trigger_type:{trigger_type_val} \
+                                     binary_version:{} binary_git_hash:{} \
+                                     process_id:{} process_name:{} \
+                                     routable_triggers:{}",
+                                    attribution.version,
+                                    attribution.git_hash,
+                                    attribution.process_id,
+                                    attribution.process_name,
+                                    attribution.routable_triggers,
+                                )),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(task_id = %task_id, error = %audit_err, "failed to write recurring_unknown_trigger audit event");
+                        }
+
+                        if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
+                            warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
+                        }
+                    } else {
+                        let err_msg = e.to_string();
+                        warn!(task_id = %task_id, error = %err_msg, "task dispatch failed");
+                        if let Err(db_err) = db.update_task_failed(&task_id, &err_msg).await {
+                            warn!(task_id = %task_id, error = %db_err, "failed to mark task as failed in DB");
+                        }
+                    }
+                }
+            }
+        });
+        // Engine lock released when fire_task() returns (immediately after spawn)
+    }
+}
+
+/// Compute how many hours old a task is based on its `created_at` timestamp.
+/// Returns 0 on parse failure (conservative — won't trigger the backfill log).
+fn compute_reaper_age_hours(created_at: &str) -> i64 {
+    crate::timestamp::parse(created_at)
+        .map(|dt| {
+            let now = chrono::Utc::now();
+            (now - dt).num_hours()
+        })
+        .unwrap_or(0)
+}
+
+/// How long ago the settled parent's **last** child moved (mika#2405, U4).
+///
+/// Sibling of [`compute_reaper_age_hours`], in seconds and keyed on
+/// `MAX(child.updated_at)` rather than the parent's `created_at` — a parent
+/// reused across dispatches (mika#920) is old by construction, so its own age
+/// would say nothing about the dispatch that just ended. Returns 0 on parse
+/// failure, like its siblings: a log field must not invent a duration.
+fn compute_settle_idle_secs(last_child_at: &str) -> i64 {
+    crate::timestamp::parse(last_child_at)
+        .map(|dt| (chrono::Utc::now() - dt).num_seconds())
+        .unwrap_or(0)
+}
+
+/// Compute how many minutes old a task is based on its `created_at` timestamp.
+/// Returns 0 on parse failure (conservative — won't inflate the reaped-log age).
+fn compute_reaper_age_minutes(created_at: &str) -> i64 {
+    crate::timestamp::parse(created_at)
+        .map(|dt| {
+            let now = chrono::Utc::now();
+            (now - dt).num_minutes()
+        })
+        .unwrap_or(0)
+}
+
+/// Pure parse of the childless-parent reaper grace window from an optional env
+/// value (mika#1687, D5). Returns [`CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS`]
+/// (1800) when the value is absent, empty, or unparseable/≤0 (WARN on invalid).
+/// Split out from the env read so it is unit-testable without mutating process
+/// environment (mirrors `parse_stuck_ready_threshold` in `auto_pull.rs`).
+fn parse_childless_parent_reaper_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = CHILDLESS_PARENT_REAPER_GRACE_ENV,
+                    value = %v,
+                    default = CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
+                    "invalid childless-parent reaper grace value; falling back to default"
+                );
+                CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+            }
+        },
+        _ => CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the childless-parent reaper grace window (mika#1687, D5).
+///
+/// Reads `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` and delegates to
+/// [`parse_childless_parent_reaper_grace`]. Same safe-fallback shape as the
+/// watchdog's `effective_callback_watchdog_grace_period_secs()`. Env read once
+/// per tick is negligible at the 60s DB-scan cadence.
+fn childless_parent_reaper_grace_secs() -> i64 {
+    parse_childless_parent_reaper_grace(
+        std::env::var(CHILDLESS_PARENT_REAPER_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the stuck-pending reaper grace window (mika#2045). Same shape
+/// as [`parse_childless_parent_reaper_grace`]: absent, empty, unparseable, or
+/// non-positive falls back to the default with a WARN.
+fn parse_stuck_pending_reaper_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = STUCK_PENDING_REAPER_GRACE_ENV,
+                    value = %v,
+                    default = STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS,
+                    "invalid stuck-pending reaper grace value; falling back to default"
+                );
+                STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+            }
+        },
+        _ => STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS,
+    }
+}
+
+/// Parse the promotion-starvation threshold (mika#2169, L2b). Same three-tier
+/// shape as `parse_stuck_pending_reaper_grace`: absent or empty → default;
+/// unparseable, zero, or negative → default with a WARN.
+fn parse_deferred_promotion_stale_secs(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                warn!(
+                    env = DEFERRED_PROMOTION_STALE_ENV,
+                    value = %v,
+                    default = DEFERRED_PROMOTION_STALE_DEFAULT_SECS,
+                    "invalid deferred-promotion stale value; falling back to default"
+                );
+                DEFERRED_PROMOTION_STALE_DEFAULT_SECS
+            }
+        },
+        _ => DEFERRED_PROMOTION_STALE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the promotion-starvation threshold (mika#2169, L2b).
+pub fn deferred_promotion_stale_secs() -> i64 {
+    parse_deferred_promotion_stale_secs(std::env::var(DEFERRED_PROMOTION_STALE_ENV).ok().as_deref())
+}
+
+/// Resolve the stuck-pending reaper grace window (mika#2045).
+///
+/// `pub` so the `mika tasks stuck` probe reports on exactly the population the
+/// reaper acts on. A probe with its own threshold would drift from the engine
+/// and answer a different question than the one the operator is asking.
+pub fn stuck_pending_reaper_grace_secs() -> i64 {
+    parse_stuck_pending_reaper_grace(
+        std::env::var(STUCK_PENDING_REAPER_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the promoted-wrapper liveness window (mika#2181). Same shape as
+/// [`parse_stuck_pending_reaper_grace`]: absent, empty, unparseable, or
+/// non-positive falls back to the default with a WARN — plus an upper clamp the
+/// sibling does not need (see [`PROMOTED_WRAPPER_LIVENESS_MAX_SECS`]).
+fn parse_promoted_wrapper_liveness(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= PROMOTED_WRAPPER_LIVENESS_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    env = PROMOTED_WRAPPER_LIVENESS_ENV,
+                    value = %v,
+                    default = PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+                    "invalid promoted-wrapper liveness value; falling back to default"
+                );
+                PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+            }
+        },
+        _ => PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the promoted-wrapper liveness window (mika#2181).
+///
+/// `pub` for the same reason as [`stuck_pending_reaper_grace_secs`]: the
+/// `mika tasks stuck` probe must report on exactly the population the reaper
+/// sees. A probe that kept the narrow predicate would show parents the reaper
+/// deliberately leaves alone — a probe that lies.
+pub fn promoted_wrapper_liveness_secs() -> i64 {
+    parse_promoted_wrapper_liveness(std::env::var(PROMOTED_WRAPPER_LIVENESS_ENV).ok().as_deref())
+}
+
+/// Pure parse of the direct-activity window (mika#2184, D4). House three-tier
+/// shape — absent or empty → default; unparseable, zero, negative, or beyond
+/// [`STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS`] → default with a WARN **naming the
+/// offending value between quotes**, so a stray space is visible.
+fn parse_stuck_pending_activity_window(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    event = "stuck_pending_activity_window_invalid",
+                    env = STUCK_PENDING_ACTIVITY_WINDOW_ENV,
+                    value = %v,
+                    default = STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+                    "invalid stuck-pending activity window value; falling back to default"
+                );
+                STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+            }
+        },
+        _ => STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the direct-activity window (mika#2184).
+fn stuck_pending_activity_window_secs() -> i64 {
+    parse_stuck_pending_activity_window(
+        std::env::var(STUCK_PENDING_ACTIVITY_WINDOW_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Moitié pure du kill-switch d'alerte (mika#2515).
+///
+/// Absent ou vide → **armé**. `0`/`false`/`off`/`no` → désarmé. Une valeur non
+/// reconnue est **dite** et laisse armé : un désarmement par coquille sur un
+/// instrument de sûreté serait la panne silencieuse que ce ticket ferme. Même
+/// table de vérité et même raison que `parse_qa_callback_verdict_net`.
+fn parse_qa_build_verdict_alert(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "qa_build_verdict_alert_invalid",
+                env = QA_BUILD_VERDICT_ALERT_ENV,
+                value = %other,
+                "valeur non reconnue pour {QA_BUILD_VERDICT_ALERT_ENV} — l'alerte \
+                 reste armée"
+            );
+            true
+        }
+    }
+}
+
+/// Résout le kill-switch d'alerte (mika#2515).
+fn qa_build_verdict_alert_enabled() -> bool {
+    parse_qa_build_verdict_alert(std::env::var(QA_BUILD_VERDICT_ALERT_ENV).ok().as_deref())
+}
+
+/// Parse pur de la fenêtre avant alerte (mika#2515). Forme maison à trois
+/// paliers — absent/vide → défaut ; illisible, `0`, négatif ou au-delà de
+/// [`QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS`] → défaut **plus** un WARN nommant la
+/// valeur **entre guillemets**, pour qu'un espace parasite se voie.
+///
+/// `0` ne désarme pas : c'est le rôle du kill-switch, et lu autrement une
+/// coquille couperait l'alerte en silence.
+fn parse_qa_build_verdict_alert_age(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    event = "qa_build_verdict_alert_age_invalid",
+                    env = QA_BUILD_VERDICT_ALERT_AGE_ENV,
+                    value = %v,
+                    default = QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+                    "valeur invalide pour la fenêtre d'alerte de verdict ; retour au défaut"
+                );
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+            }
+        },
+        _ => QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+    }
+}
+
+/// Résout la fenêtre avant alerte (mika#2515).
+fn qa_build_verdict_alert_age_secs() -> i64 {
+    parse_qa_build_verdict_alert_age(
+        std::env::var(QA_BUILD_VERDICT_ALERT_AGE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Parse pur de la profondeur du lookback (mika#2515). Mêmes trois paliers.
+fn parse_qa_build_verdict_alert_lookback_days(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(days) if days > 0 && days <= QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS => days,
+            _ => {
+                warn!(
+                    event = "qa_build_verdict_alert_lookback_invalid",
+                    env = QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV,
+                    value = %v,
+                    default = QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS,
+                    "valeur invalide pour le lookback de l'alerte de verdict ; retour au défaut"
+                );
+                QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+            }
+        },
+        _ => QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS,
+    }
+}
+
+/// Résout la profondeur du lookback (mika#2515).
+fn qa_build_verdict_alert_lookback_days() -> i64 {
+    parse_qa_build_verdict_alert_lookback_days(
+        std::env::var(QA_BUILD_VERDICT_ALERT_LOOKBACK_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the settler grace window (mika#2405, U3). House three-tier
+/// shape — absent or empty → default; unparseable, zero, or negative → default
+/// with a WARN — plus the upper clamp
+/// [`DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS`], for the same reason as
+/// [`parse_promoted_wrapper_liveness`].
+fn parse_dispatch_parent_settle_grace(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS => secs,
+            _ => {
+                warn!(
+                    env = DISPATCH_PARENT_SETTLE_GRACE_ENV,
+                    value = %v,
+                    default = DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+                    "invalid dispatch-parent settle grace value; falling back to default"
+                );
+                DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+            }
+        },
+        _ => DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+    }
+}
+
+/// Resolve the settler grace window (mika#2405, U3).
+fn dispatch_parent_settle_grace_secs() -> i64 {
+    parse_dispatch_parent_settle_grace(
+        std::env::var(DISPATCH_PARENT_SETTLE_GRACE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parse of the settler kill-switch (mika#2405, U3). Split from the env
+/// read so it is testable without mutating a process-global variable that the
+/// tests of one binary share.
+///
+/// Absence or an empty value → **armed**: the settler is the intended
+/// behaviour, not an option. An unrecognized value is **said** and leaves it
+/// armed — a disarm by typo on a closer would be exactly the silent failure
+/// this ticket exists to close. Same truth table as
+/// `parse_qa_callback_verdict_net` (mika#2368).
+fn parse_dispatch_parent_settle_enabled(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => true,
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        other => {
+            warn!(
+                event = "dispatch_parent_settle_enabled_invalid",
+                value = %format!("{other:?}"),
+                "unrecognized value for {DISPATCH_PARENT_SETTLE_ENABLED_ENV} — \
+                 the settler stays armed"
+            );
+            true
+        }
+    }
+}
+
+/// Resolve the settler kill-switch (mika#2405, U3). Default: **armed**.
+fn dispatch_parent_settle_enabled() -> bool {
+    parse_dispatch_parent_settle_enabled(
+        std::env::var(DISPATCH_PARENT_SETTLE_ENABLED_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Rebuild the deferred-dispatch `action_config` for a parent that never had a
+/// wrapper to copy (mika#2045).
+///
+/// This reproduces the `dispatch_input` `ready_label_handler` builds
+/// (`crates/mika-agent/src/server/ready_label_handler.rs:294`), plus the
+/// `__internal_deferred_dispatch` sentinel `register_deferred_callback` injects
+/// so the replay does not livelock against the open-PR guard (mika#920).
+/// `prompt` must stay the bare `<repo>#<num>` form: an owner-qualified prompt
+/// silently routes the dispatch into no-worktree free-text mode (mika#1593).
+fn rebuild_deferred_action_config(
+    parent_task_id: &str,
+    reference_url: &str,
+    dispatch_class: &str,
+) -> Option<String> {
+    // https://github.com/<owner>/<repo>/issues/<num>
+    let rest = reference_url.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split('/');
+    let _owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next()? != "issues" {
+        return None;
+    }
+    let number = parts.next()?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let skill = match dispatch_class {
+        "groom" => "dev-groom",
+        _ => "dev-pilot",
+    };
+
+    Some(
+        serde_json::json!({
+            "trigger_kind": "deferred_dispatch",
+            "original_call": {
+                "skill": skill,
+                "prompt": format!("{repo}#{number}"),
+                "task_id": parent_task_id,
+                crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD: true,
+            }
+        })
+        .to_string(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Database, NewTask};
+    use crate::messaging::MessageSender;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    fn test_db() -> AsyncDatabase {
+        let db = Database::open_in_memory().unwrap();
+        AsyncDatabase::new_with_agent(db, "mika")
+    }
+
+    struct NoopSender;
+    #[async_trait::async_trait]
+    impl MessageSender for NoopSender {
+        async fn send(&self, _text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+    }
+
+    /// An engine that has **lived through** the mika#2184 activity window.
+    ///
+    /// Every stuck-pending reaper test that expects an action needs this. A
+    /// freshly built engine has zero uptime, so `classify_wrapper_activity`
+    /// answers [`WrapperActivity::NotYetObservable`] and the reaper spares
+    /// everything — correctly, and for a reason that has nothing to do with what
+    /// those tests are asserting.
+    ///
+    /// The nominal production regime is a process that has been up for hours; a
+    /// just-restarted one is the exception, and
+    /// `mika2184_a_young_process_spares_and_the_ignorance_extinguishes_itself`
+    /// models it explicitly rather than leaving it to `Instant::now()`.
+    fn observing_engine(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> TaskEngine {
+        TaskEngine::new(db, dispatcher).with_started_at_secs_ago(24 * 3600)
+    }
+
+    fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+        test_dispatcher_with(db, |_| {})
+    }
+
+    /// `test_dispatcher`, with a hook on the resolved [`Settings`] (mika#2184).
+    ///
+    /// The one setting mika#2184 reads — `store_llm_calls || store_tool_calls` —
+    /// is a *setting*, never inferred from an absence of rows, so the test for
+    /// [`WrapperActivity::NotRecorded`] has to be able to turn it off. A shared
+    /// hook rather than a second literal copy of the struct: two dispatchers
+    /// maintained apart would drift, and the drift would be silent.
+    fn test_dispatcher_with(
+        db: AsyncDatabase,
+        tweak: impl FnOnce(&mut mika_common::config::Settings),
+    ) -> Arc<TaskDispatcher> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        tweak(&mut settings);
+        Arc::new(TaskDispatcher {
+            db,
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            llm: mika_common::llm::dummy_provider(),
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            // mika#2329 — un home global qui n'existe pas : aucun STOP n'y est
+            // armé, donc ces tests prennent le chemin nominal.
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: false,
+            settings,
+            pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn make_task(label: &str, next_fire_at: &str) -> NewTask {
+        NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "time".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: Some(next_fire_at.to_string()),
+            timeout_at: None,
+            action_type: "send_message".to_string(),
+            action_config: r#"{"text": "hello"}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_startup_recovery_empty_db() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db, dispatcher);
+        engine.startup_recovery().await.unwrap();
+        assert_eq!(engine.queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_adds_to_heap_and_id_set() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db, dispatcher);
+
+        let future_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        let id = engine
+            .enqueue(make_task("test reminder", &future_ts))
+            .await
+            .unwrap();
+
+        assert!(!id.is_empty());
+        assert_eq!(engine.queue.len(), 1);
+        assert!(engine.queued_ids.contains(&id));
+        assert_eq!(engine.queue.peek().unwrap().next_fire_at, future_ts);
+    }
+
+    #[tokio::test]
+    async fn test_tick_fires_due_task() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
+        let id = engine
+            .enqueue(make_task("past reminder", &past_ts))
+            .await
+            .unwrap();
+        assert_eq!(engine.queue.len(), 1);
+
+        engine.tick().await;
+        assert_eq!(engine.queue.len(), 0);
+        assert!(!engine.queued_ids.contains(&id));
+
+        // Poll until completed (up to 5 seconds)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let t = db.get_task(&id).await.unwrap().unwrap();
+            if t.status == "completed" {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for task to complete; status={}",
+                    t.status
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tick_does_not_fire_future_task() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db, dispatcher);
+
+        let future_ts = crate::timestamp::now_plus(chrono::Duration::seconds(3600));
+        engine
+            .enqueue(make_task("future reminder", &future_ts))
+            .await
+            .unwrap();
+        engine.tick().await;
+
+        assert_eq!(engine.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_tick_skips_cancelled_task() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
+        let id = engine
+            .enqueue(make_task("cancelled reminder", &past_ts))
+            .await
+            .unwrap();
+
+        // Cancel in DB before tick fires it
+        db.cancel_task(&id).await.unwrap();
+
+        engine.tick().await;
+
+        // Task should remain cancelled (not in_progress or completed)
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_periodic_scan_picks_up_new_tasks() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Create task directly in DB (bypassing engine.enqueue)
+        let past_ts = crate::timestamp::now_minus(chrono::Duration::seconds(10));
+        let id = db
+            .create_task(make_task("direct db task", &past_ts))
+            .await
+            .unwrap();
+
+        assert!(!engine.queued_ids.contains(&id));
+
+        // Periodic scan should pick it up
+        engine.scan_db_for_new_tasks().await;
+        assert!(engine.queued_ids.contains(&id));
+
+        // Second scan should not double-add
+        engine.scan_db_for_new_tasks().await;
+        assert_eq!(engine.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_expire_timed_out_tasks() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Create a callback task with timeout_at in the past
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long-running-job".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(crate::timestamp::now_minus(chrono::Duration::seconds(60))), // expired 60s ago
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+
+        engine.expire_timed_out_tasks().await;
+
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.status, task_status::EXPIRED);
+    }
+
+    #[tokio::test]
+    async fn test_expire_does_not_touch_active_tasks() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Task with timeout_at in the future — should NOT be expired
+        let task = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "still-running".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(crate::timestamp::now_plus(chrono::Duration::seconds(3600))),
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let id = db.create_task(task).await.unwrap();
+
+        engine.expire_timed_out_tasks().await;
+
+        let t = db.get_task(&id).await.unwrap().unwrap();
+        assert_eq!(t.status, task_status::PENDING);
+    }
+
+    #[tokio::test]
+    async fn test_expired_child_unblocks_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Create parent task
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "parent".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::INVOKE_ORCHESTRATOR.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        // Create two children: one completed, one expired
+        let child1 = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "child-ok".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let c1_id = db.create_task(child1).await.unwrap();
+        db.update_task_completed(&c1_id, Some("done"))
+            .await
+            .unwrap();
+
+        let child2 = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "child-expired".to_string(),
+            trigger_type: trigger_type::CALLBACK.to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: Some(crate::timestamp::now_minus(chrono::Duration::seconds(60))),
+            action_type: action_type::RESUME_AGENT.to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        };
+        let c2_id = db.create_task(child2).await.unwrap();
+        // Mark expired manually (in real flow, expire_timed_out_tasks does this)
+        db.update_task_status(&c2_id, task_status::EXPIRED)
+            .await
+            .unwrap();
+
+        // check_expired_siblings should detect that both children are terminal
+        engine.check_expired_siblings().await;
+
+        // Parent should have been claimed (dispatched) — status changed from pending
+        // Note: dispatch will fail (no real agent), but the attempt proves the logic works.
+        // Give spawned task a moment to run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let parent_task = db.get_task(&parent_id).await.unwrap().unwrap();
+        // Parent should be in_progress (claimed by dispatch) or failed (dispatch error)
+        assert!(
+            parent_task.status == "in_progress" || parent_task.status == "failed",
+            "expected in_progress or failed, got: {}",
+            parent_task.status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_startup_recovery_marks_orphaned_in_progress_failed() {
+        let db = test_db();
+
+        let task_id = db
+            .create_task(make_task(
+                "orphan",
+                &crate::timestamp::now_plus(chrono::Duration::seconds(3600)),
+            ))
+            .await
+            .unwrap();
+
+        db.update_task_status(&task_id, "in_progress")
+            .await
+            .unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+    }
+
+    /// mika#2379: A2A rows a dead process left open are closed with a reason and a
+    /// `completed_at` — including a `pending` one, which the generic loop ignores
+    /// (a `message/stream` turn still waiting for the agent lock never reached
+    /// `in_progress`). Non-A2A rows keep today's recovery.
+    #[tokio::test]
+    async fn mika2379_startup_recovery_closes_orphaned_a2a_rows() {
+        let db = test_db();
+        db.a2a_create_task("a2a-live", None, None).await.unwrap();
+        db.a2a_update_task_state("a2a-live", "working")
+            .await
+            .unwrap();
+        db.a2a_create_task("a2a-queued", None, None).await.unwrap(); // pending
+
+        let other = db
+            .create_task(make_task(
+                "non-a2a orphan",
+                &crate::timestamp::now_plus(chrono::Duration::seconds(3600)),
+            ))
+            .await
+            .unwrap();
+        db.update_task_status(&other, "in_progress").await.unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        for a2a_id in ["a2a-live", "a2a-queued"] {
+            let (status, completed_at, result): (String, Option<String>, Option<String>) = db
+                .with_db(move |d| {
+                    Ok(d.conn.query_row(
+                        "SELECT t.status, t.completed_at, t.result FROM tasks t
+                         JOIN a2a_task_map m ON m.task_id = t.id WHERE m.a2a_task_id = ?1",
+                        rusqlite::params![a2a_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(status, "failed", "{a2a_id}");
+            assert!(completed_at.is_some(), "{a2a_id} carries completed_at");
+            let reason = result
+                .as_deref()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+                .and_then(|v| {
+                    v.get(crate::a2a_db::A2A_CLOSE_REASON_KEY)
+                        .and_then(|r| r.as_str().map(str::to_owned))
+                });
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("orphaned:")),
+                "{a2a_id} names why it was closed, got {result:?}"
+            );
+        }
+        let other = db.get_task(&other).await.unwrap().unwrap();
+        assert_eq!(other.status, "failed", "non-A2A recovery is unchanged");
+    }
+
+    /// mika#2379: `mika chat` (`cli_mode: true`) runs `startup_recovery` against
+    /// the container database a live daemon shares, so it must not sweep A2A
+    /// rows — a `pending` stream turn waiting for the agent lock is left alone.
+    #[tokio::test]
+    async fn mika2379_cli_mode_startup_recovery_leaves_a2a_rows_alone() {
+        let db = test_db();
+        db.a2a_create_task("a2a-queued", None, None).await.unwrap(); // pending
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        let dispatcher = Arc::new(TaskDispatcher {
+            db: db.clone(),
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            llm: mika_common::llm::dummy_provider(),
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: true,
+            settings,
+            pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let (status, result): (String, Option<String>) = db
+            .with_db(|d| {
+                Ok(d.conn.query_row(
+                    "SELECT t.status, t.result FROM tasks t
+                     JOIN a2a_task_map m ON m.task_id = t.id WHERE m.a2a_task_id = 'a2a-queued'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "a CLI process must not sweep A2A rows");
+        assert_eq!(result, None);
+    }
+
+    /// Create a callback task that is already completed (as if `mika ask --task-id` ran).
+    fn make_callback_task(label: &str) -> NewTask {
+        NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: r#"{"trigger":"callback"}"#.to_string(),
+            input_context: None,
+            created_by_session: Some("test-session".to_string()),
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_mode_skips_callback_dispatch() {
+        let db = test_db();
+        // Create dispatcher with cli_mode: true
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = mika_common::config::Settings::load(tmp.path()).unwrap();
+        let dispatcher = Arc::new(TaskDispatcher {
+            db: db.clone(),
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            llm: mika_common::llm::dummy_provider(),
+            tools: Arc::new(crate::tools::default_tools()),
+            skills: Arc::new(crate::skills::SkillRegistry::empty()),
+            message_sender: Some(Arc::new(NoopSender)),
+            home_dir: PathBuf::from("/tmp"),
+            // mika#2329 — un home global qui n'existe pas : aucun STOP n'y est
+            // armé, donc ces tests prennent le chemin nominal.
+            global_home_dir: PathBuf::from("/tmp/mika-test-global-home-absent"),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: true,
+            settings,
+            pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Insert a completed callback task directly in DB
+        let task_id = db
+            .create_task(make_callback_task("long_running:test_tool"))
+            .await
+            .unwrap();
+        db.update_task_completed(&task_id, Some("test result"))
+            .await
+            .unwrap();
+
+        // Verify the task is completed
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "completed");
+
+        // Run enough ticks to trigger the DB scan (DB_SCAN_INTERVAL_TICKS = 60)
+        for _ in 0..=DB_SCAN_INTERVAL_TICKS {
+            engine.tick().await;
+        }
+
+        // In CLI mode, dispatch_undelivered_callbacks is skipped.
+        // The task should still be in 'completed' status, NOT 'delivered'.
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "completed",
+            "cli_mode should prevent engine from dispatching callbacks"
+        );
+    }
+
+    // -- complete_parent_tasks_on_callback_success tests (mika#1162) --
+
+    /// Helper: seed a `self_dev` parent in `in_progress` with `pr_url` metadata.
+    /// Adds a `delivered` implement-class callback child whose `updated_at`
+    /// is backdated past the reaper grace window.
+    async fn seed_completable_parent(db: &AsyncDatabase, pr_url: &str) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement mika#1162".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        db.update_task_status(&parent_id, "in_progress")
+            .await
+            .unwrap();
+        let meta = format!(r#"{{"claude_pilot":{{"pr_url":"{pr_url}"}}}}"#);
+        db.update_task_metadata(&parent_id, &meta).await.unwrap();
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let child_id = db.create_task(child).await.unwrap();
+        db.update_task_completed(&child_id, Some("done"))
+            .await
+            .unwrap();
+        db.mark_task_delivered(&child_id).await.unwrap();
+        // Backdate the delivered child past the grace window
+        backdate_task(db, &child_id).await;
+        (parent_id, child_id)
+    }
+
+    /// Test-only helper: shove `updated_at` back by 700s to push a task past
+    /// `REAPER_GRACE_SECONDS`. Uses `with_db` to drop into the underlying
+    /// connection — there is no public AsyncDatabase method for time travel.
+    async fn backdate_task(db: &AsyncDatabase, task_id: &str) {
+        let id = task_id.to_string();
+        db.with_db(move |inner| {
+            inner.conn.execute(
+                "UPDATE tasks SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-700 seconds') WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_complete_parent_tasks_on_callback_success_happy_path() {
+        let db = test_db();
+        let pr_url = "https://github.com/senara-solutions/mika/pull/1234";
+        let (parent_id, _child_id) = seed_completable_parent(&db, pr_url).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        let result = parent.result.unwrap();
+        assert!(
+            result.contains("parent_completed_from_callback_backstop"),
+            "result must carry the backstop marker (distinct from inline path), got: {result}"
+        );
+        assert!(
+            result.contains(pr_url),
+            "result must embed the pr_url for audit traceability"
+        );
+
+        // R3 — audit event must be written. Same tool_name as the inline path
+        // so consumers grep one name and see both call sites.
+        let pid = parent_id.clone();
+        let events = db
+            .with_db(move |inner| {
+                inner.list_audit_events_paginated(
+                    "mika",
+                    Some("task_engine_parent_completer"),
+                    Some(&pid),
+                    10,
+                    0,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "periodic backstop must log one audit event"
+        );
+        let event = &events[0];
+        assert_eq!(event.before_value.as_deref(), Some("in_progress"));
+        assert_eq!(event.after_value.as_deref(), Some("completed"));
+        let reasoning = event.reasoning.as_deref().unwrap();
+        assert!(reasoning.contains("parent_completed_from_callback_backstop"));
+        assert!(reasoning.contains(pr_url));
+    }
+
+    #[tokio::test]
+    async fn test_complete_parent_tasks_on_callback_success_idempotent_race_with_inline() {
+        // If the inline path already completed the parent, the periodic backstop
+        // is a no-op — the WHERE clause on `update_task_completed` guards it.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/1";
+        let (parent_id, _child_id) = seed_completable_parent(&db, pr_url).await;
+
+        // Simulate the inline path having already completed the parent.
+        db.update_task_completed(&parent_id, Some("inline_path_won"))
+            .await
+            .unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "completed");
+        // The inline path's reason must not be overwritten by the periodic
+        // backstop (note: this race is also blocked by the query filter
+        // `parent.status = 'in_progress'` — the WHERE clause is a second
+        // line of defense).
+        assert_eq!(parent.result.as_deref(), Some("inline_path_won"));
+    }
+
+    #[tokio::test]
+    async fn test_reaper_and_completer_orthogonal_on_pr_url() {
+        // Seed two parents: one with pr_url (completer territory), one without
+        // (reaper territory). After running both methods in the same tick, each
+        // handles its candidate without cross-contamination.
+        let db = test_db();
+        let pr_url = "https://github.com/x/y/pull/42";
+        let (completer_parent, _completer_child) = seed_completable_parent(&db, pr_url).await;
+
+        // Build a reaper candidate: same shape but no pr_url on the parent
+        // metadata. Manual setup since the helper always sets pr_url.
+        let parent_b = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "Implement #other".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let reaper_parent = db.create_task(parent_b).await.unwrap();
+        db.update_task_status(&reaper_parent, "in_progress")
+            .await
+            .unwrap();
+
+        let child_b = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(reaper_parent.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let child_b_id = db.create_task(child_b).await.unwrap();
+        db.update_task_completed(&child_b_id, Some("done"))
+            .await
+            .unwrap();
+        db.mark_task_delivered(&child_b_id).await.unwrap();
+        backdate_task(&db, &child_b_id).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Run both methods in the same tick (matching the production order).
+        engine.reap_orphaned_parent_tasks().await;
+        engine.complete_parent_tasks_on_callback_success().await;
+
+        let p_completer = db
+            .get_task_unscoped(&completer_parent)
+            .await
+            .unwrap()
+            .unwrap();
+        let p_reaper = db.get_task_unscoped(&reaper_parent).await.unwrap().unwrap();
+        assert_eq!(
+            p_completer.status, "completed",
+            "parent with pr_url goes to completer"
+        );
+        assert_eq!(
+            p_reaper.status, "failed",
+            "parent without pr_url goes to reaper"
+        );
+    }
+
+    // -- reap_orphaned_pending_issue_tasks tests (mika#2045) --
+
+    /// Seed the `ready-label` shape: a `pending` self_dev issue parent carrying a
+    /// `reference_url`, backdated `age_secs` into the past.
+    async fn seed_pending_issue_parent(db: &AsyncDatabase, issue: u32, age_secs: i64) -> String {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: format!("ready-label: senara-solutions/mika#{issue}"),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(format!(
+                "https://github.com/senara-solutions/mika/issues/{issue}"
+            )),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+        backdate_created_at(db, &parent_id, age_secs).await;
+        parent_id
+    }
+
+    async fn backdate_created_at(db: &AsyncDatabase, task_id: &str, age_secs: i64) {
+        let id = task_id.to_string();
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                 WHERE id = ?1",
+                rusqlite::params![id, format!("-{age_secs} seconds")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn wrappers_of(
+        db: &AsyncDatabase,
+        parent_id: &str,
+    ) -> Vec<crate::task_state::tasks::Task> {
+        db.get_child_tasks(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.label == crate::agent::DEFERRED_DISPATCH_LABEL)
+            .collect()
+    }
+
+    /// Rung 2: orphaned with budget left -> re-armed, still `pending`, and a
+    /// fresh wrapper now represents it.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_rearms_before_expiring() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "repair must not throw work away");
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].status, "pending");
+        assert!(
+            wrappers[0]
+                .action_config
+                .contains(crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD),
+            "the rebuilt call must keep the sentinel that stops the open-PR livelock"
+        );
+        assert!(
+            wrappers[0].action_config.contains("\"mika#2013\""),
+            "prompt must be the bare <repo>#<num> form (mika#1593)"
+        );
+    }
+
+    /// An ungroomed issue belongs to the `groom` class. Repairing it as
+    /// `implement` would queue a `dev-pilot` run for work that still needs
+    /// `dev-groom`, and would occupy the wrong slot doing it.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_repairs_into_the_parents_own_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2026, 3600).await;
+        db.update_task_dispatch_class(&parent_id, "groom")
+            .await
+            .unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0].dispatch_class.as_deref(),
+            Some("groom"),
+            "the replacement must occupy the class the task belongs to"
+        );
+        assert!(
+            wrappers[0].action_config.contains("dev-groom"),
+            "an ungroomed issue must be re-armed as a grooming dispatch"
+        );
+    }
+
+    // -- mika#2169 replays and non-regressions --
+    //
+    // Three tests, three DIFFERENT statuses of proof, and conflating them is
+    // exactly the mistake this plan made twice before landing:
+    //
+    //   L4a — VERBATIM replay of the 2026-09-04 trace (terminal parent). The
+    //         population is measured, twice, on two distinct parents.
+    //   L4b — CONSTRUCTED replay of its counterfactual (parent still alive when
+    //         the budget runs out). This population has NO measured instance;
+    //         it is required by AC1/AC3 and read off `dispatcher.rs`, not off
+    //         an incident.
+    //   L4c — the L3b net. Does NOT compile on `main` (new surfaces), so it
+    //         proves no reddening and is deliberately OUT of the anti-vacuity
+    //         protocol.
+    //
+    // L4a and L4b both compile on `main` and redden there ON ASSERTION — no
+    // method neutralisation, no teardown protocol.
+
+    /// The 2026-09-04 identifiers, verbatim. Truncated to fit the `id` column
+    /// shape used by `create_task`; the suffixes are what make the rows
+    /// recognisable in a failure message.
+    const PARENT_2140: &str = "620ae345-f97b-44a0-b099-ebdf720be88c";
+    const WRAPPER_F0CD: &str = "f0cd5967-5f22-4c66-940f-86c90beb7ed1";
+    const BLOCKER_74B3: &str = "74b3ee7d-c429-4479-ba72-dc877cc8b415";
+
+    /// The verbatim refusal JSON from the ticket body: this is what
+    /// `global_dispatch_active` writes on `tasks.result`, and it is the
+    /// discriminant L3b selects on.
+    fn refusal_result_json() -> String {
+        serde_json::json!({
+            "error": "global_dispatch_active",
+            "blocking_callback_id": BLOCKER_74B3,
+            "blocking_task_id": "c479c873-0000-0000-0000-000000000000",
+            "dispatch_class": "implement",
+            "deferred_dispatch_registered": true,
+        })
+        .to_string()
+    }
+
+    /// Insert a row with a chosen id/status, bypassing `create_task`, so the
+    /// replay carries the production identifiers rather than fresh UUIDs.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_raw_task(
+        db: &AsyncDatabase,
+        id: &str,
+        parent_task_id: Option<&str>,
+        label: &str,
+        trigger_type: &str,
+        status: &str,
+        action_config: &str,
+        reference_url: Option<&str>,
+        source: Option<&str>,
+        r#type: Option<&str>,
+        result: Option<&str>,
+        metadata: Option<&str>,
+        completed_at: Option<&str>,
+        created_at: &str,
+    ) {
+        let (
+            id,
+            parent_task_id,
+            label,
+            trigger_type,
+            status,
+            action_config,
+            reference_url,
+            source,
+            ty,
+            result,
+            metadata,
+            completed_at,
+            created_at,
+        ) = (
+            id.to_string(),
+            parent_task_id.map(str::to_string),
+            label.to_string(),
+            trigger_type.to_string(),
+            status.to_string(),
+            action_config.to_string(),
+            reference_url.map(str::to_string),
+            source.map(str::to_string),
+            r#type.map(str::to_string),
+            result.map(str::to_string),
+            metadata.map(str::to_string),
+            completed_at.map(str::to_string),
+            created_at.to_string(),
+        );
+        db.with_db(move |d| {
+            d.conn.execute(
+                "INSERT INTO tasks (
+                     id, agent_id, parent_task_id, depth, label, trigger_type,
+                     action_type, action_config, status, reference_url, source,
+                     type, result, metadata, completed_at, created_at, updated_at,
+                     dispatch_class
+                 ) VALUES (?1, 'mika', ?2, 0, ?3, ?4, 'resume_agent', ?5, ?6, ?7,
+                           ?8, COALESCE(?9, 'issue'), ?10, ?11, ?12, ?13, ?13,
+                           'implement')",
+                rusqlite::params![
+                    id,
+                    parent_task_id,
+                    label,
+                    trigger_type,
+                    action_config,
+                    status,
+                    reference_url,
+                    source,
+                    ty,
+                    result,
+                    metadata,
+                    completed_at,
+                    created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Seed the shared 2026-09-04 shape. `parent_status` is what separates the
+    /// verbatim replay (`failed` — its real state at 03:35:31Z, the instant of
+    /// the first sterile turn) from the counterfactual (`blocked` — the same
+    /// chain WITHOUT the 02:04:01Z phantom sweep).
+    async fn seed_2026_09_04_trace(
+        db: &AsyncDatabase,
+        parent_status: &str,
+        parent_metadata: Option<&str>,
+        blocker_status: &str,
+        with_wrapper: bool,
+    ) {
+        // The blocking callback the refusal named.
+        seed_raw_task(
+            db,
+            BLOCKER_74B3,
+            None,
+            "long_running:run_claude_pilot",
+            "callback",
+            blocker_status,
+            "{}",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("2026-09-04T00:42:16Z"),
+            "2026-09-03T23:29:44Z",
+        )
+        .await;
+
+        seed_raw_task(
+            db,
+            PARENT_2140,
+            None,
+            "ready-label: senara-solutions/mika#2140",
+            "manual",
+            parent_status,
+            "{}",
+            Some("https://github.com/senara-solutions/mika/issues/2140"),
+            Some("self_dev"),
+            Some("issue"),
+            Some(&refusal_result_json()),
+            parent_metadata,
+            None,
+            "2026-09-04T00:42:12Z",
+        )
+        .await;
+
+        if with_wrapper {
+            // Promoted at 00:48:11Z, not yet consumed at the moment of replay.
+            seed_raw_task(
+                db,
+                WRAPPER_F0CD,
+                Some(PARENT_2140),
+                crate::agent::DEFERRED_DISPATCH_LABEL,
+                "callback",
+                "completed",
+                &rebuild_deferred_action_config(
+                    PARENT_2140,
+                    "https://github.com/senara-solutions/mika/issues/2140",
+                    "implement",
+                )
+                .unwrap(),
+                None,
+                Some("deferred_dispatch".to_string()).as_deref(),
+                None,
+                None,
+                None,
+                Some("2026-09-04T00:48:11Z"),
+                "2026-09-04T00:42:12Z",
+            )
+            .await;
+        }
+    }
+
+    /// The dispatch-slot lease from the trace: acquired 23:29:44Z, expired
+    /// 23:31:44Z. `dispatch_slot_lease_holder` filters on `expires_at > now`,
+    /// so a past `expires_at` reads as "no holder".
+    async fn seed_expired_lease(db: &AsyncDatabase) {
+        db.with_db(|d| {
+            d.conn.execute(
+                "INSERT INTO dispatch_slot_leases
+                     (agent_id, dispatch_class, holder_task_id, dispatcher_source,
+                      acquired_at, expires_at)
+                 VALUES ('mika', 'implement', 'c479c873-0000-0000-0000-000000000000',
+                         'mika_dev', '2026-09-03T23:29:44Z', '2026-09-03T23:31:44Z')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// L4a — VERBATIM replay (AC2, AC4).
+    ///
+    /// The parent is seeded `failed`, not `blocked`: that is its real state at
+    /// 03:35:31Z, when the first sterile turn actually happened. A seed placing
+    /// it `blocked` would test a state production no longer had.
+    ///
+    /// Reddens on `main` on three assertions at once — there the wrapper ends
+    /// `delivered`, a replacement wrapper IS created, and `stuck_rearm_count`
+    /// goes to 1.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_terminal_parent_rearm_into_corpse() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        seed_2026_09_04_trace(&db, "failed", None, "completed", true).await;
+        seed_expired_lease(&db).await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        // (1) The wrapper's terminal record tells the truth, and names the
+        //     terminal parent that makes the repair vain. Accented substring on
+        //     purpose — see the accented-case note below.
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "expired",
+            "a turn that dispatched nothing must not end on the most affirmative word in the vocabulary"
+        );
+        let result = wrapper.result.unwrap_or_default();
+        assert!(
+            result.contains("terminal — re-armement impossible"),
+            "the record must name the cause, got: {result}"
+        );
+        assert!(
+            result.contains(PARENT_2140),
+            "the record must name the terminal parent, got: {result}"
+        );
+
+        // (2) The budget was not burned against a corpse. This is the
+        //     assertion that measures the whole point of L2a.
+        let children = db.get_child_tasks(PARENT_2140).await.unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "no replacement wrapper may be created for a terminal parent"
+        );
+
+        // (3) …and the counter proves it independently of the row count.
+        assert_eq!(
+            db.get_stuck_rearm_count(PARENT_2140).await.unwrap(),
+            0,
+            "repair budget must stay intact when the parent is already terminal"
+        );
+
+        // (4) The event is greppable and countable.
+        assert_eq!(
+            db.count_audit_events_by_tool_name("deferred_wrapper_orphaned_by_terminal_parent")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// L4b — CONSTRUCTED replay of the counterfactual (AC1, AC3, AC4).
+    ///
+    /// This does NOT replay the ticket's trace. It replays the same chain
+    /// WITHOUT the 02:04:01Z phantom sweep — the parent still `blocked` when
+    /// the budget runs out. That population has no measured instance; AC1 and
+    /// AC3 require it closed, and the defect is read off `dispatcher.rs` (a
+    /// `RearmOutcome` dropped on the floor) plus the enum's own written
+    /// doctrine.
+    ///
+    /// Reddens on `main` on assertion: there `rearm_deferred_callback` returns
+    /// `Unrepairable`, the value is discarded, and the parent stays `blocked`.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_live_blocked_parent_budget_exhausted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        // Budget already spent — the state that forces `Unrepairable`.
+        let metadata = serde_json::json!({
+            "stuck_rearm_count": crate::skills::executor::MAX_STUCK_REARMS,
+            "claude_pilot": { "branch": "fix/2140/auto-pull-la-porte-de-promotion-lit" },
+        })
+        .to_string();
+        seed_2026_09_04_trace(&db, "blocked", Some(&metadata), "completed", true).await;
+        seed_expired_lease(&db).await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "an exhausted budget must produce a visible failure, not indefinite silence"
+        );
+        let result = parent.result.unwrap_or_default();
+        assert!(
+            result.contains("re-armement différé épuisé"),
+            "the failure must carry its reason, got: {result}"
+        );
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name("deferred_dispatch_unrepairable_parent_failed")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// L4c — the L3b net (AC3).
+    ///
+    /// **Does not compile on `main`** — `reap_stale_blocked_dispatch_tasks` and
+    /// `find_stale_blocked_dispatch_tasks` are new surfaces. It therefore
+    /// proves NO reddening and is deliberately excluded from the anti-vacuity
+    /// protocol; mixing it into L4a or L4b would destroy their proof.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_stale_blocked_sweep_recovers() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // No wrapper: it never reached consumption. Blocker finished, lease
+        // expired, parent blocked — the AC3 trio.
+        seed_2026_09_04_trace(&db, "blocked", None, "completed", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_ne!(
+            parent.status, "blocked",
+            "the trio must not be a stable state"
+        );
+        assert_eq!(
+            parent.status, "pending",
+            "with budget left, the net hands the parent back to the mika#2045 ladder"
+        );
+        let wrappers = wrappers_of(&db, PARENT_2140).await;
+        assert_eq!(wrappers.len(), 1, "a fresh wrapper must represent it again");
+    }
+
+    /// L4c, second branch: budget spent -> the net writes a visible failure
+    /// naming `stale_blocked_dispatch` rather than leaving the parent blocked.
+    #[tokio::test]
+    async fn test_replay_2026_09_04_stale_blocked_sweep_expires_without_budget() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let metadata = serde_json::json!({
+            "stuck_rearm_count": crate::skills::executor::MAX_STUCK_REARMS
+        })
+        .to_string();
+        seed_2026_09_04_trace(&db, "blocked", Some(&metadata), "completed", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let result = parent.result.unwrap_or_default();
+        assert!(
+            result.contains("stale_blocked_dispatch"),
+            "the failure must name the sweep that wrote it, got: {result}"
+        );
+    }
+
+    /// L5 (AC5) — a genuinely live blocker still refuses the second dispatch.
+    ///
+    /// This is the line L3b must never cross. The serialisation to one
+    /// `implement` per class is under operator guard (mika#2160) and is NOT
+    /// what this ticket removes.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_skips_live_blocker() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_2026_09_04_trace(&db, "blocked", None, "in_progress", false).await;
+        seed_expired_lease(&db).await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(parent.status, "blocked", "a live blocker must be honoured");
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+        assert!(
+            wrappers_of(&db, PARENT_2140).await.is_empty(),
+            "nothing may be re-armed while the blocker still runs"
+        );
+    }
+
+    /// L5 (AC5) — an unexpired lease still refuses the second dispatch, even
+    /// with the named blocker finished. The lease is the mika#1948 claim; a
+    /// sweep that ignored it would re-open the double-dispatch window.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_skips_unexpired_lease() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_2026_09_04_trace(&db, "blocked", None, "completed", false).await;
+        // `max_slots = 1` is the value this test is *about*, not a filler for a
+        // parameter that arrived after it was written (mika#2160, v52). The
+        // assertion below says a live lease protects mika#2160's serialisation;
+        // that serialisation only exists at cap 1. `0` would be actively wrong
+        // here — it is the disable sentinel, under which the claim appends a
+        // fresh `slot_index` instead of contending, so the slot would never be
+        // saturated and the sweep would be asked to honour a lease that leaves
+        // room for the very second dispatch this test forbids.
+        db.try_acquire_dispatch_slot(
+            "implement",
+            "c479c873-0000-0000-0000-000000000000",
+            Some("mika_dev"),
+            600,
+            1,
+        )
+        .await
+        .unwrap();
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db.get_task(PARENT_2140).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "blocked",
+            "a live lease must be honoured — this is what protects mika#2160's serialisation"
+        );
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+        assert!(wrappers_of(&db, PARENT_2140).await.is_empty());
+    }
+
+    /// L3b must not touch a deliberate operator gate. `blocked` is also what an
+    /// auto-merge refusal and a QA escalation write; only the slot refusal
+    /// carries `global_dispatch_active`. Measured negative control: task
+    /// `662d9752` carries `unauthorized_webhook_dispatch` and is excluded.
+    #[tokio::test]
+    async fn test_stale_blocked_sweep_ignores_non_slot_refusals() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_raw_task(
+            &db,
+            "662d9752-e0e8-4a2b-869a-c711c37a7244",
+            None,
+            "ready-label: senara-solutions/mika#2158",
+            "manual",
+            "blocked",
+            "{}",
+            Some("https://github.com/senara-solutions/mika/issues/2158"),
+            Some("self_dev"),
+            Some("issue"),
+            Some(r#"{"error":"unauthorized_webhook_dispatch"}"#),
+            None,
+            None,
+            "2026-09-04T09:44:04Z",
+        )
+        .await;
+
+        engine.reap_stale_blocked_dispatch_tasks().await;
+
+        let parent = db
+            .get_task("662d9752-e0e8-4a2b-869a-c711c37a7244")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parent.status, "blocked",
+            "a refusal that is not a slot refusal is none of this sweep's business"
+        );
+    }
+
+    // ---- mika#2413 — a groom queued behind the arch seat spends no budget ----
+
+    const PARENT_2025: &str = "e7c4e9ad-0000-4000-8000-000000000001";
+
+    /// The 2026-09-19 shape: `#2025`'s groom parent, `pending`, `groom` class,
+    /// with the arch seat held by another groom.
+    async fn seed_2413_groom_parent(db: &AsyncDatabase, metadata: Option<&str>) {
+        db.with_db({
+            let metadata = metadata.map(str::to_string);
+            move |d| {
+                d.conn.execute(
+                    "INSERT INTO tasks
+                         (id, agent_id, depth, label, trigger_type, action_type,
+                          action_config, status, reference_url, source, type,
+                          metadata, dispatch_class, created_at, updated_at)
+                     VALUES (?1, 'mika', 0, 'ready-label: senara-solutions/mika#2025',
+                             'manual', 'none', '{}', 'pending',
+                             'https://github.com/senara-solutions/mika/issues/2025',
+                             'self_dev', 'issue', ?2, 'groom',
+                             '2026-09-19T18:55:00Z', '2026-09-19T18:55:00Z')",
+                    rusqlite::params![PARENT_2025, metadata],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// One deferred wrapper of `#2025`'s parent, in a chosen status.
+    async fn seed_2413_wrapper(db: &AsyncDatabase, id: &str, status: &str) {
+        let config = rebuild_deferred_action_config(
+            PARENT_2025,
+            "https://github.com/senara-solutions/mika/issues/2025",
+            "groom",
+        )
+        .unwrap();
+        db.with_db({
+            let (id, status) = (id.to_string(), status.to_string());
+            move |d| {
+                d.conn.execute(
+                    "INSERT INTO tasks
+                         (id, agent_id, parent_task_id, depth, label, trigger_type,
+                          action_type, action_config, status, source, dispatch_class,
+                          completed_at, created_at, updated_at)
+                     VALUES (?1, 'mika', ?2, 0, ?3, 'callback', 'resume_agent', ?4, ?5,
+                             'deferred_dispatch', 'groom',
+                             CASE WHEN ?5 IN ('completed','delivered','expired')
+                                  THEN strftime('%Y-%m-%dT%H:%M:%SZ','now') END,
+                             strftime('%Y-%m-%dT%H:%M:%SZ','now'),
+                             strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                    rusqlite::params![
+                        id,
+                        PARENT_2025,
+                        crate::agent::DEFERRED_DISPATCH_LABEL,
+                        config,
+                        status
+                    ],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// V1 (AC3) — the founding trace, three rounds deep, and the parent survives.
+    ///
+    /// Each round is one full turn of the loop mika#2413 measured: a wrapper is
+    /// promoted and consumed while another groom holds the arch seat, the turn's
+    /// `run_claude_pilot` is refused on `global_dispatch_active` and posts its
+    /// own replacement wrapper, then R9 calls the re-arm on the consumed one.
+    /// Before the fix that re-arm created a *second* wrapper and spent a point of
+    /// budget, and three rounds killed the parent at 19:19:45Z.
+    ///
+    /// The invariant asserted at every round is the one that matters
+    /// operationally: **exactly one live wrapper, and a budget still at zero**.
+    /// One wrapper is what keeps the mika#1205 `already_deferred` intercept from
+    /// short-circuiting the next turn before it even tests the slot.
+    #[tokio::test]
+    async fn mika2413_a_groom_queued_behind_the_arch_seat_spends_no_budget() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+
+        seed_2413_groom_parent(&db, None).await;
+
+        // Round 1 uses the wrapper the refusal posted at dispatch time.
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-000000000001", "pending").await;
+
+        let rounds = [
+            (
+                "5e935a39-0000-4000-8000-000000000001",
+                "e3db2a79-0000-4000-8000-000000000002",
+            ),
+            (
+                "e3db2a79-0000-4000-8000-000000000002",
+                "228efb7b-0000-4000-8000-000000000003",
+            ),
+            (
+                "228efb7b-0000-4000-8000-000000000003",
+                "aa0a5d9d-0000-4000-8000-000000000004",
+            ),
+        ];
+
+        for (round, (consumed, replacement)) in rounds.iter().enumerate() {
+            // Promotion, then the turn returns: `completed` -> `delivered`.
+            db.update_task_status(consumed, "completed").await.unwrap();
+            db.mark_task_delivered(consumed).await.unwrap();
+            // The refused turn registered its own replacement — this is
+            // `register_deferred_callback`, not the re-arm.
+            seed_2413_wrapper(&db, replacement, "pending").await;
+
+            let wrapper = db.get_task(consumed).await.unwrap().unwrap();
+            dispatcher
+                .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+                .await;
+
+            let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "pending",
+                "round {round}: a groom waiting for the arch seat must never be failed"
+            );
+            assert_eq!(
+                db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+                0,
+                "round {round}: waiting for a busy slot is not a repair, so it spends nothing"
+            );
+
+            let live: Vec<_> = wrappers_of(&db, PARENT_2025)
+                .await
+                .into_iter()
+                .filter(|w| w.status == "pending")
+                .collect();
+            assert_eq!(
+                live.len(),
+                1,
+                "round {round}: exactly one wrapper may represent the parent — a second one \
+                 makes the mika#1205 intercept short-circuit the next turn before it tests the slot"
+            );
+            assert_eq!(live[0].id, *replacement, "round {round}");
+
+            // U2 — the consumed wrapper gets the honest terminal record rather
+            // than staying `delivered` (a word reserved for a turn that
+            // dispatched) or `completed` (which L2b counts as starvation).
+            let consumed_row = db.get_task(consumed).await.unwrap().unwrap();
+            assert_eq!(consumed_row.status, "expired", "round {round}");
+            let result = consumed_row.result.unwrap_or_default();
+            assert!(
+                result.contains("déjà représenté"),
+                "round {round}: the record must name why nothing was repaired, got: {result}"
+            );
+        }
+
+        // The seat frees: the turn dispatches for real, and the re-arm stands
+        // down on the pre-existing guard rather than on the new one.
+        let last = "aa0a5d9d-0000-4000-8000-000000000004";
+        db.update_task_status(last, "completed").await.unwrap();
+        db.mark_task_delivered(last).await.unwrap();
+        db.create_task(NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(PARENT_2025.to_string()),
+            depth: 1,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let wrapper = db.get_task(last).await.unwrap().unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&wrapper, "noop_completion")
+            .await;
+
+        let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "the real dispatch is in flight");
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2025).await.unwrap(), 0);
+    }
+
+    /// V2 — the negative control, without which V1 proves nothing.
+    ///
+    /// Two halves that differ by **one row**: whether a live sibling wrapper
+    /// represents the parent. If the guard read anything other than that
+    /// population — the cause, the class, the clock — both halves would come out
+    /// the same and V1 would pass against a predicate that decides nothing.
+    ///
+    /// The second half is also the ticket's trace verbatim: with no sibling, the
+    /// three consumptions of 19:03:54 / 19:18:45 / 19:19:45 spend the budget and
+    /// the parent dies on the third. **That half must keep passing** — mika#2413
+    /// narrows which causes spend the mika#2045 budget, it does not remove it.
+    ///
+    /// Reddens on `main` on the first half: there the sibling changes nothing,
+    /// the re-arm succeeds, and `stuck_rearm_count` reaches 1.
+    #[tokio::test]
+    async fn mika2413_the_guard_reads_the_wrapper_population_and_nothing_else() {
+        // Half A — a live sibling exists: refuse, spend nothing.
+        {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            seed_2413_groom_parent(&db, None).await;
+            seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-00000000000a", "delivered").await;
+            seed_2413_wrapper(&db, "e3db2a79-0000-4000-8000-00000000000b", "pending").await;
+
+            let consumed = db
+                .get_task("5e935a39-0000-4000-8000-00000000000a")
+                .await
+                .unwrap()
+                .unwrap();
+            dispatcher
+                .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+                .await;
+
+            assert_eq!(
+                db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+                0,
+                "a represented parent spends nothing"
+            );
+            assert_eq!(
+                wrappers_of(&db, PARENT_2025).await.len(),
+                2,
+                "no replacement may be created on top of a live wrapper"
+            );
+        }
+
+        // Half B — no sibling: the mika#2045 ladder runs to the end, exactly as
+        // it did on 2026-09-19.
+        {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            seed_2413_groom_parent(&db, None).await;
+
+            let consumed_ids = [
+                "5e935a39-0000-4000-8000-0000000000b1",
+                "e3db2a79-0000-4000-8000-0000000000b2",
+                "228efb7b-0000-4000-8000-0000000000b3",
+            ];
+            for id in consumed_ids {
+                seed_2413_wrapper(&db, id, "delivered").await;
+                let consumed = db.get_task(id).await.unwrap().unwrap();
+                dispatcher
+                    .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+                    .await;
+                // The replacement the re-arm created is consumed in its turn,
+                // so the next round starts unrepresented again.
+                for w in wrappers_of(&db, PARENT_2025).await {
+                    if w.status == "pending" {
+                        db.update_task_status(&w.id, "completed").await.unwrap();
+                        db.mark_task_delivered(&w.id).await.unwrap();
+                    }
+                }
+            }
+
+            let parent = db.get_task(PARENT_2025).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "failed",
+                "a parent whose turns genuinely never dispatch must still terminate (mika#2045)"
+            );
+            let result = parent.result.unwrap_or_default();
+            assert!(
+                result.contains("re-armement différé épuisé"),
+                "the failure must still name the exhausted budget, got: {result}"
+            );
+        }
+    }
+
+    /// V4 — non-regression on mika#1124: the new arm removes a creation, it
+    /// triggers none. Nothing is promoted, no wrapper is born, no child appears.
+    #[tokio::test]
+    async fn mika2413_the_skipped_rearm_creates_nothing_at_all() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        seed_2413_groom_parent(&db, None).await;
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-0000000000c1", "delivered").await;
+        seed_2413_wrapper(&db, "e3db2a79-0000-4000-8000-0000000000c2", "pending").await;
+
+        let before = db.get_child_tasks(PARENT_2025).await.unwrap().len();
+        let consumed = db
+            .get_task("5e935a39-0000-4000-8000-0000000000c1")
+            .await
+            .unwrap()
+            .unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&consumed, "noop_completion")
+            .await;
+
+        assert_eq!(
+            db.get_child_tasks(PARENT_2025).await.unwrap().len(),
+            before,
+            "no child may be created"
+        );
+        let sibling = db
+            .get_task("e3db2a79-0000-4000-8000-0000000000c2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sibling.status, "pending",
+            "the live wrapper must not be promoted by the refusal"
+        );
+    }
+
+    /// The consumed wrapper is not evidence that its own parent is represented.
+    /// Without the exclusion, the `silent_turn_error` path — where the wrapper is
+    /// still `completed` with a fresh `completed_at` — would refuse every re-arm
+    /// for the whole liveness window, and mika#2045's repair would be dead on
+    /// that path.
+    #[tokio::test]
+    async fn mika2413_a_wrapper_cannot_represent_its_own_parent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        seed_2413_groom_parent(&db, None).await;
+        // Promotion wrote `completed`; the turn errored, so nothing wrote
+        // `delivered`. This is the mika#2045 `silent_turn_error` shape.
+        seed_2413_wrapper(&db, "5e935a39-0000-4000-8000-0000000000d1", "completed").await;
+
+        let consumed = db
+            .get_task("5e935a39-0000-4000-8000-0000000000d1")
+            .await
+            .unwrap()
+            .unwrap();
+        dispatcher
+            .rearm_consumed_deferred_wrapper(&consumed, "silent_turn_error")
+            .await;
+
+        assert_eq!(
+            db.get_stuck_rearm_count(PARENT_2025).await.unwrap(),
+            1,
+            "the consumed wrapper must be out of the population — otherwise this path never repairs"
+        );
+        let live: Vec<_> = wrappers_of(&db, PARENT_2025)
+            .await
+            .into_iter()
+            .filter(|w| w.status == "pending")
+            .collect();
+        assert_eq!(live.len(), 1, "the parent must be represented again");
+    }
+
+    /// L2b measures and mutates nothing. A wrapper promoted long ago is
+    /// counted; nothing about it changes.
+    #[tokio::test]
+    async fn test_promotion_starvation_counts_without_mutating() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        // Backdate the epoch a day: the wrapper must be born AFTER it (else the
+        // bound correctly excludes it as pre-L1 residue) and stale enough to be
+        // reported. Stamping "now" would put the epoch after the promotion.
+        db.with_db(|d| {
+            d.conn.execute(
+                "INSERT INTO schema_meta (key, value)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day'))",
+                rusqlite::params![DEFERRED_PROMOTION_EPOCH_KEY],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let epoch = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+
+        seed_2026_09_04_trace(&db, "pending", None, "completed", true).await;
+        let promoted_at = crate::timestamp::now_minus(chrono::Duration::hours(2));
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET completed_at = ?2 WHERE id = ?1",
+                rusqlite::params![WRAPPER_F0CD, promoted_at],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (count, oldest) = db
+            .count_promoted_undelivered_wrappers(900, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a wrapper promoted 2h ago is starving");
+        assert!(oldest >= 7000, "oldest age must be reported, got {oldest}");
+
+        engine.report_promotion_starvation().await;
+
+        let wrapper = db.get_task(WRAPPER_F0CD).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "completed",
+            "the indicator must not destroy live work — this is the 2h47 lesson"
+        );
+        assert_eq!(db.get_stuck_rearm_count(PARENT_2140).await.unwrap(), 0);
+    }
+
+    /// The epoch bound excludes pre-L1 residue, which would otherwise fire the
+    /// indicator permanently for a reason unrelated to starvation.
+    #[tokio::test]
+    async fn test_promotion_starvation_excludes_pre_epoch_residue() {
+        let db = test_db();
+
+        seed_2026_09_04_trace(&db, "pending", None, "completed", true).await;
+        // Promoted before the epoch is stamped: pre-L1 shape.
+        let epoch = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+
+        let (count, _) = db
+            .count_promoted_undelivered_wrappers(0, &epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a wrapper promoted at 00:48:11Z on 2026-09-04 predates the epoch and must not be counted"
+        );
+    }
+
+    /// The epoch is stamped once and never moves — a second boot must not walk
+    /// it forward, or the bound would forget everything on every restart.
+    #[tokio::test]
+    async fn test_promotion_epoch_is_stamped_once() {
+        let db = test_db();
+        let first = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+        let second = db
+            .stamp_schema_meta_epoch_if_absent(DEFERRED_PROMOTION_EPOCH_KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            first, second,
+            "INSERT OR IGNORE must make later boots no-ops"
+        );
+    }
+
+    /// Rung 3: budget spent -> expired, and the freed slot lets the `ready`
+    /// sweep create a replacement for the same issue.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_expires_once_budget_is_spent() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+        // increment touches updated_at, not created_at — the task is still aged.
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "budget spent — the task must expire"
+        );
+
+        // R7: the partial unique index excludes `failed`, so the sweep can
+        // create a fresh task for the same issue.
+        let replacement = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "ready-label: senara-solutions/mika#2013".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some("https://github.com/senara-solutions/mika/issues/2013".to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: Some("issue".to_string()),
+            dispatch_class: Some("implement".to_string()),
+        };
+        assert!(
+            db.create_task(replacement).await.is_ok(),
+            "expiring must free the idx_tasks_manual_active_ref_url slot"
+        );
+    }
+
+    /// A wrapper that survives the expiry could still be promoted and would
+    /// replay a dispatch against a dead parent while a live replacement exists
+    /// for the same issue. It must be cancelled first.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_cancels_surviving_wrappers_on_expiry() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        // A wrapper left `in_progress`: not `pending`, so the parent still reads
+        // as orphaned, yet it is not terminal either.
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+        db.update_task_status(&wrapper_id, "in_progress")
+            .await
+            .unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let wrapper = db.get_task(&wrapper_id).await.unwrap().unwrap();
+        assert_eq!(
+            wrapper.status, "cancelled",
+            "a surviving wrapper would double-dispatch after the replacement is created"
+        );
+    }
+
+    /// Anti-vacuity for R2: a task waiting behind a busy dispatch slot is old and
+    /// healthy. This test fails the moment the reaper decides on age alone.
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_spares_task_queued_behind_busy_slot() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 3600).await;
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending", "a queued task must be left alone");
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+        let wrapper = db.get_task(&wrapper_id).await.unwrap().unwrap();
+        assert_eq!(wrapper.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn test_stuck_pending_reaper_spares_task_inside_the_grace_window() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2013, 600).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending");
+        assert!(wrappers_of(&db, &parent_id).await.is_empty());
+    }
+
+    // -- mika#2181: a promoted wrapper is live, and the audit says what was seen --
+
+    /// Attach a deferred wrapper in the given status, optionally dating its
+    /// `completed_at` `offset_secs` into the past (mika#2181).
+    async fn seed_wrapper_with_status(
+        db: &AsyncDatabase,
+        parent_id: &str,
+        status: &str,
+        completed_at_offset_secs: Option<i64>,
+    ) -> String {
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.to_string()),
+            depth: 1,
+            label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("implement".to_string()),
+        };
+        let id = db.create_task(wrapper).await.unwrap();
+        let (i, st, off) = (id.clone(), status.to_string(), completed_at_offset_secs);
+        db.with_db(move |d| {
+            d.conn.execute(
+                "UPDATE tasks SET status = ?2 WHERE id = ?1",
+                rusqlite::params![i, st],
+            )?;
+            if let Some(off) = off {
+                d.conn.execute(
+                    "UPDATE tasks SET completed_at =
+                            strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                     WHERE id = ?1",
+                    rusqlite::params![i, format!("-{off} seconds")],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn reaper_audit_details(
+        db: &AsyncDatabase,
+        tool_name: &'static str,
+        parent_id: &str,
+    ) -> Vec<String> {
+        let target = format!("task:{parent_id}");
+        db.with_db(move |inner| {
+            inner.list_audit_events_paginated("mika", Some(tool_name), Some(&target), 10, 0)
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.reasoning)
+        .collect()
+    }
+
+    /// The db-level test proves the predicate; this one proves the reaper
+    /// actually consumes the corrected predicate (mika#2181).
+    ///
+    /// The wrapper was promoted at this very tick — `completed`, `completed_at`
+    /// now, never `delivered`. Before the fix the reaper called the parent
+    /// unrepresented and re-armed it; two ticks later a healthy parent was
+    /// `failed`, two minutes before its turn answered.
+    #[tokio::test]
+    async fn test_reaper_leaves_parent_alone_when_wrapper_was_just_promoted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        // Promote through the REAL code path rather than hand-writing
+        // `completed`: this is what pins the `completed_at` format contract
+        // between the writer (promotion) and the reader (the reaper's clause).
+        // A fixture that writes the timestamp itself tests the fixture.
+        let wrapper_id = seed_wrapper_with_status(&db, &parent_id, "pending", None).await;
+        let promoted = db
+            .with_db(move |d| d.promote_next_deferred_callback_for_class("mika", "implement"))
+            .await
+            .unwrap();
+        assert_eq!(promoted.as_deref(), Some(wrapper_id.as_str()));
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "pending",
+            "the turn the promoted wrapper feeds has not answered yet"
+        );
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "no repair budget may be spent on a parent that is not orphaned"
+        );
+        assert!(
+            reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id)
+                .await
+                .is_empty()
+        );
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert_eq!(wrappers.len(), 1, "no replacement wrapper was registered");
+        assert_eq!(wrappers[0].id, wrapper_id);
+    }
+
+    /// Past the liveness window the promoted wrapper is a corpse, not a shield:
+    /// the reaper must still repair (mika#2181). This is the guard that keeps the
+    /// bound from drifting to infinity in a later refactor.
+    #[tokio::test]
+    async fn test_reaper_repairs_when_promoted_wrapper_is_stale() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(3000)).await;
+
+        // 3000 s must exceed the liveness window for this test to mean anything.
+        // The reaper reads the window from the process environment, so an
+        // operator with MIKA_PROMOTED_WRAPPER_LIVENESS_SECS exported would
+        // otherwise turn this into a silent false pass.
+        assert!(
+            promoted_wrapper_liveness_secs() < 3000,
+            "test presumes a liveness window under 3000 s; \
+             MIKA_PROMOTED_WRAPPER_LIVENESS_SECS is set to {}",
+            promoted_wrapper_liveness_secs()
+        );
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+        let wrappers = wrappers_of(&db, &parent_id).await;
+        assert!(
+            wrappers.iter().any(|w| w.status == "pending"),
+            "the repair's actual product is a fresh pending wrapper"
+        );
+    }
+
+    /// The shelter is silent by construction — it lives inside a SQL
+    /// `NOT EXISTS`, so a spared parent never becomes a candidate (mika#2181).
+    /// Without this event, "acted on nobody" and "holding work back" read
+    /// identically. The case that matters is exactly this one: zero candidates,
+    /// non-empty shelter.
+    #[tokio::test]
+    async fn test_reaper_counts_parents_it_sheltered() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let sheltered = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        seed_wrapper_with_status(&db, &sheltered, "completed", Some(0)).await;
+        // Ordinary queueing is NOT the new shelter and must not be counted.
+        let queued = seed_pending_issue_parent(&db, 2159, 11_455).await;
+        seed_wrapper_with_status(&db, &queued, "pending", None).await;
+
+        let grace = stuck_pending_reaper_grace_secs();
+        let liveness = promoted_wrapper_liveness_secs();
+        let names = db
+            .find_parents_sheltered_by_promoted_wrapper(grace, liveness)
+            .await
+            .unwrap();
+        assert_eq!(
+            names,
+            vec!["https://github.com/senara-solutions/mika/issues/2158".to_string()],
+            "only the promoted-wrapper shelter counts; plain queueing does not"
+        );
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        // And the sheltered parent is genuinely untouched.
+        let parent = db.get_task(&sheltered).await.unwrap().unwrap();
+        assert_eq!(parent.status, "pending");
+        assert_eq!(db.get_stuck_rearm_count(&sheltered).await.unwrap(), 0);
+    }
+
+    /// AC4 (mika#2181): the re-arm event names which wrappers the reaper saw and
+    /// what statuses produced the "absent" verdict.
+    #[tokio::test]
+    async fn test_stuck_pending_rearm_audit_names_the_wrappers_seen() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        // Two distinct statuses, neither live: the parent IS orphaned, and the
+        // audit must show exactly why.
+        let spent = seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
+        let dead = seed_wrapper_with_status(&db, &parent_id, "cancelled", Some(60)).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let details = reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id).await;
+        assert_eq!(details.len(), 1, "one re-arm, one audit row");
+        let d = &details[0];
+        assert!(d.contains(&spent[..8]), "missing the spent wrapper: {d}");
+        assert!(d.contains(&dead[..8]), "missing the dead wrapper: {d}");
+        assert!(d.contains("delivered@"), "missing its status: {d}");
+        assert!(d.contains("cancelled@"), "missing its status: {d}");
+    }
+
+    /// AC4, the empty rendering: a parent that never had a wrapper says so.
+    #[tokio::test]
+    async fn test_stuck_pending_rearm_audit_renders_wrappers_none() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let details = reaper_audit_details(&db, "stuck_pending_task_rearmed", &parent_id).await;
+        assert_eq!(details.len(), 1);
+        assert!(
+            details[0].contains("wrappers:none"),
+            "an absent inventory must be stated, not omitted: {}",
+            details[0]
+        );
+    }
+
+    /// AC4 on the other terminal event: expiry ends the battle and reads even
+    /// worse than a re-arm, so it carries the same inventory.
+    #[tokio::test]
+    async fn test_stuck_pending_expiry_audit_names_the_wrappers_seen() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2158, 11_455).await;
+        let spent = seed_wrapper_with_status(&db, &parent_id, "delivered", Some(0)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        let details = reaper_audit_details(&db, "stuck_pending_task_expired", &parent_id).await;
+        assert_eq!(details.len(), 1);
+        assert!(details[0].contains(&spent[..8]), "got: {}", details[0]);
+        assert!(details[0].contains("delivered@"), "got: {}", details[0]);
+    }
+
+    // -- mika#2184 : la vivacité d'un tour différé se mesure sur son activité --
+
+    /// Attache au wrapper une session portant une ligne d'activité datée.
+    ///
+    /// Reproduit la trajectoire de production : `dispatch_resume_agent` ouvre sa
+    /// session via `create_session_with_parent(…, task_id = Some(&task.id))` où
+    /// `task.id` est **le wrapper**, puis le tour écrit ses `llm_calls` /
+    /// `tool_calls` sur cette session.
+    async fn seed_wrapper_activity(
+        db: &AsyncDatabase,
+        wrapper_id: &str,
+        session_id: &str,
+        age_secs: i64,
+        channel: ActivityChannel,
+    ) {
+        let w = wrapper_id.to_string();
+        let s = session_id.to_string();
+        db.with_db(move |d| {
+            d.create_session_with_parent(&s, "mika", "system", None, None, Some(&w))?;
+            let row_id = format!("row-{s}");
+            match channel {
+                ActivityChannel::Llm => d.save_llm_call(
+                    &row_id,
+                    "mika",
+                    &s,
+                    None,
+                    "mock",
+                    "mock-model",
+                    1,
+                    1,
+                    None,
+                    None,
+                    10,
+                    None,
+                    "success",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?,
+                ActivityChannel::Tool => d.save_tool_call(
+                    &row_id,
+                    "mika",
+                    &s,
+                    None,
+                    None,
+                    0,
+                    "run_shell",
+                    "builtin",
+                    None,
+                    Some("{}"),
+                    Some("ok"),
+                    true,
+                    false,
+                    10,
+                    None,
+                )?,
+            }
+            let table = match channel {
+                ActivityChannel::Llm => "llm_calls",
+                ActivityChannel::Tool => "tool_calls",
+            };
+            d.conn.execute(
+                &format!(
+                    "UPDATE {table} SET created_at =
+                       strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2) WHERE id = ?1"
+                ),
+                rusqlite::params![row_id, format!("-{age_secs} seconds")],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActivityChannel {
+        Llm,
+        Tool,
+    }
+
+    /// Les deux bornes de promotion **mesurées** sur les 8 cas résiduels du
+    /// corps de mika#2184 : 2820 s et 4996 s après promotion, tous deux hors de
+    /// portée de `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS` (2700 s) et de toute
+    /// valeur compatible avec un faucheur utile.
+    const MEASURED_RESIDUAL_PROMOTION_AGES_SECS: [i64; 2] = [2820, 4996];
+
+    /// T2 / **AC2** — rejeu anti-vacuité sur la géométrie des 8 cas résiduels.
+    ///
+    /// Sur `main`, la parente est expirée : le wrapper promu il y a 2820 s (puis
+    /// 4996 s) est hors de la fenêtre-proxy de mika#2181, donc
+    /// `find_orphaned_pending_issue_tasks` la rend candidate, le budget de
+    /// réparation est épuisé, et elle passe `failed`. Avec la mesure directe,
+    /// elle survit — la session de son wrapper porte une ligne `llm_calls` à
+    /// −60 s, c'est-à-dire que le tour **travaille**.
+    ///
+    /// **Ce que ce test n'établit pas, et le dire ici est la moitié honnête
+    /// d'AC2 :** que les 8 cas mesurés en production portaient effectivement de
+    /// l'activité. Rien dans le corps du ticket ne l'établit, et la
+    /// caractérisation n'est pas exécutable depuis le bac à sable de dispatch
+    /// (`~/.mika/data/mika.db` n'existe pas dans le bwrap du pilote). Ce test
+    /// rejoue la **géométrie** ; la sonde 1 du plan rejoue la population, avec
+    /// sa halte. Un test vert sur une fixture dont on n'a pas établi qu'elle
+    /// décrit les 8 cas serait le « rouge vacuux » que le doc de mika#2181
+    /// condamne.
+    #[tokio::test]
+    async fn mika2184_a_parent_whose_deferred_turn_is_working_survives() {
+        for (i, promoted_age) in MEASURED_RESIDUAL_PROMOTION_AGES_SECS.iter().enumerate() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let engine = observing_engine(db.clone(), dispatcher);
+
+            let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+            let wrapper_id =
+                seed_wrapper_with_status(&db, &parent_id, "completed", Some(*promoted_age)).await;
+            seed_wrapper_activity(
+                &db,
+                &wrapper_id,
+                &format!("deferred-dispatch-{i}"),
+                60,
+                ActivityChannel::Llm,
+            )
+            .await;
+            // Budget spent: without the direct measure, the ONLY outcome left is
+            // expiry. That is what makes the test non-vacuous.
+            for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+                db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+            }
+
+            engine.reap_orphaned_pending_issue_tasks().await;
+
+            let parent = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                parent.status, "pending",
+                "a parent whose deferred turn wrote an llm_calls row 60 s ago must survive \
+                 (promotion age {promoted_age} s, past every value of the proxy window)"
+            );
+
+            // R3/D6 — the spare is attributable, and to the RIGHT cause. The
+            // proxy window cannot have produced it (the promotion is past it),
+            // so a spare recorded under the mika#2181 name here would mean the
+            // two causes have been merged.
+            let details =
+                reaper_audit_details(&db, STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT, &parent_id)
+                    .await;
+            assert_eq!(
+                details.len(),
+                1,
+                "the spare must be attributable to the direct measure, not to the proxy window"
+            );
+            assert!(details[0].contains("cause:active"), "got: {}", details[0]);
+            assert!(
+                details[0].contains("last_activity_secs:"),
+                "the age must be NAMED — mika#2277 paid dearly for a spare whose age could \
+                 not be read: {}",
+                details[0]
+            );
+        }
+    }
+
+    /// T3 — même forme, activité portée par `tool_calls` seul.
+    ///
+    /// Un tour peut enchaîner plusieurs outils entre deux appels LLM. Ne lire
+    /// que `llm_calls` ferait passer ce tour-là pour mort.
+    #[tokio::test]
+    async fn mika2184_activity_on_tool_calls_alone_also_spares() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        let wrapper_id = seed_wrapper_with_status(&db, &parent_id, "completed", Some(4996)).await;
+        seed_wrapper_activity(
+            &db,
+            &wrapper_id,
+            "deferred-dispatch-tool",
+            60,
+            ActivityChannel::Tool,
+        )
+        .await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "the measure must not depend on a single channel"
+        );
+    }
+
+    /// T4 — contrôle négatif de cible : l'activité d'une **autre** parente
+    /// n'épargne pas la candidate.
+    ///
+    /// Sans lui, « la jointure discrimine » et « la jointure épargne tout le
+    /// monde » produisent exactement le même vert. Le test assert les **deux**
+    /// sens : la candidate expire, et la parente qui porte l'activité survit —
+    /// un prédicat cassé dans l'autre direction (qui n'épargne jamais personne)
+    /// rougit sur la seconde assertion.
+    #[tokio::test]
+    async fn mika2184_activity_of_another_parent_does_not_spare_the_candidate() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let candidate = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &candidate, "completed", Some(4996)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&candidate).await.unwrap();
+        }
+
+        let other = seed_pending_issue_parent(&db, 9999, 11_455).await;
+        let other_wrapper = seed_wrapper_with_status(&db, &other, "completed", Some(4996)).await;
+        seed_wrapper_activity(
+            &db,
+            &other_wrapper,
+            "deferred-dispatch-other",
+            60,
+            ActivityChannel::Llm,
+        )
+        .await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&other).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&candidate).await.unwrap().unwrap().status,
+            "failed",
+            "the candidate has no activity of its own and must still be expired"
+        );
+        assert_eq!(
+            db.get_task(&other).await.unwrap().unwrap().status,
+            "pending",
+            "the parent that DOES carry activity survives — this is what makes the \
+             negative control non-vacuous"
+        );
+    }
+
+    /// T5 / **AC3** — non-régression : une parente dont le tour est réellement
+    /// mort est toujours ré-armée puis expirée.
+    ///
+    /// Aucune activité, télémétrie armée, moteur ayant vécu la fenêtre : la
+    /// classification est `Silent`, et le comportement est celui d'aujourd'hui,
+    /// bit pour bit (R5).
+    #[tokio::test]
+    async fn mika2184_a_genuinely_dead_turn_is_still_rearmed_then_expired() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+
+        // Rung 2: repair first.
+        engine.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "repair must come before expiry"
+        );
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 1);
+
+        // Rung 3: budget spent -> expiry.
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+        db.cancel_deferred_wrappers_of_parent(&parent_id)
+            .await
+            .unwrap();
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "a turn with no activity at all is still expired once the budget is spent"
+        );
+    }
+
+    /// T7 — **cause C** (redémarrage) : `NotYetObservable` épargne, **et
+    /// s'éteint**.
+    ///
+    /// Les deux moitiés comptent. Épargner sans s'éteindre serait la même dette
+    /// que la fenêtre-proxy qu'on remplace — une ignorance permanente déguisée
+    /// en prudence. Le test rejoue la **même entrée** sous deux uptimes et exige
+    /// deux verdicts opposés.
+    #[tokio::test]
+    async fn mika2184_a_young_process_spares_and_the_ignorance_extinguishes_itself() {
+        // Uptime 120 s < window 600 s: the process could not have observed.
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let young = TaskEngine::new(db.clone(), dispatcher).with_started_at_secs_ago(120);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        young.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "pending",
+            "a process that has not lived through the window has not observed a silence"
+        );
+
+        // Same input, an engine that HAS lived through it.
+        let dispatcher = test_dispatcher(db.clone());
+        let observing = observing_engine(db.clone(), dispatcher);
+        observing.reap_orphaned_pending_issue_tasks().await;
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "the ignorance must extinguish itself — otherwise it is a permanent shield"
+        );
+    }
+
+    /// T8 — `NotRecorded` **fauche**.
+    ///
+    /// Télémétrie désarmée des deux côtés : aucune ligne d'activité ne peut
+    /// exister, donc le silence ne dit rien. Épargner ici restaurerait le
+    /// cadavre-bouclier que mika#2181 a dû borner — *ce qui ne peut pas
+    /// s'éteindre tout seul ne peut pas épargner.*
+    #[tokio::test]
+    async fn mika2184_disarmed_telemetry_reaps_rather_than_spares() {
+        let db = test_db();
+        let dispatcher = test_dispatcher_with(db.clone(), |s| {
+            s.store_llm_calls = false;
+            s.store_tool_calls = false;
+        });
+        let engine = observing_engine(db.clone(), dispatcher);
+
+        let parent_id = seed_pending_issue_parent(&db, 2184, 11_455).await;
+        seed_wrapper_with_status(&db, &parent_id, "completed", Some(4000)).await;
+        for _ in 0..crate::skills::executor::MAX_STUCK_REARMS {
+            db.increment_stuck_rearm_count(&parent_id).await.unwrap();
+        }
+
+        engine.reap_orphaned_pending_issue_tasks().await;
+
+        assert_eq!(
+            db.get_task(&parent_id).await.unwrap().unwrap().status,
+            "failed",
+            "a permanent inability to observe must not disarm the reaper"
+        );
+    }
+
+    /// T9 — **les trois fenêtres ne sont pas interchangeables** (angle mort nommé
+    /// par le doc de mika#2181).
+    ///
+    /// `grace_seconds`, `promoted_liveness_seconds` et `activity_window_secs`
+    /// sont trois `i64` de même type, et les deux premiers partagent le **même
+    /// défaut** (2700). Rien dans le compilateur ne distingue une transposition.
+    ///
+    /// **Ce test ne mute PAS l'environnement du process, et ce n'est pas un
+    /// détail de confort.** Une première version posait les trois variables
+    /// globalement ; or les trois getters sont lus par *chaque* test faucheur, et
+    /// ceux-ci tournent en parallèle dans le même binaire — le test aurait
+    /// fabriqué exactement la flakiness qu'il prétend prévenir. La propriété se
+    /// teste donc là où elle vit : sur les paramètres, que D3 a précisément
+    /// sortis de la SQL pour ça.
+    ///
+    /// Deux moitiés, et la seconde est celle qu'un test de comportement ne peut
+    /// pas voir : les trois boutons doivent être **trois** noms distincts. Deux
+    /// constantes qui se rejoignent feraient d'un réglage de l'une un réglage
+    /// silencieux de l'autre.
+    #[test]
+    fn mika2184_the_three_windows_are_not_interchangeable() {
+        // Half 1 — transposing the two adjacent `i64` of the pure function
+        // changes the verdict. Telemetry armed, no activity, window 600,
+        // uptime 120: the process has not lived through the window.
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 120, true),
+            WrapperActivity::NotYetObservable { uptime_secs: 120 }
+        );
+        // Transposed — uptime 600 >= window 120 — and the verdict flips from
+        // spare to reap. An argument inversion cannot pass unnoticed.
+        assert_eq!(
+            classify_wrapper_activity(None, 120, 600, true),
+            WrapperActivity::Silent
+        );
+
+        // Half 2 — three distinct knobs. `STUCK_PENDING_REAPER_GRACE_ENV` and
+        // `PROMOTED_WRAPPER_LIVENESS_ENV` already share a default value; if they
+        // also shared a name, setting one would silently set the other.
+        let names = [
+            STUCK_PENDING_REAPER_GRACE_ENV,
+            PROMOTED_WRAPPER_LIVENESS_ENV,
+            STUCK_PENDING_ACTIVITY_WINDOW_ENV,
+        ];
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let before = sorted.len();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            before,
+            "the three windows must be settable independently; found duplicates in {names:?}"
+        );
+    }
+
+    /// T6 — table complète de `classify_wrapper_activity`, bornes comprises.
+    #[test]
+    fn mika2184_classify_wrapper_activity_table() {
+        assert_eq!(
+            classify_wrapper_activity(Some(60), 600, 10_000, true),
+            WrapperActivity::Active { last_seen_secs: 60 }
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10_000, true),
+            WrapperActivity::Silent
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 120, true),
+            WrapperActivity::NotYetObservable { uptime_secs: 120 }
+        );
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10_000, false),
+            WrapperActivity::NotRecorded
+        );
+        // Upper bound: 700 > 600 is silent...
+        assert_eq!(
+            classify_wrapper_activity(Some(700), 600, 10_000, true),
+            WrapperActivity::Silent
+        );
+        // ...and the bound itself is INCLUSIVE, matching `LivenessSignal::from_age`.
+        assert_eq!(
+            classify_wrapper_activity(Some(600), 600, 10_000, true),
+            WrapperActivity::Active {
+                last_seen_secs: 600
+            }
+        );
+        // An age inside the window wins over EVERY unobservability: there is
+        // nothing to be unable to observe once the evidence is in hand.
+        assert_eq!(
+            classify_wrapper_activity(Some(60), 600, 10, false),
+            WrapperActivity::Active { last_seen_secs: 60 }
+        );
+        // Permanence before transience: a disarmed telemetry is reported ahead
+        // of a young process, because an operator reading "the process just
+        // started" on a fleet that stopped recording would chase the wrong fix.
+        assert_eq!(
+            classify_wrapper_activity(None, 600, 10, false),
+            WrapperActivity::NotRecorded
+        );
+    }
+
+    /// T12 — les trois paliers du bouton, plus le plafond.
+    #[test]
+    fn mika2184_parse_stuck_pending_activity_window() {
+        assert_eq!(
+            parse_stuck_pending_activity_window(None),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some("  ")),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(parse_stuck_pending_activity_window(Some("900")), 900);
+        assert_eq!(parse_stuck_pending_activity_window(Some(" 900 ")), 900);
+        for bad in ["0", "-1", "abc"] {
+            assert_eq!(
+                parse_stuck_pending_activity_window(Some(bad)),
+                STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS,
+                "{bad} must fall back to the default"
+            );
+        }
+        // Beyond the clamp: a knob whose extreme setting would spare every
+        // parent for ever must refuse it, and say so.
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some(
+                &(STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS + 1).to_string()
+            )),
+            STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_activity_window(Some(
+                &STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS.to_string()
+            )),
+            STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS,
+            "the clamp itself is a legal value"
+        );
+        assert_eq!(STUCK_PENDING_ACTIVITY_WINDOW_DEFAULT_SECS, 600);
+    }
+
+    #[test]
+    fn test_parse_promoted_wrapper_liveness() {
+        assert_eq!(
+            parse_promoted_wrapper_liveness(None),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("  ")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(parse_promoted_wrapper_liveness(Some("60")), 60);
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("0")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("-1")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some("nonsense")),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        // The upper clamp is not tidiness. SQLite returns NULL for an
+        // out-of-range strftime modifier, and `x > NULL` is NULL, so an absurd
+        // override makes the `completed` arm unsatisfiable and silently restores
+        // the mika#2181 predicate. A knob that reverts the fix without a word
+        // must fail closed.
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(
+                &(PROMOTED_WRAPPER_LIVENESS_MAX_SECS + 1).to_string()
+            )),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(&i64::MAX.to_string())),
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_promoted_wrapper_liveness(Some(&PROMOTED_WRAPPER_LIVENESS_MAX_SECS.to_string())),
+            PROMOTED_WRAPPER_LIVENESS_MAX_SECS,
+            "the clamp boundary itself is accepted"
+        );
+    }
+
+    /// mika#2405, U5 test 2 — the **three** liveness variants are decided
+    /// separately. The third assertion is the one that matters: it pins the
+    /// assumed divergence with the phantom sweep, which spares on
+    /// `unusable_children`. Without it, a re-read that "aligned" the closer on
+    /// the sweeper would make it inert on the abnormal population it exists to
+    /// close, and no other test would redden.
+    #[test]
+    fn mika2405_the_three_liveness_variants_are_decided_separately() {
+        let live = DispatchLiveness::Live {
+            child_id: "child-1".to_string(),
+            pid: 4242,
+        };
+        assert_eq!(
+            settle_action(&live),
+            SettleAction::Spare {
+                reason: "live",
+                child: Some(("child-1", 4242)),
+            },
+            "a running dispatch spares its row"
+        );
+
+        assert_eq!(
+            settle_action(&DispatchLiveness::Unknown),
+            SettleAction::Spare {
+                reason: "unknown",
+                child: None,
+            },
+            "an unreadable signal is never a satisfied term — spare, name no child"
+        );
+
+        assert_eq!(
+            settle_action(&DispatchLiveness::NoneLive {
+                unusable_children: 0
+            }),
+            SettleAction::Settle {
+                unusable_children: 0
+            }
+        );
+        assert_eq!(
+            settle_action(&DispatchLiveness::NoneLive {
+                unusable_children: 3
+            }),
+            SettleAction::Settle {
+                unusable_children: 3
+            },
+            "assumed divergence with the phantom sweep: unusable children do NOT \
+             spare here — sparing would be permanent and would make the closer \
+             inert on the very population it targets"
+        );
+    }
+
+    /// The two spare reasons are distinct strings, and the settle branch is not
+    /// reachable from a sparing variant. A single reason would merge two
+    /// populations whose remedies differ: `live` resolves itself, sustained
+    /// `unknown` means the child query is failing and **no** row is ever being
+    /// examined again.
+    #[test]
+    fn mika2405_the_two_spare_reasons_are_distinct() {
+        let live = DispatchLiveness::Live {
+            child_id: "c".to_string(),
+            pid: 1,
+        };
+        let (SettleAction::Spare { reason: a, .. }, SettleAction::Spare { reason: b, .. }) = (
+            settle_action(&live),
+            settle_action(&DispatchLiveness::Unknown),
+        ) else {
+            panic!("both variants must spare");
+        };
+        assert_ne!(a, b);
+    }
+
+    /// mika#2405, U3 — the settler grace follows the house three-tier shape
+    /// plus the upper clamp, for the same reason the sibling above states.
+    #[test]
+    fn mika2405_parse_dispatch_parent_settle_grace() {
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(None),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("  ")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(parse_dispatch_parent_settle_grace(Some("120")), 120);
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("0")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+            "`0` is not a disarm — that is the kill-switch's job"
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("-1")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some("nonsense")),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        // An out-of-range strftime modifier makes SQLite return NULL, and
+        // `x < NULL` is NULL — so an absurd override would disarm the HAVING
+        // clause without a word rather than widening it.
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(
+                &(DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS + 1).to_string()
+            )),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(&i64::MAX.to_string())),
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_dispatch_parent_settle_grace(Some(
+                &DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS.to_string()
+            )),
+            DISPATCH_PARENT_SETTLE_GRACE_MAX_SECS,
+            "the clamp boundary itself is accepted"
+        );
+    }
+
+    /// mika#2405, U3 — the kill-switch. The load-bearing row is the last one:
+    /// an unrecognized value leaves the closer **armed**, because a disarm by
+    /// typo on a safety closer is exactly the silent failure this ticket
+    /// closes.
+    #[test]
+    fn mika2405_parse_dispatch_parent_settle_enabled() {
+        assert!(parse_dispatch_parent_settle_enabled(None));
+        assert!(parse_dispatch_parent_settle_enabled(Some("")));
+        assert!(parse_dispatch_parent_settle_enabled(Some("  ")));
+        for armed in ["1", "true", "TRUE", "on", "yes", " Yes "] {
+            assert!(
+                parse_dispatch_parent_settle_enabled(Some(armed)),
+                "`{armed}` must arm"
+            );
+        }
+        for disarmed in ["0", "false", "FALSE", "off", "no", " No "] {
+            assert!(
+                !parse_dispatch_parent_settle_enabled(Some(disarmed)),
+                "`{disarmed}` must disarm"
+            );
+        }
+        assert!(
+            parse_dispatch_parent_settle_enabled(Some("plif")),
+            "an unrecognized value is said and leaves the closer armed"
+        );
+    }
+
+    /// mika#2405, U3 — the settler grace defaults equal to the #871/#1162 pair's,
+    /// which bounds the same parent↔child transition. Separate constants so they
+    /// can diverge under their env vars; this pins the default relationship.
+    #[test]
+    fn mika2405_settle_grace_default_matches_reaper_grace() {
+        assert_eq!(
+            DISPATCH_PARENT_SETTLE_GRACE_DEFAULT_SECS,
+            REAPER_GRACE_SECONDS
+        );
+    }
+
+    /// mika#2405, U5 test 5 — **SOLE WRITER.** The settled event name is
+    /// written literally at exactly one place in production: the constant.
+    ///
+    /// A *source* test, because a behavioural one cannot see this class: a
+    /// second writer would make no decision wrong, it would make the population
+    /// unattributable. Every assertion would stay green while
+    /// `SELECT … WHERE tool_name = 'dispatch_parent_settled'` stopped meaning
+    /// "rows this closer transitioned".
+    #[test]
+    fn mika2405_the_settled_event_has_exactly_one_writer_in_production() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut writers: Vec<String> = Vec::new();
+
+        fn walk(dir: &std::path::Path, needle: &str, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, needle, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // mika#2321: an extracted test module carries no `#[cfg(test)]`
+                // literal, so truncation alone would scan it whole as
+                // production. Classify by path first.
+                if crate::source_scan::is_test_source_path(&path) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = match text.find("\n#[cfg(test)]") {
+                    Some(at) => &text[..at],
+                    None => &text[..],
+                };
+                for line in production.lines() {
+                    // Doc prose and comments quote the name freely — that is
+                    // text, not a writer.
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if line.contains(&format!("\"{needle}\"")) {
+                        out.push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        walk(&root, DISPATCH_PARENT_SETTLED_EVENT, &mut writers);
+
+        assert_eq!(
+            writers.len(),
+            1,
+            "{DISPATCH_PARENT_SETTLED_EVENT} must have exactly one literal writer \
+             (the constant in this module); found: {writers:?}"
+        );
+        assert!(
+            writers[0].ends_with("engine.rs"),
+            "{DISPATCH_PARENT_SETTLED_EVENT} must be written in this module, not in {:?}",
+            writers[0]
+        );
+    }
+
+    /// T10 (mika#2184, R3/D6) — the two spare causes have **two names**, and
+    /// each has exactly one production writer.
+    ///
+    /// This is the half AC4's letter asked for as a `cause` field on a single
+    /// event, and that reading is rectified here (D6): the mika#2181 name
+    /// *carries its own cause*, so routing an unrelated spare through it would
+    /// make the name false and would split in two the population mika#2181's own
+    /// probe counts to measure whether its debt is being retired. Two names, two
+    /// counts, and an operator can subtract them.
+    ///
+    /// A behavioural test cannot see this class: a second writer would make no
+    /// decision wrong, it would only make the two populations uncountable apart
+    /// — with every assertion still green.
+    #[test]
+    fn mika2184_the_two_spare_causes_have_one_writer_each() {
+        for name in [
+            STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT,
+            "stuck_pending_sheltered_by_promoted_wrapper",
+        ] {
+            let writers = production_sites_quoting(name);
+            assert_eq!(
+                writers.len(),
+                1,
+                "`{name}` must have exactly one production writer, so the two spare \
+                 causes stay countable apart; found: {writers:?}"
+            );
+            assert!(
+                writers[0].ends_with("engine.rs"),
+                "`{name}` must be written in this module, not in {:?}",
+                writers[0]
+            );
+        }
+    }
+
+    /// Production files quoting `needle` as a string literal, excluding test
+    /// code and comment lines. Shared by the two mika#2184 scans below.
+    fn production_sites_quoting(needle: &str) -> Vec<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for (path, production) in production_sources(&root) {
+            for line in production.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&format!("\"{needle}\"")) {
+                    out.push(path.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every production `.rs` under `root`, as `(path, production-half)`.
+    ///
+    /// mika#2321: an extracted test module carries no `#[cfg(test)]` literal, so
+    /// truncation alone would scan it whole as production. Classify by path
+    /// first, then truncate.
+    fn production_sources(root: &std::path::Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                if crate::source_scan::is_test_source_path(&path) {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = match text.find("\n#[cfg(test)]") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                out.push((path.to_string_lossy().to_string(), production));
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    /// T11 / **U5** (mika#2184, R7/D7) — the question *"does this wrapper show
+    /// activity?"* has exactly one reader.
+    ///
+    /// This is the `grooming_marker` lesson (mika#2158): a copied predicate is a
+    /// predicate that will diverge, and it cost months of silent disagreement
+    /// between two regexes one of which carried a comment saying it mirrored the
+    /// other. This very file has already paid it a second time, with
+    /// `has_pending_deferred_wrapper_child`.
+    ///
+    /// **Allowlist shipped empty, and it is not a slot to fill:** when this
+    /// fires, the resolution is to remove the second site, never to exempt it.
+    ///
+    /// The needle is a **conjunction of three terms**, and each one was put
+    /// there by a measured false positive rather than by caution:
+    ///
+    /// 1. a `JOIN sessions` — `find_stuck_team_runs` (mika#1652) reads the same
+    ///    two activity tables and joins them by
+    ///    `session_id LIKE 'team-' || r.id || '%'`, touching `sessions` not at
+    ///    all. A scan that accused the neighbour is a scan somebody disarms.
+    /// 2. whose ON clause carries `.task_id =` — the direction that starts from
+    ///    a task row and reaches its session.
+    /// 3. and which is followed by a `JOIN llm_calls` / `JOIN tool_calls` — this
+    ///    is what separates it from `get_task_health_summary`'s Signal A
+    ///    (`db/tasks.rs`), which traverses the chain in the **other** direction
+    ///    (`tool_calls → sessions → tasks`) to answer *"which task does this
+    ///    failing tool call belong to?"*. Terms 1 and 2 alone accuse it, and it
+    ///    is not a reader of this question.
+    ///
+    /// Counted **per file**, not per occurrence: one query legitimately carries
+    /// two branches (the `UNION ALL` over the two activity tables), and a scan
+    /// that called that two readers would have to be softened on its first run.
+    ///
+    /// **Named limit:** a second reader written with different aliases, or
+    /// reconstructing the join in Rust rather than in SQL, escapes it. The scan
+    /// bounds the realistic regression — a copy-paste of this query — and says
+    /// so rather than claiming completeness.
+    #[test]
+    fn mika2184_wrapper_activity_has_a_single_reader() {
+        /// Byte offsets in `text` of a task→session→activity join: the shape of
+        /// this question, and only it.
+        fn join_sites(text: &str) -> Vec<usize> {
+            text.match_indices("JOIN sessions")
+                .filter(|(at, _)| {
+                    let tail = &text[*at..text.len().min(at + 400)];
+                    tail.contains(".task_id =")
+                        && (tail.contains("JOIN llm_calls") || tail.contains("JOIN tool_calls"))
+                })
+                .map(|(at, _)| at)
+                .collect()
+        }
+
+        // Good-faith controls FIRST: a matcher that matched nothing would make
+        // the real assertion below vacuously green.
+        let duplicated = "JOIN sessions s ON s.task_id = w.id JOIN llm_calls lc \
+                          ON lc.session_id = s.id ;; JOIN sessions s2 ON s2.task_id = x.id \
+                          JOIN tool_calls tc ON tc.session_id = s2.id";
+        assert_eq!(
+            join_sites(duplicated).len(),
+            2,
+            "the matcher must see a duplicated join — otherwise the scan below proves nothing"
+        );
+        // It must NOT accuse the mika#1652 neighbour (term 1)...
+        assert!(
+            join_sites("JOIN llm_calls lc ON lc.session_id LIKE 'team-' || r.id || '%'").is_empty(),
+            "the scan must not accuse find_stuck_team_runs"
+        );
+        // ...nor Signal A of `get_task_health_summary`, which walks the same
+        // three tables in the opposite direction (term 3).
+        assert!(
+            join_sites(
+                "FROM tool_calls tc LEFT JOIN sessions s ON tc.session_id = s.id \
+                 LEFT JOIN tasks t ON s.task_id = t.id AND t.status = 'in_progress'"
+            )
+            .is_empty(),
+            "the scan must not accuse the tool_call→session→task traversal — a scan that \
+             reddens on a healthy neighbour is a scan somebody disarms"
+        );
+
+        const ALLOWED: &[&str] = &[];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut readers: Vec<String> = Vec::new();
+        for (path, production) in production_sources(&root) {
+            if ALLOWED.iter().any(|a| path.ends_with(a)) {
+                continue;
+            }
+            if !join_sites(&production).is_empty() {
+                readers.push(path.clone());
+            }
+        }
+
+        assert_eq!(
+            readers.len(),
+            1,
+            "the wrapper-activity join must have exactly ONE production reader \
+             (`Database::find_deferred_wrapper_activity_age_secs`). When this fires, \
+             remove the second site — do not allowlist it. Found: {readers:?}"
+        );
+        assert!(
+            readers[0].ends_with("tasks.rs"),
+            "the single reader must be the one in db/tasks.rs, not {:?}",
+            readers[0]
+        );
+    }
+
+    /// The two windows default equal on purpose (mika#2181): one promotion
+    /// cannot hide a parent for longer than the grace took to call it stuck.
+    /// They remain separate constants so they can diverge under their env vars —
+    /// this pins the default relationship, not the freedom.
+    #[test]
+    fn test_liveness_default_matches_stuck_grace_default() {
+        assert_eq!(
+            PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS,
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_parse_stuck_pending_reaper_grace() {
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(None),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("  ")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(parse_stuck_pending_reaper_grace(Some("60")), 60);
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("0")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_stuck_pending_reaper_grace(Some("nonsense")),
+            STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(STUCK_PENDING_REAPER_GRACE_DEFAULT_SECS, 2700);
+    }
+
+    #[test]
+    fn test_rebuild_deferred_action_config() {
+        let config = rebuild_deferred_action_config(
+            "parent-1",
+            "https://github.com/senara-solutions/mika/issues/2013",
+            "implement",
+        )
+        .expect("well-formed issue url");
+        let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(parsed["trigger_kind"], "deferred_dispatch");
+        assert_eq!(parsed["original_call"]["skill"], "dev-pilot");
+        assert_eq!(parsed["original_call"]["prompt"], "mika#2013");
+        assert_eq!(parsed["original_call"]["task_id"], "parent-1");
+        assert_eq!(
+            parsed["original_call"][crate::skills::executor::INTERNAL_DEFERRED_DISPATCH_FIELD],
+            true
+        );
+
+        let groom = rebuild_deferred_action_config(
+            "parent-1",
+            "https://github.com/senara-solutions/mika/issues/7",
+            "groom",
+        )
+        .unwrap();
+        assert!(groom.contains("dev-groom"));
+
+        assert!(rebuild_deferred_action_config("p", "not a url", "implement").is_none());
+        assert!(
+            rebuild_deferred_action_config(
+                "p",
+                "https://github.com/senara-solutions/mika/pull/7",
+                "implement"
+            )
+            .is_none()
+        );
+    }
+
+    // -- promote_pending_deferred_if_idle per-class iteration tests (mika#1175) --
+
+    /// Seed a parent manual task + a `:deferred` callback wrapper child of the
+    /// given `dispatch_class`. Returns `(parent_id, wrapper_id)`.
+    async fn seed_deferred_wrapper(
+        db: &AsyncDatabase,
+        parent_label: &str,
+        dispatch_class: Option<&str>,
+    ) -> (String, String) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: parent_label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let wrapper = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id.clone()),
+            depth: 1,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let wrapper_id = db.create_task(wrapper).await.unwrap();
+        (parent_id, wrapper_id)
+    }
+
+    /// Seed a parent manual task + an active (pending, non-deferred) callback
+    /// child of the given `dispatch_class`. Used to simulate a busy slot.
+    async fn seed_active_non_deferred(
+        db: &AsyncDatabase,
+        parent_label: &str,
+        dispatch_class: Option<&str>,
+    ) {
+        let parent = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: parent_label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        let parent_id = db.create_task(parent).await.unwrap();
+
+        let child = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: Some(parent_id),
+            depth: 1,
+            label: "long_running:run_claude_pilot".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: dispatch_class.map(str::to_string),
+        };
+        db.create_task(child).await.unwrap();
+    }
+
+    // -- operator-priority in deferred promotion (mika#1948 AC3) --
+
+    /// Seed a `pending` operator-sourced task in the given class.
+    async fn seed_pending_operator_task(
+        db: &AsyncDatabase,
+        label: &str,
+        dispatch_class: &str,
+    ) -> String {
+        let t = NewTask {
+            agent_id: "mika".to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: label.to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: None,
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some(dispatch_class.to_string()),
+        };
+        let id = db.create_task(t).await.unwrap();
+        db.set_task_dispatcher_source(&id, "operator")
+            .await
+            .unwrap();
+        id
+    }
+
+    /// AC3 — an operator task waiting in a class holds priority: the automatic
+    /// wrapper promotion must stand down rather than take the slot out from
+    /// under work the operator has already drafted.
+    #[tokio::test]
+    async fn test_promote_defers_to_pending_operator_task() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        seed_pending_operator_task(&db, "operator drafted work", "implement").await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "pending",
+            "the wrapper must NOT promote while an operator task waits in the \
+             same class — operator outranks the automatic promoter (mika#1948)"
+        );
+    }
+
+    /// The anti-vacuity twin. Without it, "never promote" would satisfy the
+    /// test above; this pins that the slot is idle, the wrapper is promotable,
+    /// and it is ONLY the operator task that held it back.
+    #[tokio::test]
+    async fn test_promote_proceeds_when_no_operator_task_pending() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "with no operator task pending the wrapper must promote normally — \
+             operator-priority must not become a blanket stall"
+        );
+    }
+
+    /// Priority is class-scoped, like the slot it protects. An operator task
+    /// waiting to groom must not freeze the implement class.
+    #[tokio::test]
+    async fn test_operator_priority_is_class_scoped() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        seed_pending_operator_task(&db, "operator groom work", "groom").await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "an operator task in the groom class must not hold back the \
+             implement class — priority is scoped to the contended slot"
+        );
+    }
+
+    /// R1: two cross-class deferred wrappers, both class slots idle → both
+    /// promote in the same backstop tick.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_iterates_per_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        let t_groom = db.get_task(&w_groom).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "completed",
+            "implement wrapper must promote on a single tick when both classes idle"
+        );
+        assert_eq!(
+            t_groom.status, "completed",
+            "groom wrapper must promote in the same tick — per-class iteration \
+             prevents the mika#1175 cross-class halving"
+        );
+    }
+
+    /// R3: cross-class deferred wrappers, implement slot busy, groom slot idle
+    /// → only the groom wrapper promotes.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_skips_busy_class() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+        seed_active_non_deferred(&db, "p_busy_impl", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        let t_impl = db.get_task(&w_impl).await.unwrap().unwrap();
+        let t_groom = db.get_task(&w_groom).await.unwrap().unwrap();
+        assert_eq!(
+            t_impl.status, "pending",
+            "implement wrapper must NOT promote when implement slot is busy"
+        );
+        assert_eq!(
+            t_groom.status, "completed",
+            "groom wrapper must promote — its class slot is independent of \
+             the implement slot (mika#1175 per-class gate)"
+        );
+    }
+
+    /// R2: with two implement deferred wrappers pending and the implement slot
+    /// idle, exactly one wrapper promotes per backstop tick. Pins the
+    /// at-most-one-per-class-per-tick invariant at the engine seam (the DB
+    /// primitive's `LIMIT 1` is verified separately by
+    /// `test_promote_next_deferred_callback_for_class_filters_by_class`).
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_single_class_one_per_tick() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl_1) = seed_deferred_wrapper(&db, "p_impl_1", Some("implement")).await;
+        let (_, w_impl_2) = seed_deferred_wrapper(&db, "p_impl_2", Some("implement")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        // Exactly one wrapper must transition. Per-class tick budget is one
+        // promotion; FIFO at second-resolution timestamps is best-effort
+        // (correctness review C-01 — same-second wrappers tie-break by rowid),
+        // so we assert "one and only one" rather than locking the specific row.
+        let t1 = db.get_task(&w_impl_1).await.unwrap().unwrap();
+        let t2 = db.get_task(&w_impl_2).await.unwrap().unwrap();
+        let promoted = [&t1, &t2]
+            .iter()
+            .filter(|t| t.status == "completed")
+            .count();
+        let pending = [&t1, &t2].iter().filter(|t| t.status == "pending").count();
+        assert_eq!(
+            promoted, 1,
+            "exactly one same-class wrapper must promote per tick (mika#1175 R2); \
+             got promoted={promoted} pending={pending} t1={:?} t2={:?}",
+            t1.status, t2.status
+        );
+        assert_eq!(pending, 1, "the other wrapper must stay pending");
+
+        // A second tick promotes the remaining wrapper — confirms the loop
+        // is not somehow stuck after the first promotion.
+        engine.promote_pending_deferred_if_idle().await;
+        let t1 = db.get_task(&w_impl_1).await.unwrap().unwrap();
+        let t2 = db.get_task(&w_impl_2).await.unwrap().unwrap();
+        assert_eq!(t1.status, "completed");
+        assert_eq!(t2.status, "completed");
+    }
+
+    /// R4: with one implement + one groom deferred wrapper pending and BOTH
+    /// class slots occupied, no wrapper promotes. Exercises the double-`continue`
+    /// path through the per-class loop.
+    #[tokio::test]
+    async fn test_promote_pending_deferred_if_idle_both_classes_busy() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let (_, w_impl) = seed_deferred_wrapper(&db, "p_impl", Some("implement")).await;
+        let (_, w_groom) = seed_deferred_wrapper(&db, "p_groom", Some("groom")).await;
+        seed_active_non_deferred(&db, "p_busy_impl", Some("implement")).await;
+        seed_active_non_deferred(&db, "p_busy_groom", Some("groom")).await;
+
+        engine.promote_pending_deferred_if_idle().await;
+
+        assert_eq!(
+            db.get_task(&w_impl).await.unwrap().unwrap().status,
+            "pending",
+            "implement wrapper must NOT promote when implement slot is busy (mika#1175 R4)"
+        );
+        assert_eq!(
+            db.get_task(&w_groom).await.unwrap().unwrap().status,
+            "pending",
+            "groom wrapper must NOT promote when groom slot is busy (mika#1175 R4)"
+        );
+    }
+
+    /// Drift detector for the `DISPATCH_CLASSES` slice. Every value returned by
+    /// `derive_dispatch_class` for the currently-known skills must be in
+    /// `DISPATCH_CLASSES`. If a new class is added to `derive_dispatch_class`
+    /// (e.g., a third skill maps to a new class), this test surfaces the gap
+    /// before the periodic backstop silently loses promotion for that class.
+    ///
+    /// COUPLED PAIR (mika#1175): the probe list below is hand-maintained. When
+    /// adding a new arm to `derive_dispatch_class`, also add a representative
+    /// skill input here. The cross-pointer at the match site in
+    /// `skills/executor.rs` names this test as the required co-update.
+    #[test]
+    fn test_dispatch_classes_universe_matches_derive_fn() {
+        use crate::skills::executor::derive_dispatch_class;
+
+        for skill in [
+            Some("dev-groom"),
+            Some("dev-pilot"),
+            Some("deploy_mika"),
+            None,
+        ] {
+            let class = derive_dispatch_class(skill);
+            assert!(
+                DISPATCH_CLASSES.contains(&class),
+                "derive_dispatch_class({skill:?}) = {class:?} not in DISPATCH_CLASSES \
+                 = {DISPATCH_CLASSES:?}. If a new dispatch_class was added, update \
+                 DISPATCH_CLASSES in engine.rs to include it (mika#1175)."
+            );
+        }
+    }
+
+    // -- childless-parent reaper grace reader tests (mika#1687, D5) --
+
+    #[test]
+    fn test_childless_grace_default_when_absent() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(None),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_empty() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("   ")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_valid_override() {
+        assert_eq!(parse_childless_parent_reaper_grace(Some("3600")), 3600);
+        // Surrounding whitespace is tolerated (trimmed before parse).
+        assert_eq!(parse_childless_parent_reaper_grace(Some(" 900 ")), 900);
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_invalid() {
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("not-a-number")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    #[test]
+    fn test_childless_grace_default_when_non_positive() {
+        // Zero and negative are invalid (a legitimately-dispatching parent is
+        // never childless for a non-positive window) → fall back to default.
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("0")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_childless_parent_reaper_grace(Some("-300")),
+            CHILDLESS_PARENT_REAPER_GRACE_DEFAULT_SECS
+        );
+    }
+
+    // ── mika#2515 U2 — l'alerte de verdict non livré ─────────────────────
+
+    /// **V8** — les trois paliers de la fenêtre d'alerte, plus les deux bornes
+    /// du plafond. `0` ne désarme pas : c'est le rôle du kill-switch, et lu
+    /// autrement une coquille couperait l'alerte en silence.
+    #[test]
+    fn mika2515_parse_the_alert_age_window() {
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(None),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+        );
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some("   ")),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS
+        );
+        assert_eq!(parse_qa_build_verdict_alert_age(Some("300")), 300);
+        assert_eq!(parse_qa_build_verdict_alert_age(Some(" 300 ")), 300);
+        for bad in ["0", "-1", "abc", "540s"] {
+            assert_eq!(
+                parse_qa_build_verdict_alert_age(Some(bad)),
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+                "{bad} doit retomber au défaut"
+            );
+        }
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some(
+                &(QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS + 1).to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS,
+            "un réglage absurde rendrait l'alerte muette sans rien dire"
+        );
+        assert_eq!(
+            parse_qa_build_verdict_alert_age(Some(
+                &QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS.to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_AGE_MAX_SECS,
+            "le plafond lui-même est une valeur légale"
+        );
+    }
+
+    /// **V8** — l'arithmétique du défaut EST l'AC : fenêtre + un intervalle de
+    /// balayage = 600 s, soit « dans les 10 minutes ».
+    ///
+    /// Sans cette assertion, changer l'un des deux nombres casserait
+    /// silencieusement le critère d'acceptation du ticket.
+    #[test]
+    fn mika2515_the_default_window_plus_one_scan_meets_the_ten_minute_ac() {
+        assert_eq!(QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS, 540);
+        assert_eq!(DB_SCAN_INTERVAL_TICKS, 60);
+        assert_eq!(
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + DB_SCAN_INTERVAL_TICKS as i64,
+            600,
+            "l'AC demande « dans les 10 minutes » : fenêtre + un tick de \
+             balayage est la borne haute effective"
+        );
+    }
+
+    /// **V8** — les trois paliers du lookback, et l'égalité avec la fenêtre que
+    /// `dispatch_undelivered_callbacks` emploie : les faire diverger créerait une
+    /// poche de lignes qu'un bras tente de livrer et que l'autre n'alerte jamais.
+    #[test]
+    fn mika2515_parse_the_alert_lookback() {
+        assert_eq!(
+            parse_qa_build_verdict_alert_lookback_days(None),
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+        );
+        assert_eq!(parse_qa_build_verdict_alert_lookback_days(Some("3")), 3);
+        for bad in ["0", "-2", "sept"] {
+            assert_eq!(
+                parse_qa_build_verdict_alert_lookback_days(Some(bad)),
+                QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+            );
+        }
+        assert_eq!(
+            parse_qa_build_verdict_alert_lookback_days(Some(
+                &(QA_BUILD_VERDICT_ALERT_LOOKBACK_MAX_DAYS + 1).to_string()
+            )),
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS
+        );
+        assert_eq!(
+            QA_BUILD_VERDICT_ALERT_LOOKBACK_DEFAULT_DAYS, 7,
+            "la même valeur que `dispatch_undelivered_callbacks`, pour que les \
+             deux bras voient la même population"
+        );
+    }
+
+    /// **V8** — le kill-switch, et son contrôle négatif porteur : une valeur non
+    /// reconnue laisse **armé**. Un désarmement par coquille sur un instrument de
+    /// sûreté serait la panne silencieuse que ce ticket ferme.
+    #[test]
+    fn mika2515_an_unrecognised_kill_switch_value_leaves_the_alert_armed() {
+        assert!(parse_qa_build_verdict_alert(None));
+        assert!(parse_qa_build_verdict_alert(Some("")));
+        assert!(parse_qa_build_verdict_alert(Some("   ")));
+        for off in ["0", "false", "FALSE", "off", "no", " No "] {
+            assert!(!parse_qa_build_verdict_alert(Some(off)), "{off} désarme");
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            assert!(parse_qa_build_verdict_alert(Some(on)), "{on} arme");
+        }
+        for typo in ["disabled", "nope", "2", "flase"] {
+            assert!(
+                parse_qa_build_verdict_alert(Some(typo)),
+                "{typo} n'est pas reconnu : l'alerte doit rester ARMÉE et le dire"
+            );
+        }
+    }
+
+    /// **V9 — SOLE WRITER.** `qa_build_verdict_undelivered` est écrit
+    /// littéralement à un seul endroit de la production : la constante de ce
+    /// module.
+    ///
+    /// Scan de **source**, parce qu'aucun test comportemental ne peut voir cette
+    /// classe : un second écrivain ne rendrait **aucune décision fausse**, il
+    /// rendrait le `GROUP BY after_value` de l'opérateur inexact — et c'est ce
+    /// compte qui est la précondition explicite du suivi « poster sur
+    /// quarantaine ». Toutes les assertions resteraient vertes.
+    ///
+    /// **Allowlist livrée vide**, et un test frère refuse qu'elle cesse de
+    /// l'être : quand ce scan tire, on **retire** le second écrivain (doctrine
+    /// mika#2201).
+    ///
+    /// Porte sa propre **assertion anti-vacuité** : le scan échoue si le nom
+    /// n'est écrit **nulle part** — un scan qui visait un nom mort se lit
+    /// exactement comme un scan propre (mika#2103 / mika#2205).
+    #[test]
+    fn mika2515_the_undelivered_alert_has_a_single_writer() {
+        const ALLOWED: &[&str] = &[];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let needle = format!("\"{QA_BUILD_VERDICT_UNDELIVERED_EVENT}\"");
+        let mut sites: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path.to_string_lossy().to_string();
+            if ALLOWED.iter().any(|a| rel.ends_with(a)) {
+                return;
+            }
+            for line in production.lines() {
+                // La prose de doc cite le nom abondamment — c'est du texte, pas
+                // un écrivain.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(&needle) {
+                    sites.push(rel.clone());
+                }
+            }
+        });
+
+        assert!(
+            !sites.is_empty(),
+            "anti-vacuité : {QA_BUILD_VERDICT_UNDELIVERED_EVENT} n'est écrit \
+             NULLE PART — un scan qui visait un nom mort ne vérifie rien et se \
+             lit exactement comme un scan propre"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "{QA_BUILD_VERDICT_UNDELIVERED_EVENT} doit avoir exactement un \
+             écrivain littéral ; trouvé : {sites:?}. Retirer le second écrivain, \
+             ne PAS l'allowlister."
+        );
+        assert!(
+            sites[0].ends_with("engine.rs"),
+            "le nom doit être écrit dans ce module, pas dans {:?}",
+            sites[0]
+        );
+    }
+
+    // ── V6 — le balayage sélectionne, et refuse ──────────────────────────
+
+    /// Sème un callback **de build** livré nulle part, `completed_at` reculé de
+    /// `age_secs`, avec le `metadata` donné.
+    async fn seed_build_callback(
+        db: &AsyncDatabase,
+        age_secs: i64,
+        metadata: Option<&str>,
+    ) -> String {
+        seed_callback_with_label(
+            db,
+            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
+            age_secs,
+            metadata,
+        )
+        .await
+    }
+
+    async fn seed_callback_with_label(
+        db: &AsyncDatabase,
+        label: &str,
+        age_secs: i64,
+        metadata: Option<&str>,
+    ) -> String {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: metadata.map(str::to_owned),
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("create callback row");
+        db.update_task_completed(&id, Some("Build succeeded"))
+            .await
+            .expect("mark completed");
+        if age_secs > 0 {
+            db.backdate_task_completed_at(&id, age_secs)
+                .await
+                .expect("backdate completed_at");
+        }
+        id
+    }
+
+    async fn alert_count(db: &AsyncDatabase) -> i64 {
+        db.count_audit_events_by_tool_name(QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .await
+            .unwrap()
+    }
+
+    /// Au-delà de la fenêtre, un callback de build non livré est alerté — et la
+    /// ligne d'audit porte la **cause**, pas seulement le fait.
+    #[tokio::test]
+    async fn mika2515_the_scan_alerts_past_the_window_and_names_the_cause() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"12"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(alert_count(&db).await, 1, "une alerte, une seule");
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .expect("la ligne d'audit doit exister");
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some("agent_busy_starvation"),
+            "c'est `after_value` que l'opérateur `GROUP BY` pour dimensionner le \
+             suivi « poster sur quarantaine »"
+        );
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("deferrals:12")),
+            "les compteurs rapportés sont ceux sur lesquels la cause a été \
+             classée : {:?}",
+            row.reasoning
+        );
+    }
+
+    /// **Dans** la fenêtre, rien : un verdict qui a dix secondes de retard n'est
+    /// pas un verdict perdu.
+    #[tokio::test]
+    async fn mika2515_the_scan_is_silent_inside_the_window() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(&db, 10, Some(r#"{"delivery_attempts":"1"}"#)).await;
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(alert_count(&db).await, 0, "zéro alerte ⇒ zéro ligne");
+    }
+
+    /// Un callback **livré** n'est plus dans la population : c'est le terme que
+    /// la requête réutilisée garantit, et l'asserter empêche une future
+    /// réécriture de la requête d'ouvrir l'alerte sur des verdicts arrivés.
+    #[tokio::test]
+    async fn mika2515_a_delivered_callback_is_out_of_the_population() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let id = seed_build_callback(&db, QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60, None).await;
+        db.mark_task_delivered(&id).await.unwrap();
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 0);
+    }
+
+    /// Un callback **non-build** n'est jamais alerté : le discriminant est
+    /// l'égalité stricte de label (mika#2355 AC4b), et les cinq autres flux
+    /// `long_running` en sont exclus chacun.
+    #[tokio::test]
+    async fn mika2515_a_non_build_callback_is_never_alerted() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        for label in [
+            "long_running:run_claude_pilot",
+            "long_running:run_claude_pilot_groom",
+            "long_running:deploy_mika",
+            "long_running:build_mika_extra",
+        ] {
+            seed_callback_with_label(
+                &db,
+                label,
+                QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+                Some(r#"{"verdict_delivery_deferrals":"9"}"#),
+            )
+            .await;
+        }
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(
+            alert_count(&db).await,
+            0,
+            "égalité stricte : `long_running:build_mika_extra` n'est pas un build"
+        );
+    }
+
+    /// **L'estampille n'est PAS un terme** — et c'est la propriété qui rend ce
+    /// travail non silencieux sur le dispatch mesuré.
+    ///
+    /// Une revue QA lancée en texte libre (`mika ask --agent mika-qa "review PR
+    /// #2458"`, ce que le ticket décrit) ne produit aucune estampille : en faire
+    /// un terme rendrait l'alerte muette sur exactement la population mesurée.
+    #[tokio::test]
+    async fn mika2515_an_unstamped_callback_is_still_alerted_as_unresolved() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"delivery_attempts":"2"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(
+            alert_count(&db).await,
+            1,
+            "alertée malgré l'absence de cible"
+        );
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .unwrap();
+        assert_eq!(row.after_value.as_deref(), Some("turn_failed"));
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("target:unresolved")),
+            "l'estampille ENRICHIT la ligne ; son absence se dit, elle ne \
+             supprime pas l'alerte : {:?}",
+            row.reasoning
+        );
+    }
+
+    /// Une cible estampillée **enrichit** la ligne — l'autre moitié du test
+    /// ci-dessus, sans laquelle « l'estampille n'est pas un terme » serait
+    /// indistinguable de « l'estampille n'est jamais lue ».
+    #[tokio::test]
+    async fn mika2515_a_stamped_callback_names_its_pr() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(
+                r#"{"delivery_attempts":"2",
+                    "qa_review_pr_target":"senara-solutions/mika#2458"}"#,
+            ),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+
+        let rows = db.get_audit_events("system-mika").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.tool_name == QA_BUILD_VERDICT_UNDELIVERED_EVENT)
+            .unwrap();
+        assert!(
+            row.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("target:senara-solutions/mika#2458")),
+            "{:?}",
+            row.reasoning
+        );
+    }
+
+    /// **Déduplication 24 h par `(tâche, cause)`** : deux passes, une ligne.
+    ///
+    /// À 60 s de cadence et 9 min de fenêtre, une ligne par passe par PR serait
+    /// le churn que la doctrine mika#2131 borne.
+    #[tokio::test]
+    async fn mika2515_two_passes_write_one_line() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+        engine.alert_undelivered_build_verdicts().await;
+        engine.alert_undelivered_build_verdicts().await;
+
+        assert_eq!(
+            alert_count(&db).await,
+            1,
+            "trois passes, une ligne : l'information durable est « ce verdict est \
+             retenu par cette cause », pas « il l'était encore à 14 h 32 »"
+        );
+    }
+
+    /// **Un changement de cause RÉÉCRIT** : c'est un changement d'état, et la
+    /// moitié de la déduplication qu'une clé nue ne donnerait pas.
+    #[tokio::test]
+    async fn mika2515_a_change_of_cause_writes_a_second_line() {
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+
+        let id = seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 1);
+
+        // La ligne finit par être livrée-et-échouée, puis quarantinée : la cause
+        // change deux fois, et chaque changement mérite sa ligne.
+        db.set_task_metadata_field(&id, "delivery_attempts", "2")
+            .await
+            .unwrap();
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 2, "famine → échec de tour");
+
+        db.set_task_metadata_field(&id, "delivery_quarantined_at", "2026-09-24T15:02:27Z")
+            .await
+            .unwrap();
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 3, "échec de tour → quarantaine");
+    }
+
+    /// **Contrôle négatif du kill-switch** : désarmé, le balayage n'écrit **rien**
+    /// — il ne « s'abstient » pas, il n'existe pas ce tick.
+    ///
+    /// Sans variable d'environnement : le kill-switch est lu par une fonction
+    /// pure, testée séparément, et ce test appelle le balayage sur la moitié qui
+    /// décide. Muter une variable globale au processus polluerait les tests
+    /// voisins de la même binaire.
+    #[tokio::test]
+    async fn mika2515_a_disarmed_scan_writes_nothing() {
+        // La moitié pure, là où la décision se prend.
+        assert!(!parse_qa_build_verdict_alert(Some("0")));
+        // Et le régime armé, pour que ce test ne passe pas par vacuité.
+        assert!(parse_qa_build_verdict_alert(None));
+
+        let db = test_db();
+        let dispatcher = test_dispatcher(db.clone());
+        let engine = TaskEngine::new(db.clone(), dispatcher);
+        seed_build_callback(
+            &db,
+            QA_BUILD_VERDICT_ALERT_AGE_DEFAULT_SECS + 60,
+            Some(r#"{"verdict_delivery_deferrals":"3"}"#),
+        )
+        .await;
+
+        // Armé, la même ligne produit une alerte — c'est ce qui prouve que le
+        // zéro ci-dessus viendrait bien du désarmement et non de la fixture.
+        engine.alert_undelivered_build_verdicts().await;
+        assert_eq!(alert_count(&db).await, 1);
+    }
+
+    /// **V9** — l'allowlist du scan ci-dessus est née vide et doit le rester.
+    ///
+    /// Une allowlist née vide est un endroit où déposer la prochaine infraction
+    /// (mika#2323) ; ce test frère est ce qui fait rougir ce dépôt-là.
+    #[test]
+    fn mika2515_the_sole_writer_allowlist_is_empty() {
+        // Recopiée depuis le scan : si elle cesse d'être vide là-bas, ce test
+        // doit être modifié sciemment, ce qui est tout l'objet.
+        const ALLOWED: &[&str] = &[];
+        assert!(
+            ALLOWED.is_empty(),
+            "quand le scan tire, la résolution est de retirer la lecture — \
+             jamais d'ajouter une entrée (doctrine mika#2201)"
+        );
+    }
+}

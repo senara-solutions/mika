@@ -1,0 +1,14 @@
+{
+  "description": "Pre-fix fixture reproducing mika#732: agent responds with mis-ordered or fabricated priorities instead of reading from core memory.",
+  "incident": "mika#732",
+  "fabrication_class": "core_memory_drift",
+  "core_memory_state": {
+    "current_priorities": [
+      "Ship KG milestone #14 evaluation suite",
+      "Fix Langfuse span tracking regression",
+      "Review mika-cloud Helm chart for GPU nodepool"
+    ]
+  },
+  "pre_fix_response": "Your current priorities are:\n1. Review mika-cloud Helm chart for GPU nodepool\n2. Fix Langfuse span tracking regression\n3. Ship KG milestone #14 evaluation suite",
+  "note": "Order is completely reversed from the actual core memory state"
+}

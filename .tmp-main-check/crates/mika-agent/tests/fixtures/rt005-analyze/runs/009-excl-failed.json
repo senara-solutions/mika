@@ -1,0 +1,9 @@
+{
+  "run_id": "009-excl-failed",
+  "status": "failed",
+  "confidence": "high",
+  "reliability": "fiable",
+  "item_id": "i-ctrl",
+  "perturbed": false,
+  "spirit_session_id": "sess-009"
+}

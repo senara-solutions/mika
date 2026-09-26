@@ -1,0 +1,352 @@
+mod a2a_auth;
+mod a2a_routes;
+pub(crate) mod audit_events;
+pub(crate) mod circuit_breaker;
+/// Single producer of the gateway's user-facing copy (mika#2025).
+///
+/// Declared here rather than in `lib.rs`: that file admits a module only when it
+/// has a documented consumer outside the binary (mika#1796), and this one has
+/// none — its guards are in-crate.
+pub(crate) mod copy;
+pub(crate) mod dlq;
+pub(crate) mod egress_fetch;
+pub(crate) mod egress_search;
+pub mod github;
+pub mod openapi;
+pub(crate) mod orchestrator_inbox;
+mod routes;
+mod settings;
+mod telegram;
+mod telegram_markdown;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use std::path::Path;
+
+use anyhow::Result;
+use secrecy::ExposeSecret;
+use tokio::net::TcpListener;
+use tracing::{info, warn};
+
+use egress_fetch::{FetchEgressClient, FetchUpstream, GouvFrConfig};
+use egress_search::{BraveConfig, SearchEgressClient, SearchUpstream};
+use routes::{AppState, build_router};
+use settings::GatewaySettings;
+use telegram::TelegramClient;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // mika#2066 AC2 — answer `--version`/`-V` before loading settings. The
+    // gateway otherwise dies on `missing configuration field "database_url"`
+    // before it can state the commit it was built from; an unconfigured binary
+    // must still be interrogable for its provenance.
+    mika_common::build_info::print_version_if_requested("mika-gateway");
+
+    // Install rustls aws-lc-rs CryptoProvider before any TLS operation. Both
+    // aws-lc-rs and ring are compiled in transitively (sqlx via tls-rustls-aws-lc-rs
+    // and reqwest via rustls-tls-native-roots), so rustls cannot auto-select a
+    // process-default crypto provider. Mirrors the mika-cloud console fix
+    // (mika-cloud#97). Resolves "TLS upgrade required by connect options but
+    // SQLx was built without TLS support enabled" when connecting to RDS with
+    // force_ssl=1.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls aws-lc-rs CryptoProvider");
+
+    // Load .env from CWD (gateway has no ~/.mika/ home directory)
+    let _ = dotenvy::dotenv();
+
+    let settings = GatewaySettings::load()?;
+
+    // Initialize tracing (structured logging, + optional file output)
+    let log_format: mika_common::logging::LogFormat = settings
+        .log_format
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!(e))?;
+    let is_pretty = log_format == mika_common::logging::LogFormat::Pretty;
+    let _log_guard = mika_common::logging::init(
+        &settings.log_level,
+        settings.gateway_log_file.as_deref().map(Path::new),
+        log_format,
+        None::<mika_common::logging::NoopLayer>,
+        false, // log_llm_bodies: gateway doesn't make LLM calls
+    );
+
+    if is_pretty {
+        mika_common::logging::print_banner("mika-gateway", env!("CARGO_PKG_VERSION"));
+    }
+
+    info!(settings = ?settings, "starting mika-gateway");
+
+    // mika#2291 — resolve the Telegram HTML-rendering kill-switch once, here.
+    // Same contract as MIKA_AGENT_TIER / MIKA_DEPLOYMENT: read once per process,
+    // not hot-swappable, to be set in the service EnvironmentFile / ConfigMap
+    // BEFORE startup. Default armed; disarming emits its own INFO line, because a
+    // disarmed renderer is silent in exactly the way a healthy one is.
+    telegram_markdown::init_html_render(settings::telegram_html_render_is_enabled(
+        settings.telegram_html_render.as_deref(),
+    ));
+
+    let ready = Arc::new(AtomicBool::new(false));
+
+    // Connect to Postgres
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .min_connections(2)
+        .max_connections(20)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect(settings.database_url.expose_secret())
+        .await?;
+
+    info!("postgres connected");
+
+    // Run migrations
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    info!("migrations applied");
+
+    // Create shared HTTP client
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()?;
+
+    // Build global Telegram client whenever a bot token is configured (outbound delivery).
+    // The MIKA_TELEGRAM_SINGLE_BOT_MODE flag gates only inbound webhook registration,
+    // not client construction — operator agents need the global client for /send even
+    // in per-customer mode (mika#1590).
+    let single_bot_mode =
+        settings::telegram_single_bot_mode_is_enabled(settings.telegram_single_bot_mode.as_deref());
+    let telegram = if let Some(bot_token) = settings.telegram_bot_token.clone() {
+        let tg = TelegramClient::new(http_client.clone(), bot_token);
+
+        if single_bot_mode {
+            // Register inbound webhook with Telegram (idempotent)
+            let webhook_url = settings
+                .telegram_webhook_url
+                .as_ref()
+                .expect("validated in GatewaySettings::load");
+            tg.set_webhook(
+                webhook_url,
+                settings
+                    .telegram_webhook_secret
+                    .as_ref()
+                    .expect("validated in GatewaySettings::load")
+                    .expose_secret(),
+            )
+            .await?;
+            info!(url = %webhook_url, "telegram webhook registered (single-bot mode)");
+        } else {
+            info!(
+                "global Telegram client built for outbound delivery — inbound webhook registration skipped (per-customer mode)"
+            );
+        }
+
+        Some(tg)
+    } else {
+        info!("no MIKA_TELEGRAM_BOT_TOKEN configured — global Telegram client not built");
+        None
+    };
+
+    // Log GitHub webhook configuration status
+    if settings.github_webhook_secret.is_some() {
+        info!("GitHub webhook endpoint enabled (MIKA_GITHUB_WEBHOOK_SECRET configured)");
+    } else {
+        info!("GitHub webhook endpoint disabled (MIKA_GITHUB_WEBHOOK_SECRET not set)");
+    }
+
+    // Construct GitHub App for outbound API calls (synchronize no-diff guard #886).
+    // Returns None when credentials are incomplete — fail-open, all synchronize events pass through.
+    let github_app = match (
+        settings.github_app_id,
+        settings.github_app_private_key.as_ref(),
+        settings.github_app_installation_id,
+    ) {
+        (Some(app_id), Some(pk), Some(install_id)) => {
+            mika_common::github_app::GitHubApp::from_credentials(
+                app_id,
+                pk.expose_secret(),
+                install_id,
+            )
+        }
+        _ => {
+            info!("GitHub App not configured for gateway (synchronize no-diff guard disabled)");
+            None
+        }
+    };
+
+    let raw_orchestrator_inbox_flag = settings.orchestrator_inbox_enabled.as_deref();
+    let orchestrator_inbox_enabled =
+        settings::orchestrator_inbox_is_enabled(raw_orchestrator_inbox_flag);
+    if orchestrator_inbox_enabled {
+        info!("orchestrator inbox endpoints enabled (MIKA_ORCHESTRATOR_INBOX_ENABLED=1)");
+    } else {
+        info!(
+            raw_value = ?raw_orchestrator_inbox_flag,
+            "orchestrator inbox endpoints disabled (MIKA_ORCHESTRATOR_INBOX_ENABLED unset, empty, '0', '2', or unrecognized; only '1' or 'true' enables)"
+        );
+    }
+
+    // Build the E1 egress-search substrate client (mika#1807) — one shared
+    // instance across every tenant per Q3 partagé no-log. Absent config
+    // leaves the endpoint 404 by design. Settings validation has already
+    // hard-enforced that `search_upstream = "brave"` implies
+    // `brave_api_key` is Some.
+    let search_egress_client = match settings.search_upstream.as_deref().map(str::trim) {
+        Some(kind) if kind.eq_ignore_ascii_case("brave") => {
+            let api_key = settings
+                .brave_api_key
+                .clone()
+                .expect("validated in GatewaySettings::load");
+            let endpoint = settings
+                .brave_endpoint
+                .clone()
+                .unwrap_or_else(|| egress_search::DEFAULT_BRAVE_ENDPOINT.to_string());
+            Some(Arc::new(SearchEgressClient::new(SearchUpstream::Brave(
+                BraveConfig { api_key, endpoint },
+            ))))
+        }
+        Some("") | None => None,
+        Some(_) => unreachable!("validated in GatewaySettings::load"),
+    };
+
+    // mika#2407 — say what the search substrate actually resolved to.
+    //
+    // This replaces the two `info!` lines that used to sit inside the match
+    // above, and the replacement is the point of U1. Those lines were emitted
+    // on *one branch each* and said only "configured" or "disabled": on
+    // 2026-09-18 the disabled line was written, correctly, and answered nothing
+    // — an operator asking "is search wired?" had to read the Kubernetes
+    // secret. The mika#2293 lesson applies verbatim: *a setting you cannot
+    // observe is not a setting, it is a hope.*
+    //
+    // Emitted on **every** branch, including the healthy one, so the absence of
+    // this line means "the running binary predates the fix" and never "search
+    // is fine" (V5's fifth halt, class mika#2340).
+    //
+    // `api_key_present` is a **boolean and only ever a boolean** — never the
+    // value, never a prefix, never a length. The Q4 STRIP TOTAL discipline of
+    // the egress_search module extends to the site that builds it.
+    let raw_search_required = settings.search_required.as_deref();
+    let raw_search_upstream = settings.search_upstream.as_deref();
+    let api_key_present = settings.brave_api_key.is_some();
+    let resolved_upstream = settings::resolved_search_upstream_label(raw_search_upstream);
+    info!(
+        event = "search_upstream_resolved",
+        upstream = resolved_upstream,
+        upstream_source = settings::search_required_source(raw_search_upstream),
+        api_key_present,
+        required = settings::search_substrate_is_required(raw_search_required),
+        required_source = settings::search_required_source(raw_search_required),
+        endpoint_is_default = settings.brave_endpoint.is_none(),
+        "egress-search substrate configuration resolved"
+    );
+
+    // The half-configuration of 2026-09-18: a key was posted, the selector was
+    // not, and `POST /internal/search` answered 404 whatever the key was worth.
+    // It gets its own WARN because the shape states the intent — nobody posts a
+    // search API key by accident — and because the repairing gesture is the
+    // opposite of the obvious one: add the *selector*, not another key.
+    if api_key_present && resolved_upstream == "none" {
+        warn!(
+            event = "search_upstream_key_without_selector",
+            "mika#2407: MIKA_BRAVE_API_KEY is set but MIKA_SEARCH_UPSTREAM is not — \
+             the search substrate stays DISABLED and POST /internal/search answers 404 \
+             search_upstream_not_configured. Set MIKA_SEARCH_UPSTREAM=brave; a key on \
+             its own activates nothing."
+        );
+    }
+
+    // Build the egress-fetch substrate client (mika#1969) — always
+    // constructed. There is no upstream selection env var per KTD2;
+    // extending the allowlist is a code change. Shared across every
+    // tenant per the same Q3 partagé no-log invariant as the search
+    // substrate.
+    let fetch_egress_client = Some(Arc::new(FetchEgressClient::new(FetchUpstream::GouvFr(
+        GouvFrConfig {},
+    ))));
+    info!("egress-fetch substrate configured (upstream=gouv_fr)");
+
+    // mika#2360 — resolve the admin read token once; a collision with the
+    // internal token disarms the route (WARN) rather than failing startup.
+    let admin_read_token = settings::resolve_admin_read_token(
+        settings.gateway_admin_read_token.as_ref(),
+        &settings.internal_token,
+    );
+
+    // Build app state
+    let state = AppState {
+        pool,
+        telegram,
+        http_client,
+        internal_token: settings.internal_token.clone(),
+        webhook_secret: settings.telegram_webhook_secret.clone(),
+        ready: ready.clone(),
+        // Capacity budget: 30 permits * 2 queries/task = 60 peak connection acquisitions.
+        // Pool of 20 connections provides sufficient headroom.
+        webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+        agent_base_url: settings.agent_base_url.clone(),
+        agents_namespace: settings.agents_namespace.clone(),
+        webhook_counter: Arc::new(AtomicU64::new(0)),
+        github_webhook_secret: settings.github_webhook_secret.clone(),
+        github_delivery_cache: github::new_delivery_cache(),
+        github_app,
+        github_api_base_url: None,
+        orchestrator_inbox_enabled,
+        inbox_subscriber_semaphore: orchestrator_inbox::default_inbox_subscriber_semaphore(),
+        gateway_external_url: settings.gateway_external_url.clone(),
+        cm_api_url: settings.cm_api_url.clone(),
+        target_health: Arc::new(circuit_breaker::TargetCircuitBreaker::new()),
+        delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+            circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+        )),
+        search_egress_client,
+        fetch_egress_client,
+        admin_read_token,
+    };
+
+    // Spawn DLQ background worker (retries pending deliveries every 30s)
+    tokio::spawn(dlq::run_dlq_worker(state.clone()));
+
+    // Spawn orchestrator inbox retention task (mika#1189) — purges rows older
+    // than `ORCHESTRATOR_INBOX_RETENTION_DAYS` once an hour. Gated on the
+    // feature flag so a gateway running without the migration applied
+    // doesn't error-log a DELETE against a non-existent table every hour.
+    if orchestrator_inbox_enabled {
+        tokio::spawn(orchestrator_inbox::run_retention_task(state.pool.clone()));
+    }
+
+    let app = build_router(state);
+
+    // Bind listener
+    let port = settings.gateway_port;
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+
+    // Mark ready — health endpoint starts returning 200
+    ready.store(true, Ordering::Release);
+    info!(port, "mika-gateway listening, ready");
+
+    if is_pretty {
+        mika_common::logging::print_ready();
+    }
+
+    // Serve with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("mika-gateway shut down cleanly");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl-C, shutting down..."),
+        _ = sigterm.recv() => info!("received SIGTERM, shutting down..."),
+    }
+}

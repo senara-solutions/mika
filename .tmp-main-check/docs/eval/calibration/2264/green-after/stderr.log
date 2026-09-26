@@ -1,0 +1,4 @@
+dotenv_loaded path=/home/samidarko/.mika/.env keys_from_file=36
+  ⚠️  GATE NOT ENFORCEABLE: no usable baseline (<none provided>).
+  Supply a valid --baseline, or pass --establish-baseline to write one from this run.
+  Exiting 2 — this is NOT a pass. Nothing was verified.

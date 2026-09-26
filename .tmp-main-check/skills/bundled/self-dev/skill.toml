@@ -1,0 +1,45 @@
+[skill]
+name = "self-dev"
+description = "Orchestrator: delegates implementation work to Claude Code via claude-pilot"
+version = "0.2.0"
+always_on = true
+timeout_secs = 30
+# Relevé de 65536 à 73728 (mika#2264) : la Rule 13 (test négatif rouge-avant
+# sur une PR touchant server/task_engine/tools) porte le prompt de 59 420 à
+# ~62 790 octets, au-dessus du gate des 95 % de 65536 (62 259) qui PANIQUE au
+# lieu d'avertir (tests/bundled_skills_load.rs:141,166). Même geste et même
+# plafond que qa-review (mika#2264) et self-dev-webhook-qa (mika#2248) : ce
+# prompt énumère les règles de calibration, et en retirer une pour tenir dans
+# le budget est précisément la dérive que les règles existent pour empêcher.
+# 73728 < le plafond dur de 81 920 (skills/index.rs:27) ; le gate refera feu à
+# 70 041 octets. Le plafond déclaré ne coûte rien — c'est la taille réelle qui
+# est injectée.
+max_prompt_size = 73728
+dependencies = [
+    "build-mika",
+    "deploy-mika",
+    # dev-pilot and dev-groom must BOTH be listed — the two dispatch siblings
+    # are loader-symmetric. self-dev (always_on) is the only edge that makes a
+    # non-always-on dispatch tool reachable on keyword-less webhook turns. See
+    # mika#1251 (the gap mika#1173 left) and the parity test in bundled_skills.rs.
+    "dev-pilot",
+    "dev-groom",
+    "browser-control",
+    "resolve-pr-conflicts",
+]
+
+[constraints]
+required_tools = ["run_claude_pilot"]
+
+[triggers]
+keywords = [
+    "add feature",
+    "implement",
+    "develop yourself",
+    "build",
+    "add yourself",
+    "improve yourself",
+    "new feature",
+    "resume",
+    "continue",
+]

@@ -1,0 +1,279 @@
+openapi: 3.1.0
+info:
+  title: Mika Agent API (mika-spirit)
+  description: Per-customer agent container HTTP API. Receives messages from the gateway, runs the agent loop, and delivers responses asynchronously.
+  license:
+    name: MIT
+    identifier: MIT
+  version: 0.1.0
+paths:
+  /api/v1/dashboard/disable:
+    post:
+      tags:
+      - embedded_dashboard
+      summary: Disable the embedded dashboard at runtime.
+      operationId: handle_disable
+      responses:
+        '200':
+          description: Dashboard disabled
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: false
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /api/v1/dashboard/enable:
+    post:
+      tags:
+      - embedded_dashboard
+      summary: Enable the embedded dashboard at runtime.
+      operationId: handle_enable
+      responses:
+        '200':
+          description: Dashboard enabled
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: true
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /api/v1/dashboard/status:
+    get:
+      tags:
+      - embedded_dashboard
+      summary: Return the current dashboard status.
+      operationId: handle_status
+      responses:
+        '200':
+          description: Dashboard status
+          content:
+            application/json:
+              schema: {}
+              example:
+                enabled: true
+                has_assets: true
+                has_token: true
+        '401':
+          description: Missing or invalid Bearer token
+      security:
+      - bearer: []
+  /health:
+    get:
+      tags:
+      - handlers
+      summary: GET /health — Combined liveness+readiness probe (no auth required).
+      operationId: handle_health
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: Server is starting up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /healthz:
+    get:
+      tags:
+      - handlers
+      summary: GET /healthz — Kubernetes-convention liveness probe (no auth required).
+      description: |-
+        Distinct from `/health`: this is a pure liveness endpoint — "is the process
+        alive and able to serve HTTP?" — so it returns 200 unconditionally when the
+        router is running, including during startup. This matches the semantics ops
+        tooling and K8s probes expect from `/healthz` (readiness is a separate
+        concern, tracked as a follow-up if `/readyz` is ever needed). See mika#1735.
+      operationId: handle_healthz
+      responses:
+        '200':
+          description: Server is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /message:
+    post:
+      tags:
+      - handlers
+      summary: POST /message — gateway forwards a user message for async processing.
+      description: |-
+        Returns 202 Accepted immediately, then spawns the agent loop in background.
+        Agent responses are delivered outbound via GatewayMessageSender.
+      operationId: handle_message
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageRequest'
+        required: true
+      responses:
+        '202':
+          description: Message accepted for async processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedResponse'
+        '400':
+          description: Invalid request (empty text without images, oversized text, or unsupported image media_type)
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Agent not found
+        '429':
+          description: Agent is busy processing another message
+      security:
+      - bearer: []
+  /tasks/{id}/complete:
+    post:
+      tags:
+      - handlers
+      summary: POST /tasks/{id}/complete — mark a callback task complete and trigger resume_agent.
+      description: |-
+        Called by background processes (exec handlers, scripts) to deliver results back
+        to the agent. Validates the task exists and has trigger_type="callback", stores
+        the result, marks the task completed, then spawns the resume_agent dispatch.
+      operationId: handle_task_complete
+      parameters:
+      - name: id
+        in: path
+        description: Task UUID
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskCompleteRequest'
+        required: true
+      responses:
+        '200':
+          description: Task marked complete, resume_agent dispatched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskCompleteResponse'
+        '400':
+          description: Task is not a callback task or result is empty
+        '401':
+          description: Missing or invalid Bearer token
+        '404':
+          description: Task not found
+        '409':
+          description: Task already completed or cancelled
+      security:
+      - bearer: []
+components:
+  schemas:
+    AcceptedResponse:
+      type: object
+      description: Accepted response for async processing.
+      required:
+      - request_id
+      - status
+      properties:
+        request_id:
+          type: string
+        status:
+          type: string
+    HealthResponse:
+      type: object
+      description: Health check response body.
+      required:
+      - status
+      properties:
+        status:
+          type: string
+        uptime_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          minimum: 0
+    ImagePayload:
+      type: object
+      description: Image payload forwarded from the gateway.
+      required:
+      - media_type
+      - data
+      properties:
+        data:
+          type: string
+        media_type:
+          type: string
+    MessageRequest:
+      type: object
+      description: Inbound message from the gateway.
+      required:
+      - text
+      - channel
+      - request_id
+      properties:
+        agent:
+          type: string
+          description: Target agent name (defaults to the server's default agent if absent).
+        channel:
+          type: string
+        chat_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Telegram chat ID for outbound delivery. Absent for non-Telegram channels
+            (e.g., GitHub webhooks). Only stored in `customer_config` when present and
+            non-zero to prevent poisoning the stored chat_id.
+        images:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/ImagePayload'
+          description: Optional images forwarded from the gateway (base64-encoded).
+        request_id:
+          type: string
+        text:
+          type: string
+    TaskCompleteRequest:
+      type: object
+      description: |-
+        Request body for POST /tasks/{id}/complete.
+
+        Marks a `callback` trigger task as completed with an optional result payload,
+        then triggers `resume_agent` dispatch if the task's action_type is `resume_agent`.
+      required:
+      - result
+      properties:
+        agent:
+          type: string
+          description: Target agent name (defaults to the server's default agent if absent or empty).
+        result:
+          type: string
+          description: Result payload from the background process (required for resume_agent tasks).
+    TaskCompleteResponse:
+      type: object
+      description: Response body for POST /tasks/{id}/complete.
+      required:
+      - task_id
+      - status
+      properties:
+        status:
+          type: string
+        task_id:
+          type: string
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+      description: Shared secret between gateway and agent container (MIKA_INTERNAL_TOKEN)

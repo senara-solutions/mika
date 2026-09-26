@@ -1,0 +1,21 @@
+{
+  "description": "Pre-fix fixture reproducing mika#720: agent emits fabricated GraphQL field 'blockedByIssues' in a second GraphQL call after the first one returns a schema error.",
+  "incident": "mika#720",
+  "fabrication_class": "graphql_field_fabrication",
+  "pre_fix_response": {
+    "tool_calls": [
+      {
+        "tool": "run_gh",
+        "input": "api graphql -f query='{ repository(owner:\"senara-solutions\", name:\"mika\") { issue(number:42) { blockedByIssues(first:10) { nodes { number title } } } } }'",
+        "output": "{ \"errors\": [{ \"message\": \"Field 'blockedByIssues' doesn't exist on type 'Issue'\" }] }"
+      },
+      {
+        "tool": "run_gh",
+        "input": "api graphql -f query='{ repository(owner:\"senara-solutions\", name:\"mika\") { issue(number:42) { blockedByIssue(first:10) { nodes { number title } } } } }'",
+        "output": "{ \"errors\": [{ \"message\": \"Field 'blockedByIssue' doesn't exist on type 'Issue'\" }] }",
+        "note": "Agent fabricated ANOTHER field name instead of using the correct 'blockedBy'"
+      }
+    ],
+    "final_text": "I'm having trouble querying the blocking relationships. Let me try a different approach."
+  }
+}

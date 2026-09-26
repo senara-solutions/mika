@@ -1,0 +1,7 @@
+{
+  "description": "Pre-fix fixture reproducing mika-skills#159: agent aggregates multi-element AC into a single claim instead of enumerating each corpus with per-element pass/fail.",
+  "incident": "mika-skills#159",
+  "fabrication_class": "aggregate_claim_instead_of_per_element_enumeration",
+  "provenance": "Faithful reconstruction of the 'Example (WRONG)' block in qa-review system_prompt.md Step 2.5.5 line 195-197",
+  "pre_fix_response": "PLAN-AC VERIFICATION:\n\n- [❌] unsatisfied: coverage ≥50% for all 4 corpora — all 4 below threshold\n\nVERDICT: block[ac]"
+}

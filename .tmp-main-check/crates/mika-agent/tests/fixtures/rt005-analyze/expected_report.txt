@@ -1,0 +1,68 @@
+!! EXISTENCE CLAIM ONLY — THIS REPORT DOES NOT ESTIMATE A MAGNITUDE !!
+The reliability knob is synthetic (seeded substitution at a fixed rate in
+research::peer_b, on a fixture of deliberately easy items) and the confidence
+knob is an injected prior, not a belief formed from evidence. External validity
+is bounded by construction. The only defensible claim is whether the reliability
+effect on planning tokens CHANGES SIGN between the confidence arms — never how
+large that change is.
+
+RT-005 mechanism analyzer — brick 5/5 (mika#1891)
+Metric, pre-registered: output_tokens summed over tool-free turns. One metric
+for both contrasts below; they differ only in which runs enter.
+
+## PRIMARY contrast — the labelled arm (intention-to-treat)
+
+Every successful run, by its assigned reliability. This is the estimand the 2x2
+randomisation licenses, and it is not changed after the fact.
+
+  verdict: SIGN FLIP — the reliability effect reverses between arms
+  sign of reliability effect @ confidence=high (0.95): +
+  sign of reliability effect @ confidence=low  (0.55): -
+  runs entering this contrast: 8
+
+  reproducibility diagnostics — NOT an effect size:
+    mean planning tokens: high/fiable=100.0 high/degradee=60.0 low/fiable=50.0 low/degradee=80.0
+    raw contrast: 70.0
+
+## SECONDARY contrast, pre-specified — the realised perturbation
+
+peer_b perturbs 3 of 10 items, and a run's prompt carries only its item and
+peer_b's answer — so the arms are byte-identical on the other 7. The design is
+balanced on the label, not on the manipulation. This contrast restricts the same
+estimand to the items actually perturbed. Both contrasts are reported because
+PREREGISTRATION.md (operator, 2026-08-29, before data) fixed both: reporting only
+one is a protocol violation, whichever one it is.
+
+  perturbed items in this batch: 1
+  verdict: SIGN FLIP — the reliability effect reverses between arms
+  sign of reliability effect @ confidence=high (0.95): +
+  sign of reliability effect @ confidence=low  (0.55): -
+  runs entering this contrast: 4
+
+  reproducibility diagnostics — NOT an effect size:
+    mean planning tokens: high/fiable=110.0 high/degradee=70.0 low/fiable=55.0 low/degradee=90.0
+    raw contrast: 75.0
+
+  within-design control (unperturbed items — inputs identical across arms,
+  so this contrast should be noise; a non-null one means variation the
+  manipulation does not explain). NOT a third claim:
+    control verdict: SIGN FLIP — the reliability effect reverses between arms
+    control raw contrast: 65.0 over 4 runs
+
+## Runs excluded — not observations
+
+  status not success (incl. contaminated): 1
+  unusable record or empty capture:        1
+  capture not attributable to the run:     1
+
+## Descriptive covariates — NOT part of either contrast above
+
+Unregistered mechanical proxies, reported for description only. They carry no
+authority over either estimand and cannot enter one: PlanningTokens is a sealed
+type whose only constructor applies the pre-registered definition.
+
+  cell                turns  handshakes  recalculations   n
+  high/fiable           3.0         1.0             1.0   2
+  high/degradee         3.0         1.0             1.0   2
+  low/fiable            3.0         1.0             1.0   2
+  low/degradee          3.0         1.0             1.0   2

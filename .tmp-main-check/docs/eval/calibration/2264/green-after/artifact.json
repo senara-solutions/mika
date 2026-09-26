@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "timestamp": "2026-09-09T14:38:22.803047300+00:00",
+  "providers": {
+    "mika-qa": {
+      "model": "openrouter/z-ai/glm-5.2",
+      "scenarios": {
+        "negative_test_invariant_gate": {
+          "outcome": "pass",
+          "error_class": null,
+          "input_tokens": 35730,
+          "output_tokens": 7090,
+          "latency_ms": 61120
+        }
+      }
+    }
+  }
+}

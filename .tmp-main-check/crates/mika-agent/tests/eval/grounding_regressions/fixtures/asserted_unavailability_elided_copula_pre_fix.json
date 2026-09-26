@@ -1,0 +1,24 @@
+{
+  "_comment": "Frozen pre-fix trace shape from mika#893. The agent claimed search_memory was 'not callable in CLI session' (elided copula — missing 'is') and the asserted-unavailability guard did not fire because pattern 2 required the 'is' keyword. The required-tools gate caught it one post-condition later. This fixture reproduces the elided-copula failure class for regression assertions.",
+  "incident": "mika#893",
+  "related": ["mika#886", "mika#894"],
+  "agent": "mika-arch",
+  "failure_class": "unavailability-asserted-without-attempt",
+  "failure_shape": "elided-copula",
+  "turns": [
+    {
+      "turn": 1,
+      "role": "assistant",
+      "text": "search_memory not callable in this CLI session — tool not exposed here. I'll proceed with only the conversation context.",
+      "tool_calls": [],
+      "guard_fired": false,
+      "note": "Pre-fix: pattern 2 required 'is not callable' — the elided 'search_memory not callable' did not match. Guard did not fire at the asserted-unavailability check; the required-tools gate caught the omission on its own later in the chain."
+    }
+  ],
+  "expected_with_fix": {
+    "turn_1_guard_fires": true,
+    "corrective_reprompt_injected": true,
+    "turn_2_calls_search_memory": true,
+    "note": "With the extended regex (mika#894), pattern 2's optional copula '(?:is )?' matches 'search_memory not callable'. The guard fires on turn 1 instead of waiting for the required-tools gate."
+  }
+}

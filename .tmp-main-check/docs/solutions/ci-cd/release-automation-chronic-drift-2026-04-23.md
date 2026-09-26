@@ -1,0 +1,308 @@
+---
+title: "Release automation chronic drift — failure classes that outlive tool choice"
+date: 2026-04-23
+last_updated: 2026-08-29
+category: ci-cd
+problem_type: operational-pattern
+severity: medium
+resolved: validated
+tags:
+  - release-automation
+  - ci-cd
+  - chronic-drift
+  - institutional-memory
+  - rust-workspace
+  - disabled-channel
+modules:
+  - .github/workflows/release-pr.yml
+  - .github/workflows/release.yml
+related:
+  - docs/solutions/ci-cd/rust-workspace-release-plz-github-actions.md
+---
+
+## Problem statement
+
+Release automation for this Rust workspace has been chronically brittle across **three different tools** (semantic-release → release-plz → git-cliff) over ~7 weeks, producing **14+ fix commits with zero durable institutional memory** until this doc. Every tool landed with a working initial commit, accumulated 5–10 fixes, then either stabilized precariously or was replaced. Each fix was muscle-memory at the time and evaporated within a week.
+
+As of 2026-04-23, the current tool (git-cliff, since 2026-04-03) fails on every merge to `main` with:
+
+```
+! [rejected]        release/v0.6.0 -> release/v0.6.0 (non-fast-forward)
+error: failed to push some refs to 'https://github.com/senara-solutions/mika'
+hint: Updates were rejected because the tip of your current branch is behind
+      its remote counterpart.
+```
+
+Zero impact on the CI gate (`CI` workflow is green on the same commits). The `Release` workflow fails silently in parallel; real impact is noise plus the release PR never auto-updating. But the symptom isn't what this doc is about. **This doc is about why the same failure class keeps resurfacing under different tools**, so the next fix can address a class rather than an instance.
+
+## Failure classes that survive tool choice
+
+The 14+ historical fix commits cluster into **four root causes**, plus a fifth that no fix commit could reach (Class E, added 2026-08-29). Each has outlasted at least one tool migration. Name these explicitly when diagnosing the next failure:
+
+### Class A — Workspace dep resolution with mixed publish-status crates
+
+This workspace has 4 crates: `mika-common` (publishes to crates.io), `mika-agent` / `mika-cli` / `mika-gateway` (`publish = false`). Tools that run `cargo package` or similar verification on all workspace members can't resolve inter-crate deps: the dependent crates were never published to crates.io, so `cargo package`'s metadata lookup fails.
+
+This is the class that **killed release-plz**. From commit `4825e7ae` (migration to git-cliff, 2026-04-03):
+
+> *"release-plz is fundamentally incompatible with publish = false workspace crates that have inter-dependencies: it always runs cargo package on all workspace members, and cargo package can't resolve workspace dep versions from crates.io (where they were never published). This caused 7+ failed fix attempts over April 1-3."*
+
+Historical fixes against Class A (all release-plz era):
+
+| Commit | Fix |
+|---|---|
+| `04c65428` | remove version from workspace dep specs for publish = false crates |
+| `3361bf53` | set `release = false` on all crates except mika-common |
+| `db341b6a` | declare only mika-common in `release-plz.toml` |
+| `3ae64459` | restore `publish = false` to match Cargo.toml declarations |
+| `8800d8e8` | exclude mika-agent from release-plz packaging |
+| `076150bd` | skip cargo package verification in release-plz |
+| `58e3dd8a` | disable cargo package verification in release-plz |
+
+Cumulative trajectory of this fix cluster: **each fix narrowed release-plz's responsibility until the tool was doing almost nothing**. The underlying mismatch was never resolved; the tool was scoped down until it stopped hitting it, then replaced.
+
+**For git-cliff and any successor:** verify the tool doesn't `cargo package` all workspace members by default, or configure it to skip. If it does and there's no opt-out, that's a hard stop for this workspace shape — do not spend fix commits narrowing scope; either find a different tool or change the `publish` strategy.
+
+### Class B — Comparison mode / changelog source of truth
+
+The tool needs to know "what's unreleased?" Answer sources: crates.io metadata (doesn't exist for our non-published crates), git tags, commit history, or a persisted changelog file. Tools default to the wrong one; fixes flip flags.
+
+Historical fixes against Class B (release-plz era):
+
+| Commit | Fix |
+|---|---|
+| `8b1e1f3f` | switch release-plz to `git_only = true` mode for tag-based comparison |
+| `621af062` | revert release-plz to crates.io comparison mode |
+| `04b66e7c` | add `git_only = true` to fix release PR creation |
+
+Cluster trajectory: **one flag flipped back and forth**, indicating neither mode worked cleanly. Root cause likely same as Class A — crates.io mode fails because crates aren't published; git-only mode fails because of some other mismatch.
+
+**For git-cliff:** the equivalent decision is "conventional commits since last tag" — tag is the source of truth. Confirm the last-tag resolution is correct before diagnosing any "nothing to release" or "everything looks unreleased" failure.
+
+### Class C — Release-branch state management
+
+The tool opens/updates a PR on a long-lived `release/vX.Y.Z` branch. Branch state divergence between runs (manual commits, failed prior runs, concurrent pushes) produces non-fast-forward rejections.
+
+Historical fixes against Class C:
+
+| Commit | Fix |
+|---|---|
+| `b3fc1f44` | exclude `release/*` branches from pipeline artifact checks (adjacent fix) |
+| **(open)** | **current symptom: `release/v0.6.0` non-fast-forward on every merge** |
+
+Cluster trajectory: **only one historical fix, and it's a scope-exclusion (keep the broken branch from blocking other workflows), not a root-cause fix**. The current failure is the same class: the release branch's state diverges from what the workflow expects to push.
+
+**For git-cliff (current open issue):** the fix needs to make the `release-pr` job's push **idempotent with respect to the branch's current state**. Three candidate approaches, each with different trade-offs:
+
+| Approach | Preserves branch history? | Survives concurrent runs? | Simplicity |
+|---|---|---|---|
+| Rebase onto origin/release before push | Yes, but rewrites | No — second concurrent run still sees stale local branch | Moderate |
+| Force-push-with-lease | Partial — only allows if lease matches | Better — lease check catches concurrent divergence | Moderate |
+| Recreate `release/vX.Y.Z` from main every run | No — history thrown away each run | Yes — every run is independent | High |
+
+The release PR branch has **no meaningful history worth preserving** — commits on it are regenerated by the tool every run. That tips toward **option 3 (recreate)**, but this is a judgment call for whoever works the fix ticket (mika#775).
+
+### Class D — Packaging / build / identity
+
+Ancillary failures in the build, packaging, or git identity surrounding the release run.
+
+Historical fixes against Class D:
+
+| Commit | Fix |
+|---|---|
+| `afd8ca24` | use pinned Rust toolchain in release-plz workflow (#394) |
+| `0c649c4f` | commit dashboard dist for embedded serving and release-plz |
+| `47374b9b` | fix YAML syntax in release workflow (git-cliff era) |
+| `e89dc7a3` | add git identity for release tag creation (git-cliff era) |
+| mika#1006 | add `release` label to `.github/labels.yml` so `gh pr create --label "release"` succeeds (git-cliff era, unmasked by Class C fix in mika#1003) |
+
+Cluster trajectory: **one-off fixes, each distinct**. These are the kind of fixes that legitimately don't need root-cause analysis — the problem space is unbounded (every new tool has its own packaging/identity quirks) and each fix stands alone.
+
+**For future fixes:** anything in Class D is a one-off; anything in A/B/C is chronic-drift and needs compound-doc discipline.
+
+### Class E — the tool's strategy does not match the repo's shape
+
+Added 2026-08-29 (mika#2047). Not a thing we are doing to the tool, and not fixable by configuration:
+the tool's internal model of a repository disagrees with ours. release-please's `rust` strategy
+assumes a crate — it does not expand a `members = ["crates/*"]` glob, and it hands the root
+`Cargo.toml` to a package updater that requires a `[package]` section our virtual workspace does not
+have. See Stage 5.
+
+**Tell it apart from A–D by where the error lives.** A–D produce errors about *our* state: a
+dependency that cannot resolve, a branch that will not fast-forward, a missing label. Class E produces
+errors about the tool's own assumptions — the fix is a different strategy or a different tool, never a
+different config value. If two consecutive plausible config fixes have failed, stop and ask which
+class you are in.
+
+**Class E is the class that justifies turning a channel off** rather than iterating, when the channel
+is not delivering anything and every iteration costs a red `main`.
+
+## Current state (2026-08-29): channel disabled
+
+**There is no current failure, because there is no longer a running release workflow.** See Stage 5 —
+the `push: main` trigger was removed under mika#2047; resume conditions are in mika#2048.
+
+<details>
+<summary>Historical: current failure as of 2026-05-06 (Class C, fix in validation)</summary>
+
+Symptom on every merge to `main` from 2026-04-23 through 2026-05-06: `release/v0.6.0` non-fast-forward. Tracked as **mika#775** — see Stage 3 below for the resolution. Validation gate (10 consecutive clean merges OR 14 days, whichever comes first) was still in flight at the time of writing.
+
+</details>
+
+## Stage 3 — Class C resolution (mika#775, 2026-05-06)
+
+**Approach chosen.** Recreate `release/vX.Y.Z` from `main` HEAD on every workflow run, then `git push --force`. The release-pr job no longer probes for an existing branch state before pushing — it builds the branch deterministically from `(main HEAD, NEXT version, git-cliff output)` and overwrites whatever was on origin. After the push, it checks for an open PR and opens one only if none exists; an existing open PR auto-tracks the force-pushed branch tip.
+
+**Why this addresses the class, not the instance.** Every prior Class C symptom — including the open one resolved here — arose from "the workflow had an expectation about the prior state of `release/*` and that expectation was wrong." The fix removes the expectation entirely: the workflow no longer cares what state was on origin, because it always replaces it. Future Class C variants (a future tool also targeting `release/*` branches, a manual edit slipping in, a concurrent run) inherit a viable pattern instead of needing to invent a new state-management scheme.
+
+**What this resolution does *not* close.**
+- **Class A (workspace dep resolution with mixed publish-status crates)** — dormant under git-cliff because git-cliff doesn't `cargo package` workspace members, but would resurface immediately under any future tool migration that does. The 7+ historical fixes documented in this doc remain the canonical cautionary trail.
+- **Class B (comparison mode)** — dormant because git-cliff uses tag-based comparison and the workflow's `LATEST_TAG = git describe --tags --abbrev=0` resolution is straightforward. Same future-tool-migration risk as Class A.
+- **Class D (packaging / build / identity)** — by definition unbounded; future one-offs will land as one-off fixes per this doc's Class D guidance.
+
+**What this resolution does close (incidentally).**
+- The "PR never auto-updates" complaint from the original problem statement: under approach 3, every workflow run force-pushes the regenerated branch, and GitHub's PR view auto-tracks the branch tip. The PR now reflects current `main` after every merge. Documented as a side benefit, not the fix's primary objective.
+
+**Validation gate clock reset (mika#1006, 2026-05-07).** The Class C validation gate (10 consecutive clean merges OR 14 days) effectively resets at this fix's first clean post-merge run. The Class C fix (mika#1003) unmasked a Class D issue: `gh pr create --label "release"` failed because the `release` label did not exist. mika#1006 adds it to `.github/labels.yml`. The gate's count starts from the first merge that produces a successful release-pr workflow run end-to-end (force-push + PR creation).
+
+**Post-merge orphan branches** (`release/v0.5.0`, `release/v0.5.1`, `release/v0.6.0` after their respective releases ship) remain a related but distinct gap — a follow-up ticket will add automatic cleanup when a `chore: release vX.Y.Z` commit lands on `main`. Manual reset via `git push origin :release/vX.Y.Z` still works as documented in the operational-workaround section below.
+
+## Stage 4 — release-please (mika#1049, 2026-05-09)
+
+**Tool migration:** git-cliff (handwritten bash) → `googleapis/release-please-action` v4.
+
+**Why this addresses the failure class.** The "No commits between" error from 2026-05-09 run #32 is a Class C variant: the workflow recreates `release/v0.12.x` from `main` on every push, and on the release PR's own merge commit, the branch and `main` are identical. release-please eliminates Class C entirely by maintaining a single persistent Release PR branch with proper state reconciliation — it never recreates the branch from scratch.
+
+**Class coverage:**
+- **Class A (workspace deps):** release-please does NOT run `cargo package`. All crates are `publish = false`. Class A is structurally avoided.
+- **Class B (comparison mode):** release-please uses its own commit-tracking manifest (`.release-please-manifest.json`), not crates.io or tags. Class B is structurally avoided.
+- **Class C (branch state):** Eliminated. release-please manages branch lifecycle internally.
+- **Class D (packaging/identity):** Only risk is action-version-specific quirks. Mitigated by SHA-pinning.
+
+## Stage 5 — turned off (mika#2047, 2026-08-29)
+
+**Outcome: the release channel is disabled, not fixed.** `push: main` was removed from
+`.github/workflows/release-pr.yml`; only `workflow_dispatch` remains. Resume ticket: mika#2048.
+
+### Class E — the tool's strategy does not match the repo's shape
+
+This is a fifth failure class, and the first that no point-fix can reach. release-please's `rust`
+strategy assumes a crate, not a virtual workspace:
+
+```
+⚠ member crates/* declared but did not find Cargo.toml   ← the members glob is never expanded
+✖ is not a package manifest (might be a cargo workspace) ← root Cargo.toml has no [package]
+```
+
+Both are inside the strategy, not in our configuration. Classes A–D were all things we were doing to
+the tool; Class E is the tool's model of the world disagreeing with ours. Escaping it means changing
+`release-type` (candidate: `simple` plus the existing `extra-files` toml updater on
+`$.workspace.package.version`) — a redesign, not a fix.
+
+### The diagnostic trap this class sets
+
+The ticket's own first hypothesis was wrong, and wrong in an instructive way: it read the workflow's
+`with:` block (only `token`), saw no `config-file` / `manifest-file`, and concluded release-please was
+running in non-manifest mode. Both inputs default to `''` in the action, and release-please then falls
+back to `release-please-config.json` / `.release-please-manifest.json` on its own. The log said so
+plainly — `Fetching release-please-config.json from branch main` — 70 lines above the fatal error.
+
+**Rule: in a release-automation log, read past the first plausible-looking anomaly to the line that
+carries the non-zero exit.** These logs are full of warnings that are genuinely harmless — three
+unparseable commits here, skipped without consequence out of 1190 considered. Diagnosing from the
+first anomaly instead of the last one produces a confident fix for a non-problem. Config-shaped
+hypotheses are especially seductive because they are cheap to test; that is exactly why they get
+tested first and believed too early.
+
+### Why "turn it off" was the right call here, and when it is not
+
+The two hazards named under *Meta* below — failures only manifest on the next push to `main`, and
+there is no local reproduction — are not just slow. They mean **every verification attempt costs a red
+`main`**. Once that is true, the cost of iterating on the fix is paid in the credibility of the CI
+signal for everything else in the repo. Weigh that against what the channel delivers: here, nothing
+since 2026-05-09, across 300 consecutive failed runs.
+
+The honest version of the consumption argument matters. "Nobody consumes the releases" was the
+operator's premise; measured, it is false in the letter — 38 downloads on `v0.12.2`, 132 across all
+releases, and `install.sh` pulls from GitHub Releases. What holds is narrower and sufficient: the
+workflow has produced nothing for those users since May, so disabling it changes nothing for them.
+**State the narrow true version, not the sweeping one** — a decision resting on a claim that a
+five-minute check refutes will be reopened by the next person who runs that check.
+
+Disabling is the wrong call when the channel has live consumers who would notice, when a required
+status check depends on it (verified here: it does not — ruleset `main protection` requires only
+`Check`, `Dashboard`, `Docs Site`, `Docs Sync`, `Pipeline Artifacts`, `Security`), or when the red is
+new rather than chronic. A red that started this week is a regression to fix; a red that has run 300
+for 300 is a channel to decide about.
+
+### Disable it so the next person can read the decision
+
+- **The reason lives in the file**, as a header comment: what is off, since when, the exact cause with
+  the two log lines that prove it, the operator decision, and pointers to mika#2047 and mika#2048. An
+  `if: false` would have been technically sufficient and institutionally useless.
+- **The `name:` carries the state** (`Release (disabled — see mika#2048)`), so the Actions tab tells
+  the truth to someone who never opens the file.
+- **Every doc that promised automated releases was corrected** — `docs/deployment.md`, `README.md`,
+  `CONTRIBUTING.md`, `CLAUDE.md`. Two of them were *already* wrong, still crediting release-plz,
+  replaced back in Stage 4. Replacing a visible red with quietly false documentation is the same
+  damage in a less detectable form.
+- **`workflow_dispatch` was kept, with its limit written down.** It is the resume path's manual entry
+  point — but the action carries no `target-branch`, so it targets the default branch whatever `ref`
+  is dispatched. It is not a sandbox, and mika#2048 must add `target-branch` before using it to verify
+  anything.
+- **Nothing was half-repaired.** `Cargo.toml`, `release-please-config.json` and
+  `.release-please-manifest.json` are untouched: they are the resume ticket's raw material.
+
+## Operational workaround
+
+### Stage 4 (release-please) reset procedure
+
+If release-please gets stuck or produces an incorrect Release PR:
+
+```bash
+# 1. Delete the release-please managed branch — the action recreates it on next push to main
+git push origin :release-please--branches--main--components--mika
+
+# 2. Trigger the Release workflow manually via workflow_dispatch,
+#    or wait for the next merge to main
+```
+
+### Legacy (Stage 2–3, git-cliff) reset procedure
+
+No longer applicable — retained for reference if rollback is ever needed:
+
+```bash
+git push origin :release/v0.6.0
+```
+
+## Tool evolution (appendix — chronological index)
+
+Failure classes are the primary axis of this doc. Tool chronology is here as secondary, to help locate commits by tool-era when grep hits.
+
+- **Stage 0 — semantic-release** (pre-2026-03). No surviving config; replaced because of Rust-workspace integration issues. Primary failures were Class A.
+- **Stage 1 — release-plz** (2026-03-01 → 2026-04-03). Setup captured in [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) (now historical). 10+ fixes, all in Classes A, B, D. Migration driven by Class A.
+- **Stage 2 — git-cliff** (2026-04-03 → 2026-05-09). Migration commit `4825e7ae`. Fixes in Classes C, D. Replaced due to Class C variant ("No commits between" on release PR merge).
+- **Stage 4 — release-please** (2026-05-09 → 2026-08-29). Migration in mika#1049. `googleapis/release-please-action` v4 with persistent Release PR branch. Structurally avoided Classes A, B, C — and was killed by Class E. (This entry was numbered "Stage 3" until 2026-08-29, contradicting the "Stage 4" heading above; the headings are authoritative.)
+- **Stage 5 — disabled** (2026-08-29 → present). mika#2047. No automated release channel; `workflow_dispatch` only. Resume conditions in mika#2048.
+
+The workflow file is `.github/workflows/release-pr.yml`; the tool is `googleapis/release-please-action`. As of Stage 5 the workflow is disabled and the tool does not run.
+
+## Meta — why release automation drifts chronically
+
+Two feedback-loop hazards make release automation unusually evaporative:
+
+1. **Failures only manifest on next push to main** — not on PR CI, not on local tests. So the fix cycle is "merge a PR, observe the next merge, see if it passed" — ~1 fix per merge cycle, with 15–60 min between iterations.
+2. **No local reproduction.** The broken state lives in a GitHub Actions runner environment. Reproducing in-repo requires mocking the runner's auth context, network state, and timing.
+
+Combined effect: it's psychologically easier to apply a point-fix than to understand the class. Fourteen+ commits of point-fixes is the anti-pattern.
+
+**Rule going forward:** every release-automation fix that's more than a typo earns a compound-doc entry in THIS file, even if it's three sentences. The friction of writing is negligible compared to re-deriving context the next time. Rule operationalized in `feedback_compound_infra_fixes.md`.
+
+## Cross-references
+
+- [`rust-workspace-release-plz-github-actions.md`](./rust-workspace-release-plz-github-actions.md) — original release-plz setup (2026-03-01, now historical)
+- Commit `4825e7ae` — tool migration (release-plz → git-cliff)
+- Ticket mika#775 — fix Class C (`release/v0.6.0` non-fast-forward)
+- Ticket mika#1006 — fix Class D (`release` label missing, unmasked by mika#1003)
+- Ticket mika#1049 — Stage 4: git-cliff → release-please migration
+- MEMORY: `feedback_compound_infra_fixes.md` — institutional rule about infra-fix evaporation

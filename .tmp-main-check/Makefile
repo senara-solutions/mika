@@ -1,0 +1,277 @@
+INSTALL_DIR ?= $(HOME)/.local/bin
+BINARIES := mika mika-spirit mika-gateway
+
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard test-pilot-push-guard test-cwd-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+build: ## Build release binaries with telemetry
+	cargo build --release --features telemetry
+
+build-debug: ## Build debug binaries
+	cargo build
+
+build-dashboard: ## Build dashboard for production (installs deps + builds shared UI lib)
+	npm ci
+	npm run build -w packages/ui
+	npm run build --prefix dashboard
+
+stop: ## Stop running mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
+		echo "Stopping $$bin..."; \
+		sudo rc-service "$$bin" stop || true; \
+	done
+
+restart: ## Restart mika-spirit and mika-gateway (via OpenRC)
+	@for bin in mika-spirit mika-gateway; do \
+		echo "Restarting $$bin..."; \
+		sudo rc-service "$$bin" restart || true; \
+	done
+
+install: ## Copy release binaries + scripts to INSTALL_DIR (safe while services run)
+	@mkdir -p $(INSTALL_DIR)
+	@for bin in $(BINARIES); do \
+		if [ ! -f target/release/$$bin ]; then \
+			echo "ERROR: target/release/$$bin not found. Run 'make build' first." >&2; \
+			exit 1; \
+		fi; \
+		cp target/release/$$bin $(INSTALL_DIR)/$$bin.tmp; \
+		mv $(INSTALL_DIR)/$$bin.tmp $(INSTALL_DIR)/$$bin; \
+		if [ "$$(uname)" = "Darwin" ]; then codesign -s - $(INSTALL_DIR)/$$bin; fi; \
+		echo "Installed $$bin -> $(INSTALL_DIR)/$$bin"; \
+	done
+	@# Ship the pilot egress proxy alongside the binaries so dispatch-lib.sh
+	@# can find it on PATH (bwrap Phase 2b — network cut + hostname allowlist).
+	@cp scripts/mika-pilot-egress-proxy $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
+	@chmod +x $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-egress-proxy.tmp $(INSTALL_DIR)/mika-pilot-egress-proxy
+	@echo "Installed mika-pilot-egress-proxy -> $(INSTALL_DIR)/mika-pilot-egress-proxy"
+	@# addon deployed at stable path (2026-08-05).
+	@cp scripts/mika-pilot-anthropic-auth-addon.py $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-anthropic-auth-addon.py
+	@echo "Installed mika-pilot-anthropic-auth-addon.py"
+	@# github auth-injection addon — host-side GitHub token injection (mika#2056).
+	@cp scripts/mika-pilot-github-auth-addon.py $(INSTALL_DIR)/mika-pilot-github-auth-addon.py.tmp
+	@mv $(INSTALL_DIR)/mika-pilot-github-auth-addon.py.tmp $(INSTALL_DIR)/mika-pilot-github-auth-addon.py
+	@echo "Installed mika-pilot-github-auth-addon.py"
+
+deploy: deploy-info build-dashboard build install restart check-webhook-chain ## Full deploy: build, install, restart
+
+install-permission-policy-plugin: ## Install mika-permission-policy plugin into claude-pilot's uv tool env (mika#1817)
+	@# The plugin lives in tools/mika_permission_policy/ and provides the
+	@# per-binary safety functions loaded by claude-pilot's per-spawn evaluator
+	@# when MIKA_PERMISSION_POLICY_MODE=per_spawn +
+	@# MIKA_PERMISSION_POLICY_MODULE=mika_permission_policy:get_policy are set.
+	@#
+	@# `--with-editable` injects the plugin into the same uv tool env as
+	@# claude-pilot so the running interpreter can `import mika_permission_policy`.
+	@# `--reinstall --force` matches the discipline in the meta-repo
+	@# CLAUDE.md deploy target for claude-pilot itself.
+	uv tool install --reinstall --force --editable ../claude-pilot \
+		--with-editable ./tools/mika_permission_policy
+
+test-permission-policy-plugin: ## Run the permission-policy plugin test suite (mika#1817)
+	cd tools/mika_permission_policy && uv sync --all-extras --quiet && uv run pytest -q
+
+check-webhook-chain: ## Verify the inbound webhook chain by traversing it (never fatal, mika#2135)
+	@# The probe owns every message it emits, so there is exactly one place where
+	@# the wording of a substrate warning is written. It stays silent on a live
+	@# chain (mika#2135 AC3), prints a WARNING on a broken one, and prints a NOTE
+	@# — never a warning — when it could verify nothing (no declared URL, no
+	@# network). That NOTE/WARNING split is what reconciles AC3's "ends without a
+	@# warning" with mika#2205's "a silently inert check reads exactly like an idle
+	@# one"; `deploy-info` below already prints a bare NOTE for the same reason.
+	@#
+	@# Never fatal, whatever the verdict: the deploy chain is fail-open, and a
+	@# deploy blocked by a network probe would be an operational regression. This
+	@# posture is inherited from the target this replaced.
+	@bash scripts/smoke-webhook-chain || true
+
+# Transition alias — 2026-09-20, mika#2135.
+# The meta-repo `mika-platform` Makefile calls `make -C mika check-ngrok` by name
+# rather than delegating to `make -C mika deploy`. Renaming without this alias
+# would break `make deploy` over there with "No rule to make target 'check-ngrok'"
+# — a regression worse than the defect being repaired. The alias carries no logic
+# and emits nothing of its own, so no message names ngrok anywhere (AC2 is about
+# the message, not the target name). Follow-up ticket on `mika-platform`: switch
+# the caller to `check-webhook-chain`, then delete these three lines.
+check-ngrok: check-webhook-chain
+
+deploy-info: ## Print built SHA and warn if local HEAD is behind origin/main
+	@BRANCH=$$(git rev-parse --abbrev-ref HEAD); \
+	if [ "$$BRANCH" != "main" ]; then \
+	  if [ "$${FORCE_DEPLOY_FROM_BRANCH:-}" = "1" ]; then \
+	    printf "\033[1;33mWARN: deploying from '%s' (FORCE_DEPLOY_FROM_BRANCH=1)\033[0m\n" "$$BRANCH" >&2; \
+	  else \
+	    printf "\033[1;31mABORT: on '%s', not main.\033[0m\n" "$$BRANCH" >&2; \
+	    echo "  Fix:      git checkout main && git pull --ff-only" >&2; \
+	    echo "  Override: FORCE_DEPLOY_FROM_BRANCH=1 make deploy" >&2; \
+	    echo "  Canonical: cd ../mika-platform && make deploy" >&2; \
+	    exit 1; \
+	  fi; \
+	fi
+	@echo "Building from: $$(git rev-parse --abbrev-ref HEAD) @ $$(git rev-parse --short HEAD) ($$(git log -1 --pretty=format:'%s'))"
+	@if git fetch -q origin main 2>/dev/null; then \
+	  AHEAD=$$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0); \
+	  if [ "$$AHEAD" -gt 0 ]; then \
+	    echo "WARNING: HEAD is $$AHEAD commits behind origin/main. Run 'git pull --ff-only' if you intended to deploy origin/main."; \
+	  else \
+	    echo "origin/main: up to date"; \
+	  fi; \
+	else \
+	  echo "NOTE: could not reach origin (network/auth) — skipping freshness check."; \
+	fi
+
+calibrate-mika-dev: ## Pre-swap calibration gate for mika-dev (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-dev MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-dev --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+calibrate-mika-arch: ## Pre-swap calibration gate for mika-arch (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-arch MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-arch --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+calibrate-mika-qa: ## Pre-swap calibration gate for mika-qa (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-qa MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-qa --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+calibrate-mika-orchestrator: ## Pre-swap calibration gate for mika-orchestrator (MODEL=provider/model required)
+	@if [ -z "$(MODEL)" ]; then echo "Error: MODEL is required. Example: make calibrate-mika-orchestrator MODEL=anthropic/claude-sonnet-4-6" >&2; exit 1; fi
+	cargo run --bin calibrate --release -- --role mika-orchestrator --model "$(MODEL)" --baseline docs/eval/calibration/baselines/latest.json
+
+test: ## Run all tests
+	cargo test
+	@bash skills/bundled/_shared/test-dispatch-lib.sh
+	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
+	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
+	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
+	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
+	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
+	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
+	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
+	@bash skills/bundled/_shared/tests/test_pr_push_guard.sh
+	@bash scripts/check-pilot-push-sites.sh
+	@bash scripts/test-check-pilot-push-sites.sh
+	@bash scripts/test-pr-origin-report.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+	@bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
+	@bash scripts/verify-no-secret-in-setenv.sh
+	@bash scripts/test-verify-no-secret-in-setenv.sh
+	@bash scripts/verify-egress-no-log.sh
+	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/test-dispatch-symmetry.sh
+	@bash scripts/deploy-info-test.sh
+	@bash scripts/test-smoke-webhook-chain.sh
+	@bash scripts/verify-no-sigpipe-grep.sh
+	@bash scripts/test-verify-no-sigpipe-grep.sh
+	@bash scripts/check-image-tags-immutable.sh
+	@bash scripts/test-check-image-tags-immutable.sh
+	@bash scripts/check-dispatch-seats-declared.sh
+	@bash scripts/test-check-dispatch-seats-declared.sh
+	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
+
+test-async-db-saturation: ## Run async DB channel saturation regression test (mika#1258)
+	cargo test -p mika-agent --lib -- async_db::tests::test_async_db_saturated_channel_does_not_pin_workers --nocapture
+
+test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it into CI)
+	@bash skills/bundled/_shared/test-dispatch-lib.sh
+	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
+
+test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
+	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
+
+test-measure-empty-turns: ## Pin the axis-B emptiness predicate and its four negative controls (mika#1910)
+	@bash scripts/test-measure-empty-turns.sh
+
+test-rescue-signal: ## Run the rescue-into-open-PR signal suite (mika#2151)
+	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
+
+test-rescue-closes-guard: ## Verify the rescue net only writes `Closes #N` when it carries work (mika#2157)
+	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
+
+test-rescue-pipeline-verified: ## Verify the `rescue-pipeline-verified` marker is measured, fail-closed, kill-switchable (mika#2354)
+	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
+
+test-handler-crash-step: ## Verify a long-running handler names the step it crashed on, and arms its trap first (mika#2532)
+	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
+
+test-rescue-cause-token: ## Verify the rescue commit subject names its cause, derived from _halt_family (mika#2539)
+	@bash skills/bundled/_shared/tests/test_rescue_cause_token.sh
+	@bash skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh
+
+test-pilot-push-guard: ## Pin the PR-branch push guard and refuse unguarded push sites in skill handlers (mika#2520)
+	@bash skills/bundled/_shared/tests/test_pr_push_guard.sh
+	@bash scripts/check-pilot-push-sites.sh
+	@bash scripts/test-check-pilot-push-sites.sh
+
+test-pr-origin: ## Run the PR-origin marker + report suites (mika#2026)
+	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
+	@bash scripts/test-pr-origin-report.sh
+
+test-stamp-issue-seat: ## Verify dispatch-lib claims the issue with dispatch:loop and releases it on exit (mika#2155)
+	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
+
+test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
+	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+
+test-github-token-not-in-sandbox: ## Verify the GitHub token is host-reachable but sandbox-absent (mika#2056)
+	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
+
+test-sandbox-git-usable: ## Verify git works inside the pilot sandbox and containment stays closed (mika#2141)
+	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+
+test-cwd-guard: ## Pin the four named cwd refusals, their ORDER, and the handler wiring — pre-fix negative control included (mika#2536)
+	@bash scripts/test-cwd-guard.sh
+
+test-shared-checkout-guard: ## Pin the shared-checkout guard (both modes) and its run_shell wiring, negative control included (mika#2107 / mika#2449)
+	@bash scripts/test-guard-shared-checkout.sh
+	@bash scripts/test-shell-exec-guard.sh
+
+verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --setenv (mika#2039 R7/R14/R15)
+	@bash scripts/verify-no-secret-in-setenv.sh
+	@bash scripts/test-verify-no-secret-in-setenv.sh
+
+verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour (mika#1810 E4 / mika#2054)
+	@bash scripts/verify-egress-no-log.sh
+	@bash scripts/test-verify-egress-no-log.sh
+
+test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
+	@bash scripts/test-dispatch-symmetry.sh
+
+test-smoke-webhook-chain: ## Verify the inbound-chain probe classifies each verdict, silence included (mika#2135)
+	@bash scripts/test-smoke-webhook-chain.sh
+
+check-byte-slices: ## Reject byte offsets into text that can miss a char boundary + pin the guard's negative behaviour (mika#764 / mika#2103)
+	@bash scripts/check-byte-slices.sh
+	@bash scripts/test-check-byte-slices.sh
+
+check-image-tags-immutable: ## Reject image tags not derived from the commit sha + pin the guard's negative behaviour (mika#2143)
+	@bash scripts/check-image-tags-immutable.sh
+	@bash scripts/test-check-image-tags-immutable.sh
+
+check-dispatch-seats-declared: ## Reject drift between KNOWN_DISPATCH_SEATS and .github/labels.yml + pin the guard's negative behaviour (mika#2092)
+	@bash scripts/check-dispatch-seats-declared.sh
+	@bash scripts/test-check-dispatch-seats-declared.sh
+
+verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIPE trap, mika#2055)
+	@bash scripts/verify-no-sigpipe-grep.sh
+	@bash scripts/test-verify-no-sigpipe-grep.sh
+
+test-pilot-egress-proxy: ## Verify the pilot egress-proxy status tap + framing (mika#1901, #2317)
+	@python3 -B scripts/test-pilot-egress-proxy-status.py
+	@python3 -B scripts/test-pilot-egress-keepalive.py
+
+verify-bundled-skills: ## Verify structural invariants on bundled skills — pre-merge counterpart to AC2 (mika#1575)
+	cargo run -q --bin verify-bundled-skills
+
+lint: ## Run clippy
+	cargo clippy
+
+fmt: ## Format code
+	cargo fmt
+
+check: fmt lint test ## Format, lint, and test

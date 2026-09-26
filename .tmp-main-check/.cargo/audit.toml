@@ -1,0 +1,9 @@
+# cargo-audit configuration
+# Used by the rustsec/audit-check GitHub Action
+
+[advisories]
+ignore = [
+    # rsa Marvin Attack — pulled in transitively by sqlx-mysql; no patch
+    # available upstream. Not exploitable in our usage (no RSA operations).
+    "RUSTSEC-2023-0071",
+]

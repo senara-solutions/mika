@@ -1,0 +1,24 @@
+{
+  "_comment": "Frozen pre-fix trace shape from mika#1177 Shape A. The agent claimed 'the search_memory tool is not available' and the asserted-unavailability guard did not fire because P2 captured 'tool' (the descriptor noun) instead of 'search_memory'. The enabled-set lookup rejected 'tool' (not a registered tool name), so the guard returned None — a false negative. This fixture reproduces the descriptor-word absorption failure class for regression assertions.",
+  "incident": "mika#1177",
+  "related": ["mika#862", "mika#894"],
+  "agent": "mika-arch",
+  "failure_class": "unavailability-asserted-without-attempt",
+  "failure_shape": "descriptor-word-absorption",
+  "turns": [
+    {
+      "turn": 1,
+      "role": "assistant",
+      "text": "the search_memory tool is not available in this session \u2014 I'll proceed with only the conversation context.",
+      "tool_calls": [],
+      "guard_fired": false,
+      "note": "Pre-fix: P2 leftmost-match captured 'tool' (not 'search_memory'); enabled-set lookup rejected 'tool' \u2192 guard did not fire. The required-tools gate caught the omission later in the chain."
+    }
+  ],
+  "expected_with_fix": {
+    "turn_1_guard_fires": true,
+    "corrective_reprompt_injected": true,
+    "turn_2_calls_search_memory": true,
+    "note": "With P6 (mika#1177), the descriptor-word pattern captures the tool name before the descriptor noun. The guard fires on turn 1."
+  }
+}

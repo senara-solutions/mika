@@ -1,0 +1,30 @@
+[skill]
+name = "gh-read-only"
+description = "Read-only GitHub access — view issues, PRs, diffs, and issue lists without write capability."
+version = "0.1.0"
+always_on = false
+timeout_secs = 60
+
+# Keyword design rule (mika#1650): no bare common-English bigrams under
+# substring-only matching. Bare "pr"/"gh"/"issue"/"github"/"repo" collided
+# with ordinary prose (approach, thought, tissue, report, ...) and forced the
+# required-tools gate to fire on incidental mentions. Every keyword below is a
+# multi-word intent phrase or a literal-number pattern that signals
+# intent-to-fetch-GitHub-data, not just topic mention.
+# See docs/architecture/skill-keyword-design-rules.md.
+[triggers]
+keywords = [
+    "github issue", "github pr", "github pull request",
+    "pull request", "pull requests",
+    "view issue", "view pr", "view pull request",
+    "check issue", "check pr", "check pull request",
+    "list issues", "list prs", "list pull requests",
+    "open issues", "open prs", "open pull requests",
+    "pr diff", "pr body", "issue body", "issue list",
+    "fetch issue", "fetch pr",
+    "merge pr", "close pr", "close issue",
+    "issue #", "pr #",
+]
+
+[constraints]
+required_tools = ["gh_read"]

@@ -1,0 +1,4675 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use axum::{
+    Json, Router,
+    extract::{Path, Query, Request, State},
+    http::{self, HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use base64::Engine;
+use secrecy::{ExposeSecret, SecretString};
+use sqlx::PgPool;
+use subtle::ConstantTimeEq;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::a2a_routes;
+use crate::copy::{self, UserMessage};
+use crate::egress_fetch;
+use crate::egress_search;
+use crate::github;
+use crate::orchestrator_inbox;
+use crate::telegram::{
+    CustomerTelegramClient, Locale, LocaleSource, ParsedMessage, TelegramApiError, TelegramClient,
+    TelegramUpdate, parse_agent_prefix, parse_update, resolve_locale,
+};
+
+/// Carries HTTP method and path from request to response extensions,
+/// making them available to TraceLayer's `on_response` callback as
+/// top-level JSON fields (not nested inside the `spans` array).
+#[derive(Clone, Debug)]
+struct RequestMeta {
+    method: String,
+    path: String,
+}
+
+/// Middleware that captures method and path from the request and injects
+/// them into response extensions for downstream logging.
+async fn inject_request_meta(request: Request, next: Next) -> Response {
+    let meta = RequestMeta {
+        method: request.method().to_string(),
+        path: request.uri().path().to_owned(),
+    };
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(meta);
+    response
+}
+
+/// Build version info returned by the `/version` endpoint.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct VersionInfo {
+    /// Semantic version from Cargo.toml
+    #[schema(example = "0.4.0")]
+    version: &'static str,
+    /// Short git commit hash captured at compile time
+    #[schema(example = "abc1234")]
+    git_hash: &'static str,
+}
+
+/// GET /version — Build version and git hash (no auth).
+///
+/// Returns build version from Cargo.toml and short git hash captured at compile
+/// time. Falls back to "unknown" for git_hash when .git is absent.
+#[utoipa::path(
+    get,
+    path = "/version",
+    responses(
+        (status = 200, description = "Build version info", body = VersionInfo),
+    ),
+)]
+pub(crate) async fn handle_version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        // mika#2066 AC3 — the commit stamp now comes from the single shared
+        // capture in mika-common, not this crate's build.rs.
+        git_hash: mika_common::build_info::GIT_HASH,
+    })
+}
+
+// -- AppState --
+
+/// Shared application state for the gateway.
+/// All fields are Clone-able (owned or Arc-wrapped).
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    /// Global Telegram client — populated when `MIKA_TELEGRAM_BOT_TOKEN` is configured.
+    /// Used for outbound delivery via `/send` (operator agents without `customer_id`).
+    /// `None` only when no bot token is set.
+    pub telegram: Option<TelegramClient>,
+    pub http_client: reqwest::Client,
+    pub internal_token: SecretString,
+    /// Global webhook secret — populated only in single-bot mode. `None` in per-customer mode.
+    pub webhook_secret: Option<SecretString>,
+    pub ready: Arc<AtomicBool>,
+    pub webhook_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Optional override for agent container base URL (local E2E testing).
+    pub agent_base_url: Option<String>,
+    /// Namespace where agent pods run (for FQDN DNS resolution).
+    pub agents_namespace: String,
+    /// Counter for periodic outbound_messages cleanup (every ~100 webhook calls).
+    pub webhook_counter: Arc<AtomicU64>,
+    /// Secret for validating inbound GitHub App webhooks (HMAC-SHA256).
+    /// When `None`, `POST /webhook/github` returns 404.
+    pub github_webhook_secret: Option<SecretString>,
+    /// LRU cache for GitHub webhook delivery ID deduplication.
+    pub github_delivery_cache: Arc<std::sync::Mutex<lru::LruCache<String, ()>>>,
+    /// GitHub App for authenticating outbound GitHub API calls (synchronize no-diff guard).
+    /// `None` when credentials are incomplete — all synchronize events pass through (fail-open).
+    pub github_app: Option<Arc<mika_common::github_app::GitHubApp>>,
+    /// Override for GitHub API base URL (testing only). Defaults to `https://api.github.com`.
+    pub github_api_base_url: Option<String>,
+    /// Whether the orchestrator inbox endpoints serve requests (mika#1189).
+    /// When `false`, both `/orchestrator/inbox/{id}/message` and `.../stream`
+    /// return 404 — preserves the pre-1189 filesystem-inbox-only behavior.
+    pub orchestrator_inbox_enabled: bool,
+    /// Cap on concurrent SSE subscribers for `/orchestrator/inbox/{id}/stream`.
+    /// Each subscriber runs an independent Postgres poll loop; the pool is
+    /// shared with webhook delivery and the DLQ worker, so unbounded
+    /// subscribers can cascade into webhook failures. Default 10 permits
+    /// (see `orchestrator_inbox::ORCHESTRATOR_INBOX_DEFAULT_SUBSCRIBER_CAP`).
+    pub inbox_subscriber_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Public HTTPS base URL of the gateway. Required for per-customer webhook
+    /// registration (`POST /admin/customers`). `None` when not configured.
+    pub gateway_external_url: Option<String>,
+    /// Base URL of the control-monitor (cm-api) HTTP surface (e.g.,
+    /// `http://127.0.0.1:8090`). When set, every validated inbound GitHub
+    /// webhook is fire-and-forget forwarded to
+    /// `{cm_api_url}/api/v1/webhooks/github` so cm's `pr_lifecycle` event log
+    /// populates from the same webhook stream. See cm#88 Option B — the
+    /// gateway is the deployed reachability path; cm-api is an additional
+    /// subscriber. `None` disables cm-forwarding.
+    pub cm_api_url: Option<String>,
+    /// Per-target-agent circuit breaker (mika#1710). Shared 429 health state that
+    /// short-circuits webhook deliveries to a saturated agent straight to the DLQ
+    /// instead of hammering it with independent per-event retry chains. This is the
+    /// missing cross-event coordination layer that let the 2026-07-01 429 flood
+    /// self-amplify past the drain rate.
+    pub target_health: Arc<crate::circuit_breaker::TargetCircuitBreaker>,
+    /// In-flight delivery bound (mika#1710 R4/AC4). Caps concurrently-spawned
+    /// delivery tasks at `MAX_INFLIGHT_DELIVERIES`; overflow sheds durably to the
+    /// DLQ (drop-oldest via Postgres) rather than accumulating unbounded tasks.
+    pub delivery_slots: Arc<tokio::sync::Semaphore>,
+
+    /// E1 egress-search substrate (mika#1807). `Some` when a search upstream
+    /// is configured (`MIKA_SEARCH_UPSTREAM=brave`), `None` otherwise —
+    /// `POST /internal/search` returns 404 when absent. Shared across every
+    /// tenant per Q3 partagé no-log (see
+    /// `crates/mika-gateway/src/egress_search.rs`).
+    pub(crate) search_egress_client: Option<egress_search::SharedSearchEgressClient>,
+
+    /// Egress-fetch substrate (mika#1969). `Some` when the substrate is
+    /// wired (default — no upstream selection knob per KTD2), `None`
+    /// otherwise — `POST /internal/fetch` returns 404 when absent.
+    /// Shared across every tenant per the same Q3 partagé no-log
+    /// invariant as the search substrate (see
+    /// `crates/mika-gateway/src/egress_fetch/`).
+    pub(crate) fetch_egress_client: Option<egress_fetch::SharedFetchEgressClient>,
+
+    /// mika#2360 — admin READ-ONLY token, already resolved by
+    /// [`crate::settings::resolve_admin_read_token`]: `None` means the route
+    /// `GET /admin/tenants/{customer_id}/recurring-tasks` answers 404, whether
+    /// because the token is unset or because it collided with
+    /// `internal_token`. No request path re-checks the collision — the invalid
+    /// state never reaches this struct.
+    pub admin_read_token: Option<SecretString>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("internal_token", &"[REDACTED]")
+            .field(
+                "webhook_secret",
+                &self.webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("agent_base_url", &self.agent_base_url)
+            .field("agents_namespace", &self.agents_namespace)
+            .field("webhook_counter", &self.webhook_counter)
+            .field(
+                "github_webhook_secret",
+                &self.github_webhook_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            // mika#2360 — `Some`/`None` is the armed state of the admin read
+            // route, the first thing to look for in a diagnostic dump.
+            .field(
+                "admin_read_token",
+                &self.admin_read_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+// -- Router --
+
+/// Build the Axum router with all routes and middleware.
+pub fn build_router(state: AppState) -> Router {
+    Router::new()
+        // Webhook: Telegram sends updates here (validated by secret_token header)
+        .route(
+            "/webhook/telegram",
+            post(handle_webhook).layer(RequestBodyLimitLayer::new(64 * 1024)),
+        )
+        // Webhook: Per-customer Telegram bots — validated by per-customer webhook_secret
+        .route(
+            "/webhook/telegram/{customer_id}",
+            post(handle_customer_webhook).layer(RequestBodyLimitLayer::new(64 * 1024)),
+        )
+        // Send: Containers POST outbound messages (validated by Bearer token)
+        .route(
+            "/send",
+            post(handle_send)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        // Webhook: GitHub App sends events here (validated by HMAC-SHA256 signature)
+        .route(
+            "/webhook/github",
+            post(github::handle_github_webhook).layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        // A2A protocol proxy (API key auth)
+        .route(
+            "/a2a/{customer_id}/{agent_name}",
+            post(a2a_routes::handle_a2a_proxy).layer(RequestBodyLimitLayer::new(2 * 1024 * 1024)),
+        )
+        .route(
+            "/a2a/{customer_id}/{agent_name}/agent.json",
+            get(a2a_routes::handle_a2a_agent_card),
+        )
+        // DLQ endpoints (Bearer token auth, same as /send)
+        .route(
+            "/webhook/dlq",
+            get(handle_dlq_list).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        .route(
+            "/webhook/dlq/{delivery_id}/replay",
+            post(handle_dlq_replay).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        .route(
+            "/webhook/dlq/replay-all",
+            post(handle_dlq_replay_all).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        // Orchestrator inbox (mika#1189) — bidirectional SSE channel for
+        // spawn→orchestrator coordination. Bearer-token auth (same as /send).
+        .route(
+            "/orchestrator/inbox/{orchestrator_id}/message",
+            post(orchestrator_inbox::handle_post_message)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(256 * 1024)),
+        )
+        .route(
+            "/orchestrator/inbox/{orchestrator_id}/stream",
+            get(orchestrator_inbox::handle_stream).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        // Egress-search substrate (mika#1807) — single controlled search
+        // egress module. Bearer-token auth (same as /send). Body limit
+        // matches the tightest existing internal endpoint at 16 KB — a
+        // search request is a short query, not a payload.
+        .route(
+            "/internal/search",
+            post(egress_search::handle_internal_search)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Egress-fetch substrate (mika#1969) — GET-only lecture-seule
+        // against a compile-time gouv.fr allowlist. Bearer-token auth
+        // (same as /send). Body limit at 16 KB — the request payload
+        // is a single URL, not a document.
+        .route(
+            "/internal/fetch",
+            post(egress_fetch::handle_internal_fetch)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Admin: customer registration (mika#1609) + orphan listing (mika#1820)
+        .route(
+            "/admin/customers",
+            post(handle_register_customer)
+                .get(handle_list_customers)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        // Admin: read a customer record (mika#1820) — safe fields only, never secrets
+        .route(
+            "/admin/customers/{customer_id}",
+            get(handle_get_customer).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer_token,
+            )),
+        )
+        // Admin: unlink a customer's Telegram binding (mika#1749)
+        .route(
+            "/admin/customers/{customer_id}/unlink",
+            post(handle_admin_unlink)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ))
+                .layer(RequestBodyLimitLayer::new(1024)),
+        )
+        // Admin: read-only recurring registry of a tenant (mika#2360), proxied
+        // to the tenant pod. Dedicated READ token — the write internal token
+        // is refused here. Auth is per-route in this router: this
+        // `.route_layer` is what protects the route; without it the route is
+        // served with no authentication at all.
+        .route(
+            "/admin/tenants/{customer_id}/recurring-tasks",
+            get(handle_admin_tenant_recurring_tasks).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_read_token,
+            )),
+        )
+        // Admin: read-only outbound-send history of a tenant (mika#2387),
+        // served from the gateway's own `outbound_messages` table — no proxy
+        // hop, so the internal token never leaves the process here. Same READ
+        // token, same audit population, same per-route auth caveat as the
+        // sibling above: without this `.route_layer` the route is public.
+        .route(
+            "/admin/tenants/{customer_id}/outbound-messages",
+            get(handle_admin_tenant_outbound_messages).route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_read_token,
+            )),
+        )
+        // Health probes and version (no auth)
+        .route("/health", get(handle_readiness))
+        .route("/readyz", get(handle_readiness))
+        .route("/livez", get(handle_liveness))
+        .route("/version", get(handle_version))
+        // Security headers on all responses
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        // inject_request_meta must be inner to TraceLayer so that on the response
+        // path it inserts RequestMeta into extensions BEFORE on_response reads them.
+        .layer(middleware::from_fn(inject_request_meta))
+        // Request logging — health probes at DEBUG, everything else at INFO
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &http::Request<_>| {
+                    let path = request.uri().path();
+                    let method = request.method();
+                    if is_health_probe(path) {
+                        tracing::debug_span!("http_request", %method, path)
+                    } else {
+                        tracing::info_span!("http_request", %method, path)
+                    }
+                })
+                .on_response(
+                    |response: &http::Response<_>, latency: Duration, span: &tracing::Span| {
+                        let status = response.status().as_u16();
+                        let is_debug = span
+                            .metadata()
+                            .is_some_and(|m| *m.level() == tracing::Level::DEBUG);
+                        let (method, path) = response
+                            .extensions()
+                            .get::<RequestMeta>()
+                            .map(|m| (m.method.as_str(), m.path.as_str()))
+                            .unwrap_or(("unknown", "unknown"));
+                        if status >= 500 {
+                            tracing::warn!(status, method, path, ?latency, "response");
+                        } else if is_debug {
+                            tracing::debug!(status, method, path, ?latency, "response");
+                        } else {
+                            tracing::info!(status, method, path, ?latency, "response");
+                        }
+                    },
+                )
+                .on_failure(
+                    // NOTE: on_failure fires on connection-level failures where no
+                    // response is produced. RequestMeta is carried via response
+                    // extensions, so it is unavailable here. Method and path remain
+                    // accessible via the parent span's fields (nested in JSON output
+                    // under `spans`). Connection-level failures are rare.
+                    |error: tower_http::classify::ServerErrorsFailureClass,
+                     latency: Duration,
+                     _span: &tracing::Span| {
+                        tracing::error!(
+                            classification = %error,
+                            ?latency,
+                            "response failed"
+                        );
+                    },
+                ),
+        )
+        .with_state(state)
+}
+
+/// Returns `true` for Kubernetes health/readiness/liveness probe paths.
+/// These are logged at DEBUG level to reduce noise from frequent probe traffic.
+fn is_health_probe(path: &str) -> bool {
+    matches!(path, "/health" | "/readyz" | "/livez" | "/version")
+}
+
+// -- Webhook handler --
+
+/// POST /webhook/telegram — receive Telegram updates.
+///
+/// Validates the X-Telegram-Bot-Api-Secret-Token header using constant-time comparison.
+/// Returns 200 to Telegram immediately, then processes asynchronously.
+/// Request body is a Telegram Update JSON object (see Telegram Bot API docs).
+#[utoipa::path(
+    post,
+    path = "/webhook/telegram",
+    responses(
+        (status = 200, description = "Update accepted"),
+        (status = 401, description = "Invalid webhook secret"),
+        (status = 503, description = "At capacity, Telegram will retry"),
+    )
+)]
+pub(crate) async fn handle_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(update): Json<TelegramUpdate>,
+) -> StatusCode {
+    // Single-bot mode only — return 404 when not configured
+    let (global_telegram, global_secret) =
+        match (state.telegram.as_ref(), state.webhook_secret.as_ref()) {
+            (Some(tg), Some(secret)) => (tg, secret),
+            _ => return StatusCode::NOT_FOUND,
+        };
+
+    // Validate secret_token header (constant-time)
+    let secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !constant_time_eq(secret, global_secret.expose_secret()) {
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // Concurrency limit: shed load when at capacity (Telegram will retry)
+    let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!("webhook at capacity, shedding load");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
+
+    let parsed = parse_update(&update);
+    let (locale, locale_source) = resolve_locale(&update);
+
+    // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
+    let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
+    if count % 100 == 0 {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            cleanup_old_outbound_messages(&cleanup_state).await;
+        });
+    }
+
+    // Construct a CustomerTelegramClient from the global bot token for handler dispatch.
+    // In single-bot mode, all handlers use this wrapper over the global token.
+    let tg = CustomerTelegramClient::new(
+        state.http_client.clone(),
+        global_telegram.bot_token_cloned(),
+    );
+
+    // Dispatch asynchronously — always return 200 to Telegram
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit; // held until task completes
+        dispatch_parsed_message(&s, &tg, parsed, locale, locale_source).await;
+    });
+
+    StatusCode::OK
+}
+
+// -- Per-customer webhook handler --
+
+/// DB row for per-customer webhook lookup (includes bot_token and webhook_secret).
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerWebhookRow {
+    #[allow(dead_code)]
+    id: Uuid,
+    bot_token: Option<String>,
+    webhook_secret: Option<String>,
+}
+
+/// POST /webhook/telegram/{customer_id} — receive per-customer Telegram updates.
+///
+/// Validates the `X-Telegram-Bot-Api-Secret-Token` header against the customer's
+/// stored `webhook_secret`. Returns unified 401 for all failure cases (missing
+/// customer, wrong secret, no bot_token) to prevent customer_id enumeration.
+pub(crate) async fn handle_customer_webhook(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(update): Json<TelegramUpdate>,
+) -> StatusCode {
+    // Look up customer with per-customer Telegram columns
+    let customer = match sqlx::query_as::<_, CustomerWebhookRow>(
+        "SELECT id, bot_token, webhook_secret FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return StatusCode::UNAUTHORIZED,
+        Err(e) => {
+            warn!(error = %e, %customer_id, "customer webhook lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    // Validate webhook_secret (constant-time). Unified 401 for missing secret,
+    // invalid secret, or missing bot_token to prevent customer_id enumeration.
+    let stored_secret = match customer.webhook_secret.as_deref() {
+        Some(s) => s,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    let header_secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !constant_time_eq(header_secret, stored_secret) {
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // Require bot_token to be configured
+    let bot_token = match customer.bot_token {
+        Some(t) => t,
+        None => return StatusCode::UNAUTHORIZED,
+    };
+
+    // Concurrency limit: shed load when at capacity (Telegram will retry)
+    let permit = match state.webhook_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(%customer_id, "webhook at capacity, shedding load");
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
+
+    let parsed = parse_update(&update);
+    let (locale, locale_source) = resolve_locale(&update);
+
+    // Periodic cleanup of old outbound message mappings (~every 100 webhooks)
+    let count = state.webhook_counter.fetch_add(1, Ordering::Relaxed);
+    if count % 100 == 0 {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            cleanup_old_outbound_messages(&cleanup_state).await;
+        });
+    }
+
+    // Build per-customer telegram client
+    let tg = CustomerTelegramClient::new(state.http_client.clone(), SecretString::from(bot_token));
+
+    // Dispatch asynchronously — always return 200 to Telegram
+    let s = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit; // held until task completes
+        dispatch_parsed_message(&s, &tg, parsed, locale, locale_source).await;
+    });
+
+    StatusCode::OK
+}
+
+/// Dispatch a parsed Telegram message to the appropriate handler.
+/// Shared between `handle_webhook` (single-bot) and `handle_customer_webhook` (per-customer).
+///
+/// `locale` is a **required** argument (mika#2025 M6). There is one dispatch
+/// site and two parse sites, so making it mandatory here means the compiler —
+/// not a convention — forces both callers to resolve a language. `locale_source`
+/// rides along for `gateway_locale_resolved`; it decides nothing.
+async fn dispatch_parsed_message(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    parsed: ParsedMessage,
+    locale: Locale,
+    locale_source: LocaleSource,
+) {
+    // mika#2025 D6 — observability bounded by the rarity of the path, not by a
+    // threshold. The gateway sees every Telegram message of every tenant, so a
+    // line per resolved message would drown the signal it exists to raise
+    // (mika#2131). Commands only; the `Text` path, which carries the volume,
+    // emits nothing.
+    if let ParsedMessage::Start { chat_id, .. }
+    | ParsedMessage::BareStart { chat_id }
+    | ParsedMessage::Unlink { chat_id, .. }
+    | ParsedMessage::UnlinkConfirm { chat_id } = &parsed
+    {
+        info!(
+            event = "gateway_locale_resolved",
+            chat_id = *chat_id,
+            locale = locale.as_str(),
+            locale_source = locale_source.as_str(),
+            "resolved the language for a gateway command reply"
+        );
+    }
+
+    match parsed {
+        ParsedMessage::Start {
+            chat_id,
+            pairing_token,
+        } => {
+            handle_pairing(state, tg, chat_id, &pairing_token, locale).await;
+        }
+        ParsedMessage::Text {
+            chat_id,
+            text,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            handle_text_message(
+                state,
+                tg,
+                chat_id,
+                &text,
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+                locale,
+            )
+            .await;
+        }
+        ParsedMessage::Photo {
+            chat_id,
+            file_id,
+            caption,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            handle_photo_message(
+                state,
+                tg,
+                chat_id,
+                &file_id,
+                caption.as_deref(),
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+                locale,
+            )
+            .await;
+        }
+        ParsedMessage::Document {
+            chat_id,
+            file_id,
+            mime_type: _,
+            caption,
+            update_id,
+            reply_to_message_id,
+            reply_to_text,
+        } => {
+            // Image documents use the same flow as photos
+            handle_photo_message(
+                state,
+                tg,
+                chat_id,
+                &file_id,
+                caption.as_deref(),
+                update_id,
+                reply_to_message_id,
+                reply_to_text.as_deref(),
+                locale,
+            )
+            .await;
+        }
+        ParsedMessage::BareStart { chat_id } => {
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::BareStartWelcome, locale))
+                .await;
+        }
+        ParsedMessage::Unlink {
+            chat_id,
+            unrecognized_suffix,
+        } => {
+            handle_unlink(state, tg, chat_id, unrecognized_suffix.as_deref(), locale).await;
+        }
+        ParsedMessage::UnlinkConfirm { chat_id } => {
+            handle_unlink_confirm(state, tg, chat_id, locale).await;
+        }
+        ParsedMessage::Unsupported { chat_id } => {
+            // Fire-and-forget reply for non-image media (sticker/voice/video/etc.)
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::UnsupportedMedia, locale))
+                .await;
+        }
+        ParsedMessage::NoMessage => {
+            // Non-message update (e.g., edited_message, channel_post) — ignore
+        }
+    }
+}
+
+// -- Shared routing helpers --
+
+/// Compute container URL deterministically from customer ID.
+/// When `agent_base_url` is set, routes all traffic there (local E2E testing).
+/// Otherwise uses FQDN with the agents namespace for cross-namespace DNS resolution.
+fn container_url(
+    customer_id: &Uuid,
+    agent_base_url: &Option<String>,
+    agents_namespace: &str,
+) -> String {
+    match agent_base_url {
+        Some(base) => base.clone(),
+        None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:8080"),
+    }
+}
+
+/// Compute container URL from a string customer ID.
+/// Used by A2A proxy routes where customer_id comes from the URL path.
+pub(crate) fn container_url_str(
+    customer_id: &str,
+    agent_base_url: Option<&str>,
+    agents_namespace: &str,
+) -> String {
+    match agent_base_url {
+        Some(base) => base.to_string(),
+        None => format!("http://mika-{customer_id}.{agents_namespace}.svc.cluster.local:8080"),
+    }
+}
+
+/// Look up a customer by Telegram chat ID.
+/// Returns the customer row, or None after sending an appropriate reply.
+async fn resolve_customer(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    locale: Locale,
+) -> Option<CustomerRow> {
+    match sqlx::query_as::<_, CustomerRow>(
+        "SELECT id, status FROM customers WHERE telegram_chat_id = $1",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => {
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::NotPaired, locale))
+                .await;
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "customer lookup failed");
+            reply_transient_error(tg, chat_id, locale).await;
+            None
+        }
+    }
+}
+
+/// Atomically claim a dedup slot for the given update_id.
+/// Returns true if claimed (proceed to forward), false if already processed or on error.
+async fn claim_dedup(state: &AppState, customer_id: Uuid, update_id: i64) -> bool {
+    let claimed = sqlx::query(
+        "UPDATE customers SET last_update_id = $1 WHERE id = $2 AND last_update_id < $1 RETURNING id",
+    )
+    .bind(update_id)
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match claimed {
+        Ok(Some(_)) => true, // claimed -- proceed to forward
+        Ok(None) => false,   // already processed by another task
+        Err(e) => {
+            warn!(error = %e, "dedup update failed");
+            false
+        }
+    }
+}
+
+/// Reset the dedup slot on forwarding failure so Telegram retry can succeed.
+/// Uses CAS (compare-and-swap) to prevent incorrect rollback.
+async fn reset_dedup(state: &AppState, customer_id: Uuid, update_id: i64) {
+    let _ = sqlx::query(
+        "UPDATE customers SET last_update_id = last_update_id - 1 WHERE id = $1 AND last_update_id = $2",
+    )
+    .bind(customer_id)
+    .bind(update_id)
+    .execute(&state.pool)
+    .await;
+}
+
+/// Handle the result of forwarding a message to a customer container.
+/// On success: no-op. On error response: warn + reply. On network failure: reset dedup + warn + reply.
+#[allow(clippy::too_many_arguments)]
+async fn handle_forward_result(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    result: Result<reqwest::Response, reqwest::Error>,
+    chat_id: i64,
+    customer_id: Uuid,
+    update_id: i64,
+    msg_kind: &str,
+    locale: Locale,
+) {
+    match result {
+        Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 202 => {
+            // Successfully forwarded
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            warn!(status, %customer_id, "container returned error for {msg_kind}");
+            reply_transient_error(tg, chat_id, locale).await;
+        }
+        Err(e) => {
+            reset_dedup(state, customer_id, update_id).await;
+            let is_connect = e.is_connect();
+            warn!(error = %e, %customer_id, is_connect, "container unreachable for {msg_kind}, dedup reset");
+            let msg = forward_error_message(is_connect, locale);
+            let _ = tg.send_message(chat_id, msg).await;
+        }
+    }
+}
+
+// -- Text message routing --
+
+/// Route a text message to the correct customer container.
+#[allow(clippy::too_many_arguments)]
+async fn handle_text_message(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    text: &str,
+    update_id: i64,
+    reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
+    locale: Locale,
+) {
+    let row = match resolve_customer(state, tg, chat_id, locale).await {
+        Some(r) => r,
+        None => return,
+    };
+
+    // Suspended customer: silent drop + log
+    if row.status == "suspended" {
+        info!(chat_id, customer_id = %row.id, "message from suspended customer, dropping");
+        return;
+    }
+
+    // Claim dedup before forwarding
+    if !claim_dedup(state, row.id, update_id).await {
+        return;
+    }
+
+    // Look up target agent from reply context (if replying to an agent message)
+    let target_agent =
+        resolve_reply_agent(state, chat_id, reply_to_message_id, reply_to_text).await;
+
+    if reply_to_message_id.is_some() && target_agent.is_none() {
+        warn!(
+            chat_id,
+            reply_to_message_id = ?reply_to_message_id,
+            "reply routing: no agent found for replied-to message, falling back to default agent"
+        );
+    }
+
+    let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
+    let request_id = Uuid::new_v4().to_string();
+
+    // Forward to container
+    let mut payload = serde_json::json!({
+        "text": text,
+        "chat_id": chat_id,
+        "channel": "telegram",
+        "request_id": request_id
+    });
+    if let Some(ref agent) = target_agent {
+        payload["agent"] = serde_json::Value::String(agent.clone());
+    }
+
+    let result = state
+        .http_client
+        .post(format!("{url}/message"))
+        .bearer_auth(state.internal_token.expose_secret())
+        .json(&payload)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+
+    handle_forward_result(
+        state, tg, result, chat_id, row.id, update_id, "text", locale,
+    )
+    .await;
+}
+
+// -- Photo message routing --
+
+/// Route a photo/document message to the correct customer container.
+///
+/// Downloads the image from Telegram, base64-encodes it, and forwards
+/// alongside the caption (or synthetic text) to the agent container.
+/// Dedup is claimed *after* a successful download to prevent message loss.
+#[allow(clippy::too_many_arguments)]
+async fn handle_photo_message(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    file_id: &str,
+    caption: Option<&str>,
+    update_id: i64,
+    reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
+    locale: Locale,
+) {
+    let row = match resolve_customer(state, tg, chat_id, locale).await {
+        Some(r) => r,
+        None => return,
+    };
+
+    if row.status == "suspended" {
+        info!(chat_id, customer_id = %row.id, "photo from suspended customer, dropping");
+        return;
+    }
+
+    // Download image BEFORE claiming dedup (prevents message loss on download failure)
+    let image = match tg.download_image(file_id).await {
+        Ok(img) => img,
+        Err(TelegramApiError::BadRequest { ref message }) if message.contains("too large") => {
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::PhotoTooLarge, locale))
+                .await;
+            return;
+        }
+        Err(TelegramApiError::BadRequest { ref message }) if message.contains("unsupported") => {
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    copy::render(UserMessage::PhotoUnsupportedFormat, locale),
+                )
+                .await;
+            return;
+        }
+        Err(e) => {
+            error!(error = %e, chat_id, "failed to download image from Telegram");
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    copy::render(UserMessage::PhotoDownloadFailed, locale),
+                )
+                .await;
+            return;
+        }
+    };
+
+    let image_size = image.data.len();
+    let media_type = image.media_type.clone();
+
+    // Base64-encode the image
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&image.data);
+    drop(image); // Free raw bytes
+
+    info!(
+        chat_id,
+        customer_id = %row.id,
+        media_type = %media_type,
+        image_size,
+        "downloaded and encoded image"
+    );
+
+    // Now claim dedup (download succeeded)
+    if !claim_dedup(state, row.id, update_id).await {
+        return;
+    }
+
+    // Look up target agent from reply context (if replying to an agent message)
+    let target_agent =
+        resolve_reply_agent(state, chat_id, reply_to_message_id, reply_to_text).await;
+
+    if reply_to_message_id.is_some() && target_agent.is_none() {
+        warn!(
+            chat_id,
+            reply_to_message_id = ?reply_to_message_id,
+            "reply routing: no agent found for replied-to message, falling back to default agent"
+        );
+    }
+
+    // Use caption or synthetic text for captionless photos
+    let text = caption.unwrap_or("[Photo]");
+
+    let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
+    let request_id = Uuid::new_v4().to_string();
+
+    // Forward to container with images array (longer timeout for large payloads)
+    let mut payload = serde_json::json!({
+        "text": text,
+        "chat_id": chat_id,
+        "channel": "telegram",
+        "request_id": request_id,
+        "images": [{
+            "media_type": media_type,
+            "data": base64_data,
+        }]
+    });
+    if let Some(ref agent) = target_agent {
+        payload["agent"] = serde_json::Value::String(agent.clone());
+    }
+
+    let result = state
+        .http_client
+        .post(format!("{url}/message"))
+        .bearer_auth(state.internal_token.expose_secret())
+        .json(&payload)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+
+    handle_forward_result(
+        state, tg, result, chat_id, row.id, update_id, "photo", locale,
+    )
+    .await;
+}
+
+// -- Admin: customer registration (mika#1609) --
+
+#[derive(Debug, serde::Deserialize)]
+struct RegisterCustomerPayload {
+    customer_id: Uuid,
+    name: String,
+    bot_token: SecretString,
+    bot_username: String,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    pairing_token_ttl_hours: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RegisterCustomerResponse {
+    customer_id: Uuid,
+    bot_username: String,
+    /// `None` for active customers whose pairing token was already consumed —
+    /// the endpoint never fabricates a token it did not persist (mika#1612).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_url: Option<String>,
+    webhook_registered: bool,
+}
+
+/// Build the response pairing fields from the DB's effective pairing token.
+///
+/// Returns `(None, None)` when the customer has no live pairing token (active
+/// customers — the token was consumed by `handle_pairing`), so the response never
+/// advertises a `pairing_url` that cannot pair (mika#1612).
+fn pairing_response_fields(
+    row_pairing_token: Option<&str>,
+    bot_username: &str,
+) -> (Option<String>, Option<String>) {
+    match row_pairing_token {
+        Some(token) => {
+            let url = format!("https://t.me/{bot_username}?start={token}");
+            (Some(token.to_string()), Some(url))
+        }
+        None => (None, None),
+    }
+}
+
+/// Validate bot_username: alphanumeric + underscores, 1-32 chars, no leading `@`.
+fn is_valid_bot_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= 32
+        && !username.starts_with('@')
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The message `POST /admin/customers` returns when Telegram refuses the token.
+///
+/// **This literal is a wire format, not prose.** `classify_gateway_error` in
+/// mika-cloud (mika-cloud#205) still recognises the substring `invalid bot_token`
+/// to tell "this token is dead" from "the gateway hiccuped", and that rung stays in
+/// service until mika-cloud removes it — a date this repo does not hold. Rewording
+/// it drops the Console back into its "retry without retyping the token" branch,
+/// which is the very defect mika-cloud#205 repaired, **and no test in either repo
+/// would redden**. A change here is a cross-repo break to be dated, never a wording
+/// improvement. Two tests hold it, and they hold different halves:
+/// `mika2191_ac2_le_message_du_401_est_un_format_de_fil` asserts the string **in
+/// full** rather than against this constant (asserting the constant would prove
+/// nothing — whoever reworded it would move both sides at once), and
+/// `mika2191_le_litteral_na_quun_seul_site_de_production` keeps it to this one
+/// production site.
+const INVALID_BOT_TOKEN_MESSAGE: &str = "invalid bot_token: Telegram returned 401 Unauthorized";
+
+/// Error body for a `bot_token` validation failure on `POST /admin/customers`.
+///
+/// Always carries `error` (unchanged shape, AC2), plus `upstream_status` when the
+/// upstream actually refused — the closed field that replaces reading the sentence
+/// (mika#2191 AC1). Presence and value are decided by
+/// [`crate::telegram::upstream_status`], the single reader of that question; see its
+/// doc comment for why `Other { status: 200 }` and `BadRequest` carry none.
+///
+/// The gateway's own status stays 400 on every branch: the ticket scopes the change
+/// to the body, and moving the status would break every caller that sorts 4xx from
+/// 5xx for no gain.
+fn token_validation_error_body(err: &TelegramApiError) -> serde_json::Value {
+    let message = match err {
+        TelegramApiError::Unauthorized => INVALID_BOT_TOKEN_MESSAGE.to_string(),
+        other => format!("bot token validation failed: {other}"),
+    };
+    let mut body = serde_json::json!({ "error": message });
+    if let Some(status) = crate::telegram::upstream_status(err) {
+        body["upstream_status"] = serde_json::json!(status);
+    }
+    body
+}
+
+/// Error body for a `bot_username` that does not match what `getMe` returned.
+///
+/// Extracted from the handler so AC3 is asserted rather than deduced by reading it:
+/// this branch lives on the `Ok` arm — the upstream answered 200 and refused
+/// nothing — so it carries **no** `upstream_status`.
+fn bot_username_mismatch_body(provided: &str, actual: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!("bot_username mismatch: provided '{provided}' but Telegram returned '{actual}'")
+    })
+}
+
+/// POST /admin/customers — register or re-register a per-customer Telegram bot.
+///
+/// Creates a `customers` row with `status='provisioned'`, stores bot credentials,
+/// generates pairing token and webhook secret, registers the webhook with Telegram,
+/// and returns the pairing URL.
+///
+/// Idempotent on `customer_id`: re-registering updates bot credentials and
+/// re-registers the webhook. Pairing token is only regenerated if the customer
+/// is still in `provisioned` status.
+async fn handle_register_customer(
+    State(state): State<AppState>,
+    Json(payload): Json<RegisterCustomerPayload>,
+) -> impl IntoResponse {
+    // Validate gateway_external_url is configured
+    let gateway_url = match &state.gateway_external_url {
+        Some(url) => url.clone(),
+        None => {
+            error!("POST /admin/customers called but gateway_external_url not configured");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "gateway_external_url not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate plan
+    let plan = payload.plan.as_deref().unwrap_or("standard");
+    if plan != "standard" && plan != "premium" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid plan: must be 'standard' or 'premium'"})),
+        )
+            .into_response();
+    }
+
+    // Validate bot_username
+    if !is_valid_bot_username(&payload.bot_username) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid bot_username: must be 1-32 alphanumeric/underscore characters, no leading @"})),
+        )
+            .into_response();
+    }
+
+    // Validate bot token via getMe and check username match
+    let customer_tg = CustomerTelegramClient::new(
+        state.http_client.clone(),
+        SecretString::from(payload.bot_token.expose_secret().to_string()),
+    );
+    match customer_tg.get_me().await {
+        Ok(actual_username) => {
+            // Telegram usernames are case-insensitive; getMe returns canonical
+            // casing, so a case-differing caller must not get a 400 (mika#1612).
+            if !actual_username.eq_ignore_ascii_case(&payload.bot_username) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(bot_username_mismatch_body(
+                        &payload.bot_username,
+                        &actual_username,
+                    )),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(token_validation_error_body(&e)),
+            )
+                .into_response();
+        }
+    }
+
+    // Generate secrets
+    let webhook_secret = generate_webhook_secret();
+    let pairing_token = generate_pairing_token();
+    let ttl_hours = payload.pairing_token_ttl_hours.unwrap_or(48);
+    let timezone = payload.timezone.as_deref().unwrap_or("UTC");
+
+    // Upsert customer row
+    let upsert_result = sqlx::query_as::<_, UpsertCustomerRow>(UPSERT_CUSTOMER_SQL)
+        .bind(payload.customer_id)
+        .bind(&payload.name)
+        .bind(plan)
+        .bind(timezone)
+        .bind(payload.bot_token.expose_secret())
+        .bind(&payload.bot_username)
+        .bind(&webhook_secret)
+        .bind(&pairing_token)
+        // Postgres `make_interval(hours => $N)` expects int4; binding f64 (float8) is
+        // only an assignment cast and fails function resolution (mika#1612). Out-of-i32
+        // values fall back to the 48h default; `.max(1)` then floors zero/negative inputs
+        // to 1h so a nonsensical TTL can't mint an already-expired (unpairable) token.
+        .bind(i32::try_from(ttl_hours).unwrap_or(48).max(1))
+        .fetch_one(&state.pool)
+        .await;
+
+    let row = match upsert_result {
+        Ok(row) => row,
+        Err(e) => {
+            error!(error = %e, customer_id = %payload.customer_id, "failed to upsert customer");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Register webhook with Telegram (fail-open)
+    let webhook_url = format!(
+        "{}/webhook/telegram/{}",
+        gateway_url.trim_end_matches('/'),
+        payload.customer_id
+    );
+    let webhook_registered = match customer_tg.set_webhook(&webhook_url, &webhook_secret).await {
+        Ok(()) => {
+            info!(
+                customer_id = %payload.customer_id,
+                bot_username = %payload.bot_username,
+                webhook_url = %webhook_url,
+                "per-customer telegram webhook registered"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                customer_id = %payload.customer_id,
+                bot_username = %payload.bot_username,
+                "per-customer telegram webhook registration failed (fail-open)"
+            );
+            false
+        }
+    };
+
+    // Promote the freshly-generated secret to the DB only when Telegram has actually
+    // accepted it. The upsert above preserved the old secret for active customers, so
+    // a failed setWebhook leaves inbound validation working against the old secret
+    // (mika#1612). Fresh inserts already hold the new secret, so skip them.
+    if webhook_registered
+        && !row.was_inserted
+        && let Err(e) = sqlx::query("UPDATE customers SET webhook_secret = $1 WHERE id = $2")
+            .bind(&webhook_secret)
+            .bind(payload.customer_id)
+            .execute(&state.pool)
+            .await
+    {
+        warn!(
+            error = %e,
+            customer_id = %payload.customer_id,
+            "failed to rotate webhook_secret after successful setWebhook; DB retains old secret"
+        );
+    }
+
+    // Use the effective pairing_token from the DB. Active customers have a NULL
+    // pairing_token (consumed by handle_pairing) — return no pairing fields rather
+    // than fabricate a token that was never persisted (mika#1612).
+    let (pairing_token_resp, pairing_url) =
+        pairing_response_fields(row.pairing_token.as_deref(), &payload.bot_username);
+
+    let status_code = if row.was_inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+
+    (
+        status_code,
+        Json(RegisterCustomerResponse {
+            customer_id: payload.customer_id,
+            bot_username: payload.bot_username,
+            pairing_token: pairing_token_resp,
+            pairing_url,
+            webhook_registered,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UpsertCustomerRow {
+    #[allow(dead_code)]
+    status: String,
+    pairing_token: Option<String>,
+    was_inserted: bool,
+}
+
+// -- Admin unlink (mika#1749) --
+
+/// Response shape for `POST /admin/customers/{customer_id}/unlink`.
+#[derive(Debug, serde::Serialize)]
+struct AdminUnlinkResponse {
+    customer_id: Uuid,
+    /// The `telegram_chat_id` that was released, or `null` if the row was
+    /// already unbound. Idempotent — a repeat call returns `null` here.
+    previous_chat_id: Option<i64>,
+    /// ISO 8601 timestamp of the unlink operation (wall-clock, server-side).
+    unlinked_at: String,
+}
+
+/// Handle `POST /admin/customers/{customer_id}/unlink` — admin releases a
+/// customer's Telegram binding server-side. Same auth class as
+/// `POST /admin/customers` (bearer token). Idempotent on repeat calls.
+///
+/// Returns:
+/// - 200 with `{customer_id, previous_chat_id, unlinked_at}` on hit or idempotent no-op.
+/// - 404 with `{error}` on missing customer_id.
+async fn handle_admin_unlink(
+    State(state): State<AppState>,
+    axum::extract::Path(customer_id): axum::extract::Path<Uuid>,
+) -> impl IntoResponse {
+    // Postgres `RETURNING` returns the AFTER-image of the row, so to surface
+    // the previous `telegram_chat_id` we snapshot it in a subquery joined
+    // via FROM. The subquery reads the row BEFORE the UPDATE within the same
+    // statement (Postgres evaluates FROM subqueries against the pre-update
+    // snapshot). If the customer_id does not exist, the UPDATE affects zero
+    // rows and `fetch_optional` returns `Ok(None)` — signalled as 404.
+    //
+    // The returned `previous_chat_id` is `Option<i64>`: `Some(n)` when a
+    // binding was released, `None` when the row existed but was already
+    // unbound (idempotent no-op).
+    let result = sqlx::query_scalar::<_, Option<i64>>(
+        "UPDATE customers c \
+         SET telegram_chat_id = NULL \
+         FROM (SELECT id, telegram_chat_id FROM customers WHERE id = $1) AS old \
+         WHERE c.id = old.id \
+         RETURNING old.telegram_chat_id",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match result {
+        Ok(Some(previous_chat_id)) => {
+            info!(
+                %customer_id,
+                ?previous_chat_id,
+                "admin unlinked telegram binding"
+            );
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(AdminUnlinkResponse {
+                        customer_id,
+                        previous_chat_id,
+                        unlinked_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    })
+                    .expect("AdminUnlinkResponse serializes"),
+                ),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "customer not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin unlink query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// -- Admin: customer read + orphan listing (mika#1820) --
+//
+// GET /admin/customers/{id} — returns the customer record with the safe subset
+// of fields (never bot_token, never pairing_token value, never webhook_secret).
+// GET /admin/customers?status=X&paired=Y&stale_after_minutes=N — lists orphaned
+// customers (provisioned + unpaired + older than the stale window). Both share
+// the same `MIKA_INTERNAL_TOKEN` bearer-auth surface as `POST /admin/customers`.
+//
+// Founding friction: Yaohong pair-fail diagnostic 2026-07-22 required Vincent-only
+// port-forward+psql to answer "is this customer paired?" — this endpoint replaces
+// that multi-step flow with a 200ms `curl`. See mika#1820.
+
+/// Full customer record returned by `GET /admin/customers/{id}`.
+///
+/// **Security contract:** never contains `bot_token`, the `pairing_token` value,
+/// or the `webhook_secret` value. Only the *presence* of a pairing token is
+/// surfaced (`pairing_token_present: bool`) along with its expiry (which is
+/// non-secret — an expiry timestamp cannot be used to authenticate).
+#[derive(Debug, serde::Serialize)]
+struct GetCustomerResponse {
+    customer_id: Uuid,
+    name: String,
+    /// The per-customer Telegram bot username (mika#1454). `None` for customers
+    /// still on single-bot fallback (bot columns nullable per migration 008).
+    bot_username: Option<String>,
+    status: String,
+    /// `Some(ts)` after successful `handle_pairing`; `None` for orphaned/provisioned rows.
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(chat_id)` when paired; released to `None` by `/unlink` self-service
+    /// or `POST /admin/customers/{id}/unlink` admin release (mika#1749).
+    telegram_chat_id: Option<i64>,
+    plan: String,
+    /// Presence-only signal — the pairing_token VALUE is a secret and is never
+    /// surfaced. `true` means an unconsumed token exists; `false` after
+    /// `handle_pairing` NULLs it out (see `crates/mika-gateway/src/routes.rs::handle_pairing`).
+    pairing_token_present: bool,
+    /// Non-secret — expiry timestamp cannot be used to pair.
+    pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Some(ts)` when the `one-telegram-one-mika` guard refused a pairing
+    /// attempt on this customer (mika-cloud#208). Cleared by a later successful
+    /// pairing. This is what lets the console tell "refused" from "still
+    /// waiting" — the two were indistinguishable before.
+    pairing_rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Closed vocabulary; `telegram_already_linked` today. Non-secret: it names
+    /// the class of refusal, never the customer holding the binding.
+    pairing_rejection_reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Row shape read from Postgres for `GET /admin/customers/{id}`.
+///
+/// Note the mapping `pairing_token → pairing_token_present`: SQL uses
+/// `(pairing_token IS NOT NULL) AS pairing_token_present` so the secret value
+/// never leaves the database. The column list is intentional — it makes
+/// the `SELECT` clause below reviewable for the "no secret columns" invariant.
+///
+/// Named `AdminCustomerRow` to avoid collision with the existing routing-side
+/// `CustomerRow` (`{id, status}` only) used by the Telegram inbound path.
+#[derive(Debug, sqlx::FromRow)]
+struct AdminCustomerRow {
+    id: Uuid,
+    name: String,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    telegram_chat_id: Option<i64>,
+    plan: String,
+    pairing_token_present: bool,
+    pairing_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pairing_rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pairing_rejection_reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<AdminCustomerRow> for GetCustomerResponse {
+    fn from(r: AdminCustomerRow) -> Self {
+        Self {
+            customer_id: r.id,
+            name: r.name,
+            bot_username: r.bot_username,
+            status: r.status,
+            paired_at: r.paired_at,
+            telegram_chat_id: r.telegram_chat_id,
+            plan: r.plan,
+            pairing_token_present: r.pairing_token_present,
+            pairing_expires_at: r.pairing_expires_at,
+            pairing_rejected_at: r.pairing_rejected_at,
+            pairing_rejection_reason: r.pairing_rejection_reason,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+/// Explicit column list — enforces the "no secret columns" invariant of the
+/// mika#1820 security contract. Kept as a named `const` so any drift is caught
+/// in code review as an edit to a security-labelled constant.
+///
+/// The SELECT list intentionally *never* names `bot_token`, `pairing_token`, or
+/// `webhook_secret`. `pairing_token` is projected only as `IS NOT NULL AS
+/// pairing_token_present` — see `CustomerRow` above.
+const CUSTOMER_SAFE_COLUMNS: &str = "id, name, bot_username, status, paired_at, \
+                                     telegram_chat_id, plan, \
+                                     (pairing_token IS NOT NULL) AS pairing_token_present, \
+                                     pairing_expires_at, \
+                                     pairing_rejected_at, pairing_rejection_reason, \
+                                     created_at, updated_at";
+
+/// Handle `GET /admin/customers/{customer_id}` — returns the safe customer view.
+///
+/// Auth: `MIKA_INTERNAL_TOKEN` bearer (via `require_bearer_token` middleware,
+/// same surface as `POST /admin/customers`).
+///
+/// Returns:
+/// - 200 with `GetCustomerResponse` on hit.
+/// - 404 with `{"error": "customer not found"}` when the id does not exist.
+/// - 500 with `{"error": "database error"}` on Postgres failure.
+async fn handle_get_customer(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let sql = format!("SELECT {CUSTOMER_SAFE_COLUMNS} FROM customers WHERE id = $1");
+    match sqlx::query_as::<_, AdminCustomerRow>(&sql)
+        .bind(customer_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(row)) => (StatusCode::OK, Json(GetCustomerResponse::from(row))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "customer not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(error = %e, %customer_id, "GET /admin/customers/{{id}} query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Query params for `GET /admin/customers`.
+///
+/// **Filter semantics (mika#1820 livrable 2):**
+/// - `status` — exact match against `customers.status` (e.g. `provisioned`,
+///   `active`, `suspended`). When absent, no status filter is applied.
+/// - `paired` — `true` requires `paired_at IS NOT NULL`; `false` requires
+///   `paired_at IS NULL`. When absent, no pairing filter is applied.
+/// - `stale_after_minutes` — when set, restricts to rows whose age exceeds N
+///   minutes (`now() - created_at > N minutes`). Useful for orphan sweeps.
+///
+/// The canonical orphan probe is `?status=provisioned&paired=false&stale_after_minutes=30`
+/// — the shape the mika-cloud dashboard-side polling depends on.
+#[derive(Debug, serde::Deserialize)]
+struct ListCustomersQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    paired: Option<bool>,
+    #[serde(default)]
+    stale_after_minutes: Option<i64>,
+}
+
+/// Item in the `GET /admin/customers` list response. Same "safe fields only"
+/// contract as `GetCustomerResponse` — surfaced as a compact summary tuned for
+/// orphan-sweep dashboards + operator alerting.
+#[derive(Debug, serde::Serialize)]
+struct CustomerSummary {
+    customer_id: Uuid,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    plan: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// Elapsed minutes since `created_at`, computed server-side so operators
+    /// don't have to subtract wall-clock in dashboards.
+    age_minutes: i64,
+}
+
+/// Row shape for `GET /admin/customers` list results.
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerListRow {
+    id: Uuid,
+    bot_username: Option<String>,
+    status: String,
+    paired_at: Option<chrono::DateTime<chrono::Utc>>,
+    plan: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    age_minutes: i64,
+}
+
+impl From<CustomerListRow> for CustomerSummary {
+    fn from(r: CustomerListRow) -> Self {
+        Self {
+            customer_id: r.id,
+            bot_username: r.bot_username,
+            status: r.status,
+            paired_at: r.paired_at,
+            plan: r.plan,
+            created_at: r.created_at,
+            age_minutes: r.age_minutes,
+        }
+    }
+}
+
+/// Response body for `GET /admin/customers`.
+#[derive(Debug, serde::Serialize)]
+struct ListCustomersResponse {
+    customers: Vec<CustomerSummary>,
+    count: usize,
+}
+
+/// Max rows returned per list call — cheap defence against unbounded scans on a
+/// customers table that could grow large. Orphan sweeps of realistic size fit
+/// comfortably; a saturating response is itself a signal to page or narrow the
+/// filter.
+const LIST_CUSTOMERS_LIMIT: i64 = 500;
+
+/// Handle `GET /admin/customers` — filtered list of customer summaries.
+///
+/// Auth: `MIKA_INTERNAL_TOKEN` bearer (shared surface with `POST /admin/customers`
+/// and `GET /admin/customers/{id}`).
+///
+/// Same secret-hygiene contract as `handle_get_customer`: never returns
+/// `bot_token`, `pairing_token`, or `webhook_secret`.
+async fn handle_list_customers(
+    State(state): State<AppState>,
+    Query(q): Query<ListCustomersQuery>,
+) -> impl IntoResponse {
+    // Build the WHERE clause dynamically. Every filter is a bound parameter —
+    // no string interpolation of user-supplied values reaches the SQL text.
+    let mut where_clauses: Vec<String> = Vec::new();
+    let mut next_param: usize = 1;
+
+    let status = q.status.as_deref();
+    if status.is_some() {
+        where_clauses.push(format!("status = ${next_param}"));
+        next_param += 1;
+    }
+
+    if let Some(paired) = q.paired {
+        if paired {
+            where_clauses.push("paired_at IS NOT NULL".to_string());
+        } else {
+            where_clauses.push("paired_at IS NULL".to_string());
+        }
+    }
+
+    // Negative / zero minutes would either match everything or nothing in
+    // confusing ways; treat `< 1` as "no stale filter" and log a debug hint so
+    // operators notice the input was ignored.
+    let stale_minutes = q.stale_after_minutes.filter(|m| *m > 0);
+    if stale_minutes.is_some() {
+        where_clauses.push(format!(
+            "(EXTRACT(EPOCH FROM (now() - created_at)) / 60) > ${next_param}"
+        ));
+        next_param += 1;
+    }
+    let _ = next_param; // silence unused-assign lint on the last increment
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT id, bot_username, status, paired_at, plan, created_at, \
+                CAST(FLOOR(EXTRACT(EPOCH FROM (now() - created_at)) / 60) AS BIGINT) AS age_minutes \
+         FROM customers{where_sql} \
+         ORDER BY created_at ASC \
+         LIMIT {LIST_CUSTOMERS_LIMIT}"
+    );
+
+    let mut query = sqlx::query_as::<_, CustomerListRow>(&sql);
+    if let Some(s) = status {
+        query = query.bind(s);
+    }
+    if let Some(m) = stale_minutes {
+        query = query.bind(m);
+    }
+
+    match query.fetch_all(&state.pool).await {
+        Ok(rows) => {
+            let customers: Vec<CustomerSummary> =
+                rows.into_iter().map(CustomerSummary::from).collect();
+            let count = customers.len();
+            (
+                StatusCode::OK,
+                Json(ListCustomersResponse { customers, count }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "GET /admin/customers query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// -- Token generation --
+
+/// Customer upsert used by `POST /admin/customers`.
+///
+/// Named so the mika-cloud#208 regression test can assert on it: the
+/// `provisioned` branch that mints a fresh pairing token must also clear any
+/// refusal verdict recorded against the previous one.
+const UPSERT_CUSTOMER_SQL: &str = r#"INSERT INTO customers (id, name, plan, timezone, status, bot_token, bot_username, webhook_secret, pairing_token, pairing_expires_at)
+           VALUES ($1, $2, $3, $4, 'provisioned', $5, $6, $7, $8, now() + make_interval(hours => $9))
+           ON CONFLICT (id) DO UPDATE SET
+               name = EXCLUDED.name,
+               bot_token = EXCLUDED.bot_token,
+               bot_username = EXCLUDED.bot_username,
+               -- Preserve the existing secret for active customers so the DB never
+               -- holds a secret Telegram doesn't yet have. The new secret is only
+               -- promoted after a successful setWebhook below (mika#1612).
+               webhook_secret = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.webhook_secret ELSE customers.webhook_secret END,
+               pairing_token = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_token ELSE customers.pairing_token END,
+               pairing_expires_at = CASE WHEN customers.status = 'provisioned' THEN EXCLUDED.pairing_expires_at ELSE customers.pairing_expires_at END,
+               -- A fresh pairing token starts a fresh attempt, so any refusal
+               -- recorded against the previous one is spent (mika-cloud#208).
+               -- Leaving it would show the console a refusal the user has not
+               -- made yet — the same class of stale-state lie this ticket
+               -- exists to remove. Cleared under the same condition that
+               -- promotes the new token, so an active customer's row is
+               -- untouched here.
+               pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejected_at END,
+               pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL ELSE customers.pairing_rejection_reason END
+           RETURNING status, pairing_token, (xmax = 0) AS was_inserted"#;
+
+/// Generate a cryptographic pairing token (32 random bytes, hex-encoded → 64 chars).
+fn generate_pairing_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Generate a webhook secret (32 random bytes, hex-encoded → 64 chars).
+fn generate_webhook_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+// -- Pairing --
+
+/// Validate pairing token format: must be 64-char hex (32 bytes hex-encoded).
+fn is_valid_pairing_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Handle /start <pairing_token> deep link for customer pairing.
+async fn handle_pairing(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    pairing_token: &str,
+    locale: Locale,
+) {
+    // Reject malformed tokens before hitting the database
+    if !is_valid_pairing_token(pairing_token) {
+        let _ = tg
+            .send_message(chat_id, copy::render(UserMessage::InvalidInvite, locale))
+            .await;
+        return;
+    }
+
+    // Atomic: only pairs if token valid, not expired, not already paired, status is 'provisioned'
+    let result = sqlx::query_as::<_, PairingResultRow>(
+        r#"UPDATE customers
+           SET telegram_chat_id = $1, paired_at = now(), status = 'active',
+               pairing_token = NULL, pairing_expires_at = NULL,
+               pairing_rejected_at = NULL, pairing_rejection_reason = NULL
+           WHERE pairing_token = $2
+             AND telegram_chat_id IS NULL
+             AND status = 'provisioned'
+             AND pairing_expires_at > now()
+           RETURNING id"#,
+    )
+    .bind(chat_id)
+    .bind(pairing_token)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match result {
+        Ok(Some(row)) => {
+            info!(customer_id = %row.id, chat_id, "customer paired successfully");
+
+            // Forward synthetic "Hello!" to container for onboarding
+            let url = container_url(&row.id, &state.agent_base_url, &state.agents_namespace);
+            let request_id = Uuid::new_v4().to_string();
+
+            let _ = state
+                .http_client
+                .post(format!("{url}/message"))
+                .bearer_auth(state.internal_token.expose_secret())
+                .json(&serde_json::json!({
+                    "text": "Hello!",
+                    "chat_id": chat_id,
+                    "channel": "telegram",
+                    "request_id": request_id
+                }))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await;
+        }
+        Ok(None) => {
+            // Don't reveal why — could be expired, used, or invalid. Same key as
+            // the malformed-token branch above: they were two identical literals
+            // before mika#2025 and are one key now.
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::InvalidInvite, locale))
+                .await;
+        }
+        Err(e) => {
+            if let Some(db_err) = e.as_database_error()
+                && db_err.code().as_deref() == Some("23505")
+            {
+                let already_linked = db_err
+                    .constraint()
+                    .is_some_and(|c| c.contains("telegram_chat_id"));
+
+                let msg = if already_linked {
+                    copy::render(UserMessage::TelegramAlreadyLinked, locale)
+                } else {
+                    copy::render(UserMessage::PairingFailed, locale)
+                };
+
+                // Record the guard's verdict so the console can show it
+                // (mika-cloud#208). The refusal is already decided — the
+                // constraint rejected the UPDATE and this row is unchanged.
+                // This write cannot alter that decision: it is fire-and-forget,
+                // a failure logs WARN and lets the refusal stand, and the
+                // message above is sent either way. Keyed on `pairing_token`
+                // so it lands on the row that was refused.
+                if already_linked {
+                    record_pairing_rejection(
+                        state,
+                        pairing_token,
+                        PAIRING_REJECTION_ALREADY_LINKED,
+                    )
+                    .await;
+                }
+
+                let _ = tg.send_message(chat_id, msg).await;
+                return;
+            }
+            warn!(error = %e, chat_id, "pairing query failed");
+            reply_transient_error(tg, chat_id, locale).await;
+        }
+    }
+}
+
+/// Closed reason vocabulary for a recorded pairing refusal (mika-cloud#208).
+///
+/// Mirrors the `customers_pairing_rejection_reason_check` CHECK constraint in
+/// `migrations/010_customers_pairing_rejection.sql`. Adding a member here means
+/// adding it there too — the constraint is what makes that a deliberate act.
+pub const PAIRING_REJECTION_ALREADY_LINKED: &str = "telegram_already_linked";
+
+/// SQL that records a pairing refusal on the row bearing the presented token.
+pub const RECORD_PAIRING_REJECTION_SQL: &str = "UPDATE customers \
+                                                SET pairing_rejected_at = now(), \
+                                                    pairing_rejection_reason = $1 \
+                                                WHERE pairing_token = $2";
+
+/// Write the guard's refusal verdict to the customer row (mika-cloud#208).
+///
+/// Fire-and-forget by design: the refusal has already been decided by the
+/// `telegram_chat_id UNIQUE` constraint before this is called, and nothing here
+/// can change it. A failed write logs WARN and leaves the refusal standing —
+/// the user still receives the refusal message. Never call this on a path that
+/// did not just refuse a pairing.
+async fn record_pairing_rejection(state: &AppState, pairing_token: &str, reason: &str) {
+    match sqlx::query(RECORD_PAIRING_REJECTION_SQL)
+        .bind(reason)
+        .bind(pairing_token)
+        .execute(&state.pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() == 0 => {
+            warn!(
+                reason,
+                "pairing rejection recorded on no row — token not found"
+            );
+        }
+        Ok(_) => {
+            info!(
+                reason,
+                "pairing refused by one-telegram-one-mika; verdict recorded"
+            );
+        }
+        Err(e) => {
+            // The refusal stands. Only its visibility is lost.
+            warn!(error = %e, reason, "failed to record pairing rejection verdict");
+        }
+    }
+}
+
+// -- /unlink self-service (mika#1749) --
+
+/// Handle `/unlink` — the paired user asks to release their own binding.
+///
+/// If the chat_id is not paired to any customer, replies "not linked" and returns.
+/// If paired, replies with a warning message telling the user to send
+/// `/unlink confirm` to commit. This handler NEVER mutates the DB — the
+/// confirmation happens in `handle_unlink_confirm`.
+///
+/// `unrecognized_suffix` (mika#2025) separates three states the handler used to
+/// answer identically: a first `/unlink`, a repeated one, and a confirmation the
+/// user *tried* and misspelled. Only the third gets a different reply — the
+/// first two are the same request and the same answer. The `Ok(None)` branch
+/// comes first and is untouched: "you are not linked" precedes the question of
+/// what the suffix said.
+async fn handle_unlink(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    unrecognized_suffix: Option<&str>,
+    locale: Locale,
+) {
+    let row = sqlx::query_scalar::<_, Uuid>("SELECT id FROM customers WHERE telegram_chat_id = $1")
+        .bind(chat_id)
+        .fetch_optional(&state.pool)
+        .await;
+
+    match row {
+        Ok(Some(_)) => match unrecognized_suffix {
+            Some(suffix) => {
+                // mika#2025 D6 — the refused suffix is NEVER logged: it is user
+                // content, at the standard mika#2126 set and mika#2291 restated.
+                // It is quoted to the user, not to the operator. Expected regime
+                // NON-empty: this line is the measurement of whether the
+                // `confirmer` alias covers the forms people actually type.
+                info!(
+                    event = "unlink_suffix_unrecognized",
+                    chat_id,
+                    locale = locale.as_str(),
+                    "user sent /unlink with a suffix that is not a confirmation"
+                );
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        &copy::render_unlink_suffix_unrecognized(suffix, locale),
+                    )
+                    .await;
+            }
+            None => {
+                let _ = tg
+                    .send_message(chat_id, copy::render(UserMessage::UnlinkWarning, locale))
+                    .await;
+            }
+        },
+        Ok(None) => {
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::UnlinkNotLinked, locale))
+                .await;
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "unlink lookup query failed");
+            reply_transient_error(tg, chat_id, locale).await;
+        }
+    }
+}
+
+/// Handle `/unlink confirm` — commit the self-unlink. Atomic UPDATE releases
+/// `telegram_chat_id`. Idempotent: if the chat_id is already unbound (or cold
+/// `/unlink confirm` without prior `/unlink`), replies "nothing to unlink."
+async fn handle_unlink_confirm(
+    state: &AppState,
+    tg: &CustomerTelegramClient,
+    chat_id: i64,
+    locale: Locale,
+) {
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE customers SET telegram_chat_id = NULL WHERE telegram_chat_id = $1 RETURNING id",
+    )
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match result {
+        Ok(Some(customer_id)) => {
+            info!(
+                customer_id = %customer_id,
+                chat_id,
+                "customer self-unlinked telegram binding"
+            );
+            let _ = tg
+                .send_message(chat_id, copy::render(UserMessage::UnlinkConfirmed, locale))
+                .await;
+        }
+        Ok(None) => {
+            let _ = tg
+                .send_message(
+                    chat_id,
+                    copy::render(UserMessage::UnlinkNothingToUnlink, locale),
+                )
+                .await;
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, "unlink confirm query failed");
+            reply_transient_error(tg, chat_id, locale).await;
+        }
+    }
+}
+
+// -- Bearer auth middleware --
+
+/// Middleware: validates `Authorization: Bearer <token>` using constant-time comparison.
+async fn require_bearer_token(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if constant_time_eq(t, state.internal_token.expose_secret()) => {
+            next.run(req).await.into_response()
+        }
+        _ => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// mika#2360 — middleware for the admin READ-ONLY scope.
+///
+/// Branches, in this order:
+/// 1. route not armed (`admin_read_token == None`) → 404, before any header
+///    is read — the answer on an unconfigured route must not depend on the
+///    client's input;
+/// 2. header absent / not `Bearer ` → 403;
+/// 3. token is the admin read token → pass;
+/// 4. token is the *write* internal token → 403 + WARN (authenticated, not
+///    authorized — AC2 "wrong scope"). The bearer of the internal token is
+///    already superuser on `/admin/*`; refusing it here removes no privilege,
+///    it only means an operator who inspects no longer needs to hold the write
+///    secret;
+/// 5. anything else → 403.
+///
+/// AC2 of mika#2360 asks for 403 on all three refusals (absent / unknown /
+/// write scope). The sibling `require_bearer_token` answers 401 on absent and
+/// unknown; the AC is followed literally here, and the two tests
+/// `admin_read_rejects_missing_header_with_403` /
+/// `admin_read_rejects_unknown_token_with_403` pin that choice so it is
+/// decided, not drifted. Flipping to 401 is one line per branch.
+async fn require_admin_read_token(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> impl IntoResponse {
+    let Some(read_token) = state.admin_read_token.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if constant_time_eq(t, read_token.expose_secret()) => {
+            next.run(req).await.into_response()
+        }
+        Some(t) if constant_time_eq(t, state.internal_token.expose_secret()) => {
+            warn!(
+                path = %req.uri().path(),
+                "mika#2360: internal (write) token presented on the admin read-only \
+                 route — refused; use MIKA_GATEWAY_ADMIN_READ_TOKEN"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "admin read scope required"})),
+            )
+                .into_response()
+        }
+        Some(_) | None => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin read token required"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Query params forwarded to the tenant by
+/// `GET /admin/tenants/{customer_id}/recurring-tasks` — an allowlist, never an
+/// opaque passthrough: a parameter the tenant handler does not know today
+/// but might tomorrow must not become reachable without a line changing here.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct AdminRecurringQuery {
+    pub agent_id: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+impl AdminRecurringQuery {
+    /// Encode the allowlisted params for the tenant hop.
+    pub(crate) fn to_query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = Vec::with_capacity(3);
+        if let Some(a) = &self.agent_id {
+            pairs.push(("agent_id", a.clone()));
+        }
+        if let Some(p) = self.page {
+            pairs.push(("page", p.to_string()));
+        }
+        if let Some(p) = self.per_page {
+            pairs.push(("per_page", p.to_string()));
+        }
+        pairs
+    }
+}
+
+/// `GET /admin/tenants/{customer_id}/recurring-tasks` (mika#2360) — proxy the
+/// tenant's read-only recurring registry (`GET /api/v1/recurring-tasks` on the
+/// pod) to an operator holding the admin READ token.
+///
+/// `customer_id` is validated **before** any URL is built (T5/R12):
+/// `Path<Uuid>` rejects a non-UUID with 400 in the extractor, and an unknown
+/// UUID answers 404 without forwarding. Both matter: the internal hop carries
+/// `Bearer {internal_token}`, and `container_url_str` interpolates its argument
+/// into a hostname without validating it — on this route no per-customer API
+/// key constrains the argument the way the A2A paths are constrained, so the
+/// validation has to live here. A DB failure on the lookup answers 503 and
+/// never forwards.
+///
+/// Each served call writes one `audit_events` row (`gateway_admin_read`,
+/// `tenant:{uuid}`) — "who read Al's registry, and when" must be a SQL query.
+/// Fire-and-forget: an audit failure logs a WARN and does not change the
+/// response (a read must not depend on a write).
+async fn handle_admin_tenant_recurring_tasks(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    Query(q): Query<AdminRecurringQuery>,
+) -> Response {
+    // R12 term 2 — resolve in `customers` before any interpolation.
+    match sqlx::query_scalar::<_, i32>("SELECT 1 FROM customers WHERE id = $1")
+        .bind(customer_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "customer not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: customer lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    }
+
+    info!(%customer_id, "mika#2360: admin read of tenant recurring registry");
+    crate::audit_events::log_admin_read(
+        &state.pool,
+        &customer_id,
+        crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS,
+    )
+    .await;
+
+    forward_recurring_registry(&state, &customer_id, &q).await
+}
+
+/// The tenant hop of [`handle_admin_tenant_recurring_tasks`], split out so the
+/// forwarding contract (internal bearer, allowlisted query, 502 on any
+/// upstream failure) is testable against a fake upstream without Postgres.
+/// Callers MUST have validated `customer_id` first — this function trusts it.
+pub(crate) async fn forward_recurring_registry(
+    state: &AppState,
+    customer_id: &Uuid,
+    q: &AdminRecurringQuery,
+) -> Response {
+    let container = container_url_str(
+        &customer_id.to_string(),
+        state.agent_base_url.as_deref(),
+        &state.agents_namespace,
+    );
+    let forward_url = format!("{container}/api/v1/recurring-tasks");
+
+    let resp = match state
+        .http_client
+        .get(&forward_url)
+        .query(&q.to_query_pairs())
+        .header(
+            "authorization",
+            format!("Bearer {}", state.internal_token.expose_secret()),
+        )
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: tenant unreachable");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "tenant unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = resp.status();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin recurring-tasks: failed to read tenant response");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "failed to read tenant response"})),
+            )
+                .into_response();
+        }
+    };
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+// ── mika#2387 — GET /admin/tenants/{customer_id}/outbound-messages ───────────
+//
+// Unlike its mika#2360 sibling this is NOT a proxy: `outbound_messages` is the
+// gateway's own table, so the query is *executed* here rather than forwarded.
+// Three consequences shape everything below: the internal token never leaves
+// the process on this path, the pagination cap is the gateway's own
+// responsibility (an unbounded `per_page` is a denial of service on its own
+// database), and the parameters are validated before they can reach SQL.
+
+/// The four metadata fields this endpoint is allowed to publish — the whole of
+/// `outbound_messages` today (`migrations/002_outbound_messages.sql`).
+///
+/// **This is an allowlist by exact equality, never a blacklist.** A blacklist
+/// (`!body.contains("text")`) is true today and would stay true the day someone
+/// adds a `message_snippet` column and exposes it: it cannot see what it did not
+/// anticipate, which is precisely the case it exists to catch. Two independent
+/// guards read this constant — one on the serialized response keys, one on the
+/// SQL projection — because the struct alone would not see a switch to
+/// `serde_json::Value`, and the projection alone would not see a field added to
+/// the struct.
+///
+/// **If either guard ever goes red, the fix is never to add the new key here.**
+/// Publishing a new column on this endpoint is a data-exposure decision that
+/// belongs to the operator and its own ticket; red is the correct behaviour
+/// until then.
+///
+/// `#[cfg(test)]` on purpose: this is the reference the guards fire *at*, not a
+/// production datum. Production carries two **independent** declarations — the
+/// fields of [`OutboundMessageRow`] and the columns of
+/// [`OUTBOUND_MESSAGES_SELECT_LIST`] — and it is exactly their independence
+/// that makes two guards worth more than one. Deriving either from this array
+/// would collapse them into a single point and cost the check its value.
+#[cfg(test)]
+pub(crate) const OUTBOUND_MESSAGE_METADATA_FIELDS: [&str; 4] =
+    ["telegram_message_id", "chat_id", "agent_name", "created_at"];
+
+/// The SQL projection, spelled out. `SELECT *` is proscribed here: it would
+/// make a future migration, on its own, publish a new column.
+pub(crate) const OUTBOUND_MESSAGES_SELECT_LIST: &str =
+    "telegram_message_id, chat_id, agent_name, created_at";
+
+/// Default page size, and the hard cap the gateway applies to its own database.
+pub(crate) const OUTBOUND_DEFAULT_PER_PAGE: u32 = 100;
+pub(crate) const OUTBOUND_MAX_PER_PAGE: u32 = 1000;
+
+/// Default lower bound when `since` is omitted: the whole retention window.
+/// `cleanup_old_outbound_messages` purges anything older, so the default cannot
+/// return less than everything the table can hold.
+pub(crate) const OUTBOUND_RETENTION_DAYS: i64 = 7;
+
+/// One row of the send history. Metadata only — the table carries no content
+/// column, and this struct is the guard that keeps it that way.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub(crate) struct OutboundMessageRow {
+    pub telegram_message_id: i64,
+    pub chat_id: i64,
+    pub agent_name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Response envelope. `has_more` rather than `total`: it comes free from
+/// `LIMIT per_page + 1`, where a total would cost a second `COUNT(*)` for a
+/// number nobody needs over a seven-day window.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct OutboundMessagesResponse {
+    pub items: Vec<OutboundMessageRow>,
+    pub page: u32,
+    pub per_page: u32,
+    pub has_more: bool,
+}
+
+/// Query parameters — an allowlist, like its mika#2360 sibling: anything else
+/// is dropped at deserialization.
+///
+/// `since` / `until` are `String` rather than a date type on purpose: a typed
+/// field would be refused by the extractor with a message that does not name
+/// the offending value, and the refusal would not be ours to shape.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct AdminOutboundQuery {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// The resolved time window. `until == None` means "no upper bound".
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OutboundWindow {
+    pub since: chrono::DateTime<chrono::Utc>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What the handler is allowed to do once `customers.telegram_chat_id` is read.
+///
+/// `outbound_messages` carries no `customer_id`; the tenant link is `chat_id`,
+/// and that column is nullable (a provisioned-but-unpaired tenant, or one
+/// unlinked by `POST /admin/customers/{id}/unlink`). The reflex "optional
+/// filter" — `WHERE ($1::bigint IS NULL OR chat_id = $1)` — returns **every row
+/// of every tenant** for such a tenant. Its competitor, `WHERE chat_id = $1`
+/// with a NULL bind, returns nothing, which is right by accident rather than by
+/// design. Neither decides: a `None` short-circuits before any query is built,
+/// so no nullable value ever reaches a `WHERE` clause.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OutboundScope {
+    /// The tenant has a chat: query, filtered on this value.
+    Query(i64),
+    /// No chat: an empty list, and `outbound_messages` is never touched. Not an
+    /// error — the tenant exists and has sent nothing on Telegram.
+    EmptyWithoutQuery,
+}
+
+/// R7/D6 — the fail-closed decision, as a pure function so CI can hold it
+/// without a database (the crate's integration tests are all `#[ignore]`).
+pub(crate) fn outbound_scope(telegram_chat_id: Option<i64>) -> OutboundScope {
+    match telegram_chat_id {
+        Some(chat_id) => OutboundScope::Query(chat_id),
+        None => OutboundScope::EmptyWithoutQuery,
+    }
+}
+
+/// Page size, clamped to `[1, OUTBOUND_MAX_PER_PAGE]`. The cap is the
+/// gateway's because the gateway runs the query (mika#2360 only relayed it).
+pub(crate) fn clamp_per_page(requested: Option<u32>) -> u32 {
+    requested
+        .unwrap_or(OUTBOUND_DEFAULT_PER_PAGE)
+        .clamp(1, OUTBOUND_MAX_PER_PAGE)
+}
+
+/// Page number, 1-based. A `0` is a caller's off-by-one, not a request for
+/// page zero.
+pub(crate) fn clamp_page(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(1).max(1)
+}
+
+/// Accepted `since` / `until` spellings, quoted verbatim in the 400 body.
+const OUTBOUND_TIMESTAMP_FORMS: &str = "RFC 3339 (2026-09-17T00:00:00Z), a naive timestamp (2026-09-17T00:00:00) or a bare date (2026-09-17), all read as UTC";
+
+/// Parse one bound. RFC 3339 first; a naive timestamp and a bare date are
+/// accepted as UTC because an operator inspecting an incident types
+/// `since=2026-09-17`, and refusing that on a deadline-bound endpoint is
+/// friction with nothing behind it. Detection is permissive, the decision is
+/// not: anything else is refused rather than defaulted.
+fn parse_bound(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    if let Ok(naive) = raw.parse::<chrono::NaiveDateTime>() {
+        return Some(naive.and_utc());
+    }
+    if let Ok(date) = raw.parse::<chrono::NaiveDate>() {
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc());
+    }
+    None
+}
+
+/// D2 — resolve the window, or say why it cannot be resolved.
+///
+/// An unreadable bound is a **400 quoting the offending value**, never a silent
+/// fallback to the default: replacing `since=2026-09-17` by "seven days ago"
+/// would have the operator believe they are counting sends since the 17th while
+/// they are counting since the 11th — an instrument lying about its own window,
+/// on the very ticket whose purpose is to count sends inside a window.
+///
+/// An empty window (`until <= since`) is a 400 too, not an empty list: an empty
+/// list reads as "this tenant sent nothing", which is a false answer to a
+/// badly-posed question.
+pub(crate) fn resolve_window(
+    since: Option<&str>,
+    until: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<OutboundWindow, String> {
+    let since = match since {
+        None => now - chrono::Duration::days(OUTBOUND_RETENTION_DAYS),
+        Some(raw) => parse_bound(raw).ok_or_else(|| {
+            format!("unreadable `since`: {raw:?} — expected {OUTBOUND_TIMESTAMP_FORMS}")
+        })?,
+    };
+    let until = match until {
+        None => None,
+        Some(raw) => Some(parse_bound(raw).ok_or_else(|| {
+            format!("unreadable `until`: {raw:?} — expected {OUTBOUND_TIMESTAMP_FORMS}")
+        })?),
+    };
+
+    if let Some(until) = until
+        && until <= since
+    {
+        return Err(format!(
+            "empty window: `until` ({until:?}) is not after `since` ({since:?})"
+        ));
+    }
+
+    Ok(OutboundWindow { since, until })
+}
+
+/// `GET /admin/tenants/{customer_id}/outbound-messages` (mika#2387) — the
+/// tenant's outbound-send history, metadata only, to an operator holding the
+/// admin READ token.
+///
+/// Order of operations is load-bearing (D7): **validate, then resolve, then
+/// read**. A malformed `since` must not reach the database before being
+/// refused, and — since CI provisions no Postgres for this crate — putting the
+/// parse after the tenant lookup would also make the 400 untestable in CI,
+/// because the lazy pool answers 503 first. Good design and testability push
+/// the same way here.
+///
+/// Retention: `cleanup_old_outbound_messages` purges rows older than seven
+/// days. An absence in this response past that horizon says nothing about what
+/// was sent.
+async fn handle_admin_tenant_outbound_messages(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+    Query(q): Query<AdminOutboundQuery>,
+) -> Response {
+    // 1. Parameters, before any database access (D7).
+    let window = match resolve_window(q.since.as_deref(), q.until.as_deref(), chrono::Utc::now()) {
+        Ok(w) => w,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
+    let per_page = clamp_per_page(q.per_page);
+    let page = clamp_page(q.page);
+
+    // 2. Resolve the tenant, and with it the only chat_id this read may see.
+    let chat_id = match sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT telegram_chat_id FROM customers WHERE id = $1",
+    )
+    .bind(customer_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(chat_id)) => chat_id,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "customer not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // Never an empty list here: that would read as "this tenant sent
+            // nothing" when the truth is "the gateway could not look".
+            error!(error = %e, %customer_id, "admin outbound-messages: customer lookup failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    info!(%customer_id, "mika#2387: admin read of tenant outbound-send history");
+    crate::audit_events::log_admin_read(
+        &state.pool,
+        &customer_id,
+        crate::audit_events::ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
+    )
+    .await;
+
+    // 3. The fail-closed decision — no nullable chat_id ever reaches a WHERE.
+    let chat_id = match outbound_scope(chat_id) {
+        OutboundScope::Query(chat_id) => chat_id,
+        OutboundScope::EmptyWithoutQuery => {
+            return Json(OutboundMessagesResponse {
+                items: Vec::new(),
+                page,
+                per_page,
+                has_more: false,
+            })
+            .into_response();
+        }
+    };
+
+    // `has_more` for free: ask for one row past the page and truncate.
+    let limit = i64::from(per_page) + 1;
+    let offset = i64::from(page - 1) * i64::from(per_page);
+
+    // The upper bound uses COALESCE onto `infinity` rather than the
+    // `($n IS NULL OR ...)` shape deliberately: on `chat_id` that shape is the
+    // cross-tenant leak described on `OutboundScope`, and it should not be
+    // spelled anywhere on this query — even where it would be harmless.
+    //
+    // ORDER BY is total. The PK is `(telegram_message_id, chat_id)` and a burst
+    // of sends shares `created_at` to the millisecond; without the tiebreak,
+    // OFFSET pagination can duplicate or skip a row across pages — and a burst
+    // of near-simultaneous sends is exactly what mika#2358 is counting.
+    let sql = format!(
+        "SELECT {OUTBOUND_MESSAGES_SELECT_LIST} \
+         FROM outbound_messages \
+         WHERE chat_id = $1 \
+           AND created_at >= $2 \
+           AND created_at < COALESCE($3::timestamptz, 'infinity'::timestamptz) \
+         ORDER BY created_at DESC, telegram_message_id DESC \
+         LIMIT $4 OFFSET $5"
+    );
+
+    let mut items = match sqlx::query_as::<_, OutboundMessageRow>(&sql)
+        .bind(chat_id)
+        .bind(window.since)
+        .bind(window.until)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!(error = %e, %customer_id, "admin outbound-messages: query failed");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "database unavailable"})),
+            )
+                .into_response();
+        }
+    };
+
+    let has_more = items.len() > per_page as usize;
+    items.truncate(per_page as usize); // safe-byte-slice: Vec — element count (pagination), no char boundary
+
+    Json(OutboundMessagesResponse {
+        items,
+        page,
+        per_page,
+        has_more,
+    })
+    .into_response()
+}
+
+// -- Send handler --
+
+/// Format outbound Telegram text: prepend `[<agent_name>] ` for identification in
+/// multi-agent setups, EXCEPT when the sender is the container's default agent
+/// (`mika-common::agent::DEFAULT_AGENT`, `"mika"`). Single-agent customers —
+/// including every family-tier customer — see the raw text with no `[mika]`
+/// prefix on Telegram. Multi-agent customers who name additional agents
+/// (`work-mika`, `personal-mika`, etc.) still get the identification prefix on
+/// those non-default agents.
+///
+/// This is a rendering-layer decision only. The agent's outbound content is
+/// unchanged in its own DB, and `outbound_messages` still records `agent_name`
+/// for reply-to-message routing (`parse_agent_prefix` on inbound continues to
+/// tolerate both prefixed and unprefixed shapes for backwards compat with
+/// pre-fix history + non-default agents).
+///
+/// Founding incident: mika-cloud family-tier launch 2026-07-16 — the `[mika]`
+/// prefix leaked into a family member's first-hour Telegram greeting, breaking
+/// the persona's "warm, French, no jargon" contract before she even said
+/// hello. Pure function so the branch is unit-testable without HTTP scaffolding.
+fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
+    match agent_name {
+        Some(name) if name != mika_common::agent::DEFAULT_AGENT => {
+            format!("[{name}] {text}")
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// POST /send — containers deliver outbound messages to Telegram.
+///
+/// Authenticated via `require_bearer_token` middleware.
+#[utoipa::path(
+    post,
+    path = "/send",
+    request_body = SendPayload,
+    responses(
+        (status = 200, description = "Message sent to Telegram"),
+        (status = 400, description = "Invalid payload (empty or oversized text)"),
+        (status = 401, description = "Missing or invalid Bearer token"),
+        (status = 410, description = "Bot blocked by user"),
+        (status = 429, description = "Telegram rate limit exceeded"),
+        (status = 502, description = "Telegram API error"),
+    ),
+    security(("bearer" = []))
+)]
+pub(crate) async fn handle_send(
+    State(state): State<AppState>,
+    Json(payload): Json<SendPayload>,
+) -> impl IntoResponse {
+    // Validate payload
+    if payload.text.is_empty() || payload.text.len() > 50_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "text must be 1-50000 bytes"})),
+        )
+            .into_response();
+    }
+
+    // Validate chat_id is a usable Telegram identifier (positive for private chats,
+    // negative for groups/channels — but never zero, which is an invalid sentinel).
+    if payload.chat_id == 0 {
+        tracing::warn!(
+            agent_name = ?payload.agent_name,
+            request_id = ?payload.request_id,
+            "chat_id=0 POST received at /send — agent should use NoChannel path"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "chat_id must be non-zero"})),
+        )
+            .into_response();
+    }
+
+    // Validate agent_name format (defense-in-depth at trust boundary)
+    // Mirrors mika-common validate_agent_name: lowercase alphanumeric + hyphens, max 32 chars,
+    // no leading/trailing hyphens, no consecutive hyphens.
+    if let Some(ref name) = payload.agent_name
+        && (name.is_empty()
+            || name.len() > 32
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || name.starts_with('-')
+            || name.ends_with('-')
+            || name.contains("--"))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid agent_name: must be 1-32 lowercase alphanumeric chars or hyphens, no leading/trailing/consecutive hyphens"})),
+        )
+            .into_response();
+    }
+
+    // Render outbound text via the pure helper so the branch is unit-testable.
+    let owned_text = format_outbound_text(payload.agent_name.as_deref(), &payload.text);
+    let text_to_send = &owned_text;
+
+    // Resolve the Telegram client: per-customer bot token if customer_id is provided,
+    // otherwise fall back to the global single-bot client.
+    let tg_client: CustomerTelegramClient = if let Some(cid) = payload.customer_id {
+        // Per-customer: look up bot token by primary key
+        match sqlx::query_scalar::<_, Option<String>>(
+            "SELECT bot_token FROM customers WHERE id = $1",
+        )
+        .bind(cid)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(Some(Some(token))) => {
+                CustomerTelegramClient::new(state.http_client.clone(), SecretString::from(token))
+            }
+            Ok(Some(None)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "customer has no bot_token configured"})),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "customer not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                error!(error = %e, %cid, "customer lookup failed for /send");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    } else {
+        // Backward compat: use global single-bot client
+        match state.telegram.as_ref() {
+            Some(global_tg) => {
+                CustomerTelegramClient::new(state.http_client.clone(), global_tg.bot_token_cloned())
+            }
+            None => {
+                warn!(
+                    agent_name = ?payload.agent_name,
+                    chat_id = payload.chat_id,
+                    request_id = ?payload.request_id,
+                    "send failed: no customer_id provided and no global Telegram client configured"
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "no customer_id provided and gateway is not in single-bot mode"})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Send to Telegram (no message splitting — send as-is)
+    match tg_client.send_message(payload.chat_id, text_to_send).await {
+        Ok(message_id) => {
+            info!(chat_id = payload.chat_id, request_id = ?payload.request_id, telegram_message_id = message_id, "sent to telegram");
+
+            // Store outbound message mapping for reply routing
+            if let Some(ref name) = payload.agent_name
+                && let Err(e) = sqlx::query(
+                    "INSERT INTO outbound_messages (telegram_message_id, chat_id, agent_name) VALUES ($1, $2, $3)",
+                )
+                .bind(message_id)
+                .bind(payload.chat_id)
+                .bind(name)
+                .execute(&state.pool)
+                .await
+            {
+                warn!(
+                    error = %e,
+                    chat_id = payload.chat_id,
+                    telegram_message_id = message_id,
+                    agent_name = %name,
+                    "failed to store outbound message mapping — reply routing will not work for this message"
+                );
+            }
+
+            StatusCode::OK.into_response()
+        }
+        Err(TelegramApiError::BotBlocked) => {
+            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, "bot blocked by user");
+            StatusCode::GONE.into_response()
+        }
+        Err(TelegramApiError::RateLimited { retry_after }) => {
+            let mut resp_headers = HeaderMap::new();
+            if let Some(secs) = retry_after {
+                resp_headers.insert("retry-after", HeaderValue::from(secs));
+            }
+            (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
+        }
+        Err(e) => {
+            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, error = %e, "telegram send failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct SendPayload {
+    chat_id: i64,
+    text: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    /// Customer ID for per-customer bot token lookup.
+    /// When present, the gateway looks up the customer's bot token and sends
+    /// via their bot. When absent, falls back to the global single-bot client.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    customer_id: Option<Uuid>,
+    /// Agent name for identification in multi-agent setups.
+    /// When present, outbound messages are prefixed with `[agent_name]`.
+    #[serde(default)]
+    agent_name: Option<String>,
+}
+
+// -- Health handlers --
+
+/// GET /livez — Liveness probe (no auth, no DB).
+///
+/// Returns 200 unconditionally — the fact that HTTP is responding proves liveness.
+/// Readiness (ready flag + DB) is checked by /readyz.
+#[utoipa::path(
+    get,
+    path = "/livez",
+    responses(
+        (status = 200, description = "Process is alive"),
+    )
+)]
+pub(crate) async fn handle_liveness() -> StatusCode {
+    StatusCode::OK
+}
+
+/// GET /readyz, /health — Readiness probe (no auth).
+///
+/// Returns 200 if ready and Postgres is reachable, 503 otherwise.
+#[utoipa::path(
+    get,
+    path = "/readyz",
+    responses(
+        (status = 200, description = "Ready and database reachable"),
+        (status = 503, description = "Not ready or database unreachable"),
+    )
+)]
+pub(crate) async fn handle_readiness(State(state): State<AppState>) -> StatusCode {
+    if !state.ready.load(Ordering::Acquire) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => StatusCode::OK,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+// -- DLQ endpoints --
+
+/// Query parameters for DLQ list endpoint.
+#[derive(serde::Deserialize)]
+pub(crate) struct DlqListParams {
+    /// Filter by status: "pending", "dead", or omit for both.
+    pub status: Option<String>,
+    /// Max entries to return (default 100).
+    pub limit: Option<i64>,
+}
+
+/// GET /webhook/dlq — List DLQ entries (pending + dead by default).
+pub(crate) async fn handle_dlq_list(
+    State(state): State<AppState>,
+    Query(params): Query<DlqListParams>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(100).min(1000);
+    match crate::dlq::list_deliveries(&state.pool, params.status.as_deref(), limit).await {
+        Ok(rows) => Json(serde_json::json!({
+            "deliveries": rows,
+            "count": rows.len(),
+        }))
+        .into_response(),
+        Err(e) => {
+            error!(error = %e, "DLQ list query failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// POST /webhook/dlq/{delivery_id}/replay — Replay a single DLQ entry.
+pub(crate) async fn handle_dlq_replay(
+    State(state): State<AppState>,
+    Path(delivery_id): Path<String>,
+) -> impl IntoResponse {
+    match crate::dlq::replay_delivery(&state, &delivery_id).await {
+        Ok(Some(delivery)) => Json(serde_json::json!({
+            "delivery": delivery,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            error!(delivery_id = %delivery_id, error = %e, "DLQ replay failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Response for the replay-all endpoint.
+#[derive(serde::Serialize)]
+struct ReplayAllResponse {
+    succeeded: u32,
+    failed: u32,
+    total: u32,
+}
+
+/// POST /webhook/dlq/replay-all — Replay all dead DLQ entries.
+pub(crate) async fn handle_dlq_replay_all(State(state): State<AppState>) -> impl IntoResponse {
+    match crate::dlq::replay_all_dead(&state).await {
+        Ok((succeeded, failed)) => Json(ReplayAllResponse {
+            succeeded,
+            failed,
+            total: succeeded + failed,
+        })
+        .into_response(),
+        Err(e) => {
+            error!(error = %e, "DLQ replay-all failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// -- Reply routing --
+
+/// Look up the agent that sent a specific outbound message, for reply routing.
+/// Returns `None` if no reply context, or if the lookup fails (best-effort).
+async fn resolve_reply_agent(
+    state: &AppState,
+    chat_id: i64,
+    reply_to_message_id: Option<i64>,
+    reply_to_text: Option<&str>,
+) -> Option<String> {
+    // Primary: parse [agent_name] from the replied-to message text
+    if let Some(text) = reply_to_text
+        && let Some(agent) = parse_agent_prefix(text)
+    {
+        debug!(chat_id, agent = %agent, "reply routing: resolved agent from text prefix");
+        return Some(agent);
+    }
+
+    // Fallback: DB lookup (outbound_messages)
+    let msg_id = reply_to_message_id?;
+    match sqlx::query_scalar::<_, String>(
+        "SELECT agent_name FROM outbound_messages WHERE telegram_message_id = $1 AND chat_id = $2",
+    )
+    .bind(msg_id)
+    .bind(chat_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(opt) => {
+            if let Some(ref agent) = opt {
+                debug!(chat_id, telegram_message_id = msg_id, agent = %agent, "reply routing: resolved agent");
+            }
+            opt
+        }
+        Err(e) => {
+            warn!(error = %e, chat_id, telegram_message_id = msg_id, "reply agent lookup failed");
+            None
+        }
+    }
+}
+
+/// Purge outbound message mappings older than 7 days.
+/// Called periodically from webhook handler to avoid unbounded table growth.
+async fn cleanup_old_outbound_messages(state: &AppState) {
+    if let Err(e) = sqlx::query(
+        "DELETE FROM outbound_messages WHERE ctid IN (SELECT ctid FROM outbound_messages WHERE created_at < now() - interval '7 days' LIMIT 1000)",
+    )
+    .execute(&state.pool)
+    .await
+    {
+        debug!(error = %e, "outbound_messages cleanup failed");
+    }
+}
+
+// -- Helpers --
+
+/// Constant-time string comparison using the `subtle` crate.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+/// Classify a forwarding error into a user-facing reply message.
+/// Connect errors (connection refused, DNS failure) indicate the agent is offline.
+/// Other errors (timeout, broken pipe) are transient.
+///
+/// The two `const`s this used to select between are now `copy::` keys
+/// (mika#2025): the classification was already a pure function, so it was the
+/// exact anchor for the branch and keeps its shape.
+fn forward_error_message(is_connect: bool, locale: Locale) -> &'static str {
+    if is_connect {
+        copy::render(UserMessage::AgentOffline, locale)
+    } else {
+        copy::render(UserMessage::TransientError, locale)
+    }
+}
+
+/// Send a generic transient error reply (fire-and-forget).
+async fn reply_transient_error(tg: &CustomerTelegramClient, chat_id: i64, locale: Locale) {
+    let _ = tg
+        .send_message(chat_id, copy::render(UserMessage::TransientError, locale))
+        .await;
+}
+
+// -- DB row types (for sqlx runtime queries) --
+
+#[derive(Debug, sqlx::FromRow)]
+struct CustomerRow {
+    id: Uuid,
+    status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PairingResultRow {
+    id: Uuid,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_health_probe() {
+        assert!(is_health_probe("/health"));
+        assert!(is_health_probe("/readyz"));
+        assert!(is_health_probe("/livez"));
+        assert!(is_health_probe("/version"));
+        assert!(!is_health_probe("/webhook/telegram"));
+        assert!(!is_health_probe("/send"));
+        assert!(!is_health_probe("/a2a/customer/agent"));
+        assert!(!is_health_probe("/healthy")); // substring mismatch
+        assert!(!is_health_probe("/"));
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq("secret", "secret"));
+        assert!(!constant_time_eq("secret", "wrong"));
+        assert!(!constant_time_eq("short", "longer_string"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn test_is_valid_pairing_token() {
+        let valid = generate_pairing_token();
+        assert!(is_valid_pairing_token(&valid));
+        assert!(!is_valid_pairing_token("too-short"));
+        assert!(!is_valid_pairing_token(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )); // 64 chars, not hex
+        assert!(!is_valid_pairing_token("")); // empty
+    }
+
+    #[test]
+    fn test_container_url_default() {
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let url = container_url(&id, &None, "mika-agents");
+        assert_eq!(
+            url,
+            "http://mika-12345678-1234-1234-1234-123456789abc.mika-agents.svc.cluster.local:8080"
+        );
+    }
+
+    #[test]
+    fn test_container_url_override() {
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let url = container_url(
+            &id,
+            &Some("http://localhost:8080".to_string()),
+            "mika-agents",
+        );
+        assert_eq!(url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn test_send_payload_without_agent_name() {
+        let json = r#"{"chat_id": 42, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.chat_id, 42);
+        assert_eq!(payload.text, "hello");
+        assert!(payload.agent_name.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // format_outbound_text — mika-cloud family-tier launch 2026-07-16
+    // ------------------------------------------------------------------
+
+    /// AC1: the container's default agent (`mika`) MUST NOT prefix outbound
+    /// Telegram text — every family-tier customer only has this one agent, and
+    /// the `[mika]` parasite broke first-hour-Perfect during the family launch.
+    #[test]
+    fn format_outbound_text_suppresses_default_agent_prefix() {
+        let out = format_outbound_text(Some("mika"), "Bonjour Sonia 🌸");
+        assert_eq!(out, "Bonjour Sonia 🌸");
+        assert!(!out.starts_with('['));
+    }
+
+    /// AC2: non-default agent names (multi-agent customers) keep the
+    /// identification prefix — the "multi-agent setups" use case the wire was
+    /// originally added for still works.
+    #[test]
+    fn format_outbound_text_keeps_prefix_for_named_agents() {
+        assert_eq!(
+            format_outbound_text(Some("work-mika"), "meeting at 3"),
+            "[work-mika] meeting at 3"
+        );
+        assert_eq!(
+            format_outbound_text(Some("personal-mika"), "yoga tonight"),
+            "[personal-mika] yoga tonight"
+        );
+        assert_eq!(
+            format_outbound_text(Some("mika-dev"), "PR ready"),
+            "[mika-dev] PR ready"
+        );
+    }
+
+    /// AC3: `None` agent_name path (operator-only /send, no identification
+    /// requested) also produces raw text — same as pre-fix behavior.
+    #[test]
+    fn format_outbound_text_no_prefix_when_agent_name_absent() {
+        assert_eq!(format_outbound_text(None, "raw text"), "raw text");
+    }
+
+    /// AC4: the default-agent branch matches the exact case of
+    /// `mika_common::agent::DEFAULT_AGENT` (`"mika"`), not case-insensitively.
+    /// An agent literally named `"Mika"` (capital M) is a hypothetical
+    /// multi-agent case and gets prefixed — the existing agent-name validation
+    /// rejects uppercase anyway (see `test_agent_name_validation_rules`), so
+    /// this is a defence-in-depth assertion rather than a live path.
+    #[test]
+    fn format_outbound_text_default_agent_match_is_case_sensitive() {
+        // Live: DEFAULT_AGENT is `"mika"`, lowercase — matched.
+        assert_eq!(format_outbound_text(Some("mika"), "x"), "x");
+        // Uppercase would already fail send-handler validation; helper still
+        // behaves consistently (prefixed) if it somehow got through.
+        assert!(format_outbound_text(Some("Mika"), "x").starts_with('['));
+    }
+
+    #[test]
+    fn test_send_payload_with_agent_name() {
+        let json = r#"{"chat_id": 42, "text": "hello", "agent_name": "mika-dev"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_name.as_deref(), Some("mika-dev"));
+    }
+
+    #[test]
+    fn test_send_payload_with_underscore_agent_name() {
+        // Underscores are accepted by serde deserialization but will be rejected
+        // by handle_send validation (only lowercase alphanumeric + hyphens allowed)
+        let json = r#"{"chat_id": 42, "text": "hello", "agent_name": "my_agent"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.agent_name.as_deref(), Some("my_agent"));
+    }
+
+    #[test]
+    fn test_agent_name_validation_rules() {
+        // Helper to check if a name passes validation (mirrors handle_send logic)
+        fn is_valid_agent_name(name: &str) -> bool {
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && !name.contains("--")
+        }
+
+        // Valid names
+        assert!(is_valid_agent_name("mika"));
+        assert!(is_valid_agent_name("mika-dev"));
+        assert!(is_valid_agent_name("agent1"));
+        assert!(is_valid_agent_name("my-agent-42"));
+
+        // Invalid: uppercase
+        assert!(!is_valid_agent_name("Mika"));
+        assert!(!is_valid_agent_name("MIKA"));
+        assert!(!is_valid_agent_name("mikaA"));
+
+        // Invalid: underscore
+        assert!(!is_valid_agent_name("my_agent"));
+
+        // Invalid: leading/trailing hyphen
+        assert!(!is_valid_agent_name("-mika"));
+        assert!(!is_valid_agent_name("mika-"));
+
+        // Invalid: consecutive hyphens
+        assert!(!is_valid_agent_name("mika--dev"));
+
+        // Invalid: empty
+        assert!(!is_valid_agent_name(""));
+
+        // Invalid: too long (> 32 chars)
+        assert!(!is_valid_agent_name("a]234567890123456789012345678901234"));
+        assert!(is_valid_agent_name("a2345678901234567890123456789012")); // exactly 32
+
+        // Invalid: special characters
+        assert!(!is_valid_agent_name("agent!"));
+        assert!(!is_valid_agent_name("agent name"));
+    }
+
+    #[test]
+    fn test_container_url_env_scoped_namespace() {
+        let id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let url = container_url(&id, &None, "mika-agents-prd");
+        assert_eq!(
+            url,
+            "http://mika-12345678-1234-1234-1234-123456789abc.mika-agents-prd.svc.cluster.local:8080"
+        );
+    }
+
+    #[test]
+    fn test_container_url_str_uses_fqdn() {
+        let url = container_url_str("abc-123", None, "mika-agents");
+        assert_eq!(
+            url,
+            "http://mika-abc-123.mika-agents.svc.cluster.local:8080"
+        );
+    }
+
+    #[test]
+    fn test_container_url_str_base_url_overrides() {
+        let url = container_url_str("abc-123", Some("http://localhost:9090"), "mika-agents");
+        assert_eq!(url, "http://localhost:9090");
+    }
+
+    #[test]
+    fn test_send_payload_chat_id_validation_rules() {
+        // Mirrors the handle_send chat_id validation: `if payload.chat_id == 0`
+        // returns 400. Telegram chat IDs are non-zero: positive for private chats,
+        // negative for groups/channels. Zero is an invalid sentinel (#580).
+        //
+        // Note: handle_send requires AppState (Postgres + TelegramClient) which
+        // is not available in unit tests. This test mirrors the validation logic
+        // directly, same pattern as test_agent_name_validation_rules above.
+        fn is_valid_chat_id(id: i64) -> bool {
+            id != 0
+        }
+
+        // Valid: positive (private chat)
+        assert!(is_valid_chat_id(12345));
+        assert!(is_valid_chat_id(1));
+        assert!(is_valid_chat_id(i64::MAX));
+
+        // Valid: negative (group/channel)
+        assert!(is_valid_chat_id(-100_123_456_789));
+        assert!(is_valid_chat_id(-1));
+        assert!(is_valid_chat_id(i64::MIN));
+
+        // Invalid: zero sentinel
+        assert!(!is_valid_chat_id(0));
+    }
+
+    #[test]
+    fn test_send_payload_negative_chat_id_deserializes() {
+        // Negative chat_ids are valid Telegram group/channel identifiers.
+        let json = r#"{"chat_id": -100123456789, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.chat_id, -100_123_456_789);
+    }
+
+    #[test]
+    fn test_send_payload_with_customer_id() {
+        let json = r#"{"chat_id": 42, "text": "hello", "customer_id": "12345678-1234-1234-1234-123456789abc"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            payload.customer_id,
+            Some(Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_send_payload_without_customer_id() {
+        let json = r#"{"chat_id": 42, "text": "hello"}"#;
+        let payload: SendPayload = serde_json::from_str(json).unwrap();
+        assert!(payload.customer_id.is_none());
+    }
+
+    #[test]
+    fn test_forward_error_message_connect() {
+        let msg = forward_error_message(true, Locale::En);
+        assert!(
+            msg.contains("offline"),
+            "connect errors should mention offline"
+        );
+        assert!(
+            msg.contains("console.getmika.ai"),
+            "should include console URL"
+        );
+    }
+
+    #[test]
+    fn test_forward_error_message_other() {
+        let msg = forward_error_message(false, Locale::En);
+        assert!(
+            msg.contains("try again"),
+            "non-connect errors should suggest retry"
+        );
+        assert!(
+            !msg.contains("offline"),
+            "non-connect errors should not mention offline"
+        );
+    }
+
+    /// mika#2025 — the classification is the same in both languages, and the
+    /// console URL is an invariant rather than copy.
+    #[test]
+    fn mika2025_forward_error_message_classifies_identically_in_french() {
+        let offline = forward_error_message(true, Locale::Fr);
+        assert!(offline.contains("hors ligne"), "{offline:?}");
+        assert!(
+            offline.contains("console.getmika.ai"),
+            "the console URL is an invariant, not copy: {offline:?}"
+        );
+
+        let transient = forward_error_message(false, Locale::Fr);
+        assert!(transient.contains("Réessaie"), "{transient:?}");
+        assert!(!transient.contains("hors ligne"), "{transient:?}");
+    }
+
+    // -- generate_pairing_token / generate_webhook_secret tests --
+
+    #[test]
+    fn test_generate_pairing_token_length() {
+        let token = generate_pairing_token();
+        assert_eq!(token.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_pairing_token_unique() {
+        let t1 = generate_pairing_token();
+        let t2 = generate_pairing_token();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_generate_pairing_token_is_hex() {
+        let token = generate_pairing_token();
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_pairing_response_fields_some_builds_url() {
+        let (token, url) = pairing_response_fields(Some("abc123"), "mikabot");
+        assert_eq!(token.as_deref(), Some("abc123"));
+        assert_eq!(url.as_deref(), Some("https://t.me/mikabot?start=abc123"));
+    }
+
+    #[test]
+    fn test_pairing_response_fields_none_omits_both() {
+        // Active customers have a consumed (NULL) pairing token — the response must
+        // not fabricate a token/url that cannot pair (mika#1612).
+        let (token, url) = pairing_response_fields(None, "mikabot");
+        assert_eq!(token, None);
+        assert_eq!(url, None);
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_length() {
+        let secret = generate_webhook_secret();
+        assert_eq!(secret.len(), 64);
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_unique() {
+        let s1 = generate_webhook_secret();
+        let s2 = generate_webhook_secret();
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_generate_webhook_secret_is_hex() {
+        let secret = generate_webhook_secret();
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -- is_valid_bot_username tests --
+
+    #[test]
+    fn test_valid_bot_username() {
+        assert!(is_valid_bot_username("MyTestBot"));
+        assert!(is_valid_bot_username("test_bot_123"));
+        assert!(is_valid_bot_username("a"));
+        assert!(is_valid_bot_username("A_B_c_1"));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_empty() {
+        assert!(!is_valid_bot_username(""));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_leading_at() {
+        assert!(!is_valid_bot_username("@MyBot"));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_too_long() {
+        let name = "a".repeat(33);
+        assert!(!is_valid_bot_username(&name));
+    }
+
+    #[test]
+    fn test_invalid_bot_username_special_chars() {
+        assert!(!is_valid_bot_username("my-bot"));
+        assert!(!is_valid_bot_username("my.bot"));
+        assert!(!is_valid_bot_username("my bot"));
+    }
+
+    #[test]
+    fn test_valid_bot_username_max_length() {
+        let name = "a".repeat(32);
+        assert!(is_valid_bot_username(&name));
+    }
+
+    // ------------------------------------------------------------------
+    // mika#1820 — admin customer read + orphan listing
+    // ------------------------------------------------------------------
+    //
+    // These tests guard the SECURITY CONTRACT of the two new endpoints: the
+    // response JSON never carries secret fields (`bot_token`,
+    // `pairing_token`, `webhook_secret`). The SQL-level regression lives
+    // in `tests/admin_customers.rs` alongside the mika#1612 lifecycle test.
+
+    /// Build a filled `GetCustomerResponse` and assert the serialized JSON
+    /// contains the expected non-secret fields.
+    #[test]
+    fn get_customer_response_serializes_safe_fields() {
+        let now = chrono::Utc::now();
+        let resp = GetCustomerResponse {
+            customer_id: Uuid::parse_str("a0394c24-9558-4cb6-9078-52043912ecbc").unwrap(),
+            name: "Yaohong".to_string(),
+            bot_username: Some("mikachan1_bot".to_string()),
+            status: "provisioned".to_string(),
+            paired_at: None,
+            telegram_chat_id: None,
+            plan: "standard".to_string(),
+            pairing_token_present: true,
+            pairing_expires_at: Some(now),
+            pairing_rejected_at: None,
+            pairing_rejection_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        // The 9-ish safe fields from the ticket schema.
+        assert!(json.contains("\"customer_id\""));
+        assert!(json.contains("\"name\":\"Yaohong\""));
+        assert!(json.contains("\"bot_username\":\"mikachan1_bot\""));
+        assert!(json.contains("\"status\":\"provisioned\""));
+        assert!(json.contains("\"paired_at\":null"));
+        assert!(json.contains("\"telegram_chat_id\":null"));
+        assert!(json.contains("\"plan\":\"standard\""));
+        assert!(json.contains("\"pairing_token_present\":true"));
+        assert!(json.contains("\"pairing_expires_at\""));
+        assert!(json.contains("\"created_at\""));
+        assert!(json.contains("\"updated_at\""));
+    }
+
+    /// SECURITY-CRITICAL: the response JSON must NEVER surface any of the three
+    /// secret fields. Enforced structurally by the `CUSTOMER_SAFE_COLUMNS`
+    /// SELECT list and by omitting them from `GetCustomerResponse`, but this
+    /// test detects a future field addition that leaks a secret name.
+    #[test]
+    fn get_customer_response_never_contains_secret_fields() {
+        let now = chrono::Utc::now();
+        let resp = GetCustomerResponse {
+            customer_id: Uuid::new_v4(),
+            name: "with a secret-shaped name maybe?".to_string(),
+            bot_username: Some("botty".to_string()),
+            status: "active".to_string(),
+            paired_at: Some(now),
+            telegram_chat_id: Some(12345),
+            plan: "premium".to_string(),
+            pairing_token_present: false,
+            pairing_expires_at: None,
+            // Verdict fields populated on purpose (mika-cloud#208): the
+            // secret-hygiene contract must hold with them set, not only when
+            // they happen to be null.
+            pairing_rejected_at: Some(now),
+            pairing_rejection_reason: Some(PAIRING_REJECTION_ALREADY_LINKED.to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("bot_token"),
+            "response leaked bot_token: {json}"
+        );
+        assert!(
+            !json.contains("webhook_secret"),
+            "response leaked webhook_secret: {json}"
+        );
+        // "pairing_token_present" is allowed and expected — but the raw
+        // "pairing_token" key (value, not just presence) must never appear.
+        // Assert the exact JSON key form.
+        assert!(
+            !json.contains("\"pairing_token\":"),
+            "response leaked pairing_token value: {json}"
+        );
+    }
+
+    /// Same secret-hygiene contract for the list-endpoint summary type.
+    #[test]
+    fn customer_summary_never_contains_secret_fields() {
+        let now = chrono::Utc::now();
+        let sum = CustomerSummary {
+            customer_id: Uuid::new_v4(),
+            bot_username: Some("mikachan1_bot".to_string()),
+            status: "provisioned".to_string(),
+            paired_at: None,
+            plan: "standard".to_string(),
+            created_at: now,
+            age_minutes: 47,
+        };
+        let json = serde_json::to_string(&sum).expect("serialize");
+        assert!(!json.contains("bot_token"));
+        assert!(!json.contains("webhook_secret"));
+        assert!(!json.contains("\"pairing_token\":"));
+        // And the fields we DO want.
+        assert!(json.contains("\"customer_id\""));
+        assert!(json.contains("\"bot_username\":\"mikachan1_bot\""));
+        assert!(json.contains("\"age_minutes\":47"));
+    }
+
+    /// Regression guard on the SELECT column list — a future refactor must not
+    /// silently add `bot_token`/`pairing_token`/`webhook_secret` here. The
+    /// constant lives in code so this test locks it structurally.
+    // ------------------------------------------------------------------
+    // mika-cloud#208 — the one-telegram-one-mika verdict is recorded
+    // ------------------------------------------------------------------
+    //
+    // Founding case: Vincent finished the champion wizard, the wizard said
+    // "done", and his messages were answered by a different bot with a
+    // different agent's memory. The guard had refused his pairing — correctly,
+    // his Telegram was already bound — but the refusal was persisted nowhere,
+    // so the refused row was byte-identical to a customer who had not started.
+    // These tests pin the verdict's shape; the DB-level behaviour lives in
+    // `tests/pairing_rejection.rs`.
+
+    #[test]
+    fn pairing_rejection_reason_matches_the_migration_vocabulary() {
+        // The CHECK constraint in migrations/010_customers_pairing_rejection.sql
+        // enumerates the same members. Drift here means a refusal write that
+        // the database rejects at runtime — a silent loss of the verdict.
+        let migration = include_str!("../migrations/010_customers_pairing_rejection.sql");
+        assert!(
+            migration.contains(PAIRING_REJECTION_ALREADY_LINKED),
+            "migration 010 does not allow the reason the code writes"
+        );
+    }
+
+    #[test]
+    fn record_pairing_rejection_sql_targets_the_token_row_only() {
+        // Keyed on pairing_token: the refused row is the one bearing the token
+        // the user presented, never the row that already holds the binding.
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("WHERE pairing_token = $2"));
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("pairing_rejected_at = now()"));
+        assert!(RECORD_PAIRING_REJECTION_SQL.contains("pairing_rejection_reason = $1"));
+        // It must not touch the guard's own columns — recording a verdict may
+        // never become a second path to pairing.
+        assert!(
+            !RECORD_PAIRING_REJECTION_SQL.contains("telegram_chat_id"),
+            "the verdict write must never touch telegram_chat_id"
+        );
+        assert!(
+            !RECORD_PAIRING_REJECTION_SQL.contains("status"),
+            "the verdict write must never change customer status"
+        );
+    }
+
+    #[test]
+    fn reissuing_a_pairing_token_clears_a_spent_verdict() {
+        // A refused customer stays `provisioned`, which is exactly the branch
+        // that mints a fresh pairing token on re-provisioning. Keeping the old
+        // verdict there would make the console report a refusal the user has
+        // not made yet — the same stale-state lie this ticket exists to remove.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejected_at = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear a spent rejection verdict"
+        );
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains(
+                "pairing_rejection_reason = CASE WHEN customers.status = 'provisioned' THEN NULL"
+            ),
+            "the customer upsert must clear the spent reason too"
+        );
+        // An active customer's row is never touched by this branch.
+        assert!(
+            UPSERT_CUSTOMER_SQL.contains("ELSE customers.pairing_rejected_at END"),
+            "a non-provisioned customer must keep its verdict columns"
+        );
+    }
+
+    #[test]
+    fn customer_safe_columns_projects_the_verdict() {
+        assert!(CUSTOMER_SAFE_COLUMNS.contains("pairing_rejected_at"));
+        assert!(CUSTOMER_SAFE_COLUMNS.contains("pairing_rejection_reason"));
+    }
+
+    #[test]
+    fn customer_safe_columns_excludes_secrets() {
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("bot_token"),
+            "CUSTOMER_SAFE_COLUMNS leaks bot_token"
+        );
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("webhook_secret"),
+            "CUSTOMER_SAFE_COLUMNS leaks webhook_secret"
+        );
+        // `pairing_token` may only appear inside the `IS NOT NULL` projection.
+        // Assert the raw column value is projected only via the boolean form.
+        assert!(
+            CUSTOMER_SAFE_COLUMNS.contains("(pairing_token IS NOT NULL) AS pairing_token_present"),
+            "CUSTOMER_SAFE_COLUMNS must project pairing_token only via presence check"
+        );
+        // The bare column reference `pairing_token,` (comma-terminated) would be
+        // a leak; the projection form above ends with `AS pairing_token_present`
+        // instead. Assert the leak shape is absent.
+        assert!(
+            !CUSTOMER_SAFE_COLUMNS.contains("pairing_token,"),
+            "CUSTOMER_SAFE_COLUMNS leaks raw pairing_token column"
+        );
+    }
+
+    /// `ListCustomersQuery` deserializes cleanly from the canonical orphan
+    /// probe URL shape used by mika-cloud dashboard polling. Exercised via
+    /// JSON here (serde_json is already a direct dep) — the axum `Query`
+    /// extractor uses `serde_urlencoded` at runtime, but the derived
+    /// `Deserialize` impl is identical across formats.
+    #[test]
+    fn list_customers_query_deserializes_orphan_probe() {
+        let q: ListCustomersQuery = serde_json::from_str(
+            r#"{"status":"provisioned","paired":false,"stale_after_minutes":30}"#,
+        )
+        .expect("deserialize orphan probe");
+        assert_eq!(q.status.as_deref(), Some("provisioned"));
+        assert_eq!(q.paired, Some(false));
+        assert_eq!(q.stale_after_minutes, Some(30));
+    }
+
+    /// All three filters are optional — an empty object produces the no-filter
+    /// shape (unbounded scan up to LIST_CUSTOMERS_LIMIT).
+    #[test]
+    fn list_customers_query_all_optional() {
+        let q: ListCustomersQuery = serde_json::from_str(r#"{}"#).expect("deserialize empty");
+        assert!(q.status.is_none());
+        assert!(q.paired.is_none());
+        assert!(q.stale_after_minutes.is_none());
+    }
+
+    /// `paired=true` and `paired=false` both accepted.
+    #[test]
+    fn list_customers_query_paired_bool_only() {
+        let t: ListCustomersQuery =
+            serde_json::from_str(r#"{"paired":true}"#).expect("deserialize paired=true");
+        assert_eq!(t.paired, Some(true));
+        let f: ListCustomersQuery =
+            serde_json::from_str(r#"{"paired":false}"#).expect("deserialize paired=false");
+        assert_eq!(f.paired, Some(false));
+    }
+
+    /// The safe list-endpoint response type serializes with the wire shape the
+    /// mika-cloud dashboard poller depends on: `{customers: [...], count: N}`.
+    #[test]
+    fn list_customers_response_wire_shape() {
+        let resp = ListCustomersResponse {
+            customers: vec![CustomerSummary {
+                customer_id: Uuid::new_v4(),
+                bot_username: Some("mikachan1_bot".to_string()),
+                status: "provisioned".to_string(),
+                paired_at: None,
+                plan: "standard".to_string(),
+                created_at: chrono::Utc::now(),
+                age_minutes: 47,
+            }],
+            count: 1,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(json.contains("\"customers\":["));
+        assert!(json.contains("\"count\":1"));
+    }
+
+    // ── mika#2360 — GET /admin/tenants/{customer_id}/recurring-tasks ──────
+
+    mod mika2360 {
+        use super::super::*;
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use sqlx::postgres::PgPoolOptions;
+        use tower::ServiceExt;
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        pub(super) const INTERNAL: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        pub(super) const READ: &str = "read-only-admin-token";
+        pub(super) const CUSTOMER: &str = "a0394c24-9558-4cb6-9078-52043912ecbc";
+
+        /// Lazy Postgres pool that never connects: auth rejection, the
+        /// extractor gate and the 405 fallback run without a DB; the customer
+        /// lookup fails fast and must answer 503 without forwarding.
+        /// `pub(super)` so the mika#2387 sibling module reuses this harness
+        /// rather than cloning a second twenty-field `AppState` literal that
+        /// would silently drift from this one.
+        pub(super) fn state(
+            admin_read_token: Option<&str>,
+            agent_base_url: Option<String>,
+        ) -> AppState {
+            let http_client = reqwest::Client::new();
+            let pool = PgPoolOptions::new()
+                .acquire_timeout(Duration::from_millis(100))
+                .connect_lazy("postgres://fake:fake@localhost:1/fake")
+                .expect("lazy pool");
+            AppState {
+                pool,
+                telegram: None,
+                http_client,
+                internal_token: SecretString::from(INTERNAL),
+                webhook_secret: None,
+                ready: Arc::new(AtomicBool::new(true)),
+                webhook_semaphore: Arc::new(tokio::sync::Semaphore::new(30)),
+                agent_base_url,
+                agents_namespace: "mika-agents".to_string(),
+                webhook_counter: Arc::new(AtomicU64::new(0)),
+                github_webhook_secret: None,
+                github_delivery_cache: crate::github::new_delivery_cache(),
+                github_app: None,
+                github_api_base_url: None,
+                orchestrator_inbox_enabled: false,
+                inbox_subscriber_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
+                gateway_external_url: None,
+                cm_api_url: None,
+                target_health: Arc::new(crate::circuit_breaker::TargetCircuitBreaker::new()),
+                delivery_slots: Arc::new(tokio::sync::Semaphore::new(
+                    crate::circuit_breaker::MAX_INFLIGHT_DELIVERIES,
+                )),
+                search_egress_client: None,
+                fetch_egress_client: None,
+                admin_read_token: admin_read_token.map(SecretString::from),
+            }
+        }
+
+        pub(super) async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            bearer: Option<&str>,
+        ) -> Response {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(b) = bearer {
+                req = req.header("authorization", format!("Bearer {b}"));
+            }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+
+        fn route(customer: &str) -> String {
+            format!("/admin/tenants/{customer}/recurring-tasks")
+        }
+
+        /// R7 — unconfigured token ⇒ 404, even with a valid-looking header.
+        #[tokio::test]
+        async fn admin_read_route_404_when_token_unconfigured() {
+            let app = build_router(state(None, None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            // Not even the write token opens a disarmed route.
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// AC2 — the write-only token is authenticated but not authorized.
+        #[tokio::test]
+        async fn admin_read_rejects_internal_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("admin read scope required"));
+        }
+
+        /// AC2 "absent" — and the route has no auth by prefix: this 403 is
+        /// what proves the `.route_layer` is mounted at all.
+        #[tokio::test]
+        async fn admin_read_rejects_missing_header_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), None).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// AC2 "unknown" — pinned at 403 per the ticket (not the 401 of the
+        /// sibling `require_bearer_token`).
+        #[tokio::test]
+        async fn admin_read_rejects_unknown_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some("nope")).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            // Prefix of the real token is not the token.
+            let resp = call(app, "GET", &route(CUSTOMER), Some(&READ[..8])).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// AC3 — held by the router: no mutating method exists on the path.
+        #[tokio::test]
+        async fn no_mutating_method_on_admin_read_route() {
+            let app = build_router(state(Some(READ), None));
+            for m in ["POST", "PUT", "DELETE", "PATCH"] {
+                let resp = call(app.clone(), m, &route(CUSTOMER), Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+            }
+        }
+
+        /// R12 term 1 / T5 — a non-UUID `customer_id` is refused by the
+        /// extractor before the handler runs, so before any URL is built and
+        /// before the internal token can leave. The assertion that counts is
+        /// the upstream's request counter, not the status alone.
+        #[tokio::test]
+        async fn non_uuid_customer_id_is_rejected_before_any_forward() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(0)
+                .mount(&upstream)
+                .await;
+            let app = build_router(state(Some(READ), Some(upstream.uri())));
+
+            for bad in [
+                "x.attacker.example%2F",
+                "..%2F..%2Fadmin",
+                "a@b",
+                "id:8080",
+                "not-a-uuid",
+                "a0394c24-9558-4cb6-9078-52043912ecb", // one char short
+            ] {
+                let resp = call(app.clone(), "GET", &route(bad), Some(READ)).await;
+                assert!(
+                    matches!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+                    ),
+                    "{bad}: got {}",
+                    resp.status()
+                );
+            }
+            assert!(
+                upstream.received_requests().await.unwrap().is_empty(),
+                "no request may reach the tenant for an invalid customer_id"
+            );
+        }
+
+        /// R12 term 2, fail-closed side — when the customer cannot be
+        /// resolved (DB unavailable) the gateway answers 503 and does NOT
+        /// forward: the internal token never leaves on an unresolved id.
+        #[tokio::test]
+        async fn db_unavailable_is_503_and_does_not_forward() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(0)
+                .mount(&upstream)
+                .await;
+            let app = build_router(state(Some(READ), Some(upstream.uri())));
+
+            let resp = call(app, "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+
+        /// The tenant hop: `Bearer {internal_token}`, `/api/v1/recurring-tasks`,
+        /// allowlisted query only, body and status relayed as-is.
+        #[tokio::test]
+        async fn forward_carries_internal_token_and_allowlisted_query() {
+            let upstream = MockServer::start().await;
+            let body = r#"{"data":[{"label":"rappel","trigger_type":"recurring"}],"total":1,"page":2,"per_page":5}"#;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/recurring-tasks"))
+                .and(header(
+                    "authorization",
+                    format!("Bearer {INTERNAL}").as_str(),
+                ))
+                .and(query_param("agent_id", "mika"))
+                .and(query_param("page", "2"))
+                .and(query_param("per_page", "5"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let st = state(Some(READ), Some(upstream.uri()));
+            let q = AdminRecurringQuery {
+                agent_id: Some("mika".to_string()),
+                page: Some(2),
+                per_page: Some(5),
+            };
+
+            let resp =
+                forward_recurring_registry(&st, &Uuid::parse_str(CUSTOMER).unwrap(), &q).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(String::from_utf8_lossy(&got), body);
+
+            let reqs = upstream.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 1);
+            let sent = reqs[0].url.query().unwrap_or("");
+            assert!(!sent.contains("evil"), "query passthrough: {sent}");
+        }
+
+        /// The allowlist is the struct: unknown params are dropped at
+        /// deserialization and never encoded for the hop.
+        #[test]
+        fn admin_recurring_query_is_an_allowlist() {
+            let uri: http::Uri = "/x?agent_id=x&per_page=5&evil=1&page=3".parse().unwrap();
+            let Query(q) = Query::<AdminRecurringQuery>::try_from_uri(&uri).unwrap();
+            let pairs = q.to_query_pairs();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("agent_id", "x".to_string()),
+                    ("page", "3".to_string()),
+                    ("per_page", "5".to_string()),
+                ]
+            );
+        }
+
+        /// An unreachable tenant is 502, never an empty 200: an empty
+        /// registry and a pod the gateway could not reach are two different
+        /// answers.
+        #[tokio::test]
+        async fn upstream_failure_is_502_not_empty_200() {
+            let st = state(Some(READ), Some("http://127.0.0.1:1".to_string()));
+            let resp = forward_recurring_registry(
+                &st,
+                &Uuid::parse_str(CUSTOMER).unwrap(),
+                &AdminRecurringQuery::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
+
+        /// Upstream 4xx/5xx statuses are relayed, not rewritten.
+        #[tokio::test]
+        async fn forward_relays_upstream_status() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v1/recurring-tasks"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(r#"{"error":"x"}"#))
+                .mount(&upstream)
+                .await;
+            let st = state(Some(READ), Some(upstream.uri()));
+            let resp = forward_recurring_registry(
+                &st,
+                &Uuid::parse_str(CUSTOMER).unwrap(),
+                &AdminRecurringQuery::default(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        /// T7 a — the armed state is readable in a diagnostic dump, the
+        /// secret is not.
+        #[tokio::test]
+        async fn app_state_debug_shows_armed_state_without_secret() {
+            let armed = format!("{:?}", state(Some(READ), None));
+            assert!(
+                armed.contains("admin_read_token: Some(\"[REDACTED]\")"),
+                "{armed}"
+            );
+            assert!(!armed.contains(READ));
+            let disarmed = format!("{:?}", state(None, None));
+            assert!(disarmed.contains("admin_read_token: None"), "{disarmed}");
+        }
+    }
+
+    // ── mika#2387 — GET /admin/tenants/{customer_id}/outbound-messages ────
+    //
+    // Every test here runs **in CI, without Postgres**. That is the point, not
+    // a convenience: the five integration tests of `crates/mika-gateway/tests/`
+    // are all `#[ignore]` because CI provisions no database for this crate, so
+    // a negative test written only as a DB-backed test would be green by never
+    // running — the failure class this repo names everywhere (mika#2205: a
+    // silently inert scan reads exactly like a scan that found nothing).
+    //
+    // What CI cannot hold — real SQL semantics, and therefore the two tests
+    // that prove the absence of a cross-tenant leak — lives in
+    // `tests/admin_tenant_outbound_messages.rs` and is run by hand before
+    // merge. D6 exists so the testable half of that invariant becomes a pure
+    // function CI *can* hold.
+    mod mika2387 {
+        use super::super::*;
+        use super::mika2360::{CUSTOMER, INTERNAL, READ, call, state};
+        use http_body_util::BodyExt;
+        use std::collections::BTreeSet;
+
+        fn route(customer: &str) -> String {
+            format!("/admin/tenants/{customer}/outbound-messages")
+        }
+
+        fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }
+
+        /// **AC3, the negative test.** Serializes a *populated* instance — the
+        /// positive control, so an empty object fails instead of passing — and
+        /// asserts the key set equals the allowlist exactly.
+        ///
+        /// Exact equality, not a blacklist: a blacklist goes green on a
+        /// `message_snippet` column nobody thought to forbid, which is the one
+        /// case worth catching.
+        #[test]
+        fn mika2387_response_keys_are_exactly_the_four_metadata_fields() {
+            let row = OutboundMessageRow {
+                telegram_message_id: 4242,
+                chat_id: 987_654_321,
+                agent_name: "mika".to_string(),
+                created_at: ts("2026-09-17T08:30:00Z"),
+            };
+            let value = serde_json::to_value(&row).expect("serialize row");
+            let object = value.as_object().expect("row serializes to an object");
+
+            // Positive control: the instance really is populated, so the key
+            // set below is the key set of a real row.
+            assert_eq!(object["telegram_message_id"], 4242);
+            assert_eq!(object["agent_name"], "mika");
+            assert!(!object.is_empty());
+
+            let keys: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+            let allowed: BTreeSet<&str> =
+                OUTBOUND_MESSAGE_METADATA_FIELDS.iter().copied().collect();
+            assert_eq!(
+                keys, allowed,
+                "the response must publish exactly the four metadata fields — adding a key \
+                 here is a data-exposure decision, not a test fix"
+            );
+
+            // The envelope adds pagination, and no content either.
+            let envelope = serde_json::to_value(OutboundMessagesResponse {
+                items: vec![row],
+                page: 1,
+                per_page: 100,
+                has_more: false,
+            })
+            .expect("serialize envelope");
+            let envelope_keys: BTreeSet<&str> = envelope
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                envelope_keys,
+                BTreeSet::from(["items", "page", "per_page", "has_more"])
+            );
+        }
+
+        /// R6, second guard. The struct guard above would not see a switch to
+        /// `serde_json::Value`; this one reads the SQL projection itself.
+        #[test]
+        fn mika2387_select_list_is_an_explicit_allowlist() {
+            assert!(
+                !OUTBOUND_MESSAGES_SELECT_LIST.contains('*'),
+                "SELECT * would let a future migration publish a column on its own"
+            );
+            let projected: BTreeSet<&str> = OUTBOUND_MESSAGES_SELECT_LIST
+                .split(',')
+                .map(str::trim)
+                .collect();
+            let allowed: BTreeSet<&str> =
+                OUTBOUND_MESSAGE_METADATA_FIELDS.iter().copied().collect();
+            assert_eq!(projected, allowed);
+        }
+
+        /// R2 — an unarmed token answers 404 before any header is read, and
+        /// the write token does not open it either.
+        #[tokio::test]
+        async fn mika2387_admin_read_route_404_when_token_unconfigured() {
+            let app = build_router(state(None, None));
+            let resp = call(app.clone(), "GET", &route(CUSTOMER), Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// R2 — authenticated, not authorized: inspecting must not require
+        /// holding the write secret.
+        #[tokio::test]
+        async fn mika2387_admin_read_rejects_internal_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            let resp = call(app, "GET", &route(CUSTOMER), Some(INTERNAL)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("admin read scope required"));
+        }
+
+        /// R2 — and this 403 is what proves the `.route_layer` is mounted at
+        /// all: this router has no auth by prefix, so a missing layer would
+        /// serve the route to anyone.
+        #[tokio::test]
+        async fn mika2387_admin_read_rejects_missing_and_unknown_token_with_403() {
+            let app = build_router(state(Some(READ), None));
+            for bearer in [None, Some("nope"), Some(&READ[..8])] {
+                let resp = call(app.clone(), "GET", &route(CUSTOMER), bearer).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{bearer:?}");
+            }
+        }
+
+        /// R3 — read-only is held by the router: only `get` is mounted.
+        #[tokio::test]
+        async fn mika2387_no_mutating_method_on_outbound_messages_route() {
+            let app = build_router(state(Some(READ), None));
+            for m in ["POST", "PUT", "DELETE", "PATCH"] {
+                let resp = call(app.clone(), m, &route(CUSTOMER), Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{m}");
+            }
+        }
+
+        /// R4 — a non-UUID is refused by the extractor, before the handler and
+        /// therefore before any query.
+        #[tokio::test]
+        async fn mika2387_non_uuid_customer_id_is_rejected_by_the_extractor() {
+            let app = build_router(state(Some(READ), None));
+            for bad in [
+                "not-a-uuid",
+                "a@b",
+                "..%2F..%2Fadmin",
+                "a0394c24-9558-4cb6-9078-52043912ecb", // one char short
+            ] {
+                let resp = call(app.clone(), "GET", &route(bad), Some(READ)).await;
+                assert!(
+                    matches!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
+                    ),
+                    "{bad}: got {}",
+                    resp.status()
+                );
+            }
+        }
+
+        /// **D2/D7.** An unreadable bound is a 400 quoting the value, never a
+        /// silent default.
+        ///
+        /// This test only reaches the handler's 400 because validation
+        /// precedes the tenant lookup — the harness pool never connects, so a
+        /// parse placed after the lookup would answer 503 here. That makes
+        /// this test the pin on the *order*, not merely on the status.
+        #[tokio::test]
+        async fn mika2387_unparseable_since_is_a_400_never_a_silent_default() {
+            let app = build_router(state(Some(READ), None));
+            let uri = format!("{}?since=pas-une-date", route(CUSTOMER));
+            let resp = call(app.clone(), "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                body.contains("pas-une-date"),
+                "the 400 must quote the offending value: {body}"
+            );
+
+            // `until` is held to the same grammar and the same refusal.
+            let uri = format!("{}?until=hier", route(CUSTOMER));
+            let resp = call(app, "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            // Negative control: a valid bound is NOT refused at the parse — it
+            // gets past it and dies on the (absent) database instead.
+            let app = build_router(state(Some(READ), None));
+            let uri = format!("{}?since=2026-09-17T00:00:00Z", route(CUSTOMER));
+            let resp = call(app, "GET", &uri, Some(READ)).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        /// D2 — an empty window is a 400, not an empty list: an empty list
+        /// reads as "this tenant sent nothing".
+        #[tokio::test]
+        async fn mika2387_empty_window_is_a_400() {
+            let app = build_router(state(Some(READ), None));
+            for (since, until) in [
+                ("2026-09-17T00:00:00Z", "2026-09-16T00:00:00Z"), // inverted
+                ("2026-09-17T00:00:00Z", "2026-09-17T00:00:00Z"), // degenerate
+            ] {
+                let uri = format!("{}?since={since}&until={until}", route(CUSTOMER));
+                let resp = call(app.clone(), "GET", &uri, Some(READ)).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{since}..{until}");
+            }
+
+            // And the pure function says the same thing, with both bounds read.
+            let now = ts("2026-09-18T00:00:00Z");
+            assert!(
+                resolve_window(Some("2026-09-17"), Some("2026-09-16"), now).is_err(),
+                "an inverted window must be refused"
+            );
+            let ok = resolve_window(Some("2026-09-17"), Some("2026-09-18"), now).expect("valid");
+            assert_eq!(ok.since, ts("2026-09-17T00:00:00Z"));
+            assert_eq!(ok.until, Some(ts("2026-09-18T00:00:00Z")));
+
+            // Omitted `since` defaults to the whole retention window — the
+            // table cannot hold anything older.
+            let default = resolve_window(None, None, now).expect("valid");
+            assert_eq!(default.since, now - chrono::Duration::days(7));
+            assert_eq!(default.until, None);
+        }
+
+        /// D3 — the cap is the gateway's, because the gateway runs the query.
+        #[test]
+        fn mika2387_per_page_is_clamped() {
+            assert_eq!(clamp_per_page(None), 100);
+            assert_eq!(clamp_per_page(Some(0)), 1);
+            assert_eq!(clamp_per_page(Some(50)), 50);
+            assert_eq!(clamp_per_page(Some(1000)), 1000);
+            assert_eq!(clamp_per_page(Some(10_000)), 1000);
+
+            assert_eq!(clamp_page(None), 1);
+            assert_eq!(clamp_page(Some(0)), 1);
+            assert_eq!(clamp_page(Some(7)), 7);
+        }
+
+        /// **R7/D6 — the anti-leak guard, testable without a database.**
+        ///
+        /// The cross-tenant leak of a nullable `chat_id` cannot reach a `WHERE`
+        /// clause because the decision short-circuits first, and that decision
+        /// is a pure function over `Option<i64>`.
+        #[test]
+        fn mika2387_tenant_without_chat_id_yields_an_empty_list_without_querying() {
+            assert_eq!(outbound_scope(None), OutboundScope::EmptyWithoutQuery);
+            assert_eq!(
+                outbound_scope(Some(987_654_321)),
+                OutboundScope::Query(987_654_321)
+            );
+            // A chat id of 0 is a value, not an absence.
+            assert_eq!(outbound_scope(Some(0)), OutboundScope::Query(0));
+        }
+
+        /// **D1** — the route this handler audits under. The contract of the
+        /// audit row itself (its shape, and the `assert_ne!` against
+        /// mika#2360's literal) is held where the writer lives:
+        /// `audit_events::tests::mika2387_audit_route_names_this_endpoint`.
+        /// What is pinned *here* is the choice of scope — one `tool_name` and
+        /// one `target_key` shared with mika#2360, so that "who read this
+        /// tenant's data?" stays one SQL query.
+        #[test]
+        fn mika2387_audit_scope_is_shared_and_the_route_discriminates() {
+            let id = Uuid::parse_str(CUSTOMER).unwrap();
+            assert_eq!(
+                crate::audit_events::admin_read_target_key(&id),
+                format!("tenant:{CUSTOMER}")
+            );
+            assert_ne!(
+                crate::audit_events::ADMIN_READ_ROUTE_OUTBOUND_MESSAGES,
+                crate::audit_events::ADMIN_READ_ROUTE_RECURRING_TASKS
+            );
+        }
+    }
+
+    /// mika#2191 — the wire contract of `POST /admin/customers`' error body.
+    ///
+    /// These assert the bodies, not the handler: `AppState.pool` is a non-optional
+    /// `PgPool` (the crate's own DB-backed tests are `#[ignore]`'d for it) and
+    /// `api_url` hard-codes `https://api.telegram.org`, whose injection the crate
+    /// already declined in writing on this same enum (`should_fall_back_to_plain`).
+    /// Extracting the bodies is what makes the contract assertable without either.
+    mod mika2191_upstream_status {
+        use super::*;
+
+        /// AC1 — a 401 upstream carries its status, as a JSON **number**.
+        #[test]
+        fn mika2191_ac1_le_401_porte_le_statut_damont() {
+            let body = token_validation_error_body(&TelegramApiError::Unauthorized);
+            assert_eq!(
+                body["upstream_status"].as_u64(),
+                Some(401),
+                "the 401 branch must carry upstream_status as a number: {body}"
+            );
+            // A string "401" would satisfy a loose reader and fail the Console's
+            // typed one, so the negative half is asserted too.
+            assert!(
+                body["upstream_status"].as_str().is_none(),
+                "upstream_status must be a number, never a string: {body}"
+            );
+        }
+
+        /// AC2 — the message is a wire format, asserted in full.
+        ///
+        /// **Deliberately not `== INVALID_BOT_TOKEN_MESSAGE`.** Asserting against
+        /// the constant would prove nothing: whoever reworded it would move both
+        /// sides at once, pass this test, and break `classify_gateway_error` in
+        /// mika-cloud (mika-cloud#205), which still matches the substring
+        /// `invalid bot_token`. Redden here, and the change becomes a cross-repo
+        /// break to be dated rather than a silent one.
+        #[test]
+        fn mika2191_ac2_le_message_du_401_est_un_format_de_fil() {
+            let body = token_validation_error_body(&TelegramApiError::Unauthorized);
+            assert_eq!(
+                body["error"].as_str(),
+                Some("invalid bot_token: Telegram returned 401 Unauthorized"),
+                "this literal is consumed by mika-cloud's classify_gateway_error"
+            );
+        }
+
+        /// AC3 — no non-401 branch carries `upstream_status: 401`, and the branches
+        /// the AC names stay distinguishable by their `error`.
+        #[test]
+        fn mika2191_ac3_les_branches_non_401_ne_portent_pas_401() {
+            let server_error = token_validation_error_body(&TelegramApiError::Other {
+                status: 500,
+                body: "internal".to_string(),
+            });
+            assert_eq!(server_error["upstream_status"].as_u64(), Some(500));
+            assert_ne!(server_error["upstream_status"].as_u64(), Some(401));
+
+            // `get_me`'s "answered 200, body unusable" convention: no refusal, so no
+            // key at all — not a null, which a consumer could read as a value.
+            let unusable = token_validation_error_body(&TelegramApiError::Other {
+                status: 200,
+                body: "failed to parse getMe response".to_string(),
+            });
+            assert!(
+                unusable.get("upstream_status").is_none(),
+                "an unusable 200 must carry no upstream_status key: {unusable}"
+            );
+
+            // The mismatch lives on the `Ok` arm — the upstream answered and refused
+            // nothing.
+            let mismatch = bot_username_mismatch_body("wanted_bot", "actual_bot");
+            assert!(
+                mismatch.get("upstream_status").is_none(),
+                "the username mismatch must carry no upstream_status: {mismatch}"
+            );
+
+            // All three stay distinguishable by `error` alone.
+            let messages = [
+                server_error["error"].as_str().unwrap(),
+                unusable["error"].as_str().unwrap(),
+                mismatch["error"].as_str().unwrap(),
+            ];
+            let unique: std::collections::HashSet<_> = messages.iter().collect();
+            assert_eq!(unique.len(), 3, "branches must stay distinguishable");
+            assert!(mismatch["error"].as_str().unwrap().contains("mismatch"));
+            assert!(
+                server_error["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("bot token validation failed")
+            );
+        }
+
+        /// AC2 holds on **every** branch, not just the 401: `error` is the key the
+        /// existing callers read, and none of them may lose it.
+        #[test]
+        fn mika2191_la_cle_error_est_toujours_presente() {
+            for err in [
+                TelegramApiError::Unauthorized,
+                TelegramApiError::BotBlocked,
+                TelegramApiError::RateLimited {
+                    retry_after: Some(30),
+                },
+                TelegramApiError::BadRequest {
+                    message: "nope".to_string(),
+                },
+                TelegramApiError::Other {
+                    status: 502,
+                    body: String::new(),
+                },
+                TelegramApiError::Other {
+                    status: 200,
+                    body: "unusable".to_string(),
+                },
+            ] {
+                let body = token_validation_error_body(&err);
+                let message = body["error"].as_str();
+                assert!(
+                    message.is_some_and(|m| !m.is_empty()),
+                    "every error branch must carry a non-empty `error`: {err:?} → {body}"
+                );
+            }
+            let mismatch = bot_username_mismatch_body("a", "b");
+            assert!(mismatch["error"].as_str().is_some_and(|m| !m.is_empty()));
+        }
+
+        /// The literal has exactly one production site (KTD7).
+        ///
+        /// The ticket's whole diagnosis is that "the coupling rests on a string
+        /// nothing obliges to stay stable". Shipping the structured field while
+        /// leaving the string as loosely held as before would repair the visible
+        /// half only, during the window where the other half still decides
+        /// (mika-cloud has not removed its textual rung).
+        ///
+        /// **The opening quote is part of the pattern, and that is what makes the
+        /// guard usable.** `source_guard` masks test regions, not prose, and the
+        /// constant's own doc comment cites the substring on purpose — a guard
+        /// counting bare occurrences would fire on the sentence explaining why it
+        /// exists, and the obvious repair (delete the citation) trades a documented
+        /// wire format for an undocumented one. Requiring the quote counts string
+        /// literals and leaves every backticked mention alone.
+        #[test]
+        fn mika2191_le_litteral_na_quun_seul_site_de_production() {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let mut sites = Vec::new();
+            for file in scanner.files() {
+                let production = scanner.production_of(&file);
+                let count = production.matches("\"invalid bot_token").count();
+                if count > 0 {
+                    sites.push((file, count));
+                }
+            }
+            let total: usize = sites.iter().map(|(_, n)| n).sum();
+            assert_eq!(
+                total, 1,
+                "the literal must have exactly one production site (the constant); found: {sites:?}"
+            );
+        }
+    }
+
+    /// mika#2025 — user-facing copy has one producer, and only a scan can hold it.
+    mod mika2025_copy_has_one_producer {
+        /// Call sites of `send_message` that were handed a string literal.
+        ///
+        /// Walks the argument list of every `.send_message(` with balanced
+        /// parentheses — a fixed window would stop mid-call on the multi-line
+        /// forms `rustfmt` produces, and report clean on exactly the sites the
+        /// guard exists to see. Line comments are stripped first: this module's
+        /// own prose names the construct it forbids, and a guard that could not
+        /// tolerate being described would force the documentation to go quiet
+        /// about the rule it carries.
+        fn literal_argument_sites(production: &str) -> Vec<String> {
+            let code: String = production
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(i) => &l[..i],
+                    None => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let mut sites = Vec::new();
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find(".send_message(") {
+                let args_start = at + ".send_message(".len();
+                let mut depth = 1usize;
+                let mut end = args_start;
+                for (offset, c) in rest[args_start..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = args_start + offset;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let args = &rest[args_start..end];
+                if args.contains('"') {
+                    sites.push(args.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                rest = &rest[end.max(args_start)..];
+            }
+            sites
+        }
+
+        /// Sites exempt from the rule. **Ships empty, and stays empty.**
+        ///
+        /// When the guard reddens, the resolution is to route the string through
+        /// `copy::` — never to add an entry here. An entry decides that one
+        /// message is served in English to every user, which is the defect
+        /// mika#2025 closed and needs its own ticket to reopen. Same rule, same
+        /// wording, as `ACTOR_READING_PREDICATES_ALLOWED` (mika#2323).
+        const SEND_MESSAGE_LITERAL_ALLOWED: &[(&str, &str)] = &[];
+
+        /// mika#2025 V10 / RI2 / AC4 — no literal reaches a send site.
+        ///
+        /// **No behavioural test can see this regression.** A seventeenth
+        /// hard-coded English string makes no decision wrong and fails no
+        /// assertion; it quietly restores the original defect on one key. So the
+        /// guard is structural, and it is the only thing standing between this
+        /// module and a slow return to where it started.
+        #[test]
+        fn mika2025_v10_no_string_literal_reaches_a_send_site() {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+
+            let mut violations: Vec<String> = Vec::new();
+            let mut call_sites = 0usize;
+            for file in scanner.files() {
+                let production = scanner.production_of(&file);
+                call_sites += production.matches(".send_message(").count();
+                for args in literal_argument_sites(&production) {
+                    violations.push(format!("{}: send_message({args})", file.display()));
+                }
+            }
+
+            // Anti-vacuity on the real tree (mika#2205). The fabricated-input
+            // control below proves the detector works; this proves it was
+            // pointed at something. A `files()` that returned nothing, or a
+            // masking bug that blanked production, would otherwise leave the
+            // assertion below permanently, silently green — which is the exact
+            // failure mode a structural guard exists to not have.
+            assert!(
+                call_sites >= 8,
+                "the scan found only {call_sites} send_message call sites in the \
+                 crate's production sources — it is looking at nothing, not \
+                 finding nothing"
+            );
+
+            let allowed: Vec<&str> = SEND_MESSAGE_LITERAL_ALLOWED
+                .iter()
+                .map(|(site, _)| *site)
+                .collect();
+            let unexpected: Vec<&String> = violations
+                .iter()
+                .filter(|v| !allowed.iter().any(|a| v.contains(a)))
+                .collect();
+
+            assert!(
+                unexpected.is_empty(),
+                "mika#2025 R6/AC4 VIOLATED — these send sites carry a string \
+                 literal, so they serve one language to every user whatever \
+                 their own: {unexpected:#?}. Resolution: add a `copy::UserMessage` \
+                 key and render it. Adding an entry to \
+                 SEND_MESSAGE_LITERAL_ALLOWED decides that a message stays \
+                 English-only and needs its own ticket."
+            );
+
+            // Self-cleaning half: an allowlist entry matching no real violation
+            // is a stale permission, and stale permissions are how an exception
+            // outlives its reason.
+            for (site, ticket) in SEND_MESSAGE_LITERAL_ALLOWED {
+                assert!(
+                    violations.iter().any(|v| v.contains(site)),
+                    "stale allowlist entry {site:?} (ticket {ticket}) — remove it"
+                );
+            }
+        }
+
+        /// Negative control (mika#2205) — the scan can see a violation at all.
+        ///
+        /// Without this, a detector that returned nothing would leave the guard
+        /// above permanently, silently green: "the scan found nothing" and "the
+        /// scan looked at nothing" are the same result until one of them is
+        /// falsified.
+        #[test]
+        fn mika2025_v10_the_scan_detects_a_fabricated_literal() {
+            let fabricated = r#"
+                let _ = tg
+                    .send_message(
+                        chat_id,
+                        "Welcome! If you have an invite link, use it.",
+                    )
+                    .await;
+            "#;
+            assert_eq!(
+                literal_argument_sites(fabricated).len(),
+                1,
+                "the detector must see a literal split across lines by rustfmt"
+            );
+
+            // And it must not fire on the compliant form, or the guard would be
+            // unsatisfiable and the only way out would be the allowlist.
+            let compliant = r#"
+                let _ = tg
+                    .send_message(chat_id, copy::render(UserMessage::NotPaired, locale))
+                    .await;
+                let _ = tg.send_message(chat_id, &composed).await;
+            "#;
+            assert!(literal_argument_sites(compliant).is_empty());
+
+            // A literal in a *comment* is prose, not a send site.
+            let commented = r#"
+                // .send_message(chat_id, "an example in a doc comment")
+                let _ = tg.send_message(chat_id, rendered).await;
+            "#;
+            assert!(literal_argument_sites(commented).is_empty());
+        }
+    }
+
+    // ── mika#2135 — the status FAMILY `scripts/smoke-webhook-chain` decides on ──
+
+    /// Consumer: `scripts/smoke-webhook-chain`, called by `make check-webhook-chain`
+    /// at the end of `make deploy`.
+    ///
+    /// That probe traverses the public webhook chain (Freebox → Synology →
+    /// gentux:8080) with an unauthenticated `POST {}` and reads *the chain is
+    /// alive* off the status that comes back. It deliberately accepts a **family**
+    /// — `{400, 401, 404, 415, 422}` — rather than the `422` the founding incident
+    /// happened to measure, because all of them are answers the gateway's own Axum
+    /// stack produced, and pinning one code would make the probe shout the day an
+    /// extractor detail moved.
+    ///
+    /// The property that makes the family safe is the one asserted here: this route
+    /// **never answers 2xx to an unauthenticated `{}`**. If it ever did, the probe
+    /// would classify the answer as *nothing verified* (a 2xx is not evidence of
+    /// traversal) and a genuinely wired chain would start reporting `NOTE:` — or,
+    /// worse, a future widening of the family would turn the probe into a false
+    /// green with no behavioural test moving. The chain-side half of the contract
+    /// is pinned by `scripts/test-smoke-webhook-chain.sh`; this is the gateway half.
+    mod mika2135 {
+        use super::super::*;
+        use super::mika2360::state;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        /// The family the probe reads as "the chain was traversed".
+        const TRAVERSAL_FAMILY: [u16; 5] = [400, 401, 404, 415, 422];
+
+        async fn post_webhook(content_type: Option<&str>, body: &'static str) -> StatusCode {
+            let app = build_router(state(None, None));
+            let mut req = Request::builder().method("POST").uri("/webhook/telegram");
+            if let Some(ct) = content_type {
+                req = req.header("content-type", ct);
+            }
+            app.oneshot(req.body(Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+
+        /// What the probe actually sends: `Content-Type: application/json`, body `{}`.
+        ///
+        /// `TelegramUpdate.update_id` is a required `i64`, and `Json<_>` is an
+        /// *extractor* — Axum runs it before the handler body, so this fails before
+        /// the secret check and before the single-bot-mode guard. That is also why
+        /// the probe needs no secret and injects no update.
+        #[tokio::test]
+        async fn the_probes_own_request_lands_in_the_traversal_family() {
+            let status = post_webhook(Some("application/json"), "{}").await;
+            assert!(
+                TRAVERSAL_FAMILY.contains(&status.as_u16()),
+                "POST /webhook/telegram with `{{}}` answered {status}, which is outside the \
+                 family scripts/smoke-webhook-chain reads as a live chain ({TRAVERSAL_FAMILY:?}). \
+                 The probe would now report `NOTE: … cannot classify` on a healthy chain."
+            );
+        }
+
+        /// The load-bearing half, and the one a behavioural test of the probe cannot
+        /// see: a 2xx here would make the probe's *silence* unreachable and its
+        /// family meaningless.
+        #[tokio::test]
+        async fn an_unauthenticated_webhook_post_is_never_a_success() {
+            for (ct, body) in [
+                (Some("application/json"), "{}"),
+                (Some("application/json"), "not json at all"),
+                (Some("text/plain"), "{}"),
+                (None, "{}"),
+            ] {
+                let status = post_webhook(ct, body).await;
+                assert!(
+                    !status.is_success(),
+                    "POST /webhook/telegram (content-type {ct:?}) answered {status} — a success \
+                     to an unauthenticated request. scripts/smoke-webhook-chain treats a 2xx as \
+                     unclassifiable, so this turns a wired chain into a permanent `NOTE:`."
+                );
+                assert!(
+                    TRAVERSAL_FAMILY.contains(&status.as_u16()),
+                    "POST /webhook/telegram (content-type {ct:?}) answered {status}, outside \
+                     {TRAVERSAL_FAMILY:?}. Either widen the family in BOTH this test and the \
+                     probe's `case` statement, or the probe stops recognising a live chain."
+                );
+            }
+        }
+    }
+}

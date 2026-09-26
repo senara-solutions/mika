@@ -1,0 +1,10 @@
+# Forge-gate perimeter — self-substrate DECISION-CORE. Human-install only (@samidarko).
+# Toute PR touchant ces chemins exige l'approbation de Vincent — le bot mika-platform-dev ne peut PAS merger seul.
+
+/crates/mika-agent/src/perimeter/                   @samidarko
+/crates/mika-agent/src/server/verdict_handler.rs    @samidarko
+/crates/mika-agent/src/tools/pr_merge_with_gate.rs  @samidarko
+/docs/gate/                                         @samidarko
+
+# Self-référence : CODEOWNERS se possède lui-même
+/.github/CODEOWNERS                                 @samidarko

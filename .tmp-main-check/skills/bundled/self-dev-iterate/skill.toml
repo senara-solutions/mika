@@ -1,0 +1,17 @@
+[skill]
+name = "self-dev-iterate"
+description = "Iteration mode for existing PRs — Step 3a and Step 3b"
+version = "0.1.0"
+always_on = false
+dependencies = ["self-dev"]
+
+[triggers]
+keywords = [
+    "iterate",
+    "address",
+    "review",
+    "feedback",
+    "fix pr",
+    "pr comments",
+    "qa hold",
+]

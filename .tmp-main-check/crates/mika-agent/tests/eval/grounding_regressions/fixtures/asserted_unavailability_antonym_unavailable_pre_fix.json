@@ -1,0 +1,24 @@
+{
+  "_comment": "Frozen pre-fix trace shape from mika#1177 Shape B. The agent claimed 'search_memory is currently unavailable' and the asserted-unavailability guard did not fire because P2's terminal alternation only includes 'available|callable|accessible' \u2014 the single-word adjective 'unavailable' is not covered. No P1-P5 pattern matched. This fixture reproduces the antonym-unavailable failure class for regression assertions.",
+  "incident": "mika#1177",
+  "related": ["mika#862", "mika#894"],
+  "agent": "mika-arch",
+  "failure_class": "unavailability-asserted-without-attempt",
+  "failure_shape": "antonym-unavailable",
+  "turns": [
+    {
+      "turn": 1,
+      "role": "assistant",
+      "text": "search_memory is currently unavailable here \u2014 I'll work with the information already in the conversation.",
+      "tool_calls": [],
+      "guard_fired": false,
+      "note": "Pre-fix: P2's terminal alternation 'not (?:available|callable|accessible)' does not include the standalone adjective 'unavailable'. No P1-P5 match \u2192 guard did not fire."
+    }
+  ],
+  "expected_with_fix": {
+    "turn_1_guard_fires": true,
+    "corrective_reprompt_injected": true,
+    "turn_2_calls_search_memory": true,
+    "note": "With P7 (mika#1177), the 'unavailable' adjective is matched as a standalone pattern. The guard fires on turn 1."
+  }
+}

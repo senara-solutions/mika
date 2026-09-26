@@ -1,0 +1,279 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# mika-os-setup — Host-side provisioner for Mika OS btrfs subvolume layout.
+#
+# Usage:
+#   mika-os-setup btrfs --loopback [--size SIZE] [--path PATH]
+#   mika-os-setup btrfs --device /dev/sdX
+#   mika-os-setup btrfs --csi
+#
+# This script runs on the host OS (or inside a privileged container) to set up
+# the btrfs filesystem that Mika's time-machine feature requires.
+
+set -eu
+
+MIKA_HOME="${MIKA_HOME:-$HOME/.mika}"
+DEFAULT_LOOPBACK_SIZE="10G"
+DEFAULT_LOOPBACK_PATH="${MIKA_HOME}/pool.img"
+
+usage() {
+    cat <<'EOF'
+Usage: mika-os-setup btrfs <mode>
+
+Modes:
+  --loopback [--size SIZE] [--path PATH]
+      Create a loopback btrfs filesystem for Mika.
+      Default size: 10G. Default path: ~/.mika/pool.img
+
+  --device /dev/sdX
+      Format a dedicated partition as btrfs and mount at ~/.mika/.
+      WARNING: This will destroy all data on the device!
+
+  --csi
+      Check for btrfs-CSI StorageClass in Kubernetes and print guidance.
+
+Options:
+  --size SIZE    Loopback file size (default: 10G)
+  --path PATH    Loopback file path (default: ~/.mika/pool.img)
+  --yes          Skip confirmation prompts
+  -h, --help     Show this help message
+EOF
+    exit 0
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "WARNING: $*" >&2
+}
+
+info() {
+    echo "[mika-os-setup] $*"
+}
+
+# Check that we have the required tools
+check_btrfs_progs() {
+    command -v mkfs.btrfs >/dev/null 2>&1 || die "btrfs-progs not installed. Install with: emerge sys-fs/btrfs-progs (Gentoo) or apt install btrfs-progs (Debian/Ubuntu)"
+    command -v btrfs >/dev/null 2>&1 || die "btrfs command not found"
+}
+
+check_root() {
+    [ "$(id -u)" -eq 0 ] || die "This command requires root privileges. Run with sudo."
+}
+
+# Create the btrfs subvolume layout inside the mounted filesystem
+create_subvolume_layout() {
+    local mount_point="$1"
+
+    info "Creating subvolume layout..."
+
+    # Create nested subvolumes (excluded from parent snapshots)
+    if [ ! -d "${mount_point}/logs" ] || ! btrfs subvolume show "${mount_point}/logs" >/dev/null 2>&1; then
+        btrfs subvolume create "${mount_point}/logs"
+        info "Created nested subvolume: logs/"
+    else
+        info "Nested subvolume logs/ already exists"
+    fi
+
+    mkdir -p "${mount_point}/data"
+    if [ ! -d "${mount_point}/data/_backups" ] || ! btrfs subvolume show "${mount_point}/data/_backups" >/dev/null 2>&1; then
+        btrfs subvolume create "${mount_point}/data/_backups"
+        info "Created nested subvolume: data/_backups/"
+    else
+        info "Nested subvolume data/_backups/ already exists"
+    fi
+}
+
+# ── Loopback mode ──
+setup_loopback() {
+    local size="$DEFAULT_LOOPBACK_SIZE"
+    local loop_path="$DEFAULT_LOOPBACK_PATH"
+    local yes_flag=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --size) size="$2"; shift 2 ;;
+            --path) loop_path="$2"; shift 2 ;;
+            --yes) yes_flag="1"; shift ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    check_btrfs_progs
+    check_root
+
+    # Back up existing ~/.mika/ contents if present
+    local backup_dir=""
+    if [ -d "$MIKA_HOME" ] && [ "$(ls -A "$MIKA_HOME" 2>/dev/null)" ]; then
+        backup_dir=$(mktemp -d)
+        info "Backing up existing ${MIKA_HOME}/ contents to ${backup_dir}/"
+        cp -a "${MIKA_HOME}/." "${backup_dir}/"
+    fi
+
+    # Create loopback file
+    local loop_dir
+    loop_dir=$(dirname "$loop_path")
+    mkdir -p "$loop_dir"
+
+    if [ -f "$loop_path" ]; then
+        if [ -z "$yes_flag" ]; then
+            printf "Loopback file %s already exists. Overwrite? [y/N] " "$loop_path"
+            read -r answer
+            case "$answer" in
+                [yY]*) ;;
+                *) die "Aborted." ;;
+            esac
+        fi
+    fi
+
+    info "Creating loopback file: ${loop_path} (${size})"
+    truncate -s "$size" "$loop_path"
+
+    info "Formatting as btrfs..."
+    mkfs.btrfs -f "$loop_path"
+
+    # Mount the loopback
+    mkdir -p "$MIKA_HOME"
+    info "Mounting at ${MIKA_HOME}/"
+    mount -o loop "$loop_path" "$MIKA_HOME"
+
+    # Add fstab entry
+    if ! grep -q "$loop_path" /etc/fstab 2>/dev/null; then
+        echo "${loop_path} ${MIKA_HOME} btrfs loop,defaults 0 0" >> /etc/fstab
+        info "Added fstab entry"
+    fi
+
+    # Create subvolume layout
+    create_subvolume_layout "$MIKA_HOME"
+
+    # Restore backed-up contents
+    if [ -n "$backup_dir" ] && [ -d "$backup_dir" ]; then
+        info "Restoring backed-up contents..."
+        cp -a "${backup_dir}/." "${MIKA_HOME}/" 2>/dev/null || true
+        rm -rf "$backup_dir"
+    fi
+
+    # Fix ownership
+    if id mika >/dev/null 2>&1; then
+        chown -R mika:mika "$MIKA_HOME"
+    fi
+
+    info "Loopback btrfs setup complete at ${MIKA_HOME}/"
+    warn "Loopback files have write amplification on non-btrfs host filesystems."
+    warn "For production use, consider a dedicated btrfs partition (--device)."
+    echo ""
+    echo "Next step: mika snapshot enable"
+}
+
+# ── Device mode ──
+setup_device() {
+    local device=""
+    local yes_flag=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --yes) yes_flag="1"; shift ;;
+            *) device="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$device" ] || die "No device specified. Usage: mika-os-setup btrfs --device /dev/sdX"
+    [ -b "$device" ] || die "${device} is not a block device"
+
+    check_btrfs_progs
+    check_root
+
+    # Safety check: ensure device is not mounted
+    if mount | grep -q "$device"; then
+        die "${device} is currently mounted. Unmount it first."
+    fi
+
+    if [ -z "$yes_flag" ]; then
+        printf "WARNING: This will DESTROY ALL DATA on %s. Continue? [y/N] " "$device"
+        read -r answer
+        case "$answer" in
+            [yY]*) ;;
+            *) die "Aborted." ;;
+        esac
+    fi
+
+    info "Formatting ${device} as btrfs..."
+    mkfs.btrfs -f "$device"
+
+    mkdir -p "$MIKA_HOME"
+    info "Mounting at ${MIKA_HOME}/"
+    mount "$device" "$MIKA_HOME"
+
+    # Add fstab entry
+    if ! grep -q "$device" /etc/fstab 2>/dev/null; then
+        echo "${device} ${MIKA_HOME} btrfs defaults 0 0" >> /etc/fstab
+        info "Added fstab entry"
+    fi
+
+    create_subvolume_layout "$MIKA_HOME"
+
+    if id mika >/dev/null 2>&1; then
+        chown -R mika:mika "$MIKA_HOME"
+    fi
+
+    info "Device btrfs setup complete at ${MIKA_HOME}/"
+    echo ""
+    echo "Next step: mika snapshot enable"
+}
+
+# ── CSI mode ──
+setup_csi() {
+    command -v kubectl >/dev/null 2>&1 || die "kubectl not found. Install kubectl to check Kubernetes CSI support."
+
+    info "Checking for btrfs-CSI StorageClass..."
+
+    if kubectl get sc -o json 2>/dev/null | grep -q '"provisioner".*btrfs'; then
+        info "Found btrfs-CSI StorageClass!"
+        echo ""
+        echo "To use btrfs-backed PVCs for Mika, add to your agent values.yaml:"
+        echo ""
+        echo "  persistence:"
+        echo "    storageClass: <your-btrfs-sc-name>"
+        echo "    accessModes:"
+        echo "      - ReadWriteOnce"
+        echo "    size: 10Gi"
+        echo ""
+        echo "Then run: mika snapshot enable (inside the container)"
+    else
+        info "No btrfs-CSI StorageClass found."
+        echo ""
+        echo "To install the btrfs-CSI driver:"
+        echo "  1. Install the btrfs-CSI driver in your cluster"
+        echo "  2. Create a StorageClass that uses the btrfs provisioner"
+        echo "  3. Update your Mika Helm values to use the StorageClass"
+        echo ""
+        echo "See: https://github.com/samba-in-kubernetes/samba-container (btrfs-csi)"
+    fi
+}
+
+# ── Main dispatch ──
+main() {
+    [ $# -ge 1 ] || usage
+
+    case "$1" in
+        btrfs)
+            shift
+            [ $# -ge 1 ] || die "Specify a mode: --loopback, --device, or --csi"
+            case "$1" in
+                --loopback) shift; setup_loopback "$@" ;;
+                --device)   shift; setup_device "$@" ;;
+                --csi)      shift; setup_csi "$@" ;;
+                -h|--help)  usage ;;
+                *)          die "Unknown mode: $1. Use --loopback, --device, or --csi" ;;
+            esac
+            ;;
+        -h|--help) usage ;;
+        *) die "Unknown command: $1. Only 'btrfs' is supported." ;;
+    esac
+}
+
+main "$@"

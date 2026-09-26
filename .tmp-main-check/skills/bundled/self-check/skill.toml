@@ -1,0 +1,31 @@
+[skill]
+name = "self-check"
+description = "Diagnose errors, review conversations, audit tasks and team runs, and track behavioral trends across Mika's operation."
+version = "0.3.0"
+always_on = false
+timeout_secs = 30
+
+[triggers]
+keywords = [
+    "check logs",
+    "check log",
+    "my logs",
+    "your logs",
+    "log file",
+    "what happened",
+    "diagnose yourself",
+    "check yourself",
+    "check conversations",
+    "review conversations",
+    "how am I doing",
+    "performance review",
+    "audit trail",
+    "audit log",
+    "check tasks",
+    "task health",
+    "orphaned tasks",
+    "check teams",
+    "team runs",
+    "trace_id",
+    "missing trace",
+]

@@ -1,0 +1,42 @@
+{
+  "_comment": "Pre-fix trace shape for mika#736: qa-review required-tools-gate retry produces duplicate PR review. The agent posts a pr review on step 0 without calling qa_pr_view (the required tool). The required-tools gate rejects EndTurn, creates a retry turn. On the retry turn, the agent calls qa_pr_view AND posts a second pr review — the duplicate. Pre-fix: no session-scoped guard blocks the second review.",
+  "steps": [
+    {
+      "step": 0,
+      "type": "tool_call",
+      "tool": "run_gh",
+      "input": {"command": ["pr", "review", "https://github.com/senara-solutions/mika/pull/735", "--approve", "--body", "VERDICT: pass\nAll acceptance criteria satisfied."]},
+      "output": "Review submitted successfully.",
+      "success": true
+    },
+    {
+      "step": 1,
+      "type": "text",
+      "content": "Review submitted. PR #735 approved with VERDICT: pass.",
+      "_rejected_by": "required-tools gate (qa_pr_view not called)"
+    },
+    {
+      "step": 2,
+      "type": "tool_call",
+      "tool": "qa_pr_view",
+      "input": {"pr": 735},
+      "output": "PR #735: fix(agent): normalize PR identifier in dedup key",
+      "success": true
+    },
+    {
+      "step": 3,
+      "type": "tool_call",
+      "tool": "run_gh",
+      "input": {"command": ["pr", "review", "735", "--approve", "--body", "VERDICT: pass\nAll acceptance criteria satisfied."]},
+      "output": "Review submitted successfully.",
+      "success": true,
+      "_is_duplicate": true,
+      "_note": "This is the duplicate review — same PR but different format (bare number vs URL). Pre-fix: session guard misses because dedup keys differ."
+    },
+    {
+      "step": 4,
+      "type": "text",
+      "content": "Review submitted. PR #735 approved."
+    }
+  ]
+}

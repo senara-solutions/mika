@@ -220,6 +220,31 @@ if [ -f "$PROMPT_FILE" ]; then
     else
         FAIL=$((FAIL + 1)); echo "  ✗ Prompt enumerates dispatch_task_has_open_pr rejection variant"
     fi
+
+    # mika#2506 — the prompt must NAME the deterministic gesture.
+    #
+    # The assertion is POSITIVE, and deliberately so. The negative half of
+    # AC10 ("no longer prescribes route 1a") is not greppable: the assertion
+    # directly above REQUIRES `dispatch_task_has_open_pr` to stay mentioned,
+    # because the guard does still fire on an ACTIVE task carrying a pr_url.
+    # A denylist on that token would therefore contradict its own sibling.
+    # What separates "the prompt describes the guard" from "the prompt
+    # prescribes the broken 2-step route" is whether the deterministic
+    # command is named as the route to take — so that is what is asserted.
+    #
+    # Its failure mode is the one this ticket exists to close: a prescriber
+    # that prescribes a dead route manufactures the next occurrence. Per
+    # feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate,
+    # this prompt half does NOT hold on its own — the structural half is the
+    # `mika iterate` command itself (mika#2506 R1). This guard only stops the
+    # prompt from silently drifting back, which no behavioural test can see:
+    # re-prescribing route 1a makes no decision wrong on the day it is
+    # written, it just re-creates the mis-route measured on mika#2503.
+    if grep -qF "mika iterate" "$PROMPT_FILE"; then
+        PASS=$((PASS + 1)); echo "  ✓ Prompt names the deterministic iterate gesture (mika#2506 AC10)"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ Prompt names the deterministic iterate gesture (mika#2506 AC10)"
+    fi
 else
     FAIL=$((FAIL + 1))
     echo "  ✗ self-dev/system_prompt.md not found at expected path"

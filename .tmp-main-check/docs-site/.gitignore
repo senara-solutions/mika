@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.astro/
+
+# Content is generated at build time from docs/
+src/content/docs/
+!src/content/docs/index.mdx
