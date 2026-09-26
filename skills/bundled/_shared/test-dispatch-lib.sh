@@ -8366,7 +8366,7 @@ RESCUE_CAUSE_SUBTYPE_ALLOWED=()
 
 T2539_LEAKED=""
 for _t2539_st in $T2539_SUBTYPES; do
-    printf '%s\n' "$T2539_TOKEN_FN" | grep -qF -- "$_t2539_st" || continue
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" || continue
     _t2539_excused=no
     for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
         [ "${_t2539_entry%%|*}" = "$_t2539_st" ] && _t2539_excused=yes && break
@@ -8381,7 +8381,7 @@ assert_eq "S2: aucun sous-type amont énuméré dans _rescue_cause_token" "" \
 T2539_STALE=""
 for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
     _t2539_st="${_t2539_entry%%|*}"
-    printf '%s\n' "$T2539_TOKEN_FN" | grep -qF -- "$_t2539_st" \
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" \
         || T2539_STALE="${T2539_STALE}${_t2539_st} "
 done
 assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
