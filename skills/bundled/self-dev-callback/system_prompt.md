@@ -27,8 +27,9 @@ When you receive a callback result from a completed background task (`run_claude
 >      d. Stop the turn. The ready-label webhook handler takes over from here.
 >      **Do NOT check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
 >
->    - **If `second-pass (GROOMED)` is ABSENT → failure routing:**
->      - If the callback result text contains `PIPELINE FAILURE:` prefix → route to the "On pipeline failure" handler below (same retry logic and escalation threshold apply to groom callbacks).
+>    - **If `second-pass (GROOMED)` is ABSENT → failure routing, and the FIRST test is terminality:**
+>      - If the callback result text carries a line beginning `Outcome: ESCALATE` → route to the **"Groom-escalation discriminator"** below. **This test comes first** (mika#2545): an escalated groom is terminal, and both other branches retry.
+>      - Else if the callback result text contains `PIPELINE FAILURE:` prefix → route to the "On pipeline failure" handler below (same retry logic and escalation threshold apply to groom callbacks).
 >      - Otherwise → route to the "On failure" handler below (Step 4.5).
 
 > **CRITICAL: DO NOT end your turn after receiving a callback.** Make at least one tool call before EndTurn. Engine rejects zero-tool-call callbacks (#870).
@@ -65,6 +66,19 @@ Permitted post-callback actions are described prosaically in the success/failure
 > 3. `update_task_status(task_id, "failed")` with metadata `{"containment_refusal": true, "refusal_reason": "<cause line from RESULT>"}` — distinct from `operator_cancel`/`signal_cancel`, countable apart (mika#2131).
 > 4. `send_message` with the refusal text **verbatim** (names cause + remedy).
 > 5. Proceed to Step 6. Never announce a PR, completion, or "awaiting QA review".
+
+**Groom-escalation discriminator (mika#2545 — MANDATORY, BEFORE pipeline result classification):**
+
+> **Predicate:** `RESULT` **contains** a line beginning `Outcome: ESCALATE`. Use `contains` on the line, NEVER `starts with` on the whole `RESULT`: this `RESULT` begins with `claude-pilot completed …`.
+>
+> **Why:** an `ESCALATE` is a **terminal** grooming verdict — the exit contract of `/mika-groom-ticket` halts for a human, and the architect's findings are the artefact to read. Replaying it burns a `groom` dispatch slot without changing the verdict: measured 2026-09-26 on the groom of mika#2542, **eight replays** between 13:06:14Z and 13:20:54Z, each ESCALATE on the same cause. The `pipeline_retry_count >= 2` budget below could never bound it — nothing in the engine reads that counter, the write it prescribes lands on a task whose `trigger_type` is `callback` (which `update_task_status` refuses), and every replay is born with fresh metadata (class mika#2158).
+>
+> 1. **Do NOT retry.** Do not call `run_claude_pilot_groom` or `run_claude_pilot` for this task. The engine refuses it anyway (`dispatch_groom_escalated`), so a call costs a turn and a refusal line.
+> 2. **Do NOT increment** `pipeline_retry_count`.
+> 3. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`) — same rule as the containment-refusal branch above.
+> 4. `update_task_status(task_id, "blocked")` with metadata `{"groom_escalated": true, "escalation_stage": "<stage from the Outcome line>"}` — distinct from `operator_cancel` / `containment_refusal`, countable apart (mika#2131).
+> 5. `send_message` naming the ticket, the `Verdict:` line, the `Session:` and the **findings path** verbatim from `RESULT` (`Architect findings preserved at: …`). That path is the operator's primary artefact for deciding whether to revise, refactor or kill the plan.
+> 6. Proceed to Step 6. Never announce a PR, a retry, or "awaiting QA review".
 
 **Pipeline result classification (MANDATORY — before generic failure handling):**
 

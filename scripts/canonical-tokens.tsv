@@ -170,6 +170,13 @@ HANDLER CRASH	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	ex
 PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
 PIPELINE_INCOMPLETE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
 STATUS	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
+# mika#2545 — `Outcome: ESCALATE` gained three strict readers the day its
+# producer started writing it. Declared here rather than left to the
+# exhaustiveness scan's blind spot: the doctrine is "a token whose reader is
+# strict is declared with its site", and a silent gap is what makes a lint drift.
+ESCALATE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
+ESCALATE	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:line-anchored
+ESCALATE	B	crates/mika-agent/src/skills/executor.rs::GROOM_ESCALATE_MARKER	exact:prefix
 STRUCTURAL VIOLATION	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
 PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_post_flight_recovery	exact:literal
 NO_PR	B	crates/mika-agent/src/task_engine/dispatcher.rs::RE_NO_PR	exact:line-anchored
