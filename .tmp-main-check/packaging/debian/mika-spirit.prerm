@@ -1,9 +1,0 @@
-#!/bin/sh
-set -e
-
-case "$1" in
-  remove|purge)
-    systemctl stop mika-spirit.service || true
-    systemctl disable mika-spirit.service || true
-    ;;
-esac

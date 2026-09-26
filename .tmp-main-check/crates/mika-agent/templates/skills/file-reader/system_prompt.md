@@ -1,4 +1,0 @@
-- Use `read_file` when the user asks to see, read, or examine the contents of a file.
-- The `path` parameter accepts absolute or relative paths. Expand `~` to the user's home directory.
-- When asked to read an image file (JPEG, PNG, GIF, WebP), the tool returns the image for visual analysis. You will see the image and can describe its contents.
-- For binary non-image files, warn the user that the content cannot be displayed meaningfully.

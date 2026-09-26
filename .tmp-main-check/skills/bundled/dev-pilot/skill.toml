@@ -1,9 +1,0 @@
-[skill]
-name = "dev-pilot"
-description = "Dispatch a headless Claude Code implementation session via the claude-pilot CLI"
-version = "0.1.0"
-always_on = false
-timeout_secs = 600
-
-[triggers]
-keywords = ["claude code", "run claude", "code task", "coding task"]

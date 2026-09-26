@@ -1,3 +1,0 @@
-- Use web_search when the user asks about current events, recent information, or topics you're unsure about.
-- Prefer searching over guessing when accuracy matters.
-- Summarize search results concisely — don't dump raw results.
