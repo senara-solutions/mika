@@ -2350,6 +2350,17 @@ pub(crate) async fn validate_dispatch_readiness(
     // readable reference leaves the population: the term is unsatisfied and the
     // gate does not bite.
     //
+    // ONE subject, deliberately — and the seat gate below does the opposite, so
+    // the difference is worth naming rather than leaving a reader to wonder. That
+    // gate consults BOTH `reference_url` and the prompt because its question is
+    // *"could this dispatch put a second writer on a branch another seat owns?"*,
+    // and either subject naming a foreign seat is enough to refuse. This gate's
+    // question is *"did the grooming of the ticket this dispatch will actually
+    // groom end on a halt?"* — a question about one ticket, the one the pilot
+    // will work on. Adding `reference_url` here would refuse a dispatch because a
+    // DIFFERENT ticket escalated, which is a false positive on the exact axis
+    // where a false positive blocks the operator's recovery.
+    //
     // FAIL-CLOSED on the unreadable, and the neighbour decides: the provenance
     // gate is already fail-closed on this same door, with its reason written. The
     // cost is named — on a DB error a legitimate automatic re-groom is refused
