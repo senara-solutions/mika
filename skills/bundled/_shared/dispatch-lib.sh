@@ -2623,16 +2623,27 @@ contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'
 # vide que git ne voit pas, n'a de barrière ici que ce texte. Sa fermeture
 # structurelle appartient à la politique claude-pilot — suivi nommé au plan.
 #
+# Portée de l'interdit : les brouillons de `.pilot-scratch/`, pas tout fichier.
+# La règle mika#2211 (injectée juste avant) prescrit de supprimer `pr-body.md`
+# après `gh pr create` ; un interdit général de `rm` la contredirait, et le
+# pilote qui suit la règle la plus récente laisserait `pr-body.md` non suivi à
+# la racine — ignoré dans mika seulement, donc commité par le rescue `add -A`
+# ailleurs (mika-cloud, mika-skills). D'où l'exception nommée dans le texte.
+#
 # Inconditionnelle, comme mika#2211 : groomeurs et implémenteurs bâtissent tous
 # deux des fixtures. Appendue AVANT la règle Fire-Disposition (mika#2306), qui
 # doit rester la plus récente pour le groomeur, la récence étant son seul levier.
 _PILOT_SCRATCH_RULE="RÈGLE DE DISPATCH (mika#2548) — ton brouillon vit sous \`.pilot-scratch/\`, et tu ne le supprimes jamais.
-Pour un fixture, une copie de test ou tout fichier temporaire : crée-le sous \`.pilot-scratch/<nom>/\` à la racine
-du worktree (outil Write, ou mkdir/cp dans ce répertoire). Il existe déjà, il est exclu de git, il repart vide à
+Pour un fixture, une copie de test ou tout autre fichier temporaire : crée-le sous \`.pilot-scratch/<nom>/\` à la racine
+du worktree (outil Write, ou mkdir/cp dans ce répertoire). Pour y extraire un fichier d'une autre révision :
+\`git show <ref>:<chemin> > .pilot-scratch/<chemin>\`, SEUL sur sa ligne — sans \`--\`, sans \`2>/dev/null\`, sans \`;\` ni \`&&\`
+(toute autre forme est refusée). Il existe déjà, il est exclu de git, il repart vide à
 chaque préparation et il disparaît avec le worktree : un résidu n'y coûte rien.
-Ne supprime JAMAIS un brouillon, même vide, même en changeant d'approche : pas de \`rm\`, pas de \`rmdir\` (refusé),
-et surtout pas de \`rm -rf\` — ce refus est TERMINAL et tue la session sur le coup. Abandonner un brouillon, c'est
-le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \`cp\` et Write y sont refusés."
+Ne supprime JAMAIS un brouillon de \`.pilot-scratch/\`, même vide, même en changeant d'approche : pas de \`rm\`, pas de
+\`rmdir\` (refusé), et surtout pas de \`rm -rf\` — ce refus est TERMINAL et tue la session sur le coup. Abandonner un
+brouillon, c'est le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \`cp\` et Write y sont refusés.
+Seule exception : \`pr-body.md\` à la racine n'est pas un brouillon — la règle mika#2211 ci-dessus reste entière
+(écris-le à la racine, puis un simple \`rm pr-body.md\` après \`gh pr create\`, jamais \`rm -rf\`)."
 
 # mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
 # de grooming.
@@ -3306,15 +3317,16 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
 
         # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
         #
-        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Conditionnée au skill, à la différence des trois injections ci-dessus.
         # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
-        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # ticket, la règle de corps de PR (mika#2211) et la règle du scratch
+        # (mika#2548) servent tout pilote. Celle-ci
         # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
         # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
         # donc à écrire explicitement, jamais à hériter du voisin : la copier
         # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
         #
-        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # Appendue APRÈS les trois autres, donc les trois invariants de position
         # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
         # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
         if [ "$SKILL" = "dev-groom" ]; then

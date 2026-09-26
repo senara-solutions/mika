@@ -6217,6 +6217,19 @@ assert_contains "mika#2548: la règle interdit rmdir" '`rmdir`' "$T2548_RULE"
 assert_contains "mika#2548: la règle interdit rm -rf" '`rm -rf`' "$T2548_RULE"
 assert_contains "mika#2548: la règle dit que le refus est terminal" "TERMINAL" "$T2548_RULE"
 assert_contains "mika#2548: la règle écarte /tmp comme lieu de fixture" "/tmp" "$T2548_RULE"
+# La commande qui a réellement échoué dans l'incident fondateur (mika#2054) était un
+# `git show … -- > … 2>/dev/null; wc -l`, refusé pour sa forme et non pour sa cible :
+# la règle nomme la seule forme que la politique autorise (cpp#35, bash-git-show-redirect).
+assert_contains "mika#2548: la règle nomme la forme git show autorisée" \
+    'git show <ref>:<chemin> > .pilot-scratch/<chemin>' "$T2548_RULE"
+# L'interdit porte sur le scratch, pas sur tout fichier : sinon il contredit la
+# règle mika#2211 (« puis supprime-le ») et un pr-body.md laissé à la racine est
+# commité par le rescue dans les dépôts qui ne l'ignorent pas.
+assert_contains "mika#2548: l'interdit de suppression est borné au scratch" \
+    'Ne supprime JAMAIS un brouillon de `.pilot-scratch/`' "$T2548_RULE"
+assert_contains "mika#2548: pr-body.md (mika#2211) est l'exception nommée" 'pr-body.md' "$T2548_RULE"
+assert_not_contains "mika#2548: plus d'interdit général sur tout brouillon" \
+    'Ne supprime JAMAIS un brouillon,' "$T2548_RULE"
 
 # ============================================================================
 # mika#2120 — le second lecteur du callout `Plan` tolère le préfixe de dépôt
@@ -7530,6 +7543,8 @@ assert_eq "mika#1943 U2: _clean_worktree_for_rebase garde son rm -rf" \
     "1" "$(_mika1943_guard_calls_in _clean_worktree_for_rebase)"
 assert_eq "mika#1943 U2: _cleanup_iterate_findings garde son rm -rf" \
     "1" "$(_mika1943_guard_calls_in _cleanup_iterate_findings)"
+assert_eq "mika#1943 U2: _seed_pilot_scratch_dir garde son rm -rf (mika#2548)" \
+    "1" "$(_mika1943_guard_calls_in _seed_pilot_scratch_dir)"
 
 # --- U2: la garde est CÂBLÉE au site, et elle n'y casse rien ----------------
 #
@@ -7588,9 +7603,9 @@ _MIKA1943_CODE_LINES=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" || true)
 _MIKA1943_WT_REMOVES=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -c 'worktree remove --force' || true)
 assert_eq "mika#1943 U2: exactement trois 'worktree remove --force' recensés" \
     "3" "$_MIKA1943_WT_REMOVES"
-_MIKA1943_RMRF_WT=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -cE 'rm -rf "\$(wt|WORKTREE_DIR|findings_dir)' || true)
-assert_eq "mika#1943 U2: exactement deux 'rm -rf' sur un chemin de worktree" \
-    "2" "$_MIKA1943_RMRF_WT"
+_MIKA1943_RMRF_WT=$(printf '%s\n' "$_MIKA1943_CODE_LINES" | grep -cE 'rm -rf "\$(wt|WORKTREE_DIR|findings_dir|scratch)' || true)
+assert_eq "mika#1943 U2: exactement trois 'rm -rf' sur un chemin de worktree" \
+    "3" "$_MIKA1943_RMRF_WT"
 
 # ============================================================================
 # mika#2306 — la section `## Fire-Disposition` a un site de production (T1–T11)
