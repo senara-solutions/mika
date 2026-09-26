@@ -62,6 +62,10 @@ The remove→add cycle of the `ready` label that `auto_pull` Phase 2 performs on
 
 A one-command reproducer that spawns a real sandbox through the same code path a dispatch uses, then asserts both directions: that credentials and host state are unreachable from inside, and that the tools the session legitimately needs still work. It exists because a containment claim read from source is not a containment result — the author is not their own control — so it also offers an interactive mode an external reviewer can enter the sandbox through and probe by hand.
 
+### Pilot turn ceiling
+
+The maximum number of agent turns a dispatched pilot may take before the SDK ends the run, resolved per dispatch by a fixed-order cascade and announced on the dispatch's forensic log with the source that decided it. The explicit rollback (the setting present but empty or zero) sits above everything and passes no ceiling at all; a ticket label listed in the ceiling table comes next and raises the ceiling for that class of ticket (the `loop-substrate` class today); the host-wide setting comes after it; the in-code default comes last. The order is load-bearing: a host that sets the fleet-wide value would otherwise shadow every label, so the label wins over the host setting, and only the rollback or removing the label bounds a labelled ticket lower. A ceiling label must be declared in the repository's label registry, or label-sync deletes it and the raised ceiling silently applies to nobody.
+
 ## Dispatch gates
 
 ### Grooming-provenance gate

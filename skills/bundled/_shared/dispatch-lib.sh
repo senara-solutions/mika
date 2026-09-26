@@ -293,26 +293,21 @@ _pilot_log_dir() {
 # `_pilot_max_turns` sur la MÊME ligne, et test-dispatch-lib.sh refuse toute
 # lecture non co-localisée.
 #
-# LE DÉFAUT EST LIVRÉ À 0, C'EST-À-DIRE DÉSARMÉ — et ce n'est pas la valeur que
-# le plan de mika#2496 propose. Son § 5.1 fait de la distribution mesurée des
-# tours des runs ABOUTIS une vérification bloquante (V2) préalable à l'armement,
-# précisément parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une
-# borne qui coupe la population saine déplace le défaut au lieu de le fermer.
-# Cette mesure se lit sur `~/.mika/data/mika.db`, que le bac à sable de dispatch
-# ne monte pas — c'est un geste opérateur sur l'hôte, et le plan écrit lui-même
-# la conduite quand il n'est pas fourni : « U1 est livré DÉSARMÉ
-# (`PILOT_MAX_TURNS=0` par défaut) et la raison est écrite dans le corps de la
-# PR ». Armer est alors d'un geste et sans redéploiement :
-# `PILOT_MAX_TURNS=120` sur l'environnement du service ; ou porter ce défaut à
-# 120 une fois V2 rapportée sur le ticket.
+# LE DÉFAUT A ÉTÉ LIVRÉ DÉSARMÉ PAR mika#2496, ET EST ARMÉ À 150 PAR mika#2542.
+# Le plan de mika#2496 faisait de la distribution mesurée des tours des runs
+# ABOUTIS une vérification bloquante (V2) préalable à l'armement, précisément
+# parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une borne qui
+# coupe la population saine déplace le défaut au lieu de le fermer. Le plafond
+# 150 a donc d'abord vécu dans `~/.mika/.env` (`source=env`) ; mika#2542 le
+# rapporte ici une fois V2 fournie (voir sa note plus bas).
 #
-# Trois paliers, et le `0` n'est pas une valeur invalide mais LE ROLLBACK :
+# Le `0` n'est pas une valeur invalide mais LE ROLLBACK :
 #
-#   non défini  -> le défaut ci-dessous
 #   ""  ou "0"  -> le drapeau n'est PAS passé ; claude-pilot retombe sur son
 #                  propre `maxTurns=200`, soit le comportement d'avant
 #                  mika#2496 à l'octet près
-#   entier > 0  -> ce plafond, `source=env`
+#   entier > 0  -> ce plafond, `source=env` (sauf label de ticket, mika#2542)
+#   non défini  -> le défaut ci-dessous
 #   autre       -> le défaut, PLUS une ligne `pilot_budget_invalid` nommant la
 #                  valeur fautive entre guillemets. Un désarmement par coquille
 #                  sur un frein de coût serait la panne silencieuse que tout
@@ -322,28 +317,122 @@ _pilot_log_dir() {
 # chiffres sinon. C'est ce qui rend `${_PILOT_MAX_TURNS:+--max-turns …}` juste
 # aux sites de lancement — le drapeau littéral y reste visible (le scan de
 # source l'exige) tout en disparaissant de l'argv quand la borne est absente.
+#
+# mika#2542 — LE PLAFOND SE RÉSOUT AUSSI DEPUIS LE LABEL DU TICKET. Trois
+# implements `loop-substrate` consécutifs (#2532, #2536, #2519) ont été coupés à
+# 151 tours sous le plafond 150 : cette classe touche la famille de handlers,
+# le Rust, les tests et la doc, et elle est intrinsèquement plus longue que le
+# trafic nominal. Le défaut in-file est ARMÉ à 150 dans le même geste — V2 de
+# mika#2496 est rapportée par ce ticket : 150 tourne en production depuis le
+# 2026-09-24 et ses seuls dépassements mesurés sont la classe qu'on exempte.
+# Livrer l'exception sans la règle qu'elle exempte (règle qui ne vivait alors
+# que dans `~/.mika/.env`) aurait été la forme la plus fragile du travail.
+#
+# La cascade, et SON ORDRE EST LE LIVRABLE :
+#
+#   1. PILOT_MAX_TURNS défini et ("" ou "0") -> ROLLBACK, pas de drapeau  (env)
+#   2. un label de PILOT_LABEL_TURN_CEILINGS -> ce plafond             (label)
+#   3. PILOT_MAX_TURNS entier > 0            -> cette valeur             (env)
+#   4. sinon                                 -> le défaut in-file    (default)
+#
+# Le palier 1 est AU-DESSUS du label : un label qui écraserait le rollback
+# ferait cesser le rollback d'être un rollback, pendant un incident, sans que
+# rien ne le dise. Le palier 2 est AU-DESSUS du palier 3 : l'hôte de production
+# porte `PILOT_MAX_TURNS=150`, donc un label placé sous l'env serait inerte
+# partout où il compte — mergé, déployé, zéro effet, aucune ligne rouge (classe
+# mika#2205). Coût nommé : `PILOT_MAX_TURNS=50` ne borne PAS un ticket
+# `loop-substrate` sous 200 ; les gestes qui le font sont retirer le label, ou
+# `PILOT_MAX_TURNS=0`.
+#
+# L'argument `$1` est la liste CSV des labels du ticket (`LABELS`, posée par
+# `_set_up_worktree`). Elle est PASSÉE, jamais lue par portée dynamique — même
+# raison que `_pilot_log_dir` : un état posé 500 lignes plus haut par une autre
+# fonction peut être lu périmé sans que rien ne le dise. Un site qui oublierait
+# l'argument résout « aucun label », donc le défaut : l'oubli est fail-safe
+# vers 150, jamais vers 200, et test-dispatch-lib.sh le refuse quand même.
+#
+# L'invalidité est posée INDÉPENDAMMENT de la résolution : `PILOT_MAX_TURNS=abc`
+# sur un ticket `loop-substrate` résout 200 par le label ET émet
+# `pilot_budget_invalid` — la coquille est dite même quand elle ne décide rien.
+
+# mika#2542 — la table label → plafond de tours. UN SEUL SITE : aucun autre
+# lecteur de label ne décide d'un plafond (AC5).
+#
+# Format de fil `label=plafond`, une entrée par ligne : c'est la forme que
+# `scripts/check-pilot-turn-ceiling-labels.sh` extrait SANS exécuter ce fichier
+# pour vérifier que chaque clé est déclarée dans `.github/labels.yml`. Un label
+# non déclaré y est SUPPRIMÉ au prochain sync (`delete-other-labels: true`),
+# sans événement `unlabeled` : le relèvement deviendrait inerte en silence. Une
+# réécriture qui changerait cette forme rendrait la garde aveugle — son exit 3
+# et son harnais négatif sont là pour que ça se voie.
+#
+# `200` est une valeur POSÉE, pas mesurée : les trois runs de référence ont été
+# COUPÉS à 151, on ignore combien de tours ils auraient pris. Si la classe
+# recoupe à 201, c'est la valeur qu'il faut revoir, pas le mécanisme — et
+# `source=label` sur la ligne `pilot_budget_armed` est ce qui distingue notre
+# 200 du `maxTurns=200` amont de claude-pilot.
+PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"
+)
+
+# Assigne `_PILOT_LABEL_CEILING` / `_PILOT_LABEL_CEILING_NAME` depuis le CSV `$1`
+# et rend 0 quand un label de la table a décidé, 1 sinon. ASSIGNE, n'imprime
+# pas (mika#2039, même contrainte que `_pilot_max_turns`). Appariement EXACT sur
+# un élément du CSV : on encadre (`,$1,`) et on cherche `,<label>,`. Un glob de
+# sous-chaîne à la manière de `_label_to_type` apparierait `not-loop-substrate`
+# ou `loop-substrate-v2` — tolérable pour un préfixe de commit, faux pour un
+# frein de coût. La première entrée de la table qui apparie décide.
+_pilot_label_turn_ceiling() {
+    local _csv=",${1:-},"
+    local _entry _label
+    _PILOT_LABEL_CEILING=""
+    _PILOT_LABEL_CEILING_NAME=""
+    for _entry in "${PILOT_LABEL_TURN_CEILINGS[@]}"; do
+        _label="${_entry%%=*}"
+        case "$_csv" in
+            *",${_label},"*)
+                _PILOT_LABEL_CEILING="${_entry#*=}"
+                _PILOT_LABEL_CEILING_NAME="$_label"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 _pilot_max_turns() {
-    # LE défaut de flotte, un seul site. Vide = désarmé ; pour armer, écrire le
-    # plafond ici (`local _default=120`) une fois V2 rapportée sur le ticket.
-    local _default=""
+    # LE défaut de flotte, un seul site. Armé à 150 par mika#2542 (V2 de
+    # mika#2496 rapportée). Vide = désarmé.
+    local _default="150"
 
     _PILOT_MAX_TURNS_SOURCE="default"
     _PILOT_MAX_TURNS_INVALID=""
+    _PILOT_MAX_TURNS_LABEL=""
 
-    if [ -z "${PILOT_MAX_TURNS+set}" ]; then
-        # Non défini : le défaut de flotte.
-        _PILOT_MAX_TURNS="$_default"
-    elif [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; then
-        # Le ROLLBACK, explicite : le drapeau ne sera pas passé.
+    # L'invalidité est dite quel que soit le palier qui décide.
+    if [ -n "${PILOT_MAX_TURNS:-}" ] && [ "$PILOT_MAX_TURNS" != "0" ] \
+        && ! grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
+    fi
+
+    if [ -n "${PILOT_MAX_TURNS+set}" ] \
+        && { [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; }; then
+        # Palier 1 — le ROLLBACK, explicite : le drapeau ne sera pas passé, et
+        # aucun label n'a voix au chapitre.
         _PILOT_MAX_TURNS=""
         _PILOT_MAX_TURNS_SOURCE="env"
-    elif grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+    elif _pilot_label_turn_ceiling "${1:-}"; then
+        # Palier 2 — le label du ticket. Au-dessus de l'env : voir la cascade.
+        _PILOT_MAX_TURNS="$_PILOT_LABEL_CEILING"
+        _PILOT_MAX_TURNS_SOURCE="label"
+        _PILOT_MAX_TURNS_LABEL="$_PILOT_LABEL_CEILING_NAME"
+    elif [ -n "${PILOT_MAX_TURNS:-}" ] && [ -z "$_PILOT_MAX_TURNS_INVALID" ]; then
+        # Palier 3 — un entier positif dans l'env.
         _PILOT_MAX_TURNS="$PILOT_MAX_TURNS"
         _PILOT_MAX_TURNS_SOURCE="env"
     else
-        # Illisible ou négatif : on retombe au défaut, et on le DIT.
+        # Palier 4 — non défini, ou illisible (et alors DIT ci-dessus).
         _PILOT_MAX_TURNS="$_default"
-        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
     fi
 
     # Le résolveur ne RELIT jamais `$_PILOT_MAX_TURNS` : chaque branche l'écrit
@@ -406,10 +495,19 @@ _emit_pilot_budget_line() {
     done
 
     if [ -n "${_PILOT_MAX_TURNS_INVALID:-}" ]; then
-        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, retour au défaut" >&2
+        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, le plafond vient d'un autre palier (voir source= ci-dessous)" >&2
     fi
 
-    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset} cost_bound=absent_upstream" >&2
+    # mika#2542 — `label=` n'est émis QUE quand un label a décidé : un champ
+    # vide se lirait comme un label nommé « vide ». Placé après `source=` et
+    # avant `cost_bound=`, qui reste en dernier ; tout grep existant sur
+    # `max_turns=` ou `source=` continue d'apparier.
+    local _lbl=""
+    if [ "${_PILOT_MAX_TURNS_SOURCE:-}" = "label" ] && [ -n "${_PILOT_MAX_TURNS_LABEL:-}" ]; then
+        _lbl=" label=${_PILOT_MAX_TURNS_LABEL}"
+    fi
+
+    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset}${_lbl} cost_bound=absent_upstream" >&2
 }
 
 # mika#2165: make that directory visible — and writable — from INSIDE.
@@ -3232,7 +3330,7 @@ _run_claude_pilot() {
     # which the bind could therefore never be guaranteed to cover.
     # mika#2496: `--max-turns` is resolved on THIS line (co-location, as for
     # `--log-dir`) and expands to nothing when the budget is disarmed.
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -6529,7 +6627,7 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
         ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
@@ -6649,7 +6747,7 @@ Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
         ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${fd_findings_file}" \

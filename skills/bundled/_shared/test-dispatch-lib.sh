@@ -6560,18 +6560,22 @@ assert_eq "mika#2496 (AC7): aucun site ne passe --max-budget" "0" \
     "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF -- '--max-budget' || true)"
 
 # --- V4 : le comportement du résolveur, les trois paliers ---
+# `$2` (optionnel, mika#2542) : le CSV des labels du ticket, tel que les sites de
+# lancement le passent au résolveur.
 _mika2496_resolve_probe() {
     (
         # shellcheck disable=SC1090
         source "$DISPATCH_LIB" 2>/dev/null || true
         unset PILOT_MAX_TURNS
         if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
-        _pilot_max_turns
+        _pilot_max_turns "${2:-}"
         printf '%s|%s|%s' "$_PILOT_MAX_TURNS" "$_PILOT_MAX_TURNS_SOURCE" "$_PILOT_MAX_TURNS_INVALID"
     )
 }
-assert_eq "mika#2496: sans surcharge, le défaut de flotte est DÉSARMÉ (V2 non fournie)" \
-    "|default|" "$(_mika2496_resolve_probe __UNSET__)"
+# mika#2542 (D2) : le défaut de flotte est ARMÉ à 150 — V2 de mika#2496 rapportée.
+# Le diff de cette assertion (`|default|` → `150|default|`) EST la décision.
+assert_eq "mika#2542 (AC9): sans surcharge, le défaut de flotte est armé à 150" \
+    "150|default|" "$(_mika2496_resolve_probe __UNSET__)"
 assert_eq "mika#2496: une valeur entière est honorée, provenance env" \
     "120|env|" "$(_mika2496_resolve_probe 120)"
 # Contrôle négatif du rollback (AC4) : `0` omet le drapeau, ce qui rend le
@@ -6583,9 +6587,9 @@ assert_eq "mika#2496 (AC4): une valeur vide vaut rollback" \
 # Un désarmement par coquille sur un frein de coût serait la panne silencieuse
 # que tout ceci ferme : il retombe au défaut ET il est DIT.
 assert_eq "mika#2496: une valeur illisible retombe au défaut et est nommée" \
-    "|default|abc" "$(_mika2496_resolve_probe abc)"
+    "150|default|abc" "$(_mika2496_resolve_probe abc)"
 assert_eq "mika#2496: une valeur négative retombe au défaut et est nommée" \
-    "|default|-5" "$(_mika2496_resolve_probe '-5')"
+    "150|default|-5" "$(_mika2496_resolve_probe '-5')"
 
 # --- V4 : le drapeau atteint l'argv, avec la valeur résolue ---
 #
@@ -6598,15 +6602,18 @@ _mika2496_argv_probe() {
         source "$DISPATCH_LIB" 2>/dev/null || true
         unset PILOT_MAX_TURNS
         if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
-        _pilot_max_turns
+        _pilot_max_turns "${2:-}"
         # shellcheck disable=SC2086
         printf '%s' "claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika"
     )
 }
 assert_contains "mika#2496 (AC1): armé, l'argv porte --max-turns avec la valeur résolue" \
     '--max-turns 120' "$(_mika2496_argv_probe 120)"
+# Depuis mika#2542 le défaut est armé : le seul désarmement est le rollback `0`.
 assert_not_contains "mika#2496 (AC4): désarmé, l'argv ne porte AUCUN --max-turns" \
-    '--max-turns' "$(_mika2496_argv_probe __UNSET__)"
+    '--max-turns' "$(_mika2496_argv_probe 0)"
+assert_contains "mika#2542 (AC2): sans surcharge, l'argv porte le défaut armé" \
+    '--max-turns 150' "$(_mika2496_argv_probe __UNSET__)"
 
 # --- U2/AC2 : le budget en vigueur est dit, et la ligne lit l'ARGV ---
 _mika2496_budget_line() {
@@ -6615,7 +6622,7 @@ _mika2496_budget_line() {
         source "$DISPATCH_LIB" 2>/dev/null || true
         unset PILOT_MAX_TURNS
         if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
-        _pilot_max_turns
+        _pilot_max_turns "${2:-}"
         # shellcheck disable=SC2086
         _emit_pilot_budget_line claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika 2>&1
     )
@@ -6624,7 +6631,10 @@ assert_contains "mika#2496 (AC2): armé par l'env, la ligne dit la valeur et sa 
     'pilot_budget_armed max_turns=120 source=env cost_bound=absent_upstream' \
     "$(_mika2496_budget_line 120)"
 assert_contains "mika#2496 (AC2): désarmé, la ligne dit max_turns=none — jamais une borne inventée" \
-    'pilot_budget_armed max_turns=none source=default cost_bound=absent_upstream' \
+    'pilot_budget_armed max_turns=none source=env cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 0)"
+assert_contains "mika#2542 (AC2): sans surcharge, la ligne dit le défaut armé et sa provenance" \
+    'pilot_budget_armed max_turns=150 source=default cost_bound=absent_upstream' \
     "$(_mika2496_budget_line __UNSET__)"
 assert_contains "mika#2496: une coquille est nommée entre guillemets" \
     'pilot_budget_invalid PILOT_MAX_TURNS="oops"' \
@@ -6652,6 +6662,184 @@ assert_eq "mika#2496: la ligne est émise depuis _run_pilot_sandboxed, pas avant
 # par son indentation : un appel écrit en colonne zéro resterait compté.
 assert_eq "mika#2496: et depuis nulle part ailleurs" "1" \
     "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -E '_emit_pilot_budget_line' | grep -cvE '_emit_pilot_budget_line\(\)' || true)"
+
+# --- mika#2542 : le plafond de tours se résout depuis le label du ticket ---
+echo ""
+echo "Test: le plafond de tours se résout depuis le label du ticket (mika#2542)"
+echo "-------------------------------------------------------------------------"
+# Trois implements `loop-substrate` coupés à 151 tours sous le plafond 150. Le
+# ticket porteur du label reçoit 200 ; tout autre reste à 150. L'ORDRE de la
+# cascade est le livrable : l'hôte de production porte `PILOT_MAX_TURNS=150`,
+# donc un palier label placé sous l'env serait inerte partout où il compte
+# (classe mika#2205). Les probes réutilisent celles de mika#2496, étendues d'un
+# second argument (le CSV des labels).
+
+# Les deux allowlists sont LIVRÉES VIDES (doctrine mika#2201 : on déclare, on
+# n'allowliste pas). Quand G1 tire : déclarer le label dans labels.yml. Quand G2
+# tire : passer "${LABELS:-}" au résolveur.
+MIKA2542_CEILING_LABEL_EXCEPTIONS=()
+MIKA2542_UNARGUMENTED_SITES=()
+assert_eq "mika#2542: l'allowlist des labels non déclarés est livrée vide" "0" \
+    "${#MIKA2542_CEILING_LABEL_EXCEPTIONS[@]}"
+assert_eq "mika#2542: l'allowlist des sites sans argument est livrée vide" "0" \
+    "${#MIKA2542_UNARGUMENTED_SITES[@]}"
+
+# --- G3 / V1 : la cascade, palier par palier (`valeur|source|invalid`) ---
+assert_eq "mika#2542 (AC1): un ticket loop-substrate reçoit 200, provenance label" \
+    "200|label|" "$(_mika2496_resolve_probe __UNSET__ loop-substrate)"
+assert_eq "mika#2542 (AC2): sans label, une valeur d'env reste honorée" \
+    "120|env|" "$(_mika2496_resolve_probe 120 '')"
+# R1-bis — le cas qui décide si le ticket a un effet en production.
+assert_eq "mika#2542 (AC3): le label BAT l'env (sinon inerte sur l'hôte de prod)" \
+    "200|label|" "$(_mika2496_resolve_probe 150 loop-substrate)"
+assert_eq "mika#2542 (AC3): le label bat l'env même quand l'env vaut plus bas" \
+    "200|label|" "$(_mika2496_resolve_probe 120 loop-substrate)"
+# Le rollback mika#2496 reste un rollback, label ou pas.
+assert_eq "mika#2542 (AC4): PILOT_MAX_TURNS=0 reste le ROLLBACK, le label n'a pas voix" \
+    "|env|" "$(_mika2496_resolve_probe 0 loop-substrate)"
+assert_eq "mika#2542 (AC4): une valeur vide reste le rollback sur un ticket substrat" \
+    "|env|" "$(_mika2496_resolve_probe '' loop-substrate)"
+# L'invalidité est dite indépendamment du palier qui décide.
+assert_eq "mika#2542: une coquille sur un ticket substrat — le label décide ET la coquille est nommée" \
+    "200|label|abc" "$(_mika2496_resolve_probe abc loop-substrate)"
+assert_eq "mika#2542: une coquille sans label retombe au défaut armé, nommée" \
+    "150|default|abc" "$(_mika2496_resolve_probe abc '')"
+
+# --- G3 / V2 : appariement EXACT sur un élément du CSV (AC6) ---
+#
+# Fixtures négatives d'abord : un glob de sous-chaîne (`*loop-substrate*`, la
+# forme de `_label_to_type`) relèverait chacune d'elles. Vues rouges avant
+# d'être vues vertes — c'est la Halte 4 du plan tenue à l'unité.
+for _mika2542_near in not-loop-substrate loop-substrate-v2 xloop-substrate loop-substratex \
+    'bug,loop-substrate-v2' 'not-loop-substrate,p1-important' 'LOOP-SUBSTRATE' ' loop-substrate'; do
+    assert_eq "mika#2542 (AC6): '$_mika2542_near' ne relève RIEN" \
+        "150|default|" "$(_mika2496_resolve_probe __UNSET__ "$_mika2542_near")"
+done
+# Contrôle de bonne foi : le label relève en tête, au milieu et en queue de CSV.
+for _mika2542_pos in 'loop-substrate,p1-important' 'ready,loop-substrate,p1-important' \
+    'p1-important,loop-substrate'; do
+    assert_eq "mika#2542 (AC6): '$_mika2542_pos' relève bien" \
+        "200|label|" "$(_mika2496_resolve_probe __UNSET__ "$_mika2542_pos")"
+done
+
+# --- G3 / V3 : le drapeau atteint l'argv avec la valeur du label ---
+assert_contains "mika#2542 (AC1): un ticket loop-substrate porte --max-turns 200 dans l'argv" \
+    '--max-turns 200' "$(_mika2496_argv_probe 150 loop-substrate)"
+assert_not_contains "mika#2542 (AC4): rollback sur un ticket substrat — aucun --max-turns" \
+    '--max-turns' "$(_mika2496_argv_probe 0 loop-substrate)"
+
+# --- G3 / V5 : la ligne d'observabilité ---
+assert_contains "mika#2542 (AC1): la ligne dit source=label et QUEL label a décidé" \
+    'pilot_budget_armed max_turns=200 source=label label=loop-substrate cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 150 loop-substrate)"
+# Contrôle négatif : aucun champ `label=` quand le label n'a pas décidé — un
+# champ vide se lirait comme un label nommé « vide ».
+assert_not_contains "mika#2542 (AC2): sans label, aucun champ label= n'est émis" \
+    'label=' "$(_mika2496_budget_line 150 '')"
+assert_not_contains "mika#2542 (AC4): rollback sur un ticket substrat, aucun champ label=" \
+    'label=' "$(_mika2496_budget_line 0 loop-substrate)"
+assert_not_contains "mika#2542 (AC7 mika#2496): la ligne relevée n'annonce pas de budget dollars" \
+    'cost_bound=4' "$(_mika2496_budget_line __UNSET__ loop-substrate)"
+
+# --- G4 : la valeur du défaut in-file, pinnée littéralement ---
+#
+# Lue dans la source, pas au comportement : l'assertion comportementale
+# (`150|default|`) rougirait aussi, mais celle-ci nomme LE site à relire.
+assert_eq "mika#2542 (AC9): le défaut in-file de _pilot_max_turns vaut 150" "1" \
+    "$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" | grep -cE '^[[:space:]]*local _default="150"$' || true)"
+
+# --- AC5 : un seul site nommé, et aucun second lecteur de label ne décide ---
+assert_eq "mika#2542 (AC5): PILOT_LABEL_TURN_CEILINGS est déclarée exactement une fois" "1" \
+    "$(grep -cE '^PILOT_LABEL_TURN_CEILINGS=\(' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2542 (AC5): la table porte loop-substrate=200" "1" \
+    "$(sed -n '/^PILOT_LABEL_TURN_CEILINGS=(/,/^)/p' "$DISPATCH_LIB" | grep -cxE '[[:space:]]*"loop-substrate=200"' || true)"
+# Le seul consommateur de la table est le helper ; le seul appelant du helper
+# est le résolveur. Un second lecteur ferait deux sites de décision.
+assert_eq "mika#2542 (AC5): la table n'est itérée que par _pilot_label_turn_ceiling" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '"${PILOT_LABEL_TURN_CEILINGS[@]}"' || true)"
+assert_eq "mika#2542 (AC5): _pilot_label_turn_ceiling n'est appelée que depuis le résolveur" "1" \
+    "$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" | grep -cF '_pilot_label_turn_ceiling' || true)"
+assert_eq "mika#2542 (AC5): …et depuis nulle part ailleurs" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -F '_pilot_label_turn_ceiling' | grep -cvE '_pilot_label_turn_ceiling\(\)' || true)"
+# Le helper assigne, il n'imprime pas (mika#2039).
+assert_eq "mika#2542 × mika#2039: le helper de label n'imprime pas" "0" \
+    "$(sed -n '/^_pilot_label_turn_ceiling()/,/^}/p' "$DISPATCH_LIB" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+
+# --- G2 / V4 : les trois sites passent les labels au résolveur (AC10) ---
+#
+# Sur les invocations LOGIQUES (continuations recollées), même unité que le scan
+# mika#2496. Un appel `_pilot_max_turns` suivi d'un `;` ou d'une fin de ligne est
+# un site qui a oublié l'argument : il résout « aucun label », donc 150 — fail-
+# safe, mais silencieusement hors du mécanisme.
+# L'amorce est « tout caractère hors identifiant », pas une liste de ponctuations :
+# un appel écrit après un mot-clé (`then _pilot_max_turns …`) doit être vu aussi.
+_mika2542_resolver_calls() {
+    _mika2496_logical_invocations "$1" \
+        | grep -E '(^|[^A-Za-z0-9_])_pilot_max_turns([^A-Za-z0-9_]|$)' \
+        | grep -vE '^[[:space:]]*_pilot_max_turns\(\)' \
+        || true
+}
+_mika2542_unargumented_calls() {
+    local line exc skip
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        skip=""
+        for exc in "${MIKA2542_UNARGUMENTED_SITES[@]+"${MIKA2542_UNARGUMENTED_SITES[@]}"}"; do
+            case "$line" in *"$exc"*) skip=1 ;; esac
+        done
+        [ -n "$skip" ] && continue
+        if ! grep -qE '_pilot_max_turns[[:space:]]+"\$\{LABELS:-\}"' <<<"$line"; then
+            printf '%s\n' "$line"
+        fi
+    done < <(_mika2542_resolver_calls "$1")
+}
+assert_eq "mika#2542 (AC10): le scan voit exactement trois appels du résolveur" "3" \
+    "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
+assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
+    "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
+
+# Contrôles négatifs de G2, calqués sur la forme réelle des sites.
+MIKA2542_FIXDIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2542-fixtures.XXXXXX")
+printf '%s\n' \
+    '    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$C"' \
+    > "$MIKA2542_FIXDIR/g2_red"
+printf '%s\n' \
+    '    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --task-id "$I" \' \
+    '        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \' \
+    '        --command "/mika-revise-plan"' \
+    > "$MIKA2542_FIXDIR/g2_green"
+assert_eq "mika#2542: fixture g2_red (site sans argument) est VUE ROUGE" "1" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_red" | wc -l | tr -d ' ')"
+assert_eq "mika#2542: fixture g2_green (argument passé, multi-lignes) est VUE VERTE" "0" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
+assert_eq "mika#2542: fixture g2_green EST bien un appel vu (le vert n'est pas de la vacuité)" "1" \
+    "$(_mika2542_resolver_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
+printf '%s\n' \
+    '    if [ -n "$X" ]; then _pilot_max_turns; fi' \
+    > "$MIKA2542_FIXDIR/g2_keyword"
+assert_eq "mika#2542: fixture g2_keyword (appel après then, sans argument) est VUE ROUGE" "1" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_keyword" | wc -l | tr -d ' ')"
+rm -rf "$MIKA2542_FIXDIR"
+
+# Auto-nettoyage des allowlists (exigence (a) de mika#1574) : une entrée qui
+# n'apparie plus rien fait rougir. Livrées vides, elles le restent sans qu'un
+# relecteur ait à y penser.
+_mika2542_stale=""
+for _mika2542_exc in "${MIKA2542_UNARGUMENTED_SITES[@]+"${MIKA2542_UNARGUMENTED_SITES[@]}"}"; do
+    _mika2542_resolver_calls "$DISPATCH_LIB" | grep -qF -- "$_mika2542_exc" \
+        || _mika2542_stale+="$_mika2542_exc;"
+done
+for _mika2542_exc in "${MIKA2542_CEILING_LABEL_EXCEPTIONS[@]+"${MIKA2542_CEILING_LABEL_EXCEPTIONS[@]}"}"; do
+    sed -n '/^PILOT_LABEL_TURN_CEILINGS=(/,/^)/p' "$DISPATCH_LIB" | grep -qF -- "\"$_mika2542_exc=" \
+        || _mika2542_stale+="$_mika2542_exc;"
+done
+assert_eq "mika#2542: aucune entrée d'allowlist n'est périmée" "" "$_mika2542_stale"
+
+# G1 (table ↔ labels.yml) vit dans scripts/check-pilot-turn-ceiling-labels.sh,
+# branché en CI (`pilot-turn-ceiling-labels-lint`). On le rejoue ici pour que
+# `make test-dispatch-lib` ne puisse pas être vert avec une table non déclarée.
+assert_eq "mika#2542 (AC7): G1 — chaque clé de la table est déclarée dans labels.yml" "0" \
+    "$(bash "$(dirname "$DISPATCH_LIB")/../../../scripts/check-pilot-turn-ceiling-labels.sh" >/dev/null 2>&1; echo $?)"
 
 # --- mika#2296: un `.content` vide et un `session_id` absent ne se lisent plus pareil ---
 #
