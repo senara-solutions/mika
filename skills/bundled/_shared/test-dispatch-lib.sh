@@ -6130,7 +6130,7 @@ _t2548_run() {
 
     # S2 — un fixture écrit dedans (non vide, en sous-répertoire) est invisible.
     mkdir -p "$wt/.pilot-scratch/sub" && printf 'x\n' > "$wt/.pilot-scratch/sub/f"
-    [ -z "$(git -C "$wt" status --porcelain)" ] && out="${out}clean;"
+    [ -z "$(git -C "$wt" status --porcelain)" ] && out="${out}scratch_invisible;"
 
     # S3 — contrôle positif du prédicat : un fichier HORS scratch reste visible,
     # sinon S2 prouverait seulement que `git status` ne rend jamais rien.
@@ -6163,21 +6163,24 @@ _t2548_run() {
     printf 'meta\n' > "$plat/.claude/commands/mika-groom-ticket.md"
     _seed_worktree_slash_commands "$plat" "$wt"
     [ -f "$wt/.claude/commands/mika-groom-ticket.md" ] && [ -z "$(git -C "$wt" status --porcelain)" ] \
-        && out="${out}commands_still_clean;"
+        && out="${out}cmds_seed_ok;"
 
     git -C "$base" worktree remove --force "$wt" 2>/dev/null
     rm -rf "$root"
     printf '%s' "$out"
 }
 
+# Les jetons sont choisis pour qu'aucun ne soit sous-chaîne d'un autre :
+# assert_contains est un test de sous-chaîne, et un premier jet (`clean;` contre
+# `commands_still_clean;`) passait vert sans l'exclusion — vu au contrôle négatif.
 T2548_OUT=$(_t2548_run)
 assert_contains "mika#2548: .pilot-scratch existe après le seed" "exists;" "$T2548_OUT"
-assert_contains "mika#2548: un fixture sous .pilot-scratch/ est invisible à git status" "clean;" "$T2548_OUT"
+assert_contains "mika#2548: un fixture sous .pilot-scratch/ est invisible à git status" "scratch_invisible;" "$T2548_OUT"
 assert_contains "mika#2548: contrôle positif — un fichier hors scratch reste visible" "outside_visible;" "$T2548_OUT"
 assert_contains "mika#2548: deux seeds laissent une seule ligne d'exclusion" "lines=1;" "$T2548_OUT"
 assert_contains "mika#2548: un résidu est vidé à la préparation suivante" "reset;" "$T2548_OUT"
 assert_contains "mika#2548: un exclude sans saut de ligne final n'est pas concaténé" "newline_guard;" "$T2548_OUT"
-assert_contains "mika#2548: le seeding des commandes (mika#1415) reste propre" "commands_still_clean;" "$T2548_OUT"
+assert_contains "mika#2548: le seeding des commandes (mika#1415) reste propre" "cmds_seed_ok;" "$T2548_OUT"
 
 # --- Structure : le seed est câblé dans _set_up_worktree, et sa suppression
 # passe par la garde mika#1943 (un rm -rf nu sur un chemin non prouvé est la
