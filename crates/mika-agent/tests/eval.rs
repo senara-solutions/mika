@@ -170,6 +170,13 @@ mod eval {
     // mika#2237, et les six abstentions nommées.
     mod test_qa_ci_coherence_2455;
 
+    // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
+    // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
+    // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une
+    // assertion de sites d'appel. Les deux branches, leurs quatre contrôles
+    // négatifs et les abstentions nommées.
+    mod test_dependabot_verdict_coherence_2519;
+
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
     mod test_qa_review_reconcile_2334;

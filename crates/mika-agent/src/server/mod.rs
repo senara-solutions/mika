@@ -913,6 +913,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // exactly like the silence of a healthy one (mika#2205).
     crate::evidence::guards::log_qa_ci_coherence_gate_state();
 
+    // mika#2519 — same gesture, same reason, for the verdict↔dependabot gate.
+    crate::evidence::guards::log_dependabot_verdict_gate_state();
+
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
         warn!(

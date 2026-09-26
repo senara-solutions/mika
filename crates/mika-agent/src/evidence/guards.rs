@@ -2525,6 +2525,365 @@ pub fn log_qa_ci_coherence_gate_state() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// mika#2519 — l'exemption de plan existe deux fois ; ce qui manquait, c'est la
+// moitié qui la TIENT, et la garde de substance sur un saut de majeure
+// ---------------------------------------------------------------------------
+//
+// Quatrième membre de la famille pre-subprocess, après mika#1646, mika#2237 et
+// mika#2455. Même raison d'être à cet endroit, et mika#2237 l'a déjà écrite :
+// *« the defect is the call, not a sentence — by the time an EndTurn arm ran,
+// the review would be on GitHub. »* Un `block[pipeline]` posté est un ticket
+// sorti du rail autonome ; le rattraper après coup ne le remet pas dessus.
+//
+// **Ce que ce travail NE fait pas, et il faut le lire avant le reste.** Il
+// n'ajoute aucune exemption de plan. Elle existe déjà, à deux étages, et les
+// deux précèdent le symptôme mesuré (2026-09-24) :
+//
+// | étage | site | mergé |
+// |---|---|---|
+// | garde exécutable | `scripts/verify-pipeline.sh` mécanisme 4, sur `.pull_request.user.login` | 2026-09-21 (mika#2419) |
+// | prompt QA | `qa-review/system_prompt.md` Step 1.6, *« Do NOT run Steps 2/2.5/3e for a Dependabot PR »* | 2026-08-26 (mika#1729) |
+//
+// Écrire une troisième copie serait la classe que mika#2172 a fermée sur ce
+// prompt précis : une règle posée à un troisième endroit dérive des deux
+// autres. Et le motif que le ticket rapporte — *« Dependabot dependency bump —
+// no plan document or `Pipeline-Exempt` trailer present »* — n'est le texte
+// d'AUCUNE garde ni d'aucun prompt à HEAD (`grep -rn "no plan document"` rend
+// zéro ligne hors du plan lui-même). C'est une prose fabriquée, la signature
+// exacte de mika#2237 : *le prompt exprime l'intention ; il ne tient pas seul
+// au substrat de la boucle* (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`).
+//
+// Deux trous distincts restaient, et de natures différentes.
+//
+// **B1 (structurel).** Rien n'empêchait mika-qa de poster un `block[pipeline]`
+// sur une PR dependabot — un verdict que Step 1.6 rend *structurellement
+// inatteignable*. L'intention était écrite deux fois ; aucune moitié ne la
+// tenait.
+//
+// **B2 (substance).** Ni le build, ni la requête d'advisories, ni le scan de
+// changelog ne constituent une vérification des **sites d'appel** sur un saut
+// de majeure — et la mesure le dit contre le ticket, qui écrivait *« sur #2453
+// comme #2454 le build a réussi et aucun site d'appel n'était cassé »*.
+// mika#2525 (`d4514180`, deux commits plus tard) : *« Le bump 9.3.1 -> 11.1.0
+// faisait PANIQUER `generate_jwt` : jsonwebtoken 11 a retiré ring […] donc
+// aucun backend crypto n'était actif. **Build vert, test rouge.** »* Le `block`
+// sur #2454 était, par accident, le bon verdict. Conséquence pour la lecture de
+// ces deux branches : **AC2 du ticket pose le build comme le filet de
+// l'exemption, et le filet ne tient pas pour la classe majeure** — il reste un
+// plancher, jamais une garantie, et c'est B2 qui porte le risque réel.
+//
+// Un seul appel réseau sert les deux branches. Fail-OPEN sur tout terme
+// illisible, comme mika#2455 et pour la même arithmétique : un faux négatif
+// laisse subsister l'état actuel, un faux positif rend une revue légitime
+// impossible à poster.
+
+/// Audit-event `tool_name` de chaque décision du gate dependabot (V2).
+///
+/// Même convention que [`QA_CI_COHERENCE_AUDIT_TOOL`] et
+/// [`PR_REVIEW_FLAG_AUDIT_TOOL`] : `audit_events` n'a pas de colonne
+/// `event_type`, `tool_name` est du TEXT libre, aucune migration.
+pub const DEPENDABOT_VERDICT_AUDIT_TOOL: &str = "dependabot_verdict_guard";
+
+/// Variable de désarmement du gate.
+pub const DEPENDABOT_VERDICT_GATE_ENV: &str = "MIKA_DEPENDABOT_VERDICT_GATE";
+
+/// Plafond de temps sur la lecture `gh pr view` du gate.
+///
+/// La valeur de mika#2455, et pour la même raison : le dépassement n'est pas
+/// une erreur mais une **abstention**, donc mieux vaut laisser passer tôt que
+/// consommer le tiers de l'enveloppe de l'outil sur une lecture qui, de toute
+/// façon, ne refusera rien.
+pub const DEPENDABOT_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Les auteurs de PR que la plateforme traite comme automatisés.
+///
+/// **Propriétaire unique de cette liste côté Rust, et confronté au shell dans
+/// les deux sens** par `mika2519_la_liste_dauteurs_automatises_est_en_parite`.
+/// `scripts/verify-pipeline.sh` porte le même tableau (mécanisme 4, mika#2419)
+/// et c'est **lui** qui a introduit les deux entrées : `gh` rend l'identité
+/// sous l'une ou l'autre forme selon la surface. Une seconde liste divergerait,
+/// et c'est la classe que mika#2205 a mesurée — un accesseur étroit à côté du
+/// résolveur canonique.
+///
+/// **Égalité exacte, jamais sous-chaîne** : un auteur nommé
+/// `not-dependabot[bot]` ne doit pas apparier. La contrainte est déjà écrite
+/// dans `verify-pipeline.sh`, en toutes lettres, au-dessus de son propre
+/// tableau.
+pub const AUTOMATED_PR_AUTHORS: &[&str] = &["dependabot[bot]", "app/dependabot"];
+
+/// Le préfixe de la ligne par laquelle une revue affirme avoir vérifié les
+/// sites d'appel d'un changement de majeure.
+///
+/// **Jeton de fil** : il est lu par la branche B2 et prescrit par Step 1.6 de
+/// `qa-review`, donc il porte sa ligne dans `scripts/canonical-tokens.tsv` avec
+/// sa tolérance (`ci:line-anchored`) et son site de match. Sans cette
+/// déclaration, `canonical-tokens-lint` ne le voit pas et la classe mika#2201
+/// se rouvre.
+pub const API_SURFACE_LINE_PREFIX: &str = "API-SURFACE:";
+
+/// Un auteur de PR est-il l'un des automates connus ? (égalité exacte)
+///
+/// `contains` et non un `any` avec un prédicat : c'est la **même** égalité, et
+/// écrire le prédicat à la main laisserait un endroit où quelqu'un pourrait le
+/// relâcher en `starts_with` ou `contains` sans qu'aucun test ne rougisse
+/// autrement que par le contrôle négatif `not-dependabot[bot]`.
+pub fn is_automated_pr_author(login: &str) -> bool {
+    AUTOMATED_PR_AUTHORS.contains(&login)
+}
+
+/// Les causes d'abstention du gate, écrites une seule fois.
+///
+/// **Format de fil** : ces chaînes sont lues par `jq` sur le champ `reason` de
+/// `dependabot_verdict_abstained` et par `GROUP BY` sur `audit_events`. Deux
+/// orthographes d'une même cause couperaient une population en deux sans le
+/// dire (doctrine mika#2131). Épinglées par
+/// `mika2519_les_causes_dabstention_sont_un_format_de_fil`.
+pub struct DependabotAbstention;
+
+impl DependabotAbstention {
+    /// L'argv ne nomme pas de PR, ou la nomme sous une forme qui n'est pas un
+    /// numéro. Le gate ne devine pas une cible.
+    pub const NO_PR_TARGET: &'static str = "no_pr_target";
+    /// Aucun `--repo` : le gate ne devine pas le dépôt.
+    pub const NO_REPO: &'static str = "no_repo";
+    /// Aucun jeton GitHub résolu sur ce chemin.
+    pub const NO_TOKEN: &'static str = "no_token";
+    /// `gh` a échoué (non-zéro, absent, réseau).
+    pub const GH_FAILED: &'static str = "gh_failed";
+    /// La lecture a dépassé [`DEPENDABOT_READ_TIMEOUT_SECS`].
+    pub const GH_TIMEOUT: &'static str = "gh_timeout";
+    /// `gh` a répondu, mais sa sortie n'est pas du JSON exploitable, ou ne
+    /// porte pas `author.login`.
+    pub const UNPARSEABLE: &'static str = "unparseable";
+}
+
+/// Ce que le titre d'une PP dependabot dit du delta de version.
+///
+/// **L'illisibilité est un variant d'ici, contrairement à [`CiAbstention`]**, et
+/// l'écart vaut d'être écrit : le titre est un terme que la garde a bel et bien
+/// lu — il existe, il est simplement hors des formes connues — alors que les
+/// abstentions de mika#2455 décrivent des états où il n'y a *rien* à classer.
+/// Un titre de groupe (`Bump the <group> group with N updates`) tombe ici, et
+/// c'est la limite nommée du § 8 du plan : le couple de versions vit dans la
+/// table du corps, et lire une table markdown produite par un tiers dans un
+/// prédicat de refus est la fragilité que ce travail refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionBump {
+    /// Le couple est lisible et la majeure change (`9 → 11`).
+    MajorJump {
+        package: String,
+        from: String,
+        to: String,
+    },
+    /// Le couple est lisible et la majeure ne change pas (`0.22 → 0.23`).
+    NoMajorJump,
+    /// Aucun couple lisible : titre de groupe, forme inconnue, version non
+    /// parsable, titre vide.
+    Unreadable,
+}
+
+/// La majeure d'une version, au sens du premier segment numérique.
+///
+/// `0` inclus : `0.22` rend `Some(0)`. Un `v` de tête est toléré (`v2.0.0`).
+/// Tout premier segment non numérique rend `None`, ce qui remonte en
+/// [`VersionBump::Unreadable`] — jamais en « pas de saut ».
+fn version_major(version: &str) -> Option<u64> {
+    let trimmed = version.trim().trim_start_matches(['v', 'V']);
+    trimmed
+        .split(['.', '-', '+'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .and_then(|first| first.parse::<u64>().ok())
+}
+
+static DEPENDABOT_BUMP_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // Ancré sur le MOT `bump`, pas sur le début de ligne : dependabot peut être
+    // configuré avec un préfixe de commit conventionnel (`chore(deps): bump …`),
+    // et une ancre de début raterait exactement le cas que B2 existe pour voir.
+    // Les trois groupes sont non-blancs, ce qui borne le paquet et les deux
+    // versions sans supposer leur forme.
+    regex::Regex::new(r"(?i)\bbump\s+(\S+)\s+from\s+(\S+)\s+to\s+(\S+)")
+        .expect("dependabot bump regex")
+});
+
+/// Classe le delta de version que le titre d'une PR dependabot déclare.
+///
+/// **Détection permissive, décision stricte.** La permissivité s'arrête à la
+/// forme du titre ; toute version non parsable rend [`VersionBump::Unreadable`]
+/// et jamais « pas de saut », parce que le coût des deux erreurs n'est pas le
+/// même : un `Unreadable` laisse passer un `pass` (l'état actuel), un faux
+/// `NoMajorJump` affirmerait qu'on a regardé.
+///
+/// **La règle `0.x` de semver n'est PAS appliquée, et c'est une décision.**
+/// L'élargir ferait entrer `0.22 → 0.23`, donc #2453 et #2300/#2301/#2302 —
+/// quatre des cinq PR témoins — dans la population de B2, c'est-à-dire refuser
+/// le rail que ce ticket existe pour ouvrir. Un saut de mineure sur `0.x` reste
+/// couvert par le scan de changelog de Step 1.6 (`block[dependency]`). Si une
+/// mesure montre une rupture `0.x` passée au travers, c'est **un ticket avec
+/// son compte**, pas un élargissement au jugé.
+pub fn classify_version_bump(title: &str) -> VersionBump {
+    let Some(caps) = DEPENDABOT_BUMP_RE.captures(title) else {
+        return VersionBump::Unreadable;
+    };
+    let package = caps[1].to_string();
+    let from = caps[2].to_string();
+    let to = caps[3].to_string();
+
+    let (Some(from_major), Some(to_major)) = (version_major(&from), version_major(&to)) else {
+        return VersionBump::Unreadable;
+    };
+
+    if from_major == to_major {
+        VersionBump::NoMajorJump
+    } else {
+        VersionBump::MajorJump { package, from, to }
+    }
+}
+
+/// Le corps de revue affirme-t-il une vérification des sites d'appel ?
+///
+/// Lecture **permissive** : préfixe ancré en début de ligne (blancs de tête
+/// tolérés), casse repliée, **aucune ancre de fin** — la doctrine de
+/// `verify-pipeline.sh` sur son propre motif de section AC, et celle que
+/// `guard-parser-must-be-as-permissive-as-downstream-consumer` énonce.
+/// Décision **stricte** : une ligne présente mais vide ne compte pas.
+///
+/// La comparaison marche caractère par caractère plutôt que par tranche
+/// d'octets : un corps de revue porte de l'UTF-8 multi-octets et
+/// `scripts/check-byte-slices.sh` refuse un offset calculé (mika#764,
+/// mika#2103).
+pub fn body_asserts_api_surface(body: &str) -> bool {
+    body.lines().any(|line| {
+        let mut chars = line.trim_start().chars();
+        for expected in API_SURFACE_LINE_PREFIX.chars() {
+            match chars.next() {
+                Some(got) if got.eq_ignore_ascii_case(&expected) => {}
+                _ => return false,
+            }
+        }
+        !chars.as_str().trim().is_empty()
+    })
+}
+
+/// Ce que le gate conclut d'un couple (verdict, PR) **qu'il a pu lire**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependabotVerdictOutcome {
+    /// **B1** — un `block[pipeline]` sur une PR d'auteur automatisé. Step 1.6
+    /// rend ce verdict structurellement inatteignable sur cette classe.
+    RefusedUnreachablePipelineBlock { author: String },
+    /// **B2** — un `pass` sur un saut de majeure dont le corps n'affirme aucune
+    /// vérification des sites d'appel.
+    RefusedUnverifiedMajorBump {
+        author: String,
+        package: String,
+        from: String,
+        to: String,
+    },
+    /// Rien à refuser : hors population, ou tous les termes satisfaits.
+    Allowed,
+}
+
+/// Les deux classifications, en une fonction pure, sur les seuls faits lus.
+///
+/// `verdict_is_pipeline_block` et `verdict_is_pass` sont passés plutôt que le
+/// `Verdict` lui-même : ce module ne dépend pas de `server::verdict`, et le
+/// point de décision doit rester testable sans construire un verdict.
+///
+/// **L'ordre des deux branches ne peut pas compter** : un corps ne porte qu'un
+/// verdict, donc les deux prédicats sont mutuellement exclusifs par
+/// construction. Le `title` n'est lu que par B2.
+pub fn classify_dependabot_verdict(
+    author_login: &str,
+    verdict_is_pipeline_block: bool,
+    verdict_is_pass: bool,
+    title: &str,
+    body: &str,
+) -> DependabotVerdictOutcome {
+    if !is_automated_pr_author(author_login) {
+        return DependabotVerdictOutcome::Allowed;
+    }
+
+    if verdict_is_pipeline_block {
+        return DependabotVerdictOutcome::RefusedUnreachablePipelineBlock {
+            author: author_login.to_string(),
+        };
+    }
+
+    if verdict_is_pass
+        && let VersionBump::MajorJump { package, from, to } = classify_version_bump(title)
+        && !body_asserts_api_surface(body)
+    {
+        return DependabotVerdictOutcome::RefusedUnverifiedMajorBump {
+            author: author_login.to_string(),
+            package,
+            from,
+            to,
+        };
+    }
+
+    DependabotVerdictOutcome::Allowed
+}
+
+/// Le gate est-il armé ?
+///
+/// Polarité et vocabulaire de [`qa_ci_coherence_gate_is_enabled`], délibérément
+/// à l'identique : armé par défaut, désarmé par le seul `0`/`false`/`off`/`no`
+/// explicite, et **toute valeur non reconnue laisse ARMÉ** avec un WARN qui
+/// nomme la valeur **entre guillemets** — sans les guillemets un espace
+/// parasite est invisible (mika#2220). Un désarmement par coquille sur un gate
+/// de sûreté serait la panne silencieuse que tout ce travail ferme.
+pub fn dependabot_verdict_gate_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            tracing::warn!(
+                event = "dependabot_verdict_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2519: MIKA_DEPENDABOT_VERDICT_GATE porte une valeur non reconnue — le gate \
+                 reste ARMÉ (le défaut). Utiliser 0/false/off/no pour le désarmer."
+            );
+            true
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache.
+///
+/// Lue une fois : poser ou retirer la variable sur un process déjà démarré n'a
+/// aucun effet, par construction — même contrat que son voisin mika#2455.
+pub fn dependabot_verdict_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        dependabot_verdict_gate_is_enabled(
+            std::env::var(DEPENDABOT_VERDICT_GATE_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// Dit au démarrage que le gate est désarmé — et ne dit rien s'il est armé.
+///
+/// Même raison d'être, mot pour mot, que [`log_qa_ci_coherence_gate_state`] :
+/// le silence d'un gate désarmé se lit exactement comme le silence d'un gate
+/// sain (mika#2205).
+pub fn log_dependabot_verdict_gate_state() {
+    if !dependabot_verdict_gate_enabled() {
+        tracing::info!(
+            event = "dependabot_verdict_gate_disabled",
+            env = DEPENDABOT_VERDICT_GATE_ENV,
+            "mika#2519: le gate de cohérence verdict↔dependabot est DÉSARMÉ — un `block[pipeline]` \
+             peut être posté sur une PR dependabot, et un `pass` sur un saut de majeure non vérifié"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5163,6 +5522,462 @@ mod tests {
                     "assez pour un aller-retour gh"
                 );
             }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // mika#2519 — V1 : les deux branches, leurs contrôles négatifs, et la
+    // parité de la liste d'auteurs avec le shell.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    mod mika2519 {
+        use super::*;
+
+        const BOT: &str = "dependabot[bot]";
+        const BOT_APP: &str = "app/dependabot";
+
+        /// La forme exacte du titre de #2453 — la PR témoin dont le ticket dit
+        /// qu'elle devait passer.
+        const TITLE_2453: &str = "Bump base64 from 0.22.1 to 0.23.0";
+
+        /// La forme exacte du titre de #2454 — celle dont mika#2525 a mesuré,
+        /// deux commits plus tard, que le build était vert et le bump cassé.
+        const TITLE_2454: &str = "Bump jsonwebtoken from 9.3.1 to 11.1.0";
+
+        // -- Reconnaissance d'auteur : égalité exacte, jamais sous-chaîne --
+
+        #[test]
+        fn les_deux_formes_dauteur_automatise_sont_reconnues() {
+            assert!(is_automated_pr_author(BOT));
+            assert!(is_automated_pr_author(BOT_APP));
+        }
+
+        /// Contrôle négatif de la contrainte que `verify-pipeline.sh` écrit
+        /// au-dessus de son propre tableau, en toutes lettres.
+        #[test]
+        fn un_auteur_qui_contient_le_nom_du_bot_nest_pas_le_bot() {
+            for impostor in [
+                "not-dependabot[bot]",
+                "dependabot",
+                "dependabot[bot]x",
+                "my-app/dependabot",
+                "Dependabot[bot]",
+                "",
+            ] {
+                assert!(
+                    !is_automated_pr_author(impostor),
+                    "`{impostor}` ne doit pas apparier : l'égalité est exacte"
+                );
+            }
+        }
+
+        // -- Extraction de majeure --
+
+        #[test]
+        fn le_titre_de_2454_est_un_saut_de_majeure() {
+            assert_eq!(
+                classify_version_bump(TITLE_2454),
+                VersionBump::MajorJump {
+                    package: "jsonwebtoken".to_string(),
+                    from: "9.3.1".to_string(),
+                    to: "11.1.0".to_string(),
+                }
+            );
+        }
+
+        /// **Le contrôle négatif porteur de tout le ticket.** `0.22 → 0.23` doit
+        /// rester hors de la population de B2 : l'y faire entrer refuserait
+        /// quatre des cinq PR témoins, c'est-à-dire fermerait le rail que ce
+        /// travail existe pour ouvrir.
+        #[test]
+        fn le_titre_de_2453_nest_pas_un_saut_de_majeure() {
+            assert_eq!(classify_version_bump(TITLE_2453), VersionBump::NoMajorJump);
+        }
+
+        #[test]
+        fn un_passage_de_un_a_deux_est_un_saut_de_majeure() {
+            assert!(matches!(
+                classify_version_bump("Bump foo from 1.2.3 to 2.0.0"),
+                VersionBump::MajorJump { .. }
+            ));
+        }
+
+        /// La règle `0.x` de semver n'est PAS appliquée, et ce test l'épingle
+        /// comme une décision — voir la doc de `classify_version_bump`.
+        #[test]
+        fn la_regle_0x_de_semver_nest_pas_appliquee_et_cest_une_decision() {
+            assert_eq!(
+                classify_version_bump("Bump serde from 0.9.0 to 0.10.0"),
+                VersionBump::NoMajorJump,
+                "élargir ici ferait entrer #2453 et #2300/#2301/#2302 dans la \
+                 population de B2 — ouvrir un ticket AVEC son compte, jamais \
+                 élargir au jugé"
+            );
+        }
+
+        /// Un titre de groupe ne porte aucun couple : abstention nommée, jamais
+        /// un refus. C'est la limite du § 8 du plan.
+        #[test]
+        fn un_titre_de_groupe_est_illisible_et_sabstient() {
+            assert_eq!(
+                classify_version_bump("Bump the cargo group with 5 updates"),
+                VersionBump::Unreadable
+            );
+        }
+
+        #[test]
+        fn un_titre_hors_forme_est_illisible() {
+            for title in [
+                "",
+                "Add a dependency",
+                "Bump base64",
+                "Bump base64 from 0.22.1",
+                "Bump base64 from latest to newest",
+            ] {
+                assert_eq!(
+                    classify_version_bump(title),
+                    VersionBump::Unreadable,
+                    "`{title}` doit rendre Unreadable, jamais NoMajorJump"
+                );
+            }
+        }
+
+        /// Un préfixe de commit conventionnel ne doit pas faire perdre le
+        /// couple : dependabot peut être configuré avec `commit-message.prefix`,
+        /// et une ancre de début de ligne raterait exactement le cas que B2
+        /// existe pour voir.
+        #[test]
+        fn un_prefixe_conventionnel_ne_cache_pas_le_saut() {
+            assert!(matches!(
+                classify_version_bump("chore(deps): bump jsonwebtoken from 9.3.1 to 11.1.0"),
+                VersionBump::MajorJump { .. }
+            ));
+        }
+
+        #[test]
+        fn un_v_de_tete_est_tolere() {
+            assert!(matches!(
+                classify_version_bump("Bump actions/checkout from v4.1.0 to v5.0.0"),
+                VersionBump::MajorJump { .. }
+            ));
+        }
+
+        // -- La ligne `API-SURFACE:` : lecture permissive, décision stricte --
+
+        #[test]
+        fn la_ligne_api_surface_est_lue_permissivement() {
+            for body in [
+                "API-SURFACE: EncodingKey::from_rsa_pem — 3 sites lus, inchangés",
+                "  api-surface: lu, inchangé",
+                "DEP-REVIEW:\nPackage(s): x\nAPI-SURFACE: lu",
+                "Api-Surface: lu",
+            ] {
+                assert!(
+                    body_asserts_api_surface(body),
+                    "la ligne doit être lue dans : {body:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn une_ligne_api_surface_vide_ne_compte_pas() {
+            for body in [
+                "API-SURFACE:",
+                "API-SURFACE:   ",
+                "API-SURFACE:\nREASON: rien",
+            ] {
+                assert!(
+                    !body_asserts_api_surface(body),
+                    "décision stricte : une ligne sans contenu ne compte pas — {body:?}"
+                );
+            }
+        }
+
+        /// Le préfixe est **ancré en début de ligne** : une mention en prose
+        /// n'est pas une assertion. Même discriminant que le faux positif de
+        /// prose mesuré par mika#2050 sur le Signal S.
+        #[test]
+        fn une_mention_en_prose_nest_pas_une_assertion() {
+            assert!(!body_asserts_api_surface(
+                "I would have added an API-SURFACE: line but did not read the sites."
+            ));
+        }
+
+        /// Un corps en UTF-8 multi-octets ne doit pas paniquer : la comparaison
+        /// marche caractère par caractère (mika#764, mika#2103).
+        #[test]
+        fn un_corps_multioctets_ne_panique_pas() {
+            assert!(!body_asserts_api_surface("é\nà — ç\n🌸"));
+            assert!(body_asserts_api_surface(
+                "é\nAPI-SURFACE: relu — inchangé 🌸"
+            ));
+        }
+
+        // -- B1 : le `block[pipeline]` inatteignable --
+
+        #[test]
+        fn b1_refuse_un_block_pipeline_sur_un_auteur_automatise() {
+            let outcome = classify_dependabot_verdict(BOT, true, false, TITLE_2453, "REASON: x");
+            assert_eq!(
+                outcome,
+                DependabotVerdictOutcome::RefusedUnreachablePipelineBlock {
+                    author: BOT.to_string()
+                }
+            );
+        }
+
+        /// **Contrôle négatif 1 du § 4 du plan.** Un auteur humain garde le
+        /// droit de recevoir un `block[pipeline]` — c'est le verdict nominal
+        /// quand une garde du dépôt sort non-zéro.
+        #[test]
+        fn b1_laisse_passer_un_block_pipeline_sur_un_auteur_humain() {
+            assert_eq!(
+                classify_dependabot_verdict(
+                    "samidarko",
+                    true,
+                    false,
+                    "fix: something",
+                    "REASON: x"
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// **Contrôle négatif 2 du § 4.** Sur une PR dependabot, tout autre
+        /// verdict passe intact — `hold[review]` en particulier, qui est la
+        /// sortie fail-closed que Step 1.6 prescrit lui-même.
+        #[test]
+        fn b1_laisse_passer_un_hold_review_sur_un_auteur_automatise() {
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, false, TITLE_2453, "REASON: x"),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        // -- B2 : le `pass` sur saut de majeure non vérifié --
+
+        #[test]
+        fn b2_refuse_un_pass_sur_un_saut_de_majeure_sans_assertion() {
+            let outcome = classify_dependabot_verdict(
+                BOT,
+                false,
+                true,
+                TITLE_2454,
+                "DEP-REVIEW:\nAdvisory query: clean\nSignal: pass",
+            );
+            assert_eq!(
+                outcome,
+                DependabotVerdictOutcome::RefusedUnverifiedMajorBump {
+                    author: BOT.to_string(),
+                    package: "jsonwebtoken".to_string(),
+                    from: "9.3.1".to_string(),
+                    to: "11.1.0".to_string(),
+                }
+            );
+        }
+
+        /// **Contrôle négatif 3 du § 4** — et le plus important : #2453, la PR
+        /// témoin que ce ticket existe pour débloquer.
+        #[test]
+        fn b2_laisse_passer_un_pass_sur_2453() {
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, true, TITLE_2453, "Signal: pass"),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// **Contrôle négatif 4 du § 4.** Un saut de majeure AVEC la ligne
+        /// passe : la garde exige une affirmation, elle n'interdit pas le
+        /// verdict.
+        #[test]
+        fn b2_laisse_passer_un_saut_de_majeure_avec_lassertion() {
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    TITLE_2454,
+                    "API-SURFACE: EncodingKey::from_rsa_pem — 3 sites lus, inchangés\nSignal: pass",
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// Un titre illisible sort la PR de la population de B2 : abstention,
+        /// jamais refus. Le terme qu'on n'a pas pu évaluer n'est jamais un terme
+        /// satisfait (U6).
+        #[test]
+        fn b2_sabstient_sur_un_titre_de_groupe() {
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    "Bump the cargo group with 5 updates",
+                    "Signal: pass",
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn b2_ne_touche_pas_un_auteur_humain() {
+            assert_eq!(
+                classify_dependabot_verdict("samidarko", false, true, TITLE_2454, "Signal: pass"),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        // -- Le kill-switch --
+
+        #[test]
+        fn le_kill_switch_est_arme_par_defaut_et_desarme_explicitement() {
+            for armed in [None, Some(""), Some("  "), Some("1"), Some("true")] {
+                assert!(
+                    dependabot_verdict_gate_is_enabled(armed),
+                    "{armed:?} doit laisser le gate ARMÉ"
+                );
+            }
+            for disarmed in [Some("0"), Some("false"), Some("OFF"), Some(" no ")] {
+                assert!(
+                    !dependabot_verdict_gate_is_enabled(disarmed),
+                    "{disarmed:?} doit désarmer le gate"
+                );
+            }
+        }
+
+        /// Une valeur non reconnue laisse ARMÉ : un désarmement par coquille sur
+        /// un gate de sûreté serait la panne silencieuse que tout ce travail
+        /// ferme (mika#2220 / mika#2455).
+        #[test]
+        fn une_valeur_non_reconnue_laisse_le_gate_arme() {
+            for unrecognized in [Some("plif"), Some("disabled"), Some("2"), Some("nope")] {
+                assert!(
+                    dependabot_verdict_gate_is_enabled(unrecognized),
+                    "{unrecognized:?} n'est pas reconnu : le gate doit rester ARMÉ"
+                );
+            }
+            // Et le contrôle inverse, pour que « non reconnu » ne recouvre pas
+            // les formes que le gate lit bel et bien : la casse est repliée et
+            // les blancs sont rognés, comme chez son voisin mika#2455.
+            assert!(!dependabot_verdict_gate_is_enabled(Some("FALSE ")));
+            assert!(!dependabot_verdict_gate_is_enabled(Some(" Off")));
+        }
+
+        // -- Formats de fil --
+
+        /// Les causes d'abstention atterrissent dans `audit_events.after_value`
+        /// et l'opérateur en fait des `GROUP BY` : deux orthographes d'une même
+        /// cause couperaient une population en deux sans le dire (mika#2131).
+        #[test]
+        fn mika2519_les_causes_dabstention_sont_un_format_de_fil() {
+            assert_eq!(DependabotAbstention::NO_PR_TARGET, "no_pr_target");
+            assert_eq!(DependabotAbstention::NO_REPO, "no_repo");
+            assert_eq!(DependabotAbstention::NO_TOKEN, "no_token");
+            assert_eq!(DependabotAbstention::GH_FAILED, "gh_failed");
+            assert_eq!(DependabotAbstention::GH_TIMEOUT, "gh_timeout");
+            assert_eq!(DependabotAbstention::UNPARSEABLE, "unparseable");
+        }
+
+        #[test]
+        fn mika2519_le_nom_daudit_et_la_variable_sont_des_formats_de_fil() {
+            assert_eq!(DEPENDABOT_VERDICT_AUDIT_TOOL, "dependabot_verdict_guard");
+            assert_eq!(DEPENDABOT_VERDICT_GATE_ENV, "MIKA_DEPENDABOT_VERDICT_GATE");
+            assert_eq!(API_SURFACE_LINE_PREFIX, "API-SURFACE:");
+        }
+
+        /// Le plafond de lecture reste sous le `timeout_secs` que `qa-review`
+        /// déclare, pour la raison de son voisin mika#2455 : le dépassement est
+        /// une abstention, pas une erreur.
+        #[test]
+        fn le_plafond_de_lecture_reste_sous_le_budget_doutil() {
+            const {
+                assert!(DEPENDABOT_READ_TIMEOUT_SECS < 30);
+            }
+            const {
+                assert!(DEPENDABOT_READ_TIMEOUT_SECS >= 5);
+            }
+        }
+
+        // -- V4 : parité bidirectionnelle avec le shell --
+
+        /// **La liste d'auteurs automatisés a un seul propriétaire, et la parité
+        /// est vérifiée dans les DEUX sens.**
+        ///
+        /// `scripts/verify-pipeline.sh` porte le même tableau depuis mika#2419,
+        /// et c'est lui qui a introduit ses deux entrées. Une seconde liste
+        /// divergerait — la classe que mika#2205 a mesurée. La comparaison est
+        /// bidirectionnelle parce que les deux dérives coûtent, et pas la même
+        /// chose : une entrée présente côté shell et absente ici rend la garde
+        /// aveugle à une identité que la CI exempte déjà (faux négatif
+        /// silencieux) ; l'inverse fait refuser un verdict pour une identité que
+        /// la CI, elle, ne reconnaît pas (faux positif).
+        ///
+        /// **Aucune allowlist, et il n'y a rien à excepter** : les deux listes
+        /// sont attendues identiques. Quand ce test tire, on aligne les deux
+        /// sites ; on n'ajoute pas d'entrée.
+        #[test]
+        fn mika2519_la_liste_dauteurs_automatises_est_en_parite() {
+            let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("racine du dépôt")
+                .to_path_buf();
+            let script = repo_root.join("scripts/verify-pipeline.sh");
+            let src = std::fs::read_to_string(&script)
+                .unwrap_or_else(|e| panic!("lecture de {}: {e}", script.display()));
+
+            // La ligne d'affectation du tableau, hors commentaire. Le nom est
+            // recomposé à l'exécution pour que la doc de CE test ne se
+            // dénonce pas elle-même comme un second site.
+            let needle = format!("AUTOMATED_PR{}=(", "_AUTHORS");
+            let assignment = src
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.starts_with('#') && l.starts_with(&needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "mika#2519 — `{needle}` n'est plus affecté dans {}.\n\n\
+                         Ce scan vise alors un site mort et ne vérifie rien \
+                         (anti-vacuité, mika#2103 / mika#2205). Établir où la \
+                         liste vit désormais AVANT de toucher au prédicat.",
+                        script.display()
+                    )
+                });
+
+            // Entre les parenthèses, les littéraux entre guillemets doubles.
+            let inside = assignment
+                .split_once('(')
+                .and_then(|(_, rest)| rest.rsplit_once(')'))
+                .map(|(inner, _)| inner)
+                .expect("le tableau shell est sur une ligne");
+            let shell: Vec<&str> = inside
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+
+            assert!(
+                !shell.is_empty(),
+                "mika#2519 — aucune entrée lue dans le tableau shell : la forme \
+                 de l'affectation a changé, et un scan qui ne lit rien se lit \
+                 exactement comme un scan propre"
+            );
+
+            let rust: Vec<&str> = AUTOMATED_PR_AUTHORS.to_vec();
+            let missing_here: Vec<&&str> = shell.iter().filter(|a| !rust.contains(*a)).collect();
+            let missing_there: Vec<&&str> = rust.iter().filter(|a| !shell.contains(*a)).collect();
+
+            assert!(
+                missing_here.is_empty() && missing_there.is_empty(),
+                "mika#2519 — les deux listes d'auteurs automatisés ont divergé.\n  \
+                 présentes dans verify-pipeline.sh et absentes du Rust : {missing_here:?}\n  \
+                 présentes dans le Rust et absentes de verify-pipeline.sh : {missing_there:?}\n\n\
+                 RÉSOLUTION : aligner les deux sites dans le MÊME commit. Il n'y \
+                 a pas d'allowlist — une entrée qu'on ne veut pas aligner est une \
+                 entrée à retirer (doctrine mika#2201)."
+            );
         }
     }
 }
