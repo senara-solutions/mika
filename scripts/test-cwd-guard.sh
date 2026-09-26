@@ -128,7 +128,11 @@ BASHISMS=(
     '\+='           # string/array append
 )
 for pattern in "${BASHISMS[@]}"; do
-    if printf '%s\n' "$GUARD_CODE" | grep -Eq "$pattern"; then
+    # Here-string, never a pipeline: `grep -q` exits on its first match and the
+    # producer then dies of SIGPIPE, which `set -o pipefail` turns into a failure
+    # of the whole `if` — the assertion would then read the opposite of what it
+    # measures (mika#2055, and the guard `scripts/verify-no-sigpipe-grep.sh`).
+    if grep -Eq -- "$pattern" <<<"$GUARD_CODE"; then
         ko "cwd-guard.sh must carry no bashism" "found: $pattern"
     else
         ok "cwd-guard.sh carries no \`$pattern\`"
