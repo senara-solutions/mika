@@ -4200,6 +4200,82 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// The `result` of the **most recent** terminal groom callback for a GitHub
+    /// issue (mika#2545). Sister of [`Self::has_completed_groom_for_issue`]: same
+    /// join, same agent scoping, same tolerance for the legacy
+    /// [`crate::task_state::tasks::GROOM_PHASE_SUFFIX`] on the parent's URL.
+    ///
+    /// # Why the LAST groom, never "does an ESCALATE exist"
+    ///
+    /// The consumer asks *"did this ticket's grooming end on a halt verdict?"* —
+    /// a question about the current state, not about history. A ticket escalated
+    /// and then re-groomed successfully must become dispatchable again; an
+    /// `EXISTS`-shaped predicate would block it for ever and turn a brake into a
+    /// wall. Hence `ORDER BY … LIMIT 1` rather than a `COUNT`.
+    ///
+    /// # Why `created_at DESC, id DESC`
+    ///
+    /// `created_at` is the dispatch's BIRTH, which no reaper rewrites;
+    /// `updated_at` is touched late by the watchdog (#959), the silent-stall
+    /// reaper (mika#2249) and the phantom sweep (mika#1712), so ordering on it
+    /// would let a late sweep of an old row outrank a newer groom.
+    ///
+    /// `id DESC` makes the answer **deterministic** for two callbacks born
+    /// inside the same second — which the ISO-8601 second-resolution timestamps
+    /// make representable — and deliberately not more than that: `tasks.id` is a
+    /// UUID v4, so the tiebreak is reproducible, **never chronological**. Named
+    /// rather than implied, because the difference matters if the population
+    /// ever stops being empty: two terminal groom callbacks under one parent
+    /// inside one second is unreachable today (a groom dispatch runs for
+    /// minutes, and its class cap is 1 — `max_concurrent_for_class`), so the
+    /// tiebreak only ever has to stop the answer depending on SQLite's scan
+    /// order. Should that change, the fix is a monotonic discriminator, not a
+    /// second sort key.
+    ///
+    /// # Two levels of `Option`, and they say different things
+    ///
+    /// - `Ok(None)` — **no** terminal groom callback for this issue. The nominal
+    ///   shape of a ticket about to be groomed for the first time; the caller
+    ///   reads it as "never escalated".
+    /// - `Ok(Some(None))` — a callback exists and its `result` column is NULL.
+    ///   Anomalous (the completion write path always carries a result), and the
+    ///   caller reads it as *unreadable* rather than guessing a verdict.
+    /// - `Ok(Some(Some(text)))` — the callback's `result`, verbatim. The verdict
+    ///   is derived from it by the pure function
+    ///   `skills::executor::groom_escalate_verdict`, never here: this method
+    ///   returns a fact, the marker's grammar is the caller's business.
+    ///
+    /// Read-only. An `Err` is a DB failure and the caller refuses (fail-closed,
+    /// like `has_completed_groom_for_issue` on the same gate).
+    pub fn latest_groom_verdict_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<Option<Option<String>>> {
+        let legacy_groom_url = format!(
+            "{}{}",
+            issue_url,
+            crate::task_state::tasks::GROOM_PHASE_SUFFIX
+        );
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT child.result FROM tasks child
+                 JOIN tasks parent ON child.parent_task_id = parent.id
+                 WHERE child.agent_id = ?1
+                   AND child.trigger_type = 'callback'
+                   AND child.dispatch_class = 'groom'
+                   AND child.status IN ('completed', 'delivered')
+                   AND parent.reference_url IN (?2, ?3)
+                 ORDER BY child.created_at DESC, child.id DESC
+                 LIMIT 1",
+                params![agent_id, issue_url, legacy_groom_url],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Count pending callback tasks for a given team run with depth > 1.
     /// Used to detect grandchild long-running tasks spawned during a team run.
     pub fn count_pending_callback_tasks_by_team_run(&self, team_run_id: &str) -> Result<i64> {
