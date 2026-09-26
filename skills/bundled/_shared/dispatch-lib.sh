@@ -495,7 +495,7 @@ _emit_pilot_budget_line() {
     done
 
     if [ -n "${_PILOT_MAX_TURNS_INVALID:-}" ]; then
-        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, retour au défaut" >&2
+        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, le plafond vient d'un autre palier (voir source= ci-dessous)" >&2
     fi
 
     # mika#2542 — `label=` n'est émis QUE quand un label a décidé : un champ

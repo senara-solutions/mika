@@ -39,8 +39,9 @@
 #   scripts/test-check-pilot-turn-ceiling-labels.sh).
 #
 # Exit 0 clean, 1 on an undeclared ceiling label, 2 if a file cannot be read,
-# 3 if either list could not be parsed at all (a guard that finds nothing to
-# check must say so rather than pass).
+# 3 if either list could not be parsed at all, or the table holds a form the
+# parser cannot audit (a guard that finds nothing to check, or cannot see
+# everything, must say so rather than pass).
 
 set -euo pipefail
 
@@ -66,26 +67,56 @@ fi
 # blank lines inside the array are skipped. The file is parsed, never executed:
 # sourcing dispatch-lib.sh would run its top-level setup.
 #
+# The parser is deliberately narrow, so it must REFUSE what it cannot model
+# rather than return a partial list (the class of
+# docs/solutions/best-practices/structural-guard-fails-open-parser-fixture-harness.md,
+# mika#2039). Bash accepts an unquoted, single-quoted or multi-per-line entry,
+# and an append (`PILOT_LABEL_TURN_CEILINGS+=(...)`) anywhere in the file; the
+# resolver iterates the real array and honours every one of them. A subset
+# check that silently skipped them would go green on exactly the undeclared
+# label it exists to catch. So:
+#   - every non-blank, non-comment line inside the array must be exactly one
+#     `"label=<positive integer>"` entry (optionally followed by a comment) —
+#     which also refuses `"x="` or `"x=abc"`, values the resolver would pass
+#     straight to `--max-turns`;
+#   - the file must contain exactly one assignment to the table, counting `+=`
+#     and indented / `declare` / `readonly` forms.
+#
 # awk exits 3 when no declaration is found, 4 when a declaration is found but
-# never closed — both are "nothing to compare", reported as exit 3 below.
+# never closed, 5 on an entry line of any other shape, 6 when the table is
+# assigned more than once — all reported as exit 3 below.
 extract_ceiling_labels() {
     awk '
+        # Any assignment to the table, whatever its prefix. Comment lines are
+        # excluded; the `[@]` use site does not match (`{` precedes the name).
+        $0 !~ /^[ \t]*#/ && $0 ~ /(^|[ \t;])PILOT_LABEL_TURN_CEILINGS(\+)?=/ {
+            assignments++
+            if (assignments > 1) {
+                printf "%d: %s\n", NR, $0 > "/dev/stderr"
+                bad_assign = 1
+            }
+        }
         /^PILOT_LABEL_TURN_CEILINGS=\(/ { collecting = 1; found = 1; next }
         collecting {
             line = $0
             if (line ~ /^[ \t]*\)/) { collecting = 0; closed = 1; next }
             sub(/^[ \t]+/, "", line)
             if (line == "" || line ~ /^#/) { next }
-            n = split(line, parts, "\"")
-            if (n < 3) { next }
+            if (line !~ /^"[^"=]+=[1-9][0-9]*"[ \t]*(#.*)?$/) {
+                printf "%d: %s\n", NR, $0 > "/dev/stderr"
+                bad_entry = 1
+                next
+            }
+            split(line, parts, "\"")
             v = parts[2]
-            if (v !~ /=/) { next }
             sub(/=.*$/, "", v)
-            if (v != "") { print v }
+            print v
         }
         END {
             if (!found) { exit 3 }
             if (!closed) { exit 4 }
+            if (bad_entry) { exit 5 }
+            if (bad_assign) { exit 6 }
         }
     ' "$1"
 }
@@ -121,6 +152,16 @@ if [[ $awk_status -eq 3 ]]; then
 elif [[ $awk_status -eq 4 ]]; then
     echo "ERROR: \`PILOT_LABEL_TURN_CEILINGS=(\` was found in $DISPATCH_LIB but never closed." >&2
     echo "Expected one \"label=ceiling\" entry per line, then a line starting with \`)\`." >&2
+    exit 3
+elif [[ $awk_status -eq 5 ]]; then
+    echo "ERROR: \`PILOT_LABEL_TURN_CEILINGS\` in $DISPATCH_LIB holds an entry this guard cannot audit (line(s) above)." >&2
+    echo "Expected exactly one double-quoted \"label=<positive integer>\" per line. Bash would" >&2
+    echo "accept other shapes and the resolver would honour them, unchecked — so they are refused." >&2
+    exit 3
+elif [[ $awk_status -eq 6 ]]; then
+    echo "ERROR: \`PILOT_LABEL_TURN_CEILINGS\` is assigned more than once in $DISPATCH_LIB (line(s) above)." >&2
+    echo "An append (\`+=\`) or a second assignment adds entries this guard never reads." >&2
+    echo "Keep every ceiling inside the single \`PILOT_LABEL_TURN_CEILINGS=(\` literal." >&2
     exit 3
 elif [[ $awk_status -ne 0 ]]; then
     echo "ERROR: could not parse $DISPATCH_LIB (awk exit $awk_status)" >&2

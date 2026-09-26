@@ -6746,9 +6746,11 @@ assert_eq "mika#2542 × mika#2039: le helper de label n'imprime pas" "0" \
 # mika#2496. Un appel `_pilot_max_turns` suivi d'un `;` ou d'une fin de ligne est
 # un site qui a oublié l'argument : il résout « aucun label », donc 150 — fail-
 # safe, mais silencieusement hors du mécanisme.
+# L'amorce est « tout caractère hors identifiant », pas une liste de ponctuations :
+# un appel écrit après un mot-clé (`then _pilot_max_turns …`) doit être vu aussi.
 _mika2542_resolver_calls() {
     _mika2496_logical_invocations "$1" \
-        | grep -E '(^|[;&|{(][[:space:]]*|^[[:space:]]*)_pilot_max_turns([[:space:]]|;|$)' \
+        | grep -E '(^|[^A-Za-z0-9_])_pilot_max_turns([^A-Za-z0-9_]|$)' \
         | grep -vE '^[[:space:]]*_pilot_max_turns\(\)' \
         || true
 }
@@ -6787,6 +6789,11 @@ assert_eq "mika#2542: fixture g2_green (argument passé, multi-lignes) est VUE V
     "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
 assert_eq "mika#2542: fixture g2_green EST bien un appel vu (le vert n'est pas de la vacuité)" "1" \
     "$(_mika2542_resolver_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
+printf '%s\n' \
+    '    if [ -n "$X" ]; then _pilot_max_turns; fi' \
+    > "$MIKA2542_FIXDIR/g2_keyword"
+assert_eq "mika#2542: fixture g2_keyword (appel après then, sans argument) est VUE ROUGE" "1" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_keyword" | wc -l | tr -d ' ')"
 rm -rf "$MIKA2542_FIXDIR"
 
 # Auto-nettoyage des allowlists (exigence (a) de mika#1574) : une entrée qui

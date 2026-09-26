@@ -152,6 +152,57 @@ f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
     "loop-substrate=200"' "dispatch-lib.sh")"
 assert_exit "$f" "$YML1" 3 "an unclosed table exits 3, not 0"
 
+# ── 6b. PARTIAL PARSE — valid bash the resolver honours, but that a lenient
+#    parser would skip, leaving the extra key unchecked. Each fixture pairs the
+#    declared `loop-substrate` with an UNDECLARED `security-hot`: before the
+#    fix each of these exited 0. All must exit 3.
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"
+    security-hot=250
+)' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "an unquoted entry exits 3, not 0"
+
+f="$(make_fixture "PILOT_LABEL_TURN_CEILINGS=(
+    \"loop-substrate=200\"
+    'security-hot=250'
+)" "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "a single-quoted entry exits 3, not 0"
+
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200" "security-hot=250"
+)' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "two entries on one line exit 3, not 0"
+
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"
+)
+PILOT_LABEL_TURN_CEILINGS+=("security-hot=250")' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "an append (+=) elsewhere in the file exits 3, not 0"
+
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"
+)
+_reset() {
+    PILOT_LABEL_TURN_CEILINGS=("security-hot=250")
+}' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "an indented second assignment exits 3, not 0"
+
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate="
+)' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "an empty ceiling value exits 3, not 0"
+
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=abc"
+)' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 3 "a non-numeric ceiling value exits 3, not 0"
+
+#    A trailing comment on an entry is still the canonical shape: green.
+f="$(make_fixture 'PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"  # mika#2542
+)' "dispatch-lib.sh")"
+assert_exit "$f" "$YML1" 0 "a canonical entry with a trailing comment stays green"
+
 f="$(make_fixture '# just a comment, no entries' "labels.yml")"
 assert_exit "$LIB1" "$f" 3 "a labels file with no \`- name:\` entry exits 3, not 0"
 
