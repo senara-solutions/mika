@@ -6104,6 +6104,91 @@ if [ -f "$T2211_MIKA_CMD" ]; then
     assert_contains "mika#2211: pr-body.md is gitignored (a residue must not read as dirty)" \
         'pr-body.md' "$(cat "$REPO_ROOT/.gitignore" 2>/dev/null || true)"
 fi
+# =============================================================================
+# mika#2548 — le scratch du pilote : désigné, vide, invisible à git
+# =============================================================================
+#
+# Fonctionnel, pas seulement structurel : la propriété qui compte est ce que
+# `git status` rend dans un worktree LIÉ, et elle n'est lisible qu'en exécutant
+# git. Le worktree est créé sous un chemin qui porte `/.claude/worktrees/`, la
+# forme réelle d'un worktree de dispatch — sans quoi la garde mika#1943
+# refuserait la remise à zéro et le test mesurerait autre chose que la prod.
+
+_t2548_run() {
+    local root base wt out=""
+    root=$(mktemp -d)
+    base="$root/repo"
+    wt="$root/.claude/worktrees/fix-2548-probe/mika"
+    mkdir -p "$base" "$(dirname "$wt")"
+    git -C "$base" init -q
+    git -C "$base" commit --allow-empty -q -m initial
+    git -C "$base" worktree add -q -b t2548 "$wt" 2>/dev/null
+
+    # S1 — le répertoire existe après le seed.
+    _seed_pilot_scratch_dir "$wt" 2>/dev/null
+    [ -d "$wt/.pilot-scratch" ] && out="${out}exists;"
+
+    # S2 — un fixture écrit dedans (non vide, en sous-répertoire) est invisible.
+    mkdir -p "$wt/.pilot-scratch/sub" && printf 'x\n' > "$wt/.pilot-scratch/sub/f"
+    [ -z "$(git -C "$wt" status --porcelain)" ] && out="${out}clean;"
+
+    # S3 — contrôle positif du prédicat : un fichier HORS scratch reste visible,
+    # sinon S2 prouverait seulement que `git status` ne rend jamais rien.
+    printf 'y\n' > "$wt/visible.txt"
+    [ -n "$(git -C "$wt" status --porcelain)" ] && out="${out}outside_visible;"
+    rm -f "$wt/visible.txt"
+
+    # S4 — idempotence : un second seed laisse UNE seule ligne d'exclusion.
+    _seed_pilot_scratch_dir "$wt" 2>/dev/null
+    out="${out}lines=$(grep -cxF '.pilot-scratch/' "$base/.git/info/exclude");"
+
+    # S5 — remise à zéro : le résidu d'une session précédente a disparu, le
+    # répertoire est là et vide (réutilisation de worktree, KTD6).
+    printf 'stale\n' > "$wt/.pilot-scratch/stale"
+    _seed_pilot_scratch_dir "$wt" 2>/dev/null
+    if [ -d "$wt/.pilot-scratch" ] && [ -z "$(ls -A "$wt/.pilot-scratch")" ]; then
+        out="${out}reset;"
+    fi
+
+    # S6 — un exclude préexistant sans saut de ligne final n'est pas concaténé.
+    printf 'foo' > "$base/.git/info/exclude"
+    _seed_pilot_scratch_dir "$wt" 2>/dev/null
+    grep -qxF 'foo' "$base/.git/info/exclude" && grep -qxF '.pilot-scratch/' "$base/.git/info/exclude" \
+        && out="${out}newline_guard;"
+
+    # S7 — non-régression mika#1415 après la factorisation : un fichier semé par
+    # _seed_worktree_slash_commands reste exclu.
+    local plat="$root/platform"
+    mkdir -p "$plat/.claude/commands"
+    printf 'meta\n' > "$plat/.claude/commands/mika-groom-ticket.md"
+    _seed_worktree_slash_commands "$plat" "$wt"
+    [ -f "$wt/.claude/commands/mika-groom-ticket.md" ] && [ -z "$(git -C "$wt" status --porcelain)" ] \
+        && out="${out}commands_still_clean;"
+
+    git -C "$base" worktree remove --force "$wt" 2>/dev/null
+    rm -rf "$root"
+    printf '%s' "$out"
+}
+
+T2548_OUT=$(_t2548_run)
+assert_contains "mika#2548: .pilot-scratch existe après le seed" "exists;" "$T2548_OUT"
+assert_contains "mika#2548: un fixture sous .pilot-scratch/ est invisible à git status" "clean;" "$T2548_OUT"
+assert_contains "mika#2548: contrôle positif — un fichier hors scratch reste visible" "outside_visible;" "$T2548_OUT"
+assert_contains "mika#2548: deux seeds laissent une seule ligne d'exclusion" "lines=1;" "$T2548_OUT"
+assert_contains "mika#2548: un résidu est vidé à la préparation suivante" "reset;" "$T2548_OUT"
+assert_contains "mika#2548: un exclude sans saut de ligne final n'est pas concaténé" "newline_guard;" "$T2548_OUT"
+assert_contains "mika#2548: le seeding des commandes (mika#1415) reste propre" "commands_still_clean;" "$T2548_OUT"
+
+# --- Structure : le seed est câblé dans _set_up_worktree, et sa suppression
+# passe par la garde mika#1943 (un rm -rf nu sur un chemin non prouvé est la
+# classe que cette garde existe pour fermer).
+T2548_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2548: _set_up_worktree appelle _seed_pilot_scratch_dir" \
+    '_seed_pilot_scratch_dir "$WORKTREE_DIR"' "$T2548_SUW_SRC"
+T2548_SEED_SRC=$(sed -n '/^_seed_pilot_scratch_dir() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2548: la remise à zéro passe par _assert_removable_worktree_path" \
+    '_assert_removable_worktree_path "$scratch" seed_pilot_scratch_dir' "$T2548_SEED_SRC"
+
 # ============================================================================
 # mika#2120 — le second lecteur du callout `Plan` tolère le préfixe de dépôt
 # ============================================================================

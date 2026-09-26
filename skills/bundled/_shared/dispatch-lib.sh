@@ -2269,21 +2269,48 @@ _clean_worktree_for_rebase() {
 # Boundary (mika#1414 coordination): this helper owns ONLY the post-rebase
 # command-seed. The pre-rebase dirty-state cleanup + rebase guard (the mika#1301
 # block inside _set_up_worktree) is mika#1414's surface; the two do not overlap.
+#
+# The exclude mechanics live in the two helpers below (mika#2548), shared with
+# _seed_pilot_scratch_dir: one definition of "shield a path from git status in a
+# linked worktree", not two copies free to drift.
+
+# Print the absolute path of the COMMON-dir info/exclude for a worktree, creating
+# its parent directory. A linked worktree's own $GIT_DIR/info/exclude is not
+# consulted for status; the common dir's is. --path-format=absolute needs
+# git >= 2.31; fall back to the bare form otherwise. Prints nothing when the
+# directory is not a git worktree.
+_common_exclude_file() {
+    local worktree_dir=$1 common_dir
+    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
+    [ -n "$common_dir" ] || return 0
+    mkdir -p "$common_dir/info" 2>/dev/null || true
+    printf '%s\n' "$common_dir/info/exclude"
+}
+
+# Append one pattern to an exclude file, idempotently. Concurrent dispatches off
+# the same sub-repo share this file; the grep/append is non-atomic, so an overlap
+# may append a duplicate (inert — git collapses repeated patterns) but never
+# corrupts shielding. flock was judged not worth the complexity (P3).
+_append_exclude_line() {
+    local exclude_file=$1 pattern=$2
+    [ -n "$exclude_file" ] || return 0
+    grep -qxF "$pattern" "$exclude_file" 2>/dev/null && return 0
+    # Guard a pre-existing exclude file with no trailing newline, which would
+    # otherwise concatenate our entry onto its last line.
+    if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
+        printf '\n' >> "$exclude_file"
+    fi
+    printf '%s\n' "$pattern" >> "$exclude_file"
+}
+
 _seed_worktree_slash_commands() {
     local platform_dir=$1 worktree_dir=$2
     [ -d "$platform_dir/.claude/commands" ] || return 0
     mkdir -p "$worktree_dir/.claude/commands"
 
-    # Shared exclude lives in the common git dir (a linked worktree's own
-    # $GIT_DIR/info/exclude is not consulted for status). --path-format=absolute
-    # needs git >= 2.31; fall back to the bare form otherwise.
-    local common_dir exclude_file=""
-    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
-    if [ -n "$common_dir" ]; then
-        exclude_file="$common_dir/info/exclude"
-        mkdir -p "$(dirname "$exclude_file")"
-    fi
+    local exclude_file
+    exclude_file=$(_common_exclude_file "$worktree_dir")
 
     local src base
     for src in "$platform_dir/.claude/commands"/*.md; do
@@ -2300,19 +2327,47 @@ _seed_worktree_slash_commands() {
         fi
         cp "$src" "$worktree_dir/.claude/commands/$base" 2>/dev/null || true
         # Invariant 2: shield the scaffold copy from git status (idempotent).
-        # Concurrent dispatches off the same sub-repo share this exclude file;
-        # the grep/append is non-atomic, so an overlap may append a duplicate
-        # (inert — git collapses repeated patterns) but never corrupts shielding.
-        # flock was judged not worth the complexity (P3).
-        if [ -n "$exclude_file" ] && ! grep -qxF ".claude/commands/$base" "$exclude_file" 2>/dev/null; then
-            # Guard a pre-existing exclude file with no trailing newline, which
-            # would otherwise concatenate our entry onto its last line.
-            if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
-                printf '\n' >> "$exclude_file"
-            fi
-            printf '%s\n' ".claude/commands/$base" >> "$exclude_file"
-        fi
+        _append_exclude_line "$exclude_file" ".claude/commands/$base"
     done
+}
+
+# mika#2548 — the pilot's scratch directory: designated, empty, invisible to git.
+#
+# The failure it closes, measured 2026-09-26 (task 83db3a82, ready-label
+# mika#2054): the pilot built a fixture tree at the worktree root, every write
+# into it was refused, it abandoned the approach and tidied up — `rmdir` refused
+# twice, then `rm -rf` → `[policy:deny] … (terminal)` → session killed.
+# `rm -rf` stays terminal in claude-pilot by design (cpp#205); what this repo
+# owns is the place a scratch goes, so that nothing ever needs deleting:
+#
+#   1. It exists before the pilot starts, so there is nothing to create at an
+#      improvised path.
+#   2. It is shielded by the common-dir info/exclude (the mika#1415 mechanism
+#      above), so a leftover never reads as a dirty worktree — no mika#1282
+#      wip-rescue, no rebase refusal, never swept into a commit.
+#   3. It starts EMPTY every time the worktree is prepared. Worktrees are reused
+#      across iterations and resumes, and _clean_worktree_for_rebase (`git clean
+#      -fd` without -x, `stash --include-untracked`) spares excluded paths; a
+#      stale fixture from a previous session would otherwise push the next pilot
+#      — which the prompt rule forbids to delete it — straight back to `rm -rf`.
+#      The reset runs host-side, behind the mika#1943 guard, like the `.iterate`
+#      reset.
+#
+# Not closed here, and named: the tidy-up reflex itself on an EMPTY tree (git
+# never saw the founding directories) is barred on this side only by the prompt
+# rule _PILOT_SCRATCH_RULE. The structural half of that belongs to the
+# claude-pilot policy (make rm/rmdir under this path survivable) — follow-up.
+_PILOT_SCRATCH_DIRNAME='.pilot-scratch'
+
+_seed_pilot_scratch_dir() {
+    local worktree_dir=$1 scratch exclude_file
+    scratch="$worktree_dir/$_PILOT_SCRATCH_DIRNAME"
+    if [ -e "$scratch" ] && _assert_removable_worktree_path "$scratch" seed_pilot_scratch_dir; then
+        rm -rf "$scratch" 2>/dev/null || true
+    fi
+    mkdir -p "$scratch" 2>/dev/null || return 0
+    exclude_file=$(_common_exclude_file "$worktree_dir")
+    _append_exclude_line "$exclude_file" "$_PILOT_SCRATCH_DIRNAME/"
 }
 
 # Set up a git worktree for the target issue's branch. Parses the repo#number
@@ -3134,6 +3189,8 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # because worktrees are short-lived and mid-session command edits
         # violate slug-immutability (mika#844).
         _seed_worktree_slash_commands "$PLATFORM_DIR" "$WORKTREE_DIR"
+        # mika#2548: a designated, empty, git-excluded scratch dir for the pilot.
+        _seed_pilot_scratch_dir "$WORKTREE_DIR"
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
