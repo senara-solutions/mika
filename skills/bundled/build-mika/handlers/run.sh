@@ -3,10 +3,22 @@
 # Input: JSON on stdin with __mika_task_id and __mika_agent (injected by executor for long-running)
 # Output: Delivers result via `mika ask --task-id` callback
 #
-# This is a long-running handler: stdout goes to /dev/null, stderr is captured on failure.
+# This is a long-running handler: stdout goes to /dev/null, and stderr is read
+# by the executor, which since mika#2532 persists it on the task row under
+# `$.handler_failure` — readable with `mika tasks get <task-id>` even when the
+# EXIT trap below has already delivered a callback and made the row terminal.
 # All meaningful output must be delivered via the callback mechanism.
+#
+# --- Naming the step that failed (mika#2532 R2/R3) ---
+# `_STEP` tracks where we are; the EXIT trap reports it when it has to invent a
+# crash message. `_STEP_DETAIL` carries the specifics for the failures we saw
+# coming. The step name covers the ones we did not — which are, by definition,
+# the ones nobody thought to wrap.
 
 set -e
+
+_STEP="deps"
+_STEP_DETAIL=""
 
 # Ensure ~/.local/bin is in PATH (mika CLI needed for callback delivery)
 export PATH="$HOME/.local/bin:$PATH"
@@ -16,6 +28,7 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed
 command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
 
 # Read input JSON from stdin
+_STEP="parse_input"
 INPUT=$(cat)
 
 # Scrub sensitive env vars so cargo build scripts cannot leak them
@@ -41,7 +54,13 @@ deliver_callback() {
     [ "$CALLBACK_SENT" -eq 1 ] && return
     [ -z "$TASK_ID" ] && return
     if [ -z "$RESULT" ]; then
-        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Script failed before building result."
+        # The `HANDLER CRASH` prefix is a wire format: `self-dev-callback`
+        # documents it as a discriminant and `dispatch-lib.sh` greps it. The
+        # step is ADDED to it, never substituted for it (mika#2532 D5).
+        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}'."
+        if [ -n "$_STEP_DETAIL" ]; then
+            RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}': ${_STEP_DETAIL}"
+        fi
     fi
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
     set +e
@@ -76,6 +95,7 @@ fi
 # `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536). The `MIKA_`-
 # prefixed form was a DEAD branch here: `sandboxed_pilot_env` rebuilds the child
 # env from a positive allowlist that refuses every `MIKA_*`.
+_STEP="resolve_cwd"
 if [ -z "$CWD" ]; then
     _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
     CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
@@ -88,8 +108,27 @@ if ! validate_cwd "$CWD"; then
     exit 1
 fi
 
-# Run the build
-cd "$CWD" || { RESULT="FAILED: could not cd to $CWD"; exit 1; }
+# Run the build.
+#
+# `validate_cwd` above has already refused every uncomposable cwd BY NAME, so
+# this `cd` is now a NET rather than a path — what reaches it is a directory that
+# passed the four tests and still cannot be entered (no `+x`, a mount that went
+# away). The net keeps the `HANDLER CRASH` prefix rather than composing a
+# `RESULT` of its own: that prefix is a wire format `self-dev-callback`
+# documents as a discriminant and `dispatch-lib.sh` greps, and the step plus
+# `$_STEP_DETAIL` name the cause inside it (mika#2532 D5).
+#
+# The `echo` on fd 2 is kept, and mika#2536's reason for dropping it — "`cd`
+# writes its diagnostic to a stderr the long-running path discards" — no longer
+# holds: mika#2532 R1 persists that stderr on the task row under
+# `$.handler_failure`, readable with `mika tasks get <task-id>`.
+_STEP="chdir"
+cd "$CWD" || {
+    _STEP_DETAIL="could not cd to $CWD"
+    echo "ERROR: could not cd to $CWD" >&2
+    exit 1
+}
+_STEP="build"
 set +e
 BUILD_OUTPUT=$(cargo build --release --features telemetry 2>&1)
 BUILD_EXIT=$?
@@ -110,6 +149,7 @@ fi
 RESULT=$(printf '%s' "$RESULT" | head -c 92000)
 
 # Deliver via mika ask --task-id --task-complete
+_STEP="deliver"
 set +e
 if [ -n "$AGENT" ]; then
     mika ask --task-id "$TASK_ID" --task-complete --agent "$AGENT" -- "$RESULT"

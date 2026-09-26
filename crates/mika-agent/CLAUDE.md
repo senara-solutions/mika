@@ -1992,6 +1992,148 @@ empty) marks a WARN that landed while its audit row did not.
 
 **Long-running:** `long_running: true` + `estimated_duration_secs` in `skill.toml`. Conversation mode and `DeferredDispatch` silent mode (#1058). Creates callback task, injects `__mika_task_id` and `__mika_agent` env vars, spawns detached process. PID recorded for orphan cleanup. **Callback deferred dispatch (#1058):** When a callback or DeferredDispatch turn calls a long-running tool and `long_running_ctx` is `None`, the executor gate intercepts the call via `callback_task_id` on `ToolContext`. Instead of a hard error, it runs `check_lineage_cycle()` (lineage walk on `(repo, issue_number, skill)` tuple, max 4 hops, fail-open on extraction failure) and, if no cycle is detected, calls `register_deferred_callback()` to enqueue the dispatch. Returns `{"status": "deferred", "deferred": true}` so the LLM knows not to retry. The deferred callback fires as a `DeferredDispatch` silent turn which HAS `LongRunningContext` injected. Cycle detection rejects same-tuple re-dispatch (e.g., `groom-#159 → retry-groom-#159`) but allows cross-skill chains (e.g., `groom-#159 → pilot-#159`). **Dispatch-readiness guard (#525):** before spawning, `validate_dispatch_readiness()` enforces seven checks: (0) unauthorized webhook dispatch (#933) — if `originating_message` is present and matches the Webhook Fallthrough domain (`[GitHub]` prefix excluding ready-label, PR, and check-suite events), rejects with `unauthorized_webhook_dispatch` before any DB access. Pure string-prefix check, cheapest guard. Predicate shared via `crate::webhook_dispatch::is_unauthorized_webhook_dispatch()`. (1) task status must be `pending` or `in_progress` (rejects `blocked`/`completed`/`cancelled` with structured JSON error `task_not_dispatchable`), (2) no active callback child task may exist (rejects with `task_active_dispatch`), (3) no other task of the same dispatch class may have an active callback child — per-class slot guard (rejects with `global_dispatch_active`, scoped to `agent_id` + `dispatch_class`) (#583, #1001). `dispatch_class` is `'implement'` (dev-pilot, deploy_mika) or `'groom'` (dev-groom); pre-v34 NULL rows are treated as `'implement'` via SQL `COALESCE`. One implement + one groom dispatch may run concurrently per agent. The rejection JSON includes `blocker_kind` (`"real_callback"` or `"deferred_wrapper"`) and `blocking_label` for agent-native diagnostics (#1172 W3), (4) per-turn dispatch counter must be zero — only one long-running dispatch per agent turn (rejects with `dispatch_limit_exceeded`) (#583), (5) grooming-marker check (#919, #1108) — if the task's `reference_url` points to a GitHub issue AND the dispatch skill is `dev-pilot` AND `task.type == "issue"`, fetches the issue body via REST API and checks for three canonical grooming callouts: `> - **Branch:**`, `docs/plans/`, and a `second-pass` marker (canonical `(GROOMED)` or spec-tolerated `(READY, paraphrased GROOMED ...)`). Rejects with `dispatch_no_grooming_marker` (listing `missing_signals`) if any are absent. Bypass predicates: non-`dev-pilot` skill, non-issue task type, non-GitHub-issue reference_url, or `MIKA_DISPATCH_BYPASS_GROOMING_CHECK=1` env var (WARN-logged). Fail-open when no `github_token` configured; fail-closed on API errors. Coupled pair with `skills/bundled/self-dev/system_prompt.md:253` (defense-in-depth prompt-level check), (6) GitHub `blockedBy` check — if the task's `reference_url` points to a GitHub issue, queries the GraphQL API for open blockers and rejects with `dispatch_blocked_by` if any are still open (#713). Fail-open when no `github_token` configured (check skipped with warning); fail-closed on API errors. Uses GraphQL variables (not string interpolation) for injection safety. `extract_open_blocker_numbers()` parses the response. `LongRunningContext` carries `dispatch_count: AtomicU32` initialized to 0 per turn; incremented after task creation and path validation, right before subprocess spawn. `LongRunningContext` also carries `originating_message: Option<String>` (#933) — populated from the latest user-role message in conversation mode, `None` for silent triggers. Fail-closed on DB errors. Auto-transitions `pending` tasks to `in_progress` on successful dispatch. Stricter than the shared `validate_task()` which also allows `blocked` for `delegate_task`. **Dispatch-rejection observability (#1108):** All 7 rejection sites write the structured JSON error to `tasks.result` via `record_dispatch_rejection()` (fire-and-forget, warn on DB failure). This surfaces rejection reasons to operator-visible surfaces (`mika tasks list`, dashboard task detail) without requiring DB-level inspection. The `write_task_dispatch_rejection()` DB method is agent-unscoped (keyed by `task_id` + `trigger_type = 'manual'`) because the earliest rejection site (unauthorized webhook) fires before the task is fetched.
 
+### The stderr of a failed handler survives a terminal task (mika#2532)
+
+**The defect was never a missing capture — it was a capture whose only
+destination refused terminal rows.** `spawn_long_running_exec` has always read
+the handler's stderr on `!status.success()` and built
+`err_msg = "Process {code_display}: {stderr}"`, then handed it to
+`update_task_failed`, whose `UPDATE` carries
+`AND status NOT IN ('completed', …, 'delivered')`. A handler whose EXIT trap has
+already delivered its callback leaves the row `completed`, so that write matched
+nothing, the branch logged *"… but task already in terminal state"*, and the one
+string naming the cause was dropped on the floor. Measured 2026-09-25:
+`build-mika` crashed **4 times out of 4** during the QA of PR #2530, each attempt
+rendering only `HANDLER CRASH (exit code 1). Script failed before building
+result.` — so QA returned **COMMENTED** instead of approving and an implementation
+stayed out of merge while its GitHub CI was green.
+
+**Three cases, one broken.** Crash *before* the trap (no `TASK_ID`, missing `jq`)
+leaves the row non-terminal → `Ok(true)`, the stderr **already** reached
+`tasks.result`. Success → the branch is not taken. Crash *after* the trap and
+before `RESULT` — the `cd` — leaves the row terminal → `Ok(false)`, and that is
+the only case with no surface at all. The trap doing its job correctly is what
+closed the door behind it.
+
+**R1 — the remedy is engine-side, and that is what makes it a class fix.** Five
+sites carry the `HANDLER CRASH` trap; the three that capture a `STDERR_FILE`
+capture **claude-pilot's** stderr, never their own (the handler's `echo … >&2`
+goes to the inherited fd 2, i.e. the executor's pipe) and create that file ~200
+lines *after* the trap. All five shared the hole; one site in Rust covers them
+and every handler written later, `_shared/dispatch-lib.sh` included — which is
+why that file is deliberately untouched.
+
+The write is **unconditional**, not gated on the `Ok(false)` arm: *"what did this
+process put on fd 2"* has nothing to do with the row's status. The surface is
+`tasks.metadata` because [`Database::set_task_handler_failure`] carries no status
+filter (`WHERE id = ?`) — *"`completed` is terminal, the metadata still writes"*
+has been an explicit contract since #617, and is exactly the property AC1 asks
+for. `tasks.result` is refused (it carries the message the callback turn consumes
+and that `extract_callback_fields` / `parse_verdict` read), and a per-task
+`.stderr` file too (the house has paid three times for a documented sink nothing
+feeds — Signals M, Q, S). Payload in **one** `json_set`, `stderr` **omitted** when
+fd 2 stayed mute — never `""` (mika#2331) — fire-and-forget, scrubbed then
+truncated at `MAX_OUTPUT_LEN`. Full reasoning at each site's doc-comment.
+
+**R2/R3 — the four handlers name their step.** `_STEP` / `_STEP_DETAIL`, set at
+each site and read by the trap; the `HANDLER CRASH` prefix is **added to**, never
+replaced (`self-dev-callback:162` documents it as a discriminant and
+`dispatch-lib.sh` greps it), giving
+`HANDLER CRASH (exit code 1) at step 'chdir': could not cd to /nope/mika`. The
+detail covers the failures we saw coming; the step name covers the ones we did
+not, which are by definition the ones nobody thought to wrap. The trap is armed
+as soon as `TASK_ID` is known — **a real hole on one handler only**: `deploy-mika`
+resolved its `CWD` before arming, and that block moved after. For the other three
+the gap held only a function definition; the correction is applied to all four
+because it is cheap and makes the property true by construction rather than by
+luck.
+
+**Operator surfaces.**
+
+```bash
+mika tasks get <task-id>            # `Handler failure:` + `Handler stderr:`
+mika tasks get <task-id> --format json | jq '.metadata | fromjson | .handler_failure'
+
+grep long_running_handler_exit_nonzero "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{task_id, code_display, task_was_terminal, stderr_bytes, stderr_persisted}'
+
+# CONTROL — a refused persistence (expected regime: EMPTY)
+grep long_running_handler_failure_not_persisted "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- The population of the class, on the surface itself
+SELECT id, json_extract(metadata,'$.handler_failure.exit') AS exit_code, created_at
+  FROM tasks WHERE json_extract(metadata,'$.handler_failure') IS NOT NULL
+  ORDER BY created_at DESC;
+```
+
+| event | level | expected regime | reading |
+|---|---|---|---|
+| `long_running_handler_exit_nonzero` (`task_was_terminal: true`) | INFO | **non-empty, low** | the broken case. Each line is a crash whose cause was discarded before this fix |
+| `long_running_handler_exit_nonzero` (`task_was_terminal: false`) | WARN | non-empty, low | the already-working case, behaviour unchanged |
+| `long_running_handler_failure_not_persisted` | WARN | **empty** | any hit is a `metadata` that is not valid JSON (class mika#2179): the cause is lost again |
+
+Levels do not move; what is added is a **stable event name on both arms** and the
+fields that separate the two populations. **No `audit_events` row, deliberately:**
+the population is directly countable on the surface itself by the query above, and
+a second population would have to be kept in agreement with this one for ever, for
+a count this query already makes exact.
+
+**Post-deploy probes, and their four halts.**
+
+- **S1 — the surface exists (first real crash).** A long-running handler exiting
+  non-zero leaves `handler_failure` on its row. *Halt 1 — no
+  `long_running_handler_exit_nonzero` line while a crash did happen:* do not
+  widen the predicate by reflex. `~/.mika/skills/` is a projection of the
+  **binary**, not of the checkout — establish the deployment first
+  (`cat ~/.mika/skills/.manifest-writer`, class mika#2340), then that the served
+  `mika-spirit` carries the fix.
+- **S2 — the step is named (48 h).** Every `HANDLER CRASH` the four handlers
+  render carries `at step '<…>'`. *Halt 2 — a bare `HANDLER CRASH` survives:* a
+  fifth site carries the pattern, or `dispatch-lib.sh` served that path (out of
+  scope). Establish **which** before touching the four.
+- **S3 — attribution (30 days).** The SQL query above gives the population of the
+  class; it, and not an intuition, is what conditions opening a follow-up on the
+  remaining root cause. *Halt 3 — the population carries nominal traffic* (several
+  a day, across different handlers): observability is not the subject — the
+  long-running handlers are crashing in series, and **that** is what to treat
+  (mika#2536 for the cwd cause, one ticket per cause after).
+- **S4 — negative control (7 days).** `handler_failure` is **absent** from every
+  row whose handler succeeded. *Halt 4 — one occurrence on a success:* the write
+  predicate has left the `!status.success()` branch. Disarm by revert **before**
+  diagnosis — a cause of failure invented on a healthy row is a lie of the same
+  order as the silence being repaired.
+
+**Guards.** `skills::executor::tests::mika2532::*` — five behavioural tests on a
+real `/bin/sh` subprocess (the measured defect; **the success negative control**,
+without which "we write on failure" is indistinguishable from "we always write";
+non-regression of the live-row case; the scrub; the mute handler). They live
+in-crate, not under `tests/eval/`: `spawn_long_running_exec` is `pub(crate)`, so
+an integration crate cannot reach it, and widening a production function's
+visibility for a test file's location would be the worse trade.
+`canonical_tokens::tests::mika2532_the_handler_failure_key_has_a_single_writer` is
+a source scan with an **empty allowlist** — the CLI renderer imports the constant
+instead of retyping the literal, which is why it is `pub`. Shell side:
+`skills/bundled/_shared/tests/test_handler_crash_step.sh` (`make
+test-handler-crash-step`, CI-gated) replays the measured crash, keeps a negative
+control on the nominal path, and asserts structurally that the trap precedes every
+step a trap could cover — with its own two fixtures proving that check bites.
+
+**What this does NOT buy.** No crash is prevented: the root cause of the measured
+defect (`MIKA_PLATFORM_DIR` scrubbed, so `cd` lands on a path that does not exist)
+belongs to **mika#2536**. Nothing is retro-persisted — the four measured crashes
+will never have their stderr; the probe is the **next** occurrence. A handler
+killed by `SIGKILL` before writing anything leaves `exit` and nothing else, which
+is honest and is the limit. And no surveillance: the instruments are the greps and
+the query above, whose **silence proves nothing until someone runs them**.
+
+**Named out of scope, found on the way:** the executor writes the **un-scrubbed**
+stderr into `tasks.result` on the non-terminal case, where the shell has scrubbed
+since mika#903. A real hole, a different population, and its blast radius is the
+`result` the callback turn consumes — **follow-up ticket**. This work does not
+make it worse: its own surface is scrubbed.
+
 ### Un seul lecteur de la preuve de grooming (mika#2484)
 
 `skills::executor::groomed_state(db, owner, repo, number, issue_body)` répond à

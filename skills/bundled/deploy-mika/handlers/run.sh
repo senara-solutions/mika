@@ -6,7 +6,20 @@
 # Input: JSON on stdin with __mika_task_id, __mika_agent, and cwd
 # Output: Delivers result via `mika ask --task-id` callback
 
+# --- Naming the step that failed (mika#2532 R2/R3) ---
+# `_STEP` tracks where we are; the EXIT trap reports it when it has to invent a
+# crash message. The trap is armed as soon as `TASK_ID` is known, and the `CWD`
+# resolution below used to sit BEFORE it — this handler was the one place where
+# a real step ran unwatched (mika#2532 D10). It now runs after.
+#
+# The executor also persists this handler's stderr on the task row since
+# mika#2532 (`$.handler_failure`, `mika tasks get <task-id>`), including when
+# the trap has already made the row terminal.
+
 set -e
+
+_STEP="deps"
+_STEP_DETAIL=""
 
 # Ensure ~/.local/bin is in PATH (mika CLI needed for callback delivery)
 export PATH="$HOME/.local/bin:$PATH"
@@ -16,6 +29,7 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed
 command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
 
 # Read input JSON from stdin
+_STEP="parse_input"
 INPUT=$(cat)
 
 # Scrub all MIKA_* env vars so child processes cannot leak secrets
@@ -31,17 +45,9 @@ if [ -z "$TASK_ID" ]; then
     exit 1
 fi
 
-# Use provided cwd or default to the main mika repo root (same pattern as build-mika).
-# `PLATFORM_DIR` is the name the child receives — relayed from the operator's
-# `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536). Two independent
-# reasons the prefixed form was a DEAD branch here: `sandboxed_pilot_env` refuses
-# every `MIKA_*`, AND the scrub loop above has already unset them all.
-if [ -z "$CWD" ]; then
-    _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
-    CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
-fi
-
 # --- Crash-recovery EXIT trap ---
+# Armed as soon as TASK_ID is known (mika#2532 R3). Nothing between the parse
+# above and this line does any work, so no step can fail unwatched.
 CALLBACK_SENT=0
 
 deliver_callback() {
@@ -49,7 +55,13 @@ deliver_callback() {
     [ "$CALLBACK_SENT" -eq 1 ] && return
     [ -z "$TASK_ID" ] && return
     if [ -z "$RESULT" ]; then
-        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}). Deploy failed before building result."
+        # The `HANDLER CRASH` prefix is a wire format: `self-dev-callback`
+        # documents it as a discriminant and `dispatch-lib.sh` greps it. The
+        # step is ADDED to it, never substituted for it (mika#2532 D5).
+        RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}'."
+        if [ -n "$_STEP_DETAIL" ]; then
+            RESULT="HANDLER CRASH (exit code ${_EXIT_CODE}) at step '${_STEP}': ${_STEP_DETAIL}"
+        fi
     fi
     RESULT=$(printf '%s' "$RESULT" | head -c 92000)
     set +e
@@ -77,12 +89,28 @@ else
     exit 1
 fi
 
+# Use provided cwd or default to the main mika repo root (same pattern as
+# build-mika). Deliberately AFTER the trap: this block used to run before it,
+# which is the one real R3 hole of the four handlers (mika#2532 D10).
+#
+# `PLATFORM_DIR` is the name the child receives — relayed from the operator's
+# `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536). Two independent
+# reasons the prefixed form was a DEAD branch here: `sandboxed_pilot_env` refuses
+# every `MIKA_*`, AND the scrub loop above has already unset them all.
+_STEP="resolve_cwd"
+if [ -z "$CWD" ]; then
+    _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
+    CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
+fi
+
 # --- Mutual exclusion ---
+_STEP="lock"
 LOCKFILE="/tmp/deploy-mika.lock"
 exec 9>"$LOCKFILE"
 flock -n 9 || { RESULT="FAILED: another deploy is in progress"; exit 1; }
 
 # --- Path validation ---
+_STEP="validate_path"
 # Self-referential assignment with a default IS the canonical shape of an
 # operator knob (`VAR="${VAR:-default}"`), and it is what the mika#2508 scan's
 # term 4bis recognizes: the read is not evicted by the write, so `PLATFORM_DIR`
@@ -111,6 +139,7 @@ case "$CWD" in
 esac
 
 # --- All 3 binaries ---
+_STEP="install_binaries"
 BINARIES="mika mika-spirit mika-gateway"
 INSTALL_DIR="$HOME/.local/bin"
 DEPLOY_LOG=""
@@ -168,6 +197,7 @@ for bin in $BINARIES; do
 done
 
 # --- Restart services via rc-service (OpenRC) ---
+_STEP="restart_services"
 RESTART_LOG=""
 
 # Restart mika-spirit and mika-gateway via rc-service if the init scripts exist
