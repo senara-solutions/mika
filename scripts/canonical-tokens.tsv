@@ -88,6 +88,23 @@ rescue-pipeline-verified	A	crates/mika-agent/src/wip_rescue.rs::pipeline_verifie
 Closes #N	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 
+# mika#2519 — the call-site assertion a `pass` on a MAJOR dependency bump must
+# carry. Canonical token: `API-SURFACE:`. The survey reports the tail alone
+# because its ALL-CAPS rule needs five characters before it will join across a
+# `-`, and `API` has three — the same shape as `VERDICT` for
+# `DEADLINE_VERDICT_LINE` in class B below, so the row is written as the survey
+# produces it rather than as a human would read it.
+#
+# Class A, and the tolerance is the whole reason: the sole reader,
+# `guards.rs::body_asserts_api_surface`, walks the prefix character by character
+# with `eq_ignore_ascii_case` — so case IS read and rule L2 must not fire. The
+# walk is why the survey sees the CONSTANT and not the reader: a computed byte
+# offset into a review body is what `scripts/check-byte-slices.sh` refuses
+# (mika#764, mika#2103), so there is no `starts_with` for the survey to find.
+# Producer side is `qa-review/system_prompt.md` Step 1.6 (steps 5b and 7); this
+# column names the READER, as everywhere.
+SURFACE	A	crates/mika-agent/src/evidence/guards.rs::API_SURFACE_LINE_PREFIX	ci:line-anchored
+
 # `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
 # first tier is a strict `grep -oE` — and they are class A anyway. That is a
 # rectification of the mika#2201 plan, which listed those two literals as class

@@ -3374,6 +3374,357 @@ where
     Err(ToolOutput::error(body.to_string()))
 }
 
+/// Refuse deux verdicts qu'une PR d'auteur automatisé ne peut pas recevoir
+/// (mika#2519).
+///
+/// Quatrième membre de la famille pre-subprocess, après
+/// `validate_destructive_action_grounding` (mika#1646),
+/// `validate_pr_review_flag_coherence` (mika#2237) et `validate_qa_ci_coherence`
+/// (mika#2455). Même placement et la même raison, que mika#2237 a déjà écrite :
+/// le défaut est l'**appel** — quand un bras EndTurn tournerait, la revue serait
+/// sur GitHub. Un `block[pipeline]` posté est un ticket sorti du rail autonome ;
+/// le rattraper après coup ne le remet pas dessus.
+///
+/// Les deux branches, leur mesure et les trois refus de conception vivent dans
+/// la section mika#2519 d'`evidence::guards` ; cette fonction est leur
+/// application.
+///
+/// # Ce qu'elle gate, et ce qu'elle ne gate délibérément pas
+///
+/// Le **verdict**, jamais le flag — l'arbitrage de mika#2455 point 2, et pour la
+/// même raison : un gate sur `--approve` composerait avec mika#2237 en impasse.
+/// Les deux sorties que chaque refus nomme (rejouer Step 1.6 ; ou `block[dependency]`
+/// / citer la sortie de garde verbatim) sont atteignables quelle que soit
+/// l'histoire du tour, ce qui rend R8 structurel plutôt qu'espéré.
+///
+/// Elle tourne **après** mika#2455, en queue de chaîne : c'est le second maillon
+/// à faire un appel réseau, et l'ordre existant est justifié par ce critère.
+///
+/// # De quel côté elle échoue
+///
+/// Fail-OPEN de bout en bout, comme mika#2455 et à l'inverse de mika#1646.
+/// L'arithmétique : un faux négatif laisse l'état d'aujourd'hui — le rail
+/// dependabot passe par Vincent, ce qui est le défaut, pas une régression ; un
+/// faux positif rend une revue légitime impossible à poster et tue le tour. Donc
+/// tout terme illisible s'abstient : pas de cible, pas de dépôt, pas de jeton,
+/// `gh` en échec, timeout, sortie non parsable, `author.login` absent. Chaque
+/// abstention est **dite** (`dependabot_verdict_abstained`), jamais muette — une
+/// garde inerte se lit exactement comme une garde saine (mika#2205).
+async fn validate_dependabot_verdict_coherence(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_dependabot_verdict_coherence_with_reader(
+        args,
+        repo,
+        ctx,
+        |pr, repo, token| async move { run_gh_pr_view_author_title(pr, &repo, &token).await },
+    )
+    .await
+}
+
+/// Lit `author` et `title` d'une PR via `gh`, et rend le stdout **brut**.
+///
+/// Séparée pour que le seam de test porte sur les octets que `gh` rend, et non
+/// sur une structure déjà interprétée — voir la doc de
+/// [`validate_dependabot_verdict_coherence_with_reader`].
+async fn run_gh_pr_view_author_title(pr: u64, repo: &str, token: &str) -> Result<String, String> {
+    let pr_str = pr.to_string();
+    let args = vec![
+        "pr",
+        "view",
+        &pr_str,
+        "--repo",
+        repo,
+        "--json",
+        // `author` est un objet ; `title` porte le couple de versions. Deux
+        // champs, un appel — voir la doc du seam ci-dessous.
+        "author,title",
+    ];
+    crate::tools::pr_merge_with_gate::run_gh_subprocess(&args, token).await
+}
+
+/// Le gate mika#2519 avec son lecteur injecté.
+///
+/// **Pourquoi le seam est le stdout brut et pas la classification.** Le lecteur
+/// de production est `gh pr view --json author,title` et ne peut pas tourner
+/// dans un test (pas de réseau, pas de jeton). Poser le seam sur les faits
+/// *déjà extraits* laisserait le parseur JSON et l'extraction d'`author.login`
+/// non testés sur le chemin de production ; le poser sur le **stdout brut** fait
+/// qu'un test exerce le vrai parseur, les deux vrais classifieurs et tout le
+/// câblage dans `run_gh` — tout sauf la seule chose qu'il ne peut pas avoir, le
+/// réseau. Motif de mika#2455, mot pour mot.
+///
+/// **Un seul appel réseau pour les deux branches.** Deux appels doubleraient le
+/// coût du maillon que mika#2455 a placé en dernier précisément parce qu'il en
+/// fait un.
+///
+/// `pub` parce que `tests/eval/` est un crate séparé. Un seul appelant de
+/// production, [`validate_dependabot_verdict_coherence`].
+pub async fn validate_dependabot_verdict_coherence_with_reader<F, Fut>(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+    read_pr: F,
+) -> Result<(), ToolOutput>
+where
+    F: FnOnce(u64, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    use crate::evidence::guards::{
+        API_SURFACE_LINE_PREFIX, DEPENDABOT_READ_TIMEOUT_SECS, DEPENDABOT_VERDICT_AUDIT_TOOL,
+        DependabotAbstention, DependabotVerdictOutcome, classify_dependabot_verdict,
+        dependabot_verdict_gate_enabled, pr_review_target,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+
+    // -- Reconnaissance, fail-open, par coût croissant : aucun octet de réseau
+    //    n'est dépensé hors population --
+
+    if !dependabot_verdict_gate_enabled() {
+        return Ok(());
+    }
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+
+    // Le discriminant est le verdict, jamais le flag (mika#2455 D1). Tout autre
+    // verdict classé — `hold[review]`, `block[ac]`, `block[ci]`,
+    // `block[dependency]`, `block[security]` — et un corps sans ligne de verdict
+    // passent intacts.
+    //
+    // La classe est lue **exactement comme `verdict_handler` la lit** — casse
+    // repliée, aucun `trim` (`Verdict::Block(reason) => match
+    // reason.to_lowercase().as_str()`). La coïncidence est voulue : lire la
+    // classe plus permissivement ici ferait refuser un verdict que la machine
+    // d'état router vers son bras `_ => warn`, c'est-à-dire refuser une revue
+    // pour une classe que personne en aval ne reconnaît. La lire moins
+    // permissivement laisserait passer le défaut mesuré sous une autre casse.
+    let verdict = parse_verdict(&body);
+    let is_pipeline_block =
+        matches!(&verdict, Verdict::Block(kind) if kind.eq_ignore_ascii_case("pipeline"));
+    let is_pass = matches!(verdict, Verdict::Pass);
+    if !is_pipeline_block && !is_pass {
+        return Ok(());
+    }
+
+    // Les écritures d'audit sont warn-and-continue de bout en bout : perdre la
+    // ligne de registre ne doit jamais changer le verdict de la garde, dans un
+    // sens ni dans l'autre (motif mika#2237/#2455).
+    async fn audit(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+        if let Err(e) = ctx
+            .db
+            .log_audit_event(
+                ctx.session_id,
+                DEPENDABOT_VERDICT_AUDIT_TOOL,
+                target_key,
+                None,
+                Some(outcome),
+                Some(reasoning),
+                Some(ctx.trace_id),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "failed to write dependabot-verdict audit row");
+        }
+    }
+
+    let target = pr_review_target(args);
+    let target_key = format!(
+        "pr_review:{}#{}",
+        repo.unwrap_or("__default__"),
+        target.as_deref().unwrap_or("unknown")
+    );
+
+    async fn abstain(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) {
+        tracing::warn!(
+            event = "dependabot_verdict_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2519: could not read the PR's author/title — the verdict is let through rather \
+             than refused on an unobservable term"
+        );
+        audit(ctx, target_key, "abstained", reason).await;
+    }
+
+    let Some(pr_number) = target.as_deref().and_then(|t| t.parse::<u64>().ok()) else {
+        abstain(ctx, &target_key, DependabotAbstention::NO_PR_TARGET).await;
+        return Ok(());
+    };
+    let Some(repo) = repo else {
+        abstain(ctx, &target_key, DependabotAbstention::NO_REPO).await;
+        return Ok(());
+    };
+    let Some(token) = ctx.github_token else {
+        abstain(ctx, &target_key, DependabotAbstention::NO_TOKEN).await;
+        return Ok(());
+    };
+
+    // -- Lire, borné --
+
+    let read = read_pr(pr_number, repo.to_string(), token.to_string());
+    let raw = match tokio::time::timeout(
+        std::time::Duration::from_secs(DEPENDABOT_READ_TIMEOUT_SECS),
+        read,
+    )
+    .await
+    {
+        Err(_elapsed) => {
+            abstain(ctx, &target_key, DependabotAbstention::GH_TIMEOUT).await;
+            return Ok(());
+        }
+        Ok(Err(_e)) => {
+            abstain(ctx, &target_key, DependabotAbstention::GH_FAILED).await;
+            return Ok(());
+        }
+        Ok(Ok(raw)) => raw,
+    };
+
+    // `author` est un OBJET (`{"id":…,"is_bot":true,"login":"app/dependabot"}`),
+    // jamais une chaîne — c'est l'imprécision que Step 1.6 portait sur le seul
+    // discriminant de tout le chemin dependabot (§ 3.4(a) du plan). Un `title`
+    // absent n'est pas une abstention : il vaut la chaîne vide, que
+    // `classify_version_bump` rend `Unreadable`, donc B2 s'abstient sans que B1
+    // — qui ne lit pas le titre — en soit privé.
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        abstain(ctx, &target_key, DependabotAbstention::UNPARSEABLE).await;
+        return Ok(());
+    };
+    let Some(author_login) = parsed
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|l| l.as_str())
+    else {
+        abstain(ctx, &target_key, DependabotAbstention::UNPARSEABLE).await;
+        return Ok(());
+    };
+    let title = parsed.get("title").and_then(|t| t.as_str()).unwrap_or("");
+
+    // -- Décider --
+
+    match classify_dependabot_verdict(author_login, is_pipeline_block, is_pass, title, &body) {
+        // Le cas nominal est écrit. Sans ça, « zéro refus » ne distinguerait pas
+        // un rail sain d'une garde inerte — la panne exacte que mika#2205 a dû
+        // nommer pour ses deux scans, et le contrôle POSITIF de la sonde S5.
+        DependabotVerdictOutcome::Allowed => {
+            audit(
+                ctx,
+                &target_key,
+                "allowed",
+                &format!("author={author_login} verdict accepted by the predicate"),
+            )
+            .await;
+            Ok(())
+        }
+
+        DependabotVerdictOutcome::RefusedUnreachablePipelineBlock { author } => {
+            tracing::warn!(
+                event = "dependabot_verdict_refused",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                pr = pr_number,
+                verdict = "block[pipeline]",
+                author = %author,
+                reason = "unreachable_pipeline_block",
+                "mika#2519: refused a block[pipeline] on an automated-author PR — Step 1.6 makes \
+                 that verdict structurally unreachable for this class"
+            );
+            audit(
+                ctx,
+                &target_key,
+                "refused_unreachable_pipeline_block",
+                &format!("author={author} posted block[pipeline] on an automated-author PR"),
+            )
+            .await;
+
+            // **Aucune ligne de ce corps ne doit COMMENCER par `VERDICT:`** —
+            // `VERDICT_RE` est ancré sur ce préfixe de ligne et une ligne
+            // égarée serait lue comme un verdict. Les jetons sont nommés en
+            // clair, dans une phrase, et c'est sûr : aucun des deux lecteurs ne
+            // capture un jeton nu hors d'un préfixe de ligne. Raisonnement
+            // repris de mika#2455, où les deux lecteurs ont été lus ; ne pas le
+            // généraliser.
+            let payload = serde_json::json!({
+                "error": "dependabot_verdict_unreachable",
+                "doctrine": "mika#2519",
+                "target": target_key,
+                "author": author,
+                "remedy": format!(
+                    "This PR's author is `{author}`, an automated dependency bot. \
+                     `qa-review` Step 1.6 makes a pipeline block structurally unreachable on this \
+                     class: it prescribes skipping Step 2's pipeline checks and Step 2.5's plan-AC \
+                     verification, because a dependency bump carries no plan contract. So this \
+                     verdict cannot be the outcome of Step 1.6 having run. Two correct ways out. \
+                     (a) Run Step 1.6 for real and post its `DEP-REVIEW:` section — the advisory \
+                     query and the changelog scan are the substantive signals for this class, and \
+                     the verdict is then one of `pass`, `block[dependency]` or `hold[review]`. \
+                     (b) If a repo guard genuinely exited non-zero, quote its output VERBATIM in \
+                     the body as Step 2E requires — a paraphrase is not a guard output, and \
+                     nothing in this repo emits the wording you posted."
+                ),
+            });
+            Err(ToolOutput::error(payload.to_string()))
+        }
+
+        DependabotVerdictOutcome::RefusedUnverifiedMajorBump {
+            author,
+            package,
+            from,
+            to,
+        } => {
+            tracing::warn!(
+                event = "dependabot_verdict_refused",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                pr = pr_number,
+                verdict = "pass",
+                author = %author,
+                package = %package,
+                from = %from,
+                to = %to,
+                reason = "unverified_major_bump",
+                "mika#2519: refused a pass verdict on a major-version bump whose body asserts no \
+                 call-site verification"
+            );
+            audit(
+                ctx,
+                &target_key,
+                "refused_unverified_major_bump",
+                &format!("author={author} package={package} {from} -> {to} passed without an API-surface assertion"),
+            )
+            .await;
+
+            let payload = serde_json::json!({
+                "error": "dependabot_major_bump_unverified",
+                "doctrine": "mika#2519",
+                "target": target_key,
+                "package": package,
+                "from": from,
+                "to": to,
+                "remedy": format!(
+                    "This body carries a `pass` verdict on a MAJOR version jump — {package} \
+                     {from} -> {to} — and asserts no call-site verification. A green build does \
+                     not close this class: on mika#2454 (jsonwebtoken 9.3.1 -> 11.1.0) the build \
+                     was green and `generate_jwt` panicked at runtime, because the new major had \
+                     removed its crypto backend behind a feature cascade (mika#2525). Two correct \
+                     ways out. (a) Read the call sites of the changed API in this repo, then \
+                     re-emit this call with a line starting `{API_SURFACE_LINE_PREFIX}` naming \
+                     what you checked and what you found. (b) If the API did change under the \
+                     call sites, rewrite the verdict line to `block[dependency]` and post it with \
+                     `--comment`. The plan exemption for dependency PRs covers the PLAN, never \
+                     the SUBSTANCE of an API change."
+                ),
+            });
+            Err(ToolOutput::error(payload.to_string()))
+        }
+    }
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -3521,6 +3872,20 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // decides. Like its two siblings, it is NOT gated on
     // `required_tool_arg_suffixes`: its subject is the body itself.
     if let Err(err) = validate_qa_ci_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await {
+        return err;
+    }
+
+    // Verdict↔dependabot coherence (mika#2519): refuse a `block[pipeline]` on a
+    // PR whose author is automated (Step 1.6 makes that verdict structurally
+    // unreachable there), and refuse a `pass` on a major-version jump whose body
+    // asserts no call-site verification. Placed immediately after mika#2455, in
+    // queue of the chain, because it is the second link to make a network call
+    // and the existing order is justified by that criterion. Like its three
+    // siblings it is NOT gated on `required_tool_arg_suffixes`: its subject is
+    // the body itself.
+    if let Err(err) =
+        validate_dependabot_verdict_coherence(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
         return err;
     }
 
