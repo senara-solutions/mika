@@ -70,6 +70,13 @@ mod eval {
     // asserts the window; this one asserts what the instrument says about it.
     mod test_context_scope_observability_2305;
 
+    // mika#2425 — the per-tenant half. Its neighbour above covers the
+    // identity-declared scope; this one covers a `customer_config` narrowing
+    // reaching the real window, the refusal of a widening, and the unchanged
+    // default. No source predicate can see a decision site that reads the right
+    // field and simply never consults the database.
+    mod test_context_history_per_tenant_2425;
+
     // mika#2295 briques 1 & 2 — the two window bounds, asserted on the window the
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
@@ -111,6 +118,11 @@ mod eval {
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
     mod test_image_disposition_1784;
+    // mika#1910 — le tour de continuation dit ce qu'il a produit. Les trois
+    // valeurs que `response_chars` peut prendre y sont les trois populations que
+    // R5 refuse de confondre : `Some(n)` produit, `Some(0)` LA classe, `None`
+    // rien à mesurer.
+    mod test_continuation_response_chars_1910;
     mod test_intent_precondition_guard;
     mod test_internal_tagging;
     mod test_kg_budget_757;
@@ -135,6 +147,13 @@ mod eval {
     // un tour non mesuré qui n'atteste rien plutôt qu'un zéro.
     mod test_multi_step;
     mod test_multi_turn_persistence;
+
+    // mika#2506 — le geste déterministe d'itération, sur son chemin de
+    // production : le numéro d'ISSUE qui voyage (avec le numéro de PR en
+    // contrôle négatif), la tâche auto-descriptive dès sa création, le créneau
+    // occupé qui REFUSE au lieu de différer, et les quatre refus vus là où la
+    // forge est réellement sollicitée.
+    mod test_operator_iterate_2506;
     mod test_per_corpus_fairness_927;
     mod test_per_skill_provider_override;
     mod test_persistence_eval_guard;
@@ -152,6 +171,18 @@ mod eval {
     // `pending` sémée par le chemin de production, pilote authentiquement
     // vivant, harness multi-agents pour l'attribution.
     mod test_pr_review_idempotency;
+
+    // mika#2455 — un `pass` ne peut plus affirmer ce qu'un check requis rouge
+    // contredit : les deux têtes mesurées, l'issue laissée ouverte sous
+    // mika#2237, et les six abstentions nommées.
+    mod test_qa_ci_coherence_2455;
+
+    // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
+    // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
+    // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une
+    // assertion de sites d'appel. Les deux branches, leurs quatre contrôles
+    // négatifs et les abstentions nommées.
+    mod test_dependabot_verdict_coherence_2519;
 
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
@@ -201,6 +232,13 @@ mod eval {
     mod test_webhook_queue;
     mod test_webhook_zero_tools_guard;
 
+    // mika#2517 — un tour du domaine Webhook Fallthrough ne se voit pas servir
+    // `create_task`. Les deux contrôles négatifs (ready-label, tour ordinaire)
+    // sont porteurs : le test principal seul serait satisfait par un filtre qui
+    // retire l'outil à TOUS les tours, c'est-à-dire par un correctif qui casse
+    // la boucle en ayant l'air de fermer le ticket.
+    mod test_webhook_fallthrough_no_task_2517;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
@@ -216,6 +254,11 @@ mod eval {
     // mika#2368 — le filet moteur : le signal levé sur les DEUX sites de sortie
     // EndTurn du tour silencieux, et le registre anti-double-post qui l'atteint.
     mod test_qa_callback_verdict_net_2368;
+
+    // mika#2515 — le signal sort des CINQ sorties atteignables, pas de deux : le
+    // « Force EndTurn » de `send_message` (P0, vu rouge avant U1e) et les deux
+    // coupures (deadline, max-steps), avec leurs contrôles négatifs.
+    mod test_qa_cut_off_verdict_2515;
 
     // mika#2358 — la garde 5e sur le chemin de production : une promesse de
     // fréquence sans acteur est refusée, l'aveu d'incapacité passe, et le

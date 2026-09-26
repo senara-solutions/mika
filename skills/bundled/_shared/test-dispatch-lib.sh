@@ -220,6 +220,31 @@ if [ -f "$PROMPT_FILE" ]; then
     else
         FAIL=$((FAIL + 1)); echo "  ✗ Prompt enumerates dispatch_task_has_open_pr rejection variant"
     fi
+
+    # mika#2506 — the prompt must NAME the deterministic gesture.
+    #
+    # The assertion is POSITIVE, and deliberately so. The negative half of
+    # AC10 ("no longer prescribes route 1a") is not greppable: the assertion
+    # directly above REQUIRES `dispatch_task_has_open_pr` to stay mentioned,
+    # because the guard does still fire on an ACTIVE task carrying a pr_url.
+    # A denylist on that token would therefore contradict its own sibling.
+    # What separates "the prompt describes the guard" from "the prompt
+    # prescribes the broken 2-step route" is whether the deterministic
+    # command is named as the route to take — so that is what is asserted.
+    #
+    # Its failure mode is the one this ticket exists to close: a prescriber
+    # that prescribes a dead route manufactures the next occurrence. Per
+    # feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate,
+    # this prompt half does NOT hold on its own — the structural half is the
+    # `mika iterate` command itself (mika#2506 R1). This guard only stops the
+    # prompt from silently drifting back, which no behavioural test can see:
+    # re-prescribing route 1a makes no decision wrong on the day it is
+    # written, it just re-creates the mis-route measured on mika#2503.
+    if grep -qF "mika iterate" "$PROMPT_FILE"; then
+        PASS=$((PASS + 1)); echo "  ✓ Prompt names the deterministic iterate gesture (mika#2506 AC10)"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ Prompt names the deterministic iterate gesture (mika#2506 AC10)"
+    fi
 else
     FAIL=$((FAIL + 1))
     echo "  ✗ self-dev/system_prompt.md not found at expected path"
@@ -1502,7 +1527,7 @@ assert_not_contains "the stale-callout signal is not the refusal signal reused" 
 # The refusal RESULT must be machine-readable: mika-dev's callback turn and the
 # audit dashboard both consume it. Rebuild it with the same printf and prove jq
 # can reach every field.
-REFUSAL_JSON=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Dispatch dev-pilot to implement, or remove the plan from the branch to force a fresh groom."}' \
+REFUSAL_JSON=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","note":"A committed plan already exists on the dispatch branch. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: the provenance gate refuses it. Remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
     "mika" "2012" "fix/2012/plan-gate" "docs/plans/2026-08-27-001-plan.md")
 assert_eq "refusal RESULT is valid JSON" "0" "$(printf '%s' "$REFUSAL_JSON" | jq -e . >/dev/null 2>&1; echo $?)"
 assert_eq "refusal RESULT exposes .reason to jq" "already_groomed" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.reason')"
@@ -1511,6 +1536,19 @@ assert_eq "refusal RESULT exposes .plan to jq" "docs/plans/2026-08-27-001-plan.m
 assert_eq "refusal RESULT exposes .branch to jq" "fix/2012/plan-gate" "$(printf '%s' "$REFUSAL_JSON" | jq -r '.branch')"
 assert_contains "the refusal printf in the source matches the shape tested here" \
     '{"status":"auto_skipped","reason":"already_groomed"' "$SETUP_WT_SRC"
+
+# --- mika#2484 U5 : la note ne prescrit plus une route morte ---
+# Le texte disait « Dispatch dev-pilot to implement ». Depuis mika#2287 cette
+# moitié mène droit à `dispatch_grooming_not_verified` : la porte exige un
+# callback groom terminé portant `Outcome: PLAN_GROOMED`, et un
+# `already_groomed` n'en frappe aucun — délibérément (une garde qui lit sa
+# preuve de la revendication ne peut pas la réfuter). Un texte de remède qui
+# nomme une route morte coûte un tour de boucle et une lecture.
+assert_not_contains "the already_groomed note no longer prescribes dev-pilot" \
+    'Dispatch dev-pilot to implement' "$SETUP_WT_SRC"
+assert_contains "the already_groomed note names the gesture that works" \
+    'remove the plan from the branch AND the grooming callouts from the issue body' \
+    "$SETUP_WT_SRC"
 
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
@@ -4826,6 +4864,110 @@ assert_eq "socket path containing a single quote does not break the probe" \
 assert_eq "fake-proxy output never reaches the operational proxy log" \
     "0" "$(_egress_log_fixture_hits)"
 
+# --- mika#2051: the refusal line names the pid it just launched -------------
+#
+# A SISTER function rather than an extension of `_egress_guard_probe`, and the
+# reason is the probe's contract: it CLASSIFIES the output into one token
+# (`msg=unreachable`) and then throws the text away. Five assertions above
+# compare its `rc=… launched=… msg=…` string by strict equality, so widening it
+# by one field would redden all five for a need that concerns one. The two
+# functions say what they each do: one tests the DECISION, this one the TEXT.
+#
+# Same fake proxy, same log redirect -- the redirect is not incidental. Without
+# it the fake proxy's traceback lands in the operational log, the very file this
+# ticket exists to make legible, and the assertion at the end of the block above
+# is what catches that regression.
+# _egress_guard_line [bin_state]   bin_state: dies (default) | missing
+_egress_guard_line() {
+    local bin_state="${1:-dies}"
+    local tmp sock bin logdir out
+    tmp=$(mktemp -d)
+    sock="$tmp/mika-pilot-egress.sock"
+    bin="$tmp/fake-proxy"
+    logdir="$tmp/logs"
+    mkdir -p "$logdir"
+
+    cat > "$bin" <<'FAKE_PROXY'
+#!/bin/bash
+echo "fake-proxy: dying before bind (mika#2041 test fixture)" >&2
+exit 1
+FAKE_PROXY
+    chmod +x "$bin"
+    [ "$bin_state" = "missing" ] && rm -f "$bin"
+
+    # The orphan shape: bind then close without unlink. `[ -S ]` is satisfied,
+    # nothing listens -- the population mika#2041 measured.
+    python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+s.close()
+' "$sock"
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB"
+        _PILOT_EGRESS_SOCK="$sock"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        MIKA_PILOT_EGRESS_LOG_DIR="$logdir"
+        export MIKA_TEST_LAUNCH_MARKER="$tmp/launched"
+        _ensure_pilot_egress_proxy 2>&1 >/dev/null
+    ) || true
+    rm -rf "$tmp"
+    printf '%s' "$out"
+}
+
+_EGRESS_UNREACHABLE_LINE=$(_egress_guard_line)
+
+# The joint. `pilot_egress_startup.begin pid=<pid>` is the proxy's first line
+# (contract held by test_startup_emits_a_begin_breadcrumb_before_bind); the
+# launcher's SUCCESS line already carried the pid and its FAILURE line -- the
+# only one this ticket exists to diagnose -- did not. Without it the operator
+# joins the dispatch `.stderr` to a cumulative proxy log by timestamp, which is
+# the friction that made the 2026-08-29 diagnosis expensive.
+assert_eq "mika#2051: the unreachable refusal names the pid it launched" \
+    "yes" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The published predicates grep `^dispatch-lib: ` + a contiguous token (Signal S
+# anchor, runbook §2). Assert THAT invariant, never the pid's position: pinning
+# the position would freeze a wording choice where what matters is what the
+# operator greps bite on.
+assert_eq "mika#2051: the refusal keeps its anchor and contiguous token" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.unreachable ' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+# The Signal S predicate (CLAUDE.md) stops at the token FAMILY, `pilot_egress_guard.`,
+# precisely so it covers both causes -- mika#2050's lesson being that an operator
+# who takes `unreachable` for THE predicate reads a nominal regime on a fleet
+# whose proxy binary was never deployed. A predicate published over two tokens
+# needs both to be witnessed, or half of it is an assumption.
+_EGRESS_BINARY_MISSING_LINE=$(_egress_guard_line missing)
+
+assert_eq "mika#2051: the Signal S family predicate bites on unreachable" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.' <<<"$_EGRESS_UNREACHABLE_LINE" && echo yes || echo no)"
+
+assert_eq "mika#2051: the Signal S family predicate bites on binary_missing" \
+    "yes" \
+    "$(grep -qE '^dispatch-lib: pilot_egress_guard\.binary_missing ' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# binary_missing launched NO proxy, so it has no pid to name. Stamping one would
+# be a false statement, and this is the negative control that keeps the pid from
+# being spread to the line where it would be a lie.
+assert_eq "mika#2051: binary_missing names no pid, because it launched none" \
+    "no" \
+    "$(grep -qE 'pid [0-9]+' <<<"$_EGRESS_BINARY_MISSING_LINE" && echo yes || echo no)"
+
+# R8 again, and it must be HERE rather than only above: the sister function
+# launches its own fake proxy, so the earlier assertion -- which runs before
+# these calls -- cannot witness it. A log override that regressed only in
+# `_egress_guard_line` would leave the first check green while this suite wrote
+# fake-proxy tracebacks into the operational log, i.e. destroyed the very
+# evidence surface mika#2051 exists to make legible.
+assert_eq "mika#2051: the sister function does not reach the operational proxy log either" \
+    "0" "$(_egress_log_fixture_hits)"
+
 # ============================================================================
 # Dispatchable-repo allowlist: shell defense in depth (mika#2062)
 # ============================================================================
@@ -6218,6 +6360,487 @@ assert_contains "mika#2165: et le repli est bruyant — la moitié hôte d'AC3" 
         )
     )"
 
+echo ""
+echo "Test: le plafond de tours du pilote est armé à la source (mika#2496)"
+echo "---------------------------------------------------------------------"
+# Aucun test comportemental ne peut voir la classe que ce bloc garde. Un
+# quatrième site de lancement écrit demain sans `--max-turns` ne rend AUCUNE
+# décision fausse : il tourne simplement sans borne, et toutes les assertions
+# existantes restent vertes. C'est la forme exacte du défaut que mika#2496
+# ferme — trois sites de lancement, zéro drapeau, depuis toujours — reproduite
+# un cran plus tard. D'où un scan de source.
+#
+# LE MOTIF EST FIGÉ, parce qu'un scan sur « tout appel `claude-pilot` » est faux
+# dans les deux directions. La chaîne apparaît ~47 fois dans le fichier et une
+# seule famille est un lancement : commentaires, `--ro-bind-try
+# "$HOME/.local/bin/claude-pilot"`, `--relay-config …/claude-pilot.json`,
+# `command -v claude-pilot`, le smoke test `timeout 15 claude-pilot --help`, et
+# de la prose dans les corps `RESULT=`. Un scan naïf rougirait sur les ~44
+# autres ; resserré sur la LIGNE PHYSIQUE, il manquerait deux des trois sites
+# réels, écrits sur plusieurs lignes avec continuation `\` — `--max-turns` y vit
+# légitimement sur une ligne que le grep ne regarde pas.
+#
+# Cinq termes, dont le cinquième est une correction MESURÉE du plan :
+#
+#   1. unité d'analyse = l'INVOCATION LOGIQUE, obtenue en recollant les
+#      continuations `\`, jamais la ligne physique. C'est le terme que la forme
+#      des deux sites de revise impose (fixture N2).
+#   2. les lignes de commentaire sont retirées AVANT le recollement.
+#   3. `claude-pilot` en POSITION DE COMMANDE : précédé d'un début d'invocation
+#      (début de ligne, `;`, `|`, `&`, `(`, `{`) ou du nom du wrapper
+#      `_run_pilot_sandboxed`. Un `/` n'est pas dans ce jeu, ce qui exclut les
+#      chemins (`--ro-bind-try "…/bin/claude-pilot"`).
+#   4. le token suivant est exigé d'être un DRAPEAU (`[[:space:]]+-`). Ça borne
+#      le jeton par la droite — `claude-pilot.json` et `claude-pilot-py` ne
+#      peuvent plus matcher — et ça exclut la prose.
+#   5. la CARDINALITÉ est assertée à 3. Sans elle, un prédicat devenu trop
+#      étroit passerait au vert en ne regardant plus rien (classe mika#2205),
+#      et c'est la seule forme de panne qu'aucune des cinq fixtures ne voit.
+#
+# Le terme 4 N'EST PAS dans le plan, et il a été ajouté sur une mesure : le plan
+# nomme « de la prose dans les corps `RESULT=` » parmi ce que le scan doit
+# exclure, mais ses quatre termes ne l'excluaient pas. `dispatch-lib.sh` porte
+# `claude-pilot FAILED (exit code ${PILOT_EXIT}).` EN COLONNE ZÉRO, à
+# l'intérieur d'une chaîne `RESULT="…"` multi-lignes — donc « début de ligne »,
+# donc candidat, donc cardinalité 4 au lieu de 3. Le terme 4 l'écarte sans rien
+# coûter : un lancement porte toujours des drapeaux. Fixture N5.
+#
+# Le terme 3 est délibérément une DISJONCTION (le wrapper *ou* la position de
+# commande) et non le wrapper seul : un site futur qui appellerait le binaire
+# sans passer par `_run_pilot_sandboxed` échapperait à un prédicat ancré sur le
+# wrapper — et ce site-là est aussi celui qui perdrait le confinement réseau
+# (mika#2049), donc il doit rougir ici plutôt que passer. Fixture N4.
+
+# L'allowlist est **livrée vide**. Quand ce scan tire, la résolution est d'ARMER
+# le site, jamais de l'allowlister : doctrine mika#2201, « on déclare, on
+# n'allowliste pas ». Un site de lancement qu'on ne veut pas armer est un site
+# qu'il faut supprimer.
+MIKA2496_LAUNCH_EXCEPTIONS=()
+
+# Rend une invocation logique par ligne : commentaires retirés, continuations
+# recollées. Le `sed` est l'idiome standard de recollement (`N` + `ta`).
+_mika2496_logical_invocations() {
+    grep -vE '^[[:space:]]*#' "$1" | sed -e :a -e '/\\$/N; s/\\\n/ /; ta'
+}
+
+# Les invocations logiques qui LANCENT claude-pilot (termes 3 et 4).
+_mika2496_launch_candidates() {
+    _mika2496_logical_invocations "$1" \
+        | grep -E '(^|[;|&(){}]|_run_pilot_sandboxed)[[:space:]]*claude-pilot[[:space:]]+-' \
+        || true
+}
+
+# Celles qui le lancent SANS plafond — la population que le scan refuse.
+_mika2496_unbounded_launches() {
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local skip=""
+        local exc
+        for exc in "${MIKA2496_LAUNCH_EXCEPTIONS[@]+"${MIKA2496_LAUNCH_EXCEPTIONS[@]}"}"; do
+            case "$line" in *"$exc"*) skip=1 ;; esac
+        done
+        [ -n "$skip" ] && continue
+        case "$line" in *--max-turns*) ;; *) printf '%s\n' "$line" ;; esac
+    done < <(_mika2496_launch_candidates "$1")
+}
+
+# Terme 5 — la cardinalité. Anti-vacuité : un scan qui ne trouve PERSONNE se lit
+# exactement comme un scan propre.
+assert_eq "mika#2496: le scan voit exactement les trois sites de lancement" "3" \
+    "$(_mika2496_launch_candidates "$DISPATCH_LIB" | wc -l | tr -d ' ')"
+
+# L'assertion elle-même : aucun lancement sans son plafond.
+assert_eq "mika#2496: aucun site de lancement ne part sans --max-turns" "" \
+    "$(_mika2496_unbounded_launches "$DISPATCH_LIB" | cut -c1-100)"
+
+assert_eq "mika#2496: l'allowlist des lancements non bornés est livrée vide" "0" \
+    "${#MIKA2496_LAUNCH_EXCEPTIONS[@]}"
+
+# --- Contrôles négatifs N1–N5, sur les formes d'appel RÉELLEMENT présentes ---
+#
+# Un scan vert par vacuité sur les formes qu'il ne reconnaît pas est
+# indistinguable d'un scan qui couvre (mika#2205). Chaque fixture est donc
+# calquée sur une forme qui existe dans `dispatch-lib.sh`, jamais inventée, et
+# chacune est vue rouge ou vue verte explicitement.
+MIKA2496_FIXDIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2496-fixtures.XXXXXX")
+
+# N1 — mono-ligne, la forme du dispatch principal, sans le drapeau. ROUGE.
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" --command "$C" -- "$P"' \
+    > "$MIKA2496_FIXDIR/n1"
+
+# N2 — multi-lignes avec continuations, la forme des deux pilotes de revise,
+# sans le drapeau. ROUGE — atteste le recollement du terme 1.
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" \' \
+    '        --command "/mika-revise-plan" $CWD_ARGS \' \
+    '        -- "@$F"' \
+    > "$MIKA2496_FIXDIR/n2"
+
+# N3 — même forme, drapeau présent mais SUR UNE LIGNE DE CONTINUATION. VERT.
+# Le miroir de N2 : sans lui, « le scan lit l'invocation » ne se distingue pas
+# de « le scan rougit sur tout multi-ligne ».
+printf '%s\n' \
+    '    _pilot_log_dir; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$D" --task-id "$I" \' \
+    '        --max-turns 120 \' \
+    '        --command "/mika-revise-plan" $CWD_ARGS' \
+    > "$MIKA2496_FIXDIR/n3"
+
+# N4 — appel direct, SANS `_run_pilot_sandboxed`, sans le drapeau. ROUGE —
+# atteste la disjonction du terme 3.
+printf '%s\n' \
+    '    claude-pilot --verbose --log-dir "$D" --task-id "$I" --command "$C"' \
+    > "$MIKA2496_FIXDIR/n4"
+
+# N5 — bonne foi : un commentaire, un chemin bindé, la config du relais, et la
+# prose `RESULT=` en colonne zéro. VERT — sans quoi le scan serait rouge en
+# permanence, donc désarmé.
+printf '%s\n' \
+    '# on lancera claude-pilot --verbose ici un jour' \
+    '            --ro-bind-try "$HOME/.local/bin/claude-pilot" "$HOME/.local/bin/claude-pilot" \' \
+    '            --ro-bind-try "$HOME/.local/share/uv/tools/claude-pilot" "$X" \' \
+    '        CWD_ARGS="$CWD_ARGS --relay-config $W/.claude/claude-pilot.json"' \
+    '    command -v claude-pilot >/dev/null 2>&1 || exit 1' \
+    '    if ! timeout 15 claude-pilot --help >/dev/null 2>&9; then' \
+    'claude-pilot FAILED (exit code ${PILOT_EXIT}).' \
+    > "$MIKA2496_FIXDIR/n5"
+
+for _mika2496_red in n1 n2 n4; do
+    assert_eq "mika#2496: fixture $_mika2496_red est VUE ROUGE (lancement sans plafond)" "1" \
+        "$(_mika2496_unbounded_launches "$MIKA2496_FIXDIR/$_mika2496_red" | wc -l | tr -d ' ')"
+done
+assert_eq "mika#2496: fixture n3 est VUE VERTE (drapeau sur une continuation)" "0" \
+    "$(_mika2496_unbounded_launches "$MIKA2496_FIXDIR/n3" | wc -l | tr -d ' ')"
+assert_eq "mika#2496: fixture n3 EST bien un candidat (le vert n'est pas de la vacuité)" "1" \
+    "$(_mika2496_launch_candidates "$MIKA2496_FIXDIR/n3" | wc -l | tr -d ' ')"
+assert_eq "mika#2496: fixture n5 (bonne foi) n'est candidate à rien" "0" \
+    "$(_mika2496_launch_candidates "$MIKA2496_FIXDIR/n5" | wc -l | tr -d ' ')"
+
+rm -rf "$MIKA2496_FIXDIR"
+
+# --- CO-LOCATION, le coût de l'accesseur assignant, refermé structurellement ---
+#
+# Même mécanisme et même raison que pour `$_PILOT_LOG_DIR` (mika#2165) : un
+# accesseur qui ASSIGNE peut être lu périmé, et un site de lancement qui lirait
+# `$_PILOT_MAX_TURNS` sans appeler `_pilot_max_turns` juste avant hériterait du
+# plafond d'un appel précédent — ou de rien, c'est-à-dire d'un dispatch non
+# borné qui se lirait comme borné.
+# La co-location se lit sur l'INVOCATION LOGIQUE, pas sur la ligne physique —
+# même unité d'analyse que le scan ci-dessus, et pour la même raison : deux des
+# trois sites portent le drapeau sur une ligne de continuation, donc la lecture
+# de `$_PILOT_MAX_TURNS` et l'appel du résolveur y vivent sur des lignes
+# physiques différentes tout en appartenant à la même commande. Un prédicat à la
+# ligne les accuserait toutes les deux.
+MIKA2496_UNCOLOCATED=$(_mika2496_logical_invocations "$DISPATCH_LIB" \
+    | grep -E '\$\{?_PILOT_MAX_TURNS\b' \
+    | grep -vE '_pilot_max_turns' \
+    || true)
+assert_eq "mika#2496: chaque lecture de \$_PILOT_MAX_TURNS appelle le résolveur sur la même ligne" "" \
+    "$MIKA2496_UNCOLOCATED"
+
+# Le résolveur ASSIGNE, il n'imprime pas — collision mika#2039, identique à
+# celle que `_pilot_log_dir` documente : un accesseur imprimant se lirait
+# `$(_pilot_max_turns)` et poserait `++ printf %s <valeur>` dans la trace
+# `set -x`, forme qu'aucun scrubber ne couvre.
+MIKA2496_RESOLVER_SRC=$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2496: _pilot_max_turns a bien été trouvée (guards the guard)" "yes" \
+    "$(if [ -n "$MIKA2496_RESOLVER_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "mika#2496 × mika#2039: le résolveur n'imprime pas" "0" \
+    "$(printf '%s\n' "$MIKA2496_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "mika#2496 × mika#2039: aucune substitution \$(_pilot_max_turns) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_pilot_max_turns)' || true)"
+
+# --- AC7 : rien n'annonce un budget dollars qui n'existe pas ---
+#
+# `--max-budget` serait accepté, validé, résolu, porté jusqu'à
+# `_sdk_guardrail_kwargs` — et ignoré (son `if config.maxBudgetUsd > 0:` se
+# termine sur `pass`). Le passer ferait paraître le budget fermé dans l'argv.
+assert_eq "mika#2496 (AC7): aucun site ne passe --max-budget" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF -- '--max-budget' || true)"
+
+# --- V4 : le comportement du résolveur, les trois paliers ---
+# `$2` (optionnel, mika#2542) : le CSV des labels du ticket, tel que les sites de
+# lancement le passent au résolveur.
+_mika2496_resolve_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns "${2:-}"
+        printf '%s|%s|%s' "$_PILOT_MAX_TURNS" "$_PILOT_MAX_TURNS_SOURCE" "$_PILOT_MAX_TURNS_INVALID"
+    )
+}
+# mika#2542 (D2) : le défaut de flotte est ARMÉ à 150 — V2 de mika#2496 rapportée.
+# Le diff de cette assertion (`|default|` → `150|default|`) EST la décision.
+assert_eq "mika#2542 (AC9): sans surcharge, le défaut de flotte est armé à 150" \
+    "150|default|" "$(_mika2496_resolve_probe __UNSET__)"
+assert_eq "mika#2496: une valeur entière est honorée, provenance env" \
+    "120|env|" "$(_mika2496_resolve_probe 120)"
+# Contrôle négatif du rollback (AC4) : `0` omet le drapeau, ce qui rend le
+# comportement d'avant mika#2496 — claude-pilot retombe sur maxTurns=200.
+assert_eq "mika#2496 (AC4): PILOT_MAX_TURNS=0 est le ROLLBACK, pas une borne" \
+    "|env|" "$(_mika2496_resolve_probe 0)"
+assert_eq "mika#2496 (AC4): une valeur vide vaut rollback" \
+    "|env|" "$(_mika2496_resolve_probe '')"
+# Un désarmement par coquille sur un frein de coût serait la panne silencieuse
+# que tout ceci ferme : il retombe au défaut ET il est DIT.
+assert_eq "mika#2496: une valeur illisible retombe au défaut et est nommée" \
+    "150|default|abc" "$(_mika2496_resolve_probe abc)"
+assert_eq "mika#2496: une valeur négative retombe au défaut et est nommée" \
+    "150|default|-5" "$(_mika2496_resolve_probe '-5')"
+
+# --- V4 : le drapeau atteint l'argv, avec la valeur résolue ---
+#
+# C'est LE contrat côté mika. « Le budget tue avant 120 tours » est exécuté par
+# le SDK, dans un autre processus, avec un vrai fournisseur — la moitié
+# comportementale est la sonde S2, pas ce harnais.
+_mika2496_argv_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns "${2:-}"
+        # shellcheck disable=SC2086
+        printf '%s' "claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika"
+    )
+}
+assert_contains "mika#2496 (AC1): armé, l'argv porte --max-turns avec la valeur résolue" \
+    '--max-turns 120' "$(_mika2496_argv_probe 120)"
+# Depuis mika#2542 le défaut est armé : le seul désarmement est le rollback `0`.
+assert_not_contains "mika#2496 (AC4): désarmé, l'argv ne porte AUCUN --max-turns" \
+    '--max-turns' "$(_mika2496_argv_probe 0)"
+assert_contains "mika#2542 (AC2): sans surcharge, l'argv porte le défaut armé" \
+    '--max-turns 150' "$(_mika2496_argv_probe __UNSET__)"
+
+# --- U2/AC2 : le budget en vigueur est dit, et la ligne lit l'ARGV ---
+_mika2496_budget_line() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        if [ "$1" != "__UNSET__" ]; then export PILOT_MAX_TURNS="$1"; fi
+        _pilot_max_turns "${2:-}"
+        # shellcheck disable=SC2086
+        _emit_pilot_budget_line claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command /mika 2>&1
+    )
+}
+assert_contains "mika#2496 (AC2): armé par l'env, la ligne dit la valeur et sa provenance" \
+    'pilot_budget_armed max_turns=120 source=env cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 120)"
+assert_contains "mika#2496 (AC2): désarmé, la ligne dit max_turns=none — jamais une borne inventée" \
+    'pilot_budget_armed max_turns=none source=env cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 0)"
+assert_contains "mika#2542 (AC2): sans surcharge, la ligne dit le défaut armé et sa provenance" \
+    'pilot_budget_armed max_turns=150 source=default cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line __UNSET__)"
+assert_contains "mika#2496: une coquille est nommée entre guillemets" \
+    'pilot_budget_invalid PILOT_MAX_TURNS="oops"' \
+    "$(_mika2496_budget_line oops)"
+# AC7 : la ligne REFUSE d'annoncer un budget dollars, parce qu'il n'en existe
+# aucun en amont. Elle nomme l'absence au lieu de la taire.
+assert_not_contains "mika#2496 (AC7): la ligne n'annonce jamais un budget dollars" \
+    'cost_bound=40' "$(_mika2496_budget_line 120)"
+# Ancrage obligatoire à la lecture (mika#2050) : le `.stderr` porte aussi la
+# prose du pilote, et une session discutant du signal s'est déjà lue comme une
+# émission.
+assert_contains "mika#2496: la ligne est ancrable sur '^dispatch-lib: '" \
+    'dispatch-lib: pilot_budget_armed' "$(_mika2496_budget_line 120)"
+
+# La ligne est émise depuis `_run_pilot_sandboxed`, donc SOUS la redirection
+# `2>"$STDERR_FILE"` du site de lancement — donc dans le sillon forensique
+# per-dispatch. L'émettre avant la ligne de lancement l'enverrait sur le stderr
+# propre de dispatch-lib, que l'exécuteur ne lit QUE sur `if !status.success()` :
+# sur un dispatch qui réussit, le tuyau est jeté sans être lu (Signal M,
+# mesuré par mika#2050). Cette assertion est ce qui empêche un futur
+# contributeur de « simplifier » en déplaçant l'appel sur la ligne de lancement.
+assert_eq "mika#2496: la ligne est émise depuis _run_pilot_sandboxed, pas avant le lancement" "1" \
+    "$(sed -n '/^_run_pilot_sandboxed()/,/^}/p' "$DISPATCH_LIB" | grep -cF '_emit_pilot_budget_line' || true)"
+# Un seul APPEL en production — la définition est exclue par sa parenthèse, pas
+# par son indentation : un appel écrit en colonne zéro resterait compté.
+assert_eq "mika#2496: et depuis nulle part ailleurs" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -E '_emit_pilot_budget_line' | grep -cvE '_emit_pilot_budget_line\(\)' || true)"
+
+# --- mika#2542 : le plafond de tours se résout depuis le label du ticket ---
+echo ""
+echo "Test: le plafond de tours se résout depuis le label du ticket (mika#2542)"
+echo "-------------------------------------------------------------------------"
+# Trois implements `loop-substrate` coupés à 151 tours sous le plafond 150. Le
+# ticket porteur du label reçoit 200 ; tout autre reste à 150. L'ORDRE de la
+# cascade est le livrable : l'hôte de production porte `PILOT_MAX_TURNS=150`,
+# donc un palier label placé sous l'env serait inerte partout où il compte
+# (classe mika#2205). Les probes réutilisent celles de mika#2496, étendues d'un
+# second argument (le CSV des labels).
+
+# Les deux allowlists sont LIVRÉES VIDES (doctrine mika#2201 : on déclare, on
+# n'allowliste pas). Quand G1 tire : déclarer le label dans labels.yml. Quand G2
+# tire : passer "${LABELS:-}" au résolveur.
+MIKA2542_CEILING_LABEL_EXCEPTIONS=()
+MIKA2542_UNARGUMENTED_SITES=()
+assert_eq "mika#2542: l'allowlist des labels non déclarés est livrée vide" "0" \
+    "${#MIKA2542_CEILING_LABEL_EXCEPTIONS[@]}"
+assert_eq "mika#2542: l'allowlist des sites sans argument est livrée vide" "0" \
+    "${#MIKA2542_UNARGUMENTED_SITES[@]}"
+
+# --- G3 / V1 : la cascade, palier par palier (`valeur|source|invalid`) ---
+assert_eq "mika#2542 (AC1): un ticket loop-substrate reçoit 200, provenance label" \
+    "200|label|" "$(_mika2496_resolve_probe __UNSET__ loop-substrate)"
+assert_eq "mika#2542 (AC2): sans label, une valeur d'env reste honorée" \
+    "120|env|" "$(_mika2496_resolve_probe 120 '')"
+# R1-bis — le cas qui décide si le ticket a un effet en production.
+assert_eq "mika#2542 (AC3): le label BAT l'env (sinon inerte sur l'hôte de prod)" \
+    "200|label|" "$(_mika2496_resolve_probe 150 loop-substrate)"
+assert_eq "mika#2542 (AC3): le label bat l'env même quand l'env vaut plus bas" \
+    "200|label|" "$(_mika2496_resolve_probe 120 loop-substrate)"
+# Le rollback mika#2496 reste un rollback, label ou pas.
+assert_eq "mika#2542 (AC4): PILOT_MAX_TURNS=0 reste le ROLLBACK, le label n'a pas voix" \
+    "|env|" "$(_mika2496_resolve_probe 0 loop-substrate)"
+assert_eq "mika#2542 (AC4): une valeur vide reste le rollback sur un ticket substrat" \
+    "|env|" "$(_mika2496_resolve_probe '' loop-substrate)"
+# L'invalidité est dite indépendamment du palier qui décide.
+assert_eq "mika#2542: une coquille sur un ticket substrat — le label décide ET la coquille est nommée" \
+    "200|label|abc" "$(_mika2496_resolve_probe abc loop-substrate)"
+assert_eq "mika#2542: une coquille sans label retombe au défaut armé, nommée" \
+    "150|default|abc" "$(_mika2496_resolve_probe abc '')"
+
+# --- G3 / V2 : appariement EXACT sur un élément du CSV (AC6) ---
+#
+# Fixtures négatives d'abord : un glob de sous-chaîne (`*loop-substrate*`, la
+# forme de `_label_to_type`) relèverait chacune d'elles. Vues rouges avant
+# d'être vues vertes — c'est la Halte 4 du plan tenue à l'unité.
+for _mika2542_near in not-loop-substrate loop-substrate-v2 xloop-substrate loop-substratex \
+    'bug,loop-substrate-v2' 'not-loop-substrate,p1-important' 'LOOP-SUBSTRATE' ' loop-substrate'; do
+    assert_eq "mika#2542 (AC6): '$_mika2542_near' ne relève RIEN" \
+        "150|default|" "$(_mika2496_resolve_probe __UNSET__ "$_mika2542_near")"
+done
+# Contrôle de bonne foi : le label relève en tête, au milieu et en queue de CSV.
+for _mika2542_pos in 'loop-substrate,p1-important' 'ready,loop-substrate,p1-important' \
+    'p1-important,loop-substrate'; do
+    assert_eq "mika#2542 (AC6): '$_mika2542_pos' relève bien" \
+        "200|label|" "$(_mika2496_resolve_probe __UNSET__ "$_mika2542_pos")"
+done
+
+# --- G3 / V3 : le drapeau atteint l'argv avec la valeur du label ---
+assert_contains "mika#2542 (AC1): un ticket loop-substrate porte --max-turns 200 dans l'argv" \
+    '--max-turns 200' "$(_mika2496_argv_probe 150 loop-substrate)"
+assert_not_contains "mika#2542 (AC4): rollback sur un ticket substrat — aucun --max-turns" \
+    '--max-turns' "$(_mika2496_argv_probe 0 loop-substrate)"
+
+# --- G3 / V5 : la ligne d'observabilité ---
+assert_contains "mika#2542 (AC1): la ligne dit source=label et QUEL label a décidé" \
+    'pilot_budget_armed max_turns=200 source=label label=loop-substrate cost_bound=absent_upstream' \
+    "$(_mika2496_budget_line 150 loop-substrate)"
+# Contrôle négatif : aucun champ `label=` quand le label n'a pas décidé — un
+# champ vide se lirait comme un label nommé « vide ».
+assert_not_contains "mika#2542 (AC2): sans label, aucun champ label= n'est émis" \
+    'label=' "$(_mika2496_budget_line 150 '')"
+assert_not_contains "mika#2542 (AC4): rollback sur un ticket substrat, aucun champ label=" \
+    'label=' "$(_mika2496_budget_line 0 loop-substrate)"
+assert_not_contains "mika#2542 (AC7 mika#2496): la ligne relevée n'annonce pas de budget dollars" \
+    'cost_bound=4' "$(_mika2496_budget_line __UNSET__ loop-substrate)"
+
+# --- G4 : la valeur du défaut in-file, pinnée littéralement ---
+#
+# Lue dans la source, pas au comportement : l'assertion comportementale
+# (`150|default|`) rougirait aussi, mais celle-ci nomme LE site à relire.
+assert_eq "mika#2542 (AC9): le défaut in-file de _pilot_max_turns vaut 150" "1" \
+    "$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" | grep -cE '^[[:space:]]*local _default="150"$' || true)"
+
+# --- AC5 : un seul site nommé, et aucun second lecteur de label ne décide ---
+assert_eq "mika#2542 (AC5): PILOT_LABEL_TURN_CEILINGS est déclarée exactement une fois" "1" \
+    "$(grep -cE '^PILOT_LABEL_TURN_CEILINGS=\(' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2542 (AC5): la table porte loop-substrate=200" "1" \
+    "$(sed -n '/^PILOT_LABEL_TURN_CEILINGS=(/,/^)/p' "$DISPATCH_LIB" | grep -cxE '[[:space:]]*"loop-substrate=200"' || true)"
+# Le seul consommateur de la table est le helper ; le seul appelant du helper
+# est le résolveur. Un second lecteur ferait deux sites de décision.
+assert_eq "mika#2542 (AC5): la table n'est itérée que par _pilot_label_turn_ceiling" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '"${PILOT_LABEL_TURN_CEILINGS[@]}"' || true)"
+assert_eq "mika#2542 (AC5): _pilot_label_turn_ceiling n'est appelée que depuis le résolveur" "1" \
+    "$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" | grep -cF '_pilot_label_turn_ceiling' || true)"
+assert_eq "mika#2542 (AC5): …et depuis nulle part ailleurs" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -F '_pilot_label_turn_ceiling' | grep -cvE '_pilot_label_turn_ceiling\(\)' || true)"
+# Le helper assigne, il n'imprime pas (mika#2039).
+assert_eq "mika#2542 × mika#2039: le helper de label n'imprime pas" "0" \
+    "$(sed -n '/^_pilot_label_turn_ceiling()/,/^}/p' "$DISPATCH_LIB" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+
+# --- G2 / V4 : les trois sites passent les labels au résolveur (AC10) ---
+#
+# Sur les invocations LOGIQUES (continuations recollées), même unité que le scan
+# mika#2496. Un appel `_pilot_max_turns` suivi d'un `;` ou d'une fin de ligne est
+# un site qui a oublié l'argument : il résout « aucun label », donc 150 — fail-
+# safe, mais silencieusement hors du mécanisme.
+# L'amorce est « tout caractère hors identifiant », pas une liste de ponctuations :
+# un appel écrit après un mot-clé (`then _pilot_max_turns …`) doit être vu aussi.
+_mika2542_resolver_calls() {
+    _mika2496_logical_invocations "$1" \
+        | grep -E '(^|[^A-Za-z0-9_])_pilot_max_turns([^A-Za-z0-9_]|$)' \
+        | grep -vE '^[[:space:]]*_pilot_max_turns\(\)' \
+        || true
+}
+_mika2542_unargumented_calls() {
+    local line exc skip
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        skip=""
+        for exc in "${MIKA2542_UNARGUMENTED_SITES[@]+"${MIKA2542_UNARGUMENTED_SITES[@]}"}"; do
+            case "$line" in *"$exc"*) skip=1 ;; esac
+        done
+        [ -n "$skip" ] && continue
+        if ! grep -qE '_pilot_max_turns[[:space:]]+"\$\{LABELS:-\}"' <<<"$line"; then
+            printf '%s\n' "$line"
+        fi
+    done < <(_mika2542_resolver_calls "$1")
+}
+assert_eq "mika#2542 (AC10): le scan voit exactement trois appels du résolveur" "3" \
+    "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
+assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
+    "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
+
+# Contrôles négatifs de G2, calqués sur la forme réelle des sites.
+MIKA2542_FIXDIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2542-fixtures.XXXXXX")
+printf '%s\n' \
+    '    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$C"' \
+    > "$MIKA2542_FIXDIR/g2_red"
+printf '%s\n' \
+    '    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --task-id "$I" \' \
+    '        ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \' \
+    '        --command "/mika-revise-plan"' \
+    > "$MIKA2542_FIXDIR/g2_green"
+assert_eq "mika#2542: fixture g2_red (site sans argument) est VUE ROUGE" "1" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_red" | wc -l | tr -d ' ')"
+assert_eq "mika#2542: fixture g2_green (argument passé, multi-lignes) est VUE VERTE" "0" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
+assert_eq "mika#2542: fixture g2_green EST bien un appel vu (le vert n'est pas de la vacuité)" "1" \
+    "$(_mika2542_resolver_calls "$MIKA2542_FIXDIR/g2_green" | wc -l | tr -d ' ')"
+printf '%s\n' \
+    '    if [ -n "$X" ]; then _pilot_max_turns; fi' \
+    > "$MIKA2542_FIXDIR/g2_keyword"
+assert_eq "mika#2542: fixture g2_keyword (appel après then, sans argument) est VUE ROUGE" "1" \
+    "$(_mika2542_unargumented_calls "$MIKA2542_FIXDIR/g2_keyword" | wc -l | tr -d ' ')"
+rm -rf "$MIKA2542_FIXDIR"
+
+# Auto-nettoyage des allowlists (exigence (a) de mika#1574) : une entrée qui
+# n'apparie plus rien fait rougir. Livrées vides, elles le restent sans qu'un
+# relecteur ait à y penser.
+_mika2542_stale=""
+for _mika2542_exc in "${MIKA2542_UNARGUMENTED_SITES[@]+"${MIKA2542_UNARGUMENTED_SITES[@]}"}"; do
+    _mika2542_resolver_calls "$DISPATCH_LIB" | grep -qF -- "$_mika2542_exc" \
+        || _mika2542_stale+="$_mika2542_exc;"
+done
+for _mika2542_exc in "${MIKA2542_CEILING_LABEL_EXCEPTIONS[@]+"${MIKA2542_CEILING_LABEL_EXCEPTIONS[@]}"}"; do
+    sed -n '/^PILOT_LABEL_TURN_CEILINGS=(/,/^)/p' "$DISPATCH_LIB" | grep -qF -- "\"$_mika2542_exc=" \
+        || _mika2542_stale+="$_mika2542_exc;"
+done
+assert_eq "mika#2542: aucune entrée d'allowlist n'est périmée" "" "$_mika2542_stale"
+
+# G1 (table ↔ labels.yml) vit dans scripts/check-pilot-turn-ceiling-labels.sh,
+# branché en CI (`pilot-turn-ceiling-labels-lint`). On le rejoue ici pour que
+# `make test-dispatch-lib` ne puisse pas être vert avec une table non déclarée.
+assert_eq "mika#2542 (AC7): G1 — chaque clé de la table est déclarée dans labels.yml" "0" \
+    "$(bash "$(dirname "$DISPATCH_LIB")/../../../scripts/check-pilot-turn-ceiling-labels.sh" >/dev/null 2>&1; echo $?)"
+
 # --- mika#2296: un `.content` vide et un `session_id` absent ne se lisent plus pareil ---
 #
 # Avant ce ticket, les deux échouaient sur un seul message nommant un champ JSON
@@ -6584,6 +7207,37 @@ _MIKA2278_SUFFIXED=$(printf '%s\n' "$_MIKA2278_LOOP_BODY" \
     | grep -c '_groom_warn ".*_arch_ask failed.*_arch_ask_error_suffix' || true)
 assert_eq "mika#2278: les quatre WARN d'échec portent le message du CLI (R5)" \
     "4" "$_MIKA2278_SUFFIXED"
+
+# ===========================================================================
+# mika#2522 — les deux moitiés du code de sortie retryable sont le même nombre
+# ===========================================================================
+#
+# Le retry de mika#2278 ne rejoue que sur `75`, et mika#2522 fait arriver un `75`
+# là où arrivait un `1` : la classe `transport` attestée par le serveur devient
+# `FailureClass::Transport` côté CLI, donc `EXIT_TRANSPORT_FAILURE`. Ce ticket ne
+# touche PAS `dispatch-lib.sh` — tout ce que le shell doit garantir, c'est que la
+# constante qu'il lit est bien celle que le CLI écrit.
+#
+# Le côté Rust épingle déjà le littéral (`assert_eq!(EXIT_TRANSPORT_FAILURE, 75)`
+# dans `remote_ask.rs`). Aucun des deux tests ne voit l'autre : deux moitiés
+# épinglées séparément sur deux littéraux peuvent diverger en silence, et le seul
+# symptôme serait un retry qui cesse de s'armer — c'est-à-dire exactement le
+# défaut que mika#2522 ferme, revenu par la porte de derrière. Cette assertion est
+# la jointure.
+_MIKA2522_REMOTE_ASK_RS="$SCRIPT_DIR/../../../crates/mika-cli/src/remote_ask.rs"
+_MIKA2522_CLI_EXIT=$(grep -oE 'pub const EXIT_TRANSPORT_FAILURE: i32 = [0-9]+' \
+    "$_MIKA2522_REMOTE_ASK_RS" 2>/dev/null | grep -oE '[0-9]+$' || true)
+# Anti-vacuité : source déplacée, constante renommée, `grep` qui ne rend rien —
+# chacun donnerait une chaîne vide, et comparer deux vides passerait. Un prédicat
+# qui ne lit rien se lit exactement comme un prédicat sain (classe mika#2205).
+assert_eq "mika#2522: la constante du CLI a bien été extraite de sa source" \
+    "extracted" "$([ -n "$_MIKA2522_CLI_EXIT" ] && echo extracted || echo empty)"
+_MIKA2522_SHELL_EXIT=$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB"; printf '%s' "$_ARCH_ASK_RETRYABLE_EXIT"
+)
+assert_eq "mika#2522: _ARCH_ASK_RETRYABLE_EXIT == EXIT_TRANSPORT_FAILURE du CLI" \
+    "$_MIKA2522_CLI_EXIT" "$_MIKA2522_SHELL_EXIT"
 
 # ===========================================================================
 # mika#1943 — un chemin qu'on ne peut pas prouver worktree n'est pas supprimé
@@ -7219,6 +7873,769 @@ assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt
     'git -C $existing_wt stash apply' "$T2449_SITE_B"
 assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
     'NOT in the primary checkout' "$T2449_SITE_B"
+
+# --- mika#2492: la PR nominale de la boucle n'est pas une épave ---
+#
+# Tout ticket groomé est dispatché sous `/ce-work <plan>` (override mika#1074),
+# dont le périmètre est « implementation and local verification only, without
+# the shipping tail ». Ce pilote n'ouvre donc JAMAIS de PR — c'est son périmètre,
+# pas une troncature — et dispatch-lib classait pourtant sa PR en épave
+# (`commit-pushed-no-pr`), ce qui armait trois gardes contre la PR même que la
+# boucle existe pour produire.
+#
+# Le croisement a DEUX axes et une seule case change :
+#   A périmètre (present/absent) × B session (conclue/tronquée)
+# Les deux états de B existent dans la population mesurée du 2026-09-22 :
+# #2425 (`[done] Success | 142 turns`) contre #2484 (`[guardrail]
+# error_max_turns`), tous deux sous `/ce-work`.
+
+echo ""
+echo "Test mika#2492: classe no-shipping-tail — le chemin nominal cesse d'être une épave"
+echo "---------------------------------------------------------------------------------"
+
+# --- T1/T2/T3/T4 : le prédicat, sur ses quatre croisements (comportemental) ---
+#
+# Sonde pure : source la lib, pose les deux axes, interroge le prédicat.
+# $1 = PILOT_SHIPPING_TAIL, $2 = STATUS, $3 = SKILL
+_t2492_predicate() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        PILOT_SHIPPING_TAIL="$1"
+        STATUS="$2"
+        SKILL="$3"
+        if _pilot_had_no_shipping_tail; then echo "yes"; else echo "no"; fi
+    )
+}
+
+assert_eq "T1: périmètre absent + session conclue ⇒ classe nouvelle" \
+    "yes" "$(_t2492_predicate absent success dev-pilot)"
+assert_eq "T2 (contrôle négatif, axe B): périmètre absent + session tronquée ⇒ épave" \
+    "no" "$(_t2492_predicate absent terminated dev-pilot)"
+assert_eq "T3 (non-régression, axe A): périmètre présent + session conclue ⇒ inchangé" \
+    "no" "$(_t2492_predicate present success dev-pilot)"
+assert_eq "T3 (non-régression): périmètre présent + session tronquée ⇒ inchangé" \
+    "no" "$(_t2492_predicate present terminated dev-pilot)"
+assert_eq "T4 (fail-safe R4): estampille vide ⇒ comportement d'avant le ticket" \
+    "no" "$(_t2492_predicate '' success dev-pilot)"
+assert_eq "T4 (fail-safe R4): statut vide ⇒ comportement d'avant le ticket" \
+    "no" "$(_t2492_predicate absent '' dev-pilot)"
+assert_eq "T4 (fail-safe R4): dev-groom n'entre jamais dans la classe" \
+    "no" "$(_t2492_predicate absent success dev-groom)"
+
+# --- T7b/T8 : la garde a PRIS, et la ligne Outcome de la fenêtre (comportemental) ---
+#
+# Un scan de présence ne distingue pas « la garde est écrite » de « la garde est
+# écrite dans le bon sens » : retirer le `!` de la conjonction du bloc mika#940
+# Unit 1 est une régression d'UN caractère qui laisse T7a vert. Cette sonde
+# exécute `_post_flight_recovery` sur un vrai dépôt et lit le RESULT produit.
+#
+# $1 = PILOT_SHIPPING_TAIL, $2 = STATUS. Rend le RESULT complet.
+_t2492_recovery_probe() {
+    local base_dir wt_dir pre_head
+    base_dir=$(mktemp -d)
+    wt_dir="$base_dir/worktree"
+
+    git init -q "$wt_dir" 2>/dev/null
+    echo "initial" > "$wt_dir/file.txt"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "initial" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+    # Le pilote a commité : HEAD avance, worktree propre.
+    echo "impl" > "$wt_dir/feature.rs"
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "fix(2492): the pilot's own implementation commit" 2>/dev/null
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        # Stub : aucune sortie réseau depuis le harness. `gh` n'est jamais
+        # invoqué via `command`, donc la fonction l'emporte.
+        gh() { return 1; }
+
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD=$(git -C "$wt_dir" rev-parse HEAD)
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-pilot"
+        REPO="mika"
+        BRANCH="fix/2492/probe"
+        ISSUE_NUM="2492"
+        SESSION_ID="t2492"
+        LOG_ID="t2492"
+        RESULT="claude-pilot completed (status: ${2})."
+        RESCUED_DIRTY_WORKTREE=0
+        PILOT_SHIPPING_TAIL="$1"
+        STATUS="$2"
+
+        exec 9>&2
+        _post_flight_recovery 2>/dev/null
+        printf '%s' "$RESULT"
+    )
+
+    rm -rf "$base_dir"
+}
+
+T2492_NOMINAL=$(_t2492_recovery_probe absent success 2>/dev/null)
+assert_not_contains "T7b: périmètre absent + conclue ⇒ AUCUN PIPELINE FAILURE (la garde a pris)" \
+    "PIPELINE FAILURE:" "$T2492_NOMINAL"
+assert_contains "T8: la fenêtre avant Path B porte un motif nommé, jamais UNKNOWN" \
+    "Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation." \
+    "$T2492_NOMINAL"
+assert_not_contains "T8: et jamais le UNKNOWN générique (moins actionnable qu'aujourd'hui)" \
+    "Outcome: UNKNOWN" "$T2492_NOMINAL"
+assert_eq "T8: exactement une ligne Outcome dans la fenêtre" \
+    "1" "$(printf '%s\n' "$T2492_NOMINAL" | grep -c '^Outcome: ' || true)"
+
+# Contrôle négatif de la même sonde : le périmètre présent garde son
+# PIPELINE FAILURE, mot pour mot. Sans lui, T7b ne distingue pas « la garde
+# discrimine » de « le bloc mika#940 ne fire plus du tout ».
+T2492_PRESENT=$(_t2492_recovery_probe present success 2>/dev/null)
+assert_contains "T7b (contrôle négatif): périmètre présent ⇒ PIPELINE FAILURE inchangé" \
+    "PIPELINE FAILURE: claude-pilot produced commits" "$T2492_PRESENT"
+assert_contains "T3: et sa ligne Outcome reste PIPELINE_INCOMPLETE — manual recovery needed" \
+    "Outcome: PIPELINE_INCOMPLETE — manual recovery needed." "$T2492_PRESENT"
+assert_eq "T3: une seule ligne Outcome sur ce croisement aussi" \
+    "1" "$(printf '%s\n' "$T2492_PRESENT" | grep -c '^Outcome: ' || true)"
+
+# Le fail-safe, vu de bout en bout : estampille vide ⇒ chemin d'avant le ticket.
+T2492_UNSTAMPED=$(_t2492_recovery_probe '' success 2>/dev/null)
+assert_contains "T4 (bout en bout): estampille vide ⇒ PIPELINE FAILURE, comme avant" \
+    "PIPELINE FAILURE: claude-pilot produced commits" "$T2492_UNSTAMPED"
+
+# --- T8 (suite) : _set_outcome_line rend le contrat vrai par construction ---
+_t2492_outcome_line_probe() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        RESULT="body line
+
+Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: dispatch-lib did not reach PR creation."
+        _set_outcome_line "Outcome: PR_OPENED — https://example/pr/1"
+        printf '%s' "$RESULT"
+    )
+}
+T2492_OUTCOME=$(_t2492_outcome_line_probe 2>/dev/null)
+assert_eq "T8: après réécriture, exactement une ligne Outcome" \
+    "1" "$(printf '%s\n' "$T2492_OUTCOME" | grep -c '^Outcome: ' || true)"
+assert_contains "T8: et c'est la plus vraie des deux" \
+    "Outcome: PR_OPENED — https://example/pr/1" "$T2492_OUTCOME"
+assert_not_contains "T8: l'ancienne valeur de la fenêtre a disparu" \
+    "no_shipping_tail" "$T2492_OUTCOME"
+assert_contains "T8: le corps du RESULT est préservé" \
+    "body line" "$T2492_OUTCOME"
+
+# --- T5 : l'estampille est écrite à UN site par valeur (scan, allowlist vide) ---
+#
+# « On déclare, on n'allowliste pas » (mika#2201) : quand ce scan tire, la
+# résolution est de RETIRER le second site, jamais d'y ajouter une entrée. La
+# lecture couvre l'autre moitié — qu'aucun chemin d'entrée n'atteigne la
+# sélection de classe sans estamper — et aucun scan ne peut l'atteindre :
+# `SKILL` a un site d'écriture unique, le `case` de `dispatch_claude_pilot` est
+# exhaustif et fatal (`*) exit 1`), la suite est linéaire, et la fonction n'a
+# que deux appelants (dev-pilot/handlers/run.sh, dev-groom/handlers/run.sh).
+SHIPPING_TAIL_WRITERS_ALLOWED=""   # mika#2492: livrée VIDE, et un test le tient
+assert_eq "T5: allowlist des écrivains de l'estampille — zero entries" \
+    "" "$SHIPPING_TAIL_WRITERS_ALLOWED"
+assert_eq "T5: PILOT_SHIPPING_TAIL=\"absent\" n'est écrit qu'à un seul site" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL="absent"' "$DISPATCH_LIB" || true)"
+assert_eq "T5: PILOT_SHIPPING_TAIL=\"present\" n'est écrit qu'à un seul site" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL="present"' "$DISPATCH_LIB" || true)"
+# Le site `absent` doit être celui de l'override — pas un site voisin qui
+# devinerait le périmètre après coup.
+T2492_DETECT_FN=$(sed -n '/^_detect_plan_on_branch() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "T5: le site « absent » est la ligne même qui pose l'override /ce-work" \
+    'PILOT_SHIPPING_TAIL="absent"' "$T2492_DETECT_FN"
+assert_contains "T5: et il est adjacent à l'override qu'il décrit" \
+    'ENTRY_COMMAND="/ce-work $PLAN_PATH"' "$T2492_DETECT_FN"
+# Un seul lecteur décisionnel de l'estampille : le prédicat. Tout autre lecteur
+# ferait diverger deux jugements d'un même fait.
+assert_eq "T5: l'estampille n'a qu'un lecteur décisionnel (le prédicat)" \
+    "1" "$(grep -c 'PILOT_SHIPPING_TAIL:-' "$DISPATCH_LIB" || true)"
+
+# --- T7a : la conjonction du bloc mika#940 Unit 1 porte la NÉGATION ---
+#
+# Cherchée sur la LIGNE de la conjonction, pas dans le fichier : à l'échelle du
+# fichier, l'appel légitime — et sans `!` — de la sélection de classe satisfait
+# un scan de présence naïf.
+UNIT1_GUARD_EXEMPT=""   # mika#2492: livrée VIDE
+assert_eq "T7a: allowlist d'exemption du guard Unit 1 — zero entries" \
+    "" "$UNIT1_GUARD_EXEMPT"
+T2492_UNIT1_LINE=$(grep -n 'STATUS" = "success" \] && \[ "\$SKILL" = "dev-pilot"' "$DISPATCH_LIB" | head -1)
+assert_contains "T7a: la conjonction Unit 1 porte « ! _pilot_had_no_shipping_tail » (négation incluse)" \
+    '! _pilot_had_no_shipping_tail' "$T2492_UNIT1_LINE"
+
+# --- T6 : le bras de la classe nouvelle n'émet JAMAIS RECOVERY_PENDING ---
+NO_TAIL_RECOVERY_PENDING_ALLOWED=""   # mika#2492: livrée VIDE
+assert_eq "T6: allowlist RECOVERY_PENDING de la classe nouvelle — zero entries" \
+    "" "$NO_TAIL_RECOVERY_PENDING_ALLOWED"
+PATHB_2492=$(sed -n '/Unit 2 (mika#1282 + mika#1396): open a draft PR/,/^    _deliver_callback/p' "$DISPATCH_LIB")
+# Ancré sur le `if` à douze espaces — l'`elif` du bras titre/fact porte la même
+# comparaison et ouvrirait la plage trop tôt. Les commentaires sont retirés : le
+# scan porte sur le CODE, et le commentaire de ce bras nomme légitimement le
+# marqueur qu'il n'émet pas (même geste que GATE_CODE au test 15).
+T2492_NOTAIL_ARM=$(printf '%s\n' "$PATHB_2492" \
+    | sed -n '/^            if \[ "\$RECOVERY_CLASS" = "no-shipping-tail"/,/^            else$/p' \
+    | grep -v '^[[:space:]]*#')
+assert_contains "T6 (bonne foi): le bras de la classe nouvelle existe dans Path B" \
+    'PR: ${PR_URL}' "$T2492_NOTAIL_ARM"
+assert_not_contains "T6: et il n'émet jamais RECOVERY_PENDING: true (Guard 1 désarmée)" \
+    "RECOVERY_PENDING: true" "$T2492_NOTAIL_ARM"
+assert_contains "T6: il réécrit la ligne Outcome en PR_OPENED" \
+    '_set_outcome_line "Outcome: PR_OPENED — ${PR_URL}"' "$T2492_NOTAIL_ARM"
+# R3 : l'autre bras garde son marqueur, mot pour mot.
+assert_contains "T3 (R3): le bras des épaves émet toujours RECOVERY_PENDING: true" \
+    "RECOVERY_PENDING: true" "$PATHB_2492"
+
+# --- Sélection de classe : le bras nouveau est AVANT l'épave, et gardé ---
+T2492_SELECT=$(printf '%s\n' "$PATHB_2492" | sed -n '/local RECOVERY_CLASS=""/,/^    fi$/p')
+assert_contains "U3b: le bras no-shipping-tail est gardé par le prédicat" \
+    '_pilot_had_no_shipping_tail; then' "$T2492_SELECT"
+assert_contains "U3b: la garde RESCUED_DIRTY_WORKTREE reste première" \
+    'RESCUED_DIRTY_WORKTREE:-}" = "1" ]; then' "$T2492_SELECT"
+T2492_NOTAIL_POS=$(printf '%s\n' "$T2492_SELECT" | grep -n 'RECOVERY_CLASS="no-shipping-tail"' | head -1 | cut -d: -f1)
+T2492_WRECK_POS=$(printf '%s\n' "$T2492_SELECT" | grep -n 'RECOVERY_CLASS="commit-pushed-no-pr"' | head -1 | cut -d: -f1)
+assert_eq "U3b: le bras no-shipping-tail précède le bras commit-pushed-no-pr" "yes" \
+    "$([ -n "$T2492_NOTAIL_POS" ] && [ -n "$T2492_WRECK_POS" ] && [ "$T2492_NOTAIL_POS" -lt "$T2492_WRECK_POS" ] && echo yes || echo "non ($T2492_NOTAIL_POS vs $T2492_WRECK_POS)")"
+
+# --- Le commit marqueur reste réservé aux épaves (égalité stricte) ---
+# La borne de fin est `RESCUED_PR_URL=` seul : écrire le motif complet de
+# l'invocation ferait de cette ligne une fausse positive du détecteur
+# d'herméticité mika#2178 T9, qui balaie tout ce qui suit sa propre section.
+T2492_MARKER_GUARD=$(printf '%s\n' "$PATHB_2492" | sed -n '/RECOVERY_CLASS" = "commit-pushed-no-pr"/,/^        RESCUED_PR_URL=/p')
+assert_not_contains "U3c: le commit marqueur wip(mika#1383) n'atteint pas la classe nouvelle" \
+    "no-shipping-tail" "$T2492_MARKER_GUARD"
+assert_eq "U3c: _set_outcome_line n'est appelée qu'au seul bras de la classe nouvelle" \
+    "1" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+
+# --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
+assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
+    '_measure_pipeline_verified "$WORKTREE_DIR"' "$PATHB_2492"
+# D3 : le label est CONSERVÉ — le retirer sortirait la PR de wip_rescue.rs,
+# seul mécanisme qui la rebase, la passe à clippy et la sort du draft, sans que
+# qa_review_reconcile (qui exige isDraft == false) la rattrape.
+assert_contains "D3: le label wip-rescue reste appliqué (sinon la PR sort de tous les filets)" \
+    'add-label "wip-rescue"' "$PATHB_2492"
+
+# --- Le titre de la classe nouvelle vient du vrai commit d'implémentation ---
+_t2492_title_probe() {
+    local base_dir wt_dir
+    base_dir=$(mktemp -d); wt_dir="$base_dir/wt"
+    git init -q "$wt_dir" 2>/dev/null
+    echo x > "$wt_dir/a"; git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "fix(2492): le vrai sujet du commit du pilote" 2>/dev/null
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _derive_recovery_pr_title "no-shipping-tail" "$wt_dir" "mika" "2492" "" "titre d'issue"
+    )
+    rm -rf "$base_dir"
+}
+assert_eq "U3c: le titre de la classe nouvelle est le sujet du commit d'implémentation" \
+    "fix(2492): le vrai sujet du commit du pilote" "$(_t2492_title_probe 2>/dev/null)"
+
+# =============================================================================
+# mika#2493 — un deny non-terminal survécu est une NOTE, jamais un « halted »
+# =============================================================================
+#
+# Ce que ces détecteurs mesurent. Le champ `result` préfixait « PIPELINE
+# FAILURE: … halted by policy deny » alors que le refus n'avait pas arrêté la
+# session et qu'elle avait livré. Le libellé a fait conclure « échec » à tort
+# deux fois — opérateur ET orchestrateur — dans l'incident de la nuit du
+# 2026-09-22. Preuves re-mesurées (M0) : sessions `98b60020` (2 refus) et
+# `a0886164` (5 refus), **zéro terminal**, toutes deux `status: success`.
+#
+# Trois unités, trois populations de test :
+#   U1 — la garde `[ -z "$VALID_PLAN" ]` (T8, T9, T15, T16)
+#   U2 — le prédicat de létalité + la note annexée (T1–T7, T10, T11)
+#   U3 — la dé-troncature de l'événement rapporté (T13, T14)
+#
+# Herméticité : aucune fixture ne touche le réseau ni la forge. Les deux sondes
+# bout-en-bout redéfinissent `_pr_list_url` dans leur sous-shell.
+
+echo ""
+echo "Test mika#2493 : le libellé suit la létalité du deny"
+echo "----------------------------------------------------"
+
+T2493_FIXTURE_DIR=$(mktemp -d)
+
+# --- T1–T7 : le prédicat de létalité ----------------------------------------
+#
+# D2 : le prédicat porte sur le FICHIER, jamais sur la ligne capturée. Trois
+# raisons mesurées — le marqueur sort de la première ligne dans 23 % des cas
+# (M2, dont la preuve `98b60020`) ; une session porte plusieurs refus ; et un
+# refus terminal termine sa session (M4), donc « au moins un terminal » et « le
+# dernier est terminal » coïncident, la première formulation seule survivant à
+# la troncature.
+
+_t2493_lethality() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _policy_deny_lethality "$1"
+    )
+}
+
+# T1 — refus non-terminal mono-ligne (forme la plus fréquente : 1093 des 1185
+# marqueurs mesurés depuis cpp#151).
+printf '\x1b[31m[policy:deny]\x1b[0m Bash: env | head -3 [bash-env] (non-terminal)\n' \
+    > "$T2493_FIXTURE_DIR/nonterm.stderr"
+assert_eq "T1: refus non-terminal mono-ligne ⇒ non-terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/nonterm.stderr")"
+
+# T2 — refus terminal. La population que le verbe « halted » doit garder.
+printf '[policy:deny] Bash: rm -rf /etc [bash-destructive] (terminal)\n' \
+    > "$T2493_FIXTURE_DIR/term.stderr"
+assert_eq "T2: refus terminal ⇒ terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/term.stderr")"
+
+# T3 — forme antérieure à cpp#151 (2026-09-04) : aucun marqueur nulle part.
+# D3 : rien n'est affirmé. Replier sur `non-terminal` poserait l'affirmation
+# fausse dans l'autre sens ; replier sur `terminal` reconduirait le défaut.
+printf '[policy:deny] Bash: gh auth status 2>&1 | head -10\n' \
+    > "$T2493_FIXTURE_DIR/undeclared.stderr"
+assert_eq "T3: refus sans marqueur (pré-cpp#151) ⇒ undeclared" \
+    "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/undeclared.stderr")"
+
+# T4 — LE test qui sépare « lit le fichier » de « lit la ligne ». C'est la forme
+# exacte de la preuve `98b60020` du ticket : `<detail>` multi-ligne, marqueur en
+# 3ᵉ ligne. Toute implémentation qui lirait la ligne capturée par un
+# `grep -m1` rougit ici — et serait donc fausse sur une des deux preuves.
+printf '%s\n' \
+    '[2026-09-22T17:35:39.081Z] [policy:deny] Bash: cd /data/workspace/mika-platform/.claude/worktrees/test-2471/mika \' \
+    '  && git log --oneline -5 \' \
+    '  && echo done [bash-cd] (non-terminal)' \
+    > "$T2493_FIXTURE_DIR/multiline.stderr"
+assert_eq "T4: refus multi-ligne, marqueur en 3ᵉ ligne (forme 98b60020) ⇒ non-terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/multiline.stderr")"
+
+# T5 — plusieurs refus : la question est « un terminal existe-t-il ? », pas
+# « le premier l'était-il ? ». `a0886164` en porte cinq.
+printf '%s\n' \
+    '[policy:deny] Bash: a [r1] (non-terminal)' \
+    '[policy:deny] Bash: b [r2] (non-terminal)' \
+    '[policy:deny] Bash: c [r3] (non-terminal)' \
+    '[policy:deny] Bash: d [r4] (non-terminal)' \
+    '[policy:deny] Bash: e [r5] (terminal)' \
+    > "$T2493_FIXTURE_DIR/four_then_term.stderr"
+assert_eq "T5: quatre non-terminaux suivis d'un terminal ⇒ terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/four_then_term.stderr")"
+
+# T6 — CONTRÔLE NÉGATIF. `(non-terminal)` ne contient pas la sous-chaîne
+# `(terminal)` : la parenthèse ouvrante qu'elle exige est occupée par le `-`.
+# Inverser cette discrimination reclasserait d'un coup les 1093 refus
+# non-terminaux mesurés — c'est l'erreur que ce test existe pour attraper, et
+# elle ne se voit sur aucune des fixtures positives ci-dessus.
+printf '%s\n' \
+    '[policy:deny] Bash: x [r1] (non-terminal)' \
+    '[policy:deny] Bash: y [r2] (non-terminal)' \
+    > "$T2493_FIXTURE_DIR/only_nonterm.stderr"
+assert_eq "T6 (contrôle négatif): un fichier de non-terminaux ne rend JAMAIS terminal" \
+    "non-terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/only_nonterm.stderr")"
+# Et la vérification directe de la propriété de sous-chaîne dont tout dépend.
+assert_eq "T6: la sous-chaîne (terminal) n'est pas contenue dans (non-terminal)" \
+    "1" "$(printf '%s\n' 'x (non-terminal)' 'y (terminal)' | grep -c -F '(terminal)' || true)"
+
+# T7 — fail-open préservé, dans les deux formes d'indisponibilité.
+assert_eq "T7: fichier absent ⇒ undeclared (fail-open)" \
+    "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/does_not_exist.stderr")"
+printf '[policy:deny] Bash: z [r] (terminal)\n' > "$T2493_FIXTURE_DIR/unreadable.stderr"
+chmod 000 "$T2493_FIXTURE_DIR/unreadable.stderr" 2>/dev/null || true
+if [ -r "$T2493_FIXTURE_DIR/unreadable.stderr" ]; then
+    # root ignore les bits de permission : la sonde ne peut pas s'armer, et le
+    # dire est ce qui empêche de lire un vert à vide (mika#2149).
+    SKIPPED=$((SKIPPED + 1))
+    echo "  SKIP T7: fichier illisible — le processus lit malgré chmod 000 (root ?)"
+else
+    assert_eq "T7: fichier illisible ⇒ undeclared (fail-open)" \
+        "undeclared" "$(_t2493_lethality "$T2493_FIXTURE_DIR/unreadable.stderr")"
+fi
+chmod 644 "$T2493_FIXTURE_DIR/unreadable.stderr" 2>/dev/null || true
+
+# --- T13–T14 : l'événement rapporté est dé-tronqué et borné (U3) -------------
+#
+# U3 est la condition de VÉRIFIABILITÉ de U2 : sans lui, le message affirme
+# « non-terminal » en joignant une preuve où le marqueur n'apparaît pas (23 %
+# des cas) — un troisième « croire sur parole » dans un ticket dont le sujet est
+# un libellé qu'on a cru sur parole.
+
+_t2493_excerpt() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        sed 's/\x1b\[[0-9;]*[mK]//g' "$1" | _policy_deny_excerpt
+    )
+}
+
+T2493_EXCERPT_MULTILINE=$(_t2493_excerpt "$T2493_FIXTURE_DIR/multiline.stderr")
+assert_contains "T13: l'extrait porte le [rule-id] (perdu par grep -m1)" \
+    "[bash-cd]" "$T2493_EXCERPT_MULTILINE"
+assert_contains "T13: l'extrait porte le marqueur de létalité" \
+    "(non-terminal)" "$T2493_EXCERPT_MULTILINE"
+assert_contains "T13: et il porte toujours la première ligne du refus" \
+    "[policy:deny] Bash: cd /data/workspace" "$T2493_EXCERPT_MULTILINE"
+# Contrôle de bonne foi : ce que l'ancien prédicat rendait sur cette même
+# fixture. Si ce test rougit, c'est que la fixture ne reproduit plus la forme
+# de M2 et que T13 ne mesure plus rien.
+assert_not_contains "T13 (bonne foi): grep -m1 sur la même fixture PERD le rule-id" \
+    "[bash-cd]" "$(sed 's/\x1b\[[0-9;]*[mK]//g' "$T2493_FIXTURE_DIR/multiline.stderr" | grep -m1 '\[policy:deny\]' || true)"
+
+# T14 — bornes de D6 : un refus mono-ligne sans marqueur suivi de bruit de
+# journal s'arrête à la première ligne ouvrant un autre événement.
+printf '%s\n' \
+    '[policy:deny] Bash: gh auth status' \
+    '[debug] tool_use id=abc' \
+    '[debug] tool_result bytes=1200' \
+    '[done] Success | 5 turns' \
+    > "$T2493_FIXTURE_DIR/deny_then_noise.stderr"
+T2493_EXCERPT_NOISE=$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_then_noise.stderr")
+assert_contains "T14: l'extrait porte le refus" \
+    "[policy:deny] Bash: gh auth status" "$T2493_EXCERPT_NOISE"
+assert_not_contains "T14: et n'emporte pas le bruit [debug] qui suit" \
+    "[debug]" "$T2493_EXCERPT_NOISE"
+assert_not_contains "T14: ni la ligne de fin de session" \
+    "[done]" "$T2493_EXCERPT_NOISE"
+# Plafond : sans marqueur ET sans autre événement, la capture reste bornée.
+{
+    printf '[policy:deny] Bash: long-command \\\n'
+    for _i in $(seq 1 40); do printf '  arg%s \\\n' "$_i"; done
+} > "$T2493_FIXTURE_DIR/deny_unbounded.stderr"
+assert_eq "T14: sans marqueur ni autre événement, la capture est plafonnée" \
+    "12" "$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_unbounded.stderr" | grep -c . || true)"
+
+# --- T8 : garde de préemption, formulée sur la POPULATION des sites ----------
+#
+# Formulé sur la population — toute branche qui déclare un halt sur un deny —
+# et non sur deux lignes nommées, pour qu'un troisième site futur soit vu.
+# M5 est la mesure qui requalifie U1 : les trois autres branches de la chaîne
+# du site dev-groom portaient DÉJÀ `[ -z "$VALID_PLAN" ]`. La branche de refus
+# était la seule à ne pas la porter — et c'est elle qui est en tête. U1 rend à
+# cette branche la condition que ses sœurs ont ; il n'en invente pas une.
+#
+# « On déclare, on n'allowliste pas » (mika#2201, mika#2323) : quand ce scan
+# tire, la résolution est d'ajouter la garde au site fautif, JAMAIS d'ajouter
+# une entrée ici.
+POLICY_DENY_UNGUARDED_ALLOWED=""   # mika#2493 : LIVRÉE VIDE, et un test le tient
+assert_eq "T8: allowlist des sites de halt sans garde — zero entries" \
+    "" "$POLICY_DENY_UNGUARDED_ALLOWED"
+
+# Le scan associe chaque libellé de halt à la condition de la branche qui
+# l'englobe, et vérifie que cette condition porte les DEUX gardes. La portée de
+# `cond` est bornée à 15 lignes pour qu'un libellé lointain n'hérite pas de la
+# condition d'un autre bloc.
+T2493_HALT_SCAN=$(awk '
+    /^[[:space:]]*(el)?if .*\$POLICY_DENY/ { cond = $0; age = 0; next }
+    cond != "" { age++; if (age > 15) cond = "" }
+    /RESULT="PIPELINE FAILURE:.*halted by.*policy deny/ {
+        seen++
+        if (cond !~ /-z "\$VALID_PLAN"/) bad_plan++
+        if (cond !~ /POLICY_DENY_LETHALITY" = "terminal"/) bad_leth++
+    }
+    END { printf "%d:%d:%d", seen + 0, bad_plan + 0, bad_leth + 0 }
+' "$DISPATCH_LIB")
+# Bonne foi d'abord : un scan qui ne trouve aucun site passerait vert à vide.
+assert_eq "T8 (bonne foi): le scan voit les deux sites de halt existants" \
+    "yes" "$([ "${T2493_HALT_SCAN%%:*}" -ge 2 ] && echo yes || echo "non ($T2493_HALT_SCAN)")"
+assert_eq "T8: tout site de halt sur deny porte la garde [ -z \"\$VALID_PLAN\" ]" \
+    "0" "$(printf '%s' "$T2493_HALT_SCAN" | cut -d: -f2)"
+assert_eq "T8: tout site de halt sur deny est réservé à la létalité terminal" \
+    "0" "$(printf '%s' "$T2493_HALT_SCAN" | cut -d: -f3)"
+
+# L'ORDRE DES CONJOINTS est porteur (D1) : les deux assertions d'ordre
+# existantes (Test 13, Test 14) cherchent la sous-chaîne littérale
+# `if [ -n "$POLICY_DENY" ]`. Mettre la garde en tête les ferait rougir pour un
+# résultat identique — et donnerait l'apparence d'un fix qui corrige ses tests.
+assert_eq "D1: les deux sites gardent POLICY_DENY en conjoint de tête" \
+    "2" "$(grep -c 'if \[ -n "\$POLICY_DENY" \] && \[ -z "\$VALID_PLAN" \]' "$DISPATCH_LIB" || true)"
+
+# --- T9, T10, T11, T15, T16 : comportement bout-en-bout ---------------------
+#
+# Les deux sens du DoD, sur la forme exacte des deux preuves : dev-groom,
+# HEAD inchangé, un refus dans le stderr — et `VALID_PLAN` peuplé ou vide.
+
+_t2493_e2e() {
+    # $1 = chemin d'une fixture stderr ; $2 = "plan" pour peupler VALID_PLAN.
+    local base_dir wt_dir log_dir pre_head
+    base_dir=$(mktemp -d); wt_dir="$base_dir/wt"; log_dir="$base_dir/logs"
+    mkdir -p "$log_dir" "$wt_dir/docs/plans"
+    git init -q "$wt_dir" 2>/dev/null
+    printf 'seed\n' > "$wt_dir/seed.txt"
+    if [ "${2:-}" = "plan" ]; then
+        # >500 octets (seuil mika#1033) + en-tête nommant l'issue (tier 2).
+        {
+            printf '# Plan mika issue#9493\n\n**Ticket:** mika issue#9493\n\n'
+            for _i in $(seq 1 40); do printf 'Ligne de corps du plan, pour franchir le seuil de 500 octets.\n'; done
+        } > "$wt_dir/docs/plans/2026-09-23-001-fix-9493-sonde-plan.md"
+    fi
+    git -C "$wt_dir" add -A 2>/dev/null
+    git -C "$wt_dir" commit -q -m "seed" 2>/dev/null
+    pre_head=$(git -C "$wt_dir" rev-parse HEAD)
+    cp "$1" "$log_dir/t2493probe.stderr"
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+
+        # Herméticité : aucune requête forge. Le détecteur mika#2178 T9 balaie
+        # tout ce qui suit sa section — ces redéfinitions sont ce qui permet à
+        # la sonde de tourner sans réseau ni jeton.
+        _pr_list_url() { _LAST_PR_QUERY_RC=0; printf ''; }
+        _stamp_pr_origin() { return 0; }
+
+        PILOT_LOG_DIR="$log_dir"
+        PRE_RUN_HEAD="$pre_head"
+        POST_RUN_HEAD="$pre_head"     # HEAD inchangé — la forme des deux preuves
+        WORKTREE_DIR="$wt_dir"
+        SKILL="dev-groom"
+        REPO="mika"
+        BRANCH="fix/9493/sonde"
+        ISSUE_NUM="9493"
+        SESSION_ID="sonde-2493"
+        LOG_ID="t2493probe"
+        STATUS="success"
+        PILOT_EXIT=0
+        RESULT="claude-pilot session completed."
+        RESCUED_DIRTY_WORKTREE=0
+
+        exec 9>&2
+        _post_flight_recovery 2>/dev/null
+
+        printf '%s' "$RESULT"
+    )
+
+    rm -rf "$base_dir"
+}
+
+# T9 — DoD point 1. La population fondatrice : dev-groom qui a livré son plan,
+# refus non-terminal survécu. Ni « PIPELINE FAILURE » ni « halted ».
+T2493_E2E_SURVIVED=$(_t2493_e2e "$T2493_FIXTURE_DIR/nonterm.stderr" plan 2>/dev/null)
+assert_not_contains "T9 (DoD-1): plan livré + deny non-terminal ⇒ pas de PIPELINE FAILURE" \
+    "PIPELINE FAILURE:" "$T2493_E2E_SURVIVED"
+assert_not_contains "T9 (DoD-1): plan livré + deny non-terminal ⇒ pas de « halted »" \
+    "halted" "$T2493_E2E_SURVIVED"
+# AC4 — le refus est REQUALIFIÉ, jamais supprimé : il reste visible en annexe.
+assert_contains "AC4: le refus non-terminal reste visible dans le result (note)" \
+    "the session continued past it" "$T2493_E2E_SURVIVED"
+assert_contains "AC4: et la note joint la preuve du refus" \
+    "Observed deny:" "$T2493_E2E_SURVIVED"
+assert_contains "AC4: la note nomme la létalité lue" \
+    "Lethality marker: (non-terminal)" "$T2493_E2E_SURVIVED"
+# Idempotence : les deux sites peuvent tirer sur un même dispatch dev-groom.
+assert_eq "La note n'est annexée qu'une fois, même quand les deux sites tirent" \
+    "1" "$(grep -c 'the session continued past it' <<<"$T2493_E2E_SURVIVED" || true)"
+
+# T15 — LE TEST DE L'EFFET, et non de la formulation (M6). Le faux
+# `PIPELINE FAILURE:` ne se contentait pas de mal nommer : il CAPTURAIT le
+# classificateur de la ligne `Outcome:`. T9 assertte une ABSENCE de sous-chaîne,
+# qu'une reformulation malheureuse pourrait satisfaire sans rien réparer ; T15
+# assertte la PRÉSENCE du bon classement, qu'on ne peut pas obtenir par accident.
+assert_contains "T15 (AC6): la session est classée PLAN_COMMITTED" \
+    "Outcome: PLAN_COMMITTED" "$T2493_E2E_SURVIVED"
+assert_not_contains "T15 (AC6): et non PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_SURVIVED"
+
+# T16 — CONTRÔLE NÉGATIF de T15. Même fixture, `VALID_PLAN` vide : une session
+# qui n'a réellement rien produit continue d'être classée PIPELINE_INCOMPLETE.
+# C'est ce qui distingue « le correctif répare le faux positif » de « le
+# correctif a désarmé le classificateur ».
+T2493_E2E_NOPLAN=$(_t2493_e2e "$T2493_FIXTURE_DIR/nonterm.stderr" 2>/dev/null)
+assert_contains "T16 (contrôle négatif): sans plan, la session reste PIPELINE_INCOMPLETE" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_NOPLAN"
+assert_contains "T16: et le diagnostic de la branche qui s'applique garde la parole" \
+    "_find_issue_plan returned empty" "$T2493_E2E_NOPLAN"
+# D4 : le refus est annexé, il n'ÉVINCE pas le vrai diagnostic. Remplacer
+# « pas de plan trouvé, causes probables (a) dérive (b) bug de découverte » par
+# « halted by policy deny » déplacerait le mensonge du ticket au lieu de le
+# fermer — on substituerait au vrai diagnostic un faux, sous couvert de précision.
+assert_contains "D4: sans plan non plus, le deny non-terminal n'est qu'une annexe" \
+    "the session continued past it" "$T2493_E2E_NOPLAN"
+assert_not_contains "D4: et le verbe « halted » n'apparaît pas pour autant" \
+    "halted" "$T2493_E2E_NOPLAN"
+
+# T10 — DoD point 2, le SENS INVERSE. Un refus terminal produit toujours le
+# libellé, augmenté de la mention de sa létalité. Le verbe reste disponible
+# pour les vrais halts : c'est la moitié qu'un correctif trop large casserait.
+T2493_E2E_TERMINAL=$(_t2493_e2e "$T2493_FIXTURE_DIR/term.stderr" 2>/dev/null)
+assert_contains "T10 (DoD-2): deny terminal ⇒ le result porte « halted »" \
+    "halted" "$T2493_E2E_TERMINAL"
+assert_contains "T10 (DoD-2): et la mention (terminal)" \
+    "(terminal)" "$T2493_E2E_TERMINAL"
+assert_contains "T10: le libellé historique du site dev-groom est conservé (REQ7)" \
+    "halted by claude-pilot policy deny" "$T2493_E2E_TERMINAL"
+assert_contains "T10: et la session est bien classée en échec" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2493_E2E_TERMINAL"
+# AC3 : les deux sens sont deux tests distincts, et T5/T6 tiennent la frontière.
+assert_not_contains "T10: un halt terminal n'annexe pas en plus la note de survie" \
+    "the session continued past it" "$T2493_E2E_TERMINAL"
+
+# T11 — D5, contrainte DURE sur la note, assertée sur le TEXTE PRODUIT et non
+# sur la constante. `dispatch-lib.sh` grep le contenu de `RESULT` pour cinq
+# jetons ; une note d'information qui en introduirait un reclasserait la session
+# en échec — exactement le défaut réparé, reconstruit par le correctif.
+T2493_NOTE_ONLY=$(
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        RESULT=""
+        _annex_policy_deny_note "non-terminal" "[policy:deny] Bash: x [r] (non-terminal)"
+        printf '%s' "$RESULT"
+    )
+)
+assert_contains "T11 (bonne foi): la sonde produit bien la note" \
+    "Observed deny:" "$T2493_NOTE_ONLY"
+for _tok in "PIPELINE FAILURE:" "STRUCTURAL VIOLATION:" "HANDLER CRASH"; do
+    assert_not_contains "T11 (D5): la note ne porte pas le jeton « $_tok »" \
+        "$_tok" "$T2493_NOTE_ONLY"
+done
+assert_eq "T11 (D5): la note n'ouvre aucune ligne par STATUS=CANCELLED" \
+    "0" "$(grep -c '^STATUS=CANCELLED' <<<"$T2493_NOTE_ONLY" || true)"
+assert_eq "T11 (D5): la note n'ouvre aucune ligne par Outcome: PIPELINE_INCOMPLETE" \
+    "0" "$(grep -c '^Outcome: PIPELINE_INCOMPLETE' <<<"$T2493_NOTE_ONLY" || true)"
+# Le même prédicat que le lecteur de reclassement applique, appliqué à la note.
+assert_eq "T11 (D5): le prédicat de reclassement de dispatch-lib ne mord pas sur la note" \
+    "0" "$(grep -cE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE)' <<<"$T2493_NOTE_ONLY" || true)"
+
+# T3 bout-en-bout — REQ4/AC5 : une létalité non déclarée n'affirme rien, et le
+# message dit POURQUOI, en nommant le build du pilote plutôt que la lecture.
+T2493_E2E_UNDECLARED=$(_t2493_e2e "$T2493_FIXTURE_DIR/undeclared.stderr" plan 2>/dev/null)
+assert_contains "AC5: létalité non déclarée ⇒ ni terminal ni non-terminal affirmé" \
+    "Lethality marker: undeclared" "$T2493_E2E_UNDECLARED"
+assert_contains "AC5: et le message impute l'absence au build du pilote (cpp#151)" \
+    "cpp#151" "$T2493_E2E_UNDECLARED"
+assert_not_contains "AC5: un undeclared ne produit pas « halted »" \
+    "halted" "$T2493_E2E_UNDECLARED"
+
+# --- Herméticité de cette section (patron mika#2178 T9) ---------------------
+T2493_SECTION=$(sed -n '/^# mika#2493 — un deny non-terminal survécu est une NOTE/,$p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2493 a trouvé la section" \
+    "yes" "$(if [ -n "$T2493_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2493_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2493_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+
+rm -rf "$T2493_FIXTURE_DIR"
+
+# ============================================================================
+# mika#2539 — le jeton de cause DÉRIVE de _halt_family, il ne la redéclare pas
+#
+# Ces scans sont structurels et non comportementaux, et c'est une nécessité :
+# une seconde table de classification ne rendrait AUCUNE décision fausse le jour
+# où on l'écrit. Elle rendrait `_rescue_cause_token` juste, et la laisserait
+# dériver silencieusement ensuite — un sous-type ajouté en amont ferait rougir le
+# drift guard T6 et passerait sans un mot dans le message de sauvetage. C'est la
+# panne que mika#2158 a mesurée sur `auto_pull.rs` : une regex commentée
+# « Mirrors GROOMED_VERDICT_RE » qui n'a suivi aucun des deux élargissements
+# suivants, et promotion et routage ont répondu différemment à la même question
+# pendant des mois. Aucune suite comportementale ne voit cette classe.
+#
+# T6 n'est ni touché ni dupliqué : il couvre déjà le jeton par construction,
+# puisque le jeton EST la sortie de `_halt_family`.
+# ============================================================================
+echo ""
+echo "mika#2539: le jeton de cause du sauvetage dérive de la table de halte"
+echo "---------------------------------------------------------------------"
+
+T2539_TOKEN_FN=$(sed -n '/^_rescue_cause_token() {$/,/^}$/p' "$DISPATCH_LIB")
+T2539_RESOLVER_FN=$(sed -n '/^_resolve_halt_subtype() {$/,/^}$/p' "$DISPATCH_LIB")
+
+# S3 (anti-vacuité) — AVANT tout le reste. Un scan qui regarde une fonction
+# disparue ou vide se lit exactement comme un arbre propre (classe mika#2205),
+# et les scans S1/S2 ci-dessous seraient vacuement verts sur une chaîne vide.
+assert_eq "S3 (anti-vacuité): _rescue_cause_token existe et son corps est non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_TOKEN_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "S3 (anti-vacuité): _resolve_halt_subtype existe et son corps est non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_RESOLVER_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# S1 — la délégation, mesurée. Sans cet appel, le jeton porte une table à soi.
+assert_contains "S1: _rescue_cause_token consulte _halt_family" \
+    "_halt_family" "$T2539_TOKEN_FN"
+assert_contains "S1: et il en tire la famille (premier champ de la ligne)" \
+    '%%|*' "$T2539_TOKEN_FN"
+
+# S2 — aucun nom de sous-type amont dans le corps. C'est R-3 rendu exécutable :
+# la seule forme que prendrait une seconde table.
+#
+# La population des sous-types interdits est DÉRIVÉE de `_halt_family` elle-même,
+# jamais recopiée ici. Une liste en dur aurait exactement le défaut qu'elle
+# prétend interdire : elle cesserait de couvrir le prochain sous-type ajouté à la
+# table, donc le scan rétrécirait en silence pendant que l'arbre reste vert.
+T2539_SUBTYPES=$(sed -n '/^_halt_family() {$/,/^}$/p' "$DISPATCH_LIB" \
+    | grep -oE '^        [a-z][a-z0-9_]*\)' | tr -d ' )' || true)
+# Anti-vacuité de la dérivation : la table en compte onze aujourd'hui. Si
+# l'extraction en rend une poignée, l'ancre `case` ne matche plus et S2 ne
+# regarde plus rien.
+assert_eq "S2 (anti-vacuité): la population de sous-types est dérivée de la table" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2539_SUBTYPES" | grep -c .)" -ge 11 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Une entrée = un site qui énumère un sous-type de halte hors de _halt_family,
+# au format `<sous-type>|<raison + ticket de suivi>`. LIVRÉE VIDE : les deux
+# fonctions scannées sont créées par mika#2539, donc aucune violation
+# préexistante ne peut exister.
+#
+# QUAND CE SCAN TIRE, LA RÉSOLUTION EST DE ROUTER LE SITE VERS _halt_family —
+# JAMAIS d'ajouter une ligne ici (doctrine mika#2201). Un site qu'on ne veut pas
+# router est un site à supprimer.
+RESCUE_CAUSE_SUBTYPE_ALLOWED=()
+
+T2539_LEAKED=""
+for _t2539_st in $T2539_SUBTYPES; do
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" || continue
+    _t2539_excused=no
+    for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
+        [ "${_t2539_entry%%|*}" = "$_t2539_st" ] && _t2539_excused=yes && break
+    done
+    [ "$_t2539_excused" = "yes" ] || T2539_LEAKED="${T2539_LEAKED}${_t2539_st} "
+done
+assert_eq "S2: aucun sous-type amont énuméré dans _rescue_cause_token" "" \
+    "$(printf '%s' "$T2539_LEAKED" | sed 's/ *$//')"
+
+# Le double sens — l'assertion auto-nettoyante. Une entrée qui ne matche plus
+# rien fait rougir le build le jour de la réparation, pas des mois après.
+T2539_STALE=""
+for _t2539_entry in ${RESCUE_CAUSE_SUBTYPE_ALLOWED+"${RESCUE_CAUSE_SUBTYPE_ALLOWED[@]}"}; do
+    _t2539_st="${_t2539_entry%%|*}"
+    grep -qF -- "$_t2539_st" <<<"$T2539_TOKEN_FN" \
+        || T2539_STALE="${T2539_STALE}${_t2539_st} "
+done
+assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
+    "$(printf '%s' "$T2539_STALE" | sed 's/ *$//')"
+
+# S4 — un seul résolveur. Un troisième site qui résoudrait le sous-type à la
+# main rouvrirait la divergence que `_resolve_halt_subtype` existe pour fermer :
+# la bannière du callback dirait `Halt class: session_silent` pendant que le
+# commit dirait `rescue no_halt_signal`, pour une même session, l'un des deux
+# gravé dans l'historique git pour toujours.
+#
+# Le compte est fait hors définition et hors commentaire — seuls les appels.
+T2539_RESOLVER_CALLS=$(grep -n '_resolve_halt_subtype' "$DISPATCH_LIB" \
+    | grep -v '_resolve_halt_subtype() {' \
+    | grep -vE ':[[:space:]]*#' | grep -c . || true)
+assert_eq "S4: _resolve_halt_subtype a exactement deux appelants de production" "2" \
+    "$T2539_RESOLVER_CALLS"
+assert_contains "S4: l'un est la bannière du callback" \
+    '_resolve_halt_subtype' "$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")"
+assert_contains "S4: l'autre est le compositeur du sujet de sauvetage" \
+    '_resolve_halt_subtype' "$T2539_TOKEN_FN"
+
+# Le mémo est réinitialisé au site qui lit le sous-type d'une NOUVELLE session,
+# et pas chez l'un des deux appelants : « une session, une réponse » est ainsi
+# une propriété de la construction et non de la mémoire du prochain éditeur.
+assert_eq "S4: le mémo est réinitialisé exactement une fois, au site de SUBTYPE" "1" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$DISPATCH_LIB")"
+
+# S5 — dispatch-lib parse toujours.
+T2539_RC=0
+bash -n "$DISPATCH_LIB" 2>/dev/null || T2539_RC=$?
+assert_eq "S5: dispatch-lib.sh passe bash -n" "0" "$T2539_RC"
+
+# --- Herméticité de cette section (patron mika#2178 T9 / mika#2493) ---------
+T2539_SECTION=$(sed -n '/^# mika#2539 — le jeton de cause DÉRIVE de _halt_family/,$p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2539 a trouvé la section" \
+    "yes" "$(if [ -n "$T2539_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2539_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
 
 # --- Summary ---
 

@@ -773,7 +773,7 @@ async fn handle_pass_verdict(
 // ---------------------------------------------------------------------------
 
 /// Result of an engine-side dispatch attempt from the verdict handler.
-enum EngineDispatchResult {
+pub(crate) enum EngineDispatchResult {
     /// Subprocess spawned; return Dispatched to the LLM.
     Spawned { callback_task_id: String },
     /// Slot busy; deferred callback registered engine-side.
@@ -784,11 +784,10 @@ enum EngineDispatchResult {
 
 /// Attempt engine-side dispatch following the ready-label handler pattern (mika#1572).
 ///
-/// Eliminates the LLM-dependency gap for block[ac]/block[ci] verdicts:
-/// 1. Resolves the dispatch tool from SkillRegistry
-/// 2. Validates dispatch readiness
-/// 3. On slot-busy (`global_dispatch_active`), registers a deferred callback
-/// 4. On other failures, falls back to LLM-mediated dispatch
+/// Thin adapter over [`try_engine_dispatch_for`]: it reads the only two fields of
+/// `PrReviewEvent` the dispatch ever needed (`repo`, `pr_number`) and forwards
+/// them. **The two verdict callers see a zero diff** (mika#2506 R8) — which is
+/// what bounds the blast radius of touching a function two live handlers share.
 #[allow(clippy::too_many_arguments)]
 async fn try_engine_dispatch(
     db: &AsyncDatabase,
@@ -801,6 +800,69 @@ async fn try_engine_dispatch(
     iteration_context: &str,
     session_id: &str,
     trace_id: &str,
+) -> EngineDispatchResult {
+    try_engine_dispatch_for(
+        db,
+        skills,
+        task_id,
+        github_token,
+        &event.repo,
+        event.pr_number,
+        target_skill,
+        target_tool,
+        iteration_context,
+        session_id,
+        trace_id,
+        None,
+    )
+    .await
+}
+
+/// The **single site** that composes a deterministic engine-side pilot dispatch
+/// (mika#1630, generalized by mika#2506 U1).
+///
+/// # Why `(repo, number)` rather than `&PrReviewEvent`
+///
+/// The body only ever read `event.repo` and `event.pr_number` — plus the same two
+/// for its log line. mika#2506 needed a **third** caller whose trigger is not a PR
+/// review at all (an operator typing `mika iterate <repo>#<N>`), and there was no
+/// `PrReviewEvent` to invent for it. Fabricating one would have meant filling
+/// `reviewer`, `review_state` and a review body with plausible values nobody
+/// posted — a struct asserting a review that never happened, which is the class of
+/// false green mika#2304 had to name one field over.
+///
+/// # What the number means, and it is NOT always a PR number
+///
+/// `dispatch-lib.sh` consumes `prompt: "<repo>#<N>"` as an **issue** number:
+/// `gh issue view "$ISSUE_NUM"` then `derive-branch-name --issue "$ISSUE_NUM"
+/// --body-callout "$ISSUE_BODY"`. The two verdict callers pass `event.pr_number`
+/// there, which is a pre-existing observation carried by mika#2506 § 3 as an
+/// **observation with its own follow-up**, never asserted as a defect and
+/// deliberately not changed here: establishing what `gh issue view <pr-number>`
+/// returns needs an authenticated `gh`, which the dispatch sandbox does not have.
+/// The mika#2506 caller passes an **issue** number, which is what its own
+/// verification (V5) pins.
+///
+/// # `log_event` names the caller, so three populations stay countable apart
+///
+/// `None` keeps the historical `verdict_engine_dispatched` name for the two
+/// verdict callers — a caller that renamed it would merge its population into
+/// theirs, and the operator queries published for mika#1630 would start counting
+/// a third thing without saying so.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn try_engine_dispatch_for(
+    db: &AsyncDatabase,
+    skills: &SkillRegistry,
+    task_id: &str,
+    github_token: Option<&str>,
+    repo: &str,
+    number: u64,
+    target_skill: &str,
+    target_tool: &str,
+    iteration_context: &str,
+    session_id: &str,
+    trace_id: &str,
+    log_event: Option<&'static str>,
 ) -> EngineDispatchResult {
     use crate::skills::manifest::ToolHandler;
 
@@ -829,12 +891,12 @@ async fn try_engine_dispatch(
         }
     };
 
-    // 3. Build dispatch input. `prompt` uses bare `<repo>#<pr_number>` form
+    // 3. Build dispatch input. `prompt` uses bare `<repo>#<number>` form
     //    (not owner-qualified — dispatch-lib only accepts bare form, per mika#1593).
-    let repo_name = event.repo.rsplit('/').next().unwrap_or(&event.repo);
+    let repo_name = repo.rsplit('/').next().unwrap_or(repo);
     let dispatch_input = serde_json::json!({
         "skill": target_skill,
-        "prompt": format!("{repo_name}#{}", event.pr_number),
+        "prompt": format!("{repo_name}#{number}"),
         "task_id": task_id,
         "iteration_context": iteration_context,
     });
@@ -960,14 +1022,14 @@ async fn try_engine_dispatch(
     );
 
     info!(
-        event = "verdict_engine_dispatched",
-        repo = %event.repo,
-        pr_number = event.pr_number,
+        event = log_event.unwrap_or("verdict_engine_dispatched"),
+        repo = %repo,
+        pr_number = number,
         target_tool,
         target_skill,
         task_id = %task_id,
         callback_task_id = %callback_task_id,
-        "verdict handler: engine-side dispatch spawned"
+        "engine-side dispatch spawned"
     );
 
     EngineDispatchResult::Spawned { callback_task_id }

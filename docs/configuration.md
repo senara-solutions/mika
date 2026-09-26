@@ -526,6 +526,10 @@ emoji = "✦"
 # [context.summary]
 # inject = true                     # default: true — set false to disable summary injection entirely (Axis 4)
 # max_tokens = 1000                 # optional — cap summary to ~1000 tokens on silent-mode turns (Axis 3)
+
+# [context.history]
+# scope = "agent"                   # default: "agent" — "session" narrows the window to the turn's own session
+# max_tokens = 8000                 # optional — token ceiling on the conversation history
 ```
 
 | Field | Description |
@@ -537,6 +541,15 @@ emoji = "✦"
 | `[kg].docs_roots` | Array of absolute paths for multi-corpus agents (#798). Overrides `docs_root` (singular) and `MIKA_KG_DOCS_ROOTS` when set. Each path is validated independently; missing paths are warned and skipped. |
 | `[context.summary].inject` | Whether to load and inject the conversational summary into the system prompt. Default: `true`. Set `false` for agents where summary leakage is a known problem (#1019). |
 | `[context.summary].max_tokens` | Optional token cap applied to the summary on silent-mode turns (callback, webhook, heartbeat). `0` = omit summary on silent turns; `n > 0` = truncate to ~n tokens (4 chars/token heuristic). Non-silent turns are never affected. Default: none (#1021). |
+| `[context.history].scope` | Which rows the conversation window may draw from: `"agent"` (every session of this agent — the default, and the pre-mika#2295 behaviour) or `"session"` (the turn's own session only). Declares the **role floor**; a tenant may narrow it, never widen it (mika#2425). |
+| `[context.history].max_tokens` | Optional token ceiling on the conversation history (mika#2295). `0` is the omission sentinel — the history is dropped entirely, the turn's own user message is kept. A malformed value falls back to "no ceiling" rather than emptying the window. |
+
+**`[context.history]` is a floor, not a value.** For the four well-known agents
+this section is code-owned (`CODE_OWNED_IDENTITY_SECTIONS`) and re-applied at
+every mika-spirit startup, so a hand edit there is overwritten — deliberately, so
+the loss is legible (mika#2330). Only `mika-arch` ships a non-default
+(`session` / `8000`). To narrow the window **for one tenant**, do not edit this
+section: use the two `customer_config` keys below.
 
 **`[kg]` behavior:** When `enabled = false`, no KG subsystem components are constructed for the agent. Existing shared-corpus rows are preserved (cleanup via `mika kg purge`). When `docs_root` is set to an explicit path that doesn't exist, the agent fails to start with a clear error. Agents with matching `docs_root` share extraction via `docs_root_hash` (v27 schema).
 
@@ -570,6 +583,74 @@ To customize, edit `~/.mika/identity.toml`:
 name = "Jarvis"
 emoji = ">"
 ```
+
+---
+
+## Per-tenant conversation window (mika#2425)
+
+Two `customer_config` keys narrow the conversation window **for one agent**,
+without touching `identity.toml` and without a restart.
+
+```bash
+mika config set context_history_scope session --agent <tenant>   # narrow
+mika config set context_history_scope agent   --agent <tenant>   # cancel
+mika config set context_history_max_tokens 4000 --agent <tenant>
+mika config set context_history_max_tokens none --agent <tenant> # cancel
+```
+
+| Key | Values | Neutral |
+|-----|--------|---------|
+| `context_history_scope` | `agent` \| `session` | `agent` |
+| `context_history_max_tokens` | `none` \| integer ≥ 500 | `none` |
+
+**The cascade can only narrow.** The identity declares a role floor; these keys
+make the window smaller and never larger. `session` always wins over `agent`;
+the effective ceiling is the smaller of the two, with "no ceiling" counting as
+infinity. A database value asking for a wider window is refused and logged
+(`context_history_widening_refused`) — the remedy for a bound that is genuinely
+wrong is to edit the role's `[context.history]` in the repository, because the
+code declares that bound as a property of the role.
+
+That asymmetry is what makes cancellation safe: `delete_customer_config` does
+not exist, so **posing the neutral is how you cancel**. It takes effect on the
+next turn — the identity and this table are re-read on every turn — so no
+restart is needed, and no reconciler ever overwrites the value.
+
+`0` is refused for `context_history_max_tokens`, and the floor is 500. `Some(0)`
+is the omission sentinel that empties the history entirely; that is a role
+decision carried by `identity.toml`, and a `0` typed by mistake would be a
+context wipe wearing a configuration's clothes.
+
+Neither key is reachable by the model: they are absent from
+`SETTABLE_CONFIG_KEYS`, which is the `set_config` tool surface.
+
+### Before narrowing a Telegram tenant, measure
+
+`scope = session` removes 86–99 % of the window on an agent whose sessions carry
+several messages (CLI `mika chat`, A2A with a stable `--session-id`, singleton
+agents). On an agent that mints a fresh session per inbound message — which is
+every agent without `[session] singleton = true`, including the default and
+family identities — **a "session" is a message**, so `session` does not trim the
+window, it empties it. `mika config set` prints a warning naming that
+consequence, and refuses nothing.
+
+The probe, on 24 h of real traffic:
+
+```bash
+grep context_window_assembled "$MIKA_SPIRIT_LOG_FILE" \
+  | jq 'select(.agent_id == "<tenant>") | {message_count, distinct_sessions}'
+```
+
+If both read `1` on nearly every line, that tenant has nothing to trim. What the
+resolved bounds and their provenance are, for any agent:
+
+```bash
+grep context_history_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{agent_id, scope, scope_source, max_tokens, max_tokens_source, session_minting}'
+```
+
+`session_minting` is `singleton` or `per_message` — the field that says which of
+the two populations above this agent belongs to, without reading the code.
 
 ---
 

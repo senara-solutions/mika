@@ -487,6 +487,28 @@ Zk4PUTq3pSCC2sQY5Ay2b2iPez8d660jFuWT02+0sQdFmGwnFC9IxdEUPZXxeRr6\n\
 omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
 -----END RSA PRIVATE KEY-----";
 
+    /// RSA public key matching [`TEST_RSA_PEM`] above (SPKI PEM, as
+    /// `openssl rsa -pubout` emits it).
+    ///
+    /// Derived once from the private constant **of this module** — not from its
+    /// homonym inside `new_with_test_token` (`:179`), which is a distinct scope.
+    /// A mismatch surfaces immediately as `ErrorKind::InvalidSignature` in
+    /// `mika2525_le_jwt_produit_porte_une_signature_rs256_verifiable`.
+    ///
+    /// The name deliberately contains the substring `TEST_RSA_PEM` so that
+    /// `scripts/check-secrets.sh` keeps filtering it if its `SECRET_REGEX` is
+    /// ever hardened to cover `-----BEGIN PUBLIC KEY` (it does not today, and a
+    /// public key is not a secret — see mika#2525 §9).
+    const TEST_RSA_PEM_PUBLIC: &str = "-----BEGIN PUBLIC KEY-----\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqmNXtQx4L3Eko0G+ky5u\n\
+03BpRRwLfQ1+zuRzUxtDIAb2LFcf2PCCusvna5qAuXfCttcsTTFt0+x3vqI3wkO7\n\
+pZ7MQatBcuQSFL3eSDhqNNLZ8zh6evsuCwgdhn+etApM8PtEpwcps/pjlLsIb9iy\n\
+B7jcYBQsr0lGRrXVdsGPQXF0yGkrVd3zH11tqLOWdDGXlpZTZkwwow7ojVID5POW\n\
+Hkp1WkY6xYCq6qYA1Gt9VfQNCzE8WKjsd0phBgN1W4le0Q30UFiaFDErbW1uqrsQ\n\
+Shz0Wv9bHbUpVOyTotGdXOBWg0CPrJ5IBmt8KF73HLaK0zOwIe9qwlCLMszH4d+T\n\
+aQIDAQAB\n\
+-----END PUBLIC KEY-----";
+
     fn test_key_base64() -> String {
         base64::engine::general_purpose::STANDARD.encode(TEST_RSA_PEM.as_bytes())
     }
@@ -606,6 +628,54 @@ omInFBLWVyWK89xoc49UvUcyRcbL3iWqa+zAv7eOC5TZyy1SVJtPVw==\n\
             diff < 5,
             "iat should be ~60s before current time, diff={diff}"
         );
+    }
+
+    /// mika#2525 — the JWT carries a signature the matching public key verifies.
+    ///
+    /// Why this exists next to `test_generate_jwt_claims`: that test base64-decodes
+    /// the **payload** and never touches the signature, so once a crypto backend is
+    /// declared it goes green while saying nothing about whether the provider signs
+    /// *correctly*. It attests that a provider exists; this one attests that it
+    /// signs. AC3's testable half.
+    ///
+    /// It also exercises the provider's **verification** path (`verifier_factory`),
+    /// which the signing path alone never reaches — so a feature declaration that
+    /// could sign without being able to verify is caught here too.
+    #[test]
+    fn mika2525_le_jwt_produit_porte_une_signature_rs256_verifiable() {
+        /// Local mirror of the private `JwtClaims`, which derives `Serialize`
+        /// only. Deliberately not adding `Deserialize` to the production type for
+        /// a test's sake — the real entry point (`generate_jwt`) already drives
+        /// the behaviour under test.
+        #[derive(Deserialize)]
+        struct DecodedJwtClaims {
+            iat: u64,
+            exp: u64,
+            iss: String,
+        }
+
+        let signing_key = EncodingKey::from_rsa_pem(TEST_RSA_PEM.as_bytes()).unwrap();
+        let app = GitHubApp::new(12345, signing_key, 67890);
+
+        let jwt = app.generate_jwt().unwrap();
+
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(TEST_RSA_PEM_PUBLIC.as_bytes())
+            .expect("TEST_RSA_PEM_PUBLIC is a valid SPKI public key");
+
+        // `Validation::new` already requires and validates `exp`; the token carries
+        // `exp = iat + 540` with `iat` backdated 60s, so it is valid at test time
+        // without a simulated clock.
+        let validation = jsonwebtoken::Validation::new(Algorithm::RS256);
+
+        let decoded = jsonwebtoken::decode::<DecodedJwtClaims>(&jwt, &decoding_key, &validation)
+            .expect("the JWT must carry an RS256 signature the test public key verifies");
+
+        assert_eq!(decoded.claims.iss, "12345");
+        assert_eq!(
+            decoded.claims.exp - decoded.claims.iat,
+            JWT_LIFETIME.as_secs()
+        );
+        assert_eq!(decoded.header.alg, Algorithm::RS256);
     }
 
     #[test]

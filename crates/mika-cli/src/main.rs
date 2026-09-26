@@ -424,6 +424,9 @@ async fn main() -> Result<()> {
         Some(Commands::Webhook(args)) => commands::webhook::run(args.command, &args.format).await,
         Some(Commands::Kg(args)) => commands::kg::run(args).await,
         Some(Commands::Milestone(args)) => commands::milestone::run(args.command).await,
+        // mika#2506 — geste déterministe d'itération. Thin client : POST sur
+        // mika-spirit, aucune dérivation locale.
+        Some(Commands::Iterate(args)) => commands::iterate::run(args).await,
         Some(Commands::Logs(ref args)) => {
             let ah = agent_home
                 .ok_or_else(|| anyhow::anyhow!("Could not resolve agent home directory"))?;

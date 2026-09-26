@@ -205,3 +205,127 @@ fn prompt_requires_the_guard_output_to_be_quoted_verbatim() {
          quoted verbatim (mika#2172 AC6)."
     );
 }
+
+// ---------------------------------------------------------------------------
+// mika#2519 — Step 1.6's two corrections, and the anti-vacuity term that keeps
+// these scans from reading a disappeared section as a clean tree.
+// ---------------------------------------------------------------------------
+
+/// Every scan below aims at Step 1.6. A scan that aims at a section which no
+/// longer exists reads **exactly** like a scan on a clean tree (mika#2103 /
+/// mika#2205), so each one calls this first.
+fn assert_step_1_6_exists(prompt: &str) {
+    assert!(
+        prompt.contains("**Step 1.6 — Dependabot dependency-PR path"),
+        "qa-review/system_prompt.md no longer carries Step 1.6 at all.\n\
+         Every mika#2519 scan in this file targets that section; with the \
+         section gone they would all pass while asserting nothing. Establish \
+         where the Dependabot path lives now BEFORE touching these tests."
+    );
+}
+
+/// `author` is an **object**, and Step 1.6 used to compare it to a string.
+///
+/// `qa_pr_view` exposes `author` in its `SAFE_FIELDS`, and
+/// `gh pr view --json author` renders
+/// `{"id":…,"is_bot":true,"login":"app/dependabot","name":""}`. Step 1.6 read
+/// *"If `author == \"dependabot[bot]\"`"* — an object↔string comparison **on the
+/// single discriminant of the whole Dependabot path**. A model that took it
+/// literally never entered the dep-review flow, and the failure is silent: the
+/// PR simply goes down the plan-AC path it has no plan for.
+#[test]
+fn mika2519_step_1_6_reads_the_author_login_and_not_the_author_object() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        prompt.contains("`author.login`"),
+        "qa-review/system_prompt.md Step 1.6 no longer names `author.login` \
+         (mika#2519).\n\
+         `author` is an OBJECT — comparing it to a string never matches, so the \
+         whole Dependabot path goes unreachable while every test stays green."
+    );
+
+    // Both renderings must stay named: `gh` gives one or the other depending on
+    // the surface, and `AUTOMATED_PR_AUTHORS` carries both for that reason.
+    for login in ["dependabot[bot]", "app/dependabot"] {
+        assert!(
+            prompt.contains(login),
+            "qa-review/system_prompt.md Step 1.6 no longer names `{login}`.\n\
+             `gh` renders the bot identity either way; dropping one makes the \
+             prompt disagree with `evidence::guards::AUTOMATED_PR_AUTHORS` and \
+             with `scripts/verify-pipeline.sh`."
+        );
+    }
+}
+
+/// Step 1.6 names the major-version jump as a discriminant, and names the line
+/// the engine reads.
+///
+/// **The half that holds is the engine guard, not this clause** — per
+/// `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, and
+/// writing it the other way round would reproduce the very defect mika#2519
+/// closes. What this scan protects is the *intent* half: without it a model told
+/// by the engine to emit `API-SURFACE:` has never been told why, nor what to
+/// read before asserting it.
+#[test]
+fn mika2519_step_1_6_names_the_major_jump_and_the_api_surface_line() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        prompt.contains("API-SURFACE:"),
+        "qa-review/system_prompt.md Step 1.6 no longer names the `API-SURFACE:` \
+         line (mika#2519).\n\
+         That line is what the engine reads to let a `pass` through on a major \
+         bump (`evidence::guards::body_asserts_api_surface`). Without the \
+         prompt half the model is refused a verdict it was never told how to \
+         ground — and the canonical-token row for it goes stale."
+    );
+
+    assert!(
+        prompt.contains("first numeric segment"),
+        "qa-review/system_prompt.md Step 1.6 no longer defines the major-jump \
+         discriminant as the FIRST NUMERIC SEGMENT (mika#2519).\n\
+         The engine's `classify_version_bump` uses exactly that rule, and \
+         deliberately does NOT apply semver's `0.x` convention: a looser prompt \
+         would ask the model to block `0.22 -> 0.23`, i.e. four of the five \
+         measured witness PRs."
+    );
+
+    // The measured counter-example has to stay in the prompt: it is the whole
+    // reason a green build is not the gate on this class (mika#2525).
+    assert!(
+        prompt.contains("jsonwebtoken"),
+        "qa-review/system_prompt.md Step 1.6 no longer cites the measured case \
+         (`jsonwebtoken 9.3.1 -> 11.1.0`, mika#2454 / mika#2525: build green, \
+         `generate_jwt` panicking).\n\
+         Without it the clause reads as a precaution rather than as a \
+         measurement, and a model weighing it against a green build has no \
+         reason to prefer the clause."
+    );
+}
+
+/// The exemption is not written a third time — U5.
+///
+/// The plan exemption for dependency PRs exists at two places already
+/// (`scripts/verify-pipeline.sh` mechanism 4, and Step 1.6's skip of Steps 2 /
+/// 2.5). mika#2172 closed, on this very prompt, the class where a rule posted at
+/// a third place drifts from the other two. So Step 1.6 must keep **pointing
+/// at** the skip it already prescribes, and must not grow a second vocabulary
+/// for it.
+#[test]
+fn mika2519_step_1_6_still_delegates_the_plan_exemption_it_already_had() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        prompt.contains("Skip Step 2 pipeline checks and Step 2.5 plan-AC verification"),
+        "qa-review/system_prompt.md Step 1.6 no longer carries its own plan \
+         exemption (mika#1729).\n\
+         mika#2519 relies on that skip being the ONE prompt-side exemption: it \
+         adds the engine half that holds it, and deliberately writes no third \
+         copy (U5). If the skip moved, the engine's refusal body — which names \
+         Step 1.6 by name — now points at nothing."
+    );
+}

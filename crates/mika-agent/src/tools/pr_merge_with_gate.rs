@@ -735,6 +735,23 @@ pub(crate) async fn run_gh_checks(
     repo: &str,
     token: &str,
 ) -> Result<Vec<GhCheck>, String> {
+    parse_gh_checks(&run_gh_checks_raw(pr_number, repo, token).await?)
+}
+
+/// The network half of [`run_gh_checks`]: raw stdout of
+/// `gh pr checks <n> --repo <r> --required --json name,state,bucket,link`.
+///
+/// Split out by mika#2455 so its guard can substitute the subprocess in a test
+/// while keeping the production parser and classifier on the path. The
+/// `--required` flag is what makes this the single reader of "which check
+/// blocks" (D6): `statusCheckRollup`, which the ticket's letter suggested,
+/// returns every check — required or not — and would refuse a `pass` over a red
+/// optional check.
+pub(crate) async fn run_gh_checks_raw(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+) -> Result<String, String> {
     let pr_str = pr_number.to_string();
     let args = vec![
         "pr",
@@ -747,16 +764,39 @@ pub(crate) async fn run_gh_checks(
         "name,state,bucket,link",
     ];
 
-    let output = run_gh_subprocess(&args, token).await?;
+    run_gh_subprocess(&args, token).await
+}
 
-    // Empty output or "[]" means no required checks
+/// Prefix of the error [`parse_gh_checks`] returns when `gh` answered but its
+/// output is not exploitable JSON.
+///
+/// **Wire format, and mika#2455 is why it is a named constant.** That guard
+/// must tell `gh_failed` (the call did not go through) from `unparseable`
+/// (it did, and said something we cannot read) — two different remedies —
+/// and `run_gh_checks` flattens both into a `String`. Matching a literal at
+/// the reading site would be the substring-on-a-rendered-message the house
+/// forbids (mika#2179); sharing the constant makes the discrimination a
+/// contract between two sites rather than a coincidence. Pinned by
+/// `mika2455_the_parse_error_prefix_is_a_wire_format`.
+pub(crate) const GH_CHECKS_PARSE_ERROR_PREFIX: &str = "Failed to parse gh pr checks output";
+
+/// Parse the stdout of `gh pr checks --json name,state,bucket,link`.
+///
+/// Extracted from [`run_gh_checks`] by mika#2455 so the network half can be
+/// substituted in a test while the parsing stays the production one — a second
+/// parser written for the test would attest the test's parser, not this one.
+///
+/// Empty output or `[]` means **no required check**, which `classify_checks`
+/// then reads as `AllPassed` — a deliberate pre-existing semantics, carried
+/// here unchanged.
+pub(crate) fn parse_gh_checks(output: &str) -> Result<Vec<GhCheck>, String> {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "[]" {
         return Ok(vec![]);
     }
 
     serde_json::from_str::<Vec<GhCheck>>(trimmed)
-        .map_err(|e| format!("Failed to parse gh pr checks output: {e}"))
+        .map_err(|e| format!("{GH_CHECKS_PARSE_ERROR_PREFIX}: {e}"))
 }
 
 // ---------------------------------------------------------------------------

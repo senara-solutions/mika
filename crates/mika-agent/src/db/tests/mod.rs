@@ -124,6 +124,161 @@ fn dispatch_stamp_violations(path: &std::path::Path, src: &str) -> Vec<String> {
     violations
 }
 
+/// Registre des écrivains légitimes de `fired_at` en littéral (mika#2133 AC4).
+///
+/// **C'est une déclaration, pas une exemption** — la distinction que mika#2201 a
+/// dû écrire pour le lint de jetons canoniques (« on déclare, on n'allowliste
+/// pas »). Aucune entrée ne masque un défaut à réparer : chacune nomme un
+/// écrivain dont l'existence est une décision, avec sa raison lisible ici.
+///
+/// Les sites qui **interpolent** [`crate::db::tasks::FIRED_AT_STAMP_IF_NULL`]
+/// n'ont pas d'entrée : ils ne portent plus d'écriture littérale, et c'est
+/// exactement la propriété que la garde mesure.
+const FIRED_AT_LITERAL_WRITERS: &[(&str, &str, &str)] = &[
+    (
+        "db/tasks.rs",
+        "FIRED_AT_STAMP_IF_NULL",
+        "l'unique définition textuelle de l'acte (mika#2133 D5)",
+    ),
+    (
+        "db/tasks.rs",
+        "claim_and_fire_task",
+        "écrasement voulu — l'estampille d'une récurrente dit « dernier tir », \
+         pas « premier tir » ; uniformiser vers NULL-only la figerait sur son \
+         tir inaugural et casserait la seule population qui fonctionnait avant \
+         mika#2133 (56/64). Décision D4.",
+    ),
+    (
+        "db/tasks.rs",
+        "try_complete_parent_on_sibling_done",
+        "réclamation de tir, même famille que `claim_and_fire_task` : la \
+         transition `pending → in_progress` EST le tir, et sa garde SQL \
+         (`AND status = 'pending'`) borne l'écrasement. Recensé par le corps de \
+         mika#2133 (« une seconde forme paramétrée ») et non repris par son \
+         plan ; déclaré plutôt que migré, la sémantique de D4 s'appliquant \
+         telle quelle.",
+    ),
+];
+
+/// Nom de l'item Rust englobant l'octet `at` de `code`, ou `None`.
+///
+/// Remonte jusqu'à la première ligne dont le contenu ouvre un `fn`, un `const`
+/// ou un `static`. La **portion de la ligne courante qui précède `at`** est
+/// incluse, ce qui est ce qu'il faut pour une constante dont la valeur est sur sa
+/// propre ligne de déclaration : `…const FIRED_AT_STAMP_IF_NULL: &str = "` est
+/// bien ce qui précède l'occurrence.
+///
+/// `at` vient toujours d'un `str::find`, donc c'est une frontière de caractère :
+/// la coupe exclusive `..at` ne peut pas tomber au milieu d'un point de code.
+fn enclosing_item_name(code: &str, at: usize) -> Option<String> {
+    for line in code[..at].lines().rev() {
+        let t = line.trim_start();
+        let rest = ["fn ", "const ", "static "].iter().find_map(|kw| {
+            // Le mot-clé doit ouvrir l'item : `pub`, `pub(crate)`, `async`…
+            // peuvent le précéder, mais rien d'autre.
+            let idx = t.find(*kw)?;
+            let before = &t[..idx];
+            let opens = before.is_empty()
+                || before
+                    .split_whitespace()
+                    .all(|w| w.starts_with("pub") || w == "async" || w == "unsafe");
+            opens.then(|| &t[idx + kw.len()..])
+        });
+        if let Some(rest) = rest {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// Toutes les écritures littérales de `fired_at` dans la moitié production de
+/// `src`, rendues `(chemin relatif à src/, item englobant, ligne)` —
+/// **déclarées au registre ou non**.
+///
+/// Les deux sens de la garde lisent cette même liste : le premier en retire les
+/// sites déclarés (ce qui reste est une violation), le second vérifie que chaque
+/// entrée du registre y figure (sinon elle est morte). Les faire lire la même
+/// liste est ce qui rend l'assertion auto-nettoyante vraie plutôt que
+/// vraisemblable : un second recensement pourrait répondre « le symbole existe »
+/// quand la question est « le symbole écrit ».
+///
+/// Mêmes deux écartements composés, et dans le même ordre, que
+/// [`dispatch_stamp_violations`] : classification par chemin (mika#2321) puis
+/// masquage des régions de test (mika#2398).
+fn fired_at_literal_sites(path: &std::path::Path, src: &str) -> Vec<(String, String, usize)> {
+    if crate::source_scan::is_test_source_path(path) {
+        return Vec::new();
+    }
+    let production = mika_common::source_guard::mask_test_regions(src);
+
+    // Les lignes de commentaire sont neutralisées (et non supprimées, pour que
+    // les numéros de ligne restent ceux du fichier) : la prose doit pouvoir
+    // décrire ce qui est interdit — y compris la doc de `FIRED_AT_STAMP_IF_NULL`
+    // et celle de `set_task_process_id`, qui nomment la clause. Même idiome que
+    // `dispatch_stamp_violations`.
+    let code: String = production
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Chemin relatif à `src/` : c'est la forme sous laquelle le registre nomme
+    // ses sites, et la seule qui ne dépende pas de l'endroit où le dépôt est
+    // cloné.
+    let display = path.display().to_string();
+    let rel = display
+        .split_once("/src/")
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or(display);
+
+    let needle = "fired_at";
+    let mut sites = Vec::new();
+    let mut from = 0usize;
+    while let Some(offset) = code[from..].find(needle) {
+        let at = from + offset;
+        from = at + needle.len();
+
+        // Seule une ASSIGNATION compte : `fired_at IS NULL`, `fired_at ASC` et
+        // `fired_at <` sont des LECTURES, et une garde qui les refuserait
+        // rendrait le champ illisible pour interdire de l'écrire.
+        let tail = code[from..].trim_start();
+        if !tail.starts_with('=') || tail.starts_with("==") {
+            continue;
+        }
+
+        let item = enclosing_item_name(&code, at).unwrap_or_else(|| "<hors item>".to_string());
+        let line = code[..at].matches('\n').count() + 1;
+        sites.push((rel.clone(), item, line));
+    }
+    sites
+}
+
+/// Les sites de [`fired_at_literal_sites`] qui ne figurent PAS au registre,
+/// rendus `<chemin>:<ligne> (<item>)`.
+fn fired_at_write_violations(path: &std::path::Path, src: &str) -> Vec<String> {
+    fired_at_literal_sites(path, src)
+        .into_iter()
+        .filter(|(rel, item, _)| {
+            !FIRED_AT_LITERAL_WRITERS
+                .iter()
+                .any(|(f, sym, _)| f == rel && sym == item)
+        })
+        .map(|(rel, item, line)| format!("{rel}:{line} ({item})"))
+        .collect()
+}
+
 fn make_task(label: &str) -> NewTask {
     NewTask {
         agent_id: "mika".to_string(),

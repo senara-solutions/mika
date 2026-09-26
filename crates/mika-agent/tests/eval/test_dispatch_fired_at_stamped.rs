@@ -204,6 +204,200 @@ async fn dispatching_never_resurrects_a_parent_cancelled_meanwhile() {
     );
 }
 
+// ── mika#2133 : les deux poches résiduelles, `a2a` et `callback` sans pilote ──
+//
+// Les deux moitiés que mika#2263 et mika#2335 n'ont pas traversées. Mesure du
+// 2026-09-01 : `a2a` 0/542 estampillées, et aucun site de `a2a_db.rs` n'écrivait
+// `fired_at` — littéralement (`grep -c fired_at` rendait 0).
+//
+// Le non-écrasement (R4/D3) et l'asymétrie voulue de `claim_and_fire_task` (D4)
+// sont éprouvés dans `db::tests::dispatch_stamp_and_slots`, où `conn` est
+// visible : ils demandent une estampille ANTIDATÉE, et une égalité prise dans la
+// même seconde mesurerait la résolution de l'horloge plutôt que la clause.
+
+/// Id interne de la ligne `tasks` d'une tâche a2a.
+///
+/// Résolu par le label, que `a2a_create_task` écrit sous la forme déterministe
+/// `A2A task <a2a_task_id>` — plutôt qu'en ajoutant un accesseur à
+/// `AsyncDatabase`, qui serait une surface de production créée pour la commodité
+/// d'un test. Les deux voisins évidents ne conviennent pas : `list_active_tasks`
+/// et `find_active_task_by_label` filtrent tous deux `trigger_type = 'manual'`.
+async fn a2a_internal_task_id(db: &AsyncDatabase, a2a_task_id: &str) -> String {
+    let rows = db
+        .get_tasks_by_status_and_label(
+            vec!["pending".to_string(), "in_progress".to_string()],
+            Some(format!("A2A task {a2a_task_id}")),
+        )
+        .await
+        .expect("query a2a task by label");
+    assert_eq!(
+        rows.len(),
+        1,
+        "le label d'une tâche a2a doit résoudre exactement une ligne — sinon \
+         c'est la fixture qu'il faut corriger, pas l'assertion sur fired_at"
+    );
+    rows[0].id.clone()
+}
+
+/// Une ligne `callback`, la forme exacte d'un wrapper différé : aucun
+/// `process_id`, donc jamais estampillée par `set_task_process_id`.
+async fn seed_callback_row_without_pid(db: &AsyncDatabase, label: &str) -> String {
+    db.create_task(NewTask {
+        agent_id: AGENT_ID.to_string(),
+        team_run_id: None,
+        parent_task_id: None,
+        depth: 0,
+        label: label.to_string(),
+        trigger_type: "callback".to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: "resume_agent".to_string(),
+        action_config: "{}".to_string(),
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: None,
+        metadata: None,
+        r#type: None,
+        dispatch_class: None,
+    })
+    .await
+    .expect("create callback row")
+}
+
+/// T1 (AC1, `a2a`) — INVARIANT : un tour a2a qui démarre porte `fired_at`.
+///
+/// Les deux chemins de production qui posent `working` (`message/send`
+/// synchrone et `run_a2a_stream_turn`) traversent tous deux
+/// `a2a_update_task_state`, donc ce test les couvre par leur point de passage —
+/// et c'est aussi pourquoi le stamp y vit plutôt que chez chaque appelant.
+///
+/// Rouge-avant : sur `c8520787`, `a2a_db.rs` ne contenait pas une seule
+/// occurrence de `fired_at`.
+#[tokio::test]
+async fn an_a2a_turn_that_starts_carries_fired_at() {
+    let db = test_db();
+    db.a2a_create_task("a2a-2133-send", None, None)
+        .await
+        .expect("create a2a task");
+
+    let id = a2a_internal_task_id(&db, "a2a-2133-send").await;
+
+    let before = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(
+        before.status, "pending",
+        "contrôle positif : créée `submitted`"
+    );
+    assert!(
+        before.fired_at.is_none(),
+        "contrôle positif : une tâche a2a naît sans estampille"
+    );
+
+    db.a2a_update_task_state("a2a-2133-send", "working")
+        .await
+        .expect("the turn starts");
+
+    let after = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(after.status, "in_progress", "la transition est conservée");
+    assert!(
+        after.fired_at.is_some(),
+        "INVARIANT VIOLÉ : un tour a2a tourne sous cette ligne et elle se lit \
+         encore « jamais firée » — les 0/542 de la mesure du 2026-09-01"
+    );
+}
+
+/// T2 (AC3, **contrôle négatif obligatoire**, `a2a`) — une tâche créée et jamais
+/// déclenchée garde `fired_at` NULL.
+///
+/// C'est la forme exacte de la branche `returnImmediately` de `message/send` :
+/// elle crée la ligne, la rend en `submitted`, et n'exécute aucun tour — donc ne
+/// traverse pas `a2a_update_task_state`.
+///
+/// **Ce test est vert avant comme après, et c'est son rôle.** Un correctif qui
+/// estampillerait à la création rendrait la colonne pleine et **toujours aussi
+/// muette** : le défaut de mika#2133 déplacé d'un cran, avec les mêmes 3794
+/// lignes et plus aucun moyen de distinguer « en attente » de « en travail ».
+#[tokio::test]
+async fn an_a2a_task_never_fired_keeps_fired_at_null() {
+    let db = test_db();
+    db.a2a_create_task("a2a-2133-return-immediately", None, None)
+        .await
+        .expect("create a2a task");
+
+    let id = a2a_internal_task_id(&db, "a2a-2133-return-immediately").await;
+
+    let row = db.get_task(&id).await.unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert!(
+        row.fired_at.is_none(),
+        "AC3 VIOLÉE : une tâche jamais déclenchée porte une estampille — la \
+         colonne est pleine et ne distingue plus rien"
+    );
+}
+
+/// T3 (AC1, `callback` sans pilote) — INVARIANT : le tour de livraison
+/// estampille, **et ne touche pas au statut**.
+///
+/// La seconde moitié de l'assertion est celle qui tient la décision D6 : elle
+/// rougit si quelqu'un ajoute une transition de statut à cet écrivain. Poser
+/// `in_progress` ici ferait entrer toute la population des pilotes vivants dans
+/// la requête du watchdog #959 — **qui marque la tâche `failed`** — un périmètre
+/// que mika#2272 a borné par écrit.
+#[tokio::test]
+async fn a_callback_delivery_turn_stamps_without_touching_the_status() {
+    let db = test_db();
+    let id = seed_callback_row_without_pid(&db, "long_running:build_mika:deferred").await;
+
+    let before = db.get_task(&id).await.unwrap().unwrap();
+    assert!(
+        before.process_id.is_none(),
+        "contrôle positif : aucun pilote"
+    );
+    assert!(before.fired_at.is_none());
+    let status_before = before.status.clone();
+
+    db.stamp_task_fired_at_if_null(&id)
+        .await
+        .expect("the delivery turn starts");
+
+    let after = db.get_task(&id).await.unwrap().unwrap();
+    assert!(
+        after.fired_at.is_some(),
+        "INVARIANT VIOLÉ : le moteur tient le verrou d'agent sous cette ligne et \
+         elle se lit « jamais firée »"
+    );
+    assert_eq!(
+        after.status, status_before,
+        "D6 VIOLÉE : cet écrivain a changé le statut. Poser `in_progress` sur une \
+         ligne callback fait entrer les pilotes vivants dans le watchdog #959, \
+         qui marque `failed` — c'est un changement de comportement moteur, pas \
+         une observabilité, et c'est un ticket distinct (mika#2272)."
+    );
+}
+
+/// T4 (AC3, **contrôle négatif obligatoire**, `callback`) — une ligne callback
+/// créée et jamais dispatchée garde `fired_at` NULL.
+///
+/// Même rôle que T2 : vert avant comme après, il refuse le correctif qui
+/// estampillerait à la création.
+#[tokio::test]
+async fn a_callback_row_never_dispatched_keeps_fired_at_null() {
+    let db = test_db();
+    let id = seed_callback_row_without_pid(&db, "long_running:run_claude_pilot").await;
+
+    let row = db.get_task(&id).await.unwrap().unwrap();
+    assert!(
+        row.fired_at.is_none(),
+        "AC3 VIOLÉE : créer une tâche l'a estampillée"
+    );
+    assert!(row.process_id.is_none());
+}
+
 /// Un cas par site de dispatch de production (AC4). Assertion **structurelle**
 /// — voir l'en-tête du fichier pour pourquoi cette moitié ne peut pas être
 /// comportementale, et pourquoi elle est celle qui décide du cas fondateur.

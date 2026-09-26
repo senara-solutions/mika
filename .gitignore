@@ -1,5 +1,34 @@
 # Rust
-/target/
+#
+# `**/target/`, not `/target/` (mika#2503). In a Cargo workspace every crate
+# shares the root `target/`, so the anchored form was correct for the build —
+# and it is the artefacts a PILOT leaves behind that it did not cover. PR #2502
+# carried 28 files, 26 of them `.v1probe/target/**` (rlib, `incremental/`,
+# fingerprints) from a scratch probe crate the pilot built at a non-root path;
+# `/target/` never matched it, the mika#1282 rescue's `git add -A` obeyed
+# .gitignore exactly and had been told nothing about that path, and QA blocked
+# the result 7/7 for zero implementation. Same mechanism as #2486 the day before.
+#
+# MEASURED before changing it (2026-09-23): `git ls-files | grep -E '(^|/)target/'`
+# returns ZERO paths across 3694 tracked files, so this rule cannot swallow
+# anything that is tracked — it can only ever match an artefact.
+#
+# THE EFFECT SOUGHT IS ON THE PROBE, not just on the commit, and it is the same
+# mechanism already written below for `/pr-body.md`: `git status --porcelain` —
+# which is what `_rescue_dirty_worktree` interrogates to decide a worktree is
+# dirty — DOES NOT REPORT IGNORED FILES. So a pilot that leaves only build
+# artefacts behind no longer triggers a rescue at all, and `git add -A` is
+# repaired without being touched, along with all five sites that consume
+# RESCUE_EXCLUDE_PATHSPEC.
+#
+# DO NOT express this rule as a git pathspec instead — that is the form the next
+# editor will reach for first, and it is silently destructive. Measured on this
+# repo: `':(glob)!**/src/**'` leaves 0 of 3694 files (it excludes EVERYTHING,
+# which would throw away the pilot's content), and `':!*src/*'` leaves 3203
+# because `*` traverses slashes and so over-matches `docs/target/`, `mytarget/`,
+# `retarget/`. Only .gitignore gives `**/` the "match in all directories"
+# semantics the spec defines and this rule needs.
+**/target/
 **/*.rs.bk
 
 # Environment variables
@@ -59,6 +88,33 @@ lefthook-local.yml
 # failed `gh pr create` that leaves the file behind can no longer trip the
 # mika#1282 wip-rescue recovery it was written to avoid.
 /pr-body.md
+
+# `.tmp-main-check/` — a scratch worktree of `main` a pilot checks out inside
+# its own worktree to compare its work against the base branch. Its `.git` is a
+# FILE pointing at `.git/worktrees/<name>`, so while the worktree is registered
+# the parent git ignores it wholesale and nothing here was needed. The failure
+# is what happens AFTER it is pruned: `git worktree prune` — or the terminal
+# reaper (mika#2420) and the target purge (mika#2497) — drops those metadata,
+# and the directory degrades into an ordinary pile of files. The mika#1282
+# wip-rescue's `git add -A` then swallows it whole, obeying .gitignore exactly
+# and having been told nothing about this path. Measured on PR #2543 (mika#2506):
+# 3733 files, ~972K insertions committed over a 10-file implementation, which is
+# the third occurrence of this class after `.v1probe/target/**` (#2502) and #2486.
+#
+# NOT anchored (`.tmp-main-check/`, never `/.tmp-main-check/`), for the reason
+# written on `**/target/` above: the anchored form is the one the next editor
+# reaches for, and it is exactly what let `.v1probe/target/` through. A pilot
+# that puts its scratch checkout at a non-root path is covered by this form and
+# would not be by the other. Over-matching is not a risk — measured before
+# writing this (2026-09-26): `git ls-files | grep tmp-main-check` returns
+# nothing outside the artefact itself.
+#
+# AND THE EFFECT SOUGHT IS ON THE PROBE, not just on the commit — same mechanism
+# as `/pr-body.md` right above: `git status --porcelain`, which is what
+# `_rescue_dirty_worktree` interrogates to decide a worktree is dirty, DOES NOT
+# REPORT IGNORED FILES. So a pilot that leaves this residue behind no longer
+# triggers a rescue at all, and `git add -A` is repaired without being touched.
+.tmp-main-check/
 
 # CE review-run artifacts (ne jamais committer)
 .ce-review-run/

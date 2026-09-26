@@ -284,6 +284,7 @@ pub struct EvalHarnessBuilder {
     tools: Option<ToolRegistry>,
     skills: Option<SkillRegistry>,
     session_id: Option<String>,
+    agent_id: Option<String>,
     is_onboarding: bool,
     is_callback_turn: bool,
     skip_compaction: bool,
@@ -314,6 +315,7 @@ impl Default for EvalHarnessBuilder {
             tools: None,
             skills: None,
             session_id: None,
+            agent_id: None,
             is_onboarding: false,
             is_callback_turn: false,
             skip_compaction: true, // Default: skip compaction to simplify mock sequences
@@ -360,6 +362,26 @@ impl EvalHarnessBuilder {
     /// Set a custom session ID. Default: UUID.
     pub fn session_id(mut self, id: impl Into<String>) -> Self {
         self.session_id = Some(id.into());
+        self
+    }
+
+    /// Set the agent this harness runs as. Default: `"mika"`.
+    ///
+    /// **This is an isolation lever, not a cosmetic one.** Several production
+    /// surfaces deduplicate or accumulate in *process-global* maps keyed by
+    /// agent — `context_history::report_resolved` (mika#2425) is one — and every
+    /// test in this binary otherwise runs as `mika`. A test that asserts such an
+    /// emission is therefore asserting against a map its siblings write to
+    /// concurrently: it passes or fails on whichever ran first, which is a test
+    /// that goes green in CI and red on a busy machine. Giving the test its own
+    /// agent takes it out of the shared key entirely.
+    ///
+    /// The whole harness follows: the DB handle, the session it creates, and
+    /// therefore `customer_config` (scoped by `agent_id`) and the message
+    /// history. A test that seeds sessions of its own must seed them under this
+    /// same agent, or its window will legitimately be empty.
+    pub fn agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
         self
     }
 
@@ -559,9 +581,21 @@ impl EvalHarnessBuilder {
         let session_id = self
             .session_id
             .unwrap_or_else(|| format!("eval-{}", uuid::Uuid::new_v4()));
+        let custom_agent = self.agent_id.is_some();
+        let agent_id = self.agent_id.unwrap_or_else(|| "mika".to_string());
         let db = Database::open_in_memory()?;
-        db.create_session(&session_id, "mika", "test")?;
-        let async_db = AsyncDatabase::new(db);
+        // `sessions.agent_id` carries a foreign key onto `agents(id)`, and the
+        // migrations seed exactly one row: `mika`. Any other agent must be
+        // registered first or every write of this harness fails on a FK error.
+        // Done only for an explicitly-posed agent, so the default path stays
+        // byte-for-byte what it was — `register_agent` upserts `name`/`home_dir`,
+        // and quietly rewriting the seeded `mika` row would be a change no test
+        // asked for.
+        if custom_agent {
+            db.register_agent(&agent_id, &agent_id, "")?;
+        }
+        db.create_session(&session_id, &agent_id, "test")?;
+        let async_db = AsyncDatabase::new_with_agent(db, &agent_id);
 
         // Build provider — either real or mock
         let (llm, mock_provider): (Arc<dyn LlmProvider>, Option<Arc<MockLlmProvider>>) =

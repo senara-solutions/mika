@@ -726,6 +726,17 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Async wrapper for [`Database::stamp_task_fired_at_if_null`] (mika#2133).
+    ///
+    /// No `TaskEventFrame` emission: the status is untouched, so there is no
+    /// lifecycle transition for a subscriber to observe.
+    pub async fn stamp_task_fired_at_if_null(&self, task_id: &str) -> Result<()> {
+        let a = self.agent_id.clone();
+        let i = task_id.to_owned();
+        self.with_db(move |db| db.stamp_task_fired_at_if_null(&i, &a))
+            .await
+    }
+
     pub async fn list_manual_tasks(
         &self,
         status_filter: Option<&str>,
@@ -1452,6 +1463,27 @@ impl AsyncDatabase {
     ) -> Result<()> {
         let (i, k, v) = (task_id.to_owned(), key.to_owned(), value.to_owned());
         self.with_db(move |db| db.set_task_metadata_field(&i, &k, &v))
+            .await
+    }
+
+    /// Record a long-running handler's non-zero exit and its stderr on the
+    /// row, whatever its status (mika#2532 R1).
+    ///
+    /// See [`crate::db::Database::set_task_handler_failure`] for why this
+    /// carries no status filter and why the stderr is omitted rather than
+    /// stored empty.
+    pub async fn set_task_handler_failure(
+        &self,
+        task_id: &str,
+        exit_display: &str,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        let (i, e, s) = (
+            task_id.to_owned(),
+            exit_display.to_owned(),
+            stderr.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.set_task_handler_failure(&i, &e, s.as_deref()))
             .await
     }
 

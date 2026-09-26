@@ -14,7 +14,7 @@ Before executing any workflow, inspect the user's most recent message for these 
 | `implement <repo> project#<n>` (e.g., `implement mika project#5`) | **Project Workflow** (Step P1–P5, below Milestone Workflow). Do NOT execute the Generic Workflow. |
 | `implement <repo> issue#<n>` — a single issue reference (e.g., `implement mika issue#123`) | **Generic Workflow** below (Steps 1–6). |
 | `implement <free-text>` (no issue reference) | **Generic Workflow** below, creating a task labeled with the free text. |
-| `groom <repo>#<n>` or `groom ticket <repo>#<n>` (e.g., `groom mika#214`) | **Grooming Dispatch** below. Do NOT execute the Generic Workflow. |
+| `groom <repo> issue#<n>`, `groom <repo>#<n>` or `groom ticket <repo>#<n>` (e.g., `groom mika issue#214`, `groom mika#214`) | **Grooming Dispatch** below. Do NOT execute the Generic Workflow — **even when the ticket body already carries a `Plan:` callout**. A body callout is a shape, not proof of grooming; the engine refuses a `dev-pilot` dispatch on this turn anyway (mika#2484). |
 | `[GitHub] PR …` / `[GitHub] PR review …` / `[claude-pilot] …` webhook markers | The corresponding webhook skill has priority; fall through to `Webhook Fallthrough` below only if none matched. |
 
 **Self-check while executing:** if you find yourself in Steps 1–3 of the Generic Workflow but the user's original message contained the word "milestone" or "project", STOP. You're on the wrong branch. Go to the Milestone or Project Workflow section and start from Step M1 / P1.
@@ -84,8 +84,13 @@ The handler derives everything else (branch, worktree, pipeline command).
 - **Loop-substrate issues carry Rule 13** — if the issue names `crates/mika-agent/src/{server,task_engine,tools}/`, compose an `iteration_context` carrying Rule 13's four requirements verbatim. A bare `repo#number` dispatch instructs the pilot to write no negative test.
 - **Wait for the callback** — results arrive via callback when claude-pilot finishes. Do NOT poll.
 - **Do NOT do the work inline** — never read source files, analyze code, or produce implementation plans. That wastes your context window. Always use `run_claude_pilot`.
-- **State-awareness on re-dispatch (engine guard — see `executor.rs` `dispatch_task_has_open_pr`, mika#920):**
-  If `run_claude_pilot` returns `dispatch_task_has_open_pr`, the task already has an open PR. Surface the rejection's `pr_url`, `pr_state`, `latest_qa_verdict`, and `merge_state` to the operator via `send_message` along with the suggested options (iterate with `iteration_context`, wait for blocker to resolve, or skip). Wait for explicit instructions. Do NOT retry without the operator's go-ahead. The engine guard in `validate_dispatch_readiness()` is the authoritative enforcement point; this rule is defense-in-depth.
+- **State-awareness on re-dispatch — the 2-step route this rule used to prescribe is broken (engine guard: `executor.rs` `dispatch_task_has_open_pr`, mika#920; corrected by mika#2506):**
+
+  **The deterministic gesture is `mika iterate <repo>#<N> --context "<what the pilot must do>"`.** It is an *operator* command: it reaches mika-spirit over HTTP, resolves the issue's open PR itself, and enters iteration mode on the **existing** branch — no LLM routing, no fresh dispatch. When asked to iterate on an issue that already carries an open PR, **name this command to the operator**. It is the only route whose behaviour does not depend on your own choice of tool.
+
+  **Never dispatch a bare `repo#number` in order to iterate.** On an issue whose previous task is **terminal** (`completed`/`cancelled`/`failed`/`delivered`), `create_task` dedups against nothing — the active-reference index excludes terminal rows — so the task is fresh with empty metadata. `dispatch_task_has_open_pr` reads the `pr_url` of **that task**, never the open PR of the **issue**, so the guard finds nothing and a **fresh implement** is dispatched over a reviewed PR. This is structural, not intermittent: measured on mika#2503 (task `c4494e32`, cancelled with PR #2504 intact). If you must dispatch yourself rather than hand the operator the command above, iteration mode carrying BOTH `prompt: "<repo>#<N>"` **and** a composed `iteration_context` is the only acceptable form (Rule 4).
+
+  **The guard still fires, in exactly one shape:** a task that is still **active** and already carries a `pr_url`. If `run_claude_pilot` returns `dispatch_task_has_open_pr`, surface the rejection's `pr_url`, `pr_state`, `latest_qa_verdict`, and `merge_state` to the operator via `send_message`, together with the deterministic gesture above. Wait for explicit instructions. Do NOT retry without the operator's go-ahead. The engine guard in `validate_dispatch_readiness()` is the authoritative enforcement point; this rule is defense-in-depth.
 
 #### Metadata extraction (reused across callbacks and close-out)
 
