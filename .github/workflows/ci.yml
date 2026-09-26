@@ -105,6 +105,9 @@ jobs:
       - name: Rescue pipeline-verified producer suite (mika#2354)
         run: make test-rescue-pipeline-verified
 
+      - name: Handler crash-step naming + trap placement (mika#2532)
+        run: make test-handler-crash-step
+
       - name: Pilot sandbox secret-channel guards (mika#2039)
         run: |
           make test-sandbox-secret-argv

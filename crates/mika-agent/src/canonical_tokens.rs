@@ -956,6 +956,108 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2532 — la clé sous laquelle vit la cause d'un crash pré-résultat
+    // a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : le nom
+    /// `handler_failure` est **neuf**. Il n'y a donc rien à excepter, ni de
+    /// case où déposer la prochaine infraction (mika#2323). Quand le scan
+    /// tire, **on retire le second site**, on ne l'allowliste pas (doctrine
+    /// mika#2201).
+    const HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom de la clé existe **une fois**, dans la constante, et tout
+    /// consommateur passe par elle.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second site écrivant `$.handler_failure` ne rendrait **aucune
+    /// décision fausse** le jour où il est écrit : la persistance continuerait
+    /// de fonctionner et toutes les assertions resteraient vertes. Ce qu'il
+    /// casserait est la requête opérateur de D6 —
+    /// `SELECT … WHERE json_extract(metadata,'$.handler_failure') IS NOT NULL`
+    /// — qui **est** la mesure de la classe : elle cesserait de compter « un
+    /// handler long-running a crashé » pour compter deux populations mêlées,
+    /// en silence. C'est exactement la classe qu'aucun test de comportement ne
+    /// peut voir.
+    ///
+    /// Le lecteur CLI (`mika tasks get`) vit dans un autre crate et importe la
+    /// constante : c'est pour ça qu'elle est `pub`. Le faire porter son propre
+    /// littéral aurait été la dérive `grooming_marker` (mika#2158) — deux
+    /// orthographes d'un même nom, que rien n'oblige à rester d'accord.
+    #[test]
+    fn mika2532_the_handler_failure_key_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("handler{}", "_failure");
+        let owner = "crates/mika-agent/src/task_engine/engine.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line).iter().any(|lit| {
+                        // Le prédicat porte sur la CLÉ, jamais sur la
+                        // sous-chaîne. Deux faux positifs mesurés l'imposent,
+                        // et ils vont dans les deux sens : le nom d'événement
+                        // `long_running_handler_failure_not_persisted`
+                        // (`executor.rs`) contient la clé sans être elle, et
+                        // une prose de test qui la cite entre backticks n'est
+                        // pas un site d'écriture (classe mika#2050 — une
+                        // mention n'est pas une instruction). Ce qu'un second
+                        // écrivain porterait réellement est le littéral nu ou
+                        // un chemin JSON `$.<clé>`.
+                        *lit == needle || lit.contains(&format!("$.{needle}"))
+                    })
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2532 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2532 — la clé de metadata du crash de handler a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `task_engine::engine::HANDLER_FAILURE_METADATA_KEY`. Ne PAS l'ajouter \
+             à HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS — la requête opérateur qui \
+             compte la classe n'est exacte que tant qu'un seul nom existe."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2532_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on fait passer le second site par la \
+             constante. Une allowlist née vide est un emplacement où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2517 — une définition du domaine Webhook Fallthrough, un écrivain
     // du nom de son événement.
     //

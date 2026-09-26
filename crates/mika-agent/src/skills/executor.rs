@@ -4338,11 +4338,79 @@ pub(crate) fn spawn_long_running_exec(
                     }
                 }
             };
+            // mika#2532 D1 — persist the stderr on the row BEFORE trying to
+            // fail the task, and **without any condition on its status**.
+            //
+            // The reflex would be to write this only on the `Ok(false)` arm,
+            // i.e. only when `update_task_failed` matched nothing. It is
+            // refused: that would make observability depend on a concurrent
+            // write, when "what did this process put on its fd 2" has nothing
+            // to do with the state of the row. Writing unconditionally gives
+            // one path, no race, and no branch anyone can forget. On the
+            // non-terminal case the overlap with `tasks.result` is benign —
+            // and the metadata copy is the scrubbed one.
+            //
+            // Scrub first, truncate second: `scrub_secrets` must see whole
+            // tokens, and `truncate_output` is UTF-8 safe. The cap is
+            // `MAX_OUTPUT_LEN`, the same 10 000 bytes `err_msg` below already
+            // uses and that the handlers' own `tail -c 10000` mirrors — one
+            // number in the house for this one thing.
+            let persisted_stderr = if stderr_text.is_empty() {
+                // Omitted, never stored as `""` (mika#2331): a reader who does
+                // not find the key knows fd 2 stayed mute.
+                None
+            } else {
+                Some(truncate_output(&crate::secret_scrubber::scrub_secrets(
+                    &stderr_text,
+                )))
+            };
+            // Fire-and-forget, like the four stamps above: `json_set` raises a
+            // hard error — not a NULL — on a `metadata` that is not valid JSON
+            // (mika#2179), and an observability write must never be able to
+            // break the delivery it observes.
+            let stderr_persisted = match db
+                .set_task_handler_failure(&task_id, &code_display, persisted_stderr.as_deref())
+                .await
+            {
+                Ok(()) => true,
+                Err(db_err) => {
+                    warn!(
+                        event = "long_running_handler_failure_not_persisted",
+                        task_id = %task_id,
+                        error = %db_err,
+                        "mika#2532: could not persist the handler's stderr on the task row; \
+                         the cause of this crash is lost again"
+                    );
+                    false
+                }
+            };
+            let stderr_bytes = stderr_text.len();
+
             let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
             match db.update_task_failed(&task_id, &err_msg).await {
-                Ok(true) => warn!(task_id = %task_id, %code_display, "long-running exec failed"),
+                Ok(true) => warn!(
+                    event = "long_running_handler_exit_nonzero",
+                    task_id = %task_id,
+                    %code_display,
+                    task_was_terminal = false,
+                    stderr_bytes,
+                    stderr_persisted,
+                    "long-running exec failed"
+                ),
                 Ok(false) => {
-                    info!(task_id = %task_id, %code_display, "long-running exec exited but task already in terminal state")
+                    // The case mika#2532 was filed for: the handler's EXIT trap
+                    // delivered its callback, so the row is already terminal and
+                    // `err_msg` — which names the cause — reaches nothing. It is
+                    // now on the row's metadata, whatever this arm does.
+                    info!(
+                        event = "long_running_handler_exit_nonzero",
+                        task_id = %task_id,
+                        %code_display,
+                        task_was_terminal = true,
+                        stderr_bytes,
+                        stderr_persisted,
+                        "long-running exec exited but task already in terminal state"
+                    )
                 }
                 Err(db_err) => {
                     warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB")
@@ -11247,5 +11315,294 @@ Harness ticket.
             "a setsid-detached daemon must survive: it left the group and no \
              killpg can reach it (the `tmux new-session -d` risk)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2532 — the stderr of a failed long-running handler survives a
+    // terminal task
+    // -----------------------------------------------------------------------
+
+    /// # Why these tests live in-crate rather than under `tests/eval/`
+    ///
+    /// The mika#2532 plan places them at
+    /// `crates/mika-agent/tests/eval/test_handler_stderr_persisted_2532.rs`,
+    /// on the premise that `spawn_long_running_exec` is "callable directly
+    /// (`pub(crate)`)". The two halves of that sentence contradict each other:
+    /// `tests/eval/` is a **separate crate**, so `pub(crate)` is exactly the
+    /// visibility it cannot reach. The available options were to widen a
+    /// production function to `pub` for the sake of a test file's location, or
+    /// to put the test where the function lives. The second is taken.
+    ///
+    /// Nothing else about the contract moves: the same five cases, the same
+    /// real `/bin/sh` subprocess, no network, no external binary, no server.
+    ///
+    /// # Fire-Disposition
+    ///
+    /// **(c) halt-and-surface, blocking CI gate.** A red here means either the
+    /// cause of a pre-result crash is being discarded again (the defect), or
+    /// that a failure record is being invented on a healthy row (halt 4 of the
+    /// post-deploy probes, which asks for a revert *before* diagnosis).
+    mod mika2532 {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
+
+        /// Long enough that a green run says something, short enough that a red
+        /// one does not hang CI. T1/T3/T5 land in well under 100 ms on this
+        /// harness; the margin is for a loaded machine.
+        const SETTLE_MS: u64 = 4_000;
+
+        fn db() -> AsyncDatabase {
+            AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
+        }
+
+        /// A callback row built through [`build_callback_task`] — the
+        /// production write path, deliberately, rather than a hand-assembled
+        /// `NewTask`. A fixture that manufactures the shape the code knows how
+        /// to read is a fixture and the code agreeing with each other
+        /// (mika#2272's lesson, paid once already on this very file).
+        async fn callback_row(db: &AsyncDatabase) -> String {
+            let task = build_callback_task(
+                "mika".to_string(),
+                None,
+                "build_mika",
+                &serde_json::json!({}),
+                600,
+                "session-2532",
+                "trace-2532",
+                None,
+            );
+            db.create_task(task).await.unwrap()
+        }
+
+        fn handler(dir: &std::path::Path, body: &str) -> PathBuf {
+            let path = dir.join("handler.sh");
+            write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+            path
+        }
+
+        /// Poll until `$.handler_failure` appears, or give up after
+        /// [`SETTLE_MS`]. Returns `None` when it never appeared — which is the
+        /// assertion the negative controls make, not a test failure per se.
+        async fn await_handler_failure(
+            db: &AsyncDatabase,
+            task_id: &str,
+        ) -> Option<serde_json::Value> {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                let task = db.get_task(task_id).await.unwrap().expect("row exists");
+                if let Some(raw) = task.metadata.as_deref()
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(raw)
+                    && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
+                {
+                    return Some(found.clone());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **T1 — the measured defect.** A handler that crashes *after* its EXIT
+        /// trap delivered the callback leaves the row `completed`, so
+        /// `update_task_failed` matches nothing and the `err_msg` naming the
+        /// cause used to be dropped on the floor. The stderr must now be on the
+        /// row, and `tasks.result` must be untouched — it carries the message
+        /// the callback turn consumes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_stderr_of_a_crash_on_a_terminal_row_is_persisted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            // What the handler's trap does before the process exits non-zero.
+            db.update_task_completed(&task_id, Some("callback delivered by the trap"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo \"ERROR: could not cd to /nope/mika\" >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id)
+                .await
+                .expect("the cause of a pre-result crash must reach the row");
+
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 1")
+            );
+            let stderr = failure
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("the handler wrote on fd 2, so the key must be there");
+            assert!(
+                stderr.contains("could not cd"),
+                "the persisted stderr must name the failing line, got: {stderr}"
+            );
+            assert!(failure.get("captured_at").is_some());
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.result.as_deref(),
+                Some("callback delivered by the trap"),
+                "`tasks.result` is what the callback turn reads — persisting the \
+                 stderr must not overwrite it"
+            );
+            assert_eq!(
+                task.status, "completed",
+                "the row was terminal and stays terminal; only the metadata moved"
+            );
+        }
+
+        /// **T2 — the negative control.** Without it, "we write on failure" is
+        /// indistinguishable from "we always write", and halt 4 of the
+        /// post-deploy probes (a failure record invented on a healthy row)
+        /// would have no test behind it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_handler_that_succeeds_leaves_no_failure_record() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("all good"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "echo 'noise on stdout'\nexit 0");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert!(
+                await_handler_failure(&db, &task_id).await.is_none(),
+                "a successful handler must leave no `handler_failure`: a cause of \
+                 failure invented on a healthy row is a lie of the same order as \
+                 the silence being repaired"
+            );
+        }
+
+        /// **T3 — non-regression on the case that already worked.** A row still
+        /// `pending` takes the `Ok(true)` arm, so `tasks.result` has always
+        /// carried the error. It must keep doing so, *and* gain the metadata
+        /// copy: the write is unconditional on status by design (D1).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_crash_on_a_live_row_still_reaches_tasks_result() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            let script = handler(tmp.path(), "echo boom >&2\nexit 3");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 3")
+            );
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            let result = task.result.unwrap_or_default();
+            assert!(
+                result.contains("boom"),
+                "the pre-existing surface must keep working, got: {result}"
+            );
+        }
+
+        /// **T4 — the persisted copy is scrubbed.** `tasks.result` on the live
+        /// path is written un-scrubbed (a real, separate hole, named out of
+        /// scope by the plan); this ticket must not add a second unscrubbed
+        /// surface.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_secret_shaped_value_does_not_reach_the_metadata() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo 'auth failed for ghp_0123456789abcdefghij' >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let stderr = failure.get("stderr").and_then(|v| v.as_str()).unwrap();
+            assert!(
+                !stderr.contains("ghp_0123456789abcdefghij"),
+                "the token must not survive the scrub, got: {stderr}"
+            );
+            assert!(
+                stderr.contains("ghp_<REDACTED>"),
+                "the scrub must leave its mark rather than drop the line, got: {stderr}"
+            );
+        }
+
+        /// **T5 — an absence is not an empty string.** A handler killed before
+        /// writing anything leaves `exit` and nothing else, and that is honest
+        /// (mika#2331: `null` is never `0`). A stored `""` would read as "we
+        /// captured something empty", which is a different and false claim.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_mute_handler_carries_its_exit_and_no_stderr_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "exit 4");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 4")
+            );
+            assert!(
+                failure.get("stderr").is_none(),
+                "fd 2 stayed mute, so the key must be ABSENT — never an empty string"
+            );
+        }
     }
 }
