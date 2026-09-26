@@ -263,10 +263,9 @@ assert_mentions "missing dir: says what to update" "update EGRESS_DIR" "$R"
 # Fixture-writing rule, and it is load-bearing: the attribute goes on its OWN
 # line and the item on a following one. `/^[[:space:]]*#\[cfg\(test\)\]/` is not
 # right-anchored, so `#[cfg(test)] mod m { … }` written on one line matches the
-# attribute, consumes the whole line, and arms `pending` — the NEXT line then
-# lands in the fail-closed branch and the guard exits 1 for the wrong reason
-# ("parser", not the violation under test). Such a fixture reddens while
-# attesting nothing.
+# attribute, and an item sharing its line is refused on the spot (V14) — the
+# guard exits 1 for the wrong reason ("parser", not the violation under test).
+# Such a fixture reddens while attesting nothing.
 # ============================================================================
 
 echo ""
@@ -344,6 +343,11 @@ RS
 R=$(run_lint "$D")
 assert_exit "V3b stacked contradictory cfg: exit 1" "1" "$R"
 assert_mentions "V3b names the parser" "egress-no-log, parser" "$R"
+# The two assertions above are met by ANY parser refusal: with the stacked-cfg
+# branch deleted, the `fn` below falls into the generic unmodeled-form exit and
+# still prints "egress-no-log, parser" with exit 1. Only this substring, printed
+# by the stacked-cfg branch alone, makes the lock pin the branch it is named for.
+assert_mentions "V3b names it a stacked cfg attribute" "stacked \`cfg\` attribute" "$R"
 
 # ============================================================================
 echo ""
@@ -531,6 +535,14 @@ assert_true "V13 exactly one \`function sanitize(\` definition" \
 assert_true "V13 both awk parsers call sanitize() (anti-vacuity)" \
     "$([ "$call_count" -ge 2 ] && echo 1 || echo 0)" \
     "found $call_count call site(s) of sanitize(\$0), expected at least 2"
+# The global count above cannot tell WHICH parser calls: production_lines()
+# alone holds two call sites, so macro_block() can drop its own and the count
+# still reads 2. Count inside each function body separately.
+pl_calls=$(sed -n '/^production_lines() {/,/^}/p' "$LINT" | grep -c 'sanitize(\$0)')
+mb_calls=$(sed -n '/^macro_block() {/,/^}/p' "$LINT" | grep -c 'sanitize(\$0)')
+assert_true "V13 each parser calls sanitize() in its own body" \
+    "$([ "$pl_calls" -ge 1 ] && [ "$mb_calls" -ge 1 ] && echo 1 || echo 0)" \
+    "production_lines(): $pl_calls call(s), macro_block(): $mb_calls call(s); each needs at least 1"
 
 stale=""
 for ex in ${SANITIZE_SCAN_EXEMPTIONS+"${SANITIZE_SCAN_EXEMPTIONS[@]}"}; do
@@ -539,6 +551,127 @@ done
 assert_true "V13 no stale entry in the (empty) exemption table" \
     "$([ -z "$stale" ] && echo 1 || echo 0)" \
     "exemptions matching nothing in the guard:$stale"
+
+# ============================================================================
+echo ""
+echo "Test: the traversal does not re-arm past an item already written"
+echo "------------------------------------------------------------------"
+# The D1 traversal opened a fail-open of its own. An item carried on the SAME
+# line as `#[cfg(test)]` (`#[cfg(test)] use x;`), or on the same line as a
+# traversed attribute (`#[allow(..)] use x;`), was swallowed as if the line held
+# no item; `pending` stayed armed, and the next meaningful line -- a PRODUCTION
+# `mod client {` -- was taken as the test item and skipped to its closing brace.
+# Before D1 the blank line or the attribute line landed in the fail-closed
+# branch, so both shapes below were caught by the base guard and passed by the
+# first D1 cut. Whatever the parser then decides, it must not be exit 0.
+D=$(fixture_dir "same-line-item-then-blank")
+cat >> "$D/mod.rs" <<'RS'
+
+#[cfg(test)] use crate::testing::helper;
+
+mod v14_client {
+    pub fn go() {
+        warn!("production leak behind a same-line #[cfg(test)] item");
+    }
+}
+RS
+R=$(run_lint "$D")
+# V14 -- seen red (exit 0: the production mod was skipped as test code).
+assert_exit "V14 same-line #[cfg(test)] item, blank, production mod: exit 1" "1" "$R"
+assert_mentions "V14 names the parser" "egress-no-log, parser" "$R"
+
+D=$(fixture_dir "item-on-traversed-attribute-line")
+cat >> "$D/mod.rs" <<'RS'
+
+#[cfg(test)]
+#[allow(unused_imports)] use crate::testing::helper;
+mod v15_client {
+    pub fn go() {
+        warn!("production leak behind an item on a traversed attribute line");
+    }
+}
+RS
+R=$(run_lint "$D")
+# V15 -- seen red (exit 0).
+assert_exit "V15 item on a traversed attribute line, production mod: exit 1" "1" "$R"
+assert_mentions "V15 names the parser" "egress-no-log, parser" "$R"
+
+# ============================================================================
+echo ""
+echo "Test: two unmodeled brace errors that cancel out do not hide production"
+echo "-------------------------------------------------------------------------"
+# The EOF check catches ONE unbalanced count. Two opposite errors in two test
+# modules cancel: the first module never closes, the skip runs over the
+# production code between them, and the second module's stray `}` brings the
+# depth back to zero before end of file.
+D=$(fixture_dir "char-literal-braces-cancel")
+cat >> "$D/mod.rs" <<'RS'
+
+#[cfg(test)]
+mod v16_open {
+    const OPEN: char = '{';
+}
+
+pub fn v16_production_between() {
+    warn!("production leak between two char-literal braces");
+}
+
+#[cfg(test)]
+mod v16_close {
+    const CLOSE: char = '}';
+}
+RS
+R=$(run_lint "$D")
+# V16 -- seen red (exit 0). Char literals are now sanitized, so the modules
+# close where they end and the leak is reported by name.
+assert_exit "V16 char-literal braces cancelling across two test mods: exit 1" "1" "$R"
+assert_mentions "V16 names the forbidden macro" "warn!" "$R"
+
+D=$(fixture_dir "block-comment-braces-cancel")
+cat >> "$D/mod.rs" <<'RS'
+
+#[cfg(test)]
+mod v17_open {
+    /* { */
+}
+
+pub fn v17_production_between() {
+    warn!("production leak between two block-comment braces");
+}
+
+#[cfg(test)]
+mod v17_close {
+    /* } */
+}
+RS
+R=$(run_lint "$D")
+# V17 -- seen red (exit 0). Block comments stay unmodeled; what catches this is
+# a `#[cfg(test)]` met while the parser still believes it is inside a test
+# module -- the count is wrong, so the guard refuses.
+assert_exit "V17 block-comment braces cancelling across two test mods: exit 1" "1" "$R"
+assert_mentions "V17 says the block is undeterminable" "block undeterminable" "$R"
+
+D=$(fixture_dir "char-literals-good-faith")
+cat >> "$D/mod.rs" <<'RS'
+
+#[cfg(test)]
+mod v18_char_literals {
+    fn t<'a>(s: &'a str) -> bool {
+        let q = '"';
+        let e = '\'';
+        s.starts_with(q) || s.ends_with(e) || s.contains('}')
+    }
+}
+
+fn v18_production_after() {
+    let _ = 1;
+}
+RS
+# V18 -- LOCK against over-correction, green on both sides: lifetimes (`'a`) are
+# not char literals, and a `'"'` must not open a string. It reddens the day the
+# char-literal rule in sanitize() grows wide enough to eat a lifetime and leave
+# the module unclosed.
+assert_exit "V18 char literals and lifetimes in a test mod: exit 0" "0" "$(run_lint "$D")"
 
 # ============================================================================
 echo ""

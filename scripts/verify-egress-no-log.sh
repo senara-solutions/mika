@@ -119,11 +119,14 @@ violations=0
 # two call sites); when that scan fires you interpolate this constant, you do
 # not add an exemption.
 #
-# Known and accepted limits, unchanged by mika#2054 (the body is #2079's,
-# verbatim — this only widens its readership): no block comments (`/* */`), no
-# raw strings (`r#"…"#`), no char literals (`'{'`). None occurs in the scanned
-# substrate, and each would surface as a loud parser failure rather than a
-# silent drop: an unbalanced count now fails closed at end-of-file.
+# Known and accepted limits: no block comments (`/* */`), no raw strings
+# (`r#"…"#`), no string spanning lines. Simple char literals (`'{'`, `'\''`) ARE
+# dropped (mika#2054 review). None of the unmodeled forms occurs in the scanned
+# substrate. A single mis-count fails closed at end-of-file; two opposite
+# mis-counts in two test modules would cancel there, so the scope tracker also
+# refuses a `#[cfg(test)]` met while it believes itself inside a test module.
+# That covers mis-counts that straddle a later test module, not every pairing:
+# the limits above stay limits.
 readonly AWK_SANITIZE_FN='
 function sanitize(s,   out, i, c, n, instr, prev) {
     out = ""; instr = 0; prev = ""
@@ -134,6 +137,14 @@ function sanitize(s,   out, i, c, n, instr, prev) {
             if (c == "\"" && prev != "\\") instr = 0
             prev = c; continue
         }
+        # Char literal (quote, one char, quote; or quote, backslash, char,
+        # quote): dropped whole, so a brace char counts no brace and a
+        # double-quote char opens no string. A lifetime has no closing quote at
+        # either offset and passes through untouched. \047 is the single quote,
+        # spelled so because this program sits inside a shell single-quoted
+        # string.
+        if (c == "\047" && substr(s, i + 2, 1) == "\047") { i += 2; prev = ""; continue }
+        if (c == "\047" && substr(s, i + 1, 1) == "\\" && substr(s, i + 3, 1) == "\047") { i += 3; prev = ""; continue }
         if (c == "\"") { instr = 1; prev = c; continue }
         if (c == "/" && substr(s, i + 1, 1) == "/") break
         out = out c; prev = c
@@ -157,10 +168,13 @@ function sanitize(s,   out, i, c, n, instr, prev) {
 # forced it, below.
 #
 # Between the attribute and its item, Rust routinely puts lines that carry no
-# item at all: a blank line, a `//` comment, a further attribute. Those are
-# TRAVERSED without consuming the pending state (mika#2054 R2); the first
-# meaningful line decides. A second `cfg` attribute is not neutral and fails
-# closed — two cfg conditions on one item make the item undecidable here.
+# item at all: a blank line, a `//` comment, a further attribute on a line of
+# its own. Those are TRAVERSED without consuming the pending state (mika#2054
+# R2); the first meaningful line decides. A line that carries an item — on the
+# attribute's own line, or after a traversed attribute — is never traversed: it
+# is refused, or the state would carry past it onto the next production item.
+# A second `cfg` attribute is not neutral and fails closed — two cfg conditions
+# on one item make the item undecidable here.
 #
 # Any other `#[cfg(test)]` form (bare `fn`, `impl`, `struct`, …) is a shape
 # this parser does NOT model. It cannot delimit the test scope, so it cannot
@@ -192,6 +206,17 @@ production_lines() {
         # fail-open. (An excess `}` ended the skip early and audited test code
         # as production: same cause, opposite sign.) mika#2054 D3b.
         in_inline_test == 1 {
+            # A `#[cfg(test)]` while still inside a test module means the count
+            # went wrong somewhere above: two opposite mis-counts in two modules
+            # would otherwise cancel before end-of-file, and the skip would have
+            # run over the production code between them with exit 0. Refuse.
+            if ($0 ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+                printf("ERROR (egress-no-log, parser): `#[cfg(test)] mod` (block undeterminable) at %s:%d: a `#[cfg(test)]` appears while the inline test module opened at %s:%d is still counted open.\n", src, FNR, src, open_line) > "/dev/stderr"
+                printf("  The brace count went wrong above, so the parser cannot say where production code resumed. Refusing to emit a partial audit.\n") > "/dev/stderr"
+                printf("  Remove the unmodeled brace (block comment, raw string, multi-line string), or extend sanitize() in %s to model it, then re-run.\n", script) > "/dev/stderr"
+                bailed = 1
+                exit 4
+            }
             s = sanitize($0)
             t = s; n_open = gsub(/\{/, "", t)
             t = s; n_close = gsub(/\}/, "", t)
@@ -209,6 +234,19 @@ production_lines() {
         /^[[:space:]]*#\[cfg\(test\)\]/ {
             pending_cfg_test = 1
             pending_line = FNR
+            # An item on the SAME line (`#[cfg(test)] use x;`) is not a line
+            # that carries no item: arming `pending` past it let the traversal
+            # below carry the state to the next production `mod NAME {` and
+            # skip it as test code, exit 0. Decide nothing here; fail closed.
+            rest = sanitize($0)
+            sub(/^[[:space:]]*#\[cfg\(test\)\]/, "", rest)
+            if (rest !~ /^[[:space:]]*$/) {
+                printf("ERROR (egress-no-log, parser): unmodeled `#[cfg(test)]` form at %s:%d: %s\n", src, FNR, $0) > "/dev/stderr"
+                printf("  The attribute and its item share one line; production_lines() models the item only on a line of its own.\n") > "/dev/stderr"
+                printf("  Put the item on the next line, or extend production_lines() in %s to model this form, then re-run.\n", script) > "/dev/stderr"
+                bailed = 1
+                exit 3
+            }
             next
         }
 
@@ -240,7 +278,11 @@ production_lines() {
                     bailed = 1
                     exit 3
                 }
-                next
+                # Traverse only a line that is the attribute and nothing else.
+                # `#[allow(..)] use x;` carries an item: it falls through to
+                # the decision below, which refuses it, instead of being skipped
+                # while `pending` stays armed for the next production item.
+                if (sanitize($0) ~ /^[[:space:]]*#\[[^]]*\][[:space:]]*$/) { next }
             }
 
             pending_cfg_test = 0
@@ -266,7 +308,7 @@ production_lines() {
                 next
             }
             # Anything else after `#[cfg(test)]` — bare `fn`, `impl`, `struct`,
-            # a `mod` written on the same line, etc. — is a form this parser
+            # an item after an attribute on one line, etc. — is a form this parser
             # cannot delimit. Do NOT abandon the file silently: name the line,
             # say what to add, and fail non-zero so the guard fails closed.
             printf("ERROR (egress-no-log, parser): unmodeled `#[cfg(test)]` form at %s:%d: %s\n", src, FNR, $0) > "/dev/stderr"
