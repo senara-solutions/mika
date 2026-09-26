@@ -69,15 +69,15 @@ Permitted post-callback actions are described prosaically in the success/failure
 
 **Groom-escalation discriminator (mika#2545 — MANDATORY, BEFORE pipeline result classification):**
 
-> **Predicate:** `RESULT` **contains** a line beginning `Outcome: ESCALATE`. Use `contains` on the line, NEVER `starts with` on the whole `RESULT`: this `RESULT` begins with `claude-pilot completed …`.
+> **Predicate:** `RESULT` carries a line beginning `Outcome: ESCALATE`. Match the line, never the start of `RESULT`: this `RESULT` begins with `claude-pilot completed …`.
 >
-> **Why:** an `ESCALATE` is a **terminal** grooming verdict — the exit contract of `/mika-groom-ticket` halts for a human, and the architect's findings are the artefact to read. Replaying it burns a `groom` dispatch slot without changing the verdict: measured 2026-09-26 on the groom of mika#2542, **eight replays** between 13:06:14Z and 13:20:54Z, each ESCALATE on the same cause. The `pipeline_retry_count >= 2` budget below could never bound it — nothing in the engine reads that counter, the write it prescribes lands on a task whose `trigger_type` is `callback` (which `update_task_status` refuses), and every replay is born with fresh metadata (class mika#2158).
+> **Why:** an `ESCALATE` is a **terminal** grooming verdict — `/mika-groom-ticket` halts for a human, and the architect's findings are the artefact to read. Replaying it burns a `groom` slot without changing the verdict, and the `pipeline_retry_count` budget below cannot bound it (root `CLAUDE.md` § *Un `ESCALATE` de groom est terminal*).
 >
-> 1. **Do NOT retry.** Do not call `run_claude_pilot_groom` or `run_claude_pilot` for this task. The engine refuses it anyway (`dispatch_groom_escalated`), so a call costs a turn and a refusal line.
+> 1. **Do NOT retry** — no `run_claude_pilot_groom`, no `run_claude_pilot`. The engine refuses it (`dispatch_groom_escalated`); a call costs a turn.
 > 2. **Do NOT increment** `pipeline_retry_count`.
 > 3. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`) — same rule as the containment-refusal branch above.
-> 4. `update_task_status(task_id, "blocked")` with metadata `{"groom_escalated": true, "escalation_stage": "<stage from the Outcome line>"}` — distinct from `operator_cancel` / `containment_refusal`, countable apart (mika#2131).
-> 5. `send_message` naming the ticket, the `Verdict:` line, the `Session:` and the **findings path** verbatim from `RESULT` (`Architect findings preserved at: …`). That path is the operator's primary artefact for deciding whether to revise, refactor or kill the plan.
+> 4. `update_task_status(task_id, "blocked")` with metadata `{"groom_escalated": true, "escalation_stage": "<stage from the Outcome line>"}` — countable apart from `operator_cancel` / `containment_refusal` (mika#2131).
+> 5. `send_message` naming the ticket, the `Verdict:` line, the `Session:` and the **findings path** verbatim (`Architect findings preserved at: …`) — that path is what an operator reads to decide whether to revise, refactor or kill the plan.
 > 6. Proceed to Step 6. Never announce a PR, a retry, or "awaiting QA review".
 
 **Pipeline result classification (MANDATORY — before generic failure handling):**
