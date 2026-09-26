@@ -2087,6 +2087,75 @@ Surfaces opérateur, régimes attendus et haltes : `CLAUDE.md` racine
 
 **Cancel discriminator protocol (#749):** When `cancel_task_and_kill` terminates a long-running subprocess, it pre-writes a reason file at `/tmp/mika-cancel-reason-{pid}` with `STATUS=CANCELLED_BY_OPERATOR` before sending SIGTERM. The shell-side TERM trap in `dispatch-lib.sh` writes `STATUS=CANCELLED_BY_SIGNAL` only if no reason file exists (belt-and-suspenders for signal-initiated cancels). The EXIT trap reads the reason file and prefixes the callback envelope so the consumer (`self-dev-callback`) can distinguish cancel from crash. Two discriminators: `CANCELLED_BY_OPERATOR` (cancel_task initiated) and `CANCELLED_BY_SIGNAL` (signal-initiated, no pre-write). Absence of the prefix = existing `HANDLER CRASH` / success paths fire unchanged (backward compatible).
 
+### Platform-root relay, and the name it translates (mika#2536)
+
+`inject_platform_dir_env` is the **sixth** injector in `spawn_long_running_exec`,
+beside `inject_pilot_transcript_env`, `inject_dispatch_worktree_env`,
+`inject_rescue_verify_env`, `inject_arch_ask_retry_env` and
+`inject_pilot_dispatch_env`. Same placement contract as all five — it MUST run
+**after** `sandboxed_pilot_env`, whose `env_clear()` would erase it — and the same
+best-effort discipline: absence or an empty value is a no-op, never a blocked
+dispatch.
+
+**It is the only one that TRANSLATES the name, and that is the whole point.** It
+reads `MIKA_PLATFORM_DIR` spirit-side and poses `PLATFORM_DIR`
+(`PLATFORM_DIR_RELAY_KEY`) child-side. `inject_pilot_dispatch_env` relays
+`std::env::var(k)` under the *same* `k`, so copying its shape would have required
+the operator to rename a variable mika#2491 documents — and *a setting that stops
+being read without an error* is the exact defect mika#2536 closes, moved one notch.
+The motif followed is `inject_pilot_transcript_env`
+(`MIKA_LOG_PILOT_TRANSCRIPTS` → `ANTHROPIC_LOG_FILE`).
+
+**What was inert, and on both exec paths.** The ten sites across five scripts read
+`${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}`. `sandboxed_pilot_env`
+rebuilds the child env from a positive allowlist that refuses every `MIKA_*`
+(plus a `debug_assert` against adding one), and the non-long-running exec path
+runs `scrub_mika_env_vars`, a denylist on the same prefix. So the branch could
+only ever take its fallback — **a dead branch on every path**, which is why
+`${MIKA_PLATFORM_DIR:-…}` is a *class*, not one site.
+
+**`DISPATCH_ENV_KNOWN_INERT` decreased for the first time**, which is the effect
+its own doc-comment promises (*"when an entry is settled, we RELAY it and remove
+its line"*). The removal was not optional: the test's self-cleaning assertion
+(`population.contains(name)`) **requires** it the moment `dispatch-lib.sh` stops
+reading the prefixed name. Its sibling term (`!reaches_dispatch_child(name)`) is
+why `reaches_dispatch_child` had to learn `PLATFORM_DIR_RELAY_KEY` — the shell
+reads it self-referentially (`PLATFORM_DIR="${PLATFORM_DIR:-…}"`), so term 4bis of
+the predicate puts it **in** the population, where it would otherwise read as an
+orphan while traversing perfectly.
+
+**Two class scans, partitioning one population.**
+`mika2536_no_handler_reads_a_variable_that_cannot_reach_it` covers
+`skills/bundled/*/handlers/*.sh` **concatenated with the `_shared/` libraries they
+source**; `mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`
+covers `dispatch-lib.sh`. Eight of the ten corrected sites are in the first, two in
+the second. Three properties are worth knowing before touching either:
+
+- **The concatenation is a correctness condition, found by measurement.**
+  `external_env_reads` tracks writes *within one file*, so a variable written by a
+  sourced library and read by the handler looks external. First run of the new
+  scan: six false positives (`CWD_REFUSAL`, four `PR_PUSH_GUARD_*`). The remedy is
+  to scan the script **as it executes**, never an allowlist entry.
+- **`dispatch-lib.sh` is excluded as a PERIMETER, not an allowlist.** It has its own
+  scan and its own *named* inertia list; concatenating it would surface those three
+  entries in the new scan, whose allowlist is empty by contract — the scan would be
+  born red, and a lint red at birth gets disarmed. The exclusion is compared both
+  ways (`mika2536_the_t1_perimeter_names_only_files_that_exist`), because a
+  perimeter that outlives its file is a drawer.
+- **`HANDLER_ENV_KNOWN_INERT` is shipped empty and pinned empty.** When the scan
+  fires, route the site to the relay; do not exempt it. If an inertia genuinely must
+  be named, its place is `DISPATCH_ENV_KNOWN_INERT`, with its reason and its
+  follow-up.
+
+Neither scan is replaceable by a behavioural test: a dead branch makes **no
+decision wrong**, it makes a setting inoperative in silence, and every existing
+assertion stays green. Same reason `mika2536_the_relay_runs_after_the_env_sandbox`
+is a source scan — an injector moved above `sandboxed_pilot_env` breaks nothing
+either, it just goes back to the default.
+
+Config, the four named `cwd` refusals, the operator query and the four halts: root
+`CLAUDE.md` § *`MIKA_PLATFORM_DIR` traverse enfin*.
+
 ## MCP (Model Context Protocol) Client
 
 Connects to external MCP servers at startup via `McpManager`. Configured in `{agent_home}/mcp.json`. Supports stdio and Streamable HTTP transports. Tools namespaced as `mcp__{server}__{tool}`. Dispatch chain: builtins -> skills -> MCP -> unknown error. MCP tools excluded from silent/heartbeat mode. Child processes use `env_clear()` + allowlist.

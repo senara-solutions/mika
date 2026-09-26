@@ -73,9 +73,13 @@ WORKTREE_PATH=$(printf '%s\n' "$INPUT" | jq -r '.worktree_path // empty')
 USER_TASK_ID=$(printf '%s\n' "$INPUT" | jq -r '.task_id // empty')
 
 # mika-platform root — base for relay config resolution
-# Resolve symlinks so prefix checks work regardless of which path the caller uses
-PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+# Resolve symlinks so prefix checks work regardless of which path the caller uses.
+# `PLATFORM_DIR` is the name the child receives, relayed from the operator's
+# `MIKA_PLATFORM_DIR` (mika#2536). The prefixed form was a dead branch:
+# `sandboxed_pilot_env` refuses every `MIKA_*`. Self-referential assignment with
+# a default is the canonical operator-knob shape (mika#2508 term 4bis).
+PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
 
 if [ -z "$PR_URL" ]; then
     echo "Error: pr_url is required" >&2

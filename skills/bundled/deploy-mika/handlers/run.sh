@@ -31,9 +31,13 @@ if [ -z "$TASK_ID" ]; then
     exit 1
 fi
 
-# Use provided cwd or default to the main mika repo root (same pattern as build-mika)
+# Use provided cwd or default to the main mika repo root (same pattern as build-mika).
+# `PLATFORM_DIR` is the name the child receives — relayed from the operator's
+# `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536). Two independent
+# reasons the prefixed form was a DEAD branch here: `sandboxed_pilot_env` refuses
+# every `MIKA_*`, AND the scrub loop above has already unset them all.
 if [ -z "$CWD" ]; then
-    _DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
+    _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
     CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
 fi
 
@@ -59,14 +63,41 @@ deliver_callback() {
 }
 trap deliver_callback EXIT
 
+# --- cwd composability guard (mika#2536) ---
+# Sourced AFTER the trap: a failure here must still deliver a callback.
+# Fail-closed and NAMED, same rationale as build-mika.
+_CWD_GUARD="$(dirname "$0")/../../_shared/cwd-guard.sh"
+if [ -r "$_CWD_GUARD" ]; then
+    # shellcheck source=../../_shared/cwd-guard.sh
+    . "$_CWD_GUARD"
+else
+    RESULT="REFUSED (cwd-guard, mika#2536): shared guard unreadable at ${_CWD_GUARD}.
+\`skills/bundled/_shared/\` is a projection of the BINARY, not of the checkout: rebuild
+(\`make deploy\`) then re-seed, and read \`~/.mika/skills/.manifest-writer\`."
+    exit 1
+fi
+
 # --- Mutual exclusion ---
 LOCKFILE="/tmp/deploy-mika.lock"
 exec 9>"$LOCKFILE"
 flock -n 9 || { RESULT="FAILED: another deploy is in progress"; exit 1; }
 
 # --- Path validation ---
-PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+# Self-referential assignment with a default IS the canonical shape of an
+# operator knob (`VAR="${VAR:-default}"`), and it is what the mika#2508 scan's
+# term 4bis recognizes: the read is not evicted by the write, so `PLATFORM_DIR`
+# stays in the population the relay must cover.
+PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+
+# Refuse an uncomposable cwd BY NAMING IT (mika#2536 R6). This ADDS to the
+# allowed-prefix `case` below; it does not replace it — that one is a safety
+# perimeter, this one is composability, and weakening the former would be a side
+# effect of an observability ticket.
+if ! validate_cwd "$CWD"; then
+    RESULT="$CWD_REFUSAL"
+    exit 1
+fi
 
 CWD=$(cd "$CWD" 2>/dev/null && pwd -P) || {
     RESULT="FAILED: path does not exist: $CWD"

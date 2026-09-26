@@ -55,14 +55,41 @@ deliver_callback() {
 }
 trap deliver_callback EXIT
 
-# Use provided cwd or default to the main mika repo root
+# --- cwd composability guard (mika#2536) ---
+# Sourced AFTER the trap on purpose: a failure here must still deliver a
+# callback. Fail-closed and NAMED — a missing guard refuses the dispatch with a
+# reason instead of letting `cd` produce the generic "HANDLER CRASH" this whole
+# ticket exists to remove.
+_CWD_GUARD="$(dirname "$0")/../../_shared/cwd-guard.sh"
+if [ -r "$_CWD_GUARD" ]; then
+    # shellcheck source=../../_shared/cwd-guard.sh
+    . "$_CWD_GUARD"
+else
+    RESULT="REFUSED (cwd-guard, mika#2536): shared guard unreadable at ${_CWD_GUARD}.
+\`skills/bundled/_shared/\` is a projection of the BINARY, not of the checkout: rebuild
+(\`make deploy\`) then re-seed, and read \`~/.mika/skills/.manifest-writer\`."
+    exit 1
+fi
+
+# Use provided cwd or default to the main mika repo root.
+# `PLATFORM_DIR` is the name the child receives — relayed from the operator's
+# `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536). The `MIKA_`-
+# prefixed form was a DEAD branch here: `sandboxed_pilot_env` rebuilds the child
+# env from a positive allowlist that refuses every `MIKA_*`.
 if [ -z "$CWD" ]; then
-    _DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
+    _DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika"
     CWD=$(cd "$_DEFAULT" 2>/dev/null && pwd -P) || CWD="$_DEFAULT"
 fi
 
+# Refuse an uncomposable cwd BY NAMING IT, rather than letting `cd` fail with a
+# message no surface relays (mika#2536 R6).
+if ! validate_cwd "$CWD"; then
+    RESULT="$CWD_REFUSAL"
+    exit 1
+fi
+
 # Run the build
-cd "$CWD" || { echo "ERROR: could not cd to $CWD" >&2; exit 1; }
+cd "$CWD" || { RESULT="FAILED: could not cd to $CWD"; exit 1; }
 set +e
 BUILD_OUTPUT=$(cargo build --release --features telemetry 2>&1)
 BUILD_EXIT=$?

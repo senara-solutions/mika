@@ -562,10 +562,13 @@ branch = <headRefName from Step 1 qa_pr_view output>
 head_sha = <headRefOid from Step 1 qa_pr_view output>
 ```
 
-Derive the worktree path:
+Derive the worktree path. **Compose it from a LITERAL root, never from a shell variable** —
+`build_mika` receives this value as a tool argument, and a `cwd` still carrying a `$VAR` is
+refused by name (`REFUSED (cwd-guard, mika#2536) — unexpanded_variable`), because nothing in
+that handler's environment expands it (mika#2536):
 ```
 sanitized_branch = branch with "/" replaced by "-"
-worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/
+worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/
 ```
 
 Check the worktree exists. If not: skip build verification. Note: "BUILD VERIFICATION: skipped (no worktree found at expected path)".

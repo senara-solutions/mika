@@ -10,7 +10,11 @@ The `deploy_mika` tool is long-running:
 ### Parameters
 
 - `cwd` (optional): Path to the mika repo containing built artifacts.
-  Defaults to `$MIKA_PLATFORM_DIR/mika` (or `~/workspace/mika-platform/mika`) if omitted.
+  Defaults to `~/workspace/mika-platform/mika` if omitted.
+
+  **Pass a literal path, never a shell variable.** A `cwd` still carrying a `$VAR` is
+  **refused by name** (`REFUSED (cwd-guard, mika#2536) — unexpanded_variable`); nothing in
+  the handler's environment expands it.
 
 ### What it does
 
