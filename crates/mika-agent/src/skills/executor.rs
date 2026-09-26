@@ -1884,6 +1884,31 @@ pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch
 /// dont il est le pendant d'échec.
 pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
 
+/// Le champ `verdict` du refus mika#2545 : un **format de fil**.
+///
+/// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
+/// `tasks.result`, et l'opérateur en fait des `GROUP BY` — deux orthographes d'un
+/// même motif couperaient une population en deux sans le dire. Constantes
+/// nommées plutôt que littéraux au site de refus, motif
+/// `ALL_ITERATE_REFUSAL_REASONS` (mika#2506) et `ALL_PURGE_REFUSAL_REASONS`
+/// (mika#2497).
+///
+/// Les deux valeurs sont délibérément distinctes : « ce ticket a escaladé » et
+/// « on n'a pas pu le savoir » appellent la même disposition et **deux lectures
+/// opérateur différentes** — la première est le régime attendu non vide, la
+/// seconde doit rester vide.
+pub(crate) const GROOM_ESCALATE_VERDICT_ESCALATED: &str = "escalated";
+pub(crate) const GROOM_ESCALATE_VERDICT_UNREADABLE: &str = "unreadable";
+
+/// Les deux motifs, à un seul site, pour que leur cardinalité soit assertable.
+/// `pub` comme ses aînées [`crate::server::iterate_dispatch::ALL_ITERATE_REFUSAL_REASONS`]
+/// et `worktree_reaper::ALL_PURGE_REFUSAL_REASONS` : un format de fil déclaré est
+/// une surface, pas un détail d'implémentation.
+pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
+    GROOM_ESCALATE_VERDICT_ESCALATED,
+    GROOM_ESCALATE_VERDICT_UNREADABLE,
+];
+
 /// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
 /// (mika#2545)
 ///
@@ -2346,7 +2371,7 @@ pub(crate) async fn validate_dispatch_readiness(
         let refusal = match verdict {
             GroomVerdictState::NotEscalated => None,
             GroomVerdictState::Escalated => Some((
-                "escalated",
+                GROOM_ESCALATE_VERDICT_ESCALATED,
                 format!(
                     "The last grooming of `{owner_repo}#{number}` returned \
                      `Verdict: ESCALATE`, which is a TERMINAL grooming verdict — the \
@@ -2357,7 +2382,7 @@ pub(crate) async fn validate_dispatch_readiness(
                 ),
             )),
             GroomVerdictState::Unreadable(reason) => Some((
-                "unreadable",
+                GROOM_ESCALATE_VERDICT_UNREADABLE,
                 format!(
                     "Could not establish whether the last grooming of \
                      `{owner_repo}#{number}` escalated ({reason}). This gate refuses \

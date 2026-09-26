@@ -1713,6 +1713,35 @@ mod tests {
         );
     }
 
+    /// Les deux motifs de refus sont un **format de fil** : ils atterrissent dans
+    /// `audit_events.after_value` et dans le JSON de `tasks.result`, et
+    /// l'opérateur en fait des `GROUP BY`. Un motif ajouté ou retiré est une
+    /// RUPTURE à dater dans `CLAUDE.md`, jamais une mise à jour de ce nombre en
+    /// silence — même contrat que `ALL_ITERATE_REFUSAL_REASONS` (mika#2506).
+    #[test]
+    fn mika2545_the_two_refusal_verdicts_are_a_wire_format() {
+        use crate::skills::executor::ALL_GROOM_ESCALATE_VERDICTS;
+
+        assert_eq!(
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            2,
+            "mika#2545 — deux motifs : « ce ticket a escaladé » et « on n'a pas \
+             pu le savoir ». Ils appellent la même disposition et DEUX lectures \
+             opérateur différentes (le premier est le régime attendu non vide, le \
+             second doit rester vide), donc les fondre rendrait la seconde \
+             population incomptable."
+        );
+        let mut sorted = ALL_GROOM_ESCALATE_VERDICTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            "deux motifs portent la même valeur de fil : une population serait \
+             coupée en deux sans le dire"
+        );
+    }
+
     /// Le `match` sur [`crate::skills::executor::GroomVerdictState`] n'a **aucun
     /// bras joker** — motif `GroomedState` (mika#2484 D1). Un quatrième état
     /// devra être décidé par le compilateur, jamais absorbé par un `_ =>` qui le
