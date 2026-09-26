@@ -6,6 +6,7 @@ pub mod credential_helper;
 pub mod dashboard;
 pub mod doctor;
 pub mod format_helper;
+pub mod iterate;
 pub mod kg;
 pub mod logs;
 pub mod mcp;

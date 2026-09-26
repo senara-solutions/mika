@@ -13,6 +13,7 @@ pub mod draft_pr_opened_handler;
 pub mod embedded_dashboard;
 mod handlers;
 pub mod investigate;
+pub mod iterate_dispatch;
 pub mod json_extractor;
 pub mod merge_ready_handler;
 mod milestone_context_handler;
@@ -342,6 +343,21 @@ fn build_router(state: AppState) -> Router {
             auth::require_internal_token,
         ));
 
+    // Operator mutation routes under /api/v1 — internal token ONLY, never the
+    // dashboard token. mika#2506: `iterate` spawns a pilot that writes on a
+    // reviewed PR's branch; that is not an observability read, so it does not
+    // belong in `dashboard_routes` even though its path sits beside
+    // `/agents/{id}/budget`.
+    let operator_v1_routes = Router::new()
+        .route(
+            "/agents/{id}/iterate",
+            post(iterate_dispatch::handle_agent_iterate),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ));
+
     // A2A routes (no CORS — gateway handles external auth).
     // Accepts only MIKA_INTERNAL_TOKEN.
     let a2a_routes = Router::new()
@@ -374,7 +390,13 @@ fn build_router(state: AppState) -> Router {
     // wraps the router as a service; merging after .layer() can shadow routes).
     mutation_routes
         .merge(a2a_routes)
-        .nest("/api/v1", dashboard_routes.merge(rewind_routes).layer(cors))
+        .nest(
+            "/api/v1",
+            dashboard_routes
+                .merge(rewind_routes)
+                .merge(operator_v1_routes)
+                .layer(cors),
+        )
         // Embedded dashboard SPA (no auth — static assets; SPA authenticates its own API calls)
         .nest("/dashboard", embedded_dashboard::dashboard_routes())
         // Root: redirect to dashboard (if enabled) or return JSON info
