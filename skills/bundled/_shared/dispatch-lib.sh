@@ -2602,6 +2602,38 @@ et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\`
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
 
+# mika#2548 — la règle du scratch, portée par chaque dispatch.
+#
+# Le défaut qu'elle vise : un pilote qui range son brouillon meurt. `rm -rf` est
+# un verbe prouvé dangereux, TERMINAL par design dans claude-pilot (cpp#205), et
+# `rmdir` y est refusé ; le 2026-09-26 (tâche 83db3a82, mika#2054) le pilote a
+# construit un arbre de fixture à la racine du worktree, abandonné l'approche,
+# puis tenté de le supprimer — session tuée sur le `rm -rf`.
+#
+# Forme positive d'abord, comme la règle mika#2211 : un pilote à qui l'on dit
+# seulement « pas de rm » doit encore inventer où mettre son fixture, et le lieu
+# qu'il choisit est celui qu'il voudra nettoyer. Le lieu est donc fourni
+# (`_seed_pilot_scratch_dir`) et nommé ici. `/tmp` n'est PAS proposé : la
+# politique y refuse `cp`/`mv` (cpp#209 les rend seulement survivables) et
+# l'outil Write hors worktree (mika#2211) — on ne peut pas y bâtir un fixture.
+#
+# Ce que cette règle est, et ce qu'elle n'est pas : la moitié structurelle
+# (répertoire désigné, exclu de git, vidé à chaque préparation) retire toute
+# RAISON de nettoyer un résidu ; le réflexe de rangement lui-même, sur un arbre
+# vide que git ne voit pas, n'a de barrière ici que ce texte. Sa fermeture
+# structurelle appartient à la politique claude-pilot — suivi nommé au plan.
+#
+# Inconditionnelle, comme mika#2211 : groomeurs et implémenteurs bâtissent tous
+# deux des fixtures. Appendue AVANT la règle Fire-Disposition (mika#2306), qui
+# doit rester la plus récente pour le groomeur, la récence étant son seul levier.
+_PILOT_SCRATCH_RULE="RÈGLE DE DISPATCH (mika#2548) — ton brouillon vit sous \`.pilot-scratch/\`, et tu ne le supprimes jamais.
+Pour un fixture, une copie de test ou tout fichier temporaire : crée-le sous \`.pilot-scratch/<nom>/\` à la racine
+du worktree (outil Write, ou mkdir/cp dans ce répertoire). Il existe déjà, il est exclu de git, il repart vide à
+chaque préparation et il disparaît avec le worktree : un résidu n'y coûte rien.
+Ne supprime JAMAIS un brouillon, même vide, même en changeant d'approche : pas de \`rm\`, pas de \`rmdir\` (refusé),
+et surtout pas de \`rm -rf\` — ce refus est TERMINAL et tue la session sur le coup. Abandonner un brouillon, c'est
+le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \`cp\` et Write y sont refusés."
+
 # mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
 # de grooming.
 #
@@ -3262,6 +3294,15 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # invariants documented above still hold, and the FIRST LINE of PROMPT
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
+
+        # --- mika#2548: the scratch rule reaches the pilot ---
+        #
+        # Unconditional, same channel and same reasoning as mika#2211 above. It
+        # sits AFTER that injection (so the position invariants of mika#2178 and
+        # the `<repo>#<num>` first line still hold) and BEFORE the conditional
+        # Fire-Disposition block below, which must stay the most recent line a
+        # groomer reads.
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PILOT_SCRATCH_RULE")
 
         # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
         #

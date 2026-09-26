@@ -6192,6 +6192,32 @@ T2548_SEED_SRC=$(sed -n '/^_seed_pilot_scratch_dir() {/,/^}/p' "$DISPATCH_LIB")
 assert_contains "mika#2548: la remise à zéro passe par _assert_removable_worktree_path" \
     '_assert_removable_worktree_path "$scratch" seed_pilot_scratch_dir' "$T2548_SEED_SRC"
 
+# --- U2 : la règle atteint le pilote, au bon endroit ------------------------
+assert_eq "mika#2548: _PILOT_SCRATCH_RULE est définie exactement une fois" "1" \
+    "$(grep -c '^_PILOT_SCRATCH_RULE=' "$DISPATCH_LIB" || true)"
+assert_contains "mika#2548: la règle est APPENDUE au PROMPT (repo#N reste la 1re ligne)" \
+    'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_PILOT_SCRATCH_RULE")' "$T2548_SUW_SRC"
+assert_eq "mika#2548: l'injection suit la réaffectation ITERATION CONTEXT" "yes" \
+    "$(_t2178_after 'PROMPT" "$_PILOT_SCRATCH_RULE")' 'ITERATION CONTEXT:')"
+assert_eq "mika#2548: l'injection suit la règle mika#2211" "yes" \
+    "$(_t2178_after 'PROMPT" "$_PILOT_SCRATCH_RULE")' 'PROMPT" "$_PR_BODY_CONTAINMENT_RULE")')"
+# La règle Fire-Disposition doit rester la plus récente pour le groomeur.
+assert_eq "mika#2548: la règle Fire-Disposition (mika#2306) reste APRÈS la règle scratch" "yes" \
+    "$(_t2178_after 'PROMPT" "$_FIRE_DISPOSITION_RULE")' 'PROMPT" "$_PILOT_SCRATCH_RULE")')"
+# Inconditionnelle : l'injection n'est pas dans le bloc `if [ "$SKILL" = "dev-groom" ]`.
+T2548_GROOM_BLOCK=$(printf '%s\n' "$T2548_SUW_SRC" | sed -n '/if \[ "\$SKILL" = "dev-groom" \]; then/,/^        fi/p')
+assert_not_contains "mika#2548: l'injection n'est pas conditionnée au skill" \
+    '_PILOT_SCRATCH_RULE' "$T2548_GROOM_BLOCK"
+
+T2548_RULE=$(bash -c 'source "$1" 2>/dev/null; printf "%s" "$_PILOT_SCRATCH_RULE"' _ "$DISPATCH_LIB")
+assert_contains "mika#2548: la règle porte son étiquette de ticket" "mika#2548" "$T2548_RULE"
+assert_contains "mika#2548: la règle nomme le lieu du scratch" ".pilot-scratch/" "$T2548_RULE"
+assert_contains "mika#2548: la règle interdit rm nu" 'pas de `rm`' "$T2548_RULE"
+assert_contains "mika#2548: la règle interdit rmdir" '`rmdir`' "$T2548_RULE"
+assert_contains "mika#2548: la règle interdit rm -rf" '`rm -rf`' "$T2548_RULE"
+assert_contains "mika#2548: la règle dit que le refus est terminal" "TERMINAL" "$T2548_RULE"
+assert_contains "mika#2548: la règle écarte /tmp comme lieu de fixture" "/tmp" "$T2548_RULE"
+
 # ============================================================================
 # mika#2120 — le second lecteur du callout `Plan` tolère le préfixe de dépôt
 # ============================================================================
