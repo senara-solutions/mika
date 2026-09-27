@@ -5,14 +5,15 @@
 **Type :** fix (substrat de boucle)
 **Labels attendus :** `loop-substrate` (plafond de tours 200, mika#2542)
 
-> **Note de re-groom.** Ce fichier est réécrit, pas doublé. Une version antérieure
-> était ancrée sur le corps du ticket **d'avant sa rectification** ; le corps a
-> depuis intégré trois des quatre rectifications qu'elle proposait. Garder les deux
-> laisserait `_find_issue_plan` élire l'un des deux au tri, et laisserait
-> l'architecte réviser un plan qui argumente contre un corps qui ne dit plus ce
-> qu'il contredit — le review-anchor, très exactement la cause à laquelle le
-> ticket attribue l'échec du groom #2542. Le nom de fichier est conservé pour la
-> même raison : un seul plan par ticket.
+> **Note de re-groom (troisième passage).** Ce fichier est réécrit, pas doublé —
+> un seul plan par ticket, sans quoi `_find_issue_plan` élirait l'un des deux au
+> tri et l'architecte réviserait un plan qui argumente contre un corps qui ne dit
+> plus ce qu'il contredit. Le deuxième passage avait déjà réancré le plan sur le
+> corps rectifié du ticket. **Ce troisième passage n'a révisé aucune décision :
+> toutes les mesures de la version précédente ont été re-vérifiées à HEAD et sont
+> exactes.** Ce qu'il ajoute est six corrections de *prescription* — des endroits
+> où le plan disait à l'implémenteur de vérifier la mauvaise chose (B1–B6,
+> § *Ce que le troisième passage corrige*).
 
 ---
 
@@ -70,17 +71,17 @@ jour.
 
 #### A1 — les numéros de ligne du ticket sont périmés, et c'est structurel
 
-Le ticket localise ses lecteurs par nom de fonction, ce qui est juste. Mais
-l'ébauche précédente de ce plan citait `dispatch-lib.sh:6705` et `:6771` ; à HEAD
-`a8849236` les deux vrais sites sont **6825** et **6891**, et `_FIRE_DISPOSITION_RULE`
+Le ticket localise ses lecteurs par nom de fonction, ce qui est juste. Mais une
+ébauche antérieure de ce plan citait `dispatch-lib.sh:6705` et `:6771` ; les deux
+vrais sites sont **6825** et **6891** à HEAD `f9ca764c`, et `_FIRE_DISPOSITION_RULE`
 a glissé de 2584 à **2682**. Trois merges sur `main` (#2549, #2550, #2551) ont
-décalé le fichier entre les deux groomings.
+décalé le fichier entre deux groomings.
 
 **Conséquence tenue dans tout ce plan : aucun numéro de ligne n'est normatif.**
 Les sites sont désignés par nom de fonction et de constante
-(`_fd_retry_if_second_missing` → `_fd_retry_if_section_still_missing`,
-`_FIRE_DISPOSITION_RULE`, `AC_HEADING_RE`), qui sont stables sous rebase. Les
-numéros n'apparaissent que comme repères de lecture, jamais comme cible d'édition.
+(`_fd_retry_if_section_still_missing`, `_FIRE_DISPOSITION_RULE`, `AC_HEADING_RE`),
+qui sont stables sous rebase. Les numéros n'apparaissent que comme repères de
+lecture, jamais comme cible d'édition.
 
 #### A2 — il y a deux chaînes de déclenchement, et le ticket n'en voit qu'une
 
@@ -132,19 +133,107 @@ Sur `## 3. Fire-Disposition`, le terme 2 est **vrai**, donc le rattrapage s'arme
   (une garde non déployée se lit exactement comme un arbre propre).
 - Et même livrée, elle n'aurait rien tenu : **`verify-pipeline-test.sh` n'est
   lancé par aucun job CI ni aucune cible `make`**. `grep -rn 'verify-pipeline-test'`
-  sur `Makefile` et `.github/workflows/` rend zéro appelant ; le seul harnais shell
-  câblé est `test-dispatch-lib.sh` (`Makefile:182`, `ci.yml:85`). `verify-pipeline.sh`
-  lui-même **est** en CI (`ci.yml:452`), donc le gate tourne ; son harnais de test,
-  non.
+  sur `Makefile` et `.github/workflows/` rend **zéro appelant** (re-mesuré à HEAD) ;
+  le seul harnais shell câblé est `test-dispatch-lib.sh` (`Makefile:182`,
+  `ci.yml:85`). `verify-pipeline.sh` lui-même **est** en CI (`ci.yml:452`), donc le
+  gate tourne ; son harnais de test, non.
 
-**Ce que ça décide, et ce n'est pas ce que l'ébauche précédente avait décidé.** Le
-garde de co-mutation doit vivre dans `test-dispatch-lib.sh` — non par commodité
-(« `REPO_ROOT` y existe déjà »), mais parce que **c'est le seul des deux harnais que
-CI exécute**. Le placer dans le fichier que le commentaire nomme serait livrer un
-détecteur structurellement désarmé. Et puisqu'il ne peut pas y vivre, **le
-commentaire doit être corrigé pour nommer le bon fichier** : le laisser tel quel
-enverrait un futur lecteur chercher une garde dans un harnais que personne ne
-lance, c'est-à-dire remplacerait une fausse garantie par une autre.
+**Ce que ça décide.** Le garde de co-mutation doit vivre dans
+`test-dispatch-lib.sh` — non par commodité (« `REPO_ROOT` y existe déjà »), mais
+parce que **c'est le seul des deux harnais que CI exécute**. Le placer dans le
+fichier que le commentaire nomme serait livrer un détecteur structurellement
+désarmé. Et puisqu'il ne peut pas y vivre, **le commentaire doit être corrigé pour
+nommer le bon fichier** : le laisser tel quel enverrait un futur lecteur chercher
+une garde dans un harnais que personne ne lance, c'est-à-dire remplacerait une
+fausse garantie par une autre.
+
+---
+
+## Ce que le troisième passage corrige
+
+Six prescriptions envoyaient l'implémenteur vérifier la mauvaise chose. Aucune
+décision n'est révisée ; ce sont des corrections de **ce qu'il faut faire**, pas
+de **pourquoi**.
+
+#### B1 — les deux sites portent DÉJÀ `-E` ; le risque est de le perdre, pas de l'oublier
+
+Forme littérale mesurée à HEAD, aux deux sites :
+
+```sh
+! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0     # terme 2
+if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then        # journalisation
+```
+
+Le changement est donc **`-qE` → `-qiE`**, jamais « ajouter `-E` ». La version
+précédente de ce plan décrivait le piège comme « les deux sites ont impérativement
+besoin de leur drapeau ERE », ce qui est vrai et **envoie vérifier la mauvaise
+chose** : un implémenteur qui contrôle « `-E` est-il présent ? » trouvera oui dans
+les deux cas, y compris sur la régression réelle. **La régression réelle est
+d'écrire `-qi` en remplaçant `-qE`**, ce qui perd l'ERE silencieusement : `+`, `?`
+et le groupe `( … )` redeviennent littéraux, le motif ne matche **rien**, les deux
+termes deviennent toujours-vrais, et le rattrapage se déclenche sur **tout** plan
+dont les findings mentionnent la chaîne. Le contrôle juste est donc sur le
+**drapeau combiné** : `-qiE` aux deux sites, et c'est ce que V7 vérifie.
+
+#### B2 — la clause d'U3 s'écrit en anglais
+
+Les deux prompts architecte sont intégralement anglophones (mesuré : *« A plan
+that includes detector-class deliverables … MUST return `ITERATE` — never
+`READY`. »*). La version précédente prescrivait « une phrase par fichier » sans
+nommer la langue, ce qui invite une clause française dans un prompt anglais servi
+à un LLM. **La clause est en anglais**, dans le registre du fichier.
+
+#### B3 — le précédent du fichier SAUTE quand le fichier est absent, et le copier désarmerait U4
+
+`test-dispatch-lib.sh` contient déjà un test qui lit un fichier par `REPO_ROOT` —
+T2211, sur `$REPO_ROOT/.claude/commands/mika.md`. Sa forme est :
+
+```sh
+if [ -f "$T2211_MIKA_CMD" ]; then
+    …assertions…
+fi
+```
+
+C'est-à-dire : **fichier absent ⇒ aucune assertion, et le test passe au vert.**
+Copier ce précédent pour U4-2 (qui lit `$REPO_ROOT/scripts/verify-pipeline.sh`)
+livrerait un scan qui se désarme silencieusement dès que le harnais tourne hors du
+checkout — et un scan silencieusement inerte se lit exactement comme un arbre
+propre (mika#2205), ce que la contre-vacuité d'U4-4 existe précisément pour
+fermer. **Divergence délibérée** : U4 rougit sur fichier illisible, avec un
+message qui dit *« fichier introuvable »* et non *« zéro lecteur »* — les deux
+diagnostics envoient chercher des choses opposées.
+
+#### B4 — le gate `pr-body-validation` est anglophone, et ce plan liste quatre suivis
+
+`scripts/check-pr-body-consistency.sh` porte un `TRIGGER_PATTERN` **en anglais** :
+`follow-up PR|will be (handled|done|fixed) in a (separate|follow-up|follow up) (PR|issue)|…|addressed in a follow-up`.
+Toute occurrence dans le corps de PR **exige** une ligne `Tracked in: …#<N>` avec
+un numéro réel, sinon le job `pr-body-validation` **échoue dur**.
+
+Ce plan nomme quatre suivis. Deux conduites sûres, et une seule est à choisir :
+soit le corps nomme les suivis **en français** (« suivi », « ticket de suivi »),
+hors de la population du motif ; soit il les nomme en anglais **et** porte une
+ligne `Tracked in: senara-solutions/mika#<N>` par suivi réellement ouvert.
+**Inventer un numéro est pire que les deux** : la ligne satisfait le gate en
+désignant un ticket qui n'existe pas.
+
+#### B5 — le plan-fixture porte déjà `## Acceptance criteria` ; l'extension doit la garder
+
+`_t2306_revise_probe` écrit, après le bloc conditionnel de la section FD :
+
+```sh
+printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
+```
+
+L'extension du paramètre (U2) remplace un `if` par un `case` **au-dessus** de
+cette ligne, qui reste inchangée. La noter évite qu'une réécriture du bloc
+l'emporte au passage et casse tout futur gate AC sur ce fixture.
+
+#### B6 — cinq états supplémentaires, pas trois
+
+La version précédente annonçait « trois états supplémentaires » puis en listait
+cinq (`numbered`, `upper`, `ish`, `notes`, `subsub`). Le compte est **cinq**, plus
+les deux existants (`yes`, `no`), soit sept états pour sept fixtures.
 
 ---
 
@@ -157,7 +246,7 @@ _FD_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Fire-Disposition'
 ```
 
 Mesuré avec `grep -qiE` sur quinze fixtures (`.pilot-scratch/fd-probe/measure.sh`
-pendant ce grooming) :
+pendant un grooming antérieur ; chaque ligne re-dérivée à la lecture du motif) :
 
 | fixture | lu | statut |
 |---|---|---|
@@ -169,16 +258,20 @@ pendant ce grooming) :
 | `##   Fire-Disposition` | **présent** | espaces multiples — élargissement assumé |
 | `## Fire-Disposition (option a)` | **présent** | doit matcher : pas d'ancre de fin |
 | `## Fire-Disposition Gate` | **présent** | idem |
-| `### Fire-Disposition` | absent | ticket ✓ — refusé par `[[:space:]]+` après `##` |
+| `### Fire-Disposition` | absent | ticket ✓ — le `#` qui suit `^##` n'est pas un `[[:space:]]` |
 | `##Fire-Disposition` | absent | pas un titre Markdown (espace requis) |
 | `` la section `## Fire-Disposition` est requise `` | absent | ticket ✓ — refusé par l'ancre `^` |
 | `## Notes on Fire-Disposition` | absent | seul faux positif concevable, refusé |
 | `## 1.1 Fire-Disposition` | absent | borne du préfixe, **assumée** (D2) |
 | `## Fire-Disposition-ish` | **présent** | **divergence avec le ticket — voir D3** |
 
-Trois de ces lignes n'étaient dans aucune version antérieure de ce plan
-(`##Fire-Disposition`, `##   Fire-Disposition`, et le mécanisme exact du refus de
-`### `), et une contredit une AC du ticket. C'est la raison d'être de la mesure.
+Deux de ces lignes méritent leur mécanisme écrit, parce qu'il n'est pas celui
+qu'on suppose. `## 1.1 Fire-Disposition` : le groupe de préfixe consomme `1` puis
+`.`, exige ensuite `[[:space:]]+` et trouve `1` — le groupe échoue ; sans le
+groupe il faudrait `Fire-Disposition` juste après `## ` et on a `1.1`. Refusé par
+**arithmétique du motif**, pas par une borne explicite. `## Notes on Fire-Disposition` :
+refusé parce que le texte reste ancré juste après le préfixe optionnel, et c'est
+la propriété que le contrôle négatif T12c existe pour tenir.
 
 ---
 
@@ -214,8 +307,14 @@ fix both together for case, and nothing was left holding them together. »*
 
 Le motif vit dans une constante de portée fichier de `dispatch-lib.sh`,
 `_FD_HEADING_RE`, définie près de `_FIRE_DISPOSITION_RULE` (même famille
-mika#2306, même voisinage de lecture), **pas** en `local` dans la fonction : la
-constante doit être lisible par le scan de co-mutation (U4) sans dérouler le flot.
+mika#2306, même voisinage de lecture), **pas** en `local` dans la fonction. Deux
+raisons, et la seconde est fonctionnelle : la constante doit être lisible par le
+scan de co-mutation (U4) sans dérouler le flot ; et le harnais de sonde
+`source`-ise `dispatch-lib.sh` dans un sous-shell, donc seule une définition au
+niveau du fichier est en portée quand la fonction s'exécute. Le site choisi
+(voisinage de `_FIRE_DISPOSITION_RULE`, ~2682) précède largement la fonction
+(~6813), ce qui est de toute façon sans effet en bash mais garde la lecture
+naturelle.
 
 **Nom :** `_FD_HEADING_RE` et non `FD_HEADING_RE` comme l'écrit le ticket — la
 convention du fichier est l'underscore initial pour les constantes de portée
@@ -343,8 +442,10 @@ Précédent du prédicat positionnel : mika#2496,
 `skills/bundled/_shared/test-dispatch-lib.sh` (les trois lancements de
 `claude-pilot`).
 
-**Contre-vacuité obligatoire** : le scan doit asserter qu'il **voit** la population
-(≥ 1 lecteur trouvé par section). Un scan qui ne regarde rien rend zéro violation.
+**Contre-vacuité obligatoire**, et sa forme est décidée par B3 : le scan doit
+asserter qu'il **voit** la population (≥ 1 lecteur trouvé par section) **et**
+rougir distinctement si un fichier de la population est illisible. Un scan qui ne
+regarde rien rend zéro violation.
 
 ### D8 — pas de single-source entre les deux motifs, et le prix est nommé
 
@@ -374,30 +475,37 @@ n'existe ici, le prix est nommé plutôt que mécanisé »*.
    `! grep -qiE "$_FD_HEADING_RE" "$plan_path" 2>/dev/null || return 0`
 3. Dans la même fonction, **re-test de journalisation** →
    `if ! grep -qiE "$_FD_HEADING_RE" "$plan_path" 2>/dev/null; then`
-4. **Piège de quoting, à écrire au site** : la constante est définie en quotes
-   simples et interpolée en quotes doubles. Les deux sites ont impérativement
-   besoin de leur drapeau ERE (`-E`) : sans lui, `+`, `?` et le groupe `( … )` sont
-   des littéraux, le motif ne matche **rien**, et les deux termes deviennent
-   toujours-vrais — le rattrapage se déclencherait sur **tout** plan dont les
-   findings mentionnent la chaîne. C'est le mode de panne que mika#2516 a dû
-   documenter pour son propre motif, et il est silencieux.
-5. Mettre à jour le doc-comment de la fonction : le terme 2 se lit désormais « ne
+4. **Le drapeau est `-qiE`, et le piège est de perdre le `E` (B1).** Les deux sites
+   portent déjà `-qE` : la transformation est l'ajout du `i`, pas l'ajout du `E`.
+   Écrire `-qi` fait perdre l'ERE **en silence** — le groupe et les quantificateurs
+   redeviennent littéraux, le motif ne matche rien, les deux termes deviennent
+   toujours-vrais, et le rattrapage tire sur tout plan dont les findings mentionnent
+   la chaîne. Écrire le piège au site, et le vérifier sur le drapeau combiné (V7).
+5. **Quoting** : la constante est définie en quotes simples (le motif contient `\.`
+   et des crochets qu'aucune expansion ne doit toucher) et interpolée en quotes
+   doubles aux deux sites.
+6. Mettre à jour le doc-comment de la fonction : le terme 2 se lit désormais « ne
    porte pas de titre `Fire-Disposition`, numéroté ou non ».
-6. **Le terme 1 n'est pas touché** : c'est un `grep -qF` sur les **findings**, pas
+7. **Le terme 1 n'est pas touché** : c'est un `grep -qF` sur les **findings**, pas
    sur le plan — population différente, délibérément grossière, documentée comme
    telle.
 
-### U2 — les fixtures : un troisième état, et sept assertions
+### U2 — les fixtures : cinq états de plus, et sept assertions
 
 **Fichier :** `skills/bundled/_shared/test-dispatch-lib.sh` (harnais
 `_t2306_revise_probe`, T1–T11)
 
 Le harnais prend déjà `$2 = t2306_has_section` ∈ `{yes, no}` et écrit
-`## Fire-Disposition\n\nOption (a) …`. **Étendre ce paramètre** à trois états
-supplémentaires plutôt que dupliquer le harnais : `numbered` (`## 3. Fire-Disposition`),
-`upper` (`## 3. FIRE-DISPOSITION`), `ish` (`## Fire-Disposition-ish`), `notes`
+`## Fire-Disposition\n\nOption (a) …` sous un `if`. **Étendre ce paramètre** à
+**cinq** états supplémentaires (B6) plutôt que dupliquer le harnais, en remplaçant
+le `if` par un `case` : `numbered` (`## 3. Fire-Disposition`), `upper`
+(`## 3. FIRE-DISPOSITION`), `ish` (`## Fire-Disposition-ish`), `notes`
 (`## 11. Notes on Fire-Disposition`), `subsub` (`## 1.1 Fire-Disposition`). Le mode
 de comportement `second` reste inchangé.
+
+**La ligne `## Acceptance criteria` qui suit le bloc reste telle quelle (B5)** —
+elle est hors du `case`, et une réécriture du bloc qui l'emporterait casserait tout
+futur gate AC sur ce fixture.
 
 | id | fixture | attendu | ce que ça voit |
 |---|---|---|---|
@@ -425,10 +533,10 @@ négatif de la forme non numérotée, et il doit rester vert pour que T12a prouv
 `skills/bundled/mika-arch-second-review/system_prompt.md`, § *Fire-Disposition
 Gate (mika#1574)*, dans l'arbre de décision (branche 1 des deux).
 
-Une phrase par fichier : le titre de la section peut porter un numéro de section en
-tête (`## 3. Fire-Disposition`) parce que le producteur de plans numérote ses
-titres ; la section est la même et le gate passe. Formulée sur le **vocabulaire**,
-pas en injonction au groomeur.
+Une phrase par fichier, **en anglais** (B2), dans le registre du fichier : le titre
+de la section peut porter un numéro de section en tête (`## 3. Fire-Disposition`)
+parce que le producteur de plans numérote ses titres ; la section est la même et le
+gate passe. Formulée sur le **vocabulaire**, pas en injonction au groomeur.
 
 Assertions correspondantes dans `test-dispatch-lib.sh` (les prompts bundled y sont
 déjà lus par d'autres tests) : les deux fichiers contiennent la clause. C'est une
@@ -438,7 +546,7 @@ testable déterministement, et c'est dit au contrat de vérification.
 ### U4 — le scan de site unique et de co-mutation
 
 **Fichier :** `skills/bundled/_shared/test-dispatch-lib.sh` (nouveau bloc, après
-T12). `REPO_ROOT` y existe déjà, donc la lecture de
+T12). `REPO_ROOT` y existe déjà (`SCRIPT_DIR/../../..`), donc la lecture de
 `$REPO_ROOT/scripts/verify-pipeline.sh` ne demande aucune plomberie neuve.
 
 Quatre assertions :
@@ -455,10 +563,13 @@ Quatre assertions :
    **littéralement identique** dans `_FD_HEADING_RE` et dans `AC_HEADING_RE`. C'est
    ce qui remplace le single-source impossible (D8) : le jour où l'un des deux
    évolue, ce test rougit au lieu de laisser les deux gates redivergents en silence.
-4. **Contre-vacuité** — au moins un lecteur trouvé par section, et
-   `_FD_HEADING_RE` non vide. Sans elle, un renommage de constante ou un
-   déplacement de fichier rend le scan silencieusement inerte, ce qui se lit
-   exactement comme un arbre propre (mika#2205).
+4. **Contre-vacuité, en deux moitiés (B3)** — (i) au moins un lecteur trouvé par
+   section, et `_FD_HEADING_RE` non vide ; (ii) **un fichier de la population
+   illisible fait ROUGIR**, avec un message nommant le fichier introuvable — et non
+   un saut silencieux à la T2211. C'est une divergence délibérée avec le précédent
+   du fichier : sans elle, un renommage de constante, un déplacement de fichier ou
+   une exécution hors checkout rend le scan inerte, ce qui se lit exactement comme
+   un arbre propre (mika#2205).
 
 ### U5 — la fausse garantie de `verify-pipeline.sh` est corrigée
 
@@ -495,9 +606,11 @@ deux lecteurs et son motif ne sont **pas** touchés.
 | V4 | T12c/T12d **vues vertes avant U1** (la borne existait déjà) et après | prouve un élargissement, pas un désarmement |
 | V5 | **U4-3 vue rouge** en désalignant un caractère du préfixe dans l'un des deux motifs | la co-mutation mord réellement |
 | V6 | U4-2 verte sans toucher le **prédicat** AC de `verify-pipeline.sh` | si elle rougit, un second lecteur AC existe : le nommer avant tout élargissement |
-| V7 | `bash -n skills/bundled/_shared/dispatch-lib.sh` et `shellcheck` sans régression | le quoting de U1-4 est le piège du correctif |
-| V8 | `make verify-bundled-skills` vert | U3 touche deux bundles |
-| V9 | `bash scripts/verify-pipeline-test.sh` rend 0 | il n'est pas en CI (A4) : à lancer **à la main**, et à dire dans le corps de PR |
+| V7 | les deux sites portent `-qiE` — **drapeau combiné**, pas `-E` seul (B1) | `grep -n 'grep -qiE "\$_FD_HEADING_RE"' dispatch-lib.sh` rend **deux** lignes, et `grep -c "grep -qE '\^## Fire-Disposition'"` rend **zéro** |
+| V8 | **U4-4(ii) vue rouge** en rendant `verify-pipeline.sh` illisible | le scan ne se désarme pas en silence (B3) |
+| V9 | `bash -n skills/bundled/_shared/dispatch-lib.sh` et `shellcheck` sans régression | le quoting d'U1-5 |
+| V10 | `make verify-bundled-skills` vert | U3 touche deux bundles |
+| V11 | `bash scripts/verify-pipeline-test.sh` rend 0 | il n'est pas en CI (A4) : à lancer **à la main**, et à dire dans le corps de PR |
 
 **Ce qui n'est PAS testable ici, écrit plutôt que découvert.** « Le gate architecte
 accepte un titre numéroté » est exécuté par un LLM, contre un fournisseur réel. Le
@@ -513,20 +626,20 @@ de présence de clause (U3) et le scan de source à quatre termes (U4). **Option
 — exception nommée en allowlist, table livrée vide et vacuité assertée à
 l'exécution.**
 
-Modèle exact : `T2306_ARCH_ASK_ALLOWLIST` (T9 de `test-dispatch-lib.sh`) et
-`scripts/test-guard-shared-checkout.sh`. Le scan d'U4 porte une table
-`T2544_HEADING_READER_ALLOWLIST=()` dont le test **asserte qu'elle compte zéro
-entrée**. Elle rougit donc le jour où une exception est ajoutée, pas seulement
-quand elle devient stale — et une table vide assertée vide est ce qui distingue
-« aucune violation » de « le scan ne regarde rien ».
+Modèle exact : `T2306_ARCH_ASK_ALLOWLIST` (T9 de `test-dispatch-lib.sh`, table
+`=()` dont la taille est assertée à zéro) et `scripts/test-guard-shared-checkout.sh`.
+Le scan d'U4 porte une table `T2544_HEADING_READER_ALLOWLIST=()` dont le test
+**asserte qu'elle compte zéro entrée**. Elle rougit donc le jour où une exception
+est ajoutée, pas seulement quand elle devient stale — et une table vide assertée
+vide est ce qui distingue « aucune violation » de « le scan ne regarde rien ».
 
 **Violations préexistantes : zéro, et c'est établi par lecture, pas supposé.**
 L'inventaire du § *Cartographie* est exhaustif. Les deux populations du scan
 comptent respectivement **2 lecteurs FD** (tous deux passant par la constante après
-U1) et **2 lecteurs AC** (tous deux passant par `AC_HEADING_RE` aujourd'hui). Les
-deux `echo "FAIL: …"` de `verify-pipeline.sh` citent le littéral sans être des
-lecteurs : ils sont hors population par le prédicat **positionnel** de D7 — ce
-n'est pas une exception, c'est la définition de la population.
+U1) et **2 lecteurs AC** (tous deux passant par `AC_HEADING_RE` aujourd'hui, lignes
+174 et 184). Les deux `echo "FAIL: …"` de `verify-pipeline.sh` citent le littéral
+sans être des lecteurs : ils sont hors population par le prédicat **positionnel**
+de D7 — ce n'est pas une exception, c'est la définition de la population.
 
 **Résolution quand le scan tire : on route le site vers la constante, on n'ajoute
 pas de ligne à l'allowlist** (doctrine mika#2201). Un lecteur qu'on ne veut pas
@@ -595,7 +708,7 @@ n'ayant réellement aucune section.
 > **Halte 3 — zéro des deux événements sur 7 jours.** On ne peut **rien** conclure.
 > Vérifier qu'un groom a réellement convergé dans la fenêtre. *Un rattrapage
 > silencieusement désarmé se lit exactement comme un rattrapage qui n'a rien à
-> faire* (mika#2205) — et le mode de panne d'U1-4 (ERE manquant) produit très
+> faire* (mika#2205) — et le mode de panne d'U1-4 (ERE perdu) produit très
 > exactement l'inverse, un rattrapage qui tire sur tout : si les deux événements
 > explosent, c'est là qu'il faut regarder avant le motif.
 
@@ -632,25 +745,32 @@ n'ayant réellement aucune section.
 ## Definition of Done
 
 - [ ] `_FD_HEADING_RE` défini une fois et interpolé aux deux sites, avec les quatre
-      bornes, la décision D3 et le piège ERE écrits au site (U1)
-- [ ] Les états supplémentaires de `_t2306_revise_probe` et T12a–T12g (U2)
+      bornes, la décision D3 et le piège du drapeau combiné écrits au site (U1)
+- [ ] Les cinq états supplémentaires de `_t2306_revise_probe` et T12a–T12g (U2),
+      la ligne `## Acceptance criteria` du fixture **conservée** (B5)
 - [ ] T12a vue **rouge** avant U1 ; T12e vue **rouge** sur un correctif à moitié
       appliqué (V2, V3) — les deux notées au corps de PR
-- [ ] La clause de vocabulaire dans les deux prompts architecte + assertions de
-      présence (U3)
+- [ ] La clause de vocabulaire **en anglais** dans les deux prompts architecte +
+      assertions de présence (U3, B2)
 - [ ] Le scan à quatre termes dans `test-dispatch-lib.sh`, table d'exceptions
-      **vide et assertée vide**, avec contre-vacuité (U4)
-- [ ] U4-3 vue **rouge** en désalignant un caractère (V5)
+      **vide et assertée vide**, contre-vacuité en deux moitiés dont le refus sur
+      fichier illisible (U4, B3)
+- [ ] U4-3 vue **rouge** en désalignant un caractère (V5) ; U4-4(ii) vue **rouge**
+      sur fichier illisible (V8)
+- [ ] Les deux sites portent `-qiE` et plus aucun `grep -qE '^## Fire-Disposition'`
+      ne subsiste (V7)
 - [ ] Le commentaire de `AC_HEADING_RE` nomme le harnais qui porte réellement la
       garde, sans toucher au prédicat AC (U5)
 - [ ] `make test-dispatch-lib`, `bash -n`, `shellcheck`, `make verify-bundled-skills`
-      verts (V1, V7, V8) ; `bash scripts/verify-pipeline-test.sh` lancé **à la main**
-      et rendu 0 (V9)
+      verts (V1, V9, V10) ; `bash scripts/verify-pipeline-test.sh` lancé **à la
+      main** et rendu 0 (V11)
 - [ ] `docs/solutions/…-ac-heading-case-insensitive-2026-06-30.md` porte mika#2544
       en n=4 avec la classe reformulée, et la découverte A4 (U6)
 - [ ] Corps de PR écrit **sous le worktree** (`pr-body.md`), passé en
-      `--body-file`, supprimé ensuite (mika#2211)
-- [ ] Suivis ouverts : (1) câbler `verify-pipeline-test.sh` en CI ; (2) la clause de
+      `--body-file`, supprimé ensuite (mika#2211) — et les suivis y sont nommés en
+      français, **ou** en anglais avec une ligne `Tracked in: …#<N>` par suivi
+      réellement ouvert (B4)
+- [ ] Suivis nommés : (1) câbler `verify-pipeline-test.sh` en CI ; (2) la clause de
       vocabulaire pour le gate **AC** des deux prompts architecte ; (3) la lecture
       par code de la section avant le second passage (précondition : halte 2) ;
       (4) le resserrement du suffixe sur les deux motifs (précondition : D3)
@@ -660,7 +780,7 @@ n'ayant réellement aucune section.
 ## Acceptance criteria
 
 Les quatre premiers sont transcrits du § *Critères d'acceptation* du corps de
-mika#2544 ; les cinq suivants sont dérivés du § *Remède* et du contrat de
+mika#2544 ; les six suivants sont dérivés du § *Remède* et du contrat de
 vérification, et couvrent ce que les mesures de ce grooming ont ajouté.
 
 - **AC1** — Les deux lecteurs de `dispatch-lib.sh` lisent un titre numéroté comme
@@ -688,6 +808,9 @@ vérification, et couvrent ce que les mesures de ce grooming ont ajouté.
   ses deux lecteurs et son motif ne sont pas modifiés.
 - **AC9** — Aucune valeur de réglage, aucun événement et aucune variable
   d'environnement ne sont créés, déplacés ou supprimés.
+- **AC10** — Le scan d'U4 **rougit** quand un fichier de sa population est
+  illisible, au lieu de sauter silencieusement comme le fait le précédent T2211 du
+  même harnais.
 
 ---
 
@@ -701,6 +824,10 @@ vérification, et couvrent ce que les mesures de ce grooming ont ajouté.
   lui-même en CI. Le câbler est un élargissement de périmètre (772 lignes, dépôts
   git jetables, `gh` mocké) qui peut rougir sur des causes sans rapport.
   **Suivi**, sans précondition : c'est une inertie établie, pas une hypothèse.
+- **Corriger le saut silencieux de T2211** (`if [ -f ]` sur `mika.md`), défaut de
+  même classe que B3 trouvé en chemin. U4 ne le reproduit pas ; le réparer *lui*
+  changerait la population d'un test voisin sans rapport avec ce ticket. **Suivi**,
+  sans précondition : l'inertie est mesurée, à la ligne 6104.
 - **La clause de vocabulaire pour le gate AC des deux prompts architecte** — même
   absence que pour FD, mais AC dispose d'un filet CI en aval que FD n'a pas (D6).
   **Suivi**, sans précondition.
