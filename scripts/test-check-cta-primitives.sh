@@ -226,7 +226,7 @@ rm -rf "$d"
 #       an exemption cannot outlive its cause and silently cover a namesake later.
 d="$(make_page_with_button '      <Button onClick={() => {}}>Clean</Button>')"
 a="$(make_allowlist 'dashboard/src/pages/Probe.tsx  bg-indigo-600  # already migrated')"
-assert_exit "$d" 1 "a stale allowlist entry fails the build"
+assert_exit "$d" 1 "a stale allowlist entry fails the build" "$a"
 assert_says "$d" "Stale allowlist" "the stale-entry failure says so" "$a"
 rm -f "$a"
 rm -rf "$d"
