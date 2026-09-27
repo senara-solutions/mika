@@ -163,8 +163,12 @@ if [[ -n "$PLAN" ]]; then
     #
     # The DECISION stays strict: an absent section, or a present but empty one,
     # still FAILs — here exactly as before. Do not re-spell this pattern
-    # anywhere else; a single-reader guard in scripts/verify-pipeline-test.sh
-    # (mika#2516) reddens on a third literal spelling in command position.
+    # anywhere else; a single-reader guard in
+    # skills/bundled/_shared/test-dispatch-lib.sh (T12j, mika#2544 — the harness
+    # CI actually runs; mika#2516 had pointed at verify-pipeline-test.sh, which
+    # no CI job runs, and never shipped it) reddens on a heading literal in
+    # grep/sed position. The same test holds this pattern's numbering prefix
+    # identical to `_FD_HEADING_RE` in dispatch-lib.sh: change both together.
     #
     # Defined in single quotes, interpolated in double quotes. Both matchers
     # therefore need their ERE flag (`grep -qiE`, `sed -nE`): without it the

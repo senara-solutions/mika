@@ -2695,6 +2695,47 @@ Si le plan ne livre AUCUN détecteur, la section n'est pas requise (gate N/A) : 
 Sans elle, mika-arch rend ITERATE en première passe et ESCALATE en seconde — et la seconde
 passe est sans recours."
 
+# mika#2544 — motif de DÉTECTION du titre `## Fire-Disposition`. Site unique :
+# il est interpolé aux DEUX lecteurs de `_fd_retry_if_section_still_missing`
+# (terme 2 du prédicat de relance, et re-test de journalisation), et cette
+# co-mutation est l'objet. Les deux `grep` littéraux d'avant rejetaient
+# `## 3. Fire-Disposition` alors que `/ce:plan` numérote ses titres : sur un
+# plan CONFORME, le rattrapage relançait un pilote de revise pour rien, avec un
+# finding synthétique faux, et émettait `fire_disposition_still_missing_after_retry`
+# à tort (pilote de groom 8712b2f8, mika#2542).
+#
+# Jumeau assumé de `AC_HEADING_RE` (scripts/verify-pipeline.sh, mika#2516),
+# copié terme pour terme. Aucun fichier n'est lisible par les deux gates au même
+# instant — verify-pipeline.sh est lu depuis le dépôt, ce fichier est une
+# projection du binaire (mika#2340) — donc le préfixe est doublé, et c'est
+# test-dispatch-lib.sh (T12j) qui les tient ensemble : désaligner l'un rougit.
+#
+# Permissif par construction (détection permissive, décision stricte) :
+#   - préfixe de numérotation optionnel, borné à `<chiffres>[.]` — la forme
+#     mesurée. `## 1.1 …` et `## Phase 3 — …` ne sont PAS couverts : élargir sur
+#     une devinette est refusé ; une telle forme est un n+1 à mesurer, et
+#     l'élargissement devra bouger les DEUX motifs.
+#   - `[[:space:]]+` au lieu de l'espace littéral : `##   Fire-Disposition`
+#     matche, `##Fire-Disposition` (pas un titre Markdown) non.
+#   - casse repliée par `-i` aux deux sites : les deux gates lisent un titre
+#     écrit par le même producteur ; les séparer sur la casse recréerait un cran
+#     plus loin l'asymétrie que ce motif ferme.
+#   - PAS d'ancre `$` : `## Fire-Disposition (option a)` doit matcher. Corollaire
+#     assumé (D3 du plan) : `## Fire-Disposition-ish` en tête de ligne est lu
+#     comme la section. `AC_HEADING_RE` n'a pas de borne de fin non plus ; en
+#     ajouter une ici seul recréerait l'asymétrie sur le suffixe.
+#   - le texte reste ancré juste après le préfixe optionnel : `## Notes on
+#     Fire-Disposition` est refusé, et `### Fire-Disposition` aussi.
+#
+# Défini en quotes simples, interpolé en quotes doubles. Les deux lecteurs
+# portent `grep -qiE` — le drapeau COMBINÉ. Le piège n'est pas d'oublier `-E`
+# (il y était déjà), c'est de le perdre en écrivant `-qi` : le groupe et les
+# quantificateurs redeviennent littéraux, le motif ne matche plus rien, le
+# terme 2 devient toujours vrai et le rattrapage tire sur tout plan dont les
+# findings mentionnent la chaîne. Ne pas ré-orthographier ce motif ailleurs :
+# T12j rougit sur un littéral de titre en position de motif.
+_FD_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Fire-Disposition'
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -6782,7 +6823,8 @@ _launch_revise_pilot() {
 #   1. l'architecte a réclamé la section ⇔ le findings-file de PREMIÈRE PASSE
 #      contient la chaîne `Fire-Disposition` (le vocabulaire imposé par son
 #      propre gate) ;
-#   2. la section est absente ⇔ le plan révisé ne porte pas `^## Fire-Disposition`.
+#   2. la section est absente ⇔ le plan révisé ne porte pas de titre
+#      `Fire-Disposition`, numéroté ou non (`$_FD_HEADING_RE`, mika#2544).
 #
 # La SOURCE du premier terme est portante, pas un détail de rédaction. C'est
 # `$1` — le findings-file de première passe reçu par `_launch_revise_pilot`. Le
@@ -6821,8 +6863,9 @@ _fd_retry_if_section_still_missing() {
 
     # Terme 1 — l'architecte a réclamé la section.
     grep -qF -- 'Fire-Disposition' "$first_pass_findings" 2>/dev/null || return 0
-    # Terme 2 — le plan révisé ne la porte toujours pas.
-    ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null || return 0
+    # Terme 2 — le plan révisé ne la porte toujours pas (même motif que le re-test
+    # de journalisation plus bas : les deux lecteurs bougent ensemble, mika#2544).
+    ! grep -qiE "$_FD_HEADING_RE" "$plan_path" 2>/dev/null || return 0
 
     # Armé avant toute action : un échec en aval ne doit pas rouvrir le budget.
     _FD_REVISE_RETRIED=1
@@ -6888,7 +6931,7 @@ Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
     # à zéro. Une occurrence soutenue du second dit que le pilote de revise ne
     # sait pas écrire la section — donc que le correctif est côté
     # `/mika-revise-plan` (suivi mika-platform), PAS un troisième essai ici.
-    if ! grep -qE '^## Fire-Disposition' "$plan_path" 2>/dev/null; then
+    if ! grep -qiE "$_FD_HEADING_RE" "$plan_path" 2>/dev/null; then
         echo "fire_disposition_still_missing_after_retry: ${REPO:-?}#${ISSUE_NUM:-?} — la seconde tentative n'a pas produit la section ; le plan part au second passage architecte. Aucune troisième relance (budget épuisé)." >&2
     fi
 

@@ -87,6 +87,8 @@ When a plan includes one or more detector-class deliverables, the `## Fire-Dispo
 2. Plan has detector-class deliverables AND the section is missing or empty ⇒ return `ITERATE` with a BLOCKING F-finding naming the detected deliverables and requesting the section.
 3. Plan has no detector-class deliverables ⇒ gate is N/A (does not influence disposition).
 
+**Heading form:** a leading section number does not change the section. The plan producer numbers its headings, so `## 3. Fire-Disposition` (or `## 3 Fire-Disposition`) IS the `## Fire-Disposition` section for every branch of this tree — judge its content, never its numbering (mika#2544).
+
 **Gate precedence:** when this gate, the Unresolved-Decision Gate, and the Acceptance-Criteria Gate demand different dispositions on the same plan, take the most-blocking disposition (`ESCALATE` > `ITERATE` > `READY`) and emit the union of all F-findings under it.
 
 ### Output
