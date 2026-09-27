@@ -136,9 +136,28 @@ jobs:
       - run: npm ci
       - run: npm run build -w packages/ui
       - run: npm test -w packages/ui
+      # <Button>'s discriminated union carries a property no runtime test can
+      # observe: `<Button as="link" disabled>` must not COMPILE (mika#1801 R-2).
+      # vitest transpiles with esbuild, which strips types without checking them,
+      # so `Button.type-assertions.tsx` is inert unless a typechecker runs it —
+      # a guard nobody runs is a decoration (mika#2103).
+      - run: npm run typecheck -w packages/ui
       - run: npm run lint -w dashboard
       - run: npm run build -w dashboard
       - run: npm test -w dashboard
+      # `site/` had NO compiling check at all until mika#1801: `landing-tokens-lint`
+      # is a grep, and the job below says so in its own comment. Yet `site/` is a
+      # root npm workspace, carries `tsc -b && vite build`, and declares
+      # `@samidarko/ui` — of which it imported only the CSS. LC.2 makes the landing
+      # render <Button>, i.e. its first TypeScript component import, in the one
+      # surface where a broken import or type error would pass the merge without
+      # reddening. This line is a precondition of that migration, not a supplement,
+      # and it is ordered before it for that reason.
+      #
+      # It belongs in this job rather than a new one because it needs the same
+      # `npm ci` and the same freshly-built `packages/ui` dist that the steps above
+      # already produce. Cost is a `tsc` over twelve files.
+      - run: npm run build -w site
 
   docs-site:
     name: Docs Site
