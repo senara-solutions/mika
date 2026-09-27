@@ -540,22 +540,37 @@ paraphrased upward to the user — the being learns to name the operator
 and ask for config help ("Salut Vincent, il manque X…"). This is the
 mika#1783 failure class.
 
-Use [`ToolOutput::substrate_unavailable`](../crates/mika-agent/src/tools/mod.rs)
-and then dispatch it before returning:
+Use [`dispatch_substrate_unavailable`](../crates/mika-agent/src/tools/mod.rs),
+which builds the result **and** routes its diagnostic in one call:
 
 ```rust
-let mut out = ToolOutput::substrate_unavailable(
-    // What the LLM sees. Neutral, non-addressive, no service/config/URL:
+return crate::tools::dispatch_substrate_unavailable(
+    // What the LLM sees. Neutral, non-addressive, no service/config/URL —
+    // but never mute: it must say the capability is unavailable, or the model
+    // invents a cause.
     "La recherche web n'est pas disponible pour le moment.",
     // What the substrate telemetry sink sees. Actionable operator-shaped
     // detail: which service, which key, how to obtain:
-    "Brave Search API key not configured. \
-     Set brave_api_key in ~/.mika/config.toml or MIKA_BRAVE_API_KEY env var. \
-     Get a free key at https://brave.com/search/api/",
-);
-crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
-return out;
+    "Search substrate is not configured (gateway_url missing). \
+     Ensure MIKA_ROUTING_URL is set on mika-spirit.",
+    "web_search",
+    ctx,
+)
+.await;
 ```
+
+Since mika#1964 this is the **only** production site that may call
+`ToolOutput::substrate_unavailable` directly, and the lint below holds it. The
+reviewer of mika#1783 asked for a check on `substrate_unavailable(` not followed
+by `dispatch_substrate_diagnostic(` — the coupled-call footgun. A coupled call
+one *can* write apart is an open class; a call one can only write coupled is not,
+so the footgun was removed rather than detected.
+
+One sibling exists for the case where the result cannot be a substrate result:
+`attach_substrate_diagnostic(&mut out, diagnostic, tool, ctx)`. It keeps the same
+coupling and is used by `send_message`'s no-sender arm, whose `content` must keep
+its [`DeliveryVerdict`] (mika#2136 compares its text by equality) and must keep
+stating that nothing was delivered.
 
 The emission-site check `dispatch_substrate_diagnostic` routes by
 `ctx.tier`:
@@ -576,11 +591,60 @@ person-preference = something the user owns and can adjust.
 Reference implementation and unit tests: `web_search` in
 `crates/mika-agent/src/skills/builtin_handlers.rs` and the
 `web_search_family_tier_no_leak` / `web_search_family_tier_audit_event` /
-`web_search_default_tier_diagnostic_visible` tests in the same file.
+`web_search_default_tier_diagnostic_visible` tests in the same file, plus
+`mika1964_web_search_family_tier_no_leak_on_substrate_failure`, which drives the
+real handler against a mock substrate on 404 and 502.
 
-Follow-up hygiene ticket sweeps every existing handler that touches infra
-config; enforcement via lint/CI is planned. Until then, code review is the
-gate on new handlers.
+#### Enforcement: `substrate-leak-lint` (mika#1964)
+
+The promise of a lint gate is kept. `scripts/check-substrate-leak.sh` runs in CI
+as the `substrate-leak-lint` job (and `make check-substrate-leak` locally), with
+`scripts/test-check-substrate-leak.sh` pinning its negative behaviour beside it —
+a guard nobody has watched go red is a decoration.
+
+**Two rules.**
+
+1. **One site for the bare constructor.** `ToolOutput::substrate_unavailable(`
+   may appear in production only inside `dispatch_substrate_unavailable`. The
+   allowlist is shipped empty: when this fires, remove the second site rather
+   than exempting it.
+2. **No substrate literal in a model-visible string.** The patterns are
+   `MIKA_*`, `GH_TOKEN` / `GITHUB_TOKEN`, `XDG_CONFIG_HOME`, `config.toml`,
+   `.mika/`, `Ask the operator`, `GitHub App`, `GitHub token`.
+
+   **Rule 2 is anchored on the LITERAL, never on the constructor**, and that is
+   deliberate rather than convenient. mika#1964's founding defect lives in
+   `map_substrate_error`, a function of its own, on no line carrying
+   `ToolOutput::error` — so a constructor-keyed rule (the shape the ticket's own
+   acceptance criterion proposed) would not have seen it. The measured population
+   also spans three constructors: `error`, `success` (`resolve_issue_order`) and
+   `delivery` (`send_message`). This is the mika#2103 lesson applied before the
+   incident: a guard that knows one *writing* of a defect lets every other
+   writing through.
+
+**Two annotations, two populations, countable apart.** A literal that legitimately
+carries substrate detail is annotated on the line (or on the last comment line
+immediately above it — the window is short, and the offending strings are
+multi-line `format!`s where a `//` would land inside the string):
+
+- `// substrate-diagnostic: <reason>` — this literal **is** the operator channel;
+  naming the surface is its purpose, and the dispatch routes it.
+- `// substrate-ok: <reason>` — this literal never reaches a `content` served to
+  the LLM: an `env()` argument, a config key, a flag name, a `tracing::warn!`
+  field.
+
+One shared prefix would fuse "protected by the mechanism" with "not in the
+subject", and make the first population uncountable the day it deserves an audit.
+
+**Perimeter, stated rather than discovered.** The lint covers
+`crates/mika-agent/src/skills/builtin_handlers.rs` and
+`crates/mika-agent/src/tools/*.rs`. It does **not** cover `mika-gateway`,
+`mika-cli`, or `skills/bundled/**`, where a variable name inside a string is
+nominal; extending it there means first measuring the annotation volume. Test
+regions are excluded, because the tests assert on these very tokens — and the cut
+is on the test **module**, never on the first `#[cfg(test)]`, which in
+`builtin_handlers.rs` would leave thousands of production lines unscanned while
+the guard exits 0.
 
 ---
 

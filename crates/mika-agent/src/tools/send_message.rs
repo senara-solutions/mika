@@ -182,13 +182,38 @@ impl Tool for SendMessageTool {
             // inform the user.
             None => {
                 warn!("send_message called but no outbound sender configured");
-                Ok(ToolOutput::delivery(
-                    "No outbound sender configured — message was NOT delivered. \
-                     To enable Telegram delivery, set MIKA_ROUTING_URL and MIKA_INTERNAL_TOKEN.",
+                // mika#1964 — the ONLY site of the sweep whose neutral fallback carries
+                // a POSITIVE obligation: the `content` must keep stating that nothing
+                // was delivered, because the turn needs that fact in order not to claim
+                // it sent something (mika#2136). Only the second sentence — the two env
+                // vars — changes channel.
+                //
+                // `DeliveryOutcome::NoSender` and the captured `cleaned` are untouched:
+                // `DeliveryVerdict` compares texts by equality, so altering either would
+                // break the mika#2136 predicate. And the constructor stays
+                // `ToolOutput::delivery` rather than becoming a substrate result, for the
+                // reason stated above this arm: `ToolOutput::error` here would make the
+                // model retry a permanent condition in a loop.
+                let mut out = ToolOutput::delivery(
+                    "The message was NOT delivered — the person has not received it. \
+                     No outbound channel is available for this agent, so retrying will \
+                     not deliver it. Do not present it as sent.",
                     false,
                     cleaned.clone(),
                     DeliveryOutcome::NoSender,
-                ))
+                );
+                crate::tools::attach_substrate_diagnostic(
+                    &mut out,
+                    // substrate-diagnostic: the operator channel — the two variables are
+                    // the remedy and only the operator can apply it.
+                    "send_message has no outbound sender configured for this agent. \
+                     To enable Telegram delivery, set MIKA_ROUTING_URL and \
+                     MIKA_INTERNAL_TOKEN.",
+                    "send_message",
+                    ctx,
+                )
+                .await;
+                Ok(out)
             }
         }
     }

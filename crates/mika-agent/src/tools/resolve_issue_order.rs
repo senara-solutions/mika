@@ -209,17 +209,38 @@ impl Tool for ResolveIssueOrderTool {
         let token = match ctx.github_token {
             Some(t) => t,
             None => {
+                // substrate-ok: a `tracing::warn!` message — the operator's channel by
+                // construction, never a tool-result `content`.
                 warn!("resolve_issue_order: no GitHub token configured, returning input order");
-                return Ok(ToolOutput::success(
+                // mika#1964 — this is a `ToolOutput::success`, and that is exactly why
+                // the guard's rule 2 is anchored on the literal rather than on
+                // `ToolOutput::error(`: a rule keyed on the constructor, which is the
+                // letter of the ticket's own AC, would not see this site at all. The
+                // fail-open behaviour is unchanged (input order, same JSON shape); only
+                // the `warning` string stops naming the credential.
+                let mut out = ToolOutput::success(
                     serde_json::json!({
                         "sorted": issues,
                         "edges": {},
                         "external_blockers": {},
                         "cycle": null,
-                        "warning": "No GitHub token configured — returning issues in input order without dependency resolution."
+                        "warning": "Dependency resolution is not available — these issues are \
+                                    returned in the order they were given, NOT in dependency \
+                                    order. Do not treat this order as resolved."
                     })
                     .to_string(),
-                ));
+                );
+                crate::tools::attach_substrate_diagnostic(
+                    &mut out,
+                    // substrate-diagnostic: the operator channel.
+                    "resolve_issue_order has no GitHub credential on this agent, so \
+                     `blockedBy` edges could not be fetched and the input order was \
+                     returned unchanged.",
+                    "resolve_issue_order",
+                    ctx,
+                )
+                .await;
+                return Ok(out);
             }
         };
 
@@ -401,15 +422,70 @@ mod tests {
             .unwrap();
 
         assert!(!result.is_error, "got error: {}", result.content);
-        let json: Value = serde_json::from_str(&result.content).unwrap();
+        // mika#1964 — on operator tier the routed diagnostic is folded back into
+        // `content` after a blank line, so the JSON is the first block rather than
+        // the whole string. The JSON itself is unchanged and complete; only an
+        // operator-facing paragraph follows it. That is a declared change of served
+        // contract for the two JSON-bodied tools of the sweep (this one and
+        // `pr_merge_with_gate`), and it is what buys the family tier a `content`
+        // that names no credential at all.
+        let json_block = result.content.split("\n\n").next().unwrap();
+        let json: Value = serde_json::from_str(json_block).unwrap();
         // Should return issues in input order
         assert_eq!(json["sorted"], serde_json::json!([3, 1, 2]));
         assert!(json["warning"].as_str().is_some());
+        // The warning must still say the order is NOT resolved — that is the fact
+        // the turn needs. What it no longer says is which credential is missing.
+        let warning = json["warning"].as_str().unwrap();
+        assert!(warning.contains("NOT in dependency order"), "{warning}");
+        assert!(!warning.contains("GitHub token"), "{warning}");
+    }
+
+    /// mika#1964 V3 — family tier reads no credential, and the operator detail is
+    /// routed instead of dropped.
+    ///
+    /// This site is a `ToolOutput::success`, which is why the guard's rule 2 is
+    /// anchored on the literal and not on `ToolOutput::error(` as the ticket's
+    /// acceptance criterion proposes: a constructor-keyed rule would not see it.
+    #[tokio::test]
+    async fn mika1964_no_token_fallback_does_not_leak_on_family_tier() {
+        use crate::test_utils::test_helpers::TestHarness;
+
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let result = ResolveIssueOrderTool
+            .execute(
+                serde_json::json!({"repo": "owner/repo", "issues": [3, 1, 2]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        for token in ["GitHub token", "MIKA_GITHUB_TOKEN", "credential"] {
+            assert!(
+                !result.content.contains(token),
+                "family tier leaked {token:?}: {}",
+                result.content
+            );
+        }
+        // Family tier gets the JSON and nothing appended — so it stays parseable
+        // whole, and the fail-open behaviour is untouched.
+        let json: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(json["sorted"], serde_json::json!([3, 1, 2]));
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
         assert!(
-            json["warning"]
-                .as_str()
-                .unwrap()
-                .contains("No GitHub token")
+            events.iter().any(|e| {
+                e.tool_name == "substrate_unavailable" && e.target_key == "resolve_issue_order"
+            }),
+            "the operator detail was dropped instead of routed: {events:?}"
         );
     }
 
