@@ -2269,21 +2269,48 @@ _clean_worktree_for_rebase() {
 # Boundary (mika#1414 coordination): this helper owns ONLY the post-rebase
 # command-seed. The pre-rebase dirty-state cleanup + rebase guard (the mika#1301
 # block inside _set_up_worktree) is mika#1414's surface; the two do not overlap.
+#
+# The exclude mechanics live in the two helpers below (mika#2548), shared with
+# _seed_pilot_scratch_dir: one definition of "shield a path from git status in a
+# linked worktree", not two copies free to drift.
+
+# Print the absolute path of the COMMON-dir info/exclude for a worktree, creating
+# its parent directory. A linked worktree's own $GIT_DIR/info/exclude is not
+# consulted for status; the common dir's is. --path-format=absolute needs
+# git >= 2.31; fall back to the bare form otherwise. Prints nothing when the
+# directory is not a git worktree.
+_common_exclude_file() {
+    local worktree_dir=$1 common_dir
+    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
+    [ -n "$common_dir" ] || return 0
+    mkdir -p "$common_dir/info" 2>/dev/null || true
+    printf '%s\n' "$common_dir/info/exclude"
+}
+
+# Append one pattern to an exclude file, idempotently. Concurrent dispatches off
+# the same sub-repo share this file; the grep/append is non-atomic, so an overlap
+# may append a duplicate (inert — git collapses repeated patterns) but never
+# corrupts shielding. flock was judged not worth the complexity (P3).
+_append_exclude_line() {
+    local exclude_file=$1 pattern=$2
+    [ -n "$exclude_file" ] || return 0
+    grep -qxF "$pattern" "$exclude_file" 2>/dev/null && return 0
+    # Guard a pre-existing exclude file with no trailing newline, which would
+    # otherwise concatenate our entry onto its last line.
+    if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
+        printf '\n' >> "$exclude_file"
+    fi
+    printf '%s\n' "$pattern" >> "$exclude_file"
+}
+
 _seed_worktree_slash_commands() {
     local platform_dir=$1 worktree_dir=$2
     [ -d "$platform_dir/.claude/commands" ] || return 0
     mkdir -p "$worktree_dir/.claude/commands"
 
-    # Shared exclude lives in the common git dir (a linked worktree's own
-    # $GIT_DIR/info/exclude is not consulted for status). --path-format=absolute
-    # needs git >= 2.31; fall back to the bare form otherwise.
-    local common_dir exclude_file=""
-    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
-    if [ -n "$common_dir" ]; then
-        exclude_file="$common_dir/info/exclude"
-        mkdir -p "$(dirname "$exclude_file")"
-    fi
+    local exclude_file
+    exclude_file=$(_common_exclude_file "$worktree_dir")
 
     local src base
     for src in "$platform_dir/.claude/commands"/*.md; do
@@ -2300,19 +2327,47 @@ _seed_worktree_slash_commands() {
         fi
         cp "$src" "$worktree_dir/.claude/commands/$base" 2>/dev/null || true
         # Invariant 2: shield the scaffold copy from git status (idempotent).
-        # Concurrent dispatches off the same sub-repo share this exclude file;
-        # the grep/append is non-atomic, so an overlap may append a duplicate
-        # (inert — git collapses repeated patterns) but never corrupts shielding.
-        # flock was judged not worth the complexity (P3).
-        if [ -n "$exclude_file" ] && ! grep -qxF ".claude/commands/$base" "$exclude_file" 2>/dev/null; then
-            # Guard a pre-existing exclude file with no trailing newline, which
-            # would otherwise concatenate our entry onto its last line.
-            if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
-                printf '\n' >> "$exclude_file"
-            fi
-            printf '%s\n' ".claude/commands/$base" >> "$exclude_file"
-        fi
+        _append_exclude_line "$exclude_file" ".claude/commands/$base"
     done
+}
+
+# mika#2548 — the pilot's scratch directory: designated, empty, invisible to git.
+#
+# The failure it closes, measured 2026-09-26 (task 83db3a82, ready-label
+# mika#2054): the pilot built a fixture tree at the worktree root, every write
+# into it was refused, it abandoned the approach and tidied up — `rmdir` refused
+# twice, then `rm -rf` → `[policy:deny] … (terminal)` → session killed.
+# `rm -rf` stays terminal in claude-pilot by design (cpp#205); what this repo
+# owns is the place a scratch goes, so that nothing ever needs deleting:
+#
+#   1. It exists before the pilot starts, so there is nothing to create at an
+#      improvised path.
+#   2. It is shielded by the common-dir info/exclude (the mika#1415 mechanism
+#      above), so a leftover never reads as a dirty worktree — no mika#1282
+#      wip-rescue, no rebase refusal, never swept into a commit.
+#   3. It starts EMPTY every time the worktree is prepared. Worktrees are reused
+#      across iterations and resumes, and _clean_worktree_for_rebase (`git clean
+#      -fd` without -x, `stash --include-untracked`) spares excluded paths; a
+#      stale fixture from a previous session would otherwise push the next pilot
+#      — which the prompt rule forbids to delete it — straight back to `rm -rf`.
+#      The reset runs host-side, behind the mika#1943 guard, like the `.iterate`
+#      reset.
+#
+# Not closed here, and named: the tidy-up reflex itself on an EMPTY tree (git
+# never saw the founding directories) is barred on this side only by the prompt
+# rule _PILOT_SCRATCH_RULE. The structural half of that belongs to the
+# claude-pilot policy (make rm/rmdir under this path survivable) — follow-up.
+_PILOT_SCRATCH_DIRNAME='.pilot-scratch'
+
+_seed_pilot_scratch_dir() {
+    local worktree_dir=$1 scratch exclude_file
+    scratch="$worktree_dir/$_PILOT_SCRATCH_DIRNAME"
+    if [ -e "$scratch" ] && _assert_removable_worktree_path "$scratch" seed_pilot_scratch_dir; then
+        rm -rf "$scratch" 2>/dev/null || true
+    fi
+    mkdir -p "$scratch" 2>/dev/null || return 0
+    exclude_file=$(_common_exclude_file "$worktree_dir")
+    _append_exclude_line "$exclude_file" "$_PILOT_SCRATCH_DIRNAME/"
 }
 
 # Set up a git worktree for the target issue's branch. Parses the repo#number
@@ -2546,6 +2601,49 @@ N'écris jamais dans \`/tmp\` : la permission-policy refuse toute écriture hors
 et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\` : un corps généré peut
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
+
+# mika#2548 — la règle du scratch, portée par chaque dispatch.
+#
+# Le défaut qu'elle vise : un pilote qui range son brouillon meurt. `rm -rf` est
+# un verbe prouvé dangereux, TERMINAL par design dans claude-pilot (cpp#205), et
+# `rmdir` y est refusé ; le 2026-09-26 (tâche 83db3a82, mika#2054) le pilote a
+# construit un arbre de fixture à la racine du worktree, abandonné l'approche,
+# puis tenté de le supprimer — session tuée sur le `rm -rf`.
+#
+# Forme positive d'abord, comme la règle mika#2211 : un pilote à qui l'on dit
+# seulement « pas de rm » doit encore inventer où mettre son fixture, et le lieu
+# qu'il choisit est celui qu'il voudra nettoyer. Le lieu est donc fourni
+# (`_seed_pilot_scratch_dir`) et nommé ici. `/tmp` n'est PAS proposé : la
+# politique y refuse `cp`/`mv` (cpp#209 les rend seulement survivables) et
+# l'outil Write hors worktree (mika#2211) — on ne peut pas y bâtir un fixture.
+#
+# Ce que cette règle est, et ce qu'elle n'est pas : la moitié structurelle
+# (répertoire désigné, exclu de git, vidé à chaque préparation) retire toute
+# RAISON de nettoyer un résidu ; le réflexe de rangement lui-même, sur un arbre
+# vide que git ne voit pas, n'a de barrière ici que ce texte. Sa fermeture
+# structurelle appartient à la politique claude-pilot — suivi nommé au plan.
+#
+# Portée de l'interdit : les brouillons de `.pilot-scratch/`, pas tout fichier.
+# La règle mika#2211 (injectée juste avant) prescrit de supprimer `pr-body.md`
+# après `gh pr create` ; un interdit général de `rm` la contredirait, et le
+# pilote qui suit la règle la plus récente laisserait `pr-body.md` non suivi à
+# la racine — ignoré dans mika seulement, donc commité par le rescue `add -A`
+# ailleurs (mika-cloud, mika-skills). D'où l'exception nommée dans le texte.
+#
+# Inconditionnelle, comme mika#2211 : groomeurs et implémenteurs bâtissent tous
+# deux des fixtures. Appendue AVANT la règle Fire-Disposition (mika#2306), qui
+# doit rester la plus récente pour le groomeur, la récence étant son seul levier.
+_PILOT_SCRATCH_RULE="RÈGLE DE DISPATCH (mika#2548) — ton brouillon vit sous \`.pilot-scratch/\`, et tu ne le supprimes jamais.
+Pour un fixture, une copie de test ou tout autre fichier temporaire : crée-le sous \`.pilot-scratch/<nom>/\` à la racine
+du worktree (outil Write, ou mkdir/cp dans ce répertoire). Pour y extraire un fichier d'une autre révision :
+\`git show <ref>:<chemin> > .pilot-scratch/<chemin>\`, SEUL sur sa ligne — sans \`--\`, sans \`2>/dev/null\`, sans \`;\` ni \`&&\`
+(toute autre forme est refusée). Il existe déjà, il est exclu de git, il repart vide à
+chaque préparation et il disparaît avec le worktree : un résidu n'y coûte rien.
+Ne supprime JAMAIS un brouillon de \`.pilot-scratch/\`, même vide, même en changeant d'approche : pas de \`rm\`, pas de
+\`rmdir\` (refusé), et surtout pas de \`rm -rf\` — ce refus est TERMINAL et tue la session sur le coup. Abandonner un
+brouillon, c'est le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \`cp\` et Write y sont refusés.
+Seule exception : \`pr-body.md\` à la racine n'est pas un brouillon — la règle mika#2211 ci-dessus reste entière
+(écris-le à la racine, puis un simple \`rm pr-body.md\` après \`gh pr create\`, jamais \`rm -rf\`)."
 
 # mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
 # de grooming.
@@ -3134,6 +3232,8 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # because worktrees are short-lived and mid-session command edits
         # violate slug-immutability (mika#844).
         _seed_worktree_slash_commands "$PLATFORM_DIR" "$WORKTREE_DIR"
+        # mika#2548: a designated, empty, git-excluded scratch dir for the pilot.
+        _seed_pilot_scratch_dir "$WORKTREE_DIR"
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
@@ -3206,17 +3306,27 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
+        # --- mika#2548: the scratch rule reaches the pilot ---
+        #
+        # Unconditional, same channel and same reasoning as mika#2211 above. It
+        # sits AFTER that injection (so the position invariants of mika#2178 and
+        # the `<repo>#<num>` first line still hold) and BEFORE the conditional
+        # Fire-Disposition block below, which must stay the most recent line a
+        # groomer reads.
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PILOT_SCRATCH_RULE")
+
         # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
         #
-        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Conditionnée au skill, à la différence des trois injections ci-dessus.
         # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
-        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # ticket, la règle de corps de PR (mika#2211) et la règle du scratch
+        # (mika#2548) servent tout pilote. Celle-ci
         # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
         # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
         # donc à écrire explicitement, jamais à hériter du voisin : la copier
         # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
         #
-        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # Appendue APRÈS les trois autres, donc les trois invariants de position
         # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
         # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
         if [ "$SKILL" = "dev-groom" ]; then

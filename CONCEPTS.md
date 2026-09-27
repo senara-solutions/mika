@@ -66,6 +66,18 @@ A one-command reproducer that spawns a real sandbox through the same code path a
 
 The maximum number of agent turns a dispatched pilot may take before the SDK ends the run, resolved per dispatch by a fixed-order cascade and announced on the dispatch's forensic log with the source that decided it. The explicit rollback (the setting present but empty or zero) sits above everything and passes no ceiling at all; a ticket label listed in the ceiling table comes next and raises the ceiling for that class of ticket (the `loop-substrate` class today); the host-wide setting comes after it; the in-code default comes last. The order is load-bearing: a host that sets the fleet-wide value would otherwise shadow every label, so the label wins over the host setting, and only the rollback or removing the label bounds a labelled ticket lower. A ceiling label must be declared in the repository's label registry, or label-sync deletes it and the raised ceiling silently applies to nobody.
 
+### Pilot scratch
+
+The one directory a dispatched pilot is told to build throwaway material in — fixtures, test copies, files extracted from another revision — inside its own worktree, prepared by the dispatcher before the pilot starts. It is hidden from version control, so nothing left in it ever reads as unfinished work or reaches a commit, and it is emptied each time the worktree is prepared, so every session starts from a clean one.
+
+Its rule is the inverse of tidiness: a pilot never deletes anything in it, even when abandoning an approach, because the sandbox's permission policy treats a recursive delete as fatal to the session. Leaving material in place is how a pilot abandons it; the dispatcher's reset and the worktree's own removal are what clear it.
+
+### Dispatch rule
+
+A fixed instruction the dispatcher appends to the opening prompt of every pilot it launches — the one channel every pilot of every repository reads — as opposed to text in a repository's own command files, which only that repository's pilots see. Several are appended in a fixed order, some unconditionally and some only for grooming pilots, and the order matters because a pilot facing two instructions tends to follow the more recent one.
+
+The rules reach the pilot as one text, so a new rule is judged against all of them together: a prohibition that contradicts a prescription in a sibling rule is a defect of the set, even when each rule is sound on its own.
+
 ## Dispatch gates
 
 ### Grooming-provenance gate
