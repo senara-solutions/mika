@@ -149,9 +149,15 @@ refuse_patch_target() {
 # a prior comment exists, and both possible guesses are wrong (stacking a
 # duplicate, or patching nothing). `set -o pipefail` therefore lets the failure
 # out, and the job goes red.
+#
+# `per_page=100` is the API maximum and only changes the CALL COUNT, never the
+# result: every page is still read and the last match still wins. The route
+# defaults to 30, this workflow fires on every issue open/edit across the repo,
+# and a long ticket — this house produces them — would otherwise cost three to
+# four listing calls where one does.
 resolve_prior_annotation_url() {
     local repo="$1" num="$2"
-    gh api --paginate "repos/$repo/issues/$num/comments" \
+    gh api --paginate "repos/$repo/issues/$num/comments?per_page=100" \
         --jq ".[] | select(.body | contains(\"$ANNOTATION_MARKER\")) | .url" \
         | tail -n1
 }

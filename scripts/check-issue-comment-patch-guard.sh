@@ -41,6 +41,22 @@
 # nobody has measured as dangerous.
 #
 # ─────────────────────────────────────────────────────────────────────────────
+# KNOWN LIMITS, STATED RATHER THAN DISCOVERED
+#
+# This scan asserts the guard call's PRESENCE and its ORDER relative to the
+# PATCH. It does not prove the guard's refusal actually PREVENTS the write: a site
+# written `issue_comment_patch_target_is_valid "$x" || true` followed by the PATCH
+# would satisfy it. That half is covered behaviourally by V3b / V3b' in
+# `scripts/test-annotate-issue-token-comment.sh`, which assert that a refused
+# target yields a non-zero exit and ZERO recorded PATCH. The two guards are
+# complementary by design; neither is sufficient alone.
+#
+# Where it is imprecise, it is imprecise TOWARDS RED. A target that is not a plain
+# `"$var"`, a `}` at column 0 that is not a function end, or a guard call the
+# extractor cannot parse all push a site into the unguarded population rather than
+# out of it.
+#
+# ─────────────────────────────────────────────────────────────────────────────
 # ALLOWLIST: shipped EMPTY, compared IN BOTH DIRECTIONS.
 #
 # WHEN THIS FIRES ON A NEW SITE, ROUTE THE SITE THROUGH THE GUARD. Do not add a
