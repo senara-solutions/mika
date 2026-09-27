@@ -783,32 +783,32 @@ Les quatre premiers sont transcrits du § *Critères d'acceptation* du corps de
 mika#2544 ; les six suivants sont dérivés du § *Remède* et du contrat de
 vérification, et couvrent ce que les mesures de ce grooming ont ajouté.
 
-- **AC1** — Les deux lecteurs de `dispatch-lib.sh` lisent un titre numéroté comme
+- [x] **AC1** — Les deux lecteurs de `dispatch-lib.sh` lisent un titre numéroté comme
   présent, via un motif défini une seule fois.
-- **AC2** — Les cas négatifs listés au remède restent lus absents : `### Fire-Disposition`,
+- [x] **AC2** — Les cas négatifs listés au remède restent lus absents : `### Fire-Disposition`,
   `Fire-Disposition-ish` dans une ligne de prose, et une mention entre backticks.
   **Écart assumé et documenté (D3)** : `## Fire-Disposition-ish` **en tête de
   ligne** est lu présent, comme `## Fire-Disposition (option a)` et pour la même
   raison — l'absence d'ancre de fin, alignée sur `AC_HEADING_RE`. L'écart est
   couvert par T12g et son resserrement est un suivi.
-- **AC3** — Un test rougit si un troisième `grep` littéral `^## Fire-Disposition`
+- [x] **AC3** — Un test rougit si un troisième `grep` littéral `^## Fire-Disposition`
   apparaît dans `dispatch-lib.sh`.
-- **AC4** — Les deux prompts architecte disent explicitement que la numérotation
+- [x] **AC4** — Les deux prompts architecte disent explicitement que la numérotation
   est tolérée.
-- **AC5** — La tolérance ne dégrade aucun refus : `## Notes on Fire-Disposition` et
+- [x] **AC5** — La tolérance ne dégrade aucun refus : `## Notes on Fire-Disposition` et
   `## 1.1 Fire-Disposition` restent refusés, et le comportement sur un titre non
   numéroté est **inchangé** (T7 reste vert).
-- **AC6** — Un correctif à moitié appliqué (un seul des deux sites) est **détecté**
+- [x] **AC6** — Un correctif à moitié appliqué (un seul des deux sites) est **détecté**
   par une assertion, et non par l'absence de plainte.
-- **AC7** — La co-mutation entre le motif FD et le motif AC est tenue par une
+- [x] **AC7** — La co-mutation entre le motif FD et le motif AC est tenue par une
   assertion : désaligner l'un des deux préfixes fait rougir le build.
-- **AC8** — La garde de lecteur unique pour AC, que le commentaire de
+- [x] **AC8** — La garde de lecteur unique pour AC, que le commentaire de
   `verify-pipeline.sh` affirmait sans qu'elle existe, est livrée **dans un harnais
   que CI exécute**, et ce commentaire nomme désormais ce harnais. Le prédicat AC,
   ses deux lecteurs et son motif ne sont pas modifiés.
-- **AC9** — Aucune valeur de réglage, aucun événement et aucune variable
+- [x] **AC9** — Aucune valeur de réglage, aucun événement et aucune variable
   d'environnement ne sont créés, déplacés ou supprimés.
-- **AC10** — Le scan d'U4 **rougit** quand un fichier de sa population est
+- [x] **AC10** — Le scan d'U4 **rougit** quand un fichier de sa population est
   illisible, au lieu de sauter silencieusement comme le fait le précédent T2211 du
   même harnais.
 
