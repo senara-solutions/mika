@@ -72,7 +72,7 @@ Mika is a conversation-first AI executive assistant with per-customer container 
   - v34->v35: Expand `kg_resolutions_log.outcome` CHECK constraint to include `'no_candidate_of_type'` (#1154). Table rebuild. Enables the resolver to distinguish phantom subjects (no domain counterpart) from genuine disambiguation failures.
   - v38->v39: `operational_items` table (#1262). Canonical operational-item ledger for the What's Next engine. Seven `kind` variants (goal/task/commitment/decision/blocker/evidence/next_action), six `status` variants (now/waiting/delegated/scheduled/at_risk/done), dedup via `UNIQUE(agent_id, source_table, source_id)` partial index. Writes always-on; reads gated behind `MIKA_OPERATIONAL_PARTNER=1`. Evidence refs stored as JSON TEXT column with Rust-type-as-only-writer contract.
 - **Secrets:** All API keys and tokens in `Settings` use `secrecy::SecretString` (`Option<SecretString>`) for compile-time exposure safety and zeroize-on-drop. Secrets are exposed at the `Settings` accessor boundary (e.g., `provider_fields()`, `agent_github_token()`) via `.expose_secret()` — downstream types use plain `String`/`&str`. `Settings` has manual `Debug` impl that redacts all secret fields. `get_effective_value()` returns `"[SET]"` for secret-flagged fields (never raw values). Exec handler executor scrubs all MIKA_* env vars from child processes. MCP child processes use `env_clear()` + allowlist. Git subprocesses scrub MIKA_* vars and set `GIT_TERMINAL_PROMPT=0`.
-- **Labels:** `.github/labels.yml` is the canonical label taxonomy (type, priority, component, state, sprint hooks, automation). All issue-creation paths reference it. The `ready` label is the canonical positive-consent signal for mika-dev autonomous dispatch (mika#841). The `release` label was applied by the `release-pr` CI workflow to release PRs; that workflow is disabled (mika#2048), so nothing applies it today. **An enforcement label that is not declared here fails in silence** — the sync workflow runs with `delete-other-labels: true`, so an undeclared label is deleted from the repo *and from every issue carrying it*, with no `unlabeled` event and no log (`docs/solutions/best-practices/un-label-denforcement-non-declare-echoue-en-silence-2026-09-01.md`; three occurrences to date). The `dispatch:<seat>` family is guarded structurally: `scripts/check-dispatch-seats-declared.sh` compares this file against `KNOWN_DISPATCH_SEATS` (`crates/mika-agent/src/webhook_dispatch.rs`) **both ways** and fails CI (`dispatch-seats-lint`) on any divergence, so the two lists must move in the same commit (mika#2092). `dispatch:zorglub` is the Rust unknown-seat test fixture and must stay undeclared.
+- **Labels:** `.github/labels.yml` is the canonical label taxonomy (type, priority, component, state, sprint hooks, automation). All issue-creation paths reference it. The `ready` label is the canonical positive-consent signal for mika-dev autonomous dispatch (mika#841). The `release` label was applied by the `release-pr` CI workflow to release PRs; that workflow is disabled (mika#2048), so nothing applies it today. **An enforcement label that is not declared here fails in silence** — the sync workflow runs with `delete-other-labels: true`, so an undeclared label is deleted from the repo *and from every issue carrying it*, with no `unlabeled` event and no log (`docs/solutions/best-practices/un-label-denforcement-non-declare-echoue-en-silence-2026-09-01.md`; three occurrences to date). The `dispatch:<seat>` family is guarded structurally: `scripts/check-dispatch-seats-declared.sh` compares this file against `KNOWN_DISPATCH_SEATS` (`crates/mika-agent/src/webhook_dispatch.rs`) **both ways** and fails CI (`dispatch-seats-lint`) on any divergence, so the two lists must move in the same commit (mika#2092). `dispatch:zorglub` is the Rust unknown-seat test fixture and must stay undeclared. `loop-substrate` carries a **machine consequence** since mika#2542 — it raises the pilot turn ceiling to 200 via `PILOT_LABEL_TURN_CEILINGS` — and `scripts/check-pilot-turn-ceiling-labels.sh` (CI `pilot-turn-ceiling-labels-lint`) refuses any key of that table left undeclared here.
 - **Operational ledger:** Writes to `operational_items.evidence_refs` MUST go through `crates/mika-agent/src/operational/types.rs::EvidenceRef`. Direct SQL writes that bypass the Rust type are unsupported and will break the closed-enum guarantee from foundation Decision F.
 - **Async DB:** `AsyncDatabase` wraps sync `Database` with dedicated OS thread + `tokio::sync::mpsc::channel(512)` bounded channel (closure-based dispatch). Clone-able, Send+Sync. `with_db` releases the mutex before calling `send().await` — async backpressure yields to the Tokio executor instead of pinning worker threads (#1258). Worker thread uses `blocking_recv()` (sync bridge for the async channel; `rusqlite::Connection` is `!Send` so the worker must be a dedicated OS thread). Closures take `&mut Database` (required by `rusqlite::Transaction` RAII — see #636).
 
@@ -626,7 +626,23 @@ Optional (pilot silent-stall reaper — mika#2249):
 Optional (pilot turn budget, armed at the source — mika#2496):
 - **The failure this closes, and the rectification it had to make to its own ticket.** The rule is *« kill at 120 turns / 40 USD »*, and it could not be applied in flight: no mika surface carries the SDK turn count in real time, and the « transcript lines » proxy is unreliable (measured ratio 1.63 on #2425, 2.16 on #2484), so #2425 truncated at **142 turns** without ever crossing its calibrated line threshold. The ticket asked for the count to be **exposed** so an engine-side brake could read it. Reading the code refuses that remedy and replaces it: **claude-pilot has carried a native, exact turn ceiling all along** — `--max-turns` is parsed, validated `>= 1`, mapped onto `GuardrailConfig.maxTurns` and handed to the SDK, which ends the run on an authentic `ResultMessage` of subtype `error_max_turns`. `dispatch-lib.sh` passed it at **none** of its three launch sites, so every dispatch ran under the upstream default `maxTurns=200`. That is what #2484 at **201 turns** actually is: the ceiling *biting*, set at 200 because nothing downstream had ever set it. A count read from outside could only kill by signalling the process group, losing the exit JSON, the callback's `Turns:`/`Cost:` and the whole post-flight recovery chain. **The divergence is ratified in the body of #2496** (operator, 2026-09-23) — the exposure half is deferred to `senara-solutions/claude-pilot` (real-time turn count per boundary), and this PR does not deliver the ticket's literal DoD.
 - **The turn ceiling is NOT a dollar ceiling, and nothing here may be read as if it were.** #2484 = 201 turns / 86 USD ⇒ ≈ **0.43 USD per turn**; at that rate **120 turns ≈ 51 USD**, above the 40 USD of the rule — and a session with a heavier context crosses 40 earlier still. So this PR closes the **first** term of the rule and **not** the second. The dollar brake has no enforcement point anywhere upstream: `claude-pilot`'s `_sdk_guardrail_kwargs` carries `if config.maxBudgetUsd > 0:` and ends on `pass`, and none of its application-level guardrails (`stallThreshold`, `emptyResponseThreshold`, `idleTimeoutMs`, `toolWaitCeilingMs`, `modelWaitCeilingMs`) measures dollars — they all measure time or productivity. The subtype `error_max_budget_usd` is therefore a termination vocabulary **nothing can emit**, which is why probe S2 below excludes it: its absence is not a signal. **`--max-budget` is passed at no site, deliberately.** It would be accepted, validated, resolved, carried to `_sdk_guardrail_kwargs` — and ignored; passing it would make the budget *look* closed in the argv, in the `pilot_budget_armed` line and to anyone opening the file. *A bound announced and inert is worse than no bound: it extinguishes the question.* What the turn ceiling does buy, measured on the known population: #2484 cut at 120 instead of 201 ≈ **40 % of the cost avoided**, #2425 at 120 instead of 142 ≈ 15 %.
-- `PILOT_MAX_TURNS` — the pilot's turn ceiling, resolved by `_pilot_max_turns` in `dispatch-lib.sh` and passed at the **three** launch sites (main dispatch, revise pilot, free-dispatch). **Unprefixed on purpose**, by a precedent held in the same file: `PILOT_LOG_DIR` is too. Neither name survives on its own: the pilot dispatch child is built by `sandboxed_pilot_env` (`env_clear()` + the positive allowlist `is_sandbox_env_allowed`), which admits neither a `MIKA_*` name nor a bare `PILOT_*`, so both reach the child only through the explicit `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`) — a bare name is a convention on that relay, not a way of slipping past a scrub (mika#2508). **Shipped DISARMED (empty default), and that is not the plan's proposed value.** Arming at 120 would truncate #2425, which reached 142 legitimately; the plan makes the measured turn distribution of *completed* runs a blocking verification (V2) prior to arming, and that distribution lives in `~/.mika/data/mika.db`, which the dispatch sandbox does not mount — an operator gesture on the host, not something the implementer can supply. The plan writes the conduct for its absence: ship disarmed and say so. **Arming is one gesture and no redeploy:** `PILOT_MAX_TURNS=120` on the service environment; or raise the single in-file default (`local _default=120` in `_pilot_max_turns`) once V2 is reported on the ticket. Three tiers, and `0` is not an invalid value but **the rollback**: unset → the fleet default; `""` or `"0"` → the flag is **not** passed and claude-pilot falls back to its own `maxTurns=200`, i.e. the pre-mika#2496 behaviour byte for byte; a positive integer → that ceiling, `source=env`; anything else → the default **plus** a `pilot_budget_invalid` line naming the offending value between quotes (a disarm by typo on a cost brake would be the silent failure this whole thing closes).
+- `PILOT_MAX_TURNS` — the pilot's turn ceiling, resolved by `_pilot_max_turns` in `dispatch-lib.sh` and passed at the **three** launch sites (main dispatch, revise pilot, free-dispatch). **Unprefixed on purpose**, by a precedent held in the same file: `PILOT_LOG_DIR` is too. Neither name survives on its own: the pilot dispatch child is built by `sandboxed_pilot_env` (`env_clear()` + the positive allowlist `is_sandbox_env_allowed`), which admits neither a `MIKA_*` name nor a bare `PILOT_*`, so both reach the child only through the explicit `inject_pilot_dispatch_env` relay (`PILOT_DISPATCH_ENV`) — a bare name is a convention on that relay, not a way of slipping past a scrub (mika#2508). **Shipped DISARMED (empty default) — armed at `150` by mika#2542 (next bullet); the history is kept because the V2 discipline it describes still governs any change of that value.** Arming at 120 would truncate #2425, which reached 142 legitimately; the plan makes the measured turn distribution of *completed* runs a blocking verification (V2) prior to arming, and that distribution lives in `~/.mika/data/mika.db`, which the dispatch sandbox does not mount — an operator gesture on the host, not something the implementer can supply. The plan writes the conduct for its absence: ship disarmed and say so. **Arming is one gesture and no redeploy:** `PILOT_MAX_TURNS=120` on the service environment; or raise the single in-file default (`local _default=120` in `_pilot_max_turns`) once V2 is reported on the ticket. Three tiers, and `0` is not an invalid value but **the rollback**: unset → the fleet default; `""` or `"0"` → the flag is **not** passed and claude-pilot falls back to its own `maxTurns=200`, i.e. the pre-mika#2496 behaviour byte for byte; a positive integer → that ceiling, `source=env`; anything else → the default **plus** a `pilot_budget_invalid` line naming the offending value between quotes (a disarm by typo on a cost brake would be the silent failure this whole thing closes).
+- **The ceiling is resolved from the ticket's LABEL too (mika#2542).** Three consecutive `loop-substrate` implements (#2532, #2536, #2519) were cut at 151 turns under the 150 ceiling: that class touches the handler family, the Rust, the tests and the docs, and is intrinsically longer than nominal traffic. `PILOT_LABEL_TURN_CEILINGS` in `dispatch-lib.sh` is **the one named table** mapping a label to a ceiling (`loop-substrate=200`); `_pilot_label_turn_ceiling` matches it **exactly on a CSV element** (`not-loop-substrate`, `loop-substrate-v2` raise nothing — a substring glob is tolerable for a commit prefix, wrong for a cost brake). The three launch sites pass `"${LABELS:-}"` (the CSV `_set_up_worktree` already resolved) as an **argument**, never by dynamic scope; a site that forgets it resolves "no label", i.e. fail-safe to 150, and test-dispatch-lib.sh refuses it anyway (cardinality asserted at 3). **The in-file default is armed at `150` in the same change** — V2 of mika#2496 is reported by #2542 itself: 150 has run in production since 2026-09-24 and its only measured overruns are the class being exempted. Shipping the exception without the rule it exempts (a rule that then lived only in `~/.mika/.env`) would have been the most fragile form of the work. **The cascade, and its order IS the deliverable:**
+
+  | # | condition | result | `source=` |
+  |---|---|---|---|
+  | 1 | `PILOT_MAX_TURNS` set and (`""` or `0`) | **rollback** — no flag | `env` |
+  | 2 | a label of the table is carried | its ceiling (`200`) | `label` |
+  | 3 | `PILOT_MAX_TURNS` positive integer | that value | `env` |
+  | 4 | otherwise | in-file default (`150`) | `default` |
+
+  Tier 1 sits **above** the label so the rollback stays a rollback during an incident. Tier 2 sits **above** tier 3 because the production host carries `PILOT_MAX_TURNS=150`: a label below env would be inert exactly where it matters — merged, deployed, zero effect, no red line (class mika#2205). **Named cost:** `PILOT_MAX_TURNS=50` does **not** bound a `loop-substrate` ticket below 200; the gestures that do are removing the label or `PILOT_MAX_TURNS=0`. An invalid `PILOT_MAX_TURNS` is reported (`pilot_budget_invalid`) whichever tier decides. When the label decides, the line carries **which** label, and only then (an empty field would read as a label named "empty"):
+
+  ```
+  dispatch-lib: pilot_budget_armed max_turns=200 source=label label=loop-substrate cost_bound=absent_upstream
+  ```
+
+  `200` is a **posed** value, not a measured one: the three reference runs were *cut*, so how many turns they would have taken is unknown. If the class re-truncates at 201, revise the value in the table, not the mechanism — and `source=label` is what tells our 200 apart from claude-pilot's upstream `maxTurns=200`. **The label must be declared in `.github/labels.yml`** or label-sync deletes it silently; `scripts/check-pilot-turn-ceiling-labels.sh` (CI job `pilot-turn-ceiling-labels-lint`, `make check-pilot-turn-ceiling-labels`) refuses any table key not declared there, and exits 3 when the table does not parse at all or holds a form it cannot audit (an unquoted, single-quoted or multi-per-line entry, a non-positive-integer value, a `+=` append or a second assignment — shapes bash accepts and the resolver would honour unchecked). **Recommended operator gesture, not delivered as code:** with the default armed in-file, `PILOT_MAX_TURNS=150` in `~/.mika/.env` is redundant; removing it flips nominal dispatches from `source=env` to `source=default`, which reads more honestly. Probes: `grep -h '^dispatch-lib: pilot_budget_armed.*source=label' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` (substrate dispatches that got 200 — verify `~/.mika/skills/.manifest-writer` carries the deployed sha first, mika#2340); zero `source=label` on a ticket **without** the label (a non-zero count means the match is too broad).
 - `pilot_cost_alert_usd` (`config.toml`) / `MIKA_PILOT_COST_ALERT_USD` — cost in USD above which a **finished** dispatch is reported as an overrun (default `40`, the rule). Note the asymmetry of prefixes with its sibling above, and it is not an oversight: this key is read by **mika-spirit**, where the `MIKA_*` scrub does not run. A non-finite or non-positive value falls back to the default — a threshold at or below zero would report *every* dispatch and drown the population the measurement exists to size; an unparseable value is a `Settings::load` error, like every numeric sibling. **Forty is posed as the rule, not measured — and that is a deliberate asymmetry with the V2 discipline demanded for the turn ceiling**, because an *alert* threshold **cuts nothing**: a false positive costs one WARN line, not a truncated run. It is to be revised on the first distribution this measurement produces, and that revision is the first deliverable of the follow-up cpp ticket. If the distribution shows 40 carrying the nominal traffic, it is the threshold that rises, never the measurement that is disarmed.
 - **The budget in force is SAID at every launch (U2).** Doctrine mika#2293, quoted because it describes this ticket word for word: *a setting you cannot observe is not a setting, it is a hope.* One line on `dispatch-lib`'s stderr:
 
@@ -683,6 +699,206 @@ Optional (pilot turn budget, armed at the source — mika#2496):
 - **AC4 (rollback by variable) is conditioned on a live measurement, and so is arming itself.** V1a is statically green — the scrub is a `MIKA_*` denylist plus `GH_TOKEN`, so an unprefixed name traverses, and `PILOT_LOG_DIR` is the precedent. V1b is the operator gesture: set `PILOT_MAX_TURNS=<value>` on the **service** environment and read `source=env` on a real `pilot_budget_armed` line. **Because the default ships disarmed, a red V1b costs more than the plan's wording suggests:** it does not merely retract the rollback claim, it makes *arming by variable* unreachable, and the only remaining route is raising the in-file default. Do not claim AC4 in a PR body or here until `source=env` has been observed — a rollback announced and unreachable during an incident is exactly the false guarantee mika#2304 names, and withdrawing it beats leaving it standing.
 - **Out of scope, deliberately:** the missing dollar brake itself (`_sdk_guardrail_kwargs`'s `pass`) and the real-time per-boundary turn count, both follow-ups on `senara-solutions/claude-pilot` — this repo cannot create either; the V2 measurement, an operator gesture on the host that gates the default's value; and the revise path's stderr, whose line is persisted nowhere (inherited from Signal S).
 
+
+### `MIKA_PLATFORM_DIR` traverse enfin, et un `cwd` incomposable est refusé en le nommant (mika#2536)
+
+- `MIKA_PLATFORM_DIR` — racine de la plateforme, posée par l'opérateur sur
+  l'environnement du **service**. Défaut `$HOME/workspace/mika-platform`.
+  **Le nom ne change pas ; ce qui change est qu'il est désormais lu.**
+
+- **Le défaut, mesuré le 2026-09-25.** Le handler `build-mika` a crashé **quatre
+  fois** sur la QA de PR #2530, chaque tentative, avec le même `tasks.result` :
+  `HANDLER CRASH (exit code 1). Script failed before building result.` Le crash
+  est `cd "$CWD"`, seul `exit 1` littéral entre l'installation du trap et la
+  première assignation de `RESULT` ; son diagnostic part sur un stderr que le
+  chemin long-running jette. Quatre crashs identiques, quatre résultats
+  identiques et muets.
+
+- **La branche `${MIKA_*:-…}` était MORTE, sur les dix sites.** Le child de
+  dispatch est construit par `sandboxed_pilot_env` — `env_clear()` puis une
+  allowlist **positive** qui refuse tout `MIKA_*` — et le chemin exec non
+  long-running passe par `scrub_mika_env_vars`, une denylist sur le même
+  préfixe. Donc `${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}` ne pouvait
+  **que** prendre son repli, et si le worktree réel n'était pas là, `cd`
+  échouait à coup sûr. Le réglage existait, était documenté, et n'était lu par
+  personne.
+
+- **Le relais TRADUIT le nom, et c'est le cœur du correctif.**
+  `inject_platform_dir_env` (`crates/mika-agent/src/skills/executor.rs`) lit
+  `MIKA_PLATFORM_DIR` **côté spirit** — où il n'est pas scrubbé, le scrub étant
+  une propriété de l'environnement du *child* — et pose `PLATFORM_DIR`
+  (`PLATFORM_DIR_RELAY_KEY`) côté child. Un relais à l'identique, le motif de
+  `inject_pilot_dispatch_env`, aurait exigé que l'opérateur renomme sa variable
+  sans que rien ne le lui dise : c'est très exactement la panne que ce ticket
+  ferme, déplacée d'un cran. Motif suivi : `inject_pilot_transcript_env`, qui lit
+  `MIKA_LOG_PILOT_TRANSCRIPTS` et pose `ANTHROPIC_LOG_FILE`. **Aucun opérateur
+  n'a de variable à renommer.**
+
+  **Trois raisons pour le nom nu, la troisième étant spécifique à un
+  consommateur :** l'allowlist refuse tout `MIKA_*` ; un `debug_assert` existe
+  pour empêcher qu'on l'y ajoute ; et `deploy-mika/handlers/run.sh` fait
+  `for _var in $(env | grep -o '^MIKA_[^=]*'); do unset "$_var"; done` **avant**
+  de lire sa racine — même autorisé en amont, ce handler-là l'aurait retiré
+  lui-même. Ajouter `MIKA_PLATFORM_DIR` à `SANDBOX_ENV_CORE_ALLOWLIST` est le
+  geste tentant et il est **refusé** : percer une garde anti-fuite de secret pour
+  un confort de chemin.
+
+  L'entrée `("MIKA_PLATFORM_DIR", "mika#2491 — racine plateforme")` a quitté
+  `DISPATCH_ENV_KNOWN_INERT`, qui **décroît pour la première fois** — l'effet que
+  son doc-comment annonce (« quand une entrée est tranchée, on la RELAIE et on
+  retire sa ligne »). Ce retrait n'était pas optionnel : l'assertion
+  auto-nettoyante du test mika#2508 l'exigeait dès que `dispatch-lib.sh` a cessé
+  de lire le nom préfixé.
+
+- **Quatre refus nommés, et leur ORDRE est un livrable.**
+  `skills/bundled/_shared/cwd-guard.sh` (POSIX `sh`, sourcé par `build-mika` et
+  `deploy-mika` — motif `_shared/pr-push-guard.sh`, mika#2520) valide et
+  **nomme** ; il ne canonicalise pas, chaque handler gardant son `pwd -P` et
+  composant son propre `RESULT`.
+
+  | # | motif | test | pourquoi à ce rang |
+  |---|---|---|---|
+  | 1 | `unexpanded_variable` | `case "$CWD" in *'$'*)` | un `cwd` valant `$MIKA_PLATFORM_DIR/.claude/…` est **aussi** non-absolu et **aussi** inexistant : les trois énoncés sont vrais, seul le premier désigne le prompt fautif |
+  | 2 | `not_absolute` | `case "$CWD" in /*)` | distingue un chemin relatif d'un chemin absent |
+  | 3 | `does_not_exist` | `[ -e "$CWD" ]` | le cas que `deploy-mika` couvrait déjà seul |
+  | 4 | `not_a_directory` | `[ -d "$CWD" ]` | `cd` sur un fichier échoue avec un message qu'aucune surface ne relaie |
+
+  Sans cet ordre, la faute de prompt serait rapportée « inexistant » : vrai, et
+  **strictement moins utile** — c'est un refus qui envoie l'opérateur créer un
+  répertoire au lieu de corriger un prompt. `deploy-mika` **conserve** son `case`
+  de préfixe autorisé : la garde partagée s'ajoute, elle ne remplace pas, et
+  affaiblir un périmètre de sûreté serait un effet de bord d'un ticket
+  d'observabilité.
+
+  La garde est sourcée **après** l'installation du trap, et son absence est
+  **fail-closed et nommée** : un `RESULT` qui dit quoi reconstruire, plutôt que
+  le `HANDLER CRASH` que tout ceci retire. `skills/bundled/_shared/` est une
+  projection du **binaire**, donc handler et garde sont seedés ensemble.
+
+- **Les prompts cessent de prescrire l'indéveloppable.** Cinq lignes
+  (`qa-review:568`, `qa-review-build-callback:30`, `build-mika:20-21`,
+  `deploy-mika:13`) nomment désormais la racine **littéralement**. Les deux
+  premières étaient les dangereuses : elles donnaient au modèle une *formule de
+  composition* qu'il recopie dans un argument `cwd`. **Et la moitié qui tient
+  n'est pas celle-là** — par
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`, un
+  correctif de prompt seul ne tient pas au substrat de la boucle : le prompt
+  exprime l'intention, le refus la tient.
+
+### Surface opérateur, et il n'y en a qu'une
+
+```bash
+mika tasks get <task-id>   # le motif est dans `result`, préfixé REFUSED (cwd-guard, mika#2536)
+```
+```sql
+SELECT id, result FROM tasks
+ WHERE result LIKE 'REFUSED (cwd-guard, mika#2536)%' ORDER BY created_at DESC;
+```
+
+| motif | régime attendu | lecture |
+|---|---|---|
+| `unexpanded_variable` | **vide** | chaque occurrence est une formule de prompt recopiée dans un `cwd` — c'est le **prompt** qu'il faut lire, pas la garde |
+| `not_absolute` | **vide** | un appelant compose un chemin relatif |
+| `does_not_exist` | faible | worktree fauché (mika#2420) ou absent de cet hôte |
+| `not_a_directory` | **vide** | un appelant passe un fichier |
+
+Le handler est un sous-processus shell sans accès base, et son stderr d'avant-
+pilote est structurellement perdu sur un dispatch qui **réussit** (classe
+mika#2050 : il hérite du `Stdio::piped()` de l'exécuteur, que celui-ci ne lit que
+dans la branche `if !status.success()`). Inventer une surface de journal qui ne
+serait pas lue reproduirait le défaut du Signal M.
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir — **sans cette vérification, chacune des sondes ci-dessous
+> rend un résultat qui décrit le binaire d'hier.**
+
+**S1 — le défaut fondateur (première QA de PR après déploiement).** Le callback
+`build_mika` rend « Build succeeded » ou « Build FAILED », jamais « HANDLER
+CRASH » ni un refus de `cwd`.
+**Halte 1 — un refus de `cwd` apparaît.** Ce n'est **pas** une panne : c'est R6
+qui mord, et le motif dit lequel des quatre remèdes s'applique. Un
+`unexpanded_variable` signifie que la moitié prompt n'a pas atteint ce chemin —
+**vérifier le seed du prompt avant de toucher à la garde**. Un `does_not_exist`
+sur un worktree qui existe signifie que le relais ne traverse pas : c'est S2.
+
+**S2 — le relais traverse (contrôle POSITIF, obligatoire).** Poser
+`MIKA_PLATFORM_DIR=/chemin/de/test` sur l'environnement du **service**,
+redémarrer, lancer un dispatch, et lire le `cwd` résolu dans le RESULT du
+callback — `build-mika` le cite déjà (`Build succeeded (cwd: …)`).
+**Halte 2 — le `cwd` reste `$HOME/workspace/mika-platform/mika`.** Le relais ne
+traverse pas. **Ne pas élargir `SANDBOX_ENV_CORE_ALLOWLIST`** — c'est le geste
+que le test mika#2508 refuse en majuscules. Établir d'abord si l'injecteur est
+appelé (placement **après** `sandboxed_pilot_env`) et si la variable est posée sur
+l'environnement du service et non dans un shell interactif.
+**Sans cette sonde, « le `cwd` par défaut convient sur cet hôte » et « le relais
+est inerte » rendent des bytes identiques** — classe mika#2205 appliquée au
+correctif lui-même.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus de `cwd` sur un
+dispatch nominal, `build-mika` comme `deploy-mika`.
+**Halte 3 — un refus sur un dispatch sain.** Faux positif, et il coûte un
+dispatch entier. **Désarmer d'abord** (retirer le `.` de la garde dans le handler
+concerné), diagnostiquer ensuite — un `cwd` légitime refusé est un arbitrage de
+prédicat, pas un seuil à régler.
+
+**S4 — l'inertie est retirée pour de bon.** `grep -n MIKA_PLATFORM_DIR
+crates/mika-agent/src/skills/executor.rs` ne doit plus rendre de ligne de
+`DISPATCH_ENV_KNOWN_INERT`, et le test mika#2508 doit passer.
+**Halte 4 — le test rougit sur l'anti-vacuité (`population.len() >= 8`).** Le
+seuil est ce qui empêche un scan devenu aveugle de se lire comme un arbre propre :
+**ne pas le baisser pour faire passer le build** — établir quelle autre variable a
+quitté la population.
+
+### Ce que ce travail n'achète PAS
+
+Il ne fait pas réussir un build qui échoue, et il ne rejoue pas les quatre crashs
+du 2026-09-25 : leur worktree est fauché et leur `tool_calls` hors d'atteinte du
+bac à sable. Il ferme **deux causes structurelles établies par lecture** — la
+branche morte et la variable que rien ne développe — et rend la **prochaine**
+occurrence auto-diagnostique.
+
+Il n'ajoute **aucun compteur et aucun événement de journal** : le seul instrument
+neuf est le motif de refus dans `tasks.result`, et **son silence ne prouve rien
+tant que personne n'exécute S1 et S2** — sur un handler dispatché quelques fois
+par jour, l'absence de refus peut simplement vouloir dire qu'aucun `cwd` n'a été
+composé de travers.
+
+Enfin, il rend le réglage **effectif**, il ne le rend pas **surveillé** : rien
+n'émet le chemin résolu au démarrage, donc « quel `cwd` ce dispatch a-t-il
+réellement utilisé ? » reste une question qu'on pose au RESULT d'un callback,
+jamais à un grep. C'est l'inverse de la doctrine mika#2293 (*un réglage qu'on ne
+peut pas observer n'est pas un réglage, c'est un espoir*), assumé pour un chemin
+dont le RESULT cite déjà la valeur — mais ça mériterait une ligne
+`platform_dir_resolved` le jour où une mesure montre qu'on la cherche.
+
+### Hors périmètre, délibérément
+
+- **R1–R3 (observabilité)** — le stderr jeté par `spawn_long_running_exec`, la
+  variable `STAGE`, le trap installé plus tôt. Ils restent au parent **mika#2532**.
+  Aucune ligne de ce travail ne touche `deliver_callback` ni la branche
+  `!status.success()` de l'exécuteur : c'est ce qui rend les deux tickets
+  mergeables dans n'importe quel ordre.
+- **Les quatre commandes `run_shell` de `qa-review`** (l.12, 205, 279, prose l.9).
+  Même variable, même inertie, **autre chemin d'exécution** — `run_shell` passe par
+  `scrub_mika_env_vars` et `shell-exec/handlers/run.sh` possède déjà son propre
+  relais vers un *argument* (garde mika#2449). **Le relais livré ici ne les répare
+  pas**, et c'est à dire explicitement plutôt qu'à laisser croire. **Ticket de
+  suivi**, précondition : une mesure montrant qu'un `run_shell` de qa-review a
+  réellement échoué sur un chemin vide.
+- **Étendre R6 à `resolve-pr-conflicts` et `address-pr-comments`** : ils ne
+  prennent **aucun `cwd` du modèle** (ils dérivent `WORKTREE_PATH` d'une PR) et
+  n'ont aucun `cd` nu. Armer une garde sur une population vide produirait un
+  détecteur dont le silence ne prouve rien.
+- **Rendre le chemin configurable par l'entrée JSON de l'outil** plutôt que par
+  l'environnement — plus propre en principe, mais ça change le schéma de quatre
+  outils pour un besoin que personne n'a mesuré.
+- **Les quatre autres entrées de `DISPATCH_ENV_KNOWN_INERT`**, dont
+  `MIKA_PILOT_SANDBOX` donnerait à l'environnement du service un levier pour
+  **désarmer le confinement bwrap** — arbitrage de sûreté qui appartient à un
+  ticket qui le pèse. Suivi porté par l'umbrella mika#2491.
 
 Optional (callback delivery bounds — mika#2179):
 - **The failure this bounds.** A `resume_agent` turn that errors on a callback used to write a `warn!` and nothing else: no counter, no audit event, no `next_fire_at`. The row stayed `status='completed'`, so `get_undelivered_callback_tasks` re-selected it on the very next 60s scan (`DB_SCAN_INTERVAL_TICKS`), and each attempt held the agent lock for up to `AGENT_TOTAL_TIMEOUT_SECS` (300s). The only stop condition was the LLM eventually succeeding. Measured on the night of 2026-09-03/04: 19 transport timeouts in four hours against callback `800d739f`, delivered **5 h 06** after it completed — an hour after its own parent (`ready-label: mika#2140`) had already died `phantom_aged_out` waiting for that return.
@@ -1977,6 +2193,182 @@ publier cherche dans le voisinage des gardes de dispatch.
 
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
+
+### Un `ESCALATE` de groom est terminal, et son producteur l'estampille (mika#2545)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit un groom refusé — ou qui cherche
+pourquoi un ticket escaladé ne repart pas — cherche dans le voisinage de la porte
+de dispatch.
+
+- **Le défaut, mesuré le 2026-09-26.** Le groom de mika#2542 a rendu `ESCALATE`
+  sur review-anchor, et un mécanisme l'a **auto-rejoué huit fois** — callbacks
+  `mika-dev` en paires `expired`/`delivered` toutes les ~1 min de **13:06:14Z à
+  13:20:54Z**, chacun ESCALATE sur la même cause, chacun consommant le slot
+  `groom`. Le fichier `~/.mika/state/auto-pull-stop` était posé : **ce n'était pas
+  le feeder.**
+
+- **La chaîne, maillon par maillon — les trois pistes du ticket sont une seule
+  chaîne et aucune n'est la cause à elle seule.**
+
+  | # | site | ce qui se passe |
+  |---|---|---|
+  | 1 | `_escalate_groom` (`dispatch-lib.sh`) | ESCALATE ⇒ `RESULT` reçoit `PIPELINE FAILURE:` |
+  | 2 | `_iterate_groom_loop` | les **trois** bras ESCALATE rendent `return 1` |
+  | 3 | `dispatch_claude_pilot`, branche `else` | une **seconde** ligne `PIPELINE FAILURE:` et `Outcome: PIPELINE_INCOMPLETE` |
+  | 4 | `self-dev-callback`, § *On pipeline failure* | le marqueur fait entrer le tour dans la population **retryable** |
+  | 5 | idem, étape 4 | `run_claude_pilot_groom` ré-appelé avec le même `repo#number` |
+  | 6 | `validate_dispatch_readiness` | slot `groom` occupé ⇒ `deferred` ⇒ wrapper différé |
+  | 7 | tick moteur (60 s) | promotion du wrapper ⇒ **les paires à ~1 min** mesurées |
+  | 8 | → retour en 1 | |
+
+  **Le maillon décisif est le 1** : un verdict terminal portait le marqueur de la
+  population retryable. Le 7 explique la cadence, le 4 explique le rejeu.
+
+- **Le budget `pipeline_retry_count >= 2` ne bornait rien, et c'est la classe
+  mika#2158.** Aucun code moteur ne le lit ni ne l'applique ; l'écriture que le
+  prompt prescrit atterrit sur la tâche **callback**, dont `trigger_type` fait
+  refuser `update_task_status` ; et chaque rejeu naît avec une metadata vierge.
+  *Un compteur remis à zéro par l'action qu'il compte ne borne rien* — le budget
+  n'était pas trop large, il était **inatteignable**.
+
+- **`Outcome: ESCALATE` était cherché et écrit nulle part.** Le prédicat P4 de
+  `_measure_cycle_output` l'énumère depuis toujours ; une recherche exhaustive des
+  sites d'écriture de `^Outcome: ` rendait `PR_OPENED`, `PLAN_COMMITTED`,
+  `PLAN_GROOMED`, `PIPELINE_INCOMPLETE`, `UNKNOWN` — **jamais `ESCALATE`**. Un
+  prédicat sur une population vide se lit exactement comme un prédicat sain
+  (classe mika#2205). La maison avait déjà décidé que c'était le nom du fait ; il
+  ne restait qu'à l'écrire, et c'est ce qui rend le remède petit.
+
+- **Deux compensations, et il faut les DEUX.** `PIPELINE FAILURE:` était aussi ce
+  qui sortait le cycle de la population `empty_completion` : le retirer sans
+  compenser exposerait un ESCALATE à un faux rouge sur une sortie délibérée.
+  `^Outcome: ESCALATE` rejoint donc l'alternance de reclassement de
+  `_gate_non_empty_cycle`, **et** P4 le reconnaît déjà — mais sous réserve de
+  `CYCLE_TOOL_CALLS >= 1`, réserve qui est précisément pourquoi le premier terme
+  n'est pas redondant.
+
+- **Le ré-armement est gratuit et sans état, et c'est le cœur du remède.** La
+  garde ne mord que sur un dispatch dont l'`originating_message` est **absent** —
+  le retry pipeline est un tour silencieux. Les deux gestes d'opérateur
+  canoniques traversent par construction :
+
+  | chemin | `originating_message` | verdict |
+  |---|---|---|
+  | retry pipeline de `self-dev-callback` | absent | **refusé** |
+  | reposer `ready` en **remove → add** (mika#2323) | le marqueur webhook | **passe** |
+  | `mika ask --agent mika-dev "groom mika issue#N"` | le message | **passe** |
+
+  Aucun stamp à écrire, aucune fenêtre à régler, aucune ligne à nettoyer — et le
+  corps du refus nomme les deux gestes, parce qu'un refus qui ne nomme pas sa
+  levée est un refus qu'on contourne au jugé.
+
+### SQL
+
+```sql
+-- Les grooms qui ont escaladé (le PRODUCTEUR)
+SELECT parent.reference_url, child.created_at
+  FROM tasks child JOIN tasks parent ON child.parent_task_id = parent.id
+ WHERE child.dispatch_class = 'groom'
+   AND instr(child.result, 'Outcome: ESCALATE') > 0
+ ORDER BY child.created_at DESC;
+
+-- Les rejeux interceptés (le LECTEUR) — DOIT être très inférieur au producteur
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'groom_escalate_redispatch_refused'
+ GROUP BY 1 ORDER BY 2 DESC;
+```
+
+L'`instr` de la première requête est une **surapproximation** du prédicat moteur,
+qui est ancré sur la ligne : un `result` dont la prose cite le marqueur y entre.
+Acceptable pour un comptage, et dit plutôt que laissé supposer — le moteur, lui,
+ne s'y trompe pas.
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. Un re-dispatch a-t-il été refusé ?
+grep groom_escalate_redispatch_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{task_id, repo, issue, verdict}'
+
+# 2. CONTRÔLE POSITIF — le producteur estampille-t-il seulement ?
+grep -hc '^Outcome: ESCALATE' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `groom_escalate_redispatch_refused`, `verdict=escalated` | **non vide, faible** | chaque ligne est un dispatch de groom que l'opérateur n'a pas eu à annuler |
+| `groom_escalate_redispatch_refused`, `verdict=unreadable` | **vide** | la base n'a pas répondu ; le ticket attend et sera re-drivé |
+| `Outcome: ESCALATE` dans `tasks.result` | non vide, faible | la population du producteur ; **doit dominer** celle du lecteur |
+| une clé au-dessus de **1** dans la requête du lecteur | **anomalie** | le refus ne tient pas : un appelant rejoue par un chemin que la garde ne traverse pas |
+| `groom_escalate_refused_audit_failed` | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` est alors incomplet |
+
+Les deux populations sont **soustractibles** parce que
+`groom_escalate_redispatch_refused` a un **écrivain unique** (scan de source,
+allowlist livrée vide) — motif `phantom_aged_out` / `phantom_sweep_spared`
+(mika#2156), `closing_pr_closed_unmerged` / `ready_label_degroomed` (mika#2242).
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir — sans quoi chacune des sondes décrit le binaire d'hier.
+
+**S1 — le producteur estampille (premier ESCALATE réel).** Le `tasks.result` du
+callback de groom porte exactement une ligne `Outcome: ESCALATE` et **aucune**
+ligne `PIPELINE FAILURE:`.
+*Halte 1 — les deux sont présentes, ou `Outcome: PIPELINE_INCOMPLETE` a survécu :*
+la branche `else` de `dispatch_claude_pilot` écrase encore. **Ne pas toucher à la
+garde** — c'est le producteur qui n'a pas pris, et la garde ne peut rien lire qui
+n'ait été écrit.
+
+**S2 — la garde mord (premier ESCALATE, tour suivant).** Une ligne
+`groom_escalate_redispatch_refused` avec `verdict=escalated`, et **zéro** nouvelle
+tâche callback `dispatch_class='groom'` sous ce parent.
+*Halte 2 — un rejeu part quand même, la ligne absente :* un appelant ne traverse
+pas la porte. **Ne pas élargir le prédicat par réflexe** : établir lequel des
+quatre chemins du tableau ci-dessus a servi, les remèdes diffèrent.
+
+**S3 — contrôle négatif du ré-armement (geste opérateur).** Sur le ticket
+escaladé : `gh issue edit <n> --remove-label ready` puis `--add-label ready`. Le
+groom **doit** repartir.
+*Halte 3 — il ne repart pas :* la garde mord sur le chemin opérateur, donc le
+terme `originating_message.is_none()` est mal lu. **Désarmer d'abord** (revert de
+la garde), diagnostiquer ensuite — une garde qui bloque la reprise est pire que la
+boucle qu'elle remplace, puisqu'elle n'a pas de contournement.
+
+**S4 — contrôle négatif de bruit (7 jours).** Aucun
+`groom_escalate_redispatch_refused` sur un ticket dont le dernier groom a rendu
+`Outcome: PLAN_GROOMED`.
+*Halte 4 — une occurrence :* le prédicat lit l'**existence** d'un ESCALATE et non
+le **dernier** verdict — le `ORDER BY … LIMIT 1` ne fait pas son travail, et un
+ticket sain est gelé.
+
+**Halte transverse — les deux sondes muettes.** Zéro ligne des deux côtés ne
+prouve **rien** : il faut qu'un ESCALATE réel ait eu lieu depuis le déploiement.
+Vérifier la requête *producteur* avant toute conclusion. *Une garde que personne
+n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas converger un groom qui escalade.** Il rend l'escalade terminale
+  et lisible ; le plan reste à réviser par un humain, ce qui est le contrat de
+  sortie de `/mika-groom-ticket`.
+- **Il ne rattrape pas l'incident du 2026-09-26.** Les quinze tâches mesurées
+  portent `Outcome: PIPELINE_INCOMPLETE` et **rien ici ne rétro-estampille** :
+  fabriquer une ligne décrivant un fait qu'on n'a pas observé est l'inverse de ce
+  que ce travail défend. La sonde est la **prochaine** occurrence.
+- **Il ne borne pas le feeder.** Un `ready` reposé par `auto_pull` Phase 2
+  traverse la garde ; c'est le prix du ré-armement sans état, borné à trois tours
+  par le budget de re-drive (mika#2020). **Élargir la garde au
+  `ready_label_handler` est refusé** : ce serait retirer à l'opérateur son geste
+  de reprise le plus court. Le remède juste pour cette population est que le
+  ticket porte `operator-review`, ce qui le sort structurellement des trois phases
+  du feeder — **ticket de suivi**, précondition : que la requête du producteur
+  montre des tickets escaladés re-groomés par le feeder.
+- **Aucun compteur du producteur.** La population des grooms qui escaladent se lit
+  par la requête SQL ci-dessus, et **son silence ne prouve rien tant que personne
+  ne l'exécute**.
 
 ### Un callout de corps sans preuve en base route vers `groom` (mika#2484)
 

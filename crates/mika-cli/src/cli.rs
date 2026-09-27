@@ -96,6 +96,8 @@ pub enum Commands {
     CredentialHelper(CredentialHelperArgs),
     /// Milestone-scope operational coordinator (mika-manager Phase 1, LECTURE seule)
     Milestone(MilestoneArgs),
+    /// Iterate on the open PR of an issue — deterministic, no LLM routing (mika#2506)
+    Iterate(IterateArgs),
 }
 
 impl Commands {
@@ -126,6 +128,7 @@ impl Commands {
             | Commands::Webhook(_)
             | Commands::Notify(_)
             | Commands::Milestone(_)
+            | Commands::Iterate(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -156,6 +159,7 @@ impl Commands {
             | Commands::Logs(_)
             | Commands::Notify(_)
             | Commands::Milestone(_)
+            | Commands::Iterate(_)
             | Commands::CredentialHelper(_) => false,
         }
     }
@@ -186,6 +190,7 @@ impl Commands {
             | Commands::Logs(_)
             | Commands::Notify(_)
             | Commands::Milestone(_)
+            | Commands::Iterate(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -809,6 +814,42 @@ pub enum ReminderCommand {
     },
     /// Cancel a reminder by ID (from `mika reminders`)
     Cancel { id: String },
+}
+
+/// `mika iterate <repo>#<N> --context <texte>` — le déclencheur d'itération
+/// déterministe (mika#2506 AC1).
+///
+/// # Ce qu'il fait, et ce qu'il ne fait PAS
+///
+/// Il POST sur `/api/v1/agents/{id}/iterate` de mika-spirit, et **ne compose
+/// aucune dérivation de branche ni résolution de skill dans le processus CLI** :
+/// spirit possède le dispatch, la CLI rend. Faire autrement ferait de la CLI un
+/// second dispatcher hors du démon, ce que mika#1727 a précisément retiré.
+///
+/// # Le nombre est un numéro d'ISSUE
+///
+/// `dispatch-lib.sh` consomme `prompt: "<repo>#<N>"` comme un numéro d'issue et
+/// dérive la branche du callout `> - **Branch:**` du corps de l'issue. La PR est
+/// résolue **côté serveur** pour vérifier les préconditions, et n'est jamais
+/// passée en aval.
+#[derive(clap::Args)]
+pub struct IterateArgs {
+    /// `<repo>#<numéro-d-ISSUE>` — `mika#2503` ou `senara-solutions/mika#2503`
+    pub target: String,
+
+    /// Ce que le pilote doit faire. **Obligatoire** : la voie free-text de
+    /// `run_claude_pilot` n'a pas de worktree et la session crasherait
+    /// (self-dev Rule 4), donc une invocation sans contexte est refusée
+    /// AVANT tout appel réseau (`missing_context`).
+    #[arg(long)]
+    pub context: String,
+
+    /// Agent qui porte le dispatch (défaut : `mika-dev`).
+    #[arg(long, default_value = "mika-dev")]
+    pub agent: String,
+
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
 }
 
 /// `mika milestone {read,assess,report}` — Phase 1 LECTURE seule.

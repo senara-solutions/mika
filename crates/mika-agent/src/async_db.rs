@@ -1466,6 +1466,27 @@ impl AsyncDatabase {
             .await
     }
 
+    /// Record a long-running handler's non-zero exit and its stderr on the
+    /// row, whatever its status (mika#2532 R1).
+    ///
+    /// See [`crate::db::Database::set_task_handler_failure`] for why this
+    /// carries no status filter and why the stderr is omitted rather than
+    /// stored empty.
+    pub async fn set_task_handler_failure(
+        &self,
+        task_id: &str,
+        exit_display: &str,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        let (i, e, s) = (
+            task_id.to_owned(),
+            exit_display.to_owned(),
+            stderr.map(|s| s.to_owned()),
+        );
+        self.with_db(move |db| db.set_task_handler_failure(&i, &e, s.as_deref()))
+            .await
+    }
+
     /// Get a single metadata field from a task's metadata JSON.
     pub async fn get_task_metadata_field(
         &self,
@@ -1643,6 +1664,20 @@ impl AsyncDatabase {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
         self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u))
+            .await
+    }
+
+    /// The `result` of the most recent terminal groom callback for an issue
+    /// (mika#2545). Two levels of `Option` and they say different things —
+    /// `None` = no groom ever ran, `Some(None)` = a groom ran and its `result`
+    /// column is NULL. See [`crate::db::Database::latest_groom_verdict_for_issue`].
+    pub async fn latest_groom_verdict_for_issue(
+        &self,
+        issue_url: &str,
+    ) -> Result<Option<Option<String>>> {
+        let a = self.agent_id.clone();
+        let u = issue_url.to_owned();
+        self.with_db(move |db| db.latest_groom_verdict_for_issue(&a, &u))
             .await
     }
 

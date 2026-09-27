@@ -139,7 +139,9 @@ This step determines whether the PR is an auto-rescued dispatch-lib PR and, if s
 
 This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dependency-breakage check** instead of the plan-AC pipeline. Dependabot PRs have no plan, no acceptance criteria, and a bare version-string bump — the Step 2.5 plan-AC machinery produces a hollow verdict, and CI only proves the new version *compiles*, not that the version delta is free of breaking changes or open advisories. This step supplies the signal CI does not.
 
-1. **Detect.** Read the `author` field from Step 1's `qa_pr_view` output. If `author == "dependabot[bot]"` (or `"app/dependabot"`), this is a Dependabot PR — run the dep-review flow below. Otherwise, skip to Step 2 normally.
+1. **Detect.** Read `author.login` from Step 1's `qa_pr_view` output — `author` is an **object** (`{"login": "app/dependabot", "is_bot": true, …}`), never a bare string, so comparing `author` itself never matches and this whole step goes unreachable (mika#2519). If `author.login == "dependabot[bot]"` (or `"app/dependabot"` — `gh` renders either, depending on the surface), run the dep-review flow below. Otherwise, skip to Step 2 normally.
+
+   **`block[pipeline]` is structurally unreachable here** (mika#2519): steps 2 and 2.5 are skipped below, so no guard ran and no plan was read — nothing a pipeline block could be the outcome of, and the engine refuses such a call before the subprocess. If a guard genuinely did exit non-zero, quote its output **verbatim** per Step 2E.
 
 2. **Skip the plan-AC pipeline.** A Dependabot PR has no plan contract. Skip Step 2 pipeline checks and Step 2.5 plan-AC verification. Emit `PLAN-AC VERIFICATION: skipped (Dependabot dependency PR — no plan contract, mika#1729)` and `BUILD VERIFICATION: skipped (Dependabot dependency PR)`. You MUST still run Step 3 diff review (security patterns still apply — a dependency bump that also edits source is not a pure bump).
 
@@ -158,6 +160,12 @@ This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dep
    - This is NOT a CI-status fetch. The Data-Integrity "do not fetch CI status" rule (Step-2 area) forbids `gh pr checks` / `check-runs` / `statusCheckRollup` — the Advisory Database is a different surface and is explicitly permitted here (and only here) for qa-review.
    - For each returned advisory, judge whether its `vulnerable_version_range` **intersects the `<old> → <new>` delta**. An advisory outside the delta (e.g., only affects a version below `<old>`) is informational, not blocking.
 
+5b. **Major-version jump — read the call sites (mika#2519).** Compare the **first numeric segment** of `<old>` and `<new>`. When it changes (`9 → 11`, `1.2.3 → 2.0.0`), the exemption above stops covering you: it covers the **plan**, never the **substance** of an API change, and a green build does not close this class. Measured on mika#2454 — `jsonwebtoken 9.3.1 → 11.1.0`, build green, `generate_jwt` panicking at runtime because the new major had dropped its crypto backend behind a feature cascade (mika#2525); three sites called that API and nothing read them.
+
+   So before any `pass` on a major jump: locate the call sites of the changed API (grep the crate name and the symbols the changelog names), read them, and emit an `API-SURFACE:` line stating what you checked and what you found. Absent that line, the engine refuses the `pass` before the subprocess.
+
+   `0.22 → 0.23` is **not** a major jump here — the first segment is `0` on both sides. Semver's `0.x`-carries-breakage rule is deliberately not applied: it would pull the ordinary Cargo-bump traffic into this clause. A break inside a `0.x` minor stays the changelog scan's job (step 4 → `block[dependency]`).
+
 6. **Fail-closed on fetch failure (NF4).** If the advisory query fails — network error, rate-limit, non-zero exit, or unparseable output — the dep-review signal degrades to `hold[review]` ("could not verify breaking-change status: <error>"). **NEVER `pass` on an unverified advisory query.** Mirrors the "tool failure → max verdict hold[review]" data-integrity rule.
 
 7. **Emit the mandatory `DEP-REVIEW:` section** (this is the "present and named" AC5 signal — it MUST appear in the verdict body, never implicit):
@@ -169,9 +177,15 @@ This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dep
    Signal: <pass | block[dependency] | hold[review]>
    ```
 
+   **On a major jump (step 5b), one more line in the verdict body:**
+   ```
+   API-SURFACE: <symbols whose behaviour changed> — call sites read: <path:line, …> — <unaffected | affected: …>
+   ```
+   Emit it only once you have read those sites — it is the assertion the engine reads to let a `pass` through here, and asserting it unread is your own claim (`assert_grounded` family).
+
 8. **Verdict mapping (gating):**
-   - Advisory query clean (no advisory intersecting the delta) **AND** no breaking-change changelog entry in the delta → `pass` permitted. The `DEP-REVIEW:` section MUST state the clean result **and** cite the advisory query that grounds it.
-   - Confirmed breaking-change changelog entry in the delta **OR** an open advisory intersecting the delta → `VERDICT: block[dependency]` (gating). Name the advisory GHSA ID / changelog entry in `REASON:` and `DEP-REVIEW:`.
+   - Advisory query clean (no advisory intersecting the delta) **AND** no breaking-change changelog entry in the delta → `pass` permitted. The `DEP-REVIEW:` section MUST state the clean result **and** cite the advisory query that grounds it. **On a major jump it additionally requires step 5b's `API-SURFACE:` line.**
+   - Confirmed breaking-change changelog entry in the delta **OR** an open advisory intersecting the delta **OR** a major jump the new API breaks at a call site → `VERDICT: block[dependency]` (gating). Name the GHSA ID / changelog entry / call site in `REASON:` and `DEP-REVIEW:`.
    - Advisory query failed / unparseable → `VERDICT: hold[review]` per step 6.
 
    After emitting the verdict, post it via Step 5 (`run_gh pr review`) exactly as for any other verdict — `pass` → `--approve`, `block[dependency]`/`hold[review]` → `--comment`. Then record to memory (Step 5's `store_fact`). Do NOT run Steps 2/2.5/3e for a Dependabot PR.
@@ -562,10 +576,13 @@ branch = <headRefName from Step 1 qa_pr_view output>
 head_sha = <headRefOid from Step 1 qa_pr_view output>
 ```
 
-Derive the worktree path:
+Derive the worktree path. **Compose it from a LITERAL root, never from a shell variable** —
+`build_mika` receives this value as a tool argument, and a `cwd` still carrying a `$VAR` is
+refused by name (`REFUSED (cwd-guard, mika#2536) — unexpanded_variable`), because nothing in
+that handler's environment expands it (mika#2536):
 ```
 sanitized_branch = branch with "/" replaced by "-"
-worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/
+worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/
 ```
 
 Check the worktree exists. If not: skip build verification. Note: "BUILD VERIFICATION: skipped (no worktree found at expected path)".

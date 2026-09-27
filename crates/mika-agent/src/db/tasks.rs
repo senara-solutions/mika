@@ -3349,6 +3349,57 @@ impl Database {
         Ok(())
     }
 
+    /// Record the exit status and stderr of a long-running handler that exited
+    /// non-zero, on a row of **any** status (mika#2532 R1).
+    ///
+    /// Sibling of [`Self::write_task_dispatch_rejection`] (#1108) — same need,
+    /// *write a reason onto the row without touching its status* — and of
+    /// [`Self::set_task_metadata_field`], whose `WHERE id = ?` it shares. That
+    /// absence of a status filter is the whole point: the defect mika#2532
+    /// closes is a stderr discarded because the row had already gone
+    /// `completed` when its EXIT trap delivered the callback. See
+    /// [`crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY`] for the
+    /// measurement and for why the surface is the metadata and not `result`.
+    ///
+    /// **One object, one `json_set`.** Two successive
+    /// `set_task_metadata_field` calls would not be atomic and could leave a
+    /// stderr without its exit code — a failure record that names no failure.
+    ///
+    /// `stderr` is **omitted** when the process wrote nothing, never stored as
+    /// `""`: a reader who does not find the key knows fd 2 stayed mute, and
+    /// still finds `exit` (mika#2331 — an absence is not a null wearing a
+    /// value's clothes).
+    ///
+    /// The caller is responsible for scrubbing and truncating `stderr`; this
+    /// method writes what it is given.
+    pub fn set_task_handler_failure(
+        &self,
+        task_id: &str,
+        exit_display: &str,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        // The shape travels as a type, never as three literals spelled here and
+        // re-spelled by the CLI renderer (see `HandlerFailure`).
+        let payload = serde_json::to_string(&crate::task_engine::engine::HandlerFailure {
+            exit: exit_display.to_string(),
+            stderr: stderr.map(|s| s.to_string()),
+            captured_at: crate::timestamp::now(),
+        })?;
+
+        self.conn.execute(
+            "UPDATE tasks SET
+                metadata = json_set(COALESCE(metadata, '{}'), '$.' || ?1, json(?2)),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?3",
+            params![
+                crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY,
+                payload,
+                task_id
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Remove a single field from the task's metadata JSON (#959).
     ///
     /// Uses SQLite's `json_remove()` to delete the key. No-op if the key doesn't exist.
@@ -4147,6 +4198,82 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// The `result` of the **most recent** terminal groom callback for a GitHub
+    /// issue (mika#2545). Sister of [`Self::has_completed_groom_for_issue`]: same
+    /// join, same agent scoping, same tolerance for the legacy
+    /// [`crate::task_state::tasks::GROOM_PHASE_SUFFIX`] on the parent's URL.
+    ///
+    /// # Why the LAST groom, never "does an ESCALATE exist"
+    ///
+    /// The consumer asks *"did this ticket's grooming end on a halt verdict?"* —
+    /// a question about the current state, not about history. A ticket escalated
+    /// and then re-groomed successfully must become dispatchable again; an
+    /// `EXISTS`-shaped predicate would block it for ever and turn a brake into a
+    /// wall. Hence `ORDER BY … LIMIT 1` rather than a `COUNT`.
+    ///
+    /// # Why `created_at DESC, id DESC`
+    ///
+    /// `created_at` is the dispatch's BIRTH, which no reaper rewrites;
+    /// `updated_at` is touched late by the watchdog (#959), the silent-stall
+    /// reaper (mika#2249) and the phantom sweep (mika#1712), so ordering on it
+    /// would let a late sweep of an old row outrank a newer groom.
+    ///
+    /// `id DESC` makes the answer **deterministic** for two callbacks born
+    /// inside the same second — which the ISO-8601 second-resolution timestamps
+    /// make representable — and deliberately not more than that: `tasks.id` is a
+    /// UUID v4, so the tiebreak is reproducible, **never chronological**. Named
+    /// rather than implied, because the difference matters if the population
+    /// ever stops being empty: two terminal groom callbacks under one parent
+    /// inside one second is unreachable today (a groom dispatch runs for
+    /// minutes, and its class cap is 1 — `max_concurrent_for_class`), so the
+    /// tiebreak only ever has to stop the answer depending on SQLite's scan
+    /// order. Should that change, the fix is a monotonic discriminator, not a
+    /// second sort key.
+    ///
+    /// # Two levels of `Option`, and they say different things
+    ///
+    /// - `Ok(None)` — **no** terminal groom callback for this issue. The nominal
+    ///   shape of a ticket about to be groomed for the first time; the caller
+    ///   reads it as "never escalated".
+    /// - `Ok(Some(None))` — a callback exists and its `result` column is NULL.
+    ///   Anomalous (the completion write path always carries a result), and the
+    ///   caller reads it as *unreadable* rather than guessing a verdict.
+    /// - `Ok(Some(Some(text)))` — the callback's `result`, verbatim. The verdict
+    ///   is derived from it by the pure function
+    ///   `skills::executor::groom_escalate_verdict`, never here: this method
+    ///   returns a fact, the marker's grammar is the caller's business.
+    ///
+    /// Read-only. An `Err` is a DB failure and the caller refuses (fail-closed,
+    /// like `has_completed_groom_for_issue` on the same gate).
+    pub fn latest_groom_verdict_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<Option<Option<String>>> {
+        let legacy_groom_url = format!(
+            "{}{}",
+            issue_url,
+            crate::task_state::tasks::GROOM_PHASE_SUFFIX
+        );
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT child.result FROM tasks child
+                 JOIN tasks parent ON child.parent_task_id = parent.id
+                 WHERE child.agent_id = ?1
+                   AND child.trigger_type = 'callback'
+                   AND child.dispatch_class = 'groom'
+                   AND child.status IN ('completed', 'delivered')
+                   AND parent.reference_url IN (?2, ?3)
+                 ORDER BY child.created_at DESC, child.id DESC
+                 LIMIT 1",
+                params![agent_id, issue_url, legacy_groom_url],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Count pending callback tasks for a given team run with depth > 1.

@@ -956,6 +956,108 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2532 — la clé sous laquelle vit la cause d'un crash pré-résultat
+    // a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : le nom
+    /// `handler_failure` est **neuf**. Il n'y a donc rien à excepter, ni de
+    /// case où déposer la prochaine infraction (mika#2323). Quand le scan
+    /// tire, **on retire le second site**, on ne l'allowliste pas (doctrine
+    /// mika#2201).
+    const HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom de la clé existe **une fois**, dans la constante, et tout
+    /// consommateur passe par elle.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second site écrivant `$.handler_failure` ne rendrait **aucune
+    /// décision fausse** le jour où il est écrit : la persistance continuerait
+    /// de fonctionner et toutes les assertions resteraient vertes. Ce qu'il
+    /// casserait est la requête opérateur de D6 —
+    /// `SELECT … WHERE json_extract(metadata,'$.handler_failure') IS NOT NULL`
+    /// — qui **est** la mesure de la classe : elle cesserait de compter « un
+    /// handler long-running a crashé » pour compter deux populations mêlées,
+    /// en silence. C'est exactement la classe qu'aucun test de comportement ne
+    /// peut voir.
+    ///
+    /// Le lecteur CLI (`mika tasks get`) vit dans un autre crate et importe la
+    /// constante : c'est pour ça qu'elle est `pub`. Le faire porter son propre
+    /// littéral aurait été la dérive `grooming_marker` (mika#2158) — deux
+    /// orthographes d'un même nom, que rien n'oblige à rester d'accord.
+    #[test]
+    fn mika2532_the_handler_failure_key_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("handler{}", "_failure");
+        let owner = "crates/mika-agent/src/task_engine/engine.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line).iter().any(|lit| {
+                        // Le prédicat porte sur la CLÉ, jamais sur la
+                        // sous-chaîne. Deux faux positifs mesurés l'imposent,
+                        // et ils vont dans les deux sens : le nom d'événement
+                        // `long_running_handler_failure_not_persisted`
+                        // (`executor.rs`) contient la clé sans être elle, et
+                        // une prose de test qui la cite entre backticks n'est
+                        // pas un site d'écriture (classe mika#2050 — une
+                        // mention n'est pas une instruction). Ce qu'un second
+                        // écrivain porterait réellement est le littéral nu ou
+                        // un chemin JSON `$.<clé>`.
+                        *lit == needle || lit.contains(&format!("$.{needle}"))
+                    })
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2532 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2532 — la clé de metadata du crash de handler a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `task_engine::engine::HANDLER_FAILURE_METADATA_KEY`. Ne PAS l'ajouter \
+             à HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS — la requête opérateur qui \
+             compte la classe n'est exacte que tant qu'un seul nom existe."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2532_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "HANDLER_FAILURE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on fait passer le second site par la \
+             constante. Une allowlist née vide est un emplacement où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2517 — une définition du domaine Webhook Fallthrough, un écrivain
     // du nom de son événement.
     //
@@ -1356,6 +1458,361 @@ mod tests {
              tire, on RÉPARE la fixture, on ne l'exempte pas — une adresse de \
              documentation dans une fixture est verte sur le CI et rouge en pilote, ce \
              qui est la panne que mika#2495 a payée 6,95 USD."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2506 — le dispatch pilote a un recensement fermé, et le nom
+    // d'audit du geste opérateur a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les sites de production qui **composent** un spawn de pilote.
+    ///
+    /// # Ce n'est PAS une allowlist, et la différence est de fond
+    ///
+    /// Une allowlist est un endroit où déposer la prochaine infraction
+    /// (mika#2323). Ceci est un **recensement fermé**, comparé **dans les deux
+    /// sens** — motif `FIRED_AT_LITERAL_WRITERS` (mika#2133) : une entrée qui ne
+    /// correspond plus à aucun site fait rougir, sans quoi elle exempterait
+    /// silencieusement un futur homonyme.
+    ///
+    /// # Correction mesurée du plan mika#2506
+    ///
+    /// Sa Fire-Disposition annonce une cardinalité de **2** et « aucune
+    /// violation existante à excepter ». La mesure en donne **quatre** : les
+    /// deux handlers de `server/` composent leur propre dispatch depuis
+    /// mika#1572 / mika#1630, ce que mika#2335 a déjà dû nommer par écrit
+    /// (« the last two exist because the first was copied, and say so in their
+    /// own comments »), et `task_engine/dispatcher.rs` en est un quatrième. Une
+    /// garde figée à 2 serait **rouge à la naissance**, et un lint rouge à la
+    /// naissance se fait désarmer.
+    ///
+    /// Ce que la garde tient donc, et qui est vrai et vérifiable : **mika#2506
+    /// n'ajoute aucun site.** Son appelant passe par
+    /// `verdict_handler::try_engine_dispatch_for`, qui est l'un des quatre.
+    /// Un **cinquième** est refusé.
+    ///
+    /// Unifier les quatre est un travail réel, avec un rayon d'action sur toute
+    /// la boucle — **suivi**, précondition : que ce recensement cesse de
+    /// décroître de lui-même.
+    const ENGINE_PILOT_DISPATCH_SITES: &[&str] = &[
+        "crates/mika-agent/src/skills/executor.rs",
+        "crates/mika-agent/src/server/verdict_handler.rs",
+        "crates/mika-agent/src/server/ready_label_handler.rs",
+        "crates/mika-agent/src/task_engine/dispatcher.rs",
+    ];
+
+    /// Un cinquième site de dispatch pilote ne rendrait **aucune décision
+    /// fausse le jour où il est écrit** — il dispatcherait, tous les tests
+    /// resteraient verts — et divergerait plus tard en silence sur
+    /// `mark_parent_dispatched` (le défaut que mika#2335 a dû fermer après trois
+    /// copies), sur le bras `Deferred`, ou sur l'estampille `fired_at`. C'est la
+    /// classe que seul un scan de source voit.
+    #[test]
+    fn mika2506_le_dispatch_deterministe_a_un_recensement_ferme() {
+        // Composé à l'exécution pour que CE fichier ne se recense pas lui-même.
+        let needle = format!("spawn_long_running{}", "_exec");
+
+        let mut sites: Vec<String> = Vec::new();
+        for (rel, content) in production_sources() {
+            let calls = content.lines().any(|l| {
+                let t = l.trim_start();
+                if t.starts_with("//") || t.starts_with('*') {
+                    return false;
+                }
+                // Le SITE D'APPEL, jamais la déclaration ni un `use`.
+                l.contains(&format!("{needle}(")) && !t.starts_with("pub(crate) fn")
+            });
+            if calls {
+                sites.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve personne se lit exactement comme
+        // un arbre propre (mika#2103 / mika#2205).
+        assert!(
+            !sites.is_empty(),
+            "mika#2506 — aucun site de dispatch pilote trouvé : ce scan vise un \
+             symbole mort, il ne vérifie rien"
+        );
+
+        let newcomers: Vec<&String> = sites
+            .iter()
+            .filter(|s| !ENGINE_PILOT_DISPATCH_SITES.contains(&s.as_str()))
+            .collect();
+        assert!(
+            newcomers.is_empty(),
+            "mika#2506 — un site de dispatch pilote hors recensement : \
+             {newcomers:?}\n\n\
+             RÉSOLUTION : router ce site vers \
+             `verdict_handler::try_engine_dispatch_for`, qui compose déjà la \
+             chaîne complète (résolution d'outil, readiness, row callback, \
+             `mark_parent_dispatched`, spawn). Ne PAS ajouter de ligne au \
+             recensement : un cinquième site divergera en silence."
+        );
+
+        // Le sens inverse — une entrée périmée exempterait un futur homonyme.
+        let stale: Vec<&&str> = ENGINE_PILOT_DISPATCH_SITES
+            .iter()
+            .filter(|declared| !sites.iter().any(|s| s == *declared))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "mika#2506 — le recensement nomme des sites qui ne dispatchent plus : \
+             {stale:?}. Les retirer — un recensement périmé est une exemption \
+             silencieuse."
+        );
+    }
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : `operator_iterate_dispatch`
+    /// est un nom **neuf**. Il n'y a donc rien à excepter, ni de case où déposer
+    /// la prochaine infraction (mika#2323).
+    const OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// mika#2506 AC8 — le nom d'audit du geste opérateur a **un seul** écrivain.
+    ///
+    /// C'est ce qui rend
+    /// `SELECT after_value, count(*) … WHERE tool_name = 'operator_iterate_dispatch'
+    /// GROUP BY 1` exact plutôt qu'un nombre sur lequel deux sites peuvent
+    /// diverger — et cette requête est la sonde S3 du plan, le **contrôle
+    /// positif** sans lequel le silence de S1/S2 ne prouve rien.
+    ///
+    /// Assertion auto-nettoyante incluse : un scan visant un nom mort se lit
+    /// exactement comme un scan propre.
+    #[test]
+    fn mika2506_le_nom_daudit_a_un_seul_ecrivain() {
+        let needle = format!("operator_iterate{}", "_dispatch");
+        let owner = "crates/mika-agent/src/server/iterate_dispatch.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2506 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2506 — le nom d'audit du geste d'itération a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `server::iterate_dispatch::OPERATOR_ITERATE_AUDIT_NAME`. Ne PAS \
+             l'ajouter à OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS — la sonde S3 \
+             n'est exacte que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2506_l_allowlist_du_nom_daudit_est_vide() {
+        assert!(
+            OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "OPERATOR_ITERATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain \
+             (doctrine mika#2201)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2545 — le nom du refus d'un re-dispatch sur ESCALATE a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est vérifiable : le nom
+    /// `groom_escalate_redispatch_refused` est **neuf**. Quand ce scan tire,
+    /// **on retire le second écrivain**, on ne l'excepte pas (doctrine
+    /// mika#2201) — une allowlist née vide est un emplacement où déposer la
+    /// prochaine infraction (mika#2323).
+    const GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom sert de nom d'événement de journal **et** de `tool_name` d'audit.
+    /// C'est ce qui rend soustractibles les deux populations de mika#2545 — le
+    /// producteur (`Outcome: ESCALATE` dans `tasks.result`) et le lecteur (les
+    /// rejeux interceptés) — et donc ce qui rend la table de lecture de §7
+    /// exacte plutôt qu'un nombre sur lequel deux sites peuvent divergir.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rend **aucune** décision fausse le jour où il est écrit, il rend le
+    /// compte inexact, en silence.
+    #[test]
+    fn mika2545_the_escalate_refusal_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("groom_escalate{}", "_redispatch_refused");
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2545 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2545 — le nom du refus a un second écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS — les deux populations de \
+             mika#2545 ne sont soustractibles que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2545_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "GROOM_ESCALATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// Les deux motifs de refus sont un **format de fil** : ils atterrissent dans
+    /// `audit_events.after_value` et dans le JSON de `tasks.result`, et
+    /// l'opérateur en fait des `GROUP BY`. Un motif ajouté ou retiré est une
+    /// RUPTURE à dater dans `CLAUDE.md`, jamais une mise à jour de ce nombre en
+    /// silence — même contrat que `ALL_ITERATE_REFUSAL_REASONS` (mika#2506).
+    #[test]
+    fn mika2545_the_two_refusal_verdicts_are_a_wire_format() {
+        use crate::skills::executor::ALL_GROOM_ESCALATE_VERDICTS;
+
+        assert_eq!(
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            2,
+            "mika#2545 — deux motifs : « ce ticket a escaladé » et « on n'a pas \
+             pu le savoir ». Ils appellent la même disposition et DEUX lectures \
+             opérateur différentes (le premier est le régime attendu non vide, le \
+             second doit rester vide), donc les fondre rendrait la seconde \
+             population incomptable."
+        );
+        let mut sorted = ALL_GROOM_ESCALATE_VERDICTS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALL_GROOM_ESCALATE_VERDICTS.len(),
+            "deux motifs portent la même valeur de fil : une population serait \
+             coupée en deux sans le dire"
+        );
+    }
+
+    /// Le `match` sur [`crate::skills::executor::GroomVerdictState`] n'a **aucun
+    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un quatrième état
+    /// devra être décidé par le compilateur, jamais absorbé par un `_ =>` qui le
+    /// ferait tomber du côté « laisser passer » en silence.
+    ///
+    /// Scan de source plutôt que test comportemental : un joker ajouté ne rend
+    /// fausse aucune des décisions couvertes aujourd'hui.
+    #[test]
+    fn mika2545_the_verdict_match_has_no_wildcard_arm() {
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+        let content = production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == owner)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("mika#2545 — {owner} introuvable : le scan ne lit rien"));
+
+        // La plage du `match`, bornée sur la ligne qui le porte — composée à
+        // l'exécution pour la même raison que le needle ci-dessus.
+        let opener = format!("let refusal = match {}", "verdict {");
+        let start = content.find(opener.as_str()).unwrap_or_else(|| {
+            panic!(
+                "mika#2545 — le `match` du verdict est introuvable dans {owner} : \
+                 ce scan vise une forme morte"
+            )
+        });
+        let body: String = content[start..]
+            .lines()
+            .take(30)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body.contains("GroomVerdictState::NotEscalated")
+                && body.contains("GroomVerdictState::Escalated")
+                && body.contains("GroomVerdictState::Unreadable"),
+            "bonne foi : la plage extraite doit bien porter les trois bras — {body}"
+        );
+        for wildcard in ["_ =>", "_=>"] {
+            assert!(
+                !body.contains(wildcard),
+                "mika#2545 — le `match` du verdict porte un bras joker (`{wildcard}`) : \
+                 un quatrième état y tomberait sans décision. RÉSOLUTION : \
+                 énumérer l'état, ne pas l'absorber."
+            );
+        }
+    }
+
+    /// Le vocabulaire de refus est un **format de fil** à site unique, et cette
+    /// garde vit ici — avec les autres scans de nom — plutôt que dans le module,
+    /// parce que c'est la valeur telle qu'elle atterrit dans `audit_events` qui
+    /// compte, pas la forme de l'`enum`.
+    #[test]
+    fn mika2506_les_motifs_de_refus_sont_declares_une_fois() {
+        use crate::server::iterate_dispatch::ALL_ITERATE_REFUSAL_REASONS;
+
+        assert_eq!(
+            ALL_ITERATE_REFUSAL_REASONS.len(),
+            7,
+            "mika#2506 — sept motifs, pas six : la divergence avec l'AC3 du plan \
+             est datée sur `IterateRefusal::EngineRefused`. Un motif ajouté ou \
+             retiré est une RUPTURE de format de fil, à dater dans CLAUDE.md — \
+             jamais une mise à jour de ce nombre en silence."
+        );
+        let mut sorted = ALL_ITERATE_REFUSAL_REASONS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            ALL_ITERATE_REFUSAL_REASONS.len(),
+            "deux motifs portent la même valeur de fil : une population serait \
+             coupée en deux sans le dire"
         );
     }
 }

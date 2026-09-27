@@ -34,7 +34,28 @@ timeout_secs = 30
 # the two raises above: the prompt's subject is a closed enumeration, and the
 # fix for a self-contradicting rule is not to delete one of its halves.
 # 77824 < the 81 920 hard ceiling; the gate fires again at 73 932 bytes.
-max_prompt_size = 77824
+#
+# Raised from 77824 to 79872 (78 KB) for mika#2519, on 2026-09-26. Step 1.6 gains
+# the `author.login` correction (`author` is an OBJECT — the old text compared it
+# to a string, on the single discriminant of the whole Dependabot path, so the
+# step was unreachable) and step 5b, the major-version-jump clause with its
+# `API-SURFACE:` line. Net +2 281 bytes on a prompt that sat at 71 716 — 2 216 of
+# which fitted under the old gate, so the raise buys the last 65 and the margin
+# after them. **Roughly 900 bytes of the addition were already cut before
+# raising**: the two paragraphs were compressed twice, and what remains is four
+# rules, three of which are asserted by
+# `tests/qa_review_executes_repo_guards.rs::mika2519_*`. Same shape as the three
+# raises above, and the same reason: the fix for a missing rule is not to delete
+# a neighbouring one.
+#
+# **+2048 and not +4096, deliberately.** 77824 + 4096 lands on 81 920, i.e. ON
+# the `MAX_PROMPT_SIZE_CEILING` (`skills/index.rs:27`) — a value that satisfies
+# the gate while leaving the next rule nowhere to go, and the three comments
+# above all state "well under the ceiling" as part of the reasoning. 79872 clears
+# the gate with 1 875 bytes of headroom and keeps 2 048 below the ceiling.
+# The gate fires again at 75 878 bytes. The declared size costs nothing at
+# runtime — the real size is what is injected.
+max_prompt_size = 79872
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =
 # ["qa-review"]` — mais c'est une arête ENTRANTE, et `callback_safe_skills()`

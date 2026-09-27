@@ -293,26 +293,21 @@ _pilot_log_dir() {
 # `_pilot_max_turns` sur la MÊME ligne, et test-dispatch-lib.sh refuse toute
 # lecture non co-localisée.
 #
-# LE DÉFAUT EST LIVRÉ À 0, C'EST-À-DIRE DÉSARMÉ — et ce n'est pas la valeur que
-# le plan de mika#2496 propose. Son § 5.1 fait de la distribution mesurée des
-# tours des runs ABOUTIS une vérification bloquante (V2) préalable à l'armement,
-# précisément parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une
-# borne qui coupe la population saine déplace le défaut au lieu de le fermer.
-# Cette mesure se lit sur `~/.mika/data/mika.db`, que le bac à sable de dispatch
-# ne monte pas — c'est un geste opérateur sur l'hôte, et le plan écrit lui-même
-# la conduite quand il n'est pas fourni : « U1 est livré DÉSARMÉ
-# (`PILOT_MAX_TURNS=0` par défaut) et la raison est écrite dans le corps de la
-# PR ». Armer est alors d'un geste et sans redéploiement :
-# `PILOT_MAX_TURNS=120` sur l'environnement du service ; ou porter ce défaut à
-# 120 une fois V2 rapportée sur le ticket.
+# LE DÉFAUT A ÉTÉ LIVRÉ DÉSARMÉ PAR mika#2496, ET EST ARMÉ À 150 PAR mika#2542.
+# Le plan de mika#2496 faisait de la distribution mesurée des tours des runs
+# ABOUTIS une vérification bloquante (V2) préalable à l'armement, précisément
+# parce qu'armer à 120 tronquerait #2425 (142 tours) : livrer une borne qui
+# coupe la population saine déplace le défaut au lieu de le fermer. Le plafond
+# 150 a donc d'abord vécu dans `~/.mika/.env` (`source=env`) ; mika#2542 le
+# rapporte ici une fois V2 fournie (voir sa note plus bas).
 #
-# Trois paliers, et le `0` n'est pas une valeur invalide mais LE ROLLBACK :
+# Le `0` n'est pas une valeur invalide mais LE ROLLBACK :
 #
-#   non défini  -> le défaut ci-dessous
 #   ""  ou "0"  -> le drapeau n'est PAS passé ; claude-pilot retombe sur son
 #                  propre `maxTurns=200`, soit le comportement d'avant
 #                  mika#2496 à l'octet près
-#   entier > 0  -> ce plafond, `source=env`
+#   entier > 0  -> ce plafond, `source=env` (sauf label de ticket, mika#2542)
+#   non défini  -> le défaut ci-dessous
 #   autre       -> le défaut, PLUS une ligne `pilot_budget_invalid` nommant la
 #                  valeur fautive entre guillemets. Un désarmement par coquille
 #                  sur un frein de coût serait la panne silencieuse que tout
@@ -322,28 +317,122 @@ _pilot_log_dir() {
 # chiffres sinon. C'est ce qui rend `${_PILOT_MAX_TURNS:+--max-turns …}` juste
 # aux sites de lancement — le drapeau littéral y reste visible (le scan de
 # source l'exige) tout en disparaissant de l'argv quand la borne est absente.
+#
+# mika#2542 — LE PLAFOND SE RÉSOUT AUSSI DEPUIS LE LABEL DU TICKET. Trois
+# implements `loop-substrate` consécutifs (#2532, #2536, #2519) ont été coupés à
+# 151 tours sous le plafond 150 : cette classe touche la famille de handlers,
+# le Rust, les tests et la doc, et elle est intrinsèquement plus longue que le
+# trafic nominal. Le défaut in-file est ARMÉ à 150 dans le même geste — V2 de
+# mika#2496 est rapportée par ce ticket : 150 tourne en production depuis le
+# 2026-09-24 et ses seuls dépassements mesurés sont la classe qu'on exempte.
+# Livrer l'exception sans la règle qu'elle exempte (règle qui ne vivait alors
+# que dans `~/.mika/.env`) aurait été la forme la plus fragile du travail.
+#
+# La cascade, et SON ORDRE EST LE LIVRABLE :
+#
+#   1. PILOT_MAX_TURNS défini et ("" ou "0") -> ROLLBACK, pas de drapeau  (env)
+#   2. un label de PILOT_LABEL_TURN_CEILINGS -> ce plafond             (label)
+#   3. PILOT_MAX_TURNS entier > 0            -> cette valeur             (env)
+#   4. sinon                                 -> le défaut in-file    (default)
+#
+# Le palier 1 est AU-DESSUS du label : un label qui écraserait le rollback
+# ferait cesser le rollback d'être un rollback, pendant un incident, sans que
+# rien ne le dise. Le palier 2 est AU-DESSUS du palier 3 : l'hôte de production
+# porte `PILOT_MAX_TURNS=150`, donc un label placé sous l'env serait inerte
+# partout où il compte — mergé, déployé, zéro effet, aucune ligne rouge (classe
+# mika#2205). Coût nommé : `PILOT_MAX_TURNS=50` ne borne PAS un ticket
+# `loop-substrate` sous 200 ; les gestes qui le font sont retirer le label, ou
+# `PILOT_MAX_TURNS=0`.
+#
+# L'argument `$1` est la liste CSV des labels du ticket (`LABELS`, posée par
+# `_set_up_worktree`). Elle est PASSÉE, jamais lue par portée dynamique — même
+# raison que `_pilot_log_dir` : un état posé 500 lignes plus haut par une autre
+# fonction peut être lu périmé sans que rien ne le dise. Un site qui oublierait
+# l'argument résout « aucun label », donc le défaut : l'oubli est fail-safe
+# vers 150, jamais vers 200, et test-dispatch-lib.sh le refuse quand même.
+#
+# L'invalidité est posée INDÉPENDAMMENT de la résolution : `PILOT_MAX_TURNS=abc`
+# sur un ticket `loop-substrate` résout 200 par le label ET émet
+# `pilot_budget_invalid` — la coquille est dite même quand elle ne décide rien.
+
+# mika#2542 — la table label → plafond de tours. UN SEUL SITE : aucun autre
+# lecteur de label ne décide d'un plafond (AC5).
+#
+# Format de fil `label=plafond`, une entrée par ligne : c'est la forme que
+# `scripts/check-pilot-turn-ceiling-labels.sh` extrait SANS exécuter ce fichier
+# pour vérifier que chaque clé est déclarée dans `.github/labels.yml`. Un label
+# non déclaré y est SUPPRIMÉ au prochain sync (`delete-other-labels: true`),
+# sans événement `unlabeled` : le relèvement deviendrait inerte en silence. Une
+# réécriture qui changerait cette forme rendrait la garde aveugle — son exit 3
+# et son harnais négatif sont là pour que ça se voie.
+#
+# `200` est une valeur POSÉE, pas mesurée : les trois runs de référence ont été
+# COUPÉS à 151, on ignore combien de tours ils auraient pris. Si la classe
+# recoupe à 201, c'est la valeur qu'il faut revoir, pas le mécanisme — et
+# `source=label` sur la ligne `pilot_budget_armed` est ce qui distingue notre
+# 200 du `maxTurns=200` amont de claude-pilot.
+PILOT_LABEL_TURN_CEILINGS=(
+    "loop-substrate=200"
+)
+
+# Assigne `_PILOT_LABEL_CEILING` / `_PILOT_LABEL_CEILING_NAME` depuis le CSV `$1`
+# et rend 0 quand un label de la table a décidé, 1 sinon. ASSIGNE, n'imprime
+# pas (mika#2039, même contrainte que `_pilot_max_turns`). Appariement EXACT sur
+# un élément du CSV : on encadre (`,$1,`) et on cherche `,<label>,`. Un glob de
+# sous-chaîne à la manière de `_label_to_type` apparierait `not-loop-substrate`
+# ou `loop-substrate-v2` — tolérable pour un préfixe de commit, faux pour un
+# frein de coût. La première entrée de la table qui apparie décide.
+_pilot_label_turn_ceiling() {
+    local _csv=",${1:-},"
+    local _entry _label
+    _PILOT_LABEL_CEILING=""
+    _PILOT_LABEL_CEILING_NAME=""
+    for _entry in "${PILOT_LABEL_TURN_CEILINGS[@]}"; do
+        _label="${_entry%%=*}"
+        case "$_csv" in
+            *",${_label},"*)
+                _PILOT_LABEL_CEILING="${_entry#*=}"
+                _PILOT_LABEL_CEILING_NAME="$_label"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 _pilot_max_turns() {
-    # LE défaut de flotte, un seul site. Vide = désarmé ; pour armer, écrire le
-    # plafond ici (`local _default=120`) une fois V2 rapportée sur le ticket.
-    local _default=""
+    # LE défaut de flotte, un seul site. Armé à 150 par mika#2542 (V2 de
+    # mika#2496 rapportée). Vide = désarmé.
+    local _default="150"
 
     _PILOT_MAX_TURNS_SOURCE="default"
     _PILOT_MAX_TURNS_INVALID=""
+    _PILOT_MAX_TURNS_LABEL=""
 
-    if [ -z "${PILOT_MAX_TURNS+set}" ]; then
-        # Non défini : le défaut de flotte.
-        _PILOT_MAX_TURNS="$_default"
-    elif [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; then
-        # Le ROLLBACK, explicite : le drapeau ne sera pas passé.
+    # L'invalidité est dite quel que soit le palier qui décide.
+    if [ -n "${PILOT_MAX_TURNS:-}" ] && [ "$PILOT_MAX_TURNS" != "0" ] \
+        && ! grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
+    fi
+
+    if [ -n "${PILOT_MAX_TURNS+set}" ] \
+        && { [ -z "$PILOT_MAX_TURNS" ] || [ "$PILOT_MAX_TURNS" = "0" ]; }; then
+        # Palier 1 — le ROLLBACK, explicite : le drapeau ne sera pas passé, et
+        # aucun label n'a voix au chapitre.
         _PILOT_MAX_TURNS=""
         _PILOT_MAX_TURNS_SOURCE="env"
-    elif grep -qE -- '^[1-9][0-9]*$' <<<"$PILOT_MAX_TURNS"; then
+    elif _pilot_label_turn_ceiling "${1:-}"; then
+        # Palier 2 — le label du ticket. Au-dessus de l'env : voir la cascade.
+        _PILOT_MAX_TURNS="$_PILOT_LABEL_CEILING"
+        _PILOT_MAX_TURNS_SOURCE="label"
+        _PILOT_MAX_TURNS_LABEL="$_PILOT_LABEL_CEILING_NAME"
+    elif [ -n "${PILOT_MAX_TURNS:-}" ] && [ -z "$_PILOT_MAX_TURNS_INVALID" ]; then
+        # Palier 3 — un entier positif dans l'env.
         _PILOT_MAX_TURNS="$PILOT_MAX_TURNS"
         _PILOT_MAX_TURNS_SOURCE="env"
     else
-        # Illisible ou négatif : on retombe au défaut, et on le DIT.
+        # Palier 4 — non défini, ou illisible (et alors DIT ci-dessus).
         _PILOT_MAX_TURNS="$_default"
-        _PILOT_MAX_TURNS_INVALID="$PILOT_MAX_TURNS"
     fi
 
     # Le résolveur ne RELIT jamais `$_PILOT_MAX_TURNS` : chaque branche l'écrit
@@ -406,10 +495,19 @@ _emit_pilot_budget_line() {
     done
 
     if [ -n "${_PILOT_MAX_TURNS_INVALID:-}" ]; then
-        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, retour au défaut" >&2
+        echo "dispatch-lib: pilot_budget_invalid PILOT_MAX_TURNS=\"${_PILOT_MAX_TURNS_INVALID}\" — valeur ignorée, le plafond vient d'un autre palier (voir source= ci-dessous)" >&2
     fi
 
-    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset} cost_bound=absent_upstream" >&2
+    # mika#2542 — `label=` n'est émis QUE quand un label a décidé : un champ
+    # vide se lirait comme un label nommé « vide ». Placé après `source=` et
+    # avant `cost_bound=`, qui reste en dernier ; tout grep existant sur
+    # `max_turns=` ou `source=` continue d'apparier.
+    local _lbl=""
+    if [ "${_PILOT_MAX_TURNS_SOURCE:-}" = "label" ] && [ -n "${_PILOT_MAX_TURNS_LABEL:-}" ]; then
+        _lbl=" label=${_PILOT_MAX_TURNS_LABEL}"
+    fi
+
+    echo "dispatch-lib: pilot_budget_armed max_turns=${_mt} source=${_PILOT_MAX_TURNS_SOURCE:-unset}${_lbl} cost_bound=absent_upstream" >&2
 }
 
 # mika#2165: make that directory visible — and writable — from INSIDE.
@@ -2171,21 +2269,48 @@ _clean_worktree_for_rebase() {
 # Boundary (mika#1414 coordination): this helper owns ONLY the post-rebase
 # command-seed. The pre-rebase dirty-state cleanup + rebase guard (the mika#1301
 # block inside _set_up_worktree) is mika#1414's surface; the two do not overlap.
+#
+# The exclude mechanics live in the two helpers below (mika#2548), shared with
+# _seed_pilot_scratch_dir: one definition of "shield a path from git status in a
+# linked worktree", not two copies free to drift.
+
+# Print the absolute path of the COMMON-dir info/exclude for a worktree, creating
+# its parent directory. A linked worktree's own $GIT_DIR/info/exclude is not
+# consulted for status; the common dir's is. --path-format=absolute needs
+# git >= 2.31; fall back to the bare form otherwise. Prints nothing when the
+# directory is not a git worktree.
+_common_exclude_file() {
+    local worktree_dir=$1 common_dir
+    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
+    [ -n "$common_dir" ] || return 0
+    mkdir -p "$common_dir/info" 2>/dev/null || true
+    printf '%s\n' "$common_dir/info/exclude"
+}
+
+# Append one pattern to an exclude file, idempotently. Concurrent dispatches off
+# the same sub-repo share this file; the grep/append is non-atomic, so an overlap
+# may append a duplicate (inert — git collapses repeated patterns) but never
+# corrupts shielding. flock was judged not worth the complexity (P3).
+_append_exclude_line() {
+    local exclude_file=$1 pattern=$2
+    [ -n "$exclude_file" ] || return 0
+    grep -qxF "$pattern" "$exclude_file" 2>/dev/null && return 0
+    # Guard a pre-existing exclude file with no trailing newline, which would
+    # otherwise concatenate our entry onto its last line.
+    if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
+        printf '\n' >> "$exclude_file"
+    fi
+    printf '%s\n' "$pattern" >> "$exclude_file"
+}
+
 _seed_worktree_slash_commands() {
     local platform_dir=$1 worktree_dir=$2
     [ -d "$platform_dir/.claude/commands" ] || return 0
     mkdir -p "$worktree_dir/.claude/commands"
 
-    # Shared exclude lives in the common git dir (a linked worktree's own
-    # $GIT_DIR/info/exclude is not consulted for status). --path-format=absolute
-    # needs git >= 2.31; fall back to the bare form otherwise.
-    local common_dir exclude_file=""
-    common_dir=$(git -C "$worktree_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-        || common_dir=$(git -C "$worktree_dir" rev-parse --git-common-dir 2>/dev/null)
-    if [ -n "$common_dir" ]; then
-        exclude_file="$common_dir/info/exclude"
-        mkdir -p "$(dirname "$exclude_file")"
-    fi
+    local exclude_file
+    exclude_file=$(_common_exclude_file "$worktree_dir")
 
     local src base
     for src in "$platform_dir/.claude/commands"/*.md; do
@@ -2202,19 +2327,47 @@ _seed_worktree_slash_commands() {
         fi
         cp "$src" "$worktree_dir/.claude/commands/$base" 2>/dev/null || true
         # Invariant 2: shield the scaffold copy from git status (idempotent).
-        # Concurrent dispatches off the same sub-repo share this exclude file;
-        # the grep/append is non-atomic, so an overlap may append a duplicate
-        # (inert — git collapses repeated patterns) but never corrupts shielding.
-        # flock was judged not worth the complexity (P3).
-        if [ -n "$exclude_file" ] && ! grep -qxF ".claude/commands/$base" "$exclude_file" 2>/dev/null; then
-            # Guard a pre-existing exclude file with no trailing newline, which
-            # would otherwise concatenate our entry onto its last line.
-            if [ -s "$exclude_file" ] && [ -n "$(tail -c1 "$exclude_file" 2>/dev/null)" ]; then
-                printf '\n' >> "$exclude_file"
-            fi
-            printf '%s\n' ".claude/commands/$base" >> "$exclude_file"
-        fi
+        _append_exclude_line "$exclude_file" ".claude/commands/$base"
     done
+}
+
+# mika#2548 — the pilot's scratch directory: designated, empty, invisible to git.
+#
+# The failure it closes, measured 2026-09-26 (task 83db3a82, ready-label
+# mika#2054): the pilot built a fixture tree at the worktree root, every write
+# into it was refused, it abandoned the approach and tidied up — `rmdir` refused
+# twice, then `rm -rf` → `[policy:deny] … (terminal)` → session killed.
+# `rm -rf` stays terminal in claude-pilot by design (cpp#205); what this repo
+# owns is the place a scratch goes, so that nothing ever needs deleting:
+#
+#   1. It exists before the pilot starts, so there is nothing to create at an
+#      improvised path.
+#   2. It is shielded by the common-dir info/exclude (the mika#1415 mechanism
+#      above), so a leftover never reads as a dirty worktree — no mika#1282
+#      wip-rescue, no rebase refusal, never swept into a commit.
+#   3. It starts EMPTY every time the worktree is prepared. Worktrees are reused
+#      across iterations and resumes, and _clean_worktree_for_rebase (`git clean
+#      -fd` without -x, `stash --include-untracked`) spares excluded paths; a
+#      stale fixture from a previous session would otherwise push the next pilot
+#      — which the prompt rule forbids to delete it — straight back to `rm -rf`.
+#      The reset runs host-side, behind the mika#1943 guard, like the `.iterate`
+#      reset.
+#
+# Not closed here, and named: the tidy-up reflex itself on an EMPTY tree (git
+# never saw the founding directories) is barred on this side only by the prompt
+# rule _PILOT_SCRATCH_RULE. The structural half of that belongs to the
+# claude-pilot policy (make rm/rmdir under this path survivable) — follow-up.
+_PILOT_SCRATCH_DIRNAME='.pilot-scratch'
+
+_seed_pilot_scratch_dir() {
+    local worktree_dir=$1 scratch exclude_file
+    scratch="$worktree_dir/$_PILOT_SCRATCH_DIRNAME"
+    if [ -e "$scratch" ] && _assert_removable_worktree_path "$scratch" seed_pilot_scratch_dir; then
+        rm -rf "$scratch" 2>/dev/null || true
+    fi
+    mkdir -p "$scratch" 2>/dev/null || return 0
+    exclude_file=$(_common_exclude_file "$worktree_dir")
+    _append_exclude_line "$exclude_file" "$_PILOT_SCRATCH_DIRNAME/"
 }
 
 # Set up a git worktree for the target issue's branch. Parses the repo#number
@@ -2448,6 +2601,49 @@ N'écris jamais dans \`/tmp\` : la permission-policy refuse toute écriture hors
 et la session se termine sans PR. N'utilise pas non plus de heredoc \`<<'BODY'\` : un corps généré peut
 contenir la ligne délimitrice et le terminer trop tôt. Ne demande jamais à l'opérateur de coller le corps
 — une session dispatchée qui pose une question est une session morte."
+
+# mika#2548 — la règle du scratch, portée par chaque dispatch.
+#
+# Le défaut qu'elle vise : un pilote qui range son brouillon meurt. `rm -rf` est
+# un verbe prouvé dangereux, TERMINAL par design dans claude-pilot (cpp#205), et
+# `rmdir` y est refusé ; le 2026-09-26 (tâche 83db3a82, mika#2054) le pilote a
+# construit un arbre de fixture à la racine du worktree, abandonné l'approche,
+# puis tenté de le supprimer — session tuée sur le `rm -rf`.
+#
+# Forme positive d'abord, comme la règle mika#2211 : un pilote à qui l'on dit
+# seulement « pas de rm » doit encore inventer où mettre son fixture, et le lieu
+# qu'il choisit est celui qu'il voudra nettoyer. Le lieu est donc fourni
+# (`_seed_pilot_scratch_dir`) et nommé ici. `/tmp` n'est PAS proposé : la
+# politique y refuse `cp`/`mv` (cpp#209 les rend seulement survivables) et
+# l'outil Write hors worktree (mika#2211) — on ne peut pas y bâtir un fixture.
+#
+# Ce que cette règle est, et ce qu'elle n'est pas : la moitié structurelle
+# (répertoire désigné, exclu de git, vidé à chaque préparation) retire toute
+# RAISON de nettoyer un résidu ; le réflexe de rangement lui-même, sur un arbre
+# vide que git ne voit pas, n'a de barrière ici que ce texte. Sa fermeture
+# structurelle appartient à la politique claude-pilot — suivi nommé au plan.
+#
+# Portée de l'interdit : les brouillons de `.pilot-scratch/`, pas tout fichier.
+# La règle mika#2211 (injectée juste avant) prescrit de supprimer `pr-body.md`
+# après `gh pr create` ; un interdit général de `rm` la contredirait, et le
+# pilote qui suit la règle la plus récente laisserait `pr-body.md` non suivi à
+# la racine — ignoré dans mika seulement, donc commité par le rescue `add -A`
+# ailleurs (mika-cloud, mika-skills). D'où l'exception nommée dans le texte.
+#
+# Inconditionnelle, comme mika#2211 : groomeurs et implémenteurs bâtissent tous
+# deux des fixtures. Appendue AVANT la règle Fire-Disposition (mika#2306), qui
+# doit rester la plus récente pour le groomeur, la récence étant son seul levier.
+_PILOT_SCRATCH_RULE="RÈGLE DE DISPATCH (mika#2548) — ton brouillon vit sous \`.pilot-scratch/\`, et tu ne le supprimes jamais.
+Pour un fixture, une copie de test ou tout autre fichier temporaire : crée-le sous \`.pilot-scratch/<nom>/\` à la racine
+du worktree (outil Write, ou mkdir/cp dans ce répertoire). Pour y extraire un fichier d'une autre révision :
+\`git show <ref>:<chemin> > .pilot-scratch/<chemin>\`, SEUL sur sa ligne — sans \`--\`, sans \`2>/dev/null\`, sans \`;\` ni \`&&\`
+(toute autre forme est refusée). Il existe déjà, il est exclu de git, il repart vide à
+chaque préparation et il disparaît avec le worktree : un résidu n'y coûte rien.
+Ne supprime JAMAIS un brouillon de \`.pilot-scratch/\`, même vide, même en changeant d'approche : pas de \`rm\`, pas de
+\`rmdir\` (refusé), et surtout pas de \`rm -rf\` — ce refus est TERMINAL et tue la session sur le coup. Abandonner un
+brouillon, c'est le laisser en place. Ne bâtis pas de fixture dans \`/tmp\` : \`cp\` et Write y sont refusés.
+Seule exception : \`pr-body.md\` à la racine n'est pas un brouillon — la règle mika#2211 ci-dessus reste entière
+(écris-le à la racine, puis un simple \`rm pr-body.md\` après \`gh pr create\`, jamais \`rm -rf\`)."
 
 # mika#2306 — la prescription `## Fire-Disposition`, portée par chaque dispatch
 # de grooming.
@@ -3036,6 +3232,8 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # because worktrees are short-lived and mid-session command edits
         # violate slug-immutability (mika#844).
         _seed_worktree_slash_commands "$PLATFORM_DIR" "$WORKTREE_DIR"
+        # mika#2548: a designated, empty, git-excluded scratch dir for the pilot.
+        _seed_pilot_scratch_dir "$WORKTREE_DIR"
 
         CWD_ARGS="--cwd $WORKTREE_DIR"
         if [ -f "$WORKTREE_DIR/.claude/claude-pilot.json" ]; then
@@ -3108,17 +3306,27 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # is still exactly `<repo>#<num>` (the mika#138 contract).
         PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")
 
+        # --- mika#2548: the scratch rule reaches the pilot ---
+        #
+        # Unconditional, same channel and same reasoning as mika#2211 above. It
+        # sits AFTER that injection (so the position invariants of mika#2178 and
+        # the `<repo>#<num>` first line still hold) and BEFORE the conditional
+        # Fire-Disposition block below, which must stay the most recent line a
+        # groomer reads.
+        PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PILOT_SCRATCH_RULE")
+
         # --- mika#2306: la prescription Fire-Disposition atteint le groomeur ---
         #
-        # Conditionnée au skill, à la différence des deux injections ci-dessus.
+        # Conditionnée au skill, à la différence des trois injections ci-dessus.
         # Celles-là sont inconditionnelles et ont raison de l'être — le corps du
-        # ticket et la règle de corps de PR servent tout pilote. Celle-ci
+        # ticket, la règle de corps de PR (mika#2211) et la règle du scratch
+        # (mika#2548) servent tout pilote. Celle-ci
         # s'adresse à qui ÉCRIT un plan ; l'injecter pour `dev-pilot` serait du
         # bruit dans le prompt d'un pilote qui n'en écrit pas. La condition est
         # donc à écrire explicitement, jamais à hériter du voisin : la copier
         # sans elle est exactement l'écart que le contrôle négatif T3 attrape.
         #
-        # Appendue APRÈS les deux autres, donc les trois invariants de position
+        # Appendue APRÈS les trois autres, donc les trois invariants de position
         # documentés plus haut tiennent toujours et la PREMIÈRE LIGNE de PROMPT
         # reste exactement `<repo>#<num>` (contrat mika#138, invariant 2).
         if [ "$SKILL" = "dev-groom" ]; then
@@ -3232,7 +3440,7 @@ _run_claude_pilot() {
     # which the bind could therefore never be guaranteed to cover.
     # mika#2496: `--max-turns` is resolved on THIS line (co-location, as for
     # `--log-dir`) and expands to nothing when the budget is disarmed.
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$LOG_ID" ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} --command "$ENTRY_COMMAND" $CWD_ARGS -- "$PROMPT" >"$STDOUT_FILE" 2>"$STDERR_FILE"
     PILOT_EXIT=$?
     # Persist stderr to durable file before any processing (mika#1097).
     # Scrub secrets from the persistent copy to prevent durable secret retention (mika#903).
@@ -3284,6 +3492,13 @@ _run_claude_pilot() {
     # eighteen days (cpp#119, #145, #168, #185, #187) because nothing read it.
     SUBTYPE=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.subtype // empty' 2>/dev/null)
     TERMINATION_REASON=$(printf '%s\n' "$PILOT_OUTPUT" | jq -r '.termination_reason // empty' 2>/dev/null)
+    # mika#2539: `_resolve_halt_subtype`'s memo is reset HERE, at the site that
+    # reads a new session's subtype, rather than at either of its two callers.
+    # The memo exists so the rescue commit and the callback banner cannot say
+    # different words about the same halt; resetting it next to `SUBTYPE` makes
+    # "one session, one answer" a property of the construction instead of
+    # something the next editor has to remember.
+    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE
     # cpp#54 promised this field to "mika-dev dispatch-lib" as its consumer and
     # nothing here ever read it (mika#2149 P4). It is a qualifier on the
     # `Halt:` line, never a second classification axis: cpp#119 sets it only on
@@ -3622,7 +3837,17 @@ Measurement: cycle output undetermined — ${CYCLE_OUTPUT_EVIDENCE}. This is NOT
     # name a cause this gate could only describe as an absence. `STATUS=CANCELLED*`
     # additionally has to lead the callback for mika-dev's parser, which a
     # prefixed banner would break.
-    if grep -qE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE)' <<<"${RESULT:-}"; then
+    #
+    # mika#2545 — `^Outcome: ESCALATE` joins the alternation, and this is the
+    # FRAGILE half of that ticket rather than a courtesy. `PIPELINE FAILURE:` was
+    # also what took an escalated groom out of the `empty_completion` population;
+    # dropping it from `_escalate_groom` without compensating here would expose a
+    # deliberate terminal disposition to a false red — exactly what this gate's
+    # own comment says it exists to avoid. P4 already recognises `ESCALATE` as a
+    # motivated disposition, but only UNDER `CYCLE_TOOL_CALLS >= 1`; an escalated
+    # groom whose stderr copy is absent or unreadable has no measured count and
+    # would land here. Both terms are needed; neither is redundant.
+    if grep -qE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE|^Outcome: ESCALATE)' <<<"${RESULT:-}"; then
         echo "cycle_output.empty.banner_skipped: callback already carries a terminal classification — not stacking a second diagnosis" >&2
         return 0
     fi
@@ -3736,45 +3961,111 @@ _halt_hint_meaning() {
     esac
 }
 
+# Resolve THE halt subtype of this session, once, for every consumer (mika#2539).
+#
+# WHY THIS IS A FUNCTION AND NOT A `$SUBTYPE` READ. Two sites now ask what halted
+# the session: the callback banner (`_classify_terminated_session`) and the
+# rescue commit subject (`_rescue_cause_token`). The answer is NOT `$SUBTYPE`,
+# because a `terminated` result does not always carry one — the mika#2149 (C-4)
+# fallback scrapes the `[guardrail]` line out of stderr and derives the subtype
+# from it. A second site reading `$SUBTYPE` raw would therefore diverge from the
+# banner on exactly that population: the banner would say
+# `Halt class: session_silent` while the commit said `rescue no_halt_signal`.
+# Two contradictory statements about one session, one of them carved into git
+# history for good — the mika#2539 defect reproduced by its own fix.
+#
+# IT PUBLISHES VARIABLES AND WRITES NOTHING TO STDOUT, deliberately. A caller
+# doing `x=$(_resolve_halt_subtype)` runs it in a SUBSHELL, so both the memo and
+# `_HALT_GUARDRAIL_LINE` would die with that subshell — measured: the first draft
+# returned the subtype on stdout, and `_classify_terminated_session` rendered
+# `Halt: ` with an empty scraped line, reddening two pre-existing tests of the
+# fallback path (U2, T4). Read the variables after calling it as a command.
+#
+# MEMOISED per shell context. Reset lives at the `SUBTYPE` assignment site, not
+# here, so one session yields one answer by construction rather than by the next
+# editor remembering. What the memo buys is idempotence and one scrape instead of
+# two; what guarantees the two consumers AGREE is that there is only one resolver
+# (pinned by a scan in test-dispatch-lib.sh) fed by inputs that do not change
+# between them — not the memo, which a subshell boundary can still discard.
+#
+# COST, NAMED: the memo is process-scoped and dispatch-lib is sourced once per
+# dispatch, for one session — so the scope is right. A future caller handling two
+# sessions in one process would read the first session's answer; hence the
+# explicit name and this note.
+#
+# `_HALT_GUARDRAIL_LINE` carries the whole scraped line because the caller needs
+# it for PRESENTATION (`Halt: <line>`), and re-scraping stderr there would put a
+# second reader of the same bytes back into this file — the divergence above with
+# extra steps.
+#
+# Reads: SUBTYPE, STDERR_FILE, LOG_ID. Writes: _HALT_SUBTYPE_RESOLVED (the
+#        subtype, empty when the session left no halt signal at all),
+#        _HALT_GUARDRAIL_LINE.
+_resolve_halt_subtype() {
+    local stderr_path _candidate
+    # `+x` and not `:-`: an EMPTY resolution is a resolution — "this session
+    # left no halt signal" — and must not be recomputed as though unasked.
+    [ -n "${_HALT_SUBTYPE_RESOLVED+x}" ] && return 0
+    _HALT_GUARDRAIL_LINE=""
+
+    # The structured result first. claude-pilot puts the guardrail name in
+    # `.subtype` and its detail in `.termination_reason` (agent.py:155-162),
+    # which is more reliable than scraping stderr and is the only signal that
+    # distinguishes a guardrail abort from an SDK limit. This precedence is the
+    # pre-existing one, moved here unchanged.
+    if [ -n "${SUBTYPE:-}" ]; then
+        _HALT_SUBTYPE_RESOLVED="$SUBTYPE"
+        return 0
+    fi
+
+    # Fallback for a result without a subtype: scrape the `[guardrail]` line.
+    # Prefer the stderr still in hand; the persisted copy may not exist yet
+    # if the mkdir/scrub at the top of this run failed.
+    # KTD3: stderr only enriches. STATUS is the classification, so a missing
+    # or unreadable copy degrades the text and never the verdict — both
+    # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
+    # would have hidden the entire class.
+    _pilot_log_dir; stderr_path="$_PILOT_LOG_DIR/${LOG_ID:-}.stderr"
+    for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
+        [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
+        _HALT_GUARDRAIL_LINE=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
+            | grep -m1 '\[guardrail\]' || true)
+        [ -n "$_HALT_GUARDRAIL_LINE" ] && break
+    done
+    # mika#2149 (C-4): the scraped line feeds the same table, so a halt is never
+    # classed `unknown` for having arrived by the other channel. The ANSI strip
+    # above already ran; ui.py:113 writes `[guardrail] <name>: <detail>`.
+    if [ -n "$_HALT_GUARDRAIL_LINE" ]; then
+        _HALT_SUBTYPE_RESOLVED=$(printf '%s\n' "$_HALT_GUARDRAIL_LINE" \
+            | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
+    else
+        _HALT_SUBTYPE_RESOLVED=""
+    fi
+}
+
 _classify_terminated_session() {
     local mode="${1:-full}"
-    local cause guardrail="" stderr_path _candidate
+    local cause guardrail=""
     local halt_subtype="" halt_row halt_family halt_hint halt_meaning halt_lines
 
-    # The halt cause comes from the structured result first. claude-pilot puts
-    # the guardrail name in `.subtype` and its detail in `.termination_reason`
-    # (agent.py:155-162), which is more reliable than scraping stderr and is the
-    # only signal that distinguishes a guardrail abort from an SDK limit.
+    # mika#2539: the subtype comes from the one resolver, so this banner and the
+    # rescue commit subject cannot disagree about the same halt. Called as a
+    # command and read out of its variables — NOT `$(...)`, which would run it in
+    # a subshell and lose the scraped line the `Halt:` rendering below needs. The
+    # `Halt:` PRESENTATION stays here: it is this function's business, and the two
+    # branches below render the two channels differently on purpose.
+    _resolve_halt_subtype
+    halt_subtype="${_HALT_SUBTYPE_RESOLVED:-}"
+    guardrail="${_HALT_GUARDRAIL_LINE:-}"
+
     if [ -n "${SUBTYPE:-}" ]; then
         # mika#2149 (C-3): `api_error_status` is a qualifier, inserted only when
         # the result carried it.
         cause="Halt: ${SUBTYPE}${API_ERROR_STATUS:+ (HTTP ${API_ERROR_STATUS})}${TERMINATION_REASON:+ — ${TERMINATION_REASON}}"
-        halt_subtype="$SUBTYPE"
+    elif [ -n "$guardrail" ]; then
+        cause="Halt: ${guardrail}"
     else
-        # Fallback for a result without a subtype: scrape the `[guardrail]` line.
-        # Prefer the stderr still in hand; the persisted copy may not exist yet
-        # if the mkdir/scrub at the top of this run failed.
-        # KTD3: stderr only enriches. STATUS is the classification, so a missing
-        # or unreadable copy degrades the text and never the verdict — both
-        # 2026-08-28 tasks had no .log file at all, and a fail-closed read here
-        # would have hidden the entire class.
-        _pilot_log_dir; stderr_path="$_PILOT_LOG_DIR/${LOG_ID}.stderr"
-        for _candidate in "${STDERR_FILE:-}" "$stderr_path"; do
-            [ -n "$_candidate" ] && [ -f "$_candidate" ] && [ -r "$_candidate" ] || continue
-            guardrail=$(sed 's/\x1b\[[0-9;]*[mK]//g' "$_candidate" 2>/dev/null \
-                | grep -m1 '\[guardrail\]' || true)
-            [ -n "$guardrail" ] && break
-        done
-        if [ -n "$guardrail" ]; then
-            cause="Halt: ${guardrail}"
-            # mika#2149 (C-4): the scraped line feeds the same table, so a halt
-            # is never classed `unknown` for having arrived by the other
-            # channel. The ANSI strip above already ran; ui.py:113 writes
-            # `[guardrail] <name>: <detail>`.
-            halt_subtype=$(printf '%s\n' "$guardrail" | sed -n 's/.*\[guardrail\] \([a-z0-9_]*\):.*/\1/p')
-        else
-            cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
-        fi
+        cause="Halt: cause not recorded — no subtype on the result and no [guardrail] line in stderr."
     fi
 
     # mika#2149 (C-2): two stable prefixes after `Halt:`, in both modes — same
@@ -4038,6 +4329,98 @@ to this branch's own diff (mika#2348 D3)." --no-verify 2>&9; then
     fi
 }
 
+# Name WHY the pilot left a dirty worktree without committing (mika#2539).
+#
+# THE DEFECT THIS CLOSES. Both rescue commits below used to carry one generic
+# subject, so git history could not tell apart two sessions whose causes were
+# opposite: #2532 was stopped by a terminal classifier deny at turn 62, #2536 hit
+# the 150-turn ceiling. Same words, different organ to go and repair. Since the
+# 150-turn ceiling stays and iterate-from-wip is the nominal R-class route
+# (Prime + Vincent, 2026-09-26), the cause is the thing the history has to carry.
+#
+# DERIVED, NOT REDECLARED — this is the whole design. The four tokens the ticket
+# proposed would have been a SECOND classification of a signal `_halt_family`
+# already classifies, and a second table is a dated debt: it would sit outside
+# test-dispatch-lib.sh's T6 drift guard, so a subtype added upstream would redden
+# `_halt_family` and pass SILENTLY here. mika#2158 measured that exact shape —
+# `auto_pull.rs` carried a regex commented "Mirrors GROOMED_VERDICT_RE" that
+# followed neither of the two widenings after it, and promotion and dispatch
+# routing answered the same question differently for months. So this function
+# enumerates only the two cases that are NOT halt families and delegates
+# everything else; T6 covers the token because the token IS `_halt_family`'s
+# output. A scan in test-dispatch-lib.sh refuses any upstream subtype name in
+# this body, because that is the one form a second table would take.
+#
+# THE POPULATION IS PARTITIONED, and that is not scope creep. `_halt_family`
+# distinguishes nine families; the ticket's four tokens had room for three, and
+# the other six would have landed in a token the ticket glosses "cause NOT
+# identified" — of sessions whose cause is identified and named. That is the
+# mika#2304 shape (a field that asserts, with authority, what did not happen),
+# i.e. this ticket's own defect moved one notch. The ticket writes "distinguishing
+# AT LEAST", so the licence to go wider is in its letter.
+#
+# RANK 1 IS A PRECEDENCE THIS FILE ALREADY SETTLED. #2532 carries TWO signals:
+# a terminal deny AND a silent session. The deny is the CAUSE (the pilot was
+# prevented), the silence its CONSEQUENCE (it then went mute), so reporting the
+# halt family would send the operator to the wrong organ. `_post_flight_recovery`
+# already ranks these the same way — its Class C branch puts the deny ahead of
+# the drift message, under a comment saying THE ORDER OF THE CONJUNCTS IS
+# LOAD-BEARING and with two tests measuring its position. Taken as-is, not
+# invented here.
+#
+# Lethality is REQUIRED at rank 1, for the same reason Class C requires it: a
+# non-terminal deny is annexed as a note, never treated as the cause. Without the
+# condition, a session that SURVIVED a deny and then hit the turn ceiling would
+# read `policy_deny` — false, and false on the commonest case (mika#2493 measured
+# 1093 non-terminal denies against 62 terminal).
+#
+# Rank 1 deliberately does NOT carry Class C's third conjunct `[ -z "$VALID_PLAN" ]`.
+# There it guards a verdict about the SESSION ("one that delivered cannot be
+# labelled by a deny"); here the question is why the pilot did not COMMIT, and a
+# terminal deny is that answer even when a plan was written to disk. Worse, the
+# uncommitted-plan-on-disk case is precisely the dev-groom population this rescue
+# exists for — `_find_issue_plan` walks the filesystem — so importing the conjunct
+# would disarm rank 1 on exactly the sessions it is meant to explain.
+#
+# Reads: POLICY_DENY, POLICY_DENY_LETHALITY (both set by _post_flight_recovery's
+#        policy-deny pre-check, which always runs before the rescue: the rescue's
+#        own PRE=POST guard is strictly narrower than that block's condition).
+# Prints one snake_case token on stdout. Casing follows `_halt_family` — mixing
+# kebab- and snake_case would split one population in two at read time, which is
+# what scripts/canonical-tokens.tsv (mika#2201) exists to prevent.
+_rescue_cause_token() {
+    local _subtype _family
+
+    # Rank 1 — the deny is the cause; whatever halt followed is its consequence.
+    if [ -n "${POLICY_DENY:-}" ] && [ "${POLICY_DENY_LETHALITY:-}" = "terminal" ]; then
+        printf '%s' "policy_deny"
+        return 0
+    fi
+
+    # Called as a command, read out of its variable — see the resolver's own note
+    # on why it publishes rather than prints.
+    _resolve_halt_subtype
+    _subtype="${_HALT_SUBTYPE_RESOLVED:-}"
+
+    # Rank 4 — no halt signal at all: the session did not halt. Distinct from
+    # rank 3 below, and keeping them apart IS the partition above made
+    # executable: merged, "halted for a reason outside our table" and "never
+    # halted" become one word, which is the very confusion this ticket closes.
+    if [ -z "$_subtype" ]; then
+        printf '%s' "no_halt_signal"
+        return 0
+    fi
+
+    # Ranks 2 and 3 — one table, consulted, never copied. The discriminant is the
+    # one `_classify_terminated_session` already uses for its drift line.
+    _family=$(_halt_family "$_subtype"); _family=${_family%%|*}
+    if [ -z "$_family" ] || [ "$_family" = "unknown" ]; then
+        printf '%s' "halt_unmapped"
+        return 0
+    fi
+    printf '%s' "$_family"
+}
+
 # Preserve a zero-commit session's uncommitted content, then let the caller
 # unblock on it (mika#1282; opened to dev-groom by mika#2031).
 #
@@ -4083,14 +4466,26 @@ _rescue_dirty_worktree() {
     DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain 2>/dev/null | head -20)
     [ -n "$DIRTY_FILES" ] || return 0
 
-    # Commit subject names what was salvaged. The `commit -m "wip(` literal on
-    # both sites below is load-bearing for test_rescue_commit_no_verify.sh's
-    # static guard — keep the interpolation after it, not around it.
-    local _rescue_what
+    # Commit subject names what was salvaged, and WHY the pilot never committed
+    # it (mika#2539). The `commit -m "wip(` literal on both sites below is
+    # load-bearing for test_rescue_commit_no_verify.sh's static guard — keep the
+    # interpolation after it, not around it.
+    #
+    # mika#2539: the cause token is inserted BETWEEN the `wip(<repo>#<n>): `
+    # prefix and the existing tail, and that placement carries three properties.
+    # It is visible in `git log --oneline` before any truncation, which is the
+    # point of the ticket; the tail is left word-for-word, so every downstream
+    # consumer of this subject is untouched (the `^wip\(` anchor in
+    # self-dev-webhook-qa, the three `commit -m "wip(` sites the static guard
+    # counts); and test_dev_groom_dirty_rescue.sh's two `assert_contains` on that
+    # tail stay green unmodified, which makes them the non-regression control of
+    # the placement rather than tests to go and edit.
+    local _rescue_what _rescue_cause
+    _rescue_cause=$(_rescue_cause_token)
     if [ "$SKILL" = "dev-groom" ]; then
-        _rescue_what="plan staged by post-flight recovery (mika#2031)"
+        _rescue_what="rescue ${_rescue_cause} — plan staged by post-flight recovery (mika#2031)"
     else
-        _rescue_what="impl staged by post-flight recovery (mika#1282)"
+        _rescue_what="rescue ${_rescue_cause} — impl staged by post-flight recovery (mika#1282)"
     fi
 
     # Stage all dirty files EXCEPT the worktree-scaffold paths copied by
@@ -6352,7 +6747,7 @@ _launch_revise_pilot() {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$revise_log_id" \
         ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${findings_file}" \
@@ -6472,7 +6867,7 @@ Ne touche à rien d'autre du plan." > "$fd_findings_file" 2>/dev/null || {
     set +e
     # CWD_ARGS is intentionally word-split (multiple flags)
     # shellcheck disable=SC2086
-    _pilot_log_dir; _pilot_max_turns; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
+    _pilot_log_dir; _pilot_max_turns "${LABELS:-}"; _run_pilot_sandboxed claude-pilot --verbose --log-dir "$_PILOT_LOG_DIR" --task-id "$fd_log_id" \
         ${_PILOT_MAX_TURNS:+--max-turns $_PILOT_MAX_TURNS} \
         --command "/mika-revise-plan" $CWD_ARGS \
         -- "@${fd_findings_file}" \
@@ -6521,13 +6916,41 @@ _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
     # architect's escalation rationale to $WORKTREE_DIR/.iterate/escalate-<stage>.md
-    # for operator forensic access, and appends a structured PIPELINE FAILURE
-    # marker to RESULT so the callback delivers an actionable error rather than
-    # a generic "no PR" message.
+    # for operator forensic access, and stamps its own terminal disposition on
+    # RESULT so the callback delivers an actionable halt rather than a generic
+    # "no PR" message.
     #
     # Findings are PRESERVED on ESCALATE — never swept. Worktree TTL handles
     # eventual cleanup. The findings file is the operator's primary forensic
     # artifact when deciding whether to retry, refactor, or kill the plan.
+    #
+    # mika#2545 — THE PRODUCER STAMPS ITS OWN FACT, and the class of the marker
+    # is the whole change.
+    #
+    # This function used to write `PIPELINE FAILURE:`. That marker is what puts a
+    # turn into `self-dev-callback`'s RETRYABLE population (§ *On pipeline
+    # failure*), so an ESCALATE — a TERMINAL grooming verdict by the exit
+    # contract of `/mika-groom-ticket` — was auto-replayed. Measured on the groom
+    # of mika#2542, 2026-09-26: eight dispatches between 13:06:14Z and 13:20:54Z,
+    # each ESCALATE on the same cause, each consuming the `groom` slot. The
+    # `pipeline_retry_count >= 2` budget the prompt poses could never bound it —
+    # no engine code reads it, the write it prescribes lands on a task whose
+    # `trigger_type = 'callback'` (which `update_task_status` refuses), and each
+    # replay is born with fresh metadata. Class mika#2158: *a counter zeroed by
+    # the action it counts bounds nothing.*
+    #
+    # So the marker becomes `GROOM ESCALATED (terminal):` — same substance,
+    # another class — and the disposition line becomes `Outcome: ESCALATE`, which
+    # `_measure_cycle_output`'s P4 predicate has enumerated all along while
+    # NOTHING ever wrote it (class mika#2205: a predicate on an empty population
+    # reads exactly like a healthy one). The house had already decided this was
+    # the name of the fact; all that was left was to write it.
+    #
+    # `_set_outcome_line` (mika#2492) rather than a concatenation: it strips any
+    # prior line-anchored `Outcome:` and appends, which makes "exactly one
+    # `Outcome:` line" true BY CONSTRUCTION rather than by ordering luck — the
+    # plan-validation block may already have posed one by the time we get here.
+    # Called LAST so the engine-reason block below stays inside the body.
     #
     # Args:
     #   $1: stage label — "first-pass" | "second-pass-after-ready" | "second-pass-after-iterate"
@@ -6540,10 +6963,10 @@ _escalate_groom() {
     local findings_file="$findings_dir/escalate-${stage}.md"
     printf '%s\n' "$content" > "$findings_file" 2>/dev/null || true
 
-    echo "iterate_groom_loop: ESCALATE at ${stage} — failing loudly per mika#1033 (findings at ${findings_file})" >&2
+    echo "iterate_groom_loop: ESCALATE at ${stage} — terminal, no auto-replay (mika#2545; findings at ${findings_file})" >&2
 
     RESULT="${RESULT}
-PIPELINE FAILURE: groom escalated by mika-arch ${stage}.
+GROOM ESCALATED (terminal): mika-arch escalated at ${stage}.
 Verdict: ESCALATE — human review required.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
@@ -6562,6 +6985,8 @@ Architect findings preserved at: ${findings_file}"
 Engine reason: ${engine_line}"
         GROOM_LOOP_FAILURE_REASON="engine ESCALATE (${stage}): review-anchor attestation withheld"
     fi
+
+    _set_outcome_line "Outcome: ESCALATE — ${stage}"
 }
 
 _write_canonical_callout() {
@@ -8326,9 +8751,19 @@ EOF
         exit 1
     fi
 
-    # mika-platform root — base for sub-repo resolution
-    PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
-    PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    # mika-platform root — base for sub-repo resolution.
+    #
+    # `PLATFORM_DIR` is the name the dispatch child receives, relayed from the
+    # operator's `MIKA_PLATFORM_DIR` by `inject_platform_dir_env` (mika#2536).
+    # The prefixed form was a DEAD branch: `sandboxed_pilot_env` does
+    # `env_clear()` then copies back a positive allowlist that refuses every
+    # `MIKA_*`, so `${MIKA_PLATFORM_DIR:-…}` could only ever take its fallback.
+    # Self-referential assignment with a default IS the canonical operator-knob
+    # shape, and it is what the mika#2508 scan's term 4bis recognizes — the read
+    # is not evicted by the write, so the name stays in the population the relay
+    # has to cover.
+    PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
+    PLATFORM_DIR=$(cd "$PLATFORM_DIR" 2>/dev/null && pwd -P) || PLATFORM_DIR="${PLATFORM_DIR:-$HOME/workspace/mika-platform}"
     PLATFORM_REPO_NAME=$(basename "$PLATFORM_DIR")
 
     # Initialize callback guard
@@ -8451,6 +8886,22 @@ ${RESULT}"
 
 Outcome: PLAN_GROOMED"
             fi
+        elif grep -qE '^Outcome: ESCALATE' <<<"$RESULT"; then
+            # mika#2545 — an ESCALATE is already fully stamped by its producer
+            # (`_escalate_groom`): the terminal marker, the verdict, the session,
+            # the findings path and its own `Outcome:` line. Nothing to add, and
+            # two things NOT to do.
+            #
+            # (a) Do not rewrite the `Outcome:` line. The `sed` below matches ANY
+            #     `Outcome: .*`, so it would replace the terminal disposition with
+            #     `PIPELINE_INCOMPLETE` — silently undoing the whole ticket one
+            #     branch away from the fix.
+            # (b) Do not prepend `PIPELINE FAILURE: grooming did not converge`.
+            #     That sentence stays true for this branch's seventeen other
+            #     exits; it is FALSE for an ESCALATE, which *did* converge — on a
+            #     halt verdict — and its marker is what put a terminal verdict
+            #     into the retryable population in the first place.
+            echo "dispatch_claude_pilot: groom escalated (terminal) — preserving the producer's disposition, no retryable marker (mika#2545)" >&2
         else
             # mika#1333: propagate architect-convergence failure into RESULT.
             # Replaces the silent-tolerance pattern that caused mid-flow

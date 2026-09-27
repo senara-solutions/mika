@@ -470,6 +470,71 @@ pub(crate) const PILOT_TRANSCRIPT_REPORTED_KEY: &str = "pilot_transcript_empty_r
 pub(crate) const PILOT_STALL_SIGNAL_UNAVAILABLE_REPORTED_KEY: &str =
     "pilot_stall_signal_unavailable_reported";
 
+/// Task-metadata key under which the executor records the exit status and the
+/// stderr of a long-running handler that exited non-zero (mika#2532 R1).
+///
+/// **The stderr was never lost — it was read, formatted, then thrown away.**
+/// `spawn_long_running_exec` has always read the handler's stderr on the
+/// `!status.success()` branch and built `err_msg`, then handed it to
+/// `update_task_failed`, whose `UPDATE` carries
+/// `AND status NOT IN ('completed', …, 'delivered')`. A handler whose EXIT
+/// trap already delivered its callback leaves the row `completed`, so that
+/// write matched nothing, the branch logged `… but task already in terminal
+/// state`, and the one string naming the cause was dropped on the floor.
+///
+/// Measured on 2026-09-25: four consecutive crashes of `build-mika` during the
+/// QA of PR #2530, each one rendering only
+/// `HANDLER CRASH (exit code 1). Script failed before building result.` — a
+/// message with no cause in it, on a defect that was a class rather than a
+/// blip.
+///
+/// The surface is `tasks.metadata` and **not** `tasks.result`, deliberately:
+/// [`crate::db::Database::set_task_metadata_field`] and its sibling
+/// [`crate::db::Database::set_task_handler_failure`] carry **no** status
+/// filter (`WHERE id = ?`), and "`completed` is terminal — the status no
+/// longer transitions, the metadata still writes" is an explicit contract
+/// since #617. That is exactly the property mika#2532's AC1 asks for by
+/// *"including when the task is already terminal"*. `tasks.result`, on that
+/// same path, carries the message the callback turn consumes and that
+/// `extract_callback_fields` / `parse_verdict` read: overwriting it would
+/// break the callback, appending to it would change a wire format.
+///
+/// **`pub`, not `pub(crate)`, and that is what keeps the name honest.** The
+/// `mika tasks get` renderer lives in another crate and has to read this key.
+/// Letting it carry its own `"handler_failure"` literal would put the name in
+/// two places with nothing forcing them to agree — the `grooming_marker` class
+/// (mika#2158), which this house has already paid for twice. One definition,
+/// every consumer through it, and
+/// `canonical_tokens::tests::mika2532_the_handler_failure_key_has_a_single_writer`
+/// refuses a second occurrence of the literal anywhere in production.
+pub const HANDLER_FAILURE_METADATA_KEY: &str = "handler_failure";
+
+/// The payload stored under [`HANDLER_FAILURE_METADATA_KEY`] (mika#2532 R1).
+///
+/// **A type rather than three string literals, and for the reason the constant
+/// above is `pub`.** The engine writes this object and the `mika tasks get`
+/// renderer — another crate — reads it. Spelling `"exit"` / `"stderr"` /
+/// `"captured_at"` at both ends would put the shape in two places with nothing
+/// forcing them to agree; serde makes the agreement structural. Same doctrine
+/// as `operational::types::EvidenceRef`: the Rust type is the only writer of
+/// its JSON.
+///
+/// `stderr` is `Option` and skipped when `None`: a handler that wrote nothing
+/// on fd 2 leaves the key **absent**, never `""` (mika#2331 — an absence is not
+/// a null wearing a value's clothes). A reader that does not find it knows the
+/// process stayed mute, and still finds `exit`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HandlerFailure {
+    /// `"Exit code: 1"`, or `"Killed by signal: 9"` — the display the executor
+    /// already builds for `tasks.result`, so the two surfaces read alike.
+    pub exit: String,
+    /// Scrubbed and truncated by the caller. Absent when fd 2 stayed mute.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stderr: Option<String>,
+    /// When the executor observed the exit — not when the handler crashed.
+    pub captured_at: String,
+}
+
 /// What one liveness surface says about a dispatch (mika#2277).
 ///
 /// Three states, not two, and the third is the whole point: "I could not read

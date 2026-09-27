@@ -27,7 +27,7 @@ These rules override everything else in this prompt:
 
 **Build Callback Entry Point:** When the `build_mika` callback arrives, resume here:
 
-1. **Mandatory plan re-read (Step 2.5.1 + 2.5.2 + 2.5.3, ALWAYS).** Re-derive the worktree path from the prior turn's `qa_pr_view` output (still in conversation context as a tool result, even under partial compaction) — same formula as Step 3e.2: `sanitized_branch = headRefName with "/" → "-"`; `worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/`. Then re-read the plan and re-extract ACs unconditionally:
+1. **Mandatory plan re-read (Step 2.5.1 + 2.5.2 + 2.5.3, ALWAYS).** Re-derive the worktree path from the prior turn's `qa_pr_view` output (still in conversation context as a tool result, even under partial compaction) — same formula as Step 3e.2: `sanitized_branch = headRefName with "/" → "-"`; `worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/` — composed from a **literal** root, never from a shell variable, for the reason Step 3e.2 gives (mika#2536). Then re-read the plan and re-extract ACs unconditionally:
    ```
    run_shell("cat <worktree>/<plan-path>")
    ```

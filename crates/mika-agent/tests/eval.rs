@@ -147,6 +147,13 @@ mod eval {
     // un tour non mesuré qui n'atteste rien plutôt qu'un zéro.
     mod test_multi_step;
     mod test_multi_turn_persistence;
+
+    // mika#2506 — le geste déterministe d'itération, sur son chemin de
+    // production : le numéro d'ISSUE qui voyage (avec le numéro de PR en
+    // contrôle négatif), la tâche auto-descriptive dès sa création, le créneau
+    // occupé qui REFUSE au lieu de différer, et les quatre refus vus là où la
+    // forge est réellement sollicitée.
+    mod test_operator_iterate_2506;
     mod test_per_corpus_fairness_927;
     mod test_per_skill_provider_override;
     mod test_persistence_eval_guard;
@@ -169,6 +176,13 @@ mod eval {
     // contredit : les deux têtes mesurées, l'issue laissée ouverte sous
     // mika#2237, et les six abstentions nommées.
     mod test_qa_ci_coherence_2455;
+
+    // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
+    // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
+    // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une
+    // assertion de sites d'appel. Les deux branches, leurs quatre contrôles
+    // négatifs et les abstentions nommées.
+    mod test_dependabot_verdict_coherence_2519;
 
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.

@@ -454,6 +454,88 @@ fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Le nom que le child de dispatch porte pour la racine plateforme (mika#2536).
+///
+/// **Délibérément NON préfixé `MIKA_`**, et ce n'est pas une préférence de
+/// vocabulaire : [`is_sandbox_env_allowed`] refuse **tout** `MIKA_*` (allowlist
+/// positive + `debug_assert`), donc un nom préfixé ne traverserait pas. C'est
+/// la mesure de mika#2508 — *nommer une variable ne la fait pas traverser ; le
+/// relais explicite si.*
+///
+/// Une **troisième** raison, spécifique à un consommateur : le handler
+/// `deploy-mika` fait `for _var in $(env | grep -o '^MIKA_[^=]*'); do unset …`
+/// AVANT de lire sa racine. Même si l'allowlist admettait un `MIKA_*`, ce
+/// handler-là l'aurait retiré lui-même.
+///
+/// Ajouter `MIKA_PLATFORM_DIR` à [`SANDBOX_ENV_CORE_ALLOWLIST`] est le geste
+/// tentant et il est **refusé** : ce serait percer une garde anti-fuite de
+/// secret pour un confort de chemin, contre un `debug_assert` qui existe pour
+/// empêcher précisément ce geste. Le relais obtient le même résultat sans
+/// toucher la garde.
+const PLATFORM_DIR_RELAY_KEY: &str = "PLATFORM_DIR";
+
+/// Le nom sous lequel l'**opérateur** pose la racine plateforme (mika#2491).
+///
+/// Lu côté spirit, où il n'est pas scrubbé — le scrub est une propriété de
+/// l'environnement du *child*, jamais du nôtre.
+const PLATFORM_DIR_OPERATOR_ENV: &str = "MIKA_PLATFORM_DIR";
+
+/// Décide la paire à poser sur le child, étant donné un lecteur de
+/// l'environnement du process spirit.
+///
+/// Extraite en fonction pure pour la raison de [`relayed_env_pairs`] : la
+/// **traduction de nom** est la propriété porteuse de ce relais, et elle doit
+/// être vérifiable sans spawner de subprocess ni muter l'env du process.
+///
+/// **Pourquoi ni l'un ni l'autre des deux helpers existants.** Les deux mappent
+/// `key → (key, value)` : ils relaient un nom **à l'identique**, ce qui est
+/// exactement ce que ce relais ne doit pas faire (F4). `relayed_env_pairs` ne
+/// peut donc pas exprimer la traduction, et l'y forcer — une passe sur un
+/// tableau d'un élément suivie d'un renommage de clé — serait plus de code pour
+/// moins de lisibilité.
+///
+/// La règle sur le vide est en revanche bien celle de [`relayed_env_pairs`] et
+/// non celle de [`relayed_env_pairs_preserving_empty`], parce que le shell n'a
+/// ici **aucun palier documenté pour le vide** : ses dix sites écrivent
+/// `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où une valeur vide et une
+/// absence rendent le même défaut. Poser un vide ne changerait donc rien au
+/// child tout en rendant « réglage absent » et « réglage posé vide »
+/// indistinguables côté spirit.
+fn relayed_platform_dir_pair<F>(read: F) -> Option<(&'static str, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = read(PLATFORM_DIR_OPERATOR_ENV)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some((PLATFORM_DIR_RELAY_KEY, value))
+}
+
+/// Relaie la racine plateforme au child de dispatch (mika#2536).
+///
+/// **Il TRADUIT le nom, et c'est le cœur du relais.** L'opérateur pose
+/// `MIKA_PLATFORM_DIR` sur l'environnement du service — c'est le nom que
+/// mika#2491 documente et celui que `DISPATCH_ENV_KNOWN_INERT` nommait jusqu'à
+/// ce correctif. Un relais à l'identique (le motif de
+/// [`inject_pilot_dispatch_env`], qui reprend le nom du knob) exigerait que
+/// l'opérateur renomme sa variable sans que rien ne le lui dise, et un réglage
+/// qui cesse d'être lu **sans erreur** est très exactement la panne que
+/// mika#2536 ferme. Le motif suivi est donc celui de
+/// [`inject_pilot_transcript_env`], qui lit `MIKA_LOG_PILOT_TRANSCRIPTS` et
+/// pose `ANTHROPIC_LOG_FILE`.
+///
+/// Même contrat de placement que ses quatre siblings : DOIT tourner **après**
+/// [`sandboxed_pilot_env`], dont l'`env_clear()` l'effacerait.
+///
+/// Best-effort et silencieux : absence ou valeur vide ⇒ no-op, le child retombe
+/// sur son propre défaut — jamais un dispatch bloqué.
+fn inject_platform_dir_env(cmd: &mut tokio::process::Command) {
+    if let Some((key, value)) = relayed_platform_dir_pair(|k| std::env::var(k).ok()) {
+        cmd.env(key, value);
+    }
+}
+
 /// Maximum raw image file size (5 MB).
 const MAX_IMAGE_SIZE: u64 = 5 * 1024 * 1024;
 
@@ -1773,6 +1855,129 @@ pub(crate) async fn groomed_state(
     }
 }
 
+/// Le jeton de refus de la garde d'ESCALATE terminal (mika#2545).
+///
+/// # FORMAT DE FIL
+///
+/// Il atterrit dans `tasks.result` et un opérateur le `grep` — même raison que
+/// [`GROOMING_INTENT_MISMATCH_ERROR`] et que `ReadyLabelGate::wire_name` : deux
+/// orthographes d'un même refus couperaient une population en deux sans le dire.
+pub(crate) const GROOM_ESCALATED_ERROR: &str = "dispatch_groom_escalated";
+
+/// `audit_events.tool_name` et nom d'événement de journal du refus mika#2545.
+///
+/// **SOLE WRITER** : ce module est le seul site de production qui écrit ce nom,
+/// dans le journal comme dans `audit_events`. C'est ce qui rend
+/// `SELECT target_key, count(*) … GROUP BY 1` exact plutôt qu'un nombre sur
+/// lequel deux écrivains peuvent divergir, et donc soustractible de la
+/// population du producteur (`Outcome: ESCALATE` dans `tasks.result`). Tenu par
+/// un scan de source à allowlist vide — motif `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156),
+/// `closing_pr_closed_unmerged` / `ready_label_degroomed` (mika#2242).
+pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch_refused";
+
+/// Le marqueur que `_escalate_groom` pose sur le `result` d'un callback de groom
+/// escaladé (mika#2545, `skills/bundled/_shared/dispatch-lib.sh`).
+///
+/// L'écrivain vit dans le shell ; garder ce littéral identique à celui qu'il
+/// émet — même contrat que [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`],
+/// dont il est le pendant d'échec.
+pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
+
+/// Le champ `verdict` du refus mika#2545 : un **format de fil**.
+///
+/// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
+/// `tasks.result`, et l'opérateur en fait des `GROUP BY` — deux orthographes d'un
+/// même motif couperaient une population en deux sans le dire. Constantes
+/// nommées plutôt que littéraux au site de refus, motif
+/// `ALL_ITERATE_REFUSAL_REASONS` (mika#2506) et `ALL_PURGE_REFUSAL_REASONS`
+/// (mika#2497).
+///
+/// Les deux valeurs sont délibérément distinctes : « ce ticket a escaladé » et
+/// « on n'a pas pu le savoir » appellent la même disposition et **deux lectures
+/// opérateur différentes** — la première est le régime attendu non vide, la
+/// seconde doit rester vide.
+pub(crate) const GROOM_ESCALATE_VERDICT_ESCALATED: &str = "escalated";
+pub(crate) const GROOM_ESCALATE_VERDICT_UNREADABLE: &str = "unreadable";
+
+/// Les deux motifs, à un seul site, pour que leur cardinalité soit assertable.
+/// `pub` comme ses aînées [`crate::server::iterate_dispatch::ALL_ITERATE_REFUSAL_REASONS`]
+/// et `worktree_reaper::ALL_PURGE_REFUSAL_REASONS` : un format de fil déclaré est
+/// une surface, pas un détail d'implémentation.
+pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
+    GROOM_ESCALATE_VERDICT_ESCALATED,
+    GROOM_ESCALATE_VERDICT_UNREADABLE,
+];
+
+/// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
+/// (mika#2545)
+///
+/// Trois états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
+/// peut pas le savoir » appellent la même disposition (refuser) mais deux
+/// lectures opérateur différentes, et fondre les deux rendrait la population du
+/// fail-closed incomptable. Motif [`GroomedState`] (mika#2484 D1) : le
+/// consommateur fait un `match` **exhaustif sans bras `_ =>`**, donc un
+/// quatrième état devra être décidé par le compilateur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GroomVerdictState {
+    /// Le dernier callback de groom porte [`GROOM_ESCALATE_MARKER`]. Un
+    /// re-dispatch automatique de groom est refusé.
+    Escalated,
+    /// Aucun groom terminal, ou le dernier n'a pas escaladé. Le cas nominal.
+    NotEscalated,
+    /// La preuve n'a pas pu être lue (erreur base, ou callback terminal dont le
+    /// `result` est NULL). Porte le motif pour le JSON de refus.
+    Unreadable(String),
+}
+
+/// Le verdict, dérivé du `result` brut. **Fonction pure**, testable aux bornes
+/// sans base (mika#2545 R2).
+///
+/// Le prédicat est **ancré sur la ligne**, jamais un `contains` : le `result`
+/// d'un callback porte la prose du pilote, qui peut citer `Outcome: ESCALATE` en
+/// parlant d'un autre ticket ou de ce mécanisme même — c'est le faux positif que
+/// mika#2050 a mesuré sur le Signal S. `_set_outcome_line` (mika#2492) garantit
+/// que la vraie disposition est en début de ligne, donc l'ancrage ne perd rien.
+///
+/// `None` (colonne `result` NULL sur un callback terminal) rend `Unreadable` :
+/// on ne peut pas prouver l'absence d'escalade à partir d'une absence de texte,
+/// et un callback terminal sans `result` est anormal — le chemin de complétion
+/// en écrit toujours un. La population est donc quasi vide, et son coût est
+/// convergent (voir le site de la garde).
+pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictState {
+    match result {
+        Some(text) => {
+            if text
+                .lines()
+                .any(|line| line.starts_with(GROOM_ESCALATE_MARKER))
+            {
+                GroomVerdictState::Escalated
+            } else {
+                GroomVerdictState::NotEscalated
+            }
+        }
+        None => GroomVerdictState::Unreadable(
+            "the latest groom callback for this issue carries no `result` text".to_string(),
+        ),
+    }
+}
+
+/// Le lecteur **unique** du verdict de groom pour la garde mika#2545 : de l'URL
+/// d'issue à l'état, base comprise.
+///
+/// `Ok(None)` de la base — aucun callback de groom terminal — est traduit en
+/// [`GroomVerdictState::NotEscalated`] **ici et non dans la fonction pure** :
+/// c'est le cas nominal du tout premier grooming, et le fondre avec le `result`
+/// NULL le ferait tomber en `Unreadable`, donc en refus, donc aucun ticket ne
+/// pourrait plus être groomé.
+pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> GroomVerdictState {
+    match db.latest_groom_verdict_for_issue(issue_url).await {
+        Ok(None) => GroomVerdictState::NotEscalated,
+        Ok(Some(result)) => groom_escalate_verdict(result),
+        Err(e) => GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    }
+}
+
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
 ///
 /// This is the segment of `validate_dispatch_readiness` that follows
@@ -2108,6 +2313,142 @@ pub(crate) async fn validate_dispatch_readiness(
                 "reason": format!("Failed to check active dispatches for task: {e}")
             })
             .to_string());
+        }
+    }
+
+    // mika#2545 — Tool-boundary gate: an ESCALATE of grooming is TERMINAL, so no
+    // automatic re-dispatch of grooming goes out for that ticket.
+    //
+    // Placed HERE for the reason the seat gate below already had to write down:
+    // the per-class guards enqueue a deferred callback when a slot is busy
+    // (mika#1011), and a refusal that landed after that enqueue would be re-armed
+    // and re-refused on every replay, burning one wrapper per turn on a ticket
+    // that cannot go out. Before the queue, not after it — and before the seat
+    // gate too, since this one reads the database and the seat gate spends `gh`
+    // round trips.
+    //
+    // THREE CONJUNCTIVE TERMS, and each one is a decision:
+    //
+    // 1. The dispatch class is `groom`. A `dev-pilot` on an escalated ticket is
+    //    already refused by the provenance gate below (no `Outcome:
+    //    PLAN_GROOMED`), and widening this one to cover it would duplicate an
+    //    existing refusal under a second name.
+    // 2. `originating_message.is_none()` — THE RE-ARM DISCRIMINATOR. The house
+    //    already owns it, and its justification is written a few lines down in
+    //    this very function (mika#2484): the pipeline retry of
+    //    `self-dev-callback` is a silent turn and carries none, while
+    //    `ready_label_handler` carries the webhook marker and `mika ask` carries
+    //    the operator's message. So the two canonical recovery gestures —
+    //    re-posting `ready` as remove→add (mika#2323: GitHub only emits
+    //    `labeled` on a transition) and `mika ask --agent mika-dev "groom …"` —
+    //    traverse this gate BY CONSTRUCTION. Re-arming costs no stamp, no
+    //    window, no cleanup.
+    // 3. The last groom of this ticket escalated.
+    //
+    // The ticket is resolved from the dispatch PROMPT, which is what
+    // `dispatch-lib.sh` itself reads to build the worktree. A prompt with no
+    // readable reference leaves the population: the term is unsatisfied and the
+    // gate does not bite.
+    //
+    // ONE subject, deliberately — and the seat gate below does the opposite, so
+    // the difference is worth naming rather than leaving a reader to wonder. That
+    // gate consults BOTH `reference_url` and the prompt because its question is
+    // *"could this dispatch put a second writer on a branch another seat owns?"*,
+    // and either subject naming a foreign seat is enough to refuse. This gate's
+    // question is *"did the grooming of the ticket this dispatch will actually
+    // groom end on a halt?"* — a question about one ticket, the one the pilot
+    // will work on. Adding `reference_url` here would refuse a dispatch because a
+    // DIFFERENT ticket escalated, which is a false positive on the exact axis
+    // where a false positive blocks the operator's recovery.
+    //
+    // FAIL-CLOSED on the unreadable, and the neighbour decides: the provenance
+    // gate is already fail-closed on this same door, with its reason written. The
+    // cost is named — on a DB error a legitimate automatic re-groom is refused
+    // and the ticket waits — and it is CONVERGENT (`stuck_ready_reconcile`
+    // re-drives it under the mika#2020 budget) where a wrongful pass IS the
+    // eight-dispatch loop this ticket closes.
+    if originating_message.is_none()
+        && derive_dispatch_class(tool_input.and_then(extract_skill_from_input)) == "groom"
+        && let Some((repo_ref, number)) = tool_input
+            .and_then(|input| input.get("prompt"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    {
+        let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+        let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
+        let verdict = groom_verdict_state(db, &issue_url).await;
+        // `match` exhaustif, aucun bras `_ =>` : un quatrième état de
+        // `GroomVerdictState` doit être décidé ici par le compilateur.
+        let refusal = match verdict {
+            GroomVerdictState::NotEscalated => None,
+            GroomVerdictState::Escalated => Some((
+                GROOM_ESCALATE_VERDICT_ESCALATED,
+                format!(
+                    "The last grooming of `{owner_repo}#{number}` returned \
+                     `Verdict: ESCALATE`, which is a TERMINAL grooming verdict — the \
+                     exit contract of `/mika-groom-ticket` halts for a human. Replaying \
+                     it burns a dispatch slot without changing the verdict (mika#2545: \
+                     eight replays measured on one ticket, 2026-09-26). The architect's \
+                     findings are preserved under the worktree's `.iterate/`."
+                ),
+            )),
+            GroomVerdictState::Unreadable(reason) => Some((
+                GROOM_ESCALATE_VERDICT_UNREADABLE,
+                format!(
+                    "Could not establish whether the last grooming of \
+                     `{owner_repo}#{number}` escalated ({reason}). This gate refuses \
+                     when it cannot read its proof, like the grooming-provenance \
+                     cross-check on this same door (mika#2287): a wrongful pass is the \
+                     replay loop mika#2545 closes, a wrongful refusal makes the ticket \
+                     wait and is re-driven by the stuck-ready reconciler."
+                ),
+            )),
+        };
+        if let Some((outcome, reason)) = refusal {
+            let rejection = serde_json::json!({
+                "error": GROOM_ESCALATED_ERROR,
+                "task_id": task_id,
+                "issue": format!("{owner_repo}#{number}"),
+                "verdict": outcome,
+                "reason": reason,
+                // Les deux gestes de reprise, nommés : un refus qui ne nomme pas
+                // sa levée est un refus qu'on contourne au jugé.
+                "recovery": "This halt is for an operator, not for a retry. Either fix the \
+                             plan and re-post the `ready` label as remove→add (GitHub only \
+                             emits `labeled` on a transition — mika#2323), or run \
+                             `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`. Both \
+                             carry an originating message and traverse this gate."
+            });
+            warn!(
+                event = GROOM_ESCALATE_REFUSED_EVENT,
+                task_id = task_id,
+                repo = %owner_repo,
+                issue = number,
+                verdict = outcome,
+                "tool-boundary: groom re-dispatch refused — the last grooming escalated (mika#2545)"
+            );
+            if let Err(e) = db
+                .log_audit_event(
+                    // No session id reaches this gate; the task id is the stable
+                    // identifier of the refused dispatch, as for the seat gate.
+                    task_id,
+                    GROOM_ESCALATE_REFUSED_EVENT,
+                    &format!("{owner_repo}#{number}"),
+                    None,
+                    Some(outcome),
+                    Some(&format!("issue={owner_repo}#{number} verdict={outcome}")),
+                    None,
+                )
+                .await
+            {
+                warn!(
+                    event = "groom_escalate_refused_audit_failed",
+                    error = %e,
+                    "failed to write the mika#2545 audit event (non-fatal)"
+                );
+            }
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
         }
     }
 
@@ -4096,6 +4437,14 @@ pub(crate) fn spawn_long_running_exec(
         // Same placement rationale as the four lines above: naming them
         // unprefixed never made them traverse, the explicit relay does.
         inject_pilot_dispatch_env(&mut cmd);
+        // mika#2536: relay the platform root the four long-running handlers and
+        // `dispatch-lib.sh` read. Same placement rationale as the five lines
+        // above — and this one TRANSLATES the name (`MIKA_PLATFORM_DIR` spirit
+        // side, `PLATFORM_DIR` child side) so the operator's variable keeps its
+        // documented name. Before this, the `${MIKA_PLATFORM_DIR:-…}` branch in
+        // those scripts could never receive a value: it was a dead branch whose
+        // fallback was the only reachable arm.
+        inject_platform_dir_env(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -4248,11 +4597,79 @@ pub(crate) fn spawn_long_running_exec(
                     }
                 }
             };
+            // mika#2532 D1 — persist the stderr on the row BEFORE trying to
+            // fail the task, and **without any condition on its status**.
+            //
+            // The reflex would be to write this only on the `Ok(false)` arm,
+            // i.e. only when `update_task_failed` matched nothing. It is
+            // refused: that would make observability depend on a concurrent
+            // write, when "what did this process put on its fd 2" has nothing
+            // to do with the state of the row. Writing unconditionally gives
+            // one path, no race, and no branch anyone can forget. On the
+            // non-terminal case the overlap with `tasks.result` is benign —
+            // and the metadata copy is the scrubbed one.
+            //
+            // Scrub first, truncate second: `scrub_secrets` must see whole
+            // tokens, and `truncate_output` is UTF-8 safe. The cap is
+            // `MAX_OUTPUT_LEN`, the same 10 000 bytes `err_msg` below already
+            // uses and that the handlers' own `tail -c 10000` mirrors — one
+            // number in the house for this one thing.
+            let persisted_stderr = if stderr_text.is_empty() {
+                // Omitted, never stored as `""` (mika#2331): a reader who does
+                // not find the key knows fd 2 stayed mute.
+                None
+            } else {
+                Some(truncate_output(&crate::secret_scrubber::scrub_secrets(
+                    &stderr_text,
+                )))
+            };
+            // Fire-and-forget, like the four stamps above: `json_set` raises a
+            // hard error — not a NULL — on a `metadata` that is not valid JSON
+            // (mika#2179), and an observability write must never be able to
+            // break the delivery it observes.
+            let stderr_persisted = match db
+                .set_task_handler_failure(&task_id, &code_display, persisted_stderr.as_deref())
+                .await
+            {
+                Ok(()) => true,
+                Err(db_err) => {
+                    warn!(
+                        event = "long_running_handler_failure_not_persisted",
+                        task_id = %task_id,
+                        error = %db_err,
+                        "mika#2532: could not persist the handler's stderr on the task row; \
+                         the cause of this crash is lost again"
+                    );
+                    false
+                }
+            };
+            let stderr_bytes = stderr_text.len();
+
             let err_msg = format!("Process {code_display}: {}", truncate_output(&stderr_text));
             match db.update_task_failed(&task_id, &err_msg).await {
-                Ok(true) => warn!(task_id = %task_id, %code_display, "long-running exec failed"),
+                Ok(true) => warn!(
+                    event = "long_running_handler_exit_nonzero",
+                    task_id = %task_id,
+                    %code_display,
+                    task_was_terminal = false,
+                    stderr_bytes,
+                    stderr_persisted,
+                    "long-running exec failed"
+                ),
                 Ok(false) => {
-                    info!(task_id = %task_id, %code_display, "long-running exec exited but task already in terminal state")
+                    // The case mika#2532 was filed for: the handler's EXIT trap
+                    // delivered its callback, so the row is already terminal and
+                    // `err_msg` — which names the cause — reaches nothing. It is
+                    // now on the row's metadata, whatever this arm does.
+                    info!(
+                        event = "long_running_handler_exit_nonzero",
+                        task_id = %task_id,
+                        %code_display,
+                        task_was_terminal = true,
+                        stderr_bytes,
+                        stderr_persisted,
+                        "long-running exec exited but task already in terminal state"
+                    )
                 }
                 Err(db_err) => {
                     warn!(task_id = %task_id, error = %db_err, "failed to mark long-running exec failure in DB")
@@ -4711,8 +5128,17 @@ mod tests {
     ];
 
     fn dispatch_lib_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills/bundled/_shared/dispatch-lib.sh")
+        bundled_skills_dir().join("_shared/dispatch-lib.sh")
+    }
+
+    /// `skills/bundled/`, résolu depuis le manifeste du crate.
+    ///
+    /// Un seul site, sur le modèle de [`dispatch_lib_path`] : quatre scans
+    /// composent désormais ce chemin, et quatre littéraux dérivent en silence le
+    /// jour où l'arborescence bouge — chacun se lisant alors comme un scan propre
+    /// qui ne regarde rien.
+    fn bundled_skills_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/bundled")
     }
 
     /// Découpe une ligne en segments de commande sur `;`, `&&`, `||`, `{`, `|`.
@@ -4817,10 +5243,16 @@ mod tests {
     ///
     /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
     /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
-    /// `DISPATCH_WORKTREE_ENV` et `PILOT_TRANSCRIPT_ENV` sont des **scalaires**,
-    /// et `GH_TOKEN` est un littéral injecté en clair dans
-    /// [`spawn_long_running_exec`]. Un `.iter().chain(…)` naïf sur les cinq ne
-    /// compile pas.
+    /// `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV` et
+    /// `PLATFORM_DIR_RELAY_KEY` sont des **scalaires**, et `GH_TOKEN` est un
+    /// littéral injecté en clair dans [`spawn_long_running_exec`]. Un
+    /// `.iter().chain(…)` naïf sur les six ne compile pas.
+    ///
+    /// `PLATFORM_DIR_RELAY_KEY` (mika#2536) est ici pour une raison précise :
+    /// `dispatch-lib.sh` le lit sous la forme self-référentielle
+    /// `PLATFORM_DIR="${PLATFORM_DIR:-…}"`, donc il **entre** dans la population
+    /// par le terme 4bis du prédicat. Sans cette ligne il apparaîtrait comme un
+    /// orphelin et ferait rougir le test alors même qu'il traverse.
     fn reaches_dispatch_child(name: &str) -> bool {
         if is_sandbox_env_allowed(name) {
             return true;
@@ -4830,6 +5262,7 @@ mod tests {
             || ARCH_ASK_RETRY_ENV.contains(&name)
             || name == DISPATCH_WORKTREE_ENV
             || name == PILOT_TRANSCRIPT_ENV
+            || name == PLATFORM_DIR_RELAY_KEY
             || name == "GH_TOKEN"
     }
 
@@ -4846,6 +5279,13 @@ mod tests {
     ///
     /// Quand une entrée est tranchée, on la RELAIE et on retire sa ligne — on
     /// n'élargit pas la liste.
+    ///
+    /// **Elle a décru une fois, et c'est l'effet que son doc-comment annonçait.**
+    /// mika#2536 a tranché `MIKA_PLATFORM_DIR` : la variable est désormais
+    /// relayée sous le nom `PLATFORM_DIR` ([`inject_platform_dir_env`]) et sa
+    /// ligne est partie. Ce retrait n'était pas un nettoyage opportuniste —
+    /// l'assertion auto-nettoyante plus bas l'**exigeait** dès que
+    /// `dispatch-lib.sh` a cessé de lire le nom préfixé.
     const DISPATCH_ENV_KNOWN_INERT: &[(&str, &str)] = &[
         (
             "MIKA_PILOT_SANDBOX",
@@ -4857,7 +5297,6 @@ mod tests {
             "MIKA_PILOT_EGRESS_LOG_DIR",
             "mika#2491 — puits du journal du relais d'egress",
         ),
-        ("MIKA_PLATFORM_DIR", "mika#2491 — racine plateforme"),
         (
             "MIKA_HOME",
             "mika#2491 — l'epoch mika#2026 s'écrit sous $HOME/.mika",
@@ -4994,6 +5433,441 @@ mod tests {
             has(r#"export KNOB="${KNOB:-3}""#, "KNOB"),
             "N6 : `export VAR=\"${{VAR:-défaut}}\"` est l'idiome canonique d'un \
              knob opérateur avec défaut, pas une variable interne"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // mika#2536 — le relais de la racine plateforme, et les deux scans de classe
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// V8 — le relais **traduit** le nom. C'est la propriété porteuse, et un
+    /// test sur le nom du child seul ne la verrait pas.
+    #[test]
+    fn mika2536_the_relay_translates_the_name() {
+        let pair = relayed_platform_dir_pair(|k| {
+            assert_eq!(
+                k, "MIKA_PLATFORM_DIR",
+                "le relais doit lire le nom que l'OPÉRATEUR pose (mika#2491), \
+                 jamais celui que le child reçoit — sinon l'opérateur devrait \
+                 renommer sa variable sans que rien ne le lui dise"
+            );
+            Some("/srv/plateforme".to_string())
+        });
+        assert_eq!(
+            pair,
+            Some(("PLATFORM_DIR", "/srv/plateforme".to_string())),
+            "le child doit recevoir le nom NON préfixé : `is_sandbox_env_allowed` \
+             refuse tout `MIKA_*`, donc un nom préfixé ne traverserait pas"
+        );
+    }
+
+    /// V8 — absence et valeur vide sont toutes deux des no-op.
+    ///
+    /// Le shell n'a **aucun palier documenté pour le vide** : ses dix sites
+    /// écrivent `${PLATFORM_DIR:-$HOME/workspace/mika-platform}`, où vide et
+    /// absent rendent le même défaut. C'est ce qui distingue ce relais de
+    /// `PILOT_DISPATCH_ENV`, dont le vide EST le rollback (mika#2508).
+    #[test]
+    fn mika2536_an_absent_or_empty_setting_is_a_no_op() {
+        assert!(
+            relayed_platform_dir_pair(|_| None).is_none(),
+            "absence ⇒ no-op, le child garde son propre défaut"
+        );
+        assert!(
+            relayed_platform_dir_pair(|_| Some(String::new())).is_none(),
+            "valeur vide ⇒ no-op : le shell rendrait le même défaut, donc poser \
+             le vide ne changerait rien au child tout en rendant « réglage \
+             absent » et « réglage posé vide » indistinguables côté spirit"
+        );
+    }
+
+    /// Le relais est appelé APRÈS [`sandboxed_pilot_env`].
+    ///
+    /// Scan de source, et il n'est pas décoratif : l'`env_clear()` du bac à
+    /// sable efface tout ce qui est injecté avant lui. Un appel déplacé au-dessus
+    /// **ne casse aucune assertion** — le dispatch continue de tourner, la
+    /// variable retombe simplement sur son défaut, en silence. C'est exactement
+    /// la classe que ce ticket ferme, reproduite un cran plus haut.
+    #[test]
+    fn mika2536_the_relay_runs_after_the_env_sandbox() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("skills")
+            .join("executor.rs");
+        let whole = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", path.display()));
+
+        // Tronqué au premier `#[cfg(test)]` — motif `production_sources`
+        // (mika#2201). Sans ça le scan se compte lui-même : les deux aiguilles
+        // ci-dessous sont des littéraux de CE test, et le compte rendrait 2.
+        let cut = whole
+            .find("#[cfg(test)]")
+            .expect("executor.rs porte un module de test : sans lui, le scan se compte lui-même");
+        let src = &whole[..cut];
+
+        let sandbox = "sandboxed_pilot_env(&mut cmd);";
+        let relay = "inject_platform_dir_env(&mut cmd);";
+
+        // Anti-vacuité AVANT l'ordre : un scan dont les deux aiguilles ont
+        // disparu passerait en ne regardant rien (mika#2103, mika#2205).
+        assert_eq!(
+            src.matches(sandbox).count(),
+            1,
+            "un seul site doit appeler `{sandbox}` — si ce compte bouge, l'ordre \
+             ci-dessous ne décide plus de rien"
+        );
+        assert_eq!(
+            src.matches(relay).count(),
+            1,
+            "un seul site doit appeler `{relay}` ; s'il a disparu, le réglage \
+             `MIKA_PLATFORM_DIR` est redevenu inerte et RIEN ne le dirait"
+        );
+
+        assert!(
+            src.find(sandbox) < src.find(relay),
+            "`{relay}` doit venir APRÈS `{sandbox}` : l'`env_clear()` du bac à \
+             sable efface toute injection antérieure, et le dispatch resterait \
+             vert en retombant sur le défaut du shell"
+        );
+    }
+
+    /// La bibliothèque partagée que T1 ne concatène PAS, et c'est un
+    /// **PÉRIMÈTRE**, jamais une allowlist de sites.
+    ///
+    /// `_shared/dispatch-lib.sh` a son propre scan
+    /// ([`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`])
+    /// et sa propre liste d'inerties **nommées et documentées**
+    /// ([`DISPATCH_ENV_KNOWN_INERT`], trois décisions de canal que mika#2508 n'a
+    /// pas prises). La concaténer ici ferait remonter ces trois inerties dans T1,
+    /// dont l'allowlist est vide par contrat — T1 naîtrait rouge, et un lint
+    /// rouge à sa naissance se fait désarmer. Les deux scans **partitionnent** la
+    /// population : les handlers et leurs bibliothèques ici, `dispatch-lib.sh` là.
+    ///
+    /// La distinction périmètre/allowlist est celle que
+    /// `scripts/canonical-tokens-survey.sh` écrit pour ses `SOURCE_SCANNERS`, et
+    /// elle est vérifiée dans les deux sens : un périmètre qui survit à son
+    /// fichier est un tiroir.
+    const T1_PERIMETER_EXCLUDED_SHARED: &[&str] = &["dispatch-lib.sh"];
+
+    /// Les scripts de handler des skills bundled, **concaténés avec les
+    /// bibliothèques `_shared/` qu'ils sourcent**.
+    ///
+    /// Population **intentionnellement tous les handlers**, pas seulement les
+    /// long-running : les deux chemins d'exécution retirent les `MIKA_*` du
+    /// child — `sandboxed_pilot_env` par allowlist positive, `scrub_mika_env_vars`
+    /// par denylist de préfixe — donc un `${MIKA_…:-…}` y est une branche morte
+    /// dans les deux cas.
+    ///
+    /// **La concaténation n'est pas un raffinement, c'est une condition de
+    /// justesse, et elle a été trouvée par mesure.** [`external_env_reads`] ne
+    /// suit les écritures qu'à l'intérieur d'un fichier, donc une variable
+    /// **écrite par une bibliothèque sourcée** et lue par le handler passe pour
+    /// externe. Premier `cargo test` de T1 : six faux positifs — `CWD_REFUSAL`
+    /// (écrit par `_shared/cwd-guard.sh`) et les quatre `PR_PUSH_GUARD_*` (écrits
+    /// par `_shared/pr-push-guard.sh`). Le remède est structurel — scanner le
+    /// script **tel qu'il s'exécute** — jamais une entrée d'allowlist.
+    fn bundled_handler_scripts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let shared_ref = regex::Regex::new(r"_shared/([A-Za-z0-9._-]+\.sh)").unwrap();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let handlers = dir.join("handlers");
+            let Ok(files) = std::fs::read_dir(&handlers) else {
+                continue;
+            };
+            for file in files {
+                let path = file.expect("entrée de répertoire lisible").path();
+                if path.extension().is_none_or(|e| e != "sh") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(&base)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+                // Le script TEL QU'IL S'EXÉCUTE : son texte plus celui des
+                // bibliothèques partagées qu'il nomme.
+                let mut unit = content.clone();
+                let mut seen = std::collections::BTreeSet::new();
+                for cap in shared_ref.captures_iter(&content) {
+                    let lib = cap[1].to_string();
+                    if T1_PERIMETER_EXCLUDED_SHARED.contains(&lib.as_str())
+                        || !seen.insert(lib.clone())
+                    {
+                        continue;
+                    }
+                    if let Ok(lib_src) = std::fs::read_to_string(base.join("_shared").join(&lib)) {
+                        unit.push('\n');
+                        unit.push_str(&lib_src);
+                    }
+                }
+                out.push((rel, unit));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Les lectures orphelines d'un ensemble de scripts : lues, n'atteignant pas
+    /// le child, non nommées.
+    ///
+    /// Réutilise [`external_env_reads`] — le prédicat figé en six termes de
+    /// mika#2508 — plutôt qu'un second, parce qu'un second prédicat répondant à
+    /// la même question est la divergence que `grooming_marker` a dû graver une
+    /// fois (mika#2158).
+    fn orphan_env_reads(
+        scripts: &[(String, String)],
+        named: &std::collections::BTreeSet<&str>,
+    ) -> Vec<String> {
+        let mut orphans = Vec::new();
+        for (rel, content) in scripts {
+            for name in external_env_reads(content) {
+                if reaches_dispatch_child(&name) || named.contains(name.as_str()) {
+                    continue;
+                }
+                orphans.push(format!("{rel}: {name}"));
+            }
+        }
+        orphans
+    }
+
+    /// **Livrée vide, et elle le reste.** Quand le scan tire, on ROUTE le site
+    /// vers le relais `PLATFORM_DIR` ; on n'ajoute pas de ligne ici. Un handler
+    /// qui a besoin d'un `MIKA_*` a besoin d'un relais, pas d'une dérogation
+    /// (mika#2201 § D5/D6), et `DISPATCH_ENV_KNOWN_INERT` reste le seul endroit
+    /// où une inertie peut être **nommée**, avec sa raison et son suivi.
+    const HANDLER_ENV_KNOWN_INERT: &[(&str, &str)] = &[];
+
+    /// mika#2536 R4/R7 — T1 : aucun handler ne lit une variable qui ne peut pas
+    /// l'atteindre.
+    ///
+    /// C'est la classe F4 du plan : **une variable qui ne peut pas traverser,
+    /// lue comme si elle pouvait**. Un test comportemental ne peut pas la voir —
+    /// la branche morte ne rend AUCUNE décision fausse, elle rend un réglage
+    /// inopérant en silence, et toutes les assertions existantes restent vertes.
+    ///
+    /// Le pendant de ce scan pour `_shared/dispatch-lib.sh` est
+    /// [`mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`],
+    /// dont l'allowlist est **non vide et documentée** (trois décisions de canal
+    /// que mika#2508 n'a pas prises). Les deux moitiés couvrent les dix sites que
+    /// mika#2536 a corrigés : huit ici, deux là.
+    #[test]
+    fn mika2536_no_handler_reads_a_variable_that_cannot_reach_it() {
+        let scripts = bundled_handler_scripts();
+
+        // Anti-vacuité AVANT toute autre assertion (mika#2103, mika#2205).
+        // Sept à `d4514180` : les six `*/handlers/run.sh` (address-pr-comments,
+        // build-mika, deploy-mika, dev-groom, dev-pilot, resolve-pr-conflicts)
+        // plus `qa-review/handlers/qa_pr_view.sh`.
+        assert!(
+            scripts.len() >= 7,
+            "seulement {} handler(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            scripts.len()
+        );
+        let total: usize = scripts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 20_000,
+            "{total} octets de handlers au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let named: std::collections::BTreeSet<&str> =
+            HANDLER_ENV_KNOWN_INERT.iter().map(|(n, _)| *n).collect();
+        let orphans = orphan_env_reads(&scripts, &named);
+
+        assert!(
+            orphans.is_empty(),
+            "ces variables sont lues par un handler de skill et n'atteignent PAS \
+             le child : {orphans:?}. Elles sont INERTES — l'environnement du child \
+             est reconstruit par `sandboxed_pilot_env` (allowlist positive) ou \
+             dépouillé par `scrub_mika_env_vars` (denylist `MIKA_*`), donc la \
+             branche `${{VAR:-défaut}}` ne peut QUE prendre son défaut.\n\
+             RÉSOLUTION : relayer la variable sous un nom non préfixé \
+             (`inject_platform_dir_env` est le modèle) et faire lire ce nom au \
+             handler. N'ajoutez PAS de nom à SANDBOX_ENV_CORE_ALLOWLIST, et \
+             n'allowlistez pas le site."
+        );
+    }
+
+    /// Le périmètre de T1 ne survit pas à son fichier.
+    ///
+    /// Comparaison dans les deux sens, motif `check_perimeter_entries` du survey
+    /// mika#2201 : une exclusion qui ne nomme plus rien est un tiroir, et elle
+    /// masquerait en silence la population qu'elle prétendait déléguer.
+    #[test]
+    fn mika2536_the_t1_perimeter_names_only_files_that_exist() {
+        let shared = bundled_skills_dir().join("_shared");
+        assert!(
+            !T1_PERIMETER_EXCLUDED_SHARED.is_empty(),
+            "le périmètre est vide : la délégation à mika#2508 n'existe plus"
+        );
+        for lib in T1_PERIMETER_EXCLUDED_SHARED {
+            assert!(
+                shared.join(lib).is_file(),
+                "T1_PERIMETER_EXCLUDED_SHARED nomme `{lib}`, qui n'existe pas sous \
+                 {} — retirez l'entrée ou réparez le chemin",
+                shared.display()
+            );
+        }
+    }
+
+    /// R7 — l'allowlist de T1 est livrée vide et le reste.
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323) ; cette assertion est ce qui rend le dépôt visible.
+    #[test]
+    fn mika2536_the_handler_inert_allowlist_is_empty() {
+        assert!(
+            HANDLER_ENV_KNOWN_INERT.is_empty(),
+            "HANDLER_ENV_KNOWN_INERT n'est plus vide : {:?}. La résolution d'un \
+             site qui tire est de le ROUTER vers le relais, jamais de l'exempter \
+             (mika#2201 § D5/D6). Si une inertie doit vraiment être nommée, sa \
+             place est DISPATCH_ENV_KNOWN_INERT, avec sa raison et son suivi.",
+            HANDLER_ENV_KNOWN_INERT
+        );
+    }
+
+    /// V5 — **contrôle négatif de T1, à voir rouge.**
+    ///
+    /// Sans lui, « le scan détecte la branche morte » est indistinguable de « le
+    /// scan ne regarde rien ». La fixture est construite sur la forme
+    /// **réellement mesurée** dans l'arbre avant ce correctif, jamais sur le vrai
+    /// fichier (qui change).
+    #[test]
+    fn mika2536_the_handler_scan_reddens_on_a_reintroduced_dead_branch() {
+        let named = std::collections::BTreeSet::new();
+
+        // La forme exacte des huit sites corrigés par L1c.
+        let dead = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${MIKA_PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        let orphans = orphan_env_reads(&dead, &named);
+        assert_eq!(
+            orphans,
+            vec!["build-mika/handlers/run.sh: MIKA_PLATFORM_DIR".to_string()],
+            "T1 doit accuser une branche `${{MIKA_*:-…}}` réintroduite dans un \
+             handler — c'est la forme des huit sites que L1c a corrigés"
+        );
+
+        // Contrôle de bonne foi : la forme CORRIGÉE ne doit pas être accusée,
+        // sans quoi le scan serait rouge le jour de sa naissance et se ferait
+        // désarmer (mika#2201, avertissement en tête du TSV).
+        let alive = vec![(
+            "build-mika/handlers/run.sh".to_string(),
+            r#"_DEFAULT="${PLATFORM_DIR:-$HOME/workspace/mika-platform}/mika""#.to_string(),
+        )];
+        assert!(
+            orphan_env_reads(&alive, &named).is_empty(),
+            "la forme relayée `${{PLATFORM_DIR:-…}}` traverse : l'accuser rendrait \
+             le scan rouge à sa naissance"
+        );
+    }
+
+    /// Les prompts système des skills bundled.
+    fn bundled_system_prompts() -> Vec<(String, String)> {
+        let base = bundled_skills_dir();
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(&base)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", base.display()));
+        for entry in entries {
+            let dir = entry.expect("entrée de répertoire lisible").path();
+            let prompt = dir.join("system_prompt.md");
+            let Ok(content) = std::fs::read_to_string(&prompt) else {
+                continue;
+            };
+            let rel = prompt
+                .strip_prefix(&base)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| prompt.to_string_lossy().to_string());
+            out.push((rel, content));
+        }
+        out.sort();
+        out
+    }
+
+    /// La formule de composition de worktree que T3 refuse.
+    ///
+    /// **Prédicat étroit à dessein.** Un scan sur `$MIKA_PLATFORM_DIR` tout court
+    /// rougirait sur les quatre commandes `run_shell` de `qa-review` et deux
+    /// lignes de prose, toutes **hors périmètre** (§9 du plan : autre chemin
+    /// d'exécution, ticket de suivi). Il naîtrait donc rouge, exigerait une
+    /// allowlist de six entrées — c'est-à-dire déposerait six infractions dans un
+    /// emplacement neuf — et *un lint rouge le jour de sa naissance se fait
+    /// désarmer*. Le prédicat porte donc sur la **formule de composition d'un
+    /// worktree**, la seule forme que le modèle recopie dans un argument `cwd`.
+    const WORKTREE_FORMULA_NEEDLE: &str = "$MIKA_PLATFORM_DIR/.claude/worktrees";
+
+    /// mika#2536 R5/R7 — T3 : aucun prompt ne prescrit la formule de composition.
+    #[test]
+    fn mika2536_no_prompt_prescribes_the_worktree_composition_formula() {
+        let prompts = bundled_system_prompts();
+
+        // Anti-vacuité AVANT toute autre assertion.
+        assert!(
+            prompts.len() >= 15,
+            "seulement {} prompt(s) trouvé(s) : le chemin a pourri et ce scan ne \
+             regarde rien",
+            prompts.len()
+        );
+        let total: usize = prompts.iter().map(|(_, c)| c.len()).sum();
+        assert!(
+            total > 100_000,
+            "{total} octets de prompts au total : trop peu pour être le vrai \
+             arbre, le scan ne regarde rien"
+        );
+
+        let offenders: Vec<&String> = prompts
+            .iter()
+            .filter(|(_, c)| c.contains(WORKTREE_FORMULA_NEEDLE))
+            .map(|(rel, _)| rel)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "ces prompts prescrivent au modèle de composer un chemin de worktree \
+             depuis `$MIKA_PLATFORM_DIR` : {offenders:?}. Cette variable n'est \
+             développée par AUCUN des deux environnements — le modèle recopie la \
+             formule dans un argument `cwd`, et le handler reçoit un chemin \
+             portant un `$` littéral.\n\
+             RÉSOLUTION : nommer la racine LITTÉRALEMENT \
+             (`~/workspace/mika-platform/…`). La moitié qui tient n'est de toute \
+             façon pas celle-là mais la garde `_shared/cwd-guard.sh`, qui refuse \
+             le `cwd` en le nommant (mika#2120 : neuf récurrences sous \
+             enforcement de prompt contre zéro écrit à la main)."
+        );
+    }
+
+    /// **Contrôle négatif de T3, à voir rouge.**
+    #[test]
+    fn mika2536_the_prompt_scan_reddens_on_a_reintroduced_formula() {
+        let carries = |s: &str| s.contains(WORKTREE_FORMULA_NEEDLE);
+
+        // La forme exacte de `qa-review:568` avant ce correctif.
+        assert!(
+            carries("worktree = $MIKA_PLATFORM_DIR/.claude/worktrees/${sanitized_branch}/mika/"),
+            "T3 doit accuser la formule réintroduite"
+        );
+
+        // Bonne foi : la forme littérale passe, et la mention de la variable
+        // HORS formule de worktree aussi — c'est la population que §9 met
+        // explicitement hors périmètre, et l'accuser ferait naître T3 rouge.
+        assert!(
+            !carries("worktree = ~/workspace/mika-platform/.claude/worktrees/${b}/mika/"),
+            "la forme littérale ne doit pas être accusée"
+        );
+        assert!(
+            !carries("sed -n '1,80p' $MIKA_PLATFORM_DIR/claude-pilot/README.md"),
+            "une commande `run_shell` citant la variable est hors périmètre (§9) : \
+             l'accuser ferait naître T3 rouge, et un lint rouge à sa naissance se \
+             fait désarmer"
         );
     }
 
@@ -10131,6 +11005,360 @@ Harness ticket.
     }
 
     // -----------------------------------------------------------------------
+    // mika#2545 — un ESCALATE de groom est terminal
+    // -----------------------------------------------------------------------
+
+    mod mika2545_escalate_terminal {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent};
+
+        /// Le `result` que `_escalate_groom` écrit depuis mika#2545.
+        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+             GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
+             Verdict: ESCALATE — human review required.\n\
+             \n\
+             Outcome: ESCALATE — first-pass";
+
+        fn dispatch_input(skill: &str, prompt: &str) -> serde_json::Value {
+            serde_json::json!({ "skill": skill, "prompt": prompt, "task_id": "t-2545" })
+        }
+
+        // --- La fonction pure -------------------------------------------------
+
+        #[test]
+        fn mika2545_an_escalate_line_reads_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(ESCALATED.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        #[test]
+        fn mika2545_a_groomed_result_reads_not_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(
+                    "claude-pilot completed.\nOutcome: PLAN_GROOMED".to_string()
+                )),
+                GroomVerdictState::NotEscalated
+            );
+        }
+
+        #[test]
+        fn mika2545_an_absent_result_reads_unreadable() {
+            assert!(matches!(
+                groom_escalate_verdict(None),
+                GroomVerdictState::Unreadable(_)
+            ));
+        }
+
+        /// **Le contrôle porteur de l'ancrage.** Le `result` d'un callback porte
+        /// la prose du pilote, qui peut citer le marqueur en parlant d'un autre
+        /// ticket — ou de ce mécanisme même. C'est le faux positif que mika#2050
+        /// a mesuré sur le Signal S, et le prédicat doit être ancré sur la ligne.
+        #[test]
+        fn mika2545_a_quoted_marker_mid_line_is_not_a_verdict() {
+            let quoted = "claude-pilot completed.\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.\n\
+                 Outcome: PLAN_GROOMED";
+            assert_eq!(
+                groom_escalate_verdict(Some(quoted.to_string())),
+                GroomVerdictState::NotEscalated,
+                "une mention indentée ou en milieu de ligne est de la prose, pas \
+                 la disposition du cycle"
+            );
+        }
+
+        /// Et le contrôle de bonne foi de l'ancrage : la vraie disposition, que
+        /// `_set_outcome_line` place en début de ligne, est bien reconnue même
+        /// quand la prose en parle aussi.
+        #[test]
+        fn mika2545_a_real_disposition_is_read_even_next_to_prose_about_it() {
+            let both = "claude-pilot completed.\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.\n\
+                 Outcome: ESCALATE — second-pass-after-iterate";
+            assert_eq!(
+                groom_escalate_verdict(Some(both.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        /// Un `result` vide n'est pas une escalade — il est *lisible* et ne porte
+        /// pas le marqueur. À distinguer de `None`, qui est l'absence de texte.
+        #[test]
+        fn mika2545_an_empty_result_is_readable_and_not_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(String::new())),
+                GroomVerdictState::NotEscalated
+            );
+        }
+
+        // --- La porte ---------------------------------------------------------
+
+        /// Monte la forme que la production écrit : un parent `in_progress`
+        /// portant l'URL, et son callback de groom terminal portant `result`.
+        fn seeded(result: &str) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let callback_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&callback_id, "mika", Some(result))
+                    .unwrap()
+            );
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        /// **Le rouge du défaut.** Le re-dispatch automatique du groom — un tour
+        /// de callback, donc sans `originating_message` — est refusé à la porte.
+        #[tokio::test]
+        async fn mika2545_an_automatic_groom_redispatch_is_refused() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("un ESCALATE est terminal");
+
+            assert!(
+                rejection.contains(GROOM_ESCALATED_ERROR),
+                "le jeton de refus est un format de fil que l'opérateur grep : {rejection}"
+            );
+            assert!(
+                rejection.contains("senara-solutions/mika#123"),
+                "le refus nomme le ticket : {rejection}"
+            );
+            assert!(
+                rejection.contains("remove→add"),
+                "et il nomme LES DEUX gestes de reprise — un refus qui ne nomme \
+                 pas sa levée est un refus qu'on contourne au jugé : {rejection}"
+            );
+            assert!(
+                rejection.contains("mika ask --agent mika-dev"),
+                "le second geste de reprise est nommé aussi : {rejection}"
+            );
+        }
+
+        /// **Contrôle négatif du ré-armement.** Le geste opérateur porte un
+        /// message, donc il traverse. Sans ce contrôle, « la garde mord » ne se
+        /// distingue pas de « la garde bloque toute reprise » — et une garde qui
+        /// bloque la reprise est pire que la boucle qu'elle remplace, puisqu'elle
+        /// n'a pas de contournement.
+        #[tokio::test]
+        async fn mika2545_an_operator_regroom_traverses_the_gate() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                Some("groom mika issue#123"),
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un re-groom demandé par un opérateur doit traverser cette \
+                     garde : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif de classe : un `dev-pilot` n'est pas la population de
+        /// cette garde. Il est déjà refusé par la porte de preuve (aucun
+        /// `Outcome: PLAN_GROOMED`), et élargir ici dupliquerait ce refus sous un
+        /// second nom.
+        #[tokio::test]
+        async fn mika2545_a_dev_pilot_is_not_this_gates_population() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-pilot", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "la garde ne doit pas mordre sur dev-pilot : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif du prédicat de ticket : un prompt sans référence
+        /// lisible SORT de la population, il n'y entre pas.
+        #[tokio::test]
+        async fn mika2545_a_prompt_without_a_readable_reference_leaves_the_population() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "please groom the thing")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "sans référence lisible le terme n'est pas satisfait : {rejection}"
+                ),
+            }
+        }
+
+        /// Contrôle négatif du verdict : le chemin nominal (dernier groom
+        /// convergé) traverse. Sans lui, « la garde refuse un ESCALATE » ne se
+        /// distingue pas de « la garde refuse tout groom ».
+        #[tokio::test]
+        async fn mika2545_a_converged_groom_traverses_the_gate() {
+            let (db, parent_id) = seeded("claude-pilot completed.\nOutcome: PLAN_GROOMED");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un groom convergé n'a pas escaladé : {rejection}"
+                ),
+            }
+        }
+
+        /// Et le tout premier grooming d'un ticket — aucun callback en base —
+        /// traverse aussi. C'est le cas le plus fréquent de la flotte, et le
+        /// confondre avec « illisible » refuserait tout grooming.
+        #[tokio::test]
+        async fn mika2545_a_first_ever_groom_traverses_the_gate() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "un premier grooming n'a jamais escaladé : {rejection}"
+                ),
+            }
+        }
+
+        /// Fail-closed sur l'illisible : un callback terminal sans `result`
+        /// refuse, et le refus le DIT (`verdict: "unreadable"`) plutôt que de se
+        /// faire passer pour une escalade — les deux appellent la même
+        /// disposition et deux lectures opérateur différentes.
+        #[tokio::test]
+        async fn mika2545_an_unreadable_verdict_is_refused_and_says_so() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let callback_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&callback_id, "mika", None)
+                    .unwrap()
+            );
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("un verdict illisible refuse (fail-closed)");
+
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "unreadable",
+                "le refus distingue « illisible » de « escaladé » : {rejection}"
+            );
+        }
+
+        /// **Placement (AC1).** Le refus précède l'enregistrement d'un wrapper
+        /// différé : un refus placé après la file serait ré-armé et re-refusé à
+        /// chaque replay, brûlant un wrapper par tour sur un ticket qui ne peut
+        /// pas partir. La preuve est l'absence de row `:deferred` après le refus.
+        #[tokio::test]
+        async fn mika2545_the_refusal_precedes_any_deferred_wrapper() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let _ = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("refusé");
+
+            assert_eq!(
+                db.count_pending_deferred_callbacks().await.unwrap(),
+                0,
+                "aucun wrapper différé ne doit naître d'un refus terminal"
+            );
+        }
+
+        /// Et le refus laisse sa trace sur `tasks.result`, la surface que
+        /// `mika tasks get` et le dashboard lisent (#1108).
+        #[tokio::test]
+        async fn mika2545_the_refusal_is_recorded_on_the_task() {
+            let (db, parent_id) = seeded(ESCALATED);
+            let _ = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err("refusé");
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            let result = task.result.expect("le refus est écrit sur la tâche");
+            assert!(result.contains(GROOM_ESCALATED_ERROR), "{result}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // mika#2423 — un AC comportemental non exécutable dans le budget n'est plus
     // un `hold[review]`
     // -----------------------------------------------------------------------
@@ -10700,5 +11928,294 @@ Harness ticket.
             "a setsid-detached daemon must survive: it left the group and no \
              killpg can reach it (the `tmux new-session -d` risk)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2532 — the stderr of a failed long-running handler survives a
+    // terminal task
+    // -----------------------------------------------------------------------
+
+    /// # Why these tests live in-crate rather than under `tests/eval/`
+    ///
+    /// The mika#2532 plan places them at
+    /// `crates/mika-agent/tests/eval/test_handler_stderr_persisted_2532.rs`,
+    /// on the premise that `spawn_long_running_exec` is "callable directly
+    /// (`pub(crate)`)". The two halves of that sentence contradict each other:
+    /// `tests/eval/` is a **separate crate**, so `pub(crate)` is exactly the
+    /// visibility it cannot reach. The available options were to widen a
+    /// production function to `pub` for the sake of a test file's location, or
+    /// to put the test where the function lives. The second is taken.
+    ///
+    /// Nothing else about the contract moves: the same five cases, the same
+    /// real `/bin/sh` subprocess, no network, no external binary, no server.
+    ///
+    /// # Fire-Disposition
+    ///
+    /// **(c) halt-and-surface, blocking CI gate.** A red here means either the
+    /// cause of a pre-result crash is being discarded again (the defect), or
+    /// that a failure record is being invented on a healthy row (halt 4 of the
+    /// post-deploy probes, which asks for a revert *before* diagnosis).
+    mod mika2532 {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
+
+        /// Long enough that a green run says something, short enough that a red
+        /// one does not hang CI. T1/T3/T5 land in well under 100 ms on this
+        /// harness; the margin is for a loaded machine.
+        const SETTLE_MS: u64 = 4_000;
+
+        fn db() -> AsyncDatabase {
+            AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
+        }
+
+        /// A callback row built through [`build_callback_task`] — the
+        /// production write path, deliberately, rather than a hand-assembled
+        /// `NewTask`. A fixture that manufactures the shape the code knows how
+        /// to read is a fixture and the code agreeing with each other
+        /// (mika#2272's lesson, paid once already on this very file).
+        async fn callback_row(db: &AsyncDatabase) -> String {
+            let task = build_callback_task(
+                "mika".to_string(),
+                None,
+                "build_mika",
+                &serde_json::json!({}),
+                600,
+                "session-2532",
+                "trace-2532",
+                None,
+            );
+            db.create_task(task).await.unwrap()
+        }
+
+        fn handler(dir: &std::path::Path, body: &str) -> PathBuf {
+            let path = dir.join("handler.sh");
+            write_script(&path, &format!("#!/bin/sh\n{body}\n"));
+            path
+        }
+
+        /// Poll until `$.handler_failure` appears, or give up after
+        /// [`SETTLE_MS`]. Returns `None` when it never appeared — which is the
+        /// assertion the negative controls make, not a test failure per se.
+        async fn await_handler_failure(
+            db: &AsyncDatabase,
+            task_id: &str,
+        ) -> Option<serde_json::Value> {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                let task = db.get_task(task_id).await.unwrap().expect("row exists");
+                if let Some(raw) = task.metadata.as_deref()
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(raw)
+                    && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
+                {
+                    return Some(found.clone());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **T1 — the measured defect.** A handler that crashes *after* its EXIT
+        /// trap delivered the callback leaves the row `completed`, so
+        /// `update_task_failed` matches nothing and the `err_msg` naming the
+        /// cause used to be dropped on the floor. The stderr must now be on the
+        /// row, and `tasks.result` must be untouched — it carries the message
+        /// the callback turn consumes.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_stderr_of_a_crash_on_a_terminal_row_is_persisted() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            // What the handler's trap does before the process exits non-zero.
+            db.update_task_completed(&task_id, Some("callback delivered by the trap"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo \"ERROR: could not cd to /nope/mika\" >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id)
+                .await
+                .expect("the cause of a pre-result crash must reach the row");
+
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 1")
+            );
+            let stderr = failure
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .expect("the handler wrote on fd 2, so the key must be there");
+            assert!(
+                stderr.contains("could not cd"),
+                "the persisted stderr must name the failing line, got: {stderr}"
+            );
+            assert!(failure.get("captured_at").is_some());
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(
+                task.result.as_deref(),
+                Some("callback delivered by the trap"),
+                "`tasks.result` is what the callback turn reads — persisting the \
+                 stderr must not overwrite it"
+            );
+            assert_eq!(
+                task.status, "completed",
+                "the row was terminal and stays terminal; only the metadata moved"
+            );
+        }
+
+        /// **T2 — the negative control.** Without it, "we write on failure" is
+        /// indistinguishable from "we always write", and halt 4 of the
+        /// post-deploy probes (a failure record invented on a healthy row)
+        /// would have no test behind it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_handler_that_succeeds_leaves_no_failure_record() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("all good"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "echo 'noise on stdout'\nexit 0");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            assert!(
+                await_handler_failure(&db, &task_id).await.is_none(),
+                "a successful handler must leave no `handler_failure`: a cause of \
+                 failure invented on a healthy row is a lie of the same order as \
+                 the silence being repaired"
+            );
+        }
+
+        /// **T3 — non-regression on the case that already worked.** A row still
+        /// `pending` takes the `Ok(true)` arm, so `tasks.result` has always
+        /// carried the error. It must keep doing so, *and* gain the metadata
+        /// copy: the write is unconditional on status by design (D1).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_crash_on_a_live_row_still_reaches_tasks_result() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+
+            let script = handler(tmp.path(), "echo boom >&2\nexit 3");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 3")
+            );
+
+            let task = db.get_task(&task_id).await.unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            let result = task.result.unwrap_or_default();
+            assert!(
+                result.contains("boom"),
+                "the pre-existing surface must keep working, got: {result}"
+            );
+        }
+
+        /// **T4 — the persisted copy is scrubbed.** `tasks.result` on the live
+        /// path is written un-scrubbed (a real, separate hole, named out of
+        /// scope by the plan); this ticket must not add a second unscrubbed
+        /// surface.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_secret_shaped_value_does_not_reach_the_metadata() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(
+                tmp.path(),
+                "echo 'auth failed for ghp_0123456789abcdefghij' >&2\nexit 1",
+            );
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let stderr = failure.get("stderr").and_then(|v| v.as_str()).unwrap();
+            assert!(
+                !stderr.contains("ghp_0123456789abcdefghij"),
+                "the token must not survive the scrub, got: {stderr}"
+            );
+            assert!(
+                stderr.contains("ghp_<REDACTED>"),
+                "the scrub must leave its mark rather than drop the line, got: {stderr}"
+            );
+        }
+
+        /// **T5 — an absence is not an empty string.** A handler killed before
+        /// writing anything leaves `exit` and nothing else, and that is honest
+        /// (mika#2331: `null` is never `0`). A stored `""` would read as "we
+        /// captured something empty", which is a different and false claim.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_mute_handler_carries_its_exit_and_no_stderr_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = db();
+            let task_id = callback_row(&db).await;
+            db.update_task_completed(&task_id, Some("delivered"))
+                .await
+                .unwrap();
+
+            let script = handler(tmp.path(), "exit 4");
+            spawn_long_running_exec(
+                script,
+                tmp.path().to_path_buf(),
+                serde_json::json!({}),
+                task_id.clone(),
+                db.clone(),
+                None,
+            );
+
+            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            assert_eq!(
+                failure.get("exit").and_then(|v| v.as_str()),
+                Some("Exit code: 4")
+            );
+            assert!(
+                failure.get("stderr").is_none(),
+                "fd 2 stayed mute, so the key must be ABSENT — never an empty string"
+            );
+        }
     }
 }

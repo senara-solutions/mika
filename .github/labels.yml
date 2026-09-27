@@ -98,6 +98,16 @@
   color: "f59e0b"
   description: "Logging, tracing, metrics, dashboards \u2014 anything operator-visible"
 
+# mika#2542 — ce label porte une CONSÉQUENCE MACHINE, ce n'est pas un label de
+# rangement : `PILOT_LABEL_TURN_CEILINGS` (skills/bundled/_shared/dispatch-lib.sh)
+# relève à 200 le plafond de tours pilote de tout ticket qui le porte. Le retirer
+# d'ici le fait SUPPRIMER au prochain sync (delete-other-labels: true), de chaque
+# ticket, sans événement `unlabeled` — et le relèvement devient inerte en
+# silence. scripts/check-pilot-turn-ceiling-labels.sh refuse ce retrait en CI.
+- name: loop-substrate
+  color: "5319e7"
+  description: "Substrat de la boucle autonome (pipeline, dispatch, gardes). Relève le plafond pilote à 200 tours."
+
 # ── State ─────────────────────────────────────────────────────────────────────
 - name: ready
   color: "2ea44f"
