@@ -5673,6 +5673,104 @@ mod tests {
         );
     }
 
+    /// The argv of a close the mika#1646 gate recognises, on a fresh harness whose
+    /// trace carries no recorded tool call — the `turn_calls.is_empty()` branch.
+    fn mika1964_ungrounded_close_args() -> Vec<String> {
+        ["pr", "close", "42", "--comment", "superseded"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// mika#1964 V3 — the destructive-action gate is a GUARD, not a substrate
+    /// handler: on family tier its refusal keeps the conduct (not lifted by
+    /// retrying, surface it) and loses the setting name, which is routed instead.
+    #[tokio::test]
+    async fn mika1964_destructive_gate_no_calls_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_tier_and_brave(mika_common::home::AgentTier::Family, None);
+
+        let refusal =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+                .expect_err("an ungrounded close must be refused");
+
+        assert!(refusal.is_error);
+        assert!(
+            !refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "family tier leaked the setting name: {}",
+            refusal.content
+        );
+        // The conduct survives the channel change — without it the model would
+        // retry a refusal no retry can lift.
+        assert!(
+            refusal.content.contains("cannot be lifted by retrying"),
+            "{}",
+            refusal.content
+        );
+        // Family tier gets the structured refusal body and nothing appended.
+        let body: serde_json::Value =
+            serde_json::from_str(&refusal.content).expect("refusal body stays parseable JSON");
+        assert_eq!(
+            body["reason"],
+            "no tool calls recorded for this turn — grounding cannot be established"
+        );
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == "substrate_unavailable" && e.target_key == "run_gh")
+            .collect();
+        assert_eq!(
+            routed.len(),
+            1,
+            "expected one routed diagnostic: {events:?}"
+        );
+        assert!(
+            routed[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("MIKA_STORE_TOOL_CALLS"),
+            "the operator detail did not reach the diagnostic channel"
+        );
+    }
+
+    /// mika#1964 V2 for the gate — operator tier still reads the setting to check,
+    /// after the refusal body, and no substrate audit row is written.
+    #[tokio::test]
+    async fn mika1964_destructive_gate_no_calls_default_tier_keeps_the_detail() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let refusal =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+                .expect_err("an ungrounded close must be refused");
+
+        assert!(refusal.content.starts_with('{'), "{}", refusal.content);
+        assert!(
+            refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "operator tier lost the actionable detail: {}",
+            refusal.content
+        );
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "default tier must not write a substrate_unavailable audit row: {events:?}"
+        );
+    }
+
     #[test]
     fn test_truncate_output_short() {
         let mut output = ToolOutput::success("short content");

@@ -297,6 +297,65 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("NOT delivered"));
+        // mika#1964 — operator tier: the two variables are folded back in, after
+        // the non-delivery fact.
+        assert!(
+            result.content.contains("MIKA_ROUTING_URL"),
+            "operator tier lost the actionable detail: {}",
+            result.content
+        );
+    }
+
+    /// mika#1964 V3 — the one site whose neutral fallback carries a POSITIVE
+    /// obligation: family tier must still read that nothing was delivered
+    /// (mika#2136), must not read the two variables, and the verdict is intact.
+    #[tokio::test]
+    async fn mika1964_no_sender_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let result = SendMessageTool
+            .execute(serde_json::json!({"text": "Hello!"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("NOT delivered"),
+            "{}",
+            result.content
+        );
+        for token in ["MIKA_ROUTING_URL", "MIKA_INTERNAL_TOKEN", "Telegram"] {
+            assert!(
+                !result.content.contains(token),
+                "family tier leaked {token:?}: {}",
+                result.content
+            );
+        }
+        assert_eq!(
+            result
+                .delivery
+                .as_ref()
+                .expect("NoSender must still carry its verdict")
+                .outcome,
+            DeliveryOutcome::NoSender
+        );
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            events.iter().any(|e| e.tool_name == "substrate_unavailable"
+                && e.target_key == "send_message"
+                && e.after_value
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MIKA_ROUTING_URL")),
+            "the operator detail was dropped instead of routed: {events:?}"
+        );
     }
 
     #[tokio::test]

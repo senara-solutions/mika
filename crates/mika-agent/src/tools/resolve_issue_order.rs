@@ -439,6 +439,12 @@ mod tests {
         let warning = json["warning"].as_str().unwrap();
         assert!(warning.contains("NOT in dependency order"), "{warning}");
         assert!(!warning.contains("GitHub token"), "{warning}");
+        // Operator tier: the credential cause is folded back in after the JSON.
+        assert!(
+            result.content.contains("no GitHub credential"),
+            "operator tier lost the actionable detail: {}",
+            result.content
+        );
     }
 
     /// mika#1964 V3 — family tier reads no credential, and the operator detail is
