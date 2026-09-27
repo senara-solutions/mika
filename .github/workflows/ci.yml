@@ -310,6 +310,31 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-pilot-turn-ceiling-labels.sh
 
+  issue-annotation-guard-lint:
+    name: Issue Annotation Guard Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The annotation workflow used to resolve its PATCH target by rewriting an
+      # html url, which yielded `…/issues/N#issuecomment-ID`. The fragment is not
+      # transmitted over HTTP, so the effective target was the ISSUE-edit route
+      # and `-f body=` replaced the issue body — measured on mika#2544, where a
+      # groomed body lost its Branch / Plan / Grooming history callouts and the
+      # engine then routed a second groom instead of the implement (mika#2552).
+      #
+      # `issues: write` is necessary for `gh issue comment` and GitHub offers no
+      # "comment without editing the body" granularity, so what bounds the
+      # workflow can only ever be a predicate on the TARGET. Removing that
+      # predicate makes no decision wrong on the day it is written — the net just
+      # disappears, in silence — which is why the shape is scanned in addition to
+      # the behaviour being pinned (the mika#2511 argument).
+      - name: Reject a PATCH site that bypasses the comment-target guard (mika#2552)
+        run: bash scripts/check-issue-comment-patch-guard.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # pilot-push-lint and dispatch-seats-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-annotate-issue-token-comment.sh
+
   landing-tokens-lint:
     name: Landing Token Lint
     runs-on: ubuntu-22.04
