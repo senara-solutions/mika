@@ -78,6 +78,40 @@ html {
   scroll-behavior: smooth;
 }
 
+/* Rulebook §2 "Signature Textures" (luminescent-core.md:44) + §5 "Buttons"
+   (l.105): main CTAs are a `primary` -> `primary_dim` linear gradient at 135deg.
+   This is the SINGLE declaration of that texture, and LC.2 (mika#1801) is the
+   first time any surface applies it — every CTA in the repo was a flat
+   `bg-accent` until then.
+
+   It lives here, and not in `<Button>`'s TSX, because `theme.css` is the one file
+   all three surfaces already import (`site/` imports nothing else from this
+   package), because Tailwind v4 cannot express a 135deg gradient between two
+   arbitrary CSS variables without an arbitrary value repeated at every callsite,
+   and because this file is statically pinned — `theme.test.ts` asserts the angle,
+   the token order, and the absence of any colour literal. Written in TSX the
+   texture would be invisible to that guard.
+
+   Composes tokens, never literals: that is what keeps it tracking §2 when §2
+   moves. Pinned by `theme.test.ts` § "LC.2 (mika#1801) ... CTA texture". */
+.mika-cta-gradient {
+  background-image: linear-gradient(135deg, var(--color-primary), var(--color-primary-dim));
+}
+
+/* §5 prescribes no hover for the primary button, so this is an implementation
+   decision, named in the LC.2 PR body rather than invented into the rulebook.
+   It replaces the `hover:bg-accent-light` the five migrated CTAs carried — a
+   shift toward `--color-secondary`, i.e. darker — by sliding the gradient stops
+   toward `primary_dim`. No new colour is introduced, so the hover keeps tracking
+   §2 exactly as the rest state does.
+
+   `:not(:disabled)` because `:hover` fires on a disabled <button> in every
+   engine; it is vacuously true on the <a href> branch of <Button>, so one
+   selector serves both rendered elements. */
+.mika-cta-gradient:not(:disabled):hover {
+  background-image: linear-gradient(135deg, var(--color-primary) -25%, var(--color-primary-dim) 85%);
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

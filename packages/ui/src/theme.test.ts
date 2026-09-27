@@ -109,6 +109,23 @@ const bannedLegacyHexValues: Array<[hex: string, wasFor: string]> = [
   ['#ef4444', '§5.5 error hex — resolved to §2 canonical #ff6e84 in theme'],
 ]
 
+/**
+ * Every rule whose selector begins with `.mika-cta-gradient`, as
+ * `[selector, body]` pairs — collapsed and lowercased like the token values
+ * above. The regex deliberately admits a selector suffix (`:not(:disabled):hover`)
+ * so the hover rule is inside the population: a hover that drifted to a hex
+ * literal would be just as silent a §2 desync as the rest state doing it.
+ */
+const ctaGradientRules: Array<[selector: string, body: string]> = (() => {
+  const rules: Array<[string, string]> = []
+  const re = /(\.mika-cta-gradient[^{}]*)\{([^}]*)\}/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(THEME_CSS)) !== null) {
+    rules.push([collapse(m[1]).trim(), collapse(m[2]).trim()])
+  }
+  return rules
+})()
+
 describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
   it.each(canonicalTokens)(
     'defines canonical token %s = %s (%s)',
@@ -141,4 +158,75 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
       expect(THEME_CSS.toLowerCase()).not.toContain(hex.toLowerCase())
     },
   )
+})
+
+/**
+ * LC.2 (mika#1801) — the CTA texture.
+ *
+ * Rulebook §2 "Signature Textures" (`luminescent-core.md:44`) and §5 "Buttons"
+ * (l.105) both prescribe a `primary` -> `primary_dim` linear gradient at 135deg
+ * for main CTAs. Until LC.2 **no surface applied it**: every CTA in the repo was
+ * a flat `bg-accent`. The texture is declared here, once, rather than in
+ * `<Button>`'s TSX, for three reasons the plan states (D2):
+ *
+ *   1. `theme.css` is the one file all three surfaces already import — including
+ *      `site/`, which imports nothing else from the package — so the texture
+ *      reaches a CTA even where the primitive does not.
+ *   2. Tailwind v4 has no utility for a 135deg gradient between two arbitrary CSS
+ *      variables, so the alternative is a verbose arbitrary value repeated at
+ *      every callsite.
+ *   3. This file is already pinned by static assertion, so the texture becomes
+ *      pinnable by the same mechanism, beside the values it composes. Written in
+ *      TSX it would be invisible to this guard.
+ *
+ * What these assertions protect is not the pixels — it is that the texture keeps
+ * **tracking §2 through the tokens**. A hex literal here renders identically
+ * today and stops moving the day the rulebook moves, which is the exact defect
+ * `scripts/check-landing-tokens.sh` exists to catch one surface over.
+ */
+describe('theme.css — LC.2 (mika#1801) rulebook §2/§5 CTA texture', () => {
+  it('declares the .mika-cta-gradient rest state', () => {
+    const selectors = ctaGradientRules.map(([sel]) => sel)
+    expect(selectors).toContain('.mika-cta-gradient')
+  })
+
+  it('declares a hover state scoped away from :disabled', () => {
+    // `:hover` fires on a disabled <button> in every engine, so an unscoped
+    // hover would animate a button that cannot be pressed. `:not(:disabled)` is
+    // vacuously true on the <a> branch of <Button>, so one selector serves both.
+    const hover = ctaGradientRules.find(([sel]) => sel.includes(':hover'))
+    expect(hover).toBeDefined()
+    expect(hover?.[0]).toContain(':not(:disabled)')
+  })
+
+  it('renders the rest state as a 135deg gradient from primary to primary_dim', () => {
+    const rest = ctaGradientRules.find(([sel]) => sel === '.mika-cta-gradient')
+    const body = rest?.[1] ?? ''
+
+    expect(body).toContain('linear-gradient')
+    // §2: "at a 135-degree angle".
+    expect(body).toContain('135deg')
+
+    // §2/§5: `primary` FIRST, then `primary_dim`. The closing paren in
+    // `var(--color-primary)` is what makes this unambiguous — without it the
+    // needle would also match inside `var(--color-primary-dim)`.
+    const from = body.indexOf('var(--color-primary)')
+    const to = body.indexOf('var(--color-primary-dim)')
+    expect(from).toBeGreaterThanOrEqual(0)
+    expect(to).toBeGreaterThanOrEqual(0)
+    expect(from).toBeLessThan(to)
+  })
+
+  it.each([0, 1])('carries no colour literal in rule #%i', (i) => {
+    // The load-bearing assertion. `bannedLegacyHexValues` above is a denylist,
+    // which is right for the token table whose whole content is known values;
+    // it is green on a *new* purple written in good faith. Here the rule is
+    // shape: the texture may only reference tokens.
+    const [selector, body] = ctaGradientRules[i] ?? ['<missing>', '']
+    expect(ctaGradientRules.length).toBeGreaterThan(i)
+    expect(body, `${selector} must compose tokens, never a literal`).not.toMatch(
+      /#[0-9a-f]{3,8}\b/,
+    )
+    expect(body).not.toMatch(/\brgba?\s*\(/)
+  })
 })
