@@ -155,18 +155,25 @@ pas exécuter lui-même nommée au même endroit.
 ## 2. Inventaire de la population (partie A)
 
 > **Comment lire les positions de ce document — et pourquoi elles périmeront
-> pendant votre propre travail.** Tous les numéros de ligne sont relevés à HEAD
-> `367be118` et re-vérifiés à rev 5 (§10). **Le symbole fait foi, jamais le
-> numéro** : c'est la règle que mika#2201 a dû écrire pour
-> `scripts/canonical-tokens.tsv` — un site se déclare `chemin::symbole`, *« jamais
-> un numéro de ligne, qui pourrit en silence »*.
+> pendant votre propre travail.** **Le symbole fait foi, jamais le numéro** :
+> c'est la règle que mika#2201 a dû écrire pour `scripts/canonical-tokens.tsv` —
+> un site se déclare `chemin::symbole`, *« jamais un numéro de ligne, qui pourrit
+> en silence »*.
 >
-> Ici la dérive n'est pas un risque, c'est une **certitude, et elle est causée par
-> l'implémentation elle-même** : U2 convertit neuf sites dans ces deux fichiers et
-> chaque conversion grossit son site (un littéral devient un couple repli +
-> diagnostic), donc **toute position en aval de la première conversion est fausse
-> dès que celle-ci est faite**. Un implémenteur qui traite §2.1 dans l'ordre du
-> tableau ouvrira `:4744` sur autre chose que le faux-vert de M4. Re-localiser par
+> **Cette règle a été éprouvée entre rev 5 et rev 6, et elle a payé.** Les
+> positions de rev 1–5 étaient relevées à `367be118` ; la branche est depuis
+> rebasée sur `7c373d01`, et `builtin_handlers.rs` a grossi d'environ **650
+> lignes**. Toutes les positions de ce fichier ont donc dérivé d'un bloc
+> (`run_gh` `:3116` → `:3734`, `apply_gws_credential_state` `:3949` → `:4596`,
+> `mod tests` `:4494` → `:5141`) — **et aucune conclusion n'a bougé, parce que les
+> onze symboles ont tenu**. Les positions ci-dessous sont re-relevées à
+> `7c373d01` (§10) et périmeront de nouveau.
+>
+> Ici la dérive n'est pas un risque, c'est une **certitude, et elle est doublement
+> causée** : par le rebase, et par l'implémentation elle-même — U2 convertit neuf
+> sites dans ces deux fichiers et chaque conversion grossit son site (un littéral
+> devient un couple repli + diagnostic), donc **toute position en aval de la
+> première conversion est fausse dès que celle-ci est faite**. Re-localiser par
 > symbole (`map_substrate_error`, `apply_gws_credential_state`,
 > `web_search_family_tier_http_401_no_leak`) est la conduite, et non conclure que
 > l'inventaire est faux.
@@ -430,19 +437,49 @@ decoration »*.
 
 ### 3.5 — U5 : réparer le faux-vert, et le nommer
 
-- `web_search_family_tier_http_401_no_leak` (`:4744`) : **supprimé**. Il décrit
+**La population est de CINQ tests, pas d'un — et rev 5 n'en nommait que deux.**
+C'est la trouvaille de rev 6 (§10), et elle change la nature du travail : deux de
+ces tests **ne compileront plus** après U2, parce que §3.2 change la signature de
+`map_substrate_error` (`-> String` devient `-> (String, String)`) et qu'ils
+l'appellent directement. `map_substrate_error` compte **onze** occurrences dans
+le fichier, dont quatre appels de test.
+
+| test | position | ce qu'il fait aujourd'hui | conduite |
+|---|---|---|---|
+| `web_search_family_tier_http_401_no_leak` | `:5422` | faux-vert de M4 — construit l'objet à la main, ne pilote pas le handler | **supprimé** |
+| `test_map_substrate_error_taxonomy` | `:5657` | asserte les deux fuites (`:5666` 404, `:5668` 502) **sur la fonction nue** | **casse à la compilation** — les deux assertions migrent sur le membre `diagnostic` du couple |
+| `test_web_search_maps_substrate_404_search_upstream_not_configured` | `:5830` | asserte `MIKA_SEARCH_UPSTREAM on mika-gateway` sur `output.content` | assertion **inversée** |
+| `test_web_search_maps_substrate_502_unauthorized` | `:5866` | asserte `rotate MIKA_BRAVE_API_KEY` sur `output.content` | assertion **inversée** |
+| `mika2118_substrate_404_names_the_selector_not_a_key` | `:7364` | garde de doctrine mika#2407 — vérifie que le 404 nomme le **sélecteur** et jamais une clé absente | **casse à la compilation ; son intention doit SURVIVRE** — voir ci-dessous |
+
+**Le cinquième est le piège, et il reproduit le défaut que ce ticket corrige.**
+`mika2118_substrate_404_names_the_selector_not_a_key` n'est pas un test de
+`web_search` : c'est le garde qui tient la doctrine mika#2407 — *nommer une clé
+absente envoie l'opérateur au seul endroit qui ne peut pas l'aider*. Il appelle
+`map_substrate_error` directement, donc U2 le casse ; et un implémenteur pressé
+le supprimerait comme « test d'une fonction dont la signature a changé ». **Ce
+serait effacer, par le correctif, la doctrine que le correctif prétend servir** —
+exactement la classe M4 (un garde perdu au déplacement d'un chemin), reproduite
+une génération plus tard. Sa conduite : il doit continuer d'asserter la même
+propriété, **sur le membre `diagnostic` du couple**, et son doc-comment doit dire
+que le sujet a changé de canal sans changer de nature. Le supprimer est un échec
+de U5, pas une simplification.
+
+- `web_search_family_tier_http_401_no_leak` : **supprimé**. Il décrit
   un chemin Brave-direct qui n'existe plus depuis mika#1971 et il ne pilote pas
   le handler. Le remplacer par un test wiremock qui pilote `web_search` sur 404
   et 502, tier famille, et asserte `FORBIDDEN_FAMILY_TIER_TOKENS` sur `content`
   **plus** la ligne `audit_events`.
-- `test_web_search_maps_substrate_502_unauthorized` (`:5188`) : son assertion
-  s'inverse — `rotate MIKA_BRAVE_API_KEY` doit être **absent** du `content` et
-  **présent** dans le diagnostic d'`audit_events`. **C'est un changement de
-  contrat servi au LLM, sur le tier opérateur aussi** : sur `Default`,
-  `dispatch_substrate_diagnostic` replie le diagnostic dans le `content`, donc
-  le texte opérateur reste lisible — mais séparé par une ligne blanche, après le
-  repli neutre. Le test doit asserter cette forme, pas l'ancienne.
-- Le commentaire de `:4740` qui nomme un garde inexistant : supprimé, la
+- Les deux tests wiremock (`:5830` 404, `:5866` 502) : leurs assertions
+  s'inversent — le token doit être **absent** du `content` et **présent** dans le
+  diagnostic d'`audit_events`. **C'est un changement de contrat servi au LLM, sur
+  le tier opérateur aussi** : sur `Default`, `dispatch_substrate_diagnostic`
+  replie le diagnostic dans le `content`, donc le texte opérateur reste lisible —
+  mais séparé par une ligne blanche, après le repli neutre. Les tests doivent
+  asserter cette forme, pas l'ancienne. **Rev 5 ne nommait que la branche 502 ;
+  la 404 est le cas de panne réel de mika#2407** (§1 M3), donc celle dont
+  l'oubli coûterait le plus.
+- Le commentaire de `:5418` qui nomme un garde inexistant : supprimé, la
   règle 1 de §3.3 prend sa place.
 
 ### 3.6 — U6 : `docs/skills.md:581-583`
@@ -506,13 +543,21 @@ sujet.**
 
 ## Acceptance criteria (§5)
 
-> Même ancre que `## Fire-Disposition` ci-dessus, et pour la même raison
-> mesurée : le gate U2 est `grep -qi '^## Acceptance criteria'`
-> (`scripts/verify-pipeline.sh:147`), ancré en début de ligne, que la forme
-> numérotée `## 5. Acceptance criteria` ne matche pas — vérifié par
-> `grep -ci` rendant `0` sur la rev 3. La section existait et le garde la lisait
-> absente ; le PR aurait échoué en CI sur mika#1600. Les renvois internes « §5 »
-> (§1, §7 DoD) restent valides.
+> Même ancre que `## Fire-Disposition` ci-dessus. **La raison a changé entre
+> rev 5 et rev 6, et il faut le dire plutôt que laisser le plan affirmer un fait
+> périmé.** Rev 3 et rev 4 ont dé-numéroté ce titre parce que le gate
+> (`scripts/verify-pipeline.sh`, mika#1600) était `grep -qi '^## Acceptance
+> criteria'` et que la forme `## 5. Acceptance criteria` rendait `0`. **Ce gate a
+> depuis été assoupli par mika#2516** : il accepte désormais un préfixe numéroté
+> borné à `<chiffres>[.]`, précisément parce que `/ce:plan` numérote ses titres
+> (n=3 mesuré). La forme numérotée matcherait donc aujourd'hui.
+>
+> **Le titre reste dé-numéroté quand même**, et pour une raison qui n'est pas
+> l'inertie : il matche sous **les deux** régimes, et `## Fire-Disposition` —
+> vérifié à rev 6 — est resté strictement ancré (`^## Fire-Disposition`,
+> `dispatch-lib.sh:6825` et `:6891`). Aligner les deux titres sur le garde le
+> plus strict coûte zéro et retire une asymétrie que personne n'aurait à
+> re-mesurer. Les renvois internes « §5 » (§1, §7 DoD) restent valides.
 
 Transcrites du corps du ticket :
 
@@ -602,6 +647,11 @@ antérieur — classe mika#2340), et c'est le chemin qu'il faut établir d'abord
   passe au vert, la divergence n'est pas démontrée et c'est la règle 2 qu'il faut
   reprendre avant tout le reste, jamais l'AC qu'il faut assouplir (doctrine
   mika#2103, §3.3, §3.4).
+- **Les cinq tests de §3.5 sont traités, et `mika2118_substrate_404_names_the_selector_not_a_key` est TOUJOURS LÀ.** Deux d'entre eux cassent à la
+  compilation par le changement de signature de §3.2 ; leur réparation n'est pas
+  une mise à jour d'assertion mais un déplacement de canal. Le garde de doctrine
+  mika#2407 doit asserter la même propriété sur le `diagnostic` — **s'il a
+  disparu du diff, U5 n'est pas fait**, quel que soit l'état des quatre autres.
 - `docs/skills.md` ne promet plus, il nomme.
 - Le corps de PR déclare les deux divergences de §5 et le changement de contrat
   de §3.5 (le texte opérateur reste lisible sur tier `Default`, après le repli
@@ -732,50 +782,127 @@ p1 de fuite. Aucune AC modifiée. Détail et mesures : §1 et §9.2 du plan.
 
 ---
 
-## 10. Re-vérification des mesures (rev 5)
+## 10. Re-vérification des mesures (rev 6)
 
 Un re-groom idempotent n'a pas de findings en entrée : son livrable est de
 **re-confronter le plan à l'arbre**, parce qu'un plan dont les mesures ont pourri
-se lit exactement comme un plan juste. Relevé à la branche de grooming, base
-`367be118`.
+se lit exactement comme un plan juste. Relevé sur la branche de grooming,
+**rebasée depuis rev 5** : base `367be118` → **`7c373d01`**.
 
-**Les cinq mesures tiennent, et les trois plus contre-intuitives ont été
-re-mesurées plutôt que reconduites :**
+### Les cinq mesures tiennent, toutes re-mesurées
 
-| mesure | re-vérification | verdict |
+| mesure | re-vérification à `7c373d01` | verdict |
 |---|---|---|
-| M1 | `tools/mod.rs:1058-1059` enregistre bien les deux builtins ; `apply_agent_tool_visibility` est à `agent_loop/mod.rs:7799` ; `FAMILY_AGENT_SKILL_ALLOWLIST` à `home.rs:722` | **tient** |
-| M2 | `run_gh` est à `:3116` (le `:2472` du ticket est bien mort) ; `apply_gws_credential_state` présent et conforme | **tient** |
-| M3 | `:307` `ToolOutput::error(map_substrate_error(…))` et les deux branches fuyantes inchangées, `rotate MIKA_BRAVE_API_KEY` compris | **tient** |
-| M4 | `grep -rn web_search_no_raw_401_operator_error crates/` rend **une seule ligne**, et c'est le commentaire de `:4740` — le garde compagnon n'existe toujours pas | **tient** |
-| M5 | paire `#[cfg(not(test))]`/`#[cfg(test)]` à **600/602**, `mod tests` à **4494** — la troncature naïve laisse toujours ≈ 3 890 lignes de production hors scan | **tient** |
+| M1 | `tools/mod.rs:1058-1059` enregistre toujours les deux builtins ; `FAMILY_IDENTITY` (`home.rs:229`) ne déclare toujours aucun bloc `[tools]` | **tient** |
+| M2 | `run_gh` `:3116` → **`:3734`** (le `:2472` du ticket reste mort) ; `apply_gws_credential_state` `:3949` → **`:4596`**, conforme | **tient** |
+| M3 | `:307` `ToolOutput::error(map_substrate_error(…))` **inchangé à la ligne près** ; `map_substrate_error` toujours `:356` ; les deux branches fuyantes `:367` (404) et `:380` (502) intactes | **tient** |
+| M4 | `grep -rn web_search_no_raw_401_operator_error crates/` rend **une seule ligne** — le commentaire, désormais `:5418`. Le garde compagnon n'existe toujours pas | **tient** |
+| M5 | paire `cfg` toujours **600/602** ; `mod tests` `:4494` → **`:5141`** — la troncature naïve laisse maintenant ≈ **4 540** lignes de production hors scan, soit **650 de plus qu'à rev 5** | **tient, et s'aggrave** |
 
-**Les deux gardes ancrés matchent, vérifié par `grep -c` et non par lecture :**
-`grep -cE '^## Fire-Disposition'` → `1`, `grep -ci '^## Acceptance criteria'` → `1`.
-La **seconde moitié** du gate AC — que rev 4 n'avait pas éprouvée, n'ayant regardé
-que le `grep` d'en-tête — passe aussi : le `sed` de `verify-pipeline.sh:154`
-extrait un contenu non vide entre le titre et `## 6.`. Vérifier la première
-moitié d'un garde et déclarer le garde satisfait est la classe même que rev 3 et
-rev 4 ont fermée ; elle est donc close ici sur les deux moitiés.
+M5 mérite sa dernière colonne : la trappe ne se contente pas de survivre au
+rebase, elle **grossit avec le fichier**. Le coût d'une troncature naïve croît
+mécaniquement à chaque commit qui touche `builtin_handlers.rs`.
 
-**L'exhaustivité affirmée par rev 4 est confirmée par un balayage indépendant**
-plutôt que reconduite sur parole : les seuls prédicats ancrés `^## ` de
-`scripts/`, `skills/bundled/_shared/` et `.github/workflows/` sont ceux de
-`verify-pipeline.sh` (AC) et de `dispatch-lib.sh:5847`/`:5912`
-(Fire-Disposition). Les deux autres occurrences (`^## AC6 verbatim ground truth`)
-lisent un **corps de PR**, pas un plan — hors population.
+### La trouvaille : §3.5 nommait UN test là où la population en compte CINQ
 
-**Trois positions avaient dérivé**, toutes dans la zone GWS ou à un cran de la
-paire `cfg` : `apply_gws_credential_state` `:3951` → `:3949`,
-`GWS_CREDENTIALS_ABSENT_DIAGNOSTIC` `:3929` → `:3926`, paire `cfg`
-`:601-603` → `:600-602`. Corrigées. Aucune ne changeait une conclusion — le
-symbole restait juste dans les trois cas, ce qui **est** l'argument de la note
-d'ancrage de §2.
+C'est le livrable de rev 6, et il ne vient pas d'une dérive de position mais
+d'une **lecture que les cinq révisions précédentes n'avaient pas faite** — celle
+de la population de tests que U2 casse.
+
+Relevé par balayage des tokens fuyants dans la région de test, puis confirmé
+fonction par fonction : **cinq** tests portent sur cette fuite (table complète en
+§3.5). Rev 5 en nommait deux — le faux-vert et la branche 502 — et laissait donc
+trois tests hors du plan, dont :
+
+- **deux qui ne compileront pas** après U2, `map_substrate_error` passant de
+  `-> String` à `-> (String, String)` (§3.2) alors qu'ils l'appellent
+  directement. Leur réparation n'est pas une mise à jour d'assertion, c'est un
+  déplacement de canal — un implémenteur qui suit rev 5 à la lettre découvre le
+  problème au `cargo test`, pas au plan.
+- **un garde de doctrine**, `mika2118_substrate_404_names_the_selector_not_a_key`,
+  dont la suppression par commodité effacerait mika#2407 du dépôt **par le
+  correctif même qui prétend la servir**. C'est M4 reproduite une génération plus
+  tard, et c'est pourquoi le DoD (§7) en fait une condition nommée plutôt qu'une
+  ligne de tableau.
+
+Et la branche **404** — le cas de panne réel mesuré le 2026-09-18 sur six tenants
+(§1 M3) — était celle des deux que rev 5 **n'inversait pas**.
+
+### Le gate `Acceptance criteria` a été assoupli, et le plan l'affirmait encore strict
+
+`scripts/verify-pipeline.sh` accepte désormais un préfixe numéroté
+(`<chiffres>[.]`) depuis **mika#2516**, avec sa raison écrite sur le site :
+`/ce:plan` numérote ses titres, n=3 mesuré. La note d'ancrage de §5, posée par
+rev 4, affirmait que la forme numérotée « ne matche pas » — **vrai à rev 4, faux
+aujourd'hui**. Corrigé : la note dit maintenant ce qui a changé et pourquoi le
+titre reste dé-numéroté malgré tout (il matche sous les deux régimes, et
+`## Fire-Disposition` est resté strict).
+
+Un plan qui justifie une forme par un garde ne peut pas être relu sans
+re-vérifier le garde : c'est la même discipline que la note d'ancrage de §2
+applique aux numéros de ligne, appliquée aux **prédicats**.
+
+### Les deux gardes ancrés matchent toujours, vérifié par `grep -c`
+
+`grep -cE '^## Fire-Disposition'` → `1` ; `grep -ci '^## Acceptance criteria'`
+→ `1`. Le prédicat Fire-Disposition a **changé de position** (`:5847` → `:6825`
+et `:6891`) sans changer de forme : toujours `^## Fire-Disposition`, toujours
+strict.
+
+### Aucun livrable n'a été livré entre-temps
+
+`scripts/check-substrate-leak.sh` et `scripts/test-check-substrate-leak.sh`
+n'existent pas ; aucun job `substrate-leak-lint` dans `ci.yml`. Le plan est
+intégralement en attente d'implémentation — vérifié plutôt que supposé, un
+re-groom sur un ticket partiellement implémenté étant une autre situation.
+
+**Note pour U4 :** le corpus de harnais modèles s'est étoffé depuis rev 1 —
+`scripts/` en compte désormais six (`test-check-byte-slices.sh`,
+`test-check-a2a-timeout-literals.sh`, `test-check-canonical-tokens.sh`,
+`test-check-dispatch-seats-declared.sh`, `test-check-image-tags-immutable.sh`,
+`test-check-landing-tokens.sh`). §3.4 en nomme un ; les cinq autres sont des
+gabarits disponibles, et `test-check-canonical-tokens.sh` est le plus proche
+voisin (scan de source à allowlist, doctrine mika#2201 déjà citée en §4).
 
 ---
 
 ## Revision history
 
+- **rev 6 (2026-09-27)** — re-groom idempotent, aucun finding en entrée. La
+  branche a été **rebasée** depuis rev 5 (`367be118` → `7c373d01`) et
+  `builtin_handlers.rs` a grossi de ~650 lignes : toutes les positions de ce
+  fichier ont dérivé d'un bloc, **aucune conclusion n'a bougé, les onze symboles
+  ont tenu**. La note d'ancrage de §2 est donc passée du statut de précaution à
+  celui de mesure, et le dit.
+  - **La trouvaille est une lecture manquante, pas une dérive.** §3.5 nommait
+    **un** test à inverser ; la population en compte **cinq** (§10, table en
+    §3.5). Trois étaient hors du plan, dont **deux qui ne compileront pas** après
+    U2 — `map_substrate_error` passe de `-> String` à `-> (String, String)`
+    (§3.2) et ils l'appellent directement, donc leur réparation est un
+    déplacement de canal, pas une mise à jour d'assertion. Un implémenteur suivant
+    rev 5 l'aurait découvert au `cargo test`.
+  - **Le cinquième test est un piège de classe M4.**
+    `mika2118_substrate_404_names_the_selector_not_a_key` est le garde qui tient
+    la doctrine mika#2407 ; U2 le casse, et le supprimer comme « test d'une
+    signature morte » effacerait cette doctrine **par le correctif même qui
+    prétend la servir**. §7 en fait une condition nommée du DoD plutôt qu'une
+    ligne de tableau : s'il a disparu du diff, U5 n'est pas fait.
+  - **La branche 404 était l'oubli coûteux.** Des deux tests wiremock, rev 5
+    n'inversait que le 502 ; le 404 est le cas de panne réel mesuré le 2026-09-18
+    sur six tenants (§1 M3).
+  - **Un garde cité par le plan a été assoupli, et le plan l'affirmait encore
+    strict.** Le gate `Acceptance criteria` accepte un préfixe numéroté depuis
+    mika#2516 — la note de §5, posée par rev 4, était vraie à rev 4 et fausse
+    aujourd'hui. Corrigée. `## Fire-Disposition` reste strict (`:5847` → `:6825`,
+    même forme), donc le titre reste dé-numéroté : il matche sous les deux
+    régimes. *Un plan qui justifie une forme par un garde ne se relit pas sans
+    re-vérifier le garde* — la discipline de la note d'ancrage de §2, appliquée
+    aux prédicats.
+  - **M5 s'aggrave mécaniquement** : la troncature naïve laisse désormais ≈ 4 540
+    lignes hors scan (≈ 3 890 à rev 5). La trappe grossit avec le fichier.
+  - **Vérifié plutôt que supposé** : aucun livrable n'existe dans l'arbre (ni
+    garde, ni harnais, ni job CI) — un re-groom sur un ticket partiellement
+    implémenté serait une autre situation.
 - **rev 5 (2026-09-22)** — re-groom idempotent, aucun finding en entrée. Le plan
   est re-confronté à l'arbre (§10) : **les cinq mesures tiennent**, les deux
   gardes ancrés matchent, et l'exhaustivité affirmée par rev 4 est confirmée par
