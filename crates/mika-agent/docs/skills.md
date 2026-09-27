@@ -607,10 +607,17 @@ a guard nobody has watched go red is a decoration.
 1. **One site for the bare constructor.** `ToolOutput::substrate_unavailable(`
    may appear in production only inside `dispatch_substrate_unavailable`. The
    allowlist is shipped empty: when this fires, remove the second site rather
-   than exempting it.
+   than exempting it. No annotation silences this rule either — annotations
+   govern rule 2 only, and the enclosing function is tracked on code lines, so
+   a comment naming the helper does not count as being inside it.
 2. **No substrate literal in a model-visible string.** The patterns are
-   `MIKA_*`, `GH_TOKEN` / `GITHUB_TOKEN`, `XDG_CONFIG_HOME`, `config.toml`,
-   `.mika/`, `Ask the operator`, `GitHub App`, `GitHub token`.
+   `MIKA_*` (digits included — `MIKA_A2A_TIMEOUT_SECS` counts), `GH_TOKEN` /
+   `GITHUB_TOKEN`, any `*_API_KEY` / `*_SECRET` / `*_SECRET_KEY` /
+   `*_ACCESS_KEY` / `*_TOKEN` credential name (`OPENAI_API_KEY`,
+   `AWS_SECRET_ACCESS_KEY`; a Rust path such as `Type::NO_TOKEN` is an
+   identifier and does not count), `XDG_CONFIG_HOME`, `config.toml`, `.mika/`,
+   `Ask the operator`, `GitHub App`, `GitHub token`. They are extended by
+   property — "names an env var" — never by spelling.
 
    **Rule 2 is anchored on the LITERAL, never on the constructor**, and that is
    deliberate rather than convenient. mika#1964's founding defect lives in
@@ -624,8 +631,10 @@ a guard nobody has watched go red is a decoration.
 
 **Two annotations, two populations, countable apart.** A literal that legitimately
 carries substrate detail is annotated on the line (or on the last comment line
-immediately above it — the window is short, and the offending strings are
-multi-line `format!`s where a `//` would land inside the string):
+immediately above it — the offending strings are multi-line `format!`s where a
+`//` would land inside the string). The exemption covers **the literal that
+follows and ends with it** — the first quoted line not ending in `\` — with a
+12-line cap; an unannotated literal on the next match arm is scanned:
 
 - `// substrate-diagnostic: <reason>` — this literal **is** the operator channel;
   naming the surface is its purpose, and the dispatch routes it.

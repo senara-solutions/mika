@@ -43,10 +43,12 @@
 # AN ANNOTATION COVERS A WINDOW, AND THAT IS A CONSTRAINT OF THE LANGUAGE:
 #   The offending literals are multi-line `format!`s whose continuation lines end
 #   in `\`, so writing `//` inside one would put the comment INSIDE the string.
-#   An annotation therefore exempts the following ANNOTATION_WINDOW lines. Prefer
+#   An annotation therefore exempts the literal that FOLLOWS it — up to the first
+#   quoted line not ending in `\` — with ANNOTATION_WINDOW lines as a cap, never
+#   as the extent: an unannotated arm right below stays in the population. Prefer
 #   hoisting the text into a named constant and annotating its declaration (the
 #   `GWS_CREDENTIALS_ABSENT_DIAGNOSTIC` shape) — that keeps the window short by
-#   construction.
+#   construction. Annotations govern rule 2 only; rule 1 has no exemption.
 #
 # Exit 0 clean, 1 violations found, 2 the guard could not look where it believes
 # it looks (see GOOD-FAITH below) — a scan that lost its target must go red, not
@@ -148,37 +150,46 @@ for file in "${PERIMETER[@]}"; do
             }
 
             # ── Pass 2: judge the production slice.
-            exempt_until = 0
+            #
+            # ORDER IS THE CONTRACT (mika#1964 review):
+            #   1. comment lines leave the population FIRST — so a comment such
+            #      as `// mirrors fn dispatch_substrate_unavailable` can neither
+            #      set fn_name (which would silence rule 1 below it) nor be
+            #      judged; a comment that is an annotation arms the window;
+            #   2. fn_name is tracked on CODE lines only;
+            #   3. rule 1 runs BEFORE any window skip — annotations govern
+            #      rule 2 alone. An annotated const followed by a bare
+            #      constructor must still fire rule 1: "no allowlist" means
+            #      no annotation either;
+            #   4. only then does the window exempt the line from rule 2.
+            win_open = 0
+            win_end = 0
+            win_seen_lit = 0
             fn_name = "(top level)"
 
             for (i = 1; i < cut; i++) {
                 text = line[i]
-
-                # Track the enclosing top-level function, for rule 1 only.
-                if (match(text, /(^|[^A-Za-z0-9_])fn[ \t]+[A-Za-z0-9_]+/)) {
-                    frag = substr(text, RSTART, RLENGTH)
-                    sub(/^.*fn[ \t]+/, "", frag)
-                    fn_name = frag
-                }
-
-                # An annotation arms the window FIRST — it may itself sit at the
-                # end of a code line (`foo(); // substrate-ok: …`), in which case
-                # that line is exempt too.
-                if (index(text, "// substrate-ok:") > 0 || index(text, "// substrate-diagnostic:") > 0) {
-                    exempt_until = i + window
-                    continue
-                }
+                stripped = text
+                sub(/^[ \t]+/, "", stripped)
 
                 # Comment lines are out of the population: documenting an env var
                 # is house style (this repo is made of it), and a comment never
                 # reaches the `content` served to the LLM. The cost on the subject
                 # is nil; the benefit is that the guard is not born red, which is
                 # what keeps it armed. Covers `///` and `//!` by construction.
-                stripped = text
-                sub(/^[ \t]+/, "", stripped)
-                if (substr(stripped, 1, 2) == "//") continue
+                # A comment line carrying an annotation arms the window.
+                if (substr(stripped, 1, 2) == "//") {
+                    if (is_annotation(text)) arm_window(i)
+                    continue
+                }
 
-                if (i <= exempt_until) continue
+                # Track the enclosing top-level function, for rule 1 only —
+                # on code lines, never on comments (see ORDER above).
+                if (match(text, /(^|[^A-Za-z0-9_])fn[ \t]+[A-Za-z0-9_]+/)) {
+                    frag = substr(text, RSTART, RLENGTH)
+                    sub(/^.*fn[ \t]+/, "", frag)
+                    fn_name = frag
+                }
 
                 # ── Rule 1: the bare constructor has a single site.
                 #
@@ -187,13 +198,56 @@ for file in "${PERIMETER[@]}"; do
                 # inside `dispatch_substrate_unavailable`, which constructs AND
                 # routes in one expression so the coupled pair cannot be written
                 # apart. No allowlist: when this fires, remove the second site.
+                # Evaluated before any annotation window — no annotation can
+                # silence it, not even one trailing on the same line.
                 if (index(text, "ToolOutput::substrate_unavailable(") > 0 && fn_name != "dispatch_substrate_unavailable") {
                     printf "VIOLATION\tRule 1: bare substrate_unavailable outside dispatch_substrate_unavailable (fn %s)\t%s:%d\t%s\n", fn_name, path, i, stripped
                 }
 
+                # A trailing annotation (`foo(); // substrate-ok: …`) arms the
+                # window on its own line; that line is judged on its code part.
+                code = text
+                if (is_annotation(text)) {
+                    arm_window(i)
+                    code = substr(text, 1, annotation_at(text) - 1)
+                }
+
+                # ── The window, and where it ENDS.
+                #
+                # An annotation exempts the literal that follows it — not a
+                # fixed count of lines. The window stays open over code lines
+                # until the first quoted line that does not end in `\` (the
+                # last line of the annotated string), and ANNOTATION_WINDOW is only
+                # an upper cap. A fixed count exempted the adjacent match arm
+                # too: at builtin_handlers.rs the `unauthorized` diagnostic
+                # annotation covered the model-visible `transport_error` arm
+                # beneath it (green-while-red, mika#1964 review).
+                if (win_open) {
+                    if (i > win_end) {
+                        win_open = 0
+                    } else {
+                        if (index(code, "\"") > 0) win_seen_lit = 1
+                        tail = code
+                        sub(/[ \t\r]+$/, "", tail)
+                        if (win_seen_lit && substr(tail, length(tail), 1) != "\\") win_open = 0
+                        continue
+                    }
+                }
+
                 # ── Rule 2: no substrate literal in a model-visible string.
-                if (match(text, /MIKA_[A-Z_][A-Z_]+/))      report("MIKA_* env var", path, i, stripped)
+                #
+                # By PROPERTY: "names an env var", not "matches this spelling".
+                # `MIKA_[A-Z0-9_]+` so MIKA_A2A_* (defined in crates/) matches;
+                # the second pattern catches provider credentials
+                # (OPENAI_API_KEY, ANTHROPIC_API_KEY, AWS_SECRET_ACCESS_KEY, …).
+                # Space sentinels on both ends stand in for `^`/`$` so the
+                # boundary classes work identically under gawk and mawk. The
+                # left boundary also refuses `:` so a Rust path to a constant
+                # (`CiAbstention::NO_TOKEN`) is not read as an env var: the
+                # property is a NAME an operator sets, not an identifier.
+                if (match(text, /MIKA_[A-Z0-9_]+/))       report("MIKA_* env var", path, i, stripped)
                 else if (match(text, /GH_TOKEN|GITHUB_TOKEN/)) report("credential env var", path, i, stripped)
+                else if (match(" " text " ", /[^A-Za-z0-9_:][A-Z][A-Z0-9_]*_(API_KEY|SECRET|SECRET_KEY|ACCESS_KEY|TOKEN)[^A-Za-z0-9_]/)) report("credential env var", path, i, stripped)
                 else if (index(text, "XDG_CONFIG_HOME") > 0)   report("third-party env var", path, i, stripped)
                 else if (index(text, "config.toml") > 0)       report("config path", path, i, stripped)
                 else if (index(text, ".mika/") > 0)            report("runtime root path", path, i, stripped)
@@ -205,6 +259,26 @@ for file in "${PERIMETER[@]}"; do
 
         function report(label, p, ln, txt) {
             printf "VIOLATION\tRule 2: substrate literal (%s)\t%s:%d\t%s\n", label, p, ln, txt
+        }
+
+        # Position of the annotation marker in s, 0 when there is none.
+        function annotation_at(s,    a, b) {
+            a = index(s, "// substrate-ok:")
+            b = index(s, "// substrate-diagnostic:")
+            if (a == 0) return b
+            if (b == 0) return a
+            return (a < b) ? a : b
+        }
+
+        function is_annotation(s) {
+            return annotation_at(s) > 0
+        }
+
+        # Open (or re-open) the window at line n; ANNOTATION_WINDOW is the cap.
+        function arm_window(n) {
+            win_open = 1
+            win_end = n + window
+            win_seen_lit = 0
         }
         ' "$file")"
 

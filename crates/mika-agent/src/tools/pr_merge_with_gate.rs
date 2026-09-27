@@ -448,6 +448,21 @@ impl Tool for PrMergeWithGateTool {
 /// merge did not happen and the branch was not touched, the operator gets the
 /// remedy naming the App and the PAT scope.
 ///
+/// **The result stays a successful, parseable JSON document on every tier.** The
+/// LLM branches on `action`, and `tool_execution/dispatch.rs` reads `is_error` as
+/// "the call failed" — so the credential-scope refusal is neither turned into an
+/// error nor followed by prose. That is why this does not go through
+/// `dispatch_substrate_unavailable` (which sets `is_error` and, on operator tier,
+/// appends the diagnostic after a blank line, breaking the JSON):
+///
+/// - **Family / Champion:** the neutral JSON goes to `content`, `detail` goes to
+///   the telemetry sink via `attach_substrate_diagnostic` (`is_error` stays false).
+/// - **Default:** the operator is the reader, so the result is served whole,
+///   byte for byte as before mika#1964 — the remedy already sits inside `detail`.
+///
+/// The match names every tier (no `_ =>`), for the reason
+/// `dispatch_substrate_diagnostic` gives: the next tier must decide, not inherit.
+///
 /// Every other variant is serialized byte for byte as before.
 async fn emit_gate_result(result: MergeGateResult, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
     if let MergeGateResult::GateError {
@@ -455,17 +470,27 @@ async fn emit_gate_result(result: MergeGateResult, ctx: &ToolContext<'_>) -> Res
         detail,
     } = result
     {
-        let neutral = MergeGateResult::GateError {
-            kind,
-            detail: CREDENTIAL_SCOPE_NEUTRAL_DETAIL.to_string(),
-        };
-        return Ok(crate::tools::dispatch_substrate_unavailable(
-            serde_json::to_string_pretty(&neutral)?,
-            detail,
-            "pr_merge_with_gate",
-            ctx,
-        )
-        .await);
+        match ctx.tier {
+            mika_common::home::AgentTier::Family | mika_common::home::AgentTier::Champion => {
+                let neutral = MergeGateResult::GateError {
+                    kind,
+                    detail: CREDENTIAL_SCOPE_NEUTRAL_DETAIL.to_string(),
+                };
+                let mut out = ToolOutput::success(serde_json::to_string_pretty(&neutral)?);
+                crate::tools::attach_substrate_diagnostic(
+                    &mut out,
+                    detail,
+                    "pr_merge_with_gate",
+                    ctx,
+                )
+                .await;
+                return Ok(out);
+            }
+            mika_common::home::AgentTier::Default => {
+                let whole = MergeGateResult::GateError { kind, detail };
+                return Ok(ToolOutput::success(serde_json::to_string_pretty(&whole)?));
+            }
+        }
     }
     Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
 }
@@ -2921,6 +2946,118 @@ mod tests {
                 .unwrap_or("")
                 .contains("MIKA_GITHUB_TOKEN"),
             "the operator detail did not reach the diagnostic channel"
+        );
+    }
+
+    /// The credential-scope result as `classify_credential_scope_error` builds it
+    /// from the gh 403 of the mika#1616 root cause.
+    fn credential_scope_result() -> MergeGateResult {
+        classify_credential_scope_error(
+            "gh exit code 1: HTTP 403: Resource not accessible by integration",
+            "senara-solutions/mika-cloud",
+        )
+        .expect("a 403 classifies as credential scope")
+    }
+
+    fn substrate_rows(
+        events: &[crate::evidence::audit::AuditEvent],
+    ) -> Vec<&crate::evidence::audit::AuditEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                e.tool_name == "substrate_unavailable" && e.target_key == "pr_merge_with_gate"
+            })
+            .collect()
+    }
+
+    /// mika#1964 — the flagship site of the sweep, reached directly.
+    ///
+    /// `emit_gate_result`'s CredentialScope arm is only reachable through `.execute()`
+    /// with real gh 403 output, and this file has no gh harness — so the two tests
+    /// above stop at the missing-token guard and never touch it. This calls it in
+    /// place, on both sealed tiers.
+    ///
+    /// The shape is pinned as well as the leak: a successful, parseable JSON whose
+    /// `action` the model branches on, never an `is_error` result with prose after
+    /// the JSON (which `tool_execution/dispatch.rs` would record as a failed call).
+    #[tokio::test]
+    async fn mika1964_credential_scope_does_not_leak_on_sealed_tiers() {
+        for tier in [
+            mika_common::home::AgentTier::Family,
+            mika_common::home::AgentTier::Champion,
+        ] {
+            let harness = TestHarness::new();
+            let mut ctx = harness.ctx();
+            ctx.tier = tier;
+
+            let out = emit_gate_result(credential_scope_result(), &ctx)
+                .await
+                .unwrap();
+
+            assert!(!out.is_error, "{tier:?}: a refusal is not a failed call");
+            let json: serde_json::Value = serde_json::from_str(&out.content)
+                .unwrap_or_else(|e| panic!("{tier:?}: content is not JSON ({e}): {}", out.content));
+            assert_eq!(json["action"], "gate_errored");
+            assert_eq!(json["kind"]["kind"], "credential_scope");
+            assert_eq!(json["detail"], CREDENTIAL_SCOPE_NEUTRAL_DETAIL);
+            for token in [
+                "GitHub App",
+                "PAT",
+                "`repo` scope",
+                "Resource not accessible",
+            ] {
+                assert!(
+                    !out.content.contains(token),
+                    "{tier:?} leaked {token:?}: {}",
+                    out.content
+                );
+            }
+
+            let events = harness
+                .db
+                .get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+            let routed = substrate_rows(&events);
+            assert_eq!(routed.len(), 1, "{tier:?}: expected one routed diagnostic");
+            let after = routed[0].after_value.as_deref().unwrap_or("");
+            assert!(
+                after.contains("GitHub App") && after.contains("senara-solutions/mika-cloud"),
+                "{tier:?}: the remedy did not reach the diagnostic channel: {after}"
+            );
+        }
+    }
+
+    /// mika#1964 — the operator-tier half: the result is served whole, byte for byte
+    /// as before the sweep, and nothing is routed to the telemetry sink.
+    #[tokio::test]
+    async fn mika1964_credential_scope_default_tier_keeps_the_whole_json() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        assert_eq!(ctx.tier, mika_common::home::AgentTier::Default);
+
+        let expected = serde_json::to_string_pretty(&credential_scope_result()).unwrap();
+        let out = emit_gate_result(credential_scope_result(), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert_eq!(
+            out.content, expected,
+            "operator tier must be byte-identical"
+        );
+        let json: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert!(json["detail"].as_str().unwrap().contains("GitHub App"));
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            substrate_rows(&events).is_empty(),
+            "operator tier must not write a substrate row: {events:?}"
         );
     }
 

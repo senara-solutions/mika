@@ -193,6 +193,31 @@ fn leaks() -> String {
 assert_exit "$d" 1 "N4b: an annotation does NOT exempt a literal beyond the window"
 rm -rf "$d"
 
+# 5c. N4c — ...nor an unannotated literal INSIDE the window. The window ends
+#     where the annotated literal ends; ANNOTATION_WINDOW is only a cap. With a
+#     fixed count, the `unauthorized` diagnostic annotation in builtin_handlers.rs
+#     exempted the model-visible `transport_error` arm right beneath it — the
+#     guard went green over a real family-tier leak (mika#1964 review). N4b
+#     never saw it: it only checks what lies PAST the window.
+d="$(make_tool_fixture 'fn substrate_error_message(status: u16, code: &str) -> (String, String) {
+    match (status, code) {
+        (502, "unauthorized") => (
+            SEARCH_UNAVAILABLE_FALLBACK.to_string(),
+            // substrate-diagnostic: the operator channel.
+            "Search substrate rejected upstream credentials. \
+             Ask the operator to rotate MIKA_BRAVE_API_KEY on mika-gateway."
+                .to_string(),
+        ),
+        (502, "transport_error") => {
+            let msg = "Search request failed. Set MIKA_X before retrying.".to_string();
+            (msg.clone(), msg)
+        }
+        _ => (String::new(), String::new()),
+    }
+}')"
+assert_exit "$d" 1 "N4c: the window ends with the annotated literal, not after a fixed count"
+rm -rf "$d"
+
 # ── 6. Rule 1 — the bare constructor has a single production site.
 #
 # Allowlist shipped empty: when this fires the resolution is to remove the second
@@ -219,6 +244,68 @@ d="$(make_tool_fixture 'pub async fn dispatch_substrate_unavailable(
     out
 }')"
 assert_exit "$d" 0 "Rule 1: the coupled helper is the one permitted site"
+rm -rf "$d"
+
+# 6c. Annotations govern rule 2 only. The shape this script itself recommends —
+#     hoist the diagnostic into an annotated const — must not hide a bare
+#     constructor written within the window below it (mika#1964 review).
+d="$(make_tool_fixture 'fn other() -> ToolOutput {
+    // substrate-diagnostic: the operator channel.
+    const D: &str = "Set MIKA_ROUTING_URL.";
+    let mut out = ToolOutput::substrate_unavailable("neutral", D);
+    out
+}')"
+assert_exit "$d" 1 "Rule 1: an annotation above does not silence a bare constructor"
+rm -rf "$d"
+
+# 6d. ...nor an annotation trailing on the constructor line itself.
+d="$(make_tool_fixture 'fn other() -> ToolOutput {
+    ToolOutput::substrate_unavailable("neutral", "detail") // substrate-ok: not really
+}')"
+assert_exit "$d" 1 "Rule 1: a trailing annotation does not silence a bare constructor"
+rm -rf "$d"
+
+# 6e. A COMMENT naming the helper must not make the scan believe it is inside
+#     it: fn tracking runs on code lines only (mika#1964 review — with the
+#     comment present, the bare constructor below it used to pass).
+d="$(make_tool_fixture '// mirrors fn dispatch_substrate_unavailable
+fn other() -> ToolOutput {
+    // see also fn dispatch_substrate_unavailable
+    ToolOutput::substrate_unavailable("x", "y")
+}')"
+assert_exit "$d" 1 "Rule 1: a comment naming the helper fn does not exempt a bare constructor"
+rm -rf "$d"
+
+# ── 6f. Rule 2 is extended by PROPERTY ("names an env var"), not by spelling.
+#
+# `MIKA_[A-Z_][A-Z_]+` never matched a digit after `MIKA_`, so MIKA_A2A_* —
+# real variables of this codebase — passed; and no pattern covered provider
+# credentials such as OPENAI_API_KEY.
+d="$(make_tool_fixture 'fn probe() -> ToolOutput {
+    ToolOutput::error("Raise MIKA_A2A_TIMEOUT_SECS and retry.".to_string())
+}')"
+assert_exit "$d" 1 "Rule 2: a digit-bearing MIKA_ variable is caught"
+rm -rf "$d"
+
+d="$(make_tool_fixture 'fn probe() -> ToolOutput {
+    ToolOutput::error("Upstream refused: set OPENAI_API_KEY.".to_string())
+}')"
+assert_exit "$d" 1 "Rule 2: a provider API key name is caught"
+rm -rf "$d"
+
+d="$(make_tool_fixture 'fn probe() -> ToolOutput {
+    ToolOutput::error("Missing AWS_SECRET_ACCESS_KEY for the bucket.".to_string())
+}')"
+assert_exit "$d" 1 "Rule 2: a multi-segment credential name is caught"
+rm -rf "$d"
+
+# 6g. ...and its mirror: a Rust path to a constant is an identifier, not a name
+#     an operator sets. Without this the widened pattern is born red on
+#     `CiAbstention::NO_TOKEN` and gets disarmed.
+d="$(make_tool_fixture 'async fn probe(ctx: &ToolContext<'"'"'_>) {
+    abstain(ctx, &target_key, CiAbstention::NO_TOKEN).await;
+}')"
+assert_exit "$d" 0 "Rule 2: a Rust path to a *_TOKEN constant is not an env var"
 rm -rf "$d"
 
 # ── 7. Comment lines are out of the population — documenting an env var is house
