@@ -110,21 +110,29 @@ const bannedLegacyHexValues: Array<[hex: string, wasFor: string]> = [
 ]
 
 /**
- * Every rule whose selector begins with `.mika-cta-gradient`, as
- * `[selector, body]` pairs — collapsed and lowercased like the token values
- * above. The regex deliberately admits a selector suffix (`:not(:disabled):hover`)
- * so the hover rule is inside the population: a hover that drifted to a hex
- * literal would be just as silent a §2 desync as the rest state doing it.
+ * Every rule whose selector mentions a `.mika-` class, as `[selector, body]`
+ * pairs — collapsed and lowercased like the token values above.
+ *
+ * The regex admits a selector suffix (`:not(:disabled):hover`, `[aria-disabled]`)
+ * and a comma-separated group, so hover and disabled rules are inside the
+ * population: one of them drifting to a hex literal would be just as silent a §2
+ * desync as the rest state doing it.
  */
-const ctaGradientRules: Array<[selector: string, body: string]> = (() => {
+const mikaRules: Array<[selector: string, body: string]> = (() => {
   const rules: Array<[string, string]> = []
-  const re = /(\.mika-cta-gradient[^{}]*)\{([^}]*)\}/g
+  const re = /([^{}]*\.mika-[^{}]*)\{([^{}]*)\}/g
   let m: RegExpExecArray | null
   while ((m = re.exec(THEME_CSS)) !== null) {
     rules.push([collapse(m[1]).trim(), collapse(m[2]).trim()])
   }
   return rules
 })()
+
+const ruleFor = (selector: string): string =>
+  mikaRules.find(([sel]) => sel === selector)?.[1] ?? ''
+
+const hasRule = (selector: string): boolean =>
+  mikaRules.some(([sel]) => sel === selector)
 
 describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
   it.each(canonicalTokens)(
@@ -186,22 +194,18 @@ describe('theme.css — LC.1 (mika#1800) rulebook §2 alignment', () => {
  */
 describe('theme.css — LC.2 (mika#1801) rulebook §2/§5 CTA texture', () => {
   it('declares the .mika-cta-gradient rest state', () => {
-    const selectors = ctaGradientRules.map(([sel]) => sel)
-    expect(selectors).toContain('.mika-cta-gradient')
+    expect(hasRule('.mika-cta-gradient')).toBe(true)
   })
 
   it('declares a hover state scoped away from :disabled', () => {
     // `:hover` fires on a disabled <button> in every engine, so an unscoped
     // hover would animate a button that cannot be pressed. `:not(:disabled)` is
     // vacuously true on the <a> branch of <Button>, so one selector serves both.
-    const hover = ctaGradientRules.find(([sel]) => sel.includes(':hover'))
-    expect(hover).toBeDefined()
-    expect(hover?.[0]).toContain(':not(:disabled)')
+    expect(hasRule('.mika-cta-gradient:not(:disabled):hover')).toBe(true)
   })
 
   it('renders the rest state as a 135deg gradient from primary to primary_dim', () => {
-    const rest = ctaGradientRules.find(([sel]) => sel === '.mika-cta-gradient')
-    const body = rest?.[1] ?? ''
+    const body = ruleFor('.mika-cta-gradient')
 
     expect(body).toContain('linear-gradient')
     // §2: "at a 135-degree angle".
@@ -216,17 +220,125 @@ describe('theme.css — LC.2 (mika#1801) rulebook §2/§5 CTA texture', () => {
     expect(to).toBeGreaterThanOrEqual(0)
     expect(from).toBeLessThan(to)
   })
+})
 
-  it.each([0, 1])('carries no colour literal in rule #%i', (i) => {
-    // The load-bearing assertion. `bannedLegacyHexValues` above is a denylist,
-    // which is right for the token table whose whole content is known values;
-    // it is green on a *new* purple written in good faith. Here the rule is
-    // shape: the texture may only reference tokens.
-    const [selector, body] = ctaGradientRules[i] ?? ['<missing>', '']
-    expect(ctaGradientRules.length).toBeGreaterThan(i)
-    expect(body, `${selector} must compose tokens, never a literal`).not.toMatch(
-      /#[0-9a-f]{3,8}\b/,
+/**
+ * LC.2 (mika#1801) — `<Button>` / `<Spinner>` presentation.
+ *
+ * These live in CSS rather than in Tailwind utilities because **Tailwind does not
+ * scan `packages/ui`** — measured on this tree, with the evidence table in
+ * `theme.css`'s own block comment. A utility written inside this package is
+ * simply never generated, so `<Button>` built on utilities would ship with no
+ * padding, no radius and no focus ring. The rules below are therefore not a
+ * stylistic preference; they are the only form that reaches a consumer.
+ *
+ * That also makes them the right place to assert rulebook §5 conformance: the
+ * component test pins the class *mapping* (which variant emits which class), and
+ * these pin what those classes *mean*.
+ */
+describe('theme.css — LC.2 (mika#1801) rulebook §5 button presentation', () => {
+  it.each([
+    ['--radius-mika-xl', '1.5rem'],
+    ['--radius-mika-lg', '1rem'],
+  ])('declares the §6 roundedness token %s = %s', (name, value) => {
+    expect(declarationMap.get(name)).toBe(value)
+  })
+
+  it('does not redefine Tailwind’s own radius scale', () => {
+    // The §6 names (`xl` = 1.5rem, `lg` = 1rem) collide with Tailwind v4's
+    // (`xl` = 0.75rem, `lg` = 0.5rem) at different values. Declaring the
+    // rulebook's values under Tailwind's names would silently move every
+    // `rounded-xl` / `rounded-lg` already written across the dashboard and the
+    // landing. The prefixed tokens above exist precisely to avoid that.
+    expect(declarationMap.has('--radius-xl')).toBe(false)
+    expect(declarationMap.has('--radius-lg')).toBe(false)
+  })
+
+  it('gives every button the §6/§7 roundedness, from the token', () => {
+    // §7 Don't: "Every interactive element must adhere to the `xl` (1.5rem) or
+    // `lg` (1rem) roundedness scale." On the base rule, so no variant can miss it.
+    expect(ruleFor('.mika-btn')).toContain('border-radius: var(--radius-mika-xl)')
+  })
+
+  it('gives every button a visible focus indicator', () => {
+    expect(ruleFor('.mika-btn:focus-visible')).toContain('outline')
+  })
+
+  it('styles the disabled state on both rendered elements', () => {
+    // <a> has no `:disabled`, so the selector group must carry the aria form too
+    // or a future disabled-link affordance loses the styling in silence.
+    const disabled = mikaRules.find(([sel]) => sel.includes(':disabled,'))
+    expect(disabled?.[0]).toContain('[aria-disabled=')
+    expect(disabled?.[1]).toContain('cursor: not-allowed')
+  })
+
+  it.each(['sm', 'md', 'lg'])('declares size %s', (size) => {
+    expect(hasRule(`.mika-btn--${size}`)).toBe(true)
+  })
+
+  it('primary carries no border, per §5', () => {
+    // §5: "Primary: Gradient fill ..., `xl` (1.5rem) roundedness. No border."
+    expect(ruleFor('.mika-btn--primary')).toContain('border: 0')
+  })
+
+  it('primary text is on_surface, never pure white, per §7', () => {
+    // §7 Don't: "No Pure White: Never use `#ffffff`. All 'white' text must be
+    // `on_surface` (#e8e8ec)." The five migrated CTAs all carried `text-white`.
+    expect(ruleFor('.mika-btn--primary')).toContain('color: var(--color-on-surface)')
+  })
+
+  it('secondary is a ghost with the outline_variant border at 20%, per §5', () => {
+    const body = ruleFor('.mika-btn--secondary')
+    expect(body).toContain('background-color: transparent')
+    expect(body).toContain('var(--color-outline-variant)')
+    expect(body).toContain('20%')
+  })
+
+  it('secondary hovers to secondary_container, per §5', () => {
+    expect(ruleFor('.mika-btn--secondary:not(:disabled):hover')).toContain(
+      'background-color: var(--color-secondary-container)',
     )
+  })
+
+  it('tertiary is text-only in the primary colour, per §5', () => {
+    const body = ruleFor('.mika-btn--tertiary')
+    expect(body).toContain('color: var(--color-primary)')
+    expect(body).toContain('background-color: transparent')
+    expect(body).toContain('border: 0')
+  })
+
+  it('declares the spinner animation without relying on Tailwind', () => {
+    // `animate-spin` reaches the dashboard only because a dashboard source file
+    // happens to use it, and reaches the landing and mika-cloud not at all.
+    expect(hasRule('.mika-spin')).toBe(true)
+    expect(ruleFor('.mika-spin')).toContain('mika-spin')
+    expect(THEME_CSS).toContain('@keyframes mika-spin')
+  })
+})
+
+describe('theme.css — LC.2 (mika#1801) the .mika- rules compose tokens only', () => {
+  /**
+   * The load-bearing assertion of the whole LC.2 CSS block, and the reason it is
+   * safe for presentation to live in this file at all.
+   *
+   * `bannedLegacyHexValues` above is a denylist, which is right for a token table
+   * whose entire content is known values. It is green on a *new* purple written
+   * in good faith — the exact regression `scripts/check-landing-tokens.sh` had to
+   * switch to a shape rule to catch, one surface over. Here the rule is the same
+   * shape: a `.mika-` rule may reference tokens and nothing else.
+   */
+  it('scans a non-empty population', () => {
+    // Anti-vacuity. A renamed prefix would make every assertion below pass by
+    // looking at nothing, which reads exactly like a clean file.
+    expect(mikaRules.length).toBeGreaterThanOrEqual(12)
+  })
+
+  it.each(mikaRules)('%s carries no colour literal', (_selector, body) => {
+    expect(body).not.toMatch(/#[0-9a-f]{3,8}\b/)
     expect(body).not.toMatch(/\brgba?\s*\(/)
+    expect(body).not.toMatch(/\bhsla?\s*\(/)
+    // `white` / `black` are literals too, and the ones a hurried edit reaches
+    // for — §7 forbids the first by name.
+    expect(body).not.toMatch(/:\s*(white|black)\b/)
   })
 })
