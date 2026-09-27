@@ -80,6 +80,8 @@ Detector-class deliverables: tests, assertions, lints, invariants, validations �
 2. Detector deliverables present + section missing or empty ⇒ `ESCALATE` with a BLOCKING F-finding.
 3. No detector deliverables ⇒ gate is N/A.
 
+**Heading form:** a leading section number does not change the section. The plan producer numbers its headings, so `## 3. Fire-Disposition` (or `## 3 Fire-Disposition`) IS the `## Fire-Disposition` section for every branch of this tree — judge its content, never its numbering (mika#2544).
+
 **Gate precedence:** any `ESCALATE` from this gate or the other gates wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
 
 ### Output
