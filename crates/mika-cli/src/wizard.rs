@@ -42,7 +42,7 @@ pub fn run_agent_wizard(name: &str) -> Result<AgentWizardResult> {
 
     let style_idx = Select::new()
         .with_prompt("  Communication style")
-        .items(&style_presets)
+        .items(style_presets)
         .default(0)
         .interact()?;
 
