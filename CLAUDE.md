@@ -2194,6 +2194,182 @@ publier cherche dans le voisinage des gardes de dispatch.
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
+### Un `ESCALATE` de groom est terminal, et son producteur l'estampille (mika#2545)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit un groom refusé — ou qui cherche
+pourquoi un ticket escaladé ne repart pas — cherche dans le voisinage de la porte
+de dispatch.
+
+- **Le défaut, mesuré le 2026-09-26.** Le groom de mika#2542 a rendu `ESCALATE`
+  sur review-anchor, et un mécanisme l'a **auto-rejoué huit fois** — callbacks
+  `mika-dev` en paires `expired`/`delivered` toutes les ~1 min de **13:06:14Z à
+  13:20:54Z**, chacun ESCALATE sur la même cause, chacun consommant le slot
+  `groom`. Le fichier `~/.mika/state/auto-pull-stop` était posé : **ce n'était pas
+  le feeder.**
+
+- **La chaîne, maillon par maillon — les trois pistes du ticket sont une seule
+  chaîne et aucune n'est la cause à elle seule.**
+
+  | # | site | ce qui se passe |
+  |---|---|---|
+  | 1 | `_escalate_groom` (`dispatch-lib.sh`) | ESCALATE ⇒ `RESULT` reçoit `PIPELINE FAILURE:` |
+  | 2 | `_iterate_groom_loop` | les **trois** bras ESCALATE rendent `return 1` |
+  | 3 | `dispatch_claude_pilot`, branche `else` | une **seconde** ligne `PIPELINE FAILURE:` et `Outcome: PIPELINE_INCOMPLETE` |
+  | 4 | `self-dev-callback`, § *On pipeline failure* | le marqueur fait entrer le tour dans la population **retryable** |
+  | 5 | idem, étape 4 | `run_claude_pilot_groom` ré-appelé avec le même `repo#number` |
+  | 6 | `validate_dispatch_readiness` | slot `groom` occupé ⇒ `deferred` ⇒ wrapper différé |
+  | 7 | tick moteur (60 s) | promotion du wrapper ⇒ **les paires à ~1 min** mesurées |
+  | 8 | → retour en 1 | |
+
+  **Le maillon décisif est le 1** : un verdict terminal portait le marqueur de la
+  population retryable. Le 7 explique la cadence, le 4 explique le rejeu.
+
+- **Le budget `pipeline_retry_count >= 2` ne bornait rien, et c'est la classe
+  mika#2158.** Aucun code moteur ne le lit ni ne l'applique ; l'écriture que le
+  prompt prescrit atterrit sur la tâche **callback**, dont `trigger_type` fait
+  refuser `update_task_status` ; et chaque rejeu naît avec une metadata vierge.
+  *Un compteur remis à zéro par l'action qu'il compte ne borne rien* — le budget
+  n'était pas trop large, il était **inatteignable**.
+
+- **`Outcome: ESCALATE` était cherché et écrit nulle part.** Le prédicat P4 de
+  `_measure_cycle_output` l'énumère depuis toujours ; une recherche exhaustive des
+  sites d'écriture de `^Outcome: ` rendait `PR_OPENED`, `PLAN_COMMITTED`,
+  `PLAN_GROOMED`, `PIPELINE_INCOMPLETE`, `UNKNOWN` — **jamais `ESCALATE`**. Un
+  prédicat sur une population vide se lit exactement comme un prédicat sain
+  (classe mika#2205). La maison avait déjà décidé que c'était le nom du fait ; il
+  ne restait qu'à l'écrire, et c'est ce qui rend le remède petit.
+
+- **Deux compensations, et il faut les DEUX.** `PIPELINE FAILURE:` était aussi ce
+  qui sortait le cycle de la population `empty_completion` : le retirer sans
+  compenser exposerait un ESCALATE à un faux rouge sur une sortie délibérée.
+  `^Outcome: ESCALATE` rejoint donc l'alternance de reclassement de
+  `_gate_non_empty_cycle`, **et** P4 le reconnaît déjà — mais sous réserve de
+  `CYCLE_TOOL_CALLS >= 1`, réserve qui est précisément pourquoi le premier terme
+  n'est pas redondant.
+
+- **Le ré-armement est gratuit et sans état, et c'est le cœur du remède.** La
+  garde ne mord que sur un dispatch dont l'`originating_message` est **absent** —
+  le retry pipeline est un tour silencieux. Les deux gestes d'opérateur
+  canoniques traversent par construction :
+
+  | chemin | `originating_message` | verdict |
+  |---|---|---|
+  | retry pipeline de `self-dev-callback` | absent | **refusé** |
+  | reposer `ready` en **remove → add** (mika#2323) | le marqueur webhook | **passe** |
+  | `mika ask --agent mika-dev "groom mika issue#N"` | le message | **passe** |
+
+  Aucun stamp à écrire, aucune fenêtre à régler, aucune ligne à nettoyer — et le
+  corps du refus nomme les deux gestes, parce qu'un refus qui ne nomme pas sa
+  levée est un refus qu'on contourne au jugé.
+
+### SQL
+
+```sql
+-- Les grooms qui ont escaladé (le PRODUCTEUR)
+SELECT parent.reference_url, child.created_at
+  FROM tasks child JOIN tasks parent ON child.parent_task_id = parent.id
+ WHERE child.dispatch_class = 'groom'
+   AND instr(child.result, 'Outcome: ESCALATE') > 0
+ ORDER BY child.created_at DESC;
+
+-- Les rejeux interceptés (le LECTEUR) — DOIT être très inférieur au producteur
+SELECT target_key, count(*) FROM audit_events
+ WHERE tool_name = 'groom_escalate_redispatch_refused'
+ GROUP BY 1 ORDER BY 2 DESC;
+```
+
+L'`instr` de la première requête est une **surapproximation** du prédicat moteur,
+qui est ancré sur la ligne : un `result` dont la prose cite le marqueur y entre.
+Acceptable pour un comptage, et dit plutôt que laissé supposer — le moteur, lui,
+ne s'y trompe pas.
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. Un re-dispatch a-t-il été refusé ?
+grep groom_escalate_redispatch_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{task_id, repo, issue, verdict}'
+
+# 2. CONTRÔLE POSITIF — le producteur estampille-t-il seulement ?
+grep -hc '^Outcome: ESCALATE' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `groom_escalate_redispatch_refused`, `verdict=escalated` | **non vide, faible** | chaque ligne est un dispatch de groom que l'opérateur n'a pas eu à annuler |
+| `groom_escalate_redispatch_refused`, `verdict=unreadable` | **vide** | la base n'a pas répondu ; le ticket attend et sera re-drivé |
+| `Outcome: ESCALATE` dans `tasks.result` | non vide, faible | la population du producteur ; **doit dominer** celle du lecteur |
+| une clé au-dessus de **1** dans la requête du lecteur | **anomalie** | le refus ne tient pas : un appelant rejoue par un chemin que la garde ne traverse pas |
+| `groom_escalate_refused_audit_failed` | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` est alors incomplet |
+
+Les deux populations sont **soustractibles** parce que
+`groom_escalate_redispatch_refused` a un **écrivain unique** (scan de source,
+allowlist livrée vide) — motif `phantom_aged_out` / `phantom_sweep_spared`
+(mika#2156), `closing_pr_closed_unmerged` / `ready_label_degroomed` (mika#2242).
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir — sans quoi chacune des sondes décrit le binaire d'hier.
+
+**S1 — le producteur estampille (premier ESCALATE réel).** Le `tasks.result` du
+callback de groom porte exactement une ligne `Outcome: ESCALATE` et **aucune**
+ligne `PIPELINE FAILURE:`.
+*Halte 1 — les deux sont présentes, ou `Outcome: PIPELINE_INCOMPLETE` a survécu :*
+la branche `else` de `dispatch_claude_pilot` écrase encore. **Ne pas toucher à la
+garde** — c'est le producteur qui n'a pas pris, et la garde ne peut rien lire qui
+n'ait été écrit.
+
+**S2 — la garde mord (premier ESCALATE, tour suivant).** Une ligne
+`groom_escalate_redispatch_refused` avec `verdict=escalated`, et **zéro** nouvelle
+tâche callback `dispatch_class='groom'` sous ce parent.
+*Halte 2 — un rejeu part quand même, la ligne absente :* un appelant ne traverse
+pas la porte. **Ne pas élargir le prédicat par réflexe** : établir lequel des
+quatre chemins du tableau ci-dessus a servi, les remèdes diffèrent.
+
+**S3 — contrôle négatif du ré-armement (geste opérateur).** Sur le ticket
+escaladé : `gh issue edit <n> --remove-label ready` puis `--add-label ready`. Le
+groom **doit** repartir.
+*Halte 3 — il ne repart pas :* la garde mord sur le chemin opérateur, donc le
+terme `originating_message.is_none()` est mal lu. **Désarmer d'abord** (revert de
+la garde), diagnostiquer ensuite — une garde qui bloque la reprise est pire que la
+boucle qu'elle remplace, puisqu'elle n'a pas de contournement.
+
+**S4 — contrôle négatif de bruit (7 jours).** Aucun
+`groom_escalate_redispatch_refused` sur un ticket dont le dernier groom a rendu
+`Outcome: PLAN_GROOMED`.
+*Halte 4 — une occurrence :* le prédicat lit l'**existence** d'un ESCALATE et non
+le **dernier** verdict — le `ORDER BY … LIMIT 1` ne fait pas son travail, et un
+ticket sain est gelé.
+
+**Halte transverse — les deux sondes muettes.** Zéro ligne des deux côtés ne
+prouve **rien** : il faut qu'un ESCALATE réel ait eu lieu depuis le déploiement.
+Vérifier la requête *producteur* avant toute conclusion. *Une garde que personne
+n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas converger un groom qui escalade.** Il rend l'escalade terminale
+  et lisible ; le plan reste à réviser par un humain, ce qui est le contrat de
+  sortie de `/mika-groom-ticket`.
+- **Il ne rattrape pas l'incident du 2026-09-26.** Les quinze tâches mesurées
+  portent `Outcome: PIPELINE_INCOMPLETE` et **rien ici ne rétro-estampille** :
+  fabriquer une ligne décrivant un fait qu'on n'a pas observé est l'inverse de ce
+  que ce travail défend. La sonde est la **prochaine** occurrence.
+- **Il ne borne pas le feeder.** Un `ready` reposé par `auto_pull` Phase 2
+  traverse la garde ; c'est le prix du ré-armement sans état, borné à trois tours
+  par le budget de re-drive (mika#2020). **Élargir la garde au
+  `ready_label_handler` est refusé** : ce serait retirer à l'opérateur son geste
+  de reprise le plus court. Le remède juste pour cette population est que le
+  ticket porte `operator-review`, ce qui le sort structurellement des trois phases
+  du feeder — **ticket de suivi**, précondition : que la requête du producteur
+  montre des tickets escaladés re-groomés par le feeder.
+- **Aucun compteur du producteur.** La population des grooms qui escaladent se lit
+  par la requête SQL ci-dessus, et **son silence ne prouve rien tant que personne
+  ne l'exécute**.
+
 ### Un callout de corps sans preuve en base route vers `groom` (mika#2484)
 
 **Aucune variable d'environnement, aucun interrupteur.** Cette entrée est ici

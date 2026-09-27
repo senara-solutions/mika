@@ -1667,6 +1667,20 @@ impl AsyncDatabase {
             .await
     }
 
+    /// The `result` of the most recent terminal groom callback for an issue
+    /// (mika#2545). Two levels of `Option` and they say different things —
+    /// `None` = no groom ever ran, `Some(None)` = a groom ran and its `result`
+    /// column is NULL. See [`crate::db::Database::latest_groom_verdict_for_issue`].
+    pub async fn latest_groom_verdict_for_issue(
+        &self,
+        issue_url: &str,
+    ) -> Result<Option<Option<String>>> {
+        let a = self.agent_id.clone();
+        let u = issue_url.to_owned();
+        self.with_db(move |db| db.latest_groom_verdict_for_issue(&a, &u))
+            .await
+    }
+
     /// Count pending deferred-dispatch callbacks for this agent (mika#1011).
     pub async fn count_pending_deferred_callbacks(&self) -> Result<i64> {
         let a = self.agent_id.clone();

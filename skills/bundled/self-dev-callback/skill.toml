@@ -4,6 +4,17 @@ description = "Callback handler for claude-pilot and deploy_mika background task
 version = "0.1.0"
 always_on = false
 dependencies = ["self-dev"]
+# mika#2545 — raised 16384 → 20480. MEASURED, not padded: this prompt was at
+# **15533 B before the ticket, i.e. 31 bytes under the 95 % warn threshold** of
+# the previous ceiling, so any addition at all crossed it — and crossing the
+# ceiling itself does not warn, it DROPS the skill from the startup scan
+# (`bundled_skills_load` calls that "a silently-degraded boot"). The ticket's own
+# addition is ~1.8 KB; the rest of the new headroom is margin, deliberately,
+# because a ceiling re-raised on every edit is a ceiling nobody reasons about.
+# The historical rationale for this handler's branches lives in the root
+# `CLAUDE.md`, not here — a prompt is served on every callback turn, so the
+# *why* belongs to the reference surface and only the *gesture* belongs here.
+max_prompt_size = 20480
 
 [triggers]
 keywords = [
