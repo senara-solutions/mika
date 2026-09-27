@@ -7666,10 +7666,14 @@ _t2306_inject() {
 # dans la branche d'échec avant d'atteindre la garde.
 #
 # $1 = contenu de .iterate/findings-1.md
-# $2 = le plan initial porte-t-il déjà la section ? (yes|no)
+# $2 = le plan initial porte-t-il déjà la section ? (yes|no), ou sous quelle
+#      forme de titre (mika#2544) : numbered (`## 3.`), upper (`## 3.` en
+#      capitales), ish (`## Fire-Disposition-ish`), notes (`## 11. Notes on …`),
+#      subsub (`## 1.1 …`)
 # $3 = comportement du pilote simulé :
 #      never  — ne l'ajoute jamais
 #      second — l'ajoute à la deuxième invocation
+#      second-numbered — l'ajoute NUMÉROTÉE à la deuxième invocation (mika#2544)
 #      wipe   — supprime le findings-file de première passe (fail-safe en vol)
 # $4 = (optionnel) "residual-fd" dépose un findings-1-fd.md résiduel
 # Rend : "<rc>|<nombre d'invocations du pilote>|<stderr>"
@@ -7697,9 +7701,17 @@ _t2306_revise_probe() {
         printf 'sonde qui passe sous ce seuil ne mesure rien et le dit mal : elle rend\n'
         printf 'exactement le meme « plan introuvable » que la garde de fonction.\n\n'
         printf '## Implementation Units\n\nU1 — un livrable detecteur quelconque.\n\n'
-        if [ "$t2306_has_section" = "yes" ]; then
-            printf '## Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n'
-        fi
+        # mika#2544 — cinq formes de titre en plus des deux d'origine. La ligne
+        # `## Acceptance criteria` qui suit reste HORS du `case` : l'emporter en
+        # réécrivant ce bloc casserait tout futur gate AC sur ce fixture.
+        case "$t2306_has_section" in
+            yes)      printf '## Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n' ;;
+            numbered) printf '## 3. Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n' ;;
+            upper)    printf '## 3. FIRE-DISPOSITION\n\nOption (a) — exception nommee, table vide.\n\n' ;;
+            ish)      printf '## Fire-Disposition-ish\n\nOption (a) — exception nommee, table vide.\n\n' ;;
+            notes)    printf '## 11. Notes on Fire-Disposition\n\nRemarques, pas la section.\n\n' ;;
+            subsub)   printf '## 1.1 Fire-Disposition\n\nOption (a) — exception nommee, table vide.\n\n' ;;
+        esac
         printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
     } > "$t2306_plan"
 
@@ -7728,6 +7740,7 @@ _t2306_revise_probe() {
             case "$t2306_behaviour" in
                 wipe) rm -f "$t2306_wt/.iterate/findings-1.md" ;;
                 second) [ "$n" -ge 2 ] && printf '\n## Fire-Disposition\n\nOption (a).\n' >> "$t2306_plan" ;;
+                second-numbered) [ "$n" -ge 2 ] && printf '\n## 3. Fire-Disposition\n\nOption (a).\n' >> "$t2306_plan" ;;
             esac
             # Mutation inconditionnelle : sans elle le sha ne bouge pas, et la
             # branche de succès — donc la garde — n'est jamais atteinte.
@@ -7977,6 +7990,204 @@ assert_eq "T11 (b): un findings-1-fd.md résiduel ne déclenche aucune relance" 
     "1" "$(_t2306_field 2 "$T2306_T11")"
 assert_not_contains "T11 (b): et rien n'est journalisé" \
     "fire_disposition_revise_retried" "$T2306_T11"
+
+# ============================================================================
+# mika#2544 — les lecteurs `Fire-Disposition` tolèrent la numérotation (T12)
+# ============================================================================
+#
+# `/ce:plan` numérote ses titres de section (`## 3. Fire-Disposition`). Le gate
+# `Acceptance criteria` le tolère depuis mika#2516 ; les deux lecteurs FD de
+# `_fd_retry_if_section_still_missing` ne le toléraient pas. Sur un plan
+# CONFORME à titre numéroté, le rattrapage relançait un pilote de revise pour
+# rien, avec un finding synthétique faux, et `fire_disposition_still_missing_after_retry`
+# (régime attendu : zéro) était émis à tort — classe mika#2205, un instrument
+# qui affirme un état qui n'a pas eu lieu.
+#
+# T12a est la fixture porteuse. T12e est obligatoire : avec le seul terme 2
+# élargi, T12a passe au vert et le re-test de journalisation émet toujours
+# l'événement faux. T12c/T12d sont les contrôles négatifs de la tolérance, et
+# T7 (plus haut) reste celui de la forme non numérotée.
+
+echo ""
+echo 'Test: mika#2544 — lecteurs `Fire-Disposition` tolérant la numérotation (T12)'
+echo "-----------------------------------------------------------------------------"
+
+# --- T12a–T12g : comportement de la vraie fonction ---------------------------
+
+T2544_T12A=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "numbered" "never")
+assert_eq "T12a: findings réclamant FD + section NUMÉROTÉE ⇒ zéro relance" \
+    "1" "$(_t2306_field 2 "$T2544_T12A")"
+assert_not_contains "T12a: et rien n'est journalisé" \
+    "fire_disposition_revise_retried" "$T2544_T12A"
+
+T2544_T12B=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "upper" "never")
+assert_eq "T12b: section numérotée en capitales ⇒ zéro relance (casse tolérée, D2)" \
+    "1" "$(_t2306_field 2 "$T2544_T12B")"
+
+# Contrôles négatifs : la tolérance n'a pas avalé les refus. Vus verts AVANT le
+# correctif aussi — c'est ce qui prouve un élargissement et non un désarmement.
+T2544_T12C=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "notes" "never")
+assert_eq "T12c: seul '## 11. Notes on Fire-Disposition' ⇒ une relance (refus tenu)" \
+    "2" "$(_t2306_field 2 "$T2544_T12C")"
+T2544_T12D=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "subsub" "never")
+assert_eq "T12d: '## 1.1 Fire-Disposition' ⇒ une relance (borne du préfixe assumée, D2)" \
+    "2" "$(_t2306_field 2 "$T2544_T12D")"
+
+# La moitié oubliée : le revise AJOUTE la section, numérotée. La relance est
+# légitime (le plan initial ne la porte pas) ; l'événement d'échec, non.
+T2544_T12E=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "no" "second-numbered")
+assert_eq "T12e: section ajoutée numérotée à la relance ⇒ toujours une seule relance" \
+    "2" "$(_t2306_field 2 "$T2544_T12E")"
+assert_not_contains "T12e: et AUCUN fire_disposition_still_missing_after_retry (re-test de journalisation)" \
+    "fire_disposition_still_missing_after_retry" "$T2544_T12E"
+
+# Chaîne C2 : le plan porte déjà la section numérotée et l'architecte en
+# critique le CONTENU — le terme 1 est vrai sans ITERATE préalable sur la
+# section elle-même.
+T2544_FINDINGS_FD_CONTENT="F1 [BLOQUANT] — la section Fire-Disposition nomme l'option (a) sans
+assertion auto-nettoyante. Précise-la.
+
+Disposition: ITERATE"
+T2544_T12F=$(_t2306_revise_probe "$T2544_FINDINGS_FD_CONTENT" "numbered" "never")
+assert_eq "T12f: findings critiquant le contenu + section numérotée ⇒ zéro relance" \
+    "1" "$(_t2306_field 2 "$T2544_T12F")"
+
+# Le coût de D3, rendu lisible : pas d'ancre de fin (alignée sur AC_HEADING_RE),
+# donc un titre `## Fire-Disposition-ish` est lu comme la section.
+T2544_T12G=$(_t2306_revise_probe "$T2306_FINDINGS_WITH_FD" "ish" "never")
+assert_eq "T12g: '## Fire-Disposition-ish' en tête de ligne ⇒ lu présent, zéro relance (D3)" \
+    "1" "$(_t2306_field 2 "$T2544_T12G")"
+
+# --- T12h : la matrice du motif, ligne par ligne ------------------------------
+#
+# Les cas négatifs du ticket (`###`, prose, backticks) et les bornes de D2, lus
+# par la constante elle-même avec le drapeau des deux sites. Un motif vide
+# matcherait tout : la non-vacuité est assertée d'abord.
+
+assert_eq "T12h: _FD_HEADING_RE est définie et non vide" "non-vide" \
+    "$([ -n "${_FD_HEADING_RE:-}" ] && echo non-vide || echo vide)"
+_t2544_reads() {
+    if [ -n "${_FD_HEADING_RE:-}" ] && printf '%s\n' "$1" | grep -qiE "$_FD_HEADING_RE"; then
+        echo present
+    else
+        echo absent
+    fi
+}
+while IFS='|' read -r t2544_want t2544_line; do
+    assert_eq "T12h: « $t2544_line » ⇒ $t2544_want" "$t2544_want" "$(_t2544_reads "$t2544_line")"
+done <<'T2544_MATRIX'
+present|## Fire-Disposition
+present|## 3. Fire-Disposition
+present|## 3 Fire-Disposition
+present|## 11. Fire-Disposition
+present|## fire-disposition
+present|##   Fire-Disposition
+present|## Fire-Disposition (option a)
+present|## Fire-Disposition-ish
+absent|### Fire-Disposition
+absent|##Fire-Disposition
+absent|la section `## Fire-Disposition` est requise
+absent|une section Fire-Disposition-ish dans une ligne de prose
+absent|## Notes on Fire-Disposition
+absent|## 1.1 Fire-Disposition
+T2544_MATRIX
+
+# --- T12i : la clause de vocabulaire des deux gates architecte ---------------
+#
+# Assertion de PRÉSENCE, pas de comportement : le verdict est rendu par un LLM,
+# que ce harnais ne peut pas exercer. Le contrat côté mika est « la clause est
+# dans le prompt servi ».
+
+for t2544_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t2544_pf="$SCRIPT_DIR/../$t2544_prompt/system_prompt.md"
+    if [ -r "$t2544_pf" ]; then
+        t2544_gate=$(sed -n '/^### Fire-Disposition Gate/,/^### /p' "$t2544_pf")
+        assert_contains "T12i: $t2544_prompt — le gate FD dit qu'un titre numéroté est la section" \
+            '`## 3. Fire-Disposition`' "$t2544_gate"
+    else
+        assert_eq "T12i: $t2544_prompt/system_prompt.md lisible" "lisible" "fichier introuvable: $t2544_pf"
+    fi
+done
+
+# --- T12j : lecteur unique par section, et co-mutation FD ⇔ AC ---------------
+#
+# Le commentaire de `AC_HEADING_RE` promettait une garde de lecteur unique dans
+# scripts/verify-pipeline-test.sh ; elle n'y était pas, et ce harnais-là n'est
+# lancé par aucun job CI. Elle vit ici, dans le seul harnais shell câblé en CI,
+# et couvre les deux sections.
+#
+# Prédicat POSITIONNEL, jamais lexical : une ligne de code (hors commentaire)
+# qui invoque `grep`/`sed` ET porte, entre quotes, un littéral de titre
+# (`#…<section>`). Les `echo "FAIL: … '## Acceptance criteria' …"` de
+# verify-pipeline.sh et la prose de `_FIRE_DISPOSITION_RULE` citent le littéral
+# sans être des lecteurs : ils sont hors population par construction. Le terme 1
+# de la garde FD (`grep -qF -- 'Fire-Disposition'` sur les FINDINGS, sans `#`)
+# l'est aussi — autre population, délibérément grossière.
+#
+# Contre-vacuité en deux moitiés : (i) au moins un lecteur via la constante par
+# section ; (ii) un fichier illisible ROUGIT avec « fichier introuvable », au
+# lieu de sauter comme le `if [ -f ]` de T2211 — un scan qui ne regarde rien se
+# lit exactement comme un arbre propre (mika#2205).
+#
+# Rend : « introuvable », ou « <littéraux en position de motif>|<lecteurs via la constante> ».
+_t2544_heading_scan() {
+    local file="$1" section="$2" const="$3" code violations readers
+    [ -r "$file" ] || { printf 'introuvable'; return 0; }
+    code=$(grep -v '^[[:space:]]*#' "$file" \
+        | grep -E '(^|[^[:alnum:]_-])(grep|sed)([[:space:]]|$)' || true)
+    violations=$(printf '%s\n' "$code" \
+        | grep -iE "['\"][^'\"]*#[^'\"]*${section}" | grep -c . || true)
+    readers=$(printf '%s\n' "$code" | grep -F "\$${const}" | grep -c . || true)
+    printf '%s|%s' "$violations" "$readers"
+}
+
+T2544_FD_SCAN=$(_t2544_heading_scan "$DISPATCH_LIB" "Fire-Disposition" "_FD_HEADING_RE")
+T2544_AC_SCAN=$(_t2544_heading_scan "$REPO_ROOT/scripts/verify-pipeline.sh" "Acceptance criteria" "AC_HEADING_RE")
+
+assert_eq "T12j (FD): dispatch-lib.sh lisible par le scan" "lu" \
+    "$([ "$T2544_FD_SCAN" != introuvable ] && echo lu || echo "fichier introuvable: $DISPATCH_LIB")"
+assert_eq "T12j (FD): aucun littéral de titre Fire-Disposition en position de motif" "0" \
+    "${T2544_FD_SCAN%%|*}"
+assert_eq "T12j (FD): exactement deux lecteurs, tous deux via \$_FD_HEADING_RE" "2" \
+    "${T2544_FD_SCAN##*|}"
+# Le drapeau combiné, pas `-E` seul : écrire `-qi` en remplaçant `-qE` perd
+# l'ERE en silence, le motif ne matche plus rien et le rattrapage tire sur tout.
+assert_eq "T12j (FD): les deux lecteurs portent -qiE" "2" \
+    "$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF 'grep -qiE "$_FD_HEADING_RE"' || true)"
+
+assert_eq "T12j (AC): verify-pipeline.sh lisible par le scan" "lu" \
+    "$([ "$T2544_AC_SCAN" != introuvable ] && echo lu || echo "fichier introuvable: $REPO_ROOT/scripts/verify-pipeline.sh")"
+assert_eq "T12j (AC): aucun littéral de titre Acceptance criteria en position de motif" "0" \
+    "${T2544_AC_SCAN%%|*}"
+assert_eq "T12j (AC): exactement deux lecteurs, tous deux via \$AC_HEADING_RE" "2" \
+    "${T2544_AC_SCAN##*|}"
+
+# Contre-vacuité (ii), exercée à chaque exécution plutôt qu'une fois à la main.
+assert_eq "T12j contre-vacuité: un fichier absent rend « introuvable », pas zéro violation" \
+    "introuvable" "$(_t2544_heading_scan "/nonexistent/mika-2544.sh" "Fire-Disposition" "_FD_HEADING_RE")"
+# Et le prédicat positionnel mord : un troisième lecteur littéral est vu.
+assert_eq "T12j contre-vacuité: un grep littéral '^## Fire-Disposition' est compté" "1|0" \
+    "$(_t2544_heading_scan <(printf '%s\n' "    ! grep -qE '^## Fire-Disposition' \"\$p\" || return 0") \
+        "Fire-Disposition" "_FD_HEADING_RE")"
+
+# Co-mutation : aucun fichier n'est lisible par les deux gates au même instant
+# (verify-pipeline.sh est lu depuis le dépôt, dispatch-lib.sh est une projection
+# du binaire — mika#2340), donc le préfixe est doublé et tenu ici. Le jour où
+# l'un des deux évolue, ce test rougit au lieu de laisser les gates rediverger.
+T2544_AC_RE=$(sed -nE "s/^[[:space:]]*AC_HEADING_RE='(.*)'[[:space:]]*\$/\\1/p" \
+    "$REPO_ROOT/scripts/verify-pipeline.sh" 2>/dev/null | head -1)
+assert_eq "T12j (co-mutation): AC_HEADING_RE extraite de verify-pipeline.sh" "non-vide" \
+    "$([ -n "$T2544_AC_RE" ] && echo non-vide || echo vide)"
+T2544_FD_RE="${_FD_HEADING_RE:-}"
+assert_eq "T12j (co-mutation): préfixe de _FD_HEADING_RE == préfixe de AC_HEADING_RE" \
+    "${T2544_AC_RE%Acceptance criteria}" "${T2544_FD_RE%Fire-Disposition}"
+
+# Fire-Disposition, option (a) — table d'exceptions du scan vide, vacuité
+# assertée à l'exécution (modèle T2306_ARCH_ASK_ALLOWLIST). Quand le scan tire,
+# on route le site vers la constante ; on n'ajoute pas de ligne ici (mika#2201).
+T2544_HEADING_READER_ALLOWLIST=()
+assert_eq "T12j: table d'exceptions du scan de lecteurs — zero entries" "0" \
+    "${#T2544_HEADING_READER_ALLOWLIST[@]}"
 
 # --- mika#2449: aucun message de récupération de stash ne nomme le checkout principal ---
 #
