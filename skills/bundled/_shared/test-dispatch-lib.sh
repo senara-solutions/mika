@@ -8085,6 +8085,7 @@ present|##   Fire-Disposition
 present|## Fire-Disposition (option a)
 present|## Fire-Disposition-ish
 absent|### Fire-Disposition
+absent|# Fire-Disposition
 absent|##Fire-Disposition
 absent|la section `## Fire-Disposition` est requise
 absent|une section Fire-Disposition-ish dans une ligne de prose
@@ -8123,6 +8124,12 @@ done
 # sans être des lecteurs : ils sont hors population par construction. Le terme 1
 # de la garde FD (`grep -qF -- 'Fire-Disposition'` sur les FINDINGS, sans `#`)
 # l'est aussi — autre population, délibérément grossière.
+#
+# Borne nommée, pas découverte : la population est celle des lignes `grep`/`sed`.
+# Un lecteur `awk`, `[[ =~ ]]`, `case`, un motif en variable ou sur une ligne de
+# continuation échappe au scan. Aucun n'existe dans les deux fichiers ; le jour
+# où l'un est écrit, on élargit l'alternance de commandes ici, dans le même
+# commit.
 #
 # Contre-vacuité en deux moitiés : (i) au moins un lecteur via la constante par
 # section ; (ii) un fichier illisible ROUGIT avec « fichier introuvable », au

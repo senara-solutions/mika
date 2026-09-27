@@ -2733,7 +2733,10 @@ passe est sans recours."
 # quantificateurs redeviennent littéraux, le motif ne matche plus rien, le
 # terme 2 devient toujours vrai et le rattrapage tire sur tout plan dont les
 # findings mentionnent la chaîne. Ne pas ré-orthographier ce motif ailleurs :
-# T12j rougit sur un littéral de titre en position de motif.
+# T12j rougit sur un littéral de titre quoté dans une ligne `grep`/`sed`. Il ne
+# voit PAS un lecteur `awk`, `[[ =~ ]]`, un motif porté par une variable ou sur
+# une ligne de continuation — aucun n'existe ; en écrire un, c'est l'ajouter au
+# scan d'abord.
 _FD_HEADING_RE='^##[[:space:]]+([0-9]+\.?[[:space:]]+)?Fire-Disposition'
 
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
