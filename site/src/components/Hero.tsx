@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Button } from "@samidarko/ui";
 
 const GITHUB_URL = "https://github.com/senara-solutions/mika";
 const DOCS_URL = `${GITHUB_URL}/tree/main/docs`;
@@ -40,18 +41,23 @@ export function Hero() {
 
       {/* CTAs */}
       <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
-        <a
+        {/* The lift-on-hover and the tinted shadow are landing-specific
+            flourishes, not part of rulebook §5, so they ride along on
+            `className` rather than becoming a variant. `external` is
+            deliberately NOT set: no link in this landing carries
+            `target="_blank"` today, and changing that is a behavioural change
+            the CTA migration was not asked to make. */}
+        <Button
+          as="link"
           href={GETTING_STARTED_URL}
-          className="flex h-12 items-center justify-center rounded-xl bg-accent px-8 font-semibold text-white shadow-lg shadow-accent/20 transition-all hover:-translate-y-0.5 hover:shadow-accent/30"
+          size="lg"
+          className="shadow-lg shadow-accent/20 transition-all hover:-translate-y-0.5 hover:shadow-accent/30"
         >
           Get Started
-        </a>
-        <a
-          href={DOCS_URL}
-          className="flex h-12 items-center justify-center rounded-xl border border-white/10 bg-white/[0.03] px-8 font-semibold text-white transition-all hover:bg-white/[0.07]"
-        >
+        </Button>
+        <Button as="link" href={DOCS_URL} variant="secondary" size="lg">
           Read the Docs
-        </a>
+        </Button>
       </div>
 
       {/* Terminal Mockup */}
