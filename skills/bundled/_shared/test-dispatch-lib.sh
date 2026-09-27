@@ -8067,7 +8067,7 @@ assert_eq "T12g: '## Fire-Disposition-ish' en tête de ligne ⇒ lu présent, z�
 assert_eq "T12h: _FD_HEADING_RE est définie et non vide" "non-vide" \
     "$([ -n "${_FD_HEADING_RE:-}" ] && echo non-vide || echo vide)"
 _t2544_reads() {
-    if [ -n "${_FD_HEADING_RE:-}" ] && printf '%s\n' "$1" | grep -qiE "$_FD_HEADING_RE"; then
+    if [ -n "${_FD_HEADING_RE:-}" ] && grep -qiE -- "$_FD_HEADING_RE" <<<"$1"; then
         echo present
     else
         echo absent
