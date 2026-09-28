@@ -712,7 +712,7 @@ pub fn normalize_content(raw: &[u8]) -> String {
 pub fn compute_hash(normalized: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]
