@@ -168,7 +168,7 @@ rand = "0.10"
 hex = "0.4"
 hmac = "0.12"
 lru = "0.18"
-sha2 = "0.10"
+sha2 = "0.11"
 dialoguer = "0.12"
 
 # Testing
