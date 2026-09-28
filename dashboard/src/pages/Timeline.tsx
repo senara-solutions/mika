@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { useTimeline, type TimelineFilters } from '../api/timeline.ts'
 import { useAgents } from '../api/agents.ts'
-import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp, eventTypeBadge, LiveRefreshToggle } from '@samidarko/ui'
+import { Pagination, EmptyState, LoadingState, ErrorState, formatApiError, ListRow, AgentFilter, SelectFilter, TimeRangeFilter, formatTimestamp, eventTypeBadge, LiveRefreshToggle, Button } from '@samidarko/ui'
 import { useSearchParamsFilter } from '../hooks/useSearchParamsFilter.ts'
 import { useLiveRefresh } from '../hooks/useLiveRefresh.ts'
 import { Search } from 'lucide-react'
@@ -89,13 +89,9 @@ export default function Timeline() {
             onChange={(v) => updateFilter('event_type', v)}
             options={EVENT_TYPE_OPTIONS}
           />
-          <button
-            onClick={handleTraceSearch}
-            className="flex items-center gap-2 px-3 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-light transition-colors"
-          >
-            <Search size={14} />
+          <Button onClick={handleTraceSearch} icon={<Search size={14} />}>
             Search
-          </button>
+          </Button>
           <TimeRangeFilter
             value={{ from: filters.from, to: filters.to }}
             onChange={(range) => {

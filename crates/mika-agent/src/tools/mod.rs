@@ -487,6 +487,61 @@ pub async fn dispatch_substrate_diagnostic(
     }
 }
 
+/// Build a substrate-unavailability result **and** route its diagnostic, in one
+/// expression (mika#1964 U1).
+///
+/// This is the only production site that may call
+/// [`ToolOutput::substrate_unavailable`]. The reviewer of mika#1783 asked for a
+/// lint on `substrate_unavailable(` not followed by
+/// `dispatch_substrate_diagnostic(` — the coupled-call footgun. **A coupled call
+/// one can write apart is an open class; a call one can only write coupled is
+/// not.** So the footgun is removed rather than detected: there is no way to
+/// construct the result without routing it, because constructing and routing are
+/// one call.
+///
+/// `user_facing_fallback` must be neutral — no service name, no env var, no
+/// config path, no URL, no operator instruction. `diagnostic` carries all of
+/// that, and `dispatch_substrate_diagnostic` decides its channel by tier: the
+/// telemetry sink on family/champion, folded back into `content` on operator
+/// tier. Nothing is summarised or dropped; the operator-shaped text changes
+/// channel, not length.
+///
+/// The one-site property is held by rule 1 of `scripts/check-substrate-leak.sh`,
+/// with an allowlist shipped empty: when it fires, remove the second site rather
+/// than exempting it (mika#2201). A behavioural test cannot see that class — a
+/// second bare constructor makes no decision wrong the day it is written, it
+/// just sends operator detail to a family tenant the first time its branch is
+/// taken, with every existing assertion still green.
+pub async fn dispatch_substrate_unavailable(
+    user_facing_fallback: impl Into<String>,
+    diagnostic: impl Into<String>,
+    tool_name: &str,
+    ctx: &ToolContext<'_>,
+) -> ToolOutput {
+    let mut out = ToolOutput::substrate_unavailable(user_facing_fallback, diagnostic);
+    dispatch_substrate_diagnostic(&mut out, tool_name, ctx).await;
+    out
+}
+
+/// Attach an operator diagnostic to an **already-built** result and route it, in
+/// one expression (mika#1964 U1).
+///
+/// The sibling of [`dispatch_substrate_unavailable`], for the one case in the
+/// mika#1964 sweep where the result cannot be a substrate result:
+/// `send_message`'s no-sender arm must keep its [`DeliveryVerdict`] — mika#2136
+/// compares its text by equality — and `ToolOutput::substrate_unavailable` would
+/// drop it. Same coupling property: posing the diagnostic and routing it are one
+/// call, so the pair cannot be written apart.
+pub async fn attach_substrate_diagnostic(
+    output: &mut ToolOutput,
+    diagnostic: impl Into<String>,
+    tool_name: &str,
+    ctx: &ToolContext<'_>,
+) {
+    output.substrate_diagnostic = Some(diagnostic.into());
+    dispatch_substrate_diagnostic(output, tool_name, ctx).await;
+}
+
 /// Index a fact into the search system (FTS5 + optional vector embedding).
 ///
 /// Best-effort: logs warnings on failure but never propagates errors,

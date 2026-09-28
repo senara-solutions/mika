@@ -182,13 +182,38 @@ impl Tool for SendMessageTool {
             // inform the user.
             None => {
                 warn!("send_message called but no outbound sender configured");
-                Ok(ToolOutput::delivery(
-                    "No outbound sender configured — message was NOT delivered. \
-                     To enable Telegram delivery, set MIKA_ROUTING_URL and MIKA_INTERNAL_TOKEN.",
+                // mika#1964 — the ONLY site of the sweep whose neutral fallback carries
+                // a POSITIVE obligation: the `content` must keep stating that nothing
+                // was delivered, because the turn needs that fact in order not to claim
+                // it sent something (mika#2136). Only the second sentence — the two env
+                // vars — changes channel.
+                //
+                // `DeliveryOutcome::NoSender` and the captured `cleaned` are untouched:
+                // `DeliveryVerdict` compares texts by equality, so altering either would
+                // break the mika#2136 predicate. And the constructor stays
+                // `ToolOutput::delivery` rather than becoming a substrate result, for the
+                // reason stated above this arm: `ToolOutput::error` here would make the
+                // model retry a permanent condition in a loop.
+                let mut out = ToolOutput::delivery(
+                    "The message was NOT delivered — the person has not received it. \
+                     No outbound channel is available for this agent, so retrying will \
+                     not deliver it. Do not present it as sent.",
                     false,
                     cleaned.clone(),
                     DeliveryOutcome::NoSender,
-                ))
+                );
+                crate::tools::attach_substrate_diagnostic(
+                    &mut out,
+                    // substrate-diagnostic: the operator channel — the two variables are
+                    // the remedy and only the operator can apply it.
+                    "send_message has no outbound sender configured for this agent. \
+                     To enable Telegram delivery, set MIKA_ROUTING_URL and \
+                     MIKA_INTERNAL_TOKEN.",
+                    "send_message",
+                    ctx,
+                )
+                .await;
+                Ok(out)
             }
         }
     }
@@ -272,6 +297,65 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("NOT delivered"));
+        // mika#1964 — operator tier: the two variables are folded back in, after
+        // the non-delivery fact.
+        assert!(
+            result.content.contains("MIKA_ROUTING_URL"),
+            "operator tier lost the actionable detail: {}",
+            result.content
+        );
+    }
+
+    /// mika#1964 V3 — the one site whose neutral fallback carries a POSITIVE
+    /// obligation: family tier must still read that nothing was delivered
+    /// (mika#2136), must not read the two variables, and the verdict is intact.
+    #[tokio::test]
+    async fn mika1964_no_sender_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let result = SendMessageTool
+            .execute(serde_json::json!({"text": "Hello!"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(
+            result.content.contains("NOT delivered"),
+            "{}",
+            result.content
+        );
+        for token in ["MIKA_ROUTING_URL", "MIKA_INTERNAL_TOKEN", "Telegram"] {
+            assert!(
+                !result.content.contains(token),
+                "family tier leaked {token:?}: {}",
+                result.content
+            );
+        }
+        assert_eq!(
+            result
+                .delivery
+                .as_ref()
+                .expect("NoSender must still carry its verdict")
+                .outcome,
+            DeliveryOutcome::NoSender
+        );
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            events.iter().any(|e| e.tool_name == "substrate_unavailable"
+                && e.target_key == "send_message"
+                && e.after_value
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MIKA_ROUTING_URL")),
+            "the operator detail was dropped instead of routed: {events:?}"
+        );
     }
 
     #[tokio::test]

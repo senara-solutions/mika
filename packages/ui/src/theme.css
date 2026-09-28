@@ -62,6 +62,19 @@
   --color-heading: var(--color-on-surface);
   --color-muted: var(--color-on-surface-variant);
 
+  /* Roundedness scale per luminescent-core §6: "All interactive elements adhere
+     to the `xl` (1.5rem) or `lg` (1rem) scale."
+
+     Deliberately NOT named `--radius-xl` / `--radius-lg`. Tailwind v4 ships its
+     own `--radius-xl` at 0.75rem and `--radius-lg` at 0.5rem, so the rulebook's
+     names collide with Tailwind's at different values. Redefining Tailwind's
+     would silently move every `rounded-xl` and `rounded-lg` already written
+     across the dashboard and the landing — a blast radius nobody asked for, to
+     express two numbers. The prefixed names carry the rulebook's values without
+     touching anyone else's. (LC.2, mika#1801.) */
+  --radius-mika-xl: 1.5rem;
+  --radius-mika-lg: 1rem;
+
   /* Spacing scale per luminescent-core §6 (8px base, doubled rhythm) */
   --spacing-1: 0.25rem;   /*  4px */
   --spacing-2: 0.5rem;    /*  8px */
@@ -76,6 +89,194 @@
 
 html {
   scroll-behavior: smooth;
+}
+
+/* Rulebook §2 "Signature Textures" (luminescent-core.md:44) + §5 "Buttons"
+   (l.105): main CTAs are a `primary` -> `primary_dim` linear gradient at 135deg.
+   This is the SINGLE declaration of that texture, and LC.2 (mika#1801) is the
+   first time any surface applies it — every CTA in the repo was a flat
+   `bg-accent` until then.
+
+   It lives here, and not in `<Button>`'s TSX, because `theme.css` is the one file
+   all three surfaces already import (`site/` imports nothing else from this
+   package), because Tailwind v4 cannot express a 135deg gradient between two
+   arbitrary CSS variables without an arbitrary value repeated at every callsite,
+   and because this file is statically pinned — `theme.test.ts` asserts the angle,
+   the token order, and the absence of any colour literal. Written in TSX the
+   texture would be invisible to that guard.
+
+   Composes tokens, never literals: that is what keeps it tracking §2 when §2
+   moves. Pinned by `theme.test.ts` § "LC.2 (mika#1801) ... CTA texture". */
+.mika-cta-gradient {
+  background-image: linear-gradient(135deg, var(--color-primary), var(--color-primary-dim));
+}
+
+/* §5 prescribes no hover for the primary button, so this is an implementation
+   decision, named in the LC.2 PR body rather than invented into the rulebook.
+   It replaces the `hover:bg-accent-light` the five migrated CTAs carried — a
+   shift toward `--color-secondary`, i.e. darker — by sliding the gradient stops
+   toward `primary_dim`. No new colour is introduced, so the hover keeps tracking
+   §2 exactly as the rest state does.
+
+   `:not(:disabled)` because `:hover` fires on a disabled <button> in every
+   engine; it is vacuously true on the <a href> branch of <Button>, so one
+   selector serves both rendered elements. */
+.mika-cta-gradient:not(:disabled):hover {
+  background-image: linear-gradient(135deg, var(--color-primary) -25%, var(--color-primary-dim) 85%);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LC.2 (mika#1801) — <Button> and <Spinner> presentation.
+
+   WHY THIS IS CSS AND NOT TAILWIND UTILITIES, WHICH IS THE OPPOSITE OF EVERY
+   OTHER PRIMITIVE IN THIS PACKAGE.
+
+   Measured on this tree, 2026-09-27: **Tailwind does not scan `packages/ui`.**
+   Neither consumer declares an `@source`, and v4's automatic content detection
+   is rooted at the Vite root (`dashboard/`, `site/`), so a utility class that
+   exists only inside this package is never generated. Evidence, from
+   `dashboard/dist/assets/*.css` after `npm run build -w dashboard`:
+
+     class              lives in            in built CSS?
+     animate-spin       ui + dashboard/src  yes  (dashboard/src happens to use it)
+     h-5                ui + dashboard/src  yes  (idem)
+     w-9                ui only             NO   <- LiveRefreshToggle track
+     top-0.5            ui only             NO   <- LiveRefreshToggle thumb
+     translate-x-4      ui only             NO   <- LiveRefreshToggle thumb travel
+     w-1.5 / h-1.5      ui only             NO   <- StatusBadge dot
+     w-1/5 w-2/3 w-1/6  ui only             NO   <- LoadingState skeleton widths
+     outline-offset-... ui only             NO   <- ListRow focus ring
+
+   So the 15 primitives that predate LC.2 render correctly only by coincidence —
+   wherever a consumer's own source happens to contain the same class. That is a
+   latent defect of the package, with its own population and its own visual
+   review; repairing it means adding `@source` to both consumers, which would
+   change how badges, skeletons and toggles look across the whole dashboard. It
+   is NOT in LC.2's scope and is reported as a follow-up with this measurement.
+
+   What it does mean for LC.2 is decisive: `<Button>` is the first primitive whose
+   entire visual identity is classes no consumer source contains. Built on
+   Tailwind utilities it would ship with no padding, no radius, no focus ring and
+   no gradient — the migration of the 8 CTAs would be a visual regression rather
+   than the unification the ticket asks for. Declared here it cannot fail that
+   way: `theme.css` is plain CSS, already imported by all three surfaces, and by
+   mika-cloud with no configuration at all (which is what LC.3 consumes).
+
+   It is also what makes the §6 radius expressible. See `--radius-mika-*` above.
+
+   Tokens only, never literals — pinned by `theme.test.ts`.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.mika-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-2);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+  /* §6: `xl` (1.5rem). §5 prescribes it for Primary; §7's "No Sharp Corners"
+     extends the constraint to every interactive element, so it sits on the base
+     rather than on one variant. */
+  border-radius: var(--radius-mika-xl);
+  transition:
+    background-image 150ms ease,
+    background-color 150ms ease,
+    color 150ms ease,
+    border-color 150ms ease,
+    opacity 150ms ease;
+}
+
+/* `packages/ui/CLAUDE.md` § Accessibility Standards: "All interactive elements
+   must have visible `focus-visible:ring` or equivalent focus styles." */
+.mika-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary) 40%, transparent);
+  outline-offset: 2px;
+}
+
+/* Covers both rendered elements: `:disabled` is the <button> branch, and
+   `[aria-disabled="true"]` is there so a future disabled-link affordance cannot
+   silently lose the styling. <a> has no `:disabled`. */
+.mika-btn:disabled,
+.mika-btn[aria-disabled='true'] {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.mika-btn--sm {
+  padding: var(--spacing-2) var(--spacing-3);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.mika-btn--md {
+  padding: var(--spacing-2) var(--spacing-4);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.mika-btn--lg {
+  height: 3rem;
+  padding-inline: var(--spacing-8);
+  font-size: 1rem;
+  line-height: 1.5rem;
+}
+
+/* §5: "Primary: Gradient fill (`primary` to `primary_dim`), `xl` (1.5rem)
+   roundedness. No border."
+
+   The gradient itself is `.mika-cta-gradient` above — one declaration, composed
+   here rather than repeated, so the texture stays usable standalone (D2's whole
+   reason for putting it in this file).
+
+   Text is `on_surface`, not `#ffffff`: §7 Don't — "No Pure White: Never use
+   `#ffffff`. All 'white' text must be `on_surface` (#e8e8ec)." The five CTAs
+   migrated by LC.2 all carried `text-white`. */
+.mika-btn--primary {
+  border: 0;
+  color: var(--color-on-surface);
+}
+
+/* §5: "Secondary: Ghost style. `outline_variant` at 20% opacity border. On
+   hover, transition to `secondary_container` background." The 20% form is §4's
+   "Ghost Border Fallback" spelled out. */
+.mika-btn--secondary {
+  background-color: transparent;
+  border: 1px solid color-mix(in srgb, var(--color-outline-variant) 20%, transparent);
+  color: var(--color-on-surface);
+}
+
+.mika-btn--secondary:not(:disabled):hover {
+  background-color: var(--color-secondary-container);
+}
+
+/* §5: "Tertiary: Text-only using `primary` color, no background, for
+   low-priority actions." */
+.mika-btn--tertiary {
+  background-color: transparent;
+  border: 0;
+  color: var(--color-primary);
+}
+
+.mika-btn--tertiary:not(:disabled):hover {
+  color: var(--color-primary-container);
+}
+
+/* <Spinner>. Its own keyframes rather than Tailwind's `animate-spin`, for the
+   reason in the block comment above: `animate-spin` reaches the dashboard only
+   because `dashboard/src/components/InvestigationPanel.tsx` happens to use it,
+   and it reaches the landing and mika-cloud not at all. The animation is
+   identical to what that file renders today (1s linear rotation), so extracting
+   those three call sites changes no pixel. */
+@keyframes mika-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.mika-spin {
+  animation: mika-spin 1s linear infinite;
 }
 
 ::-webkit-scrollbar {

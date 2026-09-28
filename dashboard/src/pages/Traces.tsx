@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { Search } from 'lucide-react'
+import { Button } from '@samidarko/ui'
 
 export default function Traces() {
   const [traceId, setTraceId] = useState('')
@@ -35,14 +36,13 @@ export default function Traces() {
               className="w-full bg-bg border border-white/[0.06] rounded-lg pl-9 pr-3 py-2.5 text-sm text-heading placeholder:text-muted/30 focus:outline-none focus:border-accent/40 font-mono"
             />
           </div>
-          <button
+          <Button
             onClick={handleSearch}
             disabled={!traceId.trim()}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-light transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+            icon={<Search size={14} />}
           >
-            <Search size={14} />
             Search
-          </button>
+          </Button>
         </div>
         <p className="text-xs text-muted/40 mt-3">
           Trace IDs are 32-character hex strings that correlate events across messages, audit log, and tasks.
