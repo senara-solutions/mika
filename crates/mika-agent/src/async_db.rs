@@ -3563,6 +3563,23 @@ impl AsyncDatabase {
         .await
     }
 
+    /// Async wrapper for `Database::find_recent_build_invocation` (mika#2565).
+    pub async fn find_recent_build_invocation(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        window_secs: i64,
+    ) -> Result<Vec<crate::db::ToolCallRow>> {
+        let agent_id = agent_id.to_owned();
+        let session_id = session_id.to_owned();
+        let tool_name = tool_name.to_owned();
+        self.with_db(move |db| {
+            db.find_recent_build_invocation(&agent_id, &session_id, &tool_name, window_secs)
+        })
+        .await
+    }
+
     pub async fn query_llm_calls_by_session(
         &self,
         session_id: &str,

@@ -2656,6 +2656,103 @@ impl DependabotAbstention {
     /// `gh` a répondu, mais sa sortie n'est pas du JSON exploitable, ou ne
     /// porte pas `author.login`.
     pub const UNPARSEABLE: &'static str = "unparseable";
+    /// `gh` a répondu, mais sans `files` exploitable (mika#2565).
+    ///
+    /// Nom à soi plutôt qu'un repli sur [`Self::UNPARSEABLE`] : la population
+    /// doit être comptable séparément (sonde S4 du plan mika#2565). Un `files`
+    /// illisible signifie que B3 ne peut pas se prononcer, donc que le défaut
+    /// mesuré peut repasser — c'est le coût du fail-open, et il se mesure.
+    pub const NO_FILES: &'static str = "no_files";
+    /// La preuve de build n'est pas lisible en base (mika#2565).
+    ///
+    /// Typiquement `MIKA_STORE_TOOL_CALLS` désarmé : la table `tool_calls` est
+    /// vide et B3 refuserait **tout** `pass`, ce qui est le mode de panne
+    /// inverse du défaut et couche la revue. Même arbitrage que
+    /// `stuck_pending_activity_not_recorded` (mika#2184), et même conduite pour
+    /// l'opérateur : vérifier le réglage, pas le prédicat.
+    pub const BUILD_EVIDENCE_UNAVAILABLE: &'static str = "build_evidence_unavailable";
+}
+
+/// Variable de fenêtre de la preuve de build lue par B3 (mika#2565).
+pub const QA_BUILD_EVIDENCE_WINDOW_ENV: &str = "MIKA_QA_BUILD_EVIDENCE_WINDOW_SECS";
+
+/// Fenêtre par défaut de la preuve de build, en secondes (2 h).
+///
+/// Le défaut est large parce que le coût des deux erreurs n'est pas le même :
+/// une fenêtre trop courte refuse un build **réel** et casse une revue
+/// légitime ; une fenêtre trop longue laisse passer un build de la **même
+/// session**, ce qui reste un fait moteur. Un `build_mika` est long-running
+/// (`estimated * 3`, plancher 600 s) et son callback peut revenir bien après le
+/// tour qui l'a lancé.
+pub const QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS: i64 = 7200;
+
+/// Plafond dur de la fenêtre : 30 jours.
+///
+/// Même figure et même raison que les bornes hautes de `task_engine` : un
+/// réglage absurde rendrait le terme « un build a eu lieu » vrai pour toujours,
+/// c'est-à-dire désarmerait B3 sous couvert de configuration.
+pub const QA_BUILD_EVIDENCE_WINDOW_MAX_SECS: i64 = 30 * 24 * 3600;
+
+/// Parse pur de la fenêtre de preuve de build (mika#2565).
+///
+/// Trois paliers maison — absent ou vide → défaut ; illisible, `0`, négatif, ou
+/// au-delà de [`QA_BUILD_EVIDENCE_WINDOW_MAX_SECS`] → défaut **plus un WARN
+/// nommant la valeur entre guillemets**, sans quoi un espace parasite est
+/// invisible (mika#2220). `0` ne désarme pas : ce serait un désarmement par
+/// coquille sur une garde de sûreté.
+pub fn parse_qa_build_evidence_window(raw: Option<&str>) -> i64 {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<i64>() {
+            Ok(secs) if secs > 0 && secs <= QA_BUILD_EVIDENCE_WINDOW_MAX_SECS => secs,
+            _ => {
+                tracing::warn!(
+                    event = "qa_build_evidence_window_invalid",
+                    env = QA_BUILD_EVIDENCE_WINDOW_ENV,
+                    value = %format!("{:?}", v),
+                    default = QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS,
+                    "mika#2565: valeur de fenêtre de preuve de build invalide — repli sur le défaut"
+                );
+                QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS
+            }
+        },
+        _ => QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS,
+    }
+}
+
+/// Résout la fenêtre de preuve de build depuis l'environnement (mika#2565).
+pub fn qa_build_evidence_window_secs() -> i64 {
+    parse_qa_build_evidence_window(std::env::var(QA_BUILD_EVIDENCE_WINDOW_ENV).ok().as_deref())
+}
+
+/// Les noms de base des fichiers qui décrivent la résolution de dépendances
+/// Rust.
+///
+/// Comparaison sur le **segment final**, jamais `contains` : un fichier
+/// `docs/Cargo.toml-migration.md` parle de `Cargo.toml` et n'en est pas un, et
+/// lui demander une compilation serait un refus sans remède.
+const CARGO_DEPENDENCY_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
+
+/// Le diff de la PR touche-t-il la résolution de dépendances Rust ?
+///
+/// Le discriminant est le **FICHIER**, jamais l'écosystème deviné depuis le
+/// titre : un bump npm ou `actions/*` ne se ferme pas par `build_mika`, et lui
+/// demander une compilation Rust serait un refus dont l'auteur n'a aucun moyen
+/// de sortir. C'est aussi ce qui rend AC3 structurel — une PR docs-only
+/// `pipeline-exempt` n'entre pas dans la population, donc aucun build n'est
+/// exigé d'elle.
+///
+/// Vrai dès qu'un chemin a pour nom de base `Cargo.toml` ou `Cargo.lock`, à
+/// n'importe quelle profondeur : la racine du workspace comme les crates
+/// membres. Les séparateurs `\` sont tolérés parce que `gh` rend des chemins de
+/// dépôt (toujours `/`) mais que rien n'oblige un futur appelant à en faire
+/// autant ; la comparaison reste exacte et sensible à la casse — `cargo.toml`
+/// n'existe pas dans un dépôt Rust et l'accepter élargirait la population sans
+/// raison mesurée.
+pub fn is_cargo_dependency_pr(files: &[String]) -> bool {
+    files.iter().any(|path| {
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+        CARGO_DEPENDENCY_FILES.contains(&base)
+    })
 }
 
 /// Ce que le titre d'une PP dependabot dit du delta de version.
@@ -2780,25 +2877,43 @@ pub enum DependabotVerdictOutcome {
         from: String,
         to: String,
     },
+    /// **B3** (mika#2565) — un `pass` sur une PR dependabot dont le diff touche
+    /// la résolution de dépendances Rust, sans qu'aucun build n'ait tourné dans
+    /// cette session.
+    ///
+    /// Ajout en queue, **jamais un renommage** : les deux populations
+    /// existantes gardent leur nom et les `GROUP BY` publiés restent exacts.
+    RefusedUnbuiltCargoBump { author: String, files_seen: usize },
     /// Rien à refuser : hors population, ou tous les termes satisfaits.
     Allowed,
 }
 
-/// Les deux classifications, en une fonction pure, sur les seuls faits lus.
+/// Les trois classifications, en une fonction pure, sur les seuls faits lus.
 ///
 /// `verdict_is_pipeline_block` et `verdict_is_pass` sont passés plutôt que le
 /// `Verdict` lui-même : ce module ne dépend pas de `server::verdict`, et le
-/// point de décision doit rester testable sans construire un verdict.
+/// point de décision doit rester testable sans construire un verdict. Idem pour
+/// `build_observed` (mika#2565) : la lecture en base est faite par l'appelant,
+/// exactement comme il fait déjà la lecture réseau de `title`, ce qui garde
+/// cette fonction **pure**.
 ///
-/// **L'ordre des deux branches ne peut pas compter** : un corps ne porte qu'un
-/// verdict, donc les deux prédicats sont mutuellement exclusifs par
-/// construction. Le `title` n'est lu que par B2.
+/// **B1 et B2 restent mutuellement exclusifs** — un corps ne porte qu'un
+/// verdict. **L'ordre de B3 vis-à-vis de B2 compte, lui**, et il est
+/// délibérément B3 **avant** B2 : un bump majeur Rust satisfait les deux
+/// prédicats, et le refus le plus informatif est celui qui nomme le build.
+/// mika#2519 a mesuré que l'`API-SURFACE:` de #2561 était **présente, sincère,
+/// détaillée, et insuffisante** — refuser d'abord sur l'assertion enverrait le
+/// modèle réécrire la ligne qui n'était déjà pas le problème.
+///
+/// `files` n'est lu que par B3, `title` que par B2.
 pub fn classify_dependabot_verdict(
     author_login: &str,
     verdict_is_pipeline_block: bool,
     verdict_is_pass: bool,
     title: &str,
     body: &str,
+    files: &[String],
+    build_observed: bool,
 ) -> DependabotVerdictOutcome {
     if !is_automated_pr_author(author_login) {
         return DependabotVerdictOutcome::Allowed;
@@ -2807,6 +2922,19 @@ pub fn classify_dependabot_verdict(
     if verdict_is_pipeline_block {
         return DependabotVerdictOutcome::RefusedUnreachablePipelineBlock {
             author: author_login.to_string(),
+        };
+    }
+
+    // B3 — mika#2565. Le seul signal qui attrape les DEUX cas mesurés est la
+    // compilation : #2561 (utoipa 5 → 6) portait une `API-SURFACE:` réelle et
+    // fausse sur la conclusion, et #2560 (sha2 0.10 → 0.11) est hors de B2 par
+    // `NoMajorJump` — son incompatibilité est **transverse** (`sha2 0.11` sur
+    // `digest 0.11` contre `hmac 0.12` sur `digest 0.10`) et ne se voit sur
+    // aucun site d'appel de `sha2`. Seul le résolveur de cargo la voit.
+    if verdict_is_pass && !build_observed && is_cargo_dependency_pr(files) {
+        return DependabotVerdictOutcome::RefusedUnbuiltCargoBump {
+            author: author_login.to_string(),
+            files_seen: files.len(),
         };
     }
 
@@ -5543,6 +5671,35 @@ mod tests {
         /// La forme exacte du titre de #2454 — celle dont mika#2525 a mesuré,
         /// deux commits plus tard, que le build était vert et le bump cassé.
         const TITLE_2454: &str = "Bump jsonwebtoken from 9.3.1 to 11.1.0";
+
+        /// Les deux branches de mika#2519, **avec le terme de mika#2565
+        /// neutralisé** : un build a tourné dans cette session.
+        ///
+        /// C'est délibéré et c'est ce qui garde ces tests lisibles : ils
+        /// mesurent B1 et B2, pas la précédence. Les laisser tomber dans B3
+        /// changerait leur sujet sans le dire — un `pass` sur #2453 serait
+        /// refusé « faute de build » et le contrôle négatif porteur du ticket
+        /// mika#2519 mesurerait autre chose que ce que son nom annonce.
+        ///
+        /// La précédence B3-avant-B2, elle, est épinglée par son propre test
+        /// dans le module `mika2565` ci-dessous.
+        fn classify_2519(
+            author: &str,
+            is_pipeline_block: bool,
+            is_pass: bool,
+            title: &str,
+            body: &str,
+        ) -> DependabotVerdictOutcome {
+            classify_dependabot_verdict(
+                author,
+                is_pipeline_block,
+                is_pass,
+                title,
+                body,
+                &["Cargo.lock".to_string()],
+                true,
+            )
+        }
 
         // -- Reconnaissance d'auteur : égalité exacte, jamais sous-chaîne --
 

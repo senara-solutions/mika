@@ -2346,6 +2346,62 @@ impl Database {
         Ok(rows)
     }
 
+    /// Les invocations de `build_mika` de cette session, dans une fenêtre
+    /// (mika#2565, branche B3).
+    ///
+    /// Sœur de [`Self::find_recent_destructive_actions`] (mika#1646), et pour la
+    /// même raison d'être : **un fait qu'on lit en base ne se rédige pas.** La
+    /// branche B2 exige une *assertion* dans le corps du verdict, et mika#2519 a
+    /// mesuré que le modèle en produit une — sincère, détaillée, et insuffisante.
+    /// B3 exige un **fait moteur** : un appel `build_mika` réellement enregistré.
+    /// Une garde qui chercherait une ligne `BUILD-VERIFIED:` dans le corps serait
+    /// B2 sous un autre nom.
+    ///
+    /// **Scopée à la SESSION, pas seulement à l'agent** — l'inverse de mika#1646,
+    /// et l'inversion est raisonnée. Là-bas le défaut était un rejeu venu d'un
+    /// contexte qui ne partageait aucune mémoire avec le premier, donc la
+    /// détection devait survivre au processus. Ici la question est « cette
+    /// revue-ci a-t-elle compilé cette PR-ci ? » : un build lancé pour une
+    /// **autre** PR il y a dix minutes ne vaut rien, et l'accepter rendrait la
+    /// garde satisfaisable par le trafic de fond.
+    ///
+    /// `tool_name` est passé par le paramètre plutôt qu'écrit ici : le nom
+    /// canonique est [`crate::qa_build_callback::BUILD_MIKA_TOOL`], et un
+    /// littéral recopié serait une seconde vérité.
+    ///
+    /// **L'échec de lecture n'est pas un `false`.** La méthode rend `Result`, et
+    /// l'appelant distingue « aucun build » (refus) de « la base n'a pas
+    /// répondu » (abstention) — sans quoi `MIKA_STORE_TOOL_CALLS` désarmé
+    /// refuserait tout `pass` en silence.
+    pub fn find_recent_build_invocation(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        window_secs: i64,
+    ) -> Result<Vec<ToolCallRow>> {
+        let cutoff = timestamp::now_minus(Duration::seconds(window_secs));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_id, session_id, trace_id, llm_call_id,
+                    step, tool_name, tool_source, skill_name,
+                    input, output, success, non_zero_exit,
+                    latency_ms, error_message, created_at
+             FROM tool_calls
+             WHERE agent_id = ?1
+               AND session_id = ?2
+               AND tool_name = ?3
+               AND created_at >= ?4
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![agent_id, session_id, tool_name, cutoff],
+                Self::row_to_tool_call,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ===== LLM Call Queries (Dashboard) =====
 
     pub fn query_llm_calls_by_trace(&self, trace_id: &str) -> Result<Vec<LlmCallRow>> {
