@@ -47,7 +47,15 @@ export default function CopyButton({
           className={`absolute transition-opacity duration-150 text-success ${copied ? 'opacity-100' : 'opacity-0'}`}
         />
       </span>
-      <span className="sr-only" role="status" aria-live="polite">
+      {/* `.mika-sr-only` and not Tailwind's `sr-only`: Tailwind does not scan
+          `packages/ui`, so `sr-only` reached a consumer only where that
+          consumer's own source happened to use it. Measured 2026-09-28: it is
+          in the dashboard's built CSS solely because `CostTrendChart.tsx` uses
+          it, and it is in neither the landing's nor mika-cloud's — where this
+          live region therefore rendered as visible text. LC.2b (mika#2562)
+          declares the class in `theme.css`, so routing this callsite to it is
+          the fix, not a rename. */}
+      <span className="mika-sr-only" role="status" aria-live="polite">
         {copied ? 'Copied' : ''}
       </span>
     </button>

@@ -35,6 +35,12 @@ export type {
 } from './components/Button.tsx'
 export { default as Spinner } from './components/Spinner.tsx'
 export type { SpinnerSize, SpinnerProps } from './components/Spinner.tsx'
+export { default as SecretField } from './components/SecretField.tsx'
+export type { SecretFieldProps } from './components/SecretField.tsx'
+export { default as AuthCard } from './components/AuthCard.tsx'
+export type { AuthCardProps } from './components/AuthCard.tsx'
+export { default as Stepper } from './components/Stepper.tsx'
+export type { StepperStep, StepperStepState, StepperProps } from './components/Stepper.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

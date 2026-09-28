@@ -279,6 +279,258 @@ html {
   animation: mika-spin 1s linear infinite;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   LC.2b (mika#2562) — <SecretField>, <AuthCard> and <Stepper> presentation.
+
+   Same reason as the LC.2 block above, and it is not a stylistic preference:
+   **Tailwind does not scan `packages/ui`** (measurement and evidence table in
+   that block). A utility written inside this package is never generated, so
+   these three primitives built on utilities would ship with no surface, no
+   radius and no focus ring — exactly the regression LC.2 had to avoid for
+   `<Button>`.
+
+   It matters more here than it did there, because the only consumer of these
+   three is `mika-cloud`, which imports `theme.css` and nothing else of this
+   package's build configuration.
+
+   Tokens only, never literals — pinned by `theme.test.ts`, whose "compose
+   tokens only" rule scans every `.mika-` rule in this file and therefore picks
+   these up with no edit.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Visually hidden, still announced.
+
+   `sr-only` is a Tailwind utility and is therefore NOT generated for this
+   package. `CopyButton.tsx` uses it and renders correctly only where a
+   consumer's own source happens to contain the class — one instance of the
+   latent defect the LC.2 block measures. `<Stepper>` carries per-step state
+   that is *only* visual (a check glyph), so it needs a form of this that
+   cannot fail that way. */
+.mika-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* §5 "Input Fields", applied literally: background `surface_container_lowest`,
+   border `outline_variant` at 10% opacity, focus border → `primary` with a 4px
+   outer `primary_dim` blur at 10% opacity.
+
+   The *secret* half of `<SecretField>` — masking, the reveal control — has no
+   rulebook section (mika#2562 §2.1 measured that) and is derived from the one
+   measured caller instead. This rule is the half the rulebook does describe, so
+   it is written from §5 rather than from the caller's Tailwind classes. */
+.mika-field {
+  display: block;
+  width: 100%;
+  background-color: var(--color-surface-container-lowest);
+  border: 1px solid color-mix(in srgb, var(--color-outline-variant) 10%, transparent);
+  /* §6 `lg` (1rem), and §7 Don't — "No Sharp Corners". */
+  border-radius: var(--radius-mika-lg);
+  color: var(--color-on-surface);
+  padding: var(--spacing-3) var(--spacing-4);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.mika-field::placeholder {
+  color: var(--color-on-surface-variant);
+}
+
+.mika-field:focus {
+  /* `2px solid transparent` and not `none`: in forced-colors mode the
+     box-shadow below is dropped, and `none` would leave the field with no focus
+     indicator at all. A transparent outline is repainted by the OS palette
+     there and is invisible everywhere else. */
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-primary-dim) 10%, transparent);
+}
+
+.mika-field-label {
+  display: block;
+  margin-bottom: var(--spacing-2);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  font-weight: 500;
+  color: var(--color-on-surface);
+}
+
+.mika-field-wrap {
+  position: relative;
+  display: block;
+}
+
+/* The secret grammar, from the measured caller. */
+.mika-field--secret {
+  font-family: var(--font-mono);
+  /* Clears the reveal control. The caller writes `pr-14` (3.5rem), which is off
+     the §6 8px scale; `spacing-16` (4rem) is the nearest on-scale value that
+     still clears a `sm` tertiary button reading "Hide". */
+  padding-right: var(--spacing-16);
+}
+
+/* Positioning only. The control itself is `<Button variant="tertiary" size="sm">`,
+   so its colour, radius, hover and focus ring come from `.mika-btn--tertiary`
+   and cannot drift away from §5 — which is also why this rule declares no
+   colour and would be vacuously green under the token-only scan either way. */
+.mika-field-reveal {
+  position: absolute;
+  right: var(--spacing-2);
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+/* <AuthCard>. The full-height centring is part of the primitive because both
+   measured callers (`Login.tsx`, `Signup.tsx`) carry it identically. */
+.mika-auth-screen {
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+  /* Not in the measured callers. Without it the card touches the viewport edge
+     below 24rem, which is most phones in portrait. */
+  padding: var(--spacing-4);
+}
+
+.mika-auth-card {
+  width: 100%;
+  /* Measured `max-w-sm`. */
+  max-width: 24rem;
+  /* §7 Do — "Layer with Intent": one tier above `background`. This is the
+     canonical spelling of the `--color-bg-card` alias the callers write. */
+  background-color: var(--color-surface-container);
+  /* Measured `rounded-2xl` = 1rem = the §6 `lg` step. */
+  border-radius: var(--radius-mika-lg);
+  /* Measured `p-8`. */
+  padding: var(--spacing-8);
+}
+
+/* §7 Do — "Asymmetric Whitespace": the gap below the header is 4x the
+   title→subtitle gap. */
+.mika-auth-card__header {
+  text-align: center;
+  margin-bottom: var(--spacing-8);
+}
+
+.mika-auth-card__logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: var(--spacing-6);
+}
+
+.mika-auth-card__title {
+  font-size: 1.5rem;
+  line-height: 2rem;
+  font-weight: 700;
+  color: var(--color-on-surface);
+}
+
+.mika-auth-card__subtitle {
+  margin-top: var(--spacing-2);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--color-on-surface-variant);
+}
+
+/* <Stepper>. No hover, no focus rule, no cursor: the measured caller drives the
+   active step from server state and the steps are not navigable, so none of the
+   pills is an interactive element. */
+.mika-stepper {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.mika-stepper__step {
+  display: flex;
+  align-items: flex-start;
+}
+
+.mika-stepper__marker {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-2);
+}
+
+.mika-stepper__pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--spacing-8);
+  height: var(--spacing-8);
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  font-weight: 600;
+}
+
+/* §7 Don't — "No Pure White": the check sits on `primary`, so its ink is the
+   darkest surface rather than #ffffff. */
+.mika-stepper__pill--complete {
+  background-color: var(--color-primary);
+  color: var(--color-surface-container-lowest);
+}
+
+.mika-stepper__pill--current {
+  background-color: color-mix(in srgb, var(--color-primary) 20%, transparent);
+  border-color: color-mix(in srgb, var(--color-primary) 50%, transparent);
+  color: var(--color-on-surface);
+}
+
+.mika-stepper__pill--upcoming {
+  background-color: var(--color-surface-container-high);
+  color: var(--color-on-surface-variant);
+}
+
+.mika-stepper__label {
+  max-width: 6rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+  text-align: center;
+  color: var(--color-on-surface-variant);
+}
+
+.mika-stepper__step--current .mika-stepper__label {
+  color: var(--color-on-surface);
+}
+
+/* Measured `w-8 h-px`. §5's divider ban targets 1px rules *between list items*
+   and §7's "No Heavy Borders" targets a border reached for "to solve a layout
+   issue"; a progress connector is neither — it carries state, turning `primary`
+   once the step behind it is done. Written out rather than done silently,
+   because the two rules sit close enough to be read as covering it. */
+.mika-stepper__connector {
+  flex: none;
+  width: var(--spacing-8);
+  height: 1px;
+  /* Aligns on the pill's centre (2rem tall) rather than the marker's, since the
+     label hangs below the pill. */
+  margin-top: var(--spacing-4);
+  margin-inline: var(--spacing-2);
+  background-color: var(--color-outline-variant);
+}
+
+.mika-stepper__connector--complete {
+  background-color: color-mix(in srgb, var(--color-primary) 50%, transparent);
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;

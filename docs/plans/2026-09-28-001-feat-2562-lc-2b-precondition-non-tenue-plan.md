@@ -1,64 +1,62 @@
-# mika#2562 — LC.2b : la précondition n'est pas tenue, et une seconde s'y ajoutait
+# mika#2562 — LC.2b : la halte est levée, l'extraction est livrée
 
-> **Nature de ce plan : halte-et-remontée.** Il ne livre aucune ligne de code, et
-> ce refus est son livrable. Le ticket porte une précondition explicite ; elle est
-> mesurée **non tenue** sur ses deux voies, et le grooming en a trouvé une
-> seconde que le corps ne nomme pas. Écrire ici une API pour `PasswordInput`,
-> `AuthCard` et `Stepper` reproduirait mot pour mot le défaut que mika#1801 (LC.2)
-> a refusé de commettre en reportant ces trois-là plutôt qu'en les devinant.
+> **Nature de ce plan : halte-et-remontée, puis son exécution.** Il a été écrit
+> comme un refus — la précondition du ticket était mesurée non tenue sur ses deux
+> voies, et le grooming en avait trouvé une seconde que le corps ne nomme pas.
+> **Les trois blocages sont tombés**, le dernier par le geste que ce plan appelait
+> nommément, et le périmètre de §7 a été exécuté.
 >
-> **Re-mesuré au dispatch d'exécution (§0).** La seconde condition — LC.2 non
-> mergé — est **levée** ; les deux voies de la précondition déclarée, elles,
-> rendent le même verdict qu'au grooming. **La halte tient, et le verdict est
-> inchangé.** Avant de lire la suite : §0 pour l'état, Halte 4 (§9) pour le
-> contresens que cette levée rend possible.
+> **Ordre de lecture.** §0 pour l'état des trois blocages et l'instant de chaque
+> levée. **§5.1 pour ce que les appelants mesurés fixent, axe par axe** — c'est ce
+> qui remplace le refus d'API de §5, et c'est la section à lire avant le code.
+> Les mesures antérieures sont conservées avec leur date plutôt qu'effacées : un
+> plan qui réécrit ses mesures pour n'afficher que l'état courant cesse d'être une
+> mesure pour devenir une opinion.
+>
+> **Le nom du fichier dit encore `precondition-non-tenue`, et il n'est pas
+> renommé.** Le callout `> - **Plan:**` du corps du ticket pointe ce chemin
+> littéral, et c'est lui que lisent `auto_pull::is_groomed` et
+> `dispatch-lib.sh::_extract_plan_path` ; renommer sans pouvoir éditer le corps
+> (`gh` non authentifié dans ce bac à sable) casserait le routage groom/implement
+> au lieu de clarifier quoi que ce soit. Le titre ci-dessus porte l'état réel.
 
-## 0. Re-mesure au dispatch d'exécution — un blocage est tombé, la halte tient
+## 0. État des trois blocages — les trois sont tombés
 
-Ce plan a été groomé et committé quelques heures avant le dispatch qui l'exécute.
-Dans cet intervalle, **une de ses trois mesures a cessé d'être vraie**, et sa
-propre Halte 2 (§9) prescrit de la relire plutôt que de la suivre. Cette section
-est cette relecture. Les mesures qui la fondent sont les commandes de §9,
-rejouées à `HEAD == origin/main == fab69e13`.
+Ce plan a été groomé, puis re-mesuré à deux dispatches successifs qui ont
+maintenu sa halte, puis **levé**. Le tableau porte les trois verdicts avec
+l'instant de chacun ; les commandes qui les fondent sont celles de §9.
 
-| # | blocage | verdict au grooming (§2, §3) | verdict à l'exécution | mesure |
+| # | blocage | verdict au grooming (§2, §3) | verdict courant | ce qui l'a levé |
 |---|---|---|---|---|
-| B1 | g1 : aucune section de rulebook | non tenu | **tient toujours** | `grep -niE 'password\|secret field\|auth card\|centered card\|stepper' docs/design/luminescent-core.md` → 0 ligne ; dernier commit du rulebook `76a8b0de`, **2026-08-23**, inchangé |
-| B1′ | g2 : aucun callsite lisible | non tenu | **tient toujours** | 0 callsite dans l'arbre ; `/data/workspace/mika-platform/` ne porte que `claude-pilot` et `mika` — `mika-cloud` absent de l'hôte |
-| B2 | LC.2 non mergé, recouvrement de 3 fichiers | bloquant | **LEVÉ** | `fab69e13` (PR #2556) est le HEAD de `origin/main` ; `packages/ui` porte 17 primitives dont `Button.tsx` et `Spinner.tsx`, et `package.json` est à `0.4.0` |
+| B1 | g1 : aucune section de rulebook | non tenu | **toujours non tenu** — et sans objet | rien. Le rulebook est resté à `76a8b0de` (2026-08-23). La précondition porte sur g1 **ou** g2 ; g2 étant tenue, B1 ne bloque plus (§6) |
+| B1′ | g2 : aucun callsite lisible | non tenu | **LEVÉ** | commentaire opérateur sur mika#2562, 2026-09-28T16:04:52Z : trois appelants réels lus dans `mika-cloud` à `origin/main` 5cb2544 |
+| B2 | LC.2 non mergé, recouvrement de 3 fichiers | bloquant | **LEVÉ** | `fab69e13` (PR #2556) mergé sur `origin/main` ; `packages/ui` à `0.4.0`, 17 primitives, `Button.tsx` et `Spinner.tsx` présents |
 
-**Dernière re-mesure — `origin/main == f772b2e1`, branche à jour (`behind: 0`).**
-Les trois commandes de §9 ont été rejouées à ce troisième instant : B1 rend
-0 ligne et le rulebook est toujours à `76a8b0de` (2026-08-23) ; B1′ rend 0
-callsite et `/data/workspace/mika-platform/` ne porte toujours que `claude-pilot`
-et `mika` ; B2 reste levé (`Button.tsx`, `Spinner.tsx`, `0.4.0`, 35 fichiers dans
-`components/`). **Les trois verdicts sont inchangés.** Les deux commits arrivés
-sur `main` depuis `fab69e13` sont des bumps de dépendances Rust (`sha2`,
-`utoipa`) qui ne touchent ni le rulebook, ni `packages/ui/`, ni un callsite.
-*Cette ligne est un ancrage : un dispatch ultérieur la remplace par sa propre
-mesure, il ne l'empile pas — sans quoi ce plan accumulerait une section par
-re-drive.* Les mesures datées ci-dessus, elles, sont conservées : voir le
-paragraphe suivant.
+**La levée de B1′ est exactement le geste que ce plan appelait**, et par la voie
+qu'il désignait comme la moins chère (§6 : *« Le geste le moins cher est B1′, et
+il tient en une ligne de commentaire »*). Le pilote précédent avait écrit
+« `mika-cloud` absent de l'hôte » : vrai de son **bac à sable**, qui ne monte pas
+ce dépôt, et faux de l'hôte — c'est la limite que §2.2 avait nommée comme
+structurelle, et elle l'était bien, puisque seul un geste extérieur au dispatch
+l'a franchie.
 
-**Conséquence, et elle est celle de §6 appliquée telle quelle :** B1 **ou** B1′
-suffirait pour la précondition déclarée, et **aucun des deux n'est tenu**. B2
-était cumulatif ; le lever ne dispense de rien. **La précondition du ticket reste
-non tenue, la disposition halte-et-remontée reste en vigueur, et ce plan ne
-propose toujours aucune API.**
+**Conséquence de conduite, et c'est un renversement, pas une nuance :** la
+précondition déclarée du ticket porte sur g1 **ou** g2. g2 est tenue, donc
+**la précondition est tenue**, B1 cesse d'être nécessaire, et le périmètre de §7
+s'ouvre. La disposition halte-et-remontée est **éteinte** ; ce plan n'est plus un
+refus mais le compte rendu de la mesure qui l'a précédé, plus les axes que les
+appelants fixent (§5.1).
 
-Ce qui change n'est donc pas la conduite, c'est la **lecture** : §3 décrit un
-blocage résolu, et le laisser affirmer au présent que « LC.2 n'est pas mergé »
-enverrait son prochain lecteur sur une piste morte. Les sections concernées sont
-redatées ci-dessous plutôt que réécrites — la mesure du grooming est conservée
-avec sa date, parce qu'effacer ce qui a été observé pour n'afficher que l'état
-courant est la façon dont un plan cesse d'être une mesure pour devenir une
-opinion.
+*Ancrage, remplaçable et non cumulatif : un dispatch ultérieur remplace ce
+paragraphe par sa propre mesure, il ne l'empile pas.* Les mesures datées des
+sections suivantes sont conservées telles quelles.
 
-**Ce que la re-mesure n'a pas pu établir :** `gh` n'est toujours pas authentifié
-dans ce bac à sable (`gh auth status` → *not logged into any GitHub hosts*), et
-le contexte de dispatch n'a livré que le corps du ticket. La Halte 1 de §9 reste
-donc ouverte **à l'identique** : si un commentaire opérateur tient g1 ou g2, §2.2
-est périmé et cette halte l'est avec lui.
+**Ce que ce plan n'a toujours pas pu établir lui-même.** `gh` n'est authentifié
+dans aucun des trois bacs à sable successifs (`gh auth status` → *not logged into
+any GitHub hosts*). La Halte 1 de §9 avait tiré la bonne conséquence — *aucun
+re-dispatch ne la lèvera, quel qu'en soit le nombre* — et c'est en effet un geste
+d'opérateur qui l'a levée, en injectant le contenu des commentaires dans le
+contexte de dispatch. La halte est donc **réalisée**, pas contournée.
 
 ## 1. Ce que ce plan établit, et ce qu'il ne fait pas
 
@@ -76,8 +74,10 @@ Il établit **par mesure**, à l'instant du grooming (`HEAD == origin/main`,
    (§3). **Vraie au grooming, et le merge de LC.2 l'a rendue exacte depuis** : le
    corps du ticket n'a plus besoin d'être corrigé sur ce point.
 
-Il ne propose **aucune signature, aucun nom de prop, aucun axe de discrimination**
-pour les trois primitives. Ce silence est délibéré : voir §5.
+Il n'a proposé, tant que la précondition n'était pas tenue, **aucune signature,
+aucun nom de prop, aucun axe de discrimination** pour les trois primitives. Ce
+silence était délibéré (§5) et il a duré exactement aussi longtemps qu'il
+devait : §5.1 le remplace, et chacun de ses axes cite l'appelant qui le fixe.
 
 ## 2. La précondition déclarée, mesurée voie par voie
 
@@ -109,7 +109,14 @@ n'y est pas.
 décrit pas, avec une section nommant ses surfaces consommatrices (§8.3). Extraire
 maintenant serait inventer trois grammaires en contournement de cette procédure.
 
-### 2.2 Voie g2 — un callsite réel est-il lisible ? **Non.**
+### 2.2 Voie g2 — un callsite réel est-il lisible ? **Non au grooming — LEVÉ depuis**
+
+> **Statut : levé le 2026-09-28T16:04:52Z**, par un commentaire opérateur portant
+> trois appelants réels lus dans `mika-cloud` à `origin/main` 5cb2544 — §0 pour la
+> levée, §5.1 pour ce qu'ils fixent. Cette section est conservée plutôt
+> qu'effacée parce que sa seconde mesure — l'inexécutabilité de g2 **depuis un
+> dispatch** — est restée vraie de bout en bout et explique pourquoi la levée ne
+> pouvait venir que du dehors.
 
 Deux mesures, et la seconde est structurelle.
 
@@ -282,47 +289,120 @@ révéler, et toute union serait décorative.
 > le premier appelant réel démontrera qu'elle est fausse, après qu'elle aura été
 > publiée sous un numéro de version mineur et consommée.
 
+## 5.1 Ce que les appelants fixent — les axes, et qui les tranche
+
+Les trois appelants ont été lus dans `mika-cloud` à `origin/main` 5cb2544 et
+déposés dans le ticket (commentaire du 2026-09-28T16:04:52Z). Chaque ligne
+ci-dessous reprend **une question que §5 posait** et donne la réponse de
+l'appelant. Aucune n'est tranchée par principe.
+
+### `SecretField` — `web/src/pages/onboarding/ApiKeysStep.tsx`
+
+| question de §5 | réponse mesurée | conséquence d'API |
+|---|---|---|
+| `autocomplete` vaut-il `current-password` ou `new-password` — et si les deux, l'axe est-il une prop ou deux composants ? | **Ni l'un ni l'autre.** Le seul champ masqué de la console est une **clé API** ; l'authentification passe entièrement par Google OAuth et aucun écran ne porte de mot de passe. La valeur mesurée est `off`. | **Aucune union.** `autoComplete` est une prop plate de défaut `off`. L'axe que §5 anticipait n'existe pas — le discriminer aurait produit l'union décorative que D1 de LC.2 refuse |
+| la bascule reveal est-elle un bouton dans le champ ou à côté ? | **Dans le champ**, `absolute right-2 top-1/2`, avec `pr-14` sur l'input pour lui faire place | `.mika-field-wrap` en `position: relative`, contrôle en absolu. `pr-14` (3,5 rem) est **hors de l'échelle §6** : recalé sur `--spacing-16` |
+| l'état révélé est-il contrôlé ou interne ? | **Interne** (`showKey` en état local, rien à l'extérieur ne le lit) | `useState` dans la primitive. Pas de prop, donc pas d'axe contrôlé/non-contrôlé |
+| — (non posée par §5, imposée par l'appelant) | l'erreur de champ est rendue **sous** l'input **par l'appelant** | la primitive **ne rend pas** l'erreur ; elle expose `invalid` + `describedBy`, sans quoi l'extraction rendrait cette erreur inatteignable par un lecteur d'écran |
+| — | le contrôle est un bouton **texte** (`Show` / `Hide`), pas une icône | rendu par `<Button variant="tertiary" size="sm">` — §5 définit tertiary comme « text-only using `primary` color … for low-priority actions », soit exactement ce contrôle |
+
+**Le nom est une décision mesurée.** Le ticket offre `PasswordInput` / `SecretField`
+sans trancher. L'appelant tranche : il n'existe aucun mot de passe dans la
+console, donc `PasswordInput` nommerait une population de zéro. C'est
+`SecretField`.
+
+### `AuthCard` — `web/src/pages/Login.tsx` et `web/src/pages/Signup.tsx`
+
+§4.1 posait la question ainsi : *« ce qui fait la valeur d'un `AuthCard` est ce
+qu'il impose à son contenu — largeur maximale, place du logo, du titre, de
+l'erreur de formulaire, du lien secondaire »*. Les deux appelants répondent, et
+ils répondent **identiquement**, ce qui est la condition pour que la forme soit
+une primitive et non la page d'un seul écran.
+
+| axe | réponse mesurée | conséquence d'API |
+|---|---|---|
+| largeur maximale | `w-full max-w-sm` | `max-width: 24rem` dans la primitive |
+| la primitive porte-t-elle le centrage plein écran ? | **oui** — `flex min-h-screen items-center justify-center`, mot pour mot dans les deux | `.mika-auth-screen` en fait partie. C'est la moitié « centrée » du couple `AuthCard` / `CenteredCard` |
+| place du logo | en-tête centré, au-dessus du titre | slot `logo?: ReactNode`, **injecté par le consommateur** — la bibliothèque ne peut pas dépendre du `<Logo />` de la console (même séparation que `<AgentFilter agents>`) |
+| titre, sous-titre | `h1` puis un sous-titre muted, centrés | `title` / `subtitle?`. Niveau `h1` **non configurable** : sur les deux appelants la carte *est* la page |
+| erreur de formulaire, lien secondaire | **rien de commun** — un CTA pleine largeur et un lien d'alternance, différents entre les deux | `children` libre. Aucune API n'est tirée d'une forme qui varie |
+| le pied de page ? | **hors de la carte**, fixé en bas, et sur `Login` **seulement** | **exclu de la primitive.** Une prop `footer` aurait été une API pour un appelant sur deux |
+
+**Le nom retenu est `AuthCard`** : la grammaire d'en-tête qu'il impose est
+propre à l'authentification, et le nommer par sa forme (`CenteredCard`)
+l'inviterait sur des surfaces qui veulent la boîte sans la grammaire.
+
+### `Stepper` — `web/src/pages/Onboarding.tsx`, fonction `StepProgress`
+
+| question de §5 | réponse mesurée | conséquence d'API |
+|---|---|---|
+| nombre d'étapes fixe ou dynamique ? | **dynamique**, fonction du tier : `getStepIds(tier)` rend 3 ou 4 identifiants | `steps: { id, label }[]` en prop |
+| les étapes passées sont-elles cliquables ? | **non** — l'étape est pilotée par l'état serveur via `statusToStep` | aucune prop `onStepClick`, et surtout : un `<ol>` et **non** un `<nav>`. Un point de repère de navigation qui ne contient rien de navigable est un mensonge fait aux technologies d'assistance |
+| y a-t-il un état d'erreur par étape ? | **non**, l'appelant n'en a aucun | trois états seulement : `complete` / `current` / `upcoming` |
+| — (non posée par §5, et décisive) | l'étape terminale `success` est **exclue de l'affichage** par l'appelant, alors que `statusToStep` peut la rendre comme courante | `current` peut nommer une étape **absente** de `steps`. Lu comme « au-delà de la fin » : toutes les étapes visibles sont complètes — ce qui est vrai à cet instant-là. Coût nommé : une faute de frappe dans `current` rend la même chose |
+| `current` : identifiant ou index ? | la liste dépend du tier, donc l'index 1 est `apikey` sur un tier et `provisioning` sur un autre | **identifiant.** Un index désignerait silencieusement une autre étape selon le locataire |
+| le connecteur | `w-8 h-px`, accent/50 si l'étape derrière est faite, neutre sinon | `.mika-stepper__connector`. §5 interdit les filets d'1 px **entre éléments de liste** et §7 les bordures prises « pour résoudre un problème de mise en page » : un connecteur de progression n'est ni l'un ni l'autre — il porte un état. Nommé plutôt que fait en silence |
+
+### Ce que les appelants ne fixent pas, et qui n'a donc pas été écrit
+
+`disabled`, `required`, `name` sur `SecretField` : aucun appelant ne les passe.
+Les ajouter « par symétrie » aurait rouvert des sous-décisions que rien ne
+tranche — notamment si la bascule reveal reste vivante sur un champ désactivé,
+qui est une question de produit et non de primitive. Elles sont additives le jour
+où un appelant les demande.
+
 ## 6. Ce qui lève chaque blocage, et par qui
 
 | # | blocage | statut | geste qui le lève | propriétaire | atteignable depuis un dispatch `mika` ? |
 |---|---|---|---|---|---|
-| B1 | g1 : aucune section de rulebook | **ouvert** | ajouter à `luminescent-core.md` les sections décrivant les trois patterns, en nommant leurs surfaces consommatrices (§8.3) | **Vincent** (le rulebook est mis à jour par commits directs) | non |
-| B1′ | g2 : aucun callsite lisible | **ouvert** | déposer au moins un appelant réel **dans ce dépôt ou dans le ticket** — extrait collé en commentaire d'issue, fixture, ou ticket LC.3 portant le code | LC.3 / `mika-cloud` | non |
+| B1 | g1 : aucune section de rulebook | **ouvert, et sans objet** | ajouter à `luminescent-core.md` les sections décrivant les trois patterns, en nommant leurs surfaces consommatrices (§8.3) | **Vincent** (le rulebook est mis à jour par commits directs) | non |
+| B1′ | g2 : aucun callsite lisible | ~~ouvert~~ **LEVÉ** (2026-09-28T16:04:52Z) | déposer au moins un appelant réel **dans ce dépôt ou dans le ticket** | opérateur, par commentaire d'issue | non — et c'est bien du dehors qu'il est venu |
 | B2 | LC.2 non mergé, recouvrement de 3 fichiers | ~~bloquant~~ **LEVÉ** (`fab69e13`, PR #2556) | — | boucle QA / opérateur | — |
 
-B1 **ou** B1′ suffit pour la précondition déclarée, et **ni l'un ni l'autre n'est
-tenu**. B2 était cumulatif — il devait être levé *en plus*, et dans l'ordre
-`main` ← LC.2 puisque c'est lui qui fixait la forme du tableau, du bloc d'export
-et de la version. **Il l'a été** (§3.3), ce qui retire une condition sans en
-satisfaire aucune autre : la précondition déclarée du ticket porte sur g1/g2
-seules.
+B1 **ou** B1′ suffit pour la précondition déclarée. **B1′ est tenu**, donc la
+précondition l'est, et B1 n'est plus nécessaire. B2 était cumulatif — il devait
+être levé *en plus*, et dans l'ordre `main` ← LC.2 puisque c'est lui qui fixait
+la forme du tableau, du bloc d'export et de la version ; **il l'a été** (§3.3).
+Les trois conditions sont donc satisfaites, chacune par son propriétaire.
 
-**Il reste donc deux gestes, dont un seul suffit** — et aucun des deux n'est
-exécutable par un pilote dispatché sur `mika`. C'est ce qui fait de ce plan une
-remontée et non une étape, et ce qui rend un re-dispatch sans geste préalable
-structurellement stérile : il rejouerait cette même mesure pour rendre ce même
-verdict.
+**B1 reste ouvert, et ce n'est pas un reliquat à refermer en passant.** Le
+rulebook ne décrit toujours ni la grammaire du champ secret, ni la carte
+d'authentification, ni le stepper. §8 réserve à Vincent l'ajout d'un pattern
+qu'il ne décrit pas ; les implémentations livrées sont donc dérivées des
+appelants mesurés **plus** les contraintes §6/§7 qui lient toute surface, jamais
+d'une section inventée. Le manque est remonté comme suivi opérateur dans
+`packages/ui/CLAUDE.md`, exactement comme LC.1 a remonté la contradiction du hex
+d'erreur §5.5/§2 au lieu de la trancher dans le rulebook.
 
-**Le geste le moins cher est B1′, et il tient en une ligne de commentaire.** Le
-ticket l'autorise explicitement (*« même par simple lecture d'un fichier de la
-console »*) : coller dans un commentaire de mika#2562 le corps d'un écran de login
-ou d'onboarding de `mika-cloud` suffit à fixer les axes que §5 énumère. Il n'a
-besoin ni d'un accès à `mika-cloud` depuis cet hôte, ni d'une décision de
-rulebook.
+**Ce qui a levé B1′ est le geste que cette section désignait comme le moins
+cher**, et il a effectivement tenu en une ligne de commentaire : le ticket
+l'autorise explicitement (*« même par simple lecture d'un fichier de la
+console »*). Il a fallu qu'il vienne d'un opérateur — §2.2 avait établi que
+c'était structurel, et trois bacs à sable successifs l'ont confirmé.
 
-## 7. Le périmètre qui s'exécutera, quand les trois seront levés
+## 7. Le périmètre, et ce qui a été livré
 
-Inchangé, et transcrit ici pour que le prochain dispatch n'ait pas à le rederiver.
-Les points 1 à 5 sont ceux du corps du ticket ; la colonne de droite dit ce dont
-chacun dépend.
+Les points 1 à 5 sont ceux du corps du ticket.
 
-| # | livrable | dépend de | état de la dépendance |
+| # | livrable | état | ce qui a été fait |
 |---|---|---|---|
-| 1 | les trois primitives dans `@samidarko/ui`, exportées depuis `src/index.ts` | B1/B1′ pour l'API ; ~~B2 pour la forme du bloc d'export~~ | **ouvert** sur B1/B1′ ; la forme du bloc d'export est fixée par LC.2 (§3.3) |
-| 2 | chacune : ≥ 1 test de comportement **et** une assertion `jest-axe` (`packages/ui/CLAUDE.md` § Accessibility Standards) | 1 | ouvert par 1 |
-| 3 | types stricts ; union discriminée seulement sur l'axe que les callsites révèlent | B1′ — c'est le callsite qui fournit l'axe | **ouvert** |
-| 4 | tableau des primitives de `packages/ui/CLAUDE.md` mis à jour ; règle d'enforcement **seulement** si la primitive a une population à garder | ~~B2~~ | **résolu** — le tableau est celui que LC.2 a réécrit, **17** primitives |
-| 5 | bump mineur de `@samidarko/ui` | ~~B2~~ | **résolu** — le point de départ est `0.4.0`, plus `0.3.1` |
+| 1 | les trois primitives dans `@samidarko/ui`, exportées depuis `src/index.ts` | **livré** | `SecretField.tsx`, `AuthCard.tsx`, `Stepper.tsx` + présentation dans `theme.css` ; exports ajoutés au bloc que LC.2 a fixé |
+| 2 | chacune : ≥ 1 test de comportement **et** une assertion `jest-axe` | **livré** | 49 tests sur les trois, dont 8 assertions `axe` couvrant chaque état rendu |
+| 3 | types stricts ; union discriminée seulement sur l'axe que les callsites révèlent | **livré** | **aucune union** sur les trois, et c'est le résultat de la mesure : §5.1 montre que chaque axe candidat est tranché identiquement par l'appelant unique. Une union y aurait été une interface sous plusieurs noms |
+| 4 | tableau des primitives mis à jour ; règle d'enforcement **seulement** si la primitive a une population à garder | **livré** | 3 lignes ajoutées au tableau ; **zéro règle d'enforcement**, avec le motif écrit — voir la note ci-dessous |
+| 5 | bump mineur de `@samidarko/ui` | **livré** | `0.4.0` → `0.5.0` |
+
+**Sur la présentation, un point que le périmètre ne nommait pas et qui décide de
+tout.** LC.2 a mesuré que **Tailwind ne scanne pas `packages/ui`** : une
+utilitaire écrite dans ce paquet n'est jamais générée. Les trois primitives
+auraient donc été livrées sans surface, sans rayon et sans anneau de focus si
+elles avaient été bâties sur des utilitaires. Leur présentation vit dans
+`theme.css`, comme celle de `<Button>`, et pour la même raison mesurée — elle
+compte davantage ici, le seul consommateur des trois étant `mika-cloud`, qui
+importe `theme.css` et rien d'autre de la configuration de build de ce paquet.
+Contrôle positif et négatif exécutés après coup sur le CSS bâti du dashboard :
+les nouvelles règles `.mika-*` y sont, et `.w-9` (écrite uniquement dans
+`packages/ui`) n'y est toujours pas.
 
 Note sur le point 4, qui est le plus facile à mal exécuter : la clause
 « seulement si la primitive a une population à garder » signifie que même après
@@ -343,30 +423,69 @@ silence se lirait comme une conformité. C'est nommément la classe mika#2205 �
 garde qu'on n'a pas déployée se lit exactement comme une flotte saine* — et la
 raison pour laquelle le point 4 dit « seulement si ».
 
-## 8. Le gate détecteur de mika#2306 ne s'applique pas
+## 8. Fire-Disposition
 
-Ce plan ne livre **aucun** détecteur : ni test, ni assertion, ni règle de lint, ni
-garde CI, ni validateur de schéma, ni scan structurel, ni garde EndTurn. Il ne
-livre aucune ligne de code. La section `## Fire-Disposition` n'est donc pas
-requise — gate **N/A** au sens littéral de la règle mika#2306, qui prescrit de ne
-pas l'inventer quand il n'y a pas de détecteur à disposer.
+> **Ce titre n'était pas requis tant que ce plan était une halte** : il ne livrait
+> alors aucun détecteur, et mika#2306 prescrit de ne pas inventer la section quand
+> il n'y a rien à disposer. La levée de B1′ change cela — l'extraction livre des
+> détecteurs, et voici leur disposition.
 
-Cette absence est écrite plutôt que laissée au silence, parce qu'un titre manquant
-et un titre non requis se lisent identiquement.
+Les détecteurs livrés sont des tests unitaires, exécutés par
+`npm test --prefix packages/ui` et par la CI. Aucune garde CI nouvelle, aucun scan
+de source, aucun script — et c'est délibéré : voir la note sur la population nulle
+au point 4 de §7.
 
-Pour mémoire et sans l'appliquer à un détecteur : la disposition du **plan** est
-l'option (c) de mika#1574, halte-et-remontée — l'implémentation s'arrête et remonte
-à l'opérateur pour cadrage. C'est la disposition que le corps du ticket prescrit
-déjà de lui-même (*« Dispatcher ce ticket avant que l'un des deux soit tenu
-reproduit exactement le défaut que LC.2 a refusé de commettre »*).
+| détecteur | ce qu'il refuse | disposition quand il tire |
+|---|---|---|
+| `SecretField.test.tsx`, `AuthCard.test.tsx`, `Stepper.test.tsx` (49 tests) | une régression de comportement sur un axe que §5.1 attribue à un appelant mesuré | **corriger le code.** Si c'est l'appelant qui a changé, re-lire le callsite dans `mika-cloud` et mettre §5.1 à jour **avant** de toucher l'assertion — c'est la mesure qui gouverne, pas le test |
+| les 8 assertions `axe` des trois fichiers | une violation d'accessibilité sur un état rendu | **corriger le rendu.** `packages/ui/CLAUDE.md` § Accessibility Standards fait de l'assertion manquante un review-fail : la retirer n'est pas une option disponible |
+| `theme.test.ts` § LC.2b (22 assertions) | une règle `.mika-*` qui cesse de composer les tokens §2, perd le rayon §6, supprime l'anneau de focus, ou cache la classe `sr-only` d'une manière qui la retire aussi de l'arbre d'accessibilité | **corriger la CSS.** Ces assertions disent ce que les classes *signifient* ; le test de composant ne dit que quelle classe est émise |
+| l'anti-vacuité globale de `theme.test.ts` (plancher `>= 32`) | un scan devenu aveugle — préfixe renommé, règles disparues — qui se lirait comme un fichier propre | **établir quelles règles ont quitté le fichier.** Ne pas baisser le plancher pour faire passer le build : un plancher qui cesse de suivre le fichier est un plancher qui cesse de garder |
+
+**Contrôle négatif exécuté, et non supposé.** Les deux assertions les plus
+porteuses ont été vérifiées par mutation avant d'être retenues : passer
+`type="submit"` au contrôle reveal, et remplacer le repli `current` hors liste par
+l'index brut. Exactement trois tests rougissent, et ce sont les trois attendus.
+Sans cette vérification, le test de soumission de formulaire aurait pu être vide
+de sens — il dépend de ce que jsdom émet réellement au clic.
+
+**Disposition du plan lui-même :** la halte-et-remontée de mika#1574 option (c)
+a été **réalisée** — l'implémentation s'est arrêtée deux fois et est remontée à
+l'opérateur, qui a levé la précondition au troisième tour. Elle est éteinte.
 
 ## 9. Vérification
 
-Ce plan n'introduisant aucun code, sa vérification est la reproductibilité de ses
-mesures. Chacune est une commande, et **chacune doit rendre le résultat annoté
-tant que le blocage correspondant tient**. Les deux premières sont celles du
-grooming, rejouées inchangées au dispatch d'exécution ; la troisième a changé de
-résultat attendu, et c'est très exactement ce que §0 enregistre.
+Deux moitiés : les mesures de la halte, et la vérification du code qui l'a suivie.
+
+### 9.1 Vérification du code livré
+
+```bash
+npm test      --prefix packages/ui   # 350 tests, 21 fichiers
+npm run typecheck --prefix packages/ui
+npm run build --prefix packages/ui
+npm run build --prefix dashboard     # le consommateur bâtit toujours
+```
+
+**Contrôle positif et négatif de la décision de présentation**, qui est la seule
+partie non évidente : les règles `theme.css` doivent atteindre le CSS bâti d'un
+consommateur, là où une utilitaire Tailwind écrite dans `packages/ui` ne
+l'atteint pas.
+
+```bash
+grep -o -E 'mika-sr-only|mika-field--secret|mika-auth-card|mika-stepper__connector' \
+  dashboard/dist/assets/index-*.css | sort | uniq -c   # attendu : non vide
+grep -c -E '\.w-9[,{ ]' dashboard/dist/assets/index-*.css   # attendu : 0
+```
+
+Mesuré le 2026-09-28 : les quatre classes sont présentes, `.w-9` est absente —
+donc la mesure fondatrice de LC.2 tient toujours sur cet arbre, et c'est elle qui
+justifie que la présentation ne soit pas écrite en utilitaires.
+
+### 9.2 Les mesures de la halte, conservées
+
+Chacune est une commande, et chacune rendait le résultat annoté **tant que le
+blocage correspondant tenait**. Elles sont conservées pour que la levée reste
+vérifiable dans les deux sens.
 
 ```bash
 # B1 — aucune des trois sections de rulebook           [attendu : 0 ligne]
@@ -392,23 +511,20 @@ nul (27 au dispatch d'exécution), et `ls packages/ui/src/components/ | wc -l` u
 inventaire non vide (35 fichiers, 17 primitives et leurs tests). *Un scan
 silencieusement inerte se lit exactement comme un arbre propre.*
 
-**Quatre haltes à la relecture de ce plan :**
+**Cinq haltes à la relecture de ce plan :**
 
-- **Halte 1 — les commentaires du ticket ne m'ont pas été livrés. Toujours
-  ouverte, et structurellement.** `gh` n'est pas authentifié dans ce bac à sable
-  (`gh auth status` → *not logged into any GitHub hosts*), et le contexte injecté
-  ne portait que le corps — au grooming, au dispatch d'exécution, **et au
-  re-dispatch suivant**, où la tentative a été refaite et a échoué à l'identique.
-  Trois instants consécutifs : ce n'est donc pas un accident d'une session mais
-  une propriété du bac à sable, et il faut en tirer la même conséquence de
-  conduite que §2.2 tire pour g2 — **aucun re-dispatch ne lèvera cette halte, quel
-  qu'en soit le nombre.** La lecture des commentaires est un geste d'opérateur, ou
-  un enrichissement du contexte injecté ; elle n'est pas atteignable d'ici.
-  Si un commentaire opérateur tient g1 ou g2 —
-  par exemple un extrait de callsite collé par Vincent, ce que g2 autorise
-  explicitement — alors §2.2 est **périmé** et ce plan doit être révisé plutôt que
-  suivi. C'est la première chose à établir avant d'agir sur cette remontée, et la
-  seule que ni le grooming ni l'exécution n'ont pu établir eux-mêmes.
+- **Halte 1 — les commentaires du ticket ne m'ont pas été livrés. RÉALISÉE, et
+  c'est elle qui a débloqué le ticket.** `gh` n'était authentifié dans aucun des
+  trois bacs à sable successifs (`gh auth status` → *not logged into any GitHub
+  hosts*), et le contexte injecté ne portait que le corps. Cette halte prescrivait
+  ceci, mot pour mot : *« si un commentaire opérateur tient g1 ou g2 … alors §2.2
+  est périmé et ce plan doit être révisé plutôt que suivi »*. **C'est exactement ce
+  qui s'est produit** — un commentaire opérateur du 2026-09-28T16:04:52Z a déposé
+  trois appelants réels, et ce plan a été révisé (§0, §5.1) au lieu d'être suivi.
+  Elle avait aussi tiré la bonne conséquence de conduite : aucun re-dispatch ne
+  l'aurait levée, et aucun ne l'a levée — c'est un geste extérieur qui l'a fait.
+  Conservée parce qu'une halte qu'on supprime cesse d'expliquer pourquoi le
+  déblocage devait venir du dehors.
 - **Halte 2 — si une mesure de §9 cesse de rendre le résultat attendu**, le blocage
   correspondant est levé : ne pas re-dispatcher à l'aveugle, relire §6 pour savoir
   s'il restait cumulatif avec un autre. **Cette halte s'est réalisée** entre le
@@ -420,15 +536,22 @@ silencieusement inerte se lit exactement comme un arbre propre.*
   mergé : il n'y a plus de branche sur quoi empiler, et l'ordre prescrit — `main`
   ← LC.2, puis LC.2b — est tenu. Conservée parce qu'une halte qu'on supprime cesse
   d'expliquer pourquoi l'ordre était le bon.
-- **Halte 4 — ne pas lire « B2 est levé » comme « le ticket est débloqué ».**
-  C'est le contresens que cette mise à jour rend possible, et le seul qu'elle
-  crée. Un lecteur qui ouvre §0, voit un blocage passer au vert et en conclut
-  que le travail peut commencer aurait sauté §6 : **B2 était cumulatif, jamais
-  alternatif.** La précondition déclarée du ticket porte sur g1 et g2, elle n'a
-  jamais porté sur l'ordre de merge, et les deux mesures qui la tranchent rendent
-  aujourd'hui le résultat qu'elles rendaient au grooming. Le verdict d'exécution
-  est **identique** à celui du grooming ; seule la liste des gestes restants a
-  raccourci.
+- **Halte 4 — ne pas lire « B2 est levé » comme « le ticket est débloqué ».
+  Toujours vraie, et toujours utile, mais ce n'est plus B2 qui décide.** Elle
+  gardait contre un contresens précis : B2 était cumulatif, jamais alternatif, et
+  le lever ne fournissait ni section de rulebook ni callsite. C'est **B1′** qui a
+  débloqué, et seulement lui. Un lecteur qui ouvrirait §0 aujourd'hui, verrait
+  trois lignes vertes et en conclurait que tout a été satisfait se tromperait
+  encore : **B1 n'est pas tenu**, il est devenu *sans objet* parce que la
+  précondition est une disjonction. La différence compte pour le rulebook — §6
+  dit pourquoi le manque reste ouvert et remonté plutôt que comblé ici.
+- **Halte 5 — ne pas lire l'absence de règle d'enforcement comme un oubli.**
+  Le point 4 du périmètre dit « **seulement si** la primitive a une population à
+  garder », et les trois n'en ont aucune dans ce dépôt : leur consommateur est
+  `mika-cloud`. Une huitième règle dans `packages/ui/CLAUDE.md` passerait au vert
+  tous les jours sans jamais rien regarder, et son silence se lirait comme une
+  conformité — classe mika#2205. Le motif est écrit dans `packages/ui/CLAUDE.md`
+  lui-même, pour que le prochain relecteur trouve la décision et non le vide.
 
 ## 10. Definition of Done
 
@@ -453,18 +576,29 @@ silencieusement inerte se lit exactement comme un arbre propre.*
 - [x] Le périmètre d'exécution futur est transcrit, chaque point annoté de sa
       dépendance (§7).
 - [x] La non-applicabilité du gate mika#2306 est déclarée avec sa raison (§8).
-- [x] Les **quatre** haltes de relecture sont écrites, dont la limite de ma propre
-      mesure (Halte 1) et le contresens que la levée de B2 rend possible
-      (Halte 4) — §9.
-- [ ] **Non fait, et c'est le contrat :** aucun code, aucun test, aucun export,
-      aucun bump de version, aucune règle d'enforcement.
+- [x] Les **cinq** haltes de relecture sont écrites, dont la limite de ma propre
+      mesure (Halte 1, **réalisée** — c'est elle qui a débloqué le ticket) et le
+      contresens que la levée de B2 rend possible (Halte 4) — §9.
+- [x] **La halte a tenu jusqu'à ce que la précondition soit tenue**, et pas un
+      tour de plus : deux dispatches ont rendu le même refus, le troisième a
+      trouvé g2 satisfaite et a exécuté.
+- [x] Les axes d'API sont **dérivés des appelants**, un par un, chacun citant le
+      fichier qui le fixe (§5.1) — y compris les deux que §5 n'avait pas anticipés
+      (l'erreur rendue par l'appelant, l'étape courante hors de la liste).
+- [x] Les cinq points du périmètre sont livrés (§7), avec **zéro règle
+      d'enforcement** et le motif écrit.
+- [x] Le manque de rulebook (B1) est **remonté** à Vincent dans
+      `packages/ui/CLAUDE.md`, pas comblé ici — §8 du rulebook le lui réserve.
 
 ## Acceptance criteria
 
-Le ticket ne porte pas de section `## Acceptance criteria`. Les critères ci-dessous
-sont dérivés de sa précondition et du périmètre de ce plan de halte. **Ils portent
-sur la remontée, pas sur l'extraction** — les critères de l'extraction elle-même
-sont ceux du §7, et ils ne deviennent évaluables qu'une fois B1/B1′ et B2 levés.
+Le ticket ne porte pas de section `## Acceptance criteria`. Les critères AC1 à AC9
+ci-dessous ont été dérivés de sa précondition et portaient **sur la remontée**.
+Ils sont conservés parce qu'ils ont gouverné deux dispatches et que leur
+satisfaction est ce qui a rendu la halte défendable ; **trois d'entre eux
+(AC4, AC5, AC7) sont explicitement périmés par la levée** et le disent en place.
+Les critères de l'extraction elle-même sont ceux du §7, et AC10 à AC12 ci-dessous
+les complètent.
 
 1. **AC1 — la précondition est tranchée par mesure, pas par citation.** Les deux
    voies g1 et g2 sont chacune évaluées par une commande reproductible dont le
@@ -481,21 +615,28 @@ sont ceux du §7, et ils ne deviennent évaluables qu'une fois B1/B1′ et B2 le
    cumulatif avec la précondition plutôt qu'alternatif. **Sa levée au dispatch
    d'exécution est mesurée et datée** (§0, §3.3), et la nature cumulative est
    réaffirmée là où elle décide : le lever ne satisfait ni g1 ni g2.
-4. **AC4 — aucune API n'est inventée.** Le plan ne contient aucune signature,
-   aucun nom de prop, aucun axe de discrimination, aucun squelette de composant
-   pour `PasswordInput` / `SecretField`, `AuthCard` / `CenteredCard`, `Stepper`.
-   Le refus est motivé pour chacune des trois, en citant l'axe qu'un callsite
-   aurait révélé.
-5. **AC5 — aucune règle d'enforcement sans population.** Aucune ligne n'est
-   ajoutée à `packages/ui/CLAUDE.md`, et le plan dit pourquoi une telle règle
-   resterait muette même après extraction (les consommateurs vivent dans
-   `mika-cloud`).
+4. **AC4 — aucune API n'est inventée. ~~Tenu~~ → PÉRIMÉ par la levée, et
+   remplacé par AC10.** Il était tenu tant que la précondition ne l'était pas :
+   le refus était motivé pour chacune des trois en citant l'axe qu'un callsite
+   aurait révélé. g2 tenue, ces axes **sont** révélés, et ne pas les écrire serait
+   devenu le défaut inverse. §5.1 les écrit, chacun avec le fichier qui le fixe.
+5. **AC5 — aucune règle d'enforcement sans population. Tenu, et il survit à la
+   levée** — c'est le seul des trois. Il portait sur l'absence de ligne dans
+   `packages/ui/CLAUDE.md` tant qu'aucune primitive n'existait ; il vaut encore
+   après extraction, pour la raison que le plan donnait déjà : les consommateurs
+   vivent dans `mika-cloud`, donc la population reste nulle **dans ce dépôt**. Le
+   tableau des primitives gagne trois lignes — ce n'est pas une règle
+   d'enforcement — et la section « Enforcement Rules » n'en gagne aucune, avec le
+   motif écrit à l'endroit où un relecteur cherchera l'oubli.
 6. **AC6 — la remontée est actionnable.** Chaque blocage porte le geste qui le
    lève, son propriétaire, et la mention explicite qu'aucun des trois n'est
    exécutable par un pilote dispatché sur `mika`.
-7. **AC7 — l'arbre est inchangé hors de ce fichier.** Le diff de cette branche ne
-   contient que ce plan : aucun fichier sous `packages/ui/`, `dashboard/`,
-   `site/` ou `crates/` n'est touché.
+7. **AC7 — l'arbre est inchangé hors de ce fichier. ~~Tenu~~ → PÉRIMÉ par la
+   levée, et remplacé par AC11.** Il était le contrôle mécanique de la halte :
+   tant que la précondition n'était pas tenue, le diff ne devait contenir que ce
+   plan. Il l'a été sur deux dispatches. Le périmètre s'étant ouvert, le diff
+   touche désormais `packages/ui/` — et `dashboard/`, `site/`, `crates/` restent
+   intacts, ce qui est la part de AC7 qui garde un sens et que AC11 reprend.
 8. **AC8 — la limite de la mesure est écrite.** Le plan déclare que les
    commentaires du ticket ne lui ont pas été livrés (`gh` non authentifié) et que
    la lecture d'un commentaire tenant g1 ou g2 périme §2.2. **La tentative a été
@@ -506,14 +647,31 @@ sont ceux du §7, et ils ne deviennent évaluables qu'une fois B1/B1′ et B2 le
    d'exécution ; le verdict de chacun est donné avec sa commande ; les sections
    qu'une levée périme sont redatées plutôt qu'effacées ; et le contresens que
    cette levée rend possible — lire un blocage tombé comme un ticket débloqué —
-   est nommé en Halte 4. Le verdict d'ensemble est inchangé : la précondition
-   déclarée n'est pas tenue, et aucune API n'est proposée.
+   est nommé en Halte 4. Le verdict d'ensemble était inchangé à ces deux
+   instants ; il a changé au troisième, et §0 le mesure de la même façon.
+10. **AC10 — chaque axe d'API cite l'appelant qui le fixe.** §5.1 reprend une par
+    une les questions que §5 posait comme non répondables, et donne pour chacune
+    le fichier `mika-cloud` qui la tranche. Deux axes que §5 n'avait pas anticipés
+    y figurent aussi : l'erreur de champ rendue par l'appelant, et l'étape
+    courante qui peut légitimement ne pas être dans la liste affichée. **Aucune
+    union discriminée n'est livrée**, et c'est le résultat de la mesure, pas une
+    omission : chaque axe candidat est tranché identiquement par l'appelant
+    unique, donc une union y serait une interface sous plusieurs noms — la
+    décoration que D1 de LC.2 refuse.
+11. **AC11 — le diff est borné à `packages/ui/` et à ce plan.** Aucun fichier sous
+    `dashboard/`, `site/` ou `crates/` n'est touché. L'adoption des trois
+    primitives par une surface est LC.3, comme le corps du ticket le dit.
+12. **AC12 — la présentation atteint réellement un consommateur.** Les règles
+    `.mika-*` ajoutées à `theme.css` sont vérifiées présentes dans le CSS bâti du
+    dashboard, et le contrôle négatif (`.w-9`, écrite uniquement dans
+    `packages/ui`, absente) confirme que la mesure fondatrice de LC.2 tient
+    toujours. Sans ce couple, « la primitive est stylée » et « la primitive est
+    stylée dans un fichier que personne ne compile » se lisent identiquement.
 
 ## 11. Hors périmètre, délibérément
 
-- **L'extraction des trois primitives.** C'est le périmètre du ticket, et il
-  s'ouvre quand §6 est tenu. Ce plan ne le réduit pas : il en date la
-  précondition.
+- ~~**L'extraction des trois primitives.**~~ **Livrée** (§7) — la précondition
+  est tenue depuis la levée de B1′.
 - **L'adoption customer-facing** — c'est LC.3, comme le corps le dit déjà.
 - **Une quatrième variante de `<Button>`** (`confirm` / `destructive`) — décision
   produit §8, ticket séparé si Vincent la veut (LC.2 D4).
@@ -525,6 +683,11 @@ sont ceux du §7, et ils ne deviennent évaluables qu'une fois B1/B1′ et B2 le
   Vincent. Les écrire ici serait le contournement de procédure que §2.1 nomme, et
   la voie g1 cesserait d'être une levée de précondition pour devenir une invention
   de plus, signée d'une autre main.
-- **Fermer ou re-scoper mika#2562.** Ce plan remonte une précondition non tenue ;
-  décider si le ticket attend, se scinde ou change de dépôt est un cadrage
-  opérateur, et c'est précisément ce que la disposition halte-et-remontée demande.
+- **Migrer les appelants de `mika-cloud` vers les trois primitives.** C'est LC.3,
+  et c'est un autre dépôt. Ce qui est livré ici est ce que LC.3 consommera ; rien
+  dans `mika-cloud` n'est touché, et l'API est de ce fait **non vérifiée en
+  service** tant que cette migration n'a pas eu lieu. C'est la limite honnête de
+  ce ticket : les axes sont dérivés d'appelants lus, pas d'appelants compilés.
+- **Toute règle d'enforcement pour les trois primitives.** Point 4 du périmètre,
+  clause « seulement si » — voir Halte 5 et la note de `packages/ui/CLAUDE.md`.
+  Elle appartient au dépôt qui porte la surface.
