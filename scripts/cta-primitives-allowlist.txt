@@ -1,0 +1,34 @@
+# Allowlist for scripts/check-cta-primitives.sh (mika#1801, LC.2).
+#
+# Format, one per line:
+#
+#     <path-relative-to-repo-root>  <bg-token>  # why this CTA is not a <Button>
+#
+# PATH **AND** TOKEN, never a bare path. Allowlisting a whole file is the hole
+# `check-landing-tokens.sh` refuses by name, and for a reason measured there: the
+# file holding an exception is usually also the file that carries the next drift.
+#
+# THIS LIST IS EMPTY, AND THAT IS THE DELIVERED STATE — not an oversight.
+# The one CTA that would have needed an entry was SkillVariants' green Promote,
+# whose `bg-green-600` / `bg-green-500` are in no design token and in no rulebook
+# section. It was migrated to `primary` instead, losing its green, because §8
+# reserves a fourth variant to Vincent and the rulebook "never splits". The other
+# nine went the same way. The post-migration population is nil, so there is
+# nothing to name.
+#
+# WHEN THE SCAN FIRES, ROUTE THE SITE TO `<Button>`. Do not add a line here. This
+# list has no free slot and no precedent to point at: it has zero entries. A CTA
+# you do not want to route is a CTA to delete (mika#2201 doctrine). If a surface
+# genuinely needs a fill that §5 does not offer, that is a rulebook §8 decision
+# reserved to Vincent — it goes into `docs/design/luminescent-core.md` first, and
+# into `<Button>` second, in that order.
+#
+# COMPARED IN BOTH DIRECTIONS. An entry that matches no real violation fails the
+# build exactly as an unlisted CTA does. That is the self-cleaning assertion: on
+# the day a site is migrated, the build goes red and its line must go — not months
+# later, and not as a silent exemption waiting to cover a future namesake.
+#
+# PINNED EMPTY. `scripts/test-check-cta-primitives.sh` asserts that this file has
+# zero non-comment lines. Adding the first entry means first deleting that
+# assertion — i.e. taking the decision explicitly, in the same diff, rather than
+# accumulating it.

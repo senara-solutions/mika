@@ -136,9 +136,28 @@ jobs:
       - run: npm ci
       - run: npm run build -w packages/ui
       - run: npm test -w packages/ui
+      # <Button>'s discriminated union carries a property no runtime test can
+      # observe: `<Button as="link" disabled>` must not COMPILE (mika#1801 R-2).
+      # vitest transpiles with esbuild, which strips types without checking them,
+      # so `Button.type-assertions.tsx` is inert unless a typechecker runs it —
+      # a guard nobody runs is a decoration (mika#2103).
+      - run: npm run typecheck -w packages/ui
       - run: npm run lint -w dashboard
       - run: npm run build -w dashboard
       - run: npm test -w dashboard
+      # `site/` had NO compiling check at all until mika#1801: `landing-tokens-lint`
+      # is a grep, and the job below says so in its own comment. Yet `site/` is a
+      # root npm workspace, carries `tsc -b && vite build`, and declares
+      # `@samidarko/ui` — of which it imported only the CSS. LC.2 makes the landing
+      # render <Button>, i.e. its first TypeScript component import, in the one
+      # surface where a broken import or type error would pass the merge without
+      # reddening. This line is a precondition of that migration, not a supplement,
+      # and it is ordered before it for that reason.
+      #
+      # It belongs in this job rather than a new one because it needs the same
+      # `npm ci` and the same freshly-built `packages/ui` dist that the steps above
+      # already produce. Cost is a `tsc` over twelve files.
+      - run: npm run build -w site
 
   docs-site:
     name: Docs Site
@@ -364,6 +383,31 @@ jobs:
       # byte-slice-lint and dispatch-seats-lint above (mika#2103).
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-landing-tokens.sh
+
+  cta-primitives-lint:
+    name: CTA Primitives Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Every CTA on every surface is rendered by <Button> from @samidarko/ui,
+      # which implements rulebook §5 — including the §2 gradient a flat fill
+      # cannot reproduce (mika#1801, LC.2). Ten CTAs were hand-rolled across
+      # `dashboard/src` and `site/src` on 2026-09-27, none of them a gradient;
+      # the eleventh would have been written in good faith on a new button, so
+      # the rule is on the SHAPE (a solid background on a `<button>`/`<a>`) and
+      # not on a denylist of the ten measured classes. Sibling of
+      # `landing-tokens-lint` above: same surfaces, same reason a drift there is
+      # only visible the next time the rulebook moves.
+      - name: Reject hand-rolled CTAs outside <Button> (mika#1801)
+        run: bash scripts/check-cta-primitives.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # landing-tokens-lint above (mika#2103). This suite also pins the halves a
+      # red run cannot show: that the scan does NOT fire on a chip fill, a
+      # hover-only fill or a non-interactive `bg-accent`, and that an empty
+      # perimeter or a zero-CTA population is refused (exit 3) rather than read
+      # as a clean tree (mika#2205).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-cta-primitives.sh
 
   loop-select-lint:
     name: Loop Select Lint

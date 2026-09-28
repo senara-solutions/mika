@@ -8,6 +8,8 @@ Shared domain vocabulary for this project — entities, named processes, and sta
 
 A check that makes a forbidden pattern impossible to merge rather than discouraged, by mechanically rejecting it in CI. The distinguishing commitment is stated in the family's own headers as *construct the incapacity, don't promise the restraint*: a rule enforced by prose, a code comment, or an agent prompt is not a structural guard, however emphatic.
 
+Being invoked is part of that construction, not a deployment detail that follows it. A check no pipeline runs constructs no incapacity, so it promises the restraint exactly as prose does — and it is indistinguishable from a clean tree, since a check nothing calls reports nothing and breaks nothing. Correct, tested and merged is not the bar; reachable from something that runs is.
+
 A structural guard is deny-by-default only to the extent its parser can model the source it reads. When it meets a form it was not built to parse it must fail closed and say so, because a partial audit and a complete one produce the same green check. A guard that can be wrong quietly is a claim, not a guard.
 
 Where the guard and the component that acts on the value parse it separately, deny-by-default binds the *detection* step too, and in the opposite direction: the guard must read at least as permissively as that component, and may be strict only in what it then allows. A guard stricter than its consumer does not fail closed, because from its own side there is nothing to judge — it stays silent while the consumer proceeds. That gap has no rejection event and no red test by construction, so it is closed by tracing the value into the consumer, not by re-reading the guard.
@@ -17,6 +19,8 @@ Where the guard and the component that acts on the value parse it separately, de
 An assertion that proves a guard is capable of failing, by exercising it against a deliberately broken form and observing it go red. A guard that has only ever been observed passing has not been shown to test anything.
 
 The broken form is synthesized — built by mutating the current source — rather than fetched from version history, because a reference to a branch stops naming the broken state once the fix merges. A case that cannot be constructed is reported as a failure, never as a skip: a silently skipped anti-vacuity assertion is the exact condition it exists to detect.
+
+The same holds one level up, and more quietly: a harness nothing invokes is that condition as well, with no skip notice to give it away, because no runner exists to emit one. Its assertions can prove the guard is capable of failing and still never have proved it to anyone.
 
 It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
 
