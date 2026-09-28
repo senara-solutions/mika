@@ -65,15 +65,33 @@ EXPECTED_ENV_ALLOWLIST=(
     USER
 )
 
-# --- Named exception for rule 2 --------------------------------------------
+# --- Named exceptions for rule 2 -------------------------------------------
 #
-# `ANTHROPIC_API_KEY` is passed by name but carries a literal placeholder: the
-# real key is injected host-side by the egress proxy and never crosses the
-# bwrap boundary (see the Q3 comment in dispatch-lib.sh). The exception is
-# conditional — it holds only while the placeholder is what is actually
-# written. Swapping in a real key re-opens mika#2039 and fails this lint.
-EXEMPT_SETENV_NAME="ANTHROPIC_API_KEY"
+# Each name below is passed by `--setenv` but carries a literal placeholder:
+# the real credential is injected host-side by the egress proxy and never
+# crosses the bwrap boundary. The client only needs SOME local value so it
+# does not short-circuit before sending the request the proxy authenticates.
+#
+#   ANTHROPIC_API_KEY — Claude Code prints "Not logged in" without it (see the
+#                       Q3 comment in dispatch-lib.sh).
+#   GH_TOKEN          — the gh CLI stops locally on `gh auth login` without it,
+#                       before any network call (mika#2572). The GitHub addon
+#                       strips and replaces Authorization host-side (mika#2056).
+#
+# The exception is conditional and per-occurrence: it holds only while EVERY
+# `--setenv <NAME>` carries the placeholder. Swapping in a real value re-opens
+# mika#2039 and fails this lint. The list is closed: the placeholder value does
+# not exempt any other credential-shaped name.
+EXEMPT_SETENV_NAMES=(ANTHROPIC_API_KEY GH_TOKEN)
 EXEMPT_SETENV_VALUE="proxy-managed-no-secret"
+
+is_exempt_name() {
+    local candidate="$1" n
+    for n in "${EXEMPT_SETENV_NAMES[@]}"; do
+        [[ "$candidate" == "$n" ]] && return 0
+    done
+    return 1
+}
 
 CRED_NAME_PATTERN='TOKEN|SECRET|KEY|PASSWORD|PASSWD|(^|_)PAT(_|$)'
 
@@ -202,20 +220,23 @@ done < <(extract_array _PILOT_SANDBOX_SECRET_ALLOWLIST)
 # --- Rule 2: name-shape net over every literal --setenv --------------------
 while IFS= read -r name; do
     [[ -z "$name" ]] && continue
-    if [[ "$name" == "$EXEMPT_SETENV_NAME" ]]; then
+    if is_exempt_name "$name"; then
         # Per-occurrence, not file-global: a whole-file `grep -q` for the
-        # placeholder would still pass if a SECOND `--setenv ANTHROPIC_API_KEY`
-        # carrying a real key were added alongside it. Every occurrence must
-        # carry the placeholder.
-        _total=$(grep -cE -- "--setenv[[:space:]]+$EXEMPT_SETENV_NAME" "$CODE_ONLY" || true)
-        _placeheld=$(grep -cF -- "--setenv $EXEMPT_SETENV_NAME \"$EXEMPT_SETENV_VALUE\"" "$CODE_ONLY" || true)
+        # placeholder would still pass if a SECOND `--setenv <NAME>` carrying a
+        # real value were added alongside it. Every occurrence must carry the
+        # placeholder. The name is bounded on the right (space or end of line)
+        # so GH_TOKEN never also counts a hypothetical GH_TOKEN_EXTRA, while a
+        # `--setenv GH_TOKEN` whose value sits on the next array line is still
+        # counted — and then fails, since it does not carry the placeholder.
+        _total=$(grep -cE -- "--setenv[[:space:]]+$name([[:space:]]|\$)" "$CODE_ONLY" || true)
+        _placeheld=$(grep -cF -- "--setenv $name \"$EXEMPT_SETENV_VALUE\"" "$CODE_ONLY" || true)
         if [[ "$_total" -eq "$_placeheld" && "$_total" -ge 1 ]]; then
             continue
         fi
-        echo "VIOLATION: $_total --setenv $EXEMPT_SETENV_NAME occurrence(s), only"
+        echo "VIOLATION: $_total --setenv $name occurrence(s), only"
         echo "  $_placeheld carrying the placeholder '$EXEMPT_SETENV_VALUE'."
-        echo "  Its exemption held only because the real key is injected"
-        echo "  host-side by the egress proxy. A real key here would be"
+        echo "  Its exemption held only because the real credential is injected"
+        echo "  host-side by the egress proxy. A real value here would be"
         echo "  readable in the sandbox argv by any local user (mika#2039)."
         VIOLATIONS=$((VIOLATIONS + 1))
         continue
