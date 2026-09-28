@@ -384,6 +384,31 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-landing-tokens.sh
 
+  cta-primitives-lint:
+    name: CTA Primitives Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Every CTA on every surface is rendered by <Button> from @samidarko/ui,
+      # which implements rulebook §5 — including the §2 gradient a flat fill
+      # cannot reproduce (mika#1801, LC.2). Ten CTAs were hand-rolled across
+      # `dashboard/src` and `site/src` on 2026-09-27, none of them a gradient;
+      # the eleventh would have been written in good faith on a new button, so
+      # the rule is on the SHAPE (a solid background on a `<button>`/`<a>`) and
+      # not on a denylist of the ten measured classes. Sibling of
+      # `landing-tokens-lint` above: same surfaces, same reason a drift there is
+      # only visible the next time the rulebook moves.
+      - name: Reject hand-rolled CTAs outside <Button> (mika#1801)
+        run: bash scripts/check-cta-primitives.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # landing-tokens-lint above (mika#2103). This suite also pins the halves a
+      # red run cannot show: that the scan does NOT fire on a chip fill, a
+      # hover-only fill or a non-interactive `bg-accent`, and that an empty
+      # perimeter or a zero-CTA population is refused (exit 3) rather than read
+      # as a clean tree (mika#2205).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-cta-primitives.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
