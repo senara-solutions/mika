@@ -447,18 +447,21 @@ echo "--- must-work: allowlisted egress (api.github.com now MITM-injected) ---"
 curl -sS -m 8 -o /dev/null -w "curl_github=%{http_code}\n" https://api.github.com/ 2>&1 | head -1
 
 echo
-echo "--- must-fail: GH_TOKEN absent from the sandbox (mika#2056) ---"
+echo "--- must-fail: no GitHub token value in the sandbox (mika#2056, mika#2572) ---"
 # mika#2056 inverted the old mika#2039 must-work check. The pilot no longer
 # holds any GitHub token inside the sandbox: git push and gh reach GitHub
 # through the egress-proxy MITM, which injects the credential HOST-SIDE. So the
-# token MUST be absent here — in the environment and on the filesystem. A
-# regression that put it back would read as "ok:" under the old check and as a
-# LEAK under this one.
-if [ -n "${GH_TOKEN:-}" ]; then
-    echo "LEAK: GH_TOKEN is present in the sandbox environment (mika#2056 regressed)"
-else
-    echo "ok:   gh_token_absent_env"
-fi
+# token VALUE MUST be absent here — in the environment and on the filesystem.
+# mika#2572: the NAME GH_TOKEN is present, set to the non-secret placeholder
+# `proxy-managed-no-secret`, because gh refuses to start without some local
+# value. Any other value — the synthetic canary PAT exported above included —
+# is a LEAK. An absent GH_TOKEN is not a leak, but it is the mika#2572 defect
+# (gh stops on `gh auth login`), so it is named instead of passing silently.
+case "${GH_TOKEN-__unset__}" in
+    proxy-managed-no-secret) echo "ok:   gh_token_placeholder_only" ;;
+    __unset__)               echo "WARN: GH_TOKEN unset in the sandbox — gh will stop on gh auth login (mika#2572 regressed)" ;;
+    *)                       echo "LEAK: GH_TOKEN carries a value other than the placeholder (mika#2056 regressed)" ;;
+esac
 if [ -e /run/mika-pilot-secrets/GH_TOKEN ]; then
     echo "LEAK: /run/mika-pilot-secrets/GH_TOKEN exists (secret file channel not removed)"
 else
@@ -634,7 +637,7 @@ echo "============================================================"
 echo "canary complete — coherence review:"
 echo "  every must-fail line MUST be 'ok:' or 'blocked'"
 echo "  every must-work line MUST succeed (version string)"
-echo "  GH_TOKEN MUST be absent from the sandbox env + fs (mika#2056)"
+echo "  GH_TOKEN MUST be the placeholder, never a real token, in env + fs (mika#2056, mika#2572)"
 echo "  proxy log MUST show DENY on evil.example.com, mitm-forward on"
 echo "    api.github.com, and [github-proxy] ALLOW (host-side auth injection)"
 echo "============================================================"

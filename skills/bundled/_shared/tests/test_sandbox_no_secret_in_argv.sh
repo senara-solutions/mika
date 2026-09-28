@@ -20,8 +20,12 @@
 # it is injected host-side by the egress-proxy MITM. So the CHANNEL-mechanism
 # tests below exercise the still-generic --ro-bind-data machinery with a
 # SYNTHETIC secret (`MIKA_TEST_SECRET`), and dedicated tests assert the
-# mika#2056 invariant directly: GH_TOKEN never reaches the argv, the --setenv
-# list, or the real sandbox env/filesystem. The sandbox-absent-but-host-present
+# mika#2056 invariant directly: no GitHub token VALUE reaches the argv, the
+# --setenv list, or the real sandbox env/filesystem. Since mika#2572 the NAME
+# GH_TOKEN does travel, carrying only the non-secret placeholder
+# `proxy-managed-no-secret` (gh refuses to start without some local value) —
+# so these tests assert on the value, never on the name's absence. The
+# sandbox-absent-but-host-present
 # anti-vacuity proof lives in the sibling
 # test-pilot-github-token-not-in-sandbox.sh.
 #
@@ -179,8 +183,15 @@ setenv_names() {
 #   GIT_TERMINAL_PROMPT  the literal "0". Its absence is what turns a failed
 #                        credential injection into a silent hang instead of a
 #                        fast, traceable error.
+#
+# mika#2572 added GH_TOKEN, audited on the same terms as ANTHROPIC_API_KEY:
+#   GH_TOKEN             the literal "proxy-managed-no-secret". The GitHub
+#                        addon strips and replaces Authorization host-side; the
+#                        value exists only so gh does not stop on
+#                        `gh auth login`. Test 10b pins that EVERY occurrence
+#                        carries exactly this placeholder.
 AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
-CLAUDE_CODE_API_BASE_URL GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
+CLAUDE_CODE_API_BASE_URL GH_TOKEN GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
 GIT_TERMINAL_PROMPT HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
 LOGNAME MIKA_LOG_PILOT_TRANSCRIPTS MIKA_PILOT_CONTAINED NODE_EXTRA_CA_CERTS \
 NO_PROXY PATH SHELL TERM TMPDIR USER"
@@ -482,9 +493,10 @@ done < <(captured_args)
 assert_eq "the secret is NOT passed via --setenv" "1" "$secret_via_setenv"
 
 # ============================================================================
-# Test 10b (mika#2056): GH_TOKEN present in the parent env NEVER reaches the
-# sandbox argv, --setenv list, or --ro-bind-data channel, under the PRODUCTION
-# (empty) secret allowlist. This is the argv-side of the mika#2056 invariant;
+# Test 10b (mika#2056, mika#2572): a GH_TOKEN VALUE present in the parent env
+# NEVER reaches the sandbox argv, --setenv list, or --ro-bind-data channel,
+# under the PRODUCTION (empty) secret allowlist. The NAME does travel since
+# mika#2572, and every occurrence must carry the placeholder. This is the argv-side of the mika#2056 invariant;
 # the real-sandbox env/fs absence is Test 12 + the sibling suite.
 # ============================================================================
 echo ""
@@ -501,13 +513,21 @@ _PILOT_SANDBOX_SECRET_ALLOWLIST=()   # production shape: no sandbox-held secret
 rc=1; grep -qzF -- "$GH_LEAK_TOKEN" "$CAPTURE" && rc=0
 assert_eq "GH_TOKEN value is absent from the bwrap argv" "1" "$rc"
 
-gh_tok_setenv=1
-prev=""
-while IFS= read -r a; do
-    if [ "$prev" = "--setenv" ] && [ "$a" = "GH_TOKEN" ]; then gh_tok_setenv=0; fi
-    prev="$a"
-done < <(captured_args)
-assert_eq "GH_TOKEN is NOT passed via --setenv" "1" "$gh_tok_setenv"
+# Every `--setenv GH_TOKEN <value>` triple carries the placeholder, and there
+# is at least one (the mika#2572 fix is present on this path). A count of zero
+# would mean this block no longer runs Phase 2b and proves nothing.
+gh_tok_occ=0; gh_tok_bad=""
+_args=()
+while IFS= read -r a; do _args+=("$a"); done < <(captured_args)
+for ((i = 0; i + 2 < ${#_args[@]}; i++)); do
+    if [ "${_args[$i]}" = "--setenv" ] && [ "${_args[$((i + 1))]}" = "GH_TOKEN" ]; then
+        gh_tok_occ=$((gh_tok_occ + 1))
+        [ "${_args[$((i + 2))]}" = "proxy-managed-no-secret" ] || gh_tok_bad="$gh_tok_bad ${_args[$((i + 2))]}"
+    fi
+done
+unset _args
+assert_eq "GH_TOKEN travels via --setenv on the contained path (mika#2572)" "1" "$([ "$gh_tok_occ" -ge 1 ] && echo 1 || echo 0)"
+assert_eq "every --setenv GH_TOKEN carries the placeholder, never the parent token" "" "$gh_tok_bad"
 
 rc=1; grep -qzx -- "/run/mika-pilot-secrets/GH_TOKEN" "$CAPTURE" && rc=0
 assert_eq "no /run/mika-pilot-secrets/GH_TOKEN file channel is created" "1" "$rc"
@@ -557,15 +577,18 @@ else
         /bin/sh -c 'ls -l /run/mika-pilot-secrets/MIKA_TEST_SECRET | cut -c1-10' 2>/dev/null)
     assert_eq "secret file is mode 0600 inside the sandbox" "-rw-------" "$got_perms"
 
-    # (b) mika#2056: with the PRODUCTION (empty) allowlist, GH_TOKEN present in
-    #     the parent env is ABSENT from the real sandbox environment, and no
-    #     file materialises under /run/mika-pilot-secrets. This is the real
+    # (b) mika#2056: with the PRODUCTION (empty) allowlist, the GH_TOKEN VALUE
+    #     present in the parent env is absent from the real sandbox — the
+    #     environment carries only the mika#2572 placeholder — and no file
+    #     materialises under /run/mika-pilot-secrets. This is the real
     #     end-to-end proof the token cannot be read from inside the sandbox.
     _SAVED_ALLOWLIST=("${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}")
     _PILOT_SANDBOX_SECRET_ALLOWLIST=()
     got_gh=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    assert_eq "GH_TOKEN is ABSENT from the real sandbox environment" "<absent>" "$got_gh"
+    assert_eq "GH_TOKEN in the real sandbox is the placeholder (mika#2572)" "proxy-managed-no-secret" "$got_gh"
+    rc=1; [ "$got_gh" = "$FAKE_TOKEN" ] && rc=0
+    assert_eq "the parent GH_TOKEN value never reaches the real sandbox" "1" "$rc"
 
     got_gh_file=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c '[ -e /run/mika-pilot-secrets/GH_TOKEN ] && echo present || echo missing' 2>/dev/null)

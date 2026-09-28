@@ -48,15 +48,21 @@ Every line the scan writes says what actually happened, never what was intended:
 
 ### Pilot sandbox
 
-The isolation boundary a headless development session runs inside: fresh kernel namespaces, a filesystem allowlist rather than the host root, a cleared environment repopulated from a narrow allowlist, and no host credential store bound in. Its governing property is stated as an invariant over what crosses the boundary — no bind-in carries a credential — rather than as a list of excluded files, so a new bind is audited rather than assumed safe.
+The isolation boundary a headless development session runs inside: fresh kernel namespaces, a filesystem allowlist rather than the host root, a cleared environment repopulated from a narrow allowlist, and no host credential store bound in. Its governing property is stated as an invariant over what crosses the boundary — no bind-in carries a credential — rather than as a list of excluded files, so a new bind is audited rather than assumed safe. The invariant is about credential *values*: the environment may carry a credential variable's name set to a credential placeholder, never the secret itself.
 
 The boundary constrains what the contained session can reach. It says nothing about what the launch itself exposes to the host, which is a separate question and has to be asked separately.
 
 ### Phase 2a / Phase 2b
 
-The two containment postures the pilot sandbox runs in. **Phase 2b** is the full posture: filesystem, network and kernel cuts all active, with outbound traffic forced through a host-side relay. **Phase 2a** is the degraded fallback taken when the relay is unavailable — the filesystem and kernel cuts hold, the network does not.
+The two containment postures the pilot sandbox runs in. **Phase 2b** is the full posture: filesystem, network and kernel cuts all active, with outbound traffic forced through a host-side relay. **Phase 2a** is the filesystem-and-kernel cut alone, with the network open. It was once the fallback taken when the relay was unavailable; it no longer is: an unavailable relay now refuses the launch outright, so Phase 2a survives only as a name for the earlier stage of the design, never as a posture a session runs in.
 
-The distinction is load-bearing beyond confinement strength: the attestation that unlocks the session's wider execution tier is set only under Phase 2b, so a degraded launch keeps the narrower tier rather than silently widening.
+The distinction is load-bearing beyond confinement strength: the attestation that unlocks the session's wider execution tier is set only under Phase 2b.
+
+### Credential placeholder
+
+A fixed, non-secret value given to a sandboxed client under a credential variable's name, so that a client which refuses to send anything without a local credential still emits its request; the host-side relay then discards whatever credential header arrives and applies the real one.
+
+It exists because clients differ in when they check: one that sends first and lets the server authenticate works through the relay with no local value, while one that verifies its own configuration first stops before any request exists for the relay to rewrite. Removing a credential from the sandbox without leaving a placeholder therefore breaks only the second kind, silently, while the first kind keeps working. Guards over the sandbox assert the placeholder's value, never the variable's absence.
 
 ### Label churn
 

@@ -212,6 +212,72 @@ assert_exit "second ANTHROPIC_API_KEY alongside the placeholder: exit 1" "1" "$R
 
 # ============================================================================
 echo ""
+echo "Test: the GH_TOKEN exemption mirrors ANTHROPIC_API_KEY (mika#2572)"
+echo "-------------------------------------------------------------------"
+# mika#2572: the sandbox carries `--setenv GH_TOKEN "proxy-managed-no-secret"`
+# so the gh CLI does not short-circuit into `gh auth login` before any network
+# call. The egress proxy strips and replaces Authorization host-side, exactly
+# as for ANTHROPIC_API_KEY. `gh_placeholder_fixture` plants the placeholder
+# only when the live file does not already carry it, so these cases state the
+# property whatever the state of dispatch-lib.sh, before or after the fix.
+gh_placeholder_fixture() {
+    local f
+    f=$(fixture "$1")
+    if ! grep -qF -- '--setenv GH_TOKEN "proxy-managed-no-secret"' "$f"; then
+        perl -0pi -e 's/(--setenv ANTHROPIC_API_KEY "proxy-managed-no-secret")/$1\n            --setenv GH_TOKEN "proxy-managed-no-secret"/' "$f"
+    fi
+    printf '%s' "$f"
+}
+
+F=$(gh_placeholder_fixture "gh-placeholder.sh")
+R=$(run_lint "$F")
+assert_exit "GH_TOKEN carrying the placeholder: exit 0" "0" "$R"
+
+F=$(gh_placeholder_fixture "real-gh-token.sh")
+perl -pi -e 's/--setenv GH_TOKEN "proxy-managed-no-secret"/--setenv GH_TOKEN "\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "real GH_TOKEN replacing the placeholder: exit 1" "1" "$R"
+assert_mentions "real GH_TOKEN: names the placeholder it lost" "proxy-managed-no-secret" "$R"
+assert_mentions "real GH_TOKEN: names GH_TOKEN" "GH_TOKEN" "$R"
+
+F=$(gh_placeholder_fixture "second-gh-token.sh")
+perl -0pi -e 's/(--setenv GH_TOKEN "proxy-managed-no-secret")/$1\n            --setenv GH_TOKEN "\$MIKA_GITHUB_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "second GH_TOKEN alongside the placeholder: exit 1" "1" "$R"
+
+# Inside a bash array literal the value may sit on the next line. The
+# per-occurrence count must still see that `--setenv GH_TOKEN`, or a real token
+# would ride next to a placeholder that makes the file look clean.
+F=$(gh_placeholder_fixture "gh-token-value-next-line.sh")
+perl -0pi -e 's/(--setenv GH_TOKEN "proxy-managed-no-secret")/$1\n            --setenv GH_TOKEN\n            "\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "GH_TOKEN whose value is on the next array line: exit 1" "1" "$R"
+
+# The count is per OCCURRENCE, not per line: a decoy placeholder and a real
+# token on the SAME line are two occurrences, only one of them placeheld.
+# `grep -c` counts matching lines and saw 1 == 1 here — reproduced in review.
+F=$(gh_placeholder_fixture "gh-token-same-line-decoy.sh")
+perl -pi -e 's/(--setenv GH_TOKEN "proxy-managed-no-secret")/$1 --setenv GH_TOKEN "\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "decoy placeholder + real GH_TOKEN on one line: exit 1" "1" "$R"
+
+# The placeholder is matched as the WHOLE value, closing quote bounded: a real
+# token concatenated after it is not a placeholder — reproduced in review.
+F=$(gh_placeholder_fixture "gh-token-concatenated.sh")
+perl -pi -e 's/--setenv GH_TOKEN "proxy-managed-no-secret"/--setenv GH_TOKEN "proxy-managed-no-secret""\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "real GH_TOKEN concatenated to the placeholder: exit 1" "1" "$R"
+
+# The exemption is a closed, named list: the placeholder VALUE does not open it
+# to any other credential-shaped NAME.
+F=$(fixture "npm-token-placeholder.sh")
+perl -0pi -e 's/(--setenv ANTHROPIC_API_KEY "proxy-managed-no-secret")/$1\n            --setenv NPM_TOKEN "proxy-managed-no-secret"/' "$F"
+R=$(run_lint "$F")
+assert_exit "NPM_TOKEN carrying the placeholder: exit 1" "1" "$R"
+assert_mentions "NPM_TOKEN placeholder: names NPM_TOKEN" "NPM_TOKEN" "$R"
+
+# ============================================================================
+echo ""
 echo "Test: prose mentioning --setenv does not trip the lint"
 echo "-------------------------------------------------------"
 # This file explains itself in comments. A doc line naming the very pattern it
