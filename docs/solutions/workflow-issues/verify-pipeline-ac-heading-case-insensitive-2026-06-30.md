@@ -58,6 +58,13 @@ Both GNU flags are available on the CI runner (GitHub Actions Ubuntu) and dev ho
 `scripts/verify-pipeline-test.sh` adds a title-case-heading -> PASS case alongside the
 existing present/missing/empty cases (run `bash scripts/verify-pipeline-test.sh`).
 
+> **Caveat (mika#2544): no CI job and no `make` target runs `verify-pipeline-test.sh`.**
+> `verify-pipeline.sh` itself runs in CI; its test harness does not. Run it **by hand**
+> when you touch the gate. The single-reader guard for `AC_HEADING_RE` that mika#2516
+> announced there was never shipped; it now lives in
+> `skills/bundled/_shared/test-dispatch-lib.sh` (T12j), the shell harness CI does run
+> (`make test-dispatch-lib`).
+
 ## The recurring class (n=2): structural matchers over LLM-authored plan markdown
 
 This is the **same class** as
@@ -70,6 +77,19 @@ text is natural language the model generates, not a pinned token.
 - **n=1 — header shape** (mika#1381/#771/#1600 -> fix #1602): widen the `_find_issue_plan`
   content-fallback alternation in `dispatch-lib.sh`.
 - **n=2 — heading case** (mika#1639): case-fold the `verify-pipeline.sh` AC-heading match.
+- **n=3 — heading numbering** (mika#2516): `/ce:plan` numbers its section headings
+  (`## 11. Acceptance criteria`); `AC_HEADING_RE` gains an optional `<digits>[.]` prefix.
+- **n=4 — same numbering, another section, another file** (mika#2544): the two
+  `## Fire-Disposition` readers in `dispatch-lib.sh` (`_fd_retry_if_section_still_missing`)
+  still matched the literal, so a compliant `## 3. Fire-Disposition` plan triggered a
+  useless revise-pilot retry and a false `fire_disposition_still_missing_after_retry`.
+  Fix: `_FD_HEADING_RE`, a term-for-term twin of `AC_HEADING_RE`; T12j holds the two
+  prefixes identical and reddens on any heading literal in `grep`/`sed` position.
+
+n=4 is what names the class correctly. It is not "the AC pattern is too strict" — it is
+**any reader of a plan section heading that does not tolerate the producer's numbering**.
+When a new gate reads a plan heading, reuse the prefix and add it to the T12j scan; do not
+spell a fresh literal.
 
 **Rule of thumb:** when a gate or discovery function matches a heading/label/marker that
 an LLM authors, make the match tolerant of the natural-language variation the model will
