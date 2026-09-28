@@ -529,13 +529,13 @@ capture avant/après dans le corps de la PR. Un test ne peut pas dire qu'un dég
 
 Transcrits du corps de mika#1801, avec leur statut sous ce plan.
 
-1. **« 5 primitives extraites, exposées dans `@senara-solutions/ui` »** —
-   **partiellement satisfait, et l'écart est le sujet de D5.** Deux primitives
-   (`Button`, `Spinner`) sont extraites et exposées. Les trois autres
-   (`PasswordInput`, `AuthCard`, `Stepper`) ont une population mesurée de zéro
-   dans ce dépôt (R3) et leur consommateur vit dans `mika-cloud`, hors workspace ;
-   elles sont remontées avec leurs deux gestes de levée plutôt que devinées. Le
-   nom du paquet est `@samidarko/ui` (R1).
+1. **« `Button` et `Spinner` extraits dans `@samidarko/ui`, CTA migrés, détecteur
+   armé »** — satisfait. Cet AC1 a été **réécrit et ratifié le 2026-09-28**
+   (opérateur-proxy, découpage de périmètre) : sa version d'origine demandait les
+   5 primitives. Les trois autres (`PasswordInput`, `AuthCard`, `Stepper`) ont une
+   population mesurée de zéro dans ce dépôt (R3), leur consommateur vit dans
+   `mika-cloud` ; elles relèvent de mika#2562. Le nom du paquet est
+   `@samidarko/ui` (R1).
 2. **« Chaque primitive : tests behavior + jest-axe passing »** — satisfait pour
    les primitives livrées (R-7, V1).
 3. **« TypeScript types stricts, discriminated unions où sensé »** — satisfait :
