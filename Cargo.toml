@@ -93,7 +93,7 @@ http-body-util = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
 
 # OpenAPI
-utoipa = { version = "5", features = ["axum_extras", "yaml"] }
+utoipa = { version = "6", features = ["axum_extras", "yaml"] }
 
 # CLI / TUI
 clap = { version = "4", features = ["derive"] }
