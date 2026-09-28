@@ -14,7 +14,8 @@
 #
 #   SANDBOX-ABSENT — with the production (empty) secret allowlist, the same
 #     token, set in the parent env and staged host-side, is absent from the
-#     real sandbox environment AND from the sandbox filesystem (no
+#     real sandbox environment (whose GH_TOKEN is only the non-secret
+#     placeholder since mika#2572) AND from the sandbox filesystem (no
 #     /run/mika-pilot-secrets/GH_TOKEN, and the host-only staging file is not
 #     visible through any bind).
 #
@@ -182,7 +183,11 @@ else
 
     got_env=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    assert_eq "GH_TOKEN is absent from the real sandbox environment" "<absent>" "$got_env"
+    # mika#2572: the NAME travels, set to the non-secret placeholder so gh does
+    # not stop on `gh auth login`; the token VALUE never does.
+    assert_eq "GH_TOKEN in the real sandbox is the placeholder (mika#2572)" "proxy-managed-no-secret" "$got_env"
+    rc=1; [ "$got_env" = "$FAKE_TOKEN" ] && rc=0
+    assert_eq "the staged/parent token value never reaches the sandbox env" "1" "$rc"
 
     got_secret_file=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c '[ -e /run/mika-pilot-secrets/GH_TOKEN ] && echo present || echo missing' 2>/dev/null)

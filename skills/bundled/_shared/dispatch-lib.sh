@@ -994,11 +994,12 @@ _pilot_egress_mark_up() {
 #   * the `net_setenv_args` producer below adds HTTPS_PROXY / HTTP_PROXY /
 #     NO_PROXY / ANTHROPIC_BASE_URL / CLAUDE_CODE_API_BASE_URL (localhost
 #     URLs), MIKA_PILOT_CONTAINED ("1"), NODE_EXTRA_CA_CERTS (a path), and
-#     ANTHROPIC_API_KEY. That last one is safe ONLY because it carries the
-#     literal placeholder `proxy-managed-no-secret` — the real key is injected
-#     host-side by the egress proxy and never crosses the bwrap boundary.
-#     Replacing that placeholder with a real key would re-open this defect;
-#     scripts/verify-no-secret-in-setenv.sh fails if it ever changes.
+#     ANTHROPIC_API_KEY and GH_TOKEN (mika#2572). Those last two are safe ONLY
+#     because they carry the literal placeholder `proxy-managed-no-secret` —
+#     the real credentials are injected host-side by the egress proxy and
+#     never cross the bwrap boundary. Replacing either placeholder with a real
+#     value would re-open this defect; scripts/verify-no-secret-in-setenv.sh
+#     fails if it ever changes.
 _PILOT_SANDBOX_ENV_ALLOWLIST=(
     HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
     ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
@@ -1012,7 +1013,9 @@ _PILOT_SANDBOX_ENV_ALLOWLIST=(
 # mika#2056: this list is now EMPTY. `GH_TOKEN` was the sole entry, and it is
 # removed — the file channel it used is deleted, not stacked beside the new
 # mechanism. The sandbox no longer holds any GitHub credential in its
-# environment or on its filesystem; `git push` and the `gh` CLI reach GitHub
+# environment or on its filesystem — since mika#2572 its environment carries a
+# `GH_TOKEN` NAME, set to the non-secret placeholder so gh does not refuse to
+# start, never a token VALUE; `git push` and the `gh` CLI reach GitHub
 # through the egress-proxy MITM, which injects the credential host-side
 # (mika-pilot-github-auth-addon.py). This is the same invariant the Anthropic
 # key already has — "the sandbox NEVER holds secret material" — now extended to
@@ -1553,6 +1556,15 @@ Remedy: $_egress_remedy"
             --setenv ANTHROPIC_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
             --setenv CLAUDE_CODE_API_BASE_URL "http://127.0.0.1:$_PILOT_EGRESS_TCP_PORT/anthropic-proxy"
             --setenv ANTHROPIC_API_KEY "proxy-managed-no-secret"
+            # mika#2572: same placeholder, same reason, for the gh CLI. Without
+            # ANY local token gh stops on `gh auth login` before a single
+            # network call, so since mika#2056 no pilot could read ticket
+            # comments or open a PR (git push kept working: git sends first and
+            # lets the proxy authenticate). mika-pilot-github-auth-addon.py
+            # strips the client Authorization and sets the real one host-side
+            # on api.github.com / github.com, so this value never leaves as a
+            # credential — and it carries none.
+            --setenv GH_TOKEN "proxy-managed-no-secret"
             # γ trust for the helper CA (Vincent-authorized 2026-08-05).
             # NODE_EXTRA_CA_CERTS is ADDITIVE (adds to Node's built-in trust)
             # so bundled claude keeps trusting the system CA for anything else;
