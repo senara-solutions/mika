@@ -4,6 +4,7 @@ tags: [dispatch-lib, claude-pilot, guardrail, drift, enumeration, test-harness, 
 problem_type: drift
 category: best-practices
 ticket: mika#2149
+last_updated: 2026-09-28
 ---
 
 # Une énumération en commentaire se périme au rythme de l'amont ; une table avec branche par défaut se signale à la première dérive
@@ -112,6 +113,43 @@ n'émet **pas** la ligne stderr : il est déjà dit par « cause not recorded »
 et n'est pas une dérive amont. Émettre `halt_family.unknown subtype=` avec
 une valeur vide aurait pollué le signal exact que la ligne existe pour porter.
 
+## Quand l'amont ajoute un motif : aval d'abord (mika#2568)
+
+La garde T6 a mordu en conditions réelles le 2026-09-28 : claude-pilot#222
+(cpp#219 volet 1) a ajouté `stream_stalled` au `Literal`, a été
+mergée **avant** la branche aval, et servie depuis 15:31Z. Dès cet instant,
+`test-dispatch-lib.sh` rendait `1154 passed, 1 failed` sur le poste de
+dispatch — `✗ T6 drift: upstream value 'stream_stalled' has a downstream family
+(got: unknown)` — pour **toute** exécution locale, y compris celles des pilotes
+qui touchent dispatch-lib et n'ont rien à voir avec le motif.
+
+**L'ordre sûr est aval, puis amont, puis redéploiement de claude-pilot.** Les
+deux directions ne sont pas symétriques : une famille aval sans motif amont ne
+fait rougir aucun garde (T6 itère sur les valeurs **amont**, une ligne de table
+en trop n'est lue par personne), alors qu'un motif amont sans famille aval
+rougit le harnais de tout le monde. Le ticket qui porte la branche aval doit
+donc être mergé en premier, et la PR amont tenue par un blocage mécanique
+(la garder en draft tant que l'aval n'est pas mergé) plutôt que par une
+consigne — un moteur qui merge seul une PR approuvée et verte n'attend pas un
+ordre écrit dans un corps de ticket.
+
+Trois gestes accompagnent la ligne ajoutée à `_halt_family`, et le troisième
+ne se voit pas :
+
+- **La table T1** reçoit la même ligne `subtype|family|hint` (même forme
+  qu'`idle_timeout`).
+- **Un motif scindé d'un autre prend une famille nouvelle.** `stream_stalled`
+  a été séparé d'`idle_timeout` pour cesser de s'y blanchir ; le remettre dans
+  `session_silent` annulerait la scission en aval. De même `model_never_resumed`
+  (`awaiting_model`) veut dire *premier jeton jamais reçu*, alors qu'ici des
+  jetons l'ont été : fait distinct, famille distincte (`model_stalled`).
+- **Le plancher d'anti-vacuité du scan mika#2539 (S2)** dans
+  `test-dispatch-lib.sh` est calé sur le compte exact de la table (commentaire
+  « la table en compte N aujourd'hui » et seuil `-ge N`). L'oublier ne rougit
+  rien — la population grandit, le plancher reste satisfait — et c'est
+  justement pourquoi il faut le relever : un plancher sous le compte réel ne
+  voit plus une ligne perdue.
+
 ## Règle générale
 
 Une liste de valeurs qu'un autre dépôt possède ne se recopie pas en
@@ -128,8 +166,9 @@ Sur le poste de dispatch, après `make deploy` :
 make -C mika test-dispatch-lib 2>&1 | grep -E '^DRIFT-GUARD: |SKIPPED'
 ```
 
-doit rendre `DRIFT-GUARD: armed against …/claude-pilot/src/claude_pilot/types.py (8 values)`
-et `SKIPPED: 0`. Un `SKIP` ici est une halte : la garde n'est pas armée sur
+doit rendre `DRIFT-GUARD: armed against …/claude-pilot/src/claude_pilot/types.py (<n> values)`
+et `SKIPPED: 0` — `<n>` suit l'amont (8 au 2026-09-21, 9 depuis claude-pilot#222) ; ce
+qui compte est l'armement et zéro échec, pas la valeur. Un `SKIP` ici est une halte : la garde n'est pas armée sur
 la machine qu'elle protège — poser `CLAUDE_PILOT_TYPES` ou rétablir le
 checkout avant de dire « couvert ». Sur la prochaine session `terminated`
 réelle, le callback dans mika-dev porte `Halt class:` et `Retry hint:` ;

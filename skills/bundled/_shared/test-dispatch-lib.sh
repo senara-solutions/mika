@@ -4274,6 +4274,7 @@ rate_limited|quota_throttled|transient
 awaiting_model|model_never_resumed|transient
 awaiting_tool|tool_never_returned|investigate
 idle_timeout|session_silent|investigate
+stream_stalled|model_stalled|transient
 stall_detected|model_unproductive|investigate
 empty_response|model_unproductive|investigate
 watchdog_error|pilot_bug|investigate
@@ -8928,11 +8929,11 @@ assert_contains "S1: et il en tire la famille (premier champ de la ligne)" \
 # table, donc le scan rétrécirait en silence pendant que l'arbre reste vert.
 T2539_SUBTYPES=$(sed -n '/^_halt_family() {$/,/^}$/p' "$DISPATCH_LIB" \
     | grep -oE '^        [a-z][a-z0-9_]*\)' | tr -d ' )' || true)
-# Anti-vacuité de la dérivation : la table en compte onze aujourd'hui. Si
+# Anti-vacuité de la dérivation : la table en compte douze aujourd'hui. Si
 # l'extraction en rend une poignée, l'ancre `case` ne matche plus et S2 ne
 # regarde plus rien.
 assert_eq "S2 (anti-vacuité): la population de sous-types est dérivée de la table" "yes" \
-    "$(if [ "$(printf '%s\n' "$T2539_SUBTYPES" | grep -c .)" -ge 11 ]; then printf 'yes'; else printf 'no'; fi)"
+    "$(if [ "$(printf '%s\n' "$T2539_SUBTYPES" | grep -c .)" -ge 12 ]; then printf 'yes'; else printf 'no'; fi)"
 
 # Une entrée = un site qui énumère un sous-type de halte hors de _halt_family,
 # au format `<sous-type>|<raison + ticket de suivi>`. LIVRÉE VIDE : les deux
