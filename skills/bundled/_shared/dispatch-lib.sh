@@ -3976,6 +3976,8 @@ _halt_family() {
             printf '%s\n' "tool_never_returned|investigate|a tool never returned its result; re-running without reading which one replays it" ;;                       # cpp#145
         idle_timeout)
             printf '%s\n' "session_silent|investigate|real silence with nobody outstanding; the cause is in the log, not in a re-run" ;;                                # cpp#54, refined cpp#145
+        stream_stalled)
+            printf '%s\n' "model_stalled|transient|the model stopped mid-generation (turn open, pings only) with nobody outstanding; a re-run has a fair chance" ;;      # cpp#219, cpp#222
         stall_detected)
             printf '%s\n' "model_unproductive|investigate|N turns without a tool call; the starting state leads the model nowhere" ;;                                   # cpp#54
         empty_response)
