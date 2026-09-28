@@ -123,7 +123,7 @@ impl Tool for PrMergeWithGateTool {
                 agent_id,
                 "pr_merge_with_gate called by the reviewer agent — refused before any gh call (mika#2248)"
             );
-            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            return emit_gate_result(result, ctx).await;
         }
 
         // -- Extract and validate inputs --
@@ -161,10 +161,22 @@ impl Tool for PrMergeWithGateTool {
         let token = match ctx.github_token {
             Some(t) => t,
             None => {
-                return Ok(ToolOutput::error(
-                    "GitHub token required for pr_merge_with_gate. \
+                // mika#1964 — this is the leak M1 made reachable: `pr_merge_with_gate`
+                // is registered by `default_tools()`, so it sits in EVERY agent's tool
+                // array whatever its tier, and `FAMILY_IDENTITY` declares no
+                // `[tools].disabled` block. The old string was therefore served to a
+                // family tenant, and the ticket's "currently latent" premise was false.
+                return Ok(crate::tools::dispatch_substrate_unavailable(
+                    "Merging pull requests is not available right now. Nothing was \
+                     merged. This is not something retrying will fix — report it.",
+                    // substrate-diagnostic: the operator channel — the variable and
+                    // the App are the remedy, and only the operator can apply it.
+                    "pr_merge_with_gate has no GitHub credential on this agent. \
                      Set MIKA_GITHUB_TOKEN or configure a GitHub App.",
-                ));
+                    "pr_merge_with_gate",
+                    ctx,
+                )
+                .await);
             }
         };
 
@@ -182,13 +194,13 @@ impl Tool for PrMergeWithGateTool {
                         detail: e.message,
                     },
                 );
-                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                return emit_gate_result(result, ctx).await;
             }
         };
 
         // Classify preflight result
         if let Some(result) = classify_preflight(&preflight) {
-            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            return emit_gate_result(result, ctx).await;
         }
 
         // -- Step 1c: Forge-gate perimeter check (mika#1829) --
@@ -234,7 +246,7 @@ impl Tool for PrMergeWithGateTool {
                 failing_checks: vec![],
                 detail,
             };
-            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            return emit_gate_result(result, ctx).await;
         }
 
         // -- Step 2: Fetch required check statuses --
@@ -250,7 +262,7 @@ impl Tool for PrMergeWithGateTool {
                         detail: format!("Failed to fetch check statuses: {e}"),
                     },
                 );
-                return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                return emit_gate_result(result, ctx).await;
             }
         };
 
@@ -278,7 +290,7 @@ impl Tool for PrMergeWithGateTool {
                 failing_checks: failing.clone(),
                 detail: format!("{} required check(s) failed", failing.len()),
             };
-            return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+            return emit_gate_result(result, ctx).await;
         }
 
         // -- Step 3b: Behind-main assertion (#1577) + remediation (mika#2238) --
@@ -303,7 +315,7 @@ impl Tool for PrMergeWithGateTool {
                 )
                 .await;
                 if let Some(result) = disposition_for_remediation(&remediation, repo, &info) {
-                    return Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?));
+                    return emit_gate_result(result, ctx).await;
                 }
                 // `None` — the PR turned out not to be behind. Continue the gate.
             }
@@ -349,7 +361,7 @@ impl Tool for PrMergeWithGateTool {
                         let result = MergeGateResult::AutoMergeEnabled {
                             pending_checks: pending,
                         };
-                        Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                        emit_gate_result(result, ctx).await
                     }
                     Err(e) => {
                         let result = classify_credential_scope_error(&e, repo).unwrap_or(
@@ -360,7 +372,7 @@ impl Tool for PrMergeWithGateTool {
                                 detail: format!("Auto-merge failed: {e}"),
                             },
                         );
-                        Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                        emit_gate_result(result, ctx).await
                     }
                 }
             }
@@ -378,21 +390,21 @@ impl Tool for PrMergeWithGateTool {
                 let output_lower = output.to_lowercase();
                 if output_lower.contains("already been merged") {
                     let result = MergeGateResult::AlreadyMerged;
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else if !is_err {
                     let result = MergeGateResult::Merged;
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else if let Some(result) = classify_credential_scope_error(&output, repo) {
                     // Credential-scope 403 takes priority over the generic
                     // draft/conflict/review classification below (mika#1616).
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else if output_lower.contains("draft") {
                     let result = MergeGateResult::Blocked {
                         reason: BlockReason::Draft,
                         failing_checks: vec![],
                         detail: "PR is a draft — convert to ready before merging".to_string(),
                     };
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else if output_lower.contains("merge conflict")
                     || output_lower.contains("not mergeable")
                 {
@@ -401,25 +413,98 @@ impl Tool for PrMergeWithGateTool {
                         failing_checks: vec![],
                         detail: "PR has merge conflicts — rebase needed".to_string(),
                     };
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else if output_lower.contains("review") && output_lower.contains("required") {
                     let result = MergeGateResult::Blocked {
                         reason: BlockReason::MissingApproval,
                         failing_checks: vec![],
                         detail: "Required reviews not met".to_string(),
                     };
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 } else {
                     let result = MergeGateResult::GateError {
                         kind: GateErrorKind::Unknown,
                         detail: format!("Merge failed: {output}"),
                     };
-                    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+                    emit_gate_result(result, ctx).await
                 }
             }
         }
     }
 }
+
+/// The single site that turns a [`MergeGateResult`] into the tool's `ToolOutput`
+/// (mika#1964).
+///
+/// It exists because a diagnostic can only be routed where a `ToolContext` is in
+/// hand, and the sixteen `ToolOutput::success(to_string_pretty(&result))` call
+/// sites this replaced had no way to do it. `classify_credential_scope_error` and
+/// `disposition_for_remediation` stay pure and stay untouched: they compose the
+/// operator-shaped text, and the channel decision is taken here, once.
+///
+/// `GateErrorKind::CredentialScope` keeps its variant and its wire name — mika#1616
+/// posed them so the model could branch, and nothing here is a taxonomy change.
+/// Only the `detail` changes channel: the model gets a neutral statement that the
+/// merge did not happen and the branch was not touched, the operator gets the
+/// remedy naming the App and the PAT scope.
+///
+/// **The result stays a successful, parseable JSON document on every tier.** The
+/// LLM branches on `action`, and `tool_execution/dispatch.rs` reads `is_error` as
+/// "the call failed" — so the credential-scope refusal is neither turned into an
+/// error nor followed by prose. That is why this does not go through
+/// `dispatch_substrate_unavailable` (which sets `is_error` and, on operator tier,
+/// appends the diagnostic after a blank line, breaking the JSON):
+///
+/// - **Family / Champion:** the neutral JSON goes to `content`, `detail` goes to
+///   the telemetry sink via `attach_substrate_diagnostic` (`is_error` stays false).
+/// - **Default:** the operator is the reader, so the result is served whole,
+///   byte for byte as before mika#1964 — the remedy already sits inside `detail`.
+///
+/// The match names every tier (no `_ =>`), for the reason
+/// `dispatch_substrate_diagnostic` gives: the next tier must decide, not inherit.
+///
+/// Every other variant is serialized byte for byte as before.
+async fn emit_gate_result(result: MergeGateResult, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
+    if let MergeGateResult::GateError {
+        kind: kind @ GateErrorKind::CredentialScope { .. },
+        detail,
+    } = result
+    {
+        match ctx.tier {
+            mika_common::home::AgentTier::Family | mika_common::home::AgentTier::Champion => {
+                let neutral = MergeGateResult::GateError {
+                    kind,
+                    detail: CREDENTIAL_SCOPE_NEUTRAL_DETAIL.to_string(),
+                };
+                let mut out = ToolOutput::success(serde_json::to_string_pretty(&neutral)?);
+                crate::tools::attach_substrate_diagnostic(
+                    &mut out,
+                    detail,
+                    "pr_merge_with_gate",
+                    ctx,
+                )
+                .await;
+                return Ok(out);
+            }
+            mika_common::home::AgentTier::Default => {
+                let whole = MergeGateResult::GateError { kind, detail };
+                return Ok(ToolOutput::success(serde_json::to_string_pretty(&whole)?));
+            }
+        }
+    }
+    Ok(ToolOutput::success(serde_json::to_string_pretty(&result)?))
+}
+
+/// What the model reads in place of the credential-scope remedy.
+///
+/// It says *that* the merge did not happen and *that* the branch is untouched —
+/// the two facts the turn needs in order not to claim a merge (the mika#483 /
+/// mika#1331 family) — and nothing about infrastructure. A fallback that said
+/// nothing at all would make the model invent a cause (mika#1783 risk 2).
+const CREDENTIAL_SCOPE_NEUTRAL_DETAIL: &str = "This pull request cannot be merged from here: the merge was refused before it \
+     was attempted. Nothing was merged and the branch was not modified. This is not \
+     a problem with the pull request itself and retrying will not change it — report \
+     it rather than working around it.";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1340,6 +1425,25 @@ pub(crate) fn describe_behind_main_remediation(
              before this PR can go in.\n\n"
         )),
         BehindMainRemediation::Failed(d) | BehindMainRemediation::Contradiction(d) => {
+            // mika#1964 measured this site OUT of the population, and that is a
+            // divergence from the ticket's inventory, declared rather than absorbed.
+            // The inventory reads this text as "serialized into the MergeGateResult
+            // JSON served as content" — true of `classify_credential_scope_error`
+            // (reached through `disposition_for_remediation`), false here. This
+            // function composes a webhook PRE-DIGEST, consumed only by
+            // `ci_success_handler` and `verdict_handler`, i.e. by mika-dev / mika-qa
+            // on operator tier: a family tenant receives no GitHub webhook and can
+            // never read it. It also has no `ToolContext`, and neither of its two
+            // callers builds a `ToolOutput`, so there is no channel to route to — and
+            // on operator tier `dispatch_substrate_diagnostic` folds the diagnostic
+            // back into the content anyway, so a conversion would change no served
+            // byte. Should a family-reachable caller ever appear, this becomes a real
+            // leak and the annotation must go.
+            //
+            // The marker sits on the LAST comment line on purpose: an annotation
+            // exempts a short window, so a marker buried at the top of a long comment
+            // block would leave the literal outside it (mika#1964 §3.3 decision 3).
+            // substrate-ok: webhook pre-digest, operator tier only — see above.
             Some(format!(
                 "the PR is behind main (base: {base}, main HEAD: {head}) and the automatic \
                  branch update did not go through: {d}. Do NOT merge. Do NOT rebase by hand — \
@@ -1396,6 +1500,8 @@ pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<Stri
     // Scrub MIKA_* and GH_TOKEN, then re-inject the correct token.
     // Uses the same pattern as run_gh in builtin_handlers.rs.
     crate::skills::executor::scrub_mika_env_vars(&mut cmd);
+    // substrate-ok: an env() argument handed to a child process — it never enters a
+    // tool-result `content`, so no tier reads it.
     cmd.env("GH_TOKEN", token);
 
     cmd.kill_on_drop(true);
@@ -1600,10 +1706,16 @@ pub(crate) fn classify_credential_scope_error(err: &str, repo: &str) -> Option<M
         return None;
     }
 
+    // Since mika#1964 this `detail` IS the operator channel — `emit_gate_result`
+    // moves it out of the model-visible `content` and routes it, replacing it with
+    // CREDENTIAL_SCOPE_NEUTRAL_DETAIL. The remedy it names stays whole, which is
+    // mika#1616's contract: the agent must report a real cause rather than paraphrase
+    // an exit code. Only its reader changed.
     Some(MergeGateResult::GateError {
         kind: GateErrorKind::CredentialScope {
             repo: repo.to_string(),
         },
+        // substrate-diagnostic: routed by `emit_gate_result` — see above.
         detail: format!(
             "Merge credential lacks write access to {repo}. The GitHub App \
              installation (or PAT) used for autonomous merges is not authorized \
@@ -2764,7 +2876,189 @@ mod tests {
 
         let result = tool.execute(input, &ctx).await.unwrap();
         assert!(result.is_error);
-        assert!(result.content.contains("GitHub token required"));
+        // mika#1964 — `harness.ctx()` is operator tier, so the diagnostic is folded
+        // back into `content` and the variable is still readable here. The family
+        // half is `mika1964_missing_token_does_not_leak_on_family_tier` below.
+        assert!(result.content.contains("MIKA_GITHUB_TOKEN"));
+        assert!(
+            result
+                .content
+                .starts_with("Merging pull requests is not available"),
+            "the neutral fallback must come first: {}",
+            result.content
+        );
+    }
+
+    /// mika#1964 V3 — the leak M1 made reachable is closed.
+    ///
+    /// `pr_merge_with_gate` is registered by `default_tools()`, so it sits in every
+    /// agent's tool array whatever its tier, and `FAMILY_IDENTITY` declares no
+    /// `[tools].disabled` block. The old message was therefore served to a family
+    /// tenant — which is why the ticket's "currently latent because
+    /// FAMILY_AGENT_SKILL_ALLOWLIST excludes them" premise was false: that allowlist
+    /// gates skills, never builtin tools.
+    #[tokio::test]
+    async fn mika1964_missing_token_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let result = PrMergeWithGateTool
+            .execute(
+                json!({"pr_number": 42, "repo": "senara-solutions/mika"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        for token in ["MIKA_GITHUB_TOKEN", "GitHub App", "config.toml"] {
+            assert!(
+                !result.content.contains(token),
+                "family tier leaked {token:?}: {}",
+                result.content
+            );
+        }
+        // The fallback must still say the merge did not happen — a content that says
+        // nothing makes the model invent a cause (mika#1783 risk 2).
+        assert!(result.content.contains("Nothing was merged"));
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.tool_name == "substrate_unavailable" && e.target_key == "pr_merge_with_gate"
+            })
+            .collect();
+        assert_eq!(
+            routed.len(),
+            1,
+            "expected one routed diagnostic: {events:?}"
+        );
+        assert!(
+            routed[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("MIKA_GITHUB_TOKEN"),
+            "the operator detail did not reach the diagnostic channel"
+        );
+    }
+
+    /// The credential-scope result as `classify_credential_scope_error` builds it
+    /// from the gh 403 of the mika#1616 root cause.
+    fn credential_scope_result() -> MergeGateResult {
+        classify_credential_scope_error(
+            "gh exit code 1: HTTP 403: Resource not accessible by integration",
+            "senara-solutions/mika-cloud",
+        )
+        .expect("a 403 classifies as credential scope")
+    }
+
+    fn substrate_rows(
+        events: &[crate::evidence::audit::AuditEvent],
+    ) -> Vec<&crate::evidence::audit::AuditEvent> {
+        events
+            .iter()
+            .filter(|e| {
+                e.tool_name == "substrate_unavailable" && e.target_key == "pr_merge_with_gate"
+            })
+            .collect()
+    }
+
+    /// mika#1964 — the flagship site of the sweep, reached directly.
+    ///
+    /// `emit_gate_result`'s CredentialScope arm is only reachable through `.execute()`
+    /// with real gh 403 output, and this file has no gh harness — so the two tests
+    /// above stop at the missing-token guard and never touch it. This calls it in
+    /// place, on both sealed tiers.
+    ///
+    /// The shape is pinned as well as the leak: a successful, parseable JSON whose
+    /// `action` the model branches on, never an `is_error` result with prose after
+    /// the JSON (which `tool_execution/dispatch.rs` would record as a failed call).
+    #[tokio::test]
+    async fn mika1964_credential_scope_does_not_leak_on_sealed_tiers() {
+        for tier in [
+            mika_common::home::AgentTier::Family,
+            mika_common::home::AgentTier::Champion,
+        ] {
+            let harness = TestHarness::new();
+            let mut ctx = harness.ctx();
+            ctx.tier = tier;
+
+            let out = emit_gate_result(credential_scope_result(), &ctx)
+                .await
+                .unwrap();
+
+            assert!(!out.is_error, "{tier:?}: a refusal is not a failed call");
+            let json: serde_json::Value = serde_json::from_str(&out.content)
+                .unwrap_or_else(|e| panic!("{tier:?}: content is not JSON ({e}): {}", out.content));
+            assert_eq!(json["action"], "gate_errored");
+            assert_eq!(json["kind"]["kind"], "credential_scope");
+            assert_eq!(json["detail"], CREDENTIAL_SCOPE_NEUTRAL_DETAIL);
+            for token in [
+                "GitHub App",
+                "PAT",
+                "`repo` scope",
+                "Resource not accessible",
+            ] {
+                assert!(
+                    !out.content.contains(token),
+                    "{tier:?} leaked {token:?}: {}",
+                    out.content
+                );
+            }
+
+            let events = harness
+                .db
+                .get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+            let routed = substrate_rows(&events);
+            assert_eq!(routed.len(), 1, "{tier:?}: expected one routed diagnostic");
+            let after = routed[0].after_value.as_deref().unwrap_or("");
+            assert!(
+                after.contains("GitHub App") && after.contains("senara-solutions/mika-cloud"),
+                "{tier:?}: the remedy did not reach the diagnostic channel: {after}"
+            );
+        }
+    }
+
+    /// mika#1964 — the operator-tier half: the result is served whole, byte for byte
+    /// as before the sweep, and nothing is routed to the telemetry sink.
+    #[tokio::test]
+    async fn mika1964_credential_scope_default_tier_keeps_the_whole_json() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+        assert_eq!(ctx.tier, mika_common::home::AgentTier::Default);
+
+        let expected = serde_json::to_string_pretty(&credential_scope_result()).unwrap();
+        let out = emit_gate_result(credential_scope_result(), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert_eq!(
+            out.content, expected,
+            "operator tier must be byte-identical"
+        );
+        let json: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(json["action"], "gate_errored");
+        assert!(json["detail"].as_str().unwrap().contains("GitHub App"));
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            substrate_rows(&events).is_empty(),
+            "operator tier must not write a substrate row: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -3037,9 +3331,12 @@ mod tests {
             .expect("tool must not error out");
 
         // `ctx.github_token` est `None` : l'appel avance jusqu'à l'exigence de
-        // token, donc au-delà de la porte d'identité.
+        // token, donc au-delà de la porte d'identité. Depuis mika#1964 ce refus
+        // porte son détail opérateur par le canal de diagnostic, replié dans le
+        // `content` sur le tier opérateur — d'où le nom de variable comme témoin
+        // qu'on a bien atteint la vérification du jeton.
         assert!(
-            out.content.contains("GitHub token required"),
+            out.content.contains("MIKA_GITHUB_TOKEN"),
             "the dispatcher must reach the token check, not an authority refusal: {}",
             out.content
         );

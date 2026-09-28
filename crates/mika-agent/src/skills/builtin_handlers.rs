@@ -221,26 +221,31 @@ async fn web_search(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOut
             //   goes to `audit_events` and never enters the LLM's context.
             // Default (operator) tier: unchanged operator UX — the diagnostic
             //   is folded back into the tool-result `content`.
-            let mut out = ToolOutput::substrate_unavailable(
-                "La recherche web n'est pas disponible pour le moment.",
+            return crate::tools::dispatch_substrate_unavailable(
+                SEARCH_UNAVAILABLE_FALLBACK,
+                // substrate-diagnostic: mika#1783 — the operator channel by
+                // construction; naming the env var here is the point.
                 "Search substrate is not configured (gateway_url missing). \
                  Ensure MIKA_ROUTING_URL is set on mika-spirit.",
-            );
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
-            return out;
+                "web_search",
+                ctx,
+            )
+            .await;
         }
     };
     let internal_token = match ctx.internal_token {
         Some(t) if !t.trim().is_empty() => t,
         _ => {
             // mika#1783 doctrine — same tier-routing for internal_token missing.
-            let mut out = ToolOutput::substrate_unavailable(
-                "La recherche web n'est pas disponible pour le moment.",
+            return crate::tools::dispatch_substrate_unavailable(
+                SEARCH_UNAVAILABLE_FALLBACK,
+                // substrate-diagnostic: as above.
                 "Search substrate is not configured (internal_token missing). \
                  Ensure MIKA_INTERNAL_TOKEN is set on mika-spirit.",
-            );
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", ctx).await;
-            return out;
+                "web_search",
+                ctx,
+            )
+            .await;
         }
     };
 
@@ -304,7 +309,21 @@ async fn web_search(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOut
             serde_json::from_slice(&bytes).unwrap_or(SubstrateErrorBody {
                 error: String::new(),
             });
-        return ToolOutput::error(map_substrate_error(status.as_u16(), &err_body.error));
+        // mika#1964 — the neutral half goes to the model, the operator-shaped half
+        // to the diagnostic channel. Before this, `map_substrate_error`'s own
+        // doc-comment declared the opposite decision ("intentionally names the
+        // operator surface"), and two of its branches served MIKA_SEARCH_UPSTREAM,
+        // MIKA_BRAVE_API_KEY and "Ask the operator to…" straight to a family tenant
+        // through the `web-search` skill — the very population mika#1783 protected,
+        // re-exposed by the substrate cut mika#1971 made one file away.
+        let (fallback, diagnostic) = substrate_error_message(status.as_u16(), &err_body.error);
+        return crate::tools::dispatch_substrate_unavailable(
+            fallback,
+            diagnostic,
+            "web_search",
+            ctx,
+        )
+        .await;
     }
 
     let resp_body: SearchResponseWire = match serde_json::from_slice(&bytes) {
@@ -346,14 +365,40 @@ struct SearchResultWire {
     snippet: String,
 }
 
-/// Map a substrate HTTP status + taxonomy label to an LLM-facing message.
+/// The one neutral fallback `web_search` serves when its substrate is unavailable
+/// — no service name, no env var, no config path, no operator instruction.
+///
+/// French because the population this protects is a family tenant (mika#1783's
+/// founding incident), and because the four pre-existing fallbacks of this handler
+/// and of `fetch_url` already read this way; a fifth in another language would
+/// make the register depend on which branch failed.
+const SEARCH_UNAVAILABLE_FALLBACK: &str = "La recherche web n'est pas disponible pour le moment.";
+
+/// `fetch_url`'s neutral fallback — same contract, same register as its sibling.
+const FETCH_UNAVAILABLE_FALLBACK: &str =
+    "La récupération de contenu web n'est pas disponible pour le moment.";
+
+/// Map a substrate HTTP status + taxonomy label to **(neutral fallback, operator
+/// diagnostic)** — mika#1964.
 ///
 /// The taxonomy comes from `crates/mika-gateway/src/egress_search/mod.rs`'s
 /// `SearchError::tracing_status` and the `handle_internal_search` handler.
-/// The mapping intentionally names the operator surface (gateway container,
-/// MIKA_BRAVE_API_KEY on the gateway) so an LLM-authored ticket carries the
-/// actionable remediation rather than opaque status text.
-fn map_substrate_error(status: u16, label: &str) -> String {
+///
+/// **This function used to declare the inverse decision in its own doc-comment**
+/// — *"the mapping intentionally names the operator surface"* — and returned one
+/// `String` that went straight into `ToolOutput::error`. That was defensible while
+/// `web_search` talked to Brave directly and the skill was operator-only; it
+/// stopped being so when `web-search` entered `FAMILY_AGENT_SKILL_ALLOWLIST`. The
+/// operator surface is still named, in full, with nothing dropped — it is the
+/// second member of the pair, and `dispatch_substrate_diagnostic` is what decides
+/// who reads it.
+///
+/// Three branches change channel; four do not. `upstream_error`,
+/// `transport_error`, `parse_error` and the `_` default carry the same text on
+/// both sides: they name no service, no variable and no gesture, so there is
+/// nothing to withhold and inventing a second wording would only make the two
+/// drift.
+fn substrate_error_message(status: u16, label: &str) -> (String, String) {
     match (status, label) {
         // mika#2118 extension B — same class as the ticket's own defect, one site
         // away: this used to say a key was missing where it is the *selector* that
@@ -362,30 +407,53 @@ fn map_substrate_error(status: u16, label: &str) -> String {
         // answers 404 whatever the key is worth, "and the repairing gesture is the
         // opposite of the obvious one: add the selector, not another key". Naming a
         // missing key here sends the operator to the one place that cannot help.
-        (404, "search_upstream_not_configured") => {
+        //
+        // That doctrine is unchanged by mika#1964 — it moved channel, not content.
+        // `mika2118_substrate_404_names_the_selector_not_a_key` still guards it,
+        // now on the diagnostic member of the pair.
+        (404, "search_upstream_not_configured") => (
+            SEARCH_UNAVAILABLE_FALLBACK.to_string(),
+            // substrate-diagnostic: the operator channel — naming the selector and
+            // the key is the whole purpose of mika#2407's wording.
             "Search substrate is not configured on the gateway: no upstream is \
              selected. Ask the operator to set MIKA_SEARCH_UPSTREAM on mika-gateway \
              (and the matching upstream key, e.g. MIKA_BRAVE_API_KEY for \
              MIKA_SEARCH_UPSTREAM=brave). Without the selector the endpoint answers \
              404 whatever the key is worth, so adding a key alone changes nothing."
-                .to_string()
-        }
-        (502, "not_implemented") => {
-            "Search substrate variant not implemented on the gateway.".to_string()
-        }
+                .to_string(),
+        ),
+        (502, "not_implemented") => (
+            SEARCH_UNAVAILABLE_FALLBACK.to_string(),
+            "Search substrate variant not implemented on the gateway.".to_string(),
+        ),
         (502, "upstream_error") => {
-            "Search upstream returned an error. Try again in a moment.".to_string()
+            let msg = "Search upstream returned an error. Try again in a moment.".to_string();
+            (msg.clone(), msg)
         }
-        (502, "unauthorized") => "Search substrate rejected upstream credentials. \
+        (502, "unauthorized") => (
+            SEARCH_UNAVAILABLE_FALLBACK.to_string(),
+            // substrate-diagnostic: as above — the key name is what the operator
+            // needs and what the tenant must never read.
+            "Search substrate rejected upstream credentials. \
              Ask the operator to rotate MIKA_BRAVE_API_KEY on mika-gateway."
-            .to_string(),
-        (502, "transport_error") => "Search request failed (transport error contacting upstream). \
-             Try again in a moment."
-            .to_string(),
-        (502, "parse_error") => "Search substrate could not parse the upstream response \
-             (possible schema drift). Escalate."
-            .to_string(),
-        _ => format!("Search substrate returned HTTP {status}."),
+                .to_string(),
+        ),
+        (502, "transport_error") => {
+            let msg = "Search request failed (transport error contacting upstream). \
+                       Try again in a moment."
+                .to_string();
+            (msg.clone(), msg)
+        }
+        (502, "parse_error") => {
+            let msg = "Search substrate could not parse the upstream response \
+                       (possible schema drift). Escalate."
+                .to_string();
+            (msg.clone(), msg)
+        }
+        _ => {
+            let msg = format!("Search substrate returned HTTP {status}.");
+            (msg.clone(), msg)
+        }
     }
 }
 
@@ -443,13 +511,15 @@ async fn fetch_url(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutp
             //   operator-shaped detail (`MIKA_ROUTING_URL`) goes to audit
             //   events and never enters the LLM context. Default (operator)
             //   tier: diagnostic folds back into tool-result content.
-            let mut out = ToolOutput::substrate_unavailable(
-                "La récupération de contenu web n'est pas disponible pour le moment.",
+            return crate::tools::dispatch_substrate_unavailable(
+                FETCH_UNAVAILABLE_FALLBACK,
+                // substrate-diagnostic: mika#1783 — the operator channel.
                 "fetch_url is not configured for this agent (missing gateway URL). \
                  Set MIKA_ROUTING_URL for the agent.",
-            );
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
-            return out;
+                "fetch_url",
+                ctx,
+            )
+            .await;
         }
     };
 
@@ -457,13 +527,15 @@ async fn fetch_url(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutp
         Some(t) if !t.trim().is_empty() => t.to_string(),
         _ => {
             // mika#1783 doctrine — same tier-routing for internal_token missing.
-            let mut out = ToolOutput::substrate_unavailable(
-                "La récupération de contenu web n'est pas disponible pour le moment.",
+            return crate::tools::dispatch_substrate_unavailable(
+                FETCH_UNAVAILABLE_FALLBACK,
+                // substrate-diagnostic: as above.
                 "fetch_url is not configured for this agent (missing internal token). \
                  Set MIKA_INTERNAL_TOKEN for the agent.",
-            );
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "fetch_url", ctx).await;
-            return out;
+                "fetch_url",
+                ctx,
+            )
+            .await;
         }
     };
 
@@ -1814,6 +1886,8 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
     super::executor::scrub_mika_env_vars(&mut cmd);
 
     if let Some(token) = ctx.github_token {
+        // substrate-ok: an env() argument handed to a child process — it never
+        // enters a tool-result `content`, so no tier reads it.
         cmd.env("GH_TOKEN", token);
     }
 
@@ -2551,6 +2625,8 @@ async fn fetch_pr_wip_rescue_view(
     cmd.env("GH_PROMPT_DISABLED", "1");
     super::executor::scrub_mika_env_vars(&mut cmd);
     if let Some(token) = ctx.github_token {
+        // substrate-ok: an env() argument handed to a child process — it never
+        // enters a tool-result `content`, so no tier reads it.
         cmd.env("GH_TOKEN", token);
     }
 
@@ -2677,12 +2753,17 @@ async fn validate_destructive_action_grounding(
     // Emits the AC3 audit row, then returns the refusal. Audit failures are
     // warn-and-continue: losing the ledger row must not turn a refusal into an
     // authorization.
+    /// `diagnostic` is the mika#1964 channel: operator-shaped cause that must not
+    /// reach the model's `content`. It stays `Option` on one shared refusal path
+    /// rather than becoming a second `refuse_with_…`, so there is still exactly one
+    /// site that builds a destructive-action refusal.
     async fn refuse(
         ctx: &ToolContext<'_>,
         target_key: &str,
         block_label: &str,
         reason: &str,
         remedy: &str,
+        diagnostic: Option<&str>,
     ) -> Result<(), ToolOutput> {
         tracing::warn!(
             event = "destructive_action_blocked",
@@ -2715,7 +2796,21 @@ async fn validate_destructive_action_grounding(
             "reason": reason,
             "remedy": remedy,
         });
-        Err(ToolOutput::error(body.to_string()))
+        match diagnostic {
+            // mika#1964 — this is NOT a "capability unavailable" case, and the
+            // fallback deliberately does not say so: no capability is absent, a
+            // guard simply cannot conclude. What the model keeps is the conduct
+            // (this refusal is not lifted by retrying — surface it); what moves to
+            // the operator channel is the technical cause.
+            Some(d) => Err(crate::tools::dispatch_substrate_unavailable(
+                body.to_string(),
+                d,
+                "run_gh",
+                ctx,
+            )
+            .await),
+            None => Err(ToolOutput::error(body.to_string())),
+        }
     }
 
     // --- Layer B first: "you are repeating yourself" is the more specific and
@@ -2742,6 +2837,7 @@ async fn validate_destructive_action_grounding(
                  shown to be a first execution. Surface to the operator rather \
                  than retrying — closing on an unverifiable history is exactly \
                  the failure this gate exists to prevent.",
+                None,
             )
             .await;
         }
@@ -2772,6 +2868,7 @@ async fn validate_destructive_action_grounding(
                     noun = action.kind.noun(),
                     number = action.number,
                 ),
+                None,
             )
             .await;
         }
@@ -2788,6 +2885,7 @@ async fn validate_destructive_action_grounding(
                 &format!("could not read this turn's tool calls: {e}"),
                 "The grounding record is unreadable, so this close cannot be shown \
                  to rest on the target's current state. Surface to the operator.",
+                None,
             )
             .await;
         }
@@ -2806,16 +2904,28 @@ async fn validate_destructive_action_grounding(
         // persistence is off (MIKA_STORE_TOOL_CALLS=false), and reporting it as
         // a missing read would send the agent into a loop re-reading a target
         // whose read can never be observed.
-        let (reason, extra) = if turn_calls.is_empty() {
+        // mika#1964 — `extra` used to name MIKA_STORE_TOOL_CALLS in the refusal
+        // served to the model. The CONDUCT it carries is what the model needs and
+        // keeps (this refusal is not lifted by retrying — surface it); the technical
+        // cause is what changes channel. Converting it to "capability unavailable"
+        // would be wrong: nothing is absent, a guard cannot conclude.
+        let (reason, extra, diagnostic) = if turn_calls.is_empty() {
             (
                 "no tool calls recorded for this turn — grounding cannot be established",
-                " NOTE: this turn has NO recorded tool calls at all. If tool-call \
-                 persistence is disabled (MIKA_STORE_TOOL_CALLS=false), this gate cannot \
-                 observe your read and will keep refusing. Surface to the operator rather \
-                 than retrying.",
+                " NOTE: this turn has NO recorded tool calls at all, so this gate cannot \
+                 observe your read and will keep refusing. This refusal cannot be lifted \
+                 by retrying — surface it to the operator.",
+                Some(
+                    // substrate-diagnostic: the operator channel — the setting to
+                    // check is exactly what they need and the tenant must not read.
+                    "Operator detail (mika#1964): the destructive-action gate found zero \
+                     recorded tool calls for this trace. If tool-call persistence is \
+                     disabled (MIKA_STORE_TOOL_CALLS=false), Layer A of the mika#1646 gate \
+                     cannot observe any read and will refuse every close for this agent.",
+                ),
             )
         } else {
-            ("no read of the target in this turn", "")
+            ("no read of the target in this turn", "", None)
         };
         return refuse(
             ctx,
@@ -2833,6 +2943,7 @@ async fn validate_destructive_action_grounding(
                 number = action.number,
                 extra = extra,
             ),
+            diagnostic,
         )
         .await;
     }
@@ -2847,6 +2958,7 @@ async fn validate_destructive_action_grounding(
              Cite it in --comment: the file list, the diff, the overlap (or absence \
              of overlap) that makes this close correct. A rationale nobody can check \
              is what got replayed twice in the founding incident.",
+            None,
         )
         .await;
     }
@@ -3015,12 +3127,17 @@ async fn validate_pr_review_flag_coherence(
         // from a genuinely first call — refusing here would be refusing on an
         // unobservable term.
         if turn_calls.is_empty() {
+            // A `tracing::warn!` message — the operator's channel by construction.
+            // Its sibling at the destructive-action gate above is NOT this case: that
+            // one was concatenated into the refusal served to the model, which is why
+            // it had to be converted rather than annotated.
             tracing::warn!(
                 event = "pr_review_flag_guard_abstained",
                 agent_id = %ctx.db.agent_id(),
                 session_id = %ctx.session_id,
                 target = %target_key,
                 reason = "no_tool_calls_recorded",
+                // substrate-ok: a log message, never a tool-result content.
                 "pr-review flag guard abstained — this turn has no recorded tool calls, so a \
                  prior --approve attempt cannot be ruled out (check MIKA_STORE_TOOL_CALLS)"
             );
@@ -3921,11 +4038,15 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // scrub_mika_env_vars removes GH_TOKEN (defense-in-depth against .env leak),
     // so we must re-add the correct platform token here. See #380.
     if let Some(token) = ctx.github_token {
+        // substrate-ok: an env() argument handed to a child process — it never
+        // enters a tool-result `content`, so no tier reads it.
         cmd.env("GH_TOKEN", token);
     }
 
     // Diagnostic instrumentation (#900): log the exact gh subcommand, env key set
     // (keys only, never values), and token presence for timeout forensics.
+    // substrate-ok: env-var NAMES for a tracing field (keys only, never values) —
+    // this array reaches the log, never a tool-result `content`.
     let env_keys_set: &[&str] = match ctx.github_token {
         Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
         None => &["GH_PROMPT_DISABLED"],
@@ -4570,6 +4691,9 @@ fn gws_credentials_absent_message(
 /// routes it to `audit_events` there. On operator tier it is folded back into the
 /// content, because the operator IS its reader. It names the discriminator and
 /// what it returned, so the decision can be replayed without re-running the probe.
+// substrate-diagnostic: the operator channel by construction (mika#2118) — naming
+// the config directory is what makes the decision replayable without re-running
+// the probe. `dispatch_substrate_unavailable` routes it.
 const GWS_CREDENTIALS_ABSENT_DIAGNOSTIC: &str = "Operator detail (mika#2118): `gws auth status` reported `credential_source: none` \
      with `encrypted_credentials_exists: false` and `plain_credentials_exists: false` — \
      no Google credential store exists under this host's config directory \
@@ -4619,15 +4743,14 @@ async fn apply_gws_credential_state(
             output
         }
         GwsCredentialState::NeverConfigured => {
-            let mut out = ToolOutput::substrate_unavailable(
-                gws_credentials_absent_message(ctx.deployment, ctx.tier),
-                GWS_CREDENTIALS_ABSENT_DIAGNOSTIC,
-            );
-
             // R7, again: deployment, tier and agent only — never a Google account
             // identifier. Expected regime: non-empty on cloud tenants the first time
             // a user asks for Drive or Calendar. That population had no measurement
             // at all before this.
+            //
+            // Emitted BEFORE the coupled helper so the observable order is unchanged
+            // by mika#1964: the `info!` used to sit between construction and routing,
+            // and the helper now performs both in one call.
             tracing::info!(
                 event = "gws_credentials_absent",
                 deployment = ?ctx.deployment,
@@ -4636,8 +4759,13 @@ async fn apply_gws_credential_state(
                 "gws has no credentials on this host; served the design-limit message"
             );
 
-            crate::tools::dispatch_substrate_diagnostic(&mut out, "run_gws", ctx).await;
-            out
+            crate::tools::dispatch_substrate_unavailable(
+                gws_credentials_absent_message(ctx.deployment, ctx.tier),
+                GWS_CREDENTIALS_ABSENT_DIAGNOSTIC,
+                "run_gws",
+                ctx,
+            )
+            .await
         }
     }
 }
@@ -5405,60 +5533,242 @@ mod tests {
     // Uses `wiremock` (already a dev-dep of the workspace, per the pattern
     // in `crates/mika-common` tests).
 
-    /// Verify the HTTP 401 branch's substrate_unavailable path routes correctly
-    /// on family tier — no forbidden-token leak, audit event written.
+    /// mika#1964 V1 — the leak is closed **on the real path**, family tier, for
+    /// both measured substrate failures.
     ///
-    /// The web_search handler hardcodes `https://api.search.brave.com/...`,
-    /// so a full end-to-end network-mock test would need a base-URL override
-    /// (out of scope for this ticket). Instead, this test exercises the exact
-    /// same code path the 401 branch takes: it builds the identical
-    /// `ToolOutput::substrate_unavailable(...)` the handler now emits and
-    /// runs `dispatch_substrate_diagnostic`. This proves the leak-closure
-    /// invariant on the exact strings the handler produces. The
-    /// `web_search_no_raw_401_operator_error` source-scan test below is the
-    /// companion guard that ensures the handler actually calls this
-    /// constructor (not a bare `ToolOutput::error`).
+    /// This replaces `web_search_family_tier_http_401_no_leak`, deleted with its
+    /// ticket. That test was a false green in two independent ways, and both are
+    /// worth recording because they are what mika#1964 M4 is about. It described
+    /// a Brave-direct HTTP 401 branch that mika#1971 removed — the handler has
+    /// not spoken to Brave since — and it never called the handler at all: it
+    /// built by hand the `ToolOutput` it claimed to verify, so it stayed green
+    /// across the very change that reopened the defect. Its own comment named a
+    /// companion source-scan guard, `web_search_no_raw_401_operator_error`, which
+    /// never existed anywhere in the tree; rule 1 of
+    /// `scripts/check-substrate-leak.sh` is what finally holds that half.
+    ///
+    /// 404 first, deliberately: `search_upstream_not_configured` is the failure
+    /// actually measured on 2026-09-18 across six tenants (mika#2407).
     #[tokio::test]
-    async fn web_search_family_tier_http_401_no_leak() {
-        let harness = TestHarness::new();
-        // brave_api_key IS present here — this documents the 401 branch's
-        // structural closure, not the missing-key branch (which is covered
-        // by web_search_family_tier_no_leak above).
-        let ctx = harness
-            .ctx_with_tier_and_brave(mika_common::home::AgentTier::Family, Some("fake-key-value"));
+    async fn mika1964_web_search_family_tier_no_leak_on_substrate_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // Verbatim copy of the ToolOutput the handler builds on 401.
-        let mut out = ToolOutput::substrate_unavailable(
-            "La recherche web n'est pas disponible pour le moment.",
-            "Brave Search returned HTTP 401 (invalid or revoked API key). \
-             Check MIKA_BRAVE_API_KEY or refresh the key at \
-             https://brave.com/search/api/.",
-        );
-        crate::tools::dispatch_substrate_diagnostic(&mut out, "web_search", &ctx).await;
+        for (status, label, expected_in_diagnostic) in [
+            (
+                404u16,
+                "search_upstream_not_configured",
+                "MIKA_SEARCH_UPSTREAM",
+            ),
+            (502u16, "unauthorized", "MIKA_BRAVE_API_KEY"),
+        ] {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/internal/search"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(serde_json::json!({ "error": label })),
+                )
+                .mount(&mock)
+                .await;
 
-        // No forbidden token leaks — same allow-list as the missing-key test.
-        for token in FORBIDDEN_FAMILY_TIER_TOKENS {
+            let gateway_url = mock.uri();
+            let harness = TestHarness::new();
+            let mut ctx =
+                harness.ctx_with_tier_and_brave(mika_common::home::AgentTier::Family, None);
+            ctx.gateway_url = Some(&gateway_url);
+            ctx.internal_token = Some("test-internal-token");
+
+            let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
+            assert!(output.is_error, "{label}: expected an error result");
+
+            for token in FORBIDDEN_FAMILY_TIER_TOKENS {
+                assert!(
+                    !output.content.contains(token),
+                    "{label}: family tier leaked {token:?} in content: {:?}",
+                    output.content
+                );
+            }
+            // The neutral fallback must still SAY something — a content that says
+            // nothing makes the model invent a cause (mika#1783 risk 2).
+            assert_eq!(output.content, SEARCH_UNAVAILABLE_FALLBACK, "{label}");
             assert!(
-                !out.content.contains(token),
-                "family-tier 401 branch leaked forbidden token {token:?} in content: {:?}",
-                out.content
+                output.substrate_diagnostic.is_none(),
+                "{label}: dispatch_substrate_diagnostic should have consumed the field"
+            );
+
+            let events = harness
+                .db
+                .get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+            let substrate_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.tool_name == "substrate_unavailable" && e.target_key == "web_search")
+                .collect();
+            assert_eq!(
+                substrate_events.len(),
+                1,
+                "{label}: expected exactly one substrate_unavailable audit row, got {substrate_events:?}"
+            );
+            let after = substrate_events[0].after_value.as_deref().unwrap_or("");
+            assert!(
+                after.contains(expected_in_diagnostic),
+                "{label}: the operator detail did not reach the diagnostic channel: {after:?}"
             );
         }
-        assert!(out.substrate_diagnostic.is_none());
+    }
 
-        // Audit event landed with the operator-shaped detail.
+    /// mika#1964 V2 — the negative control. Without it, "the mechanism decides by
+    /// tier" is indistinguishable from "the mechanism blocks everything".
+    ///
+    /// On operator tier the diagnostic is folded back into `content` (after the
+    /// neutral fallback and a blank line) and **no** audit row is written. That
+    /// second half is the one an assertion on the text alone would miss.
+    #[tokio::test]
+    async fn mika1964_web_search_default_tier_keeps_the_operator_detail_readable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/internal/search"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": "search_upstream_not_configured"
+            })))
+            .mount(&mock)
+            .await;
+
+        let gateway_url = mock.uri();
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        ctx.gateway_url = Some(&gateway_url);
+        ctx.internal_token = Some("test-internal-token");
+
+        let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
+        assert!(output.is_error);
+        assert!(
+            output.content.starts_with(SEARCH_UNAVAILABLE_FALLBACK),
+            "operator tier should read the neutral fallback first: {:?}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("MIKA_SEARCH_UPSTREAM on mika-gateway"),
+            "operator tier lost the actionable detail: {:?}",
+            output.content
+        );
+
         let events = harness
             .db
             .get_audit_events("test-session")
             .await
             .expect("get_audit_events");
-        let substrate_events: Vec<_> = events
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "default tier must not write a substrate_unavailable audit row: {events:?}"
+        );
+    }
+
+    /// The argv of a close the mika#1646 gate recognises, on a fresh harness whose
+    /// trace carries no recorded tool call — the `turn_calls.is_empty()` branch.
+    fn mika1964_ungrounded_close_args() -> Vec<String> {
+        ["pr", "close", "42", "--comment", "superseded"]
             .iter()
-            .filter(|e| e.tool_name == "substrate_unavailable")
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// mika#1964 V3 — the destructive-action gate is a GUARD, not a substrate
+    /// handler: on family tier its refusal keeps the conduct (not lifted by
+    /// retrying, surface it) and loses the setting name, which is routed instead.
+    #[tokio::test]
+    async fn mika1964_destructive_gate_no_calls_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx_with_tier_and_brave(mika_common::home::AgentTier::Family, None);
+
+        let refusal =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+                .expect_err("an ungrounded close must be refused");
+
+        assert!(refusal.is_error);
+        assert!(
+            !refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "family tier leaked the setting name: {}",
+            refusal.content
+        );
+        // The conduct survives the channel change — without it the model would
+        // retry a refusal no retry can lift.
+        assert!(
+            refusal.content.contains("cannot be lifted by retrying"),
+            "{}",
+            refusal.content
+        );
+        // Family tier gets the structured refusal body and nothing appended.
+        let body: serde_json::Value =
+            serde_json::from_str(&refusal.content).expect("refusal body stays parseable JSON");
+        assert_eq!(
+            body["reason"],
+            "no tool calls recorded for this turn — grounding cannot be established"
+        );
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        let routed: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == "substrate_unavailable" && e.target_key == "run_gh")
             .collect();
-        assert_eq!(substrate_events.len(), 1);
-        let after = substrate_events[0].after_value.as_deref().unwrap_or("");
-        assert!(after.contains("401") && after.contains("MIKA_BRAVE_API_KEY"));
+        assert_eq!(
+            routed.len(),
+            1,
+            "expected one routed diagnostic: {events:?}"
+        );
+        assert!(
+            routed[0]
+                .after_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("MIKA_STORE_TOOL_CALLS"),
+            "the operator detail did not reach the diagnostic channel"
+        );
+    }
+
+    /// mika#1964 V2 for the gate — operator tier still reads the setting to check,
+    /// after the refusal body, and no substrate audit row is written.
+    #[tokio::test]
+    async fn mika1964_destructive_gate_no_calls_default_tier_keeps_the_detail() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let refusal =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+                .expect_err("an ungrounded close must be refused");
+
+        assert!(refusal.content.starts_with('{'), "{}", refusal.content);
+        assert!(
+            refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "operator tier lost the actionable detail: {}",
+            refusal.content
+        );
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "default tier must not write a substrate_unavailable audit row: {events:?}"
+        );
     }
 
     #[test]
@@ -5656,28 +5966,78 @@ mod tests {
     #[test]
     fn test_map_substrate_error_taxonomy() {
         // Every taxonomy label from crates/mika-gateway/src/egress_search/mod.rs
-        // must produce an actionable, LLM-facing message. Grep for the label
-        // strings here if the substrate taxonomy is extended.
+        // must produce an actionable message. Grep for the label strings here if
+        // the substrate taxonomy is extended.
+        //
+        // mika#1964 renamed `map_substrate_error` to `substrate_error_message` and
+        // made it return **(neutral fallback, operator diagnostic)**. The
+        // actionable text is asserted on the DIAGNOSTIC member now; asserting it
+        // on `.0` would assert the leak this ticket closed. Nothing was dropped —
+        // the operator-shaped half changed reader, not length.
         // mika#2118 extension B: the 404 names the absent *selector*. The key is
         // still mentioned as the companion setting, never as the thing that is
         // missing — see `mika2118_substrate_404_names_the_selector_not_a_key`.
-        assert!(
-            map_substrate_error(404, "search_upstream_not_configured")
-                .contains("MIKA_SEARCH_UPSTREAM on mika-gateway")
-        );
-        assert!(map_substrate_error(502, "unauthorized").contains("rotate MIKA_BRAVE_API_KEY"));
-        assert!(map_substrate_error(502, "upstream_error").contains("upstream returned an error"));
-        assert!(map_substrate_error(502, "transport_error").contains("transport error"));
-        assert!(
-            map_substrate_error(502, "parse_error")
-                .contains("could not parse the upstream response")
-        );
-        assert!(map_substrate_error(502, "not_implemented").contains("not implemented"));
-        // Unknown label → generic fallback
+        let (fallback_404, diagnostic_404) =
+            substrate_error_message(404, "search_upstream_not_configured");
+        assert_eq!(fallback_404, SEARCH_UNAVAILABLE_FALLBACK);
+        assert!(diagnostic_404.contains("MIKA_SEARCH_UPSTREAM on mika-gateway"));
+
+        let (fallback_401, diagnostic_401) = substrate_error_message(502, "unauthorized");
+        assert_eq!(fallback_401, SEARCH_UNAVAILABLE_FALLBACK);
+        assert!(diagnostic_401.contains("rotate MIKA_BRAVE_API_KEY"));
+
+        let (fallback_ni, diagnostic_ni) = substrate_error_message(502, "not_implemented");
+        assert_eq!(fallback_ni, SEARCH_UNAVAILABLE_FALLBACK);
+        assert!(diagnostic_ni.contains("not implemented"));
+
+        // The four branches that name no service, no variable and no gesture carry
+        // the SAME text on both sides: there is nothing to withhold, and a second
+        // wording would only let the two drift.
+        for (status, label, needle) in [
+            (502, "upstream_error", "upstream returned an error"),
+            (502, "transport_error", "transport error"),
+            (502, "parse_error", "could not parse the upstream response"),
+        ] {
+            let (fallback, diagnostic) = substrate_error_message(status, label);
+            assert_eq!(fallback, diagnostic, "{label} must not split");
+            assert!(fallback.contains(needle), "{label}: {fallback}");
+        }
+
+        // Unknown label → generic fallback, identical on both sides.
         assert_eq!(
-            map_substrate_error(500, "surprise"),
-            "Search substrate returned HTTP 500."
+            substrate_error_message(500, "surprise"),
+            (
+                "Search substrate returned HTTP 500.".to_string(),
+                "Search substrate returned HTTP 500.".to_string()
+            )
         );
+    }
+
+    /// mika#1964 — the neutral fallback must be free of every token the family
+    /// tier forbids, for **every** branch of the taxonomy.
+    ///
+    /// The per-branch assertions above check the wording; this one checks the
+    /// property, so a branch added later without a test of its own cannot leak.
+    #[test]
+    fn mika1964_no_substrate_branch_leaks_through_its_neutral_fallback() {
+        for (status, label) in [
+            (404, "search_upstream_not_configured"),
+            (502, "not_implemented"),
+            (502, "upstream_error"),
+            (502, "unauthorized"),
+            (502, "transport_error"),
+            (502, "parse_error"),
+            (500, "surprise"),
+            (418, ""),
+        ] {
+            let (fallback, _) = substrate_error_message(status, label);
+            for token in FORBIDDEN_FAMILY_TIER_TOKENS {
+                assert!(
+                    !fallback.contains(token),
+                    "({status}, {label:?}) fallback leaked {token:?}: {fallback}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -5851,11 +6211,23 @@ mod tests {
         // mika#2118 extension B: a 404 means no upstream is SELECTED. It used to
         // name a missing key, which is the one gesture that cannot lift the 404
         // (mika#2407). The key is still named as the companion setting.
+        //
+        // mika#1964 CHANGED THE CHANNEL, not the wording. `harness.ctx()` is
+        // operator tier, so `dispatch_substrate_diagnostic` folds the detail back
+        // into `content` — the operator still reads it, now after the neutral
+        // fallback and a blank line. On family tier the same detail goes to
+        // `audit_events` instead; that half is
+        // `mika1964_web_search_family_tier_no_leak_on_substrate_failure`.
         assert!(
             output
                 .content
                 .contains("MIKA_SEARCH_UPSTREAM on mika-gateway"),
             "unexpected error message: {}",
+            output.content
+        );
+        assert!(
+            output.content.starts_with(SEARCH_UNAVAILABLE_FALLBACK),
+            "the neutral fallback must come first (mika#1964): {}",
             output.content
         );
     }
@@ -5884,7 +6256,14 @@ mod tests {
 
         let output = web_search(&serde_json::json!({"query": "any"}), &ctx).await;
         assert!(output.is_error);
+        // Operator tier — see the sibling 404 test for why the token is still
+        // expected in `content` here and forbidden on family tier (mika#1964).
         assert!(output.content.contains("rotate MIKA_BRAVE_API_KEY"));
+        assert!(
+            output.content.starts_with(SEARCH_UNAVAILABLE_FALLBACK),
+            "the neutral fallback must come first (mika#1964): {}",
+            output.content
+        );
     }
 
     #[test]
@@ -7360,9 +7739,19 @@ mod tests {
     /// `MIKA_SEARCH_UPSTREAM` absent means the substrate is disabled and the endpoint
     /// answers 404 whatever the key is worth (mika#2407). Naming a missing key sends
     /// the operator to the one place that cannot help.
+    ///
+    /// **mika#1964 changed this test's SUBJECT and not its nature, and that is the
+    /// whole point of keeping it.** `map_substrate_error` became
+    /// `substrate_error_message`, returning a pair, so this guard stopped compiling
+    /// — which is exactly how a doctrine guard gets deleted "because its signature
+    /// died". The property is unchanged and now reads the **diagnostic** member:
+    /// the operator-shaped half is where the selector must be named, because that
+    /// is the half an operator now receives. Deleting this test would erase
+    /// mika#2407 from the tree **by way of the fix that claims to serve it** — the
+    /// mika#1964 M4 class, one generation later.
     #[test]
     fn mika2118_substrate_404_names_the_selector_not_a_key() {
-        let message = map_substrate_error(404, "search_upstream_not_configured");
+        let (_, message) = substrate_error_message(404, "search_upstream_not_configured");
         assert!(
             message.contains("MIKA_SEARCH_UPSTREAM"),
             "the 404 message does not name the selector: {message}"
