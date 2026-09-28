@@ -27,6 +27,19 @@ rejouées à `HEAD == origin/main == fab69e13`.
 | B1′ | g2 : aucun callsite lisible | non tenu | **tient toujours** | 0 callsite dans l'arbre ; `/data/workspace/mika-platform/` ne porte que `claude-pilot` et `mika` — `mika-cloud` absent de l'hôte |
 | B2 | LC.2 non mergé, recouvrement de 3 fichiers | bloquant | **LEVÉ** | `fab69e13` (PR #2556) est le HEAD de `origin/main` ; `packages/ui` porte 17 primitives dont `Button.tsx` et `Spinner.tsx`, et `package.json` est à `0.4.0` |
 
+**Dernière re-mesure — `origin/main == f772b2e1`, branche à jour (`behind: 0`).**
+Les trois commandes de §9 ont été rejouées à ce troisième instant : B1 rend
+0 ligne et le rulebook est toujours à `76a8b0de` (2026-08-23) ; B1′ rend 0
+callsite et `/data/workspace/mika-platform/` ne porte toujours que `claude-pilot`
+et `mika` ; B2 reste levé (`Button.tsx`, `Spinner.tsx`, `0.4.0`, 35 fichiers dans
+`components/`). **Les trois verdicts sont inchangés.** Les deux commits arrivés
+sur `main` depuis `fab69e13` sont des bumps de dépendances Rust (`sha2`,
+`utoipa`) qui ne touchent ni le rulebook, ni `packages/ui/`, ni un callsite.
+*Cette ligne est un ancrage : un dispatch ultérieur la remplace par sa propre
+mesure, il ne l'empile pas — sans quoi ce plan accumulerait une section par
+re-drive.* Les mesures datées ci-dessus, elles, sont conservées : voir le
+paragraphe suivant.
+
 **Conséquence, et elle est celle de §6 appliquée telle quelle :** B1 **ou** B1′
 suffirait pour la précondition déclarée, et **aucun des deux n'est tenu**. B2
 était cumulatif ; le lever ne dispense de rien. **La précondition du ticket reste
@@ -382,10 +395,16 @@ silencieusement inerte se lit exactement comme un arbre propre.*
 **Quatre haltes à la relecture de ce plan :**
 
 - **Halte 1 — les commentaires du ticket ne m'ont pas été livrés. Toujours
-  ouverte.** `gh` n'est pas authentifié dans ce bac à sable (`gh auth status` →
-  *not logged into any GitHub hosts*), et le contexte injecté ne portait que le
-  corps — au grooming **comme au dispatch d'exécution**, où la tentative a été
-  refaite et a échoué à l'identique. Si un commentaire opérateur tient g1 ou g2 —
+  ouverte, et structurellement.** `gh` n'est pas authentifié dans ce bac à sable
+  (`gh auth status` → *not logged into any GitHub hosts*), et le contexte injecté
+  ne portait que le corps — au grooming, au dispatch d'exécution, **et au
+  re-dispatch suivant**, où la tentative a été refaite et a échoué à l'identique.
+  Trois instants consécutifs : ce n'est donc pas un accident d'une session mais
+  une propriété du bac à sable, et il faut en tirer la même conséquence de
+  conduite que §2.2 tire pour g2 — **aucun re-dispatch ne lèvera cette halte, quel
+  qu'en soit le nombre.** La lecture des commentaires est un geste d'opérateur, ou
+  un enrichissement du contexte injecté ; elle n'est pas atteignable d'ici.
+  Si un commentaire opérateur tient g1 ou g2 —
   par exemple un extrait de callsite collé par Vincent, ce que g2 autorise
   explicitement — alors §2.2 est **périmé** et ce plan doit être révisé plutôt que
   suivi. C'est la première chose à établir avant d'agir sur cette remontée, et la
