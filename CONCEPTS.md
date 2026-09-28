@@ -52,6 +52,8 @@ The isolation boundary a headless development session runs inside: fresh kernel 
 
 The boundary constrains what the contained session can reach. It says nothing about what the launch itself exposes to the host, which is a separate question and has to be asked separately.
 
+The same allowlist bounds what the session can *observe*: an absence it measures — a sibling repository not mounted, ticket comments unreadable without host credentials — is a property of the boundary, not of the host. A blocker resting only on such an absence is lifted from outside the sandbox, never by re-dispatching into it.
+
 ### Phase 2a / Phase 2b
 
 The two containment postures the pilot sandbox runs in. **Phase 2b** is the full posture: filesystem, network and kernel cuts all active, with outbound traffic forced through a host-side relay. **Phase 2a** is the degraded fallback taken when the relay is unavailable — the filesystem and kernel cuts hold, the network does not.
