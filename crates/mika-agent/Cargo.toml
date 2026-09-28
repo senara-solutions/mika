@@ -66,6 +66,7 @@ dashmap.workspace = true
 url.workspace = true
 regex.workspace = true
 sha2.workspace = true
+hex.workspace = true
 clap.workspace = true
 serde_yaml.workspace = true
 flate2 = "1"

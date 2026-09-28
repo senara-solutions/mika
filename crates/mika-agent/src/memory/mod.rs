@@ -82,7 +82,7 @@ pub fn compute_content_hash(content: &str) -> String {
         .to_lowercase();
     let normalized: String = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     let hash = Sha256::digest(normalized.as_bytes());
-    format!("{hash:x}")
+    hex::encode(hash)
 }
 
 impl Database {
