@@ -253,6 +253,21 @@ perl -0pi -e 's/(--setenv GH_TOKEN "proxy-managed-no-secret")/$1\n            --
 R=$(run_lint "$F")
 assert_exit "GH_TOKEN whose value is on the next array line: exit 1" "1" "$R"
 
+# The count is per OCCURRENCE, not per line: a decoy placeholder and a real
+# token on the SAME line are two occurrences, only one of them placeheld.
+# `grep -c` counts matching lines and saw 1 == 1 here — reproduced in review.
+F=$(gh_placeholder_fixture "gh-token-same-line-decoy.sh")
+perl -pi -e 's/(--setenv GH_TOKEN "proxy-managed-no-secret")/$1 --setenv GH_TOKEN "\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "decoy placeholder + real GH_TOKEN on one line: exit 1" "1" "$R"
+
+# The placeholder is matched as the WHOLE value, closing quote bounded: a real
+# token concatenated after it is not a placeholder — reproduced in review.
+F=$(gh_placeholder_fixture "gh-token-concatenated.sh")
+perl -pi -e 's/--setenv GH_TOKEN "proxy-managed-no-secret"/--setenv GH_TOKEN "proxy-managed-no-secret""\$GH_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "real GH_TOKEN concatenated to the placeholder: exit 1" "1" "$R"
+
 # The exemption is a closed, named list: the placeholder VALUE does not open it
 # to any other credential-shaped NAME.
 F=$(fixture "npm-token-placeholder.sh")

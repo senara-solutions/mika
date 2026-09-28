@@ -228,8 +228,13 @@ while IFS= read -r name; do
         # so GH_TOKEN never also counts a hypothetical GH_TOKEN_EXTRA, while a
         # `--setenv GH_TOKEN` whose value sits on the next array line is still
         # counted — and then fails, since it does not carry the placeholder.
-        _total=$(grep -cE -- "--setenv[[:space:]]+$name([[:space:]]|\$)" "$CODE_ONLY" || true)
-        _placeheld=$(grep -cF -- "--setenv $name \"$EXEMPT_SETENV_VALUE\"" "$CODE_ONLY" || true)
+        # Both counts are OCCURRENCES (`grep -o | wc -l`), never lines
+        # (`grep -c`): a decoy placeholder and a real value on the same line
+        # are two occurrences. The placeholder's closing quote is bounded, so
+        # `"proxy-managed-no-secret""$GH_TOKEN"` is not counted as placeheld.
+        _total=$({ grep -oE -- "--setenv[[:space:]]+$name([[:space:]]|\$)" "$CODE_ONLY" || true; } | wc -l)
+        _placeheld=$({ grep -oE -- "--setenv[[:space:]]+${name}[[:space:]]+\"$EXEMPT_SETENV_VALUE\"([[:space:]]|\$)" "$CODE_ONLY" || true; } | wc -l)
+        _total=$((_total)); _placeheld=$((_placeheld))
         if [[ "$_total" -eq "$_placeheld" && "$_total" -ge 1 ]]; then
             continue
         fi

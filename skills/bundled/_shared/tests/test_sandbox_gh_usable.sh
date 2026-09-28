@@ -42,7 +42,8 @@
 #
 # Run: bash skills/bundled/_shared/tests/test_sandbox_gh_usable.sh
 # Expected: all assertions pass, exit 0. Skips cleanly when bwrap or gh is
-# absent, or when gh is not visible inside the sandbox.
+# absent from the host; gh present on the host but not visible inside the
+# sandbox is a FAILURE, not a skip.
 
 set -uo pipefail
 
@@ -146,16 +147,19 @@ echo "POSITIVE — with the placeholder, gh leaves for the network"
 echo "-----------------------------------------------------------"
 OUT_POS=$(run_in_sandbox "$DISPATCH_LIB" "$PROBE")
 assert_contains "the sandbox itself runs" "alive" "$OUT_POS"
-if [ "$(field gh "$OUT_POS")" != "present" ]; then
-    echo "⊘ skipped — gh is not visible inside the sandbox"
-    exit 0
+# gh is on the host (checked above), so gh missing INSIDE the sandbox is a bind
+# defect — the mika#2572 class itself (every pilot gh call fails) — and must
+# fail, never skip. The remaining positive checks run only when gh is visible;
+# the negative control and the results block are always reached.
+assert_eq "gh is visible inside the sandbox" "present" "$(field gh "$OUT_POS")"
+if [ "$(field gh "$OUT_POS")" = "present" ]; then
+    assert_eq "gh auth token exits 0" "0" "$(field token_rc "$OUT_POS")"
+    assert_eq "gh auth token prints the placeholder, never the parent token" "$PLACEHOLDER" "$(field token_out "$OUT_POS")"
+    assert_not_contains "gh api user does not stop on gh auth login" "gh auth login" "$OUT_POS"
+    assert_not_contains "gh api user does not report a logged-out host" "not logged into any GitHub hosts" "$OUT_POS"
+    assert_contains "gh api user attempts the request to api.github.com" 'Get "https://api.github.com/user"' "$OUT_POS"
+    assert_not_contains "gh api user does not exit with gh auth-required (4)" "api_rc=4" "$OUT_POS"
 fi
-assert_eq "gh auth token exits 0" "0" "$(field token_rc "$OUT_POS")"
-assert_eq "gh auth token prints the placeholder, never the parent token" "$PLACEHOLDER" "$(field token_out "$OUT_POS")"
-assert_not_contains "gh api user does not stop on gh auth login" "gh auth login" "$OUT_POS"
-assert_not_contains "gh api user does not report a logged-out host" "not logged into any GitHub hosts" "$OUT_POS"
-assert_contains "gh api user attempts the request to api.github.com" 'Get "https://api.github.com/user"' "$OUT_POS"
-assert_not_contains "gh api user does not exit with gh auth-required (4)" "api_rc=4" "$OUT_POS"
 
 echo ""
 echo "NEGATIVE CONTROL — without the placeholder, gh stops locally"
