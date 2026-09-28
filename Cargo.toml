@@ -85,7 +85,7 @@ http = "1"
 # HTTP server
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "limit", "set-header", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "limit", "set-header", "cors"] }
 subtle = "2"
 http-body-util = "0.1"
 
@@ -167,7 +167,7 @@ libc = "0.2"
 rand = "0.10"
 hex = "0.4"
 hmac = "0.12"
-lru = "0.16"
+lru = "0.18"
 sha2 = "0.10"
 dialoguer = "0.12"
 
