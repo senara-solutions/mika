@@ -316,6 +316,165 @@ describe('theme.css — LC.2 (mika#1801) rulebook §5 button presentation', () =
   })
 })
 
+/**
+ * LC.2b (mika#2562) — `<SecretField>`, `<AuthCard>` and `<Stepper>` presentation.
+ *
+ * Same split as LC.2 above: the component tests pin which class each state
+ * emits, and these pin what those classes *mean*. Same reason for the classes
+ * existing at all — Tailwind does not scan `packages/ui` — and it binds harder
+ * here, because the only consumer of these three is `mika-cloud`, which imports
+ * `theme.css` and none of this package's build configuration.
+ *
+ * Only one of the three has a rulebook section to conform to. §5 "Input Fields"
+ * describes the field chrome and is asserted against literally below. The
+ * *secret* grammar, the auth card and the stepper have none (mika#2562 §2.1
+ * measured that), so their rules are asserted against the measured caller and
+ * against the §6/§7 constraints that apply to any surface — never against an
+ * invented section.
+ */
+describe('theme.css — LC.2b (mika#2562) rulebook §5 input-field presentation', () => {
+  it('gives the field the §5 surface and border', () => {
+    const body = ruleFor('.mika-field')
+    // §5: "Background: `surface_container_lowest`."
+    expect(body).toContain('background-color: var(--color-surface-container-lowest)')
+    // §5: "Border: `outline_variant` at 10% opacity."
+    expect(body).toContain('var(--color-outline-variant)')
+    expect(body).toContain('10%')
+  })
+
+  it('gives the field the §6/§7 roundedness, from the token', () => {
+    expect(ruleFor('.mika-field')).toContain('border-radius: var(--radius-mika-lg)')
+  })
+
+  it('renders the §5 focus state as a primary border plus a 4px primary_dim blur', () => {
+    const body = ruleFor('.mika-field:focus')
+    // §5: "Focus State: Border transitions to `primary` with a 4px outer
+    // `primary_dim` blur at 10% opacity."
+    expect(body).toContain('border-color: var(--color-primary)')
+    expect(body).toContain('4px')
+    expect(body).toContain('var(--color-primary-dim)')
+    expect(body).toContain('10%')
+  })
+
+  it('never suppresses the focus outline outright', () => {
+    // `outline: none` plus a box-shadow leaves the field with no focus indicator
+    // at all in forced-colors mode, where the shadow is dropped. A transparent
+    // outline is repainted by the OS palette there.
+    const body = ruleFor('.mika-field:focus')
+    expect(body).not.toContain('outline: none')
+    expect(body).toContain('outline: 2px solid transparent')
+  })
+
+  it('makes the secret variant monospaced and clears its reveal control', () => {
+    const body = ruleFor('.mika-field--secret')
+    expect(body).toContain('font-family: var(--font-mono)')
+    // Off-scale `pr-14` in the measured caller; snapped to the §6 scale here.
+    expect(body).toContain('padding-right: var(--spacing-16)')
+  })
+
+  it('positions the reveal control without restyling it', () => {
+    // The control is `<Button variant="tertiary">`, so its colour, radius and
+    // focus ring come from `.mika-btn--tertiary`. This rule declaring any of
+    // them would be a second, drifting definition of §5's tertiary button.
+    const body = ruleFor('.mika-field-reveal')
+    expect(body).toContain('position: absolute')
+    expect(body).not.toContain('color:')
+    expect(body).not.toContain('background')
+    expect(body).not.toContain('border')
+  })
+})
+
+describe('theme.css — LC.2b (mika#2562) auth card and stepper presentation', () => {
+  it('layers the card one tier above the background, per §7 Do', () => {
+    // §7 Do — "Layer with Intent": every nested container is at least one tier
+    // from its parent. The screen is `background`; the card is
+    // `surface_container`.
+    expect(ruleFor('.mika-auth-card')).toContain(
+      'background-color: var(--color-surface-container)',
+    )
+  })
+
+  it('gives the card the §6 roundedness from the token, never a literal', () => {
+    expect(ruleFor('.mika-auth-card')).toContain('border-radius: var(--radius-mika-lg)')
+  })
+
+  it('keeps the card off the viewport edge on a narrow screen', () => {
+    // Absent from the measured callers. Without it the card touches the edge
+    // below its own 24rem max-width, which is most phones in portrait.
+    expect(ruleFor('.mika-auth-screen')).toContain('padding: var(--spacing-4)')
+  })
+
+  it('gives the header more room below it than it gives its own subtitle', () => {
+    // §7 Do — "Asymmetric Whitespace".
+    expect(ruleFor('.mika-auth-card__header')).toContain('margin-bottom: var(--spacing-8)')
+    expect(ruleFor('.mika-auth-card__subtitle')).toContain('margin-top: var(--spacing-2)')
+  })
+
+  it.each([
+    ['complete', 'background-color: var(--color-primary)'],
+    ['current', 'border-color: color-mix'],
+    ['upcoming', 'background-color: var(--color-surface-container-high)'],
+  ])('declares the %s pill', (state, needle) => {
+    expect(ruleFor(`.mika-stepper__pill--${state}`)).toContain(needle)
+  })
+
+  it('inks the completed pill on the darkest surface, never pure white', () => {
+    // §7 Don't — "No Pure White". The check sits on `primary`, so its ink is a
+    // surface token; the token-only scan below catches `#ffffff`, not `white`
+    // written as a keyword, which is why this is asserted positively.
+    expect(ruleFor('.mika-stepper__pill--complete')).toContain(
+      'color: var(--color-surface-container-lowest)',
+    )
+  })
+
+  it('turns the connector primary only once the step behind it is done', () => {
+    expect(ruleFor('.mika-stepper__connector')).toContain(
+      'background-color: var(--color-outline-variant)',
+    )
+    expect(ruleFor('.mika-stepper__connector--complete')).toContain('var(--color-primary)')
+  })
+
+  it('declares no hover, focus or cursor rule for a stepper that is not interactive', () => {
+    // The measured caller drives the active step from server state and no pill
+    // is clickable. A hover or a pointer cursor here would advertise an
+    // affordance that does not exist.
+    const interactive = mikaRules.filter(
+      ([sel, body]) =>
+        sel.includes('.mika-stepper') && (sel.includes(':hover') || body.includes('cursor:')),
+    )
+    expect(interactive).toEqual([])
+  })
+
+  /**
+   * The classic way to get this wrong. `display: none` and `visibility: hidden`
+   * both remove the node from the accessibility tree, which is the opposite of
+   * what a visually-hidden label is for: `<Stepper>`'s "Completed" / "Not
+   * started" text would then be announced by nothing and read by no one.
+   */
+  it('hides the sr-only helper from the eye without hiding it from AT', () => {
+    const body = ruleFor('.mika-sr-only')
+    expect(body).toContain('position: absolute')
+    expect(body).toContain('clip-path: inset(50%)')
+    expect(body).not.toContain('display: none')
+    expect(body).not.toContain('visibility: hidden')
+  })
+
+  it.each([
+    '.mika-sr-only',
+    '.mika-field',
+    '.mika-field--secret',
+    '.mika-auth-screen',
+    '.mika-auth-card',
+    '.mika-stepper',
+    '.mika-stepper__pill',
+    '.mika-stepper__connector',
+  ])('declares %s', (selector) => {
+    // Anti-vacuity for this block specifically: the global population floor
+    // below would still pass if every rule of this ticket were deleted.
+    expect(hasRule(selector)).toBe(true)
+  })
+})
+
 describe('theme.css — LC.2 (mika#1801) the .mika- rules compose tokens only', () => {
   /**
    * The load-bearing assertion of the whole LC.2 CSS block, and the reason it is
@@ -330,7 +489,12 @@ describe('theme.css — LC.2 (mika#1801) the .mika- rules compose tokens only', 
   it('scans a non-empty population', () => {
     // Anti-vacuity. A renamed prefix would make every assertion below pass by
     // looking at nothing, which reads exactly like a clean file.
-    expect(mikaRules.length).toBeGreaterThanOrEqual(12)
+    //
+    // The floor tracks the file: LC.2 set it at 12 against a population of 14,
+    // and LC.2b (mika#2562) brought the population to ~39. Left at 12, deleting
+    // every rule of this ticket would still have passed — a floor that stops
+    // tracking is a floor that stops guarding.
+    expect(mikaRules.length).toBeGreaterThanOrEqual(32)
   })
 
   it.each(mikaRules)('%s carries no colour literal', (_selector, body) => {
