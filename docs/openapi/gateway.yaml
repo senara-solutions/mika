@@ -334,16 +334,16 @@ components:
           $ref: '#/components/schemas/TelegramChat'
         document:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/TelegramDocument'
+          - type: 'null'
         from:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/TelegramUser'
             description: |-
               Sender, carried only for its `language_code` (mika#2025). Telegram has
               always sent this object; the gateway used to drop it at deserialization,
               which is why no language signal existed anywhere in the process.
+          - type: 'null'
         photo:
           type:
           - array
@@ -352,8 +352,8 @@ components:
             $ref: '#/components/schemas/PhotoSize'
         reply_to_message:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/ReplyToMessage'
+          - type: 'null'
         text:
           type:
           - string
@@ -365,8 +365,8 @@ components:
       properties:
         message:
           oneOf:
-          - type: 'null'
           - $ref: '#/components/schemas/TelegramMessage'
+          - type: 'null'
         update_id:
           type: integer
           format: int64
