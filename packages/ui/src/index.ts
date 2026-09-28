@@ -25,6 +25,16 @@ export { default as LiveRefreshToggle } from './components/LiveRefreshToggle.tsx
 export type { LiveRefreshToggleProps } from './components/LiveRefreshToggle.tsx'
 export { default as CostMeter } from './components/CostMeter.tsx'
 export type { CostMeterProps, CostMeterVariant, CostMeterTier } from './components/CostMeter.tsx'
+export { default as Button } from './components/Button.tsx'
+export type {
+  ButtonVariant,
+  ButtonSize,
+  ButtonProps,
+  ButtonActionProps,
+  ButtonLinkProps,
+} from './components/Button.tsx'
+export { default as Spinner } from './components/Spinner.tsx'
+export type { SpinnerSize, SpinnerProps } from './components/Spinner.tsx'
 
 // Utils
 export { eventTypeBadge, eventTypeColor } from './utils/badges.ts'

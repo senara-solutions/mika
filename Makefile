@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard test-pilot-push-guard test-cwd-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -235,6 +235,10 @@ test-issue-annotation-guard: ## Refuse a PATCH site that bypasses the comment-ta
 	@bash scripts/check-issue-comment-patch-guard.sh
 	@bash scripts/test-annotate-issue-token-comment.sh
 
+check-cta-primitives: ## Refuse a hand-rolled CTA outside <Button>, and pin the guard's negative behaviour (mika#1801)
+	@bash scripts/check-cta-primitives.sh
+	@bash scripts/test-check-cta-primitives.sh
+
 test-shared-checkout-guard: ## Pin the shared-checkout guard (both modes) and its run_shell wiring, negative control included (mika#2107 / mika#2449)
 	@bash scripts/test-guard-shared-checkout.sh
 	@bash scripts/test-shell-exec-guard.sh
@@ -256,6 +260,10 @@ test-smoke-webhook-chain: ## Verify the inbound-chain probe classifies each verd
 check-byte-slices: ## Reject byte offsets into text that can miss a char boundary + pin the guard's negative behaviour (mika#764 / mika#2103)
 	@bash scripts/check-byte-slices.sh
 	@bash scripts/test-check-byte-slices.sh
+
+check-substrate-leak: ## Reject substrate-config detail reaching the LLM + pin the guard's negative behaviour (mika#1783 / mika#1964)
+	@bash scripts/check-substrate-leak.sh
+	@bash scripts/test-check-substrate-leak.sh
 
 check-image-tags-immutable: ## Reject image tags not derived from the commit sha + pin the guard's negative behaviour (mika#2143)
 	@bash scripts/check-image-tags-immutable.sh

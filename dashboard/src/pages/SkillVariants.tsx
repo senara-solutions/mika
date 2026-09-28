@@ -10,6 +10,7 @@ import {
 } from '../api/variants'
 import type { VariantMetadata, ValidationResponse } from '../api/variants'
 import VariantDiffViewer from '../components/VariantDiffViewer'
+import { Button } from '@samidarko/ui'
 
 const sourceColors: Record<string, string> = {
   hand_authored: 'text-blue-400',
@@ -125,13 +126,14 @@ export default function SkillVariants() {
           <div className="p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-heading text-lg font-medium">{selectedSkill}</h2>
-              <button
+              <Button
+                variant="secondary"
+                size="sm"
                 onClick={() => setShowReflect(!showReflect)}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs rounded-lg border border-white/[0.1] text-muted hover:text-heading hover:bg-white/[0.03] transition-colors"
+                icon={<RefreshCw size={14} />}
               >
-                <RefreshCw size={14} />
                 {showReflect ? 'Hide Reflect' : 'Reflect'}
-              </button>
+              </Button>
             </div>
 
             {/* Stale warning banner */}
@@ -296,19 +298,25 @@ export default function SkillVariants() {
                     </div>
                   )}
                   <div className="flex justify-end gap-3">
-                    <button
+                    <Button
+                      variant="tertiary"
                       onClick={() => { setConfirmPromote(null); promoteMutation.reset() }}
-                      className="px-4 py-2 text-sm text-muted hover:text-heading transition-colors"
                     >
                       Cancel
-                    </button>
-                    <button
+                    </Button>
+                    {/* `loading` rather than `disabled`, deliberately: it is the
+                        one <Button> prop with no pre-existing usage anywhere in
+                        the repo (mika#1801 R5), so migrating this call site as
+                        `disabled` would ship it unexercised. The pending flag was
+                        already driving both the disabled state and a hand-rolled
+                        "Promoting..." label; `loading` is that pair, and the
+                        label now stays put instead of changing width mid-request. */}
+                    <Button
                       onClick={() => handlePromote(confirmPromote.provider, confirmPromote.model)}
-                      disabled={promoteMutation.isPending}
-                      className="px-4 py-2 text-sm bg-green-600 text-white rounded-lg hover:bg-green-500 transition-colors disabled:opacity-50"
+                      loading={promoteMutation.isPending}
                     >
-                      {promoteMutation.isPending ? 'Promoting...' : 'Promote'}
-                    </button>
+                      Promote
+                    </Button>
                   </div>
                 </div>
               </div>

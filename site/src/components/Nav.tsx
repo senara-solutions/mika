@@ -1,3 +1,5 @@
+import { Button } from "@samidarko/ui";
+
 const GITHUB_URL = "https://github.com/senara-solutions/mika";
 const DOCS_URL = `${GITHUB_URL}/tree/main/docs`;
 const GETTING_STARTED_URL = `${GITHUB_URL}/blob/main/docs/getting-started.md`;
@@ -31,12 +33,17 @@ export function Nav() {
           ))}
         </div>
 
-        <a
+        {/* Was `rounded-full`, which §6 does not offer; the §6 `xl` radius
+            (1.5rem) exceeds half this button's height, so it still renders as a
+            pill — the shape is preserved without the off-scale class. The glow
+            is a landing flourish and stays on `className`. */}
+        <Button
+          as="link"
           href={GETTING_STARTED_URL}
-          className="rounded-full bg-accent px-5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-light hover:shadow-[0_0_24px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
+          className="transition-all hover:shadow-[0_0_24px_color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
         >
           Get Started
-        </a>
+        </Button>
       </div>
     </nav>
   );

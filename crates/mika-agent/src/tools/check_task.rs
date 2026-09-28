@@ -254,6 +254,11 @@ impl Tool for CheckTaskTool {
             writeln!(output, "Process ID: {pid}").unwrap();
         }
 
+        // mika#1964 — set when the GitHub enrichment was skipped for want of a
+        // credential, so the cause can be routed to the operator once at the end
+        // rather than named in the text the model reads.
+        let mut credential_absent = false;
+
         // GitHub enrichment
         if let Some(ref url) = task.reference_url {
             writeln!(output).unwrap();
@@ -268,11 +273,10 @@ impl Tool for CheckTaskTool {
                         Err(e) => writeln!(output, "GitHub PR status: unavailable ({e})").unwrap(),
                     },
                     None => {
-                        writeln!(
-                            output,
-                            "GitHub PR status: not available (no token configured)"
-                        )
-                        .unwrap();
+                        // mika#1964 — "(no token configured)" told the model a credential
+                        // was missing; the enrichment being absent is all it needs.
+                        credential_absent = true;
+                        writeln!(output, "GitHub PR status: not available").unwrap();
                     }
                 },
                 Some(GitHubRef::Issue {
@@ -289,11 +293,8 @@ impl Tool for CheckTaskTool {
                         }
                     }
                     None => {
-                        writeln!(
-                            output,
-                            "GitHub issue status: not available (no token configured)"
-                        )
-                        .unwrap();
+                        credential_absent = true;
+                        writeln!(output, "GitHub issue status: not available").unwrap();
                     }
                 },
                 None => {
@@ -313,7 +314,20 @@ impl Tool for CheckTaskTool {
             writeln!(output, "\nChildren ({total}): {}", summary.join(", ")).unwrap();
         }
 
-        Ok(ToolOutput::success(output.trim().to_string()))
+        let mut out = ToolOutput::success(output.trim().to_string());
+        if credential_absent {
+            crate::tools::attach_substrate_diagnostic(
+                &mut out,
+                // substrate-diagnostic: the operator channel.
+                "check_task could not enrich this task with GitHub state: no GitHub \
+                 credential is configured on this agent. Set MIKA_GITHUB_TOKEN or \
+                 configure a GitHub App.",
+                "check_task",
+                ctx,
+            )
+            .await;
+        }
+        Ok(out)
     }
 
     fn timeout_secs(&self) -> Option<u64> {
@@ -405,11 +419,60 @@ mod tests {
                 .content
                 .contains("https://github.com/org/repo/pull/42")
         );
-        // No github_token in test context → should report as not available
+        // No github_token in test context → the enrichment is reported absent.
+        // mika#1964 removed "(no token configured)" from the model-visible text: the
+        // enrichment being unavailable is all the turn needs, and naming the
+        // credential is the operator's business. `harness.ctx()` is operator tier,
+        // so the detail is folded back in below.
+        assert!(result.content.contains("GitHub PR status: not available"));
+        assert!(!result.content.contains("no token configured"));
         assert!(
-            result
-                .content
-                .contains("not available (no token configured)")
+            result.content.contains("MIKA_GITHUB_TOKEN"),
+            "operator tier lost the actionable detail: {}",
+            result.content
+        );
+    }
+
+    /// mika#1964 V3 — family tier reads that the enrichment is absent and nothing
+    /// about credentials; the operator detail is routed to `audit_events`.
+    #[tokio::test]
+    async fn mika1964_missing_token_enrichment_does_not_leak_on_family_tier() {
+        let harness = TestHarness::new();
+        let id = create_test_task(
+            &harness,
+            "PR task",
+            Some("https://github.com/org/repo/pull/42"),
+            None,
+        )
+        .await;
+        let mut ctx = harness.ctx();
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let result = CheckTaskTool
+            .execute(serde_json::json!({"task_id": id}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("GitHub PR status: not available"));
+        for token in ["MIKA_GITHUB_TOKEN", "GitHub App", "no token configured"] {
+            assert!(
+                !result.content.contains(token),
+                "family tier leaked {token:?}: {}",
+                result.content
+            );
+        }
+
+        let events = harness
+            .db
+            .get_audit_events("test-session")
+            .await
+            .expect("get_audit_events");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable" && e.target_key == "check_task"),
+            "the operator detail was dropped instead of routed: {events:?}"
         );
     }
 
