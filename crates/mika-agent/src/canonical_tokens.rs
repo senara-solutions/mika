@@ -1235,6 +1235,149 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2573 — un écrivain du nom de l'événement de refus de création de
+    // travail sur un tour Fallthrough.
+    //
+    // Frère immédiat du scan mika#2517 ci-dessus, et il vit à côté de lui pour
+    // la même raison : deux gardes de la même famille se lisent mieux en paire.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// L'inventaire est **clos à un seul écrivain** au moment de la livraison :
+    /// le nom `fallthrough_work_creation` n'existait nulle part dans l'arbre
+    /// avant ce ticket, donc il n'y a **aucune violation existante** à excepter,
+    /// ni de case où déposer la prochaine (mika#2323). Quand le scan tire, **on
+    /// retire le second écrivain**, on ne l'allowliste pas (doctrine mika#2201).
+    const FALLTHROUGH_WORK_CREATION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Un seul écrivain du nom `fallthrough_work_creation` (mika#2573 U4).**
+    ///
+    /// Le fichier propriétaire est `evidence/guards.rs` — il porte la constante
+    /// `FALLTHROUGH_WORK_CREATION_AUDIT_TOOL`, et `builtin_handlers.rs`
+    /// l'**importe** plutôt que de retaper le littéral. C'est la propriété qui
+    /// rend le `GROUP BY after_value` de l'opérateur exact plutôt qu'un nombre
+    /// sur lequel deux sites peuvent diverger.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rend **aucune décision fausse**, il rend le compte inexact.
+    #[test]
+    fn mika2573_the_work_creation_event_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("fallthrough_work{}", "_creation");
+        let owner = "crates/mika-agent/src/evidence/guards.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if FALLTHROUGH_WORK_CREATION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui vise un nom mort se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2573 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2573 — le nom de l'événement de refus a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le littéral et importer \
+             `evidence::guards::FALLTHROUGH_WORK_CREATION_AUDIT_TOOL`. Ne PAS \
+             l'ajouter à FALLTHROUGH_WORK_CREATION_SOLE_WRITER_EXCEPTIONS — le \
+             `GROUP BY` qui mesure la population du défaut n'est exact que tant \
+             qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2573_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            FALLTHROUGH_WORK_CREATION_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "FALLTHROUGH_WORK_CREATION_SOLE_WRITER_EXCEPTIONS est livrée vide et \
+             doit le rester : quand le scan tire, on retire le second écrivain. \
+             Une allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    /// **Un seul site définit les deux motifs (mika#2573 U2).**
+    ///
+    /// Ils atterrissent dans `audit_events.after_value` et un opérateur en fait
+    /// des `GROUP BY` : deux orthographes d'un même motif couperaient une
+    /// population en deux sans le dire (motif mika#2323 / mika#2536). Le test de
+    /// format de fil d'`evidence::guards` fige les *valeurs* ; ce scan fige le
+    /// *nombre de sites qui les écrivent*, ce qu'une assertion sur les valeurs ne
+    /// peut pas voir.
+    #[test]
+    fn mika2573_the_work_creation_motifs_have_a_single_definition() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needles = [
+            format!("issue{}", "_create"),
+            format!("ready_label{}", "_add"),
+        ];
+        let owner = "crates/mika-agent/src/evidence/guards.rs";
+
+        let mut definers = Vec::new();
+        for (rel, content) in production_sources() {
+            let literals: Vec<String> = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .flat_map(string_literals)
+                .collect();
+            // Appariement **exact**, jamais par sous-chaîne : un voisin
+            // légitime portant `ready_label_received` ou `ready_label_outcome`
+            // *contient* l'aiguille sans l'être, et une garde qui rougit sur du
+            // code sain est une garde qu'on désarme (leçon mika#2517).
+            let defines = needles
+                .iter()
+                .all(|needle| literals.iter().any(|lit| lit == needle));
+            if defines {
+                definers.push(rel);
+            }
+        }
+
+        assert!(
+            definers.iter().any(|d| d == owner),
+            "mika#2573 — la conjonction {needles:?} n'est écrite nulle part dans \
+             {owner} : ce scan vise un registre mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = definers.iter().filter(|d| *d != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2573 — les motifs de création de travail ont une seconde \
+             définition : {strangers:?}\n\n\
+             RÉSOLUTION : retirer les littéraux et importer \
+             `WORK_CREATION_MOTIF_ISSUE_CREATE` / \
+             `WORK_CREATION_MOTIF_READY_LABEL_ADD`."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait

@@ -130,6 +130,8 @@ When you receive a GitHub webhook event (message starts with `[GitHub]`) and **n
 > 2. If the event correlates to an existing active task (by PR URL or issue URL), update the task's note with relevant context
 > 3. If the event requires Vincent's attention (e.g., external contributor comment, security alert), notify via `send_message`
 > 4. Stop — do NOT proceed to the generic Workflow section above
+>
+> **No work is created on this turn, by any route.** Creating work on the forge is refused here as well: no new issue, no label that triggers a dispatch. Reading the forge stays permitted — that is what permitted action 2 and the `--json labels` check above rest on. If the event genuinely deserves new work, that is a decision for the operator: say so with `send_message` and stop. The engine refuses these routes (mika#2517 + mika#2573); looking for a third one is not a route, it is the same refusal one step later.
 
 **What this covers:** `issues.assigned`, `issue_comment.created`, `pull_request.labeled`, `discussion.created`, and any other GitHub event type that lacks a dedicated keyword-matched handler skill.
 
@@ -324,7 +326,9 @@ When you receive a GitHub webhook event (`[GitHub]` prefix) and no webhook-speci
 
 The engine rejects `run_claude_pilot` at the webhook-fallthrough tool boundary with `unauthorized_webhook_dispatch` (mika#933) and caps one dispatch per turn — but prompt-level discipline is the first line of defense.
 
-**Incidents:** mika#583 (2026-04-15) — `pull_request_review.submitted` had no specific handler; agent ran generic Workflow, dispatched on unrelated issues. mika#932 (2026-05-02) — `issue_comment.created` with dispatch-class keywords bypassed prose rule; #910 guard fired too late.
+**The engine also refuses creating work on the forge from such a turn** (`fallthrough_work_creation_refused`, mika#2517 + mika#2573): no new issue, no dispatch-triggering label. It withholds `create_task` outright and refuses those two routes — `run_gh` stays available for reading, which is what the verification gesture above needs. If you meet that refusal, it is not a shape to work around: acknowledge the event, or hand the decision to the operator with `send_message`, and stop.
+
+**Incidents:** mika#583 (2026-04-15) — `pull_request_review.submitted` had no specific handler; agent ran generic Workflow, dispatched on unrelated issues. mika#932 (2026-05-02) — `issue_comment.created` with dispatch-class keywords bypassed prose rule; #910 guard fired too late. mika#2573 (2026-09-28) — an `issue_comment.created` turn created an issue and relaunched an implement dispatch via `run_gh`, the tool neighbouring the one mika#2517 had withheld; the model itself called the issue "created by mistake".
 
 ### Rule 10 — Verify issue numbers before completion claims
 

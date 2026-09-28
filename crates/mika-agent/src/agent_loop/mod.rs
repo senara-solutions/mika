@@ -5367,6 +5367,14 @@ async fn run_agent_inner(
         is_reflection: false,
         is_task_context: false,
         is_callback_turn: params.is_callback_turn,
+        // mika#2573 U1 — le seul site de conversation, et donc le seul qui
+        // possède le message du webhook. **Le prédicat est appelé, jamais
+        // recopié** : `canonical_tokens::tests::mika2517_the_fallthrough_domain_has_a_single_definition`
+        // refuse un second corps, et c'est très exactement la classe
+        // `grooming_marker` (mika#2158) que ce scan existe pour tenir.
+        is_webhook_fallthrough_turn: crate::webhook_dispatch::is_webhook_fallthrough_domain(
+            params.user_message,
+        ),
         provider_name: provider,
         model_name: model,
         active_skill_paths: &active_skill_paths,
@@ -6539,6 +6547,11 @@ async fn run_silent_inner(
                 | SilentTrigger::PostCallbackAdvance { .. }
                 | SilentTrigger::DeferredDispatch { .. }
         ),
+        // mika#2573 — un tour silencieux n'a pas de message de webhook :
+        // `originating_message` y vaut `None` depuis mika#933, et c'est le même
+        // périmètre qu'`effective_disabled_tools` documente déjà. Voir le
+        // doc-comment du champ pour le bord.
+        is_webhook_fallthrough_turn: false,
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Silent mode: no context-redundancy checks needed
@@ -7207,6 +7220,9 @@ async fn run_team_agent_inner_impl(
         is_reflection: false,
         is_task_context: true,
         is_callback_turn: false,
+        // mika#2573 — un tour d'équipe lit `TeamAgentParams` et ne porte aucun
+        // message de webhook. Voir le doc-comment du champ.
+        is_webhook_fallthrough_turn: false,
         provider_name: provider,
         model_name: model,
         active_skill_paths: &[], // Team mode: no context-redundancy checks needed

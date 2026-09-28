@@ -246,6 +246,15 @@ mod eval {
     // la boucle en ayant l'air de fermer le ticket.
     mod test_webhook_fallthrough_no_task_2517;
 
+    // mika#2573 — le frère du précédent, sur l'outil voisin : un tour du domaine
+    // Webhook Fallthrough se voit REFUSER les deux verbes `run_gh` qui créent du
+    // travail (`issue create`, `issue edit --add-label ready`), et garde ses
+    // lectures. Les quatre contrôles négatifs sont porteurs : V1/V2 seuls
+    // seraient satisfaits par une garde qui bloque `run_gh` sur tout tour
+    // Fallthrough, c'est-à-dire qui casse le geste de vérification que la SCOPE
+    // RULE du prompt prescrit littéralement.
+    mod test_fallthrough_run_gh_refused_2573;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
