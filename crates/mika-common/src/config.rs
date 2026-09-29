@@ -1094,6 +1094,26 @@ pub struct Settings {
     #[serde(default)]
     pub pilot_cost_alert_usd: Option<f64>,
 
+    /// Size in bytes above which a turn's brief is reported as oversized
+    /// (mika#2474).
+    ///
+    /// A **threshold**, never a ceiling: crossing it emits one
+    /// `brief_size_overrun` INFO line and one `audit_events` row, and cuts
+    /// nothing. See [`DEFAULT_BRIEF_SIZE_ALERT_BYTES`] for why 48 000 and why
+    /// nothing is truncated.
+    ///
+    /// Env override: `MIKA_BRIEF_SIZE_ALERT_BYTES`. The `MIKA_` prefix is
+    /// correct here, for the same reason as `pilot_cost_alert_usd` above and
+    /// unlike the bare `PILOT_MAX_TURNS`: this key is read by **mika-spirit**
+    /// through the config-rs `MIKA_` cascade, whose process env nothing clears.
+    ///
+    /// Signed on purpose. A `usize` would make `-1` a hard `Settings::load`
+    /// error, i.e. a third behaviour where the three tiers below declare two:
+    /// an out-of-domain value must fall back to the default **and say so**, and
+    /// it can only do that if the loader lets it through.
+    #[serde(default)]
+    pub brief_size_alert_bytes: Option<i64>,
+
     /// First backoff step after a failed callback delivery, in seconds
     /// (mika#2179). Doubles per attempt up to
     /// [`Self::callback_delivery_backoff_max_secs`].
@@ -1497,6 +1517,68 @@ pub const CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS: u64 = 30 * 24 * 60 * 60;
 ///
 /// Reversible without a rebuild via `MIKA_PILOT_COST_ALERT_USD`.
 pub const DEFAULT_PILOT_COST_ALERT_USD: f64 = 40.0;
+
+/// Default size in bytes above which a turn's brief is reported as oversized
+/// (mika#2474).
+///
+/// **48 000 is a measured percentile, not a round number.** Over the 198 plans
+/// `docs/plans/2026-09-*-plan.md` carried at HEAD `b6c95955` — the population an
+/// architect actually read that month — the distribution is p50 = 29 414,
+/// p75 = 37 382, **p90 = 48 378**, p95 = 54 340, p99 = 72 349, max = 75 871. So
+/// the population this selects is the **upper decile**, roughly two lines a day
+/// at the current cadence. p95 would halve an already small sample and make the
+/// correlation the measurement exists to establish harder to see; p75 would let
+/// in the upper quarter, which is no longer a tail.
+///
+/// **The expected regime is therefore NON-EMPTY, which is why the event is INFO
+/// and not WARN.** A threshold posed on the p90 of a *healthy* distribution
+/// fires by construction, and a WARN on a nominal upper decile is what ends up
+/// muzzled. The anomaly is not the line: it is the **correlation** between that
+/// line and a `turn_usage` carrying `status = "error"`. Contrast
+/// [`DEFAULT_PILOT_COST_ALERT_USD`], which is WARN because its threshold is a
+/// posed *rule* whose crossing is a fault.
+///
+/// **What crossing it does NOT do: bound anything.** No brief is truncated, no
+/// turn is refused, no geometry value moves. The one component of an architect
+/// brief that carries no ceiling — the plan, which travels as the turn's user
+/// message — is exempt from `truncate_history_to_token_budget` *by construction*
+/// (`agent_loop::truncate_history_to_token_budget` stops at `history.len() - 1`),
+/// and that exemption is correct: a verdict rendered on a mutilated plan is
+/// green and wrong, which is strictly worse than a timeout, which is red and
+/// visible.
+///
+/// Settable without a rebuild via `MIKA_BRIEF_SIZE_ALERT_BYTES`.
+pub const DEFAULT_BRIEF_SIZE_ALERT_BYTES: i64 = 48_000;
+
+/// Which of the three tiers a raw `brief_size_alert_bytes` landed on
+/// (mika#2474).
+///
+/// **Split out of [`Settings::effective_brief_size_alert_bytes`] so the tier —
+/// and therefore the WARN's own trigger — is assertable without a `tracing`
+/// subscriber.** The effective *value* cannot carry that: absent and invalid
+/// both resolve to [`DEFAULT_BRIEF_SIZE_ALERT_BYTES`], so a test reading the
+/// value alone cannot tell "nothing was configured" from "a typo was refused",
+/// which is exactly the pair the operator needs told apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BriefSizeAlertTier {
+    /// A usable positive value, in force.
+    Configured(i64),
+    /// Absent or empty — the nominal shape of a deployment that never set it.
+    Default,
+    /// Out of domain (`0` or negative). Carries the offending value **because
+    /// that value is what the WARN names**: a threshold silently disarmed by a
+    /// typo would be the failure this whole measurement exists to close.
+    Invalid(i64),
+}
+
+/// Classify a raw `brief_size_alert_bytes` (mika#2474). Pure — no logging.
+fn classify_brief_size_alert_bytes(raw: Option<i64>) -> BriefSizeAlertTier {
+    match raw {
+        Some(v) if v > 0 => BriefSizeAlertTier::Configured(v),
+        Some(invalid) => BriefSizeAlertTier::Invalid(invalid),
+        None => BriefSizeAlertTier::Default,
+    }
+}
 
 /// Default bounded webhook-queue max depth per agent (mika#1870).
 pub const DEFAULT_WEBHOOK_QUEUE_MAX_DEPTH: usize = 64;
@@ -2094,6 +2176,48 @@ impl Settings {
         }
     }
 
+    /// Effective brief-size alert threshold, in bytes (mika#2474).
+    ///
+    /// Three tiers, decided by `classify_brief_size_alert_bytes`: a positive
+    /// value is in force; absent or empty resolves to
+    /// [`DEFAULT_BRIEF_SIZE_ALERT_BYTES`] (48 000, the measured p90); `0` or
+    /// negative resolves to the default **and emits a WARN naming the offending
+    /// value**. An unparseable value stays a `Settings::load` error, like every
+    /// numeric sibling above — it is not softened here, because one exception
+    /// would be the invisible special case.
+    ///
+    /// `0` is deliberately not honoured as "report every turn": that would
+    /// drown the upper-decile population the measurement exists to size, and —
+    /// read the other way — a zero typed where a byte count was meant would
+    /// turn the instrument into noise without a word.
+    ///
+    /// **This accessor has exactly one production caller**, the emission site in
+    /// `mika-agent`'s `agent_loop`, held by
+    /// `canonical_tokens::tests::mika2474_the_threshold_has_a_single_reader`. A
+    /// second reader would, in practice, be the *refusal* mika#2474 declines to
+    /// ship without its precondition — a gate in `validate_dispatch_readiness`
+    /// or in `_arch_ask` — and it would cut a groom on a threshold calibrated
+    /// for an **alert**: a false alert costs one log line, a false refusal costs
+    /// an architect pass and a point of the mika#2020 re-drive budget, three of
+    /// which abandon a healthy ticket.
+    pub fn effective_brief_size_alert_bytes(&self) -> i64 {
+        match classify_brief_size_alert_bytes(self.brief_size_alert_bytes) {
+            BriefSizeAlertTier::Configured(v) => v,
+            BriefSizeAlertTier::Default => DEFAULT_BRIEF_SIZE_ALERT_BYTES,
+            BriefSizeAlertTier::Invalid(invalid) => {
+                tracing::warn!(
+                    event = "brief_size_alert_invalid",
+                    value = invalid,
+                    default_bytes = DEFAULT_BRIEF_SIZE_ALERT_BYTES,
+                    "brief_size_alert_bytes is out of domain (must be > 0); falling \
+                     back to the default. A threshold at or below zero would report \
+                     every turn as oversized (mika#2474)."
+                );
+                DEFAULT_BRIEF_SIZE_ALERT_BYTES
+            }
+        }
+    }
+
     /// Effective first backoff step after a failed delivery (mika#2179).
     ///
     /// Returns the configured value or
@@ -2531,6 +2655,7 @@ impl Settings {
             callback_delivery_slow_threshold_secs: None,
             callback_delivery_max_attempts: None,
             pilot_cost_alert_usd: None,
+            brief_size_alert_bytes: None,
             callback_delivery_backoff_base_secs: None,
             callback_delivery_backoff_max_secs: None,
             kg_docs_root: None,
@@ -4312,5 +4437,96 @@ mod tests {
                 "{key} not resolvable via get_effective_value"
             );
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2474 — brief-size alert threshold, three tiers.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The default is the measured p90, and the assertions pin the *measurement*
+    /// rather than the literal: a future edit that moves the number has to argue
+    /// with the distribution it came from (see
+    /// [`DEFAULT_BRIEF_SIZE_ALERT_BYTES`]).
+    #[test]
+    fn mika2474_absent_threshold_resolves_to_the_measured_p90() {
+        let settings = Settings::test_defaults();
+
+        assert_eq!(settings.brief_size_alert_bytes, None);
+        assert_eq!(
+            settings.effective_brief_size_alert_bytes(),
+            DEFAULT_BRIEF_SIZE_ALERT_BYTES
+        );
+        assert_eq!(settings.effective_brief_size_alert_bytes(), 48_000);
+
+        // The population must be a TAIL of the September 2026 plan distribution,
+        // not its bulk. p75 = 37 382 stays under the threshold (the upper quarter
+        // is not a tail); p99 = 72 349 is over it.
+        const P75_BYTES: i64 = 37_382;
+        const P99_BYTES: i64 = 72_349;
+        assert!(
+            P75_BYTES < settings.effective_brief_size_alert_bytes(),
+            "a p75 brief must NOT be reported — the threshold would stop selecting a tail"
+        );
+        assert!(
+            P99_BYTES > settings.effective_brief_size_alert_bytes(),
+            "a p99 brief must be reported — that is the population being sized"
+        );
+    }
+
+    /// A configured positive value is in force verbatim.
+    #[test]
+    fn mika2474_a_positive_threshold_is_in_force() {
+        let mut settings = Settings::test_defaults();
+        settings.brief_size_alert_bytes = Some(12_345);
+
+        assert_eq!(settings.effective_brief_size_alert_bytes(), 12_345);
+        assert_eq!(
+            classify_brief_size_alert_bytes(Some(12_345)),
+            BriefSizeAlertTier::Configured(12_345)
+        );
+    }
+
+    /// `0` and negatives fall back to the default — and **the tier is what says
+    /// the WARN fires**. Asserting the effective value alone cannot: absent and
+    /// invalid both return 48 000, which is exactly why the tier exists.
+    #[test]
+    fn mika2474_out_of_domain_falls_back_and_is_reported() {
+        for invalid in [0_i64, -1, -48_000, i64::MIN] {
+            let mut settings = Settings::test_defaults();
+            settings.brief_size_alert_bytes = Some(invalid);
+
+            assert_eq!(
+                settings.effective_brief_size_alert_bytes(),
+                DEFAULT_BRIEF_SIZE_ALERT_BYTES,
+                "an out-of-domain {invalid} must resolve to the default"
+            );
+            assert_eq!(
+                classify_brief_size_alert_bytes(Some(invalid)),
+                BriefSizeAlertTier::Invalid(invalid),
+                "the tier must carry {invalid} — it is the value the WARN names"
+            );
+        }
+
+        // The negative control that makes the assertion above mean something:
+        // absence is NOT reported, so the two populations stay distinguishable.
+        assert_eq!(
+            classify_brief_size_alert_bytes(None),
+            BriefSizeAlertTier::Default,
+            "an unset threshold is the nominal shape and must emit nothing"
+        );
+    }
+
+    /// `0` must not be a second way to disarm. Pinned because the tempting
+    /// reading — "zero means report everything" — would drown the upper-decile
+    /// population the measurement exists to size.
+    #[test]
+    fn mika2474_zero_is_not_honoured_as_report_everything() {
+        let mut settings = Settings::test_defaults();
+        settings.brief_size_alert_bytes = Some(0);
+
+        assert!(
+            settings.effective_brief_size_alert_bytes() > 0,
+            "a threshold of 0 would report every turn; it must fall back instead"
+        );
     }
 }
