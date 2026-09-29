@@ -8842,16 +8842,21 @@ assert_not_contains "U3c: le commit marqueur wip(mika#1383) n'atteint pas la cla
 # L'intention de cette assertion est que la réécriture en PR_OPENED n'ait qu'un
 # site — c'est la valeur, non l'helper, qui doit être unique. Le prédicat comptait
 # sur le fichier entier parce qu'il n'existait alors qu'un seul appel ; mika#2545
-# en a ajouté un second, pour `Outcome: ESCALATE`. Les deux valeurs sont donc
-# nommées et chacune comptée à un site, ce qui est plus fort que l'ancien compte
-# global : une troisième valeur écrite par un helper partagé fait rougir la
-# cardinalité ci-dessous au lieu de passer inaperçue.
+# en a ajouté un second, pour `Outcome: ESCALATE`, et mika#2590 un troisième pour
+# `Outcome: PLAN_GROOMED`. Chaque valeur est donc nommée et comptée à un site, ce
+# qui est plus fort que l'ancien compte global : une quatrième valeur écrite par
+# un helper partagé fait rougir la cardinalité ci-dessous au lieu de passer
+# inaperçue. **La cardinalité a mordu à l'arrivée de la troisième** — c'est ce
+# qui la rend crédible, et le geste juste est de nommer la valeur neuve, jamais
+# de relâcher le compte.
 assert_eq "U3c: la réécriture Outcome: PR_OPENED n'est appelée qu'au seul bras de la classe nouvelle" \
     "1" "$(grep -c '_set_outcome_line "Outcome: PR_OPENED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
     "1" "$(grep -c '_set_outcome_line "Outcome: ESCALATE' "$DISPATCH_LIB" || true)"
-assert_eq "U3c: et _set_outcome_line n'a que ces deux valeurs déclarées" \
-    "2" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+assert_eq "U3c (mika#2590): Outcome: PLAN_GROOMED n'est estampillé qu'à un site" \
+    "1" "$(grep -c '_set_outcome_line "Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
+assert_eq "U3c: et _set_outcome_line n'a que ces trois valeurs déclarées" \
+    "3" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
 
 # --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
 assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
@@ -9593,6 +9598,93 @@ assert_contains "mika#2578: ce site est la forme conditionnelle (une valeur de h
     ': "${_PILOT_GH_TOKEN_FILE:=' "$T2578_DECL"
 assert_contains "mika#2578: et son défaut est INCHANGÉ (un dispatch réel stache toujours sous \$HOME)" \
     '$HOME/.mika/pilot-gh-token' "$T2578_DECL"
+
+# ===========================================================================
+# mika#2590 — le producteur n'écrit plus le marqueur hors position, et la note
+# d'un refus ne le cite plus.
+# ===========================================================================
+#
+# Le lecteur Rust passe à une lecture ANCRÉE sur la ligne. Appliqué seul, cet
+# ancrage INTRODUIT un faux négatif (KTD3) : le producteur écrivait
+# `sed 's/Outcome: .*/Outcome: PLAN_GROOMED/'`, **non ancré**, donc sur un RESULT
+# portant `Outcome: ` en milieu de ligne il posait le marqueur hors position — et
+# le filet qui suivait (`grep -qF`, non ancré lui aussi) le voyait et n'ajoutait
+# pas la ligne canonique. Un groom RÉELLEMENT convergé aurait alors été refusé.
+# Les deux moitiés voyagent dans le même binaire (`skills/bundled/` est une
+# projection du binaire, mika#2340), donc elles ne peuvent pas être servies
+# séparément — c'est ce qui rend KTD3 sûr.
+
+# --- U8f(a), contrôle négatif PORTEUR : la forme d'avant produit le piège ----
+#
+# Reproduction explicite du couple sed+grep retiré par U5a, sur le RESULT piège.
+# Sans cette moitié, « le bras écrit une ligne ancrée » serait indistinguable de
+# « le RESULT d'entrée n'a jamais porté de piège ».
+T2590_TRAP_IN="claude-pilot completed (status: success). Outcome: PLAN_COMMITTED — plan posé.
+
+Session: sess-2590"
+T2590_OLD_FORM=$(printf '%s' "$T2590_TRAP_IN" | sed 's/Outcome: .*/Outcome: PLAN_GROOMED/')
+assert_eq "mika#2590 (contrôle négatif): la forme non ancrée ne produit AUCUNE ligne Outcome ancrée" \
+    "0" "$(printf '%s\n' "$T2590_OLD_FORM" | grep -c '^Outcome: PLAN_GROOMED' || true)"
+assert_contains "mika#2590 (contrôle négatif): elle pose bien le marqueur, mais en milieu de ligne" \
+    "success). Outcome: PLAN_GROOMED" "$T2590_OLD_FORM"
+
+# --- U8f(b), comportemental : _set_outcome_line rend la ligne ancrée ---------
+_t2590_groomed_outcome_probe() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        RESULT="claude-pilot completed (status: success). Outcome: PLAN_COMMITTED — plan posé.
+
+Session: sess-2590"
+        _set_outcome_line "Outcome: PLAN_GROOMED"
+        printf '%s' "$RESULT"
+    )
+}
+T2590_NEW_FORM=$(_t2590_groomed_outcome_probe 2>/dev/null)
+assert_eq "mika#2590: _set_outcome_line rend EXACTEMENT une ligne Outcome ancrée" \
+    "1" "$(printf '%s\n' "$T2590_NEW_FORM" | grep -c '^Outcome: PLAN_GROOMED' || true)"
+assert_contains "mika#2590: et le corps du RESULT est préservé" \
+    "Session: sess-2590" "$T2590_NEW_FORM"
+
+# --- U8f(c), scan de source : le bras GROOMED passe par _set_outcome_line ----
+#
+# C'est cette assertion qui rougit avant U5a. Aucun test comportemental ne peut
+# atteindre le bras lui-même : il vit dans `dispatch_claude_pilot`, inatteignable
+# hors d'un dispatch complet (worktree, pilote, architecte).
+T2590_GROOMED_ARM=$(sed -n '/mika#1394: Architect converged on GROOMED/,/^        elif grep -qE/p' "$DISPATCH_LIB")
+assert_eq "mika#2590 (bonne foi): le bras GROOMED a été extrait" \
+    "yes" "$(if [ -n "$T2590_GROOMED_ARM" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "mika#2590 (U5a): le bras GROOMED pose sa ligne par _set_outcome_line" \
+    '_set_outcome_line "Outcome: PLAN_GROOMED"' "$T2590_GROOMED_ARM"
+assert_not_contains "mika#2590 (U5a): et le sed NON ANCRÉ a disparu (c'est lui, le faux négatif KTD3)" \
+    's/Outcome: .*/Outcome: PLAN_GROOMED/' "$T2590_GROOMED_ARM"
+assert_contains "mika#2590 (U5a): le strip des PIPELINE FAILURE périmés est CONSERVÉ" \
+    "sed '/^PIPELINE FAILURE:/d'" "$T2590_GROOMED_ARM"
+
+# --- U7b (R8/D7) : aucune construction de RESULT auto_skipped ne cite le jeton -
+#
+# C'est la moitié STRUCTURELLE de R8. La moitié intention (la note reformulée)
+# ne tient pas seule au substrat de la boucle
+# (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`) : un
+# futur éditeur recopie la phrase depuis le commentaire voisin et le défaut
+# revient. Le lecteur corrigé le RATTRAPERAIT (l'enveloppe JSON est refusée par
+# R2), et c'est exactement pourquoi cette garde vaut le coup — elle empêche la
+# régression de se cacher derrière une défense en profondeur.
+T2590_AUTOSKIP_LINES=$(grep -n '"status":"auto_skipped"' "$DISPATCH_LIB" || true)
+T2590_AUTOSKIP_COUNT=$(printf '%s' "$T2590_AUTOSKIP_LINES" | grep -c . || true)
+assert_eq "mika#2590 anti-vacuité: des RESULT auto_skipped existent bien dans dispatch-lib.sh" \
+    "yes" "$([ "${T2590_AUTOSKIP_COUNT:-0}" -ge 1 ] && echo yes || echo "non ($T2590_AUTOSKIP_COUNT)")"
+
+T2590_AUTOSKIP_OFFENDERS=$(printf '%s\n' "$T2590_AUTOSKIP_LINES" | grep -c 'Outcome: PLAN_GROOMED' || true)
+assert_eq "mika#2590 (U7b): aucune ligne construisant un RESULT auto_skipped ne cite le marqueur" \
+    "0" "${T2590_AUTOSKIP_OFFENDERS:-0}"
+
+# Contrôle négatif de l'assertion elle-même : sur une fixture portant le
+# littéral, le prédicat DOIT accuser. Sans lui, « l'assertion tient » et
+# « l'assertion ne regarde rien » rendent les mêmes octets (classe mika#2205).
+T2590_FIXTURE='RESULT=$(printf '"'"'{"status":"auto_skipped","reason":"x","note":"… carrying Outcome: PLAN_GROOMED exists …"}'"'"')'
+assert_eq "mika#2590 (contrôle négatif U7b): le prédicat accuse une fixture qui cite le jeton" \
+    "1" "$(printf '%s\n' "$T2590_FIXTURE" | grep '"status":"auto_skipped"' | grep -c 'Outcome: PLAN_GROOMED' || true)"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0

@@ -4084,9 +4084,21 @@ async fn try_dispatch_pilot_after_groom_success(
         return;
     }
 
-    // 2. Canonical success marker in callback result text.
+    // 2. Canonical success marker in callback result text, EN POSITION DE
+    //    VERDICT (mika#2590 R5).
+    //
+    //    C'était un `contains` : même défaut que la porte de provenance, même
+    //    remède. Ce site n'était pas atteint par l'incident mesuré sur mika#2105
+    //    — l'auto-fire ne part que sur un callback de la boucle, jamais sur une
+    //    enveloppe de saut — mais il l'aurait été par un RESULT de recovery
+    //    citant le jeton dans sa prose.
+    //
+    //    Aucune émission ici, délibérément : ce site est un auto-fire
+    //    *fire-and-forget* dont chaque précondition échouée est déjà silencieuse,
+    //    et lui donner un compteur mélangerait sa population avec celle de la
+    //    porte (R6), qui est celle du ticket.
     match &task.result {
-        Some(r) if r.contains(crate::task_state::tasks::GROOM_SUCCESS_MARKER) => {}
+        Some(r) if crate::task_state::tasks::groom_result_convergence(r).is_converged() => {}
         _ => return,
     };
 
@@ -7499,6 +7511,29 @@ mod tests {
         plan_groomed: bool,
         reference_url: Option<&str>,
     ) -> (String, String) {
+        let body = if plan_groomed {
+            "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-1614"
+        } else {
+            "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-1614"
+        };
+        create_groom_callback_pair_with_result(db, body, reference_url).await
+    }
+
+    /// Même paire, mais le `result` du callback est fourni **verbatim**
+    /// (mika#2590 U8e).
+    ///
+    /// Le booléen de son frère ci-dessus ne peut produire que deux textes, tous
+    /// deux porteurs d'une ligne `Outcome:` ancrée — donc aucun de ses appelants
+    /// ne peut poser l'enveloppe JSON d'auto-skip, qui est très exactement la
+    /// forme mesurée sur mika#2105. Un helper à corps libre plutôt qu'un
+    /// troisième booléen : la population des `result` que la boucle sait écrire
+    /// n'est pas close, et un `enum` de fixtures ici dupliquerait les constantes
+    /// gelées de `db::tests`.
+    async fn create_groom_callback_pair_with_result(
+        db: &AsyncDatabase,
+        result_body: &str,
+        reference_url: Option<&str>,
+    ) -> (String, String) {
         let parent = NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,
@@ -7553,12 +7588,7 @@ mod tests {
             dispatch_class: Some("groom".to_string()),
         };
         let callback_id = db.create_task(callback).await.unwrap();
-        let body = if plan_groomed {
-            "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-1614"
-        } else {
-            "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-1614"
-        };
-        db.update_task_completed(&callback_id, Some(body))
+        db.update_task_completed(&callback_id, Some(result_body))
             .await
             .unwrap();
         (parent_id, callback_id)
@@ -8121,6 +8151,175 @@ mod tests {
         );
     }
 
+    // ---- mika#2590 U8e : la note d'un refus ne déclenche aucun auto-fire ----
+
+    /// Les labels des rows callback d'**implémentation** nées sous ce parent.
+    ///
+    /// Le discriminant est `!contains("_groom")` : `run_claude_pilot_groom` et
+    /// `run_claude_pilot` partagent le même préfixe, donc un `starts_with` seul
+    /// compterait le callback de grooming que la fixture vient de poser et
+    /// rendrait le test vert quoi qu'il arrive. Même prédicat que
+    /// `mika2498_la_sentinelle_refuse_lauto_fire_et_le_dit`.
+    async fn implement_callback_labels(db: &AsyncDatabase, parent_id: &str) -> Vec<String> {
+        db.get_child_tasks(parent_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.label)
+            .filter(|l| l.starts_with("long_running:run_claude_pilot") && !l.contains("_groom"))
+            .collect()
+    }
+
+    /// **U8e / R5 — l'auto-fire ne part pas sur une enveloppe d'auto-skip.**
+    ///
+    /// Le second lecteur du marqueur, après la porte de provenance. L'incident
+    /// mesuré sur mika#2105 ne l'a **pas** atteint — l'auto-fire ne part que sur
+    /// un callback de la boucle, jamais sur une enveloppe de saut posée par un
+    /// autre chemin — mais le prédicat y était le même `contains`, donc la même
+    /// prose l'aurait franchi. C'est une défense en profondeur mesurée, pas une
+    /// re-mesure du défaut.
+    ///
+    /// **Registre RÉEL, et c'est ce qui rend l'assertion discriminante.** Avec un
+    /// `SkillRegistry::empty()` la fonction sort à l'étape 5a (outil absent) —
+    /// *avant* la bascule 5c — donc « le `dispatch_class` n'a pas bougé » serait
+    /// trivialement vrai et n'attesterait rien du prédicat de l'étape 2. Avec ce
+    /// registre, un prédicat par sous-chaîne laisse la bascule se produire et ce
+    /// test rougit : c'est très exactement ce qu'il a été vu faire avant U3.
+    ///
+    /// Trois assertions parce que « le parent n'a pas basculé », « aucun
+    /// implement n'est né » et « rien n'a été écrit » sont trois faits distincts,
+    /// dont aucun n'implique les deux autres.
+    #[tokio::test]
+    async fn mika2590_un_auto_skip_ne_declenche_aucun_auto_fire() {
+        let db = test_db();
+        let (_skill_dir, skills) = dev_pilot_registry();
+
+        let (parent_id, callback_id) = create_groom_callback_pair_with_result(
+            &db,
+            crate::db::tests::GROOM_CALLBACK_AUTO_SKIPPED,
+            Some(TEST_ISSUE_URL),
+        )
+        .await;
+        let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &skills,
+            no_stop_home(),
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_class_of(&db, &parent_id).await,
+            "groom",
+            "le JSON d'auto-skip cite `Outcome: PLAN_GROOMED` dans sa prose pour \
+             dire qu'aucune preuve n'est frappée ; le parent basculé `implement` \
+             signifie que la note d'un refus a déclenché un dispatch d'implémentation \
+             (mika#2590, forme mesurée sur mika#2105 le 2026-09-29)"
+        );
+
+        let implement = implement_callback_labels(&db, &parent_id).await;
+        assert!(
+            implement.is_empty(),
+            "aucune row callback d'implémentation ne doit naître d'un auto-skip — \
+             trouvé : {implement:?}"
+        );
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+        assert!(
+            outcomes.is_empty(),
+            "la fonction doit sortir à l'étape 2 : ni dispatch, ni refus de frein — \
+             trouvé {outcomes:?}"
+        );
+    }
+
+    /// **U8e, contrôle positif — et sans lui le test ci-dessus ne dit rien.**
+    ///
+    /// « L'auto-fire ne part pas sur un auto-skip » est satisfait en entier par
+    /// une fonction qui ne part **jamais**, y compris cassée. Ce test pose les
+    /// deux arms côte à côte sur le même prédicat, et c'est pour cela qu'ils
+    /// vivent dans un seul test : la valeur est dans le **contraste**, et deux
+    /// tests frères peuvent diverger d'une fixture sans que rien ne rougisse.
+    ///
+    /// **La sonde est le frein mika#2498, pas le dispatch lui-même.** Le frein
+    /// est armé, donc la fonction s'arrête à l'étape 3bis en écrivant
+    /// [`GROOM_PILOT_STOPPED_VALUE`] — soit exactement un cran **après** le
+    /// prédicat de convergence et **avant** toute résolution de registre, toute
+    /// bascule et tout appel réseau. La présence de cette row est donc une
+    /// mesure directe de « l'étape 2 a été franchie », déterministe et hors
+    /// ligne. Motif établi par `mika2498_un_callback_non_converge_nemet_aucun_refus`,
+    /// qui lit la même row pour la question miroir.
+    #[tokio::test]
+    async fn mika2590_le_predicat_dauto_fire_separe_lauto_skip_de_la_ligne_ancree() {
+        // Arm A — la ligne ancrée franchit le prédicat.
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+
+        let (anchored_parent, anchored_cb) = create_groom_callback_pair_with_result(
+            &db,
+            "claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED\nSession: sess-2590",
+            Some(TEST_ISSUE_URL),
+        )
+        .await;
+        let task = db.get_task_unscoped(&anchored_cb).await.unwrap().unwrap();
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &skills_empty(),
+            tmp.path(),
+        )
+        .await;
+
+        assert!(
+            groom_pilot_audit_outcomes(&db, &anchored_parent)
+                .await
+                .iter()
+                .any(|o| o == GROOM_PILOT_STOPPED_VALUE),
+            "un groom réellement convergé porte le marqueur en début de ligne et doit \
+             franchir l'étape 2 — c'est le faux négatif de KTD3 que ce contrôle refuse : \
+             ancrer le lecteur sans ancrer le producteur casse la boucle en silence"
+        );
+
+        // Arm B — l'enveloppe d'auto-skip ne le franchit pas. Base neuve : deux
+        // parents actifs sur la même `reference_url` collisionnent sur
+        // `idx_tasks_manual_active_ref_url`, et une fixture qui échoue à
+        // s'écrire rendrait ce bras vide, donc vert, donc muet.
+        let db = test_db();
+        let (skipped_parent, skipped_cb) = create_groom_callback_pair_with_result(
+            &db,
+            crate::db::tests::GROOM_CALLBACK_AUTO_SKIPPED,
+            Some(TEST_ISSUE_URL),
+        )
+        .await;
+        let task = db.get_task_unscoped(&skipped_cb).await.unwrap().unwrap();
+        try_dispatch_pilot_after_groom_success(
+            &db,
+            &task,
+            Some("ghp_token"),
+            &skills_empty(),
+            tmp.path(),
+        )
+        .await;
+
+        let outcomes = groom_pilot_audit_outcomes(&db, &skipped_parent).await;
+        assert!(
+            outcomes.is_empty(),
+            "l'auto-skip doit sortir à l'étape 2, donc *avant* le frein : une row \
+             `{GROOM_PILOT_STOPPED_VALUE}` prouve que le prédicat de convergence l'a \
+             laissé passer — trouvé {outcomes:?}"
+        );
+    }
+
+    /// Registre vide, nommé pour que les deux bras du test ci-dessus se lisent
+    /// comme le même appel à un paramètre près.
+    fn skills_empty() -> crate::skills::SkillRegistry {
+        crate::skills::SkillRegistry::empty()
+    }
+
     // ---- mika#2287: the #1620 dispatch gate must survive the #1614 flip ----
 
     /// Anti-recursion guard (mika#2287). The #1620 grooming-provenance gate and
@@ -8152,8 +8351,9 @@ mod tests {
             .has_completed_groom_for_issue(TEST_ISSUE_URL)
             .await
             .expect("gate query must not error");
-        assert!(
+        assert_eq!(
             verified,
+            crate::task_state::tasks::GroomConvergence::Converged,
             "the #1620 gate must recognise a completed groom callback with \
              `Outcome: PLAN_GROOMED` under a parent that was flipped \
              groom→implement (mika#2287)"
@@ -8175,9 +8375,12 @@ mod tests {
             .has_completed_groom_for_issue(TEST_ISSUE_URL)
             .await
             .expect("gate query must not error");
-        assert!(
-            !verified,
-            "a groom callback without `Outcome: PLAN_GROOMED` is not proof of grooming"
+        assert_eq!(
+            verified,
+            crate::task_state::tasks::GroomConvergence::Absent,
+            "a groom callback without `Outcome: PLAN_GROOMED` is not proof of \
+             grooming — et `Absent` plutôt que `MarkerOutOfPosition` : le \
+             RESULT ne cite pas le marqueur du tout (mika#2590 D2)"
         );
     }
 

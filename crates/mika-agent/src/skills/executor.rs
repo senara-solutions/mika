@@ -19,6 +19,7 @@ use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
 use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
 use crate::task_engine::types::{action_type, trigger_type};
+use crate::task_state::tasks::GroomConvergence;
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
 /// Maximum output size from a skill tool (10,000 characters).
@@ -1792,9 +1793,18 @@ pub(crate) enum GroomedState {
     Groomed,
     /// Un ou plusieurs callouts manquent. Le cas nominal d'un premier grooming.
     MarkersMissing(Vec<&'static str>),
-    /// Callouts présents, aucune preuve. Grooming hors moteur (spawn
-    /// orchestrateur, geste manuel), ou preuve purgée par la rétention de
-    /// 30 jours (`prune_completed_tasks`).
+    /// Callouts présents, aucune preuve **recevable**. Trois causes :
+    /// grooming hors moteur (spawn orchestrateur, geste manuel) ; preuve purgée
+    /// par la rétention de 30 jours (`prune_completed_tasks`) ; ou — depuis
+    /// mika#2590 — une preuve qui **existait mais pas en position de verdict**,
+    /// typiquement la note d'un refus `auto_skipped` citant le marqueur.
+    ///
+    /// La troisième cause n'a pas de variante à elle : `route_for` et
+    /// `refusal_for` rendraient le **même** routage (`dev-groom`) et le **même**
+    /// JSON de refus (`dispatch_grooming_not_verified`, qui dit déjà la bonne
+    /// chose), donc un cinquième état forcerait quatre décisions par le
+    /// compilateur pour zéro décision nouvelle. L'information neuve est portée
+    /// par l'événement [`GROOM_PROOF_OUT_OF_POSITION_EVENT`], pas par le type.
     MarkersWithoutProof,
     /// La preuve n'a pas pu être lue. Porte le message d'erreur pour que le
     /// traducteur reproduise le JSON `dispatch_check_failed` à l'octet près.
@@ -1855,9 +1865,86 @@ pub(crate) async fn groomed_state(
     // (mika#1614) before it is terminal. Read-only.
     let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
     match db.has_completed_groom_for_issue(&issue_url).await {
-        Ok(true) => GroomedState::Groomed,
-        Ok(false) => GroomedState::MarkersWithoutProof,
+        Ok(GroomConvergence::Converged) => GroomedState::Groomed,
+        Ok(GroomConvergence::Absent) => GroomedState::MarkersWithoutProof,
+        // mika#2590 R6 — même disposition que `Absent`, lecture opérateur
+        // différente. Sans cette ligne, un ticket refoulé pour preuve polluée se
+        // lit **exactement** comme un ticket jamais groomé : la classe mika#2205
+        // appliquée au correctif lui-même.
+        Ok(GroomConvergence::MarkerOutOfPosition(reason)) => {
+            note_groom_proof_out_of_position(db, &issue_url, owner, repo, number, reason).await;
+            GroomedState::MarkersWithoutProof
+        }
         Err(e) => GroomedState::ProofUnreadable(e.to_string()),
+    }
+}
+
+/// `audit_events.tool_name` et nom d'événement de journal du refus mika#2590 R6.
+///
+/// **SOLE WRITER** : [`note_groom_proof_out_of_position`] est le seul site de
+/// production qui écrit ce nom, dans le journal comme dans `audit_events`. C'est
+/// ce qui rend `SELECT after_value, count(*) … GROUP BY 1` exact plutôt qu'un
+/// nombre sur lequel deux écrivains peuvent diverger. Motif `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156), `closing_pr_closed_unmerged` /
+/// `ready_label_degroomed` (mika#2242).
+pub(crate) const GROOM_PROOF_OUT_OF_POSITION_EVENT: &str = "groom_proof_marker_out_of_position";
+
+/// `audit_events.session_id` des lignes de mika#2590 R6.
+///
+/// La preuve est lue depuis **deux** chemins — la porte de dispatch
+/// ([`evaluate_grooming_gate`], qui ne porte aucune session) et le routage du
+/// ready-label. Emprunter la session de l'un ferait passer la ligne de l'autre
+/// pour ce qu'elle n'est pas ; une constante dédiée dit « hors session ».
+/// `audit_events.session_id` est `NOT NULL` sans clé étrangère, donc c'est le
+/// remplissage honnête — motif
+/// [`crate::evidence::audit::AUTH_BOUNDARY_SESSION_ID`] (mika#1949).
+///
+/// La corrélation se fait par `target_key`, qui porte l'issue.
+pub(crate) const GROOM_PROOF_SESSION_ID: &str = "groom-proof";
+
+/// Compte une preuve de grooming trouvée **hors position de verdict**
+/// (mika#2590 R6).
+///
+/// Fire-and-forget : une écriture d'audit qui échoue est `warn!`ée et **ne
+/// change pas le verdict** — motif `a2a_turn_failed_audit_failed` (mika#2522).
+/// Une garde qui tomberait parce qu'elle ne peut pas se compter serait une
+/// garde qu'on retire.
+async fn note_groom_proof_out_of_position(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    reason: &'static str,
+) {
+    warn!(
+        event = GROOM_PROOF_OUT_OF_POSITION_EVENT,
+        issue_url = %issue_url,
+        reason = reason,
+        "groomed_state: un callback de groom porte `Outcome: PLAN_GROOMED` \
+         ailleurs qu'en position de verdict — le dispatch implement est refusé \
+         (mika#2590)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_OUT_OF_POSITION_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(reason),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_out_of_position_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — le \
+             `GROUP BY` de la sonde S1 est alors incomplet (non fatal)"
+        );
     }
 }
 
