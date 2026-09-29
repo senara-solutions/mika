@@ -69,9 +69,42 @@ from __future__ import annotations
 
 import re
 import sys
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# `tomllib` est stdlib depuis Python 3.11. SOUS GARDE, et le refus sort en 2 —
+# pas en 1. Un `import` nu rend un traceback, donc l'exit 1 de l'interpréteur,
+# donc « violation(s) trouvée(s) » dans le vocabulaire de ce lint : un
+# interpréteur trop ancien se lisait comme un SINK NON DÉCLARÉ, et le motif
+# était faux. Mesuré le 2026-09-29 sur `ubuntu-22.04` (Python 3.10), où les
+# deux jobs egress ont rougi sur `ModuleNotFoundError` sans qu'une ligne dise
+# quoi faire — la CI est désormais épinglée par `actions/setup-python`
+# (`.github/workflows/ci.yml`), et ce refus est ce qui reste lisible sur un
+# poste dont le `python3` est antérieur.
+#
+# SITE UNIQUE : les deux consommateurs (`verify-egress-manifest.sh`,
+# `verify-egress-uniqueness.sh`) en héritent sans dupliquer la vérification.
+#
+# PAS de repli sur `tomli` : le paquet n'est pas une dépendance de ce dépôt, il
+# est absent du runner, et un repli opportuniste donnerait au même interpréteur
+# deux régimes selon ce qu'un environnement porte par accident. Un refus qui
+# nomme l'exigence vaut mieux qu'un lint dont on ne sait pas s'il a tourné.
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover — vérifié par N17 via un shadow
+    sys.stderr.write(
+        "ERROR (egress-manifest): `tomllib` introuvable — Python "
+        f"{sys.version_info.major}.{sys.version_info.minor} "
+        f"({sys.executable})\n"
+        "  Ce lint lit `docs/egress/egress-manifest.toml` et exige Python >= 3.11\n"
+        "  (tomllib est stdlib depuis 3.11).\n"
+        "  CI : le job doit déclarer `actions/setup-python` (python-version 3.12).\n"
+        "  Local : lancer sous un python3 >= 3.11.\n"
+        "  Refus plutôt que continuation : sans le manifeste, ce lint ne\n"
+        "  confronte rien et un exit 0 se lirait comme un arbre propre\n"
+        "  (classe mika#2205).\n"
+    )
+    sys.exit(2)
 
 # --------------------------------------------------------------------------
 # Périmètre du scan (AC4)

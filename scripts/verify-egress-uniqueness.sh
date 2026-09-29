@@ -75,9 +75,17 @@ fi
 
 PATTERNS=()
 derive_rc=0
+# La capture est FAITE AVANT la boucle, et c'est ce qui rend `derive_rc` vrai.
+# La forme `done < <(cmd || { derive_rc=$?; })` place l'affectation dans le
+# sous-shell de la substitution de processus : elle est perdue au retour, et le
+# refus ci-dessous rapportait « exit 0 » sur une dérivation qui avait bel et
+# bien échoué (mesuré le 2026-09-29 avec un `tomllib` absent). Seul le second
+# terme du refus mordait alors — donc une dérivation qui échouerait en écrivant
+# tout de même une ligne ne serait pas refusée du tout.
+derived=$(python3 -B "$MANIFEST_ENGINE" --confined-hosts "$REPO_ROOT") || derive_rc=$?
 while IFS= read -r host; do
     [[ -n "$host" ]] && PATTERNS+=("$host")
-done < <(python3 -B "$MANIFEST_ENGINE" --confined-hosts "$REPO_ROOT" || { derive_rc=$?; })
+done <<< "$derived"
 
 if [[ $derive_rc -ne 0 || ${#PATTERNS[@]} -eq 0 ]]; then
     echo "ERROR (egress-uniqueness): dérivation des PATTERNS depuis le manifeste échouée" >&2

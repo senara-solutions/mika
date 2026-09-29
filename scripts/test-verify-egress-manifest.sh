@@ -765,6 +765,116 @@ assert_true "N15 anti-vacuité — le détecteur voit encore la reprise témoin"
 
 # ============================================================================
 echo ""
+echo "N16 — tout job CI qui lance le moteur déclare son Python"
+echo "---------------------------------------------------------"
+# Le moteur lit du TOML via `tomllib`, stdlib depuis 3.11. `ubuntu-22.04` — le
+# seul runner de ce dépôt — porte Python 3.10. Mesuré le 2026-09-29 : les deux
+# jobs egress ont rougi sur `ModuleNotFoundError`, sur un lint par ailleurs
+# correct et vert localement.
+#
+# Le prédicat est PAR JOB, pas par fichier : un `setup-python` présent quelque
+# part dans `ci.yml` ne dit rien du job qui lance le moteur, et c'est très
+# exactement l'erreur qu'un `grep -q setup-python` commettrait. Un job ajouté
+# demain sans son Python fait rougir ICI au lieu de rougir en CI.
+#
+# ANTI-VACUITÉ portée par la cardinalité : si le découpage cessait de voir les
+# jobs, la boucle ne tournerait sur rien et l'assertion se lirait comme un
+# câblage sain (classe mika#2205).
+ci_probe=$(python3 -B - "$REPO_ROOT" <<'PY' 2>&1
+import sys
+from pathlib import Path
+
+# Les consommateurs du moteur. `test-verify-egress-manifest.sh` en est un : il
+# appelle l'engine directement (N14, N15).
+CONSUMERS = (
+    "verify-egress-manifest.sh",
+    "test-verify-egress-manifest.sh",
+    "verify-egress-uniqueness.sh",
+)
+
+ci = Path(sys.argv[1]) / ".github/workflows/ci.yml"
+job, jobs = None, {}
+for line in ci.read_text(encoding="utf-8").splitlines():
+    stripped = line.strip()
+    # Un job est une clé à l'indentation 2, sous `jobs:`. Pas un vrai parseur
+    # YAML : ce dépôt n'en a aucun en dépendance, et l'indentation suffit à
+    # séparer des blocs de job dont on ne lit que l'appartenance des lignes.
+    if line[:2] == "  " and line[2:3] not in (" ", "-", "") and stripped.endswith(":"):
+        job = stripped[:-1]
+        jobs[job] = []
+    elif job is not None:
+        jobs[job].append(line)
+
+needing = {j: b for j, b in jobs.items() if any(c in "\n".join(b) for c in CONSUMERS)}
+missing = [j for j, b in needing.items() if "actions/setup-python" not in "\n".join(b)]
+print(f"jobs={len(jobs)} needing={len(needing)} missing={','.join(sorted(missing))}")
+PY
+)
+ci_jobs=$(sed -n 's/^jobs=\([0-9]*\) .*/\1/p' <<< "$ci_probe")
+ci_needing=$(sed -n 's/^jobs=[0-9]* needing=\([0-9]*\) .*/\1/p' <<< "$ci_probe")
+ci_missing=$(sed -n 's/^.*missing=\(.*\)$/\1/p' <<< "$ci_probe")
+assert_true "N16 anti-vacuité — le découpage voit les jobs de ci.yml" \
+    "$([ "${ci_jobs:-0}" -ge 20 ] && echo 1 || echo 0)" \
+    "sortie: $ci_probe ; sans jobs vus, l'assertion suivante ne mesure rien"
+assert_true "N16 anti-vacuité — au moins deux jobs lancent le moteur" \
+    "$([ "${ci_needing:-0}" -ge 2 ] && echo 1 || echo 0)" \
+    "sortie: $ci_probe ; attendu >= 2 (egress-manifest-lint, egress-uniqueness-lint)"
+assert_true "N16 chaque job consommateur déclare actions/setup-python" \
+    "$([ -z "$ci_missing" ] && echo 1 || echo 0)" \
+    "job(s) sans setup-python : $ci_missing
+  -> ajouter l'étape \`actions/setup-python\` (python-version >= 3.11) à ce job.
+     Sans elle il tourne sous le Python de l'image (3.10 sur ubuntu-22.04) et
+     rougit sur ModuleNotFoundError, pas sur une violation d'egress."
+
+# ============================================================================
+echo ""
+echo "N17 — un Python sans tomllib REFUSE, et le dit"
+echo "-----------------------------------------------"
+# Le pendant local de N16 : sur un poste dont le `python3` est antérieur à 3.11,
+# le lint doit refuser en nommant l'exigence — pas rendre un traceback nu.
+#
+# LE CODE DE SORTIE EST LE CŒUR DE CE CAS. Un `import tomllib` nu rend l'exit 1
+# de l'interpréteur, et 1 signifie « violation(s) trouvée(s) » dans ce lint :
+# un interpréteur trop ancien se lisait comme un SINK NON DÉCLARÉ, et envoyait
+# son lecteur chercher un sink qui n'existe pas. 2 est la catégorie juste —
+# « manifeste illisible », fail-closed, jamais un vert.
+#
+# Le Python le plus ancien disponible sur cet hôte comme sur le runner armé est
+# >= 3.12, donc l'absence est SIMULÉE par un shadow `tomllib` qui lève à
+# l'import — la propriété testée est la conduite du lint face à cette exception,
+# et elle ne dépend pas de la façon dont l'exception survient.
+NOTOML="$TMPROOT/no-tomllib/tomllib"
+mkdir -p "$NOTOML"
+printf 'raise ModuleNotFoundError("No module named %s", name="tomllib")\n' "'tomllib'" \
+    > "$NOTOML/__init__.py"
+
+for consumer in "scripts/verify-egress-manifest.sh --report" "scripts/verify-egress-uniqueness.sh"; do
+    rc=0
+    # shellcheck disable=SC2086
+    out=$(PYTHONPATH="$TMPROOT/no-tomllib" bash $REPO_ROOT/${consumer} 2>&1) || rc=$?
+    label="${consumer%% *}"
+    assert_true "N17 ${label##*/} refuse en 2, jamais en 1" \
+        "$([ "$rc" -eq 2 ] && echo 1 || echo 0)" \
+        "exit $rc ; 1 voudrait dire « sink non déclaré » et le motif serait faux.
+sortie: $out"
+    assert_true "N17 ${label##*/} nomme l'exigence de version" \
+        "$(grep -q 'tomllib' <<< "$out" && grep -q '3\.11' <<< "$out" && echo 1 || echo 0)" \
+        "sortie: $out"
+done
+
+# ANTI-VACUITÉ de N17 : le shadow doit réellement masquer la stdlib. S'il ne
+# masquait rien, les deux cas ci-dessus tourneraient sur un tomllib présent, le
+# lint rendrait 0, et l'assertion d'exit 2 échouerait franchement — mais un
+# shadow qui masque SANS lever se lirait comme un refus obtenu. On mesure donc
+# que l'import échoue bien sous ce PYTHONPATH.
+shadow_rc=0
+PYTHONPATH="$TMPROOT/no-tomllib" python3 -B -c 'import tomllib' 2>/dev/null || shadow_rc=$?
+assert_true "N17 anti-vacuité — le shadow masque bien la stdlib" \
+    "$([ "$shadow_rc" -ne 0 ] && echo 1 || echo 0)" \
+    "import tomllib a réussi sous le shadow (exit $shadow_rc) ; les deux cas ci-dessus ne mesuraient alors pas l'absence"
+
+# ============================================================================
+echo ""
 echo "===================================================="
 echo "Résultats : $PASS réussies, $FAIL échouées"
 echo "===================================================="

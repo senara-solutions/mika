@@ -25,6 +25,13 @@
 # bash est exactement la fragilité que `check-pilot-turn-ceiling-labels.sh` a dû
 # border par un exit 3 « forme non auditable », et on ne la réintroduit pas.
 #
+# CETTE EXIGENCE DE VERSION EST DÉCLARÉE, PAS HÉRITÉE. `ubuntu-22.04` — le seul
+# runner de ce dépôt — porte Python 3.10, donc les deux jobs qui lancent le
+# moteur (`egress-manifest-lint`, `egress-uniqueness-lint`) épinglent leur
+# interpréteur par `actions/setup-python` dans `.github/workflows/ci.yml`. Ce
+# câblage est tenu par l'assertion N16 de `scripts/test-verify-egress-manifest.sh`
+# et le refus lisible qui reste sur un poste antérieur est pinné par N17.
+#
 # Usage :
 #   bash scripts/verify-egress-manifest.sh [--report] [<racine>] [<manifeste>]
 #
