@@ -369,7 +369,7 @@ assert_contains "T9b an invalid value is said, not swallowed" \
 
 # ── T10 (AC2) — every `no` names its term in the composed body ──────────────
 echo "-- T10: a \`no\` is actionable — it names the term (AC2) --"
-for term in diff worktree-dirty fmt clippy verify-pipeline budget worktree-unusable; do
+for term in compound-traversal diff worktree-dirty fmt clippy verify-pipeline budget worktree-unusable; do
     BODY=$(_compose_rescue_pr_body "$R1" "dirty-worktree" "Class fact." "2354" "no" "$term" "some output")
     assert_contains "T10 body names the \`$term\` term" "$BODY" "<!-- rescue-verify-failed: ${term} -->"
     assert_contains "T10 body carries the \`$term\` excerpt" "$BODY" "some output"
@@ -455,6 +455,249 @@ if [ -f "$WIP_RESCUE_RS" ]; then
 else
     FAIL=$((FAIL + 1)); echo "  ✗ T14 wip_rescue.rs not found at $WIP_RESCUE_RS"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# T15 (mika#2563) — a session the SDK killed does not attest a complete pipeline
+#
+# The founding measurement: PR #2556 carries `<!-- rescue-pipeline-verified:
+# yes -->` — "the local pipeline is complete" — while its pilot was killed at
+# 151/150 turns. None of the five terms above reads `STATUS`, so a truncated
+# session and a session that concluded produced the same green light.
+#
+# What is NOT tested here, and the omission is the point: "the diff carries no
+# `docs/solutions`" is NOT a refusal. Measured over the last 100 `--first-parent`
+# merges of `origin/main`, 66 of the 93 carrying source carry no learning — 71 %,
+# the regime, not a defect. T15e is the negative control that pins it.
+#
+# `STATUS` is the global `_run_claude_pilot` sets from the pilot's JSON. The
+# suite has run with it unset until here, which classifies `absent` — harmless,
+# because the disposition ships disarmed and T1–T14 never arm it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── T15 fixtures ────────────────────────────────────────────────────────────
+
+# add_solution <dir> — the intrinsic attestation: a learning in the diff. The
+# NESTED path is deliberate — this repo writes `docs/solutions/<category>/x.md`,
+# never a file directly under `docs/solutions/`, so a predicate anchored one
+# level too shallow would read `absent` on every real learning.
+add_solution() {
+    local dir="$1"
+    mkdir -p "$dir/docs/solutions/best-practices"
+    printf '# A learning\n' > "$dir/docs/solutions/best-practices/2026-09-28-x.md"
+    git -C "$dir" add -A
+    git -C "$dir" commit -q --no-verify -m "docs(solutions): the learning"
+}
+
+# traversal <dir> — the classifier alone, without the four terms behind it.
+traversal() { _rescue_compound_traversal "$1"; }
+
+# ── T15a (AC1) — the founding defect: a truncated session, no traversal ─────
+echo "-- T15a: truncated session, nothing attests the traversal (AC1, mika#2563) --"
+R15A=$(make_repo t15a)
+add_work "$R15A"
+assert_eq "T15a the classifier reads \`absent\`" "absent" "$(STATUS=terminated traversal "$R15A")"
+
+# Armed, the term refuses — and it refuses FIRST, so the 900s budget is not
+# spent on two cargo invocations to be told `no` at the end.
+STATUS=terminated MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15A" \
+    && { FAIL=$((FAIL + 1)); echo "  ✗ T15a refuses a truncated session with no traversal"; }
+assert_eq "T15a names the \`compound-traversal\` term" "compound-traversal" "$MEASURE_TERM"
+assert_contains "T15a excerpt names the status that was read" "$MEASURE_EXCERPT" "terminated"
+assert_contains "T15a excerpt names the intrinsic way out" "$MEASURE_EXCERPT" "docs/solutions"
+assert_contains "T15a excerpt names the declarative way out" "$MEASURE_EXCERPT" "Compound: none"
+assert_eq "T15a term 0 short-circuits: no cargo, no verifier ran" "" "$(cat "$STUB_LOG")"
+
+B15A=$(_compose_rescue_pr_body "$R15A" "dirty-worktree" "Class fact." "2563" "no" "compound-traversal" "excerpt" "absent")
+assert_contains "T15a body names the failing term" "$B15A" "<!-- rescue-verify-failed: compound-traversal -->"
+assert_contains "T15a body carries the traversal marker" "$B15A" "<!-- compound-traversal: absent -->"
+assert_contains "T15a body stays unverified" "$B15A" "<!-- rescue-pipeline-verified: no -->"
+
+# ── T15b — the intrinsic attestation: a learning is in the diff ─────────────
+echo "-- T15b: a docs/solutions file attests the traversal (AC2) --"
+R15B=$(make_repo t15b)
+add_work "$R15B"
+add_solution "$R15B"
+assert_eq "T15b the classifier reads \`attested-solution\`" \
+    "attested-solution" "$(STATUS=terminated traversal "$R15B")"
+if STATUS=terminated MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15B"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15b the conjunction continues past term 0"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15b the conjunction continues past term 0"
+    echo "    term:    '$MEASURE_TERM'"
+fi
+assert_contains "T15b the cargo terms did run" "$(cat "$STUB_LOG")" "clippy"
+B15B=$(_compose_rescue_pr_body "$R15B" "dirty-worktree" "Class fact." "2563" "yes" "" "" "attested-solution")
+assert_contains "T15b body carries the traversal marker" "$B15B" "<!-- compound-traversal: attested-solution -->"
+
+# ── T15c (AC3) — the declarative attestation: the absence is STATED ─────────
+echo "-- T15c: a \`Compound: none — <reason>\` trailer attests the traversal (AC3) --"
+R15C=$(make_repo t15c)
+add_work "$R15C"
+git -C "$R15C" commit -q --allow-empty --no-verify \
+    -m "chore: no learning here" \
+    -m "Compound: none — mechanical fix, the diff and its test say everything"
+assert_eq "T15c the classifier reads \`attested-trailer\`" \
+    "attested-trailer" "$(STATUS=terminated traversal "$R15C")"
+if STATUS=terminated MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15C"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15c the conjunction continues past term 0"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15c the conjunction continues past term 0"
+    echo "    term:    '$MEASURE_TERM'"
+fi
+
+# ── T15d (AC3) — the degraded trailer forms are REFUSED ─────────────────────
+# The shape follows `Pipeline-Exempt:` in the same ecosystem: anchored, reason
+# mandatory. No bare form — this trailer is born today and carries no backward
+# compatibility, so accepting `Compound: none` alone would be inventing a debt.
+# `--cleanup=verbatim` so git keeps the indentation the second case is about.
+echo "-- T15d: a degraded trailer does not attest (AC3) --"
+R15D=$(make_repo t15d)
+add_work "$R15D"
+git -C "$R15D" commit -q --allow-empty --no-verify --cleanup=verbatim \
+    -m "chore: bare form" -m "Compound: none"
+assert_eq "T15d a trailer with no reason does not attest" "absent" "$(STATUS=terminated traversal "$R15D")"
+
+R15D2=$(make_repo t15d2)
+add_work "$R15D2"
+git -C "$R15D2" commit -q --allow-empty --no-verify --cleanup=verbatim \
+    -m "chore: indented form" -m "  Compound: none — a reason"
+assert_eq "T15d an unanchored trailer does not attest" "absent" "$(STATUS=terminated traversal "$R15D2")"
+
+R15D3=$(make_repo t15d3)
+add_work "$R15D3"
+git -C "$R15D3" commit -q --allow-empty --no-verify --cleanup=verbatim \
+    -m "chore: prose mention" -m "We considered a Compound: none — but wrote the learning instead."
+assert_eq "T15d a mid-line mention does not attest" "absent" "$(STATUS=terminated traversal "$R15D3")"
+
+# ── T15e — NEGATIVE CONTROL, and the suite is worthless without it ──────────
+# A nominal pilot concludes in `STATUS=success`, and 71 % of the loop's merges
+# carry no `docs/solutions`. Without this case, "the term bites" would be
+# indistinguishable from "the term bites everybody" — and the second reading
+# stops the drain, because `verify-pipeline.sh` is term 5 of this very
+# conjunction and every rescue would flip to `rescue-pipeline-verified: no`.
+echo "-- T15e: NEGATIVE CONTROL — a concluded session is exempt (AC4) --"
+R15E=$(make_repo t15e)
+add_work "$R15E"
+assert_eq "T15e the classifier reads \`not-applicable\`" \
+    "not-applicable" "$(STATUS=success traversal "$R15E")"
+if STATUS=success MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15E"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15e a concluded session with no learning is NOT refused"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15e a concluded session with no learning is NOT refused"
+    echo "    term:    '$MEASURE_TERM'"
+    echo "    excerpt: '$MEASURE_EXCERPT'"
+fi
+B15E=$(_compose_rescue_pr_body "$R15E" "dirty-worktree" "Class fact." "2563" "yes" "" "" "not-applicable")
+assert_not_contains "T15e body names no failing term" "$B15E" "rescue-verify-failed"
+assert_contains "T15e body still carries the marker" "$B15E" "<!-- compound-traversal: not-applicable -->"
+
+# `no-shipping-tail` (mika#2492) is the loop's NOMINAL route and carries
+# `STATUS = success` by construction — `_pilot_had_no_shipping_tail` requires
+# it. Biting there would re-bite the 71 %, under another name (D3).
+assert_eq "T15e the no-shipping-tail route is exempt by its own STATUS" \
+    "not-applicable" "$(SKILL=dev-pilot PILOT_SHIPPING_TAIL=absent STATUS=success traversal "$R15E")"
+
+# ── T15f (D7) — fail-closed: an unreadable conclusion is not a conclusion ───
+echo "-- T15f: fail-closed on every non-success status (D7) --"
+R15F=$(make_repo t15f)
+add_work "$R15F"
+for st in "" "failed" "terminated" "cancelled" "Success" "success "; do
+    assert_eq "T15f status '$st' does not attest" "absent" "$(STATUS="$st" traversal "$R15F")"
+done
+if (unset STATUS; [ "$(_rescue_compound_traversal "$R15F")" = "absent" ]); then
+    PASS=$((PASS + 1)); echo "  ✓ T15f an absent STATUS does not attest"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15f an absent STATUS does not attest"
+fi
+# An unreadable git is never a satisfied term either — and the empty dir must
+# not be classified against the dispatch process CWD, which is a live checkout.
+assert_eq "T15f an empty worktree dir does not attest" "absent" "$(STATUS=terminated traversal "")"
+assert_eq "T15f a non-repo dir does not attest" "absent" "$(STATUS=terminated traversal "$TMP_ROOT")"
+R15F2=$(make_repo t15f2)
+add_work "$R15F2"
+git -C "$R15F2" update-ref -d refs/remotes/origin/main
+assert_eq "T15f an unfetched origin/main does not attest" "absent" "$(STATUS=terminated traversal "$R15F2")"
+
+# ── T15g (AC5) — the kill-switch rollback is byte-identical, still ──────────
+# mika#2563 extends the mika#2354 invariant rather than punching a hole in it:
+# the kill-switch path passes `$8` empty, so the marker is absent exactly where
+# the pre-fix body had nothing.
+echo "-- T15g: an absent traversal argument leaves the body byte-identical (AC5) --"
+EIGHT_ARG_EMPTY=$(_compose_rescue_pr_body "$R1" "dirty-worktree" "Class fact." "2354" "no" "" "" "")
+assert_eq "T15g an empty 8th argument is byte-identical to the pre-mika#2354 body" \
+    "$EXPECTED_PRE_2354_BODY" "$EIGHT_ARG_EMPTY"
+assert_not_contains "T15g no marker is emitted for an empty value" "$EIGHT_ARG_EMPTY" "compound-traversal"
+
+# ── T15h (AC5) — DISARMED IS NOT INERT ─────────────────────────────────────
+# The whole difference between a disarmed detector and a mute one (mika#2205):
+# the term measures and writes its marker, it simply does not flip `verified`.
+# That is what makes the arming condition measurable on the artefact instead of
+# intuited — the PR body is the only durable surface here.
+echo "-- T15h: disarmed, the term still measures and still writes its marker (AC5) --"
+R15H=$(make_repo t15h)
+add_work "$R15H"
+if STATUS=terminated measure "$R15H"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15h disarmed, the term does not flip the verdict"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15h disarmed, the term does not flip the verdict"
+    echo "    term:    '$MEASURE_TERM'"
+fi
+assert_eq "T15h the classification happened anyway" "absent" "$(STATUS=terminated traversal "$R15H")"
+B15H=$(_compose_rescue_pr_body "$R15H" "dirty-worktree" "Class fact." "2563" "yes" "" "" "absent")
+assert_contains "T15h the marker is written while disarmed" "$B15H" "<!-- compound-traversal: absent -->"
+assert_contains "T15h the verdict stays what the other terms decided" "$B15H" "<!-- rescue-pipeline-verified: yes -->"
+assert_not_contains "T15h disarmed, no term is named as failing" "$B15H" "rescue-verify-failed"
+
+# An explicit `0` is the explicit disarm and must be silent about it.
+if STATUS=terminated MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=0 measure "$R15H"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15h an explicit 0 disarms"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15h an explicit 0 disarms"
+fi
+
+# ── T15i — the disposition predicate itself ────────────────────────────────
+# House three-tier parse. An unrecognised value stays DISARMED, and says so:
+# it must not arm by accident on a term that can withhold a PR's green light,
+# and it must not disarm in silence either (mika#2293).
+echo "-- T15i: the disposition predicate (three tiers) --"
+for on in 1 true yes on TRUE Yes ON; do
+    if MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL="$on" _rescue_require_compound_traversal; then
+        PASS=$((PASS + 1)); echo "  ✓ T15i '$on' arms the disposition"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ T15i '$on' arms the disposition"
+    fi
+done
+for off in "" 0 false no off FALSE Off NO; do
+    if MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL="$off" _rescue_require_compound_traversal; then
+        FAIL=$((FAIL + 1)); echo "  ✗ T15i '$off' leaves the disposition disarmed"
+    else
+        PASS=$((PASS + 1)); echo "  ✓ T15i '$off' leaves the disposition disarmed"
+    fi
+done
+if (unset MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL; _rescue_require_compound_traversal); then
+    FAIL=$((FAIL + 1)); echo "  ✗ T15i absent leaves the disposition disarmed (default)"
+else
+    PASS=$((PASS + 1)); echo "  ✓ T15i absent leaves the disposition disarmed (default)"
+fi
+if MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=soon _rescue_require_compound_traversal 2>/dev/null; then
+    FAIL=$((FAIL + 1)); echo "  ✗ T15i an unrecognised value stays disarmed"
+else
+    PASS=$((PASS + 1)); echo "  ✓ T15i an unrecognised value stays disarmed"
+fi
+assert_contains "T15i an unrecognised value is said, not swallowed" \
+    "$(MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=soon _rescue_require_compound_traversal 2>&1 || true)" \
+    "rescue_compound_traversal_disposition_invalid"
+
+# ── T15j — the four values are a wire format ───────────────────────────────
+# They land in a PR-body marker `<!-- compound-traversal: … -->` that an
+# operator greps (mika#2201). One definition site, four values, pinned here so
+# a fifth or a rename is a decision rather than a drift.
+echo "-- T15j: the four values are a wire format (mika#2201) --"
+for value in not-applicable attested-solution attested-trailer absent; do
+    BODY=$(_compose_rescue_pr_body "$R1" "dirty-worktree" "Class fact." "2563" "no" "" "" "$value")
+    assert_contains "T15j the \`$value\` value reaches the marker verbatim" \
+        "$BODY" "<!-- compound-traversal: ${value} -->"
+done
 
 echo ""
 echo "========================================"
