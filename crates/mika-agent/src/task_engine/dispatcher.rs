@@ -4084,9 +4084,23 @@ async fn try_dispatch_pilot_after_groom_success(
         return;
     }
 
-    // 2. Canonical success marker in callback result text.
+    // 2. Canonical success marker in callback result text, EN POSITION DE
+    //    VERDICT (mika#2590 R5).
+    //
+    //    C'était un `contains` : même défaut que la porte de provenance, même
+    //    remède. Ce site n'était pas atteint par l'incident mesuré sur mika#2105
+    //    — l'auto-fire ne part que sur un callback de la boucle, jamais sur une
+    //    enveloppe de saut — mais il l'aurait été par un RESULT de recovery
+    //    citant le jeton dans sa prose.
+    //
+    //    Aucune émission ici, délibérément : ce site est un auto-fire
+    //    *fire-and-forget* dont chaque précondition échouée est déjà silencieuse,
+    //    et lui donner un compteur mélangerait sa population avec celle de la
+    //    porte (R6), qui est celle du ticket.
     match &task.result {
-        Some(r) if r.contains(crate::task_state::tasks::GROOM_SUCCESS_MARKER) => {}
+        Some(r)
+            if crate::task_state::tasks::groom_result_convergence(r)
+                == crate::task_state::tasks::GroomConvergence::Converged => {}
         _ => return,
     };
 

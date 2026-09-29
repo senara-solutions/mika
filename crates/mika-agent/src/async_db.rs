@@ -1658,9 +1658,15 @@ impl AsyncDatabase {
 
     /// Check whether the autonomous loop really groomed a GitHub issue (#1620,
     /// mika#2287): a completed groom *callback* row carrying
-    /// `Outcome: PLAN_GROOMED` under a parent for that issue. Read-only;
-    /// `Err` means the caller must refuse (fail-closed).
-    pub async fn has_completed_groom_for_issue(&self, issue_url: &str) -> Result<bool> {
+    /// `Outcome: PLAN_GROOMED` **en position de verdict** under a parent for
+    /// that issue (mika#2590). Read-only; `Err` means the caller must refuse
+    /// (fail-closed), et les deux motifs de refus de
+    /// [`crate::task_state::tasks::GroomConvergence`] sont distincts pour que la
+    /// population du correctif reste comptable.
+    pub async fn has_completed_groom_for_issue(
+        &self,
+        issue_url: &str,
+    ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
         self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u))

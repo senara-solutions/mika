@@ -6,8 +6,17 @@
 //!
 //! Enfant de `db::tests`, donc descendant de `db` : les items privés de `db` et
 //! les helpers de `db::tests` restent visibles via `use super::*`.
+//!
+//! # mika#2590 — `false` s'est scindé en deux états, et c'est un renforcement
+//!
+//! Le prédicat rend désormais [`GroomConvergence`]. Les assertions ci-dessous
+//! nomment **laquelle** des deux absences elles observent : `Absent` (rien à
+//! écarter) contre `MarkerOutOfPosition` (une preuve existait, hors position).
+//! Un `assert!(!…)` couvrait les deux ; le couple est ce qui rend la population
+//! du correctif comptable.
 
 use super::*;
+use crate::task_state::tasks::GroomConvergence;
 
 #[test]
 fn test_double_write_tagged_event() {

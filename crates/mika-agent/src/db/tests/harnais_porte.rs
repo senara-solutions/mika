@@ -29,6 +29,7 @@
 //! unchanged, and so is `cargo test -p mika-agent harnais_porte`.
 
 use super::*;
+use crate::task_state::tasks::{GROOM_REJECTED_JSON_ENVELOPE, GroomConvergence};
 
 /// Case 4 — the only term of the predicate a live run ever refuted.
 ///
@@ -78,6 +79,60 @@ fn harnais_porte_cas4_cancelled_callback_returns_false() {
         !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
             .unwrap(),
         "a groom callback cancelled after completing is not proof of grooming"
+    );
+}
+
+/// **mika#2590 R10 — la note d'un refus n'est pas une preuve.**
+///
+/// Le défaut mesuré le 2026-09-29 sur mika#2105 : le callback de groom
+/// `89165fb4` porte le JSON d'auto-skip de `dispatch-lib.sh`, dont le champ
+/// `note` **cite le marqueur en toutes lettres** pour expliquer qu'aucune preuve
+/// n'est frappée. `instr(result, 'Outcome: PLAN_GROOMED')` rend 651 : le texte
+/// qui dit « ceci n'est pas une preuve » **est** la preuve. La porte a laissé
+/// partir un pilote *implement* sur un ticket jamais re-groomé.
+///
+/// Deux raisons de refuser, et une seule suffirait — la ligne est refusée parce
+/// que le `result` est une **enveloppe JSON portant `status`** (R2), et elle le
+/// serait aussi parce que le marqueur n'y est **pas en position de verdict**
+/// (R3). Le motif rendu est le premier : une enveloppe de saut n'est pas un
+/// texte de callback mal formé, et distinguer les deux populations est ce que
+/// [`crate::task_state::tasks::ALL_GROOM_CONVERGENCE_REJECTIONS`] existe pour
+/// permettre.
+///
+/// Construit **entièrement par l'API d'écriture de production**
+/// (`completed_groom_pair` → `create_task` + `update_task_completed`), condition
+/// 5 du GO mika#2287 : zéro `INSERT` brut.
+#[test]
+fn mika2590_un_auto_skip_nest_pas_une_preuve_de_grooming() {
+    let db = db();
+    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_AUTO_SKIPPED);
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE),
+        "le JSON d'auto-skip de `dispatch-lib.sh` cite `Outcome: PLAN_GROOMED` \
+         dans sa prose pour dire qu'aucune preuve n'est frappée ; une lecture par \
+         sous-chaîne en fait une preuve et laisse partir un implement sans plan \
+         re-mesuré (mika#2590, mesuré sur mika#2105 le 2026-09-29)"
+    );
+}
+
+/// Le contrôle **positif** de son voisin ci-dessus.
+///
+/// Sans lui, « l'auto-skip est refusé » serait indistinguable de « plus rien
+/// n'est jamais accepté » — un prédicat qui refuse tout satisferait le test
+/// négatif en entier tout en cassant la boucle.
+#[test]
+fn mika2590_une_ligne_ancree_reste_une_preuve() {
+    let db = db();
+    completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Converged,
+        "un groom réellement convergé porte le marqueur en début de ligne et \
+         doit rester une preuve — c'est le faux négatif de KTD3 que ce contrôle \
+         refuse"
     );
 }
 

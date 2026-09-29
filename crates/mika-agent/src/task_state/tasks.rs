@@ -37,7 +37,157 @@ pub const GROOM_PHASE_SUFFIX: &str = "?phase=groom";
 /// dispatch-classification gate (`db::Database::has_completed_groom_for_issue`,
 /// mika#1620 / mika#2287). Writer lives in shell; keep this literal identical
 /// to the one dispatch-lib emits.
+///
+/// **Depuis mika#2590, ces deux lecteurs passent par
+/// [`groom_result_convergence`] et jamais par un `contains` / `instr`.** Un
+/// troisième lecteur lâche est refusé par un scan de source
+/// (`canonical_tokens::tests::mika2590_le_marqueur_de_convergence_na_quun_lecteur`).
 pub const GROOM_SUCCESS_MARKER: &str = "Outcome: PLAN_GROOMED";
+
+/// Motif de refus — le `result` est une **enveloppe JSON portant `status`**
+/// (mika#2590 R2).
+///
+/// # FORMAT DE FIL
+///
+/// Atterrit dans `audit_events.after_value` et l'opérateur en fait des
+/// `GROUP BY` : deux orthographes d'un même motif couperaient une population en
+/// deux sans le dire. Motif `ALL_GROOM_ESCALATE_VERDICTS` (mika#2545),
+/// `ALL_PURGE_REFUSAL_REASONS` (mika#2497).
+///
+/// **Régime attendu : vide.** `grep -o '"status":"[a-z_]*"' dispatch-lib.sh`
+/// rend **exactement une** valeur, `auto_skipped`, et aucun chemin n'écrit une
+/// convergence en JSON — donc l'allowlist des statuts convergents est vide et la
+/// règle exacte est *une enveloppe JSON portant `status` n'est jamais une
+/// preuve*. C'est une défense en profondeur ; une occurrence signifie qu'un
+/// producteur JSON est apparu, ce qui est un **résultat**, pas une panne.
+pub const GROOM_REJECTED_JSON_ENVELOPE: &str = "json_envelope";
+
+/// Motif de refus — le marqueur est présent mais **pas en position de verdict**
+/// (mika#2590 R3). Même contrat de format de fil que son voisin.
+///
+/// **Régime attendu : non vide, décroissant.** Chaque ligne est un implement
+/// sans plan re-mesuré que la porte n'a pas laissé partir.
+pub const GROOM_REJECTED_NOT_LINE_ANCHORED: &str = "marker_not_line_anchored";
+
+/// Les deux motifs, à un seul site, pour que leur cardinalité soit assertable.
+pub const ALL_GROOM_CONVERGENCE_REJECTIONS: &[&str] = &[
+    GROOM_REJECTED_JSON_ENVELOPE,
+    GROOM_REJECTED_NOT_LINE_ANCHORED,
+];
+
+/// Un `result` de callback de groom porte-t-il une convergence ? (mika#2590)
+///
+/// # Le défaut que ça ferme, mesuré le 2026-09-29 sur mika#2105
+///
+/// La preuve se lisait par **sous-chaîne** — `instr(child.result, 'Outcome:
+/// PLAN_GROOMED') > 0`. Or le RESULT d'auto-skip que `dispatch-lib.sh` écrit sur
+/// un `already_groomed` **cite le marqueur en toutes lettres** dans son champ
+/// `note`, pour expliquer qu'aucune preuve n'est frappée :
+/// `select instr(result,'Outcome: PLAN_GROOMED') …` a rendu **651**. Le texte qui
+/// dit « ceci n'est pas une preuve » **était** la preuve, et un pilote
+/// *implement* est parti sur un ticket jamais re-groomé.
+///
+/// Classe déjà mesurée deux fois : mika#2050 sur le Signal S (« un pilote qui
+/// *discute* du jeton se lit comme une émission ») et mika#2545 un marqueur plus
+/// loin, dont [`crate::skills::executor::groom_escalate_verdict`] est le frère —
+/// **déjà ancré**, avec ce raisonnement écrit mot pour mot.
+///
+/// # Trois états, et le troisième est la population du correctif
+///
+/// [`GroomConvergence::Absent`] et [`GroomConvergence::MarkerOutOfPosition`]
+/// appellent la **même** disposition (refuser) et **deux lectures opérateur
+/// différentes** : la première est le régime nominal d'un premier grooming, la
+/// seconde est un implement que la porte vient d'arrêter. Les fondre rendrait la
+/// population du correctif incomptable — motif [`crate::skills::executor::GroomedState`]
+/// (mika#2484 D1), `phantom_aged_out` / `phantom_sweep_spared` (mika#2156).
+///
+/// # L'ordre des quatre tests, et pourquoi le motif n'est posé que s'il y a
+/// quelque chose à écarter
+///
+/// L'enveloppe JSON est testée **d'abord** : c'est la forme mesurée, et R2 la
+/// refuse « quel que soit son contenu ». Mais une enveloppe JSON qui ne cite pas
+/// le marqueur rend [`GroomConvergence::Absent`] et non un motif : un saut
+/// ordinaire (`issue_closed`, mika#988) n'a rien écarté, et le compter
+/// polluerait le compteur de R6 avec une population qui n'a jamais menacé la
+/// porte.
+///
+/// # Ce que `_set_outcome_line` garantit, et pourquoi l'ancrage ne perd rien
+///
+/// Depuis mika#2590 U5a le producteur de la convergence pose sa ligne par
+/// `_set_outcome_line` (mika#2492), qui rend « exactement une ligne `Outcome:`
+/// ancrée » vraie **par construction**. Avant, le couple `sed 's/Outcome: .*/…/'`
+/// + `grep -qF` — **ni l'un ni l'autre ancrés** — pouvait poser le marqueur en
+/// milieu de ligne et le voir, donc ne pas ajouter la ligne canonique : un groom
+/// réellement convergé aurait été refusé par cette fonction. Les deux moitiés
+/// voyagent dans le même binaire (`skills/bundled/` est une projection du
+/// binaire, mika#2340), donc elles ne peuvent pas être servies séparément.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroomConvergence {
+    /// Une ligne du `result` commence par [`GROOM_SUCCESS_MARKER`].
+    Converged,
+    /// Le marqueur n'apparaît nulle part. Le cas nominal d'un premier grooming.
+    Absent,
+    /// Le marqueur apparaît, hors position de verdict. Porte son motif, qui est
+    /// un élément d'[`ALL_GROOM_CONVERGENCE_REJECTIONS`].
+    MarkerOutOfPosition(&'static str),
+}
+
+/// Le lecteur **unique** de [`GROOM_SUCCESS_MARKER`]. Fonction pure, testable
+/// aux bornes sans base (mika#2590 R1).
+pub fn groom_result_convergence(result: &str) -> GroomConvergence {
+    let mentions_marker = result.contains(GROOM_SUCCESS_MARKER);
+
+    // 1. Enveloppe JSON portant `status` ⇒ jamais une preuve (R2).
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(result)
+        && map.contains_key("status")
+    {
+        return if mentions_marker {
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE)
+        } else {
+            GroomConvergence::Absent
+        };
+    }
+
+    // 2. Le marqueur en position de verdict (R3).
+    if result
+        .lines()
+        .any(|line| line.starts_with(GROOM_SUCCESS_MARKER))
+    {
+        return GroomConvergence::Converged;
+    }
+
+    // 3. Présent, mais ailleurs — la population que R6 existe pour compter.
+    if mentions_marker {
+        return GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED);
+    }
+
+    GroomConvergence::Absent
+}
+
+/// Agrège les verdicts des callbacks de groom d'une même issue.
+///
+/// **La préséance est celle de la sémantique historique**, `COUNT(*) > 0` : une
+/// **seule** preuve valide suffit, et l'agrégat ne doit pas se laisser dégrader
+/// par un saut qui la précède dans l'ordre de balayage. À défaut de preuve, un
+/// écart *mesuré* l'emporte sur l'absence — sinon un ticket refoulé pour preuve
+/// polluée se lirait exactement comme un ticket jamais groomé, qui est la classe
+/// mika#2205 appliquée au correctif lui-même.
+pub fn aggregate_groom_convergence(
+    verdicts: impl IntoIterator<Item = GroomConvergence>,
+) -> GroomConvergence {
+    let mut rejected: Option<&'static str> = None;
+    for verdict in verdicts {
+        match verdict {
+            GroomConvergence::Converged => return GroomConvergence::Converged,
+            GroomConvergence::MarkerOutOfPosition(reason) => rejected = rejected.or(Some(reason)),
+            GroomConvergence::Absent => {}
+        }
+    }
+    match rejected {
+        Some(reason) => GroomConvergence::MarkerOutOfPosition(reason),
+        None => GroomConvergence::Absent,
+    }
+}
 
 /// `tasks.result` reason written when a phantom tracking row is cancelled
 /// because a fresh dispatch superseded it (mika#1934 AC2). SOLE WRITER:

@@ -4163,8 +4163,9 @@ impl Database {
     /// `dispatch_class='groom'` (derived from the `skill` input), reaches
     /// `completed` then `delivered`, and its `result` is the dispatch-lib RESULT
     /// written by `POST /tasks/{id}/complete`, which carries
-    /// [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`] on convergence — the
-    /// same marker `try_dispatch_pilot_after_groom_success` already trusts.
+    /// [`crate::task_state::tasks::GROOM_SUCCESS_MARKER`] **en position de
+    /// verdict** on convergence — the same marker
+    /// `try_dispatch_pilot_after_groom_success` already trusts.
     ///
     /// One query serves every groom producer: the parent `reference_url` is
     /// accepted in bare form or with the legacy
@@ -4174,30 +4175,61 @@ impl Database {
     /// Read-only, fail-closed: a single `SELECT`; a DB error propagates as
     /// `Err` and the caller refuses the dispatch. A proof pruned by
     /// `prune_completed_tasks` (30-day retention, either row) is a refusal.
-    pub fn has_completed_groom_for_issue(&self, agent_id: &str, issue_url: &str) -> Result<bool> {
+    ///
+    /// # mika#2590 — le `instr` a quitté le SQL, et il n'est PAS devenu un
+    /// pré-filtre
+    ///
+    /// Le terme était `instr(child.result, 'Outcome: PLAN_GROOMED') > 0`, et la
+    /// note JSON qu'un saut `already_groomed` écrit **cite ce marqueur en toutes
+    /// lettres** pour dire qu'aucune preuve n'est frappée : le texte qui dit
+    /// « ceci n'est pas une preuve » était la preuve. La décision est désormais
+    /// en Rust, par [`crate::task_state::tasks::groom_result_convergence`], sur
+    /// les lignes que la jointure a déjà bornées.
+    ///
+    /// Le réflexe serait de **garder** `instr > 0` comme pré-filtre grossier
+    /// (motif mika#2184 : le proxy filtre, la mesure directe tranche). Refusé
+    /// ici, pour une raison qui tient au compteur : une ligne écartée par SQL est
+    /// **invisible** au verdict, donc un `auto_skipped` remonterait `Absent` au
+    /// lieu de `MarkerOutOfPosition`, et R6 mesurerait zéro sur exactement la
+    /// population qu'il existe pour voir. La cardinalité ne le justifie pas non
+    /// plus : la jointure borne déjà à une poignée de lignes par issue
+    /// (`dispatch_class='groom'` + statut terminal + URL du parent). Effet de
+    /// bord acquis : **plus aucun lecteur SQL du marqueur**, ce qui rend la garde
+    /// R9 totale plutôt que partielle.
+    ///
+    /// Une ligne dont la colonne `result` est NULL ne porte rien, donc `Absent`.
+    pub fn has_completed_groom_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+    ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let legacy_groom_url = format!(
             "{}{}",
             issue_url,
             crate::task_state::tasks::GROOM_PHASE_SUFFIX
         );
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks child
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE child.agent_id = ?1
                AND child.trigger_type = 'callback'
                AND child.dispatch_class = 'groom'
                AND child.status IN ('completed', 'delivered')
-               AND instr(child.result, ?4) > 0
                AND parent.reference_url IN (?2, ?3)",
-            params![
-                agent_id,
-                issue_url,
-                legacy_groom_url,
-                crate::task_state::tasks::GROOM_SUCCESS_MARKER
-            ],
-            |row| row.get(0),
         )?;
-        Ok(count > 0)
+        let verdicts = stmt
+            .query_map(params![agent_id, issue_url, legacy_groom_url], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|result| match result {
+                Some(text) => crate::task_state::tasks::groom_result_convergence(&text),
+                None => crate::task_state::tasks::GroomConvergence::Absent,
+            });
+        Ok(crate::task_state::tasks::aggregate_groom_convergence(
+            verdicts,
+        ))
     }
 
     /// The `result` of the **most recent** terminal groom callback for a GitHub
