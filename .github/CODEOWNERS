@@ -6,5 +6,12 @@
 /crates/mika-agent/src/tools/pr_merge_with_gate.rs  @samidarko
 /docs/gate/                                         @samidarko
 
+# Surface de flux sortant (mika#2408) — un nouveau chemin réseau ne merge pas
+# sans revue humaine. Même classe que la forge-gate perimeter ci-dessus : le
+# lockstep de scripts/verify-egress-manifest.sh garantit qu'un sink réel EST
+# déclaré, il ne peut pas juger si `data` et `logged` disent vrai. Ces deux
+# champs-là sont une assertion humaine, et c'est cette ligne qui les fait relire.
+/docs/egress/                                       @samidarko
+
 # Self-référence : CODEOWNERS se possède lui-même
 /.github/CODEOWNERS                                 @samidarko
