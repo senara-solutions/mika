@@ -184,6 +184,13 @@ mod eval {
     // négatifs et les abstentions nommées.
     mod test_dependabot_verdict_coherence_2519;
 
+    // mika#2565 — un bump Rust se vérifie en compilant, jamais en affirmant. La
+    // branche B3 lit un FAIT MOTEUR (`tool_calls`) plutôt qu'une phrase du
+    // corps : #2561 portait une `API-SURFACE:` réelle et insuffisante, #2560
+    // était hors de B2 par `NoMajorJump`. Le contrôle positif (un build en base
+    // laisse passer) et les deux abstentions nommées.
+    mod test_dependabot_build_evidence_2565;
+
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
     mod test_qa_review_reconcile_2334;

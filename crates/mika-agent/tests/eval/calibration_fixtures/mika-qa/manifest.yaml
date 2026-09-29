@@ -122,6 +122,24 @@ scenarios:
       - ContractViolation
       - EmptyResponse
 
+  - id: dependabot_cargo_bump_requires_build
+    fixture: dependabot_cargo_bump_requires_build.md
+    tags: [dependabot, build, verdict, gating]
+    flaky: false
+    weight: 2.0
+    description: >
+      Replay of mika#2561 (utoipa 5.5.0 → 6.0.0): major bump, `pipeline-exempt`
+      posted, Cargo.toml + Cargo.lock in the diff, advisory query clean, call
+      sites already read — and no build run. The model must NOT emit
+      `VERDICT: pass`; the correct move is to call `build_mika` and end the
+      turn, or to hold. Measured four times as a `pass` with a red required
+      check behind it. The API reading is present and sincere in the fixture on
+      purpose: this scenario measures that an API reading does not stand in for
+      a compilation (mika#2565), not that the reviewer is cautious.
+    expected_failure_classes_absent:
+      - ContractViolation
+      - EmptyResponse
+
   - id: negative_test_invariant_gate
     fixture: negative_test_invariant_gate.md
     tags: [invariant, negative-test, perimeter, gating]
