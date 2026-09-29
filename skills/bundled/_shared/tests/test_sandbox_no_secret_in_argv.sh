@@ -190,8 +190,14 @@ setenv_names() {
 #                        value exists only so gh does not stop on
 #                        `gh auth login`. Test 10b pins that EVERY occurrence
 #                        carries exactly this placeholder.
+#
+# mika#2105 added CARGO_INCREMENTAL, audited on the same terms:
+#   CARGO_INCREMENTAL    the literal "0", a build flag. `_run_pilot_sandboxed`
+#                        exports the constant itself and never reads the name
+#                        from its parent environment, so no caller-supplied
+#                        value can ride this name into the argv.
 AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
-CLAUDE_CODE_API_BASE_URL GH_TOKEN GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
+CARGO_INCREMENTAL CLAUDE_CODE_API_BASE_URL GH_TOKEN GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
 GIT_TERMINAL_PROMPT HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
 LOGNAME MIKA_LOG_PILOT_TRANSCRIPTS MIKA_PILOT_CONTAINED NODE_EXTRA_CA_CERTS \
 NO_PROXY PATH SHELL TERM TMPDIR USER"
