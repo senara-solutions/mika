@@ -133,6 +133,7 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
    2. Check `qa_retry_count` in task metadata (default 0). If >= 2: escalate — notify Vincent "PR held after {n} fix attempts. {PR URL}". Proceed to Step 5 with `in_progress`.
    3. Extract `FINDINGS:` from the review body. Notify Vincent: "{repo}#{number} held by QA — attempting auto-fix (retry {n}/2). {PR URL}"
    4. Launch claude-pilot in iteration mode (Step 3a) with the QA findings as `iteration_context`. Wait for callback — on success, the new push triggers mika-qa again via `pull_request.synchronize` webhook.
+      **If the PR carries the `wip-rescue` label**, add to `iteration_context` the pipeline step its truncated session never reached (mika#2563): *traverse the compound decision — either add the `docs/solutions/**/*.md` learning, or state there is none in a commit trailer `Compound: none — <reason>` — then run `bash scripts/verify-pipeline.sh`*. Neither an iteration nor a spawn replays that step unless asked. This is the intent half; the structural half is the `compound-traversal` term in `_measure_pipeline_verified`.
    5. After callback: update `qa_retry_count` in metadata. Proceed to Step 5 with `in_progress`.
 
    **block[ci]** — CI failure, attempt auto-fix:

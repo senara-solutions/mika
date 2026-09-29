@@ -289,17 +289,23 @@ fn inject_dispatch_worktree_env(
     Some(path)
 }
 
-/// The two operator settings `dispatch-lib.sh`'s rescue-pipeline measurement
-/// honours (mika#2354): the kill-switch and the measurement's global budget.
+/// The three operator settings `dispatch-lib.sh`'s rescue-pipeline measurement
+/// honours: the kill-switch and the measurement's global budget (mika#2354),
+/// plus the disposition of the `compound-traversal` term (mika#2563).
 ///
 /// `MIKA_`-prefixed and relayed explicitly, for the reason spelled out on
 /// [`inject_rescue_verify_env`]: [`sandboxed_pilot_env`] rebuilds the child env
 /// from a **positive** allowlist, so no name crosses by inheritance — prefixed
 /// or not. A same-named-but-unprefixed variable would propagate exactly as
 /// little and cost a vocabulary divergence for nothing.
+///
+/// mika#2563's entry is what makes its kill-switch a real setting rather than a
+/// decorative one (mika#2165): `_rescue_require_compound_traversal` reads it in
+/// the dispatch child, which sees nothing this list does not carry.
 const RESCUE_VERIFY_ENV: &[&str] = &[
     "MIKA_RESCUE_VERIFY_ENABLED",
     "MIKA_RESCUE_VERIFY_BUDGET_SECS",
+    "MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL",
 ];
 
 /// The two operator settings `dispatch-lib.sh`'s architect-call retry honours

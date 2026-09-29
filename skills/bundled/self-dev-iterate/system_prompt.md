@@ -26,7 +26,20 @@ Use this step INSTEAD of Step 3 when the user asks to iterate on an existing PR 
 - Include the PR number, branch name, and "push to existing branch" directive
 - Copy the user's specific feedback **verbatim** — do not summarize, paraphrase, or lose detail
 - If the user provided QA review feedback, include the QA findings verbatim
+- **If the PR carries the `wip-rescue` label**, name the pipeline step the
+  truncated session never reached, so this iteration closes it rather than
+  inheriting the gap (mika#2563). Append:
+  `"This PR came out of a truncated session (wip-rescue). Before concluding, traverse the compound step: either add the docs/solutions/**/*.md learning, or state there is none in a commit trailer 'Compound: none — <reason>'. Then run bash scripts/verify-pipeline.sh."`
+  A rescue's initial pilot was killed before its shipping tail, so no iteration
+  replays that step unless it is asked to.
 - End with "Address ONLY these concerns. Do not re-implement the entire feature."
+
+> **This instruction is the INTENT half and does not hold on its own.**
+> `iteration_context` is composed by the model, not by the shell, and prompt
+> enforcement on loop substrate has been measured to drift. What holds is the
+> `compound-traversal` term in `_measure_pipeline_verified`
+> (`skills/bundled/_shared/dispatch-lib.sh`), which refuses to call a truncated
+> session's pipeline complete when neither attestation is present.
 
 After calling `run_claude_pilot`, the rest of the workflow is identical to Step 3 — wait for the callback, extract metadata, proceed to Step 6 (close-out). mika-qa triggers automatically via webhook.
 
