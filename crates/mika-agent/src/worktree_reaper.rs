@@ -256,8 +256,36 @@ pub const RESOLUTION_BRANCH: &str = "branch";
 /// qui partageraient une chaîne se liraient mal, même en vivant dans des champs
 /// différents — et le nom retenu dit la clé réellement employée.
 pub const RESOLUTION_DETACHED_SHA: &str = "detached_sha";
-/// Les deux clés de résolution, en un seul lieu.
-pub const ALL_RESOLUTIONS: &[&str] = &[RESOLUTION_BRANCH, RESOLUTION_DETACHED_SHA];
+/// Par quelle clé un worktree a été rattaché à ses PR — **une sonde `gh pr list
+/// --head <branche>` ciblée**, parce que l'index de masse ne le connaissait pas
+/// (mika#2482 B2.3).
+///
+/// # Ce que cette valeur compte, et pourquoi elle mérite son nom
+///
+/// `list_prs` pagine à [`LIST_LIMIT`] (300) : mesuré le 2026-09-22 la fenêtre
+/// s'arrêtait à la PR #1917, le 2026-09-29 à #2067 — **la borne recule d'environ
+/// 21 numéros par jour**. Une branche dont la PR est antérieure à cette borne est
+/// absente de l'index, donc classée **faussement** [`REASON_PR_UNKNOWN`], donc
+/// conservée indéfiniment alors que sa PR est mergée. `reasoning LIKE
+/// 'resolution=branch_probe%'` compte exactement les worktrees que cet angle mort
+/// aurait conservés à tort — la sonde d'attribution du constat 2 du ticket, sur
+/// le modèle de `detached_head_pr_unknown` (mika#2518).
+///
+/// Le défaut est **structurel, pas dimensionnel** : doubler `LIST_LIMIT` achète
+/// ~28 jours puis rouvre le trou, et paginer coûte O(total PR) à chaque tick,
+/// indéfiniment croissant, pour un gain qui ne concerne qu'une poignée de
+/// worktrees non résolus. La requête ciblée, elle, **contourne la limite** —
+/// vérifié par mesure : `--head feat/1888/…` rend `#1900`, hors d'une fenêtre
+/// dont le minimum était `#2067`.
+pub const RESOLUTION_BRANCH_PROBE: &str = "branch_probe";
+/// Les trois clés de résolution, en un seul lieu.
+pub const ALL_RESOLUTIONS: &[&str] = &[
+    RESOLUTION_BRANCH,
+    RESOLUTION_DETACHED_SHA,
+    // mika#2482 — ajouté en queue, jamais inséré : l'ordre est lu par un humain
+    // qui compare deux versions du test qui le fige.
+    RESOLUTION_BRANCH_PROBE,
+];
 
 /// `audit_events.tool_name` écrit à chaque retrait **effectif** — et event
 /// tracing de la même ligne : une seule constante sert les deux surfaces.
@@ -865,10 +893,19 @@ pub struct ReapCandidate {
 /// sans mandat — et, si elle a déjà disparu, un `git branch -D` qui échoue sans
 /// apporter d'information.
 ///
+/// **Oui sur le chemin de la sonde ciblée (mika#2482).** Le critère n'est pas la
+/// provenance de la PR mais *le worktree a-t-il checked out cette branche* :
+/// [`RESOLUTION_BRANCH_PROBE`] désigne une branche **attachée** au worktree, que
+/// l'index de masse ignorait pour une raison de pagination. Le traiter comme le
+/// chemin détaché ferait dépendre le sort de la branche locale d'un détail de
+/// fenêtre d'API, et laisserait derrière chaque fauche par sonde une branche
+/// locale que le chemin nominal aurait supprimée. C'est le corollaire direct de
+/// B2.2 — *la provenance de la PR ne change pas sa vérité*.
+///
 /// Prédicat nommé plutôt qu'un `if` en ligne dans [`remove_worktree`] : il est
 /// alors testable sans toucher au disque, ce que `remove_worktree` ne permet pas.
 pub fn should_delete_local_branch(resolution: &str) -> bool {
-    resolution == RESOLUTION_BRANCH
+    resolution == RESOLUTION_BRANCH || resolution == RESOLUTION_BRANCH_PROBE
 }
 
 /// Un worktree conservé, et le motif nommé qui l'a conservé.
@@ -1598,6 +1635,14 @@ pub async fn reap_terminal_worktrees(
     // parce que la décision d'urgence est la même : « arrête ce qui supprime
     // dans les worktrees ».
     let purge_cfg = purge_config_from_env();
+    // mika#2482 — la seconde passe. Budget propre, partagé entre dépôts comme
+    // ses deux voisins, et **délibérément absent de `should_stop_repo_loop`** :
+    // ce prédicat est le périmètre de mika#2511, qui l'a écrit et testé à ses
+    // quatre coins. Conséquence nommée : sur une configuration multi-dépôts dont
+    // le premier épuise les budgets du faucheur **et** de la purge, la sonde ne
+    // tourne pas sur les suivants — même limite que la sonde de saleté
+    // mika#2449, et le défaut (`DEFAULT_REPO_DIR` seul) n'y est pas exposé.
+    let stale_cfg = stale_probe_config_from_env();
     let repo_dirs = parse_repo_dirs(std::env::var(REPO_DIRS_ENV).ok().as_deref());
     let now = Utc::now();
 
@@ -1608,6 +1653,7 @@ pub async fn reap_terminal_worktrees(
 
     let mut budget = cfg.max_per_tick;
     let mut purge_budget = purge_cfg.max_per_tick;
+    let mut stale_budget = stale_cfg.max_per_tick;
     let mut purge_stats = TargetPurgeStats::default();
     let mut disposed = 0usize;
     let mut failed = 0usize;
@@ -1697,6 +1743,26 @@ pub async fn reap_terminal_worktrees(
         // T1-T6 d'abord : T7 coûte deux `git` par candidat, et ne se paie que
         // sur les survivants.
         let screened = screen_worktrees(&entries, &pr_index, &live, now, &cfg);
+
+        // mika#2482 — la seconde passe, **avant** l'écriture des refus : un
+        // worktree que la sonde résout ne doit jamais laisser en base une ligne
+        // `pr_unknown` à côté de son verdict réel.
+        let screened = resolve_stale_pr_unknown(
+            db,
+            session_id,
+            trace_id,
+            &repo,
+            github_token,
+            &entries,
+            &live,
+            now,
+            &cfg,
+            &stale_cfg,
+            screened,
+            &mut stale_budget,
+        )
+        .await;
+
         for refusal in &screened.refusals {
             refused += 1;
             record_refusal(db, session_id, refusal, now, trace_id).await;
@@ -2182,6 +2248,648 @@ async fn record_refusal(
             error = %e,
             trace_id,
             "worktree_reap: audit write failed (skipped)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mika#2482 — `pr_unknown` cesse de confondre deux populations
+// ---------------------------------------------------------------------------
+//
+// # Les deux constats du ticket, et la seule sonde qui les tranche
+//
+// `pr_unknown` (T3) couvre deux populations que rien ne séparait :
+//
+// - le **travail vivant récent** — groomé, PR imminente. Sa PR entrera dans
+//   l'index de masse dès qu'elle existera : la sonder serait un appel `gh` pour
+//   rien, 144 fois par jour.
+// - le **vieux groomé-jamais-implémenté** — mesurés le 22/09 : `incident/1696`
+//   (issue du 30/06), `fix/1719`, `chore/1964`, `investigation/2051`,
+//   `test/2266`, `bug/2260`. Le faucheur les conserve par conception, donc la
+//   queue s'accumule sans mécanisme de fauche (constat 1).
+//
+// Un `pr_unknown` **vieux** est soit un abandon (constat 1), soit un **faux**
+// `pr_unknown` par angle mort de pagination (constat 2 — voir
+// [`RESOLUTION_BRANCH_PROBE`]). D'où :
+//
+// > **Une seule sonde ciblée tranche les deux constats, et son coût est borné
+// > par la petitesse de la population vieille.**
+//
+// C'est ce qui fait de cette section un mécanisme et non deux.
+//
+// # Ce qui n'est PAS fait ici, et ce n'est pas de la prudence
+//
+// **Aucun `pr_unknown` n'est fauché.** Le ticket l'écrit (« pas fauche auto :
+// l'issue est vivante ») et le code va plus loin : un `pr_unknown` **sort à
+// T3**, donc **T7 (`dirty` / `unpushed_commits`) n'est jamais évalué sur lui**.
+// On ne sait pas s'il porte du travail non poussé, et le faucher détruirait du
+// travail sous un prédicat qui n'a pas regardé. Ce n'est pas une précaution,
+// c'est une contrainte — et c'est pourquoi le remède du constat 1 est (a) le
+// dérivé ([`PURGE_ELIGIBLE_REASONS`]) et (b) le signalement ci-dessous, jamais
+// une fauche ni un « parking ».
+//
+// **Aucun motif de refus n'est ajouté.** Un `REASON_PR_UNKNOWN_STALE` scinderait
+// la population `pr_unknown` en deux noms et casserait, en silence, les
+// `GROUP BY` publiés dans le `CLAUDE.md` racine — la scission datée dont
+// mika#2361 a dû écrire le coût. Le signalement est un **événement distinct à
+// côté** du refus : `pr_unknown` garde son sens intact, et les deux populations
+// restent soustractibles.
+//
+// # La datation porte sur le WORKTREE, jamais sur l'issue
+//
+// Le ticket propose « issue toujours ouverte ». Refusé, deux motifs. (1) Lire
+// l'état de l'issue coûte un `gh` par worktree et par tick pour une information
+// dont **aucune décision ne dépend** — rien n'est fauché. (2) Le filtre va dans
+// le mauvais sens : un worktree dont l'issue est *fermée* sans PR est **encore
+// plus** un candidat au signalement, donc filtrer sur « ouverte » rétrécirait la
+// population visée. La date lisible sans réseau, et qui répond à la question
+// réellement posée — *rien ne progresse ici* — est celle du dernier commit de la
+// branche. Un worktree repris par `_set_up_worktree` est rebasé, donc sa date
+// remonte : correct, la boucle l'a repris.
+
+/// `audit_events.tool_name` (et event tracing) du signal de la file
+/// groomée-jamais-implémentée (mika#2482 B3.1).
+///
+/// **SOLE WRITER** — ce module est le seul site qui écrit ce nom, épinglé par
+/// [`tests::mika2482_le_tool_name_stale_a_un_seul_writer`]. C'est ce qui fait de
+/// `SELECT … WHERE tool_name = 'worktree_stale_no_pr'` la liste exacte de la file
+/// vieille, datée et comptable — la surface que personne n'avait.
+///
+/// **Rien n'est supprimé par ce signal.** C'est de l'observabilité : il dit « ce
+/// worktree est vieux et n'a réellement aucune PR » ; décider quoi en faire est
+/// un geste d'opérateur.
+pub const STALE_NO_PR_TOOL: &str = "worktree_stale_no_pr";
+
+/// `audit_events.tool_name` du marqueur de **coût** de la sonde ciblée
+/// (mika#2482 B2.5).
+///
+/// # Deux noms, deux rôles, et le second n'est pas un doublon
+///
+/// Celui-ci est écrit après **chaque** sonde, quel que soit son résultat, et
+/// porte la déduplication 24 h : c'est lui qui tient la promesse *au plus un
+/// appel `gh` par worktree stale et par jour*. [`STALE_NO_PR_TOOL`] est le
+/// **signal**, et il hérite de cette cadence par construction — un worktree
+/// sondé n'est pas re-sondé avant 24 h, donc il ne peut pas être re-signalé.
+///
+/// **Pourquoi la dédup ne peut PAS porter sur le signal seul**, ce que le plan
+/// sous-estimait : une sonde qui *résout* une PR n'écrit aucun signal. Or son
+/// worktree, s'il est ensuite refusé pour une autre raison (`dirty`,
+/// `too_young`), reste `pr_unknown` au tick suivant — l'index de masse ne le
+/// connaît toujours pas — et serait re-sondé toutes les dix minutes,
+/// indéfiniment.
+///
+/// Son `after_value` porte l'issue de la sonde (`no_pr` | `resolved` |
+/// `unreadable`), donc un `GROUP BY after_value` rend la distribution des sondes
+/// — motif `ready_label_outcome` (mika#2323).
+pub const STALE_PROBED_TOOL: &str = "worktree_stale_probed";
+
+/// La sonde ciblée a répondu : **aucune** PR pour cette branche. Certitude.
+pub const STALE_PROBE_NO_PR: &str = "no_pr";
+/// La sonde ciblée a rendu au moins une PR — l'angle mort de pagination, fermé.
+pub const STALE_PROBE_RESOLVED: &str = "resolved";
+/// La sonde ciblée n'a pas su regarder (timeout, `gh` non nul, parse KO).
+///
+/// **Ne signale rien** : on ne sait pas si ce worktree appartient à la file. Un
+/// [`STALE_NO_PR_TOOL`] portant cette valeur affirmerait dans son **nom** ce que
+/// son champ nie — la doctrine maison exige qu'un signal illisible soit nommé
+/// sous son propre nom (`pilot_stall_signal_unavailable`, mika#2277 ;
+/// `unknown_provider`, mika#2328), d'où l'événement de journal
+/// `worktree_stale_probe_unreadable`.
+pub const STALE_PROBE_UNREADABLE: &str = "unreadable";
+
+/// Les trois issues d'une sonde, en un seul lieu — **format de fil**.
+pub const ALL_STALE_PROBE_OUTCOMES: &[&str] = &[
+    STALE_PROBE_NO_PR,
+    STALE_PROBE_RESOLVED,
+    STALE_PROBE_UNREADABLE,
+];
+
+/// Message INFO du signal.
+pub const STALE_NO_PR_MESSAGE: &str =
+    "worktree_stale_no_pr: worktree vieux et sans aucune PR — groomé, jamais implémenté";
+
+const STALE_DAYS_ENV: &str = "MIKA_WORKTREE_STALE_DAYS";
+const STALE_PROBE_MAX_PER_TICK_ENV: &str = "MIKA_WORKTREE_STALE_PROBE_MAX_PER_TICK";
+
+/// Sept jours, bornés des deux côtés par la mesure.
+///
+/// | borne | argument |
+/// |---|---|
+/// | plancher | la vie nominale d'un `pr_unknown` est de l'ordre de l'heure à la journée, et un `ready` abandonné est borné à trois re-drives (mika#2020) — 7 j laisse un ordre de grandeur |
+/// | plafond | la population mesurée le 22/09 va de ~3 semaines (`bug/2260`, `test/2266`) à ~84 jours (`incident/1696`) — elle est intégralement attrapée |
+///
+/// **L'asymétrie autorise la générosité** : un faux « stale » coûte une ligne de
+/// journal et **un** appel `gh` par jour ; un faux « pas stale » laisse le
+/// worktree invisible un jour de plus.
+const STALE_DAYS_DEFAULT: i64 = 7;
+
+/// Trois sondes par tick au plus. Population mesurée le 22/09 : 6, donc
+/// l'arriération est absorbée en deux ticks et le régime stationnaire n'atteint
+/// jamais le cap (la déduplication 24 h le voit avant).
+const STALE_PROBE_MAX_PER_TICK_DEFAULT: usize = 3;
+
+/// Les deux réglages de la seconde passe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleProbeConfig {
+    pub stale_days: i64,
+    pub max_per_tick: usize,
+}
+
+impl Default for StaleProbeConfig {
+    fn default() -> Self {
+        Self {
+            stale_days: STALE_DAYS_DEFAULT,
+            max_per_tick: STALE_PROBE_MAX_PER_TICK_DEFAULT,
+        }
+    }
+}
+
+/// Trois paliers maison : absent/vide → défaut ; illisible, `0` ou négatif →
+/// défaut **plus** un `warn!` nommant la valeur entre guillemets.
+///
+/// Le `0` **ne désarme pas** : sur un scan qui déclenche une suppression de
+/// dérivé, une coquille ne doit pas être un désarmement silencieux — le levier
+/// de désarmement est `MIKA_TARGET_PURGE` (le bras) ou la sentinelle STOP
+/// partagée (le tick).
+fn stale_probe_config_from_env() -> StaleProbeConfig {
+    StaleProbeConfig {
+        stale_days: parse_positive_i64(
+            std::env::var(STALE_DAYS_ENV).ok().as_deref(),
+            STALE_DAYS_DEFAULT,
+            STALE_DAYS_ENV,
+        ),
+        max_per_tick: parse_positive_usize(
+            std::env::var(STALE_PROBE_MAX_PER_TICK_ENV).ok().as_deref(),
+            STALE_PROBE_MAX_PER_TICK_DEFAULT,
+            STALE_PROBE_MAX_PER_TICK_ENV,
+        ),
+    }
+}
+
+/// Le numéro d'issue porté par une branche de dispatch, **s'il y en a un**.
+///
+/// Le deuxième segment, et rien d'autre : `feat/2482/slug` → `2482`,
+/// `incident/1696` → `1696`. Une branche non conforme (`main`, `feat/slug`) rend
+/// `None` — **jamais inventé** (B3.2). Un numéro fabriqué sur une surface
+/// d'observabilité enverrait l'opérateur lire le mauvais ticket, ce qui est pire
+/// qu'un champ vide.
+pub fn issue_number_from_branch(branch: &str) -> Option<u64> {
+    let mut parts = branch.split('/');
+    let _kind = parts.next()?;
+    let seg = parts.next()?;
+    if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    seg.parse().ok()
+}
+
+/// Ce que la datation d'une branche a pu établir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleVerdict {
+    /// La branche a bougé dans la fenêtre. **Nominal** : aucun appel `gh`, aucune
+    /// ligne (AC4).
+    Recent { idle_days: i64 },
+    /// Vieille : candidate à la sonde ciblée.
+    Stale { idle_days: i64 },
+    /// La date n'a pas pu être lue. **Ne sonde pas, ne signale pas** : on ne sait
+    /// même pas si ce worktree est vieux (B3.3).
+    DateUnreadable,
+}
+
+/// Classe une branche sur la sortie de `git log -1 --format=%cI HEAD`.
+///
+/// Fonction pure, donc testable à ses bornes sans toucher au disque. Une date
+/// **dans le futur** (dérive d'horloge) donne un âge ramené à `0`, donc récente :
+/// ne sonde pas, ne signale pas — la direction sûre.
+pub fn classify_branch_staleness(
+    committed_at: Option<&str>,
+    now: DateTime<Utc>,
+    stale_days: i64,
+) -> StaleVerdict {
+    let Some(raw) = committed_at.map(str::trim).filter(|s| !s.is_empty()) else {
+        return StaleVerdict::DateUnreadable;
+    };
+    let Ok(committed) = crate::timestamp::parse(raw) else {
+        return StaleVerdict::DateUnreadable;
+    };
+    let idle_days = (now - committed).num_days().max(0);
+    if idle_days < stale_days {
+        StaleVerdict::Recent { idle_days }
+    } else {
+        StaleVerdict::Stale { idle_days }
+    }
+}
+
+/// La date du dernier commit de la branche, telle que `git` la rend.
+///
+/// `%cI` — la date du **committer**, en ISO 8601 strict avec offset, que
+/// [`crate::timestamp::parse`] accepte par son repli RFC 3339. La date du
+/// committer et non celle de l'auteur : un rebase de `_set_up_worktree` la fait
+/// remonter, ce qui est exactement ce qu'on veut lire — *la boucle a repris ce
+/// worktree*.
+///
+/// Nommée plutôt qu'en ligne dans [`resolve_stale_pr_unknown`] pour que la
+/// chaîne réelle rencontre le parseur dans un test, sur un vrai dépôt, sans
+/// réseau : c'est la seule moitié de la datation qu'un test pur ne couvre pas.
+async fn read_branch_commit_date(worktree: &Path) -> Option<String> {
+    run_git(worktree, &["log", "-1", "--format=%cI", "HEAD"]).await
+}
+
+/// Un refus `pr_unknown` retenu pour la sonde ciblée.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleProbeTarget {
+    pub worktree_path: String,
+    pub branch: String,
+    pub idle_days: i64,
+}
+
+/// La sortie de la sélection de la seconde passe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaleProbeSelection {
+    /// À sonder, **du plus vieux au moins vieux**.
+    pub targets: Vec<StaleProbeTarget>,
+    /// Les chemins dont la date de branche est illisible — une ligne, aucune
+    /// sonde, aucun signal.
+    pub date_unreadable: Vec<String>,
+}
+
+/// La population de la seconde passe : les refus `pr_unknown` datés **stale**.
+///
+/// Un `pr_unknown` **récent** ne figure ni dans `targets` ni dans
+/// `date_unreadable` : il ne coûte rien et ne produit rien (AC4). C'est la moitié
+/// que le tri ci-dessous rend visible — sans elle, « la sonde est ciblée » et
+/// « la sonde est morte » se liraient pareil.
+pub fn screen_stale_probe_targets(
+    refusals: &[ReapRefusal],
+    branch_dates: &HashMap<String, Option<String>>,
+    now: DateTime<Utc>,
+    cfg: &StaleProbeConfig,
+) -> StaleProbeSelection {
+    let mut out = StaleProbeSelection::default();
+
+    for refusal in refusals {
+        if refusal.reason != REASON_PR_UNKNOWN {
+            continue;
+        }
+        // Un `pr_unknown` porte toujours une branche par construction
+        // (`screen_worktrees` ne le pousse que sur la branche attachée) ; le
+        // `else` est défensif et sort de la population sans rien dire.
+        let Some(branch) = refusal.branch.as_deref() else {
+            continue;
+        };
+        let raw = branch_dates.get(&refusal.path).and_then(Option::as_deref);
+        match classify_branch_staleness(raw, now, cfg.stale_days) {
+            StaleVerdict::Recent { .. } => {}
+            StaleVerdict::DateUnreadable => out.date_unreadable.push(refusal.path.clone()),
+            StaleVerdict::Stale { idle_days } => out.targets.push(StaleProbeTarget {
+                worktree_path: refusal.path.clone(),
+                branch: branch.to_string(),
+                idle_days,
+            }),
+        }
+    }
+
+    // Du plus vieux au moins vieux : sous le cap par tick, les plus vieux — les
+    // plus susceptibles d'être la file mesurée — sont servis d'abord. Le chemin
+    // départage, pour que l'ordre soit déterministe à âge égal.
+    out.targets.sort_by(|a, b| {
+        b.idle_days
+            .cmp(&a.idle_days)
+            .then_with(|| a.worktree_path.cmp(&b.worktree_path))
+    });
+    out
+}
+
+/// Substitue, dans la sélection de première passe, le verdict de la seconde.
+///
+/// Les worktrees que la sonde a résolus **quittent** la population `pr_unknown`
+/// et prennent le verdict du re-screen — c'est-à-dire la **même conjonction de
+/// sept termes, sans exception ni assouplissement** (B2.2). La provenance de la
+/// PR ne change pas sa vérité : une PR ouverte rend `pr_open`, un arbre sale rend
+/// `dirty`, et seuls les candidats qui franchissent les sept termes sont fauchés.
+///
+/// Seule la **clé de résolution** est réécrite, sur les candidats, pour que la
+/// ligne d'audit dise par quelle porte la PR a été trouvée.
+pub fn merge_probe_rescreen(
+    screened: ReapSelection,
+    rescreened: ReapSelection,
+    resolved_paths: &std::collections::HashSet<String>,
+) -> ReapSelection {
+    let mut out = ReapSelection {
+        candidates: screened.candidates,
+        // Le refus `pr_unknown` d'un worktree résolu n'est jamais écrit : il
+        // serait faux, et l'écrire à côté du verdict réel donnerait deux lignes
+        // contradictoires pour un seul worktree.
+        refusals: screened
+            .refusals
+            .into_iter()
+            .filter(|r| !resolved_paths.contains(&r.path))
+            .collect(),
+    };
+    for mut candidate in rescreened.candidates {
+        candidate.resolution = RESOLUTION_BRANCH_PROBE;
+        out.candidates.push(candidate);
+    }
+    out.refusals.extend(rescreened.refusals);
+    out
+}
+
+/// Clé d'audit de la seconde passe : `worktree:<chemin>`.
+///
+/// Homographe de [`reaped_audit_key`] à dessein — les `tool_name` diffèrent, donc
+/// les populations ne se mélangent pas, et un opérateur peut joindre les deux
+/// surfaces sur la même clé.
+pub fn stale_audit_key(path: &str) -> String {
+    format!("worktree:{path}")
+}
+
+/// La sonde ciblée : `gh pr list --head <branche> --state all`.
+///
+/// **Mêmes champs, même schéma que [`list_prs`], donc `Vec<PrSnapshot>` se
+/// désérialise sans une ligne de structure nouvelle** (B2.1). Une branche sans PR
+/// rend `[]`, pas une erreur — c'est ce qui rend la certitude « aucune PR »
+/// lisible plutôt que devinée.
+async fn probe_prs_for_branch(
+    repo: &str,
+    branch: &str,
+    token: &str,
+) -> Result<Vec<PrSnapshot>, String> {
+    let out = gh(
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--head",
+            branch,
+            "--json",
+            "number,state,headRefName,headRefOid,closedAt,url",
+        ],
+        token,
+    )
+    .await?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("parse gh pr list --head {branch}: {e}"))
+}
+
+/// La seconde passe : datation, sonde ciblée, signalement.
+///
+/// Rend la sélection de première passe, **amendée** des worktrees que la sonde a
+/// résolus. Fail-open de bout en bout : aucun échec d'ici ne change le verdict
+/// d'un worktree que la sonde n'a pas touché.
+///
+/// # L'ordre vis-à-vis de l'écriture des refus est porteur
+///
+/// Appelée **avant** la boucle `record_refusal` de [`reap_terminal_worktrees`].
+/// Après, un worktree résolu aurait déjà sa ligne `pr_unknown` en base — un fait
+/// faux, à côté de son verdict réel, dans la surface même que l'AC6 existe pour
+/// garder exacte.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_stale_pr_unknown(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    repo: &str,
+    github_token: &str,
+    entries: &[WorktreeEntry],
+    live: &LiveCwds,
+    now: DateTime<Utc>,
+    cfg: &ReapConfig,
+    stale_cfg: &StaleProbeConfig,
+    screened: ReapSelection,
+    budget: &mut usize,
+) -> ReapSelection {
+    if *budget == 0
+        || !screened
+            .refusals
+            .iter()
+            .any(|r| r.reason == REASON_PR_UNKNOWN)
+    {
+        return screened;
+    }
+
+    // La datation, un `git` par worktree de la population — jamais sur la
+    // population entière du registre.
+    let mut branch_dates: HashMap<String, Option<String>> = HashMap::new();
+    for refusal in &screened.refusals {
+        if refusal.reason != REASON_PR_UNKNOWN {
+            continue;
+        }
+        let date = read_branch_commit_date(Path::new(&refusal.path)).await;
+        branch_dates.insert(refusal.path.clone(), date);
+    }
+
+    let selection = screen_stale_probe_targets(&screened.refusals, &branch_dates, now, stale_cfg);
+
+    for path in &selection.date_unreadable {
+        warn!(
+            event = "worktree_stale_date_unreadable",
+            worktree_path = %path,
+            trace_id,
+            "worktree_stale: date du dernier commit illisible — ni sondé ni \
+             signalé, on ne sait pas si ce worktree est vieux"
+        );
+    }
+
+    let mut probed_prs: Vec<PrSnapshot> = Vec::new();
+    let mut resolved_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for target in &selection.targets {
+        if *budget == 0 {
+            break;
+        }
+        // Déduplication 24 h : un worktree stale n'est sondé qu'une fois par
+        // jour. Un saut ne débite **pas** le budget — celui-ci borne les appels
+        // `gh`, et un saut n'en fait aucun.
+        if stale_probe_recently_done(db, &target.worktree_path, now, trace_id).await {
+            continue;
+        }
+        *budget -= 1;
+
+        let outcome = match probe_prs_for_branch(repo, &target.branch, github_token).await {
+            Ok(prs) if prs.is_empty() => {
+                record_stale_no_pr(db, session_id, target, trace_id).await;
+                info!(
+                    event = STALE_NO_PR_TOOL,
+                    worktree_path = %target.worktree_path,
+                    branch = %target.branch,
+                    issue = issue_number_from_branch(&target.branch),
+                    branch_idle_days = target.idle_days,
+                    probe = STALE_PROBE_NO_PR,
+                    trace_id,
+                    "{}",
+                    STALE_NO_PR_MESSAGE
+                );
+                STALE_PROBE_NO_PR
+            }
+            Ok(prs) => {
+                info!(
+                    event = "worktree_stale_pr_resolved",
+                    worktree_path = %target.worktree_path,
+                    branch = %target.branch,
+                    branch_idle_days = target.idle_days,
+                    pr_count = prs.len(),
+                    trace_id,
+                    "worktree_stale: la sonde ciblée a trouvé une PR hors de la \
+                     fenêtre de l'index — angle mort de pagination fermé"
+                );
+                probed_prs.extend(prs);
+                resolved_paths.insert(target.worktree_path.clone());
+                STALE_PROBE_RESOLVED
+            }
+            Err(e) => {
+                // B2.4 — on ne sait rien : conserve, et **ne signale pas**. Un
+                // signal ici affirmerait dans son nom l'absence de PR que la
+                // sonde n'a pas pu établir.
+                warn!(
+                    event = "worktree_stale_probe_unreadable",
+                    worktree_path = %target.worktree_path,
+                    branch = %target.branch,
+                    error = %e,
+                    trace_id,
+                    "worktree_stale: la sonde ciblée n'a pas su regarder — \
+                     conservé, non signalé"
+                );
+                STALE_PROBE_UNREADABLE
+            }
+        };
+        record_stale_probed(db, session_id, target, outcome, trace_id).await;
+    }
+
+    if resolved_paths.is_empty() {
+        return screened;
+    }
+
+    // Re-screen contre un index **local** aux PR sondées. Reconstruire l'index
+    // de masse serait inutile : ces entrées n'y figurent par définition pas
+    // (c'est pourquoi elles étaient `pr_unknown`), et le re-screen porte alors
+    // sur exactement ce que la sonde a rendu.
+    let probe_index = PrIndex::build(probed_prs);
+    let resolved_entries: Vec<WorktreeEntry> = entries
+        .iter()
+        .filter(|e| resolved_paths.contains(&e.path))
+        .cloned()
+        .collect();
+    let rescreened = screen_worktrees(&resolved_entries, &probe_index, live, now, cfg);
+
+    merge_probe_rescreen(screened, rescreened, &resolved_paths)
+}
+
+/// Ce worktree a-t-il déjà été sondé dans les 24 h ?
+///
+/// Fail-**closed sur le coût** : une relecture impossible répond « déjà sondé »,
+/// donc saute la sonde. C'est la direction sûre ici et l'inverse du fail-safe du
+/// faucheur, parce que ce qui est en jeu n'est pas une suppression mais un appel
+/// réseau : sauter coûte un jour de visibilité, marteler coûte 144 appels `gh`
+/// par worktree et par jour sur une base déjà en difficulté.
+async fn stale_probe_recently_done(
+    db: &AsyncDatabase,
+    worktree_path: &str,
+    now: DateTime<Utc>,
+    trace_id: &str,
+) -> bool {
+    let key = stale_audit_key(worktree_path);
+    let since = crate::timestamp::format(
+        &now.checked_sub_signed(chrono::TimeDelta::seconds(REFUSAL_DEDUP_SECS))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+    );
+    match db
+        .count_recent_audit_events_for_target(STALE_PROBED_TOOL, &key, &since)
+        .await
+    {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(e) => {
+            debug!(
+                worktree_path = %worktree_path,
+                error = %e,
+                trace_id,
+                "worktree_stale: relecture du marqueur de sonde impossible, sonde sautée"
+            );
+            true
+        }
+    }
+}
+
+/// Écrit le marqueur de coût — **une ligne par worktree et par 24 h**, quelle que
+/// soit l'issue de la sonde.
+async fn record_stale_probed(
+    db: &AsyncDatabase,
+    session_id: &str,
+    target: &StaleProbeTarget,
+    outcome: &str,
+    trace_id: &str,
+) {
+    let reasoning = format!(
+        "branch={} issue={} branch_idle_days={}",
+        target.branch,
+        issue_number_from_branch(&target.branch)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        target.idle_days,
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            STALE_PROBED_TOOL,
+            &stale_audit_key(&target.worktree_path),
+            None,
+            Some(outcome),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            worktree_path = %target.worktree_path,
+            error = %e,
+            trace_id,
+            "worktree_stale: audit write failed (probed)"
+        );
+    }
+}
+
+/// Écrit le signal de la file groomée-jamais-implémentée.
+///
+/// `after_value` porte l'âge en jours — c'est le nombre que l'opérateur trie
+/// (`ORDER BY CAST(after_value AS INTEGER) DESC`) pour lire la file du plus vieux
+/// au plus récent.
+async fn record_stale_no_pr(
+    db: &AsyncDatabase,
+    session_id: &str,
+    target: &StaleProbeTarget,
+    trace_id: &str,
+) {
+    let reasoning = format!(
+        "branch={} issue={} probe={}",
+        target.branch,
+        issue_number_from_branch(&target.branch)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        STALE_PROBE_NO_PR,
+    );
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            STALE_NO_PR_TOOL,
+            &stale_audit_key(&target.worktree_path),
+            None,
+            Some(&target.idle_days.to_string()),
+            Some(&reasoning),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            worktree_path = %target.worktree_path,
+            error = %e,
+            trace_id,
+            "worktree_stale: audit write failed (stale_no_pr)"
         );
     }
 }
@@ -7334,5 +8042,874 @@ branch refs/heads/fix/live/x
             "}\n"
         );
         assert_eq!(scan_purge_reason_filters(fixture, &[]), Ok(2));
+    }
+
+    // =======================================================================
+    // mika#2482 B2/B3 — la sonde ciblée, et le signal de la file vieille
+    // =======================================================================
+
+    const STALE_WT: &str = "/data/workspace/mika-platform/.claude/worktrees/incident-1696-x/mika";
+
+    fn stale_cfg() -> StaleProbeConfig {
+        StaleProbeConfig::default()
+    }
+
+    fn attached(path: &str, branch: &str) -> WorktreeEntry {
+        WorktreeEntry {
+            path: path.to_string(),
+            branch: Some(branch.to_string()),
+            head: Some(sha(1)),
+        }
+    }
+
+    fn dates(path: &str, iso: Option<&str>) -> HashMap<String, Option<String>> {
+        HashMap::from([(path.to_string(), iso.map(str::to_string))])
+    }
+
+    /// `now()` moins `days` jours, au format `%cI` que `git log` rend.
+    fn iso_days_ago(days: i64) -> String {
+        (now() - chrono::TimeDelta::days(days)).to_rfc3339()
+    }
+
+    // -- V7 d'abord : l'anti-vacuité de la population -----------------------
+
+    /// **V7 / AC4** — un `pr_unknown` **récent** ne figure ni dans la population
+    /// de sonde ni dans celle du signal.
+    ///
+    /// Test d'anti-vacuité : sans lui, « la sonde est ciblée » et « la sonde est
+    /// morte » se liraient pareil. Le miroir stale est dans le même test, sans
+    /// quoi ce test passerait sur un écran qui rejette tout.
+    #[test]
+    fn mika2482_v7_un_pr_unknown_recent_ne_coute_rien() {
+        let refusals = [ReapRefusal {
+            path: STALE_WT.to_string(),
+            branch: Some("feat/2472/x".to_string()),
+            reason: REASON_PR_UNKNOWN,
+        }];
+
+        // Récent : un jour, sous la fenêtre de sept.
+        let s = screen_stale_probe_targets(
+            &refusals,
+            &dates(STALE_WT, Some(&iso_days_ago(1))),
+            now(),
+            &stale_cfg(),
+        );
+        assert!(s.targets.is_empty(), "un pr_unknown récent ne se sonde pas");
+        assert!(s.date_unreadable.is_empty(), "et ne produit aucune ligne");
+
+        // Miroir : au-delà de la fenêtre, il entre.
+        let s = screen_stale_probe_targets(
+            &refusals,
+            &dates(STALE_WT, Some(&iso_days_ago(84))),
+            now(),
+            &stale_cfg(),
+        );
+        assert_eq!(s.targets.len(), 1, "un pr_unknown vieux doit être sondé");
+        assert_eq!(s.targets[0].idle_days, 84);
+        assert_eq!(s.targets[0].branch, "feat/2472/x");
+    }
+
+    /// La population est **exactement** les refus `pr_unknown` : aucun autre
+    /// motif n'y entre, même vieux.
+    #[test]
+    fn mika2482_seuls_les_pr_unknown_entrent_dans_la_seconde_passe() {
+        for reason in [
+            REASON_PR_OPEN,
+            REASON_DIRTY,
+            REASON_TOO_YOUNG,
+            REASON_DETACHED_HEAD,
+            REASON_DETACHED_HEAD_PR_UNKNOWN,
+            REASON_UNPUSHED_COMMITS,
+        ] {
+            let s = screen_stale_probe_targets(
+                &[ReapRefusal {
+                    path: STALE_WT.to_string(),
+                    branch: Some("feat/2482/x".to_string()),
+                    reason,
+                }],
+                &dates(STALE_WT, Some(&iso_days_ago(84))),
+                now(),
+                &stale_cfg(),
+            );
+            assert!(
+                s.targets.is_empty() && s.date_unreadable.is_empty(),
+                "`{reason}` ne relève pas de la seconde passe"
+            );
+        }
+    }
+
+    /// Les cibles sont servies **du plus vieux au moins vieux** — sous le cap par
+    /// tick, la file mesurée passe avant le reste. À âge égal, le chemin
+    /// départage, pour que l'ordre soit déterministe.
+    #[test]
+    fn mika2482_les_cibles_sont_triees_du_plus_vieux_au_moins_vieux() {
+        let mk = |p: &str, b: &str| ReapRefusal {
+            path: p.to_string(),
+            branch: Some(b.to_string()),
+            reason: REASON_PR_UNKNOWN,
+        };
+        let refusals = [
+            mk("/w/.claude/worktrees/b/mika", "test/2266/x"),
+            mk("/w/.claude/worktrees/a/mika", "incident/1696/x"),
+            mk("/w/.claude/worktrees/c/mika", "fix/1719/x"),
+        ];
+        let branch_dates = HashMap::from([
+            (
+                "/w/.claude/worktrees/b/mika".to_string(),
+                Some(iso_days_ago(21)),
+            ),
+            (
+                "/w/.claude/worktrees/a/mika".to_string(),
+                Some(iso_days_ago(84)),
+            ),
+            (
+                "/w/.claude/worktrees/c/mika".to_string(),
+                Some(iso_days_ago(84)),
+            ),
+        ]);
+        let s = screen_stale_probe_targets(&refusals, &branch_dates, now(), &stale_cfg());
+        let order: Vec<&str> = s.targets.iter().map(|t| t.branch.as_str()).collect();
+        assert_eq!(order, vec!["incident/1696/x", "fix/1719/x", "test/2266/x"]);
+    }
+
+    // -- V4 / V5 : la sonde résout, et les sept termes s'appliquent ----------
+
+    /// Ce que la production fait après une sonde résolutive : re-screen contre
+    /// l'index **local** aux PR sondées, puis substitution.
+    fn rescreen_after_probe(
+        screened: ReapSelection,
+        entry: &WorktreeEntry,
+        probed: Vec<PrSnapshot>,
+        work_states: &HashMap<String, WorkState>,
+    ) -> ReapSelection {
+        let resolved: std::collections::HashSet<String> =
+            std::collections::HashSet::from([entry.path.clone()]);
+        let probe_index = PrIndex::build(probed);
+        let rescreened = screen_worktrees(
+            std::slice::from_ref(entry),
+            &probe_index,
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+        );
+        let merged = merge_probe_rescreen(screened, rescreened, &resolved);
+        // T7, exactement comme la production : la sonde ne le contourne pas.
+        let mut final_pass = apply_work_states(merged.candidates, work_states);
+        let mut refusals = merged.refusals;
+        refusals.append(&mut final_pass.refusals);
+        ReapSelection {
+            candidates: final_pass.candidates,
+            refusals,
+        }
+    }
+
+    /// Une PR mergée il y a soixante jours — la forme d'une PR hors de la
+    /// fenêtre de l'index de masse. En secondes, comme le [`merged_pr`] du
+    /// module de test, pour n'avoir qu'une seule fabrique.
+    const MERGED_LONG_AGO_SECS: i64 = 60 * 86_400;
+
+    /// **V4 / AC2** — une PR **mergée hors de la fenêtre de 300**, rendue par la
+    /// sonde ciblée, produit un candidat portant `resolution=branch_probe`, et le
+    /// refus `pr_unknown` a **disparu** de la sélection.
+    #[test]
+    fn mika2482_v4_une_pr_mergee_hors_fenetre_est_fauchee_par_la_sonde() {
+        let branch = "feat/1888/research";
+        let entry = attached(STALE_WT, branch);
+        let screened = screen_worktrees(
+            std::slice::from_ref(&entry),
+            // L'index de masse ignore cette branche : c'est l'angle mort.
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+        );
+        assert_eq!(only_reason(&screened), vec![REASON_PR_UNKNOWN]);
+
+        let out = rescreen_after_probe(
+            screened,
+            &entry,
+            vec![merged_pr(1900, branch, 60)],
+            &HashMap::from([(STALE_WT.to_string(), WorkState::Clean)]),
+        );
+
+        assert_eq!(out.candidates.len(), 1, "refus: {:?}", out.refusals);
+        let c = &out.candidates[0];
+        assert_eq!(c.resolution, RESOLUTION_BRANCH_PROBE);
+        assert_eq!(c.pr_number, 1900);
+        assert_eq!(c.pr_state, "MERGED");
+        assert_eq!(c.branch, branch);
+        assert!(c.head_sha.is_none(), "chemin attaché : pas de clé SHA");
+        assert!(
+            !out.refusals.iter().any(|r| r.reason == REASON_PR_UNKNOWN),
+            "le refus pr_unknown d'un worktree résolu ne doit pas survivre: {:?}",
+            out.refusals
+        );
+        // Et la branche locale part avec le worktree, comme sur le chemin nominal.
+        assert!(should_delete_local_branch(c.resolution));
+    }
+
+    /// **V5 / contrôle négatif de V4** — les sept termes s'appliquent **sans
+    /// assouplissement** à ce que la sonde rend. C'est la garantie de sûreté de
+    /// B2.2, et elle ne se démontre pas autrement.
+    #[test]
+    fn mika2482_v5_la_sonde_ne_relache_aucun_des_sept_termes() {
+        let branch = "feat/1888/research";
+        let entry = attached(STALE_WT, branch);
+        let clean = HashMap::from([(STALE_WT.to_string(), WorkState::Clean)]);
+
+        let fresh_screened = || {
+            screen_worktrees(
+                std::slice::from_ref(&entry),
+                &index(vec![]),
+                &no_processes(),
+                now(),
+                &ReapConfig::default(),
+            )
+        };
+
+        // T4 — une PR **ouverte** rendue par la sonde ne fauche rien.
+        let out = rescreen_after_probe(
+            fresh_screened(),
+            &entry,
+            vec![open_pr(2500, branch)],
+            &clean,
+        );
+        assert!(out.candidates.is_empty());
+        assert_eq!(only_reason(&out), vec![REASON_PR_OPEN]);
+
+        // T5 — une PR mergée **trop récemment** ne fauche rien.
+        let mut too_young = merged_pr(1900, branch, 0);
+        too_young.closed_at = Some(crate::timestamp::format(&now()));
+        let out = rescreen_after_probe(fresh_screened(), &entry, vec![too_young], &clean);
+        assert!(out.candidates.is_empty());
+        assert_eq!(only_reason(&out), vec![REASON_TOO_YOUNG]);
+
+        // T6 — un processus vivant dedans ne fauche rien.
+        let resolved: std::collections::HashSet<String> =
+            std::collections::HashSet::from([entry.path.clone()]);
+        let rescreened = screen_worktrees(
+            std::slice::from_ref(&entry),
+            &PrIndex::build(vec![merged_pr(1900, branch, 60)]),
+            &LiveCwds::Enumerated(vec![PathBuf::from(STALE_WT)]),
+            now(),
+            &ReapConfig::default(),
+        );
+        let merged = merge_probe_rescreen(fresh_screened(), rescreened, &resolved);
+        assert!(merged.candidates.is_empty());
+        assert_eq!(only_reason(&merged), vec![REASON_LIVE_PROCESS]);
+
+        // T7 — un arbre sale ne fauche rien. C'est le terme le plus important de
+        // ce contrôle : un `pr_unknown` sort à T3 sans jamais l'évaluer, donc
+        // c'est la sonde qui le rend applicable pour la première fois.
+        let out = rescreen_after_probe(
+            fresh_screened(),
+            &entry,
+            vec![merged_pr(1900, branch, 60)],
+            &HashMap::from([(STALE_WT.to_string(), WorkState::Dirty)]),
+        );
+        assert!(out.candidates.is_empty());
+        assert_eq!(only_reason(&out), vec![REASON_DIRTY]);
+
+        // Et le cas non poussé, qui est l'autre moitié de T7.
+        let out = rescreen_after_probe(
+            fresh_screened(),
+            &entry,
+            vec![merged_pr(1900, branch, 60)],
+            &HashMap::from([(STALE_WT.to_string(), WorkState::UnpushedCommits)]),
+        );
+        assert!(out.candidates.is_empty());
+        assert_eq!(only_reason(&out), vec![REASON_UNPUSHED_COMMITS]);
+    }
+
+    /// Un worktree **non** résolu par la sonde garde son refus `pr_unknown`
+    /// intact : la substitution est ciblée, jamais globale (AC3, AC6).
+    #[test]
+    fn mika2482_un_worktree_non_resolu_garde_son_refus() {
+        let a = attached("/w/.claude/worktrees/a/mika", "incident/1696/x");
+        let b = attached("/w/.claude/worktrees/b/mika", "feat/1888/research");
+        let screened = screen_worktrees(
+            &[a.clone(), b.clone()],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+        );
+        assert_eq!(screened.refusals.len(), 2);
+
+        // Seul `b` est résolu.
+        let resolved: std::collections::HashSet<String> =
+            std::collections::HashSet::from([b.path.clone()]);
+        let rescreened = screen_worktrees(
+            std::slice::from_ref(&b),
+            &PrIndex::build(vec![merged_pr(1900, "feat/1888/research", 60)]),
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+        );
+        let out = merge_probe_rescreen(screened, rescreened, &resolved);
+
+        assert_eq!(out.candidates.len(), 1);
+        assert_eq!(out.candidates[0].path, b.path);
+        assert_eq!(out.refusals.len(), 1, "{:?}", out.refusals);
+        assert_eq!(out.refusals[0].path, a.path);
+        assert_eq!(out.refusals[0].reason, REASON_PR_UNKNOWN);
+    }
+
+    // -- V6 : la dédup, et le signal ----------------------------------------
+
+    fn stale_target() -> StaleProbeTarget {
+        StaleProbeTarget {
+            worktree_path: STALE_WT.to_string(),
+            branch: "incident/1696/x".to_string(),
+            idle_days: 84,
+        }
+    }
+
+    /// **V6 / AC3** — une seconde passe dans les 24 h ne sonde pas et n'écrit pas
+    /// de seconde ligne ; au-delà, si.
+    #[tokio::test]
+    async fn mika2482_v6_la_sonde_est_dedupliquee_sur_24h() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let t = stale_target();
+        let now0 = now();
+
+        assert!(
+            !stale_probe_recently_done(&db, &t.worktree_path, now0, "trace").await,
+            "rien n'a encore été sondé"
+        );
+
+        record_stale_probed(&db, "s-2482-v6", &t, STALE_PROBE_NO_PR, "trace").await;
+        record_stale_no_pr(&db, "s-2482-v6", &t, "trace").await;
+
+        assert!(
+            stale_probe_recently_done(&db, &t.worktree_path, now0, "trace").await,
+            "dans les 24 h, la sonde est sautée"
+        );
+        // Au-delà de la fenêtre, la sonde repart : la borne basse de la
+        // relecture recule avec `now`.
+        assert!(
+            !stale_probe_recently_done(
+                &db,
+                &t.worktree_path,
+                now0 + chrono::TimeDelta::seconds(REFUSAL_DEDUP_SECS + 60),
+                "trace"
+            )
+            .await,
+            "passé 24 h, la sonde est de nouveau permise"
+        );
+
+        // Le signal porte les champs de B3.2, et son `after_value` est l'âge.
+        let rows = db
+            .get_audit_event_rows_by_tool_name(STALE_NO_PR_TOOL)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_key, format!("worktree:{STALE_WT}"));
+        assert_eq!(rows[0].after_value.as_deref(), Some("84"));
+        let reasoning = rows[0].reasoning.as_deref().unwrap_or_default();
+        assert!(reasoning.contains("branch=incident/1696/x"), "{reasoning}");
+        assert!(reasoning.contains("issue=1696"), "{reasoning}");
+        assert!(reasoning.contains("probe=no_pr"), "{reasoning}");
+
+        // Et le marqueur de coût porte l'issue de la sonde, pour que
+        // `GROUP BY after_value` rende la distribution.
+        let probed = db
+            .get_audit_event_rows_by_tool_name(STALE_PROBED_TOOL)
+            .await
+            .unwrap();
+        assert_eq!(probed.len(), 1);
+        assert_eq!(probed[0].after_value.as_deref(), Some(STALE_PROBE_NO_PR));
+    }
+
+    /// Une sonde **résolutive** écrit le marqueur de coût et **aucun** signal :
+    /// sans cela, le worktree serait re-sondé toutes les dix minutes tant qu'il
+    /// reste `pr_unknown` pour l'index de masse.
+    #[tokio::test]
+    async fn mika2482_une_sonde_resolutive_marque_le_cout_sans_signaler() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let t = stale_target();
+        record_stale_probed(&db, "s", &t, STALE_PROBE_RESOLVED, "trace").await;
+
+        assert!(
+            stale_probe_recently_done(&db, &t.worktree_path, now(), "trace").await,
+            "le marqueur de coût borne la sonde quelle que soit son issue"
+        );
+        assert!(
+            db.get_audit_event_rows_by_tool_name(STALE_NO_PR_TOOL)
+                .await
+                .unwrap()
+                .is_empty(),
+            "une PR trouvée n'est pas une absence de PR"
+        );
+    }
+
+    /// Une sonde **illisible** écrit le marqueur de coût et **aucun** signal
+    /// (AC5) : on ne sait pas si ce worktree appartient à la file, et un
+    /// `worktree_stale_no_pr` affirmerait dans son nom ce qu'on ignore.
+    #[tokio::test]
+    async fn mika2482_une_sonde_illisible_ne_signale_rien() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let t = stale_target();
+        record_stale_probed(&db, "s", &t, STALE_PROBE_UNREADABLE, "trace").await;
+
+        assert!(
+            db.get_audit_event_rows_by_tool_name(STALE_NO_PR_TOOL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let probed = db
+            .get_audit_event_rows_by_tool_name(STALE_PROBED_TOOL)
+            .await
+            .unwrap();
+        assert_eq!(probed[0].after_value.as_deref(), Some("unreadable"));
+    }
+
+    // -- V8 : les illisibles conservent et ne signalent pas ------------------
+
+    /// **V8 / AC5** — une date de branche illisible sort le worktree de la
+    /// population : ni sonde, ni signal, sous son propre motif.
+    ///
+    /// Quatre formes, parce que chacune vient d'un endroit différent :
+    /// `git` en échec (`None`), une sortie vide, une chaîne non datée, et une
+    /// date dans le futur (dérive d'horloge — ramenée à `Recent`, la direction
+    /// sûre).
+    #[test]
+    fn mika2482_v8_une_date_illisible_ne_sonde_ni_ne_signale() {
+        let refusals = [ReapRefusal {
+            path: STALE_WT.to_string(),
+            branch: Some("incident/1696/x".to_string()),
+            reason: REASON_PR_UNKNOWN,
+        }];
+
+        for raw in [None, Some(""), Some("   "), Some("pas-une-date")] {
+            let s =
+                screen_stale_probe_targets(&refusals, &dates(STALE_WT, raw), now(), &stale_cfg());
+            assert!(s.targets.is_empty(), "date {raw:?} : aucune sonde");
+            assert_eq!(
+                s.date_unreadable,
+                vec![STALE_WT.to_string()],
+                "date {raw:?} : la ligne doit être nommée"
+            );
+        }
+
+        // Une entrée **absente** de la table vaut illisible : le `git` n'a pas
+        // répondu du tout.
+        let s = screen_stale_probe_targets(&refusals, &HashMap::new(), now(), &stale_cfg());
+        assert!(s.targets.is_empty());
+        assert_eq!(s.date_unreadable, vec![STALE_WT.to_string()]);
+
+        // Futur : âge ramené à 0, donc récent — ni sonde, ni ligne.
+        let future = (now() + chrono::TimeDelta::days(30)).to_rfc3339();
+        let s = screen_stale_probe_targets(
+            &refusals,
+            &dates(STALE_WT, Some(&future)),
+            now(),
+            &stale_cfg(),
+        );
+        assert!(s.targets.is_empty());
+        assert!(s.date_unreadable.is_empty());
+    }
+
+    /// La garde d'entrée : sans `pr_unknown` dans la sélection, ou sans budget,
+    /// la seconde passe ne touche à rien et ne coûte rien.
+    #[tokio::test]
+    async fn mika2482_sans_pr_unknown_ou_sans_budget_la_seconde_passe_est_un_no_op() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let entry = attached(STALE_WT, "feat/2482/x");
+
+        // Aucun `pr_unknown` : un refus `pr_open` seul.
+        let screened = ReapSelection {
+            candidates: vec![],
+            refusals: vec![ReapRefusal {
+                path: STALE_WT.to_string(),
+                branch: Some("feat/2482/x".to_string()),
+                reason: REASON_PR_OPEN,
+            }],
+        };
+        let mut budget = 3usize;
+        let out = resolve_stale_pr_unknown(
+            &db,
+            "s",
+            "trace",
+            "senara-solutions/mika",
+            "tok",
+            std::slice::from_ref(&entry),
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+            &stale_cfg(),
+            screened.clone(),
+            &mut budget,
+        )
+        .await;
+        assert_eq!(out, screened, "la sélection doit être rendue intacte");
+        assert_eq!(budget, 3, "aucun appel gh");
+
+        // Budget nul : même sur un `pr_unknown`, rien ne part.
+        let with_unknown = ReapSelection {
+            candidates: vec![],
+            refusals: vec![ReapRefusal {
+                path: STALE_WT.to_string(),
+                branch: Some("feat/2482/x".to_string()),
+                reason: REASON_PR_UNKNOWN,
+            }],
+        };
+        let mut budget = 0usize;
+        let out = resolve_stale_pr_unknown(
+            &db,
+            "s",
+            "trace",
+            "senara-solutions/mika",
+            "tok",
+            std::slice::from_ref(&entry),
+            &no_processes(),
+            now(),
+            &ReapConfig::default(),
+            &stale_cfg(),
+            with_unknown.clone(),
+            &mut budget,
+        )
+        .await;
+        assert_eq!(out, with_unknown);
+        assert!(
+            db.get_audit_event_rows_by_tool_name(STALE_PROBED_TOOL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // -- La datation, sur un vrai dépôt : la chaîne rencontre le parseur -----
+
+    fn git_at(dir: &Path, args: &[&str], when: Option<&str>) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(w) = when {
+            cmd.env("GIT_COMMITTER_DATE", w).env("GIT_AUTHOR_DATE", w);
+        }
+        assert!(cmd.status().unwrap().success(), "git {args:?}");
+    }
+
+    /// **La seule moitié de la datation qu'un test pur ne couvre pas** : ce que
+    /// `git log -1 --format=%cI` rend réellement, et le fait que
+    /// [`crate::timestamp::parse`] l'accepte.
+    ///
+    /// Sans ce test, `classify_branch_staleness` pourrait être parfaite et la
+    /// datation entièrement inerte — chaque worktree tomberait sur
+    /// `DateUnreadable`, la sonde ne tournerait jamais, et le silence se lirait
+    /// comme une file vide (classe mika#2205).
+    #[tokio::test]
+    async fn mika2482_la_date_de_git_est_lue_et_parsee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("mika");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_at(&repo, &["init", "-q", "-b", "main"], None);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git_at(&repo, &["add", "-A"], None);
+        git_at(&repo, &["commit", "-q", "-m", "seed"], None);
+
+        // Commit du jour → récent.
+        let raw = read_branch_commit_date(&repo).await;
+        assert!(raw.is_some(), "`git log --format=%cI` doit répondre");
+        assert!(
+            matches!(
+                classify_branch_staleness(raw.as_deref(), Utc::now(), STALE_DAYS_DEFAULT),
+                StaleVerdict::Recent { .. }
+            ),
+            "un commit du jour est récent, pas illisible : {raw:?}"
+        );
+
+        // Le même dépôt, ré-écrit avec une date de committer ancienne → stale.
+        let old = "2026-06-30T12:00:00+02:00";
+        std::fs::write(repo.join("a.txt"), "b\n").unwrap();
+        git_at(&repo, &["add", "-A"], None);
+        git_at(&repo, &["commit", "-q", "-m", "vieux"], Some(old));
+        let raw = read_branch_commit_date(&repo).await;
+        match classify_branch_staleness(
+            raw.as_deref(),
+            crate::timestamp::parse("2026-09-22T12:00:00Z").unwrap(),
+            STALE_DAYS_DEFAULT,
+        ) {
+            StaleVerdict::Stale { idle_days } => assert_eq!(
+                idle_days, 84,
+                "l'âge mesuré doit être celui d'`incident/1696` au 22/09 : {raw:?}"
+            ),
+            other => panic!("attendu Stale, obtenu {other:?} sur {raw:?}"),
+        }
+
+        // Et un répertoire sans dépôt rend `None` → illisible, jamais récent.
+        let bare = tmp.path().join("pas-un-depot");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(read_branch_commit_date(&bare).await.is_none());
+    }
+
+    // -- V9 : les deux clés d'environnement ----------------------------------
+
+    /// **V9 / AC8** — trois paliers maison, et `0` **ne désarme pas**.
+    #[test]
+    fn mika2482_v9_les_deux_cles_suivent_les_trois_paliers() {
+        // Jours.
+        assert_eq!(
+            parse_positive_i64(None, STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            STALE_DAYS_DEFAULT
+        );
+        assert_eq!(
+            parse_positive_i64(Some(""), STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            STALE_DAYS_DEFAULT
+        );
+        assert_eq!(
+            parse_positive_i64(Some("0"), STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            STALE_DAYS_DEFAULT,
+            "`0` ne désarme pas : une coquille ne doit pas rendre tout stale"
+        );
+        assert_eq!(
+            parse_positive_i64(Some("-3"), STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            STALE_DAYS_DEFAULT
+        );
+        assert_eq!(
+            parse_positive_i64(Some("plif"), STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            STALE_DAYS_DEFAULT
+        );
+        assert_eq!(
+            parse_positive_i64(Some("30"), STALE_DAYS_DEFAULT, STALE_DAYS_ENV),
+            30
+        );
+
+        // Cap par tick.
+        for raw in [None, Some(""), Some("0"), Some("-1"), Some("plif")] {
+            assert_eq!(
+                parse_positive_usize(
+                    raw,
+                    STALE_PROBE_MAX_PER_TICK_DEFAULT,
+                    STALE_PROBE_MAX_PER_TICK_ENV
+                ),
+                STALE_PROBE_MAX_PER_TICK_DEFAULT,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            parse_positive_usize(
+                Some("9"),
+                STALE_PROBE_MAX_PER_TICK_DEFAULT,
+                STALE_PROBE_MAX_PER_TICK_ENV
+            ),
+            9
+        );
+
+        // Les défauts que le plan justifie par mesure.
+        let d = StaleProbeConfig::default();
+        assert_eq!(d.stale_days, 7);
+        assert_eq!(d.max_per_tick, 3);
+    }
+
+    // -- V10 : les formats de fil, et le numéro d'issue ----------------------
+
+    /// **V10 / AC6** — `ALL_REFUSAL_REASONS` est **inchangé** : aucun motif
+    /// ajouté, renommé ni retiré, donc les `GROUP BY` publiés restent exacts de
+    /// part et d'autre du déploiement.
+    ///
+    /// Un `REASON_PR_UNKNOWN_STALE` aurait scindé la population en deux noms et
+    /// cassé ces requêtes en silence — la scission datée de mika#2361, refusée
+    /// ici.
+    #[test]
+    fn mika2482_v10_aucun_motif_de_refus_nest_ajoute() {
+        assert_eq!(
+            ALL_REFUSAL_REASONS.len(),
+            12,
+            "mika#2482 n'ajoute aucun motif de refus (AC6) : le signal est un \
+             événement distinct à côté du refus"
+        );
+        for forbidden in [
+            "pr_unknown_stale",
+            "stale_no_pr",
+            "branch_probe",
+            "worktree_stale_no_pr",
+        ] {
+            assert!(
+                !ALL_REFUSAL_REASONS.contains(&forbidden),
+                "`{forbidden}` ne doit pas être un motif de refus"
+            );
+        }
+    }
+
+    /// **V10 / AC7** — `ALL_RESOLUTIONS` gagne `branch_probe` et rien d'autre ;
+    /// les deux valeurs existantes sont intactes.
+    #[test]
+    fn mika2482_v10_les_resolutions_gagnent_branch_probe_et_rien_dautre() {
+        assert_eq!(
+            ALL_RESOLUTIONS,
+            &["branch", "detached_sha", "branch_probe"],
+            "renommer une clé de résolution est une rupture de format de fil : \
+             la dater dans CLAUDE.md, jamais mettre ce test à jour en silence"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for r in ALL_RESOLUTIONS {
+            assert!(seen.insert(*r), "résolution dupliquée: {r}");
+        }
+        // La clé de résolution ne doit partager aucune chaîne avec le vocabulaire
+        // des motifs de refus (§ mika#2518 2.3, appliqué à la nouvelle valeur).
+        assert!(!ALL_REFUSAL_REASONS.contains(&RESOLUTION_BRANCH_PROBE));
+        // `branch_probe` supprime la branche locale, `detached_sha` non : le
+        // critère est *le worktree a-t-il checked out cette branche*.
+        assert!(should_delete_local_branch(RESOLUTION_BRANCH));
+        assert!(should_delete_local_branch(RESOLUTION_BRANCH_PROBE));
+        assert!(!should_delete_local_branch(RESOLUTION_DETACHED_SHA));
+    }
+
+    /// **Format de fil** — les trois issues de sonde atterrissent dans
+    /// `audit_events.after_value` et l'opérateur en fait des `GROUP BY`.
+    #[test]
+    fn mika2482_les_issues_de_sonde_sont_un_format_de_fil() {
+        assert_eq!(
+            ALL_STALE_PROBE_OUTCOMES,
+            &["no_pr", "resolved", "unreadable"],
+            "renommer une issue de sonde est une rupture de format de fil"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for o in ALL_STALE_PROBE_OUTCOMES {
+            assert!(seen.insert(*o), "issue dupliquée: {o}");
+        }
+        // Le signal ne partage pas son nom avec le marqueur de coût : deux
+        // populations, deux rôles, comptables séparément.
+        assert_ne!(STALE_NO_PR_TOOL, STALE_PROBED_TOOL);
+        assert_ne!(STALE_NO_PR_TOOL, SKIPPED_TOOL);
+        assert_ne!(STALE_NO_PR_TOOL, REAPED_TOOL);
+    }
+
+    /// Le numéro d'issue est le **deuxième segment**, et rien d'autre — **jamais
+    /// inventé** (B3.2).
+    #[test]
+    fn mika2482_le_numero_dissue_nest_jamais_invente() {
+        // Les formes mesurées le 22/09.
+        assert_eq!(issue_number_from_branch("incident/1696"), Some(1696));
+        assert_eq!(issue_number_from_branch("fix/1719/slug"), Some(1719));
+        assert_eq!(issue_number_from_branch("chore/1964/x"), Some(1964));
+        assert_eq!(issue_number_from_branch("investigation/2051"), Some(2051));
+        assert_eq!(issue_number_from_branch("test/2266/y"), Some(2266));
+        assert_eq!(issue_number_from_branch("bug/2260"), Some(2260));
+        assert_eq!(
+            issue_number_from_branch("feat/2482/worktree-reaper-pr-unknown-confond"),
+            Some(2482)
+        );
+
+        // Et tout ce qui n'est pas conforme rend `None`.
+        for branch in [
+            "main",
+            "",
+            "feat",
+            "feat/",
+            "feat/slug",
+            "feat/slug/2482",
+            "feat/24a82/x",
+            "feat/ 2482/x",
+            "feat/-1/x",
+            "/2482/x",
+        ] {
+            assert_eq!(
+                issue_number_from_branch(branch),
+                None,
+                "`{branch}` ne porte pas de numéro d'issue lisible"
+            );
+        }
+    }
+
+    // -- Le scan SOLE WRITER ------------------------------------------------
+
+    /// Allowlist de la garde SOLE WRITER — **livrée vide, et elle le reste**.
+    const STALE_WRITER_ALLOWED: &[&str] = &[];
+
+    /// Quand la garde tire, on retire le second écrivain — on ne l'allowliste pas
+    /// (doctrine mika#2201).
+    #[test]
+    fn mika2482_lallowlist_de_la_garde_stale_est_vide() {
+        assert!(
+            STALE_WRITER_ALLOWED.is_empty(),
+            "mika#2201 — la résolution est de retirer le second écrivain"
+        );
+    }
+
+    /// **B3.1** — `worktree_stale_no_pr` (et son marqueur de coût) ont **un seul
+    /// écrivain** dans le crate.
+    ///
+    /// Un test comportemental ne peut pas voir cette classe : un second writer ne
+    /// rendrait aucune décision fausse, il rendrait
+    /// `SELECT … WHERE tool_name = 'worktree_stale_no_pr'` — la liste de la file
+    /// vieille — inexacte, en silence.
+    ///
+    /// La garde porte son **assertion auto-nettoyante** : elle échoue si le nom
+    /// n'est écrit **nulle part** dans ce module, parce qu'un scan visant un nom
+    /// mort vérifie zéro chose et se lit exactement comme un scan propre (classe
+    /// mika#2205).
+    #[test]
+    fn mika2482_le_tool_name_stale_a_un_seul_writer() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = src_root.join("worktree_reaper.rs");
+        // Écrites en deux morceaux pour que la garde ne se dénonce pas elle-même.
+        let needles = [
+            format!("worktree_stale{}", "_no_pr"),
+            format!("worktree_stale{}", "_probed"),
+        ];
+
+        let here = include_str!("worktree_reaper.rs");
+        for needle in &needles {
+            assert!(
+                here.contains(needle.as_str()),
+                "`{needle}` n'est écrit nulle part dans ce module — un scan visant \
+                 un nom mort ne vérifie rien"
+            );
+        }
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![src_root.clone()];
+        let mut scanned = 0usize;
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("lecture de src/").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || path == this_module
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&src_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if STALE_WRITER_ALLOWED.contains(&rel.as_str()) {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).expect("lecture de fichier source");
+                scanned += 1;
+                for needle in &needles {
+                    if content.contains(needle.as_str()) {
+                        offenders.push(format!("{} — `{needle}`", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(scanned > 0, "la garde n'a scanné aucun fichier");
+        assert!(
+            offenders.is_empty(),
+            "mika#2482 — `worktree_stale_no_pr` et `worktree_stale_probed` sont \
+             SOLE WRITER de `worktree_reaper.rs`. Un second writer rendrait la \
+             requête opérateur inexacte sans rien casser.\n{}",
+            offenders.join("\n")
+        );
     }
 }
