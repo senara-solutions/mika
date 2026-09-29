@@ -2155,6 +2155,145 @@ _assert_removable_worktree_path() {
     return 0
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# _is_scaffold_path — ce chemin est-il de l'échafaudage possédé par dispatch-lib ?
+#
+# mika#2144. SITE UNIQUE des quatre motifs. mika#2157 (R3) écrivait déjà, dans ce
+# fichier, que les deux autorités existantes « peuvent diverger ; quand vous
+# ajoutez un chemin ici, ajoutez-le au classificateur aussi ». En ajouter une
+# TROISIÈME orthographe sans lecteur unique serait cette dette écrite une fois de
+# plus, par un ticket dont le sujet est précisément le coût d'un correctif qu'il
+# faut refaire.
+#
+# La liste est celle du Tier 2 de `_clean_worktree_for_rebase` — les quatre
+# chemins qu'il remet à HEAD — et PAS la formulation large du ticket mika#2144,
+# qui écrit « `.claude/` ». Le Tier 2 ne possède pas `.claude/` en entier :
+# `.claude/settings.json` et `.claude/claude-pilot.json` sont TRACKÉS, du contenu
+# réel du dépôt. Les classer « échafaudage » ferait qu'une modification de la
+# configuration du dépôt cesserait d'être stashée — une perte silencieuse
+# introduite par un ticket qui prétend protéger le filet (mika#2144 R5).
+#
+# Un motif en `<dir>/*` couvre les deux formes que ses deux lecteurs produisent :
+# `git diff --name-only` ne rend jamais qu'un fichier (`docs/plans/x.md`), tandis
+# que `git status --porcelain` condense un répertoire entièrement untracked en
+# `docs/plans/` — et `*` matche la chaîne vide dans un `case`. Un `.claude/`
+# entièrement untracked, lui, remonte comme `.claude/` et ne matche AUCUN motif :
+# il est donc classé travail et stashé, ce qui est la réponse voulue par R5.
+#
+# Args: $1 — un chemin relatif à la racine du dépôt.
+# Rend : 0 si échafaudage, en posant `_SCAFFOLD_PATH_CLASS` (la classe, pour la
+#          ligne d'observabilité de l'appelant) ; 1 sinon, classe vidée.
+_is_scaffold_path() {
+    case "${1-}" in
+        .claude/groom-verdict-trail.log) _SCAFFOLD_PATH_CLASS=trail;    return 0 ;;
+        .claude/commands/*)              _SCAFFOLD_PATH_CLASS=commands; return 0 ;;
+        .iterate/*)                      _SCAFFOLD_PATH_CLASS=iterate;  return 0 ;;
+        docs/plans/*)                    _SCAFFOLD_PATH_CLASS=plans;    return 0 ;;
+    esac
+    _SCAFFOLD_PATH_CLASS=""
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _residue_is_scaffold_only — le résidu sale est-il ENTIÈREMENT de l'échafaudage ?
+#
+# mika#2144. Le Tier 3 de `_clean_worktree_for_rebase` se décrit comme un filet
+# pour du résidu « genuinely-unexpected ». Mesuré le 2026-09-02 : 136 des 152
+# stashes lisibles du dépôt ne touchaient QUE de l'échafaudage, soit 8,5 stashes
+# de bruit pour 1 stash à examiner. Un message de récupération émis 136 fois pour
+# rien apprend à tout le monde à l'ignorer et enterre les 16 vrais.
+#
+# Le trou est étroit et il est entièrement dans les UNTRACKED : le Tier 2 remet
+# ses quatre chemins à HEAD, et `git checkout HEAD -- docs/plans/` restaure les
+# entrées CONNUES de l'arbre sans jamais supprimer un untracked (comportement
+# git). Donc un pilote de groom qui écrit son plan et meurt avant de committer
+# (signature mika#2141) laisse un `?? docs/plans/…-plan.md` que le Tier 2 ne peut
+# pas mordre. Les 11 stashes du seul 2026-09-01 sont de cette forme.
+#
+# Ce prédicat DÉCIDE, il ne nettoie pas : `reset --hard` + `clean -fd` tournent
+# déjà dans les deux cas, donc le nettoyage est inchangé et seule l'émission du
+# stash bouge. C'est la lettre d'AC1 et la conception la plus petite.
+#
+# `core.quotePath=false` + `-z` est PORTEUR, pas de l'hygiène, et la raison est
+# déjà écrite sur `_rescue_diff_carries_work` : sous le défaut de git, tout chemin
+# portant un octet non-ASCII revient entre guillemets avec des échappements
+# octaux — `"docs/plans/\303\251tude-plan.md"` — qui ne matche aucun motif et
+# serait classé « travail ». Ce dépôt écrit ses plans en français tous les jours :
+# c'est précisément la population visée. (Substitution de PROCESSUS et jamais
+# `$(...)` : bash supprime les octets NUL dans une substitution de commande, ce
+# qui recollerait tous les chemins en un seul blob non matché.)
+#
+# Deux détails du format `--porcelain` qu'un classificateur naïf rate :
+#   * chaque enregistrement commence par DEUX caractères de statut plus une
+#     espace (`?? `, ` M `, `A  `) : le chemin est à l'OFFSET 3. Sans ce retrait,
+#     aucun motif ne matche jamais et la fonction est inerte tout en ayant l'air
+#     correcte — c'est la halte 1 de la sonde S1 ;
+#   * un renommage (`R`) émet en `-z` DEUX enregistrements NUL-séparés,
+#     destination puis origine, et l'origine n'a PAS de préfixe de statut. Les
+#     deux doivent être classés, et le résidu n'est « entièrement échafaudage »
+#     que si les deux le sont : un renommage qui sort un fichier de `docs/plans/`
+#     vers un chemin de code doit stasher.
+#
+# FAIL-CLOSED VERS LE STASH. Statut illisible, `$wt` vide ou non-worktree, zéro
+# chemin lu alors que l'appelant a mesuré un arbre sale, enregistrement trop
+# court pour porter un chemin : on stashe. L'asymétrie est celle d'AC2 — un stash
+# de trop coûte une ligne de bruit dans une pile ; un stash manquant coûte le
+# travail d'un pilote mort, IRRÉVERSIBLEMENT, puisque le `clean -fd` qui suit
+# supprime le résidu de toute façon. Cette polarité est l'INVERSE de celle du
+# voisin `_rescue_touches_tracked_tree` (fail-open) et la MÊME que celle de
+# `_rescue_diff_carries_work` (fail-closed) ; chaque prédicat énonce sa raison à
+# son propre site, faute de quoi un relecteur « harmonise » celui qu'il déplace.
+#
+# Args: $1 — worktree dir.
+# Rend : 0 quand tout le résidu est de l'échafaudage, en posant
+#          `RESIDUE_SCAFFOLD_PATH_COUNT` et `RESIDUE_SCAFFOLD_CLASSES` pour la
+#          ligne d'observabilité de l'appelant ; 1 dans TOUS les autres cas.
+_residue_is_scaffold_only() {
+    local wt="${1-}" rec path xy classes="" count=0 expect_origin=0
+    RESIDUE_SCAFFOLD_PATH_COUNT=0
+    RESIDUE_SCAFFOLD_CLASSES=""
+
+    # Même garde, même raison, que `_clean_worktree_for_rebase` : `git -C ""`
+    # opère silencieusement sur le CWD du processus de dispatch — un checkout
+    # vivant — donc un `$wt` vide mesurerait le MAUVAIS arbre. Ici l'erreur
+    # coûteuse est de ne pas stasher : fail closed.
+    if [ -z "$wt" ] || ! git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 1
+    fi
+
+    while IFS= read -r -d '' rec; do
+        [ -n "$rec" ] || continue
+        if [ "$expect_origin" = "1" ]; then
+            # L'origine d'un renommage/copie : l'enregistrement est le chemin nu.
+            path="$rec"
+            expect_origin=0
+        else
+            # `XY ` puis le chemin. Un enregistrement plus court que 4 octets ne
+            # peut pas porter de chemin : on ne sait pas classer → fail closed.
+            [ "${#rec}" -ge 4 ] || return 1
+            xy="${rec:0:2}"
+            path="${rec:3}"
+            case "$xy" in *R*|*C*) expect_origin=1 ;; esac
+        fi
+        [ -n "$path" ] || return 1
+        _is_scaffold_path "$path" || return 1
+        count=$((count + 1))
+        case ",${classes}," in
+            *",${_SCAFFOLD_PATH_CLASS},"*) ;;
+            *) classes="${classes:+${classes},}${_SCAFFOLD_PATH_CLASS}" ;;
+        esac
+    done < <(git -C "$wt" -c core.quotePath=false status --porcelain -z 2>/dev/null)
+
+    # Zéro chemin lu alors que l'appelant vient de mesurer un arbre sale : le
+    # statut n'a pas pu être relu (dépôt cassé, git en échec). Un `return 0` ici
+    # serait un fail-OPEN sur une mesure absente — la direction qu'AC2 interdit.
+    [ "$count" -gt 0 ] || return 1
+
+    RESIDUE_SCAFFOLD_PATH_COUNT="$count"
+    RESIDUE_SCAFFOLD_CLASSES="$classes"
+    return 0
+}
+
 # mika#1414: Pre-rebase worktree cleanup for the resume path.
 #
 # On a resume dispatch _set_up_worktree() reuses an existing worktree, then
@@ -2216,8 +2355,15 @@ _clean_worktree_for_rebase() {
     # the other being the rescue commit's `git add -A` scaffold exclusions. They
     # are NOT merged: this one resets, that one classifies, and a shared
     # abstraction over two different semantics would cost more than a handful of
-    # duplicated patterns. They can drift; when you add a path here, add it to
-    # the classifier too (and give it a symmetric test).
+    # duplicated patterns.
+    #
+    # mika#2144: "they can drift" is now half-closed. The CLASSIFICATION of these
+    # four paths has a single site, `_is_scaffold_path`, consulted by the Tier 3
+    # below and by `_rescue_diff_carries_work`; a source scan refuses a second
+    # declaration. These four reset COMMANDS stay a separate expression on
+    # purpose — they restore to HEAD rather than classify, and folding them into
+    # the classifier would change their semantics. So when you add a path here,
+    # add it to `_is_scaffold_path` too (and give it a symmetric test).
     git -C "$wt" checkout -- .claude/groom-verdict-trail.log 2>/dev/null || true
     # mika#1943: `$wt` a déjà prouvé qu'il est un dépôt git (garde en tête de
     # fonction), jamais qu'il est un worktree GÉRÉ — et c'est la seconde moitié
@@ -2231,23 +2377,51 @@ _clean_worktree_for_rebase() {
 
     # Tier 3: blanket fallback for genuinely-unexpected residue.
     if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
-        local stash_msg
-        stash_msg="dispatch-lib-resume-cleanup-${LOG_ID:-unknown}-$(date -u +%Y%m%dT%H%M%SZ)"
-        if git -C "$wt" stash push --include-untracked -m "$stash_msg" >/dev/null 2>&1; then
-            # Capture the IMMUTABLE stash commit SHA — stash@{0} shifts as other
-            # worktrees push/pop on the shared stash stack. Use `--verify --quiet`:
-            # plain `rev-parse 'stash@{0}'` on a missing ref exits non-zero but
-            # echoes the literal string "stash@{0}" to stdout, which `|| true`
-            # would capture as a bogus handle when `stash push` reported success
-            # yet created no entry (e.g. nothing actually stashable). --verify
-            # --quiet prints nothing and exits non-zero in that case → empty.
-            RESUME_CLEANUP_STASH=$(git -C "$wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
-            echo "dispatch-lib: resume-cleanup stashed dirty worktree before rebase → stash ${RESUME_CLEANUP_STASH:-<unknown>} (msg: ${stash_msg}); recover with: git -C ${wt} stash apply ${RESUME_CLEANUP_STASH:-<sha>}" >&2
+        # mika#2144: le Tier 3 DÉCIDE désormais avant de stasher. Le résidu qui
+        # survit aux resets du Tier 2 est « genuinely-unexpected » sur le papier ;
+        # mesuré, il est neuf fois sur dix exactement l'échafaudage que le Tier 2
+        # vient de traiter, mais en version UNTRACKED — que `checkout HEAD --`
+        # ne peut structurellement pas supprimer. Le nettoyage ci-dessous est
+        # inchangé dans les deux branches : seule l'émission du stash bouge.
+        if _residue_is_scaffold_only "$wt"; then
+            # L'abstention est DITE, sinon ce correctif serait exactement ce que
+            # mika#2144 reproche à celui de juillet : une purge sans compteur, à
+            # refaire. Régime attendu : non vide et faible — chaque ligne est un
+            # stash de bruit qui n'a pas été créé. Un flot soutenu sur
+            # `classes=plans` dit que mika#2141 produit encore des plans non
+            # committés : c'est un RÉSULTAT, pas une panne de ce correctif.
+            #
+            # Nomme les CLASSES, jamais les chemins complets : un chemin de plan
+            # porte le numéro du ticket et son slug, et ce n'est pas au journal de
+            # les recopier. Puits : le `.stderr` par dispatch, le même que la
+            # ligne de récupération ci-dessous, avec la limite héritée que la voie
+            # `revise` redirige vers un `mktemp` qu'elle supprime (Signal S).
+            echo "dispatch-lib: resume_cleanup_scaffold_only paths=${RESIDUE_SCAFFOLD_PATH_COUNT} classes=${RESIDUE_SCAFFOLD_CLASSES} (mika#2144)" >&2
         else
-            echo "dispatch-lib: resume-cleanup found nothing to stash or stash errored; proceeding with hard reset" >&2
+            local stash_msg
+            stash_msg="dispatch-lib-resume-cleanup-${LOG_ID:-unknown}-$(date -u +%Y%m%dT%H%M%SZ)"
+            if git -C "$wt" stash push --include-untracked -m "$stash_msg" >/dev/null 2>&1; then
+                # Capture the IMMUTABLE stash commit SHA — stash@{0} shifts as other
+                # worktrees push/pop on the shared stash stack. Use `--verify --quiet`:
+                # plain `rev-parse 'stash@{0}'` on a missing ref exits non-zero but
+                # echoes the literal string "stash@{0}" to stdout, which `|| true`
+                # would capture as a bogus handle when `stash push` reported success
+                # yet created no entry (e.g. nothing actually stashable). --verify
+                # --quiet prints nothing and exits non-zero in that case → empty.
+                RESUME_CLEANUP_STASH=$(git -C "$wt" rev-parse --verify --quiet 'stash@{0}' 2>/dev/null || true)
+                echo "dispatch-lib: resume-cleanup stashed dirty worktree before rebase → stash ${RESUME_CLEANUP_STASH:-<unknown>} (msg: ${stash_msg}); recover with: git -C ${wt} stash apply ${RESUME_CLEANUP_STASH:-<sha>}" >&2
+            else
+                echo "dispatch-lib: resume-cleanup found nothing to stash or stash errored; proceeding with hard reset" >&2
+            fi
         fi
         # Belt-and-suspenders: ensure a clean tree even if the stash captured
         # nothing (e.g. unmerged paths). No -x, so gitignored config survives.
+        # mika#2144: hors du `if` ci-dessus, donc INCHANGÉ dans les deux branches —
+        # c'est ce qui fait que ce ticket ne déplace que la décision de stasher, et
+        # ce qui rend le résidu d'échafaudage définitivement perdu là où il était
+        # stashé. Le prix est nommé : cette récupérabilité était fictive (une pile
+        # de 163 entrées que personne ne lit, effacée en bloc sans qu'on s'en
+        # aperçoive), et on l'échange contre un signal lisible.
         git -C "$wt" reset --hard HEAD >/dev/null 2>&1 || true
         git -C "$wt" clean -fd >/dev/null 2>&1 || true
     fi
@@ -7838,8 +8012,16 @@ _derive_recovery_pr_title() {
 #     `.claude/claude-pilot.json`, `.claude/settings.local.json`,
 #     `.claude/*.local.*`), whose NOTE line already calls them "scaffold paths".
 # A path the rebase overwrites, or that the rescue refuses to stage, cannot be a
-# deliverable. Keep all three sites in step — they express one notion in three
-# spellings and can drift (mika#2157 R3).
+# deliverable.
+#
+# mika#2144 closed the drift mika#2157 R3 could only warn about: the FOUR patterns
+# shared with the Tier 2 now live at one site, `_is_scaffold_path`, which this
+# function and the Tier 3 classifier both consume. What remains local below is the
+# pair that comes from the SECOND authority only (`.claude/claude-pilot.json`,
+# `.claude/*.local.*`) — deliberately not promoted, see its own note. So two
+# spellings of the notion survive, not three: this classifier and the Tier 2's
+# four reset COMMANDS, which are irreducible (they do not classify, they restore
+# to HEAD). A source scan in test-dispatch-lib.sh holds the single site.
 #
 # The list is deliberately CLOSED and SHORT: any path not listed counts as work.
 # Every path added here takes weight away from the net in its useful case, so an
@@ -7887,15 +8069,18 @@ _rescue_diff_carries_work() {
 
     while IFS= read -r -d '' f; do
         [ -n "$f" ] || continue
+        # mika#2144: les deux motifs qui ne viennent PAS du Tier 2 restent locaux,
+        # avec leur provenance. Ils sortent de la SECONDE autorité de cette
+        # fonction — les exclusions `git add -A` du commit de rescue — et les
+        # fondre dans `_is_scaffold_path` élargirait la liste que le Tier 3
+        # consulte à des chemins que le Tier 2 ne remet PAS à HEAD : on cesserait
+        # de stasher du contenu sans l'avoir jamais restauré (mika#2144 R5).
         case "$f" in
-            .claude/groom-verdict-trail.log) ;;
-            .claude/commands/*)              ;;
-            .claude/claude-pilot.json)       ;;
-            .claude/*.local.*)               ;;
-            .iterate/*)                      ;;
-            docs/plans/*)                    ;;
-            *) return 0 ;;
+            .claude/claude-pilot.json) continue ;;
+            .claude/*.local.*)         continue ;;
         esac
+        # Les quatre motifs communs au Tier 2 ont un site de déclaration unique.
+        _is_scaffold_path "$f" || return 0
     done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
     return 1
 }
