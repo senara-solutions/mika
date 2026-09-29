@@ -1009,6 +1009,14 @@ _pilot_egress_mark_up() {
 #       — POSIX environment, non-secret by definition.
 #   * ANTHROPIC_LOG_FILE, MIKA_LOG_PILOT_TRANSCRIPTS
 #       — a path and a boolean gate. No credential material.
+#   * CARGO_INCREMENTAL (mika#2105)
+#       — the literal `0`, a build flag. No credential material, and no value
+#         of it could carry any: it is exported a few hundred lines below in
+#         `_run_pilot_sandboxed` with a constant, never read from the parent
+#         env. Present so the sandboxed path recovers it through the
+#         re-injection loop despite `--clearenv`. The loop's test is
+#         `[ -n "${!var:-}" ]`, and `-n "0"` is TRUE in shell — `0` is not the
+#         empty string — so the value does reach `--setenv`.
 #   * the `net_setenv_args` producer below adds HTTPS_PROXY / HTTP_PROXY /
 #     NO_PROXY / ANTHROPIC_BASE_URL / CLAUDE_CODE_API_BASE_URL (localhost
 #     URLs), MIKA_PILOT_CONTAINED ("1"), NODE_EXTRA_CA_CERTS (a path), and
@@ -1021,6 +1029,7 @@ _pilot_egress_mark_up() {
 _PILOT_SANDBOX_ENV_ALLOWLIST=(
     HOME PATH USER LOGNAME SHELL TERM LANG LC_ALL TMPDIR HOSTNAME
     ANTHROPIC_LOG_FILE MIKA_LOG_PILOT_TRANSCRIPTS
+    CARGO_INCREMENTAL
 )
 
 # Secret passthrough allowlist (mika#2039). These NEVER travel via `--setenv`.
@@ -1379,6 +1388,38 @@ _run_pilot_sandboxed() {
     # same placement, for the same reason, as `_ensure_pilot_egress_proxy`
     # (mika#2041) and the mika#2039 sandbox-secret prologue. Before the
     # sandbox-enabled branch so a direct-exec dispatch is reported too.
+    #
+    # mika#2105: Cargo's incremental state is pure waste in a dispatch worktree,
+    # and it is the single largest item in it — 42.4 % of `target/` measured
+    # across the five live worktrees of 2026-09-09 (53 603 M of 126 356 M).
+    # Incremental state only pays for repeated rebuilds of the SAME tree over
+    # time; a dispatch worktree is built one to three times and then thrown
+    # away, so that state is produced in full and never once reused.
+    #
+    # The export is placed HERE, at the top of the wrapper, for the same reason
+    # the budget line above is: this is the one function every launch site
+    # traverses, and it sits BEFORE the sandbox branch — so the direct-exec
+    # paths below (`MIKA_PILOT_SANDBOX=0`, and bwrap absent from PATH) inherit
+    # it from this shell, while the sandboxed path recovers it through the
+    # `_PILOT_SANDBOX_ENV_ALLOWLIST` re-injection loop despite `--clearenv`.
+    # One site, both paths, no launch site able to forget it. THE ORDER IS
+    # LOAD-BEARING: moved below the branch, the two direct-exec paths would
+    # lose the setting in silence — the half-fix mika#2105 exists to exclude.
+    #
+    # Scope is the dispatch and nothing else: `dispatch-lib.sh` is sourced only
+    # by dispatch handlers, so the main checkout — where iterating on one tree
+    # makes incremental state worth its size — is untouched by construction
+    # rather than by discipline. This is why the setting is NOT a
+    # `.cargo/config.toml`, which would apply to every build of the repo.
+    #
+    # Deliberately NOT applied to the two handlers that launch claude-pilot
+    # without sourcing this file (`address-pr-comments`, `resolve-pr-conflicts`):
+    # those recompile the SAME PR worktree across review rounds, which is the
+    # one regime where incremental state pays. The argument that carries this
+    # change does not hold there. That enumeration is pinned by the mika#2105
+    # scan in test-dispatch-lib.sh, so a fifth path forces a scope decision
+    # instead of losing the gain quietly.
+    export CARGO_INCREMENTAL=0
     _emit_pilot_budget_line "$@"
     if ! _pilot_sandbox_enabled; then
         "$@"

@@ -9691,6 +9691,256 @@ T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
 assert_eq "dispatch-lib.sh passe bash -n" "0" "$T2545_RC"
 
+echo ""
+echo "Test: l'état incrémental de Cargo n'est plus produit dans un worktree jetable (mika#2105)"
+echo "-------------------------------------------------------------------------------------------"
+# Aucun test comportemental ne peut voir cette classe. Retirer l'export demain
+# ne rend AUCUNE décision fausse : le dispatch continue de dispatcher, le pilote
+# continue de compiler, et toutes les assertions existantes restent vertes —
+# seul le disque se remplit, en silence, de 42,4 % de déchet pur (53 603 M sur
+# 126 356 M mesurés le 2026-09-09 sur cinq worktrees). C'est très exactement le
+# mode d'échec que l'AC1 du ticket nomme : « un levier posé sur un seul chemin
+# perd le gain en silence sur l'autre ». D'où un scan de source.
+#
+# LES PRÉDICATS SONT PARAMÉTRÉS PAR FICHIER, et ce n'est pas du style : c'est ce
+# qui rend le comportement négatif pinnable. Un prédicat qui lirait `$DISPATCH_LIB`
+# en dur ne pourrait être exercé que sur l'arbre réel, donc jamais vu rouge — et
+# un garde qu'on n'a jamais vu rouge ne garde rien (modèle : `verify-egress-no-log`
+# et `check-byte-slices`, qui pinnent tous deux leur négatif).
+#
+# Le contrôle positif et le contrôle négatif vivent dans le MÊME appel de test
+# (`feedback_a_probe_needs_both_controls_in_the_same_call`).
+
+# La liste des handlers qui lancent `claude-pilot` SANS sourcer dispatch-lib.sh.
+# Ce n'est pas une allowlist de dérogation : c'est un périmètre décidé (option A
+# du plan), et la comparaison ci-dessous est BIDIRECTIONNELLE — un cinquième
+# chemin fait rougir, et une entrée devenue périmée aussi, sans quoi elle
+# exempterait silencieusement un futur homonyme (modèle mika#2092).
+#
+# Pourquoi ces deux-là sont hors périmètre plutôt qu'oubliés : ils recompilent
+# le MÊME worktree de PR d'un round de revue au suivant, le régime exact où
+# l'incrémental paie. L'argument qui porte mika#2105 — « le worktree est jeté,
+# donc l'état est du déchet pur » — n'y tient pas.
+MIKA2105_NON_DISPATCH_LIB_PILOT_HANDLERS=(address-pr-comments resolve-pr-conflicts)
+
+# --- Prédicats ---------------------------------------------------------------
+
+# "yes" si $2 figure dans `_PILOT_SANDBOX_ENV_ALLOWLIST` de $1.
+_mika2105_allowlist_has() {
+    local names
+    names=$(awk '
+        /^_PILOT_SANDBOX_ENV_ALLOWLIST=\(/ { inside = 1; next }
+        inside && /^\)/                    { inside = 0; exit }
+        inside                             { print }
+    ' "$1" | tr -s ' \t' '\n' || true)
+    # Here-string, jamais `printf | grep -q` : `grep -q` ferme le tuyau au
+    # premier match et le producteur prend SIGPIPE, que `pipefail` promeut en
+    # échec de pipeline (mika#2055, gardé par verify-no-sigpipe-grep).
+    if grep -qx -- "$2" <<<"$names"; then printf 'yes'; else printf 'no'; fi
+}
+
+# La valeur exportée pour CARGO_INCREMENTAL dans $1, ou vide si l'export
+# n'existe pas. Les lignes de commentaire sont retirées d'abord — ce fichier
+# explique ses propres réglages en prose, et la prose ne doit pas satisfaire un
+# garde (même raison que le `CODE_ONLY` de verify-no-secret-in-setenv.sh).
+_mika2105_export_value() {
+    local hits
+    hits=$(grep -vE '^[[:space:]]*#' "$1" \
+        | sed -nE 's/^[[:space:]]*export[[:space:]]+CARGO_INCREMENTAL=([^[:space:];]+).*$/\1/p' \
+        || true)
+    # Première ligne sans `head -1` : un `head` fermerait le tuyau sous pipefail.
+    printf '%s' "${hits%%$'\n'*}"
+}
+
+# L'ORDRE, et c'est lui qui garde réellement l'AC1. « L'export existe » ne dit
+# rien : placé sous la branche `_pilot_sandbox_enabled`, il ne serait atteint
+# que par le chemin sandboxé et les deux sorties directes (`MIKA_PILOT_SANDBOX=0`,
+# bwrap absent du PATH) perdraient le réglage — le demi-correctif que l'AC1
+# exclut nommément, et qui passerait toutes les autres assertions de ce bloc.
+_mika2105_export_precedes_branch() {
+    local raw body exp_pos branch_pos
+    raw=$(sed -n '/^_run_pilot_sandboxed()/,/^}/p' "$1" || true)
+    [ -n "$raw" ] || { printf 'corps-introuvable'; return; }
+    body=$(grep -vE '^[[:space:]]*#' <<<"$raw" || true)
+    exp_pos=$(grep -n 'export CARGO_INCREMENTAL=' <<<"$body" | sed -nE '1s/^([0-9]+):.*/\1/p' || true)
+    branch_pos=$(grep -n '_pilot_sandbox_enabled' <<<"$body" | sed -nE '1s/^([0-9]+):.*/\1/p' || true)
+    [ -n "$exp_pos" ]    || { printf 'export-absent'; return; }
+    [ -n "$branch_pos" ] || { printf 'branche-absente'; return; }
+    if [ "$exp_pos" -lt "$branch_pos" ]; then printf 'ok'; else printf 'apres-la-branche'; fi
+}
+
+# AC2 rendue vérifiable plutôt que promise. Un fichier ABSENT satisfait
+# l'assertion — c'est l'état nominal du dépôt — d'où un mot distinct de 'no' :
+# « le fichier n'existe pas » et « le fichier existe et se tait » sont deux
+# faits, et les confondre rendrait le vert illisible.
+_mika2105_cargo_config_sets_incremental() {
+    [ -f "$1" ] || { printf 'absent'; return; }
+    if grep -qE '^[[:space:]]*incremental[[:space:]]*=' -- "$1"; then printf 'yes'; else printf 'no'; fi
+}
+
+# Les skills dont un handler LANCE claude-pilot. Le prédicat de lancement est
+# `_mika2496_launch_candidates`, réutilisé et non recopié : « qu'est-ce qu'un
+# lancement de claude-pilot » doit avoir une seule définition, faute de quoi les
+# deux copies divergent (c'est la leçon que `grooming_marker` a dû graver une
+# fois, mika#2158). Il porte déjà ses cinq termes mesurés et ses cinq fixtures.
+_mika2105_pilot_launching_handlers() {
+    local f skill
+    for f in "$1"/skills/bundled/*/handlers/*.sh; do
+        [ -f "$f" ] || continue
+        skill=${f#"$1"/skills/bundled/}
+        skill=${skill%%/*}
+        case "$skill" in _*) continue ;; esac
+        if [ -n "$(_mika2496_launch_candidates "$f")" ]; then
+            printf '%s\n' "$skill"
+        fi
+    done | sort -u
+}
+
+# --- Assertion A — l'entrée d'allowlist ---------------------------------------
+assert_eq "mika#2105 (A): CARGO_INCREMENTAL est dans _PILOT_SANDBOX_ENV_ALLOWLIST" \
+    "yes" "$(_mika2105_allowlist_has "$DISPATCH_LIB" CARGO_INCREMENTAL)"
+
+# Bonne foi : le prédicat sait aussi dire non. Sans ce contrôle, un awk cassé
+# qui rendrait 'yes' pour tout passerait l'assertion A sans rien lire.
+assert_eq "mika#2105 (A, bonne foi): le prédicat d'allowlist sait dire non" \
+    "no" "$(_mika2105_allowlist_has "$DISPATCH_LIB" CARGO_INCREMENTAL_ABSENT)"
+
+# --- Assertion B — l'export, et sa valeur ------------------------------------
+assert_eq "mika#2105 (B): dispatch-lib.sh exporte CARGO_INCREMENTAL=0" \
+    "0" "$(_mika2105_export_value "$DISPATCH_LIB")"
+
+# --- Assertion B' — l'ordre, qui est ce qui couvre les DEUX chemins ----------
+assert_eq "mika#2105 (B'): l'export précède la branche de sandbox (les deux chemins couverts)" \
+    "ok" "$(_mika2105_export_precedes_branch "$DISPATCH_LIB")"
+
+# Le réglage doit effectivement traverser `--clearenv`. La boucle de réinjection
+# teste `[ -n "${!var:-}" ]`, et `-n "0"` est VRAI en shell : `0` n'est pas la
+# chaîne vide. Cette assertion pinne la forme du test, parce qu'un passage à
+# `[ "${!var:-}" != "" ]`… serait équivalent, mais un passage à un test de
+# véracité (`[ "${!var:-0}" != 0 ]`) laisserait tomber précisément cette
+# variable-ci, et seulement elle.
+assert_contains "mika#2105: la réinjection teste la non-vacuité, pas la véracité" \
+    '[ -n "${!var:-}" ]' "$(sed -n '/for var in "${_PILOT_SANDBOX_ENV_ALLOWLIST\[@\]}"/,/done/p' "$DISPATCH_LIB")"
+
+# --- Assertion C — AC2 : le réglage ne quitte pas le dispatch ----------------
+assert_eq "mika#2105 (C): le dépôt ne définit pas incremental dans .cargo/config.toml" \
+    "yes" \
+    "$(case "$(_mika2105_cargo_config_sets_incremental "$REPO_ROOT/.cargo/config.toml")" in
+           absent|no) printf 'yes' ;;
+           *)         printf 'non — .cargo/config.toml définit incremental, AC2 violée' ;;
+       esac)"
+
+# --- Assertion D — l'énumération des chemins hors dispatch-lib ---------------
+MIKA2105_OBSERVED_HANDLERS=$(_mika2105_pilot_launching_handlers "$REPO_ROOT")
+MIKA2105_DECLARED_HANDLERS=$(printf '%s\n' "${MIKA2105_NON_DISPATCH_LIB_PILOT_HANDLERS[@]}" | sort -u)
+
+# Anti-vacuité d'abord : un glob qui ne voit plus aucun handler (répertoire
+# renommé, extension changée) rendrait deux ensembles vides et donc égaux — un
+# scan silencieusement inerte se lit exactement comme un scan propre (mika#2205).
+assert_eq "mika#2105 (D, anti-vacuité): le glob des handlers voit des fichiers" "yes" \
+    "$(if [ -n "$(echo "$REPO_ROOT"/skills/bundled/*/handlers/*.sh)" ] \
+          && [ -f "$REPO_ROOT/skills/bundled/dev-pilot/handlers/run.sh" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# La comparaison, dans les DEUX SENS par construction (égalité de chaînes triées).
+assert_eq "mika#2105 (D): les chemins hors dispatch-lib sont exactement ceux déclarés" \
+    "$MIKA2105_DECLARED_HANDLERS" "$MIKA2105_OBSERVED_HANDLERS"
+
+# --- Comportements négatifs pinnés -------------------------------------------
+#
+# Trois mutations, une par assertion porteuse. Chacune est vue ROUGE ici, et son
+# miroir vert est l'assertion correspondante ci-dessus — les deux contrôles dans
+# le même appel de test.
+MIKA2105_FIXDIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2105-fixtures.XXXXXX")
+
+# N1 — dispatch-lib privé de son export. L'assertion B doit cesser de passer.
+grep -v 'export CARGO_INCREMENTAL=0' "$DISPATCH_LIB" > "$MIKA2105_FIXDIR/no-export.sh" || true
+assert_eq "mika#2105 (N1): privé de l'export, le garde est VU ROUGE" "" \
+    "$(_mika2105_export_value "$MIKA2105_FIXDIR/no-export.sh")"
+
+# N2 — dispatch-lib privé de son entrée d'allowlist. Le réglage existerait
+# encore, et serait retiré par `--clearenv` sur le chemin sandboxé : le gain
+# serait perdu sur un chemin et conservé sur l'autre, sans rien casser.
+grep -vE '^[[:space:]]*CARGO_INCREMENTAL[[:space:]]*$' "$DISPATCH_LIB" > "$MIKA2105_FIXDIR/no-allowlist.sh" || true
+assert_eq "mika#2105 (N2): privée de son entrée d'allowlist, l'assertion A est VUE ROUGE" "no" \
+    "$(_mika2105_allowlist_has "$MIKA2105_FIXDIR/no-allowlist.sh" CARGO_INCREMENTAL)"
+# … et la mutation n'a pas emporté l'export au passage (sinon N2 attesterait N1).
+assert_eq "mika#2105 (N2, bonne foi): la mutation n'a retiré QUE l'entrée d'allowlist" "0" \
+    "$(_mika2105_export_value "$MIKA2105_FIXDIR/no-allowlist.sh")"
+
+# N3 — l'export déplacé SOUS la branche de sandbox. Fixture synthétique plutôt
+# qu'une mutation du vrai fichier : ce qu'on veut exercer est le prédicat
+# d'ordre, et une fixture minimale le montre sans dépendre de la forme exacte
+# que `_run_pilot_sandboxed` aura demain.
+printf '%s\n' \
+    '_run_pilot_sandboxed() {' \
+    '    _emit_pilot_budget_line "$@"' \
+    '    if ! _pilot_sandbox_enabled; then' \
+    '        "$@"' \
+    '        return $?' \
+    '    fi' \
+    '    export CARGO_INCREMENTAL=0' \
+    '}' \
+    > "$MIKA2105_FIXDIR/order-bad.sh"
+assert_eq "mika#2105 (N3): l'export sous la branche est VU ROUGE" "apres-la-branche" \
+    "$(_mika2105_export_precedes_branch "$MIKA2105_FIXDIR/order-bad.sh")"
+
+# N3' — le miroir vert, sur la MÊME forme minimale. Sans lui, « le prédicat lit
+# l'ordre » ne se distingue pas de « le prédicat rougit sur toute fixture ».
+printf '%s\n' \
+    '_run_pilot_sandboxed() {' \
+    '    export CARGO_INCREMENTAL=0' \
+    '    _emit_pilot_budget_line "$@"' \
+    '    if ! _pilot_sandbox_enabled; then' \
+    '        "$@"' \
+    '        return $?' \
+    '    fi' \
+    '}' \
+    > "$MIKA2105_FIXDIR/order-good.sh"
+assert_eq "mika#2105 (N3'): la même forme, export en tête, est VUE VERTE" "ok" \
+    "$(_mika2105_export_precedes_branch "$MIKA2105_FIXDIR/order-good.sh")"
+
+# N4 — un `.cargo/config.toml` qui réintroduit le réglage globalement (AC2
+# violée) doit être vu. Et son miroir : un config.toml qui parle d'autre chose
+# ne doit pas déclencher.
+mkdir -p "$MIKA2105_FIXDIR/cargo"
+printf '%s\n' '[build]' 'incremental = false' > "$MIKA2105_FIXDIR/cargo/bad.toml"
+printf '%s\n' '[build]' 'jobs = 4' > "$MIKA2105_FIXDIR/cargo/ok.toml"
+assert_eq "mika#2105 (N4): un .cargo/config.toml posant incremental est VU ROUGE" "yes" \
+    "$(_mika2105_cargo_config_sets_incremental "$MIKA2105_FIXDIR/cargo/bad.toml")"
+assert_eq "mika#2105 (N4', bonne foi): un .cargo/config.toml sans incremental est VU VERT" "no" \
+    "$(_mika2105_cargo_config_sets_incremental "$MIKA2105_FIXDIR/cargo/ok.toml")"
+
+# N5 — un cinquième chemin d'invocation. L'arbre fixture porte un skill de plus
+# qui lance claude-pilot ; le scan doit le VOIR, donc l'assertion D rougirait.
+mkdir -p "$MIKA2105_FIXDIR/tree/skills/bundled/nouveau-chemin/handlers"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'claude-pilot --verbose --task-id "$I" --command "$C"' \
+    > "$MIKA2105_FIXDIR/tree/skills/bundled/nouveau-chemin/handlers/run.sh"
+assert_eq "mika#2105 (N5): un cinquième chemin d'invocation est VU par le scan" "nouveau-chemin" \
+    "$(_mika2105_pilot_launching_handlers "$MIKA2105_FIXDIR/tree")"
+
+# N5' — bonne foi : un handler qui NE lance PAS claude-pilot n'est pas compté.
+# Les formes sont celles réellement présentes dans l'arbre (un `command -v`, un
+# chemin bindé, la config du relais) — sans quoi le scan serait rouge en
+# permanence sur des handlers innocents, donc désarmé.
+mkdir -p "$MIKA2105_FIXDIR/tree2/skills/bundled/innocent/handlers"
+printf '%s\n' \
+    '#!/bin/bash' \
+    'command -v claude-pilot >/dev/null 2>&1 || exit 1' \
+    'cp "$P/.claude/claude-pilot.json" "$W/.claude/" || true' \
+    '# on lancera claude-pilot --verbose ici un jour' \
+    > "$MIKA2105_FIXDIR/tree2/skills/bundled/innocent/handlers/run.sh"
+assert_eq "mika#2105 (N5', bonne foi): un handler qui ne lance pas n'est pas compté" "" \
+    "$(_mika2105_pilot_launching_handlers "$MIKA2105_FIXDIR/tree2")"
+
+rm -rf "$MIKA2105_FIXDIR"
+
+# --- dispatch-lib parse toujours (mika#2105) ---------------------------------
+MIKA2105_RC=0
+bash -n "$DISPATCH_LIB" 2>/dev/null || MIKA2105_RC=$?
+assert_eq "mika#2105: dispatch-lib.sh passe bash -n après l'export" "0" "$MIKA2105_RC"
+
 # --- Summary ---
 
 echo ""

@@ -52,6 +52,7 @@ TARGET="${1:-$REPO_ROOT/skills/bundled/_shared/dispatch-lib.sh}"
 # `_PILOT_SANDBOX_ENV_ALLOWLIST` in dispatch-lib.sh, then update this set.
 EXPECTED_ENV_ALLOWLIST=(
     ANTHROPIC_LOG_FILE
+    CARGO_INCREMENTAL
     HOME
     HOSTNAME
     LANG
