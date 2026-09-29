@@ -370,6 +370,92 @@ assert_eq "D3 (KTD7): the canary installs exactly one EXIT trap" "1" "${canary_e
 assert_contains "D3 (KTD7): and that trap also cleans the mika#2141 victim ref" \
     'CANARY_VICTIM_REF' "$canary_exit_fn"
 
+# --- D3, fourth term (R1/R13): no OTHER non-comment line WRITES the host default.
+# The three scans above constrain where the REDIRECTION is posed; not one of them
+# would see a site that bypasses `_PILOT_GH_TOKEN_FILE` entirely and names the
+# host path directly. That is exactly how the ticket's rejected "voie 2" would be
+# written — back the file up, restore it in a trap — and it is a write to the live
+# credential either way.
+#
+# Two terms, and the second is what makes this fail-closed:
+#   A. a MUTATING form on a line that names the host path — a redirect into it, or
+#      a mutating command anywhere on the line;
+#   B. a line that names the host path and matches NONE of the declared read
+#      forms — an unrecognised shape is REFUSED, never assumed harmless.
+#
+# Neither term subsumes the other. Term B alone would pass
+# `echo x > "$HOME/.mika/pilot-gh-token"`, which matches the `echo` read form;
+# term A alone is a denylist of command names, which the next write idiom walks
+# straight past. The asymmetry that settles the direction: a wrongful red costs
+# one CI run plus a one-line declaration below, a wrongful green costs the
+# operator's live GitHub credential and every in-flight pilot's authentication,
+# irreversibly. Same rule mika#2520 states, running the opposite way — there an
+# unreadable signal must KEEP because the action destroyed work; here it must
+# REFUSE because the action IS the write.
+#
+# Shipped EMPTY and pinned empty. When this fires: on a WRITE, redirect the
+# offending site; on a legitimate new READ, declare its form in
+# canary_host_read_forms. Never add an exemption — doctrine mika#2201, "on
+# déclare, on n'allowliste pas": a guard you can exempt is a guard with an
+# off-switch nobody announces.
+CANARY_HOST_MUTATION_ALLOWLIST=""
+
+# The allowlist is consumed BEFORE both violation terms, so an exemption really
+# does silence them — and the emptiness pin below is then the ONLY assertion that
+# reddens, naming the exempted line verbatim. That is the point: exempting is a
+# visible act, never a quiet bypass. A pin standing beside a variable nothing
+# reads is a PASS that measures nothing — the trap the pose-count block one screen
+# up already names — and this one was measured: with the allowlist carrying one
+# write, both terms went green and the pin went red alone.
+#
+# The floor is a different guard, against a different failure: it catches the path
+# being RENAMED out from under the scan, not an exemption (one entry takes the
+# count from 6 to 5, which clears 4).
+canary_host_hits=$(grep -vE '^[[:space:]]*#' "$CANARY" \
+    | grep -F -- '.mika/pilot-gh-token' || true)
+canary_host_hits=$(printf '%s\n' "$canary_host_hits" \
+    | grep -vxF -e "$CANARY_HOST_MUTATION_ALLOWLIST" || true)
+canary_host_hit_count=$(printf '%s' "$canary_host_hits" | grep -c . || true)
+
+rc=1; [ "${canary_host_hit_count:-0}" -ge 4 ] && rc=0
+assert_eq "D3 anti-vacuity: the host default is still named on non-comment lines ($canary_host_hit_count)" "0" "$rc"
+assert_eq "D3: and the allowlist that filter consumes is empty" "" "$CANARY_HOST_MUTATION_ALLOWLIST"
+
+# Term A. `>>?` covers truncate and append; `2>/dev/null` cannot match it because
+# the target has to be the host path itself. The command list is the mutating
+# half of what a shell can do to a file that already exists, deletion included —
+# R1 forbids writing, truncating AND removing it.
+canary_host_writes=$(printf '%s\n' "$canary_host_hits" | grep -E \
+    -e '>>?[[:space:]]*"?\$\{?HOME\}?/\.mika/pilot-gh-token' \
+    -e '(^|[[:space:]]|\||;|&)(cp|mv|rm|ln|dd|tee|touch|truncate|install|shred|chmod|chown)([[:space:]]|$)' \
+    -e 'sed[[:space:]]+-i' \
+    || true)
+assert_eq "D3: no non-comment line writes, truncates or removes the host default" "" "$canary_host_writes"
+
+# Term B. The declared read forms — the vocabulary of the predicate, NOT an
+# exemption list: each one is a shape the canary legitimately needs to observe
+# its own blast radius (the BEFORE fingerprint, the _canary_on_exit comparison,
+# and the R9 attribution line). Reformat one of those sites and this goes red
+# with the line printed; that is the intended cost of a fail-closed predicate.
+canary_host_read_forms=(
+    '_canary_digest_of[[:space:]]+"\$HOME/\.mika/pilot-gh-token"'
+    '^[[:space:]]*(local[[:space:]]+)?_[A-Za-z0-9_]+="\$HOME/\.mika/pilot-gh-token"$'
+    '\[[[:space:]]+-[efsr][[:space:]]+"\$HOME/\.mika/pilot-gh-token"[[:space:]]+\]'
+    'stat[[:space:]]+-c[[:space:]]'
+    '^[[:space:]]*echo[[:space:]]'
+)
+canary_host_unknown=$(
+    while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        _matched=1
+        for _form in "${canary_host_read_forms[@]}"; do
+            if grep -qE -- "$_form" <<<"$_line"; then _matched=0; break; fi
+        done
+        [ "$_matched" -eq 0 ] || printf '%s\n' "$_line"
+    done <<<"$canary_host_hits"
+)
+assert_eq "D3: every non-comment mention of the host default is a declared read form" "" "$canary_host_unknown"
+
 # --- The canary still parses.
 canary_rc=0
 bash -n "$CANARY" 2>/dev/null || canary_rc=$?
