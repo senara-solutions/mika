@@ -409,6 +409,24 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-cta-primitives.sh
 
+  publish-verify-lint:
+    name: Publish Verify Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # `publish-ui.yml` ne se déclenche que sur `packages/ui/**`, donc quelques
+      # fois par mois : la boucle de vérification qu'il porte n'était exercée par
+      # rien, et son insuffisance ne se découvrait qu'au bump suivant, sur `main`,
+      # en rouge (mika#1917 puis mika#2566, deux occurrences de la même classe).
+      # Ce job est ce qui rompt cette série — il exerce la logique sur CHAQUE PR,
+      # hors réseau, sans npm réel, en moins d'une seconde.
+      #
+      # Contrôles négatifs joués à la livraison et consignés en tête du harnais :
+      # un script remplacé par `exit 1` laisse N3 (AC2) vert et fait rougir N7 —
+      # c'est pour ce cas précis que N7 existe.
+      - name: Exercise the post-publish verification, AC1 and AC2 included (mika#2566)
+        run: bash scripts/test-verify-npm-publish.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
