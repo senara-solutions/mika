@@ -15,7 +15,7 @@
 # pas à exempter.
 #
 # Aucun appel réseau, aucun `npm` réel, aucun sommeil réel hors de N4a : la
-# suite tourne en moins d'une seconde.
+# suite tourne en un peu plus de 2 s, dont les 2 s de sommeil réel de N4a.
 #
 # CONTRÔLES NÉGATIFS JOUÉS, ET CE QUI A ROUGI (2026-09-29) — chacun est une
 # mutation du script gardé, passée en argument (voir plus bas) :
@@ -282,6 +282,14 @@ assert_eq "$(loop_calls)" 3 "N7: le npm factice a été appelé exactement MAX_A
 # `date +%s%N` est GNU. Une horloge qui ne rend pas que des chiffres (un `date`
 # BSD rend `%N` littéral) fait échouer N4a en le nommant : une garde qui ne peut
 # plus mesurer ne doit pas se lire comme une garde qui passe.
+#
+# D'où aussi la borne BASSE, 1900 ms : les 2 vrais sommeils coûtent au moins
+# 2000 ms (moins 1 ms de troncature). En dessous, soit ils n'ont pas eu lieu
+# (doublure `sleep` restée sur le PATH, sortie précoce du script), soit
+# l'horloge rend des chiffres sans mesurer — un `date` qui ignore `%N` en
+# silence rend des secondes, soit 0 ms d'écart. Sans cette borne, les deux
+# passeraient au vert.
+N4A_FLOOR_MS=1900
 N4A_THRESHOLD_MS=2900
 
 now_ms() {
@@ -300,7 +308,9 @@ if [ -z "$N4A_START_MS" ] || [ -z "$N4A_END_MS" ]; then
     ko "N4a: horloge sans millisecondes (\`date +%s%N\` ne rend pas que des chiffres) — la durée n'a pas pu être mesurée"
 else
     N4A_ELAPSED_MS=$((N4A_END_MS - N4A_START_MS))
-    if [ "$N4A_ELAPSED_MS" -lt "$N4A_THRESHOLD_MS" ]; then
+    if [ "$N4A_ELAPSED_MS" -lt "$N4A_FLOOR_MS" ]; then
+        ko "N4a: durée ${N4A_ELAPSED_MS} ms < ${N4A_FLOOR_MS} ms — les 2 vrais sommeils n'ont pas eu lieu, ou l'horloge ne mesure pas"
+    elif [ "$N4A_ELAPSED_MS" -lt "$N4A_THRESHOLD_MS" ]; then
         ok "N4a: 3 essais à 1 s de base coûtent 2 sommeils (${N4A_ELAPSED_MS} ms < ${N4A_THRESHOLD_MS} ms)"
     else
         ko "N4a: durée ${N4A_ELAPSED_MS} ms ≥ ${N4A_THRESHOLD_MS} ms — le sommeil terminal est de retour"
