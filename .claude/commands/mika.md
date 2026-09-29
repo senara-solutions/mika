@@ -61,7 +61,27 @@ Before running the pipeline, set up an isolated worktree:
 3. `/ce:work`
 4. `/ce:review`
 5. `/compound-engineering:resolve_todo_parallel`
-6. `/ce:compound`
+6. `/ce:compound` — **traverse the decision, then attest it one of two ways.**
+   The step is not "write a learning"; it is "decide whether there is one, and
+   leave a trace of the decision". Two attestations, both machine-readable:
+   - **there is a learning** → the `docs/solutions/**/*.md` file in the diff is
+     the attestation, nothing else to do;
+   - **there is none** → say so in a commit trailer, on its own line, with a
+     reason:
+     ```
+     Compound: none — mechanical fix, the diff and its test say everything
+     ```
+     The reason is **mandatory** (same shape as `Pipeline-Exempt:`): a bare
+     `Compound: none` is not recognised, and neither is an indented one.
+
+   **Why this matters for a session that gets cut short (mika#2563).** When a
+   pilot is killed mid-run — turn ceiling, guardrail, SDK limit — the
+   post-flight recovery opens a draft PR and `dispatch-lib` measures whether
+   the local pipeline is complete. Neither attestation present on a **truncated**
+   session reads as *"the compound decision was never traversed"*, and the PR's
+   body carries `<!-- compound-traversal: absent -->`. A session that concluded
+   normally is exempt: this step's absence is only held against work that was
+   interrupted.
 7. Run `bash scripts/verify-pipeline.sh` to verify pipeline artifacts exist. If it fails, read the error messages to identify missing artifacts, go back and produce them (run `/ce:plan` if no plan doc, `/ce:work` if no source changes), then re-run verification until it passes.
 8. Create a PR if one doesn't already exist. **The PR body file lives inside the
    worktree — never outside it.** Write the body with the **Write** tool to

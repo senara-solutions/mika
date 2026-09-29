@@ -8009,6 +8009,179 @@ _rescue_touches_tracked_tree() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _rescue_compound_traversal — was the compound decision traversed? (mika#2563)
+#
+# Classifies, and classifies ONLY. The disposition — whether an `absent` verdict
+# refuses the green light — belongs to `_rescue_require_compound_traversal`
+# below. Same split as mika#2249/#2420: the detection is unconditional, only the
+# consequence is gated, so a disarmed deployment still MEASURES and still writes
+# its marker. A detector whose silence is indistinguishable from a healthy fleet
+# is the mika#2205 class, and a disarmed term that computed nothing would be it.
+#
+# WHAT IT REFUSES TO ASK, and this is the ticket's central rectification.
+# mika#2563's remedy 2 reads "require `docs/solutions/*.md` as soon as
+# SOURCE_BUCKET is non-empty". Measured over the last 100 `--first-parent`
+# merges of `origin/main`: 93 carry source and 66 of those — 71 % — carry no
+# `docs/solutions/` at all. That is the REGIME, not a defect: `/ce:compound` is
+# not on the loop's nominal path (`_detect_plan_on_branch` overrides every
+# groomed ticket to `/ce-work <plan>`, whose perimeter excludes the shipping
+# tail), so the 29 % that do carry a learning got it from their PLAN. A term
+# written that way would refuse two thirds of the nominal traffic through
+# `_measure_pipeline_verified`'s term 5, flip every rescue to
+# `rescue-pipeline-verified: no`, and stop the drain.
+#
+# So the predicate is on the TRUNCATION, never on the absence of a file. The
+# defect mika#2563 actually measured is a FALSE GREEN: #2556 carries
+# `<!-- rescue-pipeline-verified: yes -->` — "the local pipeline is complete" —
+# while its pilot was killed at 151/150 turns. None of the five existing terms
+# reads `STATUS`. The sentence that condemns that sits thirty lines away in
+# `_pilot_had_no_shipping_tail` (mika#2492), written for the CLASSIFICATION and
+# never applied to the MARKER:
+#
+#   "Truncated work must not be presented as complete just because its
+#    perimeter had no shipping tail."
+#
+# Four values, and they are a WIRE FORMAT — they land in a PR-body marker
+# `<!-- compound-traversal: … -->` (mika#2201). One definition site; the set is
+# pinned by the T15 suite.
+#
+#   not-applicable    — `STATUS = success`: the session concluded. Nothing was
+#                       truncated, so there is nothing for this term to say.
+#                       This is the 71 % above, and D3: `no-shipping-tail` is
+#                       the NOMINAL route and carries `success` by construction
+#                       (`_pilot_had_no_shipping_tail` requires it), so it never
+#                       lands here.
+#   attested-solution — the diff `origin/main...HEAD` carries a
+#                       `docs/solutions/**/*.md`: the decision "there is a
+#                       lesson" was taken AND executed.
+#   attested-trailer  — a commit of `origin/main..HEAD` carries an anchored
+#                       `Compound: none <reason>` trailer: the decision "there
+#                       is no lesson" was taken AND said. Shape borrowed from
+#                       `Pipeline-Exempt:` in the same ecosystem — anchored, and
+#                       the reason MANDATORY. No bare form: this trailer is born
+#                       today and carries no backward compatibility.
+#   absent            — neither. The session was cut short and nothing says the
+#                       decision was reached.
+#
+# FAIL-CLOSED (D7). An unreadable git, an absent `origin/main`, an empty
+# worktree dir — each yields `absent`, never a satisfied term. Same asymmetry
+# mika#2354 already arbitrated on this very body: one `no` too many costs a
+# visible, reversible operator gesture; one `yes` too many opens the review on
+# incomplete work.
+#
+# CALLED TWICE PER DISPATCH, and that is forced rather than sloppy: the callsite
+# invokes `_measure_pipeline_verified` inside `$(…)`, i.e. in a SUBSHELL, so a
+# global written there could not reach the body composer. Two calls of a pure
+# function of (`STATUS`, worktree state) cannot diverge — nothing between them
+# mutates either — and the alternative, a second classification written at the
+# callsite, is the duplicated-predicate class this file has had to undo before.
+#
+# Args: $1 — worktree dir
+# Outputs: exactly one of the four values above, no trailing newline.
+_rescue_compound_traversal() {
+    local wt_dir="${1-}" f
+
+    # `STATUS` is the global `_run_claude_pilot` sets from the pilot's JSON
+    # (`.status`). Read here, at the same place and by the same test
+    # `_pilot_had_no_shipping_tail` reads it — a second reading of the same
+    # field would be a second vocabulary for one fact.
+    [ "${STATUS:-}" = "success" ] && { printf 'not-applicable'; return 0; }
+
+    # Same guard, same reason, as `_rescue_diff_carries_work`: `git -C ""`
+    # silently operates on the dispatch process CWD — a live checkout — so an
+    # empty dir would classify the WRONG tree. Here it must fail closed.
+    if [ -z "$wt_dir" ] || ! git -C "$wt_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        printf 'absent'
+        return 0
+    fi
+    # No fetched `origin/main` ⇒ both forms below are unmeasurable. `absent`,
+    # never a pass: an unreadable signal is never a satisfied term.
+    if ! git -C "$wt_dir" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+        printf 'absent'
+        return 0
+    fi
+
+    # ── (a) intrinsic: the learning is in the diff ──────────────────────────
+    # `core.quotePath=false` + `-z` + process substitution for the reason
+    # `_rescue_touches_tracked_tree` states at length: quoted octal escapes on
+    # French paths, and bash dropping NULs inside `$(…)`. A `case` glob rather
+    # than a regex because bash's `*` spans `/`, so one pattern covers the
+    # nested layout this repo actually uses (`docs/solutions/<category>/x.md`).
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            docs/solutions/*.md)
+                printf 'attested-solution'
+                return 0
+                ;;
+        esac
+    done < <(git -C "$wt_dir" -c core.quotePath=false diff --name-only -z origin/main...HEAD 2>/dev/null)
+
+    # ── (b) declarative: the absence of a learning is stated ────────────────
+    # `origin/main..HEAD` (two dots) — the commits this branch adds, which is
+    # where a trailer can live; the diff above uses three, which is the content
+    # it publishes. The two ranges answer two different questions.
+    local _bodies
+    _bodies=$(git -C "$wt_dir" log --format='%B' origin/main..HEAD 2>/dev/null) || {
+        printf 'absent'
+        return 0
+    }
+    # Here-string, never `printf … | grep -q` (mika#2055): under this library's
+    # `pipefail`, `grep -q`'s early exit makes the producer take SIGPIPE and the
+    # pipeline read 141 — which here would turn an attested trailer into
+    # `absent`, i.e. refuse a PR that had done the work.
+    if grep -qE '^Compound: none[[:space:]]+.+$' <<<"$_bodies"; then
+        printf 'attested-trailer'
+        return 0
+    fi
+
+    printf 'absent'
+}
+
+# _rescue_require_compound_traversal — may an `absent` verdict refuse? (mika#2563)
+#
+# DEFAULT DISARMED, and the reason is a measurement that cannot be taken from a
+# dispatch worktree: how many rescues carry `STATUS != success` is readable only
+# from claude-pilot's logs or the agent database, neither of which the sandbox
+# mounts. Known upper bound: ~1.1 rescue/day (16 `wip(` commits over 14 days).
+# Arming without that number would put up to one DECISION-CORE PR a day behind a
+# HUMAN gesture — the `wip_rescue` daemon parks a DECISION-CORE draft on marker
+# `no` (mika#2286). Precedent: mika#2496 shipped `PILOT_MAX_TURNS` disarmed
+# pending its V2 distribution; mika#2201 shipped its S2 gate `continue-on-error`.
+# This is NOT the mika#2272 case, where the zero was the absence of measurement:
+# here the measurement exists, it is simply taken on the marker after deploy.
+# The arming probe and its three halts are in the ticket's plan, § Fire-Disposition.
+#
+# DISTINCT from `MIKA_RESCUE_VERIFY_ENABLED` on purpose: that switch disarms the
+# WHOLE mika#2354 measurement and restores the pre-mika#2354 body byte for byte.
+# Reusing it to gate one term would be a rollback far wider than what mika#2563
+# adds, and an operator reaching for a switch mid-incident is not in a position
+# to discover that.
+#
+# House three-tier parse: absent/empty → disarmed; `1`/`true`/`on`/`yes` →
+# armed; `0`/`false`/`no`/`off` → the explicit disarm, silently; anything else →
+# disarmed WITH a WARN naming the value between quotes. An unrecognised value
+# must not arm by accident on a term that can withhold a PR's green light, and
+# it must not disarm in silence either — that is how a setting reads as applied
+# while it is not (mika#2293).
+#
+# Reaches this process by explicit injection from
+# `skills/executor.rs::inject_rescue_verify_env` — `sandboxed_pilot_env`
+# rebuilds the child env from a positive allowlist, so nothing crosses by
+# inheritance. A setting only its reader honours is decorative (mika#2165).
+_rescue_require_compound_traversal() {
+    local raw="${MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL:-}"
+    [ -z "$raw" ] && return 1
+    case "${raw,,}" in
+        1|true|yes|on) return 0 ;;
+        0|false|no|off) return 1 ;;
+        *)
+            echo "WARN: rescue_compound_traversal_disposition_invalid: MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL='${raw}' is not recognised — staying disarmed (mika#2563)" >&2
+            return 1
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _measure_pipeline_verified — give `rescue-pipeline-verified` a producer.
 #
 # mika#2354. Two gates read `<!-- rescue-pipeline-verified: yes -->` — qa-review
@@ -8033,6 +8206,13 @@ _rescue_touches_tracked_tree() {
 # ticket under another name.
 #
 # Conjunction, cheapest term first, short-circuited on the first failure:
+#   0. compound-traversal — a session the SDK killed does not attest a complete
+#                         pipeline (mika#2563). Placed first because it reads
+#                         one variable and two git plumbing calls, so it
+#                         short-circuits ahead of the two cargo invocations.
+#                         Gated in DISPOSITION by
+#                         `_rescue_require_compound_traversal` (default
+#                         disarmed); its classification runs regardless.
 #   1. diff             — the captured diff carries work (reuses the mika#2157
 #                         predicate; an incident-only diff can satisfy no AC and
 #                         has nothing to verify)
@@ -8097,6 +8277,21 @@ _measure_pipeline_verified() {
 
     budget=$(_rescue_verify_budget_secs)
     deadline=$(( $(date +%s) + budget ))
+
+    # ── Term 0: the compound decision was traversed (mika#2563) ─────────────
+    # Before the budget clock matters and before anything shells out: the two
+    # git plumbing calls behind this cost microseconds, and a truncated session
+    # has no business spending a 900s budget on cargo to be told `no` at the
+    # end. The refusal is on the TRUNCATION, never on the absence of a file —
+    # see `_rescue_compound_traversal`'s header for the 71 % that makes the
+    # latter unshippable.
+    local _traversal
+    _traversal=$(_rescue_compound_traversal "$wt_dir")
+    if [ "$_traversal" = "absent" ] && _rescue_require_compound_traversal; then
+        printf 'compound-traversal\nthe pilot session did not conclude (status: %s) and nothing attests the compound decision was traversed.\nNo docs/solutions/**/*.md in `origin/main...HEAD`, and no `Compound: none — <reason>` trailer in `origin/main..HEAD`.\nLift it either way: write the learning, or state in a commit trailer that there is none.\n' \
+            "${STATUS:-<unreadable>}"
+        return 1
+    fi
 
     # ── Term 1: the diff carries work ───────────────────────────────────────
     if ! _rescue_diff_carries_work "$wt_dir"; then
@@ -8283,19 +8478,36 @@ _rescue_verify_excerpt() {
 #            argument keeps the pre-mika#2354 call shape working)
 #       $6 — failing term's wire name, empty when none (kill-switch, or `yes`)
 #       $7 — excerpt of the failing term's output, empty when none
+#       $8 — compound-traversal verdict (mika#2563), empty when not measured
 # Reads SESSION_ID / TURNS / COST from the environment, as the heredoc did.
 # Outputs: the PR body to stdout.
 #
-# AC4 invariant: with $5..$7 absent or ("no", "", "") the body is BYTE-IDENTICAL
-# to the pre-mika#2354 one. That is what makes `MIKA_RESCUE_VERIFY_ENABLED=0` a
-# real rollback — one that also changed the shape of the body would not be one.
+# AC4 invariant: with $5..$8 absent or ("no", "", "", "") the body is
+# BYTE-IDENTICAL to the pre-mika#2354 one. That is what makes
+# `MIKA_RESCUE_VERIFY_ENABLED=0` a real rollback — one that also changed the
+# shape of the body would not be one. mika#2563 extends the invariant to its own
+# argument rather than weakening it: the kill-switch path passes $8 empty, so
+# the marker is absent exactly where the pre-fix body had nothing.
+#
+# mika#2563: $8 is written WHATEVER ITS VALUE and whatever the disposition of
+# `_rescue_require_compound_traversal` — including `absent` on a disarmed
+# deployment, where it does NOT flip `$5`. That is the whole difference between
+# a disarmed detector and a mute one (mika#2205), and it is what makes the
+# arming condition measurable on the artefact instead of intuited: the body is
+# the only durable surface here, `_post_flight_recovery`'s stderr being the
+# `Stdio::piped()` handle the executor reads only under `if !status.success()`
+# (Signal M, the mika#2050 class).
 _compose_rescue_pr_body() {
     local wt_dir="$1" recovery_class="$2" class_fact="$3" issue_num="$4"
     local verified="${5:-no}" failed_term="${6:-}" failed_excerpt="${7:-}"
+    local compound_traversal="${8:-}"
     local diff_marker issue_ref lede=""
-    local verify_marker="" operator_line verify_detail=""
+    local verify_marker="" operator_line verify_detail="" compound_marker=""
 
     [ "$verified" = "yes" ] || verified="no"
+
+    [ -n "$compound_traversal" ] && compound_marker="
+<!-- compound-traversal: ${compound_traversal} -->"
 
     if [ "$verified" = "yes" ]; then
         # No object left for the operator gesture: naming it anyway would keep
@@ -8341,7 +8553,7 @@ ${failed_excerpt}
 ${lede}## Auto-rescued PR (dispatch-lib recovery, class: ${recovery_class})
 
 <!-- rescue-pipeline-verified: ${verified} -->
-<!-- rescue-diff: ${diff_marker} -->${verify_marker}
+<!-- rescue-diff: ${diff_marker} -->${verify_marker}${compound_marker}
 
 This PR was created by dispatch-lib's git-workflow recovery. ${class_fact}
 
@@ -9190,16 +9402,29 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
         # refuses — the producer stays dispatch-lib, sole writer of its own
         # green light.
         local _rescue_verified="no" _rescue_verify_term="" _rescue_verify_excerpt=""
+        local _rescue_compound=""
         if _rescue_verify_enabled; then
             local _rescue_verify_out=""
+            # mika#2563: classified HERE as well as inside the measurement, and
+            # that is forced by the shell rather than careless — the call below
+            # runs in a `$(…)` SUBSHELL, so a global written by term 0 could not
+            # reach the composer. Pure function of (`STATUS`, worktree state),
+            # nothing between the two calls mutates either, so they cannot
+            # disagree; the alternative — a second classification written out at
+            # this site — is the duplicated-predicate class this file has had to
+            # undo before (mika#2158).
+            _rescue_compound=$(_rescue_compound_traversal "$WORKTREE_DIR")
             if _rescue_verify_out=$(_measure_pipeline_verified "$WORKTREE_DIR"); then
                 _rescue_verified="yes"
             else
                 _rescue_verify_term=$(head -1 <<<"$_rescue_verify_out")
                 _rescue_verify_excerpt=$(tail -n +2 <<<"$_rescue_verify_out")
             fi
-            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} (mika#2354)" >&2
+            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} compound-traversal=${_rescue_compound} (mika#2354, mika#2563)" >&2
         else
+            # The kill-switch leaves `$8` empty too, so the body stays
+            # byte-identical to the pre-mika#2354 one — mika#2563 extends that
+            # rollback rather than punching a hole in it.
             echo "rescue_pipeline_verified: disabled by MIKA_RESCUE_VERIFY_ENABLED — marker stays 'no', body unchanged (mika#2354)" >&2
         fi
 
@@ -9209,7 +9434,7 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             --base main \
             --draft \
             --title "$_rescue_title" \
-            --body "$(_compose_rescue_pr_body "$WORKTREE_DIR" "$RECOVERY_CLASS" "$_rescue_class_fact" "$ISSUE_NUM" "$_rescue_verified" "$_rescue_verify_term" "$_rescue_verify_excerpt")" 2>&9 || true)
+            --body "$(_compose_rescue_pr_body "$WORKTREE_DIR" "$RECOVERY_CLASS" "$_rescue_class_fact" "$ISSUE_NUM" "$_rescue_verified" "$_rescue_verify_term" "$_rescue_verify_excerpt" "$_rescue_compound")" 2>&9 || true)
 
         if [ -n "$RESCUED_PR_URL" ]; then
             PR_URL="$RESCUED_PR_URL"
