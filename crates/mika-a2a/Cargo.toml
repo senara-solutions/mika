@@ -26,6 +26,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `mika_common::dead_endpoint::DeadEndpoint` (mika#2569) — un point de
+# terminaison mort se RÉSERVE, il ne se libère pas. Pas de cycle (`mika-common`
+# ne dépend pas de `mika-a2a`) et pas d'inversion de hiérarchie : la chaîne est
+# `common → a2a → agent → cli`. Coût réel : un `cargo test -p mika-a2a` isolé
+# compile `mika-common` ; sous `cargo test --workspace` — ce que fait la CI — il
+# est nul.
+mika-common = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

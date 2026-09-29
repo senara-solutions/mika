@@ -174,6 +174,13 @@ dialoguer = "0.12"
 # Testing
 tempfile = "3"
 serial_test = "4"
+# Socket primitives sans réglage implicite, pour `mika_common::dead_endpoint`
+# (mika#2569). `std::net::TcpListener::bind` pose `SO_REUSEADDR` sur Unix, ce qui
+# fait perdre au garde la propriété de RÉSERVATION qu'on lui demande : deux
+# sockets `SO_REUSEADDR` dont aucun n'est en `LISTEN` peuvent lier la même
+# adresse exacte. `socket2::Socket::new` ne pose rien. Déjà dans `Cargo.lock`
+# (0.6.5, transitivement via tokio/hyper-util) : aucune caisse nouvelle.
+socket2 = "0.6"
 # HTTP mock server for wiremock-style integration tests (mika-gateway egress-search)
 wiremock = "0.6"
 # mtime stamping for the mika#2249 worktree-activity probe tests. std can read

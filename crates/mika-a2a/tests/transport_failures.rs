@@ -11,6 +11,7 @@ use std::time::Duration;
 use mika_a2a::client::{A2aClient, DEFAULT_TIMEOUT};
 use mika_a2a::error::TransportFailure;
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role};
+use mika_common::dead_endpoint::DeadEndpoint;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
@@ -98,11 +99,12 @@ async fn a_silent_server_is_abandoned_on_the_clients_budget() {
 /// a task the server never created.
 #[tokio::test]
 async fn a_refused_port_is_unreachable_and_forbids_recovery() {
-    // Bind then drop: the port is known-free and nothing is listening on it.
-    let addr = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    };
+    // mika#2569 — le port est TENU pendant l'appel, par un socket lié et non
+    // écoutant. Le bloc précédent le libérait, et `a_silent_server_is_abandoned…`
+    // — du MÊME binaire de test — lie `127.0.0.1:0` : il pouvait le recevoir et
+    // faire lire `TimedOut` là où `Unreachable` est asserté.
+    let dead = DeadEndpoint::reserve();
+    let addr = dead.addr();
 
     let client = A2aClient::new(format!("http://{addr}{AGENT_PATH}"), None);
     let failure = classify(

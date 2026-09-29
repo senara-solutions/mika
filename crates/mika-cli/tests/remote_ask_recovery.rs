@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use mika_cli::remote_ask::{
     EXIT_TRANSPORT_FAILURE, exit_code_for, render_task_parts, send_message_to_agent,
 };
+use mika_common::dead_endpoint::DeadEndpoint;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -246,11 +247,11 @@ async fn a_generated_response_survives_a_dropped_socket() {
 /// never a phantom recovery — and the recovery read must not even be attempted.
 #[tokio::test]
 async fn a_refused_port_errors_without_attempting_a_recovery() {
-    // Bind then drop: known-free port, nothing listening.
-    let addr = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    };
+    // mika#2569 — le port est TENU pendant l'appel. Le bloc précédent le libérait
+    // en sortant de sa portée, ce qui laissait un serveur factice d'un test voisin
+    // le recevoir et servir l'appel.
+    let dead = DeadEndpoint::reserve();
+    let addr = dead.addr();
 
     let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
         .await
@@ -348,10 +349,9 @@ async fn a_missing_task_is_reported_differently_from_one_in_flight() {
 /// would let a change to either pass on the strength of the other.
 #[tokio::test]
 async fn a_refused_port_is_retryable_and_exits_75() {
-    let addr = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    };
+    // mika#2569 — même fixture que le test ci-dessus, même raison de la tenir.
+    let dead = DeadEndpoint::reserve();
+    let addr = dead.addr();
 
     let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
         .await
