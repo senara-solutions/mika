@@ -192,11 +192,52 @@ de tête de `scripts/lib/egress_manifest_lint.py` pour les deux mesures qui
 l'imposent. Son unité d'analyse est différente : il répond *« ce **fichier**
 a-t-il un sink en production ? »*, pas *« quelles **lignes** sont
 production ? »*. Sa règle de doute est donc **inverse** : tout doute conclut
-« production », donc « déclare ». Une erreur de découpe ne peut produire
-qu'une **déclaration de plus** — jamais un silence.
+« production », donc « déclare ». Une erreur de découpe produit alors une
+**déclaration de plus**, pas un silence.
 
 **Il sur-déclare, et c'est le prix choisi.** Une ligne de manifeste de trop est
 visible et corrigible ; un sink omis est silencieux.
+
+### La limite de la coupure, mesurée plutôt que supposée
+
+Le parseur **coupe** au premier `#[cfg(test)] mod X {` au lieu de sauter le bloc
+puis de reprendre. Un fichier portant du code de production **après** ce bloc
+verrait donc son sink disparaître en silence — l'exact inverse de la règle de
+doute ci-dessus.
+
+Le saut a été écrit, essayé, et **refusé sur mesure**. Il demande de compter des
+accolades, et les formes que ce comptage ne modélise pas — chaîne sur plusieurs
+lignes, chaîne brute, commentaire de bloc — sont *réellement présentes* dans
+l'arbre : il fermait le module de test de `crates/mika-gateway/src/telegram.rs`
+**265 lignes trop tôt** et produisait trois faux positifs sur `main`, ce qu'AC4
+interdit.
+
+**Le trou est réel, pas hypothétique** : `crates/mika-agent/src/server/dashboard.rs`
+porte du code de production après son module de test (lignes 1596-1732). Il ne
+porte simplement aucun sink — et c'est cette phrase-là qui est remesurée à
+chaque run :
+
+```bash
+python3 -B scripts/lib/egress_manifest_lint.py --audit-cut-holes .
+```
+
+Sortie vide = régime nominal. Le cas N15 de
+`scripts/test-verify-egress-manifest.sh` exige qu'elle le reste, et porte son
+propre contrôle d'anti-vacuité (le détecteur doit encore *voir* la reprise
+témoin, sinon il rendrait 0 en ne mesurant rien — classe mika#2205).
+**Un trou mesuré en continu n'est pas un trou silencieux.**
+
+L'assertion porte sur la **conséquence** (un sink invisible), jamais sur la
+forme : la détection de reprise sur-rapporte — une fixture Rust dans une chaîne
+à continuation de ligne est lue comme une reprise — et cette sur-détection ne
+coûte rien tant que la région ne porte aucun sink. Une sur-détection qui en
+porte un est exactement ce qu'on veut voir.
+
+**Si N15 rougit**, le remède est de déplacer le code de production **avant** le
+bloc `#[cfg(test)] mod` — pas d'élargir le prédicat par réflexe. Apprendre au
+parseur à sauter le bloc est possible mais demande de refaire la mesure
+ci-dessus d'abord : c'est le comptage d'accolades qui a échoué, et rien ne dit
+qu'il réussirait mieux aujourd'hui.
 
 ## Ce que ce manifeste n'achète PAS
 
@@ -266,6 +307,6 @@ et c'est le mécanisme qu'il faut relire.
 | `docs/egress/egress-manifest.toml` | le manifeste — la source unique de vérité |
 | `docs/egress/README.md` | ce fichier |
 | `scripts/verify-egress-manifest.sh` | l'entrée du lint (CI + `make verify-egress-manifest`) |
-| `scripts/lib/egress_manifest_lint.py` | le moteur : inventaire + D1–D4 |
+| `scripts/lib/egress_manifest_lint.py` | le moteur : inventaire + D1–D4, plus les modes `--report`, `--confined-hosts` (AC5) et `--audit-cut-holes` |
 | `scripts/test-verify-egress-manifest.sh` | le test négatif — chaque direction vue rouge |
 | `scripts/egress-manifest-exceptions.tsv` | livré **vide**, et pinné vide |

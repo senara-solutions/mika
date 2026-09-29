@@ -243,22 +243,54 @@ EXTERNAL_TEST_MOD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z0
 COMMENT_LINE_RE = re.compile(r"^\s*//")
 
 
-def production_prefix(lines: list[str]) -> tuple[list[tuple[int, str]], list[str]]:
+# Un item Rust en COLONNE ZÉRO — la seule évidence de « la production reprend »
+# qui ne demande aucun comptage d'accolades. Voir `production_slices` § limite.
+COLUMN_ZERO_ITEM_RE = re.compile(
+    r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(?:fn|impl|struct|enum|trait|static|const|type)\b"
+)
+
+# Ouverture / fermeture d'une chaîne brute Rust : `r"`, `r#"`, `r##"`, …
+# Le nombre de `#` doit correspondre à la fermeture, d'où la capture.
+RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+
+
+def production_slices(lines: list[str]) -> tuple[list[tuple[int, str]], list[str]]:
     """Rend `(lignes de production, modules de test déclarés en externe)`.
 
     Voir la note de tête : ce parseur est délibérément grossier et conclut
     « production » au moindre doute. Le premier `#[cfg(test)]` suivi d'un
-    `mod X {` coupe ; toute autre forme ne coupe pas.
+    `mod X {` COUPE le fichier ; toute autre forme de `#[cfg(test)]` — `fn`,
+    `const`, `impl` — ne coupe rien.
 
-    Le second membre du couple est la liste des `#[cfg(test)] mod NAME;` —
-    des déclarations qui ne coupent RIEN dans ce fichier-ci (elles ne
-    délimitent aucun bloc) mais qui nomment un fichier frère entièrement
-    dédié au test. Sans ce relevé, `egress_search/tests_e4_no_log.rs` est lu
-    en entier comme de la production et son host de fixture (`ex.com`)
-    rougit en D2 — un faux positif de la classe qu'AC4 interdit.
+    LIMITE, et elle a été mesurée plutôt que supposée. Couper au lieu de
+    *sauter le bloc puis reprendre* laisse un trou : un fichier portant du code
+    de production APRÈS un `#[cfg(test)] mod tests { … }` verrait son sink
+    disparaître en silence. Le saut a été écrit, essayé, et refusé sur mesure :
+    il demande de compter des accolades, et les formes que ce comptage ne
+    modélise pas — chaîne sur plusieurs lignes, chaîne brute, commentaire de
+    bloc — sont RÉELLEMENT PRÉSENTES dans l'arbre. Il fermait le module de test
+    de `crates/mika-gateway/src/telegram.rs` 265 lignes trop tôt et produisait
+    trois faux positifs sur `main`, ce qu'AC4 interdit.
 
-    Les lignes de commentaire (`//`, `///`, `//!`) sont retirées : un host
-    cité en prose de commentaire n'est pas un appel.
+    Le trou est donc assumé, et il n'est pas silencieux : le relevé au moment de
+    l'écrire donne 297 fichiers coupés, 8 portant encore un host après la
+    fermeture du premier bloc, et les 8 dans un SECOND bloc de test — la
+    population dangereuse est VIDE. Le cas N15 de
+    `scripts/test-verify-egress-manifest.sh` la remesure à chaque run, par un
+    prédicat qui ne compte aucune accolade (un item en colonne zéro après le
+    premier `#[cfg(test)]`), et rougit le jour où elle cesse de l'être. Un trou
+    mesuré en continu n'est pas un trou silencieux.
+
+    Le second membre du couple est la liste des `#[cfg(test)] mod NAME;` — des
+    déclarations qui ne coupent RIEN ici mais nomment un fichier frère
+    entièrement dédié au test. Sans ce relevé,
+    `egress_search/tests_e4_no_log.rs` est lu en entier comme de la production
+    et son host de fixture (`ex.com`) rougit en D2 — un faux positif de la même
+    classe.
+
+    Les lignes de commentaire (`//`, `///`, `//!`) sont retirées : un host cité
+    en prose de commentaire n'est pas un appel.
     """
     out: list[tuple[int, str]] = []
     external_test_mods: list[str] = []
@@ -292,6 +324,111 @@ def production_prefix(lines: list[str]) -> tuple[list[tuple[int, str]], list[str
         out.append((idx, raw))
 
     return out, external_test_mods
+
+
+def production_resumes_after_cut(lines: list[str]) -> int | None:
+    """Rend la ligne où la production REPREND après la coupure, ou `None`.
+
+    C'est la remesure continue de la limite de `production_slices`, et son
+    prédicat ne compte AUCUNE accolade — c'est tout son intérêt, puisque c'est
+    le comptage qui a rendu le saut de bloc inutilisable.
+
+    Le signal est un item Rust en COLONNE ZÉRO après le premier
+    `#[cfg(test)] mod X {`. Dans un fichier conforme, le corps d'un module de
+    test est indenté, et un second `#[cfg(test)] mod Y {` n'est pas un item au
+    sens de `COLUMN_ZERO_ITEM_RE` — d'où un prédicat qui ne se déclenche que
+    sur la forme dangereuse : de la production redevenue frère du module.
+
+    Les régions de CHAÎNE BRUTE sont sautées, et ce n'est pas une précaution
+    théorique : six fichiers de ce dépôt embarquent des fixtures Rust dans des
+    `r#"…"#` — les scans de source (`source_scan.rs`, `source_guard.rs`,
+    `ready_label_handler.rs`, …) — et leurs `fn` de fixture sont en colonne
+    zéro. Sans ce saut, le prédicat rapporte six reprises dont aucune n'existe.
+
+    Consommé par le cas N15 du test. Rend `None` quand rien ne reprend.
+    """
+    cut = None
+    pending = False
+    for idx, raw in enumerate(lines, start=1):
+        if CFG_TEST_RE.match(raw):
+            pending = True
+            continue
+        if pending:
+            stripped = raw.strip()
+            if not stripped or COMMENT_LINE_RE.match(raw) or stripped.startswith("#["):
+                continue
+            pending = False
+            if INLINE_TEST_MOD_RE.match(raw):
+                cut = idx
+                break
+    if cut is None:
+        return None
+
+    raw_hashes: str | None = None  # `None` = hors chaîne brute
+    for idx in range(cut, len(lines)):
+        raw = lines[idx]
+        if raw_hashes is not None:
+            if f'"{raw_hashes}' in raw:
+                raw_hashes = None
+            continue
+        opened = RAW_STRING_OPEN_RE.search(raw)
+        if opened:
+            closing = '"' + opened.group(1)
+            # Une chaîne brute ouverte ET fermée sur la même ligne ne masque
+            # rien ; seule celle qui reste ouverte fait entrer dans le saut.
+            if closing not in raw[opened.end() :]:
+                raw_hashes = opened.group(1)
+                continue
+        if COLUMN_ZERO_ITEM_RE.match(raw):
+            return idx + 1
+    return None
+
+
+def audit_cut_holes(root: Path) -> list[str]:
+    """Les sinks que la coupure de `production_slices` laisse hors inventaire.
+
+    L'assertion porte sur la CONSÉQUENCE — un sink invisible — et non sur la
+    forme. C'est ce qui la rend utilisable : la détection de reprise
+    sur-rapporte (une fixture Rust dans une chaîne à continuation de ligne est
+    lue comme une reprise), et cette sur-détection ne coûte rien tant que la
+    région ne porte aucun sink. Une sur-détection QUI EN PORTE un est
+    exactement ce qu'on veut voir.
+
+    Mesure au moment de l'écrire : quatre fichiers voient une reprise, dont un
+    vrai (`crates/mika-agent/src/server/dashboard.rs` porte du code de
+    production après son module de test, lignes 1596-1732) — et AUCUN ne porte
+    de sink derrière. La liste rendue est donc vide, et le cas N15 du test
+    exige qu'elle le reste.
+
+    Rend une liste de `chemin:ligne <MOTIF>`, vide en régime nominal.
+    """
+    out: list[str] = []
+    scan_root = root / SCAN_ROOT
+    if not scan_root.is_dir():
+        return out
+
+    for path in sorted(scan_root.rglob("*.rs")):
+        rel = path.relative_to(root).as_posix()
+        if is_excluded(rel):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        at = production_resumes_after_cut(lines)
+        if at is None:
+            continue
+        for off in range(at - 1, len(lines)):
+            content = lines[off]
+            if COMMENT_LINE_RE.match(content):
+                continue
+            if CLIENT_CONSTRUCTION_RE.search(content):
+                out.append(f"{rel}:{off + 1} client HTTP hors inventaire")
+            for raw_host in URL_LITERAL_RE.findall(content):
+                host = normalize_host(raw_host)
+                if host and not is_non_sink_host(host):
+                    out.append(f"{rel}:{off + 1} host '{host}' hors inventaire")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -368,7 +505,7 @@ def build_inventory(root: Path) -> Inventory:
             # serait un silence de plus. Il reste hors inventaire et hors
             # compte, donc le contrôle positif de `--report` le voit.
             continue
-        prod, external_mods = production_prefix(lines)
+        prod, external_mods = production_slices(lines)
         parsed[rel] = prod
         test_module_files |= _test_module_paths(rel, external_mods)
 
@@ -692,8 +829,18 @@ def main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if not a.startswith("--")]
     report = "--report" in argv[1:]
     want_confined = "--confined-hosts" in argv[1:]
+    want_cut_audit = "--audit-cut-holes" in argv[1:]
 
     root = Path(args[0]).resolve() if args else Path.cwd()
+
+    # --audit-cut-holes : remesure la limite connue de la découpe
+    # production/test (voir `production_slices`). Ne lit pas le manifeste — la
+    # question ne porte que sur l'arbre. Sortie vide = régime nominal.
+    if want_cut_audit:
+        holes = audit_cut_holes(root)
+        for hole in holes:
+            print(hole)
+        return 1 if holes else 0
     manifest_path = (
         Path(args[1]).resolve()
         if len(args) > 1

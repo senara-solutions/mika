@@ -716,6 +716,55 @@ assert_true "N14d le refus nomme le consommateur" \
 
 # ============================================================================
 echo ""
+echo "N15 — la coupure production/test ne cache AUCUN sink"
+echo "------------------------------------------------------"
+# La limite connue de `production_slices` : elle COUPE au premier
+# `#[cfg(test)] mod X {` au lieu de sauter le bloc puis reprendre, donc un
+# fichier portant du code de production APRÈS ce bloc verrait son sink
+# disparaître en silence. Le saut a été écrit, essayé et refusé sur mesure — il
+# demande de compter des accolades, et les formes que ce comptage ne modélise
+# pas (chaîne multi-ligne, chaîne brute, commentaire de bloc) sont RÉELLEMENT
+# présentes : il fermait le module de test de `gateway/src/telegram.rs` 265
+# lignes trop tôt, pour trois faux positifs sur main.
+#
+# LE TROU EST RÉEL, PAS HYPOTHÉTIQUE : `crates/mika-agent/src/server/dashboard.rs`
+# porte du code de production après son module de test (lignes 1596-1732). Il
+# ne porte simplement aucun sink — et c'est cette phrase-là qu'on remesure ici,
+# à chaque run. Un trou mesuré en continu n'est pas un trou silencieux.
+#
+# L'assertion porte sur la CONSÉQUENCE (un sink invisible), jamais sur la
+# forme : la détection de reprise sur-rapporte, et cette sur-détection ne coûte
+# rien tant que la région ne porte pas de sink.
+holes_rc=0
+holes=$(python3 -B "$ENGINE" --audit-cut-holes "$REPO_ROOT" 2>&1) || holes_rc=$?
+assert_true "N15 aucun sink derrière la coupure production/test" \
+    "$([ "$holes_rc" -eq 0 ] && echo 1 || echo 0)" \
+    "sinks hors inventaire :
+$holes
+  -> déplacer le code de production AVANT le bloc \`#[cfg(test)] mod\`, ou
+     apprendre à production_slices() à sauter le bloc (voir la mesure ci-dessus
+     avant d'essayer : c'est le comptage d'accolades qui a échoué)."
+
+# ANTI-VACUITÉ de N15 : le mode d'audit doit encore REGARDER quelque chose. S'il
+# cessait de trouver la moindre reprise — répertoire renommé, prédicat cassé —
+# il rendrait 0 en ne mesurant rien, et se lirait exactement comme un arbre
+# propre (classe mika#2205). La reprise de `dashboard.rs` est le témoin.
+witness=$(python3 -B - "$REPO_ROOT" <<'PY' 2>&1
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts" / "lib"))
+from egress_manifest_lint import production_resumes_after_cut
+p = root / "crates/mika-agent/src/server/dashboard.rs"
+print(production_resumes_after_cut(p.read_text(encoding="utf-8").splitlines()))
+PY
+)
+assert_true "N15 anti-vacuité — le détecteur voit encore la reprise témoin" \
+    "$([ "$witness" != "None" ] && [ -n "$witness" ] && echo 1 || echo 0)" \
+    "production_resumes_after_cut(dashboard.rs) a rendu '$witness' ; attendu un numéro de ligne. Si ce fichier a été réorganisé, choisir un autre témoin — mais ne pas retirer l'assertion, sinon N15 rend 0 sans rien mesurer"
+
+# ============================================================================
+echo ""
 echo "===================================================="
 echo "Résultats : $PASS réussies, $FAIL échouées"
 echo "===================================================="
