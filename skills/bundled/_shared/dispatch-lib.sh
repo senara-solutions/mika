@@ -590,7 +590,25 @@ _PILOT_GH_HELPER_ADDON="$HOME/.local/bin/mika-pilot-github-auth-addon.py"
 # mika#2056: host-only file the dispatcher rewrites with the current GitHub
 # token before each spawn, for the github addon to read host-side. NEVER bound
 # into the sandbox (not among the --ro-bind paths below). 0600.
-_PILOT_GH_TOKEN_FILE="$HOME/.mika/pilot-gh-token"
+#
+# mika#2578: the declaration is CONDITIONAL, and the default is unchanged — a
+# real dispatch still stages to "$HOME/.mika/pilot-gh-token". What the `:=`
+# buys is that a HARNESS which exported the variable before sourcing this file
+# keeps its own value. The one harness that needs it is
+# `scripts/canary-pilot-containment`: it runs on the operator's real $HOME (it
+# needs the relay, the ~/.mitmproxy CA and the installed proxy binary), exports
+# a decoy GH_TOKEN, and calls _run_pilot_sandboxed five times — so before this,
+# every canary run overwrote the host's live GitHub credential with the decoy
+# and every in-flight pilot went 401 on api.github.com until the next dispatch
+# restaged. The other five harnesses that source this file redirect $HOME to a
+# temp tree instead, and are unaffected either way.
+#
+# The name is DELIBERATELY `_`-prefixed and is NOT an operator knob. Relaying it
+# to the dispatch child would hand the service environment a lever over where a
+# real dispatch writes its GitHub credential; it is therefore absent from
+# SANDBOX_ENV_CORE_ALLOWLIST and from PILOT_DISPATCH_ENV, and the `_` prefix
+# keeps it out of the mika#2508 operator-variable scan by construction.
+: "${_PILOT_GH_TOKEN_FILE:=$HOME/.mika/pilot-gh-token}"
 _PILOT_HELPER_CA="$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 _PILOT_HELPER_LOG="/var/log/mika/pilot-helper.log"
 # Bind target for the helper CA inside the sandbox. MUST be under /tmp
