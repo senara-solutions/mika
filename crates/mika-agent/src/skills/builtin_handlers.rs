@@ -3599,8 +3599,18 @@ where
         dependabot_verdict_gate_enabled, is_cargo_dependency_pr, pr_review_target,
         qa_build_evidence_window_secs,
     };
-    use crate::qa_build_callback::BUILD_MIKA_TOOL;
     use crate::server::verdict::{Verdict, parse_verdict};
+    // `BUILD_MIKA_TOOL` est un identifiant Rust — le NOM de l'outil de build
+    // (`build_mika`), jamais une variable d'environnement. Il est aliasé ici
+    // parce que le corps de refus plus bas interpole ce nom dans une chaîne
+    // **servie au modèle** : le lint substrat apparie `MIKA_[A-Z0-9_]+` sans
+    // frontière gauche, donc `BUILD_MIKA_TOOL` y est lu comme une variable. Le
+    // remède est de retirer le segment du site, jamais d'annoter un littéral
+    // model-visible `substrate-ok` — l'annotation affirmerait « n'atteint
+    // jamais un `content` », ce qui y serait faux.
+    // substrate-ok: un chemin de constante Rust dans une déclaration `use` —
+    // aucune chaîne, donc rien qui puisse atteindre un `content`.
+    use crate::qa_build_callback::BUILD_MIKA_TOOL as BUILD_TOOL;
 
     // -- Reconnaissance, fail-open, par coût croissant : aucun octet de réseau
     //    n'est dépensé hors population --
@@ -3789,7 +3799,7 @@ where
             .find_recent_build_invocation(
                 ctx.db.agent_id(),
                 ctx.session_id,
-                BUILD_MIKA_TOOL,
+                BUILD_TOOL,
                 qa_build_evidence_window_secs(),
             )
             .await
@@ -3802,6 +3812,7 @@ where
                     agent_id = %ctx.db.agent_id(),
                     session_id = %ctx.session_id,
                     target = %target_key,
+                    // substrate-ok: a log message, never a tool-result content.
                     "mika#2565: la preuve de build n'est pas lisible — B3 s'abstient plutôt \
                      que de refuser sur un terme inobservable. Vérifier MIKA_STORE_TOOL_CALLS \
                      avant de toucher au prédicat."
@@ -3935,12 +3946,12 @@ where
                 "remedy": format!(
                     "This body carries a `pass` verdict on a dependency PR whose diff touches \
                      Rust dependency resolution (`Cargo.toml` / `Cargo.lock`), and no \
-                     `{BUILD_MIKA_TOOL}` call was recorded in this session. A reading of the API \
+                     `{BUILD_TOOL}` call was recorded in this session. A reading of the API \
                      surface does not close this class: on mika#2560 (sha2 0.10.9 -> 0.11.0) the \
                      incompatibility was TRANSVERSE — sha2 0.11 on digest 0.11 against hmac 0.12 \
                      on digest 0.10 — and shows on no call site of sha2. Only cargo's resolver \
                      sees it. Two correct ways out. (a) Create the managed worktree if it does \
-                     not exist, call `{BUILD_MIKA_TOOL}` on it and END YOUR TURN — the build \
+                     not exist, call `{BUILD_TOOL}` on it and END YOUR TURN — the build \
                      callback resumes the review with its result (qa-review Step 1.6 item 5c). \
                      (b) If compilation breaks, rewrite the verdict line to `block[dependency]`, \
                      naming the compile error, and post it with `--comment`. The plan exemption \
