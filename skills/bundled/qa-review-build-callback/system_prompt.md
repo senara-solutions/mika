@@ -27,7 +27,13 @@ These rules override everything else in this prompt:
 
 **Build Callback Entry Point:** When the `build_mika` callback arrives, resume here:
 
-1. **Mandatory plan re-read (Step 2.5.1 + 2.5.2 + 2.5.3, ALWAYS).** Re-derive the worktree path from the prior turn's `qa_pr_view` output (still in conversation context as a tool result, even under partial compaction) — same formula as Step 3e.2: `sanitized_branch = headRefName with "/" → "-"`; `worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/` — composed from a **literal** root, never from a shell variable, for the reason Step 3e.2 gives (mika#2536). Then re-read the plan and re-extract ACs unconditionally:
+0. **Dependabot dependency PR — there is no plan to re-read (mika#2565).** If the opening turn took the Step 1.6 path — an automated author, and **no `> - **Plan:** \`<path>\`` callout** on the issue or PR body — then item 1 below does not apply and you must not run it. The discriminant is the **absence of the plan callout**, which is already what item 1 derives `<plan-path>` from; it is not the `dependabot/` branch prefix, which would be a naming heuristic where a fact is available.
+
+   On this class: skip straight to qa-review Step 1.6 item 8 and map the verdict with the build result in hand, emitting `PLAN-AC VERIFICATION: skipped (Dependabot dependency PR — no plan contract, mika#1729)` and `BUILD VERIFICATION: Build: pass|fail` with the callback's own result. A green build clears the last term of step 8's `pass`; a red one is `VERDICT: block[dependency]`, quoting the compiler error verbatim.
+
+   **Never emit `block[pipeline]` on this class.** It is structurally unreachable here — Steps 2 and 2.5 were skipped, so no guard ran and no plan was read — and the engine refuses the call before the subprocess (mika#2519 B1). Running item 1 on a plan-less PR would produce exactly that verdict ("plan unreadable in callback"), and the review would die on a tool refusal rather than on a judgment.
+
+1. **Mandatory plan re-read (Step 2.5.1 + 2.5.2 + 2.5.3, ALWAYS — except on the class item 0 names).** Re-derive the worktree path from the prior turn's `qa_pr_view` output (still in conversation context as a tool result, even under partial compaction) — same formula as Step 3e.2: `sanitized_branch = headRefName with "/" → "-"`; `worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/` — composed from a **literal** root, never from a shell variable, for the reason Step 3e.2 gives (mika#2536). Then re-read the plan and re-extract ACs unconditionally:
    ```
    run_shell("cat <worktree>/<plan-path>")
    ```

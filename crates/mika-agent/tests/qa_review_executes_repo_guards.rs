@@ -329,3 +329,211 @@ fn mika2519_step_1_6_still_delegates_the_plan_exemption_it_already_had() {
          Step 1.6 by name — now points at nothing."
     );
 }
+
+// ---------------------------------------------------------------------------
+// mika#2565 — Layer C. A Rust bump is verified by compiling, never by asserting.
+//
+// These scans read the prompt as text and prove nothing about what the model
+// does with it; the behavioural half is the calibration scenario
+// `dependabot_cargo_bump_requires_build` and sonde S1. What they close is the
+// regression class: the unconditional build skip coming back, or Step 3e being
+// re-forbidden on the one path that now needs it.
+// ---------------------------------------------------------------------------
+
+/// **The prescription that produced the defect must be gone.**
+///
+/// Step 1.6 item 2 read, literally: "Emit … `BUILD VERIFICATION: skipped
+/// (Dependabot dependency PR)`". Unconditional. That is what the four measured
+/// `pass` verdicts were obeying — the `(pipeline-exempt label)` wording they
+/// carried was the model's own paraphrase, and the label exempts the plan, not
+/// the build (R1 of the plan).
+#[test]
+fn mika2565_step_1_6_no_longer_prescribes_an_unconditional_build_skip() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        !prompt.contains("`BUILD VERIFICATION: skipped (Dependabot dependency PR)`"),
+        "qa-review/system_prompt.md Step 1.6 prescribes an UNCONDITIONAL build \
+         skip again (mika#2565).\n\
+         That exact string is what mika#2560 and mika#2561 were obeying when \
+         they were approved with a red required check behind them. The build \
+         skip must be conditioned on the diff: a `Cargo.toml` / `Cargo.lock` \
+         path makes the build REQUIRED (step 5c); anything else skips with a \
+         reason that is true — `(dependency PR, no Rust dependency resolution \
+         in the diff)`."
+    );
+}
+
+/// **The label must not be offered as a build dispensation.**
+///
+/// This is the topical stop rather than an enumeration of forbidden phrases:
+/// the prompt does not list "API-compatible" / "API-surface verified" — listing
+/// them would hand the model the template it is being denied (mika#2292), and
+/// R2 established the phrase was never the problem. What is pinned is narrower
+/// and checkable: the label and the build must not be tied together.
+#[test]
+fn mika2565_step_1_6_does_not_present_the_label_as_a_build_exemption() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        !prompt.contains("skipped (pipeline-exempt label)"),
+        "qa-review/system_prompt.md offers `pipeline-exempt` as a build \
+         exemption (mika#2565).\n\
+         It exempts the PLAN and has never exempted the BUILD. The measured \
+         verdicts invoked it in exactly this wording; the prompt must not make \
+         that reading available."
+    );
+}
+
+/// **Step 3e is no longer forbidden on the one path that now needs it.**
+///
+/// The closing line of Step 1.6 read "Do NOT run Steps 2/2.5/3e for a
+/// Dependabot PR". Step 5c *is* this path's build verification, so leaving 3e
+/// in that list would make the new step contradict its own section.
+#[test]
+fn mika2565_step_1_6_no_longer_forbids_step_3e() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    assert!(
+        !prompt.contains("Do NOT run Steps 2/2.5/3e"),
+        "qa-review/system_prompt.md Step 1.6 forbids Step 3e again (mika#2565 \
+         AC5).\n\
+         Step 5c is this path's build verification and reuses 3e's worktree \
+         formula and its end-the-turn discipline. Forbidding 3e here makes the \
+         section contradict itself, and the build never runs."
+    );
+    assert!(
+        prompt.contains("Do NOT run Steps 2/2.5 for a Dependabot PR"),
+        "the plan-AC skip must still be prescribed — this scan removes `3e` \
+         from that list, it does not remove the list."
+    );
+}
+
+/// **The build step must actually be reachable and executable as written.**
+///
+/// A prompt that said "verify the build" without naming the tool, or without
+/// the worktree the tool needs, would be the inert branch the plan's O1 names:
+/// Step 3e's own path derivation ends in "skipped (no worktree found at
+/// expected path)" for a Dependabot PR, because the loop never dispatched one.
+#[test]
+fn mika2565_step_1_6_names_the_build_tool_and_creates_its_worktree() {
+    let prompt = qa_review_prompt();
+    assert_step_1_6_exists(&prompt);
+
+    let step_5c = prompt
+        .split_once("5c. **Compile it")
+        .expect(
+            "qa-review/system_prompt.md Step 1.6 no longer carries step 5c \
+             (mika#2565). Every scan below targets it; establish where the \
+             build requirement lives now BEFORE touching these tests.",
+        )
+        .1
+        .split_once("\n8. **Verdict mapping")
+        .expect("step 5c must sit before item 8, which consumes its result")
+        .0;
+
+    assert!(
+        step_5c.contains("build_mika(cwd="),
+        "step 5c must name the build tool and its argument, or it prescribes an \
+         intention rather than a gesture"
+    );
+    // The `worktree add` lines, not the prose around them. The section
+    // legitimately *mentions* `--detach` to say it is not used, and a bare
+    // `contains` over the whole section would read that mention as the gesture
+    // — the false-positive class mika#2050 measured on Signal S. Every line
+    // that carries the subcommand is checked rather than the first one, so a
+    // second invocation added later cannot slip past under the first's cover.
+    let creations: Vec<&str> = step_5c
+        .lines()
+        .filter(|l| l.contains("worktree add"))
+        .collect();
+
+    assert!(
+        !creations.is_empty(),
+        "step 5c must CREATE the worktree (plan O1): a Dependabot PR is never \
+         dispatched by the loop, so the path Step 3e derives does not exist and \
+         the build would skip under one more name"
+    );
+    assert!(
+        creations.iter().any(|l| l.contains(".claude/worktrees/")),
+        "the worktree must be created under the MANAGED root (plan O2) — that \
+         is term T1 of the mika#2420 reaper and the population of the mika#2497 \
+         `target/` purge. Elsewhere it is a 15-50 GB orphan nothing reaps.\n\
+         lines read: {creations:?}"
+    );
+    assert!(
+        !creations.iter().any(|l| l.contains("--detach")),
+        "the worktree must be ATTACHED to the branch (plan O2), so the reaper \
+         resolves it by branch key (T3) rather than through mika#2518's SHA \
+         catch-up.\n\
+         lines read: {creations:?}"
+    );
+    assert!(
+        step_5c.contains("END YOUR TURN"),
+        "step 5c must end the turn after the build call — `build_mika` is \
+         long-running and any verdict posted before its callback is premature"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// mika#2565 — the build callback
+// ---------------------------------------------------------------------------
+
+fn qa_review_build_callback_prompt() -> String {
+    let path = workspace_root().join("skills/bundled/qa-review-build-callback/system_prompt.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
+/// **The callback's dependabot branch must come BEFORE the plan re-read.**
+///
+/// The callback opens on "Mandatory plan re-read … If the plan file is
+/// unreadable: `VERDICT: block[pipeline]` … NOT downgraded to `hold[review]`".
+/// A Dependabot PR has no plan, so on that class the callback would produce
+/// exactly the verdict mika#2519's B1 refuses structurally — the review would
+/// die on a tool refusal rather than on a judgment (plan O3).
+///
+/// Order is the whole assertion: a branch placed after the re-read is a branch
+/// the re-read has already pre-empted.
+#[test]
+fn mika2565_the_build_callback_branches_on_dependabot_before_the_plan_reread() {
+    let prompt = qa_review_build_callback_prompt();
+
+    let dependabot_branch = prompt
+        .find("0. **Dependabot dependency PR — there is no plan to re-read")
+        .expect(
+            "qa-review-build-callback/system_prompt.md no longer carries its \
+             Dependabot branch (mika#2565 / plan O3). Without it the callback \
+             emits `block[pipeline]` on a plan-less PR — the verdict mika#2519 \
+             B1 refuses before the subprocess, so the review dies on a tool \
+             refusal.",
+        );
+    let plan_reread = prompt
+        .find("**Mandatory plan re-read")
+        .expect("the plan re-read must still exist — this scan orders it, it does not remove it");
+
+    assert!(
+        dependabot_branch < plan_reread,
+        "the Dependabot branch must come BEFORE the mandatory plan re-read \
+         (mika#2565). Placed after it, the re-read has already run and already \
+         emitted `block[pipeline]` for a plan that was never supposed to exist."
+    );
+
+    assert!(
+        prompt.contains("Never emit `block[pipeline]` on this class"),
+        "the branch must say what it forbids, not merely where to resume: \
+         `block[pipeline]` is structurally unreachable here (mika#2519 B1) and \
+         the engine refuses the call before the subprocess"
+    );
+    assert!(
+        prompt.contains("no `> - **Plan:** \\`<path>\\`** callout")
+            || prompt.contains("no `> - **Plan:**"),
+        "the discriminant must be the ABSENCE OF THE PLAN CALLOUT — the fact \
+         item 1 already derives `<plan-path>` from — and not the \
+         `dependabot/` branch prefix, which would be a naming heuristic where a \
+         fact is available"
+    );
+}

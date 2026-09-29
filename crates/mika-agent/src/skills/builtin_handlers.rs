@@ -3555,9 +3555,13 @@ async fn run_gh_pr_view_author_title(pr: u64, repo: &str, token: &str) -> Result
         "--repo",
         repo,
         "--json",
-        // `author` est un objet ; `title` porte le couple de versions. Deux
-        // champs, un appel — voir la doc du seam ci-dessous.
-        "author,title",
+        // `author` est un objet ; `title` porte le couple de versions ;
+        // `files` porte le diff que B3 lit (mika#2565). Trois champs, **un
+        // seul appel** — un champ de plus sur l'appel qui existe déjà coûte
+        // zéro aller-retour, là où une seconde lecture doublerait le coût du
+        // maillon que mika#2455 a placé en dernier précisément parce qu'il en
+        // fait un.
+        "author,title,files",
     ];
     crate::tools::pr_merge_with_gate::run_gh_subprocess(&args, token).await
 }
@@ -3592,9 +3596,21 @@ where
     use crate::evidence::guards::{
         API_SURFACE_LINE_PREFIX, DEPENDABOT_READ_TIMEOUT_SECS, DEPENDABOT_VERDICT_AUDIT_TOOL,
         DependabotAbstention, DependabotVerdictOutcome, classify_dependabot_verdict,
-        dependabot_verdict_gate_enabled, pr_review_target,
+        dependabot_verdict_gate_enabled, is_cargo_dependency_pr, pr_review_target,
+        qa_build_evidence_window_secs,
     };
     use crate::server::verdict::{Verdict, parse_verdict};
+    // `BUILD_MIKA_TOOL` est un identifiant Rust — le NOM de l'outil de build
+    // (`build_mika`), jamais une variable d'environnement. Il est aliasé ici
+    // parce que le corps de refus plus bas interpole ce nom dans une chaîne
+    // **servie au modèle** : le lint substrat apparie `MIKA_[A-Z0-9_]+` sans
+    // frontière gauche, donc `BUILD_MIKA_TOOL` y est lu comme une variable. Le
+    // remède est de retirer le segment du site, jamais d'annoter un littéral
+    // model-visible `substrate-ok` — l'annotation affirmerait « n'atteint
+    // jamais un `content` », ce qui y serait faux.
+    // substrate-ok: un chemin de constante Rust dans une déclaration `use` —
+    // aucune chaîne, donc rien qui puisse atteindre un `content`.
+    use crate::qa_build_callback::BUILD_MIKA_TOOL as BUILD_TOOL;
 
     // -- Reconnaissance, fail-open, par coût croissant : aucun octet de réseau
     //    n'est dépensé hors population --
@@ -3720,9 +3736,118 @@ where
     };
     let title = parsed.get("title").and_then(|t| t.as_str()).unwrap_or("");
 
+    // L'abstention de mika#2565 est **PARTIELLE** : elle porte sur B3 et sur
+    // elle seule.
+    //
+    // Écrire `abstain(); return` ici retirerait B1 et B2 de la décision — deux
+    // branches qui ne lisent ni `files` ni la base et dont le jugement reste
+    // entier quand ces deux termes manquent. Mesuré : cette forme faisait
+    // tomber les neuf tests de mika#2519, et le `pass` sur #2453 — la PR témoin
+    // que mika#2519 existe pour débloquer — ressortait `abstained` au lieu
+    // d'`allowed`. Un terme qu'on n'a pas pu évaluer n'est jamais un terme
+    // satisfait ; il n'est pas non plus une raison de cesser d'évaluer les
+    // autres.
+    async fn abstain_b3(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) {
+        tracing::warn!(
+            event = "dependabot_build_evidence_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2565: could not read the build-evidence term — B3 abstains and the \
+             remaining branches still decide"
+        );
+        audit(ctx, target_key, "abstained", reason).await;
+    }
+
+    // `files` est un tableau d'objets `{"path":…,"additions":…}` (mika#2565).
+    // Absent, non-tableau, ou vide ⇒ la liste reste vide, donc
+    // `is_cargo_dependency_pr` est faux et B3 ne s'applique pas — l'abstention
+    // est obtenue par le prédicat lui-même plutôt que par un saut. Le motif est
+    // néanmoins **écrit**, sous un nom à lui et jamais replié sur
+    // `unparseable` : c'est là que le défaut mesuré peut repasser, et la
+    // population doit rester comptable séparément (sonde S4). Un `title`
+    // absent, lui, reste la chaîne vide : il n'est lu que par B2, qui rend
+    // `Unreadable` et s'abstient de lui-même.
+    let files: Vec<String> = parsed
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if files.is_empty() {
+        abstain_b3(ctx, &target_key, DependabotAbstention::NO_FILES).await;
+    }
+
+    // Le fait moteur que B3 lit (mika#2565). Il n'est interrogé que sur un
+    // `pass` dont le diff touche cargo : hors de cette population la question
+    // n'a pas d'objet, et une lecture en base par verdict serait un coût payé
+    // par tout le trafic pour une branche qui ne s'applique presque jamais.
+    //
+    // Trois états, et le troisième est celui qui compte : « un build a tourné »
+    // (laisser passer), « aucun build » (refuser), « la base n'a pas répondu »
+    // (s'abstenir). Confondre le troisième avec le deuxième ferait refuser tout
+    // `pass` quand `MIKA_STORE_TOOL_CALLS` est désarmé — le mode de panne
+    // inverse du défaut, et celui qui couche la revue.
+    let build_observed = if is_pass && is_cargo_dependency_pr(&files) {
+        match ctx
+            .db
+            .find_recent_build_invocation(
+                ctx.db.agent_id(),
+                ctx.session_id,
+                BUILD_TOOL,
+                qa_build_evidence_window_secs(),
+            )
+            .await
+        {
+            Ok(rows) => !rows.is_empty(),
+            Err(e) => {
+                tracing::warn!(
+                    event = "qa_build_evidence_unreadable",
+                    error = %e,
+                    agent_id = %ctx.db.agent_id(),
+                    session_id = %ctx.session_id,
+                    target = %target_key,
+                    // substrate-ok: a log message, never a tool-result content.
+                    "mika#2565: la preuve de build n'est pas lisible — B3 s'abstient plutôt \
+                     que de refuser sur un terme inobservable. Vérifier MIKA_STORE_TOOL_CALLS \
+                     avant de toucher au prédicat."
+                );
+                abstain_b3(
+                    ctx,
+                    &target_key,
+                    DependabotAbstention::BUILD_EVIDENCE_UNAVAILABLE,
+                )
+                .await;
+                // `true` neutralise B3 pour ce verdict — et **seulement B3** :
+                // B2 ne lit ni la base ni `files`, son jugement sur ce corps
+                // reste entier, et le lui retirer ici ferait d'une base
+                // illisible un désarmement de la branche voisine.
+                true
+            }
+        }
+    } else {
+        // Hors population de B3 : la valeur ne sera pas lue. `true` plutôt que
+        // `false` pour que, si le prédicat de population venait à diverger, le
+        // défaut soit « laisser passer » et non « refuser tout ».
+        true
+    };
+
     // -- Décider --
 
-    match classify_dependabot_verdict(author_login, is_pipeline_block, is_pass, title, &body) {
+    match classify_dependabot_verdict(
+        author_login,
+        is_pipeline_block,
+        is_pass,
+        title,
+        &body,
+        &files,
+        build_observed,
+    ) {
         // Le cas nominal est écrit. Sans ça, « zéro refus » ne distinguerait pas
         // un rail sain d'une garde inerte — la panne exacte que mika#2205 a dû
         // nommer pour ses deux scans, et le contrôle POSITIF de la sonde S5.
@@ -3782,6 +3907,55 @@ where
                      (b) If a repo guard genuinely exited non-zero, quote its output VERBATIM in \
                      the body as Step 2E requires — a paraphrase is not a guard output, and \
                      nothing in this repo emits the wording you posted."
+                ),
+            });
+            Err(ToolOutput::error(payload.to_string()))
+        }
+
+        DependabotVerdictOutcome::RefusedUnbuiltCargoBump { author, files_seen } => {
+            tracing::warn!(
+                event = "dependabot_verdict_refused",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                pr = pr_number,
+                verdict = "pass",
+                author = %author,
+                files_seen = files_seen,
+                reason = "unbuilt_cargo_bump",
+                "mika#2565: refused a pass verdict on a Rust dependency bump that never compiled \
+                 in this session"
+            );
+            audit(
+                ctx,
+                &target_key,
+                "refused_unbuilt_cargo_bump",
+                &format!(
+                    "author={author} files_seen={files_seen} passed without a build in this session"
+                ),
+            )
+            .await;
+
+            // **Aucune ligne de ce corps ne doit COMMENCER par `VERDICT:`** —
+            // même contrainte et même raison que les deux refus voisins.
+            let payload = serde_json::json!({
+                "error": "dependabot_cargo_bump_unbuilt",
+                "doctrine": "mika#2565",
+                "target": target_key,
+                "files_seen": files_seen,
+                "remedy": format!(
+                    "This body carries a `pass` verdict on a dependency PR whose diff touches \
+                     Rust dependency resolution (`Cargo.toml` / `Cargo.lock`), and no \
+                     `{BUILD_TOOL}` call was recorded in this session. A reading of the API \
+                     surface does not close this class: on mika#2560 (sha2 0.10.9 -> 0.11.0) the \
+                     incompatibility was TRANSVERSE — sha2 0.11 on digest 0.11 against hmac 0.12 \
+                     on digest 0.10 — and shows on no call site of sha2. Only cargo's resolver \
+                     sees it. Two correct ways out. (a) Create the managed worktree if it does \
+                     not exist, call `{BUILD_TOOL}` on it and END YOUR TURN — the build \
+                     callback resumes the review with its result (qa-review Step 1.6 item 5c). \
+                     (b) If compilation breaks, rewrite the verdict line to `block[dependency]`, \
+                     naming the compile error, and post it with `--comment`. The plan exemption \
+                     for dependency PRs covers the PLAN; it has never covered the BUILD."
                 ),
             });
             Err(ToolOutput::error(payload.to_string()))
