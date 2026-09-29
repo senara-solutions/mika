@@ -103,6 +103,7 @@
 
 pub mod assessor;
 pub mod cadence;
+pub mod liveness;
 pub mod reader;
 pub mod reporter;
 pub mod sink_dir;
@@ -118,6 +119,11 @@ pub use cadence::{
     ManagerConfig, MilestoneCheckpoint, ROUTE_HTTP, ROUTE_OFFLINE_SINK,
     ROUTE_OFFLINE_SINK_FALLBACK, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
     run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
+};
+pub use liveness::{
+    ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
+    LivenessEmitter, LivenessFailure, LivenessFailureClass, LivenessSink, REASON_DELIVERY_PREFIX,
+    REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
 pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};

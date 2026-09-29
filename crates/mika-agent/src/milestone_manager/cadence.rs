@@ -61,6 +61,18 @@ pub struct ManagerConfig {
     /// en vigueur — et une provenance fausse est strictement pire qu'aucune
     /// provenance (mika#2293).
     pub sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource,
+    /// Endpoint du battement de vivacité, **déclaré** par
+    /// `MIKA_MANAGER_LIVENESS_URL` (mika#1990).
+    ///
+    /// Jamais composé depuis `delivery_url` ni depuis `health_url` : les trois
+    /// URLs désignent trois routes de formes et de sémantiques distinctes, et
+    /// `health_url` est même de sens **inverse** (on y lit la santé de
+    /// l'exécuteur ; ici on écrit la nôtre). Voir
+    /// [`super::liveness`] pour le raisonnement complet.
+    ///
+    /// Absente ou vide ⇒ canal désarmé : zéro POST, zéro erreur. C'est aussi le
+    /// rollback — retirer la variable désarme sans redéploiement.
+    pub liveness_url: Option<String>,
 }
 
 // ---- mika#2267 C4 — `route` est un format de fil ---------------------------
@@ -813,6 +825,9 @@ mod tests {
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
             sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource::Default,
+            // Le battement de liveness (mika#1990) est un canal distinct du POST
+            // de rapport : aucun test de cadence ne l'exerce, d'où `None`.
+            liveness_url: None,
         }
     }
 
