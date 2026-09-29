@@ -36,7 +36,7 @@ export function Hero() {
       {/* Subheading */}
       <p className="mt-8 max-w-2xl text-lg leading-relaxed text-muted sm:text-xl">
         Mika is an open-source executive assistant that remembers everything,
-        acts proactively, and runs entirely on your machine.
+        acts proactively, and runs where you want: on your machine or on Mika Cloud.
       </p>
 
       {/* CTAs */}

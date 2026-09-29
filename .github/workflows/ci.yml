@@ -113,6 +113,15 @@ jobs:
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
 
+      # mika#2578: this suite was in `make test` — a local target CI does not
+      # call — so its guards gated nothing on a PR. It now carries the scan that
+      # refuses a canary writing the host GitHub credential (PART D) and the
+      # behavioural half proving the staging path is redirectable (PART B), and
+      # a guard the pipeline never runs refuses nothing. Its real-sandbox part
+      # skips cleanly when bwrap is absent, so it is safe on a hosted runner.
+      - name: GitHub token host-reachable / sandbox-absent (mika#2056, mika#2578)
+        run: make test-github-token-not-in-sandbox
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
@@ -465,6 +474,15 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Ce lint DÉRIVE ses PATTERNS du manifeste depuis mika#2408 (AC5), donc il
+      # lit du TOML, donc il exige `tomllib` (stdlib >= 3.11). `ubuntu-22.04`
+      # porte Python 3.10 : sans cette étape le job rougit sur
+      # `ModuleNotFoundError`. La version est DÉCLARÉE ici plutôt que héritée de
+      # l'image — une bascule de runner ne doit pas décider en silence si une
+      # garde de confinement peut tourner.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
       - name: Enforce single-controlled search egress (mika#1807 AC4)
         run: bash scripts/verify-egress-uniqueness.sh
 
@@ -495,6 +513,23 @@ jobs:
         run: bash scripts/verify-egress-no-log.sh
       - name: Pin the egress no-log guard's negative behaviour (mika#2054)
         run: bash scripts/test-verify-egress-no-log.sh
+
+  egress-manifest-lint:
+    name: Egress Manifest Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Le moteur du lockstep lit le manifeste TOML via `tomllib` (stdlib
+      # >= 3.11) et `ubuntu-22.04` porte Python 3.10. Même raison qu'au job
+      # `egress-uniqueness-lint` ci-dessus ; le câblage des deux est tenu par
+      # l'assertion N16 de `scripts/test-verify-egress-manifest.sh`.
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Enforce manifest↔code lockstep on outbound sinks (mika#2408)
+        run: bash scripts/verify-egress-manifest.sh --report
+      - name: Pin the guard's negative behaviour in all four directions (AC1, AC1b)
+        run: bash scripts/test-verify-egress-manifest.sh
 
   sigpipe-grep-lint:
     name: SIGPIPE grep-q Lint

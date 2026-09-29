@@ -1,0 +1,380 @@
+# Manifeste d'egress — mika#2408
+#
+# Chaque [[sink]] déclare un chemin réseau sortant. Le manifeste est tenu en
+# LOCKSTEP BIDIRECTIONNEL avec le code par `scripts/verify-egress-manifest.sh` :
+# il ne peut ni omettre un sink réel, ni nommer un sink qui n'existe pas.
+#
+# `docs/egress/` est sous CODEOWNERS @samidarko : aucune entrée ne merge sans
+# revue humaine. Schéma, procédure d'ajout et sondes : docs/egress/README.md
+#
+# DEUX CHAMPS QU'AUCUNE MACHINE NE VÉRIFIE, et c'est pour eux que la revue
+# existe : `data` (quelle donnée part) et `logged` (est-elle journalisée).
+# En cas de doute sur `logged`, on écrit `true` — un `logged = false` faux est
+# le mode de panne le plus coûteux de ce fichier.
+
+schema_version = 1
+
+# ===========================================================================
+# EGRESS CONFINÉ — les deux substrats
+# ===========================================================================
+
+[[sink]]
+id                 = "brave-search"
+destination        = "api.search.brave.com"
+destination_source = "literal"
+class              = "external"
+data               = "le texte de la requête de recherche de l'utilisateur, et rien d'autre (STRIP-TOTAL : ni identité, ni IP, ni en-tête d'origine)"
+logged             = false
+client_site        = "crates/mika-gateway/src/egress_search/mod.rs"
+call_site          = "crates/mika-gateway/src/egress_search/"
+confined           = true
+owner              = "@samidarko"
+notes              = "Substrat E1 (mika#1807). Le no-log est tenu MÉCANIQUEMENT par scripts/verify-egress-no-log.sh (mika#1810) et la forme de la requête par scripts/verify-egress-request-shape.sh — c'est le seul sink du fichier dont `logged = false` est vérifié par une machine. Le confinement (ce host n'apparaît que dans son substrat) est tenu par scripts/verify-egress-uniqueness.sh."
+
+[[sink]]
+id                 = "gouv-fr-fetch"
+destination        = "service-public.fr"
+destination_source = "literal"
+class              = "external"
+data               = "une URL GET appartenant à l'allowlist compile-time ; aucun corps, aucune donnée utilisateur au-delà du chemin demandé"
+logged             = false
+client_site        = "crates/mika-gateway/src/egress_fetch/mod.rs"
+call_site          = "crates/mika-gateway/src/egress_fetch/"
+confined           = true
+confined_hosts     = ["service-public.fr", "ants.gouv.fr", "impots.gouv.fr", "data.gouv.fr"]
+also_declares      = ["ants.gouv.fr", "impots.gouv.fr", "data.gouv.fr"]
+owner              = "@samidarko"
+notes              = "Substrat mika#1969, GET seulement. L'allowlist est compile-time et son extension est un changement de code + deploy (KTD2) — délibérément PAS une variable d'environnement. Le builtin `fetch_url` côté agent ne nomme aucun de ces hosts : il délègue à POST /internal/fetch."
+
+# ===========================================================================
+# EGRESS EXTERNE — forge
+# ===========================================================================
+
+[[sink]]
+id                 = "github-api-agent"
+destination        = "api.github.com"
+destination_source = "literal"
+class              = "external"
+data               = "requêtes GraphQL et REST sur issues, PR, revues et labels : titres, corps, commentaires et diffs du dépôt, plus le jeton d'App ou le PAT"
+logged             = false
+client_site        = "crates/mika-agent/src/github_graphql.rs"
+call_site          = "crates/mika-agent/src/github_graphql.rs"
+also_declares      = ["github.com"]
+owner              = "@samidarko"
+notes              = "`github.com` (host web et git) est déclaré ici plutôt que sur une entrée propre : il est atteint par `git push` depuis crates/mika-agent/src/skills/git.rs, qui ne construit AUCUN client HTTP (il délègue au binaire git) et ne peut donc pas porter un `client_site` valide. Même forge, même credential, une entrée."
+
+[[sink]]
+id                 = "github-api-gateway"
+destination        = "api.github.com"
+destination_source = "config"
+class              = "external"
+data               = "appels Compare API sur un couple de SHA — nom du dépôt, deux révisions, et le jeton"
+logged             = false
+client_site        = "crates/mika-gateway/src/github.rs"
+call_site          = "crates/mika-gateway/src/github.rs"
+owner              = "@samidarko"
+notes              = "`config` et non `literal` : la base est `github_api_base_url`, repointable (compatibilité GitHub Enterprise). La valeur déclarée est le défaut du dépôt, jamais celle du pod."
+
+[[sink]]
+id                 = "github-app-tokens"
+destination        = "api.github.com"
+destination_source = "literal"
+class              = "external"
+data               = "un JWT signé par la clé privée de la GitHub App, échangé contre un jeton d'installation"
+logged             = false
+client_site        = "crates/mika-common/src/github_app.rs"
+call_site          = "crates/mika-common/src/github_app.rs"
+owner              = "@samidarko"
+notes              = "ADR-008 : c'est ce chemin qui porte l'identité machine. Le jeton rendu est un secret ; il n'est jamais journalisé (Settings a un Debug manuel qui rédige les champs secrets)."
+
+[[sink]]
+id                 = "github-pr-context"
+destination        = "api.github.com"
+destination_source = "literal"
+class              = "external"
+data               = "un GET sur une PR citée dans un message utilisateur, pour injecter son contexte dans le prompt"
+logged             = false
+client_site        = "crates/mika-agent/src/skills/context.rs"
+call_site          = "crates/mika-agent/src/skills/context.rs"
+owner              = "@samidarko"
+notes              = "Le déclencheur est une URL de PR repérée dans le message de l'utilisateur. Rien de l'utilisateur ne part : seule l'URL qu'il a lui-même citée est résolue."
+
+[[sink]]
+id                 = "github-task-check"
+destination        = "api.github.com"
+destination_source = "literal"
+class              = "external"
+data               = "un GET sur une issue ou une PR nommée par `reference_url` d'une tâche, pour lire son état"
+logged             = false
+client_site        = "crates/mika-agent/src/tools/check_task.rs"
+call_site          = "crates/mika-agent/src/tools/check_task.rs"
+owner              = "@samidarko"
+
+# ===========================================================================
+# EGRESS EXTERNE — fournisseurs LLM et embeddings
+# ===========================================================================
+
+[[sink]]
+id                 = "anthropic-messages"
+destination        = "api.anthropic.com"
+destination_source = "literal"
+class              = "external"
+data               = "LE PROMPT COMPLET : prompt système, mémoire cœur, historique de conversation, résultats d'outils et message de l'utilisateur"
+logged             = true
+client_site        = "crates/mika-common/src/claude.rs"
+call_site          = "crates/mika-common/src/claude.rs"
+owner              = "@samidarko"
+notes              = "`logged = true` est l'assertion PRUDENTE et elle est exacte : MIKA_LOG_LLM_BODIES (défaut off) journalise corps de requête et de réponse, et MIKA_STORE_LLM_CALLS (défaut ON) persiste `llm_calls.response_text` et `.reasoning` en base, capés à 50 K. Les secrets sont scrubbés (secret_scrubber, v28→v29), le contenu ne l'est pas."
+
+[[sink]]
+id                 = "anthropic-oauth"
+destination        = "console.anthropic.com"
+destination_source = "literal"
+class              = "external"
+data               = "un échange PKCE : code d'autorisation, verifier, refresh token. Aucune donnée d'utilisateur final"
+logged             = false
+client_site        = "crates/mika-common/src/oauth.rs"
+call_site          = "crates/mika-common/src/oauth.rs"
+also_declares      = ["claude.ai"]
+owner              = "@samidarko"
+notes              = "`claude.ai` est l'hôte de l'écran d'autorisation (ouvert dans le navigateur de l'opérateur) ; `console.anthropic.com` est l'endpoint de jeton réellement appelé. Les jetons sont cachés en clair dans ~/.mika/oauth.json — c'est un secret au repos, pas un egress."
+
+[[sink]]
+id                 = "openai-compat-llm"
+destination        = "openrouter.ai"
+destination_source = "config"
+class              = "external"
+data               = "LE PROMPT COMPLET, comme le rail Anthropic ci-dessus"
+logged             = true
+client_site        = "crates/mika-common/src/llm/openai.rs"
+call_site          = "crates/mika-common/src/llm/openai.rs"
+also_declares = [
+    "api.groq.com",
+    "api.mistral.ai",
+    "generativelanguage.googleapis.com",
+    "api.deepseek.com",
+    "api.minimax.io",
+    "api.moonshot.cn",
+    "dashscope.aliyuncs.com",
+    "api.z.ai",
+]
+owner              = "@samidarko"
+notes              = "L'ENTRÉE LA PLUS DENSE DU FICHIER, et `config` est ce qui la rend honnête. Un seul rail OpenAI-compatible sert treize fournisseurs ; les hosts ci-dessus sont les DÉFAUTS DU DÉPÔT (crates/mika-common/src/llm/mod.rs), chacun repointable par une variable d'environnement de base_url. Le manifeste déclare la destination du dépôt, JAMAIS celle du pod — même rapport que llm_budget_resolved avec le config.toml (mika#2293). `logged` : voir anthropic-messages."
+
+[[sink]]
+id                 = "llm-model-listing"
+destination        = "openrouter.ai"
+destination_source = "config"
+class              = "external"
+data               = "un GET sans corps sur l'endpoint /models du fournisseur actif, plus la clé d'API"
+logged             = false
+client_site        = "crates/mika-common/src/llm/models.rs"
+call_site          = "crates/mika-common/src/llm/models.rs"
+owner              = "@samidarko"
+notes              = "Aucune donnée d'utilisateur ne part : c'est la découverte du catalogue de modèles. Même cascade de base_url que openai-compat-llm."
+
+[[sink]]
+id                 = "openai-embeddings"
+destination        = "api.openai.com"
+destination_source = "literal"
+class              = "external"
+data               = "le TEXTE À VECTORISER — contenu de mémoire, extraits de documents, requêtes de recherche de la couche 3"
+logged             = false
+client_site        = "crates/mika-common/src/embedding.rs"
+call_site          = "crates/mika-common/src/embedding.rs"
+owner              = "@samidarko"
+notes              = "Ce sink porte du contenu de mémoire d'utilisateur. Il est le moins évident des rails LLM et c'est pourquoi il a son entrée propre plutôt que d'être fondu dans openai-compat-llm."
+
+[[sink]]
+id                 = "ollama-local"
+destination        = "localhost:11434"
+destination_source = "config"
+class              = "internal"
+data               = "LE PROMPT COMPLET, vers un serveur de modèle local (MikaModel)"
+logged             = true
+client_site        = "crates/mika-common/src/llm/ollama.rs"
+call_site          = "crates/mika-common/src/llm/ollama.rs"
+owner              = "@samidarko"
+notes              = "`internal` tant que la base_url reste loopback — et c'est précisément pourquoi `class` est déclaré plutôt qu'inféré : le jour où MIKA_OLLAMA_BASE_URL pointe un hôte distant, ce champ doit passer à `external` et ce diff d'un mot passe sous CODEOWNERS."
+
+# ===========================================================================
+# EGRESS EXTERNE — messagerie et opérations
+# ===========================================================================
+
+[[sink]]
+id                 = "telegram-bot-api"
+destination        = "api.telegram.org"
+destination_source = "literal"
+class              = "external"
+data               = "le TEXTE DES MESSAGES SORTANTS de l'agent, le chat_id du destinataire, et le téléchargement des fichiers entrants (getFile)"
+logged             = false
+client_site        = "crates/mika-gateway/src/main.rs"
+call_site          = "crates/mika-gateway/src/telegram.rs"
+also_declares      = ["t.me"]
+owner              = "@samidarko"
+notes              = "`client_site` ≠ `call_site` ICI, et c'est la mesure qui a imposé les deux champs : telegram.rs ne construit AUCUN client en production, le sien vient du reqwest::Client::builder() partagé de main.rs, également injecté dans github.rs et orchestrator_inbox.rs. `t.me` n'est pas un appel sortant : c'est un lien profond généré (crates/mika-gateway/src/routes.rs) que le NAVIGATEUR de l'utilisateur atteint, jamais nous — déclaré parce qu'il apparaît comme littéral et qu'un identifiant de ressource non déclaré se lit comme un sink non déclaré."
+
+[[sink]]
+id                 = "control-monitor-delivery"
+destination        = "MIKA_MANAGER_DELIVERY_URL (aucun défaut)"
+destination_source = "config"
+class              = "external"
+data               = "rapports de cadence de milestone : identifiants de tickets, verdicts, texte d'escalade destiné à l'opérateur"
+logged             = false
+client_site        = "crates/mika-agent/src/milestone_manager/cadence.rs"
+call_site          = "crates/mika-agent/src/milestone_manager/cadence.rs"
+owner              = "@samidarko"
+notes              = "Endpoint du control-monitor, entièrement piloté par l'environnement (MIKA_MANAGER_DELIVERY_URL / _ESCALATION_URL / _HEALTH_URL). AUCUN défaut : sans variable, rien ne part. `external` parce que rien ne garantit que la cible est locale — c'est l'arbitrage prudent, la classe étant une assertion et non une déduction."
+
+[[sink]]
+id                 = "control-monitor-spawn"
+destination        = "MIKA_MANAGER_HEALTH_URL (aucun défaut)"
+destination_source = "config"
+class              = "external"
+data               = "sondes de santé et rapports d'escalade au spawn d'un manager de milestone"
+logged             = false
+client_site        = "crates/mika-agent/src/milestone_manager/spawn.rs"
+call_site          = "crates/mika-agent/src/milestone_manager/spawn.rs"
+owner              = "@samidarko"
+notes              = "Même famille d'endpoints que control-monitor-delivery, autre site de construction."
+
+[[sink]]
+id                 = "skill-http-handler"
+destination        = "déclarée par le manifeste de la skill — inconnaissable statiquement"
+destination_source = "skill-declared"
+class              = "external"
+data               = "l'entrée JSON de l'outil, telle que le modèle l'a composée"
+logged             = false
+client_site        = "crates/mika-agent/src/skills/executor.rs"
+call_site          = "crates/mika-agent/src/skills/executor.rs"
+owner              = "@samidarko"
+notes              = "LE SINK À DESTINATION ARBITRAIRE, et il se déclare quand même — c'est ce qui rend l'allowlist d'exceptions inutile (doctrine mika#2201 : il n'existe aucun sink qu'on ne puisse pas déclarer). Un handler de type `http` dans un skill.toml porte son URL ; aucun scan statique ne peut la connaître. Ce que le manifeste dit ici est exactement ce qui est vrai : la destination vient du manifeste d'une skill, donc la surface est bornée par l'allowlist de skills de l'agent (identity.toml [skills].allowlist), pas par ce fichier."
+
+# ===========================================================================
+# EGRESS INTERNE — déclaré, jamais exclu (voir README § Pourquoi `class`)
+# ===========================================================================
+
+[[sink]]
+id                 = "agent-to-gateway-delivery"
+destination        = "MIKA_ROUTING_URL (le gateway)"
+destination_source = "config"
+class              = "internal"
+data               = "messages sortants de l'agent vers son canal, plus les requêtes /internal/search et /internal/fetch"
+logged             = false
+client_site        = "crates/mika-agent/src/server/mod.rs"
+call_site          = "crates/mika-agent/src/server/mod.rs"
+owner              = "@samidarko"
+notes              = "C'est l'unique porte de sortie de mika-spirit vers le monde : tout egress produit transite par le gateway (invariant single-egress mika#1806 E1–E4). Le trafic lui-même est interne ; ce qu'il transporte ne l'est pas, et c'est la raison pour laquelle les substrats du gateway ont leurs propres entrées ci-dessus."
+
+[[sink]]
+id                 = "search-substrate-client"
+destination        = "MIKA_ROUTING_URL/internal/search (le gateway)"
+destination_source = "config"
+class              = "internal"
+data               = "la requête de recherche de l'utilisateur, en route vers le substrat Brave"
+logged             = false
+client_site        = "crates/mika-agent/src/skills/builtin_handlers.rs"
+call_site          = "crates/mika-agent/src/skills/builtin_handlers.rs"
+owner              = "@samidarko"
+notes              = "Client nommé et délibérément non réutilisable (`SUBSTRATE_HTTP_CLIENT`, mika#1971) : son commentaire de tête interdit en toutes lettres de l'élargir à une autre destination, pour que le signal grep « quoi parle à quoi » reste net. Depuis mika#1971 ce fichier ne nomme plus aucun host d'upstream de recherche."
+
+[[sink]]
+id                 = "a2a-client"
+destination        = "l'URL du pair A2A (agent ou spirit)"
+destination_source = "config"
+class              = "internal"
+data               = "le message A2A JSON-RPC : texte de la tâche, identifiants de session, et le jeton interne"
+logged             = false
+client_site        = "crates/mika-a2a/src/client.rs"
+call_site          = "crates/mika-a2a/src/client.rs"
+owner              = "@samidarko"
+notes              = "Le rail agent↔spirit. Depuis mika#1727 `mika ask` est un client mince : c'est par ici que passe tout tour d'agent lancé en ligne de commande."
+
+[[sink]]
+id                 = "cli-spirit-dashboard"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "commandes d'activation/désactivation du dashboard et lecture de statut, avec le jeton de dashboard"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/dashboard.rs"
+call_site          = "crates/mika-cli/src/commands/dashboard.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-spirit-agents"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "lecture du record de budget d'un agent (mika#2457) — aucune écriture"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/agents.rs"
+call_site          = "crates/mika-cli/src/commands/agents.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-spirit-tasks"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "ouverture d'un flux SSE de tâches ; aucun corps envoyé au-delà du jeton"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/tasks.rs"
+call_site          = "crates/mika-cli/src/commands/tasks.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-spirit-iterate"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "déclenchement d'une itération sur une PR : numéro d'issue et jeton"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/iterate.rs"
+call_site          = "crates/mika-cli/src/commands/iterate.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-spirit-tui"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "activation/désactivation du dashboard depuis la TUI"
+logged             = false
+client_site        = "crates/mika-cli/src/tui/app.rs"
+call_site          = "crates/mika-cli/src/tui/app.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-gateway-webhook"
+destination        = "MIKA_GATEWAY_URL (défaut http://localhost:3001)"
+destination_source = "config"
+class              = "internal"
+data               = "lecture et rejeu de la dead-letter queue de webhooks : identifiants de livraison et jeton interne"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/webhook.rs"
+call_site          = "crates/mika-cli/src/commands/webhook.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-gateway-notify"
+destination        = "MIKA_GATEWAY_URL (défaut http://localhost:3001)"
+destination_source = "config"
+class              = "internal"
+data               = "le TEXTE DE LA NOTIFICATION à livrer à l'opérateur — il ressort ensuite par telegram-bot-api"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/notify.rs"
+call_site          = "crates/mika-cli/src/commands/notify.rs"
+owner              = "@samidarko"
+
+[[sink]]
+id                 = "cli-chat-worker"
+destination        = "MIKA_ROUTING_URL (le gateway)"
+destination_source = "config"
+class              = "internal"
+data               = "messages sortants des tours en mode silencieux et des sessions TUI, qui tournent encore en process dans le CLI"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/chat.rs"
+call_site          = "crates/mika-cli/src/commands/chat.rs"
+owner              = "@samidarko"
+notes              = "La population restante du CLI depuis mika#1727 : heartbeat, réflexion, rappels et `mika chat` appellent encore agent::run_agent en process, donc leur livraison part d'ici et non de mika-spirit."

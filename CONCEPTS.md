@@ -20,6 +20,8 @@ An assertion that proves a guard is capable of failing, by exercising it against
 
 The broken form is synthesized — built by mutating the current source — rather than fetched from version history, because a reference to a branch stops naming the broken state once the fix merges. A case that cannot be constructed is reported as a failure, never as a skip: a silently skipped anti-vacuity assertion is the exact condition it exists to detect.
 
+Where the mutation would itself inflict the damage the guard exists to prevent — the guard forbids writing a live resource, so reproducing the violation writes it — the mutation goes to a copy rather than to the working tree, and the copy reproduces the relative layout the harness computes its own root from, so the real guard runs against the mutated subject with no predicate duplicated anywhere. That copy needs its own positive control before any conclusion: an unmutated copy must go green first, or a red proves the harness is misresolving rather than that the predicate bites.
+
 The same holds one level up, and more quietly: a harness nothing invokes is that condition as well, with no skip notice to give it away, because no runner exists to emit one. Its assertions can prove the guard is capable of failing and still never have proved it to anyone.
 
 It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
@@ -73,6 +75,10 @@ The remove→add cycle of the `ready` label that `auto_pull` Phase 2 performs on
 ### Containment canary
 
 A one-command reproducer that spawns a real sandbox through the same code path a dispatch uses, then asserts both directions: that credentials and host state are unreachable from inside, and that the tools the session legitimately needs still work. It exists because a containment claim read from source is not a containment result — the author is not their own control — so it also offers an interactive mode an external reviewer can enter the sandbox through and probe by hand.
+
+Running the production path on the operator's own host, rather than under an isolated home the way an ordinary harness does, is what makes it a result — and it is also why the canary shares the host's live resources, including the credentials a dispatch in flight is authenticating with. So a third direction is asserted, about the canary itself: any production path it would write is redirected to a location of its own, posed before the production code is loaded so that every mode is covered by one gesture, and the redirection is an internal knob rather than an operator setting, because an operator setting would be a lever on where a real dispatch writes its credential. The redirected path must still traverse the real writer: neutralising the write would stop exercising the code the canary exists to exercise.
+
+On exit it attests that the shared resource did not move, and the verdict is three-valued: unchanged, changed-into-the-canary's-own-decoy, and changed-otherwise. The third value is what makes the second readable — the resource legitimately rotates on its own schedule and a concurrent dispatch legitimately rewrites it, so a two-valued comparison reports a violation on every rotation, and a guard that cries wrongly gets muzzled. The attested path is the production default written out literally, never the redirection, or the check compares the redirected copy against itself and reports clean whatever happened. A host missing the means to take the fingerprint reports the third value too, never the first: a check that could not look must not read as a pass.
 
 ### Pilot turn ceiling
 

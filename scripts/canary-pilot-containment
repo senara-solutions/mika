@@ -31,6 +31,12 @@
 #   * env_ok + proc_ok
 #   * curl exfil returns 403 (proxy DENY) or blocked_direct
 #   * curl allowlisted returns 200
+#   * the LAST line of the run is the mika#2578 self-check, printed on every
+#     exit path (success, `set -e` abort, interrupt), with three values:
+#       ok:           ~/.mika/pilot-gh-token is byte-identical to what it was
+#       VIOLATION:    this run overwrote it with the canary decoy — a regression
+#       INCONCLUSIVE: it changed WITHOUT carrying the decoy (a concurrent
+#                     dispatch restaged, or an App token rotated) — not a fault
 #
 # INVOKE:
 #   ./scripts/canary-pilot-containment              # run canary, print report
@@ -73,6 +79,162 @@ fi
 # Install the proxy binary to ~/.local/bin (mimics `make install`). Safe:
 # same path production uses; overwrite is idempotent.
 install -Dm755 "$SCRIPT" "$INSTALLED_PROXY"
+
+# ---------------------------------------------------------------------------
+# mika#2578 — the canary must not write the host's GitHub credential.
+#
+# `_stage_pilot_gh_token` runs on EVERY `_run_pilot_sandboxed` call and writes
+# $GH_TOKEN to $_PILOT_GH_TOKEN_FILE, whose default is the host-side file the
+# mika#2056 mitmdump addon reads. This script exports a DECOY GH_TOKEN and calls
+# the sandbox five times, so before this fix each run overwrote the operator's
+# live credential with `github_pat_0…canary…` and every in-flight pilot went 401
+# on api.github.com — `git push` included — until the next real dispatch
+# restaged. Measured 2026-09-28 (49 bytes at 20:33:03Z against 93 at 17:32,
+# `curl_github=401` in the same run, pilot 6d61c747 in flight).
+#
+# The staging is REDIRECTED, never neutralised: the canary still traverses the
+# real `_stage_pilot_gh_token`, which is the code it exists to exercise. The
+# export happens BEFORE the `source` and before any mode branch, which is what
+# makes one gesture cover all five modes (--show-args, --ensure-relay,
+# --restart-relay, --enter, default) — and `--show-args` re-sources dispatch-lib
+# in a child `bash -c`, so the value has to travel by environment inheritance
+# rather than by a post-source assignment.
+# The redirection itself is posed further down, immediately AFTER the EXIT trap
+# that removes its staging directory: created before the trap, a `set -e` abort
+# in between would leak the directory with no cleanup site.
+# ---------------------------------------------------------------------------
+
+# The decoy is defined here rather than at its export site below so the exit
+# self-check can fingerprint it on every mode, including the ones that exit
+# before the export block is reached.
+_CANARY_GH_TOKEN_DECOY="github_pat_0000000000000000canary0000000000000000"
+
+# Digest tool, resolved once. A host with NEITHER makes the self-check report
+# INCONCLUSIVE — never `ok:` (a check that cannot look must not read as a pass).
+if command -v sha256sum >/dev/null 2>&1; then
+    _CANARY_DIGEST_TOOL=sha256sum
+elif command -v cksum >/dev/null 2>&1; then
+    _CANARY_DIGEST_TOOL=cksum
+else
+    _CANARY_DIGEST_TOOL=""
+fi
+
+# Sentinel for "the file is there and could not be digested". Distinct from the
+# empty string, which means "absent": without the distinction, a host file that
+# is unreadable both before AND after compares equal to itself and the run
+# prints `ok:` — a pass from a check that could not look, which is the one thing
+# the no-tool branch below exists to forbid.
+_CANARY_DIGEST_UNREADABLE="__digest_unreadable__"
+
+# The one place the digest tool is chosen and its output normalised. Reads
+# STDIN, so it never receives a path in its argv and never prints a file name.
+#
+# Shared on purpose between the two entry points below: the decoy's digest comes
+# from the string side and the host file's from the file side, and the VIOLATION
+# arm compares them. Duplicated, a normalisation edited on one side only would
+# make that comparison never match again — the guard would stop firing in
+# silence and every real regression would report INCONCLUSIVE.
+_canary_digest_stdin() {
+    case "$_CANARY_DIGEST_TOOL" in
+        sha256sum) sha256sum | cut -d' ' -f1 ;;
+        cksum)     cksum | tr -s ' ' | cut -d' ' -f1,2 | tr ' ' '-' ;;
+    esac
+}
+
+# Digest of a FILE. The path travels as a REDIRECT, never as an argument, so no
+# token value and no file name lands in an argv or a `set -x` trace (mika#2039
+# discipline). An absent file digests to the empty string, which is a state, not
+# an error; a present-but-undigestible one gets the sentinel above.
+_canary_digest_of() {
+    [ -f "$1" ] || return 0
+    [ -n "$_CANARY_DIGEST_TOOL" ] || return 0
+    local _d=""
+    _d=$(_canary_digest_stdin < "$1" 2>/dev/null || true)
+    if [ -z "$_d" ]; then
+        printf '%s' "$_CANARY_DIGEST_UNREADABLE"
+    else
+        printf '%s' "$_d"
+    fi
+}
+
+# Digest of a STRING, for the decoy discriminant. `printf` is the bash builtin,
+# so the value never reaches a separate process's argv.
+_canary_digest_str() {
+    [ -n "$_CANARY_DIGEST_TOOL" ] || return 0
+    printf '%s' "$1" | _canary_digest_stdin
+}
+
+# Reference fingerprint, taken BEFORE the first sandbox call. The path is the
+# HOST DEFAULT, written as a literal on purpose — see _canary_on_exit.
+_CANARY_HOST_TOKEN_SHA_BEFORE=$(_canary_digest_of "$HOME/.mika/pilot-gh-token" 2>/dev/null || true)
+_CANARY_DECOY_DIGEST=$(_canary_digest_str "$_CANARY_GH_TOKEN_DECOY" 2>/dev/null || true)
+
+# Single EXIT trap, installed once and early (mika#2578). It composes the token
+# self-check, the mika#2141 victim-ref cleanup and the staging-dir removal.
+# A second `trap … EXIT` added later would REPLACE this one and leave a
+# refs/heads/canary-victim/* dangling in the operator's repository.
+_canary_on_exit() {
+    local rc=$?
+
+    # mika#2578 R6 — the observed path is the HOST DEFAULT, as a literal.
+    # Reading $_PILOT_GH_TOKEN_FILE here would observe the redirection this
+    # script installed above and make the check tautologically green.
+    local _host_token="$HOME/.mika/pilot-gh-token"
+    local _after=""
+    _after=$(_canary_digest_of "$_host_token" 2>/dev/null || true)
+
+    echo
+    if [ -z "$_CANARY_DIGEST_TOOL" ]; then
+        echo "INCONCLUSIVE: neither sha256sum nor cksum on this host, so the canary"
+        echo "  could not check whether it left $_host_token untouched."
+        echo "  This is NOT a pass — it is an unchecked run."
+    elif [ "$_after" = "$_CANARY_DIGEST_UNREADABLE" ] \
+        || [ "$_CANARY_HOST_TOKEN_SHA_BEFORE" = "$_CANARY_DIGEST_UNREADABLE" ]; then
+        # Tested BEFORE the equality, on purpose: two unreadable ends compare
+        # equal to each other, so the `ok:` arm below would report a pass on a
+        # file the canary never managed to read.
+        echo "INCONCLUSIVE: $_host_token is present but could not be digested,"
+        echo "  so this run was not checked. Same reading as a missing digest"
+        echo "  tool — NOT a pass."
+    elif [ "$_after" = "$_CANARY_HOST_TOKEN_SHA_BEFORE" ]; then
+        echo "ok:   host_gh_token_untouched ($_host_token)"
+    elif [ -n "$_after" ] && [ "$_after" = "$_CANARY_DECOY_DIGEST" ]; then
+        echo "VIOLATION: the canary overwrote $_host_token with its own decoy."
+        echo "  mika#2578 has regressed — every in-flight pilot is now sending the"
+        echo "  decoy to api.github.com, git push included. The next real dispatch"
+        echo "  restages the true token; read the mika#2578 D3 scan before touching"
+        echo "  any predicate."
+        rc=1
+    else
+        echo "INCONCLUSIVE: $_host_token changed without carrying the canary decoy."
+        echo "  A concurrent dispatch most likely restaged it (App installation"
+        echo "  tokens rotate hourly). Not a canary fault, and nothing to repair."
+    fi
+
+    # mika#2141 victim ref. Conditioned on the variable the PART 2 setup block
+    # sets; empty means no ref was ever created.
+    # Both guarded with `${…:-}`: the trap is installed BEFORE either variable is
+    # assigned, and `set -u` firing in here would skip the staging-dir cleanup
+    # and the `exit "$rc"` below.
+    if [ -n "${CANARY_VICTIM_REF:-}" ] && [ -n "${WORKTREE_DIR:-}" ]; then
+        git -C "$WORKTREE_DIR" update-ref -d "$CANARY_VICTIM_REF" >/dev/null 2>&1 || true
+    fi
+
+    if [ -n "${_CANARY_TOKEN_STAGE_DIR:-}" ] && [ -d "${_CANARY_TOKEN_STAGE_DIR:-}" ]; then
+        rm -rf "$_CANARY_TOKEN_STAGE_DIR" 2>/dev/null || true
+    fi
+
+    exit "$rc"
+}
+trap _canary_on_exit EXIT
+
+# The redirection, posed immediately after the trap that removes its directory
+# and still well before the `source` and before any mode branch. `mktemp -d`
+# creates 0700 by construction, so no `chmod` follows it — the repo relies on
+# that guarantee at every other `mktemp -d` site, and the staged file is written
+# under `( umask 077; … )` by `_stage_pilot_gh_token` regardless.
+_CANARY_TOKEN_STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mika2578-canary-XXXXXX")
+export _PILOT_GH_TOKEN_FILE="$_CANARY_TOKEN_STAGE_DIR/pilot-gh-token"
 
 # Source dispatch-lib. Set WORKTREE_DIR to the branch worktree — matches
 # the invariant that _run_pilot_sandboxed binds this path rw.
@@ -189,6 +351,24 @@ if [ "${1:-}" = "--enter" ]; then
     exit $?
 fi
 
+# mika#2578 (KTD6): warm the host daemons BEFORE the decoys are exported.
+# `_ensure_pilot_helper` launches mitmdump with `nohup … &` and no `env -i`, so
+# the daemon inherits its launcher's whole environment — decoy GH_TOKEN
+# included — and outlives every subsequent dispatch. Starting it here means that
+# on a host whose daemon was down, it comes up with a clean environment. Both
+# calls are idempotent (liveness probe first), so the PART 0 warm-up below and
+# every `_run_pilot_sandboxed` call relaunch nothing.
+#
+# This BOUNDS the channel, it does not close it: a daemon that dies mid-canary
+# is relaunched by a later call, with the decoys in scope. Closing it means
+# taking the mitmdump daemon's env fallback away — a deliberate production
+# fallback (`dispatch-lib.sh`: "falls back to the mitmdump process env"), so a
+# channel arbitration and a follow-up ticket, not a side effect of this one.
+# Largely masked in practice: the addon PREFERS the staged file, and a real
+# dispatch restages the true token before every spawn.
+_ensure_pilot_helper >/dev/null 2>&1 || true
+_ensure_pilot_egress_proxy >/dev/null 2>&1 || true
+
 # Simulate host env vars a real spawn would carry through (post PR#1893
 # env allowlist). Only allowlisted vars will survive `--clearenv`.
 export ATLASSIAN_API_TOKEN="canary-must-not-leak-atlassian"
@@ -200,7 +380,10 @@ export NODE_AUTH_TOKEN="canary-must-not-leak-npm"
 # credential on the wire, and the placeholder it used before did not match any
 # credential shape, which would have made the PART 0 probe below vacuous.
 # Nothing here authenticates; the must-work suite only runs `gh --version`.
-export GH_TOKEN="github_pat_0000000000000000canary0000000000000000"
+# mika#2578: the literal lives at the top of this script (_CANARY_GH_TOKEN_DECOY)
+# so the exit self-check can fingerprint it on every mode; and since the staging
+# path was redirected above, this value no longer reaches the host credential.
+export GH_TOKEN="$_CANARY_GH_TOKEN_DECOY"
 export ANTHROPIC_LOG_FILE="/tmp/pilot-transcripts.jsonl"
 export MIKA_LOG_PILOT_TRANSCRIPTS="1"
 
@@ -209,6 +392,23 @@ echo "canary-pilot-containment — real spawn under branch shape"
 echo "============================================================"
 echo "WORKTREE_DIR: $WORKTREE_DIR"
 echo "proxy binary: $INSTALLED_PROXY ($(stat -c %y "$INSTALLED_PROXY" 2>/dev/null | cut -d. -f1))"
+# mika#2578 R9: name the host-side state the `curl_github` line depends on, so a
+# 401 is attributable without archaeology. Since the staging is redirected, the
+# credential the addon injects is whatever the LAST REAL DISPATCH staged there —
+# never this run. Never the content, only presence, size and mtime.
+# `|| true` INSIDE the substitution: an assignment whose value is a command
+# substitution takes that substitution's status, so under `set -euo pipefail` a
+# failing `stat` would abort the canary here — before PART 0, with nothing on
+# stdout but the exit verdict. Its neighbour one line up is immune only because
+# its substitution sits inside `echo`'s arguments.
+_canary_host_token_state="absent (no dispatch has ever staged on this host)"
+if [ -f "$HOME/.mika/pilot-gh-token" ]; then
+    _canary_host_token_state="present, $(stat -c '%s bytes, mtime %y' "$HOME/.mika/pilot-gh-token" 2>/dev/null | cut -d. -f1 || true)"
+fi
+echo "host gh token: $HOME/.mika/pilot-gh-token — $_canary_host_token_state"
+echo "              curl_github below authenticates with what the LAST REAL"
+echo "              DISPATCH staged there; this run never writes it (mika#2578)."
+echo "              Staging for this run is redirected to $_PILOT_GH_TOKEN_FILE"
 echo "bwrap:        $(command -v bwrap) ($(bwrap --version 2>&1))"
 echo "date:         $(date -Iseconds)"
 echo
@@ -381,8 +581,12 @@ CANARY_VICTIM_REF=""
 if [ "$CANARY_LINKED_WORKTREE" -eq 1 ]; then
     CANARY_VICTIM_REF="refs/heads/canary-victim/mika2141-$$"
     if git -C "$WORKTREE_DIR" update-ref "$CANARY_VICTIM_REF" HEAD 2>/dev/null; then
-        # shellcheck disable=SC2064
-        trap "git -C '$WORKTREE_DIR' update-ref -d '$CANARY_VICTIM_REF' >/dev/null 2>&1 || true" EXIT
+        # mika#2578: cleanup moved into the single `_canary_on_exit` trap
+        # installed at the top of this script. A second `trap … EXIT` here would
+        # REPLACE that one — and with it the token self-check — while a second
+        # trap added later would silently drop THIS cleanup and leave a
+        # refs/heads/canary-victim/* dangling in the operator's repository.
+        :
     else
         CANARY_VICTIM_REF=""
         echo "negative control: could not create a victim ref — the delete probe will report 'skipped'"
@@ -417,12 +621,41 @@ done
 
 echo
 echo "--- must-fail: env vars (should be dropped by --clearenv) ---"
-env | grep -E "^(ATLASSIAN|AWS_SECRET|NODE_AUTH|ANTHROPIC_API_KEY)=" >/dev/null 2>&1 \
-    && echo "ENV_LEAK: some cred-shaped var survived" \
-    || echo "ok:   env_cleared (no ATLASSIAN/AWS_SECRET/NODE_AUTH/ANTHROPIC_API_KEY)"
+# mika#2578: ANTHROPIC_API_KEY STAYS in the pattern and the legitimate
+# placeholder is excluded BY VALUE, on the whole line. The sandbox --setenv
+# (mika#2039, mika#2572) always overwrites the parent value with
+# `proxy-managed-no-secret`, so the only leak still possible on that NAME is
+# someone changing that --setenv line to pass a real key — exactly what a
+# by-value exclusion keeps catching, and exactly what dropping the name from the
+# pattern would make invisible. Before this, the placeholder tripped the check on
+# every healthy run and the line read ENV_LEAK unconditionally.
+# Names only, never values: "some cred-shaped var survived" named nothing, which
+# is what made the line unusable once it was firing.
+#
+# `[A-Z0-9_]*=` and not a bare `=` — measured while writing the mika#2578
+# negative control. The four decoys this script exports are ATLASSIAN_API_TOKEN,
+# AWS_SECRET_ACCESS_KEY and NODE_AUTH_TOKEN, and `^ATLASSIAN=` matches NONE of
+# them: only `ANTHROPIC_API_KEY=` ever entered the population, and that one is
+# the legitimate placeholder. So the sole matchable member was the false
+# positive — remove it by value and the check becomes structurally unable to say
+# anything but `ok:`, a silently inert probe reading exactly like a clean
+# sandbox (class mika#2205). The suffix restores the three decoys to the
+# population the surrounding comment always claimed they were in.
+_env_survivors=$(env | grep -E "^(ATLASSIAN|AWS_SECRET|NODE_AUTH|ANTHROPIC_API_KEY)[A-Z0-9_]*=" 2>/dev/null \
+    | grep -vxF "ANTHROPIC_API_KEY=proxy-managed-no-secret" || true)
+if [ -n "$_env_survivors" ]; then
+    echo "ENV_LEAK: $(printf "%s\n" "$_env_survivors" | cut -d= -f1 | tr "\n" " ")"
+else
+    echo "ok:   env_cleared (no ATLASSIAN/AWS_SECRET/NODE_AUTH; ANTHROPIC_API_KEY is the mika#2572 placeholder)"
+fi
 
 echo
 echo "--- must-fail: /proc/1/environ (host mika-spirit env harvest) ---"
+# The pattern below differs from the one above DELIBERATELY — do not harmonise
+# them. This one targets the host mika-spirit environment (MIKA_ANTHROPIC,
+# MIKA_INTERNAL_TOKEN) and carries no ANTHROPIC_API_KEY, so it never had the
+# placeholder false positive mika#2578 fixed above. Two patterns, two
+# populations.
 if cat /proc/1/environ 2>/dev/null | tr "\0" "\n" | grep -qE "^(ATLASSIAN|AWS_SECRET|MIKA_ANTHROPIC|MIKA_INTERNAL_TOKEN)="; then
     echo "PROC_LEAK"
 else
@@ -640,4 +873,7 @@ echo "  every must-work line MUST succeed (version string)"
 echo "  GH_TOKEN MUST be the placeholder, never a real token, in env + fs (mika#2056, mika#2572)"
 echo "  proxy log MUST show DENY on evil.example.com, mitm-forward on"
 echo "    api.github.com, and [github-proxy] ALLOW (host-side auth injection)"
+echo "  the self-check line printed BELOW (mika#2578) MUST read 'ok:' — it is"
+echo "    the direct answer to 'did this run damage anything on the host?'"
+echo "    An INCONCLUSIVE is not a failure; a VIOLATION is."
 echo "============================================================"
