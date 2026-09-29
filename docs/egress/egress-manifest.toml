@@ -239,6 +239,18 @@ owner              = "@samidarko"
 notes              = "Même famille d'endpoints que control-monitor-delivery, autre site de construction."
 
 [[sink]]
+id                 = "control-monitor-liveness"
+destination        = "MIKA_MANAGER_LIVENESS_URL (aucun défaut)"
+destination_source = "config"
+class              = "external"
+data               = "un battement de vivacité minimal, un POST JSON par tick de poll RÉUSSI : le nom de l'entité (`mika-manager`, constante), le motif du battement (`poll:<n>` où `<n>` est le compteur d'itérations de boucle, ou `delivery:<healthy|attention|blocked>`), un horodatage RFC 3339, et la référence du jalon suivi (dépôt + numéro). AUCUN contenu de rapport, aucun texte de ticket, aucune donnée d'utilisateur — c'est la différence de nature avec control-monitor-delivery, qui poste le rapport entier."
+logged             = true
+client_site        = "crates/mika-agent/src/milestone_manager/liveness.rs"
+call_site          = "crates/mika-agent/src/milestone_manager/spawn.rs"
+owner              = "@samidarko"
+notes              = "mika#1990 — canal DISTINCT de control-monitor-delivery : autre endpoint, autre cadence (un battement par poll de 5 min contre un rapport toutes les 6 h), autre corps. Il existe parce que la freshness cm passait RED entre deux deliveries légitimes. Le bearer est `MIKA_MANAGER_DELIVERY_TOKEN` — même destinataire, même credential (D6) — et le jeton n'atteint aucun journal (seul le booléen `delivery_token_present` est émis au démarrage). L'URL est DÉCLARÉE, jamais dérivée de DELIVERY_URL ni de HEALTH_URL (§ R2) ; absente ou vide ⇒ zéro POST, zéro erreur, et c'est aussi le rollback. `logged = true` est l'assertion PRUDENTE et elle est exacte au champ près : un battement RÉUSSI n'écrit RIEN (AC4), mais les deux lignes de TRANSITION (`manager_liveness_failed` WARN, `manager_liveness_recovered` INFO) portent deux champs du corps — `reason` et la référence du jalon. `generated_at` et l'URL ne sont jamais journalisés. `client_site` ≠ `call_site` : le client `reqwest` (timeout 5 s) naît dans `HttpLivenessSink::new()` ici, la boucle qui bat vit dans `spawn_manager_cycle_task`. Un seul site d'appel au sink en production, tenu par la garde `mika1990_le_battement_a_un_seul_ecrivain` (allowlist vide)."
+
+[[sink]]
 id                 = "skill-http-handler"
 destination        = "déclarée par le manifeste de la skill — inconnaissable statiquement"
 destination_source = "skill-declared"

@@ -1954,8 +1954,14 @@ mod tests {
             chrono::Duration::milliseconds(50),
         );
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), static_resolver(None), None)
-            .expect("first spawn returns Some(handle)");
+        let handle = spawn_manager_cycle_task(
+            cfg,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        )
+        .expect("first spawn returns Some(handle)");
 
         // Let the loop tick at least once.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2413,12 +2419,24 @@ mod tests {
         let cfg2 = cfg1.clone();
 
         let cancel = CancellationToken::new();
-        let first = spawn_manager_cycle_task(cfg1, cancel.clone(), static_resolver(None), None);
+        let first = spawn_manager_cycle_task(
+            cfg1,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
         // Second call MUST be rejected — regardless of whether the first
         // task is still running.
-        let second = spawn_manager_cycle_task(cfg2, cancel.clone(), static_resolver(None), None);
+        let second = spawn_manager_cycle_task(
+            cfg2,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        );
         assert!(
             second.is_none(),
             "second spawn within same process must be rejected"
@@ -2575,8 +2593,14 @@ mod tests {
         let calls = resolver.calls.clone();
 
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), Arc::new(resolver), None)
-            .expect("spawn returns Some(handle)");
+        let handle = spawn_manager_cycle_task(
+            cfg,
+            cancel.clone(),
+            Arc::new(resolver),
+            None,
+            noop_liveness_sink(),
+        )
+        .expect("spawn returns Some(handle)");
 
         // Wait for the CONDITION, not a fixed duration: the boot-time
         // `verify_gh_auth` probe is a real `gh` subprocess call that precedes

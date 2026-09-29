@@ -1631,7 +1631,7 @@ worse than the silence it replaces.
 
 ## Milestone Manager (Phase 1)
 
-`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge; the only outbound side effect is a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset.
+`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge. **Two** outbound side effects, both towards the control-monitor and neither a forge write: a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset, and — since mika#1990 — a **liveness beat**, one light `POST` per successful poll tick (§ *Liveness beat* below). Both are declared in `docs/egress/egress-manifest.toml`.
 
 **Three composers + one loop.** `Reader` (`reader.rs`) wraps `gh` CLI (`api`/`issue list`/`pr list`) mirroring the `auto_pull::gh_list_open_issues` subprocess shape and composes `MilestoneState` (sub-issues + progress counts + recent activity). `Assessor` (`assessor.rs`) applies four rules (stale-blocker, silent-progress, silence-in-JOURS, priority ranking) and classifies `Severity` (Healthy/Attention/Blocked). `Reporter` (`reporter.rs`) formats the § 2d Markdown report. `run_manager_cycle` in `cadence.rs` orchestrates read→assess→deliver with hybrid cadence: event-driven trigger on `state_digest` change + 6h plancher heartbeat (« l'absence d'event EST l'event »).
 
@@ -1661,7 +1661,104 @@ worse than the silence it replaces.
 
 **Out of scope, named.** The sink has **no rotation** and grows unbounded; the reader makes the volume visible, which is the precondition for deciding on rotation — a follow-up ticket if the probe shows a problematic volume. And `emit_auth_alarm` (`spawn.rs`) still writes **nothing** to the sink when `escalation_url` is unset: it returns early and only the `error!` survives. A real hole, found on the way and deliberately **distinct** — a lost report is not a lost alarm, and fixing it requires deciding what an alarm in a well even means. **Follow-up ticket.**
 
-**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`). **All ten are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
+### Liveness beat — the freshness beats at the poll's pace (mika#1990)
+
+`milestone_manager/liveness.rs` — one light `POST` per **successful** poll tick on
+`MIKA_MANAGER_LIVENESS_URL`, so the cm registry sees a 5-min sign of life instead of
+one every 6 hours.
+
+**The defect.** The manager polls every 5 min and posted **nothing** until it
+delivered — delivery being hybrid (`state_changed || heartbeat_fired`, the second on
+a **6 h** floor). Between two legitimate beats the registry received no sign of life,
+the entity's freshness went RED, and the nudge-scanner would cry wolf on its first
+scan while the cadence was running perfectly.
+
+**A distinct channel, never a field on `DeliveryBody`.** That struct is a wire format
+cm consumes, and the *freshness* does not read in a 30 KB report posted four times a
+day. Distinct endpoint, minimal body, one beat per tick — and `reason` says *why this
+beat happened*, which is what makes AC3 readable literally: N poll ticks + 1 delivery
+= N+1 beats, exactly one carrying `delivery:<severity>`.
+
+**The URL is DECLARED, never derived** (mika#2249 / mika#2368 doctrine). Not composed
+from `delivery_url` (`…/api/v1/messages/dispatch` — unrelated shape), nor from
+`health_url` (`…/agents/mika-dev/health`), whose entity is not ours and whose meaning
+is **inverse**: there we *read* the executor's health, here we *write* our own.
+
+**Why not `…HEARTBEAT_URL`.** `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` already exists and
+names the **6 h delivery floor**. Side by side in the same `EnvironmentFile`, a
+`…HEARTBEAT_URL` would read as *"the heartbeat to that URL beats every 6 hours"* —
+precisely the false belief this ticket exists to kill. The endpoint path keeps the word
+(the ticket names it); the variable does not. Pinned by
+`mika1990_le_nom_de_la_variable_ne_dit_pas_heartbeat`.
+
+**On the `Ok` arm, and only there.** A cycle that fails — typically `gh` in 401 — is a
+**broken** manager; posting *"I am alive"* there would be the exact lie freshness must
+not tell. That half already has its channel (`manager_cycle_error`, and the mika#2013
+`manager_auth_persistent_failure` alarm). The beat says *"the cadence runs **and** reads
+GitHub"*, which is stronger than *"the process exists"*.
+
+**`<n>` counts loop iterations, not beats emitted.** Incremented at the head of the
+iteration, **by the call site** rather than by `beat` — otherwise a failing cycle, which
+does not beat, would not increment and the holes would vanish. A run of `poll:5` →
+`poll:9` therefore says *"four cycles failed"*. The counter restarts at `1` on process
+start, so `poll:1` marks a restart — useful, not a defect.
+
+**`reason` is a wire format.** The values land in the cm registry and an operator will
+`GROUP BY` them, so two spellings of one motive would split a population without saying
+so. Two constants, **one composition site** (`liveness_reason`), `severity` rendered by
+the same `snake_case` as `serde` — pinned against serde's real output by
+`mika1990_la_severite_du_motif_suit_serde`, because the `match` alone could drift from
+the `rename_all` attribute.
+
+**The failure class comes from the STATUS, never from the message text** (mika#2179
+rule): `CredentialRefused` (401 | 403), `Unreachable` (`is_connect() || is_timeout()`),
+`Other`.
+
+**Best-effort, and the signature is what guarantees it (AC1).** `beat` returns nothing,
+so no caller has any way to let a lost beat break its loop. Bounded by `LIVENESS_TIMEOUT`
+(5 s, aligned on `probe_executor_health` — same nature, a liveness probe runs short),
+i.e. at worst **1.7 %** of a 300 s poll. Emitted **after** the cycle, so it delays no
+cycle of its own; it can delay the *next* one, and `tokio::time::interval` catches up a
+late tick. A detached `tokio::spawn` was declined: it would make AC1 trivially true at
+the cost of the beats' ordering (two `poll:<n>` could reach cm inverted) and of a
+deterministic AC3.
+
+**No beat is ever retried.** No queue, no replay: a missed beat is lost and the next one
+arrives in 5 minutes. That is the right trade for a liveness signal — replaying a stale
+*"I am alive"* is at best useless, at worst a dated lie.
+
+**The auth reuses `delivery_token` but the beat does NOT feed the auth-boundary ledger**
+(D6). That population counts **report-delivery** failures — on the order of 4
+attempts/day — and pouring **288 attempts/day** into it would change what the operator
+query `… WHERE tool_name = 'auth_boundary'` measures and drown the signal mika#1949
+exists to raise. The class information is not lost: it rides the transition WARN.
+
+**`no_dispatch_test.rs` forbids the literal `"POST"` in every file of the module**, so
+the sink writes `client.post(url)` — a `Method::POST` or string construction would carry
+it and redden the LECTURE-SEULE guard. The contract itself is untouched: what is added is
+an **outbound liveness** side effect, the same family as the report `POST` that has
+existed since day one — no forge write, no ticket mutation.
+
+**Guards.** `mika1990_le_battement_a_un_seul_ecrivain` — a source scan asserting **one**
+composition site for `reason` and **one** call site to the sink in production, allowlist
+shipped **empty**, with its anti-vacuity assertion (it reddens if the name it looks for
+is written nowhere — a scan aiming at a dead name verifies zero things and reads exactly
+like a clean tree, class mika#2205) and its good-faith control
+`mika1990_le_scan_du_battement_voit_un_second_site`. No behavioural test can see that
+class: a second beat writer makes **no decision wrong** the day it is written — the cycle
+keeps running, every assertion stays green, and only the freshness becomes uncountable
+(two interleaved `<n>` runs at cm). **When it fires, remove the second site — do not
+allowlist it** (doctrine mika#2201).
+
+**Egress.** Declared as `control-monitor-liveness` in `docs/egress/egress-manifest.toml`,
+`logged = true` at field granularity: a **successful** beat writes nothing (AC4), but the
+two **transition** lines carry `reason` and the milestone reference.
+
+Operator surfaces (`manager_delivery_resolved.liveness_url_set`,
+`manager_liveness_failed`, `manager_liveness_recovered`), expected regimes, the four
+probes and their halts: root `CLAUDE.md` § *Optional (battement de vivacité du manager)*.
+
+**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`), `MIKA_MANAGER_LIVENESS_URL` (mika#1990, no default — absent ⇒ the beat channel is disarmed). **All eleven are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
 
 **Cadence spawn.** `spawn.rs` (`manager_config_from_env` + `spawn_manager_cycle_task`, the latter taking an `Arc<dyn TokenResolver>` since mika#2013) wires the cycle as a background tokio task at `server::run_server` startup. Env-gated on `MIKA_MANAGER_TARGET_MILESTONE`: unset → INFO `manager_cadence_disabled` and no spawn; set-and-valid → INFO `manager_cadence_start` + spawn; set-and-malformed → ERROR `manager_cadence_config_invalid` and no spawn (startup continues). The loop polls at `cfg.poll_interval` and calls `run_manager_cycle`; the cycle body itself decides whether to deliver (state-change OR heartbeat-elapsed) and is a no-op otherwise. Cycle failures log at WARN and do not stop the loop — except a sustained authentication failure, which escalates per the token-renewal note below (mika#2013). Graceful shutdown responds to a dedicated `manager_shutdown_token` (sibling to `kg_shutdown_token` and `webhook_queue_shutdown`) — cancelled at the same `.with_graceful_shutdown` site. Structurally mirrors `kg::resolver_tick::spawn_resolver_tick_task` (same `tokio::select!` shape, same fail-open discipline, same `info!/warn!` lifecycle events). Injection-verified per `todos/mika-manager-cadence-wiring-injection-verification.md`.
 

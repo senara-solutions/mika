@@ -936,6 +936,42 @@ mod tests {
             .to_path_buf()
     }
 
+    /// L'octet où commence la **région** de test : un `#[cfg(test)]` suivi d'une
+    /// déclaration `mod`, jamais un `#[cfg(test)]` posé sur un item isolé.
+    ///
+    /// **Ce n'est pas un raffinement cosmétique, c'est ce qui rend le scan
+    /// capable de voir.** Couper au premier littéral `#[cfg(test)]` suppose que
+    /// ce littéral marque le début du code de test — faux pour un attribut
+    /// d'item. `spawn.rs` porte `#[cfg(test)] fn reset_spawn_guard_for_test()` en
+    /// ligne 83 et son câblage du battement en ligne 472 : la coupure naïve
+    /// jetait 1 470 lignes de **production**, dont le seul site que ce scan
+    /// existe pour compter. C'est le trou que `docs/egress/README.md` documente
+    /// pour son propre parseur (§ *La limite de la coupure*) — ici il n'est pas
+    /// hypothétique, il est réalisé.
+    ///
+    /// La direction de l'erreur est ce qui décide : élargir ne peut faire voir
+    /// que **plus** de sites, donc au pire un faux positif bruyant ; rétrécir
+    /// rend le scan silencieusement inerte, ce qui se lit exactement comme un
+    /// arbre propre (classe mika#2205). Un helper `#[cfg(test)]` d'item qui
+    /// écrirait un battement serait donc compté et ferait rougir — ce qui est le
+    /// bon sens de l'erreur : on le déplace dans le `mod tests`.
+    fn find_test_region_start(src: &str) -> Option<usize> {
+        const ATTR: &str = "#[cfg(test)]";
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(ATTR) {
+            let at = from + rel;
+            let rest = src[at + ATTR.len()..].trim_start();
+            if rest.starts_with("mod ")
+                || rest.starts_with("pub mod ")
+                || rest.starts_with("pub(crate) mod ")
+            {
+                return Some(at);
+            }
+            from = at + ATTR.len();
+        }
+        None
+    }
+
     /// La moitié « production » d'un fichier source. `None` quand le fichier
     /// **entier** est du code de test — la leçon de mika#2321 : un module de test
     /// extrait ne porte aucun littéral `#[cfg(test)]`, donc la troncature seule
@@ -944,7 +980,7 @@ mod tests {
         if crate::source_scan::is_test_source_path(path) {
             return None;
         }
-        Some(match src.find("#[cfg(test)]") {
+        Some(match find_test_region_start(src) {
             Some(i) => src[..i].to_string(),
             None => src.to_string(),
         })
@@ -1136,6 +1172,53 @@ mod tests {
             count_beat_sites(en_prose),
             BeatSites::default(),
             "la prose décrit le canal, elle ne l'écrit pas (classe mika#2050)"
+        );
+    }
+
+    /// **Contrôle de bonne foi de la COUPURE** — un `#[cfg(test)]` d'item ne
+    /// masque pas la production qui le suit, un `#[cfg(test)] mod` si.
+    ///
+    /// Sans ce contrôle, la coupure et l'aveuglement se lisent pareil : le scan
+    /// rendrait `wiring: 0` sur `spawn.rs` en ayant l'air de l'avoir lu. C'est
+    /// le défaut mesuré le 2026-09-29, et c'est celui-ci qui rougit si quelqu'un
+    /// restaure la troncature au premier littéral.
+    #[test]
+    fn mika1990_un_cfg_test_ditem_ne_masque_pas_la_production() {
+        // La forme exacte de `spawn.rs` : un helper de test en tête de fichier,
+        // le câblage bien plus bas.
+        let src = concat!(
+            "static GUARD: AtomicBool = AtomicBool::new(false);\n",
+            "#[cfg(test)]\n",
+            "fn reset_guard_for_test() { GUARD.store(false, Ordering::SeqCst); }\n",
+            "pub fn boucle() { liveness.beat(&cfg, sink, &outcome).await; }\n",
+        );
+        let prod = production_half(Path::new("spawn.rs"), src).expect("fichier de production");
+        assert!(
+            prod.contains(".beat("),
+            "un `#[cfg(test)]` d'item a masqué le câblage qui le suit — le scan est aveugle \
+             sur le fichier même qu'il existe pour compter"
+        );
+        assert_eq!(count_beat_sites(&prod).wiring, 1);
+
+        // Le `mod tests`, lui, coupe : c'est la région de test.
+        let avec_mod = concat!(
+            "pub fn boucle() { liveness.beat(&cfg, sink, &outcome).await; }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn faux_cablage() { autre.beat(&cfg, sink, &o).await; }\n",
+            "}\n",
+        );
+        let prod = production_half(Path::new("spawn.rs"), avec_mod).expect("fichier de production");
+        assert_eq!(
+            count_beat_sites(&prod).wiring,
+            1,
+            "le câblage d'un `mod tests` ne doit pas compter — sinon tout fichier testé rougit"
+        );
+
+        // Le fichier entièrement de test sort de la population (mika#2321).
+        assert!(
+            production_half(Path::new("crates/mika-agent/src/db/tests/foo.rs"), src).is_none(),
+            "un module de test extrait ne porte aucun littéral `#[cfg(test)]`"
         );
     }
 
