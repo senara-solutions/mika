@@ -496,6 +496,16 @@ jobs:
       - name: Pin the egress no-log guard's negative behaviour (mika#2054)
         run: bash scripts/test-verify-egress-no-log.sh
 
+  egress-manifest-lint:
+    name: Egress Manifest Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Enforce manifest↔code lockstep on outbound sinks (mika#2408)
+        run: bash scripts/verify-egress-manifest.sh --report
+      - name: Pin the guard's negative behaviour in all four directions (AC1, AC1b)
+        run: bash scripts/test-verify-egress-manifest.sh
+
   sigpipe-grep-lint:
     name: SIGPIPE grep-q Lint
     runs-on: ubuntu-22.04

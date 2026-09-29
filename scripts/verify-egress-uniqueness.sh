@@ -47,23 +47,45 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Anything in this list appearing in a source file outside the authorized
 # path is a discipline violation.
 #
+# SOURCE UNIQUE — mika#2408 AC5. Cette liste vivait ici, maintenue à la main,
+# et rien ne forçait son entrée : un nouvel upstream absent de la liste passait
+# en silence. Elle est désormais DÉRIVÉE de `docs/egress/egress-manifest.toml`
+# — les `destination` (ou `confined_hosts`) des entrées portant
+# `confined = true` — que le lockstep de `scripts/verify-egress-manifest.sh`
+# tient en phase avec le code dans les deux sens.
+#
 # Scope discipline: this list catches real API endpoint hosts / paths — the
 # strings that appear ONLY in code performing an actual network call. Marketing
-# URLs (like `https://brave.com/search/api/` — the free-key sign-up landing
-# page) are intentionally out of scope; they cannot reach the upstream and
-# their presence in docs is legitimate.
-PATTERNS=(
-    "api.search.brave.com"
-    # egress_fetch (mika#1969) — gouv.fr allowlist. Each substring must
-    # match ALLOWED_HOSTS in `crates/mika-gateway/src/egress_fetch/mod.rs`.
-    # Extension is a code change + deploy per KTD2 — do not turn into
-    # an env var.
-    "service-public.fr"
-    "ants.gouv.fr"
-    "impots.gouv.fr"
-    "data.gouv.fr"
-    # Future upstreams — extend as new egress classes are added.
-)
+# URLs (like the free-key sign-up landing page of a search upstream) are
+# intentionally out of scope; they cannot reach the upstream and their presence
+# in docs is legitimate. C'est pourquoi le champ `confined` du manifeste est
+# OPT-IN : tout sink n'est pas confinable, et seuls les substrats le sont.
+#
+# FAIL-CLOSED. Une dérivation qui échouerait — manifeste absent, TOML cassé,
+# zéro entrée `confined` — laisserait ce lint tourner sur un tableau vide et
+# rendre « aucune violation », c'est-à-dire se lire exactement comme une garde
+# qui passe. On refuse plutôt que de continuer.
+MANIFEST_ENGINE="$REPO_ROOT/scripts/lib/egress_manifest_lint.py"
+if [[ ! -f "$MANIFEST_ENGINE" ]]; then
+    echo "ERROR (egress-uniqueness): moteur du manifeste introuvable à $MANIFEST_ENGINE" >&2
+    echo "  Les PATTERNS de ce lint en sont dérivés depuis mika#2408 (AC5)." >&2
+    echo "  Sans lui, ce lint tournerait sur une liste vide et se lirait comme vert." >&2
+    exit 2
+fi
+
+PATTERNS=()
+derive_rc=0
+while IFS= read -r host; do
+    [[ -n "$host" ]] && PATTERNS+=("$host")
+done < <(python3 -B "$MANIFEST_ENGINE" --confined-hosts "$REPO_ROOT" || { derive_rc=$?; })
+
+if [[ $derive_rc -ne 0 || ${#PATTERNS[@]} -eq 0 ]]; then
+    echo "ERROR (egress-uniqueness): dérivation des PATTERNS depuis le manifeste échouée" >&2
+    echo "  (exit $derive_rc, ${#PATTERNS[@]} pattern(s) obtenu(s))" >&2
+    echo "  Source: docs/egress/egress-manifest.toml, entrées \`confined = true\`." >&2
+    echo "  Diagnostic: bash scripts/verify-egress-manifest.sh --report" >&2
+    exit 2
+fi
 
 # Files/dirs allowed to contain these identifiers. Substring match.
 AUTHORIZED_PATHS=(
@@ -84,6 +106,11 @@ AUTHORIZED_PATHS=(
     # consumer-side migration removes; must cite the pre-migration Brave
     # URL to document the fix. Same shape as the E1 plan above.
     "docs/plans/2026-08-23-003-fix-1971-web-search-substrate-routing-plan.md"
+    # Egress manifest (mika#2408) — le manifeste nomme chaque destination par
+    # définition : c'est son objet. Il ne réalise aucun appel, et une
+    # déclaration est le contraire d'un chemin de reachability. Sans cette
+    # entrée, le premier commit du manifeste fait rougir ce lint.
+    "docs/egress/"
     "scripts/verify-egress-uniqueness.sh"
     "scripts/verify-egress-request-shape.sh"
     "scripts/verify-egress-no-log.sh"
@@ -174,5 +201,11 @@ if [[ $violations -gt 0 ]]; then
     exit 1
 fi
 
-echo "No egress-uniqueness violations found."
+# CONTRÔLE POSITIF (mika#2408). Depuis que les PATTERNS sont dérivés du
+# manifeste, « aucune violation » a deux causes possibles : l'arbre est propre,
+# ou la liste a rétréci sans qu'on le voie. Dire COMBIEN de patterns ont été
+# confrontés est ce qui sépare les deux — sans cette ligne, une dérivation
+# tombée de cinq hosts à un se lirait exactement comme une flotte saine
+# (classe mika#2205).
+echo "No egress-uniqueness violations found (${#PATTERNS[@]} confined host(s) from docs/egress/egress-manifest.toml)."
 exit 0

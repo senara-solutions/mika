@@ -1,0 +1,34 @@
+# Exceptions au lockstep d'egress (mika#2408) — LIVRÉ VIDE, ET PINNÉ VIDE.
+#
+# Doctrine mika#2201 : « on déclare, on n'allowliste pas. » Elle s'applique ici
+# à la lettre, parce que la résolution d'une violation EST l'écriture d'une
+# ligne de `docs/egress/egress-manifest.toml` — il n'existe aucun sink qu'on ne
+# puisse pas déclarer, y compris celui dont la destination est arbitraire
+# (`skills/executor.rs::execute_http` se déclare
+# `destination_source = "skill-declared"`).
+#
+# QUAND CETTE TABLE SE REMPLIT, ON LIT LA LIGNE QU'ON VIENT D'AJOUTER ET ON SE
+# DEMANDE POURQUOI CE SINK NE PEUT PAS SE DÉCLARER. Un détecteur livré avec
+# cinq exceptions le jour de sa naissance est un détecteur dont personne ne
+# lira jamais la sixième.
+#
+# Deux assertions de `scripts/test-verify-egress-manifest.sh` la tiennent :
+#   - AUTO-NETTOYANTE — chaque entrée doit encore correspondre à une violation
+#     réelle. Une exception devenue stale fait rougir le build LE JOUR DE LA
+#     RÉPARATION, pas des mois après. Même mécanisme que
+#     `scripts/canonical-tokens-exceptions.tsv`.
+#   - PIN-VIDE — le fichier doit ne porter aucune ligne de données. Modèle :
+#     `canonical_tokens` et `scripts/check-pilot-push-sites.sh`.
+#
+# NE PAS CONFONDRE avec `NON_SINK_HOSTS` (scripts/lib/egress_manifest_lint.py),
+# qui n'est pas une allowlist d'exception : c'est une liste de CLASSES de hosts
+# non routables ou réservées aux fixtures (RFC 2606, loopback,
+# `*.svc.cluster.local`). Elle est structurelle, justifiée par classe, et ne
+# référence aucun ticket de suivi parce qu'elle ne décrit aucune violation. Les
+# deux fichiers restent séparés pour que le `wc -l` de celui-ci reste lisible.
+#
+# Format — quatre colonnes séparées par des TABULATIONS, toutes obligatoires :
+#   chemin<TAB>direction<TAB>ticket de suivi<TAB>raison
+#
+# Exemple (commenté — ce fichier ne porte aucune entrée) :
+#   crates/x/src/y.rs	D1	mika#9999	<pourquoi ce sink ne peut pas se déclarer>

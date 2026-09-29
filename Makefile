@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels test-verify-npm-publish verify-egress-no-log verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -163,6 +163,8 @@ test: ## Run all tests
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/verify-egress-manifest.sh
+	@bash scripts/test-verify-egress-manifest.sh
 	@bash scripts/test-dispatch-symmetry.sh
 	@bash scripts/deploy-info-test.sh
 	@bash scripts/test-smoke-webhook-chain.sh
@@ -254,6 +256,10 @@ verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --s
 verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour (mika#1810 E4 / mika#2054)
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+
+verify-egress-manifest: ## Enforce manifest<->code lockstep on outbound sinks + pin the guard's four directions (mika#2408)
+	@bash scripts/verify-egress-manifest.sh --report
+	@bash scripts/test-verify-egress-manifest.sh
 
 test-dispatch-symmetry: ## Verify dev-pilot and dev-groom handlers are structurally symmetric (mika#893 R5)
 	@bash scripts/test-dispatch-symmetry.sh
