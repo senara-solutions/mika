@@ -38,9 +38,21 @@ hex.workspace = true
 regex.workspace = true
 jsonwebtoken.workspace = true
 
+# `dead_endpoint` (mika#2569) — dépendance RÉGULIÈRE optionnelle, jamais une
+# dev-dépendance. Le plan mika#2569 la décrivait comme dev-only ; c'est
+# inapplicable : mika-a2a, mika-agent et mika-cli consomment `mika-common` avec
+# `features = ["test-utils"]`, et dans cette compilation-là mika-common est bâtie
+# comme une bibliothèque ordinaire — ses propres dev-dépendances n'existent pas.
+# Une dev-dep aurait donc rendu le module indécompilable partout sauf dans les
+# tests de mika-common elle-même. Optionnelle + activée par la feature :
+# `cargo build -p mika-common` ne la compile pas.
+[dependencies.socket2]
+workspace = true
+optional = true
+
 [features]
 telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-test-utils = []
+test-utils = ["dep:socket2"]
 
 [dependencies.opentelemetry]
 workspace = true

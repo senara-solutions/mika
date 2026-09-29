@@ -1397,11 +1397,12 @@ mod tests {
             offenders.is_empty(),
             "mika#2495 — une fixture sonde une plage d'adresses réservée à la \
              documentation (RFC 5737 / RFC 3849) :\n  {}\n\n\
-             RÉSOLUTION : remplacer la fixture par un port de boucle locale fermé \
-             (`TcpListener::bind(\"127.0.0.1:0\")` puis `drop`). Un proxy intercepte \
-             une adresse non routable et rend un 400, jamais une erreur de transport — \
-             le test est alors vert sur le CI et rouge en pilote. Ne PAS ajouter \
-             d'entrée à ALLOWED_DOC_RANGE_FIXTURES.\n\n\
+             RÉSOLUTION : remplacer la fixture par \
+             `mika_common::dead_endpoint::DeadEndpoint`, qui RÉSERVE un port de boucle \
+             locale au lieu de le libérer (mika#2569). Un proxy intercepte une adresse \
+             non routable et rend un 400, jamais une erreur de transport — le test est \
+             alors vert sur le CI et rouge en pilote. Ne PAS ajouter d'entrée à \
+             ALLOWED_DOC_RANGE_FIXTURES.\n\n\
              Une mention en COMMENTAIRE n'est pas accusée : si cette ligne apparaît \
              pour de la prose, c'est le dépouillement de \
              `source_scan::strip_comment_lines` qu'il faut lire, pas l'aiguille qu'il \
@@ -1459,6 +1460,425 @@ mod tests {
              documentation dans une fixture est verte sur le CI et rouge en pilote, ce \
              qui est la panne que mika#2495 a payée 6,95 USD."
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2569 — un point de terminaison mort se RÉSERVE, il ne se libère pas.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// L'identifiant lié par une ligne `let <id> … = … TcpListener::bind …`.
+    ///
+    /// **Angle mort assumé et écrit** : une liaison dont `let <id> =` et
+    /// `TcpListener::bind` sont sur deux lignes distinctes n'est pas vue. Les six
+    /// sites mesurés à la livraison sont tous sur une ligne ; un scan qui attrape
+    /// la forme réelle vaut mieux qu'un scan qui prétend attraper toutes les
+    /// formes concevables.
+    fn dead_listener_binding_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        let rest = t.strip_prefix("let ")?;
+        let eq = rest.find('=')?;
+        // Couper l'annotation de type éventuelle : `let l: TcpListener = …`.
+        let mut name = &rest[..eq];
+        if let Some(colon) = name.find(':') {
+            name = &name[..colon];
+        }
+        let name = name.trim().strip_prefix("mut ").unwrap_or(name).trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// `true` si l'offset `at` tombe **à l'intérieur d'un littéral de chaîne**,
+    /// approximé par la parité des `"` non échappés qui le précèdent sur sa ligne.
+    ///
+    /// # Pourquoi ce terme existe, et il n'était pas dans le plan
+    ///
+    /// Sans lui, le scan **rate son propre site fondateur**. Mesuré à la
+    /// livraison sur la version HEAD de `remote_ask_integration.rs` : la ligne
+    /// `.expect_err("should fail when no listener accepts the connection")` porte
+    /// le mot `listener` en frontière de mot, ni suivi de `.local_addr` ni
+    /// précédé de `drop(` — donc comptée comme un usage légitime, et le site que
+    /// mika#2569 existe pour refuser serait passé en vert.
+    ///
+    /// L'approximation est à la ligne, donc une chaîne multi-ligne peut être mal
+    /// comptée. Le **sens** de cette erreur est sûr : elle fait ignorer une
+    /// occurrence, donc elle penche vers l'accusation — jamais vers le silence.
+    fn dead_listener_in_string_literal(window: &str, at: usize) -> bool {
+        let line_start = window[..at].rfind('\n').map_or(0, |i| i + 1);
+        let prefix = &window[line_start..at];
+        let mut quotes = 0usize;
+        let mut escaped = false;
+        for c in prefix.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '"' => quotes += 1,
+                _ => {}
+            }
+        }
+        quotes % 2 == 1
+    }
+
+    /// `true` si `window` porte au moins une occurrence de `name` qui ne soit ni
+    /// `name.local_addr…`, ni `drop(name)`, ni dans un littéral de chaîne.
+    ///
+    /// La recherche traverse les retours à la ligne des deux côtés : sur
+    /// `cadence.rs`, avant sa migration, l'usage s'écrivait `let port = listener`
+    /// puis `.local_addr()` à la ligne suivante — un prédicat à la ligne aurait
+    /// lu ça comme un usage légitime et raté le site.
+    fn dead_listener_has_real_use(window: &str, name: &str) -> bool {
+        let bytes = window.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = window[from..].find(name) {
+            let at = from + rel;
+            let after = at + name.len();
+            from = after;
+
+            let prev_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
+            let next_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+            if !prev_ok || !next_ok {
+                continue;
+            }
+            if dead_listener_in_string_literal(window, at) {
+                continue;
+            }
+            if window[after..].trim_start().starts_with(".local_addr") {
+                continue;
+            }
+            if window[..at].trim_end().ends_with("drop(") {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Les identifiants liés à un `TcpListener::bind` qui n'existent que pour
+    /// rendre leur adresse — le motif « lier puis libérer » de mika#2569.
+    ///
+    /// Fonction **pure**, testable sur chaîne, sur le modèle de `doc_range_hits`.
+    ///
+    /// La fenêtre d'un site est bornée par la **prochaine liaison du même
+    /// identifiant**, et cette borne est porteuse : `transport_failures.rs` lie
+    /// trois fois `listener` dans le même fichier, dont un site fautif encadré par
+    /// deux sites légitimes. Sans la borne, le `listener.accept()` du troisième
+    /// site rendrait le second vert.
+    fn dead_listener_hits(src: &str) -> Vec<String> {
+        let code = crate::source_scan::strip_comment_lines(src);
+
+        // (début de ligne, fin de ligne, identifiant)
+        let mut bindings: Vec<(usize, usize, String)> = Vec::new();
+        let mut offset = 0usize;
+        for line in code.lines() {
+            let end = offset + line.len();
+            if line.contains("TcpListener::bind")
+                && let Some(name) = dead_listener_binding_name(line)
+            {
+                bindings.push((offset, end, name));
+            }
+            offset = end + 1; // le `\n` réinséré par `strip_comment_lines`
+        }
+
+        let mut hits = Vec::new();
+        for (i, (_, line_end, name)) in bindings.iter().enumerate() {
+            let limit = bindings[i + 1..]
+                .iter()
+                .find(|(_, _, n)| n == name)
+                .map_or(code.len(), |(start, _, _)| *start);
+            let from = (*line_end).min(code.len());
+            let to = limit.max(from).min(code.len());
+            if !dead_listener_has_real_use(&code[from..to], name) {
+                hits.push(name.clone());
+            }
+        }
+        hits
+    }
+
+    /// **Un recensement fermé, pas une allowlist — et la différence est de fond**
+    /// (même distinction que `PILOT_DISPATCH_SITES` de mika#2506 ci-dessous).
+    ///
+    /// # Ce que le plan mika#2569 annonçait, et ce que l'arbre porte
+    ///
+    /// Le plan prévoyait cette constante **vide**, sur la foi d'un recensement
+    /// (« R1 ») qui listait cinq sites. Le recensement est **incomplet d'un
+    /// site** : `crates/mika-agent/tests/smoke.rs::free_port` porte exactement le
+    /// même motif — lier `127.0.0.1:0`, relever le port, laisser l'écouteur
+    /// mourir — et n'y figure pas. Livrer la constante vide aurait demandé soit
+    /// de rétrécir le prédicat jusqu'à ne plus le voir, soit de retirer le
+    /// littéral de ce fichier pour faire taire le scan. Les deux sont la
+    /// décoration que ce module refuse ailleurs en toutes lettres.
+    ///
+    /// # Pourquoi ce site ne peut PAS être migré
+    ///
+    /// `free_port` a l'intention **inverse** : il veut un port qu'un
+    /// `mika-spirit` fraîchement lancé pourra **lier**. Un `DeadEndpoint` tient le
+    /// port, donc le serveur échouerait à démarrer. Sa course est réelle et de la
+    /// même famille, mais son remède — tenir le port — lui est structurellement
+    /// indisponible, puisqu'il doit passer le port à un autre processus.
+    ///
+    /// # Ce que ça n'autorise PAS
+    ///
+    /// **Quand le scan tire sur un site NEUF, on le migre vers `DeadEndpoint` ; on
+    /// n'ajoute pas de ligne ici** (doctrine mika#2201, « on déclare, on
+    /// n'allowliste pas »). Une entrée de plus se paie d'un ticket qui pèse
+    /// pourquoi ce site-là ne peut pas tenir son port.
+    ///
+    /// Comparé **dans les deux sens** par le test plus bas : une entrée qui ne
+    /// désigne plus un site fautif rougit, sans quoi elle exempterait
+    /// silencieusement un futur homonyme (motif `FIRED_AT_LITERAL_WRITERS`).
+    const DEAD_LISTENER_CENSUS: &[&str] = &["crates/mika-agent/tests/smoke.rs"];
+
+    /// **AC1 structurellement — aucun site n'obtient un endpoint mort en libérant
+    /// un port.**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe. Un sixième site écrit
+    /// demain ne rendrait **aucune** décision fausse : il passerait, sauf une fois
+    /// sur cent, sur une machine chargée, dans un job dont on relance le rouge
+    /// sans le lire. C'est cette signature qui justifie un scan de source.
+    #[test]
+    fn mika2569_aucune_fixture_nobtient_un_endpoint_mort_en_liberant_un_port() {
+        let sources = all_rust_sources();
+
+        // Anti-vacuité sur la POPULATION : le motif vit dans le code de test, et
+        // `is_test_source_path` répond `false` pour `cadence.rs` (test inline sous
+        // `src/`), donc la population est délibérément NON filtrée. Si quelqu'un
+        // la recâble un jour sur `production_sources()` — le réflexe, puisque
+        // c'est ce que font ses voisines — le scan se tairait en ayant l'air sain.
+        assert!(
+            sources
+                .iter()
+                .any(|(rel, _)| crate::source_scan::is_test_source_path(Path::new(rel))),
+            "mika#2569 — la population du scan ne contient aucune source de test : elle a \
+             été recâblée sur la moitié de production, où le motif cherché ne vit presque \
+             jamais. Le scan est alors décoratif (mika#2103)."
+        );
+
+        let mut offenders = Vec::new();
+        for (rel, content) in &sources {
+            if DEAD_LISTENER_CENSUS.contains(&rel.as_str()) {
+                continue;
+            }
+            for name in dead_listener_hits(content) {
+                offenders.push(format!(
+                    "{rel} : `{name}` n'est lié que pour rendre son adresse"
+                ));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2569 — un écouteur est lié puis libéré pour servir d'endpoint « mort » :\n  \
+             {}\n\n\
+             RÉSOLUTION : remplacer la fixture par `mika_common::dead_endpoint::DeadEndpoint`, \
+             qui RÉSERVE le port (socket lié, jamais `listen()`, jamais `SO_REUSEADDR`) au lieu \
+             de le libérer. Tant que le garde vit, aucun `bind(\"127.0.0.1:0\")` concurrent ne \
+             peut recevoir ce port, et toute connexion vers lui est refusée immédiatement.\n\n\
+             Ne PAS ajouter d'entrée à DEAD_LISTENER_CENSUS : une entrée se paie d'un ticket \
+             qui établit pourquoi ce site ne peut pas tenir son port.\n\n\
+             Un écouteur SERVI (`axum::serve(l, …)`) ou ACCEPTÉ (`l.accept()`) n'est pas \
+             accusé. Si cette ligne apparaît pour de la prose, c'est le dépouillement de \
+             `source_scan::strip_comment_lines` qu'il faut lire, pas l'aiguille qu'il faut \
+             rétrécir.",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Plante une fixture en substituant `@BIND@` par l'appel de liaison,
+    /// **assemblé à l'exécution**.
+    ///
+    /// Sans cette indirection, les fixtures ci-dessous feraient rougir le scan sur
+    /// sa propre définition — et un scan rouge en permanence est un scan qu'on
+    /// désarme. Même motif et même raison que `doc_range_needles` ci-dessus.
+    fn plant_dead_listener(src: &str) -> String {
+        src.replace("@BIND@", concat!("TcpListener", "::bind"))
+    }
+
+    /// **Contrôle de non-vacuité — le scan attrape les formes plantées.**
+    ///
+    /// Sans lui, « la garde se tait » et « la garde ne regarde rien » se lisent
+    /// pareil. Les deux formes sont celles que l'arbre portait : `drop` explicite
+    /// (`remote_ask_integration`, `cadence`) et bloc d'initialisation
+    /// (`remote_ask_recovery` ×2, `transport_failures`).
+    #[test]
+    fn mika2569_le_scan_attrape_les_deux_formes_plantees() {
+        let drop_explicite = plant_dead_listener(
+            r#"
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let url = format!("http://{addr}/health");
+        "#,
+        );
+        assert_eq!(
+            dead_listener_hits(&drop_explicite),
+            vec!["listener".to_string()],
+            "le scan ne voit plus la forme `drop` explicite"
+        );
+
+        let bloc_initialisation = plant_dead_listener(
+            r#"
+            let addr = {
+                let listener = @BIND@("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap()
+            };
+        "#,
+        );
+        assert_eq!(
+            dead_listener_hits(&bloc_initialisation),
+            vec!["listener".to_string()],
+            "le scan ne voit plus la forme « bloc d'initialisation »"
+        );
+
+        // La forme multi-ligne de `cadence.rs` : l'usage traverse un retour à la
+        // ligne. Un prédicat à la ligne lirait `let port = listener` comme un
+        // usage légitime et raterait le site.
+        let usage_multiligne = plant_dead_listener(
+            r#"
+            let listener = std::net::@BIND@("127.0.0.1:0").unwrap();
+            let port = listener
+                .local_addr()
+                .unwrap()
+                .port();
+        "#,
+        );
+        assert_eq!(
+            dead_listener_hits(&usage_multiligne),
+            vec!["listener".to_string()],
+            "le scan rate l'usage qui traverse un retour à la ligne"
+        );
+
+        // **La forme EXACTE du site fondateur de mika#2569**, et le terme que le
+        // plan n'avait pas : le mot `listener` apparaît dans une chaîne littérale
+        // (`.expect_err("… no listener accepts …")`). Sans le dépouillement des
+        // littéraux, il compte comme un usage légitime et le site que ce ticket
+        // existe pour refuser passe en vert. Mesuré à la livraison sur la version
+        // HEAD de `remote_ask_integration.rs`.
+        let mot_dans_une_chaine = plant_dead_listener(
+            r#"
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let err = dispatch_remote("hi", &url)
+                .await
+                .expect_err("should fail when no listener accepts the connection");
+        "#,
+        );
+        assert_eq!(
+            dead_listener_hits(&mot_dans_une_chaine),
+            vec!["listener".to_string()],
+            "le scan compte une occurrence dans un littéral de chaîne comme un usage : \
+             il rate le site fondateur de mika#2569"
+        );
+    }
+
+    /// **L'autre moitié — une fixture de bonne foi n'est PAS accusée.**
+    ///
+    /// Une aiguille qui n'attraperait plus rien et un prédicat qui accuserait tout
+    /// produisent deux verts différents ; seul le couple les distingue. Un scan
+    /// rouge en permanence est un scan qu'on désarme.
+    #[test]
+    fn mika2569_le_scan_epargne_une_fixture_de_bonne_foi() {
+        let servi = plant_dead_listener(
+            r#"
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app.into_make_service()).await.unwrap();
+            });
+        "#,
+        );
+        assert!(
+            dead_listener_hits(&servi).is_empty(),
+            "un écouteur SERVI est accusé : le scan rougirait sur tous les serveurs factices"
+        );
+
+        let accepte = plant_dead_listener(
+            r#"
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let held = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+            });
+        "#,
+        );
+        assert!(
+            dead_listener_hits(&accepte).is_empty(),
+            "un écouteur ACCEPTÉ est accusé"
+        );
+
+        // La prose qui DÉCRIT le motif fautif n'est pas une violation — c'est le
+        // faux positif que le doc-comment de chaque fixture réparée produirait.
+        let prose = plant_dead_listener(
+            r#"
+            // let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            /// Le motif précédent était `drop(listener)` après `local_addr`.
+        "#,
+        );
+        assert!(
+            dead_listener_hits(&prose).is_empty(),
+            "le scan accuse une mention en commentaire : la réparation deviendrait indicible"
+        );
+
+        // Trois liaisons du même nom dans un fichier, dont la fautive est ENCADRÉE
+        // par deux légitimes. C'est la forme réelle de `transport_failures.rs`, et
+        // la seule que le bornage par « prochaine liaison du même identifiant »
+        // existe pour tenir.
+        let encadree = plant_dead_listener(
+            r#"
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (s, _) = listener.accept().await.unwrap();
+
+            let addr2 = {
+                let listener = @BIND@("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap()
+            };
+
+            let listener = @BIND@("127.0.0.1:0").await.unwrap();
+            let addr3 = listener.local_addr().unwrap();
+            let (s3, _) = listener.accept().await.unwrap();
+        "#,
+        );
+        assert_eq!(
+            dead_listener_hits(&encadree),
+            vec!["listener".to_string()],
+            "le bornage par la prochaine liaison du même identifiant ne tient pas : \
+             un site fautif encadré par deux sites légitimes passe en vert"
+        );
+    }
+
+    /// Le pendant auto-nettoyant du recensement : comparé **dans les deux sens**.
+    ///
+    /// Une entrée qui ne désigne plus un site fautif est retirée le jour de sa
+    /// péremption, et non des mois plus tard — sans quoi elle exempterait
+    /// silencieusement un futur homonyme au même chemin.
+    #[test]
+    fn mika2569_le_recensement_ne_nomme_que_des_sites_reellement_fautifs() {
+        let sources = all_rust_sources();
+
+        for entry in DEAD_LISTENER_CENSUS {
+            let found = sources.iter().find(|(rel, _)| rel == entry);
+            let Some((_, content)) = found else {
+                panic!(
+                    "mika#2569 — le recensement nomme `{entry}`, qui n'existe plus. Une \
+                     exception périmée exempte silencieusement un futur homonyme : la \
+                     retirer."
+                );
+            };
+            assert!(
+                !dead_listener_hits(content).is_empty(),
+                "mika#2569 — `{entry}` est recensé mais ne porte plus le motif : le site a \
+                 été réparé, l'entrée doit partir avec lui."
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
