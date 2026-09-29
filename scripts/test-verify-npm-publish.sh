@@ -15,7 +15,7 @@
 # pas à exempter.
 #
 # Aucun appel réseau, aucun `npm` réel, aucun sommeil réel hors de N4a : la
-# suite tourne en moins d'une seconde.
+# suite tourne en un peu plus de 2 s, dont les 2 s de sommeil réel de N4a.
 #
 # CONTRÔLES NÉGATIFS JOUÉS, ET CE QUI A ROUGI (2026-09-29) — chacun est une
 # mutation du script gardé, passée en argument (voir plus bas) :
@@ -257,14 +257,64 @@ assert_eq "$(loop_calls)" 3 "N7: le npm factice a été appelé exactement MAX_A
 # N4 — les sommeils sont ENTRE les essais, jamais après le dernier.
 #   (a) encadrement de durée avec le vrai `sleep`
 #   (b) contrôle positif déterministe : nombre et valeurs des sommeils
-# ===========================================================================
-START="$(date +%s)"
+#
+# N4a est le seul cas qui mesure le vrai temps écoulé. N4b et N4c comptent les
+# appels à la doublure `sleep` : une attente réelle qui ne passe pas par la
+# commande `sleep` (un `/bin/sleep` en chemin absolu, un `read -t`, un
+# `timeout`) leur échappe et n'est visible qu'ici.
+#
+# Pourquoi des millisecondes (mika#2584). La mesure lisait `date +%s`, en
+# secondes entières, avec un seuil à 3 s : un intervalle réel d'environ 2,05 s
+# qui commence à x,97 s et finit à x+3,02 s se lit « 3 ». C'est un faux rouge
+# vu en CI sur la PR #2583 : un défaut de MESURE du harnais, pas un
+# comportement de verify-npm-publish.sh. La règle de l'en-tête (« on répare le
+# script ») ne s'applique donc pas à ce cas-là.
+#
+# Pourquoi 2900 ms. Nominal : 3 essais, BASE=1, CAP=1 → 2 sommeils, ≈ 2000 ms
+# plus le démarrage de bash et des doublures. Mutation « sommeil terminal de
+# retour » : 3 sommeils d'au moins 1 s chacun → ≥ 3000 ms, plancher DUR puisque
+# `sleep` garantit au moins sa durée. Tout seuil < 3000 ms garde donc le
+# contrôle négatif rouge ; 2900 laisse ~900 ms au démarrage et 100 ms sous le
+# plancher. Un seuil à 4 s (l'autre voie proposée par le ticket) laisserait
+# passer la mutation : avec CAP=1, le sommeil terminal ne coûte qu'une seconde
+# de plus.
+#
+# `date +%s%N` est GNU. Une horloge qui ne rend pas que des chiffres (un `date`
+# BSD rend `%N` littéral) fait échouer N4a en le nommant : une garde qui ne peut
+# plus mesurer ne doit pas se lire comme une garde qui passe.
+#
+# D'où aussi la borne BASSE, 1900 ms : les 2 vrais sommeils coûtent au moins
+# 2000 ms (moins 1 ms de troncature). En dessous, soit ils n'ont pas eu lieu
+# (doublure `sleep` restée sur le PATH, sortie précoce du script), soit
+# l'horloge rend des chiffres sans mesurer — un `date` qui ignore `%N` en
+# silence rend des secondes, soit 0 ms d'écart. Sans cette borne, les deux
+# passeraient au vert.
+N4A_FLOOR_MS=1900
+N4A_THRESHOLD_MS=2900
+
+now_ms() {
+    local ns
+    ns="$(date +%s%N)"
+    case "$ns" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$((ns / 1000000))"
+}
+
+N4A_START_MS="$(now_ms)" || N4A_START_MS=""
 run_case n4a --real-sleep NPM_STUB_VISIBLE_FROM=999 PUBLISH_VERIFY_MAX_ATTEMPTS=3 PUBLISH_VERIFY_SLEEP_BASE_SECS=1 PUBLISH_VERIFY_SLEEP_CAP_SECS=1
-ELAPSED=$(( $(date +%s) - START ))
-if [ "$ELAPSED" -lt 3 ]; then
-    ok "N4a: 3 essais à 1 s de base coûtent 2 sommeils (${ELAPSED}s < 3s)"
+N4A_END_MS="$(now_ms)" || N4A_END_MS=""
+if [ -z "$N4A_START_MS" ] || [ -z "$N4A_END_MS" ]; then
+    ko "N4a: horloge sans millisecondes (\`date +%s%N\` ne rend pas que des chiffres) — la durée n'a pas pu être mesurée"
 else
-    ko "N4a: durée ${ELAPSED}s ≥ 3s — le sommeil terminal est de retour"
+    N4A_ELAPSED_MS=$((N4A_END_MS - N4A_START_MS))
+    if [ "$N4A_ELAPSED_MS" -lt "$N4A_FLOOR_MS" ]; then
+        ko "N4a: durée ${N4A_ELAPSED_MS} ms < ${N4A_FLOOR_MS} ms — les 2 vrais sommeils n'ont pas eu lieu, ou l'horloge ne mesure pas"
+    elif [ "$N4A_ELAPSED_MS" -lt "$N4A_THRESHOLD_MS" ]; then
+        ok "N4a: 3 essais à 1 s de base coûtent 2 sommeils (${N4A_ELAPSED_MS} ms < ${N4A_THRESHOLD_MS} ms)"
+    else
+        ko "N4a: durée ${N4A_ELAPSED_MS} ms ≥ ${N4A_THRESHOLD_MS} ms — le sommeil terminal est de retour"
+    fi
 fi
 
 run_case n4b NPM_STUB_VISIBLE_FROM=999 PUBLISH_VERIFY_MAX_ATTEMPTS=3 PUBLISH_VERIFY_SLEEP_BASE_SECS=1 PUBLISH_VERIFY_SLEEP_CAP_SECS=1

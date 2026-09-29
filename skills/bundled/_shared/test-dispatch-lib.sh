@@ -2818,6 +2818,384 @@ else
     FAIL=$((FAIL + 1)); echo "  ✗ Resume half-finished-rebase abort (mika#1414): $RESULT_12K"
 fi
 
+# --- Test 12l: résidu d'échafaudage UNTRACKED seul → aucun stash (mika#2144) ---
+#
+# Le trou que mika#2144 ferme, et il est étroit : `git checkout HEAD -- docs/plans/`
+# restaure les entrées CONNUES de l'arbre et ne supprime jamais un untracked —
+# comportement git, pas accident local. Donc un pilote de groom qui écrit son plan
+# puis meurt avant de committer (signature mika#2141) laisse un `?? docs/plans/…`
+# que le Tier 2 ne peut pas mordre, que le Tier 3 stashe, et que le `clean -fd`
+# qui suit supprime de toute façon. Les 11 stashes du seul 2026-09-01 sont de
+# cette forme.
+#
+# Ce test est le contrôle négatif de la correction : contre le Tier 3 NON modifié
+# il DOIT échouer (un stash apparaît). Une version verte avant correction ne
+# mesure pas le trou et sa verdeur ne prouverait rien (classe mika#2205).
+#
+# `docs/plans/` porte ici un plan COMMITTÉ en plus de l'untracked, pour que le
+# reset chirurgical du Tier 2 réussisse sur son pathspec : le test attesterait
+# autrement un `checkout` en échec plutôt que le trou lui-même.
+test_resume_untracked_scaffold_no_stash() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/untracked-plan
+    mkdir -p "$FIXTURE_CLONE/docs/plans"
+    echo "plan v1" > "$FIXTURE_CLONE/docs/plans/committed-plan.md"
+    echo "feat" > "$FIXTURE_CLONE/feature.txt"
+    git -C "$FIXTURE_CLONE" add docs/plans/committed-plan.md feature.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "feature + committed plan"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/untracked-plan
+
+    # Advance origin/main (non-conflicting) so BEHIND>0 and the rebase replays.
+    local advance_clone
+    advance_clone=$(mktemp -d)
+    git clone -q "file://$FIXTURE_BARE" "$advance_clone"
+    git -C "$advance_clone" config user.email "test@mika.local"
+    git -C "$advance_clone" config user.name "mika test"
+    echo "advance" > "$advance_clone/main-advance.txt"
+    git -C "$advance_clone" add main-advance.txt
+    git -C "$advance_clone" commit -q -m "advance main"
+    git -C "$advance_clone" push -q origin main
+    rm -rf "$advance_clone"
+    git -C "$FIXTURE_CLONE" fetch -q origin
+
+    # Le résidu réellement producteur : un plan de groom jamais committé.
+    echo "plan the pilot never committed" \
+        > "$FIXTURE_CLONE/docs/plans/2026-09-29-001-chore-2144-untracked-plan.md"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    LOG_ID="test-2144-untracked"
+    RESUME_CLEANUP_STASH=""
+
+    # stderr dans un FICHIER, jamais `$(… 2>&1)` : une substitution de commande
+    # ouvre un sous-shell, et `RESUME_CLEANUP_STASH` — l'effet de bord dont tout
+    # ce test dépend — y resterait invisible. Mesuré : le contrôle négatif passait
+    # alors sur la mauvaise assertion. Le fichier vit dans le dépôt NU, hors de
+    # l'arbre de travail, donc il ne peut pas salir le `status --porcelain` qu'on
+    # mesure, et `_fixture_cleanup` l'emporte avec lui.
+    local stderr_file="$FIXTURE_BARE/cleanup.stderr" stderr_seen
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    stderr_seen=$(cat "$stderr_file" 2>/dev/null || true)
+
+    local status_after
+    status_after=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+    local rebase_rc=0
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 || rebase_rc=$?
+
+    local failures=""
+    # Le nettoyage est INCHANGÉ : seule l'émission du stash bouge (mika#2144 § 2).
+    [ -z "$status_after" ] || failures="${failures}worktree not clean after cleanup: [$status_after]; "
+    [ "$rebase_rc" -eq 0 ] || failures="${failures}rebase should succeed on clean tree, got rc=$rebase_rc; "
+    # AC1 : résidu entièrement échafaudage → aucun stash, malgré l'untracked.
+    [ -z "$RESUME_CLEANUP_STASH" ] || failures="${failures}untracked scaffold must NOT create a stash (got $RESUME_CLEANUP_STASH); "
+    if git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -qF "dispatch-lib-resume-cleanup-"; then
+        failures="${failures}no resume-cleanup stash should exist for untracked scaffold; "
+    fi
+    # AC2 en négatif : le message de récupération ne doit pas être imprimé pour rien.
+    if grep -qF 'resume-cleanup stashed dirty worktree' <<<"$stderr_seen"; then
+        failures="${failures}recovery message printed for scaffold-only residue; "
+    fi
+    # U5 : l'abstention est DITE, sinon sa mesure n'existe pas.
+    if ! grep -qF 'resume_cleanup_scaffold_only' <<<"$stderr_seen"; then
+        failures="${failures}expected the abstention line resume_cleanup_scaffold_only; "
+    fi
+    if ! grep -qF 'classes=plans' <<<"$stderr_seen"; then
+        failures="${failures}abstention line should name the class (classes=plans); "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12L=$(test_resume_untracked_scaffold_no_stash 2>/dev/null)
+if [ "$RESULT_12L" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Resume untracked scaffold: no stash, abstention said (mika#2144)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Resume untracked scaffold no-stash (mika#2144): $RESULT_12L"
+fi
+
+# --- Test 12m: AC6 — les deux branches dans un seul test (mika#2144) ---
+#
+# La lettre d'AC6 : « une exécution réelle de la voie de reprise sur un worktree
+# portant du `.iterate/` et rien d'autre ne crée aucun stash, et la même exécution
+# avec un fichier de code modifié en crée un. Les deux, dans le même test. »
+#
+# `.iterate/` arrive bien au Tier 3 dans une fixture, et pas par artifice : le
+# `rm -rf "$wt/.iterate"` du Tier 2 est gardé par `_assert_removable_worktree_path`,
+# dont le terme T4 exige un chemin sous `/.claude/worktrees/`. Une fixture en
+# `mktemp -d` est refusée — la forme exacte que R4 décrit en production (une
+# branche antérieure à `ac1ee87e`, où `.iterate/` n'est ni ignoré ni forcément
+# hors de l'index).
+#
+# La phase 2 est le contrôle négatif non négociable d'AC2 : elle doit rester verte
+# avant ET après la correction. Si elle rougit, le filet est devenu muet et c'est
+# la perte des 16 stashes de code en train de se rejouer.
+test_resume_ac6_both_branches() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/ac6-both
+    echo "feat" > "$FIXTURE_CLONE/feature.txt"
+    git -C "$FIXTURE_CLONE" add feature.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "feature work"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/ac6-both
+
+    local failures=""
+    # stderr dans un fichier, pour la raison écrite sur le test 12l : une
+    # substitution de commande perdrait `RESUME_CLEANUP_STASH`. Le dépôt nu est
+    # hors de l'arbre mesuré.
+    local stderr_file="$FIXTURE_BARE/cleanup.stderr"
+
+    # ---- Phase 1 : `.iterate/` et rien d'autre → aucun stash ----
+    mkdir -p "$FIXTURE_CLONE/.iterate"
+    echo "scratch" > "$FIXTURE_CLONE/.iterate/findings.txt"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    LOG_ID="test-2144-ac6-iterate"
+    RESUME_CLEANUP_STASH=""
+    local stderr_phase1
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    stderr_phase1=$(cat "$stderr_file" 2>/dev/null || true)
+
+    [ -z "$RESUME_CLEANUP_STASH" ] || failures="${failures}phase1: .iterate/-only dirt must NOT stash (got $RESUME_CLEANUP_STASH); "
+    if git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -qF "dispatch-lib-resume-cleanup-test-2144-ac6-iterate"; then
+        failures="${failures}phase1: no resume-cleanup stash should exist for .iterate/-only dirt; "
+    fi
+    if ! grep -qF 'classes=iterate' <<<"$stderr_phase1"; then
+        failures="${failures}phase1: abstention line should name classes=iterate; "
+    fi
+    local status_p1
+    status_p1=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+    [ -z "$status_p1" ] || failures="${failures}phase1: tree not clean after cleanup: [$status_p1]; "
+
+    # ---- Phase 2 : un fichier de code modifié → un stash, ET son message ----
+    echo "real work the pilot did not commit" >> "$FIXTURE_CLONE/feature.txt"
+
+    LOG_ID="test-2144-ac6-code"
+    RESUME_CLEANUP_STASH=""
+    local stderr_phase2
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    stderr_phase2=$(cat "$stderr_file" 2>/dev/null || true)
+
+    if [ -z "$RESUME_CLEANUP_STASH" ]; then
+        failures="${failures}phase2: a modified code file MUST be stashed (AC2); "
+    elif ! git -C "$FIXTURE_CLONE" cat-file -e "$RESUME_CLEANUP_STASH" 2>/dev/null; then
+        failures="${failures}phase2: RESUME_CLEANUP_STASH ($RESUME_CLEANUP_STASH) is not a valid git object; "
+    elif ! git -C "$FIXTURE_CLONE" stash show "$RESUME_CLEANUP_STASH" 2>/dev/null | grep -qF 'feature.txt'; then
+        failures="${failures}phase2: stashed content should hold the code file (feature.txt); "
+    fi
+    # Le message de récupération est la moitié d'AC2 que le ticket nomme.
+    if ! grep -qF 'resume-cleanup stashed dirty worktree' <<<"$stderr_phase2"; then
+        failures="${failures}phase2: the recovery message must still be printed; "
+    fi
+    if grep -qF 'resume_cleanup_scaffold_only' <<<"$stderr_phase2"; then
+        failures="${failures}phase2: abstention line must NOT appear when code is present; "
+    fi
+    local status_p2
+    status_p2=$(git -C "$FIXTURE_CLONE" status --porcelain 2>/dev/null)
+    [ -z "$status_p2" ] || failures="${failures}phase2: tree not clean after cleanup: [$status_p2]; "
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12M=$(test_resume_ac6_both_branches 2>/dev/null)
+if [ "$RESULT_12M" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ AC6: .iterate/-only no stash, code still stashed (mika#2144)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ AC6 both branches (mika#2144): $RESULT_12M"
+fi
+
+# --- Test 12n: renommages — le piège `R ` du format -z (mika#2144) ---
+#
+# `git status --porcelain -z` émet pour un renommage DEUX enregistrements
+# NUL-séparés : la destination avec son préfixe `XY `, puis l'origine SANS préfixe.
+# Un classificateur qui applique l'offset 3 aux deux tronque l'origine
+# (`docs/plans/b.md` → `s/plans/b.md`), qui ne matche plus aucun motif.
+#
+# Le plan mika#2144 nomme le sens « sortant de docs/plans/ ». Livré seul, ce sens
+# ne discrimine RIEN : sa destination est déjà du code, donc le premier
+# enregistrement suffit à décider, et le test passerait avec ou sans le traitement
+# de l'origine. Les trois volets sont donc livrés ensemble.
+#
+# Le volet 2 (l'origine est du code) est le contrôle de SÛRETÉ : sans lecture de
+# l'origine, un `git mv code/y.rs docs/plans/d.md` verrait une destination
+# d'échafaudage et cesserait de stasher du code. Fail-closed ou pas, c'est la
+# perte qu'AC2 interdit.
+#
+# Le volet 3 est le volet DISCRIMINANT, et il vit sous `.iterate/` — pas sous
+# `docs/plans/` comme le premier jet l'écrivait. Mesuré : le Tier 2 DÉMONTE un
+# renommage interne à `docs/plans/` avant que le Tier 3 ne le voie
+# (`checkout HEAD -- docs/plans/` restaure l'origine et laisse la destination
+# seule → un seul enregistrement, `paths=1`), donc ce sens-là n'atteint jamais le
+# chemin à deux enregistrements. `.iterate/` y arrive, et pas par artifice : le
+# `rm -rf` du Tier 2 est refusé sur une fixture hors de `/.claude/worktrees/`, et
+# un `.iterate/` TRACKÉ est exactement la population que R4 décrit (une branche
+# antérieure à `ac1ee87e`, dont le commit s'intitule *untrack*). Sous un offset 3
+# appliqué à tort à l'origine, `terate/a` ne matche plus rien et le résidu est
+# stashé : ce volet rougit.
+test_resume_rename_records() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b feat/renames
+    mkdir -p "$FIXTURE_CLONE/docs/plans" "$FIXTURE_CLONE/code"
+    # Contenu identique et assez long pour que la détection de renommage de
+    # `git status` (activée par défaut) apparie les deux côtés.
+    local filler
+    filler=$(printf 'ligne de contenu stable %s\n' 1 2 3 4 5 6 7 8 9 10)
+    mkdir -p "$FIXTURE_CLONE/.iterate"
+    printf '%s' "$filler" > "$FIXTURE_CLONE/docs/plans/a-plan.md"
+    printf '%s' "$filler" > "$FIXTURE_CLONE/code/y.rs"
+    # `.iterate/` TRACKÉ : la population de R4 (branche antérieure à `ac1ee87e`).
+    printf '%s' "$filler" > "$FIXTURE_CLONE/.iterate/findings-a.txt"
+    git -C "$FIXTURE_CLONE" add docs/plans code .iterate
+    git -C "$FIXTURE_CLONE" commit -q -m "plans + code + tracked .iterate"
+    git -C "$FIXTURE_CLONE" push -q -u origin feat/renames
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    local failures="" stderr_file="$FIXTURE_BARE/cleanup.stderr"
+
+    # ---- Volet 1 : docs/plans/a-plan.md → code/x.rs  ⇒ STASH ----
+    git -C "$FIXTURE_CLONE" mv docs/plans/a-plan.md code/x.rs
+    LOG_ID="test-2144-rename-out"
+    RESUME_CLEANUP_STASH=""
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    [ -n "$RESUME_CLEANUP_STASH" ] \
+        || failures="${failures}volet1: a rename OUT of docs/plans/ must stash; "
+
+    # ---- Volet 2 : code/y.rs → docs/plans/d-plan.md  ⇒ STASH (origine = code) ----
+    git -C "$FIXTURE_CLONE" mv code/y.rs docs/plans/d-plan.md
+    LOG_ID="test-2144-rename-in"
+    RESUME_CLEANUP_STASH=""
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    [ -n "$RESUME_CLEANUP_STASH" ] \
+        || failures="${failures}volet2: a rename INTO docs/plans/ from code must stash (the origin is work); "
+
+    # ---- Volet 3 : .iterate/findings-a → .iterate/findings-b  ⇒ AUCUN stash ----
+    # Le volet discriminant : les deux enregistrements sont de l'échafaudage, et
+    # seul un traitement correct de l'origine sans préfixe le voit.
+    git -C "$FIXTURE_CLONE" mv .iterate/findings-a.txt .iterate/findings-b.txt
+    LOG_ID="test-2144-rename-internal"
+    RESUME_CLEANUP_STASH=""
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
+    local stderr_internal
+    stderr_internal=$(cat "$stderr_file" 2>/dev/null || true)
+    [ -z "$RESUME_CLEANUP_STASH" ] \
+        || failures="${failures}volet3: a rename WITHIN .iterate/ must NOT stash (got $RESUME_CLEANUP_STASH); "
+    if ! grep -qF 'resume_cleanup_scaffold_only' <<<"$stderr_internal"; then
+        failures="${failures}volet3: expected the abstention line for an internal rename; "
+    fi
+    # Les deux enregistrements comptent : destination ET origine.
+    if ! grep -qE 'resume_cleanup_scaffold_only paths=2 classes=iterate ' <<<"$stderr_internal"; then
+        failures="${failures}volet3: both rename records should be counted (paths=2 classes=iterate), got [$stderr_internal]; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_12N=$(test_resume_rename_records 2>/dev/null)
+if [ "$RESULT_12N" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ Renames: both -z records classified (mika#2144)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ Rename -z records (mika#2144): $RESULT_12N"
+fi
+
+# --- mika#2144 : `_is_scaffold_path` est le seul site déclarant LA LISTE --------
+#
+# mika#2157 (R3) écrivait déjà, dans dispatch-lib.sh, que ses deux autorités
+# « peuvent diverger ; quand vous ajoutez un chemin ici, ajoutez-le au
+# classificateur aussi ». C'était une consigne sans garde. Celle-ci l'arme.
+#
+# LE PRÉDICAT PORTE SUR LA LISTE, JAMAIS SUR LE LITTÉRAL ISOLÉ — et ce n'est pas
+# un assouplissement, c'est la correction d'un premier jet mesuré faux. Un scan
+# « un littéral d'échafaudage en position de motif de `case` » accuse
+# `_extract_plan_path` (`docs/plans/*)`, dispatch-lib.sh), qui ne déclare pas
+# l'échafaudage : il normalise le chemin porté par le callout d'une issue, et son
+# second motif `*/docs/plans/*` est la forme PRÉFIXÉE PAR LE DÉPÔT, que le Tier 2
+# ne remet justement pas à HEAD. Le router vers `_is_scaffold_path` élargirait la
+# liste du Tier 3 à un chemin jamais restauré : très exactement la perte
+# silencieuse que R5 refuse. Ce n'est donc pas une exception à allowlister, c'est
+# une autre notion — et la notion surveillée ici est l'ENSEMBLE des quatre
+# chemins. Un bloc `case` qui en porte DEUX OU PLUS redéclare la liste.
+#
+# BORNE NOMMÉE, pas découverte (modèle T12j) : un site isolé portant UN SEUL de
+# ces chemins pour une raison qui lui est propre est hors population. Le jour où
+# quelqu'un scinde la liste en plusieurs `case` d'un motif chacun, ce scan ne le
+# voit pas — on élargit alors le prédicat ici, dans le même commit.
+#
+# Rend : « introuvable », ou le nombre de blocs `case` redéclarant la liste.
+_t2144_scaffold_decl_scan() {
+    local file="$1" body
+    [ -r "$file" ] || { printf 'introuvable'; return 0; }
+    # Le corps du site unique est retiré AVANT le comptage : c'est lui la
+    # déclaration légitime, et le scan cherche ses concurrents.
+    body=$(sed '/^_is_scaffold_path()/,/^}/d' "$file" | grep -v '^[[:space:]]*#' || true)
+    printf '%s\n' "$body" | awk '
+        BEGIN { inblk = 0; viol = 0 }
+        function flush(   k, n) {
+            n = 0
+            for (k in seen) n++
+            if (n >= 2) viol++
+            delete seen
+        }
+        {
+            if ($0 ~ /(^|[[:space:];&|(])case[[:space:]]/) inblk = 1
+            if (inblk) {
+                if ($0 ~ /^[[:space:]]*\.claude\/groom-verdict-trail\.log[^[:space:]]*\)/) seen["trail"] = 1
+                if ($0 ~ /^[[:space:]]*\.claude\/commands\/[^[:space:]]*\)/)               seen["commands"] = 1
+                if ($0 ~ /^[[:space:]]*\.iterate\/[^[:space:]]*\)/)                        seen["iterate"] = 1
+                if ($0 ~ /^[[:space:]]*docs\/plans\/[^[:space:]]*\)/)                      seen["plans"] = 1
+            }
+            if ($0 ~ /(^|[[:space:];&|])esac([[:space:]]|;|$)/) { flush(); inblk = 0 }
+        }
+        END { if (inblk) flush(); print viol + 0 }
+    '
+}
+
+T2144_DECL_SCAN=$(_t2144_scaffold_decl_scan "$DISPATCH_LIB")
+assert_eq "mika#2144: dispatch-lib.sh lisible par le scan de déclaration" "lu" \
+    "$([ "$T2144_DECL_SCAN" != introuvable ] && echo lu || echo "fichier introuvable: $DISPATCH_LIB")"
+assert_eq "mika#2144: aucun second bloc case ne redéclare la liste d'échafaudage" "0" \
+    "$T2144_DECL_SCAN"
+
+# Anti-vacuité (i) : le scan viserait un nom mort si la fonction disparaissait, et
+# un scan sur un nom mort se lit exactement comme un arbre propre (mika#2205).
+assert_eq "mika#2144 anti-vacuité: _is_scaffold_path existe dans dispatch-lib.sh" "1" \
+    "$(grep -c '^_is_scaffold_path()' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2144 anti-vacuité: le site unique porte bien les QUATRE motifs" "4" \
+    "$(sed -n '/^_is_scaffold_path()/,/^}/p' "$DISPATCH_LIB" \
+       | grep -cE '^[[:space:]]*(\.claude/groom-verdict-trail\.log|\.claude/commands/|\.iterate/|docs/plans/)[^[:space:]]*\)' || true)"
+
+# Anti-vacuité (ii) : le prédicat MORD, exercé à chaque exécution plutôt qu'une
+# fois à la main. Un `case` portant deux des quatre chemins est compté…
+assert_eq "mika#2144 anti-vacuité: un case redéclarant deux chemins est vu" "1" \
+    "$(_t2144_scaffold_decl_scan <(printf '%s\n' \
+        'f() {' '    case "$p" in' '        .iterate/*) ;;' '        docs/plans/*) ;;' '    esac' '}'))"
+# …et un `case` n'en portant qu'un seul ne l'est pas : c'est la borne ci-dessus,
+# celle qui laisse `_extract_plan_path` tranquille.
+assert_eq "mika#2144 borne: un case portant un seul chemin reste hors population" "0" \
+    "$(_t2144_scaffold_decl_scan <(printf '%s\n' \
+        'f() {' '    case "$p" in' '        docs/plans/*) ;;' '        */docs/plans/*) ;;' '    esac' '}'))"
+# …et un fichier illisible ROUGIT au lieu de rendre zéro violation.
+assert_eq "mika#2144 anti-vacuité: un fichier absent rend « introuvable »" "introuvable" \
+    "$(_t2144_scaffold_decl_scan /nonexistent/mika-2144.sh)"
+
+# Option (a) de la Fire-Disposition : table d'exceptions livrée VIDE, vacuité
+# assertée à l'exécution (modèle T2544_HEADING_READER_ALLOWLIST). Quand le scan
+# tire, la résolution est de router le site vers `_is_scaffold_path` ; on n'ajoute
+# pas de ligne ici (doctrine mika#2201).
+T2144_SCAFFOLD_PATTERN_DECLARATION_ALLOWED=()
+assert_eq "mika#2144: table d'exceptions du scan de déclaration — zero entries" "0" \
+    "${#T2144_SCAFFOLD_PATTERN_DECLARATION_ALLOWED[@]}"
+
+# Les deux consommateurs lisent le site unique, et c'est ce qui rend la garde
+# ci-dessus autre chose qu'une assertion sur du texte mort.
+assert_eq "mika#2144: _is_scaffold_path a exactement deux consommateurs" "2" \
+    "$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '_is_scaffold_path "' || true)"
+
 # ============================================================================
 # Pre-flight stale-relic cleanup + dual-failure diagnostic (mika#1472)
 # ============================================================================
