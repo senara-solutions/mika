@@ -2250,6 +2250,13 @@ _is_scaffold_path() {
 #          ligne d'observabilité de l'appelant ; 1 dans TOUS les autres cas.
 _residue_is_scaffold_only() {
     local wt="${1-}" rec path xy classes="" count=0 expect_origin=0
+    # `_SCAFFOLD_PATH_CLASS` est le canal de retour INTERNE de `_is_scaffold_path`,
+    # pas une sortie de cette fonction. Le tenir local l'empêche de fuir dans
+    # l'environnement du shell de dispatch : la portée dynamique de bash fait que
+    # la fonction appelée écrit bien cette instance-ci, restaurée en sortie. Les
+    # deux `RESIDUE_*` ci-dessous, eux, SONT la sortie et restent globaux — même
+    # contrat que `RESUME_CLEANUP_STASH`.
+    local _SCAFFOLD_PATH_CLASS=""
     RESIDUE_SCAFFOLD_PATH_COUNT=0
     RESIDUE_SCAFFOLD_CLASSES=""
 
@@ -8055,6 +8062,10 @@ _derive_recovery_pr_title() {
 #          does not get to land on the automatic side.
 _rescue_diff_carries_work() {
     local wt_dir="$1" f
+    # Canal de retour interne de `_is_scaffold_path`, tenu local pour la raison
+    # écrite sur `_residue_is_scaffold_only` : il ne fait pas partie du contrat de
+    # cette fonction, qui ne rend qu'un code de sortie.
+    local _SCAFFOLD_PATH_CLASS=""
 
     # Guard mirrored from _clean_worktree_for_rebase, for its stated reason:
     # `git -C ""` silently operates on the dispatch process CWD — a live

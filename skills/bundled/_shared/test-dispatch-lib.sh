@@ -3055,13 +3055,13 @@ test_resume_rename_records() {
     git -C "$FIXTURE_CLONE" push -q -u origin feat/renames
 
     WORKTREE_DIR="$FIXTURE_CLONE"
-    local failures="" stash_file="$FIXTURE_BARE/cleanup.stderr"
+    local failures="" stderr_file="$FIXTURE_BARE/cleanup.stderr"
 
     # ---- Volet 1 : docs/plans/a-plan.md → code/x.rs  ⇒ STASH ----
     git -C "$FIXTURE_CLONE" mv docs/plans/a-plan.md code/x.rs
     LOG_ID="test-2144-rename-out"
     RESUME_CLEANUP_STASH=""
-    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stash_file" >/dev/null || true
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
     [ -n "$RESUME_CLEANUP_STASH" ] \
         || failures="${failures}volet1: a rename OUT of docs/plans/ must stash; "
 
@@ -3069,7 +3069,7 @@ test_resume_rename_records() {
     git -C "$FIXTURE_CLONE" mv code/y.rs docs/plans/d-plan.md
     LOG_ID="test-2144-rename-in"
     RESUME_CLEANUP_STASH=""
-    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stash_file" >/dev/null || true
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
     [ -n "$RESUME_CLEANUP_STASH" ] \
         || failures="${failures}volet2: a rename INTO docs/plans/ from code must stash (the origin is work); "
 
@@ -3079,9 +3079,9 @@ test_resume_rename_records() {
     git -C "$FIXTURE_CLONE" mv .iterate/findings-a.txt .iterate/findings-b.txt
     LOG_ID="test-2144-rename-internal"
     RESUME_CLEANUP_STASH=""
-    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stash_file" >/dev/null || true
+    _clean_worktree_for_rebase "$FIXTURE_CLONE" 2>"$stderr_file" >/dev/null || true
     local stderr_internal
-    stderr_internal=$(cat "$stash_file" 2>/dev/null || true)
+    stderr_internal=$(cat "$stderr_file" 2>/dev/null || true)
     [ -z "$RESUME_CLEANUP_STASH" ] \
         || failures="${failures}volet3: a rename WITHIN .iterate/ must NOT stash (got $RESUME_CLEANUP_STASH); "
     if ! grep -qF 'resume_cleanup_scaffold_only' <<<"$stderr_internal"; then
