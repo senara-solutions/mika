@@ -113,6 +113,15 @@ jobs:
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
 
+      # mika#2578: this suite was in `make test` — a local target CI does not
+      # call — so its guards gated nothing on a PR. It now carries the scan that
+      # refuses a canary writing the host GitHub credential (PART D) and the
+      # behavioural half proving the staging path is redirectable (PART B), and
+      # a guard the pipeline never runs refuses nothing. Its real-sandbox part
+      # skips cleanly when bwrap is absent, so it is safe on a hosted runner.
+      - name: GitHub token host-reachable / sandbox-absent (mika#2056, mika#2578)
+        run: make test-github-token-not-in-sandbox
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
