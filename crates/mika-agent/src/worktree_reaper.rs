@@ -2196,8 +2196,15 @@ async fn record_refusal(
 // PR est ouverte lui est refusé sous le motif [`REASON_PR_OPEN`], et son
 // `target/` vit aussi longtemps que la PR — 15 à 50 Go par pilote. La nuit du
 // 2026-09-22 : **+90 Go en 8 h**, `/data` à 83 %, worktrees à 165 Go, nettoyé à
-// la main. Cette population est **exactement** l'ensemble des refus `pr_open`
-// du même tick : une donnée déjà en mémoire, sans une requête de plus.
+// la main. Cette population est **exactement** l'ensemble des refus éligibles
+// du même tick ([`PURGE_ELIGIBLE_REASONS`]) : une donnée déjà en mémoire, sans
+// une requête de plus.
+//
+// Depuis mika#2482 elle compte aussi [`REASON_PR_UNKNOWN`] — le « groomé, pas
+// encore implémenté », dont la vieille queue s'accumulait sans mécanisme de
+// fauche parce que `pr_unknown` conserve par conception. Voir
+// [`PURGE_ELIGIBLE_REASONS`] pour l'argument : l'asymétrie qui autorise ce bras
+// ne lit pas *pourquoi* le worktree est conservé.
 //
 // # L'asymétrie est INVERSE de celle du faucheur, et c'est ce qui autorise tout
 //
@@ -2311,6 +2318,51 @@ pub const ALL_PURGE_REFUSAL_REASONS: &[&str] = &[
     PURGE_REASON_OUTSIDE_MANAGED_ROOT,
     PURGE_REASON_BUILD_LOCK_RACED,
 ];
+
+/// Les motifs de refus du faucheur dont le `target/` est **purgeable**
+/// (mika#2482 B1).
+///
+/// # Ce que ça élargit, et pourquoi c'est gratuit en sûreté
+///
+/// Le bras de purge ne voyait que [`REASON_PR_OPEN`]. Or la condition de réveil
+/// de mika#2482 est *« `/data` refranchit régulièrement 80 % »*, et ce qui coûte
+/// ce disque n'est pas le worktree mais son `target/` — 15 à 50 Go par pilote.
+/// L'asymétrie écrite qui autorise ce bras — *« le faucheur supprime du travail
+/// potentiel, ce bras supprime du dérivé pur »* — est **indifférente à la raison
+/// pour laquelle le worktree est conservé** : un `target/` de `pr_unknown` est
+/// exactement aussi reconstructible par `cargo build` qu'un `target/` de
+/// `pr_open`. La moitié disque du constat 1 du ticket ne demande donc **aucune
+/// règle N-jours** : elle demande d'élargir une population de deux noms à trois.
+///
+/// **Les cinq termes P1–P5 ne bougent pas**, verrou de build compris : le seul
+/// danger de ce bras est la **concurrence** avec un `cargo build`, et P5
+/// (mika#2511) la couvre identiquement sur la population élargie.
+///
+/// # Ce que ça n'élargit PAS
+///
+/// La **fauche** d'un `pr_unknown` reste refusée, et pas seulement par prudence :
+/// un `pr_unknown` sort à T3, donc **T7 n'est jamais évalué sur lui** — on ne
+/// sait pas s'il porte du travail non poussé. Ce qui est retiré ici est le
+/// `target/`, jamais le worktree, jamais une branche, jamais un commit.
+pub const PURGE_ELIGIBLE_REASONS: &[&str] = &[REASON_PR_OPEN, REASON_PR_UNKNOWN];
+
+/// Le **lecteur unique** de [`PURGE_ELIGIBLE_REASONS`] (mika#2482 B1.1).
+///
+/// # Les deux sites doivent bouger ensemble, et le dire une seule fois
+///
+/// La population de purge est décidée à **deux** endroits : le calcul des
+/// `TargetState` dans [`purge_stale_target_dirs`] et la décision dans
+/// [`screen_target_purges`]. Élargir la décision sans le calcul d'états fait
+/// tomber les nouveaux worktrees sur
+/// `unwrap_or(TargetState::Present { idle_secs: None })`, c'est-à-dire
+/// **conserve tout** : un bras qui se lit comme élargi et ne purge rien (classe
+/// mika#2205). Un prédicat nommé rend cette coordination structurelle plutôt
+/// que mémorielle, et
+/// [`tests::mika2482_le_predicat_deligibilite_de_purge_a_un_site_unique`] refuse
+/// un troisième site qui comparerait le motif à la main.
+pub fn is_purge_eligible_reason(reason: &str) -> bool {
+    PURGE_ELIGIBLE_REASONS.contains(&reason)
+}
 
 /// `audit_events.tool_name` (et event tracing) d'une purge **effective**.
 ///
@@ -2504,7 +2556,8 @@ pub struct TargetPurgeSelection {
     pub refusals: Vec<TargetPurgeRefusal>,
 }
 
-/// P1 à P4, sur les refus `pr_open` du faucheur du **même tick**.
+/// P1 à P4, sur les refus **éligibles** du faucheur du **même tick**
+/// ([`PURGE_ELIGIBLE_REASONS`] : `pr_open` et, depuis mika#2482, `pr_unknown`).
 ///
 /// | # | terme | source de vérité | illisible ⇒ |
 /// |---|---|---|---|
@@ -2528,11 +2581,13 @@ pub fn screen_target_purges(
     let mut out = TargetPurgeSelection::default();
 
     for refusal in reaper_refusals {
-        // La population EST l'ensemble des refus `pr_open` — et rien d'autre.
-        // C'est ce qui rend les deux populations disjointes par construction :
-        // un worktree retenu par le faucheur n'est pas dans ses refus, et un
-        // worktree refusé sous un autre motif relève d'une autre question.
-        if refusal.reason != REASON_PR_OPEN {
+        // La population EST l'ensemble des refus **éligibles** du faucheur — et
+        // rien d'autre. C'est ce qui rend les deux populations disjointes par
+        // construction : un worktree retenu par le faucheur n'est pas dans ses
+        // refus, et un worktree refusé sous un motif non éligible relève d'une
+        // autre question. Le prédicat est le lecteur unique de la liste
+        // (mika#2482 B1.1) — cette comparaison ne se réécrit pas à la main.
+        if !is_purge_eligible_reason(refusal.reason) {
             continue;
         }
 
@@ -3079,11 +3134,12 @@ struct TargetPurgeStats {
 /// Trois choses doivent être vivantes ensemble à ce point, et c'est ce qui fixe
 /// le site de branchement :
 ///
-/// - `screened.refusals` — **et pas `selection.refusals`** : T4 pousse
-///   [`REASON_PR_OPEN`] dans [`screen_worktrees`], tandis que les refus de
-///   [`apply_work_states`] ne portent que `dirty` / `unpushed_commits`. Filtrer
-///   le mauvais vecteur rendrait une population vide, c'est-à-dire un bras qui
-///   se lit comme sain en ne faisant rien (classe mika#2205).
+/// - `screened.refusals` — **et pas `selection.refusals`** : T3 et T4 poussent
+///   [`REASON_PR_UNKNOWN`] et [`REASON_PR_OPEN`] dans [`screen_worktrees`],
+///   tandis que les refus de [`apply_work_states`] ne portent que `dirty` /
+///   `unpushed_commits`. Filtrer le mauvais vecteur rendrait une population
+///   vide, c'est-à-dire un bras qui se lit comme sain en ne faisant rien (classe
+///   mika#2205).
 /// - l'index des PR — nécessaire au `pr_number` de la surface opérateur. Depuis
 ///   mika#2518 il porte aussi la population détachée : un worktree détaché dont
 ///   la PR est **ouverte** était refusé `detached_head`, donc son `target/`
@@ -3114,7 +3170,10 @@ async fn purge_stale_target_dirs(
     let system_now = SystemTime::now();
     let mut states: HashMap<String, TargetState> = HashMap::new();
     for refusal in reaper_refusals {
-        if refusal.reason != REASON_PR_OPEN || !is_managed_worktree_path(&refusal.path) {
+        // Même prédicat que [`screen_target_purges`], par le même lecteur : les
+        // deux sites décident de la même population et doivent bouger ensemble
+        // (mika#2482 B1.2).
+        if !is_purge_eligible_reason(refusal.reason) || !is_managed_worktree_path(&refusal.path) {
             continue;
         }
         states.insert(
@@ -3238,6 +3297,13 @@ async fn purge_stale_target_dirs(
         // la ligne, ne suspend pas la purge** (modèle `repo=unknown`,
         // mika#2496) — un worktree purgé dont on ne sait pas nommer la PR reste
         // un worktree purgé, et le taire rétrécirait le compte en silence.
+        //
+        // Sur la population `pr_unknown` (mika#2482 B1.4), `by_branch` rend
+        // `None` par définition — **il n'y a pas de PR** — donc `pr_number` vaut
+        // `null` et c'est la sémantique exacte, pas une dégradation : `null`
+        // n'est jamais `0` (mika#2331). C'est aussi ce qui fait de
+        // `jq 'select(.pr_number == null)'` la sonde de la surface opérateur 1.
+        // Zéro ligne à changer ici.
         let pr_number = candidate
             .branch
             .as_deref()
@@ -6948,5 +7014,325 @@ branch refs/heads/fix/live/x
             purge_refusal_audit_key("/x/a", PURGE_REASON_RECENTLY_ACTIVE),
             "target:/x/a@recently_active"
         );
+    }
+
+    // =======================================================================
+    // mika#2482 B1 — la purge `target/` couvre `pr_unknown`
+    // =======================================================================
+
+    fn pr_unknown_refusal(path: &Path, branch: &str) -> ReapRefusal {
+        ReapRefusal {
+            path: path.to_string_lossy().into_owned(),
+            branch: Some(branch.to_string()),
+            reason: REASON_PR_UNKNOWN,
+        }
+    }
+
+    /// **V1 / AC1** — un refus `pr_unknown` entre dans la population de purge et
+    /// en sort purgé : mêmes cinq termes, même disposition, même cap, même
+    /// surface opérateur.
+    ///
+    /// Bout-en-bout par `purge_stale_target_dirs` plutôt que par la fonction
+    /// pure : c'est **le calcul des `TargetState`** qui devait bouger avec la
+    /// décision (B1.2), et un test sur `screen_target_purges` seul serait resté
+    /// vert sur un bras élargi qui ne purge rien.
+    #[tokio::test]
+    async fn mika2482_v1_un_pr_unknown_inactif_est_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "incident-1696-x");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2482-v1",
+            "trace-2482-v1",
+            &[pr_unknown_refusal(&wt, "incident/1696/x")],
+            // L'index ne connaît pas cette branche — c'est la définition de
+            // `pr_unknown`.
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1, "refus inattendu: {stats:?}");
+        assert_eq!(stats.failed, 0);
+        assert!(!target.exists(), "`target/` doit avoir été retiré");
+        assert!(
+            wt.join("src/main.rs").exists(),
+            "le worktree lui-même n'est JAMAIS retiré par ce bras"
+        );
+        assert!(wt.join(".git").exists(), "`.git` doit être intact");
+    }
+
+    /// **V2 / contrôle négatif de V1** — un refus non éligible n'entre pas.
+    ///
+    /// Sans lui, « la population est élargie » est indistinguable de « la
+    /// population est devenue tout le monde » — et `dirty` est le motif le plus
+    /// dangereux à admettre : il signale du travail non committé.
+    #[test]
+    fn mika2482_v2_un_refus_non_eligible_reste_hors_population() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2482-x");
+        let path = wt.to_string_lossy().into_owned();
+
+        for reason in [
+            REASON_DIRTY,
+            REASON_UNPUSHED_COMMITS,
+            REASON_TOO_YOUNG,
+            REASON_WORK_STATE_UNREADABLE,
+            REASON_DETACHED_HEAD,
+            REASON_DETACHED_HEAD_PR_UNKNOWN,
+        ] {
+            let selection = select_target_purges(
+                &[ReapRefusal {
+                    path: path.clone(),
+                    branch: Some("fix/2482/x".to_string()),
+                    reason,
+                }],
+                &no_processes(),
+                &purge_states(
+                    &wt,
+                    TargetState::Present {
+                        idle_secs: Some(99_999),
+                    },
+                ),
+                &free_lock(&target_dir_of(&path)),
+                &TargetPurgeConfig::default(),
+            );
+            assert!(
+                selection.candidates.is_empty() && selection.refusals.is_empty(),
+                "`{reason}` ne doit produire ni candidat ni refus de purge — il \
+                 relève d'une autre question"
+            );
+        }
+
+        // Et les deux éligibles, eux, produisent bien un candidat : sans ce
+        // miroir, le test ci-dessus passerait sur un bras entièrement mort.
+        for reason in [REASON_PR_OPEN, REASON_PR_UNKNOWN] {
+            let selection = select_target_purges(
+                &[ReapRefusal {
+                    path: path.clone(),
+                    branch: Some("fix/2482/x".to_string()),
+                    reason,
+                }],
+                &no_processes(),
+                &purge_states(
+                    &wt,
+                    TargetState::Present {
+                        idle_secs: Some(99_999),
+                    },
+                ),
+                &free_lock(&target_dir_of(&path)),
+                &TargetPurgeConfig::default(),
+            );
+            assert_eq!(
+                selection.candidates.len(),
+                1,
+                "`{reason}` doit être éligible"
+            );
+        }
+    }
+
+    /// **V3 / AC1 (B1.4)** — sur la population `pr_unknown`, `pr_number` vaut
+    /// `null` et **jamais `0`** : il n'y a pas de PR, la sémantique est exacte.
+    ///
+    /// C'est aussi ce qui rend `jq 'select(.pr_number == null)'` — la surface
+    /// opérateur 1 — sélective sur cette population.
+    #[tokio::test]
+    async fn mika2482_v3_le_numero_de_pr_est_null_sans_pr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "chore-1964-x");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2482-v3",
+            "trace-2482-v3",
+            &[pr_unknown_refusal(&wt, "chore/1964/x")],
+            // Une PR existe, mais sur une AUTRE branche : l'index est non vide
+            // et ne résout toujours pas celle-ci.
+            &index(vec![open_pr(9999, "feat/9999/autre")]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1, "refus inattendu: {stats:?}");
+        let events = db.get_audit_events("session-2482-v3").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .expect("une ligne `target_purged` doit exister");
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(
+            reasoning.contains("pr=null"),
+            "`pr=null` attendu — `null` n'est jamais `0` (mika#2331): {reasoning}"
+        );
+        assert!(
+            !reasoning.contains("pr=9999"),
+            "la PR d'une autre branche ne doit pas être attribuée: {reasoning}"
+        );
+    }
+
+    /// **Format de fil** — la liste des motifs éligibles à la purge.
+    #[test]
+    fn mika2482_les_motifs_eligibles_a_la_purge_sont_un_format_de_fil() {
+        assert_eq!(
+            PURGE_ELIGIBLE_REASONS,
+            &["pr_open", "pr_unknown"],
+            "élargir cette liste change ce que la boucle supprime : le dater dans \
+             CLAUDE.md, jamais mettre ce test à jour en silence"
+        );
+        // Chaque entrée doit être un motif réel du faucheur — une faute de
+        // frappe rendrait le prédicat silencieusement plus étroit.
+        for reason in PURGE_ELIGIBLE_REASONS {
+            assert!(
+                ALL_REFUSAL_REASONS.contains(reason),
+                "`{reason}` n'est pas un motif de refus du faucheur"
+            );
+            assert!(is_purge_eligible_reason(reason));
+        }
+        // Et le prédicat refuse ce qui n'y est pas.
+        assert!(!is_purge_eligible_reason(REASON_DIRTY));
+        assert!(!is_purge_eligible_reason(REASON_TOO_YOUNG));
+        assert!(!is_purge_eligible_reason("pr_unknown_"));
+        assert!(!is_purge_eligible_reason(""));
+    }
+
+    /// Allowlist du scan d'éligibilité — **livrée vide, et elle le reste**.
+    const PURGE_REASON_FILTER_ALLOWED: &[&str] = &[];
+
+    /// Quand le scan tire, on route le site vers [`is_purge_eligible_reason`] —
+    /// on ne l'allowliste pas (doctrine mika#2201).
+    #[test]
+    fn mika2482_lallowlist_du_scan_deligibilite_est_vide() {
+        assert!(
+            PURGE_REASON_FILTER_ALLOWED.is_empty(),
+            "mika#2201 — la résolution est de router le site vers le prédicat"
+        );
+    }
+
+    /// Les lignes exécutables qui **comparent** un motif à `REASON_PR_OPEN`.
+    ///
+    /// Rend `Ok(n)` avec `n` = le nombre de lignes exécutables mentionnant le
+    /// motif (contrôle de non-vacuité), ou `Err(lignes fautives)`.
+    fn scan_purge_reason_filters(production: &str, allowed: &[&str]) -> Result<usize, Vec<String>> {
+        // Écrit en deux morceaux pour que le scan ne se dénonce pas lui-même.
+        let needle = format!("REASON_PR{}", "_OPEN");
+        // Les formes qui **décident** : une comparaison, un `matches!`, une
+        // appartenance. Un site qui se contente de *pousser* le motif (T4) ou de
+        // le *déclarer* (les deux listes) n'en porte aucune.
+        let deciders = ["!=", "==", "matches!", ".contains(", ".eq("];
+
+        let mut offenders = Vec::new();
+        let mut found = 0usize;
+        for line in production.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if !line.contains(needle.as_str()) {
+                continue;
+            }
+            found += 1;
+            let label = trimmed.trim_end().to_string();
+            if allowed.contains(&label.as_str()) {
+                continue;
+            }
+            if deciders.iter().any(|d| line.contains(d)) {
+                offenders.push(label);
+            }
+        }
+        if offenders.is_empty() {
+            Ok(found)
+        } else {
+            Err(offenders)
+        }
+    }
+
+    /// **B1.2** — la population de purge a **un seul site de décision**.
+    ///
+    /// Pourquoi un scan et pas un test comportemental : un troisième site qui
+    /// comparerait le motif à la main ne rendrait **aucune décision fausse** le
+    /// jour où il est écrit. Il divergerait plus tard, en silence, avec toutes
+    /// les autres assertions vertes — et la divergence mesurée de cette classe
+    /// (décision élargie, calcul d'états non élargi) produit un bras qui se lit
+    /// comme élargi et ne purge rien (classe mika#2205).
+    #[test]
+    fn mika2482_le_predicat_deligibilite_de_purge_a_un_site_unique() {
+        let here = include_str!("worktree_reaper.rs");
+        let production = here
+            .split("#[cfg(test)]")
+            .next()
+            .expect("le module porte un `mod tests`");
+        assert!(
+            production.len() < here.len(),
+            "le module de test doit être tronqué — sinon les fixtures du scan \
+             seraient lues comme de la production"
+        );
+
+        match scan_purge_reason_filters(production, PURGE_REASON_FILTER_ALLOWED) {
+            Ok(found) => assert!(
+                found >= 1,
+                "contrôle de non-vacuité : le motif n'est mentionné nulle part en \
+                 position exécutable — le scan ne vérifie plus rien"
+            ),
+            Err(offenders) => panic!(
+                "mika#2482 — un site décide de la population de purge sans passer \
+                 par `is_purge_eligible_reason`: {}. Les deux sites (calcul des \
+                 `TargetState` et décision) doivent bouger ensemble ; router le \
+                 site vers le prédicat, jamais l'allowlister.",
+                offenders.join(" | ")
+            ),
+        }
+    }
+
+    /// **Contrôle négatif du scan, vu rouge.** Sans lui, « le scan lit les
+    /// comparaisons » est indistinguable de « le scan ne lit rien ».
+    #[test]
+    fn mika2482_le_scan_deligibilite_est_vu_rouge_sur_un_second_filtre() {
+        let fixture = concat!(
+            "fn autre_bras(r: &ReapRefusal) {\n",
+            "    if r.reason != REASON_PR",
+            "_OPEN { return; }\n",
+            "}\n"
+        );
+        assert!(
+            scan_purge_reason_filters(fixture, &[]).is_err(),
+            "une comparaison directe doit rougir"
+        );
+    }
+
+    /// **Contrôle négatif miroir, vu vert.** Sans lui, « le scan lit les
+    /// comparaisons » est indistinguable de « le scan rougit sur toute mention
+    /// du motif » — et la déclaration de la liste en est une.
+    #[test]
+    fn mika2482_le_scan_deligibilite_est_vert_sur_la_declaration_et_le_push() {
+        let fixture = concat!(
+            "pub const PURGE_ELIGIBLE_REASONS: &[&str] = &[REASON_PR",
+            "_OPEN, REASON_PR_UNKNOWN];\n",
+            "fn t4(out: &mut ReapSelection) {\n",
+            "    refuse_resolved(out, REASON_PR",
+            "_OPEN);\n",
+            "}\n"
+        );
+        assert_eq!(scan_purge_reason_filters(fixture, &[]), Ok(2));
     }
 }
