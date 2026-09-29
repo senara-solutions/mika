@@ -953,6 +953,46 @@ pub(crate) const GROOM_CALLBACK_PLAN_GROOMED: &str =
 const GROOM_CALLBACK_PLAN_ITERATE: &str =
     "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE\nSession: sess-2287";
 
+/// mika#2590 — le `result` d'un callback de groom **auto-skippé**, dans la forme
+/// que `dispatch-lib.sh` écrivait le 2026-09-29 sur mika#2105.
+///
+/// # GELÉ. Ne pas régénérer depuis `dispatch-lib.sh`.
+///
+/// U5b de mika#2590 retire le littéral `Outcome: PLAN_GROOMED` de cette note.
+/// Régénérer ce fixture depuis le producteur corrigé ferait **disparaître la
+/// forme même que le prédicat doit refuser** : le test passerait des deux côtés
+/// du correctif et n'attesterait rien. Motif écrit :
+/// `tests/fixtures/grooming_bodies/` (mika#2158) et `plan_callout_bodies/`
+/// (mika#2120) — « rafraîchir depuis GitHub effacerait les formes que le
+/// prédicat doit reconnaître ».
+///
+/// # Ce qui est gelé ici est la FORME, pas l'octet
+///
+/// La **structure** — enveloppe JSON `{"status":"auto_skipped",…}` dont le champ
+/// `note` cite le marqueur en toutes lettres — est celle du producteur au SHA de
+/// l'incident, recopiée depuis `dispatch-lib.sh`. Les valeurs variables
+/// (`branch`, `plan`, `provenance`) sont **reconstituées** : la base de
+/// production n'est pas montée dans le bac à sable de dispatch, donc la ligne
+/// `89165fb4` n'est pas atteignable depuis ici. Conséquence mesurable : le
+/// marqueur tombe à l'offset 616 dans ce fixture contre les **651** relevés en
+/// base — même forme, valeurs plus courtes. C'est dit plutôt que passé sous
+/// silence : prétendre à une copie octet-pour-octet serait fabriquer une mesure.
+pub(crate) const GROOM_CALLBACK_AUTO_SKIPPED: &str = concat!(
+    r#"{"status":"auto_skipped","reason":"already_groomed","#,
+    r#""issue":"senara-solutions/mika#2105","#,
+    r#""branch":"fix/2105/loop-substrate-un-implement-sans-plan","#,
+    r#""plan":"docs/plans/2026-09-28-002-fix-2105-plan.md","#,
+    r#""provenance":"committed on branch @ 4f2a1c8e","#,
+    r#""note":"The plan named by this ticket resolves on the dispatch branch "#,
+    r#"(committed on branch @ 4f2a1c8e) and its header does not claim a "#,
+    r#"different ticket. Re-grooming would re-derive it and stack a second body "#,
+    r#"callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate "#,
+    r#"refuses it with dispatch_grooming_not_verified unless a completed groom "#,
+    r#"callback carrying Outcome: PLAN_GROOMED exists, and this skip mints none. "#,
+    r#"To make the ticket dispatchable, remove the plan from the branch AND the "#,
+    r#"grooming callouts from the issue body, then let the loop re-groom it."}"#,
+);
+
 /// Groom parent as the structural ready-label handler creates it
 /// (`trigger_type='manual'`, bare issue URL, `dispatch_class='groom'`).
 pub(crate) fn groom_parent(agent_id: &str, reference_url: &str) -> NewTask {

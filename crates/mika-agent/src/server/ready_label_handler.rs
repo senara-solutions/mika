@@ -3213,6 +3213,50 @@ mod tests {
             }
         }
 
+        /// **mika#2590 R10, seconde moitié — le routage d'un ticket dont
+        /// l'unique « preuve » est un auto-skip.**
+        ///
+        /// Même corps que le test 1, mais la base porte cette fois une paire
+        /// groom **terminale** dont le `result` est le JSON d'auto-skip mesuré
+        /// sur mika#2105. Le 2026-09-29 cette ligne suffisait à faire rendre
+        /// `Groomed` au prédicat et `implement` au routage : un pilote est parti
+        /// sans plan re-mesuré.
+        ///
+        /// Le test 1 ne peut pas voir ce défaut — il n'a **aucune** ligne en
+        /// base, donc il passerait même sous le prédicat fautif. Ce qui distingue
+        /// les deux populations est la présence d'un callback groom terminal, et
+        /// c'est exactement ce que ce test pose.
+        #[tokio::test]
+        async fn mika2590_un_auto_skip_ne_route_pas_vers_implement() {
+            let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+            completed_groom_pair(
+                &sync_db,
+                AGENT_ID,
+                &issue_url(),
+                crate::db::tests::GROOM_CALLBACK_AUTO_SKIPPED,
+            );
+            let db = AsyncDatabase::new_with_agent(sync_db, AGENT_ID);
+
+            let class = run_and_read_class(&db, CALLOUTED_BODY).await;
+            assert_eq!(
+                class.as_deref(),
+                Some("groom"),
+                "la note d'un refus n'est pas une preuve de convergence : routé \
+                 `implement`, ce ticket part en dev-pilot sans plan re-mesuré — \
+                 c'est le défaut mesuré sur mika#2105 (mika#2590)"
+            );
+
+            let names = audit_tool_names(&db).await;
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == READY_LABEL_MARKERS_WITHOUT_PROOF_TOOL),
+                "un ticket refoulé pour preuve polluée doit se lire comme tel — \
+                 sans cette ligne il est indistinguable d'un ticket jamais \
+                 groomé (classe mika#2205) — {names:?}"
+            );
+        }
+
         /// **Test 3 / AC5 — le chemin de mika#2242 est intact.**
         ///
         /// Corps sans callout : routage `groom` comme avant, et **aucune** des
