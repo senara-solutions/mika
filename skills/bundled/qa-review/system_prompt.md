@@ -143,7 +143,14 @@ This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dep
 
    **`block[pipeline]` is structurally unreachable here** (mika#2519): steps 2 and 2.5 are skipped below, so no guard ran and no plan was read — nothing a pipeline block could be the outcome of, and the engine refuses such a call before the subprocess. If a guard genuinely did exit non-zero, quote its output **verbatim** per Step 2E.
 
-2. **Skip the plan-AC pipeline.** A Dependabot PR has no plan contract. Skip Step 2 pipeline checks and Step 2.5 plan-AC verification. Emit `PLAN-AC VERIFICATION: skipped (Dependabot dependency PR — no plan contract, mika#1729)` and `BUILD VERIFICATION: skipped (Dependabot dependency PR)`. You MUST still run Step 3 diff review (security patterns still apply — a dependency bump that also edits source is not a pure bump).
+2. **Skip the plan-AC pipeline — the plan, never the build (mika#2565).** A Dependabot PR has no plan contract. Skip Step 2 pipeline checks and Step 2.5 plan-AC verification, and emit `PLAN-AC VERIFICATION: skipped (Dependabot dependency PR — no plan contract, mika#1729)`. You MUST still run Step 3 diff review (security patterns still apply — a dependency bump that also edits source is not a pure bump).
+
+   **The build is a separate question, decided by the diff.** Read `files[].path` from Step 1's `qa_pr_view` output:
+
+   - **Any path whose final segment is `Cargo.toml` or `Cargo.lock`** → the build is **REQUIRED**: go to step 5c before any verdict. Emit no `BUILD VERIFICATION: skipped` line on this class, under any wording — the engine refuses a `pass` here until a build has run (mika#2565 B3).
+   - **Otherwise** (`actions/*`, npm, pip) → `BUILD VERIFICATION: skipped (dependency PR, no Rust dependency resolution in the diff)`. That reason is **true**: `build_mika` compiles Rust and nothing else.
+
+   `pipeline-exempt` is **not** a term of this decision — it exempts the **plan**. Never cite it to skip a build.
 
 3. **Extract package + version delta.** Parse the PR title/body (from Step 1's `qa_pr_view`):
    - Single bump: title `Bump <package> from <old> to <new>` → one `(package, old, new)`.
@@ -166,6 +173,21 @@ This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dep
 
    `0.22 → 0.23` is **not** a major jump here — the first segment is `0` on both sides. Semver's `0.x`-carries-breakage rule is deliberately not applied: it would pull the ordinary Cargo-bump traffic into this clause. A break inside a `0.x` minor stays the changelog scan's job (step 4 → `block[dependency]`).
 
+5c. **Compile it (mika#2565).** When step 2 routed you here, the bump compiles before any verdict — **every Rust dependency PR, major jump or not**. Step 5b is no substitute: a break can be transverse between two crates' shared dependency and show on no call site. *A reading of the API is not a compilation.*
+
+   **i. Derive the path** — Step 3e.2's formula, from a **LITERAL root, never a shell variable** (a `$VAR` in `cwd` is refused, mika#2536): `sanitized_branch` = `headRefName` with `/` → `-`, then `worktree = ~/workspace/mika-platform/.claude/worktrees/${sanitized_branch}/mika/`.
+
+   **ii. Create it if absent** — a Dependabot PR is never dispatched by the loop, so Step 3e's "skipped (no worktree found)" would apply and this step be inert.
+   ```
+   run_shell("git -C ~/workspace/mika-platform/mika fetch origin <branch> && git -C ~/workspace/mika-platform/mika worktree add ~/workspace/mika-platform/.claude/worktrees/<sanitized_branch>/mika <branch>")
+   ```
+   Two load-bearing properties: **under `.claude/worktrees/`**, so the reaper (mika#2420) and the `target/` purge (mika#2497) reclaim it and its 15–50 GB when the PR closes — elsewhere it is never reaped; and **attached to the branch, not detached**, so the reaper resolves it by branch key. The mika#2449 guard admits `worktree *`.
+
+   **iii. Build, then END YOUR TURN.** `build_mika(cwd=<worktree>)`.
+   > **STOP: END YOUR TURN after calling `build_mika`.** Post no verdict in this turn. The build is long-running; `qa-review-build-callback` resumes you at step 8 with its result.
+
+   **iv. If the worktree cannot be created**, emit `VERDICT: hold[review]` naming the error verbatim. **Never `pass`** — a guard you could not run is not a guard that passed (Step 2C).
+
 6. **Fail-closed on fetch failure (NF4).** If the advisory query fails — network error, rate-limit, non-zero exit, or unparseable output — the dep-review signal degrades to `hold[review]` ("could not verify breaking-change status: <error>"). **NEVER `pass` on an unverified advisory query.** Mirrors the "tool failure → max verdict hold[review]" data-integrity rule.
 
 7. **Emit the mandatory `DEP-REVIEW:` section** (this is the "present and named" AC5 signal — it MUST appear in the verdict body, never implicit):
@@ -184,11 +206,11 @@ This step detects a Dependabot PR and, when found, runs a **distinct-from-CI dep
    Emit it only once you have read those sites — it is the assertion the engine reads to let a `pass` through here, and asserting it unread is your own claim (`assert_grounded` family).
 
 8. **Verdict mapping (gating):**
-   - Advisory query clean (no advisory intersecting the delta) **AND** no breaking-change changelog entry in the delta → `pass` permitted. The `DEP-REVIEW:` section MUST state the clean result **and** cite the advisory query that grounds it. **On a major jump it additionally requires step 5b's `API-SURFACE:` line.**
-   - Confirmed breaking-change changelog entry in the delta **OR** an open advisory intersecting the delta **OR** a major jump the new API breaks at a call site → `VERDICT: block[dependency]` (gating). Name the GHSA ID / changelog entry / call site in `REASON:` and `DEP-REVIEW:`.
-   - Advisory query failed / unparseable → `VERDICT: hold[review]` per step 6.
+   - Advisory query clean (no advisory intersecting the delta) **AND** no breaking-change changelog entry in the delta → `pass` permitted. The `DEP-REVIEW:` section MUST state the clean result **and** cite the advisory query that grounds it. **On a major jump it additionally requires step 5b's `API-SURFACE:` line.** **On a Rust dependency PR (step 5c) it additionally requires a green build**, reported as `BUILD VERIFICATION: Build: pass`. The engine reads a **fact it recorded itself** — a `build_mika` call in this session — never that line: writing it without the build refuses the verdict (mika#2565 B3).
+   - Confirmed breaking-change changelog entry in the delta **OR** an open advisory intersecting the delta **OR** a major jump the new API breaks at a call site **OR** a build that does not compile → `VERDICT: block[dependency]` (gating). Name the GHSA ID / changelog entry / call site / compile error in `REASON:` and `DEP-REVIEW:`, quoting the compiler verbatim on a red build.
+   - Advisory query failed / unparseable → `VERDICT: hold[review]` per step 6; worktree uncreatable → `hold[review]` per step 5c.iv.
 
-   After emitting the verdict, post it via Step 5 (`run_gh pr review`) exactly as for any other verdict — `pass` → `--approve`, `block[dependency]`/`hold[review]` → `--comment`. Then record to memory (Step 5's `store_fact`). Do NOT run Steps 2/2.5/3e for a Dependabot PR.
+   After emitting the verdict, post it via Step 5 (`run_gh pr review`) exactly as for any other verdict — `pass` → `--approve`, `block[dependency]`/`hold[review]` → `--comment`. Then record to memory (Step 5's `store_fact`). Do NOT run Steps 2/2.5 for a Dependabot PR — step 5c **is** this path's build verification, so Step 3e is no longer off-limits here.
 
 **Step 2 — Pipeline compliance — run the target repo's own guards (hard blocks)**
 

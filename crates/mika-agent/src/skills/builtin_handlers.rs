@@ -3726,25 +3726,51 @@ where
     };
     let title = parsed.get("title").and_then(|t| t.as_str()).unwrap_or("");
 
+    // L'abstention de mika#2565 est **PARTIELLE** : elle porte sur B3 et sur
+    // elle seule.
+    //
+    // Écrire `abstain(); return` ici retirerait B1 et B2 de la décision — deux
+    // branches qui ne lisent ni `files` ni la base et dont le jugement reste
+    // entier quand ces deux termes manquent. Mesuré : cette forme faisait
+    // tomber les neuf tests de mika#2519, et le `pass` sur #2453 — la PR témoin
+    // que mika#2519 existe pour débloquer — ressortait `abstained` au lieu
+    // d'`allowed`. Un terme qu'on n'a pas pu évaluer n'est jamais un terme
+    // satisfait ; il n'est pas non plus une raison de cesser d'évaluer les
+    // autres.
+    async fn abstain_b3(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) {
+        tracing::warn!(
+            event = "dependabot_build_evidence_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2565: could not read the build-evidence term — B3 abstains and the \
+             remaining branches still decide"
+        );
+        audit(ctx, target_key, "abstained", reason).await;
+    }
+
     // `files` est un tableau d'objets `{"path":…,"additions":…}` (mika#2565).
-    // **Fail-open nommé** : absent, non-tableau, ou vide ⇒ abstention sous son
-    // propre motif, jamais un repli sur `unparseable` — la population doit
-    // rester comptable séparément parce que c'est là que le défaut mesuré peut
-    // repasser (sonde S4). Un `title` absent, lui, reste la chaîne vide : il
-    // n'est lu que par B2, qui rend `Unreadable` et s'abstient de lui-même.
-    let files: Vec<String> = match parsed.get("files").and_then(|f| f.as_array()) {
-        Some(entries) => entries
-            .iter()
-            .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(str::to_string))
-            .collect(),
-        None => {
-            abstain(ctx, &target_key, DependabotAbstention::NO_FILES).await;
-            return Ok(());
-        }
-    };
+    // Absent, non-tableau, ou vide ⇒ la liste reste vide, donc
+    // `is_cargo_dependency_pr` est faux et B3 ne s'applique pas — l'abstention
+    // est obtenue par le prédicat lui-même plutôt que par un saut. Le motif est
+    // néanmoins **écrit**, sous un nom à lui et jamais replié sur
+    // `unparseable` : c'est là que le défaut mesuré peut repasser, et la
+    // population doit rester comptable séparément (sonde S4). Un `title`
+    // absent, lui, reste la chaîne vide : il n'est lu que par B2, qui rend
+    // `Unreadable` et s'abstient de lui-même.
+    let files: Vec<String> = parsed
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     if files.is_empty() {
-        abstain(ctx, &target_key, DependabotAbstention::NO_FILES).await;
-        return Ok(());
+        abstain_b3(ctx, &target_key, DependabotAbstention::NO_FILES).await;
     }
 
     // Le fait moteur que B3 lit (mika#2565). Il n'est interrogé que sur un
@@ -3776,17 +3802,21 @@ where
                     agent_id = %ctx.db.agent_id(),
                     session_id = %ctx.session_id,
                     target = %target_key,
-                    "mika#2565: la preuve de build n'est pas lisible — le verdict est laissé \
-                     passer plutôt que refusé sur un terme inobservable. Vérifier \
-                     MIKA_STORE_TOOL_CALLS avant de toucher au prédicat."
+                    "mika#2565: la preuve de build n'est pas lisible — B3 s'abstient plutôt \
+                     que de refuser sur un terme inobservable. Vérifier MIKA_STORE_TOOL_CALLS \
+                     avant de toucher au prédicat."
                 );
-                abstain(
+                abstain_b3(
                     ctx,
                     &target_key,
                     DependabotAbstention::BUILD_EVIDENCE_UNAVAILABLE,
                 )
                 .await;
-                return Ok(());
+                // `true` neutralise B3 pour ce verdict — et **seulement B3** :
+                // B2 ne lit ni la base ni `files`, son jugement sur ce corps
+                // reste entier, et le lui retirer ici ferait d'une base
+                // illisible un désarmement de la branche voisine.
+                true
             }
         }
     } else {

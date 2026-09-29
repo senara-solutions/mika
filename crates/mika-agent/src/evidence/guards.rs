@@ -5874,7 +5874,7 @@ mod tests {
 
         #[test]
         fn b1_refuse_un_block_pipeline_sur_un_auteur_automatise() {
-            let outcome = classify_dependabot_verdict(BOT, true, false, TITLE_2453, "REASON: x");
+            let outcome = classify_2519(BOT, true, false, TITLE_2453, "REASON: x");
             assert_eq!(
                 outcome,
                 DependabotVerdictOutcome::RefusedUnreachablePipelineBlock {
@@ -5889,13 +5889,7 @@ mod tests {
         #[test]
         fn b1_laisse_passer_un_block_pipeline_sur_un_auteur_humain() {
             assert_eq!(
-                classify_dependabot_verdict(
-                    "samidarko",
-                    true,
-                    false,
-                    "fix: something",
-                    "REASON: x"
-                ),
+                classify_2519("samidarko", true, false, "fix: something", "REASON: x"),
                 DependabotVerdictOutcome::Allowed
             );
         }
@@ -5906,7 +5900,7 @@ mod tests {
         #[test]
         fn b1_laisse_passer_un_hold_review_sur_un_auteur_automatise() {
             assert_eq!(
-                classify_dependabot_verdict(BOT, false, false, TITLE_2453, "REASON: x"),
+                classify_2519(BOT, false, false, TITLE_2453, "REASON: x"),
                 DependabotVerdictOutcome::Allowed
             );
         }
@@ -5915,7 +5909,7 @@ mod tests {
 
         #[test]
         fn b2_refuse_un_pass_sur_un_saut_de_majeure_sans_assertion() {
-            let outcome = classify_dependabot_verdict(
+            let outcome = classify_2519(
                 BOT,
                 false,
                 true,
@@ -5938,7 +5932,7 @@ mod tests {
         #[test]
         fn b2_laisse_passer_un_pass_sur_2453() {
             assert_eq!(
-                classify_dependabot_verdict(BOT, false, true, TITLE_2453, "Signal: pass"),
+                classify_2519(BOT, false, true, TITLE_2453, "Signal: pass"),
                 DependabotVerdictOutcome::Allowed
             );
         }
@@ -5949,7 +5943,7 @@ mod tests {
         #[test]
         fn b2_laisse_passer_un_saut_de_majeure_avec_lassertion() {
             assert_eq!(
-                classify_dependabot_verdict(
+                classify_2519(
                     BOT,
                     false,
                     true,
@@ -5966,7 +5960,7 @@ mod tests {
         #[test]
         fn b2_sabstient_sur_un_titre_de_groupe() {
             assert_eq!(
-                classify_dependabot_verdict(
+                classify_2519(
                     BOT,
                     false,
                     true,
@@ -5980,7 +5974,7 @@ mod tests {
         #[test]
         fn b2_ne_touche_pas_un_auteur_humain() {
             assert_eq!(
-                classify_dependabot_verdict("samidarko", false, true, TITLE_2454, "Signal: pass"),
+                classify_2519("samidarko", false, true, TITLE_2454, "Signal: pass"),
                 DependabotVerdictOutcome::Allowed
             );
         }
@@ -6134,6 +6128,426 @@ mod tests {
                  RÉSOLUTION : aligner les deux sites dans le MÊME commit. Il n'y \
                  a pas d'allowlist — une entrée qu'on ne veut pas aligner est une \
                  entrée à retirer (doctrine mika#2201)."
+            );
+        }
+    }
+
+    /// **mika#2565 — un bump Rust se vérifie en compilant, jamais en affirmant.**
+    ///
+    /// Layer A du contrat de vérification : les prédicats purs, sans réseau ni
+    /// base. Le câblage est mesuré par `tests/eval/test_dependabot_build_evidence_2565.rs`.
+    mod mika2565 {
+        use super::super::*;
+
+        const BOT: &str = "app/dependabot";
+
+        /// `utoipa 5.5.0 → 6.0.0` — le témoin dont les quatre `pass` portaient
+        /// une `API-SURFACE:` réelle et un `Check` rouge derrière.
+        const TITLE_2561: &str = "Bump utoipa from 5.5.0 to 6.0.0";
+
+        /// `sha2 0.10.9 → 0.11.0` — hors de B2 par `NoMajorJump`, et dont la
+        /// casse est **transverse** (`digest 0.11` contre `hmac 0.12`).
+        const TITLE_2560: &str = "Bump sha2 from 0.10.9 to 0.11.0";
+
+        fn files(paths: &[&str]) -> Vec<String> {
+            paths.iter().map(|p| (*p).to_string()).collect()
+        }
+
+        // -- Le prédicat de population --
+
+        #[test]
+        fn is_cargo_dependency_pr_voit_les_deux_fichiers_a_la_racine() {
+            assert!(is_cargo_dependency_pr(&files(&["Cargo.lock"])));
+            assert!(is_cargo_dependency_pr(&files(&["Cargo.toml"])));
+            assert!(is_cargo_dependency_pr(&files(&[
+                "Cargo.toml",
+                "Cargo.lock"
+            ])));
+        }
+
+        /// Un workspace a des crates membres, et un bump n'y touche parfois que
+        /// le `Cargo.toml` d'un seul. Une comparaison ancrée à la racine raterait
+        /// exactement cette population.
+        #[test]
+        fn is_cargo_dependency_pr_voit_les_crates_membres_a_toute_profondeur() {
+            assert!(is_cargo_dependency_pr(&files(&[
+                "crates/mika-agent/Cargo.toml"
+            ])));
+            assert!(is_cargo_dependency_pr(&files(&["a/b/c/d/e/f/Cargo.lock"])));
+        }
+
+        /// **Le piège nommé par la sonde S2 du plan.** `contains` rendrait vrai
+        /// ici, et une PR de documentation partirait compiler pendant plusieurs
+        /// minutes pour un fichier qui *parle* de `Cargo.toml` sans en être un.
+        #[test]
+        fn is_cargo_dependency_pr_ne_confond_pas_un_prefixe_avec_le_fichier() {
+            assert!(!is_cargo_dependency_pr(&files(&[
+                "docs/Cargo.toml-migration.md"
+            ])));
+            assert!(!is_cargo_dependency_pr(&files(&["docs/Cargo.lock.bak"])));
+            assert!(!is_cargo_dependency_pr(&files(&["Cargo.toml.orig"])));
+            // Et le symétrique : un suffixe ne suffit pas non plus.
+            assert!(!is_cargo_dependency_pr(&files(&["vendor-Cargo.toml"])));
+        }
+
+        /// **AC3, dans sa forme structurelle.** Une PR dependabot qui ne touche
+        /// pas la résolution Rust n'entre pas dans la population, donc aucun
+        /// build ne lui est demandé — et c'est le prédicat qui le garantit, pas
+        /// une clause de prompt.
+        #[test]
+        fn is_cargo_dependency_pr_laisse_dehors_les_autres_ecosystemes() {
+            assert!(!is_cargo_dependency_pr(&files(&["package.json"])));
+            assert!(!is_cargo_dependency_pr(&files(&["package-lock.json"])));
+            assert!(!is_cargo_dependency_pr(&files(&[
+                ".github/workflows/ci.yml"
+            ])));
+            assert!(!is_cargo_dependency_pr(&files(&["requirements.txt"])));
+            assert!(!is_cargo_dependency_pr(&files(&["docs/solutions/x.md"])));
+        }
+
+        /// Une liste vide n'est pas une PR cargo. L'appelant s'abstient avant
+        /// d'en arriver là (`NO_FILES`), mais le prédicat ne doit pas dépendre
+        /// de cette politesse.
+        #[test]
+        fn is_cargo_dependency_pr_est_faux_sur_une_liste_vide() {
+            assert!(!is_cargo_dependency_pr(&[]));
+        }
+
+        /// Un seul fichier cargo dans un diff par ailleurs étranger suffit :
+        /// c'est la résolution qui bouge, et elle bouge pour tout le workspace.
+        #[test]
+        fn is_cargo_dependency_pr_suffit_dun_seul_fichier() {
+            assert!(is_cargo_dependency_pr(&files(&[
+                "README.md",
+                ".github/workflows/ci.yml",
+                "Cargo.lock",
+            ])));
+        }
+
+        // -- B3 : le refus --
+
+        /// **Le défaut fondateur, dans sa forme la plus nue.**
+        #[test]
+        fn b3_refuse_un_pass_sur_un_bump_cargo_sans_build() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    TITLE_2561,
+                    "Signal: pass",
+                    &f,
+                    false
+                ),
+                DependabotVerdictOutcome::RefusedUnbuiltCargoBump {
+                    author: BOT.to_string(),
+                    files_seen: 2,
+                }
+            );
+        }
+
+        /// **Le test qui distingue ce travail de mika#2519.** Le corps porte une
+        /// `API-SURFACE:` détaillée — donc B2 est satisfaite — et le verdict est
+        /// refusé quand même. Sans B3, ce corps passe : c'est très exactement ce
+        /// qui s'est produit quatre fois sur #2561.
+        #[test]
+        fn b3_refuse_un_pass_que_lassertion_api_suffisait_a_laisser_passer() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            let body = "API-SURFACE: 29 #[derive(ToSchema)] sites (mika-agent: 27, \
+                        mika-gateway: 2) — 14 #[utoipa::path(...)] call sites — 0 \
+                        #[into_params] usages — unaffected\nSignal: pass";
+            // La prémisse du test, posée plutôt que supposée : ce corps satisfait
+            // bien B2. Sans cette assertion, le test pourrait passer parce que
+            // B2 aurait cessé de reconnaître la ligne, et il mesurerait alors la
+            // précédence d'une branche sur une branche morte.
+            assert!(
+                body_asserts_api_surface(body),
+                "la prémisse du test est que ce corps SATISFAIT B2"
+            );
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, true, TITLE_2561, body, &f, false),
+                DependabotVerdictOutcome::RefusedUnbuiltCargoBump {
+                    author: BOT.to_string(),
+                    files_seen: 2,
+                }
+            );
+        }
+
+        /// **Rejeu de #2560.** `0.10.9 → 0.11.0` est hors de B2 par
+        /// `NoMajorJump`, et les trois `pass` mesurés ne portaient aucune ligne
+        /// `API-SURFACE:`. Rien de ce qui existait ne l'attrapait ; B3 l'attrape.
+        #[test]
+        fn b3_attrape_2560_que_b2_ne_voyait_pas() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            // Prémisse posée : ce titre est bien hors de B2.
+            assert!(
+                matches!(classify_version_bump(TITLE_2560), VersionBump::NoMajorJump),
+                "la prémisse du test est que #2560 est HORS de la population de B2"
+            );
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    TITLE_2560,
+                    "Signal: pass",
+                    &f,
+                    false
+                ),
+                DependabotVerdictOutcome::RefusedUnbuiltCargoBump {
+                    author: BOT.to_string(),
+                    files_seen: 2,
+                }
+            );
+        }
+
+        // -- B3 : les contrôles négatifs, sans lesquels « refuse » et « refuse
+        //    tout » sont indistinguables --
+
+        /// **Le contrôle POSITIF du plan (§ 9, Layer B) porté au niveau du
+        /// prédicat.** Un build observé laisse passer.
+        ///
+        /// Le corps porte son `API-SURFACE:` pour que B2 soit hors de cause :
+        /// sans cette ligne le verdict serait refusé quand même, mais par
+        /// l'autre branche, et le test ne dirait plus rien de B3.
+        #[test]
+        fn b3_laisse_passer_quand_un_build_a_tourne() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            let body = "API-SURFACE: 29 ToSchema sites lus — inchangés\nSignal: pass";
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, true, TITLE_2561, body, &f, true),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// **AC3 au niveau de la garde** : une PR dependabot sans fichier cargo
+        /// garde son `pass` sans aucun build.
+        ///
+        /// Le bump est délibérément **mineur** (`4.1.1 → 4.2.0`) : un
+        /// `actions/checkout` de `4` à `5` est un saut de majeure et tombe dans
+        /// B2, qui s'applique à tout écosystème. Le test mesurerait alors la
+        /// mauvaise branche.
+        #[test]
+        fn b3_laisse_passer_une_pr_sans_fichier_cargo() {
+            let f = files(&[".github/workflows/ci.yml"]);
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    "Bump actions/checkout from 4.1.1 to 4.2.0",
+                    "Signal: pass",
+                    &f,
+                    false,
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// Le premier terme de la garde reste l'auteur automatisé — sonde S5.
+        #[test]
+        fn b3_ne_touche_pas_un_auteur_humain() {
+            let f = files(&["Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(
+                    "samidarko",
+                    false,
+                    true,
+                    TITLE_2561,
+                    "Signal: pass",
+                    &f,
+                    false,
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        /// B3 ne mord que sur un `pass`. Un `hold[review]` est la sortie que le
+        /// refus lui-même prescrit : la refuser enfermerait la revue.
+        #[test]
+        fn b3_ne_touche_pas_un_verdict_qui_nest_pas_pass() {
+            let f = files(&["Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, false, TITLE_2561, "REASON: x", &f, false),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        // -- La précédence --
+
+        /// **B3 avant B2, et l'ordre est une décision.** Un bump majeur Rust non
+        /// compilé et sans `API-SURFACE:` satisfait les DEUX prédicats. Le refus
+        /// rendu doit nommer le build : mika#2519 a mesuré que l'assertion d'API
+        /// de #2561 était présente, sincère et insuffisante, donc renvoyer le
+        /// modèle la réécrire l'enverrait travailler sur ce qui n'était déjà pas
+        /// le problème.
+        #[test]
+        fn b3_precede_b2_sur_un_bump_majeur_rust_non_compile() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            let outcome = classify_dependabot_verdict(
+                BOT,
+                false,
+                true,
+                TITLE_2561,
+                "Signal: pass",
+                &f,
+                false,
+            );
+            assert_eq!(
+                outcome,
+                DependabotVerdictOutcome::RefusedUnbuiltCargoBump {
+                    author: BOT.to_string(),
+                    files_seen: 2,
+                },
+                "sur un bump majeur non compilé, le refus doit nommer le BUILD, pas \
+                 l'assertion d'API"
+            );
+        }
+
+        /// Le symétrique, sans lequel le test précédent ne prouverait pas une
+        /// précédence mais une éviction : une fois le build observé, B2 reprend
+        /// la main sur le même corps.
+        #[test]
+        fn b2_reprend_la_main_une_fois_le_build_observe() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(BOT, false, true, TITLE_2561, "Signal: pass", &f, true),
+                DependabotVerdictOutcome::RefusedUnverifiedMajorBump {
+                    author: BOT.to_string(),
+                    package: "utoipa".to_string(),
+                    from: "5.5.0".to_string(),
+                    to: "6.0.0".to_string(),
+                },
+                "un build observé retire le terme de B3 et laisse B2 juger l'assertion"
+            );
+        }
+
+        /// B1 reste devant tout le monde : un `block[pipeline]` est refusé sur
+        /// un auteur automatisé quels que soient les fichiers et le build.
+        #[test]
+        fn b1_reste_devant_b3() {
+            let f = files(&["Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(BOT, true, false, TITLE_2561, "REASON: x", &f, false),
+                DependabotVerdictOutcome::RefusedUnreachablePipelineBlock {
+                    author: BOT.to_string()
+                }
+            );
+        }
+
+        // -- Non-régression de mika#2519 --
+
+        /// **Le témoin que mika#2519 existe pour débloquer.** `base64 0.22.1 →
+        /// 0.23.0` garde son `pass` : c'est une PR cargo, donc B3 s'applique, et
+        /// la moitié prompt la fait compiler — avec le build observé, elle passe
+        /// exactement comme avant.
+        #[test]
+        fn mika2519_2453_garde_son_verdict_une_fois_compile() {
+            let f = files(&["Cargo.toml", "Cargo.lock"]);
+            assert_eq!(
+                classify_dependabot_verdict(
+                    BOT,
+                    false,
+                    true,
+                    "Bump base64 from 0.22.1 to 0.23.0",
+                    "Signal: pass",
+                    &f,
+                    true,
+                ),
+                DependabotVerdictOutcome::Allowed
+            );
+        }
+
+        // -- Formats de fil --
+
+        /// Les deux causes neuves atterrissent dans `audit_events.after_value`
+        /// et l'opérateur en fait des `GROUP BY` (sondes S4). Frère de
+        /// `mika2519_les_causes_dabstention_sont_un_format_de_fil`.
+        #[test]
+        fn mika2565_les_causes_neuves_sont_un_format_de_fil() {
+            assert_eq!(DependabotAbstention::NO_FILES, "no_files");
+            assert_eq!(
+                DependabotAbstention::BUILD_EVIDENCE_UNAVAILABLE,
+                "build_evidence_unavailable"
+            );
+            assert_eq!(
+                QA_BUILD_EVIDENCE_WINDOW_ENV,
+                "MIKA_QA_BUILD_EVIDENCE_WINDOW_SECS"
+            );
+        }
+
+        /// **Les six causes préexistantes gardent leur nom.** Un renommage
+        /// rendrait faux tout `GROUP BY` qui enjambe le déploiement, et les deux
+        /// populations de mika#2519 cesseraient d'être comparables à
+        /// elles-mêmes (motif mika#2361).
+        #[test]
+        fn mika2565_najoute_aucun_nom_en_renommant_un_ancien() {
+            let toutes = [
+                DependabotAbstention::NO_PR_TARGET,
+                DependabotAbstention::NO_REPO,
+                DependabotAbstention::NO_TOKEN,
+                DependabotAbstention::GH_FAILED,
+                DependabotAbstention::GH_TIMEOUT,
+                DependabotAbstention::UNPARSEABLE,
+                DependabotAbstention::NO_FILES,
+                DependabotAbstention::BUILD_EVIDENCE_UNAVAILABLE,
+            ];
+            let mut vues: Vec<&str> = toutes.to_vec();
+            vues.sort_unstable();
+            vues.dedup();
+            assert_eq!(
+                vues.len(),
+                toutes.len(),
+                "deux causes partagent une orthographe : leurs populations seraient \
+                 fusionnées dans le GROUP BY sans que rien ne le dise"
+            );
+        }
+
+        // -- La fenêtre de preuve de build --
+
+        #[test]
+        fn la_fenetre_a_trois_paliers() {
+            // Absent ou vide → défaut, sans bruit.
+            assert_eq!(
+                parse_qa_build_evidence_window(None),
+                QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS
+            );
+            assert_eq!(
+                parse_qa_build_evidence_window(Some("")),
+                QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS
+            );
+            assert_eq!(
+                parse_qa_build_evidence_window(Some("   ")),
+                QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS
+            );
+
+            // Une valeur valide est honorée, blancs rognés.
+            assert_eq!(parse_qa_build_evidence_window(Some("900")), 900);
+            assert_eq!(parse_qa_build_evidence_window(Some(" 900 ")), 900);
+
+            // Illisible, nulle, négative, ou absurde → défaut.
+            for invalide in ["plif", "0", "-1", "3.5", "99999999999"] {
+                assert_eq!(
+                    parse_qa_build_evidence_window(Some(invalide)),
+                    QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS,
+                    "{invalide:?} doit retomber sur le défaut"
+                );
+            }
+        }
+
+        /// **`0` ne désarme pas, et c'est le point.** Une fenêtre nulle ne
+        /// trouverait jamais de build et refuserait tout `pass` ; une fenêtre
+        /// infinie rendrait « un build a eu lieu » vrai pour toujours. Les deux
+        /// seraient un désarmement par coquille sur une garde de sûreté.
+        #[test]
+        fn la_fenetre_ne_se_desarme_par_aucune_extremite() {
+            assert!(parse_qa_build_evidence_window(Some("0")) > 0);
+            assert!(
+                parse_qa_build_evidence_window(Some(&format!(
+                    "{}",
+                    QA_BUILD_EVIDENCE_WINDOW_MAX_SECS + 1
+                ))) <= QA_BUILD_EVIDENCE_WINDOW_MAX_SECS
             );
         }
     }

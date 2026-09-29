@@ -55,7 +55,38 @@ timeout_secs = 30
 # the gate with 1 875 bytes of headroom and keeps 2 048 below the ceiling.
 # The gate fires again at 75 878 bytes. The declared size costs nothing at
 # runtime — the real size is what is injected.
-max_prompt_size = 79872
+#
+# Raised from 79872 to 81408 (79.5 KB) for mika#2565, on 2026-09-28. Step 1.6
+# stops prescribing an UNCONDITIONAL `BUILD VERIFICATION: skipped` — the exact
+# line mika#2560 and mika#2561 were obeying when they were approved with a red
+# required check behind them — and gains step 5c, which creates the managed
+# worktree a Dependabot PR never has and compiles it. Net +3 013 bytes on a
+# prompt that sat at 73 997.
+#
+# **Roughly 2 000 bytes of the addition were cut before raising**, in three
+# passes: the measured evidence (the sha2/hmac/digest triangle, #2561's
+# eleven-line API reading) and the reaper/purge rationale now live where they
+# are actually consumed — in the B3 refusal payload the engine serves the model
+# at the moment it gets this wrong (`skills/builtin_handlers.rs`), in the plan,
+# and in the assertion messages of `tests/qa_review_executes_repo_guards.rs`.
+# The prompt keeps the rule; the *why* is not deleted, it is relocated to the
+# surfaces that read it.
+#
+# **79.5 KB and not a round 79 KB**, which is the first non-round value in this
+# list and is worth the sentence: 80 896 (79 KB) puts the gate at 76 851, below
+# the 77 010 the prompt now measures, so the round value does not clear its own
+# gate. 81 408 clears it with 327 bytes and keeps 512 below the 81 920 ceiling
+# (`skills/index.rs:27`). The gate fires again at 77 337 bytes.
+#
+# **This prompt is now effectively at its ceiling, and the next rule cannot be
+# added by raising this number.** 327 bytes of gate headroom is under one
+# paragraph, and the remaining 512 to the hard ceiling is less than the smallest
+# of the five raises above. The next addition takes the third remediation the
+# gate offers — shard via `[dependencies]`, extracting a sibling skill — and
+# Step 1.6 is the natural seam, being a self-contained path with its own entry
+# condition. Doing it here was declined as out of scope and not risk-free: a
+# handler no one depends on is unreachable and silently mute (mika#2355).
+max_prompt_size = 81408
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =
 # ["qa-review"]` — mais c'est une arête ENTRANTE, et `callback_safe_skills()`

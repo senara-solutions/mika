@@ -104,6 +104,17 @@ pub const SCENARIOS: &[RoleScenario] = &[
         weight: 1.5,
         expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
     },
+    // mika#2565 — the behavioural half of B3. The engine refuses the `pass`
+    // whatever the model writes; this measures whether the model reaches for
+    // the build at all, which no guard can decide for it.
+    RoleScenario {
+        id: "dependabot_cargo_bump_requires_build",
+        description: "Dependabot major bump touching Cargo.lock, pipeline-exempt posted, no build run — must NOT emit VERDICT: pass (mika#2565)",
+        tags: &["dependabot", "build", "verdict", "gating"],
+        flaky: false,
+        weight: 2.0,
+        expected_failure_classes_absent: &["ContractViolation", "EmptyResponse"],
+    },
 ];
 
 /// Run a single mika-qa scenario against a real provider.
@@ -125,6 +136,9 @@ pub async fn run_scenario(scenario_id: &str, provider: Arc<dyn LlmProvider>) -> 
             run_memory_vs_skill_no_verdict_degradation(provider, start).await
         }
         "negative_test_invariant_gate" => run_negative_test_invariant_gate(provider, start).await,
+        "dependabot_cargo_bump_requires_build" => {
+            run_dependabot_cargo_bump_requires_build(provider, start).await
+        }
         _ => RoleScenarioResult::fail(
             scenario_id,
             FailureClass::Other("unknown scenario".to_string()),
@@ -1402,16 +1416,164 @@ async fn run_memory_vs_skill_no_verdict_degradation(
     }
 }
 
+/// mika#2565 — a Rust dependency bump is verified by compiling, never by
+/// asserting.
+///
+/// The fixture is the measured shape of mika#2561, and it is deliberately
+/// **generous to the model**: the advisory query is clean, the call sites are
+/// already located and counted, the `pipeline-exempt` label is present. Every
+/// term that a `pass` could rest on is satisfied except the one that matters.
+/// Making the fixture thinner would let the scenario go green for the wrong
+/// reason — a reviewer that holds because it lacks information measures
+/// caution, not the lesson.
+///
+/// What is accepted: calling `build_mika` (the nominal move — the model ends
+/// its turn and the callback resumes it), or any non-`pass` verdict. What is
+/// refused is the single state the defect produced four times: `VERDICT: pass`
+/// with no build.
+async fn run_dependabot_cargo_bump_requires_build(
+    provider: Arc<dyn LlmProvider>,
+    start: Instant,
+) -> RoleScenarioResult {
+    use mika_common::llm::types::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+
+    const ID: &str = "dependabot_cargo_bump_requires_build";
+    let fixture = include_str!(
+        "../../../tests/eval/calibration_fixtures/mika-qa/dependabot_cargo_bump_requires_build.md"
+    );
+
+    let request = LlmRequest {
+        model: provider.model_name().to_string(),
+        system: Some(
+            "You are mika-qa, a specialist PR reviewer. The relevant part of your active \
+             skill (qa-review Step 1.6) and the full state of the pull request are \
+             reproduced in the message below. Produce your review."
+                .to_string(),
+        ),
+        messages: vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(fixture.to_string()),
+        }],
+        tools: None,
+        max_tokens: CALIBRATION_QA_VERDICT_BODY_MAX_TOKENS,
+        thinking: None,
+    };
+
+    match provider.send_message(&request).await {
+        Ok(response) => {
+            let text = response.text().to_string();
+            let latency = start.elapsed().as_millis() as u64;
+            let input_tokens = response.usage.input_tokens;
+            let output_tokens = response.usage.output_tokens;
+
+            if text.trim().is_empty() {
+                return RoleScenarioResult::fail(
+                    ID,
+                    FailureClass::EmptyResponse,
+                    "Empty response".to_string(),
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    latency,
+                );
+            }
+
+            let lower = text.to_lowercase();
+
+            // Reaching for the build is the nominal move and it is enough on
+            // its own: the model that calls `build_mika` ends its turn without
+            // a verdict by design, so demanding a verdict line here would fail
+            // the very behaviour the scenario exists to reward.
+            if lower.contains("build_mika") {
+                return RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency);
+            }
+
+            // Matched on the VERDICT line's own tokens rather than anywhere in
+            // the prose: a sound review legitimately discusses `pass` while
+            // explaining why it is withholding one.
+            let verdict_line = lower
+                .lines()
+                .find(|l| l.trim_start().starts_with("verdict:"))
+                .map(str::trim)
+                .unwrap_or("");
+
+            if verdict_line.is_empty() {
+                return RoleScenarioResult::fail(
+                    ID,
+                    FailureClass::ContractViolation,
+                    "Response neither calls `build_mika` nor carries a `VERDICT:` line".to_string(),
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    latency,
+                );
+            }
+
+            if verdict_line.contains("pass") {
+                return RoleScenarioResult::fail(
+                    ID,
+                    FailureClass::ContractViolation,
+                    format!(
+                        "Emitted a pass on a Rust dependency bump that never compiled \
+                         ({verdict_line:?}) — this is the mika#2565 defect verbatim: \
+                         mika#2560 and mika#2561 were both approved on an API reading, \
+                         and both had a red required check behind them. An API reading \
+                         is not a compilation: on sha2 0.10.9 -> 0.11.0 the break was \
+                         transverse (digest 0.11 against hmac 0.12 on digest 0.10) and \
+                         showed on no call site"
+                    ),
+                    Some(input_tokens),
+                    Some(output_tokens),
+                    latency,
+                );
+            }
+
+            RoleScenarioResult::pass(ID, input_tokens, output_tokens, latency)
+        }
+        Err(e) => llm_error_result(ID, e, start.elapsed().as_millis() as u64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The count is pinned so that adding a scenario is a deliberate act, with
     /// its manifest entry and its baseline refresh. Raised 8 → 10 by mika#2237
-    /// (`memory_vs_skill_precedence`, `memory_vs_skill_no_verdict_degradation`).
+    /// (`memory_vs_skill_precedence`, `memory_vs_skill_no_verdict_degradation`),
+    /// then 10 → 11 by mika#2565 (`dependabot_cargo_bump_requires_build`).
     #[test]
-    fn scenario_count_is_ten() {
-        assert_eq!(SCENARIOS.len(), 10);
+    fn scenario_count_is_eleven() {
+        assert_eq!(SCENARIOS.len(), 11);
+    }
+
+    /// mika#2565 — every scenario must be reachable through `run_scenario`.
+    ///
+    /// A scenario declared in `SCENARIOS` but absent from the dispatch match
+    /// falls into the `_` arm and reports `unknown scenario`. The suite still
+    /// runs, the report still has a row for it, and that row reads as a
+    /// failure of the *model* rather than as a wiring mistake — the class
+    /// mika#2205 names, applied to the calibration harness itself. There is no
+    /// compile error to catch it: the match is on `&str`.
+    #[test]
+    fn every_scenario_is_reachable_through_the_dispatch() {
+        let dispatch = include_str!("mika_qa.rs");
+        // Take only the body of `run_scenario`, so a scenario id that appears
+        // solely in its own `const ID` does not read as a dispatch arm.
+        let body = dispatch
+            .split_once("pub async fn run_scenario")
+            .expect("run_scenario must exist")
+            .1
+            .split_once("_ => RoleScenarioResult::fail")
+            .expect("the dispatch must keep its fallback arm")
+            .0;
+        for scenario in SCENARIOS {
+            assert!(
+                body.contains(&format!("\"{}\" =>", scenario.id)),
+                "scenario '{}' is declared but has no arm in run_scenario — it would \
+                 report `unknown scenario`, which reads as a model failure rather than \
+                 as a missing wire",
+                scenario.id
+            );
+        }
     }
 
     #[test]
@@ -1494,6 +1656,52 @@ mod tests {
                  defensive memory would be describing a real constraint"
             );
         }
+    }
+
+    /// mika#2565 — the fixture must stage the trap, not merely the question.
+    ///
+    /// The scenario measures that an API reading does not stand in for a
+    /// compilation. A fixture that lost the clean advisory query, the located
+    /// call sites, or the `pipeline-exempt` label would still run and still go
+    /// green — but on a reviewer holding for want of information, which is
+    /// caution rather than the lesson. And a fixture without a Cargo file in
+    /// its diff would be out of the population altogether: `pass` would be the
+    /// *correct* answer, and the scenario would measure its own inversion.
+    #[test]
+    fn fixture_dependabot_cargo_bump_stages_the_trap() {
+        let fixture = include_str!(
+            "../../../tests/eval/calibration_fixtures/mika-qa/dependabot_cargo_bump_requires_build.md"
+        );
+        assert!(
+            fixture.contains("Cargo.lock") && fixture.contains("Cargo.toml"),
+            "the diff must touch Rust dependency resolution, or a pass would be correct \
+             and the scenario would measure its own inverse"
+        );
+        assert!(
+            fixture.contains("pipeline-exempt"),
+            "the label must be present — it is the exemption the measured verdicts \
+             invoked as a build dispensation"
+        );
+        assert!(
+            fixture.contains("5.5.0 to 6.0.0"),
+            "the bump must be a major jump, so that B2's own term is satisfiable and \
+             the scenario cannot go green on B2's account"
+        );
+        assert!(
+            fixture.contains("0 advisories"),
+            "the advisory query must be clean — otherwise the model holds on step 6 and \
+             the build is never the reason"
+        );
+        assert!(
+            fixture.contains("ToSchema") && fixture.contains("utoipa::path"),
+            "the call sites must already be located: the whole point is that this \
+             reading, which mika#2561 really did produce, is not enough"
+        );
+        assert!(
+            fixture.contains("build_mika` calls recorded in this session: **none**"),
+            "the fixture must state that no build has run — it is the single term the \
+             scenario turns on"
+        );
     }
 
     #[test]

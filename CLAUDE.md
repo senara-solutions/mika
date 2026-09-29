@@ -2507,6 +2507,203 @@ SELECT count(*) FROM tasks WHERE result LIKE '%dispatch_grooming_intent_mismatch
 - **La garde d'intention devrait-elle vérifier le numéro d'issue ?** Arbitrage
   assumé, à rouvrir si la halte 5 montre un faux positif.
 
+### Un bump Rust se vérifie en compilant, jamais en affirmant (mika#2565)
+
+**Une variable d'environnement, une branche de garde.** Cette entrée est ici
+parce que l'opérateur qui voit une PR dependabot refuser son `pass` — ou qui
+cherche pourquoi un worktree dependabot apparaît sous `.claude/worktrees/` —
+cherche dans le voisinage de la porte de verdict de mika#2519.
+
+- **Le défaut, mesuré le 2026-09-28.** Deux PR dependabot approuvées avec un
+  check requis rouge derrière. **mika#2560** (`sha2 0.10.9 → 0.11.0`) : trois
+  `pass`, dont « API-compatible (Sha256/Digest trait stable) … BUILD
+  VERIFICATION: skipped (pipeline-exempt label) » ; `Docker Build` rouge, et
+  l'affirmation était fausse — `finalize()` avait perdu son `LowerHex` et `hmac`
+  a dû suivre. **mika#2561** (`utoipa 5.5.0 → 6.0.0`) : le verdict **s'inverse**
+  au fil des tours, `hold[review]` deux fois puis `pass` quatre fois ; `Check`
+  rouge. La porte de merge a tenu ; le défaut est l'**approbation**, qui porte
+  une affirmation non vérifiée et s'affiche `APPROVED` pour l'humain qui merge.
+
+- **Trois rectifications que la lecture du code impose au ticket, et c'est le
+  premier livrable.** *(R1)* `pipeline-exempt` **n'exempte le build nulle part**
+  — ses quatre occurrences dans le prompt sont toutes dans Step 2. Ce qui
+  prescrivait le skip était Step 1.6 item 2, inconditionnellement ; le
+  `(pipeline-exempt label)` des verdicts était une **paraphrase du modèle**, et
+  la trace le montre (la première revue de #2561 écrit la formulation du prompt,
+  le label n'apparaît qu'aux tours suivants). Le remède 1 du ticket visait donc
+  un mécanisme inexistant. *(R2)* La garde `API-SURFACE:` de mika#2519 **a
+  tourné et a été satisfaite** : chaque `pass` de #2561 porte une ligne réelle,
+  la dernière de onze lignes, sourcée par grep — et fausse sur la conclusion. Le
+  remède 3 (« aucune phrase sans preuve citée ») était déjà en vigueur et déjà
+  satisfait. *(R3)* #2560 est **hors de B2 par construction** (`0.10 → 0.11`
+  rend `NoMajorJump`), et l'élargir aux `0.x` ne l'aurait pas attrapé non plus :
+  son incompatibilité est **transverse** — `sha2 0.11` sur `digest 0.11` contre
+  `hmac 0.12` sur `digest 0.10` — et ne se voit sur **aucun** site d'appel de
+  `sha2`. *Le seul signal qui attrape les deux cas est la compilation.*
+
+- **Deux moitiés, et c'est la structurelle qui tient**
+  (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`). La
+  moitié **intention** est Step 1.6 (le skip devient conditionnel au diff, un
+  nouveau 5c crée le worktree managé et lance `build_mika`, l'item 8 gagne son
+  terme de build) plus la branche dependabot du callback. La moitié
+  **structurelle** est la branche **B3**, qui ne lit **aucune phrase du corps** :
+  elle exige un **fait moteur**, un appel `build_mika` réellement enregistré dans
+  `tool_calls` pour cette session. C'est la leçon de R2 — *une garde qui lit une
+  assertion est B2 sous un autre nom, et le modèle en produit une.* Précédent
+  maison : `find_recent_destructive_actions` (mika#1646), qui lit la même table
+  pour la même raison.
+
+- **Quatre obstacles structurels, et c'est le vrai contenu du travail.**
+  *(O1)* Le chemin de build existant est **inatteignable** depuis une PR
+  dependabot — Step 3e dérive un worktree de **dispatch**, qu'une PR dependabot
+  n'a jamais, donc brancher 3e sans plus aurait été un skip de plus sous un
+  autre motif. *(O2)* Le worktree doit être **managé** (sous `.claude/worktrees/`,
+  terme T1 du faucheur mika#2420 et population de la purge `target/` mika#2497)
+  et **attaché à la branche**, sinon c'est un orphelin de 15–50 Go que rien ne
+  fauche. *(O3)* Le callback est plan-centré et aurait rendu `block[pipeline]`
+  sur une PR sans plan — le verdict que **B1 refuse structurellement** sur un
+  auteur automatisé : le callback aurait produit le verdict que la garde
+  interdit, et la revue serait morte sur un refus d'outil. *(O4)* B3 atteste que
+  le build **a eu lieu**, pas qu'il était vert — un modèle qui compile, voit
+  rouge et poste `pass` quand même franchit B3. Population nommée, mesurable a
+  posteriori (`tasks.result` du callback porte `Build FAILED`), **suivi**.
+
+- `MIKA_QA_BUILD_EVIDENCE_WINDOW_SECS` — fenêtre de la preuve de build lue par
+  B3 (défaut `7200`, 2 h ; trois paliers maison ; plafond dur 30 jours). **Le
+  défaut est large parce que le coût des deux erreurs n'est pas le même** : trop
+  courte, elle refuse un build réel et casse une revue légitime ; trop longue,
+  elle laisse passer un build de la **même session**, ce qui reste un fait
+  moteur. `0` ne désarme pas — ce serait un désarmement par coquille sur une
+  garde de sûreté — et une valeur absurde est ramenée au défaut : rendre « un
+  build a eu lieu » vrai pour toujours désarmerait B3 sous couvert de
+  configuration. La lecture est **scopée à la session**, pas seulement à
+  l'agent : un build lancé pour une *autre* PR il y a dix minutes ne vaut rien.
+
+- **L'abstention est PARTIELLE, et c'est une régression mesurée.** Un `files`
+  illisible ou une base qui ne répond pas retirent **B3** et rien d'autre : B1 et
+  B2 ne lisent ni `files` ni la base, et leur jugement reste entier. Le premier
+  câblage faisait `abstain(); return`, ce qui les retirait aussi — les neuf tests
+  de mika#2519 rougissaient et le `pass` sur #2453, la PR témoin que mika#2519
+  existe pour débloquer, ressortait `abstained` au lieu d'`allowed`. *Un terme
+  qu'on n'a pas pu évaluer n'est jamais un terme satisfait ; ce n'est pas non
+  plus une raison de cesser d'évaluer les autres.*
+
+### SQL
+
+```sql
+-- Les trois issues du même gate, soustractibles. `tool_name` est la constante
+-- EXISTANTE `DEPENDABOT_VERDICT_AUDIT_TOOL` : ce travail AJOUTE une valeur
+-- d'`after_value`, il ne crée pas un second nom d'outil.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'dependabot_verdict_guard' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+**Coût nommé, et daté :** un `GROUP BY after_value` qui enjambe le déploiement
+voit apparaître une valeur qui n'existait pas avant. Les lignes antérieures ne
+sont **pas** réécrites — les réécrire rendrait faux ce qu'elles ont dit quand
+elles ont été écrites (motif mika#2361). Les deux populations préexistantes
+restent comparables à elles-mêmes.
+
+### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. La garde a-t-elle refusé un pass sans build ?
+grep dependabot_verdict_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.reason == "unbuilt_cargo_bump") | {target, author, files_seen}'
+
+# 2. CONTRÔLE POSITIF — la garde tourne-t-elle seulement ?
+grep -c dependabot_verdict_abstained "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Les abstentions neuves, comptables séparément
+grep dependabot_build_evidence_abstained "$MIKA_SPIRIT_LOG_FILE" | jq -c '{target, reason}'
+```
+
+| valeur | régime attendu | lecture |
+|---|---|---|
+| `refused_unbuilt_cargo_bump` | **non vide, décroissant** | chaque ligne est une approbation non compilée arrêtée. Décroît quand le prompt prend. |
+| `refused_unverified_major_bump` | inchangé | population B2, comptable séparément |
+| `abstained` / `no_files` | **proche de zéro** | `gh` n'a pas rendu les fichiers ; le défaut peut repasser |
+| `abstained` / `build_evidence_unavailable` | **vide** | `MIKA_STORE_TOOL_CALLS` désarmé : B3 est inerte |
+
+Le nom `refused_unbuilt_cargo_bump` est **distinct** de
+`refused_unverified_major_bump` bien que les deux mènent au même verdict : le
+premier dit « rien n'a compilé », le second « rien n'a été lu ». Les remèdes
+diffèrent, et les confondre rendrait les deux populations incomptables (motif
+`phantom_aged_out` / `phantom_sweep_spared`, mika#2156).
+
+### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir — sans quoi chaque sonde décrit le binaire d'hier.
+
+**S1 — le rejeu du défaut fondateur** (première PR dependabot Rust après
+déploiement). Le tour d'ouverture doit appeler `build_mika` et finir **sans
+verdict** ; le callback doit poster un verdict portant `BUILD VERIFICATION:
+Build: pass|fail`. Aucun `pass` sans build.
+*Halte 1 — la revue rend `pass` immédiatement et la garde est muette.* **Ne pas
+élargir le prédicat par réflexe** : lire d'abord `abstained`/`no_files` (sonde
+2), puis établir que le binaire servi porte le correctif (classe mika#2340).
+
+**S2 — contrôle négatif docs-only (AC3).** Une PR dependabot dont le diff ne
+touche ni `Cargo.toml` ni `Cargo.lock` (bump `actions/*`, npm) ne doit
+déclencher **aucun** build et rester éligible au `pass`.
+*Halte 2 — un build part sur une PR sans Cargo.* `is_cargo_dependency_pr`
+apparie trop large (le piège est `contains` au lieu du segment final). **Réparer
+le prédicat, pas le prompt.**
+
+**S3 — le worktree est fauché** (7 jours après la première PR mergée). Après
+merge + grâce, `SELECT target_key FROM audit_events WHERE tool_name =
+'worktree_reaped'` doit porter le worktree dependabot.
+*Halte 3 — il n'est jamais fauché.* Lire le motif :
+`SELECT after_value, count(*) FROM audit_events WHERE tool_name =
+'worktree_reap_skipped' GROUP BY 1`. Un `detached_head` signifie que le worktree
+a été créé `--detach` contre la décision d'O2 ; un `outside_managed_root` que le
+chemin n'est pas sous `.claude/worktrees/`. Les deux sont des orphelins de
+dizaines de gigaoctets et **se réparent à la création, pas au faucheur**.
+
+**S4 — l'abstention reste rare** (30 jours). `no_files` proche de zéro.
+*Halte 4 — `no_files` porte du trafic nominal.* `gh pr view --json files` ne rend
+pas ce qu'on croit (pagination, champ absent selon la version de `gh`). **Ne pas
+basculer en fail-closed** — ce serait refuser des revues sur un terme qu'on ne
+sait pas lire ; réparer la lecture.
+
+**S5 — contrôle négatif de bruit** (30 jours). Aucun
+`refused_unbuilt_cargo_bump` sur une PR **non** dependabot : le premier terme de
+`classify_dependabot_verdict` est l'auteur automatisé, et une occurrence hors de
+cette classe signifie qu'il a été relâché.
+*Halte 5 — une occurrence.* Désarmer (`MIKA_DEPENDABOT_VERDICT_GATE=0`, le
+levier existant de mika#2519), **puis** diagnostiquer. Une garde qui refuse les
+revues humaines coûte plus que le défaut qu'elle ferme.
+
+**Halte transverse — les deux sondes muettes.** Zéro refus **et** zéro abstention
+ne prouve rien : il faut qu'une PR dependabot Rust ait été revue depuis le
+déploiement. Vérifier le contrôle positif (sonde 2) avant toute conclusion. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne rattrape pas #2560 et #2561.** Les verdicts sont postés, #2560 est
+  mergée. Rien ici ne réécrit un verdict passé : fabriquer une ligne décrivant
+  une vérification qui n'a pas eu lieu est l'inverse de ce que ce travail
+  défend. La sonde est la **prochaine** PR dependabot.
+- **Il ne garantit pas qu'un `pass` soit vrai.** Il garantit qu'un `pass` sur un
+  bump Rust a été précédé d'une compilation (O4 — autre famille, **suivi**).
+- **Il ne couvre pas les bumps non-Rust.** `build_mika` ne compile ni npm ni
+  `actions/*` ; conséquence assumée d'un prédicat sur le **fichier** plutôt que
+  sur l'intention — un prédicat sur l'écosystème deviné depuis le titre
+  produirait un refus sans remède.
+- **Il n'élargit pas B2 aux `0.x`**, et R3 montre que l'élargir n'aurait rien
+  attrapé.
+- **Il crée un coût réel, et il faut le dire** : un `cargo build --release
+  --features telemetry` sur un `target/` vide pèse 15 à 50 Go et plusieurs
+  minutes, à 4–8 PR dependabot par semaine. Borné par les deux faucheurs
+  (mika#2420, mika#2497) — mais c'est un coût que ce travail **crée**.
+- **Aucune ligne de journal nouvelle côté producteur** : le seul instrument est
+  le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
+  contrôle positif n'est pas établi.**
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash
