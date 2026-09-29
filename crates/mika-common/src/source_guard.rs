@@ -1645,16 +1645,41 @@ pub fn before() {}
     }
 
     /// Every `pub fn` this module hides on the real tree, measured 2026-09-19,
-    /// extended 2026-09-22 (mika#2473).
+    /// extended 2026-09-22 (mika#2473) and 2026-09-29 (mika#1990).
     ///
     /// **This is a census, not an allowlist**, and the difference is the whole
-    /// point of freezing it. These eleven are not *exempted* from the control
+    /// point of freezing it. These fifteen are not *exempted* from the control
     /// below — they pass it, because each sits under a `cfg(test)`-mentioning
     /// attribute and is excluded **structurally**, by the boundary rule
     /// itself. Writing them as exemptions would create a dead
     /// dispensation nothing later cleans up; writing them as a census makes a
     /// future widening of the rule visible the moment it happens.
     const MASKED_PUB_FN_CENSUS: &[(&str, &str)] = &[
+        // mika#1990, case (a) of the message below — with one nuance worth
+        // reading before adding a sibling: these four are not helpers, they are
+        // **fixture text**. They are Rust source written inside `r#"…"#`
+        // literals in `mika1990_le_scan_du_battement_voit_un_second_site`, the
+        // good-faith control of the liveness beat's single-writer scan: it
+        // feeds that scan a fabricated second writer to prove the scan is not
+        // inert (class mika#2205). A fixture is masked for the same structural
+        // reason a helper is — it sits inside the `#[cfg(test)] mod tests`
+        // region — so nothing here is exempted.
+        //
+        // The discriminator that makes this case (a) and not (b): the file's
+        // *production* `liveness_reason` and `beat` live at lines 284 and 393,
+        // **before** the region opens at line 474, and are not masked. `beat`
+        // appears twice because the test carries two fixtures, a clean one and
+        // a faulty one, and the census counts occurrences rather than names.
+        (
+            "mika-agent/src/milestone_manager/liveness.rs",
+            "liveness_reason",
+        ),
+        ("mika-agent/src/milestone_manager/liveness.rs", "beat"),
+        ("mika-agent/src/milestone_manager/liveness.rs", "beat"),
+        (
+            "mika-agent/src/milestone_manager/liveness.rs",
+            "un_second_ecrivain",
+        ),
         (
             "mika-agent/src/server/permissions_stream.rs",
             "receiver_count",
@@ -1691,7 +1716,10 @@ pub fn before() {}
     /// **The good-faith control, on the dangerous axis.**
     ///
     /// Applied to a real tree, the `pub fn` this module hides must be exactly
-    /// the eleven test helpers of [`MASKED_PUB_FN_CENSUS`] — no more.
+    /// the fifteen entries of [`MASKED_PUB_FN_CENSUS`] — no more. "Entries"
+    /// rather than "helpers": since mika#1990 four of them are fixture text
+    /// inside a test's string literals, masked for the same structural reason
+    /// and counted the same way.
     ///
     /// **What this is, stated rather than overclaimed.** It is a frozen census,
     /// not a proof: no mechanical predicate can tell a swallowed production
