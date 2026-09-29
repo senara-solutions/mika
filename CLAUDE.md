@@ -2705,6 +2705,196 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
   le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
   contrôle positif n'est pas établi.**
 
+### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit un `run_gh` refusé sur un tour
+conversationnel — ou qui cherche à qui attribuer un `ready` posé par
+`mika-platform-dev` — cherche dans le voisinage des portes de dispatch
+ci-dessus.
+
+- **Le défaut, mesuré le 2026-09-28 (n=1, session `4511a958`, trace
+  `614242b0…`).** Un tour **Webhook Fallthrough** de mika-dev, déclenché par un
+  commentaire de l'orchestrateur fermant la PR #2567, a créé l'issue #2571 par
+  `run_gh issue create` — que le modèle a lui-même qualifiée de « créée par
+  erreur (devait être une tâche) » — puis relancé un dispatch implement
+  (`53a10c4a`) par `run_gh issue edit 2562 --add-label ready`. **L'issue a été
+  heureuse et le chemin n'a rien vérifié :** un commentaire humain quelconque
+  suffisait.
+
+- **Pourquoi mika#2517 ne l'a pas couvert.** `FALLTHROUGH_WITHHELD_TOOLS`
+  retient `create_task` — **un** levier de création de travail. `run_gh` en porte
+  deux autres, équivalents en effet : `issue create` (le substitut que le modèle
+  a pris pour la tâche retenue) et `issue edit --add-label ready` (le label
+  `ready` étant le signal canonique de dispatch, mika#841). Même intention,
+  contournée par l'outil voisin.
+
+- **Refuser, jamais retenir — et ce n'est pas une préférence.** La SCOPE RULE du
+  prompt `self-dev` prescrit, mot pour mot, un `run_gh issue view <n> --json
+  labels` comme geste de vérification : c'est la seule sortie correcte qu'elle
+  offre. Ajouter `run_gh` à `FALLTHROUGH_WITHHELD_TOOLS` **casserait ce geste**.
+  La retenue est donc *indisponible* ici, et le refus est la seule forme qui
+  reste. C'est aussi ce qui laisse la lecture intacte dans ce tour.
+
+- **Deux dispositions, dans cet ordre.** *Fail-open à la détection* : un argv qui
+  n'est aucune des deux formes n'est pas l'affaire de la garde — `gh` dans son
+  ensemble est intouché et la surface reste bornée à deux verbes. *Fail-closed
+  après* : forme reconnue **et** tour Fallthrough ⇒ refus, avant tout appel
+  réseau. Le terme de classe de tour est **dans le prédicat**, jamais une
+  branche de l'appelant : « hors tour Fallthrough, rien ne change » est ainsi une
+  propriété de la fonction, avec son propre test.
+
+- **L'asymétrie est INVERSE de celle du faucheur mika#2420, et l'arbitrage ne se
+  transporte pas.** Un faux positif coûte **un `run_gh` refusé** sur un tour dont
+  le contrat écrit est *accuser réception et s'arrêter* — visible, borné,
+  rattrapable au tour suivant. Un faux négatif coûte un **dispatch implement que
+  personne n'a autorisé** (un créneau, un pilote, un coût en USD) **et** une
+  issue à fermer à la main. Là-bas l'action détruisait du travail, ici l'action
+  *est* la création de travail non autorisé.
+
+- **Les trois formes syntaxiques ne sont pas de la minutie.** `gh` accepte
+  `--add-label ready`, `--add-label=ready`, `--add-label "bug,ready"`, et le
+  drapeau est **répétable** : rater une des trois rend la garde contournable par
+  une virgule. La comparaison de l'étiquette est `eq_ignore_ascii_case` — un
+  label `Ready` déclenche le même webhook côté GitHub. `issue create` est refusé
+  **entier**, indépendamment de ses étiquettes.
+
+- **Pas d'interrupteur d'environnement, avec son précédent.** mika#1646, la garde
+  sœur la plus proche, n'en a pas non plus : un désarmement par variable sur un
+  chemin de création de travail serait un désarmement par coquille. Le geste de
+  désarmement est un **revert**, et le coût d'un faux positif le supporte.
+
+#### SQL
+
+```sql
+-- La population du refus
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'fallthrough_work_creation' GROUP BY 1 ORDER BY 2 DESC;
+
+-- CONTRÔLE POSITIF — combien de tours auraient PU en produire un
+SELECT count(*) FROM audit_events WHERE tool_name = 'webhook_fallthrough_turn';
+
+-- Le résidu `run_shell` : précondition du ticket de suivi
+SELECT id, created_at, substr(input, 1, 200) FROM tool_calls
+ WHERE tool_name = 'run_shell'
+   AND (input LIKE '%--add-label%ready%' OR input LIKE '%issue create%')
+ ORDER BY created_at DESC;
+```
+
+`fallthrough_work_creation` a un **écrivain unique**
+(`skills::builtin_handlers`, scan de source à allowlist livrée vide), et c'est
+ce qui rend le `GROUP BY after_value` exact plutôt qu'un nombre sur lequel deux
+sites peuvent diverger. Les deux motifs (`issue_create`, `ready_label_add`) sont
+un **format de fil** à site de définition unique, épinglé par test.
+
+#### Journal (`$MIKA_SPIRIT_LOG_FILE`)
+
+```bash
+# 1. La garde a-t-elle mordu, et sur quel motif ?
+grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, session_id, trace_id, motif, verb, label}'
+
+# 2. La sonde du ticket : quel acteur a posé `ready` ?
+grep ready_label_received "$MIKA_SPIRIT_LOG_FILE" \
+  | jq 'select(.actor == "mika-platform-dev")'
+
+# 3. Le tour correspondant (jointure par trace_id)
+grep webhook_fallthrough_turn "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.trace_id == "<trace_id>") | {marker_class, withheld_tools}'
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `fallthrough_work_creation_blocked` | **non vide, faible** | chaque ligne est une création de travail que le moteur a arrêtée |
+| `after_value = 'ready_label_add'` | non vide, faible | le vecteur de dispatch mesuré le 2026-09-28 |
+| `after_value = 'issue_create'` | non vide, faible | le substitut mesuré à `create_task` |
+| `webhook_fallthrough_turn` | non vide | **le contrôle positif** : zéro refus avec zéro tour ne prouve rien (mika#2205) |
+| une même session portant plusieurs refus | **anomalie** | le modèle insiste ; lire le prompt servi **avant** de toucher au prédicat |
+| `fallthrough_work_creation_audit_failed` | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` est alors incomplet |
+
+La ligne de refus ne porte **pas** de `marker_class` : le booléen ne la
+transporte pas, et l'inventer serait un champ qui affirme ce qu'on n'a pas
+mesuré (classe mika#2304). `webhook_fallthrough_turn` la porte déjà **sous le
+même `trace_id`** — une ligne dit *quel tour*, l'autre *ce qu'il a tenté*, et le
+`trace_id` les joint exactement.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable à toutes.** `skills/bundled/` est une projection du **binaire**,
+> pas du checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter
+> le sha qu'on vient de bâtir, **et** le `mika-spirit` servi doit porter le
+> correctif — sans ces deux vérifications, chaque sonde décrit le binaire
+> d'hier.
+
+**S1 — la garde mord (premier tour Fallthrough qui tente).** Une ligne
+`fallthrough_work_creation_blocked`, une ligne `audit_events`, et **aucune**
+issue créée ni label `ready` posé par ce tour.
+*Halte 1 — aucune ligne alors qu'une issue a été créée et que
+`webhook_fallthrough_turn` est non vide :* **ne pas élargir la liste de verbes
+par réflexe.** Établir d'abord le déploiement (préalable ci-dessus), puis
+**quelle porte** a servi — `run_shell` rend exactement cette signature, et son
+remède est un autre ticket.
+
+**S2 — contrôle négatif de la lecture (7 jours).** Aucun refus sur un
+`issue view` / `issue list` / `issue comment`.
+*Halte 2 — une occurrence :* c'est un faux positif, et il casse le geste de
+vérification que le prompt prescrit lui-même. **Revert d'abord, diagnostic
+ensuite** — il n'y a pas d'interrupteur, par décision, et le coût d'un revert
+est inférieur à celui d'une lecture refusée en boucle.
+
+**S3 — la sonde du ticket (30 jours).** Chaque `ready_label_received` portant
+`actor: mika-platform-dev` est attribuable à `auto_pull` Phase 2 (remove → add),
+jamais à une session conversationnelle dont le tour est un Fallthrough.
+*Halte 3 — un refus apparaît sur un tour qui n'est **pas** Fallthrough :* c'est
+le **prédicat de classe du tour** qui est mal lu, pas la liste de verbes. Lire le
+message servi (`is_webhook_fallthrough_domain` refuse `[GitHub] PR `,
+`[GitHub] Check suite ` et le marqueur ready-label) **avant** de toucher au
+prédicat argv.
+
+**S4 — le résidu `run_shell` (30 jours).** La requête SQL n°3 ci-dessus.
+*Halte 4 — elle rend des lignes :* le vecteur est réel et mesuré ; le ticket de
+suivi s'ouvre **avec ce compte**, jamais avec une intuition. Zéro ligne est un
+**résultat** — il dit que le modèle n'emprunte pas cette route — et non une
+preuve que la route est fermée.
+
+**Halte transverse — les deux sondes muettes.** Zéro refus et zéro tour
+Fallthrough ne prouve **rien** : vérifier le contrôle positif avant toute
+conclusion. *Une garde que personne n'a exercée se lit exactement comme une
+garde qui marche* (mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne ferme pas `run_shell`.** Un modèle déterminé à créer du travail garde
+  une route ; ce qui lui est retiré est celle qu'il a **effectivement** prise,
+  déclarée, documentée et keyword-tirée par le vocabulaire même du webhook.
+  **Ticket de suivi**, précondition S4.
+- **Il n'empêche pas de demander.** Un tour Fallthrough peut toujours dire à
+  l'opérateur « ce commentaire mérite un re-groom » par `send_message` — c'est la
+  sortie correcte, et le corps du refus la nomme, **sans nommer aucun
+  contournement** (un refus qui donne le gabarit est une fuite avec une étape de
+  plus, doctrine mika#2520).
+- **Il ne rattrape pas l'incident du 2026-09-28.** L'issue #2571 existe et le
+  dispatch `53a10c4a` a eu lieu ; **rien ici ne rétro-estampille** — fabriquer
+  une ligne décrivant un fait qu'on n'a pas observé est l'inverse de ce que ce
+  travail défend. La sonde est la **prochaine** occurrence.
+- **Il ne surveille rien.** Les seuls instruments sont les greps et les requêtes
+  ci-dessus, et **leur silence ne prouve rien tant que personne ne les
+  exécute** — d'où le contrôle positif sur `webhook_fallthrough_turn`, sans
+  lequel zéro refus et zéro tour rendent les mêmes octets.
+
+#### Hors périmètre, délibérément
+
+- **Le routage `issue_comment` → mika-dev** et le cas des PR commentées par
+  l'orchestrateur : le ticket les exclut nommément.
+- **`gh pr edit --add-label ready`** et `gh issue reopen` — hors population, et
+  armer une garde sur une population vide produirait un détecteur dont le
+  silence ne prouve rien.
+- **Élargir `FALLTHROUGH_WITHHELD_TOOLS`** — refusé avec sa raison : la retenue
+  casserait le geste de vérification que le prompt prescrit.
+- **La classification `marker_class` sur la ligne de refus** — refusée : la
+  jointure par `trace_id` la donne, et l'inventer serait un champ qui affirme ce
+  qu'on n'a pas mesuré.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash
