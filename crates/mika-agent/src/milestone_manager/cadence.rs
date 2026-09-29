@@ -1054,22 +1054,20 @@ mod tests {
     /// Un port de boucle locale que rien n'écoute rend `ECONNREFUSED` sous proxy
     /// comme sans, parce que la boucle locale n'est jamais proxifiée — exclue
     /// par `NO_PROXY=localhost,127.0.0.1` dans le bac à sable, et par l'absence
-    /// de tout proxy sur le CI. Le motif est le classique « bind puis drop » :
-    /// le noyau attribue un port libre, on le libère, la connexion suivante est
-    /// refusée.
+    /// de tout proxy sur le CI.
+    ///
+    /// Le motif était le classique « bind puis drop ». **mika#2569 l'a retiré** :
+    /// ce binaire de tests unitaires est le plus parallèle de l'arbre, et un
+    /// port libéré peut être repris entre le `drop` et l'appel. Le garde tient
+    /// désormais le port pour toute la durée de la sonde.
     ///
     /// Renommé depuis `…_on_bogus_host` : « bogus host » décrivait la prémisse
     /// écartée (un hôte fantaisiste) ; ce qui est asserté est un point de
     /// terminaison injoignable.
     #[tokio::test]
     async fn probe_executor_health_returns_none_on_unreachable_endpoint() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("la boucle locale doit être bindable");
-        let port = listener
-            .local_addr()
-            .expect("le port attribué doit être lisible")
-            .port();
-        drop(listener);
+        let dead = mika_common::dead_endpoint::DeadEndpoint::reserve();
+        let port = dead.addr().port();
 
         let url = format!("http://127.0.0.1:{port}/health");
         let res = probe_executor_health(Some(&url)).await;

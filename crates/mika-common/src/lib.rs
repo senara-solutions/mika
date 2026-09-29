@@ -3,6 +3,11 @@ pub mod auth_boundary;
 pub mod build_info;
 pub mod claude;
 pub mod config;
+/// Point de terminaison de boucle locale **réservé** et refusant les connexions
+/// (mika#2569). Test-only par construction : il n'entre dans aucun binaire de
+/// production, comme [`source_guard`].
+#[cfg(any(test, feature = "test-utils"))]
+pub mod dead_endpoint;
 pub mod dotenv;
 pub mod embedding;
 pub mod forge_identity;

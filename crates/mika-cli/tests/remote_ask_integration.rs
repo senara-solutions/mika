@@ -13,6 +13,7 @@ use mika_cli::remote_ask::{
     CALLER_SESSION_ID_KEY, NO_ISOLATION_ATTESTATION_LINE, OutputFormat, SESSION_ISOLATED_KEY,
     dispatch_remote, send_message_to_agent,
 };
+use mika_common::dead_endpoint::DeadEndpoint;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -144,10 +145,14 @@ async fn dispatch_surfaces_jsonrpc_error_with_remote_prefix() {
 
 #[tokio::test]
 async fn dispatch_surfaces_connection_error_for_dead_endpoint() {
-    // Bind a listener, immediately drop it — the port is now closed.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    // mika#2569 — le port est TENU pour toute la durée de l'appel, par un socket
+    // lié et non écoutant : aucun `bind("127.0.0.1:0")` concurrent ne peut le
+    // recevoir, et la connexion est refusée immédiatement. Le motif précédent
+    // liait puis LIBÉRAIT le port, et un serveur factice d'un test voisin du même
+    // binaire a servi cet appel le 2026-09-28 sur le job `Check` de mika#2561.
+    // `dead` doit rester vivant jusqu'après `dispatch_remote`.
+    let dead = DeadEndpoint::reserve();
+    let addr = dead.addr();
 
     let url = format!("http://{addr}/a2a/cust-5/mika-prime");
     let err = dispatch_remote("hi", &url, OutputFormat::Text, false, None, false)
