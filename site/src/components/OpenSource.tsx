@@ -20,10 +20,10 @@ export function OpenSource() {
 
           <div className="relative z-10">
             <h2 className="text-3xl font-black text-white sm:text-4xl lg:text-5xl">
-              MIT Licensed. Self-hosted. Yours.
+              MIT Licensed. Self-hosted or Cloud. Yours.
             </h2>
             <p className="mx-auto mt-6 max-w-lg text-lg leading-relaxed text-muted">
-              Mika is free and open source. Your data never leaves your machine.
+              Mika is free and open source. Run it where you want: on your machine (self-hosted) or on Mika Cloud, operated by Senara on AWS, by invitation.
             </p>
             <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
               {/* Was a solid `bg-white` fill with `text-bg` — a §7 "No Pure
