@@ -2433,9 +2433,18 @@ fn stale_probe_config_from_env() -> StaleProbeConfig {
 /// `None` — **jamais inventé** (B3.2). Un numéro fabriqué sur une surface
 /// d'observabilité enverrait l'opérateur lire le mauvais ticket, ce qui est pire
 /// qu'un champ vide.
+///
+/// Le **premier** segment doit être non vide, et ce n'est pas un détail de
+/// forme : `/2482/x` porte bien `2482` en deuxième position, mais une branche
+/// sans type n'est pas une branche de dispatch, donc le nombre qu'on y lirait
+/// serait deviné plutôt que porté. Le test
+/// `mika2482_le_numero_dissue_nest_jamais_invente` épingle la forme.
 pub fn issue_number_from_branch(branch: &str) -> Option<u64> {
     let mut parts = branch.split('/');
-    let _kind = parts.next()?;
+    let kind = parts.next()?;
+    if kind.is_empty() {
+        return None;
+    }
     let seg = parts.next()?;
     if seg.is_empty() || !seg.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -5142,12 +5151,24 @@ mod tests {
     /// **Format de fil (mika#2518).** Les clés de résolution atterrissent en tête
     /// de `audit_events.reasoning` et sur le champ `resolution` de la ligne INFO.
     /// Même forme que son aînée ci-dessus : liste figée, unicité, et l'assertion
-    /// que les deux valeurs diffèrent.
+    /// que les valeurs diffèrent.
+    ///
+    /// **Étendu par mika#2482 (2026-09-29) — une addition, jamais un renommage.**
+    /// `branch_probe` est ajouté **en queue** ; `branch` et `detached_sha` sont
+    /// intacts, donc aucune requête publiée ne change de sens. C'est la conduite
+    /// que le message d'échec ci-dessous prescrit : on étend la liste figée et on
+    /// date l'ajout, on ne met pas le test à jour en silence.
     #[test]
     fn mika2518_les_resolutions_sont_un_format_de_fil() {
         assert_eq!(
             ALL_RESOLUTIONS,
-            &["branch", "detached_sha"],
+            &[
+                "branch",
+                "detached_sha",
+                // mika#2482 — ajouté en queue, jamais inséré : l'ordre est lu
+                // par un humain qui compare deux versions de ce test.
+                "branch_probe",
+            ],
             "renommer une clé de résolution est une rupture de format de fil : \
              la dater dans CLAUDE.md, jamais mettre ce test à jour en silence"
         );
@@ -8228,7 +8249,7 @@ branch refs/heads/fix/live/x
         let out = rescreen_after_probe(
             screened,
             &entry,
-            vec![merged_pr(1900, branch, 60)],
+            vec![merged_pr(1900, branch, MERGED_LONG_AGO_SECS)],
             &HashMap::from([(STALE_WT.to_string(), WorkState::Clean)]),
         );
 
@@ -8289,7 +8310,7 @@ branch refs/heads/fix/live/x
             std::collections::HashSet::from([entry.path.clone()]);
         let rescreened = screen_worktrees(
             std::slice::from_ref(&entry),
-            &PrIndex::build(vec![merged_pr(1900, branch, 60)]),
+            &PrIndex::build(vec![merged_pr(1900, branch, MERGED_LONG_AGO_SECS)]),
             &LiveCwds::Enumerated(vec![PathBuf::from(STALE_WT)]),
             now(),
             &ReapConfig::default(),
@@ -8304,7 +8325,7 @@ branch refs/heads/fix/live/x
         let out = rescreen_after_probe(
             fresh_screened(),
             &entry,
-            vec![merged_pr(1900, branch, 60)],
+            vec![merged_pr(1900, branch, MERGED_LONG_AGO_SECS)],
             &HashMap::from([(STALE_WT.to_string(), WorkState::Dirty)]),
         );
         assert!(out.candidates.is_empty());
@@ -8314,7 +8335,7 @@ branch refs/heads/fix/live/x
         let out = rescreen_after_probe(
             fresh_screened(),
             &entry,
-            vec![merged_pr(1900, branch, 60)],
+            vec![merged_pr(1900, branch, MERGED_LONG_AGO_SECS)],
             &HashMap::from([(STALE_WT.to_string(), WorkState::UnpushedCommits)]),
         );
         assert!(out.candidates.is_empty());
@@ -8341,7 +8362,11 @@ branch refs/heads/fix/live/x
             std::collections::HashSet::from([b.path.clone()]);
         let rescreened = screen_worktrees(
             std::slice::from_ref(&b),
-            &PrIndex::build(vec![merged_pr(1900, "feat/1888/research", 60)]),
+            &PrIndex::build(vec![merged_pr(
+                1900,
+                "feat/1888/research",
+                MERGED_LONG_AGO_SECS,
+            )]),
             &no_processes(),
             now(),
             &ReapConfig::default(),
@@ -8371,7 +8396,12 @@ branch refs/heads/fix/live/x
     async fn mika2482_v6_la_sonde_est_dedupliquee_sur_24h() {
         let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
         let t = stale_target();
-        let now0 = now();
+        // L'horloge RÉELLE, et pas le `now()` figé du module : `log_audit_event`
+        // estampille la ligne à `Utc::now()`, donc une borne calculée sur une date
+        // fixe s'éloigne de la ligne écrite d'un jour par jour écoulé — la sonde
+        // répondrait « déjà sondé » pour toujours. Même raison que les tests de
+        // dédup voisins (`record_refusal`, `probe_main_checkout`).
+        let now0 = Utc::now();
 
         assert!(
             !stale_probe_recently_done(&db, &t.worktree_path, now0, "trace").await,
@@ -8403,10 +8433,11 @@ branch refs/heads/fix/live/x
             .get_audit_event_rows_by_tool_name(STALE_NO_PR_TOOL)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].target_key, format!("worktree:{STALE_WT}"));
-        assert_eq!(rows[0].after_value.as_deref(), Some("84"));
-        let reasoning = rows[0].reasoning.as_deref().unwrap_or_default();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (target_key, _before, after_value, reasoning) = &rows[0];
+        assert_eq!(target_key, &format!("worktree:{STALE_WT}"));
+        assert_eq!(after_value.as_deref(), Some("84"));
+        let reasoning = reasoning.as_deref().unwrap_or_default();
         assert!(reasoning.contains("branch=incident/1696/x"), "{reasoning}");
         assert!(reasoning.contains("issue=1696"), "{reasoning}");
         assert!(reasoning.contains("probe=no_pr"), "{reasoning}");
@@ -8417,8 +8448,8 @@ branch refs/heads/fix/live/x
             .get_audit_event_rows_by_tool_name(STALE_PROBED_TOOL)
             .await
             .unwrap();
-        assert_eq!(probed.len(), 1);
-        assert_eq!(probed[0].after_value.as_deref(), Some(STALE_PROBE_NO_PR));
+        assert_eq!(probed.len(), 1, "{probed:?}");
+        assert_eq!(probed[0].2.as_deref(), Some(STALE_PROBE_NO_PR));
     }
 
     /// Une sonde **résolutive** écrit le marqueur de coût et **aucun** signal :
@@ -8462,7 +8493,7 @@ branch refs/heads/fix/live/x
             .get_audit_event_rows_by_tool_name(STALE_PROBED_TOOL)
             .await
             .unwrap();
-        assert_eq!(probed[0].after_value.as_deref(), Some("unreadable"));
+        assert_eq!(probed[0].2.as_deref(), Some("unreadable"));
     }
 
     // -- V8 : les illisibles conservent et ne signalent pas ------------------
