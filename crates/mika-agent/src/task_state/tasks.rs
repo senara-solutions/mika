@@ -115,9 +115,10 @@ pub const ALL_GROOM_CONVERGENCE_REJECTIONS: &[&str] = &[
 ///
 /// Depuis mika#2590 U5a le producteur de la convergence pose sa ligne par
 /// `_set_outcome_line` (mika#2492), qui rend « exactement une ligne `Outcome:`
-/// ancrée » vraie **par construction**. Avant, le couple `sed 's/Outcome: .*/…/'`
-/// + `grep -qF` — **ni l'un ni l'autre ancrés** — pouvait poser le marqueur en
-/// milieu de ligne et le voir, donc ne pas ajouter la ligne canonique : un groom
+/// ancrée » vraie **par construction**. Avant, le couple
+/// `sed 's/Outcome: .*/…/'` puis `grep -qF` — **ni l'un ni l'autre ancrés** —
+/// pouvait poser le marqueur en milieu de ligne et le voir, donc ne pas
+/// ajouter la ligne canonique : un groom
 /// réellement convergé aurait été refusé par cette fonction. Les deux moitiés
 /// voyagent dans le même binaire (`skills/bundled/` est une projection du
 /// binaire, mika#2340), donc elles ne peuvent pas être servies séparément.
@@ -130,6 +131,30 @@ pub enum GroomConvergence {
     /// Le marqueur apparaît, hors position de verdict. Porte son motif, qui est
     /// un élément d'[`ALL_GROOM_CONVERGENCE_REJECTIONS`].
     MarkerOutOfPosition(&'static str),
+}
+
+impl GroomConvergence {
+    /// Ce verdict prouve-t-il le grooming ?
+    ///
+    /// # Pourquoi une méthode plutôt qu'un `matches!` au site d'appel
+    ///
+    /// La question « un `dev-pilot` peut-il partir ? » n'a qu'une bonne réponse
+    /// — `Converged` — et **deux** refus, dont l'un est arrivé après coup. Un
+    /// `!matches!(v, MarkerOutOfPosition(_))` écrit à la main compile, se lit
+    /// comme une garde, et accepte `Absent` : le contournement exact que ce
+    /// ticket ferme, reproduit un cran plus loin. C'est la classe que mika#1940
+    /// a dû nommer sur `RunStatus` (`matches!` et `if let` sont les deux formes
+    /// qui continuent de compiler quand une variante apparaît).
+    ///
+    /// **Ce n'est PAS un substitut au `match` exhaustif** des deux sites qui
+    /// doivent *disposer* différemment des deux refus :
+    /// [`crate::skills::executor::groomed_state`] compte
+    /// `MarkerOutOfPosition` (R6) là où `Absent` est le régime nominal d'un
+    /// premier grooming. Un booléen y fondrait les deux populations et rendrait
+    /// le correctif incomptable (D2).
+    pub fn is_converged(&self) -> bool {
+        matches!(self, GroomConvergence::Converged)
+    }
 }
 
 /// Le lecteur **unique** de [`GROOM_SUCCESS_MARKER`]. Fonction pure, testable
@@ -620,4 +645,185 @@ pub struct TaskHealthSummary {
     pub active_tasks: Vec<Task>,
     /// Anomalous task states across all trigger types, capped at [`health_thresholds::MAX_ANOMALIES`].
     pub anomalies: Vec<TaskHealthAnomaly>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------
+    // mika#2590 U8c — la fonction pure aux bornes.
+    //
+    // Testée ici plutôt qu'uniquement à travers la base : les trois refus de
+    // `groom_result_convergence` appellent tous la même disposition côté porte,
+    // donc un test qui n'observe que « le dispatch est refusé » ne distingue pas
+    // un motif d'un autre — et distinguer les deux motifs est très exactement ce
+    // que R6 existe pour permettre (D2). Sans ces cas, `marker_not_line_anchored`
+    // pourrait n'avoir aucune population et rien ne le dirait.
+    // ---------------------------------------------------------------------
+
+    /// Le RESULT d'un groom réellement convergé, tel que `_set_outcome_line`
+    /// le pose depuis U5a : le marqueur en début de ligne.
+    const CONVERGED: &str =
+        "claude-pilot completed (status: done).\nSession: sess-2590\nOutcome: PLAN_GROOMED";
+
+    #[test]
+    fn mika2590_une_ligne_ancree_est_une_convergence() {
+        assert_eq!(
+            groom_result_convergence(CONVERGED),
+            GroomConvergence::Converged
+        );
+    }
+
+    /// Borne basse : le marqueur **seul**, sans rien autour — la forme la plus
+    /// courte qu'un producteur puisse écrire, et celle où « début de ligne » et
+    /// « début de texte » coïncident.
+    #[test]
+    fn mika2590_le_marqueur_seul_est_une_convergence() {
+        assert_eq!(
+            groom_result_convergence(GROOM_SUCCESS_MARKER),
+            GroomConvergence::Converged
+        );
+    }
+
+    /// **Le défaut fondateur, forme minimale.** Une enveloppe JSON portant
+    /// `status` dont la prose cite le marqueur pour expliquer qu'aucune preuve
+    /// n'est frappée.
+    #[test]
+    fn mika2590_une_enveloppe_json_citant_le_marqueur_est_refusee() {
+        let auto_skipped = format!(
+            r#"{{"status":"auto_skipped","reason":"already_groomed","note":"the provenance gate refuses it unless a completed groom callback carrying {} exists, and this skip mints none."}}"#,
+            GROOM_SUCCESS_MARKER
+        );
+        assert_eq!(
+            groom_result_convergence(&auto_skipped),
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE),
+            "le texte qui dit « ceci n'est pas une preuve » ne peut pas être la \
+             preuve — défaut mesuré sur mika#2105 le 2026-09-29, où \
+             `instr(result, marker)` rendait 651"
+        );
+    }
+
+    /// **Le motif n'est posé que s'il y a quelque chose à écarter.** Un saut
+    /// ordinaire (`issue_closed`, mika#988) ne cite pas le marqueur : le compter
+    /// sous `json_envelope` polluerait le compteur de R6 avec une population qui
+    /// n'a jamais menacé la porte.
+    #[test]
+    fn mika2590_une_enveloppe_json_sans_marqueur_est_absente_et_non_un_motif() {
+        assert_eq!(
+            groom_result_convergence(r#"{"status":"auto_skipped","reason":"issue_closed"}"#),
+            GroomConvergence::Absent
+        );
+    }
+
+    /// **Le cas frontière qui compte** (mika#2050) : la prose d'un pilote qui
+    /// *discute* du mécanisme, hors JSON, marqueur en milieu de ligne. C'est la
+    /// seule population de `marker_not_line_anchored`, dont la doc opérateur
+    /// annonce un régime « non vide, décroissant » — sans ce test, ce motif
+    /// pourrait être mort sans que rien ne le dise.
+    #[test]
+    fn mika2590_un_marqueur_en_milieu_de_ligne_hors_json_est_refuse() {
+        let prose = format!(
+            "claude-pilot completed (status: done).\n\
+             I checked whether a callback carrying {} exists, and none does.\n\
+             Session: sess-2590",
+            GROOM_SUCCESS_MARKER
+        );
+        assert_eq!(
+            groom_result_convergence(&prose),
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED),
+            "un pilote qui DISCUTE du jeton ne l'a pas émis — la classe que \
+             mika#2050 a mesurée sur le Signal S"
+        );
+    }
+
+    #[test]
+    fn mika2590_un_result_sans_marqueur_est_absent() {
+        assert_eq!(
+            groom_result_convergence(
+                "claude-pilot completed (status: done).\nOutcome: PLAN_ITERATE"
+            ),
+            GroomConvergence::Absent
+        );
+        assert_eq!(groom_result_convergence(""), GroomConvergence::Absent);
+    }
+
+    /// Un JSON qui n'est pas un **objet portant `status`** n'est pas une
+    /// enveloppe de saut : il retombe sur la lecture par ligne. Sans ce
+    /// contrôle, « l'enveloppe est refusée » serait indistinguable de « tout ce
+    /// qui parse comme du JSON est refusé ».
+    #[test]
+    fn mika2590_un_json_sans_champ_status_retombe_sur_la_lecture_par_ligne() {
+        assert_eq!(
+            groom_result_convergence(r#"{"reason":"already_groomed"}"#),
+            GroomConvergence::Absent
+        );
+    }
+
+    // --- l'agrégat, et sa préséance ---
+
+    /// La sémantique historique est `COUNT(*) > 0` : **une** preuve valide
+    /// suffit, et l'agrégat ne doit pas se laisser dégrader par un saut qui la
+    /// précède dans l'ordre de balayage.
+    #[test]
+    fn mika2590_une_seule_preuve_valide_suffit_quel_que_soit_lordre() {
+        let rejected = GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_JSON_ENVELOPE);
+        for order in [
+            vec![rejected.clone(), GroomConvergence::Converged],
+            vec![GroomConvergence::Converged, rejected.clone()],
+            vec![
+                GroomConvergence::Absent,
+                rejected.clone(),
+                GroomConvergence::Converged,
+            ],
+        ] {
+            assert_eq!(
+                aggregate_groom_convergence(order),
+                GroomConvergence::Converged
+            );
+        }
+    }
+
+    /// À défaut de preuve, un écart **mesuré** l'emporte sur l'absence — sinon
+    /// un ticket refoulé pour preuve polluée se lirait exactement comme un
+    /// ticket jamais groomé (la classe mika#2205 appliquée au correctif).
+    #[test]
+    fn mika2590_a_defaut_de_preuve_un_ecart_mesure_lemporte_sur_labsence() {
+        assert_eq!(
+            aggregate_groom_convergence(vec![
+                GroomConvergence::Absent,
+                GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED),
+                GroomConvergence::Absent,
+            ]),
+            GroomConvergence::MarkerOutOfPosition(GROOM_REJECTED_NOT_LINE_ANCHORED)
+        );
+        assert_eq!(
+            aggregate_groom_convergence(vec![]),
+            GroomConvergence::Absent,
+            "aucune ligne de callback est le régime nominal d'un premier \
+             grooming, jamais un écart"
+        );
+    }
+
+    /// `is_converged` ne rend vrai que sur `Converged` — le contrôle qui empêche
+    /// qu'un futur éditeur en fasse « tout sauf le motif que je connais ».
+    #[test]
+    fn mika2590_is_converged_nest_vrai_que_sur_converged() {
+        assert!(GroomConvergence::Converged.is_converged());
+        assert!(!GroomConvergence::Absent.is_converged());
+        for reason in ALL_GROOM_CONVERGENCE_REJECTIONS {
+            assert!(!GroomConvergence::MarkerOutOfPosition(reason).is_converged());
+        }
+    }
+
+    /// Les deux motifs sont un **format de fil** : ils atterrissent dans
+    /// `audit_events.after_value` et l'opérateur en fait des `GROUP BY`. Deux
+    /// orthographes d'un même motif couperaient une population en deux sans le
+    /// dire.
+    #[test]
+    fn mika2590_les_motifs_sont_un_format_de_fil() {
+        assert_eq!(GROOM_REJECTED_JSON_ENVELOPE, "json_envelope");
+        assert_eq!(GROOM_REJECTED_NOT_LINE_ANCHORED, "marker_not_line_anchored");
+        assert_eq!(ALL_GROOM_CONVERGENCE_REJECTIONS.len(), 2);
+    }
 }

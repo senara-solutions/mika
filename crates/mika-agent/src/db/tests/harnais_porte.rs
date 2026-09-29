@@ -55,9 +55,14 @@ fn harnais_porte_cas4_failed_callback_returns_false() {
     let (_, callback_id) =
         completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
     db.update_task_status(&callback_id, "failed").unwrap();
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+    // `Absent` et non `!is_converged()` : la row est écartée par le filtre de
+    // statut, donc rien n'est lu et rien n'est écarté au sens de R6. Un
+    // `MarkerOutOfPosition` ici dirait que la ligne a été lue puis refusée pour
+    // sa forme — deux diagnostics opposés que le booléen confondrait.
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
             .unwrap(),
+        GroomConvergence::Absent,
         "a groom callback that carries `Outcome: PLAN_GROOMED` but died \
          `failed` is not proof of grooming — dropping the \
          `status IN ('completed','delivered')` filter would make a dead \
@@ -75,9 +80,10 @@ fn harnais_porte_cas4_cancelled_callback_returns_false() {
     let (_, callback_id) =
         completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
     db.update_task_status(&callback_id, "cancelled").unwrap();
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
             .unwrap(),
+        GroomConvergence::Absent,
         "a groom callback cancelled after completing is not proof of grooming"
     );
 }

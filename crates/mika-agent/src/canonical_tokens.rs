@@ -642,6 +642,119 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2590 R9 / U7a — le marqueur de convergence n'a qu'un lecteur.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// L'inventaire a été relevé avant rédaction : `GROOM_SUCCESS_MARKER` était
+    /// lu par **deux** sites lâches — `db/tasks.rs` par `instr` en SQL et
+    /// `task_engine/dispatcher.rs` par `contains` — que mika#2590 retire dans le
+    /// même commit au profit de [`crate::task_state::tasks::groom_result_convergence`].
+    /// Quand ce scan tire, **la résolution est de retirer la lecture**, jamais
+    /// d'ajouter une entrée (doctrine mika#2201).
+    const GROOM_MARKER_LOOSE_READERS_ALLOWED: &[&str] = &[];
+
+    /// Le **propriétaire** du marqueur : il le définit et porte son unique
+    /// lecteur. Hors population par construction, jamais par exemption.
+    const GROOM_MARKER_OWNER: &str = "crates/mika-agent/src/task_state/tasks.rs";
+
+    /// **U7a / R9 — aucun second lecteur lâche du marqueur de convergence.**
+    ///
+    /// Le défaut mesuré sur mika#2105 est une lecture par **sous-chaîne** : la
+    /// note d'un saut `already_groomed` cite `Outcome: PLAN_GROOMED` en toutes
+    /// lettres pour expliquer qu'aucune preuve n'est frappée, et
+    /// `instr(child.result, …) > 0` en faisait la preuve. Le remède est un
+    /// lecteur unique et ancré ; ce scan est ce qui empêche un troisième site de
+    /// rouvrir la classe.
+    ///
+    /// **Aucun test comportemental ne peut voir cette classe.** Un second
+    /// lecteur écrit par `contains` ne rend *aucune* décision fausse le jour où
+    /// il est écrit — il diverge plus tard, en silence, avec toutes les
+    /// assertions au vert. C'est très exactement ce que `grooming_marker.rs`
+    /// (mika#2158) a dû graver une fois, et ce que la porte a repayé ici.
+    ///
+    /// **Ce que ce scan n'attrape pas, nommé :** un lecteur qui reconstruirait
+    /// le littéral à la main (`"Outcome: " + "PLAN_GROOMED"`) échappe au
+    /// prédicat, qui porte sur le **symbole**. Le scan d'exhaustivité
+    /// `mika2201_every_match_site_is_declared`, lui, part du **jeton** et verrait
+    /// le littéral : la composition des deux ferme le trou que chacun laisse.
+    #[test]
+    fn mika2590_le_marqueur_de_convergence_na_quun_lecteur() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas
+        // lui-même — motif `mika2484_un_seul_lecteur_decisionnel_de_la_preuve`.
+        let symbol = format!("GROOM_SUCCESS{}", "_MARKER");
+        let loose = [".contains(", "instr(", ".find("];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut owner_seen = false;
+
+        for (rel, content) in production_sources() {
+            if GROOM_MARKER_LOOSE_READERS_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            // Le corps de production seul : une doc-prose qui *parle* du
+            // `contains` retiré n'est pas une lecture (classe mika#2050, dont
+            // le faux positif a été mesuré sur le Signal S).
+            let production = match content.find("\n#[cfg(test)]\nmod tests {") {
+                Some(i) => &content[..i],
+                None => &content[..],
+            };
+            let lines: Vec<&str> = production
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .filter(|l| l.contains(&symbol))
+                .collect();
+
+            if rel == GROOM_MARKER_OWNER {
+                owner_seen = !lines.is_empty();
+                continue;
+            }
+            if lines.iter().any(|l| loose.iter().any(|n| l.contains(n))) {
+                offenders.push(rel);
+            }
+        }
+
+        // Anti-vacuité, les deux moitiés. Sans elles un renommage rendrait ce
+        // scan silencieusement inerte, ce qui se lit exactement comme un arbre
+        // propre (mika#2205).
+        assert!(
+            !production_sources().is_empty(),
+            "mika#2590 — la population examinée est vide : ce scan ne regarde rien"
+        );
+        assert!(
+            owner_seen,
+            "mika#2590 — `{symbol}` n'est lu nulle part dans {GROOM_MARKER_OWNER} : \
+             ce scan vise un mort, il ne vérifie rien"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2590 — le marqueur de convergence a un second lecteur lâche : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : passer par `task_state::tasks::groom_result_convergence`, \
+             qui lit le marqueur EN POSITION DE VERDICT. Ne PAS ajouter le site à \
+             GROOM_MARKER_LOOSE_READERS_ALLOWED — une lecture par sous-chaîne est \
+             polluée par la prose qui nomme ce qu'elle cherche, et c'est le défaut \
+             mesuré sur mika#2105 (la note d'un refus valait preuve)."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist de U7a.
+    #[test]
+    fn mika2590_lallowlist_des_lecteurs_laches_reste_vide() {
+        assert!(
+            GROOM_MARKER_LOOSE_READERS_ALLOWED.is_empty(),
+            "GROOM_MARKER_LOOSE_READERS_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on RETIRE la lecture. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
     /// **Test 12 — les deux noms d'événement du routage sont un format de fil.**
     ///
     /// Ils atterrissent dans `audit_events.tool_name` et l'opérateur en fait des

@@ -4098,9 +4098,7 @@ async fn try_dispatch_pilot_after_groom_success(
     //    et lui donner un compteur mélangerait sa population avec celle de la
     //    porte (R6), qui est celle du ticket.
     match &task.result {
-        Some(r)
-            if crate::task_state::tasks::groom_result_convergence(r)
-                == crate::task_state::tasks::GroomConvergence::Converged => {}
+        Some(r) if crate::task_state::tasks::groom_result_convergence(r).is_converged() => {}
         _ => return,
     };
 
@@ -8166,8 +8164,9 @@ mod tests {
             .has_completed_groom_for_issue(TEST_ISSUE_URL)
             .await
             .expect("gate query must not error");
-        assert!(
+        assert_eq!(
             verified,
+            crate::task_state::tasks::GroomConvergence::Converged,
             "the #1620 gate must recognise a completed groom callback with \
              `Outcome: PLAN_GROOMED` under a parent that was flipped \
              groom→implement (mika#2287)"
@@ -8189,9 +8188,12 @@ mod tests {
             .has_completed_groom_for_issue(TEST_ISSUE_URL)
             .await
             .expect("gate query must not error");
-        assert!(
-            !verified,
-            "a groom callback without `Outcome: PLAN_GROOMED` is not proof of grooming"
+        assert_eq!(
+            verified,
+            crate::task_state::tasks::GroomConvergence::Absent,
+            "a groom callback without `Outcome: PLAN_GROOMED` is not proof of \
+             grooming — et `Absent` plutôt que `MarkerOutOfPosition` : le \
+             RESULT ne cite pas le marqueur du tout (mika#2590 D2)"
         );
     }
 

@@ -1141,9 +1141,10 @@ fn test_get_last_cli_session_excludes_active_sessions() {
 #[test]
 fn test_groom_cross_check_no_task_returns_false() {
     let db = db();
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1151,9 +1152,10 @@ fn test_groom_cross_check_no_task_returns_false() {
 fn test_groom_cross_check_completed_callback_returns_true() {
     let db = db();
     completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
-    assert!(
+    assert_eq!(
         db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+            .unwrap(),
+        GroomConvergence::Converged
     );
 }
 
@@ -1163,9 +1165,10 @@ fn test_groom_cross_check_delivered_callback_returns_true() {
     let (_, callback_id) =
         completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
     db.update_task_status(&callback_id, "delivered").unwrap();
-    assert!(
+    assert_eq!(
         db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+            .unwrap(),
+        GroomConvergence::Converged
     );
 }
 
@@ -1182,9 +1185,10 @@ fn test_groom_cross_check_survives_parent_flip_to_implement() {
         db.update_task_dispatch_class(&parent_id, "mika", "implement")
             .unwrap()
     );
-    assert!(
+    assert_eq!(
         db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+            .unwrap(),
+        GroomConvergence::Converged
     );
 }
 
@@ -1199,9 +1203,10 @@ fn test_groom_cross_check_legacy_suffixed_parent_url_returns_true() {
         crate::task_state::tasks::GROOM_PHASE_SUFFIX
     );
     completed_groom_pair(&db, "mika", &suffixed, GROOM_CALLBACK_PLAN_GROOMED);
-    assert!(
+    assert_eq!(
         db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+            .unwrap(),
+        GroomConvergence::Converged
     );
 }
 
@@ -1214,9 +1219,10 @@ fn test_groom_cross_check_pending_callback_returns_false() {
     db.create_task(&groom_callback("mika", &parent_id, "groom"))
         .unwrap();
     // Callback never completed — no result, status pending.
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1224,9 +1230,13 @@ fn test_groom_cross_check_pending_callback_returns_false() {
 fn test_groom_cross_check_plan_iterate_returns_false() {
     let db = db();
     completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_ITERATE);
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    // Un groom qui a tourné sans converger ne cite pas le marqueur : `Absent`,
+    // pas `MarkerOutOfPosition`. C'est le contrôle qui sépare « n'a pas
+    // convergé » de « a convergé et l'a mal écrit » (mika#2590 D2).
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1241,9 +1251,10 @@ fn test_groom_cross_check_implement_class_callback_returns_false() {
         .unwrap();
     db.update_task_completed(&callback_id, "mika", Some(GROOM_CALLBACK_PLAN_GROOMED))
         .unwrap();
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1258,9 +1269,10 @@ fn test_groom_cross_check_different_agent_returns_false() {
         GROOM_CALLBACK_PLAN_GROOMED,
     );
     // Query for "mika" — must not see the other agent's proof.
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1268,12 +1280,13 @@ fn test_groom_cross_check_different_agent_returns_false() {
 fn test_groom_cross_check_different_issue_returns_false() {
     let db = db();
     completed_groom_pair(&db, "mika", GROOM_ISSUE_URL, GROOM_CALLBACK_PLAN_GROOMED);
-    assert!(
-        !db.has_completed_groom_for_issue(
+    assert_eq!(
+        db.has_completed_groom_for_issue(
             "mika",
             "https://github.com/senara-solutions/mika/issues/124",
         )
-        .unwrap()
+        .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
@@ -1290,9 +1303,10 @@ fn test_groom_cross_check_parent_only_legacy_shape_returns_false() {
     );
     let parent_id = db.create_task(&groom_parent("mika", &suffixed)).unwrap();
     db.update_task_status(&parent_id, "completed").unwrap();
-    assert!(
-        !db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
-            .unwrap()
+    assert_eq!(
+        db.has_completed_groom_for_issue("mika", GROOM_ISSUE_URL)
+            .unwrap(),
+        GroomConvergence::Absent
     );
 }
 
