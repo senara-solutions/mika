@@ -9565,6 +9565,35 @@ assert_contains "AC6: le chemin GROOMED écrit toujours Outcome: PLAN_GROOMED" \
 assert_contains "AC6: et strippe toujours les marqueurs PIPELINE FAILURE périmés" \
     "sed '/^PIPELINE FAILURE:/d'" "$T2545_GROOMED_ARM"
 
+# ===========================================================================
+# mika#2578 (D2) — le chemin de staging du jeton a UN site de déclaration,
+# conditionnel.
+# ===========================================================================
+# Aucun test comportemental ne peut voir cette classe : une régression vers
+# l'affectation inconditionnelle (`_PILOT_GH_TOKEN_FILE="$HOME/…"`) laisse
+# TOUTES les assertions de staging vertes — le défaut est que la pose d'un
+# harness redevient silencieusement inerte au `source`, donc que le canari se
+# remet à écraser la credential GitHub de l'hôte sans que rien ne rougisse.
+
+# Anti-vacuité d'abord : un scan dont le chemin pourrit se lit exactement comme
+# un arbre propre (classe mika#2205).
+T2578_BYTES=$(wc -c < "$DISPATCH_LIB" 2>/dev/null || echo 0)
+assert_eq "mika#2578 anti-vacuité: dispatch-lib.sh est bien le vrai fichier" "yes" \
+    "$([ "${T2578_BYTES:-0}" -gt 100000 ] && echo yes || echo "non ($T2578_BYTES octets)")"
+
+# Un seul passage de filtrage : dispatch-lib.sh pèse ~537 Ko, et le compte comme
+# la ligne se lisent du même résultat.
+T2578_DECL_LINES=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -E '_PILOT_GH_TOKEN_FILE:?=' || true)
+T2578_DECL_COUNT=$(printf '%s' "$T2578_DECL_LINES" | grep -c . || true)
+assert_eq "mika#2578: exactement un site de déclaration de _PILOT_GH_TOKEN_FILE" \
+    "1" "${T2578_DECL_COUNT:-0}"
+
+T2578_DECL=$(printf '%s\n' "$T2578_DECL_LINES" | head -1)
+assert_contains "mika#2578: ce site est la forme conditionnelle (une valeur de harness survit au source)" \
+    ': "${_PILOT_GH_TOKEN_FILE:=' "$T2578_DECL"
+assert_contains "mika#2578: et son défaut est INCHANGÉ (un dispatch réel stache toujours sous \$HOME)" \
+    '$HOME/.mika/pilot-gh-token' "$T2578_DECL"
+
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
