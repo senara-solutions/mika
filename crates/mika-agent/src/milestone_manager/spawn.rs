@@ -31,6 +31,7 @@ use super::cadence::{
     DeliveryError, DeliveryFailureKind, ManagerConfig, classify_delivery_auth,
     run_manager_cycle_with_auth,
 };
+use super::liveness::{LivenessEmitter, LivenessSink};
 use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
@@ -102,6 +103,13 @@ pub const ENV_CHECKPOINT_DIR: &str = "MIKA_MANAGER_CHECKPOINT_DIR";
 // `super::sink_dir`.
 pub use super::sink_dir::ENV_OFFLINE_SINK_DIR;
 
+// `ENV_LIVENESS_URL` vit dans `liveness.rs` depuis mika#1990, pour la même
+// raison et avec le même précédent : la garde `mika1990_le_battement_a_un_seul_ecrivain`
+// a besoin d'un fichier propriétaire unique, et la constante appartient au canal
+// qui la nomme. Le test T7 (`mika2267_every_manager_env_const_is_declared_in_env_example`)
+// scanne tout le répertoire, donc la déclaration reste couverte où qu'elle vive.
+pub use super::liveness::ENV_LIVENESS_URL;
+
 /// Default heartbeat interval in seconds (6 hours per brief § verdict 2).
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: i64 = 21_600;
 /// Default silence threshold in days (per brief § verdict 5).
@@ -156,6 +164,10 @@ pub async fn manager_config_from_env(
     let delivery_token = read_string_env(ENV_DELIVERY_TOKEN);
     let escalation_url = read_string_env(ENV_ESCALATION_URL);
     let health_url = read_string_env(ENV_HEALTH_URL);
+    // mika#1990 D4 — trois paliers de la forme maison : absente ou vide ⇒ canal
+    // désarmé (zéro POST, zéro erreur) ; posée ⇒ canal armé. Aucune valeur
+    // dérivée des deux URLs voisines : voir `super::liveness` § R2.
+    let liveness_url = read_string_env(ENV_LIVENESS_URL);
 
     // mika#1968 AC5 (change 5a) — route through Settings::resolve_github_token
     // (PAT first, App installation-token fallback) instead of raw env read.
@@ -198,6 +210,7 @@ pub async fn manager_config_from_env(
         checkpoint_dir,
         offline_sink_dir,
         sink_dir_source,
+        liveness_url,
     }))
 }
 
@@ -225,11 +238,18 @@ pub async fn manager_config_from_env(
 /// at spawn. See `TokenResolver` for why the once-at-spawn shape was the
 /// founding bug. Production passes `SettingsTokenResolver`; tests inject a
 /// static or counting resolver.
+///
+/// **mika#1990 — `liveness_sink`.** The loop posts one light liveness beat per
+/// **successful** cycle, so the cm registry sees a 5-min sign of life instead of
+/// one every 6 hours. Injected exactly as `token_resolver` was, and for the same
+/// reason: production passes `HttpLivenessSink`, tests inject an in-memory sink.
+/// The beat is best-effort — it can neither fail a cycle nor stop the loop.
 pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
     token_resolver: Arc<dyn TokenResolver>,
     auth_ledger: Option<Arc<dyn AuthBoundaryLedger>>,
+    liveness_sink: Arc<dyn LivenessSink>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -346,6 +366,12 @@ pub fn spawn_manager_cycle_task(
         let mut boundary_tracker = AuthBoundaryTracker::default();
         let mut pending_auth_notes: Vec<AuthBoundaryNote> = Vec::new();
 
+        // mika#1990 — le compteur de ticks et l'état de transition du canal de
+        // liveness. En mémoire, perdu au redémarrage à dessein : un process neuf
+        // re-photographie ce qu'il trouve, et `poll:1` est alors le marqueur
+        // lisible d'un redémarrage.
+        let mut liveness = LivenessEmitter::default();
+
         let poll = duration_from_chrono(cfg.poll_interval);
         let mut interval = tokio::time::interval(poll);
         // Skip the first immediate fire so we don't cycle before the server
@@ -370,6 +396,13 @@ pub fn spawn_manager_cycle_task(
             if cancel.is_cancelled() {
                 return;
             }
+
+            // mika#1990 D3 — le compteur avance en TÊTE d'itération, avant le
+            // cycle, et c'est le site d'appel qui l'avance plutôt que `beat` :
+            // sinon un cycle en erreur, qui ne bat pas, n'incrémenterait pas et
+            // les trous disparaîtraient. Une suite `poll:5` → `poll:9` dit
+            // « quatre cycles ont échoué ».
+            liveness.next_tick();
 
             // mika#2013 volet A — re-resolve the token before EVERY cycle.
             // This is the whole fix: the renewal already existed inside
@@ -422,8 +455,28 @@ pub fn spawn_manager_cycle_task(
                         // via structured info at low verbosity by omitting;
                         // silence keeps the log cheap.
                     }
+
+                    // mika#1990 D2 — le battement, sur le bras `Ok` et SEULEMENT
+                    // là. Un cycle qui échoue — typiquement `gh` en 401 — est un
+                    // manager **cassé** ; y poster « je suis vivant » serait le
+                    // mensonge exact que la freshness ne doit pas raconter. La
+                    // panne de cette moitié a déjà son canal
+                    // (`manager_cycle_error` + l'alarme mika#2013). La freshness
+                    // dit « la cadence tourne ET lit GitHub », ce qui est plus
+                    // fort que « le process existe ».
+                    //
+                    // Émis APRÈS le cycle, donc il ne retarde pas ce cycle-ci ;
+                    // il peut retarder le suivant, borné à `LIVENESS_TIMEOUT`
+                    // (5 s, soit 1,7 % d'un poll de 300 s), et
+                    // `tokio::time::interval` rattrape un tick retardé.
+                    liveness.beat(&cfg, liveness_sink.as_ref(), &outcome).await;
                 }
                 Err(e) => {
+                    // mika#1990 D2 — AUCUN battement de liveness ici, et c'est
+                    // une décision, pas un oubli : « à CHAQUE poll tick réussi »
+                    // (le ticket, en majuscules). Un trou dans la suite de `<n>`
+                    // est l'information que ce bras produit.
+                    //
                     // mika#1968 AC5 (change 5c) — structured `auth_class`
                     // field on cycle errors lets operators grep specifically
                     // for `manager_cycle_error auth_class=401` to separate
@@ -505,6 +558,19 @@ pub fn spawn_manager_cycle_task(
 /// émetteur de `manager_delivery_resolved` ; l'assertion négative — aucun
 /// matériel de credential n'atteint un champ — doit piloter le site d'émission
 /// réel, sinon elle atteste une copie de lui.
+///
+/// **mika#1990 U5 — `liveness_url_set` s'ajoute ici, et aucun second événement
+/// de configuration n'est créé.** Sans ce booléen, « l'endpoint de liveness
+/// n'est pas configuré » et « l'émetteur n'est pas déployé » rendent des octets
+/// identiques (classe mika#2205, *une garde qu'on n'a pas déployée se lit
+/// exactement comme une flotte saine*). Cette ligne EST déjà l'événement de
+/// configuration de ce module, émise une fois par démarrage, et son absence est
+/// déjà documentée comme un signal de déploiement (classe mika#2340) : y ajouter
+/// un champ est le geste le plus court et le plus juste.
+///
+/// Lu comme un **booléen**, jamais l'URL : même discipline que
+/// `delivery_token_present`, et l'assertion négative qui balaie tous les champs
+/// couvre donc le nouveau par construction.
 pub fn emit_delivery_resolved(cfg: &ManagerConfig) {
     info!(
         target: "mika::milestone_manager",
@@ -515,6 +581,7 @@ pub fn emit_delivery_resolved(cfg: &ManagerConfig) {
         delivery_url_set = cfg.delivery_url.is_some(),
         escalation_url_set = cfg.escalation_url.is_some(),
         delivery_token_present = cfg.delivery_token.is_some(),
+        liveness_url_set = super::cadence::url_is_routable(cfg.liveness_url.as_deref()),
         offline_sink_dir = %cfg.offline_sink_dir.display(),
         sink_dir_source = cfg.sink_dir_source.as_str(),
         "mika-manager delivery routing resolved"
@@ -1833,6 +1900,9 @@ mod tests {
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
             sink_dir_source: super::super::sink_dir::SinkDirSource::Default,
+            // Canal de liveness désarmé par défaut dans les helpers de test :
+            // les cas qui l'exercent le posent explicitement.
+            liveness_url: None,
         }
     }
 
@@ -1884,8 +1954,14 @@ mod tests {
             chrono::Duration::milliseconds(50),
         );
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), static_resolver(None), None)
-            .expect("first spawn returns Some(handle)");
+        let handle = spawn_manager_cycle_task(
+            cfg,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        )
+        .expect("first spawn returns Some(handle)");
 
         // Let the loop tick at least once.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2343,12 +2419,24 @@ mod tests {
         let cfg2 = cfg1.clone();
 
         let cancel = CancellationToken::new();
-        let first = spawn_manager_cycle_task(cfg1, cancel.clone(), static_resolver(None), None);
+        let first = spawn_manager_cycle_task(
+            cfg1,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
         // Second call MUST be rejected — regardless of whether the first
         // task is still running.
-        let second = spawn_manager_cycle_task(cfg2, cancel.clone(), static_resolver(None), None);
+        let second = spawn_manager_cycle_task(
+            cfg2,
+            cancel.clone(),
+            static_resolver(None),
+            None,
+            noop_liveness_sink(),
+        );
         assert!(
             second.is_none(),
             "second spawn within same process must be rejected"
@@ -2375,6 +2463,33 @@ mod tests {
 
     fn static_resolver(v: Option<&str>) -> Arc<dyn TokenResolver> {
         Arc::new(StaticTokenResolver(v.map(str::to_string)))
+    }
+
+    // ---- mika#1990 test helper ------------------------------------------
+
+    /// Sink de liveness qui n'enregistre rien et réussit toujours.
+    ///
+    /// Les tests de ce fichier portent sur la cadence, l'auth et le garde de
+    /// double-spawn ; le contrat du battement est attesté dans `liveness.rs`, où
+    /// l'émetteur est piloté directement. Ici le sink n'est qu'une dépendance à
+    /// satisfaire — et les configs de ces tests portent `liveness_url: None`,
+    /// donc il n'est de toute façon jamais appelé.
+    struct NoopLivenessSink;
+
+    #[async_trait::async_trait]
+    impl super::super::liveness::LivenessSink for NoopLivenessSink {
+        async fn deliver_beat(
+            &self,
+            _url: &str,
+            _token: Option<&str>,
+            _body: &super::super::liveness::LivenessBody,
+        ) -> Result<(), super::super::liveness::LivenessFailure> {
+            Ok(())
+        }
+    }
+
+    fn noop_liveness_sink() -> Arc<dyn LivenessSink> {
+        Arc::new(NoopLivenessSink)
     }
 
     /// A `TokenResolver` that hands out a different token on every call and
@@ -2478,8 +2593,14 @@ mod tests {
         let calls = resolver.calls.clone();
 
         let cancel = CancellationToken::new();
-        let handle = spawn_manager_cycle_task(cfg, cancel.clone(), Arc::new(resolver), None)
-            .expect("spawn returns Some(handle)");
+        let handle = spawn_manager_cycle_task(
+            cfg,
+            cancel.clone(),
+            Arc::new(resolver),
+            None,
+            noop_liveness_sink(),
+        )
+        .expect("spawn returns Some(handle)");
 
         // Wait for the CONDITION, not a fixed duration: the boot-time
         // `verify_gh_auth` probe is a real `gh` subprocess call that precedes

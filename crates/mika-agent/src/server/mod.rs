@@ -1632,6 +1632,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     ))
                         as std::sync::Arc<dyn crate::auth_boundary_ledger::AuthBoundaryLedger>
                 }),
+                // mika#1990 — le canal du battement de vivacité. Le sink est
+                // toujours construit ; c'est `MIKA_MANAGER_LIVENESS_URL` qui
+                // décide s'il est appelé, donc rien n'est posté tant que
+                // l'opérateur n'a pas déclaré l'endpoint.
+                std::sync::Arc::new(crate::milestone_manager::HttpLivenessSink::new()),
             ),
             Ok(None) => {
                 info!(

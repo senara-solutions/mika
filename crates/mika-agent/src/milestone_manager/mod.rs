@@ -3,9 +3,15 @@
 //! **LECTURE SEULE.** This module reads milestone state (via `gh` CLI), assesses it
 //! (rules-driven recommendations), and reports structured Markdown to Prime→sami→Vincent.
 //! It has **zero write authority**: no dispatch, no ticket label mutation, no PR merge,
-//! no scope approval. The only outbound side effect is a report `POST` to a well-known
-//! delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern), or an offline sink
-//! write when the URL is unset.
+//! no scope approval. It has exactly **two** outbound side effects, both towards the
+//! control-monitor and neither of them a write on the forge: a report `POST` to a
+//! well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern), or an
+//! offline sink write when the URL is unset — and, since mika#1990, a **liveness beat**,
+//! one light `POST` per successful poll tick on `MIKA_MANAGER_LIVENESS_URL` (see
+//! [`liveness`]). The beat carries no report content: the entity name, the beat motive,
+//! a timestamp and the milestone reference. Both are declared in
+//! `docs/egress/egress-manifest.toml` (`control-monitor-delivery`,
+//! `control-monitor-liveness`).
 //!
 //! The chain of authority is Prime → Manager → Executors. `mika-manager` is a distinct
 //! entity from `mika-prime`; see the ratified brief at
@@ -103,6 +109,7 @@
 
 pub mod assessor;
 pub mod cadence;
+pub mod liveness;
 pub mod reader;
 pub mod reporter;
 pub mod sink_dir;
@@ -118,6 +125,11 @@ pub use cadence::{
     ManagerConfig, MilestoneCheckpoint, ROUTE_HTTP, ROUTE_OFFLINE_SINK,
     ROUTE_OFFLINE_SINK_FALLBACK, ReportDeliverer, run_manager_cycle, run_manager_cycle_in,
     run_manager_cycle_with, run_manager_cycle_with_auth, state_digest,
+};
+pub use liveness::{
+    ENV_LIVENESS_URL, HttpLivenessSink, LIVENESS_ENTITY, LIVENESS_TIMEOUT, LivenessBody,
+    LivenessEmitter, LivenessFailure, LivenessFailureClass, LivenessSink, REASON_DELIVERY_PREFIX,
+    REASON_POLL_PREFIX, TransitionLine, liveness_reason,
 };
 pub use reader::{GhRunner, ProcessGhRunner, Reader, compose_from_gh_outputs};
 pub use reporter::{AuthBoundaryNote, AuthBoundaryTracker, Reporter};

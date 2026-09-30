@@ -2214,6 +2214,67 @@ publier cherche dans le voisinage des gardes de dispatch.
   « durcissement ruleset no-bypass main », seconde moitié de l'incident, et les
   deux moitiés tombent séparément.
 
+Optional (battement de vivacité du manager — mika#1990) :
+- **Le défaut que ça ferme.** `mika-manager` poll toutes les 5 min et ne POSTait **rien** tant que le cycle ne délivrait pas — la delivery étant hybride (`state_changed || heartbeat_fired`, le second sur un plancher de **6 h**). Entre deux battements légitimes, le registre cm ne recevait aucun signe de vie, la freshness de l'entité passait RED, et le nudge-scanner criait au loup alors que la cadence tournait parfaitement.
+- `MIKA_MANAGER_LIVENESS_URL` — l'endpoint du battement, **déclaré** et jamais dérivé. Absente ou vide ⇒ **canal désarmé** : zéro POST, zéro erreur, zéro ligne par tick — et c'est aussi le **rollback**, retirer la variable désarme sans redéploiement. Posée ⇒ un POST léger par tick **réussi**, borné à 5 s.
+  ```
+  MIKA_MANAGER_LIVENESS_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
+  ```
+- **Pourquoi ce nom et pas `…HEARTBEAT_URL`.** `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` existe déjà et désigne le **plancher de delivery 6 h**. Côte à côte dans le même `EnvironmentFile`, un `…HEARTBEAT_URL` se lirait « le heartbeat vers cette URL bat toutes les 6 heures » — très exactement la croyance fausse que ce ticket existe pour tuer. Le chemin de l'endpoint garde le mot, la variable non.
+- **L'URL est déclarée, jamais composée** depuis `MIKA_MANAGER_DELIVERY_URL` (forme sans rapport) ni depuis `MIKA_MANAGER_HEALTH_URL`, dont l'entité n'est pas la nôtre et dont la sémantique est **inverse** — on y *lit* la santé de l'exécuteur, ici on *écrit* la nôtre. Doctrine maison, pas une invention : mika#2249 et mika#2368.
+- **Deux motifs, distincts et figés** : `poll:<n>` quand le cycle n'a rien délivré, `delivery:<healthy|attention|blocked>` quand il a délivré. **Jamais deux POST sur le même tick** — la freshness est un instant, pas un compte. `<n>` compte les **itérations de boucle**, pas les battements émis : une suite `poll:5` → `poll:9` dit « quatre cycles ont échoué », information qu'un compteur de battements effacerait. Le compteur repart à `1` au démarrage du process, donc **`poll:1` est le marqueur d'un redémarrage** — utile, pas un défaut.
+- **Un cycle en échec ne bat pas, et c'est une décision.** Un cycle qui échoue — typiquement `gh` en 401 — est un manager **cassé** ; y poster « je suis vivant » serait le mensonge exact que la freshness ne doit pas raconter. Cette moitié a déjà son canal : `manager_cycle_error` et l'alarme `manager_auth_persistent_failure` (mika#2013).
+
+### Surfaces opérateur
+
+```bash
+# 1. Le canal est-il armé ? (une ligne par démarrage)
+grep manager_delivery_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{milestone, liveness_url_set, route_normal, delivery_token_present}'
+
+# 2. Le canal est-il tombé ? (régime attendu : VIDE)
+grep manager_liveness_failed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{milestone, class, consecutive_failures, reason}'
+
+# 3. S'est-il rétabli ?
+grep manager_liveness_recovered "$MIKA_SPIRIT_LOG_FILE"
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `manager_delivery_resolved` avec `liveness_url_set: true` | INFO | **1 / démarrage** | le canal est armé. Son **absence** pendant que la cadence tourne = binaire antérieur au correctif (classe mika#2340) — **jamais** « tout va bien » |
+| `liveness_url_set: false` | INFO | — | canal désarmé : c'est une **configuration**, pas une panne ; la freshness restera RED et c'est attendu |
+| `manager_liveness_failed` | WARN | **vide** | chaque ligne est un battement perdu ; `class` (`credential_refused` / `unreachable` / `other`) dit lequel des trois remèdes |
+| `manager_liveness_recovered` | INFO | vide | le pendant du précédent |
+| ligne par battement réussi | — | **aucune** | AC4 : à 288 battements/jour et par milestone, une ligne par battement serait exactement le churn que la doctrine mika#2131 borne |
+
+**Pas de ligne `audit_events`, et c'est une décision** : l'information durable (« le canal est tombé à telle heure ») est déjà portée par les deux lignes de transition, et la population des battements **réussis** se lit chez cm — c'est son registre, c'est tout l'objet du ticket. La détection de transition est un état **en mémoire**, perdu au redémarrage à dessein : un process neuf re-photographie ce qu'il trouve (motif `auto_pull_stop`, mika#2329).
+
+### Sondes post-déploiement, et leurs haltes
+
+> **Préalable.** Établir que le binaire servi porte le correctif : la ligne `manager_delivery_resolved` doit porter le champ `liveness_url_set`. **Sans cette vérification, chacune des sondes ci-dessous décrit le binaire d'hier** (classe mika#2340).
+
+**S1 — le symptôme (~15 min après le déploiement).** Côté cm, la freshness de l'entité `mika-manager` reste verte en continu, avec un battement toutes les ~5 min, et le nudge-scanner cesse de la signaler entre deux deliveries.
+**Halte 1 — la freshness reste RED alors que `manager_liveness_failed` est vide.** Le POST part et n'atteint pas le registre : **ne pas élargir l'émetteur par réflexe** — vérifier d'abord `liveness_url_set` (sonde 1), puis que l'endpoint cm existe et lit ce corps. C'est la moitié `control-monitor` du travail, et elle a son propre dépôt.
+
+**S2 — contrôle positif de non-vacuité (24 h).** Le registre cm doit montrer les deux motifs : beaucoup de `poll:*` et quelques `delivery:*`.
+**Halte 2 — uniquement des `poll:*` sur 24 h.** C'est **attendu** si aucune delivery n'a eu lieu (état stable, moins de 6 h écoulées) — vérifier `manager_cycle_delivered` **avant** de conclure à un défaut. Zéro des deux ne prouve rien.
+
+**S3 — AC1 sur le terrain (48 h).** Aucune régression de cadence : `manager_cycle_delivered` continue d'apparaître à son rythme, aucun `manager_cycle_error` neuf.
+**Halte 3 — les cycles ralentissent.** Lire `manager_liveness_failed` : un `class = unreachable` soutenu signifie que le timeout est atteint à chaque tick, soit 5 s perdues toutes les 5 min. **Désarmer d'abord** (retirer `MIKA_MANAGER_LIVENESS_URL` de l'environnement du service — le rollback, sans redéploiement), diagnostiquer ensuite.
+
+**S4 — contrôle négatif de bruit (7 jours).** `manager_liveness_failed` reste vide.
+**Halte 4 — flot soutenu.** Ce n'est pas un seuil à régler : c'est l'endpoint cm qui refuse, et `class` dit lequel des trois remèdes. Un `credential_refused` renvoie au `delivery_token` et **pas** à ce code.
+
+**Halte transverse — les trois greps muets et la freshness verte.** On ne peut rien conclure : vérifier que la cadence a réellement tourné (`manager_cadence_start`, puis au moins un `manager_cycle_delivered` ou une erreur) avant toute conclusion. *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas exister l'endpoint cm.** `control-monitor` est hors de ce workspace. Si `/api/v1/agents/mika-manager/heartbeat` n'existe pas encore, chaque battement part en 404, `manager_liveness_failed` le dit **une fois**, et la freshness reste RED. La moitié cm est un **ticket frère**, et les deux moitiés tombent indépendamment : émettre avant que l'endpoint existe est **sûr** (un 404 est borné, journalisé, non bloquant), et un endpoint sans émetteur est simplement inerte.
+- **Il ne rend pas la delivery plus fréquente.** Le plancher 6 h et le déclencheur `state_changed` ne bougent pas d'un octet. Ce qui change est **ce que cm sait de notre vivacité** entre deux rapports.
+- **Il ne rattrape aucun battement perdu.** Pas de file, pas de réessai : un battement raté est perdu, le suivant arrive dans 5 min. C'est le bon arbitrage pour un signal de vivacité — réessayer un « je suis vivant » périmé est au mieux inutile, au pire un mensonge daté.
+- **Il n'ajoute aucun compteur et aucune ligne d'audit** : les seuls instruments neufs sont les deux lignes de transition et le booléen de configuration, et **leur silence ne prouve rien tant que personne n'exécute les sondes**.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
