@@ -28,6 +28,18 @@
 //!   The cost is one extra QA cycle. The alternative is silently trusting
 //!   that the push was safe, which is the judgment call we're trying to avoid here.
 //!
+//! - Porte d'entrée (mika#2260) : ce handler **n'évalue que dans le dispatcher**.
+//!   `try_handle_ci_success` refuse en tête — après la sélection par type
+//!   d'événement, avant l'exigence de token, avant tout appel `gh`, avant toute
+//!   écriture de dedup — quand `owns_merge_transition(db.agent_id())` est faux, et
+//!   rend alors `Passthrough { enrichment: None }` plus une ligne d'audit
+//!   `ci_success_handler_skipped_not_merge_actor`. #2248 avait mis l'identité à la
+//!   **sortie** (qui merge) ; elle était absente de l'**entrée** (pour qui cette
+//!   évaluation existe), si bien que le relecteur parcourait tout l'évaluateur
+//!   avant d'être retenu à l'acteur. L'ordre de la porte est épinglé par
+//!   `tests/eval/test_ci_success_handler.rs`, l'attribution par
+//!   `tests/eval/test_ci_success_fanout_2260.rs`.
+//!
 //! - Signal, pas acteur (mika#2248): ce handler **ne merge pas**. Il évalue, et
 //!   émet un signal merge-ready ([`MergeReadySignal`]) que le dispatcher
 //!   (`mika-dev`) consomme dans [`super::merge_ready_handler`] pour merger sous
@@ -66,7 +78,7 @@ use crate::tools::pr_merge_with_gate::{
     describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
     run_gh_pr_view, run_gh_subprocess,
 };
-use mika_common::forge_identity::MergeReadySignal;
+use mika_common::forge_identity::{DISPATCHER_AGENT, MergeReadySignal, owns_merge_transition};
 
 use super::check_suite_dedup;
 use super::verdict::{Verdict, parse_verdict};
@@ -133,6 +145,74 @@ pub async fn try_handle_ci_success(
         Some(e) => e,
         None => return VerdictAction::Passthrough { enrichment: None },
     };
+
+    // 1b. Porte d'entrée — seul le dispatcher évalue (mika#2260).
+    //
+    // La transition évaluer→signaler→merger est un tout, et elle appartient au
+    // dispatcher. Un agent qui ne peut pas consommer le signal n'a aucune raison
+    // de l'émettre : son évaluation n'a, par construction, aucun consommateur —
+    // le signal voyage en bande dans `req.text`, relu par le handler suivant *du
+    // même agent*, où l'acteur le retient.
+    //
+    // Le placement est le point porteur, et il est dicté par les effets mesurés le
+    // 2026-09-09/10, dans l'ordre d'exécution : la clé de dedup de l'étape 2b est
+    // **globale au processus** et clé sur `{repo}:{branch}:{head_sha}` sans
+    // `agent_id`, donc le relecteur entrant en premier consommait le créneau du
+    // dispatcher (mesuré à 5 ms près le 09:12:36 — un deferral à 59,9 s au lieu
+    // de 60,005 s laissait la PR verte et ouverte sans que rien ne la ferme) ;
+    // s'y ajoutaient cinq appels `gh` sous le PAT du relecteur, une écriture
+    // `PUT …/update-branch` à l'étape 5c, et une notification opérateur
+    // DECISION-CORE en double. La porte précède donc **tout** : le `evaluating`
+    // ci-dessous, l'exigence de token, le dedup, et toute ligne d'audit.
+    //
+    // `Passthrough { enrichment: None }` et non `Handled` : le tour du relecteur
+    // doit voir l'**événement brut**, que `qa-review-webhook-success` attend pour
+    // corréler la PR — le pré-digest de l'évaluateur remplaçait `req.text`. Et
+    // sans enrichissement : le prompt du relecteur sait déjà qu'il ne merge pas,
+    // lui redire n'ajoute qu'un second texte à suivre.
+    //
+    // La seconde ceinture de mika#2248 (`authorize_merge`, le refus outil) n'est
+    // pas remplacée : après cette porte le hold du relecteur devient inatteignable
+    // en production, mais il reste la défense si un signal arrivait par un chemin
+    // que cet évaluateur n'a pas posé.
+    let agent_id = db.agent_id();
+    if !owns_merge_transition(agent_id) {
+        info!(
+            event = "ci_success_handler_skipped_not_merge_actor",
+            repo = %event.repo,
+            branch = %event.branch,
+            agent_id = %agent_id,
+            dispatcher = DISPATCHER_AGENT,
+            "CI success: cet agent ne possède pas la transition de merge — aucune évaluation, \
+             l'événement brut passe à son tour (mika#2260)"
+        );
+
+        // La clé cible porte `{repo}@{branch}` et non un numéro de PR : celui-ci
+        // n'est pas connu ici, et ne doit pas l'être — le connaître coûterait le
+        // premier appel `gh`, c'est-à-dire l'effet de bord que cette porte retire.
+        if let Err(e) = db
+            .log_audit_event(
+                session_id,
+                "ci_success_handler_skipped_not_merge_actor",
+                &format!("event:{}@{}", event.repo, event.branch),
+                None,
+                None,
+                Some(&format!(
+                    "trigger=check_suite_success agent_id={agent_id} dispatcher={DISPATCHER_AGENT}"
+                )),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                agent_id = %agent_id,
+                "Failed to log ci_success_handler_skipped_not_merge_actor audit event (continuing)"
+            );
+        }
+
+        return VerdictAction::Passthrough { enrichment: None };
+    }
 
     info!(
         repo = %event.repo,
@@ -210,9 +290,14 @@ pub async fn try_handle_ci_success(
     // The in-memory map above is empty after a process restart; the audit trail
     // persists. A re-fired event within the window still dedups via a marker row.
     // Scope note: count_recent_audit_events_for_target counts within this agent's
-    // agent_id scope. check_suite success events for a given PR route to the same
-    // agent (mika-qa), so the scope is correct. Fail-open on read error — never
-    // let an audit hiccup block a legitimate merge.
+    // agent_id scope, and since mika#2260 only the dispatcher reaches this point —
+    // the entry gate turns every other agent away above. Before that gate, this
+    // note claimed check_suite events "route to the same agent (mika-qa)", which
+    // has been false since the mika#1711 fan-out: they reach mika-dev AND mika-qa,
+    // both ran this path, and the in-memory dedup key one hop above is process-global
+    // and carries no agent_id — so the reviewer's entry consumed the dispatcher's
+    // slot. Fail-open on read error — never let an audit hiccup block a legitimate
+    // merge.
     let processed_key = format!("pr:{}#{}@{}", event.repo, pr.number, pr.head_sha);
     let since = crate::timestamp::now_minus(chrono::Duration::seconds(60));
     match db
@@ -514,8 +599,11 @@ pub async fn try_handle_ci_success(
     // Ce handler tourne dans `mika-dev` ET dans `mika-qa` (fan-out mika#1711) ;
     // un `gh pr merge` ici merge sous le token de celui qui gagne la course. Le
     // signal est inerte : il dit « cette PR a franchi toutes les portes pour ce
-    // head_sha », et laisse le dispatcher agir sous sa propre identité. Aucune
-    // logique d'identité ici, par conception — ce fichier évalue, il n'agit pas.
+    // head_sha », et laisse le dispatcher agir sous sa propre identité.
+    //
+    // L'identité décide à l'**entrée** si cette évaluation a un consommateur
+    // (mika#2260, la porte 1b ci-dessus) ; elle ne décide jamais **ici** qui
+    // merge — cela reste l'affaire de l'acteur, et cette ligne-là n'a pas bougé.
     let pr_url = format!("https://github.com/{}/pull/{}", event.repo, pr.number);
     let task = match db.find_active_task_by_pr_url(&pr_url).await {
         Ok(t) => t,

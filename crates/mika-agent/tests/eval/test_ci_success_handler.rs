@@ -38,6 +38,33 @@ async fn test_db() -> AsyncDatabase {
     AsyncDatabase::new(db)
 }
 
+/// Un handle scopé sur `agent_id`, sur sa propre base en mémoire (mika#2260).
+///
+/// `AsyncDatabase::new` délègue à `new_with_agent(db, "mika")`, donc le helper
+/// ci-dessus ne peut pas répondre à « quel agent a atteint ce callsite ? ».
+/// T1 n'a pas besoin d'état croisé — il assert trois verdicts indépendants — donc
+/// des bases disjointes suffisent **ici** ; le partage est l'objet de T2, qui
+/// monte `MultiAgentHarness` pour cette raison exacte (voir son § *Le montage à
+/// NE PAS refaire*).
+fn db_for_agent(agent_id: &str, session_id: &str) -> AsyncDatabase {
+    let db = Database::open_in_memory().expect("in-memory db");
+    db.register_agent(agent_id, agent_id, "")
+        .expect("register agent");
+    db.create_session(session_id, agent_id, "github")
+        .expect("create session");
+    AsyncDatabase::new_with_agent(db, agent_id)
+}
+
+/// Le nom d'audit de la porte d'entrée (mika#2260).
+const SKIPPED_EVENT: &str = "ci_success_handler_skipped_not_merge_actor";
+/// Le nom d'audit du marqueur de dedup — la première ligne que l'évaluateur
+/// écrit quand il travaille. Zéro ici prouve que la porte a précédé le travail.
+const PROCESSED_EVENT: &str = "ci_success_handler_processed";
+
+/// Le texte d'événement bien formé, partagé par T1 et T2.
+const CHECK_SUITE_TEXT: &str =
+    "[GitHub] Check suite success on senara-solutions/mika (branch: fix/x)";
+
 /// Source of the handler under test, pinned at compile time so the structural
 /// assertions below cannot pass against a stale copy on disk.
 const CI_SUCCESS_HANDLER_SRC: &str = include_str!("../../src/server/ci_success_handler.rs");
@@ -96,9 +123,12 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
     );
     assert_eq!(classification.decision_core_files, files);
 
-    // Layer B — the handler does not merge. With `gh` unresolvable, `find_open_pr`
-    // bails before step 5c, so this asserts the fail-safe direction of that bail:
-    // no PR resolved means no merge issued, never an optimistic merge.
+    // Layer B — the handler does not merge. Since mika#2260 this `AGENT_ID` ("mika")
+    // is outside the merge-transition whitelist, so the entry gate turns the event
+    // away one step in — earlier than the `find_open_pr` bail that used to stop it
+    // here, and for a different reason. Either way this asserts the same fail-safe
+    // direction: nothing resolved means no merge issued, never an optimistic merge.
+    // The gate's own behaviour is covered by `mika2260_*` below, on named agents.
     let db = test_db().await;
     let text = "[GitHub] Check suite success on senara-solutions/mika \
                 (branch: test/1947/perimeter-manager-forge-gate-loop-r)";
@@ -128,8 +158,8 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
     }
     // `ci_success_merge` is the row the handler writes after `run_gh_merge`
     // (`after = "merge_initiated"`); `ci_success_handler_human_gate_required` is
-    // the DECISION-CORE hold. Both are zero here because the handler bailed at
-    // `find_open_pr` — which is the point: this path did nothing, and in
+    // the DECISION-CORE hold. Both are zero here because the handler bailed at the
+    // mika#2260 entry gate — which is the point: this path did nothing, and in
     // particular did not merge.
     for event in ["ci_success_merge", "ci_success_handler_human_gate_required"] {
         assert_audit_event_name_is_real(event);
@@ -183,4 +213,152 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// mika#2260 — la porte d'entrée : seul le dispatcher évalue
+// ---------------------------------------------------------------------------
+
+/// T1 (AC1, AC7) — le relecteur est transparent à l'événement, le dispatcher passe.
+///
+/// Les trois agents sont exercés dans **un seul** test, et c'est porteur : un
+/// handler qui rendrait toujours `Passthrough { enrichment: None }` satisferait
+/// les deux cas négatifs et serait indistinguable du correctif. Le contrôle
+/// positif dans le même souffle prouve deux choses d'un coup — que la porte
+/// laisse passer le dispatcher, et qu'elle a joué **avant** l'exigence de token
+/// (sinon `mika-dev` s'arrêterait sans enrichissement, comme les autres).
+#[tokio::test]
+async fn mika2260_le_relecteur_est_transparent_a_levenement() -> Result<()> {
+    assert_audit_event_name_is_real(SKIPPED_EVENT);
+
+    // --- Les deux cas négatifs : hors liste blanche, aucun travail n'a lieu. ---
+    //
+    // `mika-qa` est le relecteur mesuré ; `mika` est un agent hors liste, qui
+    // atteste que la porte lit la liste blanche et non un nom codé en dur.
+    for agent in ["mika-qa", "mika"] {
+        let session = format!("ci-success-2260-{agent}");
+        let db = db_for_agent(agent, &session);
+
+        let action = try_handle_ci_success(
+            CHECK_SUITE_TEXT,
+            &db,
+            // Pas de token : si la porte ne mordait pas, le chemin s'arrêterait
+            // une ligne plus loin **avec** un enrichissement — c'est très
+            // exactement ce qui distingue les deux états.
+            None,
+            None,
+            &session,
+            "trace-2260-negatif",
+        )
+        .await;
+
+        match action {
+            VerdictAction::Passthrough { enrichment: None } => {}
+            other => panic!(
+                "`{agent}` n'est pas acteur d'un merge : l'évaluateur doit le rendre \
+                 transparent à l'événement (`Passthrough` sans enrichissement), pour que son \
+                 tour voie le texte brut que `qa-review-webhook-success` attend. \
+                 Obtenu : {other:?}"
+            ),
+        }
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(SKIPPED_EVENT).await?,
+            1,
+            "`{agent}` : la porte doit laisser une ligne d'audit — sans elle, un refus se lit \
+             exactement comme un événement jamais arrivé (classe mika#2205)"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name(PROCESSED_EVENT).await?,
+            0,
+            "`{agent}` : aucun marqueur de dedup ne doit être écrit — c'est la clé mémoire \
+             globale au processus qui avalait l'évaluation du dispatcher (mika#2260)"
+        );
+    }
+
+    // --- Le contrôle positif : le dispatcher franchit la porte. ---
+    let session = "ci-success-2260-mika-dev";
+    let db = db_for_agent("mika-dev", session);
+
+    let action = try_handle_ci_success(
+        CHECK_SUITE_TEXT,
+        &db,
+        None,
+        None,
+        session,
+        "trace-2260-positif",
+    )
+    .await;
+
+    match action {
+        VerdictAction::Passthrough {
+            enrichment: Some(s),
+        } => assert!(
+            s.contains("no GitHub token"),
+            "le dispatcher doit s'arrêter sur la PREMIÈRE ligne après la porte (l'exigence de \
+             token), ce qui atteste l'ordre. Enrichissement obtenu : {s}"
+        ),
+        other => panic!(
+            "`mika-dev` est le dispatcher : la porte doit le laisser passer, et le chemin \
+             s'arrêter sur l'absence de token. Obtenu : {other:?}"
+        ),
+    }
+
+    assert_eq!(
+        db.count_audit_events_by_tool_name(SKIPPED_EVENT).await?,
+        0,
+        "le dispatcher ne doit JAMAIS être écarté : sans cette assertion, une porte qui \
+         refuserait tout le monde passerait les deux cas négatifs ci-dessus"
+    );
+
+    Ok(())
+}
+
+/// T3 (AC3) — la porte précède tout travail.
+///
+/// Structurel et non comportemental, parce que la régression ne rendrait aucune
+/// décision fausse : déplacer la porte d'entrée après le dedup laisserait le
+/// verdict correct et rouvrirait en silence la consommation du créneau du
+/// dispatcher. Les indices sont pris dans le corps de la fonction, jamais dans
+/// le fichier entier — la signature nomme `github_token` bien avant son usage.
+#[test]
+fn mika2260_la_porte_precede_tout_travail() {
+    let body = try_handle_ci_success_body();
+
+    // Anti-vacuité : un scan qui vise un nom mort se lit exactement comme un
+    // arbre propre (classe mika#2103/#2205).
+    let gate_at = body.find("owns_merge_transition(").expect(
+        "la porte d'entrée `owns_merge_transition(` doit être dans le corps de \
+         `try_handle_ci_success` — sans elle les assertions d'ordre ci-dessous sont vacues",
+    );
+
+    for (needle, what) in [
+        ("match github_token {", "l'exigence de token"),
+        ("find_open_pr(", "le premier appel `gh`"),
+        (
+            "try_dedup_check_suite(",
+            "l'écriture de la clé dedup mémoire",
+        ),
+        (
+            "count_recent_audit_events_for_target(",
+            "la lecture du dedup durable",
+        ),
+    ] {
+        let at = body
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` doit exister dans le corps — renommé ?"));
+        assert!(
+            gate_at < at,
+            "la porte d'entrée doit précéder {what} (`{needle}`) : un agent hors liste blanche \
+             qui atteint ce point a déjà exercé un effet de bord — cinq appels `gh` sous son \
+             PAT, ou la clé dedup globale au processus qui avale l'évaluation du dispatcher \
+             (mika#2260)"
+        );
+    }
+}
+
+/// T4 (AC4) — le nom d'audit de la porte est réel.
+#[test]
+fn mika2260_le_nom_daudit_de_la_porte_est_reel() {
+    assert_audit_event_name_is_real(SKIPPED_EVENT);
 }

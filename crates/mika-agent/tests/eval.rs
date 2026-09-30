@@ -62,6 +62,11 @@ mod eval {
     mod test_callback_terminal_action;
     mod test_callback_turn;
     mod test_ci_success_handler;
+
+    // mika#2260 — l'attribution du fan-out `check_suite` est mesurée sur une base
+    // container partagée : un seul agent évalue, dans les deux patrons (ordre et
+    // course).
+    mod test_ci_success_fanout_2260;
     mod test_completion_claim_guard;
     mod test_context_summary_inject;
 
