@@ -32,6 +32,115 @@ fn migration_v38_to_v39_idempotent() {
     db.migrate_v38_to_v39().unwrap();
 }
 
+/// V7 — la migration v54→v55 est idempotente (mika#1833 R4).
+///
+/// Rejouée sur une base déjà migrée, elle doit rendre `Ok` sans dupliquer
+/// l'index ni réécrire la version.
+#[test]
+fn mika1833_migration_v54_to_v55_is_idempotent() {
+    let mut db = db();
+
+    let version_before: i64 = db
+        .conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema version readable");
+
+    db.migrate_v54_to_v55().expect("replay must be a no-op");
+    db.migrate_v54_to_v55().expect("and stay one");
+
+    let version_after: i64 = db
+        .conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema version readable");
+    assert_eq!(
+        version_before, version_after,
+        "un rejeu ne doit pas faire avancer la version"
+    );
+
+    let index_rows: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_kg_cs_entity_recent'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("index lookup");
+    assert_eq!(index_rows, 1, "l'index doit exister exactement une fois");
+
+    // L'index préexistant n'est PAS retiré : il sert les requêtes scopées par
+    // corpus, qui sont une autre population (plan mika#1833 D5).
+    let legacy_rows: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'idx_kg_cs_entity'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("legacy index lookup");
+    assert_eq!(
+        legacy_rows, 1,
+        "retirer un index pour en ajouter un autre serait un arbitrage que \
+         rien dans mika#1833 ne mesure"
+    );
+}
+
+/// V6 — l'index sert réellement la sous-requête corrélée (mika#1833 R4, AC3).
+///
+/// **Le seul test capable de prouver R4.** Une assertion sur l'*existence* de
+/// l'index ne prouve pas qu'il est **utilisé** : c'est précisément le défaut
+/// de `idx_kg_cs_entity(docs_root_hash, subject_entity_id)`, qui existe depuis
+/// la v27 et que SQLite ne peut pas utiliser en *seek* ici parce que sa
+/// colonne de tête n'apparaît pas dans le `WHERE` de la sous-requête.
+///
+/// Le plan de requête doit donc nommer `idx_kg_cs_entity_recent` en `SEARCH`,
+/// jamais en `SCAN`.
+#[test]
+fn mika1833_index_serves_the_pending_subquery() {
+    let db = db();
+
+    // La sous-requête corrélée, verbatim depuis les trois requêtes de
+    // détection du pending (`count_pending`, `count_pending_for_corpus`,
+    // `get_pending_entities_for_corpus`).
+    let plan: Vec<String> = {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT cs.extraction_trace_id
+                   FROM kg_chunk_subjects cs
+                  WHERE cs.subject_entity_id = ?1
+                  ORDER BY cs.created_at DESC LIMIT 1",
+            )
+            .expect("EXPLAIN must parse");
+        let rows = stmt
+            .query_map([1i64], |row| row.get::<_, String>(3))
+            .expect("plan rows");
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let joined = plan.join("\n");
+    assert!(
+        joined.contains("idx_kg_cs_entity_recent"),
+        "mika#1833 — la sous-requête corrélée n'est pas servie par \
+         `idx_kg_cs_entity_recent`. C'est le coût des 26-48 s par tick.\n\
+         Plan observé :\n{joined}"
+    );
+    assert!(
+        joined.contains("SEARCH"),
+        "mika#1833 — l'index est nommé mais la table est parcourue : un index \
+         présent et non utilisé en seek est exactement le défaut que R4 ferme.\n\
+         Plan observé :\n{joined}"
+    );
+    assert!(
+        !joined.contains("SCAN kg_chunk_subjects"),
+        "mika#1833 — `SCAN kg_chunk_subjects` est le parcours par ligne \
+         candidate que cet index existe pour retirer.\n\
+         Plan observé :\n{joined}"
+    );
+}
+
 // ===== KG Schema Migration Tests (v24 → v25 forward-test harness) =====
 
 /// A structural fingerprint of a SQLite table, including columns, indexes,

@@ -215,6 +215,21 @@ pub struct RebuildStats {
     /// resolution log rows invalidated this rebuild. Populated when entity types
     /// gain new entities; empty when no type had `added > 0`. See #960, #1154.
     pub invalidated_no_match: HashMap<String, usize>,
+    /// Recensement du graphe **après** le rebuild : nombre total de lignes dans
+    /// `kg_entities` (mika#1833 R6).
+    ///
+    /// Distinct de `entities_added` + `entities_updated`, qui comptent ce que
+    /// *ce* rebuild a écrit. Le suivi 1 du ticket demande *« vérifier
+    /// `kg_entities` row count post-boot »* — c'est ce nombre-là, et il rend
+    /// l'hypothèse « graphe de domaine vide » **mesurable** au lieu de
+    /// tranchable à l'aveugle.
+    pub entities_total: usize,
+    /// Le même recensement, ventilé par type d'entité.
+    ///
+    /// Une carte vide pour un type déclaré signifie qu'aucune entité de ce
+    /// type n'existe — ce qui est précisément ce qu'un Stage-1 exact-match
+    /// à zéro sur 50 candidats laisserait supposer.
+    pub entities_total_per_type: HashMap<String, usize>,
 }
 
 /// Information about an agent to include in the domain graph.
@@ -261,6 +276,48 @@ impl<'a> DomainGraphBuilder<'a> {
     ///
     /// The entire operation runs in a single transaction. If any step fails,
     /// the whole rebuild rolls back and the graph remains in its previous state.
+    /// Recense `kg_entities` par type, après rebuild (mika#1833 R6).
+    ///
+    /// Scopé à [`KG_DOMAIN_ENTITY_TYPES`] — les types que ce module projette
+    /// et dont il est l'écrivain unique. Compter les autres mêlerait au
+    /// recensement des lignes que ce rebuild ne gouverne pas, et ferait lire
+    /// « graphe non vide » sur un graphe dont la part de domaine est vide.
+    ///
+    /// Un type sans aucune ligne est **absent** de la carte plutôt que
+    /// présent à zéro : c'est la sortie naturelle d'un `GROUP BY`, et la
+    /// somme des valeurs reste le total.
+    async fn census_entities_by_type(&self) -> Result<HashMap<String, usize>> {
+        self.db
+            .with_db(move |db| {
+                let placeholders: String = KG_DOMAIN_ENTITY_TYPES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!(
+                    "SELECT type, COUNT(*) FROM kg_entities
+                     WHERE type IN ({placeholders})
+                     GROUP BY type"
+                );
+                let mut stmt = db.conn.prepare(&sql)?;
+                let params: Vec<&dyn rusqlite::ToSql> = KG_DOMAIN_ENTITY_TYPES
+                    .iter()
+                    .map(|t| t as &dyn rusqlite::ToSql)
+                    .collect();
+                let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+                })?;
+                let mut out = HashMap::new();
+                for row in rows {
+                    let (t, n) = row?;
+                    out.insert(t, n);
+                }
+                Ok(out)
+            })
+            .await
+    }
+
     pub async fn rebuild(&self) -> Result<RebuildStats> {
         let start = Instant::now();
         info!(trace_id = %self.trace_id, event = "domain_rebuild_start");
@@ -473,6 +530,31 @@ impl<'a> DomainGraphBuilder<'a> {
 
         let (total_added, total_updated, removed, type_stats, edge_stats, invalidated_no_match) =
             stats;
+
+        // mika#1833 R6 — recensement du graphe APRÈS le rebuild. Une requête
+        // agrégée sur `kg_entities`, hors de la transaction d'écriture : ce
+        // qu'on veut recenser est l'état final, pas un état intermédiaire.
+        //
+        // Échec fail-open : un recensement illisible ne doit pas faire échouer
+        // un rebuild qui a réussi. Le champ retombe à zéro et le WARN
+        // ci-dessous ne tire pas — on ne crie pas « graphe vide » sur une
+        // requête qu'on n'a pas su lire (motif mika#2277 : un terme qu'on ne
+        // peut pas lire n'est jamais un terme satisfait).
+        let entities_total_per_type = match self.census_entities_by_type().await {
+            Ok(census) => census,
+            Err(e) => {
+                warn!(
+                    trace_id = %self.trace_id,
+                    error = %e,
+                    event = "domain_census_unreadable",
+                    "could not census kg_entities after rebuild — the census fields \
+                     of domain_rebuild_complete are not to be read as a measurement"
+                );
+                HashMap::new()
+            }
+        };
+        let entities_total: usize = entities_total_per_type.values().sum();
+
         let duration_ms = start.elapsed().as_millis();
 
         // Log per-type stats
@@ -513,11 +595,35 @@ impl<'a> DomainGraphBuilder<'a> {
                 event = "domain_rebuild_invalidated_resolutions",
             );
         }
+        // mika#1833 R6 — le recensement voyage sur la ligne de complétion, et
+        // **sur toutes les branches, y compris saine** (doctrine mika#2293).
+        // Son absence est donc elle-même de l'information : un journal qui
+        // tourne sans ces champs dit que le binaire servi est antérieur au
+        // correctif (classe mika#2340), jamais que le graphe est sain.
+        let per_type_json = serde_json::to_string(&entities_total_per_type).unwrap_or_default();
         info!(
             trace_id = %self.trace_id,
             event = "domain_rebuild_complete",
+            entities_total,
+            per_type = %per_type_json,
             duration_ms,
         );
+
+        // L'état exact que le ticket a supposé, enfin observable.
+        // **Régime attendu : zéro ligne.** Sans cet événement, « le graphe est
+        // vide » resterait inférable et jamais observé — et c'est l'hypothèse
+        // sur laquelle mika#1833 a été ouvert.
+        if entities_total == 0 {
+            warn!(
+                trace_id = %self.trace_id,
+                event = "domain_graph_empty",
+                entities_added = total_added,
+                entities_updated = total_updated,
+                entities_removed = removed,
+                "domain graph is empty after a successful rebuild — every Stage-1 \
+                 exact match will miss and every subject entity will resolve no_match"
+            );
+        }
 
         Ok(RebuildStats {
             entities_added: total_added,
@@ -527,6 +633,8 @@ impl<'a> DomainGraphBuilder<'a> {
             edges_provides: edge_stats.get("PROVIDES").map_or(0, |s| s.count),
             duration_ms,
             invalidated_no_match,
+            entities_total,
+            entities_total_per_type,
         })
     }
 
@@ -1082,6 +1190,117 @@ mod tests {
         assert_eq!(stats.entities_removed, 0);
         assert_eq!(stats.edges_provides, 1); // alpha -> alpha_tool
         assert_eq!(stats.edges_depends_on, 0);
+    }
+
+    /// V8 — le recensement compte ce que le rebuild a réellement écrit
+    /// (mika#1833 R6).
+    ///
+    /// Le suivi 1 du ticket demande *« vérifier `kg_entities` row count
+    /// post-boot »* : ce test est ce qui rend ce nombre fiable plutôt que
+    /// plausible. Il le confronte à un `SELECT COUNT(*) GROUP BY type` lu
+    /// indépendamment — sans cette confrontation, « le recensement compte »
+    /// serait indistinguable de « le recensement recopie `entities_added` »,
+    /// qui est un autre nombre (ce que *ce* rebuild a écrit, pas ce que le
+    /// graphe porte).
+    #[tokio::test]
+    async fn mika1833_domain_census_counts_what_the_rebuild_wrote() {
+        let db = make_async_db();
+        let skill = make_skill("alpha", "Alpha skill", vec![], vec!["alpha_tool"]);
+        let registry = SkillRegistry::from_test_entries(vec![skill]);
+        let tool_registry = make_tool_registry(&["search_memory"]);
+        let agents = vec![AgentInfo {
+            name: "test-agent".to_string(),
+            role: None,
+            model: None,
+        }];
+
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &agents);
+        let stats = builder.rebuild().await.expect("rebuild should succeed");
+
+        // Lecture indépendante de la même table.
+        let observed: HashMap<String, usize> = db
+            .with_db(|db| {
+                let mut stmt = db
+                    .conn
+                    .prepare("SELECT type, COUNT(*) FROM kg_entities GROUP BY type")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+                })?;
+                let mut out = HashMap::new();
+                for row in rows {
+                    let (t, n) = row?;
+                    out.insert(t, n);
+                }
+                Ok(out)
+            })
+            .await
+            .expect("census query");
+
+        assert_eq!(
+            stats.entities_total_per_type, observed,
+            "le recensement par type doit coïncider avec la table"
+        );
+        assert_eq!(
+            stats.entities_total,
+            observed.values().sum::<usize>(),
+            "le total doit être la somme du recensement par type"
+        );
+        assert!(
+            stats.entities_total > 0,
+            "un rebuild qui a écrit 29 entités ne peut pas recenser un graphe vide"
+        );
+
+        // Et le recensement n'est PAS `entities_added` : sur ce premier
+        // rebuild ils coïncident, donc c'est le second qui les sépare.
+        let builder2 = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &agents);
+        let stats2 = builder2.rebuild().await.expect("second rebuild");
+        assert_eq!(
+            stats2.entities_added, 0,
+            "un second rebuild n'ajoute rien — c'est le contrôle qui sépare \
+             « recensement » de « ce que ce rebuild a écrit »"
+        );
+        assert_eq!(
+            stats2.entities_total, stats.entities_total,
+            "…et le recensement, lui, ne bouge pas : il décrit le graphe"
+        );
+    }
+
+    /// V9 — contrôle négatif : un graphe peuplé n'émet pas l'alerte de vide.
+    ///
+    /// Sans lui, « la garde détecte le vide » est indistinguable de « la garde
+    /// crie toujours ». Le prédicat est testé directement plutôt qu'en
+    /// capturant le journal : ce qui doit être vrai est *le graphe n'est pas
+    /// vide*, et `entities_total == 0` est la condition littérale du WARN.
+    #[tokio::test]
+    async fn mika1833_a_populated_graph_does_not_emit_the_empty_warning() {
+        let db = make_async_db();
+        let registry = SkillRegistry::from_test_entries(vec![]);
+        let tool_registry = make_tool_registry(&["search_memory"]);
+        let agents = vec![AgentInfo {
+            name: "test-agent".to_string(),
+            role: None,
+            model: None,
+        }];
+
+        let builder = DomainGraphBuilder::new(&db, &registry, &tool_registry, None, &agents);
+        let stats = builder.rebuild().await.expect("rebuild should succeed");
+
+        assert!(
+            stats.entities_total > 0,
+            "même sans skill déclarée, les seeds de problem_type et de concept \
+             peuplent le graphe — le WARN ne doit donc pas pouvoir tirer ici"
+        );
+        // Les seeds sont ce qui rend le contrôle non vide : les nommer ici
+        // évite qu'un futur retrait des seeds transforme ce contrôle en
+        // assertion vide sans que rien ne rougisse.
+        assert!(
+            stats.entities_total_per_type.contains_key("problem_type"),
+            "les seeds de problem_type sont ce qui peuple le graphe de ce test"
+        );
+        assert!(
+            stats.entities_total_per_type.contains_key("concept"),
+            "idem pour les seeds de concept"
+        );
     }
 
     #[tokio::test]

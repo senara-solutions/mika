@@ -146,6 +146,44 @@ pub const AUTO_PULL_SCAN: &str = "auto-pull";
 /// existence vaut STOP, son contenu n'est jamais lu.
 pub const WORKTREE_REAP_SCAN: &str = "worktree-reap";
 
+/// Le nom de scan du tick d'ingestion KG (mika#1833).
+///
+/// Troisième usage du mécanisme. Le fichier est `~/.mika/state/kg-tick-stop`,
+/// et sa sémantique est celle des deux autres : son existence vaut STOP, son
+/// contenu n'est jamais lu.
+///
+/// # Le besoin est mesuré, pas anticipé
+///
+/// La doc de module ci-dessus refuse d'étendre le mécanisme sans besoin
+/// mesuré : *« arrêter la revue QA n'est pas la même décision qu'arrêter le
+/// feeder »*. **Un scan qui a brûlé 26 à 48 s par tick sur cinq agents et
+/// affamé la boucle de développement est ce besoin.** Le 2026-07-26, chaque
+/// `kg_resolver_tick` rendait `pending: 1288-1493`, `resolved_in_tick: 0`,
+/// `aborted_budget: true`, `llm_calls: 0` ; le palliatif a demandé d'éditer
+/// cinq `identity.toml` **et** de redémarrer mika-spirit — précisément le
+/// geste qu'on veut le moins poser pendant un incident.
+///
+/// Et il satisfait le critère de mika#2420 (*une décision distincte mérite un
+/// fichier distinct*) : arrêter l'ingestion KG n'est ni arrêter le frein de
+/// dispatch de la boucle ([`AUTO_PULL_SCAN`]), ni arrêter le faucheur de
+/// worktrees ([`WORKTREE_REAP_SCAN`]). Aucune de ces trois décisions ne se
+/// déduit d'une autre.
+///
+/// # Ce que ça remplace, et pourquoi pas une variable d'environnement
+///
+/// Le suivi 3 du ticket demandait `MIKA_KG_RESOLVER_DISABLED=1`. La raison du
+/// refus est déjà écrite dans la doc de module : `load_dotenv` est appelé
+/// **une fois** au démarrage, et l'environnement d'un process Linux vivant
+/// n'est pas mutable de l'extérieur — donc éditer `~/.mika/.env` ne change
+/// rien à ce que `std::env::var` renverra, **même relu à chaque tick**.
+///
+/// # Aucune ligne n'est touchée
+///
+/// Le tick continue de tourner ; c'est le corps qui rend la main. La
+/// réversibilité est donc l'absence de machinerie : aucun contact avec la
+/// garde anti-zombie mika#1742, ni avec l'exemption config-cancel mika#2271.
+pub const KG_TICK_SCAN: &str = "kg-tick";
+
 /// La variable d'environnement boot-time dont ce module ferme le piège.
 const AUTO_PULL_ENV_KNOB: &str = "MIKA_DEV_AUTO_PULL";
 
@@ -281,6 +319,10 @@ mod tests {
             PathBuf::from("/home/x/.mika/state/worktree-reap-stop")
         );
         assert_eq!(
+            stop_file_path(home, KG_TICK_SCAN),
+            PathBuf::from("/home/x/.mika/state/kg-tick-stop")
+        );
+        assert_eq!(
             stop_file_path(home, "wip-rescue"),
             PathBuf::from("/home/x/.mika/state/wip-rescue-stop")
         );
@@ -292,6 +334,17 @@ mod tests {
         arm(tmp.path(), WORKTREE_REAP_SCAN, "");
         assert!(!is_stopped(tmp.path(), AUTO_PULL_SCAN));
         assert!(is_stopped(tmp.path(), WORKTREE_REAP_SCAN));
+        assert!(
+            !is_stopped(tmp.path(), KG_TICK_SCAN),
+            "arrêter le faucheur ne doit pas arrêter l'ingestion KG — \
+             trois décisions distinctes, trois fichiers (mika#1833)"
+        );
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        arm(tmp2.path(), KG_TICK_SCAN, "");
+        assert!(is_stopped(tmp2.path(), KG_TICK_SCAN));
+        assert!(!is_stopped(tmp2.path(), AUTO_PULL_SCAN));
+        assert!(!is_stopped(tmp2.path(), WORKTREE_REAP_SCAN));
     }
 
     /// T4 — la garde émet quand le `.env` disque contredit le process, sur les
@@ -385,10 +438,11 @@ mod tests {
     #[test]
     fn mika2329_le_chemin_du_fichier_sentinelle_a_un_seul_lecteur() {
         // Écrits en deux morceaux pour que la garde ne se dénonce pas elle-même
-        // lorsqu'un scan de source la lit. mika#2420 ajoute le second scan : la
-        // garde doit couvrir **chaque** nom, sinon le nouveau naît hors
-        // protection et la leçon `grooming_marker` se rejoue sur lui.
-        let literals: Vec<String> = [AUTO_PULL_SCAN, WORKTREE_REAP_SCAN]
+        // lorsqu'un scan de source la lit. mika#2420 ajoute le second scan,
+        // mika#1833 le troisième : la garde doit couvrir **chaque** nom, sinon
+        // le nouveau naît hors protection et la leçon `grooming_marker` se
+        // rejoue sur lui.
+        let literals: Vec<String> = [AUTO_PULL_SCAN, WORKTREE_REAP_SCAN, KG_TICK_SCAN]
             .iter()
             .map(|scan| format!("{scan}{}", "-stop"))
             .collect();

@@ -259,6 +259,15 @@ impl SubjectEntityResolver {
         extraction_trace_id: &str,
         budget: u32,
     ) -> Result<ResolutionStats> {
+        // mika#1833 — un budget nul désactive la phase, **avant** toute
+        // requête. Voir `kg::budget::phase_is_disabled` pour ce que ce
+        // court-circuit retire (le passage gratuit des exact matches de
+        // Stage-1) et pourquoi ce comportement n'était déjà pas délivré à la
+        // population modale.
+        if crate::kg::budget::phase_is_disabled(budget) {
+            return Ok(ResolutionStats::default());
+        }
+
         if entity_ids.is_empty() {
             return Ok(ResolutionStats::default());
         }
@@ -278,14 +287,25 @@ impl SubjectEntityResolver {
     /// Resolve all pending entities for an agent (startup or re-resolution),
     /// capped by `budget` Stage-2 LLM disambiguation calls (#757 R2).
     ///
-    /// `budget == 0` short-circuits with no LLM calls. On overflow the method
-    /// aborts cleanly, emits a `kg_budget_exhausted` WARN, and leaves
-    /// remaining entities pending for the next run. Stage-1 exact matches do
-    /// not consume the budget, so entities that resolve without the LLM still
-    /// make progress even when `budget` is tight.
+    /// **`budget == 0` est un no-op déclaré (mika#1833) :** la méthode rend
+    /// `ResolutionStats::default()` **avant** `get_pending_entities`, donc
+    /// avant la sous-requête corrélée sur `kg_chunk_subjects` qui portait
+    /// l'essentiel des 26-48 s par tick. Le prédicat a un lecteur unique,
+    /// [`crate::kg::budget::phase_is_disabled`], dont la doc porte ce que ce
+    /// court-circuit retire et pourquoi.
+    ///
+    /// Au-dessus de zéro, le comportement est inchangé : sur dépassement la
+    /// méthode abandonne proprement, émet un `kg_budget_exhausted` WARN et
+    /// laisse les entités restantes en attente. Les exact matches de Stage-1
+    /// ne consomment pas le budget, donc un budget serré laisse encore
+    /// progresser les entités qui résolvent sans le LLM.
     pub async fn resolve_pending(&self, budget: u32) -> Result<ResolutionStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
+
+        if crate::kg::budget::phase_is_disabled(budget) {
+            return Ok(ResolutionStats::default());
+        }
 
         let pending = self.get_pending_entities(budget).await?;
 
@@ -298,11 +318,11 @@ impl SubjectEntityResolver {
         );
 
         // Batch-start operator-visibility log (#761).
-        let expected_cycles = if budget == 0 {
-            0u32
-        } else {
-            ((pending.len() as u32).saturating_sub(1) / budget).saturating_add(1)
-        };
+        // Le garde `budget == 0` d'avant mika#1833 est retiré plutôt que
+        // conservé : le court-circuit au-dessus rend la branche inatteignable,
+        // et un second site testant le budget nul serait le second lecteur que
+        // `budget::phase_is_disabled` existe pour refuser.
+        let expected_cycles = ((pending.len() as u32).saturating_sub(1) / budget).saturating_add(1);
         info!(
             trace_id = %self.trace_id,
             agent_id = %agent_id,
@@ -1100,10 +1120,15 @@ impl SubjectEntityResolver {
             return Ok(Vec::new());
         }
 
-        // When budget is 0, Stage-2 LLM calls are blocked but Stage-1 exact
-        // matches still proceed for free (documented invariant in CLAUDE.md).
-        // Use a minimal selection limit so we don't load the entire backlog.
-        let effective_budget = if total_budget == 0 { 50 } else { total_budget };
+        // mika#1833 : le repli « budget nul ⇒ sélectionner quand même 50
+        // entités pour laisser passer les exact matches gratuits » est retiré.
+        // C'est lui qui faisait re-sélectionner indéfiniment la même tête de
+        // file — `ORDER BY e.id ASC LIMIT 50`, escalade en Stage-2 à la
+        // confiance modale 0.9, `SkippedBudget`, aucune ligne
+        // `kg_resolutions_log` écrite, donc même tête au tick suivant. Les
+        // appelants court-circuitent désormais avant d'arriver ici, et
+        // `budget::phase_is_disabled` porte le raisonnement complet.
+        let effective_budget = total_budget;
 
         // Single-corpus fast path — skip allocation overhead.
         if self.docs_root_hashes.len() == 1 {
