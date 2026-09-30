@@ -2661,6 +2661,42 @@ _plan_provenance() {
 # provenance is measured before it is described. Same class as mika#2028's
 # fourth false statement, a different site — #2028 fixed the failure callback's
 # guard, never this one.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# mika#2608 phase 2 — CE SITE DÉLÈGUE. IL NE PORTE PLUS DE MOTIF.
+#
+# Le `sed` retiré n'était PAS « strict, ancré » au sens du lecteur unique, et
+# l'écart le plus important va dans le sens de la sûreté : il n'exigeait pas le
+# littéral `docs/plans/`. Un corps portant `> - **Plan:** \`README.md\`` en
+# extrayait `README.md`, `cat-file -t` rendait `blob` (tout dépôt a un README),
+# et la liaison mika#2034 — dont le contrat est la RÉFUTATION, jamais la
+# confirmation — ne trouvait aucun `issue:` dans un README et ne réfutait donc
+# pas. La porte TIRAIT, et le ticket restait bloqué en `already_groomed` de
+# façon permanente : la classe exacte que mika#2034 a ouverte pour fermer
+# (#1887, #2026, tous deux « stranded »). Le lecteur unique exige
+# `docs/plans/`, donc ce faux positif latent est fermé — effet COLLATÉRAL de la
+# migration, nommé plutôt que découvert.
+#
+# Deux autres resserrements, tous deux fail-open pour cette porte : un espace
+# exactement (contre ` *`) et le refus de `../docs/plans/` ou
+# `a/b/docs/plans/`. Un callout que le nouveau lecteur refuse fait que la porte
+# NE TIRE PAS, donc que le grooming procède — la doctrine écrite de cette
+# fonction, appliquée à un changement de tolérance.
+#
+# UN SEUL CANDIDAT, et c'est le cœur de la bascule. `${plan_path#"${repo}/"}`
+# était une seconde implémentation — partielle — de `plan_callout::normalize` ;
+# la préserver (en appelant le canal deux fois, une fois `--raw`) garderait dans
+# bash la moitié de la logique que la migration existe pour retirer. La boucle à
+# deux candidats n'existait que parce que bash devait DEVINER la normalisation.
+# Deux changements de comportement, nommés :
+#   (a) le candidat brut disparaît — sans population : sur la forme nue
+#       `raw == normalized`, et sur la forme préfixée `$sub_repo_dir` est DÉJÀ
+#       la racine du sous-dépôt, donc `mika/docs/plans/x.md` y désignerait
+#       `…/mika/mika/docs/…`, qui n'existe pas. Le candidat brut était mort pour
+#       la seule forme où il différait.
+#   (b) un préfixe de dépôt ÉTRANGER résout désormais (`mika-cloud/docs/…` sur
+#       un ticket de `mika`) — élargissement borné par la liaison mika#2034 :
+#       l'en-tête du plan nommerait `mika-cloud#220`, donc la porte ne tire pas.
 _committed_plan_on_branch() {
     local sub_repo_dir="$1" branch="$2" issue_body="$3" repo="$4"
     # mika#2034: the target issue, optional and defaulted, so the four existing
@@ -2668,11 +2704,24 @@ _committed_plan_on_branch() {
     # neither is available the binding check is skipped rather than guessed —
     # refute on evidence, never on absence (KTD3).
     local issue_num="${5:-${ISSUE_NUM:-}}"
-    local plan_path candidate
+    local plan_path candidate _plan_rc=0
 
-    plan_path=$(printf '%s\n' "$issue_body" \
-        | sed -n 's/^> - \*\*Plan:\*\* *`\([^`]*\)`.*/\1/p' | head -1)
-    [ -n "$plan_path" ] || return 1
+    # Les trois codes du canal (mika#2194). `≥2` est « je n'ai pas pu regarder »
+    # — une population NEUVE, créée par la migration : avant elle il n'y avait
+    # pas de fichier à ne pas pouvoir lire. Elle est fail-open comme le reste de
+    # cette fonction, et le refus est NOMMÉ sur les deux surfaces : stderr, et
+    # `_PLAN_CALLOUT_REFUSAL`, parce que le second appelant de cette fonction
+    # (la composition du `RESULT` d'un groom non convergé) redirige
+    # `2>/dev/null` — sur ce chemin la variable annexée au `RESULT` est la SEULE
+    # surface. Le stderr d'avant-pilote est de toute façon structurellement
+    # perdu sur un dispatch qui réussit (classe mika#2050, Signal M).
+    plan_path=$(_extract_plan_path "$issue_body") || _plan_rc=$?
+    if [ "$_plan_rc" -ge 2 ]; then
+        echo "dispatch-lib: REFUSED (plan-callout, mika#2194) — lecture du callout impossible (code $_plan_rc) dans la porte de grooming ; le grooming procède (mika#2608)" >&2
+        _PLAN_CALLOUT_REFUSAL="lecture du callout impossible (code $_plan_rc) dans _committed_plan_on_branch — la porte de grooming n'a pas tiré, le grooming procède"
+        return 1
+    fi
+    [ "$_plan_rc" -eq 0 ] || return 1
 
     # Fetch the dispatch branch into a BRANCH-NAMED ref, never FETCH_HEAD.
     #
@@ -2692,62 +2741,64 @@ _committed_plan_on_branch() {
     git -C "$sub_repo_dir" fetch --quiet --force origin \
         "refs/heads/${branch}:${gate_ref}" 2>/dev/null || return 1
 
-    # The callout carries two historical shapes: repo-prefixed
-    # (`mika/docs/plans/…`) and repo-relative (`docs/plans/…`). Try both — U3
-    # normalizes new writes, but tickets groomed before it keep the old form.
+    # UN candidat, la forme normalisée rendue par le lecteur unique (mika#2608).
+    # Les deux écritures historiques du callout — préfixée (`mika/docs/plans/…`)
+    # et nue (`docs/plans/…`) — sont toujours LUES, mais elles le sont par
+    # `plan_callout::normalize`, qui retire le premier segment quel qu'il soit.
+    # Le `${plan_path#"${repo}/"}` qui vivait ici ne retirait que le préfixe de
+    # CE dépôt, donc il était à la fois une duplication et un strict
+    # sous-ensemble du lecteur.
     local tmp_plan claimed
-    for candidate in "$plan_path" "${plan_path#"${repo}/"}"; do
-        # `cat-file -e` answers "does this path resolve", which a DIRECTORY also
-        # satisfies — and `git show` on a tree prints a listing, so a callout
-        # naming `docs/plans` would have been read as a plan with no issue
-        # header and fired the gate. Demand a blob (mika#2034, found by the
-        # unbindable-candidate test below).
-        [ "$(git -C "$sub_repo_dir" cat-file -t "${gate_ref}:${candidate}" 2>/dev/null)" = "blob" ] || continue
+    candidate="$plan_path"
 
-        # --- Issue binding (mika#2034). The gate decision. ---
-        #
-        # `_plan_header_refutes_issue` takes a readable path and the candidate
-        # lives in a git object, so materialize it (KTD4). Its contract is
-        # refutation, not confirmation, and it is reused verbatim: a header that
-        # claims nothing does NOT refute. 95 of the 745 plans in docs/plans/
-        # carry no issue marker, and demanding a positive match would strand
-        # every one of them — the false-negative class mika#1421, #1602 and
-        # #1617 were each opened to close.
-        # When the binding cannot be PERFORMED — mktemp fails, `git show` cannot
-        # write the blob — the check must not be silently skipped. Skipping it
-        # fires the gate on an unbound candidate, which is the defect this whole
-        # change exists to close, arrived at by a different road. Decline
-        # instead: an extra grooming costs one dispatch, a strand costs the
-        # ticket. That is this function's stated doctrine ("when in doubt,
-        # returns 1 and grooming runs"), applied to its own failure modes.
-        if [ -n "$issue_num" ]; then
-            tmp_plan=$(mktemp -t mika-gate-plan-XXXXXX.md 2>/dev/null) || {
-                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — mktemp failed, cannot bind the plan to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
-                return 1
-            }
-            if ! git -C "$sub_repo_dir" show "${gate_ref}:${candidate}" > "$tmp_plan" 2>/dev/null \
-               || [ ! -s "$tmp_plan" ]; then
-                echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — could not read the plan blob from ${gate_ref}, cannot bind it to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
-                rm -f "$tmp_plan"
-                return 1
-            fi
-            if _plan_header_refutes_issue "$tmp_plan" "$issue_num"; then
-                claimed=$(_plan_header_claimed_issues "$tmp_plan" | tr '\n' ' ')
-                echo "dispatch_gate_groom_plan_refuted: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — the plan's own header claims issue ${claimed% }, not ${issue_num}; the body callout names a plan belonging to another ticket, so this ticket is NOT groomed and grooming proceeds (mika#2034)" >&2
-                rm -f "$tmp_plan"
-                return 1
-            fi
+    # `cat-file -e` answers "does this path resolve", which a DIRECTORY also
+    # satisfies — and `git show` on a tree prints a listing, so a callout naming
+    # `docs/plans` would have been read as a plan with no issue header and fired
+    # the gate. Demand a blob (mika#2034, found by the unbindable-candidate test
+    # below).
+    [ "$(git -C "$sub_repo_dir" cat-file -t "${gate_ref}:${candidate}" 2>/dev/null)" = "blob" ] || return 1
+
+    # --- Issue binding (mika#2034). The gate decision. ---
+    #
+    # `_plan_header_refutes_issue` takes a readable path and the candidate lives
+    # in a git object, so materialize it (KTD4). Its contract is refutation, not
+    # confirmation, and it is reused verbatim: a header that claims nothing does
+    # NOT refute. 95 of the 745 plans in docs/plans/ carry no issue marker, and
+    # demanding a positive match would strand every one of them — the
+    # false-negative class mika#1421, #1602 and #1617 were each opened to close.
+    # When the binding cannot be PERFORMED — mktemp fails, `git show` cannot
+    # write the blob — the check must not be silently skipped. Skipping it fires
+    # the gate on an unbound candidate, which is the defect this whole change
+    # exists to close, arrived at by a different road. Decline instead: an extra
+    # grooming costs one dispatch, a strand costs the ticket. That is this
+    # function's stated doctrine ("when in doubt, returns 1 and grooming runs"),
+    # applied to its own failure modes.
+    if [ -n "$issue_num" ]; then
+        tmp_plan=$(mktemp -t mika-gate-plan-XXXXXX.md 2>/dev/null) || {
+            echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — mktemp failed, cannot bind the plan to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
+            return 1
+        }
+        if ! git -C "$sub_repo_dir" show "${gate_ref}:${candidate}" > "$tmp_plan" 2>/dev/null \
+           || [ ! -s "$tmp_plan" ]; then
+            echo "dispatch_gate_groom_bind_unavailable: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — could not read the plan blob from ${gate_ref}, cannot bind it to the issue; declining rather than firing on an unbound candidate (mika#2034)" >&2
             rm -f "$tmp_plan"
+            return 1
         fi
+        if _plan_header_refutes_issue "$tmp_plan" "$issue_num"; then
+            claimed=$(_plan_header_claimed_issues "$tmp_plan" | tr '\n' ' ')
+            echo "dispatch_gate_groom_plan_refuted: repo=${repo} issue=${issue_num} branch=${branch} plan=${candidate} — the plan's own header claims issue ${claimed% }, not ${issue_num}; the body callout names a plan belonging to another ticket, so this ticket is NOT groomed and grooming proceeds (mika#2034)" >&2
+            rm -f "$tmp_plan"
+            return 1
+        fi
+        rm -f "$tmp_plan"
+    fi
 
-        # Provenance is NOT measured here: this function runs inside a command
-        # substitution at every call site, so it must keep stdout to the plan
-        # path alone. Callers that describe the plan ask `_plan_provenance` for
-        # it by name.
-        printf '%s' "$candidate"
-        return 0
-    done
-    return 1
+    # Provenance is NOT measured here: this function runs inside a command
+    # substitution at every call site, so it must keep stdout to the plan path
+    # alone. Callers that describe the plan ask `_plan_provenance` for it by
+    # name.
+    printf '%s' "$candidate"
+    return 0
 }
 
 # --- Dispatchable-repo allowlist: shell defense in depth (mika#2062) ---
@@ -3242,7 +3293,33 @@ _set_up_worktree() {
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
-            elif grep -qE -- '^> - \*\*Plan:\*\*' <<<"$ISSUE_BODY"; then
+            elif _extract_plan_path "$ISSUE_BODY" >/dev/null 2>&1; then
+                # mika#2608 phase 2 — CE SITE DÉLÈGUE AUSSI.
+                #
+                # Le `grep -qE` retiré posait une question booléenne de présence,
+                # et le canal y répond SANS une ligne de code neuve : la
+                # distinction 0/1 de `mika plan-callout` EST la réponse. Aucune
+                # sous-commande, aucun drapeau. Le chemin rendu est jeté
+                # (`>/dev/null`) parce que ce site n'en veut pas — il ne décide
+                # rien, il journalise.
+                #
+                # Le code `≥2` est traité comme `1` ICI, et c'est cohérent : les
+                # deux disent « pas de ligne à écrire ». Le refus n'est pas perdu
+                # pour autant — `_extract_plan_path` le nomme déjà sur stderr, et
+                # ce site-là ne décidant rien, il n'a pas de disposition à
+                # inverser. Le `2>&1` ne masque donc pas le diagnostic du canal,
+                # il évite seulement que le refus du canal se mêle à la ligne de
+                # journal que cette branche existe pour écrire.
+                #
+                # La population de cette ligne se RÉTRÉCIT : un callout nommant
+                # autre chose qu'un `docs/plans/` ne l'émet plus. C'est un
+                # changement de JOURNAL seulement, et il va dans le sens de la
+                # justesse — un callout qui ne nomme pas un plan n'est pas un
+                # « stale callout », c'est un callout malformé. Ce site ne devient
+                # PAS une porte et le `elif` garde sa place dans la chaîne :
+                # élargir sa disposition serait un changement de comportement
+                # moteur habillé en migration.
+                #
                 # Grooming is ALLOWED here — the gate correctly declined to fire
                 # because no plan is committed on the branch. But this is not a
                 # first grooming either: the body claims a plan that isn't there
@@ -8910,6 +8987,37 @@ _deliver_callback() {
 # (la réponse est « non ») · ≥2 = je n'ai pas pu regarder. Avant la bascule
 # cette fonction rendait `1` dans les deux derniers cas et l'appelant faisait
 # `|| return 0`, donc une erreur de lecture se lisait comme « pas de plan ».
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# TROIS APPELANTS DEPUIS mika#2608, ET LE FAN-IN N'ENFREINT PAS C2
+#
+#   1. `_detect_plan_on_branch` — « quel fichier ouvrir ? » (phase 1) : résout
+#      `"$WORKTREE_DIR/$PLAN_PATH"` et bascule `ENTRY_COMMAND` sur `/ce-work`.
+#      Traite `≥2` par un refus nommé qui laisse le pilote partir sur `/mika`.
+#   2. `_committed_plan_on_branch` — « quel chemin ce corps nomme-t-il ? »
+#      (phase 2) : le résout contre l'arbre de la branche, le lie au ticket
+#      (mika#2034) et REFUSE le grooming s'il tient. Traite `≥2` en fail-open.
+#   3. le `elif` de `_set_up_worktree` — « ce corps porte-t-il un callout ? »
+#      (phase 2) : une ligne de journal, `dispatch_gate_groom_allowed_stale_callout`.
+#      La distinction 0/1 EST sa réponse booléenne ; il jette le chemin.
+#
+# C2 du § 3 de `docs/architecture/dispatch-lib-migration.md` (« un seul
+# appelant ») est un critère de SÉLECTION d'un maillon à migrer, pas une
+# contrainte sur le fan-in d'un site de délégation déjà migré. Le coût de la
+# preuve de parité croît avec le nombre de MAILLONS, jamais avec le nombre
+# d'appelants d'un lecteur unique — c'est le contraire qui est vrai, chaque
+# appelant de plus étant une copie de moins. Sans cette note, un futur lecteur
+# croirait C2 enfreint et re-dupliquerait le motif pour le « respecter ».
+#
+# COÛT, CHIFFRÉ. Un dispatch dev-groom paie au plus TROIS démarrages de `mika` :
+# l'appelant 2 depuis `_set_up_worktree`, l'appelant 3 sur la branche `elif`,
+# puis l'appelant 2 depuis la composition du `RESULT` d'un groom non convergé.
+# Contre un dispatch qui dure des minutes à des heures, c'est l'arithmétique du
+# § 2 du document de migration. La sonde S3 (le coût réel d'un démarrage, NON
+# mesuré depuis le bac à sable) reste la précondition : si un démarrage dépasse
+# ce que trois tolèrent, c'est le PLACEMENT dans `main.rs` qu'il faut réparer,
+# jamais un cache — un cache sur un prédicat pur est une seconde source de
+# vérité, c'est-à-dire la duplication qu'on vient de retirer.
 _extract_plan_path() {
     local body="$1" tmp path rc=0
 

@@ -93,6 +93,26 @@ double-callout.md	0	mika/docs/plans/first-plan.md	docs/plans/first-plan.md	equal
 minimal-callout.md	0	docs/plans/short.md	docs/plans/short.md	equal	both
 neg-prose-plan-no-dir.md	1	-	-	equal	both
 
+# ── mika#2608 phase 2 — les trois deltas que la bascule des DEUX sites bash
+#    produit. `phase` vaut `both` : ils sont exercés par le lecteur Rust ET par
+#    le bloc bash, y compris par les deux passages de parité PAR SITE.
+#
+#    gate-non-plan-path — le faux positif LATENT que la migration ferme. Le
+#    `sed` de `_committed_plan_on_branch` n'exigeait pas `docs/plans/`, donc
+#    `README.md` extrayait, `cat-file -t` rendait `blob`, la liaison mika#2034
+#    ne réfutait rien (pas d'`issue:` dans un README) et la porte TIRAIT : le
+#    ticket bloqué en `already_groomed` pour toujours. Le lecteur unique refuse.
+#
+#    gate-double-space — resserrement (` *` → un espace exactement). Fail-open
+#    pour la porte : refusé ⇒ elle ne tire pas ⇒ le grooming procède.
+#
+#    gate-foreign-prefix-resolves — le seul ÉLARGISSEMENT (D2b), borné par la
+#    liaison mika#2034. Distinct de `other-repo-prefix.md` par son objet : là le
+#    lecteur, ici ce que le site 1 en fait.
+gate-non-plan-path.md	1	-	-	equal	both
+gate-double-space.md	1	-	-	equal	both
+gate-foreign-prefix-resolves.md	0	mika-skills/docs/plans/2026-09-30-002-fix-2608-prefixe-etranger-plan.md	docs/plans/2026-09-30-002-fix-2608-prefixe-etranger-plan.md	equal	both
+
 # ── Les contrôles négatifs. Élargir au segment de dépôt ne veut pas dire tout
 #    accepter : sans eux, un prédicat devenu permissif passerait le corpus.
 neg-brainstorms.md	1	-	-	equal	both

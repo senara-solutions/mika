@@ -1,4 +1,4 @@
-# Le corpus doré du callout `Plan` — un corpus, deux lecteurs (mika#2120, mika#2194)
+# Le corpus doré du callout `Plan` — un corpus, deux lecteurs (mika#2120, mika#2194, mika#2608)
 
 Les **six premiers** fichiers (`1680.md` … `1949.md`) sont des corps de ticket réels, un
 fichier par ticket, et le **jeu de mesure** de la condition `Plan` de
@@ -67,13 +67,43 @@ n'étaient nommées ni dans le ticket ni dans le plan.**
 retirée — elle ne peut pas devenir périmée en silence. C'est ce qui distingue une exception
 d'un contournement.
 
+## Les trois corps de la phase 2 (mika#2608)
+
+`gate-non-plan-path.md`, `gate-double-space.md` et `gate-foreign-prefix-resolves.md` sont
+ajoutés par la phase 2, qui fait déléguer les **deux derniers lecteurs bash** du callout
+(`_committed_plan_on_branch` et le `elif` de `_set_up_worktree`). Chacun exerce **un** delta
+de tolérance que cette bascule produit, et le nomme dans son propre corps :
+
+| fixture | delta | direction | `rc` |
+|---|---|---|---|
+| `gate-non-plan-path.md` | le littéral `docs/plans/` n'était **pas** exigé par le `sed` | resserre — **ferme un faux positif latent** | `1` |
+| `gate-double-space.md` | ` *` (zéro espace ou plus) devient un espace exactement | resserre — fail-open pour la porte | `1` |
+| `gate-foreign-prefix-resolves.md` | la normalisation ne retirait que le préfixe de **ce** dépôt | **élargit** — borné par la liaison mika#2034 | `0` |
+
+Le premier est le seul dont la fermeture achète quelque chose : un corps portant
+``> - **Plan:** `README.md` `` en extrayait `README.md`, `cat-file -t` rendait `blob` (tout
+dépôt a un README), la liaison mika#2034 — dont le contrat est la **réfutation** — ne
+trouvait aucun `issue:` et ne réfutait pas, donc la porte **tirait** et le ticket restait
+bloqué en `already_groomed` de façon permanente.
+
+`gate-foreign-prefix-resolves.md` ressemble à `other-repo-prefix.md` et en diffère par son
+**objet** : l'un atteste que le *lecteur* accepte n'importe quel segment de tête, l'autre ce
+que le *site 1* en fait — il est exercé par le passage de parité qui appelle
+`_committed_plan_on_branch` contre un clone fixture où le plan est réellement committé.
+
+Les deux passages de parité **par site** que ces corps servent vivent dans le bloc
+« mika#2608 » de `skills/bundled/_shared/test-dispatch-lib.sh`, chacun avec son contrôle
+négatif : la mutation du lecteur du site doit faire **rougir** la parité (11 écarts pour le
+site 1, 6 pour le site 2 — vus rouges à l'implémentation).
+
 ## Provenance — ce qui est mesuré, ce qui est reconstruit
 
 Les fixtures **ajoutées par mika#2194** portent leur provenance dans leur propre corps, en
 tête : `bare-callout.md`, `other-repo-prefix.md`, `double-callout.md`, `minimal-callout.md`,
-les six `neg-*.md`, et les trois fixtures de divergence ci-dessus. Aucune n'est un corps
-d'issue réel — toutes sont **construites pour ce test** ou **rapatriées** du bloc bash à
-fixtures inline, et chacune dit laquelle des deux.
+les six `neg-*.md`, et les trois fixtures de divergence ci-dessus. Celles de **mika#2608**
+(les trois `gate-*.md`) font de même. Aucune n'est un corps d'issue réel — toutes sont
+**construites pour ce test** ou **rapatriées** du bloc bash à fixtures inline, et chacune dit
+laquelle des deux.
 
 Le tableau ci-dessous décrit les **six corps mesurés** de mika#2120.
 

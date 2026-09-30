@@ -6,13 +6,18 @@ in a repository that writes its tickets in French, and NEITHER of the two bites
 mika#2201 cites has produced it yet — which is the whole prospective value of
 the lint rather than a retrospective one.
 
-All three readers of the `Plan` callout are line-anchored and literal:
+Since mika#2194 (phase 1) and mika#2608 (phase 2) there is exactly ONE reader of
+the `Plan` callout, and it is line-anchored and literal:
 
-    auto_pull.rs::PLAN_CALLOUT_RE            (?m)^> - \*\*Plan:\*\* `…`
-    dispatch-lib.sh::_extract_plan_path      grep -oP '^> - \*\*Plan:\*\* `\K…'
-    dispatch-lib.sh::_committed_plan_on_branch  grep -qE '^> - \*\*Plan:\*\*'
+    plan_callout.rs::PLAN_CALLOUT_RE   (?m)^> - \*\*Plan:\*\* `…`
 
-One of these forms makes the ticket invisible to the feeder. mika#2120 measured
+The three bash and Rust readers this fixture used to name — `auto_pull`'s own
+regex, and the two in `dispatch-lib.sh` — all delegate to it now and carry no
+copy. They are deliberately NOT named here any more: a fixture that prescribes a
+dead site is what a future editor copies (class mika#2050, measured twice in this
+repo), and this file's whole job is to be read by someone repairing a lint hit.
+
+The form below makes the ticket invisible to the feeder. mika#2120 measured
 what that costs on a neighbouring axis: `auto_feeder_no_backlog` on every
 ten-minute tick with SIX groomed candidates in front of it, an empty queue for
 over fifteen hours, and the loop stopping precisely when grooming SUCCEEDED.

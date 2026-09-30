@@ -212,6 +212,59 @@ pub fn priority_from_labels(labels: &[String]) -> Option<u8> {
 
 /// Parse whether the issue body carries a `Plan: docs/plans/` callout.
 /// Matches the loose form documented in the milestone-cascade contract.
+///
+/// # Tolérance CONSERVÉE, décidée par mika#2608 (phase 2 de mika#2194)
+///
+/// Ce lecteur est le **quatrième** de la table des tolérances de
+/// [`crate::plan_callout`], et il a été trouvé en implémentant la phase 1, qui
+/// l'a nommé sans le trancher. La phase 2 tranche : **il n'est pas migré.**
+/// Quatre raisons, dans l'ordre de leur force.
+///
+/// ## 1. Un appel au lecteur strict y serait PROUVABLEMENT inerte
+///
+/// C'est l'argument décisif, et il est structurel plutôt que prudentiel. La
+/// première branche ci-dessous est un **sur-ensemble strict** du lecteur unique :
+/// toute ligne que `PLAN_CALLOUT_RE` accepte commence par `> - **Plan:** `, donc,
+/// `trim_start` appliqué, commence par `> ` **et** contient `**Plan:**`. **Il
+/// n'existe aucun corps que le lecteur strict accepte et que cette branche
+/// refuse.**
+///
+/// Conséquence : la réparation tentante — « appeler `plan_callout` en première
+/// branche et garder les branches lâches en repli » — ajouterait un appel qui ne
+/// peut **jamais** décider de rien. Ce serait une unification apparente et
+/// inerte, c'est-à-dire la classe mika#2205 appliquée à un chemin de code : verte,
+/// plausible, et mesurant zéro. La propriété de sur-ensemble est **épinglée par un
+/// test** sur le corpus doré, pas laissée à un raisonnement dans un plan.
+///
+/// ## 2. Ce n'est pas la même question
+///
+/// Le lecteur unique répond « quel chemin, sous quelle forme ? » ; celui-ci
+/// répond « ce corps porte-t-il un callout ? », en booléen, sans rendre de
+/// chemin. Le migrer serait répondre à une autre question.
+///
+/// ## 3. La forme lâche est PRESCRITE
+///
+/// Son contrat est celui de la cascade milestone (la ligne de doc ci-dessus le
+/// dit depuis l'origine), et le dépôt porte un troisième prédicat de la même
+/// famille dans un prompt (`self-dev/system_prompt.md`, sous-chaîne
+/// `Plan: docs/plans/`).
+///
+/// ## 4. Le coût des deux erreurs penche dans le sens sûr
+///
+/// Le manager est **LECTURE seule**, zéro dispatch. `plan_present` alimente un
+/// **rapport à un humain** et `SubIssue::is_in_governed_progress`. Un
+/// resserrement produirait des **faux négatifs** sur un rapport dont l'objet est
+/// de dire à un humain quels sous-tickets restent à groomer — il lui dirait de
+/// groomer un ticket groomé.
+///
+/// # La faiblesse réelle, nommée et NON corrigée
+///
+/// La seconde branche (`> ` + `contains("docs/plans/")`) lit une citation en
+/// prose comme un callout : un blockquote disant « le plan vit dans
+/// `docs/plans/` » rend `true`. C'est un faux positif plausible, et **aucune
+/// mesure ne l'établit**. Suivi nommé, avec sa précondition : un rapport dont
+/// `plan_present` est mesurément faux. Armer un resserrement sur une population
+/// non mesurée est ce que mika#2520 refuse.
 pub fn plan_callout_present(body: &str) -> bool {
     // Canonical callout shape: `> - **Plan:** docs/plans/...`.
     // Loose form: any occurrence of `docs/plans/` in a callout blockquote.
@@ -562,6 +615,108 @@ mod tests {
     fn plan_callout_absent() {
         let body = "No plan here.\nSome plain text mentioning docs/plans/x.md outside a callout.\n";
         assert!(!plan_callout_present(body));
+    }
+
+    /// mika#2608 V11 — la propriété de sur-ensemble de M4, **assertée** plutôt
+    /// que raisonnée dans un plan.
+    ///
+    /// Elle est ce qui rend la décision de ne PAS migrer ce lecteur structurelle :
+    /// si la première branche est un sur-ensemble strict du lecteur unique, alors
+    /// un appel strict-first y serait inerte, et une unification qui ne peut rien
+    /// décider est une unification apparente (classe mika#2205 appliquée à un
+    /// chemin de code).
+    ///
+    /// Mesurée sur le **corpus doré commun** plutôt que sur des corps inventés
+    /// ici : c'est le corpus que les deux lecteurs du callout partagent depuis
+    /// mika#2194, donc le seul endroit où « les mêmes entrées » veut dire quelque
+    /// chose.
+    #[test]
+    fn mika2608_la_branche_lache_est_un_surensemble_du_lecteur_strict() {
+        use crate::plan_callout::{FenceHandling, plan_callout};
+
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/plan_callout_bodies");
+        let mut accepted_by_strict = 0usize;
+
+        let entries = std::fs::read_dir(&corpus)
+            .unwrap_or_else(|e| panic!("corpus doré illisible ({}): {e}", corpus.display()));
+        for entry in entries {
+            let path = entry.expect("entrée de corpus illisible").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue; // README.md est un .md — voir le filtre ci-dessous.
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("README.md") {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("corps illisible ({}): {e}", path.display()));
+
+            // `Keep` : la politique de `dispatch-lib`, donc la moitié dont la
+            // parité était inconnue avant mika#2194. Sous `Strip` la population
+            // acceptée est un sous-ensemble, donc l'assertion serait plus faible.
+            if plan_callout(&body, FenceHandling::Keep).is_some() {
+                accepted_by_strict += 1;
+                assert!(
+                    plan_callout_present(&body),
+                    "{}: le lecteur STRICT accepte ce corps et la branche lâche le refuse — \
+                     la propriété de sur-ensemble de mika#2608 M4 est fausse, donc un appel \
+                     strict-first ici ne serait plus inerte et la décision de ne pas migrer \
+                     ce lecteur doit être reprise",
+                    path.display()
+                );
+            }
+        }
+
+        // Anti-vacuité : un corpus vide, ou un filtre trop large, rendrait cette
+        // assertion verte sans avoir rien comparé.
+        assert!(
+            accepted_by_strict >= 6,
+            "seulement {accepted_by_strict} corps acceptés par le lecteur strict — \
+             le corpus doré en porte au moins six (les six corps mesurés de mika#2120)"
+        );
+    }
+
+    /// mika#2608 V10 — le **pin de décision**. Motif
+    /// `mika2120_divergence_is_still_open_and_this_test_pins_it`.
+    ///
+    /// Il pose la tolérance conservée comme une DÉCISION, de sorte qu'un futur
+    /// éditeur qui « harmonise » ce lecteur vers le strict fasse rougir un test au
+    /// lieu de changer un rapport opérateur en silence. Les deux formes ci-dessous
+    /// sont exactement celles que le lecteur unique refuse et que celui-ci doit
+    /// continuer d'accepter.
+    #[test]
+    fn mika2608_la_tolerance_lache_est_une_decision_epinglee() {
+        use crate::plan_callout::{FenceHandling, plan_callout};
+
+        // (a) Branche 1 : le callout SANS le préfixe `> - ` que le strict exige.
+        let no_dash = "> **Plan:** docs/plans/x.md\n";
+        assert!(
+            plan_callout(no_dash, FenceHandling::Keep).is_none(),
+            "prémisse : le lecteur strict refuse un callout sans `> - `"
+        );
+        assert!(
+            plan_callout_present(no_dash),
+            "mika#2608 D6 : la tolérance de ce lecteur est CONSERVÉE par décision. \
+             Si vous l'avez resserrée pour « harmoniser », lisez le doc-comment de \
+             plan_callout_present : le manager est LECTURE seule, son rapport dit à un \
+             humain quels sous-tickets restent à groomer, et un faux négatif lui dit de \
+             groomer un ticket groomé."
+        );
+
+        // (b) Branche 2 : une citation en PROSE dans un blockquote. C'est la
+        //     faiblesse réelle, nommée et non corrigée (suivi avec précondition).
+        let prose = "> le plan vit dans docs/plans/ quelque part\n";
+        assert!(
+            plan_callout(prose, FenceHandling::Keep).is_none(),
+            "prémisse : le lecteur strict refuse une citation en prose"
+        );
+        assert!(
+            plan_callout_present(prose),
+            "mika#2608 D6 : la branche 2 est le faux positif NOMMÉ de ce lecteur. \
+             Le fermer demande une mesure (un rapport dont `plan_present` est faux), \
+             pas un resserrement — armer un détecteur sur une population non mesurée \
+             est ce que mika#2520 refuse."
+        );
     }
 
     #[test]
