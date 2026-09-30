@@ -197,10 +197,51 @@ mika-agent = { path = "crates/mika-agent" }
 mika-a2a = { path = "crates/mika-a2a" }
 mika-os = { path = "crates/mika-os" }
 
+# Release profile — the two debuginfo clauses are ONE setting (mika#1719).
+#
+# `strip = true` here is what turned a one-line deadlock into four days of gdb
+# archaeology across five outages: every frame of every capture answered `?? ()`,
+# the PIE base had to be recomputed by hand, and three hypotheses were falsified
+# before the real site was named on the fourth day.
+#
+# NEITHER CLAUSE WORKS ALONE, and each one looks like it carries the setting:
+#   - `strip = "none"` alone keeps nothing — a release profile defaults to
+#     `debug = 0`, so there is no debug info to keep and `addr2line` answers `??:0`.
+#   - `debug = "line-tables-only"` alone emits tables that `strip` then removes.
+# A future editor who deletes one will have good reason to believe the other
+# still holds the guarantee. `scripts/check-release-debuginfo.sh` (CI job
+# `release-debuginfo-lint`) is what refuses that, because the regression would
+# otherwise be silent until the next wedge (mika#2205 class).
+#
+# `line-tables-only` rather than `debug = true` (full DWARF, hundreds of MB) or
+# `strip = "debuginfo"` (keeps `.symtab`: names, but no `file:line`). It gives
+# exactly what the July diagnosis needed — a name AND a `file:line`.
+#
+# `split-debuginfo = "packed"` is the AC3 fallback, and it was TAKEN on measurement,
+# not on principle: `line-tables-only` alone weighed 4.20x the stripped reference
+# (36,262,568 -> 152,373,632 bytes), past the 3x threshold. Packed brings it to
+# 2.67x (96,758,664) and moves 51 MB into `target/release/mika-spirit.dwp`.
+#
+# WHAT PACKED MOVES, measured — and it is the opposite of what the plan predicted.
+# It deports `.debug_info` (44.7 MB -> 4.8) and `.debug_str` (20.3 -> 0.4), i.e.
+# types and variables. It KEEPS `.symtab` (1.25 MB) and `.debug_line` (16.6 MB) in
+# the binary — the name half and the file:line half. So the deployed binary stays
+# self-sufficient for reading a wedge, the `.dwp` does NOT need to follow it, and
+# `make install` is deliberately left alone. The `.dwp` is only wanted for a
+# deeper session (inspecting types or locals under gdb); it lives in `target/` on
+# the build host. Worked chain:
+# docs/solutions/infrastructure/1719-symboliser-un-wedge-mika-spirit.md
+#
+# `strip` is never the lever here: putting it back reopens mika#1719 in full.
+#
+# `lto` and `codegen-units` are deliberately untouched: this changes what the
+# binary CARRIES, never how it runs.
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+strip = "none"                # keep what debug emits (mika#1719)
+debug = "line-tables-only"    # emit it in the first place (mika#1719)
+split-debuginfo = "packed"    # AC3 size fallback, taken on measurement (see above)
 
 # Workspace-wide clippy lints (mika#1724 — wedge-class prevention).
 #
