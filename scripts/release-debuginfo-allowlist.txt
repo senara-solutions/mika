@@ -1,0 +1,34 @@
+# Allowlist for scripts/check-release-debuginfo.sh (mika#1719).
+#
+# Format, one per line:
+#
+#     <manifest-basename>:<key>  # why this profile is not diagnosable yet
+#
+# The reason is not decoration. It is what a future reader needs in order to
+# re-audit the profile, and an entry without one is indistinguishable from a
+# forgotten exemption. Name (i) the manifest and the exact key, (ii) a follow-up
+# ticket, (iii) the reason.
+#
+# COMPARED IN BOTH DIRECTIONS. An entry that matches no real violation fails the
+# build exactly as an unlisted violation does. That is the self-cleaning
+# assertion: on the day the profile is repaired, the build goes red and the entry
+# must go — not months later. Without that second direction an exemption
+# outlives its motive and silently exempts a future namesake.
+#
+# THIS LIST IS EMPTY, AND ITS POPULATION IS EMPTY BY CONSTRUCTION. The commit
+# that armed this guard is the commit that set the conforming value, so there was
+# never a pre-existing violation to exempt. That emptiness is pinned by
+# scripts/test-check-release-debuginfo.sh, which fails if a line appears here
+# without the reviewer having seen it.
+#
+# WHEN THE GUARD FIRES, REPAIR THE PROFILE. Do not add a line here. The two
+# clauses are one setting — `strip = "none"` keeps what `debug =
+# "line-tables-only"` emits — and a profile you do not want to make diagnosable
+# is a profile to discuss, not one to exempt (mika#2201 doctrine, "on déclare, on
+# n'allowliste pas").
+#
+# If image size is the reason you are reading this, the lever is
+# `split-debuginfo = "packed"` (a `.dwp` beside a thin binary), NOT the return of
+# `strip = true` — which would reopen mika#1719 in full. Note the `.dwp` must
+# then travel with the binary to whichever machine symbolises: a thin image whose
+# symbols stayed on the build host symbolises nothing.
