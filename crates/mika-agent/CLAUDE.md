@@ -1339,6 +1339,139 @@ Config, the operator surfaces, the four probes (starting with *run in `observe`
 first*) and the four halts: root `CLAUDE.md` § *Optional (purge du `target/` d'un
 worktree vif — mika#2497)*.
 
+### Un hold explicite tient contre `wip_rescue` (mika#2597)
+
+**Le défaut, mesuré le 2026-09-29.** `wip_rescue` a repris une PR maintenue en
+**brouillon de hold**, l'a rebasée puis **sortie du brouillon** — deux fois en
+35 minutes sur PR #2589, la seconde après une remise en draft explicite de
+l'orchestrateur. La Fire-Disposition du plan interdisait la fusion (rebuild
++190 %, au-delà du seuil de renoncement de +50 %). **Le merge autonome n'a été
+empêché que parce que le diff touchait des fichiers decision-core** : sur un
+autre jeu de fichiers la PR était CLEAN et APPROVED. La défense en profondeur a
+tenu par coïncidence de périmètre, pas par conception.
+
+**Le discriminant que le démon n'avait pas.** Un *draft de rescue* est l'état de
+**départ** — `dispatch-lib` fait `gh pr create --draft` — et le promouvoir est la
+raison d'être de mika#1852. Un *draft de hold* est un état **remis après** le
+travail. Les deux se lisent `isDraft: true` et rien ne les séparait.
+
+**Le prédicat ne compare aucun instant, et c'est le cœur.** La timeline d'une PR
+de rescue ne porte **aucun** `ConvertToDraftEvent` à la naissance ; les deux
+seules transitions d'état draft sont `ConvertToDraftEvent` et
+`ReadyForReviewEvent` ; et le listing filtre déjà `--draft`. Donc une PR qui
+porte ≥ 1 `ConvertToDraftEvent` **et** qui est brouillon *maintenant* a
+forcément eu son dernier basculement **vers** le brouillon : c'est un hold.
+Aucune date, aucun ordre, aucune pagination. *Fragilité nommée* : retirer
+`--draft` du listing casse l'équivalence — le sens de la casse est l'inertie, pas
+la violation, et `mika2597_le_listing_filtre_toujours_draft` refuse l'édition.
+
+**Les deux pistes du ticket sont réfutées par le code.** (a) *« un
+`ConvertToDraftEvent` postérieur au dernier push »* s'auto-annule :
+`prepare_branch` **pousse lui-même** en `--force-with-lease` à l'étape 4, avant
+l'un-draft de l'étape 7, dans la même chaîne — le prédicat serait voidé par le
+push du démon en train de violer le hold ; et un push ultérieur ne lève pas une
+décision d'opérateur. (b) *un label porteur* exigerait que l'opérateur apprenne
+un **nouveau** geste alors que celui qui a échoué deux fois est « je remets en
+draft », et il faudrait le déclarer dans `.github/labels.yml` sous peine de
+suppression silencieuse par `delete-other-labels: true` (classe à cinq
+occurrences). `human-review-required` est refusé comme support : il porte **sa
+propre cause** (« le démon a bailé »), et y router un hold d'opérateur
+fusionnerait deux populations que le dépôt compte séparément.
+
+**Le placement EST le livrable.** Le terme vit dans `select_eligible`, en
+**troisième et dernière** exclusion (après le marqueur de bail mika#2199 et le
+marqueur de park mika#2286), **jamais** dans `resume_chain`. Le scan traite au
+plus **un brouillon par tick** (AC6 de mika#1852, cap = 1, le plus vieux
+d'abord) : un hold placé dans la chaîne consommerait ce créneau unique à chaque
+tick, indéfiniment — et un brouillon de hold est *vieux par nature*, donc il
+reste le plus ancien candidat pour toujours. C'est la forme de livelock que
+mika#2199 a mesurée (14 bails sur une PR en six heures) et que mika#2286 a dû
+refermer une seconde fois. Coût : **un** appel GraphQL par tick en régime
+nominal, grâce au court-circuit sur le premier candidat non exclu.
+
+**GraphQL et pas la timeline REST**, qui a pourtant un lecteur maison
+(`ready_label::TimelinePageFetcher`) : c'est mika#2315 qui l'écarte. Son défaut
+B1 mesuré est que REST rend ses événements en ordre **ascendant**, donc un
+événement récent vit en dernière page — d'où sa pagination explicite et son
+plafond de 20 pages. Transposé ici : jusqu'à 20 `gh api` par candidat et par tick
+(cron 5 min). Le `last: 1` retire d'un coup le piège de l'ordre, la pagination et
+le plafond. Réutilisation : `github_graphql::fetch_convert_to_draft_events`, dans
+la forme exacte de `fetch_open_blockers` (même client, même classification
+401/403/429).
+
+**Trois états, jamais un `bool` (`HoldVerdict`).** `NotHeld` (comportement
+d'aujourd'hui, octet pour octet) / `Held { since, actor }` / `Unreadable`. Deux
+des trois excluent et appellent des remèdes **opposés** : l'un dit que le
+mécanisme marche, l'autre que `wip_rescue` est gelé par son propre fail-closed et
+que la cause est le jeton ou l'API. Un booléen ferait lire le second comme le
+premier. **Fail-closed vers « tenu »** — *un terme qu'on ne peut pas lire n'est
+jamais un terme satisfait* (mika#2277), ici appliqué au terme « ce brouillon
+n'est **pas** tenu ». C'est aussi la politique **uniforme** du module :
+`has_bailed_marker`, `has_parked_marker`, `classify_route` et
+`fresh_pipeline_verified` sont tous les quatre fail-closed. Coût nommé : une
+panne durable de l'API GitHub gèle `wip_rescue` en entier, d'où le nom
+d'événement distinct pour l'inertie.
+
+**Pas de filtre d'acteur machine, et c'est une décision.** mika#2315 en porte un
+parce que son propre `remove → add` se parquerait lui-même ; ici **aucun** chemin
+n'écrit de `ConvertToDraftEvent`, donc le terme aurait une population vide — et
+si une machine s'y mettait, lire son geste comme un hold est le sens **sûr**.
+L'acteur et l'instant sont **rapportés** sur la ligne d'observabilité sans rien
+décider, ce qui rend visible le jour où cette population cesse d'être vide.
+
+**Sortie du hold : aucun geste à apprendre, aucun état à nettoyer.** L'opérateur
+sort la PR du brouillon ; elle quitte le listing `--draft` et donc la population
+entière. Le hold n'existe que tant que la PR *est* un brouillon — il se lève de
+lui-même, comme le park de mika#2315. C'est ce qui distingue ce remède d'un
+marqueur durable : il n'y a rien à effacer.
+
+**Deux noms, comptables séparément.** `wip_rescue_hold_respected` (INFO + ligne
+d'audit, **régime attendu non vide** — chaque ligne est un hold que le démon n'a
+pas violé) et `wip_rescue_hold_unreadable` (WARN + ligne d'audit, **régime
+attendu vide**). Motif `phantom_aged_out` / `phantom_sweep_spared` (mika#2156) :
+les fondre ferait lire une panne comme un succès. Dédupliqués par `(PR, motif)`
+sur 24 h — un hold est un **état**, pas un événement, et un brouillon tenu trois
+semaines écrirait sinon 288 lignes/jour (doctrine mika#2131, forme exacte de
+`worktree_reap_skipped`). La clé porte le motif après un `@`, ce qui rend un
+`LIKE` de préfixe sûr (mika#2361 : `#234` ne doit pas apparier `#2343`). La ligne
+INFO suit la **même** porte que la ligne d'audit, comme chez son voisin
+`worktree_reaper::record_main_checkout_dirty` — coût nommé : une base illisible
+est aussi un hold non rapporté, ce qui est un incident en soi et ne change
+**jamais** la décision.
+
+**Deux scans de source, allowlists livrées vides.**
+`mika2597_un_seul_site_dundraft_en_production` refuse un second `gh pr ready` en
+production — aucun test comportemental ne peut voir cette classe : un second site
+ne rend **aucune** décision fausse le jour où il est écrit, toutes les assertions
+restent vertes pendant qu'un chemin un-drafte sans consulter le hold. L'aiguille
+est cherchée sur une source **normalisée en espaces**, donc rustfmt ne peut pas
+la cacher ; `validate_pr_ready_undraft_scope` (mika#1682) compare
+`verb == "ready"` à une variable et sort de la population **par sa forme**, pas
+par une exemption. Quand il tire, **on route le nouveau site par la garde ; on
+n'ajoute pas de ligne** (doctrine mika#2201).
+`mika2597_le_listing_filtre_toujours_draft` épingle la prémisse ci-dessus.
+
+**Le contrôle négatif V3 est porteur** : sans lui, « la garde décide » est
+indistinguable de « la garde bloque tout », et le mécanisme mika#1852 pourrait
+être mort avec tous les tests au vert. Chaque terme a été vu **rouge par
+mutation**, un à la fois — une conjonction de termes fail-safe ne se prouve pas
+en les neutralisant tous ensemble (leçon mika#2277).
+
+**Ce que ce travail ne fait PAS.** Il ne rattrape pas l'incident fondateur :
+mika#2589 a été sortie du brouillon deux fois et **rien ici ne réécrit une ligne
+d'audit datée d'un hold qu'on n'a pas observé** — la sonde est la **prochaine**
+occurrence. Il ne ferme pas le chemin `gh pr ready` d'un modèle sur une PR **hors
+signature `wip-rescue`** : mika#1682 le couvre déjà sur la population mesurée
+(#2589 porte le label), et l'élargir coûterait un appel timeline sur *chaque*
+`gh pr ready` pour une population dont aucune violation n'est mesurée — armer un
+détecteur sur du vide est ce que mika#2520 refuse (**suivi nommé**, précondition
+écrite). Il ne retire pas le palliatif à trois couches, et il ne touche pas le
+bypass admin de l'identité du pilote — les deux moitiés tombent séparément.
+Aucune valeur de réglage ne bouge, aucune migration, aucune variable neuve.
+
+Surfaces opérateur, régimes attendus, sondes et haltes : racine `CLAUDE.md`
+§ Signal N.
+
 ### Unknown-Trigger Veto Lift (mika#2337)
 
 **The failure this closes is a veto, not a missing wire.** A `run_skill` recurrence
