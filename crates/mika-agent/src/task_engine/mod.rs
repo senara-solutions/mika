@@ -26,7 +26,8 @@ use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
 use chrono::Timelike;
 use std::path::Path;
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 /// Prune completed/failed/cancelled/expired tasks older than 30 days at startup
 /// to prevent unbounded DB growth.
@@ -35,6 +36,177 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
     const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
     if let Err(e) = db.prune_completed_tasks(THIRTY_DAYS_SECS).await {
         warn!("Failed to prune completed tasks: {}", e);
+    }
+}
+
+/// Événement de journal (INFO) : une tentative > 1 a abouti (mika#2601).
+///
+/// **Régime attendu : NON VIDE, faible.** Chaque ligne est un enregistrement
+/// que l'ancien code perdait jusqu'au redémarrage suivant — c'est la mesure
+/// directe que le réessai mord. Sans elle, « aucune contention n'a eu lieu »
+/// (le bon état) et « le classifieur est inerte » rendent des octets
+/// identiques : la classe mika#2205, que ce dépôt a payée quatre fois.
+pub(crate) const RECURRING_REGISTRATION_RETRIED_EVENT: &str = "recurring_registration_retried";
+
+/// Événement de journal (ERROR) : le budget est épuisé, l'enregistrement est
+/// perdu jusqu'au prochain redémarrage (mika#2601).
+///
+/// **Régime attendu : VIDE.** ERROR et non WARN parce que la conséquence n'est
+/// **pas rattrapable** : aucune ligne n'a été créée donc rien ne tire, le
+/// balayage des 60 ticks ne réenregistre aucune récurrente, et
+/// `mika tasks rearm <label>` exige une ligne **morte** — il refuse
+/// `RearmError::NoDeadRow`, « a rearm never creates a recurrence ex nihilo ».
+/// Un WARN convient à ce qui se répare tout seul, pas à un scan mort jusqu'au
+/// prochain redémarrage.
+pub(crate) const RECURRING_REGISTRATION_FAILED_EVENT: &str = "recurring_registration_failed";
+
+/// Trois tentatives, entrecoupées de 250 ms puis 1000 ms (mika#2601).
+///
+/// **Chaque tentative porte déjà les 5 s de `busy_timeout` de la connexion**
+/// (`Database::open`), donc ce compte est un multiplicateur sur une unité de
+/// 5 s, pas sur rien :
+///
+/// - régime nominal (verrou libre)  : 0 ms ajouté, une tentative ;
+/// - le cas mesuré (un pic)         : ≤ 5,25 s, deuxième tentative servie ;
+/// - pire cas par label             : 3 × 5 s + 1,25 s ≈ 16,25 s.
+///
+/// Pire cas sur un démarrage à 4 agents × 7 labels : ≈ 7 min 35 s, contre
+/// ≈ 2 min 20 s aujourd'hui — et aujourd'hui les scans meurent pour 24 h. Un
+/// démarrage de sept minutes est bruyant par lui-même, et chaque label produit
+/// une ligne ERROR.
+///
+/// **Ce budget absorbe un pic ; il ne peut pas survivre à un `VACUUM`**, et il
+/// faut le dire plutôt que de le laisser découvrir. Un verrou tenu 60 s ferait
+/// échouer les trois tentatives de chaque label — on aurait payé sept minutes
+/// pour rien. Le choix est donc délibéré : *absorber le pic à bas coût,
+/// abandonner fort*. La population mesurée est **un** label par redémarrage,
+/// c'est-à-dire un pic ; la sonde S3 est ce qui distingue les deux régimes, et
+/// la cause-racine du régime soutenu a son propre suivi.
+const PRODUCTION_ATTEMPTS: u32 = 3;
+const PRODUCTION_BACKOFFS: [Duration; 2] =
+    [Duration::from_millis(250), Duration::from_millis(1000)];
+
+/// Budget de réessai de l'enregistrement d'une récurrente (mika#2601).
+///
+/// Injectable pour que le contrôle négatif d'AC3 emprunte le **même chemin de
+/// code** que la production, au lieu d'en simuler un — idiome maison des points
+/// d'entrée `*_with_deadline` réservés aux tests. Délibérément **pas** de
+/// variable d'environnement (D1) : précédent `GH_AUTH_PROBE_TIMEOUT`, et un `0`
+/// sur un budget de réessai serait un désarmement silencieux d'un filet de
+/// sûreté.
+#[derive(Debug, Clone)]
+pub(crate) struct RecurringRetryPolicy {
+    /// Nombre total de tentatives, réessais compris. Toujours ≥ 1.
+    attempts: u32,
+    /// Attente après la n-ième tentative ratée. Une liste plus courte que
+    /// `attempts - 1` réutilise sa dernière valeur ; vide signifie aucune
+    /// attente.
+    backoffs: Vec<Duration>,
+}
+
+impl RecurringRetryPolicy {
+    /// La politique en vigueur au démarrage : voir [`PRODUCTION_ATTEMPTS`].
+    pub(crate) fn production() -> Self {
+        Self {
+            attempts: PRODUCTION_ATTEMPTS,
+            backoffs: PRODUCTION_BACKOFFS.to_vec(),
+        }
+    }
+
+    // NOTE: aucun constructeur réservé aux tests ici, et aucun attribut de
+    // compilation conditionnelle dans cet `impl`. Les scans de source de ce
+    // dépôt tronquent chaque fichier au **premier** marqueur de module de
+    // test textuel, indentation comprise ; un attribut posé ici couperait le
+    // fichier AVANT `ensure_recurring_task` et rendrait le scan R-8 aveugle
+    // sur sa propre cible — en se lisant comme un arbre propre (classe
+    // mika#2103 / mika#2205). Ce commentaire évite lui-même d'écrire la
+    // séquence littérale, pour la même raison (faux positif mika#2050).
+    // Le constructeur à une tentative vit donc dans `mod tests`, qui voit ces
+    // champs privés en tant que module descendant.
+
+    /// Attente à observer après la tentative `attempt` (1-indexée) ratée.
+    fn backoff_after(&self, attempt: u32) -> Duration {
+        let idx = attempt.saturating_sub(1) as usize;
+        self.backoffs
+            .get(idx)
+            .or_else(|| self.backoffs.last())
+            .copied()
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// Ce qu'une boucle de réessai a consommé, quelle que soit son issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryReport {
+    /// Tentatives réellement effectuées (≥ 1).
+    pub attempts: u32,
+    /// Somme des backoffs réellement dormis.
+    pub waited: Duration,
+}
+
+/// L'enregistrement n'a pas pris et le budget est épuisé (mika#2601).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "recurring task `{label}` was not registered after {} attempt(s) \
+     ({} ms of backoff, busy={busy}): {error}",
+    .report.attempts,
+    .report.waited.as_millis()
+)]
+pub(crate) struct RegistrationFailure {
+    pub label: String,
+    pub report: RetryReport,
+    /// L'échec était-il de la contention ? `false` signifie **un autre
+    /// défaut** : c'est `error` qu'il faut lire, pas le budget qu'il faut
+    /// rallonger.
+    pub busy: bool,
+    pub error: anyhow::Error,
+}
+
+/// Rejoue `op` tant que son erreur est une contention SQLite et que le budget
+/// reste (mika#2601).
+///
+/// Écrit sur un `Result` **générique** plutôt que sur « busy uniquement »
+/// délibérément : c'est ce qui rend « une erreur non-busy n'est pas rejouée »
+/// une propriété de cette fonction, testable sans base, plutôt qu'une
+/// conséquence de ce que son appelant veut bien lui passer.
+async fn retry_on_busy<F, Fut>(
+    policy: &RecurringRetryPolicy,
+    mut op: F,
+) -> Result<RetryReport, (RetryReport, bool, anyhow::Error)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut waited = Duration::ZERO;
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Ok(()) => {
+                return Ok(RetryReport {
+                    attempts: attempt,
+                    waited,
+                });
+            }
+            Err(e) => {
+                let busy = crate::db::is_sqlite_busy(&e);
+                if !busy || attempt >= policy.attempts.max(1) {
+                    return Err((
+                        RetryReport {
+                            attempts: attempt,
+                            waited,
+                        },
+                        busy,
+                        e,
+                    ));
+                }
+                let backoff = policy.backoff_after(attempt);
+                if !backoff.is_zero() {
+                    tokio::time::sleep(backoff).await;
+                    waited += backoff;
+                }
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -51,12 +223,117 @@ pub async fn prune_old_tasks(db: &AsyncDatabase) {
 /// reverts it before re-registering. Terminal failures (`failed` / `expired`)
 /// keep blocking through the mika#1742 refuse-to-zombie guard — only the
 /// deliberate `cancelled` state is cleared here.
+///
+/// **Depuis mika#2601 l'enregistrement réessaie sous contention SQLite.** La
+/// signature publique est inchangée, donc les huit sites d'appel ont un diff
+/// nul : le ticket porte sur le réessai, pas sur la forme des appelants.
 pub async fn ensure_recurring_task(
     db: &AsyncDatabase,
     label: &str,
     cron_expr: &str,
     action_config: &str,
 ) {
+    let _ = ensure_recurring_task_with_policy(
+        db,
+        label,
+        cron_expr,
+        action_config,
+        &RecurringRetryPolicy::production(),
+    )
+    .await;
+}
+
+/// [`ensure_recurring_task`] avec son budget de réessai explicite (mika#2601).
+///
+/// **L'unité réessayée est l'enregistrement ENTIER**, et c'est son idempotence
+/// qui l'autorise plutôt qu'un raisonnement sur une écriture partielle :
+/// `revert_config_cancel_recurring_task` exclut par son `WHERE` les lignes
+/// portant déjà le marqueur (second passage ⇒ `n = 0`) ;
+/// `create_recurring_task_if_absent` est deux `SELECT` puis un
+/// `INSERT OR IGNORE`, en autocommit, **l'écriture en dernier**, donc un échec
+/// laisse la base intacte ; `update_recurring_task_cron` est un `UPDATE` vers
+/// une valeur fixe.
+pub(crate) async fn ensure_recurring_task_with_policy(
+    db: &AsyncDatabase,
+    label: &str,
+    cron_expr: &str,
+    action_config: &str,
+    policy: &RecurringRetryPolicy,
+) -> Result<(), RegistrationFailure> {
+    let outcome = retry_on_busy(policy, || {
+        register_recurring_task_once(db, label, cron_expr, action_config)
+    })
+    .await;
+
+    match outcome {
+        Ok(report) => {
+            if report.attempts > 1 {
+                info!(
+                    event = RECURRING_REGISTRATION_RETRIED_EVENT,
+                    agent_id = %db.agent_id(),
+                    label,
+                    cron = cron_expr,
+                    attempts = report.attempts,
+                    waited_ms = report.waited.as_millis() as u64,
+                    "recurring task registration succeeded after retrying under SQLite contention"
+                );
+            }
+            Ok(())
+        }
+        Err((report, busy, error)) => {
+            error!(
+                event = RECURRING_REGISTRATION_FAILED_EVENT,
+                agent_id = %db.agent_id(),
+                label,
+                cron = cron_expr,
+                attempts = report.attempts,
+                waited_ms = report.waited.as_millis() as u64,
+                busy,
+                error = %error,
+                "recurring task registration LOST — nothing will fire this label \
+                 until the next restart (mika#2601)"
+            );
+            Err(RegistrationFailure {
+                label: label.to_string(),
+                report,
+                busy,
+                error,
+            })
+        }
+    }
+}
+
+/// Une tentative d'enregistrement (mika#2601).
+///
+/// **Une règle, un classifieur, quatre sites :** *une erreur busy avorte la
+/// tentative (donc l'enregistrement entier est rejoué) ; toute autre erreur
+/// garde la disposition d'aujourd'hui.* C'est un sur-ensemble strict du
+/// comportement antérieur — aucune régression possible sur les erreurs
+/// non-busy, qui continuent d'être avalées exactement comme avant.
+///
+/// **Son nom ne doit pas se terminer par celui de l'API publique suivi d'une
+/// parenthèse ouvrante, et ce n'est pas une préférence de style.** La garde de
+/// classe mika#2337 recense les *sites d'enregistrement* en cherchant ce motif
+/// **en sous-chaîne** sur le texte brut de l'arbre, puis exige que le 4ᵉ
+/// argument de chaque site soit un littéral — c'est ainsi qu'elle lit le
+/// trigger déclaré et vérifie qu'il a un bras dans `dispatch_run_skill`. Un
+/// helper nommé `try_` + le nom public est apparié par cette sous-chaîne : sa
+/// **définition** est écartée (la garde saute les lignes portant `fn `) mais
+/// **son appel** ne l'est pas, et il passe son `action_config` en *variable*
+/// par construction — donc la garde halte en nommant un enregistrement dont
+/// elle ne peut pas lire le destinataire. Renommer est le seul remède :
+/// déplacer ce helper dans un autre fichier n'y change rien, la garde balayant
+/// tout `src/` et non le seul `task_engine/mod.rs` que son message cite.
+/// Le vocabulaire retenu est donc celui de la primitive de base
+/// (`create_recurring_task_if_absent`), jamais celui de l'API publique.
+async fn register_recurring_task_once(
+    db: &AsyncDatabase,
+    label: &str,
+    cron_expr: &str,
+    action_config: &str,
+) -> anyhow::Result<()> {
+    let agent_id = db.agent_id.clone();
+
     // mika#2271: knob-off cancelled this label; the caller now says it must run.
     // Clear the config-cancel veto so the mika#1742 guard doesn't refuse the
     // re-registration below.
@@ -64,17 +341,20 @@ pub async fn ensure_recurring_task(
         Ok(0) => {}
         Ok(n) => {
             info!(
+                agent_id = %agent_id,
                 label,
                 rows = n,
                 "reverted config cancel on recurring task (mika#2271)"
             )
         }
-        Err(e) => warn!(label, error = %e, "failed to revert config cancel on recurring task"),
+        Err(e) if crate::db::is_sqlite_busy(&e) => return Err(e),
+        Err(e) => {
+            warn!(agent_id = %agent_id, label, error = %e, "failed to revert config cancel on recurring task")
+        }
     }
 
-    let agent_id = db.agent_id.clone();
     let task = NewTask {
-        agent_id,
+        agent_id: agent_id.clone(),
         team_run_id: None,
         parent_task_id: None,
         depth: 0,
@@ -99,37 +379,56 @@ pub async fn ensure_recurring_task(
     };
 
     match db.create_recurring_task_if_absent(task).await {
-        Ok(Some(id)) => info!(label, task_id = %id, cron = cron_expr, "registered recurring task"),
+        Ok(Some(id)) => {
+            info!(agent_id = %agent_id, label, task_id = %id, cron = cron_expr, "registered recurring task")
+        }
         Ok(None) => {
             // Task already exists — check if the cron expression changed.
-            if let Ok(Some(existing_cron)) = db.get_recurring_task_cron(label).await {
-                if existing_cron != cron_expr {
-                    let now = crate::timestamp::now();
-                    match cron::next_fire_from_cron(cron_expr, &now) {
-                        Ok(next_fire) => {
-                            match db
-                                .update_recurring_task_cron(label, cron_expr, &next_fire)
-                                .await
-                            {
-                                Ok(_) => {
-                                    info!(label, old_cron = %existing_cron, new_cron = cron_expr, "updated recurring task cron")
-                                }
-                                Err(e) => {
-                                    warn!(label, error = %e, "failed to update recurring task cron")
+            match db.get_recurring_task_cron(label).await {
+                Ok(Some(existing_cron)) => {
+                    if existing_cron != cron_expr {
+                        let now = crate::timestamp::now();
+                        match cron::next_fire_from_cron(cron_expr, &now) {
+                            Ok(next_fire) => {
+                                match db
+                                    .update_recurring_task_cron(label, cron_expr, &next_fire)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        info!(agent_id = %agent_id, label, old_cron = %existing_cron, new_cron = cron_expr, "updated recurring task cron")
+                                    }
+                                    Err(e) if crate::db::is_sqlite_busy(&e) => return Err(e),
+                                    Err(e) => {
+                                        warn!(agent_id = %agent_id, label, error = %e, "failed to update recurring task cron")
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                warn!(agent_id = %agent_id, label, cron = cron_expr, error = %e, "failed to compute next fire time for updated cron")
+                            }
                         }
-                        Err(e) => {
-                            warn!(label, cron = cron_expr, error = %e, "failed to compute next fire time for updated cron")
-                        }
+                    } else {
+                        debug!(agent_id = %agent_id, label, "recurring task already registered, skipping");
                     }
-                } else {
-                    debug!(label, "recurring task already registered, skipping");
+                }
+                // Une ligne sans cron lisible : rien à comparer, rien à dire.
+                Ok(None) => {}
+                Err(e) if crate::db::is_sqlite_busy(&e) => return Err(e),
+                // Ce bras était ENTIÈREMENT muet avant mika#2601 (`if let
+                // Ok(Some(..))`) : un cron qui ne se relit pas se lisait comme
+                // un cron en phase.
+                Err(e) => {
+                    warn!(agent_id = %agent_id, label, error = %e, "failed to read recurring task cron")
                 }
             }
         }
-        Err(e) => warn!(label, error = %e, "failed to register recurring task"),
+        Err(e) if crate::db::is_sqlite_busy(&e) => return Err(e),
+        Err(e) => {
+            warn!(agent_id = %agent_id, label, error = %e, "failed to register recurring task")
+        }
     }
+
+    Ok(())
 }
 
 /// Pourquoi `mika tasks rearm` a refusé (mika#2446 R-4/R-5).
@@ -625,6 +924,293 @@ mod tests {
         assert_eq!(
             statuses_for(&db, "zorglub_scan").await,
             vec!["failed".to_string()]
+        );
+    }
+
+    // ── mika#2601 — la boucle de réessai sous contention (V2) ───────────
+    //
+    // Unitaire, sans base : `retry_on_busy` est écrit sur un `Result`
+    // générique précisément pour que « une erreur non-busy n'est pas
+    // rejouée » soit une propriété de la fonction et non de son appelant.
+
+    /// Une seule tentative, aucune attente — le comportement d'avant
+    /// mika#2601, utilisé par le contrôle négatif d'AC3.
+    ///
+    /// Vit ici plutôt que dans l'`impl` de production : voir la note à cet
+    /// endroit, un `#[cfg(test)]` indenté y tronquerait les scans de source.
+    impl RecurringRetryPolicy {
+        fn single_attempt() -> Self {
+            Self {
+                attempts: 1,
+                backoffs: Vec::new(),
+            }
+        }
+    }
+
+    fn busy_err() -> anyhow::Error {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        ))
+    }
+
+    fn not_busy_err() -> anyhow::Error {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL),
+            Some("NOT NULL constraint failed".to_string()),
+        ))
+    }
+
+    /// Réessaie sous busy, s'arrête au premier `Ok`, et `waited_ms` est bien
+    /// la somme des backoffs réellement dormis.
+    #[tokio::test(start_paused = true)]
+    async fn mika2601_la_boucle_reessaie_sous_busy_et_sarrete_au_premier_ok() {
+        let policy = RecurringRetryPolicy::production();
+        let calls = std::cell::Cell::new(0u32);
+
+        let report = retry_on_busy(&policy, || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move { if n < 2 { Err(busy_err()) } else { Ok(()) } }
+        })
+        .await
+        .expect("la deuxième tentative aboutit");
+
+        assert_eq!(calls.get(), 2, "exactement deux tentatives");
+        assert_eq!(report.attempts, 2);
+        assert_eq!(
+            report.waited, PRODUCTION_BACKOFFS[0],
+            "un seul backoff dormi : celui qui suit la première tentative"
+        );
+    }
+
+    /// **Contrôle négatif porteur.** Une erreur qui n'est pas de la
+    /// contention ne doit pas être rejouée — sinon « la boucle réessaie sous
+    /// busy » serait indistinguable de « la boucle réessaie tout ».
+    #[tokio::test(start_paused = true)]
+    async fn mika2601_une_erreur_non_busy_nest_jamais_rejouee() {
+        let policy = RecurringRetryPolicy::production();
+        let calls = std::cell::Cell::new(0u32);
+
+        let (report, busy, _err) = retry_on_busy(&policy, || {
+            calls.set(calls.get() + 1);
+            async move { Err(not_busy_err()) }
+        })
+        .await
+        .expect_err("une erreur non-busy est rendue telle quelle");
+
+        assert_eq!(calls.get(), 1, "une seule tentative, aucun réessai");
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.waited, Duration::ZERO);
+        assert!(!busy, "l'échec doit être rapporté comme non-contention");
+    }
+
+    /// Le budget est borné : après N tentatives busy, on abandonne — et
+    /// `waited` porte la somme des deux backoffs.
+    #[tokio::test(start_paused = true)]
+    async fn mika2601_le_budget_est_borne_et_labandon_est_date() {
+        let policy = RecurringRetryPolicy::production();
+        let calls = std::cell::Cell::new(0u32);
+
+        let (report, busy, _err) = retry_on_busy(&policy, || {
+            calls.set(calls.get() + 1);
+            async move { Err(busy_err()) }
+        })
+        .await
+        .expect_err("trois tentatives busy épuisent le budget");
+
+        assert_eq!(calls.get(), PRODUCTION_ATTEMPTS);
+        assert_eq!(report.attempts, PRODUCTION_ATTEMPTS);
+        assert!(busy, "l'abandon doit être attribué à la contention");
+        assert_eq!(
+            report.waited,
+            PRODUCTION_BACKOFFS[0] + PRODUCTION_BACKOFFS[1],
+            "les deux backoffs ont été dormis, et pas un troisième"
+        );
+    }
+
+    /// Une politique à une seule tentative ne dort jamais — c'est le
+    /// comportement d'avant mika#2601, et le contrôle négatif d'AC3.
+    #[tokio::test(start_paused = true)]
+    async fn mika2601_une_politique_a_une_tentative_ne_reessaie_pas() {
+        let policy = RecurringRetryPolicy::single_attempt();
+        let calls = std::cell::Cell::new(0u32);
+
+        let (report, busy, _err) = retry_on_busy(&policy, || {
+            calls.set(calls.get() + 1);
+            async move { Err(busy_err()) }
+        })
+        .await
+        .expect_err("aucun réessai disponible");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.waited, Duration::ZERO);
+        assert!(busy);
+    }
+
+    // ── mika#2601 — AC3 : contention réelle, deux agents (V3) ───────────
+
+    /// Ouvre une base **sur fichier** et abaisse son `busy_timeout`.
+    ///
+    /// **Pourquoi l'abaisser, et il faut le dire :** sans ça les 5 s de
+    /// production absorberaient les ~600 ms de verrou et **le réessai ne
+    /// serait pas exercé du tout** — il faudrait tenir le verrou > 5 s, soit
+    /// un test de six secondes sur chaque `cargo test`. Ce que ce montage
+    /// mesure est le *mécanisme* (une erreur busy est classée, réessayée, et
+    /// l'enregistrement atterrit) ; l'arithmétique de production vit dans le
+    /// doc-comment de [`PRODUCTION_ATTEMPTS`], pas ici.
+    async fn open_registrant(path: &std::path::Path, agent_id: &str) -> AsyncDatabase {
+        let db = Database::open(path).expect("ouverture de la base de test");
+        // `PRAGMA busy_timeout = N` REND UNE LIGNE : `execute_sql` (qui passe
+        // par `Connection::execute`) échouerait sur `ExecuteReturnedResults`.
+        db.query_scalar::<i64>("PRAGMA busy_timeout = 200", &[])
+            .expect("le pragma doit se poser");
+        let handle = AsyncDatabase::new_with_agent(db, agent_id);
+        // **Obligatoire, et hors contention.** `tasks.agent_id REFERENCES
+        // agents(id)` et la migration ne seede que `'mika'` ; or
+        // `create_recurring_task_if_absent` insère en `INSERT OR IGNORE`, qui
+        // **avale une violation de FK** et rend `Ok(None)` — indistinguable de
+        // « la ligne existait déjà ». Sans cet enregistrement le montage
+        // mesurerait une FK manquante en croyant mesurer un verrou.
+        handle
+            .register_agent(agent_id, agent_id, "")
+            .await
+            .expect("enregistrement de l'agent de test");
+        handle
+    }
+
+    /// Prend le verrou d'écriture pour `hold`, puis le relâche.
+    ///
+    /// En WAL les deux `SELECT` de `create_recurring_task_if_absent`
+    /// **aboutissent** (les lecteurs ne sont pas bloqués) et l'échec tombe sur
+    /// l'`INSERT` — très exactement la forme mesurée en production.
+    ///
+    /// **Rend la main une fois le verrou RÉELLEMENT pris.** Sans ce
+    /// rendez-vous, le registrant court contre le `BEGIN IMMEDIATE` du thread
+    /// et peut écrire avant lui : le test passerait alors sans avoir jamais
+    /// rencontré de contention, c'est-à-dire en ne mesurant rien.
+    fn hold_write_lock(path: std::path::PathBuf, hold: Duration) -> std::thread::JoinHandle<()> {
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(&path).expect("connexion du bloqueur");
+            conn.execute_batch("PRAGMA journal_mode = WAL;")
+                .expect("wal");
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .expect("le bloqueur prend le verrou d'écriture");
+            acquired_tx.send(()).expect("signal de prise du verrou");
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT;")
+                .expect("relâchement du verrou");
+        });
+        acquired_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("le bloqueur doit avoir pris le verrou avant qu'on enregistre");
+        handle
+    }
+
+    async fn active_recurring_labels(db: &AsyncDatabase, label: &str) -> Vec<String> {
+        db.get_tasks_by_status(vec!["recurring_active".to_string()])
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.label == label && t.agent_id == db.agent_id)
+            .map(|t| t.agent_id)
+            .collect()
+    }
+
+    /// AC3 — deux agents enregistrent concurremment pendant qu'un tiers tient
+    /// le verrou d'écriture ; les deux doivent finir `recurring_active`.
+    #[tokio::test]
+    async fn mika2601_un_enregistrement_concurrent_sous_verrou_aboutit_pour_chaque_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mika.db");
+        // Première ouverture : migration, hors contention.
+        drop(Database::open(&path).expect("migration initiale"));
+
+        // Les deux registrants sont ouverts et enregistrés AVANT que le verrou
+        // soit pris : ce qu'on met sous contention est l'enregistrement de la
+        // récurrente, rien d'autre.
+        let db_a = open_registrant(&path, "agent-a").await;
+        let db_b = open_registrant(&path, "agent-b").await;
+        let blocker = hold_write_lock(path.clone(), Duration::from_millis(600));
+        let policy = RecurringRetryPolicy::production();
+
+        let (ra, rb) = tokio::join!(
+            ensure_recurring_task_with_policy(
+                &db_a,
+                FEEDER_LABEL,
+                FEEDER_CRON,
+                FEEDER_CONFIG,
+                &policy
+            ),
+            ensure_recurring_task_with_policy(
+                &db_b,
+                FEEDER_LABEL,
+                FEEDER_CRON,
+                FEEDER_CONFIG,
+                &policy
+            ),
+        );
+        blocker.join().expect("le bloqueur se termine");
+
+        assert!(
+            ra.is_ok(),
+            "agent-a : l'enregistrement doit aboutir — {:?}",
+            ra.err().map(|e| e.to_string())
+        );
+        assert!(
+            rb.is_ok(),
+            "agent-b : l'enregistrement doit aboutir — {:?}",
+            rb.err().map(|e| e.to_string())
+        );
+        assert_eq!(
+            active_recurring_labels(&db_a, FEEDER_LABEL).await,
+            vec!["agent-a".to_string()],
+            "agent-a doit porter une ligne recurring_active"
+        );
+        assert_eq!(
+            active_recurring_labels(&db_b, FEEDER_LABEL).await,
+            vec!["agent-b".to_string()],
+            "agent-b doit porter une ligne recurring_active"
+        );
+    }
+
+    /// **Contrôle négatif d'AC3 : « sans le réessai, le test rougit ».**
+    ///
+    /// Le *même* montage via [`ensure_recurring_task_with_policy`] à une seule
+    /// tentative — pas une simulation : le même chemin de code, un budget
+    /// différent. Aucune ligne `recurring_active`, et l'appel rend son
+    /// [`RegistrationFailure`] en nommant la contention.
+    #[tokio::test]
+    async fn mika2601_sans_reessai_lenregistrement_est_perdu() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mika.db");
+        drop(Database::open(&path).expect("migration initiale"));
+
+        let db = open_registrant(&path, "agent-a").await;
+        let blocker = hold_write_lock(path.clone(), Duration::from_millis(600));
+        let res = ensure_recurring_task_with_policy(
+            &db,
+            FEEDER_LABEL,
+            FEEDER_CRON,
+            FEEDER_CONFIG,
+            &RecurringRetryPolicy::single_attempt(),
+        )
+        .await;
+        blocker.join().expect("le bloqueur se termine");
+
+        let failure = res.expect_err("sans réessai, l'enregistrement est perdu");
+        assert_eq!(failure.label, FEEDER_LABEL);
+        assert_eq!(failure.report.attempts, 1);
+        assert!(
+            failure.busy,
+            "l'échec doit être attribué à la contention, pas à un autre défaut : {}",
+            failure.error
+        );
+        assert!(
+            active_recurring_labels(&db, FEEDER_LABEL).await.is_empty(),
+            "aucune ligne recurring_active ne doit exister"
         );
     }
 

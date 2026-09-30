@@ -1067,6 +1067,141 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2601 — l'enregistrement d'une récurrente a UN appelant, et ses
+    // deux événements UN écrivain chacun.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// La population a été recensée avant d'écrire ce scan : un seul site de
+    /// production appelle `create_recurring_task_if_absent` hors plomberie, et
+    /// c'est celui qu'on attend. **Quand ce scan tire, on route le nouveau site
+    /// par `ensure_recurring_task` ; on n'ajoute pas de ligne** (doctrine
+    /// mika#2201) — un site qu'on ne veut pas armer est un site à supprimer.
+    const RECURRING_REGISTRATION_SCAN_EXCEPTIONS: &[&str] = &[];
+
+    /// **Un seul appelant de l'enregistrement, deux écrivains d'événement
+    /// (mika#2601 R-8).**
+    ///
+    /// *Aucun test comportemental ne peut voir cette classe :* un second site
+    /// d'enregistrement ne rend **aucune** décision fausse le jour où il est
+    /// écrit — l'enregistrement fonctionne, toutes les assertions restent
+    /// vertes, et seul le réessai disparaît, en silence.
+    ///
+    /// Les deux aiguilles sont composées à l'exécution pour que CE fichier ne
+    /// se dénonce pas lui-même (motif mika#2496).
+    ///
+    /// **Limite héritée, nommée plutôt que découverte :** `production_sources`
+    /// tronque chaque fichier au premier marqueur de module de test *textuel*,
+    /// où qu'il soit. Un étranger placé après un tel marqueur est donc
+    /// invisible — faux négatif partagé par tous les scans de ce module. Ce que
+    /// l'anti-vacuité ci-dessous garantit, c'est que le scan n'est pas devenu
+    /// aveugle **sur sa propre cible**, ce qui est le mode de panne qui se lit
+    /// comme un arbre propre.
+    #[test]
+    fn mika2601_la_registration_recurrente_a_un_seul_appelant_et_deux_ecrivains() {
+        let owner = "crates/mika-agent/src/task_engine/mod.rs";
+        // La plomberie : la définition et son enveloppe asynchrone. Ce ne sont
+        // pas des appelants, ce sont les deux maillons que tout appelant
+        // traverse.
+        let plumbing = [
+            "crates/mika-agent/src/db/tasks.rs",
+            "crates/mika-agent/src/async_db.rs",
+        ];
+
+        let call_needle = format!("create_recurring_task{}", "_if_absent(");
+        let retried_needle = format!("recurring_registration{}", "_retried");
+        let failed_needle = format!("recurring_registration{}", "_failed");
+
+        let mut callers = Vec::new();
+        let mut retried_writers = Vec::new();
+        let mut failed_writers = Vec::new();
+
+        for (rel, content) in production_sources() {
+            if RECURRING_REGISTRATION_SCAN_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let code: Vec<&str> = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .collect();
+
+            if !plumbing.contains(&rel.as_str()) && code.iter().any(|l| l.contains(&call_needle)) {
+                callers.push(rel.clone());
+            }
+            // Les noms d'événement sont des littéraux de chaîne : les chercher
+            // comme tels évite de compter une mention en prose.
+            let literal_carries = |needle: &str| {
+                code.iter()
+                    .any(|line| string_literals(line).iter().any(|lit| lit.contains(needle)))
+            };
+            if literal_carries(&retried_needle) {
+                retried_writers.push(rel.clone());
+            }
+            if literal_carries(&failed_needle) {
+                failed_writers.push(rel.clone());
+            }
+        }
+
+        // ── Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement
+        // comme un scan propre (mika#2103 / mika#2205). Les trois aiguilles
+        // doivent apparaître, et sur le fichier attendu.
+        for (what, found) in [
+            ("l'appel à l'enregistrement", &callers),
+            ("l'événement de réessai", &retried_writers),
+            ("l'événement d'échec", &failed_writers),
+        ] {
+            assert!(
+                found.iter().any(|f| f == owner),
+                "mika#2601 — {what} est introuvable dans {owner} : ce scan vise \
+                 un nom mort, il ne vérifie rien.\n\
+                 Cause la plus probable : un marqueur de module de test est \
+                 apparu plus haut dans ce fichier et `production_sources` l'a \
+                 tronqué avant la cible."
+            );
+        }
+
+        let stray_callers: Vec<&String> = callers.iter().filter(|c| *c != owner).collect();
+        assert!(
+            stray_callers.is_empty(),
+            "mika#2601 — un second site de production enregistre une récurrente \
+             sans passer par `ensure_recurring_task` : {stray_callers:?}\n\n\
+             RÉSOLUTION : router ce site par `ensure_recurring_task`, qui porte \
+             le réessai sous contention. Ne PAS l'ajouter à \
+             RECURRING_REGISTRATION_SCAN_EXCEPTIONS — un site qu'on ne veut pas \
+             armer est un site à supprimer (doctrine mika#2201)."
+        );
+
+        for (event, writers) in [
+            (&retried_needle, &retried_writers),
+            (&failed_needle, &failed_writers),
+        ] {
+            let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+            assert!(
+                strangers.is_empty(),
+                "mika#2601 — `{event}` a un second écrivain : {strangers:?}\n\n\
+                 RÉSOLUTION : retirer le second site. Les deux régimes attendus \
+                 (`_retried` non vide et faible, `_failed` vide) ne sont \
+                 lisibles que tant qu'un seul site écrit chaque nom."
+            );
+        }
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2601_lallowlist_du_scan_est_livree_vide() {
+        assert!(
+            RECURRING_REGISTRATION_SCAN_EXCEPTIONS.is_empty(),
+            "RECURRING_REGISTRATION_SCAN_EXCEPTIONS est livrée vide et doit le \
+             rester : une allowlist née vide est un tiroir où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2496 — le nom d'audit du dépassement de coût a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 

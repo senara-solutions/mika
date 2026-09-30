@@ -2630,6 +2630,97 @@ fn test_is_unique_violation_only_catches_unique() {
     assert!(!is_unique_violation(&anyhow::Error::from(notnull_err)));
 }
 
+// ── mika#2601 — le classifieur de contention SQLite (V1) ────────────────
+//
+// Voisin immédiat du test ci-dessus, et pour la même raison : les deux
+// prédicats vivent côte à côte dans `db.rs` et se lisent ensemble.
+
+/// **Le terme porteur est le `context`.** C'est lui qui atteste que le
+/// `downcast` traverse la chaîne de causes d'`anyhow`, donc la frontière
+/// `AsyncDatabase::with_db` — sans quoi le prédicat serait juste dans un
+/// test et inerte en production.
+#[test]
+fn mika2601_un_busy_est_reconnu_a_travers_la_chaine_anyhow() {
+    use rusqlite::ffi;
+
+    let busy = rusqlite::Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_BUSY),
+        Some("database is locked".to_string()),
+    );
+    let wrapped = anyhow::Error::from(busy)
+        .context("create_recurring_task_if_absent")
+        .context("failed to register recurring task");
+
+    assert!(
+        is_sqlite_busy(&wrapped),
+        "un SQLITE_BUSY enveloppé par deux `.context(...)` doit rester reconnu : \
+         c'est exactement la forme que `with_db` transmet"
+    );
+}
+
+/// `SQLITE_LOCKED` est le voisin de famille : inclus, borné par le budget.
+#[test]
+fn mika2601_un_locked_est_aussi_un_busy() {
+    use rusqlite::ffi;
+
+    let locked = rusqlite::Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_LOCKED),
+        Some("database table is locked".to_string()),
+    );
+    assert!(is_sqlite_busy(&anyhow::Error::from(locked)));
+}
+
+/// Le code PRIMAIRE décide, jamais l'étendu : `SQLITE_BUSY_SNAPSHOT` (517)
+/// a `SQLITE_BUSY` pour code primaire et doit être attrapé.
+#[test]
+fn mika2601_snapshot_est_un_busy() {
+    use rusqlite::ffi;
+
+    let snapshot = rusqlite::Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_BUSY_SNAPSHOT),
+        Some("database is locked".to_string()),
+    );
+    let err = anyhow::Error::from(snapshot);
+
+    // Précondition du test : c'est bien un code ÉTENDU distinct du primaire.
+    match err.downcast_ref::<rusqlite::Error>() {
+        Some(rusqlite::Error::SqliteFailure(e, _)) => {
+            assert_eq!(e.code, rusqlite::ErrorCode::DatabaseBusy);
+            assert_ne!(
+                e.extended_code,
+                ffi::SQLITE_BUSY,
+                "si l'étendu valait le primaire, ce test ne distinguerait rien"
+            );
+        }
+        other => panic!("attendu SqliteFailure, obtenu {other:?}"),
+    }
+
+    assert!(is_sqlite_busy(&err));
+}
+
+/// **Contrôles négatifs.** Sans eux, « le classifieur décide » est
+/// indistinguable de « le classifieur rend toujours vrai ».
+#[test]
+fn mika2601_le_classifieur_ne_lit_pas_le_message_rendu() {
+    use rusqlite::ffi;
+
+    // (a) Une autre variante SQLite n'est pas un busy.
+    let unique = rusqlite::Error::SqliteFailure(
+        ffi::Error::new(ffi::SQLITE_CONSTRAINT_UNIQUE),
+        Some("UNIQUE constraint failed".to_string()),
+    );
+    assert!(!is_sqlite_busy(&anyhow::Error::from(unique)));
+
+    // (b) Le TEXTE de l'erreur mesurée, nu, sans variante rusqlite derrière :
+    //     refusé. C'est ce qui épingle que la classification vient de la
+    //     variante et jamais de la chaîne rendue.
+    assert!(
+        !is_sqlite_busy(&anyhow::anyhow!("database is locked")),
+        "un message nu ne doit JAMAIS être classé busy — sinon le prédicat \
+         lit le texte, ce que mika#2179 / mika#2289 / mika#2522 refusent"
+    );
+}
+
 #[test]
 fn test_trace_id_propagation() {
     let (db, sid) = db_with_session();
