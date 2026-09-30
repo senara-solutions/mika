@@ -1083,15 +1083,26 @@ impl TaskEngine {
                     error = %e,
                     "cannot reschedule in-flight recurring task on startup, marking failed"
                 );
-                if let Err(db_err) = self
+                // L'audit suit l'écriture et ne la précède pas : `after_value`
+                // doit rapporter ce qui **s'est passé**, jamais ce qui était
+                // voulu (doctrine mika#2249). Si l'UPDATE échoue, la ligne reste
+                // `in_progress` et le démarrage suivant réessaiera — exactement
+                // le cas du ré-armement raté plus bas, qui n'écrit rien non
+                // plus. Poser `failed_no_cron` ici mettrait dans le `GROUP BY`
+                // de l'opérateur une ligne que la base ne porte pas.
+                match self
                     .db
                     .update_task_status(&task.id, task_status::FAILED)
                     .await
                 {
-                    warn!(task_id = %task.id, error = %db_err, "failed to mark task as failed during recovery");
+                    Ok(()) => {
+                        self.audit_recurring_restore(task, RECURRING_RESTORE_OUTCOME_NO_CRON, None)
+                            .await;
+                    }
+                    Err(db_err) => {
+                        warn!(task_id = %task.id, error = %db_err, "failed to mark task as failed during recovery");
+                    }
                 }
-                self.audit_recurring_restore(task, RECURRING_RESTORE_OUTCOME_NO_CRON, None)
-                    .await;
                 return;
             }
         };
@@ -5810,8 +5821,8 @@ mod tests {
                 if crate::source_scan::is_test_source_path(&path) {
                     continue;
                 }
-                let rel = path.to_string_lossy().replace('\\', "/");
-                if !rel.contains("/src/") {
+                let full = path.to_string_lossy().replace('\\', "/");
+                if !full.contains("/src/") {
                     continue;
                 }
                 let Ok(text) = std::fs::read_to_string(&path) else {
@@ -5821,12 +5832,12 @@ mod tests {
                     Some(at) => text[..at].to_string(),
                     None => text,
                 };
-                // Le chemin rendu est relatif au dossier `crates/`, ce qui suffit
-                // à nommer un site dans un message d'échec.
+                // Rendu relatif au dossier `crates/`, ce qui suffit à nommer un
+                // site dans un message d'échec ; le chemin absolu sert de repli.
                 let rel = path
                     .strip_prefix(&root)
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or(rel);
+                    .unwrap_or(full);
                 out.push((rel, production));
             }
         }
@@ -5861,6 +5872,15 @@ mod tests {
     /// mauvais endroit, ce qui est pire qu'aucun numéro. C'est la raison pour
     /// laquelle `canonical-tokens.tsv` refuse déjà, en toutes lettres, qu'un site
     /// soit désigné par un numéro de ligne. Le texte se `grep`.
+    ///
+    /// Limite **nommée**, la même que la garde sœur mika#2335 documente pour
+    /// elle-même : le prédicat est **à la ligne**, donc un `SET status =` dont le
+    /// littéral serait renvoyé à la ligne suivante passerait dessous. Les douze
+    /// occurrences de l'arbre tiennent toutes sur une ligne, et un scan
+    /// sémantique demanderait une analyse de flot que cette famille de gardes
+    /// n'a pas. T2, lui, lit l'invocation logique — la forme multi-lignes y est
+    /// probable parce que rustfmt la produit, alors qu'ici elle serait un
+    /// retour à la ligne écrit à la main au milieu d'une chaîne SQL.
     fn literal_status_write_sites(src: &str) -> Vec<String> {
         crate::source_scan::strip_comment_lines(src)
             .lines()
