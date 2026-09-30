@@ -35,6 +35,64 @@ vient lui-même d'écrire.
 
 ---
 
+## Re-mesure du 2026-09-30 (re-groom), contre `origin/main` @ `a0d1f2c3`
+
+Le groom moteur `8fc22e77` (2026-09-29) avait rendu READY en première passe puis
+`ESCALATE — second-pass-after-ready` sur un défaut de **réponse** (seconde
+réponse de l'architecte sans ligne d'ancre, `anchors_found=0`), pas de plan. Un
+plan groomé a une demi-vie : avant de le re-soumettre, ses prémisses ont été
+re-mesurées (lectures seules — base en `sqlite3 -readonly`, journal par `grep`
+filtré sur `"level":"WARN"`, les corps LLM du groom précédent citant eux-mêmes le
+WARN mika#1742 et polluant un grep nu).
+
+**Le défaut n'a pas été corrigé ; il s'est résorbé par expiration de la grâce, et
+il a coûté ~28 h de scan.**
+
+| instant (UTC) | événement |
+|---|---|
+| 2026-09-28 17:00:00Z | tir `wip_rescue` (`ce90ad84`) |
+| 17:01:20Z | restart n°11 (`91372f95`) — la ligne passe `failed` à 17:01:21Z |
+| 17:31, 19:01, 02:00, 07:00, 07:30, 10:00 | six restarts, **six refus** mika#1742 sur `ce90ad84` |
+| 2026-09-29 17:00:44Z | restart n°18 — **refusé à 37 s de la fin de grâce** (17:01:21Z) |
+| 21:00:54Z | restart n°19 (`2975e3e1`) — ligne neuve `358c6e37` créée à **21:01:01Z** |
+| 2026-09-30 04:05Z | `wip_rescue` tire normalement (`recurring_active`, `next_fire_at` futur) |
+
+- **`wip_rescue` est redevenu `recurring_active` après le n°19, mais par une ligne
+  NEUVE** (`358c6e37`), pas par une réparation de `ce90ad84` — qui reste `failed`,
+  `updated_at 2026-09-28T17:01:21Z`. C'est la garde mika#1742 qui a cessé de
+  refuser (fenêtre de 24 h écoulée), rien d'autre.
+- **Zéro** ligne `wip_rescue: running auto-resume scan` entre 2026-09-28T17:01Z et
+  2026-09-29T21:01Z : le scan a été mort ~28 h, et la durée n'est pas « 24 h » mais
+  « 24 h, arrondies au restart suivant » — le n°18 l'a ratée de 37 s.
+- **La sonde du ticket passe aujourd'hui** : les quatre labels (`wip_rescue`,
+  `auto_pull_groomed`, `qa_review_reconcile`, `worktree_reap`) sont
+  `recurring_active` pour `mika-dev`. Ce n'est **pas** une preuve de correctif :
+  c'est l'état d'une base où aucun restart n'est tombé pendant un tir depuis le n°19.
+- **Seconde occurrence, n=2, autre label et autre agent.** `heartbeat` de
+  **mika-arch** (`2b71969e`) : tiré 2026-09-25T16:00:00Z, restart à 16:00:47Z,
+  `failed` à 16:01:22Z (mika-arch est servi ~35 s après le démarrage par la boucle
+  par agent de `run_server`, d'où le décalage), refusé par mika#1742 le 26/09 à
+  09:02, 10:35, 11:01 et 14:31, ré-armé par une ligne neuve (`4a88fd04`) à
+  16:31:03Z — **~24,5 h** sans heartbeat. `heartbeat` est l'un des sept
+  `ensure_recurring_task` (`server/mod.rs:1762`), donc R2 le couvre sans ligne de
+  plus : la classe « toute récurrente » du ticket est désormais **mesurée**, pas
+  seulement inférée.
+
+**Ancres : aucune n'a bougé de sens.** Les trois commits entre la base du plan
+(`b6c95955`) et `origin/main` (`2975e3e1`, `1e977a07`, `a0d1f2c3`) ne touchent ni
+`task_engine/engine.rs`, ni `server/mod.rs`, ni `task_engine/cron.rs`, ni
+`mika-cli/src/commands/chat.rs`. `db/tasks.rs` n'a changé qu'à partir de la l.4163
+(`has_completed_groom_for_issue`, mika#2590) : `create_recurring_task_if_absent`
+(l.204), l'`INSERT … 'recurring_active'` (l.288-294) et `update_task_rescheduled`
+(l.860-866) sont intacts. Deux ancres du plan étaient imprécises et sont
+corrigées dans le texte : l'`INSERT` est l.288-294 (le plan disait l.292), et le
+chemin CLI est `crates/mika-cli/src/commands/chat.rs:261` (le plan disait
+`commands/chat.rs:261`). Les autres (`engine.rs:4810`, `engine.rs:5512`,
+`startup_recovery` l.797, `enqueue_queued_task` l.4682, `fire_task` l.4755,
+`server/mod.rs:1762-1905` et `:1917`) sont exactes sur `origin/main`.
+
+---
+
 ## La chaîne, maillon par maillon (lue dans le code, pas déduite)
 
 | # | site | ce qui se passe |
@@ -131,7 +189,7 @@ ne doit pas se ré-inscrire toutes les minutes.
 
 ### Le mode CLI est la seconde porte du même défaut
 
-`mika chat` exécute `startup_recovery` (`commands/chat.rs:261`) avec
+`mika chat` exécute `startup_recovery` (`crates/mika-cli/src/commands/chat.rs:261`) avec
 `cli_mode: true`, contre la base **partagée avec le démon**. L'étape 2a (balayage
 A2A) est déjà gatée sur `!cli_mode`, avec son raisonnement écrit sur place :
 *« there the "dead process" argument is false, and sweeping would fail live
@@ -367,7 +425,7 @@ retenue : **(a) exception nommée en allowlist — allowlist livrée VIDE.**
   de `Database::update_task_rescheduled`. **Vérifié vert sur l'arbre courant** :
   ce littéral n'apparaît aujourd'hui qu'à deux endroits, cet `UPDATE`
   (`db/tasks.rs:862`) et l'`INSERT` de `create_recurring_task_if_absent`
-  (`db/tasks.rs:292`, sous la forme `VALUES (…,'recurring_active',…)`, donc hors
+  (`db/tasks.rs:288-294`, sous la forme `VALUES (…,'recurring_active',…)`, donc hors
   du prédicat qui vise `SET status =`). Les onze autres occurrences du littéral
   sont des lectures `status IN (…)`. Le prédicat **dépouille les commentaires
   avant de scanner** : le doc-comment de `update_task_rescheduled`
