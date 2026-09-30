@@ -67,6 +67,37 @@ pub fn next_fire_from_cron_tz(expr: &str, after: &str, tz: &Tz) -> Result<String
     Ok(crate::timestamp::format(&next_utc))
 }
 
+/// Le **lecteur unique** du calcul de l'instant de tir d'une récurrente
+/// (mika#2575).
+///
+/// Le triplet `metadata → timezone → next_fire_from_cron{,_tz}` existait deux
+/// fois — `fire_task` (repos nominal après un tir) et `enqueue_queued_task`
+/// (mise en tas) — et le ré-armement au démarrage en aurait été la troisième.
+/// Trois formulations d'un même calcul divergent, et la divergence est
+/// silencieuse : chacune rend un instant plausible.
+///
+/// **Sémantique, identique aux deux sites qu'il remplace.** `cron_expr` absent
+/// ⇒ `Err` nommant l'absence ; timezone lue dans `metadata` par
+/// [`extract_timezone_from_metadata`] puis [`parse_timezone`], **repli UTC sans
+/// erreur** si elle est absente ou illisible — un fuseau qu'on ne sait pas lire
+/// ne doit pas empêcher une récurrente de se replanifier.
+///
+/// **Chaque appelant garde sa disposition d'erreur** : `fire_task` et le
+/// ré-armement marquent `failed`, `enqueue_queued_task` renonce à empiler. Ce
+/// helper calcule ; il ne décide de rien.
+pub fn next_fire_for_recurring(
+    cron_expr: Option<&str>,
+    metadata: Option<&str>,
+    now: &str,
+) -> Result<String> {
+    let expr = cron_expr.ok_or_else(|| anyhow!("recurring task missing cron_expr"))?;
+
+    match extract_timezone_from_metadata(metadata).and_then(|tz| parse_timezone(&tz).ok()) {
+        Some(tz) => next_fire_from_cron_tz(expr, now, &tz),
+        None => next_fire_from_cron(expr, now),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +203,67 @@ mod tests {
         let tz = parse_timezone("UTC").unwrap();
         let tz_result = next_fire_from_cron_tz("0 0 9 * * *", after, &tz).unwrap();
         assert_eq!(utc_result, tz_result);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2575 — le lecteur unique du calcul de tir d'une récurrente.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mika2575_le_lecteur_unique_calcule_en_utc_sans_metadata() {
+        let after = "2026-03-30T00:00:00Z";
+        let direct = next_fire_from_cron("0 0 9 * * *", after).unwrap();
+        let through = next_fire_for_recurring(Some("0 0 9 * * *"), None, after).unwrap();
+        assert_eq!(direct, through);
+    }
+
+    #[test]
+    fn mika2575_le_lecteur_unique_honore_la_timezone_du_metadata() {
+        let after = "2026-03-30T00:00:00Z";
+        let next = next_fire_for_recurring(
+            Some("0 0 9 * * *"),
+            Some(r#"{"timezone":"Asia/Singapore"}"#),
+            after,
+        )
+        .unwrap();
+        // 9h SGT (UTC+8) le 30/03 = 01:00Z — la même valeur que le site
+        // timezone-aware qu'il remplace.
+        assert_eq!(next, "2026-03-30T01:00:00Z");
+    }
+
+    #[test]
+    fn mika2575_un_cron_absent_rend_une_erreur_qui_nomme_labsence() {
+        let err = next_fire_for_recurring(None, None, "2026-01-01T00:00:00Z")
+            .expect_err("cron_expr absent doit rendre Err");
+        assert!(
+            err.to_string().contains("cron_expr"),
+            "le message doit nommer l'absence : {err}"
+        );
+    }
+
+    #[test]
+    fn mika2575_un_cron_illisible_rend_une_erreur() {
+        assert!(
+            next_fire_for_recurring(Some("pas un cron"), None, "2026-01-01T00:00:00Z").is_err()
+        );
+    }
+
+    /// **Le repli est UTC, jamais une erreur.** Un fuseau illisible ne doit pas
+    /// empêcher une récurrente de se replanifier — c'est la sémantique des deux
+    /// sites remplacés (`.ok()` y jette l'erreur de parsing), et l'inverser
+    /// ferait retomber sur `failed` toute récurrente dont le metadata a été
+    /// édité de travers.
+    #[test]
+    fn mika2575_une_timezone_illisible_retombe_sur_utc_sans_erreur() {
+        let after = "2026-03-30T00:00:00Z";
+        let utc = next_fire_from_cron("0 0 9 * * *", after).unwrap();
+        let fallback = next_fire_for_recurring(
+            Some("0 0 9 * * *"),
+            Some(r#"{"timezone":"Not/A/Zone"}"#),
+            after,
+        )
+        .unwrap();
+        assert_eq!(utc, fallback);
     }
 
     #[test]

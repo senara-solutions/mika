@@ -3138,6 +3138,199 @@ indicator.
 - **`PILOT_COST_OVERRUN_TOOL` is SOLE WRITER**, pinned by the source scan `canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer` (allowlist shipped empty, and `…_the_sole_writer_allowlist_is_empty` keeps it that way — an allowlist born empty is a place to drop the next infraction, mika#2323). The property is what makes the operator's `SELECT count(*), round(avg(CAST(after_value AS REAL)), 2) FROM audit_events WHERE tool_name = 'pilot_cost_overrun';` an **exact** count rather than a number two writers can disagree about — and that count is the explicit precondition of the follow-up ticket on `senara-solutions/claude-pilot`, which has to size the missing dollar brake. A second writer would make no decision wrong; it would make that count inexact, which is invisible to every behavioural test, hence a source scan. The scan carries its own anti-vacuity assertion (it fails if the name is written nowhere in `dispatcher.rs`), because a scan aiming at a dead name reads exactly like a clean one (mika#2103 / mika#2205). **When it fires, remove the second site — do not allowlist it.**
 - **Row shape:** `tool_name = 'pilot_cost_overrun'`, `target_key = 'task:<callback-id>'`, `after_value` = the cost **and nothing else** (it is what the operator averages), `reasoning` = `repo:… issue:… turns:… threshold_usd:…` as free text. Log side: a `pilot_cost_overrun` WARN in `$MIKA_SPIRIT_LOG_FILE`, expected regime **non-empty**. Its halt: a nil count while runs are known to exceed 40 USD means `Cost:` parsing returns nothing on that population — check `extract_callback_fields` against a real `status: terminated` before concluding the fleet is under threshold. Tests: `mika2496_a_cost_above_the_threshold_is_counted`, `…_below_… is_not_counted`, `…_the_threshold_is_what_decides`, `…_an_absent_cost_is_not_a_zero_cost`, `…_an_orphan_dispatch_still_counts`.
 
+### A recurring task caught mid-fire is re-armed, never failed (mika#2575)
+
+`startup_recovery` step 2 marks every orphaned `in_progress` row `failed`. For a
+**recurring** row that write is wrong, and the damage is not the row: it is what
+the next startup makes of it.
+
+**For a recurring task, `in_progress` is a transitory FIRING state, not a
+registry state.** `claim_and_fire_task` sets it for the duration of the fire and
+`update_task_rescheduled` restores `recurring_active` on return. So a recurring
+row found `in_progress` at startup does not say *this scan failed*, it says *a
+fire was interrupted* — and writing `failed` confuses the failure of a **fire**
+with the death of a **registration**. That confusion, and nothing else, is what
+arms the mika#1742 anti-zombie guard.
+
+**The chain, read in the code rather than deduced.** (1) The seven
+`ensure_recurring_task` calls run **before** `startup_recovery`
+(`server/mod.rs`); (2) the guard in `create_recurring_task_if_absent` looks for
+`status IN ('failed','cancelled','expired')` — `in_progress` is **invisible** to
+it, so no refusal; (3) its `INSERT OR IGNORE` then collides with
+`idx_tasks_unique_recurring`, whose predicate covers `in_progress`, so `n = 0`
+and the call returns "already existed" — **no new row**; (4) step 2 marks the
+live row `failed`; (5) `get_schedulable_tasks` selects only
+`('pending','recurring_active')`, so that row never enters the heap; (6) **at the
+next startup the guard now sees a `failed` inside its window and refuses
+re-registration for 24 h.** No single decision is wrong — it is an *ordering*,
+and link 6 turns a one-cycle outage into a day-long one.
+
+**Measured twice.** `wip_rescue` dead ~28 h (row `ce90ad84`, fired
+2026-09-28T17:00:00Z, `failed` at 17:01:21Z — one second after `mika-spirit
+starting` — six restarts refused, re-armed only when the grace expired); and
+mika-arch's `heartbeat` (`2b71969e`) dead ~24,5 h on 2026-09-25 by the same
+chain. The second occurrence is what makes "any recurring task" a *measurement*
+rather than an inference.
+
+**Two remedies refused, each on its own cost.** *Reordering* (`startup_recovery`
+before the registrations), which the ticket body proposes: alone it makes the
+guard read a `failed` a few milliseconds old, so link 6 fires **within the same
+startup** — it converts a one-cycle outage into an immediate 24 h one. *A
+distinct status* (`interrupted_by_restart`), which the ticket comment proposes:
+a new value of the `CHECK` on `tasks.status`, which SQLite cannot alter in place
+— a table rebuild on `tasks`, referenced by `tasks.parent_task_id` and
+`sessions.task_id`, plus a review of every query enumerating statuses (four
+indexes, the dashboard, the CLI). Both remedies also share a premise worth
+retiring: that the row **must** receive a terminal state. It must not.
+
+**The fix.** `restore_recurring_after_restart` re-arms instead — `next_fire_at`
+recomputed from the cron, `status = 'recurring_active'` — through the same
+primitive as the nominal fire, `Database::update_task_rescheduled`. Three
+properties follow, none of which needs a mechanism: the re-arm happens **in the
+same startup** (step 2 precedes step 3, and `get_schedulable_tasks` selects
+`recurring_active`, so the row enters the heap without waiting for the 60-tick
+scan or another restart); the anti-zombie guard is **never armed** for this class
+(no terminal state is written, so mika#1742 is neither modified, exempted nor
+bypassed — it simply stops having a population manufactured by startup); and
+`recurring_active` keeps **one writer**, since the re-arm and the nominal
+rescheduling become one textual act rather than two formulations free to diverge.
+
+**Fallback, already the house rule.** No computable cron ⇒ the row falls back to
+`failed` with a named reason — exactly what `fire_task` already does in the same
+case (*"cannot reschedule recurring task, marking failed"*), so the fallback
+introduces no new semantics; and there the mika#1742 guard arms **legitimately**,
+a recurring task whose cron will not compute having no business re-registering
+every minute.
+
+**CLI mode is the second door of the same defect, and it is closed by
+abstention.** `mika chat` runs this same recovery (`cli_mode: true`) against the
+database it **shares** with a possibly-live daemon. Step 2a (the A2A sweep) is
+already gated `!cli_mode` with its reasoning written on site; the generic loop was
+not, so launching `mika chat` while a recurring task fired killed that scan
+exactly like the measured restart. The re-arm is therefore **not applied** in CLI
+mode: the row is left `in_progress`, untouched. Two reasons, in order — the CLI
+cannot know whether the daemon is firing right now, and it will not run the scan
+it would be rescheduling anyway. If the daemon is dead, its own startup re-arms.
+Strictly better than today's `failed`, and non-recurring rows keep their current
+CLI treatment word for word.
+
+**One reader for the fire-time computation.** The `metadata → timezone →
+next_fire_from_cron{,_tz}` triplet existed twice (`fire_task`,
+`enqueue_queued_task`) and the re-arm would have been a third.
+`task_engine::cron::next_fire_for_recurring` is extracted and all **three** sites
+call it; each keeps its own error disposition (`fire_task` and the re-arm mark
+`failed`, `enqueue_queued_task` declines to enqueue). Pure extraction, no
+behaviour change.
+
+**No interruption counter, and the refusal is measured.** The legitimate question
+is what bounds a recurring task that would kill the process on every fire, once
+we stop writing `failed`. There is **no mechanism by which a scan kills the
+process** (`fire_task` dispatches inside a `tokio::spawn`, where a panic is
+collected as a `JoinError`; the scans shell out through `tokio::process`); the
+real cause of an `in_progress` at startup is **external** (deployment SIGTERM,
+operator, OOM killer) and is measured — this ticket documents restarts n°11 and
+n°13 in one evening; and a low-threshold counter would fire on the **healthy**
+regime (`wip_rescue` has a 5-minute cron and a fire that can last ~900 s, so on a
+host restarting several times an hour — the regime this ticket documents — three
+consecutive interruptions without an intervening complete fire are ordinary, and a
+budget of 3 would mute the scan for 24 h on a deployment day, i.e. **reopen this
+defect under another name**). A counter would also need a reset site on the
+successful fire (`reset_stuck_rearm_count` pattern, mika#2413, whose written
+lesson is *a counter the success never clears ends up bounding something else*),
+hence a second writer on the recurring success path. What replaces it is a
+**measurement**: one log event and one audit row per re-arm, single-writer, so
+that if a label starts appearing several times a day the follow-up opens **with a
+count** rather than an intuition.
+
+*What is given up by saying it:* today's `failed` behaves like a circuit breaker
+— it mutes the scan for 24 h after an interruption. But it trips on the **common**
+case (a restart) and not on the rare one (a pathological scan, for which no
+mechanism is identified): that is not a brake, it is a false classifier. Removing
+it removes no real protection.
+
+**No retroactive repair.** `ce90ad84` and its kin stay `failed`. Rewriting a
+terminal state after the fact would falsify what the row said when it was written
+(mika#2361 motif), and the gesture already exists: `mika tasks rearm <label>`
+(mika#2446), which sets the `operator_rearm` marker the guard excludes.
+
+**Guards.** Seven behavioural tests in `task_engine::engine::tests::mika2575_*`
+(six of them **seen red** before the fix, with the one-shot negative control
+staying green), five in `task_engine::cron::tests::mika2575_*`, and two source
+scans. `mika2575_le_statut_recurring_active_a_un_ecrivain_unique` carries **two
+terms**: T1 the literal `UPDATE … SET status = 'recurring_active'` outside
+`update_task_rescheduled`, and T2 the dynamic-status write — three DB functions
+take the status as a **parameter** (`db/tasks.rs` `update_task_status`,
+`update_manual_task_status`, `terminal_mark_tracking_row_upstream_closed`, all of
+the form `SET status = ?1`), so a future writer could set `recurring_active`
+through one of them **without any `UPDATE … SET status = 'recurring_active'`
+appearing in the tree**. Formulated on T1 alone, the scan would be blind to the
+likelier route. T2's anti-vacuity cannot rest on the presence of the name —
+`task_status::RECURRING_ACTIVE` is consumed nowhere today, so T2 is green by
+**empty population**, which reads exactly like a clean tree (mika#2205); its
+control is therefore on the **shape of the predicate**, by a negative fixture
+**seen red** (including the multi-line form rustfmt produces past 100 columns,
+which a line-anchored predicate would miss). T1 keeps its anti-vacuity by name,
+and its own good-faith control **seen green** covers the doc-comment of
+`db/tasks.rs::update_task_rescheduled`, which writes *"set next_fire_at and
+status = 'recurring_active'"* — the loose predicate a future editor would reach
+for "to be sure to catch everything" would count that prose as a second writer,
+the false positive mika#2050 measured on Signal S. Both allowlists ship **empty**:
+when the scan fires, remove the second site, do not exempt it (doctrine
+mika#2201).
+
+**The scan enumerates its own sources rather than reusing
+`canonical_tokens::production_sources()`**, and the difference is load-bearing:
+that enumerator truncates at the first `#[cfg(test)]` **wherever it is**, including
+indented — and `engine.rs` carries one on a helper method far above
+`startup_recovery`. Reusing it would cut the file before the fix itself, leaving
+the scan green by not looking at the one file it exists to watch. The anchor on
+`"\n#[cfg(test)]"` is taken from
+`mika2405_the_settled_event_has_exactly_one_writer_in_production`, in this same
+module for this same reason. Both helpers report the **text** of a site and never
+a line number: `strip_comment_lines` *removes* the lines it discards, so any
+number computed after it is off — and a wrong number in a failure message sends
+the reader to the wrong place, which is why `canonical-tokens.tsv` already refuses
+line numbers in as many words.
+
+**`fired_at` is deliberately NOT stamped here, and the log field is named
+accordingly.** The re-arm reschedules, it does not fire; mika#2133 reserves
+`fired_at` for the last fire, which `claim_and_fire_task` will set at the next
+one. Writing it here would state a false fact. The INFO line therefore carries
+`last_fire` rather than `fired_at` — the guard
+`mika2133_fired_at_has_a_single_literal_definition` is lexical on `fired_at` + `=`
+and would count the field as a fifth writer; its message offers interpolating the
+constant or refining the guard, and both are declined (the first poses the false
+fact, the second widens a neighbouring ticket's predicate for a log field).
+
+**Operator surfaces.** `recurring_restored_after_restart` (INFO — expected regime
+**non-empty and low**: one line per recurring task that was in flight at shutdown,
+each one a scan the restart did not kill); `recurring_restore_failed_no_cron`
+(WARN — expected **empty**); `recurring_restore_skipped_cli` (DEBUG, not
+instrumented: CLI population, no associated conduct). Audit: a single `tool_name`,
+`recurring_restart_restore`, with the outcome in `after_value`
+(`recurring_active` | `failed_no_cron`) — the `ready_label_outcome` motif
+(mika#2323) rather than the two-name motif of `phantom_aged_out` /
+`phantom_sweep_spared` (mika#2156), which applies when each name carries its own
+cause; here both outcomes belong to the **same site** and the **same population**.
+Both values are a **wire format**, frozen by test. Queries, expected regimes, the
+five probes and their halts: root `CLAUDE.md` § *Une récurrente en vol au
+démarrage est ré-armée, jamais échouée*.
+
+**Out of scope, deliberately.** The mika#1742 guard and its four exemptions
+(config-cancel mika#2271, unknown-trigger mika#2337, operator lift mika#2446,
+`RECURRING_ZOMBIE_GRACE_HOURS`) are untouched — this removes a population startup
+was manufacturing, it does not touch the predicate that read it. The CLI gating of
+step 2's generic loop for **non-recurring** tasks: `mika chat` can still mark a
+live `time` / `event` / `callback` task `failed`; distinct population, distinct
+blast radius, and the remedy requires deciding what a CLI may sweep in a live
+daemon's database — **follow-up ticket**, precondition being a measurement showing
+a live task reaped by a CLI invocation. And **recurring tasks carrying a
+`timeout_at`**: step 1 (`mark_tasks_expired`) precedes the sweep and writes
+`expired`, which the guard also counts; the seven startup recurring tasks have
+`timeout_at: None` (`task_engine/mod.rs`), so that population is empty for them,
+but one created through the scheduling tool with a `timeout_at` would escape this
+fix — a **named**, uncovered limit.
+
 **Callback process liveness watchdog (#959):** `check_callback_process_liveness()` runs every 60-tick cycle and detects when a long-running subprocess (e.g., `run_claude_pilot`) has crashed without delivering its callback result. Detection: queries `in_progress` callback tasks with `process_id IS NOT NULL`, checks PID liveness via `kill(pid, 0)` + `/proc/<pid>/stat` field 22 (process start time) comparison to guard against PID reuse. On first detection of a dead process, records `first_dead_at` in task metadata; after `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` (default 120s) elapses, re-checks task status (race guard) then marks the task `failed` with `error_reason = "subprocess_exited_without_delivery"`. Process start time is stored in callback task metadata at spawn time by `spawn_long_running_exec()`. The watchdog detects death in ~60s (one tick) + 120s grace = ~3 minutes total, vs the previous 6-hour `timeout_at` fallback. Platform: Linux only (`/proc` filesystem). The existing `timeout_at` mechanism serves as a panic-fallback for edge cases where PID tracking fails.
 
 **Pilot silent-stall reaper (mika#2249, predicate corrected in mika#2277):** `reap_silently_stalled_pilots()` runs every 60-tick cycle **immediately after** `check_callback_process_liveness`, and the two are exact mirrors: the watchdog owns the dispatch whose process is **dead**, this one owns the dispatch whose process is **alive** and has gone silent on **every** observable surface. Nothing owned that second population before — every other reaper fires on task state — which is why `fb355061` sat `in_progress` for 2 h 18 with a live PID, an empty `result` and no terminal marker. The two select disjoint sets by construction, so the ordering costs nothing.
