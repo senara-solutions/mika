@@ -175,6 +175,39 @@ pub fn is_unique_violation(err: &anyhow::Error) -> bool {
     }
 }
 
+/// Un `SQLITE_BUSY` / `SQLITE_LOCKED` : le verrou d'écriture était tenu
+/// ailleurs quand cette instruction a voulu écrire (mika#2601).
+///
+/// **La classification vient de la VARIANTE, jamais du texte rendu** — doctrine
+/// maison écrite trois fois (mika#2179, mika#2289, mika#2522), et le précédent
+/// exact est son voisin [`is_unique_violation`] : `downcast_ref` parcourt toute
+/// la chaîne de causes d'un `anyhow::Error`, donc la classification traverse la
+/// frontière `AsyncDatabase::with_db`, qui transmet le `Result` verbatim.
+///
+/// Trois propriétés de ce prédicat, et chacune a coûté une décision :
+///
+/// - **Le code PRIMAIRE, pas l'étendu.** `SQLITE_BUSY_SNAPSHOT` (517) a pour
+///   code primaire `SQLITE_BUSY`, donc `ErrorCode::DatabaseBusy` l'attrape.
+///   Tester `extended_code` — ce que fait son voisin, pour une bonne raison qui
+///   est la sienne — raterait cette famille entière.
+/// - **`DatabaseLocked` est inclus** parce que sa population est bornée par le
+///   budget de réessai et que son coût en faux réessai est de trois tentatives.
+///   Ce n'est pas le code mesuré en production (`sqlite3_errmsg(SQLITE_BUSY)`
+///   rend `"database is locked"`, `SQLITE_LOCKED` rend
+///   `"database table is locked"` — une chaîne différente) : c'est le voisin de
+///   famille.
+/// - **Jamais le message.** Un `anyhow!("database is locked")` nu n'est pas un
+///   busy : il ne porte aucune variante `rusqlite`, et l'épingler est ce qui
+///   atteste que la classification ne lit pas le texte.
+pub fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
 pub const COMMITMENT_STATUSES: &[&str] = &["pending", "completed", "cancelled"];
 
 pub const CORE_MEMORY_SECTIONS: &[(&str, &str)] = &[
