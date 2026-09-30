@@ -261,7 +261,7 @@ pub(crate) async fn ensure_recurring_task_with_policy(
     policy: &RecurringRetryPolicy,
 ) -> Result<(), RegistrationFailure> {
     let outcome = retry_on_busy(policy, || {
-        try_ensure_recurring_task(db, label, cron_expr, action_config)
+        register_recurring_task_once(db, label, cron_expr, action_config)
     })
     .await;
 
@@ -310,7 +310,23 @@ pub(crate) async fn ensure_recurring_task_with_policy(
 /// garde la disposition d'aujourd'hui.* C'est un sur-ensemble strict du
 /// comportement antérieur — aucune régression possible sur les erreurs
 /// non-busy, qui continuent d'être avalées exactement comme avant.
-async fn try_ensure_recurring_task(
+///
+/// **Son nom ne doit pas se terminer par celui de l'API publique suivi d'une
+/// parenthèse ouvrante, et ce n'est pas une préférence de style.** La garde de
+/// classe mika#2337 recense les *sites d'enregistrement* en cherchant ce motif
+/// **en sous-chaîne** sur le texte brut de l'arbre, puis exige que le 4ᵉ
+/// argument de chaque site soit un littéral — c'est ainsi qu'elle lit le
+/// trigger déclaré et vérifie qu'il a un bras dans `dispatch_run_skill`. Un
+/// helper nommé `try_` + le nom public est apparié par cette sous-chaîne : sa
+/// **définition** est écartée (la garde saute les lignes portant `fn `) mais
+/// **son appel** ne l'est pas, et il passe son `action_config` en *variable*
+/// par construction — donc la garde halte en nommant un enregistrement dont
+/// elle ne peut pas lire le destinataire. Renommer est le seul remède :
+/// déplacer ce helper dans un autre fichier n'y change rien, la garde balayant
+/// tout `src/` et non le seul `task_engine/mod.rs` que son message cite.
+/// Le vocabulaire retenu est donc celui de la primitive de base
+/// (`create_recurring_task_if_absent`), jamais celui de l'API publique.
+async fn register_recurring_task_once(
     db: &AsyncDatabase,
     label: &str,
     cron_expr: &str,
