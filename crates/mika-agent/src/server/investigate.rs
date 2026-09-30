@@ -775,6 +775,8 @@ async fn run_investigation(
         is_reflection: false,
         is_task_context: false,
         is_callback_turn: false,
+        // mika#2573 — le panneau d'investigation n'est pas servi par un webhook.
+        is_webhook_fallthrough_turn: false,
         provider_name: llm.provider_name(),
         model_name: llm.model_name(),
         active_skill_paths: &[],

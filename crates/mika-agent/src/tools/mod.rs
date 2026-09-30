@@ -148,6 +148,34 @@ pub struct ToolContext<'a> {
     pub is_task_context: bool,
     /// True when running in a callback turn (Guard 3 — blocks ALL task creation).
     pub is_callback_turn: bool,
+    /// True when this turn is a **Webhook Fallthrough** turn (mika#2573).
+    ///
+    /// Quatrième booléen de classe de tour, à côté de `is_reflection`,
+    /// `is_task_context` et `is_callback_turn` — la forme de la maison, pas une
+    /// exception. Lu par la garde `validate_fallthrough_work_creation` de
+    /// `run_gh`, qui refuse les verbes créant du travail (`issue create`,
+    /// `issue edit --add-label ready`) sur un tel tour.
+    ///
+    /// # Un booléen, jamais `originating_message`
+    ///
+    /// mika#2517 a écrit pourquoi il n'avait pas refusé au niveau de l'outil :
+    /// *« Refusing at the tool boundary would need `ToolContext` to carry
+    /// `originating_message`, which it does not. »* L'objection porte sur une
+    /// `&str` avec sa durée de vie et sa charge utile. Ce qui traverse ici est
+    /// le **verdict**, calculé au seul site qui possède déjà le message et qui
+    /// appelle déjà le prédicat de domaine.
+    ///
+    /// # Bord : le site de conversation, et il est structurel
+    ///
+    /// `false` aux trois autres sites de production (silent, team,
+    /// `server::investigate`), pour exactement le périmètre
+    /// qu'`effective_disabled_tools` documente déjà : un webhook arrive par
+    /// `POST /message` → `run_agent` → mode conversation ; un tour silencieux
+    /// n'a pas de message de webhook (`originating_message` vaut `None` depuis
+    /// mika#933) ; un tour d'équipe lit `TeamAgentParams`. Un futur chemin
+    /// servant un webhook en mode silencieux échapperait à cette garde — c'est
+    /// le bord, et il hérite de la sonde S3 de mika#2517.
+    pub is_webhook_fallthrough_turn: bool,
     /// Current LLM provider name (e.g., "anthropic", "openrouter").
     /// Used by builtin handlers that need to know the agent's active provider.
     pub provider_name: &'a str,

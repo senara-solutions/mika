@@ -2641,6 +2641,153 @@ async fn fetch_pr_wip_rescue_view(
     parse_pr_wip_rescue_view(&output.content)
 }
 
+/// Refuse, sur un tour **Webhook Fallthrough**, les verbes `run_gh` qui créent
+/// du travail (mika#2573).
+///
+/// # Ce que ça ferme
+///
+/// mika#2517 retient `create_task` sur ce tour précisément pour qu'aucun
+/// travail n'y naisse. Le 2026-09-28 le modèle a créé la même chose par l'outil
+/// voisin : `run_gh issue create` (l'issue #2571, qu'il a lui-même qualifiée
+/// d'« erreur »), puis a relancé un dispatch implement par
+/// `run_gh issue edit --add-label ready` — le label `ready` étant le signal
+/// canonique de dispatch (mika#841). Même intention, contournée par un
+/// substitut hors du périmètre de la retenue.
+///
+/// # Refuser, jamais retenir
+///
+/// La SCOPE RULE du prompt `self-dev` prescrit, mot pour mot, un
+/// `run_gh issue view <n> --json labels` comme geste de vérification — la seule
+/// sortie correcte qu'elle offre. Ajouter `run_gh` à
+/// `FALLTHROUGH_WITHHELD_TOOLS` casserait ce geste. La retenue est donc
+/// *indisponible* ici, et le refus est la seule forme qui reste.
+///
+/// # Position dans la chaîne
+///
+/// Inséré après `validate_qa_review_gh_scope` et **avant**
+/// `validate_pr_ready_undraft_scope`, le premier maillon qui fait un appel
+/// réseau : la chaîne va du plus local au plus engageant, et cette garde est du
+/// pur argv plus un booléen. Même raison qu'au site de mika#2455.
+///
+/// # Les deux dispositions, dans cet ordre
+///
+/// 1. **Fail-open à la détection.** Un argv qui n'est aucune des deux formes
+///    n'est pas l'affaire de cette garde ⇒ `Ok(())`. `gh` dans son ensemble est
+///    intouché et la surface reste bornée à deux verbes.
+/// 2. **Fail-closed après.** Forme reconnue **et**
+///    `ctx.is_webhook_fallthrough_turn` ⇒ refus. Hors tour Fallthrough,
+///    `Ok(())` — c'est la garantie de non-régression, et c'est un **terme du
+///    prédicat**, pas une branche de l'appelant.
+///
+/// # L'asymétrie qui décide du sens du fail-safe
+///
+/// Un faux positif coûte **un appel `run_gh` refusé** sur un tour dont le
+/// contrat écrit est *accuser réception et s'arrêter* : le tour peut encore
+/// accuser réception, alerter l'opérateur, lire l'issue. Visible, borné,
+/// rattrapable au tour suivant. Un faux négatif coûte un **dispatch implement
+/// que personne n'a autorisé** (un créneau, un pilote, un coût en USD) **et**
+/// une issue créée par accident qu'un humain devra fermer. C'est l'inverse du
+/// faucheur mika#2420, où un signal illisible *conserve* — là-bas l'action
+/// détruisait du travail, ici l'action *est* la création de travail non
+/// autorisé. **L'arbitrage est local et ne se transporte pas.**
+///
+/// Pas d'interrupteur d'environnement, et c'est un choix avec son précédent :
+/// mika#1646, la garde sœur la plus proche, n'en a pas non plus. Un
+/// désarmement par variable sur un chemin de création de travail serait un
+/// désarmement par coquille ; le geste de désarmement est un revert, et le coût
+/// d'un faux positif le supporte.
+async fn validate_fallthrough_work_creation(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        FALLTHROUGH_WORK_CREATION_AUDIT_TOOL, WorkCreationAction, detect_fallthrough_work_creation,
+    };
+
+    // Disposition 1 — fail-open : ce n'est pas le sujet de cette garde.
+    let Some(action) = detect_fallthrough_work_creation(args) else {
+        return Ok(());
+    };
+
+    // Disposition 2 — le terme de classe de tour est DANS le prédicat, jamais
+    // une branche de l'appelant : « hors tour Fallthrough, rien ne change »
+    // devient une propriété de cette fonction, avec son propre test.
+    if !ctx.is_webhook_fallthrough_turn {
+        return Ok(());
+    }
+
+    let motif = action.motif();
+    let verb = action.verb();
+    let label = match &action {
+        WorkCreationAction::ReadyLabelAdd { label } => Some(label.as_str()),
+        WorkCreationAction::IssueCreate => None,
+    };
+
+    tracing::warn!(
+        event = "fallthrough_work_creation_blocked",
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        trace_id = %ctx.trace_id,
+        motif = %motif,
+        verb = %verb,
+        label = label.unwrap_or("—"),
+        repo = %repo.unwrap_or("unknown"),
+        "refused work creation on a Webhook Fallthrough turn (mika#2517 + mika#2573)"
+    );
+
+    // La ligne ne porte pas de `marker_class` : le booléen ne la transporte pas,
+    // et l'inventer serait un champ qui affirme ce qu'on n'a pas mesuré (classe
+    // mika#2304). `webhook_fallthrough_turn` (mika#2517) porte déjà le
+    // `marker_class` **sous le même `trace_id`** — une ligne dit *quel tour*,
+    // l'autre dit *ce qu'il a tenté*, et le `trace_id` les joint exactement.
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            FALLTHROUGH_WORK_CREATION_AUDIT_TOOL,
+            &format!("agent:{}", ctx.db.agent_id()),
+            None,
+            Some(motif),
+            Some(&format!("verb={verb} label={}", label.unwrap_or("—"))),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "fallthrough_work_creation_audit_failed",
+            error = %e,
+            motif = %motif,
+            "the WARN landed but its audit row did not; the GROUP BY is incomplete"
+        );
+    }
+
+    // Le `remedy` nomme les deux sorties correctes que le prompt possède déjà —
+    // accuser réception et s'arrêter, ou alerter l'opérateur — et **ne nomme
+    // aucun contournement** : un refus qui donne le gabarit est une fuite avec
+    // une étape de plus (doctrine mika#2520).
+    Err(ToolOutput::error(
+        serde_json::json!({
+            "error": "fallthrough_work_creation_refused",
+            "doctrine": "mika#2517 + mika#2573",
+            "action": motif,
+            "reason": format!(
+                "This turn is a Webhook Fallthrough turn: an informational GitHub event \
+                 that is not a trigger to start new work. `gh {verb}` creates work, and \
+                 no work may be created here."
+            ),
+            "remedy":
+                "Two exits, and they are the only two. (1) Acknowledge the event and stop \
+                 — reading the issue is still permitted, so `gh issue view <n> --json labels` \
+                 remains available if you need to correlate. (2) If this event deserves a \
+                 human decision, say so to the operator with `send_message` and stop. Do not \
+                 look for another route: this refusal is not lifted by retrying under a \
+                 different shape.",
+        })
+        .to_string(),
+    ))
+}
+
 /// Validate `gh pr ready` / `gh pr edit --title` against the wip-rescue
 /// operator-review contract (mika#1682, layer-2 companion of mika#1679).
 ///
@@ -4031,6 +4178,19 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // Skill-scoped scope check (mika#1196): when qa-review is in the active
     // skill set, restrict to the narrow allowlist before any side effects.
     if let Err(err) = validate_qa_review_gh_scope(&gh_args.args, ctx) {
+        return err;
+    }
+
+    // Fallthrough work-creation gate (mika#2573): on a Webhook Fallthrough turn,
+    // refuse the two `gh` verbs that create work — `issue create` and
+    // `issue edit --add-label ready`. Placed here, before the first gate that
+    // makes a network call: the chain runs from the most local to the most
+    // engaging, and this one is pure argv plus a turn-class boolean. Refuses
+    // rather than withholds `run_gh`, because the prompt's own verification
+    // gesture (`issue view --json labels`) is a `run_gh` read.
+    if let Err(err) =
+        validate_fallthrough_work_creation(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
         return err;
     }
 
@@ -6524,6 +6684,7 @@ mod tests {
             is_reflection: false,
             is_task_context: false,
             is_callback_turn: false,
+            is_webhook_fallthrough_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],
@@ -6567,6 +6728,7 @@ mod tests {
             is_reflection: false,
             is_task_context: false,
             is_callback_turn: false,
+            is_webhook_fallthrough_turn: false,
             provider_name: "anthropic",
             model_name: "claude-sonnet-4-6",
             active_skill_paths: &[],

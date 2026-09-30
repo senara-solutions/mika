@@ -1872,6 +1872,199 @@ pub fn parse_repeat_window(raw: Option<&str>) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// mika#2573 — un tour Webhook Fallthrough ne crée pas de travail par `run_gh`
+// ---------------------------------------------------------------------------
+//
+// Frère immédiat de mika#1646 ci-dessus : même foyer, même forme (pur argv,
+// sans `ToolContext`, donc testable aux bornes sans base ni tour), même
+// consommateur (la chaîne pré-subprocess de `run_gh`), et la même raison de ne
+// pas être une garde EndTurn — le défaut est l'appel, pas une phrase. Une issue
+// créée au pas 3 de la boucle d'outils est créée ; un re-prompt à la clôture ne
+// peut que l'annoter.
+//
+// Ce que ça ferme. mika#2517 **retient** `create_task` sur un tour Fallthrough
+// pour qu'aucun travail n'y naisse. Le 2026-09-28 le modèle a créé la même
+// chose par l'outil voisin : `run_gh issue create` (l'issue #2571, qu'il a
+// lui-même qualifiée d'« erreur »), et a relancé un dispatch implement par
+// `run_gh issue edit --add-label ready`. Même intention, contournée par un
+// substitut hors du périmètre de la retenue.
+//
+// Pourquoi REFUSER et non RETENIR. La SCOPE RULE du prompt `self-dev`
+// prescrit, mot pour mot, un `run_gh issue view <n> --json labels` comme geste
+// de vérification — la seule sortie correcte qu'elle offre. Ajouter `run_gh` à
+// `FALLTHROUGH_WITHHELD_TOOLS` casserait ce geste. La retenue est donc
+// *indisponible* ici, et le refus est la seule forme qui reste.
+
+/// Audit-event `tool_name` pour chaque refus de création de travail sur un tour
+/// Fallthrough (mika#2573 U4).
+///
+/// **SOLE WRITER** : `skills::builtin_handlers`, épinglé par
+/// `canonical_tokens::tests::mika2573_the_work_creation_event_has_a_single_writer`.
+/// C'est cette propriété qui rend le `GROUP BY after_value` de l'opérateur
+/// exact plutôt qu'un nombre sur lequel deux sites peuvent diverger.
+pub const FALLTHROUGH_WORK_CREATION_AUDIT_TOOL: &str = "fallthrough_work_creation";
+
+/// L'étiquette dont la pose déclenche un dispatch (mika#841).
+///
+/// Comparée en `eq_ignore_ascii_case` : un label `Ready` déclenche le même
+/// webhook côté GitHub, donc un prédicat sensible à la casse serait
+/// contournable par une majuscule.
+pub const DISPATCH_TRIGGER_LABEL: &str = "ready";
+
+/// Les deux verbes `run_gh` qui créent du travail, comme **format de fil**
+/// (mika#2573 U2).
+///
+/// Ces deux valeurs atterrissent dans `audit_events.after_value` et un
+/// opérateur écrit des `GROUP BY` dessus, donc deux orthographes d'un même
+/// motif couperaient une population en deux sans le dire (motif mika#2323 /
+/// mika#2536). Un seul site de définition, épinglé par test.
+pub const WORK_CREATION_MOTIF_ISSUE_CREATE: &str = "issue_create";
+/// Voir [`WORK_CREATION_MOTIF_ISSUE_CREATE`].
+pub const WORK_CREATION_MOTIF_READY_LABEL_ADD: &str = "ready_label_add";
+
+/// Toutes les valeurs que [`WorkCreationAction::motif`] peut rendre, pour
+/// l'épinglage du format de fil.
+///
+/// Reste en production plutôt que sous `#[cfg(test)]` : le registre d'un format
+/// de fil est ce qu'un opérateur lit pour savoir ce qu'un `GROUP BY` peut
+/// rendre, et un registre qui n'existe que sous `cfg(test)` est un registre que
+/// le lecteur de ce fichier ne peut pas trouver (même arbitrage que
+/// `webhook_dispatch::ALL_MARKER_CLASSES`).
+pub const ALL_WORK_CREATION_MOTIFS: &[&str] = &[
+    WORK_CREATION_MOTIF_ISSUE_CREATE,
+    WORK_CREATION_MOTIF_READY_LABEL_ADD,
+];
+
+/// Une création de travail reconnue dans un argv `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkCreationAction {
+    /// `gh issue create …` — le substitut mesuré à la tâche retenue.
+    IssueCreate,
+    /// `gh issue edit … --add-label ready` — la pose du signal canonique de
+    /// dispatch (mika#841). Porte l'étiquette **telle qu'elle a été écrite**,
+    /// pour que la ligne de journal dise ce que le modèle a tapé plutôt qu'une
+    /// forme normalisée.
+    ReadyLabelAdd { label: String },
+}
+
+impl WorkCreationAction {
+    /// Le motif, format de fil — voir [`ALL_WORK_CREATION_MOTIFS`].
+    pub fn motif(&self) -> &'static str {
+        match self {
+            WorkCreationAction::IssueCreate => WORK_CREATION_MOTIF_ISSUE_CREATE,
+            WorkCreationAction::ReadyLabelAdd { .. } => WORK_CREATION_MOTIF_READY_LABEL_ADD,
+        }
+    }
+
+    /// Le verbe `gh`, pour la ligne de journal.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            WorkCreationAction::IssueCreate => "issue create",
+            WorkCreationAction::ReadyLabelAdd { .. } => "issue edit --add-label",
+        }
+    }
+}
+
+/// Les drapeaux `gh` qui **ajoutent** une étiquette.
+///
+/// `--add-label` est la forme d'`issue edit` ; `--label` / `-l` est celle
+/// d'`issue create`. Les deux sont listés parce que le scan des étiquettes sert
+/// aussi à la ligne de journal du verbe `create`, mais `IssueCreate` est refusé
+/// **entier** : le verbe suffit, indépendamment de ses étiquettes.
+const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
+
+/// Reconnaît, dans un argv `gh`, un verbe qui crée du travail (mika#2573 U2).
+///
+/// # Fail-open, comme son frère mika#1646
+///
+/// Un argv qui n'est aucune des deux formes n'est pas l'affaire de cette garde
+/// ⇒ `None`. `gh` dans son ensemble est intouché et la surface reste bornée à
+/// deux verbes. Ce qui suit la reconnaissance est fail-closed, et c'est
+/// `run_gh` qui le porte.
+///
+/// # Les trois formes syntaxiques ne sont pas de la minutie
+///
+/// `gh` accepte `--add-label ready`, `--add-label=ready`,
+/// `--add-label "bug,ready"`, et le drapeau est **répétable**. Rater une des
+/// trois rend la garde contournable par une virgule. Le précédent est dans le
+/// même arbre : `validate_gh_input` refuse déjà `--repo` **et** `--repo=value`.
+///
+/// # Ce qui est délibérément HORS population
+///
+/// `gh pr edit --add-label ready` : le marqueur de dispatch est porté par
+/// `issues.labeled`, donc un label de PR ne déclenche aucun dispatch — armer
+/// une garde sur une population vide est ce que mika#2536 refuse. Idem
+/// `gh label create ready`, qui gère une *définition* de label et n'émet aucun
+/// événement `labeled`, et `gh issue reopen`, GitHub n'émettant `labeled` que
+/// sur une **transition** (mika#2323).
+pub fn detect_fallthrough_work_creation(args: &[String]) -> Option<WorkCreationAction> {
+    // Positionnel, parce que c'est la seule forme que `gh` accepte — même
+    // lecture que `detect_destructive_action` ci-dessus.
+    if args.first().map(String::as_str) != Some("issue") {
+        return None;
+    }
+
+    match args.get(1).map(String::as_str) {
+        Some("create") => Some(WorkCreationAction::IssueCreate),
+        Some("edit") => added_dispatch_trigger_label(&args[2..])
+            .map(|label| WorkCreationAction::ReadyLabelAdd { label }),
+        _ => None,
+    }
+}
+
+/// Rend la première étiquette ajoutée qui vaut le signal de dispatch, telle
+/// qu'elle a été écrite.
+///
+/// Balaye **tous** les `--add-label`, parce que le drapeau est répétable et
+/// qu'un `--add-label bug --add-label ready` ne doit pas passer sur la foi du
+/// premier. Chaque valeur est découpée sur les virgules : `gh` accepte une
+/// liste, et `"bug,ready"` pose bien les deux étiquettes.
+fn added_dispatch_trigger_label(tail: &[String]) -> Option<String> {
+    let mut i = 0usize;
+    while i < tail.len() {
+        let arg = &tail[i];
+
+        // Forme collée : `--add-label=ready` ou `--add-label=bug,ready`.
+        if let Some((flag, inline)) = arg.split_once('=')
+            && ADD_LABEL_FLAGS.contains(&flag)
+        {
+            if let Some(found) = dispatch_trigger_in_list(inline) {
+                return Some(found);
+            }
+            i += 1;
+            continue;
+        }
+
+        // Forme séparée : `--add-label ready`.
+        if ADD_LABEL_FLAGS.contains(&arg.as_str()) {
+            if let Some(value) = tail.get(i + 1)
+                && let Some(found) = dispatch_trigger_in_list(value)
+            {
+                return Some(found);
+            }
+            i += 2;
+            continue;
+        }
+
+        i += 1;
+    }
+    None
+}
+
+/// L'étiquette de dispatch dans une liste `gh` séparée par virgules, telle
+/// qu'elle a été écrite.
+///
+/// Insensible à la casse : un label `Ready` déclenche le même webhook, donc
+/// fail-closed sur la casse.
+fn dispatch_trigger_in_list(value: &str) -> Option<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|entry| entry.eq_ignore_ascii_case(DISPATCH_TRIGGER_LABEL))
+        .map(str::to_string)
+}
+
+// ---------------------------------------------------------------------------
 // mika#2136 — un envoi échoué ne peut pas se clore en silence
 // ---------------------------------------------------------------------------
 
@@ -4919,6 +5112,219 @@ mod tests {
             parse_repeat_window(Some("-1")),
             REPEAT_ACTION_WINDOW_DEFAULT_SECS
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2573 — `detect_fallthrough_work_creation`
+    // -----------------------------------------------------------------------
+
+    mod mika2573 {
+        use super::super::*;
+
+        fn argv(parts: &[&str]) -> Vec<String> {
+            parts.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        /// L'argv mesuré le 2026-09-28 à 16:05:42Z, verbatim.
+        #[test]
+        fn the_measured_ready_label_argv_is_detected() {
+            let action = detect_fallthrough_work_creation(&argv(&[
+                "issue",
+                "edit",
+                "2562",
+                "--add-label",
+                "ready",
+            ]))
+            .expect("the founding argv must be recognized");
+            assert_eq!(
+                action,
+                WorkCreationAction::ReadyLabelAdd {
+                    label: "ready".to_string()
+                }
+            );
+            assert_eq!(action.motif(), WORK_CREATION_MOTIF_READY_LABEL_ADD);
+        }
+
+        /// L'argv mesuré le 2026-09-28 à 16:05:54Z, verbatim.
+        #[test]
+        fn the_measured_issue_create_argv_is_detected() {
+            let action = detect_fallthrough_work_creation(&argv(&[
+                "issue",
+                "create",
+                "--title",
+                "Re-groom mika#2562 — reprise substrat",
+            ]))
+            .expect("the founding argv must be recognized");
+            assert_eq!(action, WorkCreationAction::IssueCreate);
+            assert_eq!(action.motif(), WORK_CREATION_MOTIF_ISSUE_CREATE);
+        }
+
+        /// Les trois formes syntaxiques que `gh` accepte.
+        ///
+        /// Rater une des trois rend la garde contournable **par une virgule**,
+        /// ce qui est la forme la moins visible de tout ce fichier. Le précédent
+        /// est dans `validate_gh_input`, qui refuse déjà `--repo` *et*
+        /// `--repo=value`.
+        #[test]
+        fn the_three_syntactic_forms_are_recognized() {
+            for cmd in [
+                argv(&["issue", "edit", "42", "--add-label", "ready"]),
+                argv(&["issue", "edit", "42", "--add-label=ready"]),
+                argv(&["issue", "edit", "42", "--add-label", "bug,ready"]),
+                argv(&["issue", "edit", "42", "--add-label=bug,ready"]),
+                // Avec des espaces autour, comme un humain l'écrirait.
+                argv(&["issue", "edit", "42", "--add-label", "bug, ready"]),
+            ] {
+                assert!(
+                    detect_fallthrough_work_creation(&cmd).is_some(),
+                    "the dispatch trigger must be found in {cmd:?} — a form missed here \
+                     is a form the guard can be bypassed with"
+                );
+            }
+        }
+
+        /// Le drapeau est **répétable**, et un premier label innocent ne doit pas
+        /// faire passer le second.
+        #[test]
+        fn a_repeated_flag_does_not_hide_the_trigger_behind_an_innocent_one() {
+            let action = detect_fallthrough_work_creation(&argv(&[
+                "issue",
+                "edit",
+                "42",
+                "--add-label",
+                "bug",
+                "--add-label",
+                "ready",
+            ]))
+            .expect("the second --add-label must be scanned too");
+            assert_eq!(action.motif(), WORK_CREATION_MOTIF_READY_LABEL_ADD);
+        }
+
+        /// `Ready` déclenche le même webhook côté GitHub, donc fail-closed sur
+        /// la casse — et l'étiquette rendue est celle **écrite**, pour que la
+        /// ligne de journal dise ce que le modèle a tapé.
+        #[test]
+        fn the_label_comparison_is_case_insensitive_and_reports_what_was_written() {
+            let action = detect_fallthrough_work_creation(&argv(&[
+                "issue",
+                "edit",
+                "42",
+                "--add-label",
+                "Ready",
+            ]))
+            .expect("a capitalized label triggers the same webhook");
+            assert_eq!(
+                action,
+                WorkCreationAction::ReadyLabelAdd {
+                    label: "Ready".to_string()
+                },
+                "the line must report the label as written, not a normalized form"
+            );
+        }
+
+        /// **Contrôles négatifs.** Sans eux, un prédicat qui refuserait *tout*
+        /// `issue …` serait indistinguable d'un prédicat qui lit les deux verbes
+        /// — et il casserait le geste de vérification que le prompt prescrit.
+        #[test]
+        fn reads_and_non_triggering_labels_are_not_work_creation() {
+            for cmd in [
+                // Le geste que la SCOPE RULE du prompt prescrit littéralement.
+                argv(&["issue", "view", "2562", "--json", "labels"]),
+                argv(&["issue", "list", "--label", "ready"]),
+                argv(&["issue", "comment", "2562", "--body", "noted"]),
+                // Une étiquette qui ne déclenche aucun dispatch.
+                argv(&["issue", "edit", "2562", "--add-label", "bug"]),
+                argv(&["issue", "edit", "2562", "--add-label=p1-important"]),
+                // Retirer l'étiquette ne la pose pas.
+                argv(&["issue", "edit", "2562", "--remove-label", "ready"]),
+                // Éditer autre chose que les étiquettes.
+                argv(&["issue", "edit", "2562", "--title", "ready to go"]),
+                // Hors population, nommée au § 2 du plan : le marqueur de
+                // dispatch est porté par `issues.labeled`, donc un label de PR
+                // ne déclenche aucun dispatch.
+                argv(&["pr", "edit", "2562", "--add-label", "ready"]),
+                argv(&["pr", "create", "--title", "x"]),
+                // Idem : `label create` gère une *définition*, pas une
+                // assignation ⇒ aucun événement `labeled`.
+                argv(&["label", "create", "ready"]),
+                argv(&["issue", "reopen", "2562"]),
+                // Argv vides ou tronqués.
+                argv(&[]),
+                argv(&["issue"]),
+            ] {
+                assert!(
+                    detect_fallthrough_work_creation(&cmd).is_none(),
+                    "{cmd:?} creates no work and must pass — a guard that refuses a read \
+                     breaks the only correct exit the prompt offers"
+                );
+            }
+        }
+
+        /// `issue create --label ready` est couvert par le refus du verbe
+        /// **entier**, indépendamment de ses étiquettes.
+        #[test]
+        fn issue_create_is_refused_whole_whatever_its_labels() {
+            for cmd in [
+                argv(&["issue", "create", "--title", "x"]),
+                argv(&["issue", "create", "--title", "x", "--label", "ready"]),
+                argv(&["issue", "create", "--title", "x", "--label", "bug"]),
+            ] {
+                assert_eq!(
+                    detect_fallthrough_work_creation(&cmd).map(|a| a.motif()),
+                    Some(WORK_CREATION_MOTIF_ISSUE_CREATE),
+                    "{cmd:?} must be refused on the verb, not on its label list"
+                );
+            }
+        }
+
+        /// Les deux motifs sont un **format de fil** : ils atterrissent dans
+        /// `audit_events.after_value` et un opérateur en fait des `GROUP BY`.
+        /// Deux orthographes couperaient une population en deux sans le dire
+        /// (motif mika#2323 / mika#2536).
+        #[test]
+        fn the_motifs_are_a_wire_format() {
+            assert_eq!(WORK_CREATION_MOTIF_ISSUE_CREATE, "issue_create");
+            assert_eq!(WORK_CREATION_MOTIF_READY_LABEL_ADD, "ready_label_add");
+            assert_eq!(
+                ALL_WORK_CREATION_MOTIFS,
+                &["issue_create", "ready_label_add"],
+                "the registry is what an operator reads to know what a GROUP BY can \
+                 return; renaming a value is a wire break to date in CLAUDE.md"
+            );
+            assert_eq!(
+                FALLTHROUGH_WORK_CREATION_AUDIT_TOOL,
+                "fallthrough_work_creation"
+            );
+        }
+
+        /// Anti-vacuité du registre : chaque variante rend un motif déclaré, et
+        /// chaque motif déclaré est rendu par une variante.
+        ///
+        /// Sans ce test, ajouter une troisième variante sans l'inscrire au
+        /// registre laisserait un `GROUP BY` rendre une valeur que le lecteur
+        /// de `ALL_WORK_CREATION_MOTIFS` ne trouve pas.
+        #[test]
+        fn every_variant_is_declared_in_the_registry() {
+            let produced = [
+                WorkCreationAction::IssueCreate.motif(),
+                WorkCreationAction::ReadyLabelAdd {
+                    label: "ready".to_string(),
+                }
+                .motif(),
+            ];
+            for motif in produced {
+                assert!(
+                    ALL_WORK_CREATION_MOTIFS.contains(&motif),
+                    "{motif} is produced by a variant and absent from the registry"
+                );
+            }
+            assert_eq!(
+                ALL_WORK_CREATION_MOTIFS.len(),
+                produced.len(),
+                "the registry has an entry no variant produces — a dead value in a wire \
+                 format reads exactly like a live one"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
