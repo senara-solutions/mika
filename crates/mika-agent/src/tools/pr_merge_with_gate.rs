@@ -530,8 +530,11 @@ pub(crate) enum MergeGateResult {
     AlreadyMerged,
     #[serde(rename = "gate_errored")]
     GateError { kind: GateErrorKind, detail: String },
-    /// The PR was behind `main` and GitHub accepted an update of its branch
-    /// (mika#2238). Deliberately NOT a `Blocked` variant: a behind-main state
+    /// The PR was behind `main`, GitHub accepted an update of its branch
+    /// (mika#2238), and the PR's base was then **read** to have moved
+    /// (mika#2252). `new_main_sha` is that read value — an acceptance whose
+    /// landing was not observed is `blocked[behind_main]`, never this variant.
+    /// Deliberately NOT a `Blocked` variant: a behind-main state
     /// that was repaired is not a blockage, and collapsing the two would leave
     /// the agent unable to tell "the mechanical state is fixed" from "something
     /// is wrong". No merge was attempted and none must be attempted this turn —
@@ -966,11 +969,113 @@ const UPDATE_ATTEMPT_TTL: Duration = Duration::from_secs(6 * 3600);
 /// Key = `"{repo}#{pr}@{target_main_sha}"`, value = monotonic `Instant`.
 static UPDATE_ATTEMPTS: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
 
+/// How many times, and how far apart, an accepted update-branch is re-read
+/// before its landing is called unobserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LandingBudget {
+    pub(crate) attempts: u32,
+    pub(crate) delay: Duration,
+}
+
+/// Three re-reads, two seconds apart — six seconds at worst.
+///
+/// **This value is a choice, not a measurement, and saying so is part of it.**
+/// The real landing latency of a `202 update-branch` on this repository has
+/// never been observed. What makes a short budget SAFE is not the number but
+/// the benignity of its error: an update that lands after the budget expires is
+/// read as `AcceptedNotLanded`, which **releases the claim**, and the next
+/// arrival re-measures `is_behind_main` and finds the PR no longer behind. No
+/// double merge commit follows, and nothing is lost but one turn.
+///
+/// What makes it ACCEPTABLE IN COST is measured: of the three sites that reach
+/// [`remediate_behind_main`], only the tool path is inside a bounded envelope
+/// (`PrMergeWithGateTool::timeout_secs` = 60 s), so six seconds is a tenth of
+/// the tightest budget — and it is paid *only* when nothing lands, i.e. in the
+/// case that costs six hours today. The two webhook handlers have no enclosing
+/// timeout and absorb it.
+///
+/// Revise it on the distribution the `accepted_not_landed` trace produces
+/// (mika#2252), never on intuition. If that token ever carries nominal traffic,
+/// read first whether those PRs eventually land — then the value is too low —
+/// or never do, in which case the GitHub job is genuinely failing and the cause
+/// is upstream of this constant.
+const UPDATE_LANDING_BUDGET: LandingBudget = LandingBudget {
+    attempts: 3,
+    delay: Duration::from_secs(2),
+};
+
+/// What the post-acceptance re-read of the PR's base established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LandingObservation {
+    /// The base moved, and this is the SHA that was READ off the PR.
+    Landed { observed_base_sha: String },
+    /// The budget expired without the base being seen to move. Says nothing
+    /// about *why* — a slow async job and a failed one look identical here, and
+    /// pretending otherwise is the class of claim mika#2252 exists to remove.
+    NotObserved,
+}
+
+/// Re-read the PR's base until it moves, or until the budget runs out.
+///
+/// The effect is INJECTED (`read_base`) rather than called directly, and that
+/// is what makes AC3/AC4 assertable without a forge: the decision is a pure
+/// loop over a closure, the network lives at the call site. Same idiom, same
+/// reason, as `server::deadline_verdict`'s `poster`.
+///
+/// Two properties are contractual:
+///
+/// **The wait PRECEDES the first read.** The endpoint is asynchronous by
+/// contract, so reading immediately would produce a systematic false negative —
+/// the exact remedy the ticket's first draft prescribed and that this shape
+/// replaces. The loop returns on the first success, so a fast landing pays one
+/// delay and the full budget is only ever spent when nothing lands.
+///
+/// **An unreadable base is never a landing.** An `Err`, a SHA equal to
+/// `before_base_sha`, **or an empty SHA** all count as "not yet" and continue.
+/// The empty-SHA term is load-bearing rather than defensive:
+/// `PrPreflight::base_ref_oid` falls back to the empty string when GitHub does
+/// not render the field (pinned by `preflight_base_ref_oid_defaults_to_empty`),
+/// so without it `"" != before_base_sha` would be true and an absent field
+/// would read as a landing — the very defect being closed, one layer down.
+pub(crate) async fn observe_update_branch_landing<F, Fut>(
+    before_base_sha: &str,
+    budget: LandingBudget,
+    mut read_base: F,
+) -> LandingObservation
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    for _ in 0..budget.attempts {
+        tokio::time::sleep(budget.delay).await;
+
+        if let Ok(observed) = read_base().await
+            && !observed.is_empty()
+            && observed != before_base_sha
+        {
+            return LandingObservation::Landed {
+                observed_base_sha: observed,
+            };
+        }
+    }
+
+    LandingObservation::NotObserved
+}
+
 /// Outcome of one `update-branch` call against a PR.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdateBranchOutcome {
-    /// GitHub accepted the update — a new commit now sits on the PR head.
-    Updated,
+    /// GitHub took the request — and that is the whole of what it says.
+    ///
+    /// The endpoint answers `202 Accepted` and performs the merge
+    /// asynchronously, so a zero exit proves the request was accepted, never
+    /// that a commit exists (mika#2252). The name is the fix: this variant used
+    /// to be called `Updated` and to claim "a new commit now sits on the PR
+    /// head", which no line of code had read. Whether the update landed is
+    /// established downstream by re-reading the PR's base — see
+    /// [`observe_update_branch_landing`] — and only that reading produces
+    /// [`BehindMainRemediation::Updated`].
+    Accepted,
     /// GitHub declined because the branch is not behind after all (benign race).
     AlreadyUpToDate,
     /// The update revealed a real content conflict — resolution is required.
@@ -982,8 +1087,26 @@ pub(crate) enum UpdateBranchOutcome {
 /// What the behind-main path decided for this PR, in this turn.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BehindMainRemediation {
-    /// The branch was brought up to date. A fresh CI run is expected.
-    Updated,
+    /// The re-read OBSERVED the PR's base move: the update landed, and a fresh
+    /// CI run is expected on the new head.
+    ///
+    /// The SHA is the one that was read off the PR (mika#2252), never
+    /// `BehindMainInfo::current_main_sha`, which is the SHA that was *aimed
+    /// at*. The two differ whenever `main` moves again between the update and
+    /// the re-read, and publishing the second under the name of the first is
+    /// the defect this variant's payload exists to close.
+    Updated { observed_base_sha: String },
+    /// GitHub accepted the update and the re-read never saw the base move
+    /// inside the landing budget (mika#2252).
+    ///
+    /// Three facts about this state, each load-bearing. It is **not** a
+    /// failure: the request was taken, and the async job may still be running
+    /// or may have failed — the engine cannot tell which, and says so rather
+    /// than guessing. It **releases the anti-thrash claim**, because a claim
+    /// spent on an update nobody observed landing would otherwise strand the
+    /// PR for the six-hour TTL. And it is **not** [`Self::Updated`], so no
+    /// caller can read "repaired" off an outcome nothing measured.
+    AcceptedNotLanded,
     /// The anti-thrash guard already spent this PR's attempt at this main SHA.
     AlreadyAttempted,
     /// The PR turned out not to be behind after all — the gate may continue.
@@ -1046,8 +1169,8 @@ pub(crate) fn claim_update_branch_attempt(
 /// `main` may not advance for hours. A permanent stall is exactly the state
 /// mika#2238 exists to end, so the guard must not manufacture one.
 ///
-/// Released only for `Failed` — a `Conflict` is a stable fact about the PR that
-/// re-asking cannot change, and an `Updated` is the case the cap is for.
+/// Which outcomes give the claim back is decided by [`releases_claim`], whose
+/// doc-comment carries the per-variant reasoning.
 ///
 /// The cost of releasing, stated: a persistently failing update (a 403) is
 /// retried once per webhook rather than once per `main` SHA. That is a bounded
@@ -1055,6 +1178,42 @@ pub(crate) fn claim_update_branch_attempt(
 /// notifying the operator — cheaper than a PR nobody comes back to.
 fn release_update_branch_attempt(pr_number: u64, repo: &str, target_main_sha: &str) {
     UPDATE_ATTEMPTS.remove(&format!("{repo}#{pr_number}@{target_main_sha}"));
+}
+
+/// Does this outcome give its anti-thrash claim back?
+///
+/// **An exhaustive `match` with no `_` arm, and that is the point of extracting
+/// it.** The release used to be an inline `matches!` in
+/// [`remediate_behind_main`] — the one site in this chain the compiler could
+/// not hold, since `matches!` keeps compiling when a variant appears (the shape
+/// mika#1940 had to name in writing). A new variant now fails to compile here,
+/// where the decision is, instead of silently defaulting to "keep the claim"
+/// six hours at a time. Being pure also makes it assertable without a forge,
+/// which is the discipline the rest of this module already follows.
+///
+/// Two outcomes release, for two different reasons:
+///
+/// - `Failed` — the attempt never reached GitHub, so it made no commit and is
+///   not the thrash the cap exists to stop.
+/// - `AcceptedNotLanded` — GitHub took the request and nothing was seen to
+///   land. Keeping the claim would strand the PR until the six-hour TTL or the
+///   next move of `main`, which is the state mika#2238 exists to end and
+///   mika#2252 found still reachable through the accepted-but-not-landed door.
+///
+/// The rest keep it. `Updated` is the case the cap is *for*; `Conflict` is a
+/// stable fact about the PR that re-asking cannot change; `AlreadyAttempted`
+/// never took a claim of its own; `NotBehind`, `Contradiction` and
+/// `BaseNotMain` describe a PR the repair must not be re-aimed at.
+pub(crate) fn releases_claim(remediation: &BehindMainRemediation) -> bool {
+    match remediation {
+        BehindMainRemediation::Failed(_) | BehindMainRemediation::AcceptedNotLanded => true,
+        BehindMainRemediation::Updated { .. }
+        | BehindMainRemediation::AlreadyAttempted
+        | BehindMainRemediation::NotBehind
+        | BehindMainRemediation::Conflict(_)
+        | BehindMainRemediation::Contradiction(_)
+        | BehindMainRemediation::BaseNotMain(_) => false,
+    }
 }
 
 /// Core of [`claim_update_branch_attempt`], parameterized over the backing map
@@ -1109,12 +1268,19 @@ fn claim_update_attempt_in(
 /// case it exists for. The SHA comparison in `is_behind_main` is the authority
 /// on "behind"; this endpoint is the authority on "make it not so".
 ///
-/// **`Updated` means accepted, not finished.** The endpoint answers `202
-/// Accepted` and performs the merge asynchronously, so a zero exit proves
-/// GitHub took the request, never that a commit exists. Every string this
-/// module renders for `Updated` says "accepted" for that reason. The failure it
-/// leaves open — GitHub accepts, the async job fails, no commit and no webhook —
-/// resolves the next time `main` moves, because that is a new claim key.
+/// **`Accepted` means accepted, and the name is now the whole claim.** The
+/// endpoint answers `202 Accepted` and performs the merge asynchronously, so a
+/// zero exit proves GitHub took the request, never that a commit exists. This
+/// function therefore establishes nothing about landing, and since mika#2252 it
+/// no longer pretends to: whether the update landed is read off the PR's base
+/// by [`observe_update_branch_landing`], and only that reading yields
+/// [`BehindMainRemediation::Updated`].
+///
+/// The failure this used to leave open — GitHub accepts, the async job fails,
+/// no commit, no CI, no webhook — is no longer bounded by the six-hour TTL. An
+/// acceptance whose landing is not observed becomes
+/// [`BehindMainRemediation::AcceptedNotLanded`], which releases the claim, so
+/// the next arrival re-measures instead of waiting for `main` to move.
 pub(crate) async fn attempt_update_branch(
     pr_number: u64,
     repo: &str,
@@ -1124,7 +1290,7 @@ pub(crate) async fn attempt_update_branch(
     let args = vec!["api", "--method", "PUT", &endpoint];
 
     match run_gh_subprocess(&args, token).await {
-        Ok(_) => UpdateBranchOutcome::Updated,
+        Ok(_) => UpdateBranchOutcome::Accepted,
         Err(e) => classify_update_branch_error(&e),
     }
 }
@@ -1212,7 +1378,25 @@ pub(crate) async fn remediate_behind_main(
     }
 
     let remediation = match attempt_update_branch(pr_number, repo, token).await {
-        UpdateBranchOutcome::Updated => BehindMainRemediation::Updated,
+        // A `202` says the request was taken. Whether a commit exists is read
+        // off the PR, never inferred from the exit code (mika#2252).
+        UpdateBranchOutcome::Accepted => {
+            let observation =
+                observe_update_branch_landing(&info.pr_base_sha, UPDATE_LANDING_BUDGET, || async {
+                    run_gh_pr_view(pr_number, repo, token)
+                        .await
+                        .map(|preflight| preflight.base_ref_oid)
+                        .map_err(|e| e.message)
+                })
+                .await;
+
+            match observation {
+                LandingObservation::Landed { observed_base_sha } => {
+                    BehindMainRemediation::Updated { observed_base_sha }
+                }
+                LandingObservation::NotObserved => BehindMainRemediation::AcceptedNotLanded,
+            }
+        }
         UpdateBranchOutcome::AlreadyUpToDate => {
             reconcile_already_up_to_date(pr_number, repo, token)
                 .await
@@ -1222,9 +1406,9 @@ pub(crate) async fn remediate_behind_main(
         UpdateBranchOutcome::Failed(detail) => BehindMainRemediation::Failed(detail),
     };
 
-    // An attempt that never reached GitHub made no commit, so it is not the
-    // thrash the cap exists to stop — see `release_update_branch_attempt`.
-    if matches!(remediation, BehindMainRemediation::Failed(_)) {
+    // Which outcomes give the claim back — and why each one does or does not —
+    // lives in `releases_claim`, an exhaustive match the compiler holds.
+    if releases_claim(&remediation) {
         release_update_branch_attempt(pr_number, repo, &info.current_main_sha);
     }
 
@@ -1266,6 +1450,33 @@ async fn reconcile_already_up_to_date(
     }
 }
 
+/// The `outcome` token and optional `detail` of one behind-main decision.
+///
+/// **The tokens are a WIRE FORMAT.** They land in `$MIKA_SPIRIT_LOG_FILE` and
+/// [`log_behind_main_remediation`]'s doc-comment publishes one of them as an
+/// operator predicate, so two spellings of one outcome would split a population
+/// without saying so. Pure, and an exhaustive `match` with no `_` arm, so the
+/// set is pinnable by test and a new variant is a compile error rather than a
+/// silent `"unknown"`.
+///
+/// `"updated"` is deliberately UNCHANGED by mika#2252: renaming it would break
+/// a published reading for no gain, and after that fix it is *truer* than it
+/// was — it now designates a landing that was observed, where it used to
+/// designate an acceptance nobody had read. `"accepted_not_landed"` is the
+/// added token, and it is what makes the two populations countable apart.
+fn behind_main_trace_fields(remediation: &BehindMainRemediation) -> (&'static str, Option<&str>) {
+    match remediation {
+        BehindMainRemediation::Updated { .. } => ("updated", None),
+        BehindMainRemediation::AcceptedNotLanded => ("accepted_not_landed", None),
+        BehindMainRemediation::AlreadyAttempted => ("already_attempted", None),
+        BehindMainRemediation::NotBehind => ("not_behind", None),
+        BehindMainRemediation::Conflict(d) => ("conflict", Some(d.as_str())),
+        BehindMainRemediation::Failed(d) => ("failed", Some(d.as_str())),
+        BehindMainRemediation::Contradiction(d) => ("contradiction", Some(d.as_str())),
+        BehindMainRemediation::BaseNotMain(d) => ("base_not_main", Some(d.as_str())),
+    }
+}
+
 /// Emit the structured trace for one behind-main decision (R7).
 ///
 /// One emission point for all three sites: a PR that shows up behind without a
@@ -1282,15 +1493,7 @@ fn log_behind_main_remediation(
     info: &BehindMainInfo,
     remediation: &BehindMainRemediation,
 ) {
-    let (outcome, detail) = match remediation {
-        BehindMainRemediation::Updated => ("updated", None),
-        BehindMainRemediation::AlreadyAttempted => ("already_attempted", None),
-        BehindMainRemediation::NotBehind => ("not_behind", None),
-        BehindMainRemediation::Conflict(d) => ("conflict", Some(d.as_str())),
-        BehindMainRemediation::Failed(d) => ("failed", Some(d.as_str())),
-        BehindMainRemediation::Contradiction(d) => ("contradiction", Some(d.as_str())),
-        BehindMainRemediation::BaseNotMain(d) => ("base_not_main", Some(d.as_str())),
-    };
+    let (outcome, detail) = behind_main_trace_fields(remediation);
 
     info!(
         event = "behind_main_update_branch",
@@ -1333,9 +1536,38 @@ pub(crate) fn disposition_for_remediation(
 
     match remediation {
         BehindMainRemediation::NotBehind => None,
-        BehindMainRemediation::Updated => Some(MergeGateResult::BranchUpdated {
-            pr_base_sha: info.pr_base_sha.clone(),
-            new_main_sha: info.current_main_sha.clone(),
+        // `new_main_sha` is the SHA that was READ off the PR, never
+        // `info.current_main_sha`, which is the SHA that was aimed at. This
+        // field is DATA, serialized to the monitor and to the LLM: filling it
+        // from the target would declare a base nothing had measured, which is
+        // the defect mika#2252 closes.
+        BehindMainRemediation::Updated { observed_base_sha } => {
+            Some(MergeGateResult::BranchUpdated {
+                pr_base_sha: info.pr_base_sha.clone(),
+                new_main_sha: observed_base_sha.clone(),
+            })
+        }
+        // Blocked[behind_main] rather than a seventh `MergeGateResult` variant,
+        // for three reasons in order of weight. It is the FACT: the base did not
+        // move, so the PR is still behind. The precedent is the `AlreadyAttempted`
+        // arm immediately below — same shape, same reason, different cause. And
+        // the three embedded prompts enumerate **six** variants while instructing
+        // the agent to branch on them exhaustively, so a seventh would reopen T2
+        // of mika#2238 — an agent meeting a variant outside its list has no
+        // defined move, and the observed behaviour is a silent stop.
+        BehindMainRemediation::AcceptedNotLanded => Some(MergeGateResult::Blocked {
+            reason: BlockReason::BehindMain {
+                pr_base_sha: info.pr_base_sha.clone(),
+                current_main_sha: info.current_main_sha.clone(),
+            },
+            failing_checks: vec![],
+            detail: format!(
+                "PR is behind main (base: {}, main HEAD: {}) — GitHub accepted an automatic \
+                 branch update, but the PR's base had not moved when it was re-read, so the \
+                 update is not confirmed to have landed. A fresh attempt is open: the next \
+                 arrival re-measures rather than waiting.",
+                info.pr_base_sha, info.current_main_sha
+            ),
         }),
         BehindMainRemediation::AlreadyAttempted => Some(MergeGateResult::Blocked {
             reason: BlockReason::BehindMain {
@@ -1402,10 +1634,19 @@ pub(crate) fn describe_behind_main_remediation(
 
     match remediation {
         BehindMainRemediation::NotBehind => None,
-        BehindMainRemediation::Updated => Some(format!(
-            "the PR was behind main (base: {base}, main HEAD: {head}). GitHub has accepted an \
-             automatic branch update toward {head} (mika#2238), which moves the PR's head to a \
-             new commit. Do NOT merge this PR in this turn and do NOT call \
+        BehindMainRemediation::AcceptedNotLanded => Some(format!(
+            "the PR is behind main (base: {base}, main HEAD: {head}). GitHub accepted an \
+             automatic branch update, but the PR's base had not moved when it was re-read, so \
+             the update is NOT confirmed to have landed (mika#2252). It may still be running \
+             on GitHub's side, or it may have failed — the engine cannot tell which, and does \
+             not guess. A fresh attempt is open for the next arrival. Do NOT merge this PR and \
+             do NOT call `pr_merge_with_gate` for it. Do NOT rebase by hand. End the turn.\n\n"
+        )),
+        BehindMainRemediation::Updated { observed_base_sha } => Some(format!(
+            "the PR was behind main (base: {base}, main HEAD: {head}). An automatic branch \
+             update was accepted and the PR's base was then read at {observed_base_sha} \
+             (mika#2238, mika#2252), which moves the PR's head to a new commit. Do NOT merge \
+             this PR in this turn and do NOT call \
              `pr_merge_with_gate` for it: that new head commit has no CI result, and merging \
              it would put an unvalidated commit on main (the failure mika#1577 closed). Do NOT \
              rebase by hand. End the turn. **The PR now needs a fresh QA review** — the head \
@@ -2104,6 +2345,15 @@ mod tests {
 
     const REPO: &str = "senara-solutions/mika";
 
+    /// A base SHA the re-read OBSERVED — deliberately equal to neither
+    /// `pr_base_sha` nor `current_main_sha` of [`behind_info`].
+    ///
+    /// That third value is what makes "measured" testable at all: with an
+    /// observed SHA equal to the target, every assertion below would pass on
+    /// the pre-mika#2252 code, which published the target under the name of a
+    /// reading nothing had made.
+    const OBSERVED_SHA: &str = "0b5e4ved0b5e4ved0b5e4ved0b5e4ved0b5e4ved";
+
     fn behind_info() -> BehindMainInfo {
         BehindMainInfo {
             pr_base_sha: "abc1234deadbeef".to_string(),
@@ -2185,7 +2435,13 @@ mod tests {
         // has not run; merging it in the same turn is exactly the failure
         // mika#1577 was written to close, re-opened through mika#2238's door.
         let info = behind_info();
-        let disposition = disposition_for_remediation(&BehindMainRemediation::Updated, REPO, &info);
+        let disposition = disposition_for_remediation(
+            &BehindMainRemediation::Updated {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            },
+            REPO,
+            &info,
+        );
 
         assert!(
             disposition.is_some(),
@@ -2195,7 +2451,9 @@ mod tests {
             disposition,
             Some(MergeGateResult::BranchUpdated {
                 pr_base_sha: info.pr_base_sha.clone(),
-                new_main_sha: info.current_main_sha.clone(),
+                // Since mika#2252 this field carries the SHA that was READ, not
+                // the one that was aimed at — see `mika2252_branch_updated_*`.
+                new_main_sha: OBSERVED_SHA.to_string(),
             })
         );
     }
@@ -2211,7 +2469,10 @@ mod tests {
             "a PR that is genuinely not behind must not be held by this path"
         );
         for held in [
-            BehindMainRemediation::Updated,
+            BehindMainRemediation::Updated {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            },
+            BehindMainRemediation::AcceptedNotLanded,
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict".to_string()),
             BehindMainRemediation::Failed("HTTP 403".to_string()),
@@ -2528,6 +2789,401 @@ mod tests {
             "senara-solutions/mika",
             sha
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2252 — `Accepted` is not `Updated`: measuring the landing
+    // -----------------------------------------------------------------------
+
+    /// A budget with no wall-clock cost. `attempts` is what the tests vary;
+    /// the delay only has to be *some* duration for the loop to be exercised.
+    fn instant_budget(attempts: u32) -> LandingBudget {
+        LandingBudget {
+            attempts,
+            delay: Duration::ZERO,
+        }
+    }
+
+    const BEFORE_SHA: &str = "abc1234deadbeef";
+
+    #[tokio::test]
+    async fn mika2252_a_base_that_never_moves_is_not_observed() {
+        // The founding case. GitHub answered `202`, the async job produced no
+        // commit, and the base still reads what it read before. Nothing has
+        // landed, and the engine must say so rather than publish a repair.
+        let observation = observe_update_branch_landing(BEFORE_SHA, instant_budget(3), || async {
+            Ok(BEFORE_SHA.to_string())
+        })
+        .await;
+
+        assert_eq!(observation, LandingObservation::NotObserved);
+    }
+
+    #[tokio::test]
+    async fn mika2252_the_loop_stops_on_the_first_observed_move() {
+        // The loop returns on success: exactly 2 calls out of a budget of 3.
+        // A third would mean a fast landing still pays the whole budget, i.e.
+        // 6 s added to every repaired PR instead of only to the unrepaired ones.
+        let calls = std::cell::Cell::new(0u32);
+
+        let observation = observe_update_branch_landing(BEFORE_SHA, instant_budget(3), || {
+            let n = calls.get() + 1;
+            calls.set(n);
+            let answer = if n >= 2 {
+                Ok(OBSERVED_SHA.to_string())
+            } else {
+                Ok(BEFORE_SHA.to_string())
+            };
+            async move { answer }
+        })
+        .await;
+
+        assert_eq!(
+            observation,
+            LandingObservation::Landed {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            },
+            "the SHA carried must be the one that was READ, not the one aimed at"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "the loop must stop on the first observed move — a fast landing \
+             must not pay the whole budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mika2252_the_wait_precedes_the_first_read() {
+        // R3, and it needs a CLOCK to be measurable at all.
+        //
+        // The call count cannot attest this — verified by mutation: deleting
+        // the `sleep` leaves every other test in this section green, because a
+        // read-then-wait loop reaches the same SHA at the same iteration. What
+        // separates the two orders is *when* the first read happens, so that is
+        // what this asserts.
+        //
+        // It matters because the endpoint is asynchronous by contract: a read
+        // issued at t=0 sees the pre-update base, and on a budget of 1 that is
+        // a systematic false negative on a PR that lands perfectly well — the
+        // remedy the ticket's first draft prescribed and that this shape exists
+        // to replace.
+        //
+        // `start_paused` gives tokio a virtual clock it auto-advances while
+        // idle, so the two seconds below are free and deterministic.
+        let budget = LandingBudget {
+            attempts: 1,
+            delay: Duration::from_secs(2),
+        };
+
+        let started = tokio::time::Instant::now();
+        let first_read_at = std::cell::Cell::new(None::<Duration>);
+
+        let observation = observe_update_branch_landing(BEFORE_SHA, budget, || {
+            if first_read_at.get().is_none() {
+                first_read_at.set(Some(started.elapsed()));
+            }
+            async { Ok(OBSERVED_SHA.to_string()) }
+        })
+        .await;
+
+        assert_eq!(
+            observation,
+            LandingObservation::Landed {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            }
+        );
+        assert_eq!(
+            first_read_at.get(),
+            Some(budget.delay),
+            "the first re-read must happen AFTER one delay, never at t=0 — \
+             reading immediately would answer `NotObserved` on every PR whose \
+             update lands normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika2252_an_unreadable_base_is_never_a_landing() {
+        // R4, first negative control. `gh` failing is not evidence that the
+        // update landed; it is the absence of evidence either way. Kept
+        // SEPARATE from its two siblings on purpose: a conjunction of fail-safe
+        // terms is not proven by neutralising them together — a predicate
+        // reading only one of the three would pass a combined test.
+        let observation = observe_update_branch_landing(BEFORE_SHA, instant_budget(3), || async {
+            Err("gh exit code 1: Not Found (HTTP 404)".to_string())
+        })
+        .await;
+
+        assert_eq!(observation, LandingObservation::NotObserved);
+    }
+
+    #[tokio::test]
+    async fn mika2252_an_empty_base_is_never_a_landing() {
+        // R4, second negative control — and the load-bearing one.
+        // `PrPreflight::base_ref_oid` falls back to the empty string when
+        // GitHub does not render the field (pinned by
+        // `preflight_base_ref_oid_defaults_to_empty`), so that population
+        // exists. Without the emptiness term, `"" != before_base_sha` is true
+        // and an ABSENT FIELD reads as a landing — the defect this ticket
+        // closes, reproduced one layer down.
+        let observation = observe_update_branch_landing(BEFORE_SHA, instant_budget(3), || async {
+            Ok(String::new())
+        })
+        .await;
+
+        assert_eq!(
+            observation,
+            LandingObservation::NotObserved,
+            "an unrendered base field must never be read as a landing"
+        );
+    }
+
+    #[test]
+    fn mika2252_an_unlanded_acceptance_blocks_behind_main_and_gives_its_claim_back() {
+        // AC3, both halves. The disposition half alone is not enough: a test
+        // asserting only `Blocked[behind_main]` would stay green with R6
+        // forgotten and D2 — the six-hour stall — wide open.
+        let info = behind_info();
+
+        let disposition =
+            disposition_for_remediation(&BehindMainRemediation::AcceptedNotLanded, REPO, &info)
+                .expect("an unlanded acceptance must terminate the turn, never merge");
+
+        match &disposition {
+            MergeGateResult::Blocked { reason, detail, .. } => {
+                assert_eq!(
+                    *reason,
+                    BlockReason::BehindMain {
+                        pr_base_sha: info.pr_base_sha.clone(),
+                        current_main_sha: info.current_main_sha.clone(),
+                    },
+                    "the PR IS still behind — that is the fact, not a fallback"
+                );
+                assert!(
+                    detail.contains("not confirmed to have landed"),
+                    "the detail must say what was not established: {detail}"
+                );
+            }
+            other => panic!("expected blocked[behind_main], got {other:?}"),
+        }
+
+        assert!(
+            !matches!(disposition, MergeGateResult::BranchUpdated { .. }),
+            "the loop must never read `repaired` off a landing nobody observed"
+        );
+
+        // The claim half, exercised against the real process-global ledger.
+        assert!(
+            releases_claim(&BehindMainRemediation::AcceptedNotLanded),
+            "an acceptance whose landing was not observed must give its claim \
+             back — keeping it strands the PR for the six-hour TTL (D2)"
+        );
+
+        let sha = "mika2252-not-landed-unique-sha-91af3c";
+        assert!(claim_update_branch_attempt(2252, REPO, sha));
+        assert!(!claim_update_branch_attempt(2252, REPO, sha));
+        release_update_branch_attempt(2252, REPO, sha);
+        assert!(
+            claim_update_branch_attempt(2252, REPO, sha),
+            "a released claim must be re-takeable — otherwise the next arrival \
+             cannot re-measure and the stall is back"
+        );
+    }
+
+    #[test]
+    fn mika2252_branch_updated_carries_the_observed_sha_not_the_target() {
+        // AC2, and the test that separates "measured" from "declared". It only
+        // discriminates because the observed SHA differs from BOTH shas of
+        // `behind_info()` — with `observed == current_main_sha` this assertion
+        // would pass on the pre-fix code, which published `info.current_main_sha`
+        // under the name of a reading nothing had made.
+        let info = behind_info();
+        assert_ne!(
+            OBSERVED_SHA, info.current_main_sha,
+            "the fixture must distinguish the read SHA from the aimed-at one"
+        );
+
+        let disposition = disposition_for_remediation(
+            &BehindMainRemediation::Updated {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            },
+            REPO,
+            &info,
+        )
+        .expect("an updated branch must terminate the turn");
+
+        match disposition {
+            MergeGateResult::BranchUpdated { new_main_sha, .. } => {
+                assert_eq!(
+                    new_main_sha, OBSERVED_SHA,
+                    "`new_main_sha` is serialized to the monitor and to the LLM: \
+                     it must be the base that was READ, never the one aimed at"
+                );
+                assert_ne!(
+                    new_main_sha, info.current_main_sha,
+                    "publishing the target would declare a base nothing measured"
+                );
+            }
+            other => panic!("expected branch_updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mika2252_an_observed_landing_keeps_its_claim() {
+        // AC4. The anti-thrash cap of mika#2238 R4 is untouched for the
+        // nominal case: an update that landed is exactly what the cap exists
+        // for, and releasing there would re-open the thrash loop this fix is
+        // built on top of.
+        assert!(!releases_claim(&BehindMainRemediation::Updated {
+            observed_base_sha: OBSERVED_SHA.to_string(),
+        }));
+
+        let sha = "mika2252-landed-keeps-claim-unique-sha-5d7b2e";
+        assert!(claim_update_branch_attempt(2252, REPO, sha));
+        assert!(
+            !claim_update_branch_attempt(2252, REPO, sha),
+            "an observed landing must NOT give its claim back"
+        );
+    }
+
+    #[test]
+    fn mika2252_only_failure_and_unlanded_acceptance_release_the_claim() {
+        // The other four outcomes keep it, each for a reason written on
+        // `releases_claim`. Enumerated rather than spot-checked so that a
+        // future variant routed to `true` by reflex reddens here.
+        for keeps in [
+            BehindMainRemediation::Updated {
+                observed_base_sha: OBSERVED_SHA.to_string(),
+            },
+            BehindMainRemediation::AlreadyAttempted,
+            BehindMainRemediation::NotBehind,
+            BehindMainRemediation::Conflict("merge conflict".to_string()),
+            BehindMainRemediation::Contradiction("still behind".to_string()),
+            BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
+        ] {
+            assert!(
+                !releases_claim(&keeps),
+                "{keeps:?} must keep its claim — see `releases_claim` for why"
+            );
+        }
+        assert!(releases_claim(&BehindMainRemediation::Failed(
+            "HTTP 403".to_string()
+        )));
+    }
+
+    #[test]
+    fn mika2252_merge_gate_result_still_has_exactly_six_variants() {
+        // AC8 — the guard that keeps this fix from re-opening T2 of mika#2238.
+        //
+        // The three embedded prompts (`self-dev`, `self-dev-webhook-ci`,
+        // `self-dev-webhook-qa`) state that `pr_merge_with_gate` returns **six**
+        // typed variants and instruct the agent to branch on them exhaustively.
+        // An agent meeting a seventh has no defined move, and the observed
+        // behaviour is a silent stop — the mika#2236 shape.
+        //
+        // The REAL protection is the exhaustive `match` below, which fails to
+        // compile on a new variant and names the site. The count assertion is
+        // the anti-vacuity term: without it a scan that stopped looking at
+        // anything would read exactly like a clean tree.
+        fn action_token(result: &MergeGateResult) -> &'static str {
+            match result {
+                MergeGateResult::Merged => "merged",
+                MergeGateResult::AutoMergeEnabled { .. } => "auto_merge_enabled",
+                MergeGateResult::Blocked { .. } => "blocked",
+                MergeGateResult::AlreadyMerged => "already_merged",
+                MergeGateResult::GateError { .. } => "gate_errored",
+                MergeGateResult::BranchUpdated { .. } => "branch_updated",
+            }
+        }
+
+        let one_of_each = [
+            MergeGateResult::Merged,
+            MergeGateResult::AutoMergeEnabled {
+                pending_checks: vec![],
+            },
+            MergeGateResult::Blocked {
+                reason: BlockReason::MergeConflict,
+                failing_checks: vec![],
+                detail: String::new(),
+            },
+            MergeGateResult::AlreadyMerged,
+            MergeGateResult::GateError {
+                kind: GateErrorKind::Unknown,
+                detail: String::new(),
+            },
+            MergeGateResult::BranchUpdated {
+                pr_base_sha: String::new(),
+                new_main_sha: String::new(),
+            },
+        ];
+
+        let tokens: Vec<&'static str> = one_of_each.iter().map(action_token).collect();
+        assert_eq!(
+            tokens.len(),
+            6,
+            "mika#2252 AC8 — `MergeGateResult` must still carry exactly six \
+             variants. If a seventh was added, the three `self-dev*` prompts \
+             saying \"six typed variants … branch exhaustively\" must be \
+             updated IN THE SAME COMMIT; do not relax this assertion. Tokens \
+             seen: {tokens:?}"
+        );
+
+        // The tokens are the serde tags an agent actually branches on.
+        for (result, token) in one_of_each.iter().zip(&tokens) {
+            let json = serde_json::to_value(result).expect("MergeGateResult serializes");
+            assert_eq!(json["action"], *token, "serde tag drifted for {token}");
+        }
+    }
+
+    #[test]
+    fn mika2252_the_behind_main_outcome_tokens_are_a_wire_format() {
+        // AC6. These land in `$MIKA_SPIRIT_LOG_FILE` and one of them is
+        // published as an operator predicate, so a rename is a break to DATE in
+        // `CLAUDE.md` — never a test quietly brought into line.
+        let cases: [(BehindMainRemediation, &str); 8] = [
+            (
+                BehindMainRemediation::Updated {
+                    observed_base_sha: OBSERVED_SHA.to_string(),
+                },
+                "updated",
+            ),
+            (
+                BehindMainRemediation::AcceptedNotLanded,
+                "accepted_not_landed",
+            ),
+            (BehindMainRemediation::AlreadyAttempted, "already_attempted"),
+            (BehindMainRemediation::NotBehind, "not_behind"),
+            (BehindMainRemediation::Conflict("c".to_string()), "conflict"),
+            (BehindMainRemediation::Failed("f".to_string()), "failed"),
+            (
+                BehindMainRemediation::Contradiction("x".to_string()),
+                "contradiction",
+            ),
+            (
+                BehindMainRemediation::BaseNotMain("release/1.4".to_string()),
+                "base_not_main",
+            ),
+        ];
+
+        for (remediation, expected) in &cases {
+            let (token, _) = behind_main_trace_fields(remediation);
+            assert_eq!(
+                token, *expected,
+                "outcome token drifted for {remediation:?} — this is a wire \
+                 format read by operators; restore it or date the break"
+            );
+        }
+
+        // Anti-vacuity: the set must stay complete AND distinct. A duplicated
+        // token would merge two populations while every line above passed.
+        let mut tokens: Vec<&str> = cases.iter().map(|(_, t)| *t).collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(
+            tokens.len(),
+            8,
+            "the eight behind-main outcomes must have eight distinct tokens"
+        );
     }
 
     // -- R1: one call site, and only one --
