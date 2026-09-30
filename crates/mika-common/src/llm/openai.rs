@@ -1326,6 +1326,12 @@ mod tests {
     /// import at the top of the file names the classifier too, so an unbounded
     /// search would report the import and the scan below would pass on a site
     /// that no longer calls anything.
+    ///
+    /// Every byte offset below lands on a char boundary, which is what keeps the
+    /// slicing panic-free (the class `scripts/check-byte-slices.sh` exists for):
+    /// `start` and `o` both come from `str::find`, which only ever returns a
+    /// boundary; the `+ 1` is safe because the needle starts with an ASCII
+    /// space; and the fallback is `text.len()`.
     fn send_once_body() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
