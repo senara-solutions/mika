@@ -596,6 +596,12 @@ assert_eq "'**Ticket:** mika#1772/#1773' still claims BOTH numbers" \
 # From docs/plans/2026-09-15-003-fix-2295-*-plan.md
 assert_eq "'**Ticket :** mika issue#2295' claims 2295 (space inside the bold)" \
     "2295" "$(claims_of fr-inside '**Ticket :** mika issue#2295 — fenêtre de contexte')"
+# From docs/plans/2026-09-15-005-fix-2293-*-plan.md — the fourth header the ticket
+# cites by name. Same shape as 2295, asserted rather than assumed covered, and its
+# transcribed title carries a backticked env var and a `120 s` that must NOT be
+# read as a claim.
+assert_eq "'**Ticket :** mika issue#2293 — \`MIKA_…\` (120 s) …' claims only 2293" \
+    "2293" "$(claims_of fr-inside-envvar '**Ticket :** mika issue#2293 — `MIKA_LLM_HTTP_TIMEOUT_SECS` (120 s) coupe une génération')"
 
 # --- Shape 2: the header sits in a quote block. 28 plans.
 # From docs/plans/2026-09-15-004-fix-2315-*-plan.md
