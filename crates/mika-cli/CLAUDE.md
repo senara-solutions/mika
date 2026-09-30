@@ -8,7 +8,43 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`.
+
+### `mika plan-callout` (mika#2194)
+
+`mika plan-callout --body-file <path> [--raw]` — read the `Plan` callout of an issue body. It is the channel through which `dispatch-lib.sh` interrogates the repo's **single** reader of that callout ([`mika_agent::plan_callout`]) instead of carrying a second implementation in PCRE.
+
+**The shortest path in the binary, and deliberately shorter than `token`.** It exits in the head `match &cli.command` of `main.rs`, beside `Token` and `CredentialHelper`, and does **strictly less** than either: no `dotenv`, no `Settings`, no `home`, no DB, no network. A pure predicate has no reason to resolve an agent — and that is what makes a process start acceptable on a path called **once per dispatch** (the channel criterion in `docs/architecture/dispatch-lib-migration.md` § 2).
+
+**The body travels as a FILE, never as an argument.** An issue body carries newlines, backticks and `$`, so passing it in argv would re-introduce the quote-scoping failure class (cpp#157) *in the very gesture meant to close it*. The refusal is structural: there is no positional variant to work around.
+
+**Three exit codes, and the third is the deliverable:**
+
+| code | stdout | meaning |
+|---|---|---|
+| `0` | the path, one line | a callout was read |
+| `1` | empty | **no callout** — the answer is "no" |
+| `≥2` | empty, reason on stderr | **I could not look** |
+
+Before the switch, `_extract_plan_path` returned `1` in both of the last two cases and its caller did `|| return 0`, so a read failure read as "no plan". The "unreadable file" population is **created by the migration** — the body used to be a variable, so there was no file to fail to read — and collapsing it into `1` would manufacture a silence that did not exist.
+
+`--raw` returns the path **as written**, repo prefix included (what `auto_pull::plan_ownership` needs, since its question is ownership); the default is normalized, first segment removed (what `dispatch-lib` resolves against `$WORKTREE_DIR`). One reader, two forms, because the two consumers do not ask the same question.
+
+**Refusal reasons**, all expected empty, and all surfaced in the callback's `tasks.result` prefixed `REFUSED (plan-callout, mika#2194)` — the `cwd-guard.sh` (mika#2536) / `pr-push-guard.sh` (mika#2520) family, so the operator query is the same shape:
+
+| reason | reading |
+|---|---|
+| `body_file_unreadable` | the file named by `--body-file` could not be read |
+| `body_file_unwritable` | `mktemp` or the write failed — the host, not the predicate |
+| `path_not_single_line` | the capture crossed a newline (divergence n°3: `[^`]+` does not exclude `\n` in Rust while `grep` works line by line). The pattern is kept **identical** — B1 forbids tightening it — so the **channel** is what bounds, never the predicate |
+| `subcommand_error` | new dispatch-lib + old `mika`: the two halves are out of phase, and it is the **deployment** to establish (class mika#2340) |
+
+**Why the refusal reaches `tasks.result` rather than a log:** dispatch-lib's pre-pilot stderr is structurally **lost** on a dispatch that succeeds (class mika#2050 — it inherits the executor's `Stdio::piped()`, which the executor only reads in its `if !status.success()` branch), and this refusal lets the dispatch succeed on `/mika`. Inventing a log surface nobody reads would reproduce the Signal M defect.
+
+```sql
+SELECT id, result FROM tasks
+ WHERE result LIKE 'REFUSED (plan-callout, mika#2194)%' ORDER BY created_at DESC;
+```
 
 ### Key Commands
 

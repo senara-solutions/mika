@@ -304,9 +304,18 @@ assert_contains "Case switch maps dev-groom to /mika-groom-plan-only (mika#1271 
 assert_not_contains "Case block is multi-line (no inlined dev-groom mapping to /mika-groom-ticket)" 'dev-groom)  ENTRY_COMMAND="/mika-groom-ticket"' "$CASE_BLOCK"
 
 # Verify fallback behavior: function returns 0 (no-op) on guard failures
-# 4 guards: skill, issue_body, worktree_dir, plan_path empty
+#
+# Cinq sorties no-op depuis mika#2194, et la cinquième est un livrable (AC4) :
+# skill, issue_body, worktree_dir, callout illisible (code ≥2 — REFUS NOMMÉ),
+# puis aucun callout (code 1). La quatrième est la population que la migration
+# CRÉE : avant elle, le corps était en variable et il n'y avait pas de fichier à
+# ne pas pouvoir lire. La confondre avec « aucun callout » fabriquerait un
+# silence qui n'existait pas.
+#
+# Le compte reste une assertion de FORME : une sixième sortie ajoutée sans
+# raison écrite fait rougir ce test, ce qui est son objet.
 NON_COMMENT_RETURNS=$(printf '%s\n' "$PLAN_FUNC" | grep -v '^\s*#' | grep -c 'return 0' || true)
-assert_eq "Has 4 guard return statements (skill, body, worktree, plan_path)" "4" "$NON_COMMENT_RETURNS"
+assert_eq "Has 5 guard return statements (skill, body, worktree, unreadable, no-callout)" "5" "$NON_COMMENT_RETURNS"
 
 # --- Test 7: Plan callout regex extraction (mika#1074) ---
 
@@ -6374,11 +6383,21 @@ assert_contains "T7: reader 4 — stale callout (dispatch_gate_groom_allowed_sta
     "$T2178_ISSUE_BODY_LINES"
 assert_contains "T7: reader 5 — _detect_plan_on_branch guard" \
     '[ -n "$ISSUE_BODY" ] || return 0' "$T2178_ISSUE_BODY_LINES"
-# Reader 6 a changé de forme en mika#2120 : le motif vit désormais dans
+# Reader 6 a changé de forme deux fois, et le lecteur est resté unique.
+#
+# mika#2120 : le motif a quitté `_detect_plan_on_branch` pour
 # `_extract_plan_path`, qui accepte les deux écritures du callout et normalise.
-# Le lecteur reste unique et lit toujours `$ISSUE_BODY` — c'est ce que T7 fige.
+#
+# mika#2194 : `_extract_plan_path` ne porte plus de motif du tout — elle délègue
+# au lecteur Rust — et son code de retour est désormais CAPTURÉ au lieu d'être
+# écrasé par `|| return 0`, parce qu'il porte trois valeurs et non deux
+# (0 lu · 1 aucun callout · ≥2 illisible). C'est le livrable d'AC4 : confondre
+# les deux dernières fabriquerait un silence que la migration vient de créer.
+#
+# Ce que T7 fige reste vrai et inchangé : il y a UN lecteur, et il lit
+# `$ISSUE_BODY`.
 assert_contains "T7: reader 6 — plan-path extraction" \
-    'PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || return 0' \
+    'PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || _plan_rc=$?' \
     "$T2178_ISSUE_BODY_LINES"
 assert_contains "T7: reader 7 — plan-line rescue in _iterate_groom_loop" \
     'elif _groom_plan_path=$(_committed_plan_on_branch "$SUB_REPO_DIR" "$BRANCH" "$ISSUE_BODY" "$REPO" "$ISSUE_NUM" 2>/dev/null); then' \
@@ -6632,69 +6651,36 @@ echo ""
 echo "Test: _extract_plan_path — les deux écritures du callout (mika#2120)"
 echo "---------------------------------------------------------------------"
 
-MIKA2120_BARE='> - **Plan:** `docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed on branch @ `abc1234`)'
-MIKA2120_PREFIXED='> - **Plan:** `mika/docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed on branch @ `abc1234`)'
-MIKA2120_OTHER_REPO='> - **Plan:** `mika-cloud/docs/plans/2026-09-02-001-fix-220-x-plan.md` (committed on branch @ `abc1234`)'
-
-assert_eq "mika#2120: forme nue → chemin inchangé" \
-    "docs/plans/2026-09-01-004-fix-2120-x-plan.md" \
-    "$(_extract_plan_path "$MIKA2120_BARE" || true)"
-
-assert_eq "mika#2120: forme préfixée → segment de dépôt retiré" \
-    "docs/plans/2026-09-01-004-fix-2120-x-plan.md" \
-    "$(_extract_plan_path "$MIKA2120_PREFIXED" || true)"
-
-# La parité elle-même, affirmée plutôt que déduite des deux lignes ci-dessus.
-assert_eq "mika#2120: les deux écritures rendent le même chemin" \
-    "$(_extract_plan_path "$MIKA2120_BARE" || true)" \
-    "$(_extract_plan_path "$MIKA2120_PREFIXED" || true)"
-
-# Le préfixe accepté est n'importe quel segment de tête, pas la constante `mika/`
-# — le grooming écrit le préfixe du dépôt cible (mika-cloud#220, 2026-09-02).
-assert_eq "mika#2120: le préfixe accepté n'est pas la constante 'mika/'" \
-    "docs/plans/2026-09-02-001-fix-220-x-plan.md" \
-    "$(_extract_plan_path "$MIKA2120_OTHER_REPO" || true)"
-
-# Contrôle négatif : élargir ne veut pas dire tout accepter. Un chemin refusé
-# rend une sortie vide ET un code non nul.
-for mika2120_bad in \
-    '> - **Plan:** `docs/brainstorms/2026-09-01-x.md` (committed @ `abc`)' \
-    '> - **Plan:** `mika/docs/solutions/2026-09-01-x.md` (committed @ `abc`)' \
-    '> - **Plan:** `../docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)' \
-    '> - **Plan:** `a/b/docs/plans/2026-09-01-004-fix-2120-x-plan.md` (committed @ `abc`)'
-do
-    mika2120_rc=0
-    mika2120_out=$(_extract_plan_path "$mika2120_bad") || mika2120_rc=$?
-    assert_eq "mika#2120: refus — ${mika2120_bad:16:40}" "empty/nonzero" \
-        "$(if [ -z "$mika2120_out" ] && [ "$mika2120_rc" -ne 0 ]; then printf 'empty/nonzero'; else printf "out='%s' rc=%s" "$mika2120_out" "$mika2120_rc"; fi)"
-done
-
-# Ancré, comme côté Rust : la prose qui *parle* du callout n'en est pas un.
-mika2120_rc=0
-_extract_plan_path 'voir la ligne > - **Plan:** `docs/plans/x-plan.md` du corps' >/dev/null || mika2120_rc=$?
-assert_eq "mika#2120: le motif est ancré en début de ligne" "1" "$mika2120_rc"
-
-# Cas d'extraction hérités du Test 7 (mika#1074), rapatriés ici pour qu'ils
-# exercent la fonction de production au lieu d'une copie de son motif.
-assert_eq "Extracts plan path from canonical callout" \
-    "docs/plans/2026-05-11-001-feat-foo-plan.md" \
-    "$(_extract_plan_path '> - **Plan:** `docs/plans/2026-05-11-001-feat-foo-plan.md` (committed on branch @ abc1234)' || true)"
-
-assert_eq "Extracts plan path from minimal callout" "docs/plans/short.md" \
-    "$(_extract_plan_path '> - **Plan:** `docs/plans/short.md`' || true)"
-
-assert_eq "Prose Plan: without docs/plans/ prefix does not match" "" \
-    "$(_extract_plan_path 'The Plan: is to refactor the module' || true)"
-
-assert_eq "Multiple callouts: first one wins" "docs/plans/first.md" \
-    "$(_extract_plan_path '> - **Plan:** `docs/plans/first.md` (committed on branch @ aaa)
-> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)' || true)"
-
-# Et la même règle quand les deux écritures se côtoient : c'est la ligne, pas la
-# forme, qui décide de la priorité.
-assert_eq "Multiple callouts: first wins whatever the écriture" "docs/plans/first.md" \
-    "$(_extract_plan_path '> - **Plan:** `mika/docs/plans/first.md` (committed on branch @ aaa)
-> - **Plan:** `docs/plans/second.md` (committed on branch @ bbb)' || true)"
+# ─────────────────────────────────────────────────────────────────────────────
+# mika#2194 — CES FIXTURES INLINE SONT PARTIES DANS LE CORPUS COMMUN
+#
+# Ce bloc portait **17 assertions à fixtures inline**, et le corpus Rust voisin
+# portait **6 corps d'issue réels** : deux jeux soignés, tous les deux, et
+# **aucune entrée commune**. Personne n'avait jamais exécuté les deux lecteurs
+# sur la même entrée — c'est le défaut central que mika#2194 M3 relève, et il
+# n'était ni dans le corps du ticket ni dans le TSV de mika#2201.
+#
+# Les cas sont donc rapatriés dans
+# `crates/mika-agent/tests/fixtures/plan_callout_bodies/`, où les DEUX lecteurs
+# les lisent. Le bloc « parité du callout Plan sur le corpus commun » en fin de
+# fichier est leur nouveau site d'exécution côté bash ; `plan_callout_parity.rs`
+# est l'autre. Correspondance, pour que rien ne se perde :
+#
+#   forme nue                       → bare-callout.md
+#   forme préfixée + parité         → 1680.md … 1949.md (six corps MESURÉS)
+#   préfixe ≠ `mika/`               → other-repo-prefix.md
+#   quatre contrôles négatifs       → neg-brainstorms / neg-solutions /
+#                                     neg-parent-traversal / neg-two-segments
+#   ancrage en début de ligne       → neg-inline-prose.md
+#   callout canonique / minimal     → bare-callout.md / minimal-callout.md
+#   prose « Plan: » sans docs/plans → neg-prose-plan-no-dir.md
+#   deux callouts, le premier gagne → double-callout.md
+#
+# Ne pas les réécrire ici : deux jeux de mesure pour un prédicat, c'est
+# exactement la configuration qui a permis à la divergence de vivre.
+#
+# Les assertions **structurelles** de mika#2120 restent, elles : elles ne
+# mesurent pas une entrée, elles mesurent qu'il n'y a qu'un lecteur.
 
 # Un seul lecteur : `_detect_plan_on_branch` ne doit pas reporter sa propre
 # extraction. C'est la copie-à-côté-du-lecteur qui a fait diverger les deux
@@ -9685,6 +9671,270 @@ assert_eq "mika#2590 (U7b): aucune ligne construisant un RESULT auto_skipped ne 
 T2590_FIXTURE='RESULT=$(printf '"'"'{"status":"auto_skipped","reason":"x","note":"… carrying Outcome: PLAN_GROOMED exists …"}'"'"')'
 assert_eq "mika#2590 (contrôle négatif U7b): le prédicat accuse une fixture qui cite le jeton" \
     "1" "$(printf '%s\n' "$T2590_FIXTURE" | grep '"status":"auto_skipped"' | grep -c 'Outcome: PLAN_GROOMED' || true)"
+
+# ============================================================================
+# mika#2194 — UN corpus, DEUX lecteurs, UNE parité (R4) + le scan anti-copie (R5)
+# ============================================================================
+#
+# Le lecteur BASH du corpus doré. Son jumeau est
+# `crates/mika-agent/tests/plan_callout_parity.rs`, et les deux lisent le MÊME
+# fichier d'attendus. Avant mika#2194 chacun des deux lecteurs du callout avait
+# un corpus soigné et **aucune entrée n'était commune** : personne n'avait
+# jamais exécuté les deux sur la même entrée.
+#
+# Cette passe-ci est la NON-RÉGRESSION, pas la preuve. La preuve de parité
+# (« mêmes entrées → mêmes sorties que le bash ») se mesure contre le bash
+# d'AVANT la bascule, et elle a été faite une fois, à l'implémentation : après
+# R3 le bash appelle le Rust, donc un lecteur comparé à lui-même est toujours
+# d'accord avec lui-même. D'où la colonne `phase` du TSV, et d'où le fait que
+# ce bloc n'exerce que les lignes `both`.
+
+echo ""
+echo "Test: mika#2194 — parité du callout Plan sur le corpus commun"
+echo "-------------------------------------------------------------"
+
+M2194_CORPUS="$SCRIPT_DIR/../../../crates/mika-agent/tests/fixtures/plan_callout_bodies"
+M2194_TSV="$M2194_CORPUS/expectations.tsv"
+
+# ── Anti-vacuité, en trois termes. C'est le mode de panne que R4 nomme : une
+#    parité verte sur zéro cas. Le motif dominant du harnais est
+#    `source "$DISPATCH_LIB" 2>/dev/null || true`, donc un dispatch-lib qui
+#    cesse de sourcer laisserait les assertions vertes sur des fonctions
+#    inexistantes — éliminatoire pour un test de parité.
+assert_eq "mika#2194 (anti-vacuité 1/3): le corpus d'attendus existe" "yes" \
+    "$(if [ -f "$M2194_TSV" ]; then printf 'yes'; else printf 'no'; fi)"
+
+M2194_DECLARED=0
+if [ -f "$M2194_TSV" ]; then
+    M2194_DECLARED=$(grep -cv '^[[:space:]]*\(#\|$\)' "$M2194_TSV" || true)
+fi
+assert_eq "mika#2194 (anti-vacuité 2/3): le corpus n'est pas vide" "yes" \
+    "$(if [ "$M2194_DECLARED" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+
+assert_eq "mika#2194 (anti-vacuité 3/3): _extract_plan_path est définie après le sourcing" "yes" \
+    "$(if declare -f _extract_plan_path >/dev/null; then printf 'yes'; else printf 'no'; fi)"
+
+# ── Le binaire. `_extract_plan_path` invoque `mika` PAR SON NOM depuis la
+#    bascule, donc ce bloc a besoin de le trouver. Trois portes, dans l'ordre :
+#    le PATH (le cas production), puis les cibles cargo (le cas dev et CI, où
+#    `cargo test` précède `make test-dispatch-lib`).
+#
+#    Aucun des deux lecteurs ne ment quand le binaire manque : le bloc SKIPPE
+#    en le disant, plutôt que de compter des assertions qu'il n'a pas pu faire.
+#    C'est la troisième colonne de mika#2149 — « a guard that could not arm is
+#    never read as a bare green ».
+M2194_MIKA=""
+if command -v mika >/dev/null 2>&1; then
+    M2194_MIKA="$(command -v mika)"
+else
+    for _cand in "$SCRIPT_DIR/../../../target/debug/mika" "$SCRIPT_DIR/../../../target/release/mika"; do
+        if [ -x "$_cand" ]; then M2194_MIKA="$_cand"; break; fi
+    done
+fi
+
+if [ -z "$M2194_MIKA" ] || [ "$M2194_DECLARED" -eq 0 ]; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2194 parité — binaire 'mika' introuvable (PATH, target/debug, target/release)."
+    echo "    Ce bloc mesure la parité du callout via 'mika plan-callout' : sans le"
+    echo "    binaire il ne peut RIEN mesurer, et le dire est le contrat de la"
+    echo "    troisième colonne (mika#2149). Remède : cargo build -p mika-cli --bin mika"
+else
+    # `_extract_plan_path` appelle `mika` par son nom : on augmente le PATH pour
+    # la durée du bloc plutôt que d'introduire une variable de production que
+    # seul le test lirait.
+    M2194_OLD_PATH="$PATH"
+    PATH="$(cd "$(dirname "$M2194_MIKA")" && pwd -P):$PATH"
+    export PATH
+
+    M2194_CASES=0
+    M2194_BAD=0
+    while IFS=$'\t' read -r m_file m_rc m_raw m_norm m_parity m_phase; do
+        case "$m_file" in ''|'#'*) continue ;; esac
+        [ -n "${m_rc:-}" ] || continue
+        # Seules les lignes `both` sont exerçables après la bascule. Une ligne
+        # `pre-switch` décrit le bash d'AVANT, qui n'existe plus ici.
+        [ "$m_phase" = "both" ] || continue
+
+        m_body_file="$M2194_CORPUS/$m_file"
+        if [ ! -f "$m_body_file" ]; then
+            echo "    ✗ $m_file — corps introuvable"
+            M2194_BAD=$((M2194_BAD + 1)); continue
+        fi
+        m_body=$(cat "$m_body_file")
+        M2194_CASES=$((M2194_CASES + 1))
+
+        m_got_rc=0
+        m_got=$(_extract_plan_path "$m_body") || m_got_rc=$?
+
+        if [ "$m_rc" = "0" ]; then
+            # Le bash veut le chemin NORMALISÉ : sa question est quel fichier
+            # ouvrir, et il le résout contre "$WORKTREE_DIR".
+            if [ "$m_got_rc" != "0" ] || [ "$m_got" != "$m_norm" ]; then
+                echo "    ✗ $m_file — attendu rc=0 '$m_norm', lu rc=$m_got_rc '$m_got'"
+                M2194_BAD=$((M2194_BAD + 1))
+            fi
+        else
+            if [ "$m_got_rc" = "0" ] || [ -n "$m_got" ]; then
+                echo "    ✗ $m_file — attendu un refus, lu rc=$m_got_rc '$m_got'"
+                M2194_BAD=$((M2194_BAD + 1))
+            fi
+        fi
+    done < "$M2194_TSV"
+
+    PATH="$M2194_OLD_PATH"
+    export PATH
+
+    assert_eq "mika#2194: parité bash↔Rust sur le corpus commun (aucun écart)" \
+        "0" "$M2194_BAD"
+    # Le compte de cas EST une assertion, pas un affichage : c'est le seul
+    # moyen qu'a ce lecteur de dire qu'il a regardé quelque chose.
+    assert_eq "mika#2194: le lecteur bash nomme son compte de cas (non nul)" "yes" \
+        "$(if [ "$M2194_CASES" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+    echo "    → mika#2194 parité bash : $M2194_CASES cas exercés (phase=both)"
+fi
+
+# ── R5 — le scan anti-copie, étendu de UNE fonction à TOUT dispatch-lib.
+#
+# Le scan de mika#2120 couvrait `_detect_plan_on_branch` seule. Après la
+# bascule, plus aucun site de dispatch-lib ne doit **lire** le callout : le
+# lecteur est en Rust, et un second motif écrit ici rejouerait exactement la
+# divergence que ce ticket ferme.
+#
+# ── PREMIER PIÈGE, déjà mesuré deux fois dans ce dépôt (mika#2050 sur le
+#    Signal S, mika#2201 § R4) : ce fichier CITE le motif dans ses commentaires
+#    de doctrine. Le prédicat porte donc sur les lignes de COMMANDE,
+#    commentaires retirés d'abord — sans quoi il serait rouge à la naissance,
+#    donc désarmé.
+#
+# ── SECOND PIÈGE, trouvé en exécutant ce scan : dispatch-lib **écrit** aussi le
+#    callout (`_write_canonical_callout`, qui compose le corps d'issue que le
+#    grooming publie). L'écrivain n'est pas un lecteur, et l'accuser rendrait ce
+#    scan rouge sur du code sain — donc désarmé, donc inutile.
+#
+#    Ce n'est PAS une allowlist d'exemption : c'est la définition de la
+#    population. Le TSV de mika#2201 fait déjà exactement cette distinction en
+#    ne déclarant que des *sites de match*. La doctrine « on route, on
+#    n'allowliste pas » porte sur les lecteurs ; un écrivain n'a rien à router.
+#
+#    Le discriminant est donc la présence d'un OUTIL DE LECTURE sur la même
+#    ligne. Limite nommée : un futur lecteur écrit par expansion de paramètre
+#    (`${body##*Plan:}`) passerait sous ce prédicat. Le test Rust
+#    `mika2194_aucun_motif_de_callout_hors_de_ce_module` couvre l'autre moitié
+#    de l'arbre, et c'est ensemble qu'ils bornent la classe.
+M2194_CMD_LINES=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" || true)
+M2194_EXTRACT_SRC_EARLY=$(sed -n '/^_extract_plan_path()/,/^}/p' "$DISPATCH_LIB")
+
+# L'aiguille couvre les DEUX écritures du motif — le littéral `**Plan:**` et sa
+# forme échappée pour une regex `\*\*Plan:\*\*`. La première version de ce scan
+# ne portait que la première, donc elle n'aurait PAS vu revenir le `grep -oP`
+# qu'elle existe pour refuser : son propre contrôle négatif l'a montré.
+M2194_NEEDLE='Plan:(\\)?\*(\\)?\*'
+M2194_READER='grep|sed|awk|=~|case[[:space:]]|expr[[:space:]]'
+
+m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE portant le motif
+    grep -v '^[[:space:]]*#' \
+        | grep -E -- "$M2194_NEEDLE" \
+        | grep -Ec -- "$M2194_READER" || true
+}
+
+# ── L'assertion est un INVENTAIRE FERMÉ, pas un zéro — et c'est une correction
+#    que l'exécution impose au plan.
+#
+#    R5 demande « aucun motif du callout hors du site de délégation », mais R6
+#    garde DÉLIBÉRÉMENT deux lecteurs : `_committed_plan_on_branch` et
+#    `_set_up_worktree` lisent le callout pour d'autres questions, sur d'autres
+#    chemins, et les migrer élargirait ce maillon au-delà de son unique
+#    appelant. Ils sont la phase 2, et leurs lignes du TSV restent inchangées.
+#    Un scan exigeant zéro serait donc rouge à la naissance, donc désarmé — la
+#    panne que ce fichier documente déjà deux fois.
+#
+#    Un inventaire fermé est plus fort qu'un zéro impossible : il refuse un
+#    TROISIÈME lecteur, ce qui est exactement la classe que R5 existe pour
+#    borner, et il rougit aussi si l'un des deux disparaît sans que le TSV
+#    bouge.
+M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites)
+assert_eq "mika#2194 (R5): exactement les DEUX lecteurs de phase 2, et aucun autre" \
+    "2" "$M2194_READ_COUNT"
+
+# Et ce sont bien ceux-là : un inventaire qui compte sans nommer laisserait un
+# troisième lecteur passer pour l'un des deux attendus.
+M2194_COMMITTED_SRC=$(sed -n '/^_committed_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2194 (R5): le lecteur de phase 2 n°1 est _committed_plan_on_branch" "yes" \
+    "$(if printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites | grep -qv '^0$'; then printf 'yes'; else printf 'no'; fi)"
+M2194_WORKTREE_SRC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2194 (R5): le lecteur de phase 2 n°2 est _set_up_worktree" "yes" \
+    "$(if printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites | grep -qv '^0$'; then printf 'yes'; else printf 'no'; fi)"
+
+# Et le site que ce ticket bascule n'en est PLUS un : c'est le livrable de R3.
+assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
+    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites)"
+
+# Contrôle de bonne foi n°1 : sur une fixture portant le motif ÉCHAPPÉ en
+# position de lecture, le prédicat DOIT accuser. Sans lui, « aucun site » est
+# indistinguable de « le prédicat ne regarde rien » (classe mika#2205) — et ce
+# scan est précisément celui que R5 élargit, donc son inertie coûterait le
+# livrable.
+M2194_FX_PCRE='    path=$(printf "%s\n" "$body" | grep -oP "^> - \*\*Plan:\*\* `\K[^`]+")'
+assert_eq "mika#2194 (R5, contrôle négatif a): le prédicat accuse un PCRE échappé" "1" \
+    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites)"
+
+# Contrôle de bonne foi n°2 : la forme NON échappée aussi (un `case` sur le
+# littéral, la façon dont un futur lecteur bash le plus simple s'écrirait).
+M2194_FX_LITERAL='    case "$body" in *"> - **Plan:**"*) printf yes ;; esac'
+assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéral lu" "1" \
+    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites)"
+
+# Contrôle de bonne foi n°3 — celui qui borne la population : l'ÉCRIVAIN du
+# callout porte le motif et ne doit PAS être accusé. Sans ce contrôle, la
+# réparation tentante serait d'élargir le prédicat jusqu'à ce qu'il n'attrape
+# plus rien.
+M2194_FX_WRITER='> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)'
+assert_eq "mika#2194 (R5, contrôle négatif c): l'écrivain du callout est hors population" "0" \
+    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites)"
+
+# Et l'anti-vacuité de la population elle-même : le motif DOIT encore
+# apparaître dans dispatch-lib (l'écrivain plus les deux lecteurs de phase 2).
+# S'il disparaissait entièrement, les contrôles ci-dessus mesureraient une
+# population vide et se liraient comme un scan propre.
+M2194_NEEDLE_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | grep -cE -- "$M2194_NEEDLE" || true)
+assert_eq "mika#2194 (R5, anti-vacuité a): le motif a une population non vide" "yes" \
+    "$(if [ "$M2194_NEEDLE_COUNT" -ge 3 ]; then printf 'yes'; else printf "no ($M2194_NEEDLE_COUNT)"; fi)"
+
+# Et le contrôle positif que le scan a bien vu le fichier : un dispatch-lib
+# introuvable rendrait zéro ligne de commande, donc zéro offender, donc un vert
+# sur rien.
+assert_eq "mika#2194 (R5, anti-vacuité b): le scan a lu des lignes de commande" "yes" \
+    "$(if [ "$(printf '%s\n' "$M2194_CMD_LINES" | wc -l)" -gt 100 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Un seul lecteur : `_extract_plan_path` délègue, et `_detect_plan_on_branch`
+# ne reporte pas sa propre extraction (l'assertion de mika#2120, conservée).
+M2194_EXTRACT_SRC=$(sed -n '/^_extract_plan_path()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2194: _extract_plan_path a bien été trouvée (guards the guard)" "yes" \
+    "$(if [ -n "$M2194_EXTRACT_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "mika#2194: _extract_plan_path délègue à la sous-commande" \
+    "mika plan-callout --body-file" "$M2194_EXTRACT_SRC"
+assert_not_contains "mika#2194: _extract_plan_path ne porte plus de PCRE" \
+    "grep -oP" "$M2194_EXTRACT_SRC"
+# Le corps passe par un FICHIER : un argument ré-introduirait la classe de
+# panne de portée de guillemets dans le geste qui prétend la fermer.
+assert_contains "mika#2194: le corps passe par un fichier temporaire" \
+    "mktemp" "$M2194_EXTRACT_SRC"
+
+# Les trois codes de sortie sont traités, et `≥2` ne devient pas un PLAN_PATH
+# vide — c'est le livrable d'AC4.
+M2194_DETECT_SRC=$(sed -n '/^_detect_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2194 (AC4): _detect_plan_on_branch distingue le code ≥2" \
+    '_plan_rc" -ge 2' "$M2194_DETECT_SRC"
+assert_contains "mika#2194 (AC4): le refus est nommé plutôt que silencieux" \
+    "REFUSED (plan-callout, mika#2194)" "$M2194_DETECT_SRC"
+# Le motif voyage jusqu'au RESULT : le stderr d'avant-pilote est perdu sur un
+# dispatch qui réussit (classe mika#2050), et ce refus laisse le dispatch
+# réussir. Une surface que personne ne lit reproduirait le défaut du Signal M.
+assert_contains "mika#2194: le refus atteint le RESULT du callback" \
+    "_PLAN_CALLOUT_REFUSAL" "$M2194_DETECT_SRC"
+M2194_DELIVER_SRC=$(sed -n '/^_deliver_callback()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2194: _deliver_callback annexe le refus" \
+    "_annex_plan_callout_refusal" "$M2194_DELIVER_SRC"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0

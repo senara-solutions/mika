@@ -14,6 +14,7 @@ pub mod memory;
 pub mod milestone;
 pub mod model;
 pub mod notify;
+pub mod plan_callout;
 pub mod provider;
 pub mod reminders;
 pub mod setup;
