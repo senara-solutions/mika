@@ -1347,7 +1347,23 @@ mod tests {
             .or_else(|| rest.find("\n    fn "))
             .or_else(|| rest.find("\n    pub fn "))
             .map_or(text.len(), |o| start + 1 + o);
-        text[start..end].to_string()
+        let body = text[start..end].to_string();
+
+        // The bound is what keeps this scan from reading ITSELF. The needle
+        // `blank_response_body(&body)` occurs three times in this file: once at
+        // the production site, and twice inside the test below (its own `find`
+        // and its own panic message). Were the bound ever to slip to
+        // `text.len()` — `send_once` becoming the last item before `mod tests` —
+        // the scan would match its own source and pass on a site that had been
+        // disarmed. That is a false green on the detector itself, the inverse of
+        // the vacuity the `expect`s guard against, so the bound is asserted
+        // rather than trusted.
+        assert!(
+            !body.contains("mod tests"),
+            "the isolated body reached the test module — the bound slipped, and the scan is now \
+             able to match its own source. Repair the bound before trusting this test."
+        );
+        body
     }
 
     /// V2 — the call site consults the classifier, and does so BEFORE
