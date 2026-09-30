@@ -3222,13 +3222,23 @@ _set_up_worktree() {
                 # Elle disait « Dispatch dev-pilot to implement », et depuis
                 # mika#2287 cette moitié mène droit à
                 # `dispatch_grooming_not_verified` : la porte exige un callback
-                # groom terminé portant `Outcome: PLAN_GROOMED`, qu'aucun
+                # groom terminé portant une convergence, qu'aucun
                 # `already_groomed` ne frappe — délibérément, une garde qui lit
                 # sa preuve de la revendication ne peut pas la réfuter. Le geste
                 # nommé ici est celui que `groom_provenance_verdict` nomme déjà
                 # dans son champ `recovery`. Un texte de remède qui nomme une
                 # route morte coûte un tour de boucle et une lecture.
-                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carrying Outcome: PLAN_GROOMED exists, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
+                #
+                # mika#2590 U5b — et cette note ne CITE plus le marqueur.
+                # Elle le nommait en toutes lettres pour expliquer qu'aucune
+                # preuve n'est frappée ; la porte prouvait le grooming par une
+                # sous-chaîne, donc le texte qui disait « ceci n'est pas une
+                # preuve » EST devenu la preuve (mika#2105, 2026-09-29 : offset
+                # 651). La correction qui tient est le lecteur ancré côté Rust ;
+                # celle-ci est une défense en profondeur, et elle est tenue par
+                # une assertion de `test-dispatch-lib.sh` — sans quoi un futur
+                # éditeur recopie la phrase depuis ce commentaire même.
+                RESULT=$(printf '{"status":"auto_skipped","reason":"already_groomed","issue":"senara-solutions/%s#%s","branch":"%s","plan":"%s","provenance":"%s","note":"The plan named by this ticket resolves on the dispatch branch (%s) and its header does not claim a different ticket. Re-grooming would re-derive it and stack a second body callout. Do NOT dispatch dev-pilot: since mika#2287 the provenance gate refuses it with dispatch_grooming_not_verified unless a completed groom callback carries a convergence verdict, and this skip mints none. To make the ticket dispatchable, remove the plan from the branch AND the grooming callouts from the issue body, then let the loop re-groom it."}' \
                     "$REPO" "$ISSUE_NUM" "$BRANCH" "$existing_plan" "$plan_provenance" "$plan_provenance")
                 _deliver_callback
                 exit 0
@@ -9365,13 +9375,25 @@ ${RESULT}"
             # written and the grooming is complete — strip any stale PIPELINE
             # FAILURE markers and set the authoritative outcome.
             RESULT=$(printf '%s' "$RESULT" | sed '/^PIPELINE FAILURE:/d')
-            RESULT=$(printf '%s' "$RESULT" | sed 's/Outcome: .*/Outcome: PLAN_GROOMED/')
-            # Safety net: if no Outcome: line existed (edge case), append one.
-            if ! grep -qF -- 'Outcome: PLAN_GROOMED' <<<"$RESULT"; then
-                RESULT="${RESULT}
-
-Outcome: PLAN_GROOMED"
-            fi
+            # mika#2590 U5a — la ligne est posée par `_set_outcome_line`, jamais
+            # plus par un `sed` non ancré doublé d'un filet non ancré.
+            #
+            # Le couple retiré était un piège : `sed 's/Outcome: .*/…/'` matche
+            # `Outcome: ` **n'importe où dans la ligne**, donc sur un RESULT
+            # portant « (status: success). Outcome: PLAN_COMMITTED » il posait le
+            # marqueur en milieu de ligne ; et le filet qui suivait
+            # (`grep -qF`, non ancré lui aussi) le voyait et n'ajoutait donc PAS
+            # la ligne canonique. Le lecteur Rust étant désormais ancré
+            # (`task_state::tasks::groom_result_convergence`), un groom
+            # RÉELLEMENT convergé aurait alors été refusé — c'est le faux négatif
+            # que ce ticket devait fermer dans le même commit.
+            #
+            # `_set_outcome_line` (mika#2492) rend « exactement une ligne
+            # `Outcome:` ancrée » vraie PAR CONSTRUCTION, là où le couple ne la
+            # rendait vraie que par coïncidence d'ordonnancement. Le filet
+            # disparaît avec lui : il n'a plus rien à rattraper. Le strip des
+            # `PIPELINE FAILURE:` périmés au-dessus est conservé.
+            _set_outcome_line "Outcome: PLAN_GROOMED"
         elif grep -qE '^Outcome: ESCALATE' <<<"$RESULT"; then
             # mika#2545 — an ESCALATE is already fully stamped by its producer
             # (`_escalate_groom`): the terminal marker, the verdict, the session,

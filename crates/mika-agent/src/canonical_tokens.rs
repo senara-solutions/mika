@@ -642,6 +642,119 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2590 R9 / U7a — le marqueur de convergence n'a qu'un lecteur.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// L'inventaire a été relevé avant rédaction : `GROOM_SUCCESS_MARKER` était
+    /// lu par **deux** sites lâches — `db/tasks.rs` par `instr` en SQL et
+    /// `task_engine/dispatcher.rs` par `contains` — que mika#2590 retire dans le
+    /// même commit au profit de [`crate::task_state::tasks::groom_result_convergence`].
+    /// Quand ce scan tire, **la résolution est de retirer la lecture**, jamais
+    /// d'ajouter une entrée (doctrine mika#2201).
+    const GROOM_MARKER_LOOSE_READERS_ALLOWED: &[&str] = &[];
+
+    /// Le **propriétaire** du marqueur : il le définit et porte son unique
+    /// lecteur. Hors population par construction, jamais par exemption.
+    const GROOM_MARKER_OWNER: &str = "crates/mika-agent/src/task_state/tasks.rs";
+
+    /// **U7a / R9 — aucun second lecteur lâche du marqueur de convergence.**
+    ///
+    /// Le défaut mesuré sur mika#2105 est une lecture par **sous-chaîne** : la
+    /// note d'un saut `already_groomed` cite `Outcome: PLAN_GROOMED` en toutes
+    /// lettres pour expliquer qu'aucune preuve n'est frappée, et
+    /// `instr(child.result, …) > 0` en faisait la preuve. Le remède est un
+    /// lecteur unique et ancré ; ce scan est ce qui empêche un troisième site de
+    /// rouvrir la classe.
+    ///
+    /// **Aucun test comportemental ne peut voir cette classe.** Un second
+    /// lecteur écrit par `contains` ne rend *aucune* décision fausse le jour où
+    /// il est écrit — il diverge plus tard, en silence, avec toutes les
+    /// assertions au vert. C'est très exactement ce que `grooming_marker.rs`
+    /// (mika#2158) a dû graver une fois, et ce que la porte a repayé ici.
+    ///
+    /// **Ce que ce scan n'attrape pas, nommé :** un lecteur qui reconstruirait
+    /// le littéral à la main (`"Outcome: " + "PLAN_GROOMED"`) échappe au
+    /// prédicat, qui porte sur le **symbole**. Le scan d'exhaustivité
+    /// `mika2201_every_match_site_is_declared`, lui, part du **jeton** et verrait
+    /// le littéral : la composition des deux ferme le trou que chacun laisse.
+    #[test]
+    fn mika2590_le_marqueur_de_convergence_na_quun_lecteur() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas
+        // lui-même — motif `mika2484_un_seul_lecteur_decisionnel_de_la_preuve`.
+        let symbol = format!("GROOM_SUCCESS{}", "_MARKER");
+        let loose = [".contains(", "instr(", ".find("];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut owner_seen = false;
+
+        for (rel, content) in production_sources() {
+            if GROOM_MARKER_LOOSE_READERS_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            // Le corps de production seul : une doc-prose qui *parle* du
+            // `contains` retiré n'est pas une lecture (classe mika#2050, dont
+            // le faux positif a été mesuré sur le Signal S).
+            let production = match content.find("\n#[cfg(test)]\nmod tests {") {
+                Some(i) => &content[..i],
+                None => &content[..],
+            };
+            let lines: Vec<&str> = production
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .filter(|l| l.contains(&symbol))
+                .collect();
+
+            if rel == GROOM_MARKER_OWNER {
+                owner_seen = !lines.is_empty();
+                continue;
+            }
+            if lines.iter().any(|l| loose.iter().any(|n| l.contains(n))) {
+                offenders.push(rel);
+            }
+        }
+
+        // Anti-vacuité, les deux moitiés. Sans elles un renommage rendrait ce
+        // scan silencieusement inerte, ce qui se lit exactement comme un arbre
+        // propre (mika#2205).
+        assert!(
+            !production_sources().is_empty(),
+            "mika#2590 — la population examinée est vide : ce scan ne regarde rien"
+        );
+        assert!(
+            owner_seen,
+            "mika#2590 — `{symbol}` n'est lu nulle part dans {GROOM_MARKER_OWNER} : \
+             ce scan vise un mort, il ne vérifie rien"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2590 — le marqueur de convergence a un second lecteur lâche : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : passer par `task_state::tasks::groom_result_convergence`, \
+             qui lit le marqueur EN POSITION DE VERDICT. Ne PAS ajouter le site à \
+             GROOM_MARKER_LOOSE_READERS_ALLOWED — une lecture par sous-chaîne est \
+             polluée par la prose qui nomme ce qu'elle cherche, et c'est le défaut \
+             mesuré sur mika#2105 (la note d'un refus valait preuve)."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist de U7a.
+    #[test]
+    fn mika2590_lallowlist_des_lecteurs_laches_reste_vide() {
+        assert!(
+            GROOM_MARKER_LOOSE_READERS_ALLOWED.is_empty(),
+            "GROOM_MARKER_LOOSE_READERS_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on RETIRE la lecture. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
     /// **Test 12 — les deux noms d'événement du routage sont un format de fil.**
     ///
     /// Ils atterrissent dans `audit_events.tool_name` et l'opérateur en fait des
@@ -2376,6 +2489,233 @@ mod tests {
             ALL_ITERATE_REFUSAL_REASONS.len(),
             "deux motifs portent la même valeur de fil : une population serait \
              coupée en deux sans le dire"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2474 — un écrivain du nom de dépassement, un lecteur du seuil.
+    //
+    // Les deux gardes vivent ici parce que c'est le module des scans de nom :
+    // il porte déjà `production_sources()` (qui parcourt `crates/` ENTIER, donc
+    // `mika-common` comme `mika-agent` — ce qu'un `ProductionScanner::for_crate`
+    // ne saurait pas faire) et `string_literals()`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Population pré-existante : **zéro, mesurée** — le nom est neuf, et
+    /// `grep -rn brief_size_overrun crates/` ne rendait aucune ligne à HEAD
+    /// `b6c95955`. Il n'y a donc rien à excepter, ni de case où déposer la
+    /// prochaine infraction (mika#2323). Quand le scan tire, **on retire le
+    /// second site**, on ne l'allowliste pas (doctrine mika#2201).
+    const BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Livrée vide**, même conduite. Un second lecteur du seuil serait, en
+    /// pratique, le **refus** que mika#2474 décline de livrer sans sa
+    /// précondition (§ 9) — une garde dans `validate_dispatch_readiness` ou dans
+    /// `_arch_ask` — et il couperait un groom sur une valeur calibrée pour une
+    /// **alerte**. L'asymétrie est écrite : un faux positif d'alerte coûte une
+    /// ligne de journal, un faux positif de refus coûte une passe d'architecte
+    /// et un point du budget de re-drive (mika#2020 : trois abandonnent un
+    /// ticket sain).
+    const BRIEF_SIZE_THRESHOLD_READERS_ALLOWED: &[&str] = &[];
+
+    /// Le fichier qui **définit** l'accesseur : ses propres lignes de définition
+    /// ne sont pas des lectures.
+    const BRIEF_SIZE_THRESHOLD_OWNER: &str = "crates/mika-common/src/config.rs";
+
+    /// Les lignes de production qui **appellent** l'accesseur du seuil.
+    ///
+    /// Le prédicat est lexical et en trois termes, chacun ajouté pour une raison :
+    /// (1) hors commentaire — la prose *sur* le seuil n'est pas une lecture, et ce
+    /// dépôt en porte beaucoup (la classe du faux positif du Signal S, mika#2050) ;
+    /// (2) portant le nom de l'accesseur ; (3) **sans `fn `** — ce qui écarte la
+    /// ligne de définition sans avoir à exempter son fichier, une exemption de
+    /// fichier aveuglant aussi tout appel qu'il viendrait à contenir.
+    fn brief_size_threshold_reader_sites(content: &str) -> Vec<(usize, String)> {
+        let needle = format!("effective_brief_size{}", "_alert_bytes");
+        content
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                    return None;
+                }
+                if !t.contains(needle.as_str()) || t.contains("fn ") {
+                    return None;
+                }
+                Some((i + 1, t.to_string()))
+            })
+            .collect()
+    }
+
+    /// Le nom du dépassement a un seul écrivain, journal **et** `audit_events`.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** le jour où il
+    /// est écrit : la mesure continuerait de fonctionner et toutes les assertions
+    /// resteraient vertes. Ce qu'il casserait est le `GROUP BY target_key` de la
+    /// sonde S2 — plus tard, en silence, sur un compte que personne ne saurait
+    /// être devenu inexact.
+    #[test]
+    fn mika2474_the_overrun_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("brief_size{}", "_overrun");
+        let owner = "crates/mika-agent/src/agent_loop/mod.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2474 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2474 — le nom du dépassement de taille de brief a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `agent_loop::BRIEF_SIZE_OVERRUN_EVENT`, ou le retirer. Ne PAS \
+             l'ajouter à BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS — le compte \
+             par agent qui conditionne le suivi n'est exact que tant qu'un seul \
+             site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2474_the_overrun_sole_writer_allowlist_is_empty() {
+        assert!(
+            BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    /// Le seuil a un seul lecteur de production : le site d'émission.
+    #[test]
+    fn mika2474_the_threshold_has_a_single_reader() {
+        let expected = "crates/mika-agent/src/agent_loop/mod.rs";
+        let mut sites: Vec<String> = Vec::new();
+        let mut owner_seen = false;
+
+        for (rel, content) in production_sources() {
+            if BRIEF_SIZE_THRESHOLD_READERS_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            if rel == BRIEF_SIZE_THRESHOLD_OWNER {
+                // L'accesseur EXISTE-t-il encore ? Sans ce terme, un renommage
+                // rendrait le scan silencieux et donc décoratif.
+                owner_seen = content.contains("effective_brief_size_alert_bytes");
+                continue;
+            }
+            for (line, text) in brief_size_threshold_reader_sites(&content) {
+                sites.push(format!("{rel}:{line}: {text}"));
+            }
+        }
+
+        assert!(
+            owner_seen,
+            "mika#2474 — `effective_brief_size_alert_bytes` n'existe plus dans \
+             {BRIEF_SIZE_THRESHOLD_OWNER} : ce scan vise un nom mort"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "mika#2474 — attendu EXACTEMENT un lecteur de production du seuil : le \
+             site d'émission. Trouvé {} :\n{}\n\n\
+             RÉSOLUTION : retirer le second lecteur, ne pas l'allowlister. Un \
+             second lecteur est en pratique un REFUS, et il couperait un groom sur \
+             un seuil calibré pour une alerte — un faux positif d'alerte coûte une \
+             ligne, un faux positif de refus coûte une passe d'architecte.",
+            sites.len(),
+            sites.join("\n")
+        );
+        assert!(
+            sites[0].starts_with(expected),
+            "mika#2474 — le lecteur unique doit être le site d'émission dans \
+             {expected} :\n{}",
+            sites[0]
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur un lecteur ajouté ailleurs, et rester muet sur les trois formes qui
+    /// nomment le seuil sans le lire.
+    #[test]
+    fn mika2474_the_reader_scan_reddens_on_a_second_reader() {
+        let offending = "fn gate(settings: &Settings) -> bool {\n    \
+             bytes > settings.effective_brief_size_alert_bytes()\n}\n";
+        assert_eq!(
+            brief_size_threshold_reader_sites(offending).len(),
+            1,
+            "le scan doit voir un lecteur ajouté hors du site d'émission"
+        );
+
+        // 1. La prose d'un doc-comment.
+        let prose = "/// Voir `Settings::effective_brief_size_alert_bytes` pour les \
+                     trois paliers.\n";
+        assert!(
+            brief_size_threshold_reader_sites(prose).is_empty(),
+            "nommer le seuil dans un commentaire n'est pas le lire"
+        );
+
+        // 2. Un commentaire de bloc, et une ligne de continuation.
+        let block = "/* effective_brief_size_alert_bytes */\n \
+                     * effective_brief_size_alert_bytes\n";
+        assert!(
+            brief_size_threshold_reader_sites(block).is_empty(),
+            "un commentaire de bloc n'est pas une lecture"
+        );
+
+        // 3. La DÉFINITION elle-même — c'est ce qui dispense d'exempter son
+        //    fichier, une exemption de fichier aveuglant aussi tout appel qu'il
+        //    viendrait à contenir.
+        let definition = "    pub fn effective_brief_size_alert_bytes(&self) -> i64 {\n";
+        assert!(
+            brief_size_threshold_reader_sites(definition).is_empty(),
+            "la ligne de définition n'est pas un site d'appel"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist du lecteur.
+    #[test]
+    fn mika2474_the_threshold_reader_allowlist_is_empty() {
+        assert!(
+            BRIEF_SIZE_THRESHOLD_READERS_ALLOWED.is_empty(),
+            "BRIEF_SIZE_THRESHOLD_READERS_ALLOWED est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second lecteur (doctrine \
+             mika#2201)."
         );
     }
 }

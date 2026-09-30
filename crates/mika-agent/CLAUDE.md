@@ -3034,6 +3034,102 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **`turn_usage` says how big the brief was, including when the turn fails (mika#2331 AC1).** `TurnUsageFields` carries `request_bytes` and `system_prompt_bytes`, threaded through all three `build_turn_usage_fields` / `emit_turn_usage` pairs (the `Ok` arm, the `Err` arm, and `save_continuation_llm_call`). The `Err` arm is the point: `usage` is `None` there, so every token count is 0, and the line used to say nothing about the size of the brief that timed out — `input_tokens = 0` was all an operator measuring a 420 s hang could read. Both values are computed **before** the call (`request.payload_bytes()`, `system_prompt_len`) and therefore survive it; both were already written to `llm_calls` (v53 / v38) and were simply invisible to the log stream, so this moves an existing measurement from a gated surface to the ungated one. `Option`, and `null` is never `0`: no request is empty, so a zero would be a readable lie about a measurement that did not happen. Both are RAW dimensions, so Prime hard condition #1 (no `phase`/`is_planning`/`role`) still holds. Companion event `llm_call_attempt` lives in `mika-common` (see its CLAUDE.md); the procedure that reads the two together is in the workspace `CLAUDE.md` § *Lire un hang LLM « 420 s sans octet »*.
 
+### The tail of the brief-size distribution is a population (mika#2474)
+
+`brief_size_overrun` — an INFO event emitted at the **single** production site
+where a conversation window is assembled (`agent_loop`, immediately after
+`context_window_assembled`), **only** when the turn's `user_message_bytes` crosses
+`Settings::effective_brief_size_alert_bytes()`. Under the threshold it is a no-op:
+no line, no audit row.
+
+**What the code reading displaced in the ticket, and it is the first deliverable.**
+mika#2474 asked to *measure* and to *bound* the architect brief. **The measurement
+already existed**, component by component, on ungated events: the system prompt on
+`system_prompt_assembled` (`system_prompt_bytes`, `per_skill_bytes`, mika#1217);
+the history, the plan and the tool definitions on `context_window_assembled`
+(`history_bytes`, `user_message_bytes`, `tool_defs_bytes`, mika#2295); the total on
+`turn_usage` (`request_bytes`, mika#2331). Nothing needed instrumenting — and a
+fifth instrument restating those same numbers would have created two sources of
+truth for one value, exactly what `emit_context_window_assembled`'s own doc-comment
+warns against. **The one component carrying no ceiling is the plan**, and
+`user_message_bytes` *is* the plan on an architect pass: `_arch_ask` runs
+`mika ask … - < "$plan_path"`, so the file's content is the turn's user message.
+
+**Its exemption from the ceiling is structural, and correct.**
+`truncate_history_to_token_budget` stops at `history.len() - 1`, so the turn's own
+user message is never elided. Truncating it would render a verdict on a mutilated
+plan — **green and wrong**, which is strictly worse than a timeout, which is red
+and visible (`ESCALATE`, `PIPELINE FAILURE`). Same arbitration mika#2368 had to
+write when it refused to let a net post `pass`.
+
+**So nothing is bounded, and the four conceivable transformations are refused with
+their own motive:** truncating the plan (the verdict then covers a mutilated plan);
+summarising it by an LLM call (the architect reviews a *summary*, and the summary is
+itself a brief, so the cost moves rather than goes); splitting it into
+independently-reviewed sections (the `docs/architecture/review-guide.md` findings —
+SOLID / DRY / Orthogonality — are transverse by nature, so a per-section review
+loses precisely what the review exists to find); and not re-sending the plan on the
+second pass (the history *is* truncable — at `max_tokens = 8000`, a 72 KB plan is
+elided **whole**, so the second pass would review nothing; the redundancy is real but
+touches only *small* plans, i.e. not the population of the problem).
+
+**Threshold, not ceiling — and the regime is deliberately non-empty.** 48 000 is the
+**measured p90** of the 198 plans of September 2026 (p50 29 414, p75 37 382, p90
+48 378, p99 72 349). The population is therefore the upper decile, ~2 lines a day,
+which is why the event is **INFO**: a WARN on a nominal upper decile is what ends up
+muzzled. The anomaly is not the line — it is the **correlation** between it and a
+`turn_usage` carrying `status = "error"`, which is mika#2457's Halt 3 made
+executable. Contrast `pilot_cost_overrun` (mika#2496), WARN because its threshold is
+a posed *rule* whose crossing is a fault.
+
+**Why a distinct event name rather than a flag on the sibling.** A boolean on
+`context_window_assembled` buys nothing — reading it still means `jq` over *every*
+turn, which `select(.user_message_bytes > 48000)` already does. What a name buys is
+the **grep**: over 19 GB of log, the difference between a question and an analysis
+(`llm_budget_resolved`'s reasoning, mika#2293; mika#2131's aggregate-in-log,
+detail-elsewhere).
+
+`system_prompt_bytes` rides on the line — `system.len()`, in scope because
+`emit_system_prompt_assembled` consumed the prompt by reference — so the line is
+**self-sufficient for attribution**: without it, "the brief was large" needs a second
+grep to learn what it was large *of*. Not a second source of truth: the same value, at
+the same instant, on the line that needs it.
+
+**SOLE WRITER** of `brief_size_overrun` in the log and in `audit_events`
+(`tool_name = 'brief_size_overrun'`, `target_key = 'agent:<id>'`, `after_value` = the
+bytes **and nothing else** — it is what the operator averages, the
+`pilot_cost_overrun` motif). Pinned by
+`canonical_tokens::tests::mika2474_the_overrun_name_has_a_single_writer`, allowlist
+shipped empty, with its anti-vacuity assertion. **No deduplication, deliberately**:
+each crossing is a distinct dated fact one wants to *count*, the population is a few
+a day rather than a hundred per tick, so mika#2131's doctrine does not apply
+(`ready_label_outcome` motif, mika#2323). The audit write is fire-and-forget;
+`brief_size_overrun_audit_failed` marks an INFO line whose row did not land, i.e. a
+`GROUP BY` that undercounts.
+
+**The threshold has ONE production reader**, held by
+`mika2474_the_threshold_has_a_single_reader` (allowlist shipped empty, with a
+good-faith control **verified red** on a real second site). A second reader would in
+practice be the *refusal* mika#2474 declines to ship without its precondition, and it
+would cut a groom on a value calibrated for an **alert**: a false alert costs one log
+line, a false refusal costs an architect pass and a point of the mika#2020 re-drive
+budget, three of which abandon a healthy ticket.
+
+**Correction found on the way:** `ContextWindowFields::truncated_messages` /
+`truncated_bytes` claimed "always `0` today" while brique 2 of mika#2295 had landed —
+contradicted by the comment at the emission site in the same file. That matters
+because `truncated_messages` is **the** field saying whether a second architect pass
+had the first pass's plan elided out of its window, and an operator reading "always 0"
+will not read the field.
+
+**What this does NOT buy.** No verdict is made to fit under a ceiling; no size is
+reduced; nothing is retro-filled (briefs already sent will never have their line —
+fabricating an audit row dated to an unobserved crossing is the inverse of what this
+defends). It makes the brief **legible**, not **watched**: the only new instrument is
+a threshold, and its silence proves nothing until someone runs the probes. Config,
+the four commands, the reading table and the four halts: root `CLAUDE.md`
+§ *Optional (brief-size alert threshold — mika#2474)*.
+
 **Session lifecycle:** Silent dispatcher variants call `end_session()` after completion. CLI commands call `end_session()` on all exit paths. `startup_recovery()` prunes old sessions via `prune_old_sessions()`.
 
 ### Guard Fabrication Telemetry (#953)

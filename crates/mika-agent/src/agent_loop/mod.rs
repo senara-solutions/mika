@@ -45,7 +45,7 @@ use crate::tool_execution::{
     ToolCallSummary, format_tool_summary_block, process_tool_calls, tool_calls_metadata_json,
 };
 use crate::tools::{SkillPathInfo, ToolContext, ToolRegistry};
-use mika_common::config::Settings;
+use mika_common::config::{DEFAULT_BRIEF_SIZE_ALERT_BYTES, Settings};
 use mika_common::embedding::EmbeddingClient;
 use mika_common::llm::ProviderKind;
 
@@ -5268,26 +5268,52 @@ async fn run_agent_inner(
     // explains. `history_config.scope` is already in hand here, so nothing below
     // needed widening: the event gains the one field that makes
     // `distinct_sessions > 1` readable instead of ambiguous.
+    let context_window_fields = build_context_window_fields(
+        &history,
+        // mika#1951 — the instrument reports the scope that DECIDED this
+        // window, which for an isolated turn is the caller's, not the
+        // identity's. Reporting `history_config.scope` here would make the
+        // event say `agent` about a window that really was filtered — the
+        // mika#2305 defect with the sign flipped, and it would break the
+        // post-deploy probe that reads exactly this field.
+        effective_scope,
+        &skill_tool_defs,
+        truncation.truncated_messages,
+        truncation.truncated_bytes,
+        chrono::Utc::now(),
+    );
     emit_context_window_assembled(
         &db.agent_id,
         session_id,
         trace_id,
         "conversation",
-        &build_context_window_fields(
-            &history,
-            // mika#1951 — the instrument reports the scope that DECIDED this
-            // window, which for an isolated turn is the caller's, not the
-            // identity's. Reporting `history_config.scope` here would make the
-            // event say `agent` about a window that really was filtered — the
-            // mika#2305 defect with the sign flipped, and it would break the
-            // post-deploy probe that reads exactly this field.
-            effective_scope,
-            &skill_tool_defs,
-            truncation.truncated_messages,
-            truncation.truncated_bytes,
-            chrono::Utc::now(),
-        ),
+        &context_window_fields,
     );
+
+    // mika#2474 — the tail of the brief-size distribution becomes a greppable,
+    // countable population. `user_message_bytes` is the one component of an
+    // architect brief that carries no ceiling: for a `mika ask … - < "$plan_path"`
+    // turn it IS the plan, and `truncate_history_to_token_budget` exempts the last
+    // message by construction. Nothing here truncates, refuses or bounds it — the
+    // threshold only names it. `system.len()` is in scope because
+    // `emit_system_prompt_assembled` above consumed the prompt by reference.
+    //
+    // THE SINGLE production reader of the threshold, held by
+    // `canonical_tokens::tests::mika2474_the_threshold_has_a_single_reader`: a
+    // second one would in practice be a *refusal*, cutting a groom on a value
+    // calibrated for an alert.
+    report_brief_size_overrun(
+        db,
+        session_id,
+        trace_id,
+        "conversation",
+        &context_window_fields,
+        system.len(),
+        params.settings.map_or(DEFAULT_BRIEF_SIZE_ALERT_BYTES, |s| {
+            s.effective_brief_size_alert_bytes()
+        }),
+    )
+    .await;
 
     // Build initial message list from history.
     // The last message in history is the user message we just saved.
@@ -8665,10 +8691,19 @@ struct ContextWindowFields {
     /// Age in seconds of the oldest retained message. `0` when the window is
     /// empty or the timestamp is unreadable — never negative, never a guess.
     oldest_age_secs: i64,
-    /// What a byte ceiling removed from the window. Always `0` today: the ceiling
-    /// is brique 2 of the mika#2295 plan and is deliberately gated on the verdict
-    /// this very event produces. The fields ship now so the log schema does not
-    /// change under an analyzer written against this first brick.
+    /// What the byte ceiling removed from the window.
+    ///
+    /// **Non-zero since brique 2 of mika#2295 landed** (`max_tokens` is applied a
+    /// few lines above the emission site whenever `resolved_history.max_tokens`
+    /// is `Some`, and mika-arch declares `8000`). These doc comments said
+    /// "always `0` today" until mika#2474, which was already contradicted by the
+    /// comment at the emission site — *"and, since the two bounds above landed,
+    /// how much they took back out"*.
+    ///
+    /// The correction matters beyond tidiness: `truncated_messages` is **the**
+    /// field that says whether a second architect pass had the first pass's plan
+    /// elided out of its window (mika#2474 probe S3), and an operator who reads
+    /// "always 0" will not read the field.
     truncated_messages: usize,
     truncated_bytes: usize,
 }
@@ -8872,6 +8907,125 @@ fn emit_context_window_assembled(
         truncated_bytes = fields.truncated_bytes,
         "context window assembled"
     );
+}
+
+/// Audit + log name for a brief that crossed the size threshold (mika#2474).
+///
+/// **SOLE WRITER**, in the log stream and in `audit_events`, held by
+/// `canonical_tokens::tests::mika2474_the_overrun_name_has_a_single_writer`. That
+/// property is what makes the operator's `GROUP BY target_key` an *exact* count
+/// per agent rather than a number two sites can disagree about — and that count
+/// is what the follow-up refusal (§ 9 of the mika#2474 plan) is conditioned on.
+const BRIEF_SIZE_OVERRUN_EVENT: &str = "brief_size_overrun";
+
+/// Did this turn's brief cross the threshold, and under which resolved value
+/// (mika#2474)?
+///
+/// Pure, so the crossing — **and its negative control** — is assertable without a
+/// database or a subscriber. Returns the resolved threshold on a crossing, which
+/// is also what the emitted line reports: a reader must be able to tell a 50 KB
+/// brief reported against 48 000 from the same brief reported against 20 000.
+///
+/// A non-representable threshold reports nothing. Unreachable in production —
+/// [`Settings::effective_brief_size_alert_bytes`] guarantees a positive `i64`, so
+/// `usize::try_from` cannot fail on a 64-bit target — and written rather than
+/// assumed, because the fail-safe direction on an alert is silence: a threshold
+/// we cannot read is never a threshold that was crossed.
+fn brief_size_overrun_verdict(user_message_bytes: usize, threshold_bytes: i64) -> Option<usize> {
+    let threshold = usize::try_from(threshold_bytes).ok()?;
+    (user_message_bytes > threshold).then_some(threshold)
+}
+
+/// Report a brief that crossed the size threshold — and nothing else (mika#2474).
+///
+/// Emitted at the **single** production site where a conversation window is
+/// assembled, immediately after `context_window_assembled`, and **only on a
+/// crossing**. Under the threshold this is a no-op: no line, no audit row.
+///
+/// # Why a distinct event name rather than a flag on the sibling event
+///
+/// A boolean on `context_window_assembled` would buy nothing — reading it still
+/// means `jq 'select(.oversized)'` over *every* turn, which one can already do
+/// with `select(.user_message_bytes > 48000)`. What a distinct name buys is the
+/// **grep**: over 19 GB of log, that is the difference between a question and an
+/// analysis. Same reasoning as `llm_budget_resolved` (mika#2293, *"it must grep
+/// alone"*) and mika#2131 (per-tick aggregate in the log, per-anomaly detail
+/// elsewhere).
+///
+/// # Why INFO, and why the expected regime is NON-EMPTY
+///
+/// The threshold is the p90 of a **healthy** distribution, so the upper decile
+/// fires by construction — roughly two lines a day. A WARN on a nominal upper
+/// decile is what ends up muzzled. The anomaly is not the line: it is the
+/// **correlation** between it and a `turn_usage` carrying `status = "error"`.
+/// Contrast `pilot_cost_overrun` (mika#2496), WARN because its threshold is a
+/// posed *rule* whose crossing is a fault.
+///
+/// # Why `system_prompt_bytes` rides along
+///
+/// It makes the line **self-sufficient for attribution**: without it, reading
+/// "the brief was large" needs a second grep to learn *what* it was large of.
+/// This is not a second source of truth — it is the same value, at the same
+/// instant, on the line that needs it; `context_window_assembled` remains the
+/// only per-turn surface for these numbers.
+///
+/// The audit write is **fire-and-forget**, like its five siblings in this crate:
+/// measuring a size must not be able to break a turn.
+async fn report_brief_size_overrun(
+    db: &AsyncDatabase,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    fields: &ContextWindowFields,
+    system_prompt_bytes: usize,
+    threshold_bytes: i64,
+) {
+    let Some(threshold) = brief_size_overrun_verdict(fields.user_message_bytes, threshold_bytes)
+    else {
+        return;
+    };
+
+    info!(
+        target: "mika::otel",
+        event = BRIEF_SIZE_OVERRUN_EVENT,
+        agent_id = %db.agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        user_message_bytes = fields.user_message_bytes,
+        history_bytes = fields.history_bytes,
+        system_prompt_bytes = system_prompt_bytes,
+        tool_defs_bytes = fields.tool_defs_bytes,
+        threshold_bytes = threshold,
+        distinct_sessions = fields.distinct_sessions,
+        truncated_messages = fields.truncated_messages,
+        "brief size crossed the alert threshold (mika#2474)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            BRIEF_SIZE_OVERRUN_EVENT,
+            &format!("agent:{}", db.agent_id),
+            None,
+            // `after_value` carries the bytes and NOTHING else: it is what the
+            // operator averages (`pilot_cost_overrun` motif, mika#2496).
+            Some(&fields.user_message_bytes.to_string()),
+            Some(&format!(
+                "trace_id={trace_id} history={} system={system_prompt_bytes} tools={} threshold={threshold}",
+                fields.history_bytes, fields.tool_defs_bytes
+            )),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "brief_size_overrun_audit_failed",
+            error = %e,
+            user_message_bytes = fields.user_message_bytes,
+            "the INFO line landed but its audit row did not; the GROUP BY undercounts"
+        );
+    }
 }
 
 /// Raw dimensions of a per-turn LLM `usage` observation, decoupled from log emission
@@ -16903,6 +17057,123 @@ mod tests {
              `HistoryScope` variant would then inherit an existing label, and \
              `context_window_assembled` would report a scope that is not the one \
              in force. Name the new variant explicitly instead.\nbody was:\n{body}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2474 — the tail of the brief-size distribution.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build a window whose last message — the turn's user message, i.e. the plan
+    /// on an architect pass — weighs exactly `bytes`.
+    fn window_with_brief(bytes: usize) -> ContextWindowFields {
+        let ts = crate::timestamp::format(&at(10));
+        let history = vec![
+            window_msg("s1", "older history", &ts),
+            window_msg("s1", &"p".repeat(bytes), &ts),
+        ];
+        build_context_window_fields(
+            &history,
+            prompt::HistoryScope::Session,
+            &[],
+            0,
+            0,
+            chrono::Utc::now(),
+        )
+    }
+
+    /// The threshold is what decides, **and the boundary is exclusive**.
+    ///
+    /// The `==` case is the negative control that separates "the threshold
+    /// decides" from "anything non-trivial is reported": at exactly p90 a brief is
+    /// still inside the healthy distribution the threshold was calibrated on.
+    #[test]
+    fn mika2474_the_verdict_fires_only_above_the_threshold() {
+        assert_eq!(brief_size_overrun_verdict(48_001, 48_000), Some(48_000));
+        assert_eq!(brief_size_overrun_verdict(48_000, 48_000), None);
+        assert_eq!(brief_size_overrun_verdict(1_260, 48_000), None);
+
+        // The resolved threshold is reported, not the default: a 50 KB brief read
+        // against 48 000 and the same brief read against 20 000 are two different
+        // facts, and the line has to say which.
+        assert_eq!(brief_size_overrun_verdict(50_000, 20_000), Some(20_000));
+
+        // A non-representable threshold reports nothing — silence is the fail-safe
+        // direction for an alert. Unreachable in production (the accessor
+        // guarantees a positive `i64`), asserted rather than assumed.
+        assert_eq!(brief_size_overrun_verdict(usize::MAX, -1), None);
+    }
+
+    /// The crossing writes one audit row, and `after_value` carries the bytes and
+    /// nothing else — it is what the operator averages.
+    #[tokio::test]
+    async fn mika2474_an_oversized_brief_is_reported_and_audited() {
+        let db = test_async_db();
+        let fields = window_with_brief(72_349); // p99 of September 2026.
+
+        report_brief_size_overrun(
+            &db,
+            "test-session",
+            "trace-2474",
+            "conversation",
+            &fields,
+            16_562, // the `mika-arch-groom-ticket` prompt, measured.
+            48_000,
+        )
+        .await;
+
+        let rows = db.get_audit_events("test-session").await.unwrap();
+        let overruns: Vec<_> = rows
+            .iter()
+            .filter(|r| r.tool_name == BRIEF_SIZE_OVERRUN_EVENT)
+            .collect();
+
+        assert_eq!(overruns.len(), 1, "exactly one row per crossing");
+        assert_eq!(overruns[0].target_key, format!("agent:{}", db.agent_id));
+        assert_eq!(
+            overruns[0].after_value.as_deref(),
+            Some("72349"),
+            "after_value is the byte count alone — the `pilot_cost_overrun` motif"
+        );
+        assert_eq!(
+            overruns[0].before_value, None,
+            "a size has no prior state to name"
+        );
+        assert_eq!(overruns[0].trace_id.as_deref(), Some("trace-2474"));
+
+        // The reasoning carries the other three components so the row can be read
+        // without a second query.
+        let reasoning = overruns[0].reasoning.as_deref().unwrap_or_default();
+        for expected in ["trace_id=trace-2474", "system=16562", "threshold=48000"] {
+            assert!(
+                reasoning.contains(expected),
+                "reasoning must carry {expected}; got {reasoning}"
+            );
+        }
+    }
+
+    /// **The negative control, and without it "the threshold decides" is
+    /// indistinguishable from "the threshold always emits".**
+    #[tokio::test]
+    async fn mika2474_a_brief_under_the_threshold_emits_nothing() {
+        let db = test_async_db();
+        let fields = window_with_brief(29_414); // the measured median.
+
+        report_brief_size_overrun(
+            &db,
+            "test-session",
+            "trace-nominal",
+            "conversation",
+            &fields,
+            16_562,
+            48_000,
+        )
+        .await;
+
+        let rows = db.get_audit_events("test-session").await.unwrap();
+        assert!(
+            rows.iter().all(|r| r.tool_name != BRIEF_SIZE_OVERRUN_EVENT),
+            "a median brief must write no row: this is a threshold, not a per-turn event"
         );
     }
 

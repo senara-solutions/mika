@@ -158,13 +158,27 @@ READY	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:l
 
 # ── Callback-envelope grammar. `^Outcome: <TOKEN>`, `^STATUS=<TOKEN>` and the
 # crash/violation markers — all line-anchored or literal, no fuzzy tier behind.
+#
+# mika#2590 moved BOTH halves of `PLAN_GROOMED` to an anchored position, and the
+# two rows below say so. `dispatch_claude_pilot` was `exact:literal` while it
+# wrote through `sed 's/Outcome: .*/…/'` + `grep -qF`, neither anchored — a pair
+# that could post the marker mid-line and then SEE it, so it skipped the
+# canonical line. It now passes the token to `_set_outcome_line`, which writes
+# exactly one anchored `Outcome:` line by construction. `groom_result_convergence`
+# is the new strict READER (`starts_with`, hence `exact:prefix`) that replaced
+# `instr(child.result, …) > 0` in SQL: a substring read let the note of a refusal
+# — which cites the marker in full to explain that no proof is minted — count as
+# the proof itself. Declared with its site per this file's doctrine, even though
+# the exhaustiveness scan was already satisfied by the constant's row above: a
+# silent hole is what makes a lint drift.
 ESCALATE	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
 PLAN_COMMITTED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
 PLAN_GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
 PR_OPENED	B	skills/bundled/_shared/dispatch-lib.sh::_measure_cycle_output	exact:line-anchored
-PLAN_GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:literal
+PLAN_GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:line-anchored
 PIPELINE_INCOMPLETE	B	skills/bundled/_shared/dispatch-lib.sh::dispatch_claude_pilot	exact:literal
 PLAN_GROOMED	B	crates/mika-agent/src/task_state/tasks.rs::GROOM_SUCCESS_MARKER	exact:literal
+PLAN_GROOMED	B	crates/mika-agent/src/task_state/tasks.rs::groom_result_convergence	exact:prefix
 CANCELLED	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:line-anchored
 HANDLER CRASH	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
 PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal

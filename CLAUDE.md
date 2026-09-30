@@ -3529,6 +3529,189 @@ d'autre du déploiement, cherche dans ce voisinage.
   **aucune décision fausse** le jour où on l'écrit : la purge continue de purger,
   toute la suite reste verte, et seule la fenêtre se rouvre, en silence.
 
+### `pr_unknown` cesse de confondre deux populations (mika#2482)
+
+`pr_unknown` (T3 du faucheur) veut dire « aucune PR résolvable pour cette
+branche », et il couvrait deux populations que rien ne séparait : le **travail
+vivant récent** (groomé, PR imminente) et le **vieux groomé-jamais-implémenté**
+(mesurés le 22/09 : `incident/1696` — issue du 30/06 —, `fix/1719`, `chore/1964`,
+`investigation/2051`, `test/2266`, `bug/2260`). Le faucheur conserve les deux, et
+c'est correct : **un `pr_unknown` sort à T3, donc T7 (`dirty` /
+`unpushed_commits`) n'est jamais évalué sur lui** — on ne sait pas s'il porte du
+travail non poussé, et le faucher détruirait du travail sous un prédicat qui n'a
+pas regardé. Ce n'est pas une précaution, c'est une contrainte : **rien n'est
+fauché ici**, jamais.
+
+Trois briques, et une seule sonde les tient toutes :
+
+- **La purge `target/` couvre `pr_unknown`.** Le bras mika#2497 filtrait sur le
+  seul motif `pr_open` ; or son asymétrie fondatrice — *« le faucheur supprime du
+  travail potentiel, ce bras supprime du dérivé pur »* — est **indifférente à la
+  raison pour laquelle le worktree est conservé**. Un `target/` de `pr_unknown`
+  est exactement aussi reconstructible que celui d'un `pr_open`. La population
+  passe de deux noms à trois par une constante unique (`PURGE_ELIGIBLE_REASONS`)
+  et un prédicat unique (`is_purge_eligible_reason`), lus par les **deux** sites —
+  la décision et le calcul des états. **Les deux doivent bouger ensemble** :
+  élargir la décision seule ferait tomber les nouveaux worktrees sur
+  `unwrap_or(TargetState::Present { idle_secs: None })`, c'est-à-dire un bras qui
+  se lit comme élargi et ne purge rien (classe mika#2205). Aucun des cinq termes
+  P1–P5 ne bouge ; le verrou de build (mika#2511) couvre la population élargie à
+  l'identique. `pr_number` vaut naturellement `null` sur cette population.
+- **Une sonde ciblée ferme l'angle mort de pagination.** `list_prs` borne à 300 :
+  la fenêtre s'arrêtait à la PR **#1917** le 22/09 et à **#2067** le 29/09 — **la
+  borne recule d'environ 21 numéros par jour**. Le défaut est donc **structurel,
+  pas dimensionnel** : doubler la limite achète ~28 jours puis rouvre le trou, et
+  paginer coûte O(total PR) à chaque tick pour une poignée de worktrees. La
+  requête `gh pr list --head <branche>` **contourne** la limite (vérifié :
+  `--head feat/1888/…` rend `#1900` sous une fenêtre dont le minimum était
+  `#2067`) et rend les mêmes champs, donc se désérialise sans une ligne de
+  structure nouvelle. Une PR trouvée fait **re-screener** le worktree sous la
+  **même conjonction de sept termes**, sans exception : la provenance d'une PR ne
+  change pas sa vérité.
+- **Un signal nomme la file vieille.** `worktree_stale_no_pr`, **SOLE WRITER**,
+  dédupliqué 24 h. **Rien n'est supprimé par cette brique** — c'est de
+  l'observabilité.
+
+**La sonde est ciblée sur les vieux, et c'est ce qui fait de ce travail un
+mécanisme et non deux.** Un `pr_unknown` **récent** est nominal : sa PR entrera
+dans l'index de masse dès qu'elle existera, et la sonder serait un appel `gh`
+pour rien, 144 fois par jour. Un `pr_unknown` **vieux** est soit un abandon, soit
+un faux `pr_unknown` par angle mort — et la même sonde tranche les deux.
+
+**La datation porte sur le WORKTREE, pas sur l'issue.** Le dernier commit de la
+branche (`git log -1 --format=%cI`), lisible sans réseau. Lire l'état de l'issue
+coûterait un `gh` par worktree et par tick pour une information dont **aucune
+décision ne dépend** (rien n'est fauché), et le filtre irait dans le mauvais
+sens : un worktree dont l'issue est *fermée* sans PR est **encore plus** un
+candidat au signalement.
+
+**Aucun motif de refus n'est ajouté, renommé ni retiré.** `REASON_PR_UNKNOWN_STALE`
+était tentant et est **refusé** : il scinderait `pr_unknown` en deux noms et
+casserait en silence les `GROUP BY` publiés ci-dessus. C'est la scission datée
+dont mika#2361 a dû écrire le coût. `ALL_RESOLUTIONS` gagne `branch_probe` **en
+queue** et rien d'autre — une addition, jamais un renommage, donc aucune requête
+publiée ne change de sens.
+
+- `MIKA_WORKTREE_STALE_DAYS` — âge du dernier commit de branche au-delà duquel un
+  `pr_unknown` est vieux (défaut **7**). Bornes mesurées : la vie nominale d'un
+  `pr_unknown` est de l'ordre de l'heure à la journée et un `ready` abandonné est
+  borné à trois re-drives (mika#2020), donc 7 j laisse un ordre de grandeur ; la
+  population du 22/09 va de ~3 semaines à ~84 jours et est intégralement
+  attrapée. Le seuil peut être généreux, l'asymétrie penchant du bon côté : un
+  faux « stale » coûte une ligne de journal et **un** appel `gh`/jour, un faux
+  « pas stale » laisse le worktree invisible un jour de plus.
+- `MIKA_WORKTREE_STALE_PROBE_MAX_PER_TICK` — cap de sondes par tick (défaut
+  **3**). **Plus** la déduplication 24 h : au plus **un appel `gh` par worktree
+  stale et par jour**. Population mesurée le 22/09 : 6.
+
+Les deux suivent les trois paliers maison (absent/vide → défaut ; illisible, `0`
+ou négatif → défaut **plus** un `warn!` nommant la valeur **entre guillemets**).
+**Le `0` ne désarme pas** : sur un scan qui déclenche une suppression de dérivé,
+une coquille ne doit pas être un désarmement silencieux — les leviers de
+désarmement sont `MIKA_TARGET_PURGE` (le bras) et la sentinelle STOP partagée
+`~/.mika/state/worktree-reap-stop` (le tick entier).
+
+#### Surfaces opérateur
+
+```bash
+# 1. Des `target/` de worktrees SANS PR sont-ils purgés ? (la brique 1)
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.pr_number == null) | {worktree_path, branch, idle_secs, bytes_reclaimed}'
+
+# 2. Quels worktrees sont vieux et sans PR ? — CONTRÔLE POSITIF de la sonde
+grep worktree_stale_no_pr "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{worktree_path, branch, issue, branch_idle_days, probe}'
+```
+
+```sql
+-- 3. Combien de worktrees l'angle mort aurait-il conservés à tort ?
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'worktree_reaped' AND reasoning LIKE 'resolution=branch_probe%';
+
+-- 4. La file vieille, datée et comptable
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'worktree_stale_no_pr' ORDER BY created_at DESC;
+
+-- 5. AC6 — la distribution des motifs, INCHANGÉE de part et d'autre du déploiement
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'worktree_reap_skipped' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `target_purged` avec `pr_number: null` | **non vide** après déploiement | chaque ligne est du disque rendu que ni le faucheur ni le bras ne rendaient |
+| `worktree_stale_no_pr` | **non vide, faible et stable** (~6 mesurés le 22/09) | la file groomée-jamais-implémentée, enfin nommée |
+| `resolution=branch_probe` | **rare** | chaque ligne est un faux `pr_unknown` fermé. Zéro ⇒ voir Halte 2 |
+| `worktree_stale_probe_unreadable` | **vide** | toute occurrence est une sonde qui n'a pas su regarder |
+| `worktree_reap_skipped` / `pr_unknown` | **inchangé en sens** | AC6 : la scission a été refusée pour que cette requête reste exacte |
+
+**`issue` n'est jamais inventé.** C'est le deuxième segment de la branche, et le
+premier doit être non vide : `/2482/x` porte bien `2482` en deuxième position,
+mais une branche sans type n'est pas une branche de dispatch, donc le nombre
+qu'on y lirait serait deviné plutôt que porté. Toute forme non conforme rend
+`None` — un numéro fabriqué sur une surface d'observabilité enverrait l'opérateur
+lire le mauvais ticket, ce qui est pire qu'un champ vide.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces sondes lisent l'hôte. Établir d'abord que le binaire servi
+> porte le correctif — une ligne absente ne prouve rien tant qu'on n'a pas établi
+> que le binaire qui tourne sait l'écrire (classe mika#2340).
+
+**S1 — la purge mord (48 h).** La requête 1 est non vide, et `/data` cesse de
+retrouver 80 % au rythme observé.
+*Halte 1 —* si des purges surviennent sur des worktrees **fraîchement groomés**,
+lire `idle_secs` **avant** de rallonger la fenêtre : un worktree qui vient d'être
+groomé n'a pas de `target/` du tout (P2 le refuse), donc une purge là signifie
+qu'un `target/` est réellement resté inactif au-delà de la fenêtre — le contrat,
+pas un défaut.
+
+**S2 — la sonde mord (30 jours).** La requête 3 rend au moins une ligne.
+*Halte 2 —* **zéro ligne ne prouve rien** tant que le contrôle positif n'est pas
+établi : il faut qu'une sonde ait réellement tourné, et c'est la requête 2 qui le
+dit (une ligne `worktree_stale_no_pr` prouve qu'une sonde a tourné et rendu « pas
+de PR »). Zéro des deux ⇒ la population stale est vide, ce qui est un **résultat**
+et non une panne. *Une garde que personne n'a exercée se lit exactement comme une
+garde qui marche* (mika#2205).
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun `worktree_stale_no_pr` sur un
+worktree dont la branche a bougé dans les `N` jours.
+*Halte 3 —* une occurrence signifie que la datation lit autre chose que ce qu'on
+croit (un `fetch` qui touche un mtime, une branche rebasée non détectée) :
+**réparer la datation, pas relever le seuil.**
+
+**S4 — AC6, la non-régression des comptes.** La requête 5 doit garder le même
+vocabulaire de part et d'autre du déploiement.
+*Halte 4 —* l'apparition d'une valeur nouvelle signifie qu'un motif a été ajouté
+contre la décision ci-dessus : **désarmer d'abord** (`MIKA_TARGET_PURGE=0` puis
+revert), les requêtes publiées étant cassées en silence pendant ce temps.
+
+**Halte transverse — la file stale croît sans borne.** Si la requête 4 grossit de
+semaine en semaine, le remède n'est **pas** dans ce module : c'est que le grooming
+produit plus de worktrees que l'implémentation n'en consomme. Ouvrir le suivi
+**avec ce compte**, jamais avec une intuition.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fauche aucun `pr_unknown`.** Ce qui est retiré est le `target/` — du
+  dérivé pur — jamais le worktree, jamais une branche, jamais un commit.
+- **Il ne ferme aucune issue et ne réveille aucun ticket.** Le signal dit « ce
+  worktree est vieux » ; décider quoi en faire est un geste d'opérateur.
+- **Il ne borne pas la production.** Si N pilotes compilent simultanément, aucun
+  n'est stale et rien n'est purgé pendant la montée — limite héritée de
+  mika#2497, inchangée.
+- **Il ne rend pas la pagination exacte.** L'index de masse reste borné à 300 ; ce
+  qui est ajouté est un rattrapage **ciblé** sur les non-résolus vieux. Un faux
+  `pr_unknown` **récent** — PR hors fenêtre **et** branche mue dans les 7 jours —
+  reste invisible. Combinaison improbable (une PR hors fenêtre a des semaines) et
+  **nommée plutôt que masquée**.
+- **La population réelle n'est PAS mesurable depuis un pilote**, et les sondes
+  ci-dessus sont pour cette raison toutes post-déploiement, sur l'hôte : le bac à
+  sable de dispatch ne monte que le worktree courant et `~/.mika/data/mika.db`
+  n'y est pas montée, donc les 13 `pr_unknown` du 22/09 y sont invisibles et
+  aucune requête `audit_events` n'y est exécutable. Les chiffres cités viennent du
+  ticket (22/09) et de `gh` (29/09).
+
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
 **Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
@@ -4222,6 +4405,142 @@ Optional (runtime observability):
   - **The flag is process-global; an agent's turns are not all served by one process.** When capture is armed, the process emits one `llm_body_capture` WARN naming the file it writes to. WARN because the CLI's default level is `warn` (an INFO line would be filtered out on precisely the surface that needed it), and because full prompt bodies on disk is a state worth flagging. **Its absence is itself information:** it means capture is not armed on the process you are reading.
   - **The trap it exists to close.** Since mika#1727 `mika ask` is a thin A2A client, so its agent turns — and every webhook/callback turn — execute in mika-spirit and land in `$MIKA_SPIRIT_LOG_FILE`, not in `~/.mika/agents/<name>/logs/`. Arming the variable on the agent's own process and then reading the agent's own file yields an empty file and the conclusion that the flag is broken; that is the founding observation of mika#2220. `mika ask` now warns (`llm_body_capture_wrong_process`) when capture is armed on a process that will not run the turn. To capture a QA review or any autonomous-loop turn: arm the flag on **mika-spirit**, restart it, read `$MIKA_SPIRIT_LOG_FILE`. See § Log Sinks in `crates/mika-agent/CLAUDE.md`.
   - **Not hot-swappable and not per-agent.** Read once at startup, applied to the whole process. Making it either would mean a reloadable `tracing` filter and a decision about what "per agent" means in a daemon serving all of them — deliberately out of scope for mika#2220.
+
+Optional (seuil d'alerte sur la taille du brief — mika#2474) :
+- `brief_size_alert_bytes` (`config.toml`) / `MIKA_BRIEF_SIZE_ALERT_BYTES` — taille en octets au-delà de laquelle le brief d'un tour est **rapporté** (défaut `DEFAULT_BRIEF_SIZE_ALERT_BYTES = 48_000`). Trois paliers : absent ou vide → défaut ; illisible → erreur `Settings::load`, comme tout frère numérique ; `0` ou négatif → défaut **plus un WARN nommant la valeur** (un seuil à zéro rapporterait *chaque* tour et noierait la population que la mesure existe pour dimensionner). Le préfixe `MIKA_` est correct : la clé est lue par **mika-spirit**, par la cascade config-rs, dont rien ne nettoie l'environnement du process — à l'inverse de `PILOT_MAX_TURNS`, nu parce que l'enfant de dispatch efface son env (mika#2508). **Pas de seuil par agent**, comme `pilot_cost_alert_usd` : la population de fait est celle d'arch, et un réglage par agent serait un `config.toml` de plus à réconcilier pour un besoin que personne n'a mesuré.
+- **Ce que la lecture du code a déplacé dans le ticket, et c'est le premier livrable.** Le ticket demandait de **mesurer** et de **borner**. *La mesure existait déjà*, composant par composant, sur des événements **ungated** : le prompt système sur `system_prompt_assembled` (mika#1217), l'historique / le plan / les définitions d'outils sur `context_window_assembled` (mika#2295), le total sur `turn_usage` (`request_bytes`, mika#2331). Il n'y avait **rien à instrumenter**, et un cinquième instrument qui redirait ces nombres aurait créé deux sources de vérité pour une même valeur. Le seul composant **non borné** est le plan — `user_message_bytes` *est* le plan sur une passe arch, puisque `_arch_ask` fait `mika ask … - < "$plan_path"` — et son exemption du plafond est **structurelle** : `truncate_history_to_token_budget` s'arrête à `history.len() - 1`. **Cette exemption est correcte** : tronquer la question rend un verdict qui porte sur un plan mutilé, c'est-à-dire **vert et faux**, strictement pire qu'un timeout, qui est rouge et visible.
+- **Les quatre transformations concevables sont refusées, chacune sur son motif.** *Tronquer* le plan (le verdict porte alors sur un plan mutilé) ; *résumer* par un appel LLM (l'architecte revient un résumé, et le résumé est lui-même un brief : le coût est déplacé, pas supprimé) ; *découper* en sections revues séparément (les findings de `docs/architecture/review-guide.md` — SOLID / DRY / Orthogonalité — sont **transverses par nature**, donc une revue par section perd très exactement ce que la revue existe pour trouver) ; *ne pas ré-envoyer* le plan en seconde passe (l'historique est **tronquable** — à `max_tokens = 8000`, un plan de 72 Ko est élidé **en entier**, donc la seconde passe reviendrait *rien* ; la redondance est réelle et ne touche que les **petits** plans, c'est-à-dire pas la population du problème).
+- **La distribution, mesurée** sur les 198 plans `docs/plans/2026-09-*-plan.md` de l'arbre : min 1 260, p25 21 807, **p50 29 414**, p75 37 382, **p90 48 378**, p95 54 340, p99 72 349, max 75 871, moyenne 30 211. Pour situer : les trois prompts arch pèsent 40 384 B à eux trois, et **depuis mika#2363 un plan médian (29 Ko) pèse deux fois le prompt de la passe servie (16,5 Ko) — le prompt système n'est plus le levier, le plan l'est.** Ce que cette mesure **ne** dit pas : elle porte sur les plans **écrits**, pas sur les briefs **échoués** ; la corrélation est la sonde S2 ci-dessous.
+
+### Surfaces opérateur
+
+```bash
+# 1. Quels briefs ont franchi le seuil, et de quoi étaient-ils faits ?
+grep brief_size_overrun "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, trace_id, user_message_bytes, history_bytes,
+            system_prompt_bytes, tool_defs_bytes, threshold_bytes}'
+
+# 2. CONTRÔLE POSITIF — le site tourne-t-il seulement ?
+grep -c context_window_assembled "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. LA CORRÉLATION — la Halte 3 de mika#2457, rendue exécutable.
+grep turn_usage "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.agent_id == "mika-arch" and .status == "error")
+           | {trace_id, latency_ms, request_bytes, system_prompt_bytes}'
+#    …puis joindre sur trace_id avec la commande 1. La population de la
+#    commande 1 étant petite (~2/j), le join est une lecture, pas une analyse.
+
+# 4. La fenêtre de la seconde passe a-t-elle élidé le plan ?
+grep context_window_assembled "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.agent_id == "mika-arch" and .truncated_messages > 0)
+           | {trace_id, history_bytes, truncated_messages, truncated_bytes}'
+```
+
+```sql
+-- La population, par agent. `brief_size_overrun` est SOLE WRITER, donc ce compte
+-- est exact plutôt qu'un nombre sur lequel deux sites peuvent diverger.
+SELECT target_key,
+       count(*)                              AS n,
+       round(avg(CAST(after_value AS REAL))) AS moy_octets,
+       max(CAST(after_value AS INTEGER))     AS max_octets
+  FROM audit_events
+ WHERE tool_name = 'brief_size_overrun'
+ GROUP BY 1 ORDER BY 2 DESC;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `brief_size_overrun` | INFO | **non vide, ~2/jour** | le décile supérieur, par construction. Ce n'est **pas** une anomalie |
+| `brief_size_overrun` sur un agent ≠ `mika-arch` | INFO | **vide** | le seuil mesure autre chose que ce qu'on croit — halte 3 |
+| `brief_size_alert_invalid` | WARN | **vide** | une coquille dans la variable, nommée |
+| `brief_size_overrun_audit_failed` | WARN | **vide** | la ligne INFO est passée, l'audit non — le `GROUP BY` sous-compte |
+
+### Sondes, et leurs quatre haltes
+
+> **Préalable.** La valeur est lue par **mika-spirit**, donc la sonde décrit le
+> binaire servi. Établir le déploiement avant toute conclusion.
+
+**S1 — le seuil mord** (première passe arch sur un plan du décile supérieur) : une
+ligne portant `agent_id = "mika-arch"` et un `user_message_bytes` cohérent avec le
+`wc -c` du plan. **Halte 1 — aucune ligne alors qu'un gros plan est passé :** ne pas
+baisser le seuil par réflexe. Lire d'abord le **contrôle positif** (commande 2) :
+zéro `context_window_assembled` signifie que le site ne tourne pas — ou que le
+binaire servi est antérieur au correctif. *Zéro franchissement avec zéro
+`context_window_assembled` ne prouve rien du tout* (classe mika#2205).
+
+**S2 — la corrélation, 30 jours.** C'est **la** sonde du ticket, et son résultat
+décide du suivi. Croiser les commandes 1 et 3 : les tours en échec **majoritairement**
+dans la population de la commande 1 ⇒ la Halte 3 de mika#2457 est **confirmée**, le
+levier est la taille du brief, et le suivi (refus a priori) s'ouvre **avec un
+compte**. Les tours en échec **répartis** indépendamment de la taille ⇒ la Halte 3
+est **réfutée**, et c'est un **résultat**, pas un échec : la cause est ailleurs (le
+modèle, le transport — voisinage mika#2522/#2342), et ce ticket se referme sur sa
+mesure.
+
+**Halte 2 — la population de la commande 1 est vide sur 30 jours alors que des
+grooms ont tourné.** Deux causes opposées, à séparer avant de conclure : les plans de
+la fenêtre étaient tous sous 48 Ko (résultat honnête — la distribution a bougé, et
+c'est à noter), ou le seuil n'est pas lu (vérifier `llm_budget_resolved` pour établir
+qu'un tour arch a bien eu lieu).
+
+**S3 — l'élision de la seconde passe (30 jours).** La commande 4 dit si la fenêtre de
+la seconde passe a élidé le plan de la première. Régime attendu : **non vide sur les
+gros plans** — c'est le comportement correct décrit ci-dessus, pas un défaut. **Halte
+— si elle est non vide sur des plans de 15 Ko**, le budget d'historique résolu n'est
+pas celui qu'on croit : lire `context_history_resolved` (mika#2425) **avant** de
+toucher au plafond.
+
+**Halte 3 — la population porte un agent autre que `mika-arch`.** Le message
+utilisateur des autres tours est petit par construction (Telegram < 4 Ko, corps de PR
+tronqué à 2 000 c., `CALLBACK_RESULT_MAX_BYTES` = 10 240, et le diff de QA passe par
+le prompt de skill donc compte dans `system_prompt_bytes`). Établir **quel** tour
+porte un message de cette taille avant de régler le seuil : un seuil calibré sur la
+distribution des plans et mesurant autre chose mentira sur les deux populations.
+
+**Halte 4 — `brief_size_overrun_audit_failed` non vide.** Le `GROUP BY` SQL
+sous-compte. Réparer l'écriture ; ne pas lire le compte comme une mesure entre-temps.
+
+### Ce que ce travail n'achète PAS
+
+Il ne fait tenir **aucun** verdict sous le plafond : il ne coupe rien, ne résume
+rien, ne découpe rien. Un brief de 72 Ko part exactement comme avant ; ce qui change
+est qu'il est **nommé** et **compté**. Il ne réduit aucune taille (ni le plan, ni le
+prompt système, ni la fenêtre, ni les définitions d'outils) et ne tranche pas entre
+les deux branches du couplage réel — (a) le temps jusqu'au premier octet croît avec
+l'entrée et mange le plafond **temporel**, (b) **un plan plus gros demande
+légitimement un verdict plus long** (plus d'ACs, plus de findings ancrés), ce qui rend
+« borner le brief » ambigu puisque *réduire l'entrée réduit la sortie en réduisant la
+revue*. Il ne rétro-remplit rien : les briefs déjà envoyés n'auront jamais leur ligne
+— fabriquer une ligne d'audit datée d'un franchissement qu'on n'a pas observé est
+l'inverse de ce que ce travail défend, et la sonde est le **prochain** gros brief.
+Enfin il rend le brief **lisible**, pas **surveillé** : le seul instrument neuf est un
+seuil, et **son silence ne prouve rien tant que personne n'exécute les sondes
+ci-dessus** — sur une population de deux lignes par jour, l'absence d'occurrence peut
+simplement vouloir dire qu'aucun gros plan n'a été groomé cette semaine.
+
+### Hors périmètre, délibérément
+
+Les quatre transformations ci-dessus. **Un refus a priori au-delà d'une taille** —
+c'est la forme la plus utile que le ticket puisse prendre, et elle est **conditionnée
+à sa propre précondition** : refuser une passe au-dessus d'une taille suppose de
+connaître cette taille, c'est-à-dire la mesure que ce ticket livre, et un refus ne
+peut pas atterrir dans la même PR que sa précondition (**suivi**, précondition
+écrite : la sonde S2 sur 30 jours). **La géométrie de mika-arch** (`llm_max_tokens`,
+plafond, enveloppe, modèle) — refusée au § 2 de mika#2457 par quatre raisons
+indépendantes, et le dépôt déclare `kimi-k2.5` / 32768 / 240 / 900 là où le corps de
+mika#2457 affirme `kimi-k3` / 16384 / 300 : on ne sait même pas laquelle des deux
+géométries tourne (c'est la dérive que mika#2473 a livré D1/D2 pour **mesurer**).
+**La réduction du prompt arch** — mika#2363 en a évincé 23,5 Ko, et le reste est deux
+fois plus petit qu'un plan médian. **La réduction de `tool_defs_bytes`** — restreindre
+la surface d'outils change **ce que l'architecte peut faire** : décision de capacité,
+pas de taille (**suivi**, précondition : que `tool_defs_bytes` soit mesuré non
+négligeable devant `user_message_bytes` sur la population ci-dessus — le champ existe
+déjà, la mesure est une ligne de `jq`). **Un signal côté shell dans `_arch_ask`** —
+son sink n'existe pas : `_iterate_groom_loop` est appelé **après** `_run_claude_pilot`,
+donc hors de la redirection `2>"$STDERR_FILE"`, et son stderr est le `Stdio::piped()`
+que l'exécuteur ne lit que dans la branche `if !status.success()` — or un dispatch de
+groom sort **toujours en 0**, donc le tuyau est lâché sans être lu (classe mika#2050,
+Signaux M et Q). **La cause fournisseur des coupures** — voisinage mika#2522 / #2342.
 
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 
