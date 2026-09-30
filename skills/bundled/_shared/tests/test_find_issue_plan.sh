@@ -670,6 +670,38 @@ assert_empty "'groom_session_id: 557a…' still claims nothing" \
 assert_empty "'**Ticket** de fond : mika#111' claims nothing (space spans no letters)" \
     "$(claims_of narrow-words '**Ticket** de fond : mika#111')"
 
+echo
+echo "mika#2606 — the two bounds that keep the widening from claiming rubbish:"
+
+# Bound 1: the quote prefix admits at most ONE `>`. Our issue bodies carry their
+# own `> - **Ticket:**` callouts, so a plan that quotes a ticket body inside its
+# 20-line header zone produces `> > - **Ticket:**` — a FOREIGN header, in the
+# zone chosen to keep quoted foreign headers out. Unbounded nesting would read it
+# as this plan's own claim and refute the plan for its real ticket. Measured: 0
+# plans change across the corpus when the prefix is bounded to one.
+assert_empty "a NESTED quote is a quoted foreign header, not this plan's claim" \
+    "$(claims_of bound-nested-quote '> > - **Ticket :** senara-solutions/mika#2038')"
+assert_eq "one quote level is still this plan's own header" \
+    "2038" "$(claims_of bound-one-quote '> - **Ticket :** senara-solutions/mika#2038')"
+
+# Bound 2: a bare numeric value counts only when the number is the WHOLE value.
+# A prefix match reads an issue claim out of a date, a version or a sentence, and
+# such a plan then refutes for every target including its own. The first of these
+# is a PRE-EXISTING sharp edge (the old glued pattern claimed 2026 from it too);
+# the widening would have extended it to the French and quote forms.
+assert_empty "'**Ticket:** 2026-09-30' claims nothing (a date is not an issue)" \
+    "$(claims_of bound-date '**Ticket:** 2026-09-30')"
+assert_empty "'- Issue : 3 phases remain' claims nothing (a sentence is not an issue)" \
+    "$(claims_of bound-sentence '- Issue : 3 phases remain')"
+assert_empty "'number : 1.2.3' claims nothing (a version is not an issue)" \
+    "$(claims_of bound-version 'number : 1.2.3')"
+assert_empty "'> Issue : 42 tickets restants' claims nothing (leading count is not an issue)" \
+    "$(claims_of bound-count '> Issue :    42 tickets restants')"
+# …and the two real bare-numeric shapes mika#1617 taught must survive the bound,
+# including one with a trailing blank (a CRLF file would otherwise go silent).
+assert_eq "bare numeric with a trailing blank still claims" \
+    "1679" "$(claims_of bound-trailing-blank 'issue: 1679 ')"
+
 # And the widening must still REFUTE, not merely parse: a French-typography
 # header naming another ticket is the population the guard was mute on.
 {

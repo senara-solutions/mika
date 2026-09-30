@@ -8,20 +8,33 @@
 # C'est la classe mika#2205 : une garde que personne n'a exercée se lit
 # exactement comme une garde qui marche.
 #
-# Cet instrument SOURCE dispatch-lib.sh et appelle la vraie fonction. Il n'en
-# redéfinit aucune copie : une sonde qui reporte son propre motif divergerait du
-# code au premier changement, et c'est très exactement le défaut qu'elle mesure
+# Cet instrument SOURCE dispatch-lib.sh et appelle la vraie fonction : le compte
+# « lu / non lu » ne peut donc pas diverger du code, ce qui est tout l'intérêt
 # (la leçon que mika#2293 a dû épingler pour sa reconstruction de cascade).
+#
+# EN REVANCHE le discriminant du bas — « ce plan porte-t-il malgré tout une ligne
+# à label ? » — est un motif SÉPARÉ et délibérément plus large que celui de la
+# fonction : c'est ce qui permet de voir une forme que la fonction n'atteint pas.
+# Il ne peut pas être partagé, `hdr` étant un `local`. Prix à connaître : si la
+# fonction gagne un préfixe que ce motif-ci ignore (une puce `* **Ticket :**`, par
+# exemple, qu'aucun des deux ne lit aujourd'hui), un vrai trou de lecteur serait
+# rapporté sous « sans aucune ligne à label », le seau qui veut dire « sain ».
+# En toucher un, c'est devoir toucher l'autre.
 #
 # CE N'EST PAS UN DÉTECTEUR. Sortie de rapport, toujours exit 0, jamais câblé à
 # la CI — il asserterait une propriété d'un corpus de documents en croissance,
 # pas une propriété du code. Le refus est raisonné en R6 du plan mika#2606 ; la
 # régression de code est couverte par les fixtures de tests/test_find_issue_plan.sh.
 #
+# Le défaut est `docs/plans/*-plan.md` et non `*.md` : c'est la population que
+# `_find_issue_plan` globe réellement à ses trois tiers. Mesuré, `*.md` ajoute 26
+# fichiers que le lecteur n'ouvre jamais, crédite 12 « en-têtes lus » et gonfle de
+# 14 le seau même que le rapport appelle fail-open.
+#
 # Usage:
-#   scripts/measure-plan-header-coverage.sh                        # docs/plans/*.md
-#   scripts/measure-plan-header-coverage.sh 'docs/plans/2026-09-*' # motif entre quotes
-#   scripts/measure-plan-header-coverage.sh a.md b.md              # chemins explicites
+#   bash scripts/measure-plan-header-coverage.sh                        # docs/plans/*-plan.md
+#   bash scripts/measure-plan-header-coverage.sh 'docs/plans/2026-09-*' # motif entre quotes
+#   bash scripts/measure-plan-header-coverage.sh a.md b.md              # chemins explicites
 
 set -uo pipefail
 
@@ -42,7 +55,7 @@ source "$DISPATCH_LIB"
 # l'ait passé entre quotes.
 PLANS=()
 if [ "$#" -eq 0 ]; then
-    set -- "$REPO_ROOT/docs/plans/*.md"
+    set -- "$REPO_ROOT/docs/plans/*-plan.md"
 fi
 for arg in "$@"; do
     if [ -f "$arg" ]; then
@@ -84,6 +97,11 @@ for plan in "${PLANS[@]}"; do
     # pas », qui est le défaut. Une recherche non ancrée ne trancherait rien :
     # mesurée, elle rend 122 des 126 non-lus, parce que la prose de nos plans
     # dit « ticket » à longueur de paragraphe.
+    #
+    # C'est la copie séparée dont l'en-tête de ce fichier nomme le prix. Elle est
+    # PLUS LARGE que le motif de la fonction (aucune exigence de deux-points,
+    # citation non bornée) : c'est délibéré, un discriminant plus étroit que le
+    # lecteur ne pourrait jamais montrer une forme non lue.
     label_lines=$(head -n 20 "$plan" 2>/dev/null \
         | grep -inE '^[[:space:]]*(>[[:space:]]*)*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)' || true)
     UNREAD_REPORT="${UNREAD_REPORT}

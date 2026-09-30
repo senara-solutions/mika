@@ -6233,18 +6233,33 @@ _plan_header_claimed_issues() {
     # the house had to engrave for `grooming_marker` (mika#2158) and for
     # `parse_log_llm_bodies` (mika#2220).
     #
-    # Widening can only ADD lines, so it can only GROW the claimed set; and
-    # refutation requires that NONE of the claimed numbers is the target. A
-    # larger set therefore makes refutation LESS likely, never more — which is
-    # why a legitimate plan cannot be refuted by this widening, and why a header
-    # transcribing its ticket's title (`… issue#2606 — … #2038 …`, ~50 plans)
-    # claiming both numbers is neutral. Measured: 0 lost tier-1 selections across
-    # 482 canonical issue slots, 0 new refutations across 983 plans.
+    # What bounds the risk, stated precisely — because the tempting version of
+    # this sentence is FALSE. On a header that ALREADY claimed something,
+    # widening only grows the claimed set, and refutation requires that NONE of
+    # the claimed numbers is the target, so a larger set makes refutation less
+    # likely: that is why a header transcribing its ticket's title
+    # (`… issue#2606 — … #2038 …`, ~50 plans) claiming both numbers is neutral.
+    # But the dominant transition here is empty -> non-empty, and that one is
+    # NOT monotone: `_plan_header_refutes_issue` reads an empty set as "no
+    # refutation", so ~120 plans go from structurally unrefutable to refuting
+    # every target they do not name. That is the POINT of this change, not a
+    # side effect — and what makes it safe is not an invariant but a
+    # measurement: 0 lost tier-1 selections across 484 canonical issue slots of
+    # 1011 plans, because a plan's own header names its own number.
+    #
+    # The corollary is the reason the quote prefix is bounded to ONE `>`. Our
+    # issue bodies carry their own `> - **Ticket:**` callouts, so a plan quoting
+    # a ticket body inside its 20-line header zone produces `> > - **Ticket:**`
+    # — a FOREIGN header, in a zone chosen precisely to keep quoted foreign
+    # headers out (the false positive mika#1421's v1 self-test hit). Unbounded
+    # nesting would read it as this plan's own claim and refute the plan for its
+    # real ticket. Bounding to one `>` costs nothing measurable (0 plans change
+    # across the corpus) and every real quote-block header we write uses one.
     local candidate="$1"
     [ -n "$candidate" ] && [ -r "$candidate" ] || return 0
     # POSIX classes, not `\s`: this function is already written in them, and two
     # different tools share these patterns.
-    local hdr='^[[:space:]]*(>[[:space:]]*)*(-[[:space:]]+)?(\*\*)?'
+    local hdr='^[[:space:]]*(>[[:space:]]*)?(-[[:space:]]+)?(\*\*)?'
     local sep='(\*\*)?[[:space:]]*(:\*\*|:)'
     local label_lines
     label_lines=$(head -n 20 "$candidate" 2>/dev/null \
@@ -6254,10 +6269,16 @@ _plan_header_claimed_issues() {
         # Every `#N` on a label line, not just the last: a header may name two
         # tickets in one field (`**Ticket:** mika#1772/#1773`).
         printf '%s\n' "$label_lines" | grep -oE '#[0-9]+' | tr -d '#'
-        # A bare numeric value sitting directly after the label (`issue: 1679`).
+        # A bare numeric value sitting directly after the label (`issue: 1679`),
+        # and ONLY when the number is the whole value. A prefix match reads 2026
+        # out of `**Ticket:** 2026-09-30`, 1 out of `number : 1.2.3` and 3 out of
+        # `Issue : 3 phases remain` — a claim on something that is not an issue
+        # number at all, which refutes the plan for every target including its
+        # own. The trailing `[[:space:]]*` absorbs a trailing blank and the `\r`
+        # of a CRLF file, so neither turns a real claim into silence.
         printf '%s\n' "$label_lines" \
             | sed -E "s/${hdr}[A-Za-z]+${sep}[[:space:]]*//" \
-            | grep -oE '^[0-9]+'
+            | grep -oE '^[0-9]+[[:space:]]*$' | tr -d '[:space:]'
     } | sort -u
 }
 
