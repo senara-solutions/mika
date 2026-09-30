@@ -235,7 +235,13 @@ impl LivenessSink for HttpLivenessSink {
                 };
                 return Err(LivenessFailure {
                     class,
-                    message: format!("battement non parti: {e}"),
+                    // `without_url()` et non `{e}` : le `Display` de `reqwest::Error`
+                    // appende « for url (…) » à toute erreur qui porte une URL, et
+                    // ce message part dans le champ `error` du WARN de transition.
+                    // Or le manifeste d'egress affirme que l'URL du battement n'est
+                    // **jamais** journalisée. La classe est déjà calculée au-dessus,
+                    // donc la moitié actionnable de la ligne ne perd rien.
+                    message: format!("battement non parti: {}", e.without_url()),
                 });
             }
         };
