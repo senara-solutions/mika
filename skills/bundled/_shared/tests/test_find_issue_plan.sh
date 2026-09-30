@@ -544,6 +544,192 @@ else
     PASS=$((PASS + 1)); echo "  ✓ claim past line 20 does not refute (header-zone scope)"
 fi
 
+# ============================================================================
+# mika#2606: the three typographic shapes our plans actually write, plus the
+# quote block.
+#
+# The mika#2038 reader required the colon GLUED to the label and admitted no
+# quote prefix. Our plans are written in French — space before the colon — and
+# often sit their header in a `>` block, so the reader was mute on most of them:
+# measured on the 165 plans of 2026-09, it read 39 headers and missed 126, of
+# which 112 carry a real label line. The refutation guard above therefore
+# refuted nothing on those plans. It did not fail; it saw nothing — the mika#2205
+# class, where a guard nobody has exercised reads exactly like one that works.
+#
+# THESE HEADER LINES ARE REAL AND FROZEN. Each is copied verbatim from the plan
+# named beside it. Do NOT refresh them from docs/plans/ and do NOT replace them
+# with tidier equivalents: regenerating fixtures from the repo erases the very
+# shapes the reader must recognise, which is the doctrine mika#2158 had to write
+# for its own frozen fixtures. They are LINES, not copies of the plan files —
+# six whole plans would add ~100 KB of noise and drift the day someone edits one.
+# ============================================================================
+
+echo
+echo "mika#2606 — the header shapes our plans really write (helper: _plan_header_claimed_issues):"
+
+SHAPES_ROOT=$(fresh_root)
+
+# Writes a plan whose header zone carries exactly $2 (via this file's own
+# write_plan, which already pads past the 500-byte filter), and returns what the
+# reader claims from it as a space-separated set.
+claims_of() {
+    local nick="$1" line="$2" f
+    f="$SHAPES_ROOT/docs/plans/shape-${nick}.md"
+    write_plan "$f" "$line"
+    _plan_header_claimed_issues "$f" | tr '\n' ' ' | sed 's/ $//'
+}
+
+# --- Non-regression: the five shapes mika#2038/#1617 already read. These sit
+# --- in the same block as what changes, so a regression is visible next to it.
+assert_eq "'**Issue:** #539' still claims 539 (founding incident)" \
+    "539" "$(claims_of glued-bold '**Issue:** #539')"
+assert_eq "YAML 'issue: 1679' still claims 1679 (bare numeric, mika#1617)" \
+    "1679" "$(claims_of glued-yaml 'issue: 1679')"
+assert_eq "YAML 'number: 3030' still claims 3030" \
+    "3030" "$(claims_of glued-number 'number: 3030')"
+assert_eq "'issue: senara-solutions/mika#1772' still claims 1772 (org prefix)" \
+    "1772" "$(claims_of glued-org 'issue: senara-solutions/mika#1772')"
+assert_eq "'**Ticket:** mika#1772/#1773' still claims BOTH numbers" \
+    "1772 1773" "$(claims_of glued-two '**Ticket:** mika#1772/#1773')"
+
+# --- Shape 1: the space sits INSIDE the bold (`**Ticket :**`). 50 plans.
+# From docs/plans/2026-09-15-003-fix-2295-*-plan.md
+assert_eq "'**Ticket :** mika issue#2295' claims 2295 (space inside the bold)" \
+    "2295" "$(claims_of fr-inside '**Ticket :** mika issue#2295 — fenêtre de contexte')"
+# From docs/plans/2026-09-15-005-fix-2293-*-plan.md — the fourth header the ticket
+# cites by name. Same shape as 2295, asserted rather than assumed covered, and its
+# transcribed title carries a backticked env var and a `120 s` that must NOT be
+# read as a claim.
+assert_eq "'**Ticket :** mika issue#2293 — \`MIKA_…\` (120 s) …' claims only 2293" \
+    "2293" "$(claims_of fr-inside-envvar '**Ticket :** mika issue#2293 — `MIKA_LLM_HTTP_TIMEOUT_SECS` (120 s) coupe une génération')"
+
+# --- Shape 2: the header sits in a quote block. 28 plans.
+# From docs/plans/2026-09-15-004-fix-2315-*-plan.md
+assert_eq "'> Ticket : senara-solutions/mika#2315' claims 2315 (quote block)" \
+    "2315" "$(claims_of quoted-bare '> Ticket : senara-solutions/mika#2315 (p1 substrat)')"
+# From docs/plans/2026-09-15-004-test-2310-*-plan.md
+assert_eq "'> - **Ticket :** …#2310' claims 2310 (quote + dash + bold)" \
+    "2310" "$(claims_of quoted-dash-bold '> - **Ticket :** senara-solutions/mika#2310')"
+
+# --- Shape 3: the bold CLOSES before the colon (`**Ticket** :`). 9 plans, and
+# --- the shape the ticket's own proposed pattern does NOT reach: its
+# --- `(\s*:\*\*|\s*:)` reads the space inside the bold but not outside it.
+# --- Implemented to the ticket's letter, 9 real headers would stay unread and
+# --- AC3 would be reported satisfied over them.
+# From docs/plans/2026-09-21-003-fix-2331-*-plan.md
+assert_eq "'- **Ticket** : …#2331' claims 2331 (bold closes before the colon)" \
+    "2331" "$(claims_of fr-outside '- **Ticket** : senara-solutions/mika#2331')"
+# From docs/plans/2026-09-24-002-fix-2522-*-plan.md
+assert_eq "'> **Ticket** : …#2523' claims 2523 (quote + bold closes)" \
+    "2523" "$(claims_of quoted-fr-outside '> **Ticket** : senara-solutions/mika#2523 — « … »')"
+# From docs/plans/2026-09-27-001-fix-2575-*-plan.md — value wrapped in backticks
+assert_eq "'- **Ticket** : \`mika issue#2575\`' claims 2575 (backticked value)" \
+    "2575" "$(claims_of fr-outside-backtick '- **Ticket** : `mika issue#2575`')"
+
+# --- The dominant shape: the ticket TITLE transcribed after the number, which
+# --- imports every `#N` the title contains. Asserted with BOTH numbers, not
+# --- just the right one: that is the third mika#2038 narrowing ("every `#N` on
+# --- a label line counts") pinned on a line the widening makes newly readable.
+# --- A greedy read keeping only the last `#N` would go red here — the very
+# --- defect that narrowing was written for, when `**Ticket:** mika#1772/#1773`
+# --- claimed only 1773. Widening can only GROW the claimed set, and refutation
+# --- needs NONE of the claimed numbers to be the target, so a bigger set makes
+# --- refutation less likely, never more.
+# From docs/plans/2026-09-30-003-fix-2606-*-plan.md (this ticket's own plan)
+assert_eq "a transcribed title claims its own number AND the ones it cites" \
+    "2038 2606" \
+    "$(claims_of transcribed-title '**Ticket :** mika issue#2606 — garde de réfutation #2038 muette')"
+
+echo
+echo "mika#2606 — the two patterns move together (bare-numeric in the NEW shapes):"
+
+# The function reads by two branches: a `grep` for `#N`, and a `sed` that strips
+# the prefix so a `grep` can see a BARE numeric value. Each carried its own copy
+# of the prefix. Widening the grep alone leaves the sed blind on exactly the
+# lines the grep just admitted — and every `#N` fixture above stays green, so a
+# half-fix is green on all of them and silently broken only here. These four are
+# the only assertions that tell "both patterns moved" from "the `#N` half works".
+assert_eq "bare numeric survives the space before the colon" \
+    "1679" "$(claims_of nu-fr 'issue : 1679')"
+assert_eq "bare numeric survives a quote prefix" \
+    "1679" "$(claims_of nu-quoted '> issue: 1679')"
+assert_eq "bare numeric survives quote AND space before the colon" \
+    "1679" "$(claims_of nu-quoted-fr '> issue : 1679')"
+assert_eq "bare numeric survives the bold closing before the colon" \
+    "1679" "$(claims_of nu-fr-outside '- **issue** : 1679')"
+
+echo
+echo "mika#2606 — the three mika#2038 narrowings are intact:"
+
+# Narrowing 1: the label anchors the line. Widening the prefix must not let a
+# word in front of the label through.
+assert_empty "'Related issue: #456' is still a cross-reference, not a claim" \
+    "$(claims_of narrow-xref 'Related issue: #456')"
+assert_empty "prose 'The issue: 3 phases remain' is still not a claim" \
+    "$(claims_of narrow-prose 'The issue: 3 phases remain before this lands.')"
+# Narrowing 2: `id` is not a refuting label.
+assert_empty "'groom_session_id: 557a…' still claims nothing" \
+    "$(claims_of narrow-sessionid 'groom_session_id: 557a7808-17f2-4f7e-bcfe-25e8df3021d9')"
+# A NEW negative the widening makes thinkable: `[[:space:]]*` must not span
+# letters, so a label followed by words is not a header field. The property holds
+# by construction — which is exactly the kind one believes and never checks.
+assert_empty "'**Ticket** de fond : mika#111' claims nothing (space spans no letters)" \
+    "$(claims_of narrow-words '**Ticket** de fond : mika#111')"
+
+echo
+echo "mika#2606 — the two bounds that keep the widening from claiming rubbish:"
+
+# Bound 1: the quote prefix admits at most ONE `>`. Our issue bodies carry their
+# own `> - **Ticket:**` callouts, so a plan that quotes a ticket body inside its
+# 20-line header zone produces `> > - **Ticket:**` — a FOREIGN header, in the
+# zone chosen to keep quoted foreign headers out. Unbounded nesting would read it
+# as this plan's own claim and refute the plan for its real ticket. Measured: 0
+# plans change across the corpus when the prefix is bounded to one.
+assert_empty "a NESTED quote is a quoted foreign header, not this plan's claim" \
+    "$(claims_of bound-nested-quote '> > - **Ticket :** senara-solutions/mika#2038')"
+assert_eq "one quote level is still this plan's own header" \
+    "2038" "$(claims_of bound-one-quote '> - **Ticket :** senara-solutions/mika#2038')"
+
+# Bound 2: a bare numeric value counts only when the number is the WHOLE value.
+# A prefix match reads an issue claim out of a date, a version or a sentence, and
+# such a plan then refutes for every target including its own. The first of these
+# is a PRE-EXISTING sharp edge (the old glued pattern claimed 2026 from it too);
+# the widening would have extended it to the French and quote forms.
+assert_empty "'**Ticket:** 2026-09-30' claims nothing (a date is not an issue)" \
+    "$(claims_of bound-date '**Ticket:** 2026-09-30')"
+assert_empty "'- Issue : 3 phases remain' claims nothing (a sentence is not an issue)" \
+    "$(claims_of bound-sentence '- Issue : 3 phases remain')"
+assert_empty "'number : 1.2.3' claims nothing (a version is not an issue)" \
+    "$(claims_of bound-version 'number : 1.2.3')"
+assert_empty "'> Issue : 42 tickets restants' claims nothing (leading count is not an issue)" \
+    "$(claims_of bound-count '> Issue :    42 tickets restants')"
+# …and the two real bare-numeric shapes mika#1617 taught must survive the bound,
+# including one with a trailing blank (a CRLF file would otherwise go silent).
+assert_eq "bare numeric with a trailing blank still claims" \
+    "1679" "$(claims_of bound-trailing-blank 'issue: 1679 ')"
+
+# And the widening must still REFUTE, not merely parse: a French-typography
+# header naming another ticket is the population the guard was mute on.
+{
+    echo "# Plan — mika#2572"
+    echo ""
+    echo "**Ticket :** senara-solutions/mika#2572"
+    echo ""
+    for i in $(seq 1 30); do echo "Body padding line $i for size."; done
+} > "$SHAPES_ROOT/docs/plans/fr-header-refutes.md"
+
+if _plan_header_refutes_issue "$SHAPES_ROOT/docs/plans/fr-header-refutes.md" 1837; then
+    PASS=$((PASS + 1)); echo "  ✓ '**Ticket :** …#2572' refutes target 1837 (the guard was mute here)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ '**Ticket :** …#2572' should refute target 1837"
+fi
+
+if _plan_header_refutes_issue "$SHAPES_ROOT/docs/plans/fr-header-refutes.md" 2572; then
+    FAIL=$((FAIL + 1)); echo "  ✗ '**Ticket :** …#2572' must NOT refute its own target 2572"
+else
+    PASS=$((PASS + 1)); echo "  ✓ '**Ticket :** …#2572' does not refute its own target 2572"
+fi
+
 echo
 echo "mika#2038 — tier 1 discards the RustSec false positive:"
 
