@@ -35,7 +35,7 @@ vient lui-même d'écrire.
 
 ---
 
-## Re-mesure du 2026-09-30 (re-groom), contre `origin/main` @ `a0d1f2c3`
+## Re-mesure de terrain (2026-09-30) — le défaut s'est résorbé par expiration, pas par correctif
 
 Le groom moteur `8fc22e77` (2026-09-29) avait rendu READY en première passe puis
 `ESCALATE — second-pass-after-ready` sur un défaut de **réponse** (seconde
@@ -74,22 +74,68 @@ il a coûté ~28 h de scan.**
   par agent de `run_server`, d'où le décalage), refusé par mika#1742 le 26/09 à
   09:02, 10:35, 11:01 et 14:31, ré-armé par une ligne neuve (`4a88fd04`) à
   16:31:03Z — **~24,5 h** sans heartbeat. `heartbeat` est l'un des sept
-  `ensure_recurring_task` (`server/mod.rs:1762`), donc R2 le couvre sans ligne de
+  `ensure_recurring_task` (`server/mod.rs:1767`), donc R2 le couvre sans ligne de
   plus : la classe « toute récurrente » du ticket est désormais **mesurée**, pas
   seulement inférée.
 
-**Ancres : aucune n'a bougé de sens.** Les trois commits entre la base du plan
-(`b6c95955`) et `origin/main` (`2975e3e1`, `1e977a07`, `a0d1f2c3`) ne touchent ni
-`task_engine/engine.rs`, ni `server/mod.rs`, ni `task_engine/cron.rs`, ni
-`mika-cli/src/commands/chat.rs`. `db/tasks.rs` n'a changé qu'à partir de la l.4163
-(`has_completed_groom_for_issue`, mika#2590) : `create_recurring_task_if_absent`
-(l.204), l'`INSERT … 'recurring_active'` (l.288-294) et `update_task_rescheduled`
-(l.860-866) sont intacts. Deux ancres du plan étaient imprécises et sont
-corrigées dans le texte : l'`INSERT` est l.288-294 (le plan disait l.292), et le
-chemin CLI est `crates/mika-cli/src/commands/chat.rs:261` (le plan disait
-`commands/chat.rs:261`). Les autres (`engine.rs:4810`, `engine.rs:5512`,
-`startup_recovery` l.797, `enqueue_queued_task` l.4682, `fire_task` l.4755,
-`server/mod.rs:1762-1905` et `:1917`) sont exactes sur `origin/main`.
+---
+
+## Re-vérification du code (2026-09-30, re-groom moteur) contre `origin/main` @ `a923b352`
+
+Le groom par spawn a rendu READY en première passe, mais depuis mika#2591 un
+groom hors moteur ne frappe aucune preuve `PLAN_GROOMED` en base : le ticket
+n'était pas dispatchable (cul-de-sac mika#2484 D4). Le plan est donc re-dérivé
+par la boucle. **Un plan groomé a une demi-vie ; ses prémisses sont re-lues, pas
+recopiées.** Chaque affirmation du § *La chaîne* et du § *Fire-Disposition* a été
+re-vérifiée dans le code à `a923b352`.
+
+**Trois ancres ont bougé, et la cause est nommée.** Le commit `a923b352`
+(mika#1990, liveness de mika-manager) ajoute **5 lignes** à
+`crates/mika-agent/src/server/mod.rs` — le seul fichier du périmètre qu'il
+touche. Les ancres corrigées :
+
+| ancre du plan (mesure 09-30 matin) | valeur à `a923b352` | objet |
+|---|---|---|
+| `server/mod.rs:1762-1905` | **`:1767-1910`** | les sept `ensure_recurring_task` |
+| `server/mod.rs:1917` | **`:1922`** | l'appel à `startup_recovery` |
+| « onze autres occurrences » du littéral dans `db/tasks.rs` | **dix** (12 au total : 1 `UPDATE` + 1 `INSERT` + 10 lectures) | compte du § *Fire-Disposition* |
+
+**Ancres re-vérifiées exactes** (aucune correction) : `startup_recovery`
+(`engine.rs:797`), `enqueue_queued_task` (`:4682`, calcul `:4696-4705`),
+`fire_task` (`:4755`, calcul `:4786-4810`), le `warn!` *cannot reschedule
+recurring task* (`:4810`), `make_task`/`trigger_type: "time"` (`:5505`/`:5512`),
+`create_recurring_task_if_absent` (`db/tasks.rs:204`), l'`INSERT` posant le
+littéral (`:292`), `update_task_rescheduled` (`:860`, `UPDATE` à `:862`), son
+doc-comment (`:858`), `get_schedulable_tasks` (`:722`, prédicat `:725`),
+`update_task_status` (`:737-739`), `mark_tasks_expired` (`:1643`), le chemin CLI
+(`mika-cli/src/commands/chat.rs:261`), et le prédicat de
+`idx_tasks_unique_recurring` (`db/migrations.rs:1403-1406`).
+
+**Quatre prémisses re-mesurées vertes**, chacune portante pour un livrable :
+
+1. **Les six maillons de la chaîne sont lus, pas déduits.** La garde cherche
+   `status IN ('failed','cancelled','expired')` (`db/tasks.rs:232`) — `in_progress`
+   lui est **invisible** ; le prédicat de l'index unique exclut
+   `('cancelled','failed','expired','delivered')` — `in_progress` est donc
+   **couvert**, d'où `n = 0` ; l'étape 2 n'épargne que `MANUAL`
+   (`engine.rs:876-885`) ; l'étape 2a **est** gatée `!cli_mode` avec son
+   raisonnement écrit sur place, la boucle générique ne l'est pas.
+2. **`update_task_rescheduled` est le seul `UPDATE` qui pose le statut** dans
+   tout `crates/` — vérifié par grep sur `UPDATE tasks SET` croisé au littéral :
+   une seule ligne, `db/tasks.rs:862`. Le terme T1 du scan est vert.
+3. **`mika tasks rearm` existe** — `task_engine::rearm_recurring_task`, appelé par
+   `mika-cli/src/commands/tasks.rs:195`, audité sous
+   `tool_name = 'recurring_operator_rearm'`. Le geste que le plan nomme pour les
+   lignes déjà empoisonnées n'est pas une intention, il est livré.
+4. **La limite « récurrentes portant un `timeout_at` » est exacte** :
+   `ensure_recurring_task` pose `timeout_at: None` (`task_engine/mod.rs:88`), donc
+   cette population est bien vide pour les sept récurrentes du démarrage.
+
+**Une lacune réelle du prédicat de Fire-Disposition a été trouvée**, et elle est
+de la classe même que le scan existe pour fermer : voir § *Fire-Disposition*,
+terme T2. Les trois fonctions DB à statut **dynamique** (`db/tasks.rs:739`,
+`:917`, `:1297`) permettent de poser `recurring_active` sans jamais écrire le
+littéral dans un `UPDATE`.
 
 ---
 
@@ -97,7 +143,7 @@ chemin CLI est `crates/mika-cli/src/commands/chat.rs:261` (le plan disait
 
 | # | site | ce qui se passe |
 |---|---|---|
-| 1 | `server/mod.rs:1762-1905` | les **sept** `ensure_recurring_task` tournent **avant** `startup_recovery` (l. 1917) |
+| 1 | `server/mod.rs:1767-1910` | les **sept** `ensure_recurring_task` tournent **avant** `startup_recovery` (l. 1922) |
 | 2 | `db/tasks.rs::create_recurring_task_if_absent` | la garde anti-zombie cherche `status IN ('failed','cancelled','expired')` — la ligne est `in_progress`, **elle ne la voit pas**, aucun refus |
 | 3 | idem | `INSERT OR IGNORE` entre en collision avec `idx_tasks_unique_recurring`, dont le prédicat est `status NOT IN ('cancelled','failed','expired','delivered')` — `in_progress` est **couvert** ⇒ `n = 0` ⇒ `Ok(None)` « already existed ». **Aucune ligne neuve** |
 | 4 | `engine.rs::startup_recovery` étape 2 | seul `trigger_type = 'manual'` est épargné ; la récurrente est passée à `failed` |
@@ -421,24 +467,57 @@ Ce plan livre des détecteurs (tests comportementaux, un scan de source). Option
 retenue : **(a) exception nommée en allowlist — allowlist livrée VIDE.**
 
 - **Le scan `mika2575_le_statut_recurring_active_a_un_ecrivain_unique`** refuse
-  un second `UPDATE … SET status = 'recurring_active'` en code de production hors
-  de `Database::update_task_rescheduled`. **Vérifié vert sur l'arbre courant** :
-  ce littéral n'apparaît aujourd'hui qu'à deux endroits, cet `UPDATE`
-  (`db/tasks.rs:862`) et l'`INSERT` de `create_recurring_task_if_absent`
-  (`db/tasks.rs:288-294`, sous la forme `VALUES (…,'recurring_active',…)`, donc hors
-  du prédicat qui vise `SET status =`). Les onze autres occurrences du littéral
-  sont des lectures `status IN (…)`. Le prédicat **dépouille les commentaires
-  avant de scanner** : le doc-comment de `update_task_rescheduled`
-  (`db/tasks.rs:858`) cite la forme `set next_fire_at and status =
-  'recurring_active'`, et un scan lexical nu compterait cette prose comme un
-  second écrivain — c'est le faux positif que mika#2050 a mesuré sur le Signal S.
-  L'allowlist `RECURRING_ACTIVE_WRITERS_ALLOWED` est donc livrée **vide**, et un
-  test frère (`…_allowlist_is_empty`) refuse qu'elle cesse de l'être — *une
-  allowlist née vide est un tiroir où déposer la prochaine infraction*
-  (mika#2323). Assertion anti-vacuité : le scan échoue si le littéral n'est écrit
-  **nulle part**, un scan visant un nom mort se lisant exactement comme un arbre
-  propre (mika#2103 / mika#2205). **Quand il tire, on retire le second site — on
-  ne l'allowliste pas** (doctrine mika#2201).
+  un second écrivain de `recurring_active` en code de production hors de
+  `Database::update_task_rescheduled`. **Son prédicat est une disjonction à deux
+  termes, et le second est une correction que la re-mesure du re-groom a
+  imposée** — le formuler sur T1 seul aurait produit un scan aveugle à la voie la
+  plus probable.
+
+  **T1 — l'écriture littérale.** Un `UPDATE … SET status = 'recurring_active'`
+  hors de `update_task_rescheduled`. **Vérifié vert** : le croisement de
+  `UPDATE tasks SET` et du littéral ne rend qu'**une** ligne dans tout `crates/`,
+  `db/tasks.rs:862`. L'`INSERT` de `create_recurring_task_if_absent` pose le même
+  littéral (`db/tasks.rs:292`, sous la forme `VALUES (…,'recurring_active',…)`) et
+  tombe hors du terme, à dessein : créer l'enregistrement est l'autre acte
+  légitime. Les dix autres occurrences du fichier sont des lectures
+  `status IN (…)`.
+
+  **T2 — l'écriture par statut dynamique, la voie que T1 ne voit pas.** Trois
+  fonctions DB prennent le statut en **paramètre** (`db/tasks.rs:739`, `:917`,
+  `:1297`, toutes de la forme `SET status = ?1`). Un futur écrivain peut donc
+  poser le statut par `update_task_status(&id, task_status::RECURRING_ACTIVE)` —
+  ou par son littéral — **sans qu'aucun `UPDATE … SET status = 'recurring_active'`
+  n'apparaisse dans l'arbre**. C'est mot pour mot la classe que ce scan existe
+  pour fermer : *un second écrivain ne rendrait aucune décision fausse le jour où
+  il est écrit, il divergerait plus tard, en silence, tous les tests au vert.* T2
+  refuse donc qu'un argument de statut valant `recurring_active` (littéral ou
+  `task_status::RECURRING_ACTIVE`) soit passé à l'une de ces trois fonctions.
+
+  **L'anti-vacuité de T2 ne peut PAS porter sur la présence du nom, et c'est le
+  piège.** `task_status::RECURRING_ACTIVE` (`task_engine/types.rs:12`) n'est
+  consommée **nulle part** aujourd'hui — zéro occurrence hors sa définition —
+  donc T2 est vert par **population vide**, ce qui se lit exactement comme un
+  arbre propre (mika#2205). Son contrôle porte donc sur la **forme du prédicat**,
+  par une fixture négative **vue rouge** : un appel
+  `update_task_status(&id, task_status::RECURRING_ACTIVE)` construit pour le test
+  doit faire tirer le scan. T1, lui, garde l'anti-vacuité par le nom (il échoue
+  si le littéral n'est écrit nulle part) — les deux termes n'ont pas le même
+  contrôle parce qu'ils n'ont pas la même population.
+
+  **Le prédicat dépouille les commentaires avant de scanner.** Le doc-comment de
+  `update_task_rescheduled` (`db/tasks.rs:858`) écrit *« set next_fire_at and
+  status = 'recurring_active' »* : un prédicat ancré sur `SET status =` ne le
+  matche pas, mais un prédicat sur `status = 'recurring_active'` — la forme
+  laxiste vers laquelle un futur éditeur glisserait pour « être sûr de ne rien
+  rater » — compterait cette prose comme un second écrivain. C'est le faux
+  positif que mika#2050 a mesuré sur le Signal S, et le dépouillement le ferme
+  quelle que soit la précision du prédicat.
+
+  L'allowlist `RECURRING_ACTIVE_WRITERS_ALLOWED` est livrée **vide** pour les deux
+  termes, et un test frère (`…_allowlist_is_empty`) refuse qu'elle cesse de
+  l'être — *une allowlist née vide est un tiroir où déposer la prochaine
+  infraction* (mika#2323). **Quand il tire, on retire le second site — on ne
+  l'allowliste pas** (doctrine mika#2201).
 - **Le scan d'écrivain unique du nom d'audit** (`recurring_restart_restore`) :
   nom neuf, donc allowlist vide par construction, même contrôle anti-vacuité.
 - **Les tests comportementaux** sont armés d'emblée : ils décrivent la
@@ -471,7 +550,9 @@ Aucun détecteur n'est livré désarmé, et aucune halte-et-remontée n'est requ
 
 | test | classe couverte |
 |---|---|
-| `mika2575_le_statut_recurring_active_a_un_ecrivain_unique` | un second écrivain ne rendrait **aucune décision fausse** le jour où il est écrit ; il divergerait plus tard, en silence, tous les tests au vert |
+| `mika2575_le_statut_recurring_active_a_un_ecrivain_unique` | **T1 + T2** — un second écrivain ne rendrait **aucune décision fausse** le jour où il est écrit ; il divergerait plus tard, en silence, tous les tests au vert |
+| `…_le_prédicat_voit_lécriture_par_statut_dynamique` | **contrôle négatif de T2, à voir ROUGE** — une fixture passant `task_status::RECURRING_ACTIVE` à `update_task_status` doit faire tirer le scan. Sans lui, T2 est vert par population vide et se lit comme un arbre propre (mika#2205) |
+| `…_le_prédicat_ne_compte_pas_un_doc_comment` | **contrôle de bonne foi, à voir VERT** — le doc-comment de `db/tasks.rs:858` ne doit pas compter comme écrivain ; sans lui, un prédicat laxiste rend le scan rouge en permanence, donc désarmé (classe mika#2050) |
 | `…_allowlist_is_empty` | contrôle de bonne foi de l'allowlist |
 | `mika2575_le_nom_daudit_a_un_seul_ecrivain` | rend le `GROUP BY after_value` exact plutôt qu'un nombre sur lequel deux sites peuvent diverger |
 | `mika2575_les_valeurs_daudit_sont_un_format_de_fil` | fige `recurring_active` / `failed_no_cron` |
@@ -508,14 +589,19 @@ comportementale en service est la sonde S1.
 - [ ] Repli `failed` nommé quand le cron n'est pas calculable.
 - [ ] Mode CLI : aucune écriture sur une ligne récurrente.
 - [ ] Événement INFO + ligne d'audit à écrivain unique, valeurs figées.
-- [ ] Les sept tests comportementaux et les quatre tests structurels passent ;
-      les trois « vus rouges » l'ont été avant le correctif.
+- [ ] Le scan d'écrivain unique porte ses **deux** termes (T1 littéral, T2 statut
+      dynamique), avec le contrôle négatif de T2 **vu rouge** et le contrôle de
+      bonne foi du doc-comment **vu vert**.
+- [ ] Les sept tests comportementaux et les six tests structurels passent ; les
+      quatre « vus rouges » l'ont été avant le correctif.
 - [ ] `cargo test -p mika-agent`, `clippy -D warnings`, `fmt --check` verts.
 - [ ] `crates/mika-agent/CLAUDE.md` § *Unified Task Engine* documente la
       transition et son raisonnement ; le `CLAUDE.md` racine porte les surfaces
       opérateur, les sondes et leurs haltes.
 - [ ] Corps de PR : les rectifications R-A à R-D, la mesure qui refuse le
-      compteur, et le geste `mika tasks rearm` pour les lignes déjà empoisonnées.
+      compteur, le geste `mika tasks rearm` pour les lignes déjà empoisonnées, et
+      la voie T2 — un scan formulé sur T1 seul aurait été aveugle à l'écriture
+      par statut dynamique.
 
 ## Acceptance criteria
 
