@@ -355,6 +355,29 @@ fn mika2260_la_porte_precede_tout_travail() {
              (mika#2260)"
         );
     }
+
+    // Les quatre aiguilles ci-dessus sont une liste **fermée**, donc elles ne
+    // peuvent pas voir un effet de bord d'une forme NOUVELLE inséré avant la
+    // porte. Le doc d'en-tête du module promet davantage — « avant l'exigence de
+    // token, avant tout appel `gh`, avant toute écriture de dedup, avant toute
+    // ligne d'audit » — et les deux termes qui suivent tiennent la fin de cette
+    // phrase par la **forme** plutôt que par un nom, ce qui est la seule façon
+    // d'attraper un site qui n'existe pas encore.
+    for (needle, what) in [
+        (".log_audit_event(", "toute écriture d'audit"),
+        ("info!(", "toute ligne de journal de l'évaluateur"),
+    ] {
+        let first = body.find(needle).unwrap_or_else(|| {
+            panic!("`{needle}` doit exister dans le corps — sinon ce terme est vacue")
+        });
+        assert!(
+            gate_at < first,
+            "la porte d'entrée doit précéder {what} (`{needle}`) : la PREMIÈRE occurrence \
+             doit être celle de la porte elle-même. Un site inséré au-dessus d'elle \
+             passerait les quatre aiguilles nommées ci-dessus sans être vu, et c'est très \
+             exactement la classe qu'une liste fermée ne couvre pas (mika#2260)"
+        );
+    }
 }
 
 /// T4 (AC4) — le nom d'audit de la porte est réel.

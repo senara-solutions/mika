@@ -302,6 +302,19 @@ mod tests {
         // Deux noms, deux questions, **une** table. Ce test est ce qui rougit le
         // jour où l'une des deux fonctions bouge sans l'autre — le mode de panne
         // qu'une seconde liste blanche rendrait silencieux.
+        //
+        // **Ce qu'il vaut, et ce qu'il ne vaut pas.** Tant que
+        // `owns_merge_transition` est défini *par délégation* à
+        // `merge_disposition`, cette égalité est une tautologie et ce test ne peut
+        // pas échouer. Sa valeur est conditionnelle et future : il mord le jour où
+        // quelqu'un réécrit le prédicat autrement. Et même alors il ne mord que
+        // sur les entrées échantillonnées — une réimplémentation en
+        // `trim().eq_ignore_ascii_case(DISPATCHER_AGENT)` les satisfait toutes les
+        // huit et resterait verte. L'idiome maison pour fermer cela entièrement
+        // serait un scan de source refusant un second lecteur de la liste blanche ;
+        // il n'est pas livré, parce qu'un seul site consomme ce prédicat
+        // aujourd'hui et qu'un scan sur une population d'un est un détecteur dont
+        // le silence ne prouve rien. C'est dit ici plutôt que découvert plus tard.
         for agent in [
             "mika-dev",
             "mika-qa",

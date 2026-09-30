@@ -10,15 +10,29 @@
 //! vacuously satisfaite. D'où [`MultiAgentHarness`] (mika#2265), dont le
 //! doc-comment nomme ce ticket : *« le mot load-bearing est **attribution** »*.
 //!
-//! # Les deux patrons, et pourquoi il faut les deux
+//! # Les deux patrons, et ce que le second N'EST PAS
 //!
-//! `multi_agent.rs` documente la raison en une phrase : **#2248 est un *ordre* et
-//! #2260 est une *course***. Le double chemin mesuré le 2026-09-09 (09:08:11 pour
-//! mika-qa, 09:08:26 pour mika-dev, puis 5 ms d'écart à 09:12:36) *est* une
-//! course ; un test qui ne l'exercerait qu'en séquence ne décrirait pas le
-//! défaut. Les deux sous-cas vivent donc dans le même test, chacun sur son propre
-//! harness — les comptes d'audit s'accumuleraient sinon, et `1` est une assertion
-//! plus lisible que `2`.
+//! `multi_agent.rs` documente la raison d'être des deux patrons en une phrase :
+//! **#2248 est un *ordre* et #2260 est une *course***. Les deux sous-cas vivent
+//! donc dans le même test, chacun sur son propre harness — les comptes d'audit
+//! s'accumuleraient sinon, et `1` est une assertion plus lisible que `2`.
+//!
+//! **Mais le sous-cas (b) n'exerce PAS une course, et c'est à dire plutôt qu'à
+//! laisser croire.** `tokio::join!` sonde les deux futurs sur une seule tâche,
+//! sans `spawn` ; et à `github_token = None` le futur du dispatcher n'atteint
+//! **aucun point `.await`** avant de rendre la main — `parse_check_suite_success`,
+//! `db.agent_id()`, `owns_merge_transition` et les deux macros de journal sont
+//! synchrones, puis `match github_token { None => return … }`. Le premier sondage
+//! le résout donc, il ne se suspend jamais, et aucun entrelacement n'a lieu.
+//!
+//! Ce que (b) établit réellement : **le verdict est une fonction pure de
+//! l'`agent_id`**, donc indépendant de l'ordre d'arrivée par construction. C'est
+//! plus faible que « la course se résout bien », et strictement moins que ce que
+//! le patron promet. La course authentique — deux évaluateurs suspendus en même
+//! temps sur la clé de dedup process-globale — n'est atteignable qu'avec un vrai
+//! token et une couture sur `gh`, que mika#1947 a déclarée hors périmètre. Le
+//! sous-cas est conservé parce qu'il est bon marché et qu'il épingle
+//! l'indépendance à l'ordre ; il n'est pas conservé comme preuve de course.
 //!
 //! # Ce que ce fichier mesure, et ce qu'il ne mesure pas
 //!
@@ -162,11 +176,14 @@ async fn mika2260_lattribution_du_fanout_est_mesurable() -> Result<()> {
         h.shutdown();
     }
 
-    // --- (b) Course : les deux handlers concurrents sur la base partagée. ---
+    // --- (b) Concurrence structurelle : les deux handlers sur la base partagée. ---
     //
-    // C'est la forme du défaut. En séquence, « le relecteur entre d'abord » est
-    // une hypothèse ; ici les deux partent ensemble et l'attribution doit tenir
-    // quel que soit l'ordre d'arrivée.
+    // Ce sous-cas atteste que le verdict est **indépendant de l'ordre**, parce
+    // qu'il est une fonction pure de l'`agent_id`. Il n'atteste **pas** qu'une
+    // course se résout bien : à `token = None` aucun des deux futurs ne se
+    // suspend, donc aucun entrelacement n'a lieu — voir le § *ce que le second
+    // N'EST PAS* en tête de fichier, qui nomme la limite et pourquoi la course
+    // authentique est hors d'atteinte sans réseau.
     {
         let h = MultiAgentHarness::builder()
             .agent(DISPATCHER)

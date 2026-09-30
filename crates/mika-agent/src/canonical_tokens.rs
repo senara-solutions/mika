@@ -911,6 +911,84 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2260 — le nom d'audit de la porte d'entrée a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// Rien à excepter à la livraison : le nom
+    /// `ci_success_handler_skipped_not_merge_actor` est **neuf**. Quand ce scan
+    /// tire, **on retire le second écrivain**, on ne l'excepte pas (doctrine
+    /// mika#2201).
+    const ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom d'audit de la porte d'entrée de l'évaluateur n'a qu'un écrivain.
+    ///
+    /// La propriété est porteuse parce que `CLAUDE.md` déclare ce nom **compteur
+    /// mesuré** — c'est la population qu'AC6 interroge après déploiement, et son
+    /// comparaison avec `ci_success_handler_processed` sous le même `agent_id` est
+    /// ce qui dit « un seul agent entre ». Deux écrivains rendraient ce compte
+    /// inexact, et aucun test comportemental ne peut voir cette classe : un second
+    /// site ne rendrait **aucune** décision fausse le jour où il est écrit.
+    #[test]
+    fn mika2260_the_entry_gate_skip_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("ci_success_handler_skipped{}", "_not_merge_actor");
+        let owner = "crates/mika-agent/src/server/ci_success_handler.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2260 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2260 — le nom d'audit de la porte d'entrée a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS — la mesure d'AC6 (« un seul \
+             agent entre ») n'est exacte que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2260_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2522 — le nom d'audit du tour A2A échoué a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 
