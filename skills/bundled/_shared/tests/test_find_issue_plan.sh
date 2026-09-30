@@ -569,18 +569,13 @@ echo "mika#2606 — the header shapes our plans really write (helper: _plan_head
 
 SHAPES_ROOT=$(fresh_root)
 
-# Writes a plan whose header zone carries exactly $2, and returns what the
+# Writes a plan whose header zone carries exactly $2 (via this file's own
+# write_plan, which already pads past the 500-byte filter), and returns what the
 # reader claims from it as a space-separated set.
 claims_of() {
     local nick="$1" line="$2" f
     f="$SHAPES_ROOT/docs/plans/shape-${nick}.md"
-    {
-        echo "# Plan: example"
-        echo ""
-        printf '%s\n' "$line"
-        echo ""
-        for i in $(seq 1 30); do echo "Body padding line $i for size."; done
-    } > "$f"
+    write_plan "$f" "$line"
     _plan_header_claimed_issues "$f" | tr '\n' ' ' | sed 's/ $//'
 }
 

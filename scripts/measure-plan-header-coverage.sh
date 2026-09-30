@@ -65,7 +65,7 @@ fi
 
 READ_COUNT=0
 UNREAD_COUNT=0
-UNREAD_WITH_LABEL_WORD=0
+UNREAD_WITH_LABEL_LINE=0
 UNREAD_REPORT=""
 
 for plan in "${PLANS[@]}"; do
@@ -84,19 +84,19 @@ for plan in "${PLANS[@]}"; do
     # pas », qui est le défaut. Une recherche non ancrée ne trancherait rien :
     # mesurée, elle rend 122 des 126 non-lus, parce que la prose de nos plans
     # dit « ticket » à longueur de paragraphe.
-    label_words=$(head -n 20 "$plan" 2>/dev/null \
+    label_lines=$(head -n 20 "$plan" 2>/dev/null \
         | grep -inE '^[[:space:]]*(>[[:space:]]*)*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)' || true)
     UNREAD_REPORT="${UNREAD_REPORT}
   ${plan#"$REPO_ROOT"/}"
-    if [ -n "$label_words" ]; then
-        UNREAD_WITH_LABEL_WORD=$((UNREAD_WITH_LABEL_WORD + 1))
+    if [ -n "$label_lines" ]; then
+        UNREAD_WITH_LABEL_LINE=$((UNREAD_WITH_LABEL_LINE + 1))
         while IFS= read -r line; do
             UNREAD_REPORT="${UNREAD_REPORT}
       | ${line}"
-        done <<< "$label_words"
+        done <<< "$label_lines"
     else
         UNREAD_REPORT="${UNREAD_REPORT}
-      | (aucun mot de label dans les 20 premières lignes)"
+      | (aucune ligne à label dans les 20 premières lignes)"
     fi
 done
 
@@ -106,8 +106,8 @@ echo "  motif ................................ $*"
 echo "  plans examinés ....................... $TOTAL"
 echo "  en-tête LU (réclame ≥ 1 numéro) ...... $READ_COUNT"
 echo "  en-tête NON LU (réclame rien) ........ $UNREAD_COUNT"
-echo "    dont porteurs d'une ligne à label .. $UNREAD_WITH_LABEL_WORD"
-echo "    dont sans aucune ligne à label ..... $((UNREAD_COUNT - UNREAD_WITH_LABEL_WORD))"
+echo "    dont porteurs d'une ligne à label .. $UNREAD_WITH_LABEL_LINE"
+echo "    dont sans aucune ligne à label ..... $((UNREAD_COUNT - UNREAD_WITH_LABEL_LINE))"
 
 if [ "$UNREAD_COUNT" -gt 0 ]; then
     echo
