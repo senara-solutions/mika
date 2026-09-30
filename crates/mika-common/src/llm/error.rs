@@ -57,6 +57,40 @@ pub fn classify_transport_message(message: &str) -> &'static str {
     }
 }
 
+/// A response body made only of whitespace is an EMPTY response, therefore
+/// transitory — never a malformed JSON (mika#1781).
+///
+/// Returns `Some(Transport(…))` when `body.trim()` is empty, `None` otherwise.
+/// `None` is what lets a non-blank body **traverse** to `serde_json`, keeping
+/// mika#2015's population intact: a body that is invalid without being blank is
+/// an error, not something to sew back together.
+///
+/// # Why a function rather than an `if` at the call site
+///
+/// `send_once` performs a real HTTP POST, while every test of `openai.rs` is a
+/// synchronous `#[test]` over pure functions — so the rule has to live somewhere
+/// testable without standing up a server. It is also the one site where this
+/// message is worded, and the message decides the wire class: duplicating it on
+/// a second rail is how the [`error_class`] divergence gets programmed.
+///
+/// The message deliberately contains no `timed out`, so
+/// [`classify_transport_message`] files it under [`error_class::TRANSPORT`] and
+/// not [`error_class::TRANSPORT_TIMEOUT`]. That is a decision, not a side
+/// effect: the observed shape *suggests* an upstream timeout (padding emitted
+/// while a backend expires) but nothing in the body attests it, and `transport`
+/// is precisely the "any other transport failure" class.
+#[must_use]
+pub fn blank_response_body(body: &str) -> Option<LlmError> {
+    if body.trim().is_empty() {
+        Some(LlmError::Transport(format!(
+            "empty (whitespace-only) response body, {} bytes",
+            body.len()
+        )))
+    } else {
+        None
+    }
+}
+
 /// Provider-agnostic LLM error type.
 ///
 /// Each provider maps its native errors into this enum. The `retryable` field
@@ -274,6 +308,92 @@ mod tests {
         assert_eq!(error_class::UNSUPPORTED, "unsupported");
         assert_eq!(error_class::OTHER, "other");
         assert_eq!(error_class::http(429), "http_429");
+    }
+
+    // ── blank_response_body (mika#1781) ──
+
+    /// The measured body of 2026-08-28T20:53:23Z, provider `openrouter`:
+    /// **1320 bytes, 240 newlines, not one JSON character** — which is why serde
+    /// reported `EOF while parsing a value at line 241 column 0`.
+    ///
+    /// Built rather than captured: mika#2015 fixed the posture (capped excerpt,
+    /// on failure only), and a body of whitespace carries no customer content to
+    /// protect — which is exactly what makes it reproducible here without
+    /// raising a privacy question.
+    fn measured_blank_body() -> String {
+        // 240 lines totalling 1080 spaces + 240 '\n' = 1320 bytes. The split
+        // (120 lines of 4 spaces, 120 of 5) is what makes both numbers exact.
+        let mut body = String::new();
+        for i in 0..240 {
+            body.push_str(if i % 2 == 0 { "    " } else { "     " });
+            body.push('\n');
+        }
+        body
+    }
+
+    /// V1a — the measured shape is claimed, routed to `Transport`, and retryable.
+    ///
+    /// **Seen red before the production rule existed**, per the plan's DoD: on
+    /// `main` a blank body reaches no classifier at all, so a test that passed
+    /// first try would not attest that it measures anything.
+    #[test]
+    fn mika1781_the_measured_blank_body_is_retryable_transport() {
+        let body = measured_blank_body();
+        assert_eq!(body.len(), 1320, "the fixture must be the measured size");
+        assert_eq!(
+            body.matches('\n').count(),
+            240,
+            "240 newlines — serde reported line 241"
+        );
+        assert!(
+            !body.contains(|c: char| !c.is_whitespace()),
+            "not one JSON character"
+        );
+
+        let err = blank_response_body(&body).expect("a whitespace-only body must be claimed");
+        assert!(
+            matches!(err, LlmError::Transport(_)),
+            "must be Transport, never ParseError: {err:?}"
+        );
+        assert!(err.is_retryable(), "the whole point of mika#1781");
+        assert!(err.is_transport(), "and it takes the mika#1744 fast retry");
+        assert_eq!(
+            err.error_class(),
+            error_class::TRANSPORT,
+            "transport, not transport_timeout — nothing in the body attests a timeout"
+        );
+        assert!(
+            err.to_string().contains("1320"),
+            "the message must name the byte size (AC1): {err}"
+        );
+    }
+
+    /// V1b — negative control, and the frontier of the whole fix: a malformed
+    /// JSON is **not claimed**, so it traverses to serde and keeps its
+    /// `ParseError` plus mika#2015's full diagnostic (AC3).
+    ///
+    /// Without this test the fix could eat #2015's population.
+    #[test]
+    fn mika1781_a_malformed_json_traverses_the_classifier() {
+        assert!(
+            blank_response_body("{bad").is_none(),
+            "a non-blank body stays serde's business"
+        );
+        // And the error it then produces is the terminal one, unchanged.
+        let parse = LlmError::ParseError("failed to parse response: expected value".into());
+        assert!(!parse.is_retryable());
+        assert_eq!(parse.error_class(), error_class::PARSE);
+    }
+
+    /// V1c — negative control: a valid response body is not claimed either.
+    /// Guards against a predicate that bites too wide.
+    #[test]
+    fn mika1781_a_valid_body_is_not_claimed() {
+        let valid = r#"{"id":"x","object":"chat.completion","choices":[]}"#;
+        assert!(blank_response_body(valid).is_none());
+        // An empty body is blank too — `trim()` of "" is empty. Stated rather
+        // than left to inference: a zero-byte 200 is the same class of failure.
+        assert!(blank_response_body("").is_some());
     }
 
     /// Case-insensitive, because the substring is all that separates a timeout
