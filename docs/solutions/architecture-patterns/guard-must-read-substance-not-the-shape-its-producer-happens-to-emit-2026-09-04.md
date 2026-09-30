@@ -7,6 +7,7 @@ problem_type: architecture_pattern
 component: auto-pull
 severity: high
 applies_when:
+  - The producer is an LLM writing prose in French (typography varies legally)
   - Writing a gate that classifies an artifact produced by another part of the system
   - The classifier keys off a count, a length, a filename, or any other cheap proxy
   - The producer is a documented pipeline whose output shape can legitimately vary
@@ -16,6 +17,7 @@ symptoms:
   - A manual lift of the gate's label survives minutes to hours, then re-fires
   - The refusal message states a category ("partial work") without naming evidence
   - The gate's own tests are green because they encode the same false assumption
+  - A fail-open guard emits nothing at all, on most of its population
 root_cause: incorrect_assumption
 resolution_type: code_fix
 related_components:
@@ -25,6 +27,8 @@ related_issues:
   - mika#2140
   - mika#2120
   - mika#2123
+  - mika#2606
+  - mika#2038
 ---
 
 # A guard must read substance, not the shape its producer happens to emit
@@ -151,3 +155,46 @@ in the module rather than implying completeness.
    the *sole* cause of a refusal that would otherwise have promoted, that
    assertion fails and reopens the question instead of letting it answer itself
    in silence.
+
+## Fourth instance: the producer writes French, and the guard fails open (mika#2606, 2026-09-30)
+
+| # | guard | assumption | reality |
+|---|---|---|---|
+| 4 | `dispatch-lib.sh::_plan_header_claimed_issues` (refutation guard mika#2038) | a plan header reads `Ticket:` / `**Ticket:**`, colon glued to the label, at column zero | the plans are LLM-written **in French**: a space before the colon (`Ticket :`), the bold closed *before* the colon (`**Ticket** :`), and the header often inside a blockquote (`> - **Ticket :**`) |
+
+**The producer's legal shapes come from the corpus, not from the spec.** No spec
+listed the three French forms; they were enumerated by reading the real headers
+of September's plans. The third form, `**Ticket** :`, was not named in the
+ticket either — it was found by the measurement. When the producer is an LLM
+writing natural-language prose, the enumeration step of the check below means
+*read the population*, because the spec describes intent and the model writes
+typography.
+
+**A fail-open guard makes its own muteness invisible.** mika#2038's contract is
+deliberate: a plan whose header claims nothing is accepted, so a plan is never
+refused for lack of a header. The consequence nobody wrote down: when the reader
+fails to parse a header, the guard does not misfire, it **abstains** — no
+refusal, no log line, no counter. It was mute on **135 of 212** September plans
+and nothing anywhere said so. Unlike instances 1–3, there was no wrong refusal
+to notice: the defect produced *silence*, which reads exactly like a healthy
+guard with nothing to refute (class mika#2205).
+
+**The only detector is a population measurement run through the real
+function.** `scripts/measure-plan-header-coverage.sh` (`make
+measure-plan-header-coverage`) **sources the actual `dispatch-lib.sh`** and runs
+`_plan_header_claimed_issues` over the corpus, reporting which headers are read
+and naming each unread one. A copy of the regex in the script would measure the
+copy. It is deliberately an instrument and **not a CI gate**: it measures a
+property of a growing corpus of *documents*, and 14 plans legitimately carry no
+header (the fail-open population), so a gate would redden on correct input.
+
+**Two coupled patterns need a half-fix control.** The reader is a `grep` that
+selects lines and a `sed` that strips the prefix and label. Widening the `grep`
+alone leaves the classic tests green (a bare `issue: 1679` still works) while
+every new form yields a wrong number. Only fixtures built from **frozen real
+headers** make the half-fix go red — and they must never be refreshed from
+`docs/plans/`, which would erase the very forms the predicate must recognize.
+
+**Add to the check below:** when the guard fails open, step 3 is mandatory, not
+optional — there is no refusal log to tell you the guard is blind. Count what it
+**reads**, not what it refuses.

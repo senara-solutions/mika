@@ -6281,20 +6281,81 @@ _plan_header_claimed_issues() {
     # Header zone is the first 20 lines, the same scope tier 2 uses: body prose
     # quoting another ticket's header must not be read as a claim (the
     # false-positive mika#1421's v1 self-test hit).
+    #
+    # mika#2606 — what the narrowings above do NOT describe is what the pattern
+    # could not REACH. This comment carefully said what the pattern refuses and
+    # never once what it misses, and that is why the defect survived: measured on
+    # the 165 plans of 2026-09, the reader saw 39 headers and missed 126, of which
+    # 112 carry a real label line. The guard above therefore refuted nothing on
+    # most recent plans — it did not fail, it was mute, which is the mika#2205
+    # class (a guard nobody has exercised reads exactly like a guard that works).
+    # Our plans are written in French and put a space before the colon, and they
+    # often sit their header in a quote block. Three shapes were unreachable:
+    #   - `Ticket :` — the space before the colon (French typography);
+    #   - `**Ticket** :` — the bold CLOSES before the colon, a second and
+    #     distinct shape from `**Ticket :**` where the space is inside the bold;
+    #   - `> Ticket :`, `> - **Ticket :**` — the header in a quote block.
+    #
+    # The prefix and the label/value separator are therefore defined ONCE, as
+    # `hdr` and `sep`, and interpolated into BOTH patterns. That single site is
+    # the load-bearing part, not an elegance: the `grep` reads `#N` while the
+    # `sed` strips the prefix to expose a bare numeric value, so each carried its
+    # own copy of the prefix. Widening the `grep` alone leaves the `sed` blind on
+    # the very lines the `grep` just admitted — measured, `issue : 1679`,
+    # `> issue: 1679` and `> issue : 1679` all return empty while every `#N`
+    # fixture stays green. A half-fix is green on every `#N` shape and silently
+    # broken on the bare-numeric ones: this ticket's own failure class, one notch
+    # later. One variable consumed by both makes the desynchronisation
+    # inexpressible rather than detected afterwards — the single-reader doctrine
+    # the house had to engrave for `grooming_marker` (mika#2158) and for
+    # `parse_log_llm_bodies` (mika#2220).
+    #
+    # What bounds the risk, stated precisely — because the tempting version of
+    # this sentence is FALSE. On a header that ALREADY claimed something,
+    # widening only grows the claimed set, and refutation requires that NONE of
+    # the claimed numbers is the target, so a larger set makes refutation less
+    # likely: that is why a header transcribing its ticket's title
+    # (`… issue#2606 — … #2038 …`, ~50 plans) claiming both numbers is neutral.
+    # But the dominant transition here is empty -> non-empty, and that one is
+    # NOT monotone: `_plan_header_refutes_issue` reads an empty set as "no
+    # refutation", so ~120 plans go from structurally unrefutable to refuting
+    # every target they do not name. That is the POINT of this change, not a
+    # side effect — and what makes it safe is not an invariant but a
+    # measurement: 0 lost tier-1 selections across 484 canonical issue slots of
+    # 1011 plans, because a plan's own header names its own number.
+    #
+    # The corollary is the reason the quote prefix is bounded to ONE `>`. Our
+    # issue bodies carry their own `> - **Ticket:**` callouts, so a plan quoting
+    # a ticket body inside its 20-line header zone produces `> > - **Ticket:**`
+    # — a FOREIGN header, in a zone chosen precisely to keep quoted foreign
+    # headers out (the false positive mika#1421's v1 self-test hit). Unbounded
+    # nesting would read it as this plan's own claim and refute the plan for its
+    # real ticket. Bounding to one `>` costs nothing measurable (0 plans change
+    # across the corpus) and every real quote-block header we write uses one.
     local candidate="$1"
     [ -n "$candidate" ] && [ -r "$candidate" ] || return 0
+    # POSIX classes, not `\s`: this function is already written in them, and two
+    # different tools share these patterns.
+    local hdr='^[[:space:]]*(>[[:space:]]*)?(-[[:space:]]+)?(\*\*)?'
+    local sep='(\*\*)?[[:space:]]*(:\*\*|:)'
     local label_lines
     label_lines=$(head -n 20 "$candidate" 2>/dev/null \
-        | grep -iE '^[[:space:]]*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)(:\*\*|:)')
+        | grep -iE "${hdr}(ticket|issue|number)${sep}")
     [ -n "$label_lines" ] || return 0
     {
         # Every `#N` on a label line, not just the last: a header may name two
         # tickets in one field (`**Ticket:** mika#1772/#1773`).
         printf '%s\n' "$label_lines" | grep -oE '#[0-9]+' | tr -d '#'
-        # A bare numeric value sitting directly after the label (`issue: 1679`).
+        # A bare numeric value sitting directly after the label (`issue: 1679`),
+        # and ONLY when the number is the whole value. A prefix match reads 2026
+        # out of `**Ticket:** 2026-09-30`, 1 out of `number : 1.2.3` and 3 out of
+        # `Issue : 3 phases remain` — a claim on something that is not an issue
+        # number at all, which refutes the plan for every target including its
+        # own. The trailing `[[:space:]]*` absorbs a trailing blank and the `\r`
+        # of a CRLF file, so neither turns a real claim into silence.
         printf '%s\n' "$label_lines" \
-            | sed -E 's/^[[:space:]]*(-[[:space:]]+)?(\*\*)?[A-Za-z]+(:\*\*|:)[[:space:]]*//' \
-            | grep -oE '^[0-9]+'
+            | sed -E "s/${hdr}[A-Za-z]+${sep}[[:space:]]*//" \
+            | grep -oE '^[0-9]+[[:space:]]*$' | tr -d '[:space:]'
     } | sort -u
 }
 

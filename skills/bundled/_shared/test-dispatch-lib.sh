@@ -1568,6 +1568,46 @@ PLAN_PROVENANCE_SRC=$(declare -f _plan_provenance)
 assert_contains "provenance compares the branch blob against main's" \
     'origin/main:' "$PLAN_PROVENANCE_SRC"
 
+# --- mika#2606: the reader's two patterns have ONE definition site ---
+# `_plan_header_claimed_issues` reads a plan header by two branches: a `grep`
+# for `#N`, and a `sed` that strips the prefix so a `grep` can see a BARE
+# numeric value (`issue: 1679`, mika#1617). Each used to carry its own copy of
+# the prefix. Widening one alone leaves the other blind on exactly the lines the
+# first just admitted — measured on mika#2606: `issue : 1679`, `> issue: 1679`
+# and `> issue : 1679` all return empty while EVERY `#N` fixture stays green.
+# A half-fix is therefore green on the whole `#N` population and silently broken
+# only on the bare-numeric shapes, which is this ticket's own failure class one
+# notch later. A behavioural test cannot catch the class: recopying the prefix
+# makes no decision wrong on the day it is written.
+# `|| true` so a rename produces a NAMED failure instead of an unexplained
+# abort: under `set -e`, `declare -f` on a missing function kills the suite
+# before the anti-vacuity assertion below can say what went wrong. Verified by
+# renaming the function — without it the run stops with exit 1 and no diagnostic.
+CLAIMED_SRC_2606=$(declare -f _plan_header_claimed_issues || true)
+
+# Anti-vacuity FIRST. Without it, a rename or deletion makes every assertion
+# below pass against an empty string, and a scan that looks at nothing reads
+# exactly like a clean tree — literally the mika#2205 class this ticket closes.
+assert_contains "mika#2606: the header reader still exists (anti-vacuity)" \
+    '_plan_header_claimed_issues (' "$CLAIMED_SRC_2606"
+
+assert_contains "mika#2606: the line prefix has one definition" \
+    'local hdr=' "$CLAIMED_SRC_2606"
+assert_contains "mika#2606: the label/value separator has one definition" \
+    'local sep=' "$CLAIMED_SRC_2606"
+assert_contains "mika#2606: the grep interpolates both, never its own copy" \
+    '${hdr}(ticket|issue|number)${sep}' "$CLAIMED_SRC_2606"
+assert_contains "mika#2606: the sed interpolates both, never its own copy" \
+    '${hdr}[A-Za-z]+${sep}' "$CLAIMED_SRC_2606"
+
+# The teeth: each literal may appear exactly once — inside its own definition.
+# A future editor who inlines the prefix back into either pattern goes red here
+# instead of reopening the desynchronisation.
+assert_eq "mika#2606: the dash-prefix literal appears once (in hdr alone)" \
+    "1" "$(grep -oF -- '(-[[:space:]]+)?' <<<"$CLAIMED_SRC_2606" | wc -l | tr -d '[:space:]')"
+assert_eq "mika#2606: the colon literal appears once (in sep alone)" \
+    "1" "$(grep -oF -- '(:\*\*|:)' <<<"$CLAIMED_SRC_2606" | wc -l | tr -d '[:space:]')"
+
 # Code-shape: the gate must use mika#988 exit semantics — _deliver_callback +
 # exit 0, never exit 1. An `exit 1` here is wrapped as HANDLER CRASH by the EXIT
 # trap and stalls the loop (7 h on 2026-05-06).
