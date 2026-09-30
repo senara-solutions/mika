@@ -98,6 +98,10 @@ pub enum Commands {
     Milestone(MilestoneArgs),
     /// Iterate on the open PR of an issue — deterministic, no LLM routing (mika#2506)
     Iterate(IterateArgs),
+    /// Read the `Plan` callout of an issue body (mika#2194) — pure predicate,
+    /// no agent, no DB, no network
+    #[command(name = "plan-callout")]
+    PlanCallout(PlanCalloutArgs),
 }
 
 impl Commands {
@@ -129,6 +133,7 @@ impl Commands {
             | Commands::Notify(_)
             | Commands::Milestone(_)
             | Commands::Iterate(_)
+            | Commands::PlanCallout(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -160,6 +165,7 @@ impl Commands {
             | Commands::Notify(_)
             | Commands::Milestone(_)
             | Commands::Iterate(_)
+            | Commands::PlanCallout(_)
             | Commands::CredentialHelper(_) => false,
         }
     }
@@ -191,9 +197,32 @@ impl Commands {
             | Commands::Notify(_)
             | Commands::Milestone(_)
             | Commands::Iterate(_)
+            | Commands::PlanCallout(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
+}
+
+/// `mika plan-callout --body-file <path> [--raw]` (mika#2194 R2).
+///
+/// **Aucune variante positionnelle, et c'est structurel.** Un corps d'issue
+/// porte des retours à la ligne, des backticks et des `$` : le passer en argv
+/// ré-introduirait la classe de panne de portée de guillemets dans le geste
+/// même qui prétend la fermer. Il n'y a donc pas d'argument positionnel à
+/// contourner — le fichier est le seul canal.
+#[derive(clap::Args)]
+pub struct PlanCalloutArgs {
+    /// Fichier contenant le corps de l'issue à lire.
+    #[arg(long, value_name = "PATH")]
+    pub body_file: std::path::PathBuf,
+    /// Rendre le chemin **tel qu'écrit**, préfixe de dépôt compris.
+    ///
+    /// Par défaut le chemin est normalisé (premier segment retiré), qui est la
+    /// forme que `dispatch-lib` résout contre `$WORKTREE_DIR`. `--raw` rend
+    /// celle dont `auto_pull::plan_ownership` a besoin, puisque sa question est
+    /// l'appartenance du plan et non le fichier à ouvrir.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(clap::Args)]

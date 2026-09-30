@@ -8793,6 +8793,32 @@ ${issue_ref}
 RESCUEBODY
 }
 
+# Le refus de lecture du callout, annexé au `RESULT` (mika#2194).
+#
+# `_PLAN_CALLOUT_REFUSAL` est posée par `_detect_plan_on_branch` quand
+# `mika plan-callout` a rendu ≥2 — « je n'ai pas pu regarder ». Le dispatch
+# continue sur `/mika`, donc il RÉUSSIT, donc son stderr d'avant-pilote est
+# perdu (classe mika#2050). Sans cette annexe, le seul refus que ce ticket
+# ajoute serait invisible exactement dans le cas où il tire.
+#
+# Préfixé `REFUSED (plan-callout, mika#2194)` comme les refus de `cwd-guard.sh`
+# (mika#2536) et de `pr-push-guard.sh` (mika#2520), pour que la requête
+# opérateur soit la même famille :
+#   SELECT id, result FROM tasks WHERE result LIKE 'REFUSED (plan-callout%';
+#
+# Idempotent (`grep -qF`, le motif de `_gate_non_empty_cycle`) : le trap EXIT et
+# `_deliver_callback` peuvent tourner dans le même process, et une ligne écrite
+# deux fois se lirait comme deux refus.
+_annex_plan_callout_refusal() {
+    [ -n "${_PLAN_CALLOUT_REFUSAL:-}" ] || return 0
+    if grep -qF -- 'REFUSED (plan-callout, mika#2194)' <<<"${RESULT:-}"; then
+        return 0
+    fi
+    RESULT="${RESULT:-}
+
+REFUSED (plan-callout, mika#2194) ${_PLAN_CALLOUT_REFUSAL}"
+}
+
 _deliver_callback() {
     # mika#1996: every delivery path crosses the non-empty-output gate. First
     # executable statement, so no future early-return above it can skip it.
@@ -8800,6 +8826,11 @@ _deliver_callback() {
     # a callback does not arrive. Its own failure is announced rather than
     # swallowed — a silent gate is the defect this ticket exists to remove.
     _gate_non_empty_cycle || echo "cycle_output.gate_error: the non-empty-output gate failed (rc=$?) — delivering the callback unchanged" >&2
+    # mika#2194: same reasoning one notch further — a refusal announced only on
+    # a stderr nobody reads is the Signal M defect. Annexed here, at the single
+    # point every RESULT leaves by, and after the gate so a refusal can never be
+    # what makes a callback fail to arrive.
+    _annex_plan_callout_refusal
     # mika#2155: end the loop's live claim BEFORE the message that can start
     # the next dispatch on this ticket. No-op unless _set_up_worktree claimed
     # (ISSUE_SEAT_CLAIMED=1); the EXIT trap repeats it only if this one failed.
@@ -8848,16 +8879,65 @@ _deliver_callback() {
 # de la prose qui en parle. Il ne distingue pas le callout de sa citation dans un
 # bloc de code — cette moitié-là n'existe que côté Rust, où elle garde une
 # promotion ; ici un faux positif est déjà rattrapé par le test `-f` qui suit.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# mika#2194 — CE LECTEUR DÉLÈGUE. IL NE PORTE PLUS DE MOTIF.
+#
+# Le motif vit dans `crates/mika-agent/src/plan_callout.rs`, seul et unique, et
+# cette fonction l'interroge par `mika plan-callout`. Les trois classes de panne
+# que mika#2194 cite — portée des guillemets (cpp#157), `>` littéral pris pour
+# redirection, jetons matchés en sous-chaîne (#2188) — sont des pièges de
+# parsing DANS le code du prédicat, et un `Regex` Rust sur un `&str` n'en a
+# aucun : ni portée de guillemets, ni redirection, ni sous-chaîne accidentelle,
+# et le compilateur refuse une regex invalide.
+#
+# Effet de bord non anticipé par le ticket, et réel : le `grep -oP` retiré était
+# une dépendance à PCRE (`\K`), que `grep -P` ne garantit pas (busybox, macOS).
+# La délégation la retire du chemin critique du dispatch.
+#
+# Le corps passe par un FICHIER, jamais par un argument : il porte des retours à
+# la ligne, des backticks et des `$`, donc le passer en argv ré-introduirait la
+# classe de panne de portée de guillemets dans le geste même qui prétend la
+# fermer. La sous-commande n'a pas de variante positionnelle.
+#
+# PAS DE REPLI BASH, et c'est une décision : un repli serait une seconde
+# implémentation, c'est-à-dire précisément ce qu'on retire. La dépendance à
+# `mika` n'est pas nouvelle — `dispatch_claude_pilot` refuse déjà de démarrer
+# sans lui (« Error: mika CLI is required »).
+#
+# Les trois codes de sortie sont RELAYÉS TELS QUELS, et c'est le contrat que
+# `_detect_plan_on_branch` lit : 0 = un callout a été lu · 1 = aucun callout
+# (la réponse est « non ») · ≥2 = je n'ai pas pu regarder. Avant la bascule
+# cette fonction rendait `1` dans les deux derniers cas et l'appelant faisait
+# `|| return 0`, donc une erreur de lecture se lisait comme « pas de plan ».
 _extract_plan_path() {
-    local body="$1" path
-    path=$(printf '%s\n' "$body" \
-        | grep -oP '^> - \*\*Plan:\*\* `\K(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+' \
-        | head -1)
-    [ -n "$path" ] || return 1
-    case "$path" in
-        docs/plans/*) printf '%s\n' "$path" ;;
-        */docs/plans/*) printf '%s\n' "${path#*/}" ;;
-        *) return 1 ;;
+    local body="$1" tmp path rc=0
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/mika-plan-callout.XXXXXX") || {
+        echo "dispatch-lib: REFUSED (plan-callout, mika#2194) body_file_unwritable: mktemp a échoué" >&2
+        return 2
+    }
+    printf '%s\n' "$body" > "$tmp" || {
+        rm -f "$tmp"
+        echo "dispatch-lib: REFUSED (plan-callout, mika#2194) body_file_unwritable: écriture impossible dans $tmp" >&2
+        return 2
+    }
+
+    path=$(mika plan-callout --body-file "$tmp") || rc=$?
+    rm -f "$tmp"
+
+    case "$rc" in
+    0) printf '%s\n' "$path" ;;
+    1) return 1 ;;
+    *)
+        # `mika` sort non-zéro sur une sous-commande inconnue, donc un
+        # `dispatch-lib` neuf servi par un `mika` ancien atterrit ici : refus
+        # bruyant, jamais un PLAN_PATH vide. Ce n'est pas produit par
+        # `make deploy` (le binaire qui seede est celui qui est installé) mais
+        # une copie à la main le produit, et il faut que ce soit lisible.
+        echo "dispatch-lib: REFUSED (plan-callout, mika#2194) subcommand_error: 'mika plan-callout' a rendu $rc" >&2
+        return "$rc"
+        ;;
     esac
 }
 
@@ -8890,8 +8970,31 @@ _detect_plan_on_branch() {
     # Guard: no callout, or a callout whose path is not a plan → no-op. The
     # helper never succeeds with an empty path, so its exit code IS the
     # emptiness guard; a second `[ -n "$PLAN_PATH" ]` here would be dead.
-    local PLAN_PATH
-    PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || return 0
+    #
+    # mika#2194 — TROIS codes, pas deux, et c'est le livrable de R2.
+    #
+    # `1` garde le comportement d'aujourd'hui (aucun callout → no-op, le pilote
+    # part sur `/mika`). `≥2` est une population NEUVE, créée par la migration :
+    # avant elle, le corps était en variable et il n'y avait pas de fichier à ne
+    # pas pouvoir lire. La confondre avec `1` fabriquerait un silence qui
+    # n'existait pas — un `PLAN_PATH` vide sur une erreur de lecture, donc un
+    # pilote qui part sur `/mika` en croyant que le ticket n'est pas groomé.
+    # Le refus est donc nommé, et il est bruyant.
+    local PLAN_PATH _plan_rc=0
+    PLAN_PATH=$(_extract_plan_path "$ISSUE_BODY") || _plan_rc=$?
+    if [ "$_plan_rc" -ge 2 ]; then
+        echo "dispatch-lib: REFUSED (plan-callout, mika#2194) — lecture du callout impossible (code $_plan_rc)." >&2
+        # Le stderr d'avant-pilote est structurellement PERDU sur un dispatch
+        # qui réussit (classe mika#2050 : il hérite du `Stdio::piped()` de
+        # l'exécuteur, que celui-ci ne lit que dans sa branche
+        # `if !status.success()`) — et ce refus laisse justement le dispatch
+        # réussir sur `/mika`. Une surface qui n'est lue nulle part
+        # reproduirait le défaut du Signal M, donc le motif voyage jusqu'au
+        # `RESULT` du callback, là où l'opérateur le cherchera déjà.
+        _PLAN_CALLOUT_REFUSAL="lecture du callout impossible (code $_plan_rc) — ENTRY_COMMAND laissé sur '/mika'"
+        return 0
+    fi
+    [ "$_plan_rc" -eq 0 ] || return 0
 
     # Validate the plan file exists in the worktree
     if [ -f "$WORKTREE_DIR/$PLAN_PATH" ]; then

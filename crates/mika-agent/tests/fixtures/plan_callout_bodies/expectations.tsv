@@ -1,0 +1,130 @@
+# Le corpus doré du callout `Plan` — UN corpus, DEUX lecteurs, UNE parité.
+# mika#2194 phase 1. Lecteurs : crates/mika-agent/tests/plan_callout_parity.rs
+# (Rust) et le bloc « mika#2194 » de skills/bundled/_shared/test-dispatch-lib.sh
+# (bash).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CE QUE LES COLONNES DÉCRIVENT, ET POURQUOI C'EST `Keep`
+#
+# `rc` / `raw` / `normalized` décrivent le résultat du lecteur unique sous
+# `FenceHandling::Keep`. Ce choix n'est pas cosmétique : `Keep` est la politique
+# de `dispatch-lib`, donc ces trois colonnes sont **directement comparables au
+# lecteur bash**, qui est la moitié dont la parité était inconnue. Décrire le
+# résultat sous `Strip` aurait rendu le TSV illisible par le bash et aurait
+# demandé une seconde table.
+#
+#   fichier      nom du fichier de corps, dans ce répertoire
+#   rc           0 = un callout a été lu · 1 = aucun callout
+#   raw          le chemin tel qu'écrit, préfixe de dépôt compris
+#   normalized   le même, premier segment retiré
+#   parity       la relation attendue entre lecteurs — voir ci-dessous
+#   phase        both = exercé avant ET après la bascule · pre-switch = avant seulement
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# UNE COLONNE SANS VALEUR PORTE `-`, JAMAIS LE VIDE — ET C'EST UN PIÈGE MESURÉ
+#
+# TAB fait partie des caractères *whitespace* d'IFS, donc `IFS=$'\t' read` en
+# bash **fusionne les tabulations consécutives** : une colonne vide disparaît et
+# tout ce qui suit se décale d'un cran. Mesuré sur la première exécution de la
+# preuve pré-bascule — les cinq contrôles négatifs y lisaient leur `parity` dans
+# une colonne vide et échouaient sur « parity inconnue '' », pendant que le
+# lecteur Rust (dont le `split('\t')` ne fusionne rien) les lisait correctement.
+#
+# Un format que les deux lecteurs ne lisent pas pareil est exactement ce que ce
+# ticket existe pour retirer, donc la sentinelle est dans le FORMAT et non dans
+# un contournement chez l'un des deux.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# LES QUATRE VALEURS DE `parity`, ET CE QUE CHACUNE ASSERTE
+#
+#   equal
+#       `Keep` et `Strip` rendent la même chose, et les deux lecteurs
+#       s'accordent. C'est le régime de la quasi-totalité du corpus.
+#
+#   divergent-fences
+#       `Keep` != `Strip` — la divergence n°1, mesurée, DOCUMENTÉE en production
+#       côté bash, et NON corrigée ici (les bornes du ticket interdisent un
+#       changement de comportement pendant la migration).
+#       ASSERTION AUTO-NETTOYANTE : le test Rust **échoue** si les deux
+#       politiques rendent la même valeur. Le jour où la divergence est
+#       tranchée, la ligne rougit et doit être retirée — elle ne peut pas
+#       devenir périmée en silence. C'est ce qui distingue une exception d'un
+#       contournement.
+#       Elle est vérifiable EN PERMANENCE, et c'est une correction que
+#       l'implémentation apporte au plan : en faisant porter `parity` sur
+#       `Keep`↔`Strip` (interne au Rust, donc toujours mesurable) plutôt que sur
+#       bash↔Rust (qui cesse d'avoir deux côtés après la bascule), l'assertion
+#       survit à la bascule au lieu d'être éphémère.
+#
+#   divergent-bash-legacy
+#       Le bash d'**avant** la bascule divergeait des deux politiques Rust. La
+#       ligne est donc `pre-switch` : après la bascule le bash délègue, et cette
+#       population n'existe plus. Les colonnes décrivent le lecteur unique.
+#
+#   divergent-multiline
+#       Idem, plus une propriété que le TSV ne peut pas porter : la capture est
+#       un chemin contenant un retour à la ligne. `raw` / `normalized` portent
+#       la sentinelle `<multiline>` et le test Rust asserte la présence du
+#       `\n` plutôt qu'une égalité de chaîne.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ANTI-VACUITÉ
+#
+# Les deux lecteurs **échouent** si ce fichier est introuvable, vide, ou si un
+# fichier de corps qu'il nomme est absent — et chacun **nomme son compte de
+# cas**. Une parité verte sur zéro cas est le mode de panne que R4 nomme, et
+# c'est le seul que ni l'un ni l'autre ne verrait tout seul.
+#
+# fichier	rc	raw	normalized	parity	phase
+
+# ── Les six corps MESURÉS de mika#2120. Ne pas rafraîchir : voir README.md.
+1680.md	0	mika/docs/plans/2026-06-30-016-fix-1680-mika-dev-cn-output-bleed-plan.md	docs/plans/2026-06-30-016-fix-1680-mika-dev-cn-output-bleed-plan.md	equal	both
+1694.md	0	mika/docs/plans/2026-07-01-002-fix-1694-worktree-debt-hygiene-plan.md	docs/plans/2026-07-01-002-fix-1694-worktree-debt-hygiene-plan.md	equal	both
+1699.md	0	mika/docs/plans/2026-07-01-001-feat-1699-permission-policy-disambiguator-plan.md	docs/plans/2026-07-01-001-feat-1699-permission-policy-disambiguator-plan.md	equal	both
+1934.md	0	mika/docs/plans/2026-08-22-001-fix-1934-cause-racine-phantom-tracking-plan.md	docs/plans/2026-08-22-001-fix-1934-cause-racine-phantom-tracking-plan.md	equal	both
+1947.md	0	mika/docs/plans/2026-08-30-001-fix-1947-remplissage-plan.md	docs/plans/2026-08-30-001-fix-1947-remplissage-plan.md	equal	both
+1949.md	0	mika/docs/plans/2026-08-31-001-feat-1949-auth-manager-internal-token-alignment-plan.md	docs/plans/2026-08-31-001-feat-1949-auth-manager-internal-token-alignment-plan.md	equal	both
+
+# ── Les formes que seul le bloc bash exerçait. Le corpus Rust ne les portait
+#    pas : ses six corps mesurés sont tous préfixés.
+bare-callout.md	0	docs/plans/2026-09-30-001-fix-2194-forme-nue-plan.md	docs/plans/2026-09-30-001-fix-2194-forme-nue-plan.md	equal	both
+other-repo-prefix.md	0	mika-cloud/docs/plans/2026-09-02-001-fix-220-console-tier-plan.md	docs/plans/2026-09-02-001-fix-220-console-tier-plan.md	equal	both
+double-callout.md	0	mika/docs/plans/first-plan.md	docs/plans/first-plan.md	equal	both
+minimal-callout.md	0	docs/plans/short.md	docs/plans/short.md	equal	both
+neg-prose-plan-no-dir.md	1	-	-	equal	both
+
+# ── Les contrôles négatifs. Élargir au segment de dépôt ne veut pas dire tout
+#    accepter : sans eux, un prédicat devenu permissif passerait le corpus.
+neg-brainstorms.md	1	-	-	equal	both
+neg-solutions.md	1	-	-	equal	both
+neg-parent-traversal.md	1	-	-	equal	both
+neg-two-segments.md	1	-	-	equal	both
+neg-inline-prose.md	1	-	-	equal	both
+
+# ── EXCEPTION mika#2194 n°1 — divergence fences, mesurée, DOCUMENTÉE, non
+#    corrigée ici.
+#    Le bash lit un callout cité dans un bloc clôturé, le Rust non
+#    (`plan_callout::strip_fenced_blocks`, mika#2120). L'asymétrie est ASSUMÉE
+#    côté bash, avec sa raison écrite en production : « un faux positif est
+#    déjà rattrapé par le test `-f` qui suit ».
+#    Ce rattrapage est PARTIEL — il couvre un chemin inexistant, pas un chemin
+#    existant cité dans un bloc.
+#    Suivi : voir « Ticket de suivi » dans README.md § La divergence fences.
+#    `parity` vaut `divergent-fences` : le test EXIGE la divergence.
+fences-quoted-callout.md	0	docs/plans/2026-09-30-001-fix-2194-exemple-cite-plan.md	docs/plans/2026-09-30-001-fix-2194-exemple-cite-plan.md	divergent-fences	both
+
+# ── EXCEPTION mika#2194 n°2 — le backtick fermant est exigé.
+#    Trouvée en écrivant le lecteur unique ; ni le ticket ni le plan ne la
+#    nomment. Le PCRE bash s'arrêtait à `[^`]+` sans borne droite et lisait donc
+#    un callout non terminé ; le motif Rust exige le backtick. Le lecteur unique
+#    garde la forme stricte — desserrer aurait élargi la surface de faux positif
+#    de `plan_ownership`, qui décide d'un ABANDON de ticket (mika#2020).
+backtick-unterminated.md	1	-	-	divergent-bash-legacy	pre-switch
+
+# ── EXCEPTION mika#2194 n°3 — la capture traverse les lignes.
+#    `[^`]+` n'exclut pas `\n`, donc un backtick apparaissant plus loin dans le
+#    corps ferme la capture : côté Rust le chemin est multi-ligne, côté bash
+#    (ligne à ligne) il était tronqué. Le motif est conservé à l'identique ; ce
+#    qui est borné est le CANAL — `mika plan-callout` refuse d'émettre un chemin
+#    qui n'est pas d'une seule ligne (code ≥2, motif `path_not_single_line`).
+backtick-late-close.md	0	<multiline>	<multiline>	divergent-multiline	pre-switch

@@ -20,6 +20,20 @@ async fn main() -> Result<()> {
     // These need only dotenv + Settings + GitHubApp — fast startup for credential helper usage.
     // When --agent is specified, resolve per-agent home dir for per-agent GitHub App config.
     match &cli.command {
+        // mika#2194 — le chemin le plus court du binaire, et délibérément plus
+        // court que `Token` : ni `dotenv`, ni `Settings`, ni `home`, ni base, ni
+        // réseau. `plan-callout` est un prédicat pur, qui n'a aucune raison de
+        // résoudre un agent — c'est ce qui rend le coût d'un démarrage de
+        // process acceptable sur un chemin appelé une fois par dispatch.
+        //
+        // `std::process::exit` plutôt qu'un `Result` : les trois codes de
+        // sortie SONT le contrat (0 lu · 1 aucun callout · ≥2 illisible), et
+        // laisser `main` écraser une erreur en `1` effacerait la distinction
+        // entre « pas de plan » et « je n'ai pas pu regarder », c'est-à-dire le
+        // livrable de R2.
+        Some(Commands::PlanCallout(args)) => {
+            std::process::exit(commands::plan_callout::run(&args.body_file, args.raw));
+        }
         Some(Commands::Token(args)) => {
             let global_home = home::resolve_home_dir()?;
             let agent_home = cli
@@ -447,7 +461,9 @@ async fn main() -> Result<()> {
             commands::notify::run(&args.text, &args.channel, &args.severity).await
         }
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
-        Some(Commands::Token(_) | Commands::CredentialHelper(_)) => unreachable!(),
+        Some(Commands::Token(_) | Commands::CredentialHelper(_) | Commands::PlanCallout(_)) => {
+            unreachable!()
+        }
     }
 }
 

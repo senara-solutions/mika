@@ -1,15 +1,43 @@
-# Corps d'issue figés — callout `Plan` préfixé par le dépôt (mika#2120)
+# Le corpus doré du callout `Plan` — un corpus, deux lecteurs (mika#2120, mika#2194)
 
-Six corps de ticket, un fichier par ticket, qui sont le **jeu de mesure** de la condition
-`Plan` de `mika_agent::auto_pull::is_groomed`. Ce sont les six tickets nommés dans le corps
-de mika#2120 : groomés selon la lettre de la spec, et invisibles à l'alimenteur parce que
-leur callout portait le préfixe de dépôt (`mika/docs/plans/…`) là où le prédicat exigeait
+Les **six premiers** fichiers (`1680.md` … `1949.md`) sont des corps de ticket réels, un
+fichier par ticket, et le **jeu de mesure** de la condition `Plan` de
+`mika_agent::auto_pull::is_groomed`. Ce sont les six tickets nommés dans le corps de
+mika#2120 : groomés selon la lettre de la spec, et invisibles à l'alimenteur parce que leur
+callout portait le préfixe de dépôt (`mika/docs/plans/…`) là où le prédicat exigeait
 `docs/plans/` collé au backtick.
 
 Jeu distinct, et délibérément séparé de `../grooming_bodies/` : celui-là mesure l'axe du
 **verdict** (mika#2158), celui-ci mesure l'axe du **chemin de plan**. Les deux axes vivaient
 dans la même fonction et ont été corrigés l'un après l'autre ; mélanger leurs jeux de mesure
 rendrait indécidable lequel des deux correctifs un test atteste.
+
+## Le second axe : la parité bash ↔ Rust (mika#2194)
+
+Avant mika#2194, les deux lecteurs du callout avaient **chacun** un corpus soigné et
+**aucune entrée n'était commune** :
+
+| | lecteur | corpus |
+|---|---|---|
+| Rust | `auto_pull::extract_plan_path` | les **6 corps** ci-dessus |
+| Bash | `dispatch-lib::_extract_plan_path` | **17 assertions** à fixtures inline dans `test-dispatch-lib.sh` |
+
+Personne n'avait jamais exécuté les deux sur la même entrée et comparé. Ce n'est pas une
+négligence — les deux jeux sont documentés, l'un ligne par ligne — c'est une configuration
+dans laquelle une divergence **ne peut pas être vue**. Et il y en avait trois (voir plus bas).
+
+Les fixtures inline du bloc bash sont donc **rapatriées ici**, et les attendus vivent dans
+`expectations.tsv`, que les **deux** lecteurs lisent :
+
+- `crates/mika-agent/tests/plan_callout_parity.rs` — le lecteur Rust
+- le bloc « mika#2194 — parité du callout Plan sur le corpus commun » de
+  `skills/bundled/_shared/test-dispatch-lib.sh` — le lecteur bash
+
+**Ne pas réécrire une assertion d'entrée dans l'un des deux lecteurs.** Deux jeux de mesure
+pour un prédicat, c'est exactement la configuration qui a permis à la divergence de vivre.
+
+Doctrine complète (la forme du corpus, l'anti-vacuité, `pre-switch`/`post-switch`) :
+`docs/architecture/dispatch-lib-migration.md` § 4.
 
 ## Ne pas rafraîchir
 
@@ -21,7 +49,33 @@ recorrigés à la main vers la forme nue. Un jeu refetché aujourd'hui passerait
 comme après** le correctif, et n'attesterait rien du tout. La forme préfixée est exactement
 ce que ces fixtures conservent.
 
+## Les trois divergences mesurées, et laquelle est nommée dans le corpus
+
+Elles ont été relevées en exécutant la preuve de parité de mika#2194 contre le
+`dispatch-lib.sh` d'**avant** la bascule (17 cas, 17 concordances, 3 divergences). **Deux
+n'étaient nommées ni dans le ticket ni dans le plan.**
+
+| fixture | divergence | corrigée ? |
+|---|---|---|
+| `fences-quoted-callout.md` | le bash lit un callout **cité dans un bloc clôturé**, le Rust non | **non** — asymétrie assumée par écrit en production côté bash ; le rattrapage par `-f` qu'elle invoque est **partiel** (il couvre un chemin *inexistant*, pas un chemin *existant cité*) |
+| `backtick-unterminated.md` | le PCRE bash lisait un callout dont le **backtick fermant** manque ; le motif Rust l'exige | **non** — le lecteur unique garde la forme stricte, et le resserrement du bash est **dit** plutôt que découvert |
+| `backtick-late-close.md` | `[^`]+` n'exclut pas `\n` en Rust, donc un backtick apparaissant plus loin fait **traverser les lignes** à la capture ; `grep` travaillait ligne à ligne | **non** — le motif est conservé à l'identique (B1) ; c'est le **canal** qui borne (`mika plan-callout` refuse un chemin qui n'est pas d'une seule ligne) |
+
+**L'assertion auto-nettoyante** porte sur la première : un cas déclaré
+`divergent-fences` dont les deux politiques de fence rendraient la **même** valeur fait
+**échouer** le test. Le jour où la divergence est tranchée, la ligne rougit et doit être
+retirée — elle ne peut pas devenir périmée en silence. C'est ce qui distingue une exception
+d'un contournement.
+
 ## Provenance — ce qui est mesuré, ce qui est reconstruit
+
+Les fixtures **ajoutées par mika#2194** portent leur provenance dans leur propre corps, en
+tête : `bare-callout.md`, `other-repo-prefix.md`, `double-callout.md`, `minimal-callout.md`,
+les six `neg-*.md`, et les trois fixtures de divergence ci-dessus. Aucune n'est un corps
+d'issue réel — toutes sont **construites pour ce test** ou **rapatriées** du bloc bash à
+fixtures inline, et chacune dit laquelle des deux.
+
+Le tableau ci-dessous décrit les **six corps mesurés** de mika#2120.
 
 | ligne | provenance |
 |---|---|

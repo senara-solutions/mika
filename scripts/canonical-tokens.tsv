@@ -142,9 +142,31 @@ READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
 # about the PATH shape, not about the key (grooming_marker.rs).
 > - **Branch:**	B	crates/mika-agent/src/skills/executor.rs::check_grooming_markers	exact:literal
 > - **Grooming history:**	B	crates/mika-agent/src/grooming_marker.rs::CALLOUT_LINE_RE	exact:line-anchored
-> - **Plan:**	B	crates/mika-agent/src/auto_pull.rs::PLAN_CALLOUT_RE	exact:line-anchored
+# mika#2194 phase 1 — DEUX lignes ont fusionné vers un site unique, et deux
+# restent. Ce n'est pas un nettoyage : c'est le périmètre du maillon.
+#
+# Le motif vivait deux fois, dans deux langues — `auto_pull::PLAN_CALLOUT_RE` en
+# Rust et `dispatch-lib::_extract_plan_path` en PCRE — et les deux n'avaient
+# JAMAIS été exécutés sur la même entrée. Ils portent désormais un seul site,
+# `plan_callout.rs`, que les deux appellent sans en garder de copie ; les deux
+# anciennes lignes disparaissent parce qu'aucun des deux n'est plus un site de
+# match. Un appelant qui délègue n'en est pas un, et le déclarer ferait mentir
+# l'inventaire avec l'autorité d'un inventaire.
+#
+# Les deux lecteurs bash de dispatch-lib restent DÉLIBÉRÉMENT : ils lisent le
+# callout pour d'autres questions, sur d'autres chemins, et les migrer
+# élargirait ce maillon au-delà de son unique appelant. Ils sont la phase 2, et
+# `test-dispatch-lib.sh` fige leur inventaire (exactement deux, nommés) plutôt
+# qu'un zéro qui serait rouge à la naissance.
+#
+# Quatrième tolérance, trouvée en implémentant et absente de la borne B1 du
+# plan, qui n'en nommait que trois : `milestone_manager::reader.rs` lit
+# `**Plan:**` par `contains`, SANS le préfixe `> - `, pour répondre à une
+# question booléenne de présence (LECTURE seule, aucun chemin rendu). Il est
+# hors de ce jeton par sa forme, donc hors de cet inventaire — et il est nommé
+# ici pour qu'un futur maillon ne le croie ni oublié ni autorisé à l'absorber.
+> - **Plan:**	B	crates/mika-agent/src/plan_callout.rs::PLAN_CALLOUT_RE	exact:line-anchored
 > - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_committed_plan_on_branch	exact:line-anchored
-> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_extract_plan_path	exact:line-anchored
 > - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_set_up_worktree	exact:literal
 
 # ── Verdict tokens. Case-sensitive by written decision: `GROOMED` is a token the
@@ -302,6 +324,28 @@ rescue-pipeline-verified	B	crates/mika-agent/src/wip_rescue.rs::PIPELINE_VERIFIE
 # (PR #2535, closed). The constant is NEW in this ticket, so there was nothing to
 # declare before it existed — creating it and declaring it belong to one commit.
 PLATFORM_DIR	B	crates/mika-agent/src/skills/executor.rs::PLATFORM_DIR_RELAY_KEY	exact:literal
+
+# ── mika#2194 — le préfixe de refus du lecteur de callout, et pourquoi il est
+#    dans cet inventaire alors que ses deux aînés n'y sont pas.
+#
+# `cwd-guard.sh` (mika#2536) et `pr-push-guard.sh` (mika#2520) écrivent le même
+# préfixe `REFUSED (…, mika#N)` et ne sont PAS déclarés : ils le composent sans
+# jamais le relire, donc ils n'ont aucun site de match. Les deux sites ci-dessous
+# en ont un chacun, pour deux raisons distinctes :
+#
+#   REFUSAL_PREFIX             une constante en `*_PREFIX` portant le jeton —
+#                              la forme que le survey énumère.
+#   _annex_plan_callout_refusal un `grep -qF` qui RELIT le préfixe déjà présent
+#                              dans `$RESULT`, garde d'idempotence : le trap EXIT
+#                              et `_deliver_callback` peuvent tourner dans le même
+#                              process, et une ligne écrite deux fois se lirait
+#                              comme deux refus.
+#
+# Donc ce jeton est bien LU ici, et le déclarer est la seule réponse juste — la
+# tentation était de renommer la constante pour sortir de la population, ce qui
+# aurait caché un lecteur réel derrière un nom.
+REFUSED	B	crates/mika-cli/src/commands/plan_callout.rs::REFUSAL_PREFIX	exact:prefix
+REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	exact:prefix
 
 # ═══ Labels. Out of the survey's perimeter (not source), so never compared.
 #

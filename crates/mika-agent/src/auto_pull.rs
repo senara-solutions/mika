@@ -69,7 +69,6 @@
 use anyhow::{Result, anyhow};
 use mika_common::label_write::LabelWriteToken;
 use regex::Regex;
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -389,74 +388,12 @@ pub struct Issue {
 
 // ───────────────────── Grooming detection (F1) ─────────────────────
 
-/// Le marqueur de fence d'une ligne, s'il y en a un : `` ` `` ou `~` répété au
-/// moins trois fois, premier caractère non blanc de la ligne.
-///
-/// L'indentation est tolérée parce que GitHub la rend comme un bloc de code : un
-/// gabarit de callout cité en retrait est aussi cité qu'un autre.
-fn fence_marker(line: &str) -> Option<char> {
-    let trimmed = line.trim_start();
-    let c = trimmed.chars().next()?;
-    if c != '`' && c != '~' {
-        return None;
-    }
-    (trimmed.chars().take_while(|&x| x == c).count() >= 3).then_some(c)
-}
-
-/// Rend le corps privé de ses blocs clôturés (```` ``` ```` et `~~~`), pour que
-/// le gabarit d'un callout **cité** dans un ticket ne satisfasse pas le garde qui
-/// le lit (mika#2120, AC6).
-///
-/// L'ancrage en début de ligne ne suffit pas à lui seul : une ligne citée dans une
-/// fence commence elle aussi en colonne zéro. mika#2120 en est la démonstration —
-/// son corps cite verbatim le gabarit de l'étape 19 de `mika-groom-ticket.md`.
-/// Élargir un prédicat non ancré élargit sa surface de faux positif, et le coût
-/// d'un faux positif est un créneau de dispatch mort à `_find_issue_plan returned
-/// empty`, c'est-à-dire au pire endroit.
-///
-/// Une fence ouverte par ```` ``` ```` ne se ferme que sur ```` ``` ````, jamais
-/// sur `~~~`.
-///
-/// **Repli sur fence non fermée : ne rien retirer.** Un corps dont une fence n'est
-/// jamais refermée est ambigu, et les deux erreurs n'ont pas le même prix — un
-/// faux positif coûte un créneau, un faux négatif a coûté quinze heures de boucle
-/// (le relevé du 2026-08-31 qui a ouvert ce ticket). La doctrine citée par le
-/// ticket tranche dans le même sens : la *détection* doit être au moins aussi
-/// permissive que le consommateur, la *décision* reste stricte. Voir
-/// `docs/solutions/architecture-patterns/guard-parser-must-be-as-permissive-as-downstream-consumer-2026-08-29.md`.
-fn strip_fenced_blocks(body: &str) -> Cow<'_, str> {
-    let mut open: Option<char> = None;
-    let mut saw_fence = false;
-    for line in body.lines() {
-        match (open, fence_marker(line)) {
-            (None, Some(c)) => {
-                open = Some(c);
-                saw_fence = true;
-            }
-            (Some(c), Some(m)) if m == c => open = None,
-            _ => {}
-        }
-    }
-    // Aucune fence, ou une fence laissée ouverte : on rend le corps tel quel.
-    if !saw_fence || open.is_some() {
-        return Cow::Borrowed(body);
-    }
-
-    let mut out = String::with_capacity(body.len());
-    let mut open: Option<char> = None;
-    for line in body.lines() {
-        match (open, fence_marker(line)) {
-            (None, Some(c)) => open = Some(c),
-            (Some(c), Some(m)) if m == c => open = None,
-            (None, None) => {
-                out.push_str(line);
-                out.push('\n');
-            }
-            _ => {}
-        }
-    }
-    Cow::Owned(out)
-}
+// Le retrait des blocs clôturés vit désormais chez le lecteur unique du callout
+// (`plan_callout`, mika#2194) : celui-ci doit être autonome, sans quoi il
+// dépendrait d'un de ses propres appelants. Les tests de frontière de mika#2120
+// restent ici, où l'ancrage du ticket a sa valeur historique — ils exercent la
+// fonction importée, pas une copie.
+use crate::plan_callout::strip_fenced_blocks;
 
 /// Structural detection of a groomed issue body.
 ///
@@ -579,15 +516,26 @@ pub enum PlanOwnership {
 /// [`extract_branch_name`] n'en fait **pas** autant, et c'est un choix noté
 /// plutôt qu'un oubli : mika#2120 n'élargit pas ce lecteur-là, et changer ce que
 /// la porte de promotion (mika#2123) lit comme branche n'est pas de ce ticket.
+///
+/// # Ce lecteur est devenu un adaptateur (mika#2194)
+///
+/// Le motif ne vit plus ici. Il vit dans [`crate::plan_callout`], seul et
+/// unique, et cette fonction l'appelle en nommant sa politique de fence et la
+/// forme qu'elle veut. **Elle n'en garde aucune copie** — un motif du callout
+/// réécrit dans ce fichier fait échouer
+/// `plan_callout::tests::mika2194_aucun_motif_de_callout_hors_de_ce_module`.
+///
+/// La raison est celle que `grooming_marker` a dû graver une fois (mika#2158) :
+/// le même jeton était lu par deux motifs, dans deux langues, jamais exécutés
+/// sur la même entrée. Ici l'appelant appelle, il ne recopie pas.
+///
+/// `raw` et non `normalized`, parce que la question de ce fichier est
+/// l'**appartenance** du plan à son ticket ([`plan_ownership`]) : le préfixe de
+/// dépôt fait partie de ce qui est jugé. C'est `dispatch-lib` qui veut la forme
+/// normalisée, parce que sa question est quel fichier ouvrir.
 fn extract_plan_path(body: &str) -> Option<String> {
-    static PLAN_CALLOUT_RE: OnceLock<Regex> = OnceLock::new();
-    let callout_re = PLAN_CALLOUT_RE.get_or_init(|| {
-        Regex::new(r"(?m)^> - \*\*Plan:\*\* `((?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)?docs/plans/[^`]+)`")
-            .expect("plan callout regex must compile")
-    });
-    callout_re
-        .captures(&strip_fenced_blocks(body))
-        .map(|c| c[1].to_string())
+    crate::plan_callout::plan_callout(body, crate::plan_callout::FenceHandling::Strip)
+        .map(|c| c.raw)
 }
 
 /// Decide whether the plan named in a ticket's grooming callout belongs to that
@@ -4212,6 +4160,10 @@ async fn phase2_reconcile_stuck_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `mika2120_strip_fenced_blocks_frontiere` asserte sur la variante de `Cow`
+    // rendue : c'est la moitié « emprunte plutôt que copie » du contrat de
+    // `strip_fenced_blocks`, que le seul type de retour ne dit pas.
+    use std::borrow::Cow;
 
     /// mika#2263 — the label this module APPLIES on a promotion refusal must
     /// stay one the shared operator-held list EXCLUDES. If the two ever drift,

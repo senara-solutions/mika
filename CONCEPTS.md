@@ -26,6 +26,12 @@ The same holds one level up, and more quietly: a harness nothing invokes is that
 
 It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
 
+### Parity corpus
+
+One set of inputs and expected results read by every implementation of the same decision, so that two readers can disagree only where a row says they do. A known difference is declared as a row property the test *requires*: a declared divergence that stops diverging turns the test red and has to be removed, so the exception cannot outlive its cause — unlike a difference tolerated in a comment.
+
+During a migration from one implementation to another, agreement with the old one is measured once, before it starts delegating to the new one. Afterwards the old reader calls the new one and agrees with it by construction, so the permanent pass is non-regression, not proof, and an assertion meant to outlive the switch must compare two things that both still exist. Like any fixture-driven check it carries an [anti-vacuity assertion](#anti-vacuity-assertion): a missing or empty corpus fails, and each reader reports how many cases it exercised.
+
 ### Review-anchor attestation
 
 The evidence a non-terminal architect disposition (`Disposition: READY`, `Verdict: GROOMED`) must carry to count as a review: at least three anchor lines (`A1:`…) each quoting at least forty characters of the brief, at distinct regions of it. A disposition keyword alone is an acknowledgement, not an attestation, and the engine treats an unattested one as no verdict at all — never as an approval.
