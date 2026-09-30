@@ -2575,4 +2575,112 @@ mod tests {
              mika#2201)."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2575 — le nom d'audit du ré-armement d'une récurrente en vol.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Le nom `recurring_restart_restore` est **neuf** : il n'y a rien à
+    /// excepter à la livraison, et c'est vérifiable. Quand ce scan tire, **on
+    /// retire le second écrivain** (doctrine mika#2201) — une allowlist née vide
+    /// est un emplacement où déposer la prochaine infraction (mika#2323).
+    const RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom sert de `tool_name` d'audit aux **deux** issues du ré-armement,
+    /// l'issue étant portée par `after_value` (motif `ready_label_outcome`,
+    /// mika#2323). C'est ce qui rend soustractible le `GROUP BY after_value` de
+    /// la sonde S5 — et donc ce qui distingue « le ré-armement a tenu » de « le
+    /// cron était cassé » par une requête plutôt que par un grep.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rendrait **aucune** décision fausse le jour où il est écrit, il
+    /// rendrait le compte inexact, en silence, tous les tests au vert.
+    #[test]
+    fn mika2575_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("recurring_restart{}", "_restore");
+        let owner = "crates/mika-agent/src/task_engine/engine.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2575 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2575 — le nom d'audit du ré-armement a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `task_engine::engine`'s `RECURRING_RESTART_RESTORE_AUDIT`, ou le \
+             retirer. Ne PAS l'ajouter à \
+             RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS — le `GROUP BY \
+             after_value` de la sonde S5 n'est exact que tant qu'un seul site \
+             l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2575_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS est livrée vide et \
+             doit le rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// Les deux `after_value` du ré-armement sont un **format de fil** : ils
+    /// atterrissent dans `audit_events.after_value` et l'opérateur en fait des
+    /// `GROUP BY`. Deux orthographes couperaient une population en deux sans le
+    /// dire — c'est ce que la scission datée de mika#2361 a dû écrire une fois.
+    ///
+    /// Les valeurs sont figées ici plutôt que dans `engine.rs` pour la même
+    /// raison que les autres formats de fil de ce fichier : un renommage est une
+    /// **rupture à dater**, jamais une mise à jour de test en silence.
+    #[test]
+    fn mika2575_les_valeurs_daudit_sont_un_format_de_fil() {
+        let owner = repo_root().join("crates/mika-agent/src/task_engine/engine.rs");
+        let src = std::fs::read_to_string(&owner).expect("engine.rs lisible");
+
+        for (konst, value) in [
+            ("RECURRING_RESTORE_OUTCOME_REARMED", "recurring_active"),
+            ("RECURRING_RESTORE_OUTCOME_NO_CRON", "failed_no_cron"),
+        ] {
+            let decl = format!("const {konst}: &str = \"{value}\";");
+            assert!(
+                src.contains(&decl),
+                "mika#2575 — `{konst}` ne vaut plus `{value}`.\n\n\
+                 Ces deux valeurs sont un FORMAT DE FIL : l'opérateur en fait des \
+                 `GROUP BY after_value`. Les changer est une rupture à dater dans \
+                 `CLAUDE.md`, pas une mise à jour de test."
+            );
+        }
+    }
 }

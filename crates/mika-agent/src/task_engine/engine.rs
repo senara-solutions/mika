@@ -11,10 +11,9 @@ use crate::skills::executor::RearmOutcome;
 
 use crate::async_db::AsyncDatabase;
 use crate::db::NewTask;
+use crate::task_state::Task;
 
-use super::cron::{
-    extract_timezone_from_metadata, next_fire_from_cron, next_fire_from_cron_tz, parse_timezone,
-};
+use super::cron::next_fire_for_recurring;
 use super::dispatcher::TaskDispatcher;
 use super::liveness::EngineHeartbeat;
 use super::pilot_transcript;
@@ -251,6 +250,64 @@ const STUCK_PENDING_ACTIVITY_WINDOW_MAX_SECS: i64 = 30 * 24 * 3600;
 /// `auto_pull_no_token` / `wip_rescue_no_token` (mika#2205). AC4's *intent* —
 /// the two causes are distinguishable — is held; its letter is corrected.
 const STUCK_PENDING_SHELTERED_BY_ACTIVITY_EVENT: &str = "stuck_pending_sheltered_by_activity";
+
+// ── mika#2575 — une récurrente en vol au démarrage est ré-armée, jamais échouée ──
+
+/// Événement de journal du ré-armement réussi (INFO).
+///
+/// **Régime attendu : non vide et faible** — une ligne par récurrente qui était
+/// `in_progress` au moment de l'arrêt. Chaque ligne est un scan que le
+/// redémarrage n'a pas tué. Un label qui domine largement les autres n'est pas
+/// une panne de ce correctif : c'est la mesure qui conditionne le suivi
+/// « borner les interruptions répétées » (sonde S5).
+const RECURRING_RESTORED_AFTER_RESTART_EVENT: &str = "recurring_restored_after_restart";
+
+/// Événement de journal du repli (WARN) : le cron n'est pas calculable, la
+/// ligne retombe sur `failed` — le comportement d'avant mika#2575.
+///
+/// **Régime attendu : vide.** Une occurrence est une récurrente dont le cron est
+/// cassé, et c'est *lui* qu'il faut lire ; la garde mika#1742 s'arme alors
+/// **légitimement** (une récurrente dont le cron ne se calcule pas ne doit pas
+/// se ré-inscrire toutes les minutes).
+const RECURRING_RESTORE_FAILED_NO_CRON_EVENT: &str = "recurring_restore_failed_no_cron";
+
+/// Événement de journal du saut en mode CLI (DEBUG).
+///
+/// Non instrumenté en audit : population CLI, sans conduite associée. `mika
+/// chat` partage la base du démon et ne peut pas savoir si celui-ci tire en ce
+/// moment — il laisse donc la ligne `in_progress` intacte.
+const RECURRING_RESTORE_SKIPPED_CLI_EVENT: &str = "recurring_restore_skipped_cli";
+
+/// `tool_name` d'audit des deux issues du ré-armement (mika#2575, R3).
+///
+/// **SOLE WRITER** : [`TaskEngine::restore_recurring_after_restart`], épinglé
+/// par un scan de source à allowlist vide. C'est cette propriété qui rend le
+/// `GROUP BY after_value` de l'opérateur **exact** plutôt qu'un nombre sur
+/// lequel deux sites peuvent diverger.
+///
+/// **Un seul nom, l'issue dans `after_value`** — motif `ready_label_outcome`
+/// (mika#2323) plutôt que le motif à deux noms de `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156) : celui-là s'applique quand chaque nom
+/// porte sa propre cause, et ici les deux issues appartiennent au **même site**
+/// et à la **même population** (les récurrentes en vol au démarrage).
+const RECURRING_RESTART_RESTORE_AUDIT: &str = "recurring_restart_restore";
+
+/// `after_value` du ré-armement réussi. **Format de fil** : l'opérateur en fait
+/// des `GROUP BY`, deux orthographes couperaient une population en deux sans le
+/// dire. Figé par test.
+///
+/// Le littéral coïncide aujourd'hui avec [`task_status::RECURRING_ACTIVE`] et
+/// n'en est **pas** un alias : celui-ci nomme une valeur de la colonne
+/// `tasks.status`, celui-là une valeur d'`audit_events.after_value`. Les lier
+/// ferait qu'un renommage du statut réécrirait en silence le sens d'une
+/// population déjà comptée. Corollaire pour le scan d'écrivain unique : ce
+/// littéral est ici et ne doit **pas** compter comme un écrivain du statut —
+/// d'où un prédicat ancré sur la **forme d'écriture** et jamais sur la présence
+/// du mot.
+const RECURRING_RESTORE_OUTCOME_REARMED: &str = "recurring_active";
+
+/// `after_value` du repli. Même contrat de format de fil que son frère.
+const RECURRING_RESTORE_OUTCOME_NO_CRON: &str = "failed_no_cron";
 
 // ── mika#2515 U2 — l'alerte « un build vert, un verdict qui n'arrive pas » ──
 
@@ -876,6 +933,19 @@ impl TaskEngine {
                 debug!(task_id = %task.id, "skipping manual task during startup recovery");
                 continue;
             }
+
+            // mika#2575 — pour une RÉCURRENTE, `in_progress` est un état de tir
+            // transitoire, pas un état de registre : `claim_and_fire_task` le
+            // pose le temps du tir et `update_task_rescheduled` repose
+            // `recurring_active` au retour. Écrire `failed` ici confond l'échec
+            // d'un *tir* avec la mort d'un *enregistrement*, et c'est cette
+            // confusion — et rien d'autre — qui arme la garde anti-zombie
+            // mika#1742 pour 24 h au démarrage suivant. On ré-arme.
+            if task.trigger_type == trigger_type::RECURRING {
+                self.restore_recurring_after_restart(&task, &now).await;
+                continue;
+            }
+
             debug!(task_id = %task.id, "marking orphaned in_progress task as failed on startup");
             if let Err(e) = self
                 .db
@@ -943,6 +1013,168 @@ impl TaskEngine {
             "task engine startup recovery complete"
         );
         Ok((count, self.queue.len()))
+    }
+
+    /// Ré-arme une récurrente que le redémarrage a surprise en plein tir
+    /// (mika#2575).
+    ///
+    /// **Le défaut qu'elle ferme.** `startup_recovery` écrivait `failed` sur
+    /// toute ligne `in_progress` non manuelle. Sur une récurrente, ce `failed`
+    /// est un artefact du redémarrage, pas un échec du scan — et la garde
+    /// anti-zombie de `create_recurring_task_if_absent` (mika#1742) le compte
+    /// comme la mort d'un enregistrement et **refuse la ré-inscription pendant
+    /// 24 h**. Mesuré deux fois : `wip_rescue` mort ~28 h (2026-09-28) et le
+    /// `heartbeat` de mika-arch ~24,5 h (2026-09-25). La garde n'est ni
+    /// modifiée, ni exemptée, ni contournée : elle cesse d'avoir une population
+    /// que le démarrage fabriquait.
+    ///
+    /// **Le ré-armement a lieu dans le MÊME démarrage** : l'étape 2 précède
+    /// l'étape 3, et `get_schedulable_tasks` sélectionne `recurring_active`, donc
+    /// la ligne entre dans le tas sans attendre ni le scan périodique ni un
+    /// redémarrage.
+    ///
+    /// **Un seul écrivain de `recurring_active`** : le repos nominal après un tir
+    /// et ce ré-armement passent tous deux par
+    /// [`crate::async_db::AsyncDatabase::update_task_rescheduled`], donc ils sont
+    /// un seul acte textuel et non deux formulations qui peuvent diverger.
+    ///
+    /// **Fail-safe.** Toute écriture qui échoue est journalisée et n'interrompt
+    /// pas `startup_recovery` : la ligne reste `in_progress` et le démarrage
+    /// suivant réessaiera — jamais un démarrage avorté. L'écriture d'audit est
+    /// *fire-and-forget* (motif `qa_build_verdict_alert_audit_failed`) : perdre
+    /// une ligne d'audit ne doit pas pouvoir changer l'état d'une tâche.
+    async fn restore_recurring_after_restart(&self, task: &Task, now: &str) {
+        // `mika chat` exécute cette même récupération (`cli_mode: true`) contre
+        // la base qu'il PARTAGE avec un démon possiblement vivant. Il ne peut
+        // pas savoir si celui-ci tire en ce moment, et il n'exécutera de toute
+        // façon pas le scan qu'il replanifierait — il laisse donc la ligne
+        // intacte. Strictement meilleur que le `failed` d'aujourd'hui, qui tuait
+        // le scan du démon depuis le CLI ; si le démon est mort, son propre
+        // démarrage ré-armera. Même raisonnement que le gating de l'étape 2a.
+        if self.dispatcher.cli_mode {
+            debug!(
+                event = RECURRING_RESTORE_SKIPPED_CLI_EVENT,
+                task_id = %task.id,
+                label = %task.label,
+                "cli mode: leaving the in-flight recurring row untouched"
+            );
+            return;
+        }
+
+        let next = match next_fire_for_recurring(
+            task.cron_expr.as_deref(),
+            task.metadata.as_deref(),
+            now,
+        ) {
+            Ok(ts) => ts,
+            Err(e) => {
+                // Aucun instant futur n'est calculable : la ligne retombe sur
+                // `failed`, le comportement d'avant mika#2575, avec un motif
+                // nommé. C'est ce que `fire_task` fait déjà dans le même cas —
+                // aucune sémantique neuve — et la garde de mika#1742 s'arme
+                // alors LÉGITIMEMENT : une récurrente dont le cron ne se calcule
+                // pas ne doit pas se ré-inscrire toutes les minutes.
+                warn!(
+                    event = RECURRING_RESTORE_FAILED_NO_CRON_EVENT,
+                    task_id = %task.id,
+                    label = %task.label,
+                    agent_id = %self.db.agent_id(),
+                    cron_expr = task.cron_expr.as_deref().unwrap_or("<none>"),
+                    error = %e,
+                    "cannot reschedule in-flight recurring task on startup, marking failed"
+                );
+                if let Err(db_err) = self
+                    .db
+                    .update_task_status(&task.id, task_status::FAILED)
+                    .await
+                {
+                    warn!(task_id = %task.id, error = %db_err, "failed to mark task as failed during recovery");
+                }
+                self.audit_recurring_restore(task, RECURRING_RESTORE_OUTCOME_NO_CRON, None)
+                    .await;
+                return;
+            }
+        };
+
+        if let Err(e) = self.db.update_task_rescheduled(&task.id, &next).await {
+            warn!(
+                task_id = %task.id,
+                label = %task.label,
+                error = %e,
+                "failed to re-arm in-flight recurring task on startup; leaving it in_progress \
+                 for the next startup to retry"
+            );
+            return;
+        }
+
+        // `last_fire` et non `fired_at`, et ce n'est pas une préférence de
+        // nommage. Ce site **n'estampille pas** : le ré-armement replanifie, il
+        // ne tire pas, et la sémantique posée par mika#2133 réserve `fired_at`
+        // au dernier tir — que `claim_and_fire_task` reposera au prochain. Y
+        // écrire l'instant du ré-armement serait un fait faux.
+        //
+        // Le nom du CHAMP suit, parce que la garde
+        // `mika2133_fired_at_has_a_single_literal_definition` est lexicale sur
+        // `fired_at` + `=` et compterait `fired_at = …` ici comme un cinquième
+        // écrivain. Son message laisse le choix entre interpoler la constante
+        // et affiner la garde ; les deux sont refusés — la première poserait le
+        // fait faux ci-dessus, la seconde élargirait le prédicat d'un ticket
+        // voisin pour un champ de journal. Ne PAS renommer en `fired_at` : la
+        // valeur rendue est bien celle de `task.fired_at`, et le nom dit ce
+        // qu'elle est — le dernier tir, celui que le redémarrage a interrompu.
+        let last_fire = task.fired_at.as_deref().unwrap_or("<none>");
+        info!(
+            event = RECURRING_RESTORED_AFTER_RESTART_EVENT,
+            task_id = %task.id,
+            label = %task.label,
+            agent_id = %self.db.agent_id(),
+            cron_expr = task.cron_expr.as_deref().unwrap_or("<none>"),
+            previous_next_fire_at = task.next_fire_at.as_deref().unwrap_or("<none>"),
+            next_fire_at = %next,
+            last_fire,
+            "a restart interrupted this recurring task mid-fire — re-armed instead of failed"
+        );
+        self.audit_recurring_restore(task, RECURRING_RESTORE_OUTCOME_REARMED, Some(&next))
+            .await;
+    }
+
+    /// **SOLE WRITER** de [`RECURRING_RESTART_RESTORE_AUDIT`] (mika#2575, R3).
+    ///
+    /// Un seul nom d'audit pour les deux issues, l'issue étant portée par
+    /// `after_value` : c'est ce qui rend le `GROUP BY after_value` de
+    /// l'opérateur soustractible. *Fire-and-forget* — l'échec de l'écriture est
+    /// dit et ne change l'état d'aucune tâche.
+    async fn audit_recurring_restore(
+        &self,
+        task: &Task,
+        outcome: &str,
+        next_fire_at: Option<&str>,
+    ) {
+        let reasoning = format!(
+            "task_id:{} cron:{} next_fire_at:{}",
+            task.id,
+            task.cron_expr.as_deref().unwrap_or("<none>"),
+            next_fire_at.unwrap_or("<none>"),
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                &format!("system-{}", self.db.agent_id()),
+                RECURRING_RESTART_RESTORE_AUDIT,
+                &format!("recurring:{}", task.label),
+                Some(task_status::IN_PROGRESS),
+                Some(outcome),
+                Some(&reasoning),
+                None,
+            )
+            .await
+        {
+            warn!(
+                task_id = %task.id,
+                error = %e,
+                "failed to write the recurring-restore audit row"
+            );
+        }
     }
 
     /// Insert a new task into the DB and enqueue it in the BinaryHeap.
@@ -4692,28 +4924,15 @@ impl TaskEngine {
         if self.queued_ids.contains(task_id) {
             return;
         }
-        // Extract timezone from metadata for timezone-aware cron evaluation
-        let parsed_tz = extract_timezone_from_metadata(metadata)
-            .and_then(|tz_str| parse_timezone(&tz_str).ok());
 
         let fire_at = if trigger_type_str == trigger_type::RECURRING {
-            match cron_expr {
-                Some(expr) => {
-                    let result = if let Some(ref tz) = parsed_tz {
-                        next_fire_from_cron_tz(expr, now, tz)
-                    } else {
-                        next_fire_from_cron(expr, now)
-                    };
-                    match result {
-                        Ok(ts) => ts,
-                        Err(e) => {
-                            warn!(task_id, error = %e, "failed to compute cron next fire");
-                            return;
-                        }
-                    }
-                }
-                None => {
-                    warn!(task_id, "recurring task missing cron_expr");
+            // mika#2575 — lecteur unique du calcul (timezone du metadata
+            // comprise). La disposition d'erreur reste celle de ce site :
+            // renoncer à empiler.
+            match next_fire_for_recurring(cron_expr, metadata, now) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    warn!(task_id, error = %e, "failed to compute cron next fire");
                     return;
                 }
             }
@@ -4780,12 +4999,9 @@ impl TaskEngine {
             match result {
                 Ok(()) => {
                     if trigger_type_val == trigger_type::RECURRING {
-                        // Read timezone from task metadata for timezone-aware rescheduling
-                        let parsed_tz = match db.get_task(&task_id).await {
-                            Ok(Some(task)) => {
-                                extract_timezone_from_metadata(task.metadata.as_deref())
-                                    .and_then(|tz_str| parse_timezone(&tz_str).ok())
-                            }
+                        // Read the task metadata for timezone-aware rescheduling
+                        let metadata = match db.get_task(&task_id).await {
+                            Ok(Some(task)) => task.metadata,
                             Ok(None) => None,
                             Err(e) => {
                                 warn!(task_id = %task_id, error = %e, "failed to read task for timezone metadata, falling back to UTC");
@@ -4793,18 +5009,15 @@ impl TaskEngine {
                             }
                         };
 
-                        // Recompute next fire time and re-enqueue
+                        // Recompute next fire time and re-enqueue. mika#2575 —
+                        // lecteur unique du calcul ; la disposition d'erreur
+                        // reste celle de ce site : marquer `failed`.
                         let now_str = crate::timestamp::now();
-                        let next = match cron_expr
-                            .as_deref()
-                            .ok_or_else(|| anyhow::anyhow!("recurring task missing cron_expr"))
-                            .and_then(|e| {
-                                if let Some(ref tz) = parsed_tz {
-                                    next_fire_from_cron_tz(e, &now_str, tz)
-                                } else {
-                                    next_fire_from_cron(e, &now_str)
-                                }
-                            }) {
+                        let next = match next_fire_for_recurring(
+                            cron_expr.as_deref(),
+                            metadata.as_deref(),
+                            &now_str,
+                        ) {
                             Ok(ts) => ts,
                             Err(e) => {
                                 warn!(task_id = %task_id, error = %e, "cannot reschedule recurring task, marking failed");
@@ -5527,6 +5740,629 @@ mod tests {
             r#type: None,
             dispatch_class: None,
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // mika#2575 — `recurring_active` a un écrivain unique (T1 + T2).
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// **Livrée VIDE pour les DEUX termes, et le test frère l'assert.**
+    ///
+    /// Quand ce scan tire, **on retire le second écrivain** — on ne l'allowliste
+    /// pas (doctrine mika#2201). Une allowlist née vide est un emplacement où
+    /// déposer la prochaine infraction (mika#2323).
+    const RECURRING_ACTIVE_WRITERS_ALLOWED: &[&str] = &[];
+
+    /// Les trois fonctions DB qui prennent le statut **en paramètre**, et qui
+    /// sont donc la voie que le terme T1 ne peut pas voir (mika#2575).
+    ///
+    /// Toutes de la forme `SET status = ?1` : un futur écrivain peut poser
+    /// `recurring_active` par l'une d'elles **sans qu'aucun
+    /// `UPDATE … SET status = 'recurring_active'` n'apparaisse dans l'arbre**.
+    const DYNAMIC_STATUS_WRITERS: &[&str] = &[
+        "update_task_status",
+        "update_manual_task_status",
+        "terminal_mark_tracking_row_upstream_closed",
+    ];
+
+    /// Les sources `.rs` de **production** sous `crates/*/src`, tronquées au
+    /// premier `#[cfg(test)]` **ancré en début de ligne**.
+    ///
+    /// **Pourquoi pas `canonical_tokens::production_sources()`** — l'ancrage est
+    /// la différence, et elle est portante ici. Cet énumérateur-là tronque au
+    /// premier `#[cfg(test)]` où qu'il soit, y compris **indenté** ; or ce
+    /// fichier en porte un sur une méthode d'aide, loin au-dessus de
+    /// `startup_recovery`. Réutiliser `production_sources()` couperait donc
+    /// `engine.rs` avant le correctif lui-même : le scan serait vert en ne
+    /// regardant pas le seul fichier qu'il existe pour surveiller — la forme
+    /// exacte du scan silencieusement inerte que mika#2205 nomme.
+    ///
+    /// L'ancrage sur `"\n#[cfg(test)]"` est repris de
+    /// `mika2405_the_settled_event_has_exactly_one_writer_in_production`, qui
+    /// vit dans ce même module pour cette même raison.
+    fn production_rust_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/")
+            .to_path_buf();
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                // mika#2321 : un module de test extrait ne porte aucun
+                // `#[cfg(test)]`, donc la troncature seule le scannerait en
+                // entier comme de la production. Classer par chemin d'abord.
+                if crate::source_scan::is_test_source_path(&path) {
+                    continue;
+                }
+                let rel = path.to_string_lossy().replace('\\', "/");
+                if !rel.contains("/src/") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = match text.find("\n#[cfg(test)]") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                // Le chemin rendu est relatif au dossier `crates/`, ce qui suffit
+                // à nommer un site dans un message d'échec.
+                let rel = path
+                    .strip_prefix(&root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or(rel);
+                out.push((rel, production));
+            }
+        }
+
+        assert!(
+            !out.is_empty(),
+            "aucune source de production trouvée — un scan qui ne scanne rien est \
+             un laissez-passer vide, pas un scan propre (mika#2103)"
+        );
+        out
+    }
+
+    /// **T1** — les sites qui écrivent le statut par son **littéral** dans un
+    /// `SET`.
+    ///
+    /// Le prédicat dépouille les commentaires **avant** de scanner, et ce n'est
+    /// pas cosmétique : le doc-comment de `db/tasks.rs::update_task_rescheduled`
+    /// écrit *« set next_fire_at and status = 'recurring_active' »*, et le
+    /// compter ferait de la prose un second écrivain. C'est le faux positif que
+    /// mika#2050 a mesuré sur le Signal S, et le dépouillement le ferme quelle
+    /// que soit la précision du prédicat.
+    ///
+    /// Ancré sur `status =` et non sur la seule présence du mot : `status IN
+    /// ('pending','recurring_active')` est une **lecture** (douze dans
+    /// `db/tasks.rs`, une trentaine dans `migrations.rs`), et l'`INSERT … VALUES
+    /// (…,'recurring_active',…)` de `create_recurring_task_if_absent` est
+    /// l'autre acte **légitime** — créer l'enregistrement. Les deux tombent hors
+    /// du terme, à dessein.
+    /// Rend le **texte** du site, jamais son numéro de ligne : `strip_comment_lines`
+    /// *retire* les lignes qu'il écarte, donc tout numéro calculé après lui est
+    /// décalé — et un numéro faux dans un message d'échec envoie le lecteur au
+    /// mauvais endroit, ce qui est pire qu'aucun numéro. C'est la raison pour
+    /// laquelle `canonical-tokens.tsv` refuse déjà, en toutes lettres, qu'un site
+    /// soit désigné par un numéro de ligne. Le texte se `grep`.
+    fn literal_status_write_sites(src: &str) -> Vec<String> {
+        crate::source_scan::strip_comment_lines(src)
+            .lines()
+            .filter(|line| {
+                let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                squeezed.contains("status='recurring_active'")
+            })
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    /// **T2** — les appels aux trois écrivains à statut **dynamique** dont un
+    /// argument vaut `recurring_active`.
+    ///
+    /// **Le prédicat lit l'invocation LOGIQUE, jamais la ligne physique.**
+    /// rustfmt casse volontiers un appel long en plusieurs lignes, et le nom de
+    /// la fonction se retrouve alors sur une ligne et son argument sur une
+    /// autre : un prédicat à la ligne serait aveugle à la forme la plus probable
+    /// de la régression. On avance donc de la parenthèse ouvrante à sa fermante
+    /// équilibrée, et on cherche le jeton dans l'intervalle.
+    ///
+    /// Limite **nommée** : le compte de parenthèses ignore celles qui vivraient
+    /// dans un littéral de chaîne de l'appel. Un `update_task_status(&id, ")")`
+    /// tronquerait la fenêtre — forme inexistante dans cet arbre, et un faux
+    /// **négatif** réparable, pas un faux positif.
+    ///
+    /// Rend le texte de l'invocation et jamais son numéro de ligne, pour la
+    /// raison écrite sur [`literal_status_write_sites`].
+    fn dynamic_status_write_sites(src: &str) -> Vec<String> {
+        let stripped = crate::source_scan::strip_comment_lines(src);
+        let mut out = Vec::new();
+
+        for name in DYNAMIC_STATUS_WRITERS {
+            let opener = format!("{name}(");
+            let mut from = 0usize;
+            while let Some(rel) = stripped[from..].find(&opener) {
+                let at = from + rel;
+                let args_start = at + opener.len();
+                from = args_start;
+
+                // Avance jusqu'à la parenthèse fermante équilibrée.
+                let mut depth = 1usize;
+                let mut end = args_start;
+                for (off, c) in stripped[args_start..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = args_start + off;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if depth != 0 {
+                    continue; // parenthèses déséquilibrées : rien de décidable
+                }
+
+                let args = &stripped[args_start..end];
+                if args.contains("RECURRING_ACTIVE") || args.contains("\"recurring_active\"") {
+                    let args: String = args.split_whitespace().collect::<Vec<_>>().join(" ");
+                    out.push(format!("{name}({args})"));
+                }
+            }
+        }
+        out
+    }
+
+    /// mika#2575 — **`recurring_active` a un écrivain unique** :
+    /// `Database::update_task_rescheduled`.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe. Un second écrivain
+    /// ne rendrait **aucune** décision fausse le jour où il est écrit — il
+    /// divergerait plus tard, en silence, avec tous les tests au vert. C'est
+    /// précisément ce qui donne son prix à la propriété : le ré-armement au
+    /// démarrage et le repos nominal après un tir sont **un seul acte textuel**,
+    /// pas deux formulations qui peuvent s'écarter.
+    ///
+    /// Le prédicat est une **disjonction à deux termes**, et le second n'est pas
+    /// une précaution abstraite : formulé sur T1 seul, ce scan serait aveugle à
+    /// la voie la plus probable — poser le statut par un paramètre.
+    #[test]
+    fn mika2575_le_statut_recurring_active_a_un_ecrivain_unique() {
+        let owner = "mika-agent/src/db/tasks.rs";
+        let mut literal_sites: Vec<String> = Vec::new();
+        let mut dynamic_sites: Vec<String> = Vec::new();
+        let mut owner_carries_the_literal = false;
+
+        for (rel, content) in production_rust_sources() {
+            if RECURRING_ACTIVE_WRITERS_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            for text in literal_status_write_sites(&content) {
+                if rel == owner {
+                    owner_carries_the_literal = true;
+                    continue;
+                }
+                literal_sites.push(format!("{rel}: {text}"));
+            }
+            for text in dynamic_status_write_sites(&content) {
+                dynamic_sites.push(format!("{rel}: {text}"));
+            }
+        }
+
+        // Anti-vacuité de T1 — elle porte sur le NOM, parce que T1 a une
+        // population non vide : `db/tasks.rs` écrit ce littéral aujourd'hui, et
+        // un scan qui ne le trouve plus vise un site mort.
+        assert!(
+            owner_carries_the_literal,
+            "mika#2575 / T1 — le littéral n'est écrit nulle part dans {owner} : ce \
+             scan vise un site mort, il ne vérifie rien (mika#2205)"
+        );
+
+        assert!(
+            literal_sites.is_empty(),
+            "mika#2575 / T1 — `recurring_active` a un second écrivain littéral : \
+             {literal_sites:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `Database::update_task_rescheduled`. Ne PAS l'ajouter à \
+             RECURRING_ACTIVE_WRITERS_ALLOWED — le ré-armement du démarrage et le \
+             repos nominal après un tir ne sont un seul acte que tant qu'un seul \
+             site les écrit."
+        );
+
+        assert!(
+            dynamic_sites.is_empty(),
+            "mika#2575 / T2 — `recurring_active` est posé par un écrivain à statut \
+             DYNAMIQUE : {dynamic_sites:?}\n\n\
+             C'est la voie que T1 ne voit pas : ces trois fonctions prennent le \
+             statut en paramètre (`SET status = ?1`), donc le poser ainsi ne fait \
+             apparaître aucun `UPDATE … SET status = 'recurring_active'` dans \
+             l'arbre.\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `Database::update_task_rescheduled`, qui pose AUSSI le `next_fire_at` \
+             — une récurrente rendue `recurring_active` sans instant de tir futur \
+             est une ligne qui ne tirera jamais."
+        );
+    }
+
+    /// **Contrôle négatif de T2, à voir ROUGE.**
+    ///
+    /// `task_status::RECURRING_ACTIVE` n'est consommée **nulle part** en
+    /// production aujourd'hui : T2 est donc vert par **population vide**, ce qui
+    /// se lit exactement comme un arbre propre (mika#2205). Son anti-vacuité ne
+    /// peut donc pas porter sur la présence du nom — elle porte sur la **forme
+    /// du prédicat**, par une fixture que le scan doit accuser.
+    ///
+    /// C'est la différence de contrôle entre les deux termes, et elle vient de
+    /// ce qu'ils n'ont pas la même population : T1 en a une, T2 n'en a pas.
+    #[test]
+    fn mika2575_le_predicat_voit_lecriture_par_statut_dynamique() {
+        // La forme d'une ligne : ce que rustfmt produit pour un appel court.
+        let one_line =
+            "        db.update_task_status(&task.id, task_status::RECURRING_ACTIVE).await?;\n";
+        assert_eq!(
+            dynamic_status_write_sites(one_line).len(),
+            1,
+            "un appel d'une ligne passant RECURRING_ACTIVE doit faire tirer le scan"
+        );
+
+        // La forme multi-lignes : ce que rustfmt produit au-delà de 100 colonnes,
+        // et la raison pour laquelle le prédicat lit l'invocation logique.
+        let wrapped = "        self.db\n            .update_task_status(\n                &task.id,\n                task_status::RECURRING_ACTIVE,\n            )\n            .await?;\n";
+        assert_eq!(
+            dynamic_status_write_sites(wrapped).len(),
+            1,
+            "un appel coupé par rustfmt doit faire tirer le scan — sinon le \
+             prédicat est aveugle à la forme la plus probable de la régression"
+        );
+
+        // Le littéral, pas seulement la constante.
+        let literal =
+            "        db.update_manual_task_status(&id, \"mika\", \"recurring_active\").await?;\n";
+        assert_eq!(
+            dynamic_status_write_sites(literal).len(),
+            1,
+            "le littéral passe par les mêmes fonctions que la constante"
+        );
+
+        // Et la troisième fonction de la famille.
+        let third = "        db.terminal_mark_tracking_row_upstream_closed(&id, \"mika\", task_status::RECURRING_ACTIVE, \"x\")?;\n";
+        assert_eq!(
+            dynamic_status_write_sites(third).len(),
+            1,
+            "les trois écrivains à statut dynamique sont couverts"
+        );
+    }
+
+    /// **Contrôle de bonne foi de T2, à voir VERT.**
+    ///
+    /// Un appel des mêmes fonctions avec un *autre* statut n'est pas une
+    /// infraction. Sans ce contrôle, un prédicat resserré sur le seul nom de
+    /// fonction rendrait le scan rouge en permanence — donc désarmé.
+    #[test]
+    fn mika2575_le_predicat_nacuse_pas_un_autre_statut() {
+        let benign = "        db.update_task_status(&task.id, task_status::FAILED).await?;\n";
+        assert!(
+            dynamic_status_write_sites(benign).is_empty(),
+            "poser `failed` par la même fonction est le chemin nominal"
+        );
+    }
+
+    /// **Contrôle de bonne foi de T1, à voir VERT.**
+    ///
+    /// Le doc-comment de `db/tasks.rs::update_task_rescheduled` écrit
+    /// *« set next_fire_at and status = 'recurring_active' »*. Un prédicat
+    /// laxiste — la forme vers laquelle un futur éditeur glisserait pour « être
+    /// sûr de ne rien rater » — compterait cette prose comme un second
+    /// écrivain, rendrait le scan rouge en permanence, et le ferait désarmer.
+    /// C'est le faux positif que mika#2050 a mesuré sur le Signal S.
+    #[test]
+    fn mika2575_le_predicat_ne_compte_pas_un_doc_comment() {
+        let prose =
+            "    /// Atomically reschedule: set next_fire_at and status = 'recurring_active'\n";
+        assert!(
+            literal_status_write_sites(prose).is_empty(),
+            "une prose qui DÉCRIT le motif interdit n'est pas une violation de \
+             celui-ci"
+        );
+
+        // Et la lecture, qui est l'autre forme non fautive et de loin la plus
+        // fréquente (≈ 40 occurrences dans l'arbre).
+        let read =
+            "             WHERE agent_id = ?1 AND status IN ('pending','recurring_active')\n";
+        assert!(
+            literal_status_write_sites(read).is_empty(),
+            "`status IN (…)` est une lecture, pas une écriture"
+        );
+
+        // L'INSERT de `create_recurring_task_if_absent` : l'autre acte légitime.
+        let insert = "             VALUES (?1,?2,?3,?4,?5,?6,?7,'recurring_active',?8)\",\n";
+        assert!(
+            literal_status_write_sites(insert).is_empty(),
+            "créer l'enregistrement est l'autre acte légitime, hors du terme"
+        );
+
+        // Contrôle positif du prédicat lui-même : la forme qu'il DOIT accuser.
+        let write = "            \"UPDATE tasks SET next_fire_at = ?1, status = 'recurring_active' WHERE id = ?2\",\n";
+        assert_eq!(
+            literal_status_write_sites(write).len(),
+            1,
+            "sans ce contrôle, un prédicat devenu trop étroit se lirait comme un \
+             arbre propre"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist des deux termes.
+    #[test]
+    fn mika2575_lallowlist_des_ecrivains_du_statut_est_vide() {
+        assert!(
+            RECURRING_ACTIVE_WRITERS_ALLOWED.is_empty(),
+            "RECURRING_ACTIVE_WRITERS_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on retire le second écrivain (doctrine \
+             mika#2201)."
+        );
+    }
+
+    /// Une récurrente, telle que `ensure_recurring_task` la pose au démarrage :
+    /// `trigger_type = 'recurring'`, un cron, et **pas** de `timeout_at`
+    /// (`task_engine/mod.rs` pose `None` — c'est ce qui met les sept
+    /// récurrentes du démarrage hors de portée de `mark_tasks_expired`).
+    fn make_recurring_task(label: &str, cron_expr: Option<&str>) -> NewTask {
+        NewTask {
+            trigger_type: "recurring".to_string(),
+            cron_expr: cron_expr.map(str::to_owned),
+            next_fire_at: Some(crate::timestamp::now()),
+            ..make_task(label, &crate::timestamp::now())
+        }
+    }
+
+    /// Sème une récurtente surprise en plein tir par le redémarrage : la ligne
+    /// est `in_progress`, exactement l'état que `claim_and_fire_task` pose le
+    /// temps du tir.
+    async fn seed_in_flight_recurring(
+        db: &AsyncDatabase,
+        label: &str,
+        cron: Option<&str>,
+    ) -> String {
+        let id = db
+            .create_task(make_recurring_task(label, cron))
+            .await
+            .unwrap();
+        db.update_task_status(&id, "in_progress").await.unwrap();
+        id
+    }
+
+    /// mika#2575 / AC1 — **le test littéral du corps du ticket.** Une récurrente
+    /// `in_progress` au démarrage ressort `recurring_active`, avec un
+    /// `next_fire_at` strictement futur.
+    ///
+    /// Vu rouge sans le correctif : la ligne ressortait `failed`.
+    #[tokio::test]
+    async fn mika2575_une_recurrente_en_vol_ressort_recurring_active() {
+        let db = test_db();
+        let before = crate::timestamp::now();
+        let task_id = seed_in_flight_recurring(&db, "wip_rescue", Some("0 */5 * * * *")).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "recurring_active",
+            "une récurrente en vol est ré-armée, jamais échouée — sinon la garde \
+             mika#1742 la refuse 24 h au démarrage suivant"
+        );
+        let next = task.next_fire_at.expect("un next_fire_at doit être posé");
+        assert!(
+            next > before,
+            "le next_fire_at doit être strictement futur, pas l'ancien : {next} <= {before}"
+        );
+    }
+
+    /// mika#2575 / AC2 — le ré-armement a lieu **dans le même démarrage**.
+    ///
+    /// L'étape 2 précède l'étape 3 et `get_schedulable_tasks` sélectionne
+    /// `recurring_active`, donc la ligne entre dans le tas sans attendre le scan
+    /// périodique de 60 ticks ni un redémarrage. Vu rouge sans le correctif : une
+    /// ligne `failed` n'est pas schedulable.
+    #[tokio::test]
+    async fn mika2575_la_ligne_rearmee_entre_dans_le_tas_au_meme_demarrage() {
+        let db = test_db();
+        seed_in_flight_recurring(&db, "auto_pull_groomed", Some("0 */10 * * * *")).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        let (loaded, queue_len) = engine.startup_recovery().await.unwrap();
+
+        assert_eq!(loaded, 1, "la ligne ré-armée doit être chargée");
+        assert_eq!(queue_len, 1, "et empilée, au même démarrage");
+    }
+
+    /// mika#2575 / AC3 — la garde anti-zombie mika#1742 ne s'arme plus sur ce
+    /// chemin.
+    ///
+    /// Elle n'est ni modifiée, ni exemptée, ni contournée : aucun état terminal
+    /// n'étant écrit, elle n'a simplement plus de population à lire. Vu rouge
+    /// sans le correctif : `create_recurring_task_if_absent` rendait `Ok(None)`
+    /// pendant les 24 h de grâce.
+    #[tokio::test]
+    async fn mika2575_la_garde_zombie_ne_sarme_pas_apres_un_rearmement() {
+        let db = test_db();
+        seed_in_flight_recurring(&db, "wip_rescue", Some("0 */5 * * * *")).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        // Le démarrage SUIVANT tente de ré-enregistrer le même label. Sans le
+        // correctif, il trouve un `failed` dans la fenêtre de grâce et refuse.
+        let outcome = db
+            .create_recurring_task_if_absent(make_recurring_task(
+                "wip_rescue",
+                Some("0 */5 * * * *"),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            outcome.is_none(),
+            "la ligne existe déjà en `recurring_active`, donc l'INSERT OR IGNORE \
+             entre en collision avec l'index unique — c'est « already existed », \
+             pas un refus"
+        );
+
+        // Ce qui distingue les deux `None` : l'état de la ligne. Un refus aurait
+        // laissé un `failed` ; un « already existed » laisse le ré-armement.
+        let rows = db
+            .get_tasks_by_status(vec!["recurring_active".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactement une ligne `recurring_active` pour ce label — ni refus, ni doublon"
+        );
+    }
+
+    /// mika#2575 / AC5 — **contrôle négatif.** Une tâche à un coup interrompue
+    /// garde le comportement d'aujourd'hui.
+    ///
+    /// Un tir à un coup rejoué est un effet de bord qu'aucun seuil ne corrige,
+    /// d'où un contrôle explicite en plus de
+    /// `test_startup_recovery_marks_orphaned_in_progress_failed` (qui le couvre
+    /// déjà pour `time`, sans avoir été touché).
+    #[tokio::test]
+    async fn mika2575_une_tache_a_un_coup_reste_failed() {
+        let db = test_db();
+        let one_shot = db
+            .create_task(make_task(
+                "one-shot",
+                &crate::timestamp::now_plus(chrono::Duration::seconds(3600)),
+            ))
+            .await
+            .unwrap();
+        db.update_task_status(&one_shot, "in_progress")
+            .await
+            .unwrap();
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let task = db.get_task(&one_shot).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "failed",
+            "le ré-armement est borné aux récurrentes : rejouer un tir à un coup \
+             serait un effet de bord"
+        );
+    }
+
+    /// mika#2575 / AC6 — le repli. Un cron absent n'offre aucun instant futur
+    /// calculable : la ligne retombe sur `failed`, comportement d'avant le
+    /// correctif, avec un motif nommé dans `after_value`.
+    ///
+    /// Dans ce cas la garde mika#1742 s'arme **légitimement** — une récurrente
+    /// dont le cron ne se calcule pas ne doit pas se ré-inscrire toutes les
+    /// minutes.
+    #[tokio::test]
+    async fn mika2575_un_cron_illisible_retombe_sur_failed() {
+        let db = test_db();
+        let task_id = seed_in_flight_recurring(&db, "cronless", None).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+
+        let rows = db
+            .get_audit_event_rows_by_tool_name(RECURRING_RESTART_RESTORE_AUDIT)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "le repli s'écrit, il ne se tait pas");
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some(RECURRING_RESTORE_OUTCOME_NO_CRON),
+            "c'est `after_value` que l'opérateur `GROUP BY` pour séparer les deux \
+             issues du même site"
+        );
+    }
+
+    /// mika#2575 — le mode CLI ne ré-arme pas, et n'écrit rien du tout.
+    ///
+    /// `mika chat` partage la base du démon. Il ne peut pas savoir si celui-ci
+    /// tire en ce moment, et il n'exécutera de toute façon pas le scan qu'il
+    /// replanifierait. Vu rouge sans le correctif : la ligne passait `failed`,
+    /// ce qui tuait le scan du démon depuis le CLI.
+    #[tokio::test]
+    async fn mika2575_le_mode_cli_ne_rearme_pas() {
+        let db = test_db();
+        let task_id = seed_in_flight_recurring(&db, "wip_rescue", Some("0 */5 * * * *")).await;
+
+        let dispatcher = test_dispatcher_with(db.clone(), |_| {});
+        let dispatcher = Arc::new(TaskDispatcher {
+            cli_mode: true,
+            ..Arc::try_unwrap(dispatcher).ok().expect("un seul détenteur")
+        });
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let task = db.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(
+            task.status, "in_progress",
+            "le CLI laisse la ligne intacte — ni ré-armée, ni échouée"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name(RECURRING_RESTART_RESTORE_AUDIT)
+                .await
+                .unwrap(),
+            0,
+            "population CLI sans conduite associée : rien n'est instrumenté"
+        );
+    }
+
+    /// mika#2575 / AC7 — chaque ré-armement est observable.
+    #[tokio::test]
+    async fn mika2575_le_rearmement_ecrit_sa_ligne_daudit() {
+        let db = test_db();
+        seed_in_flight_recurring(&db, "worktree_reap", Some("0 */10 * * * *")).await;
+
+        let dispatcher = test_dispatcher(db.clone());
+        let mut engine = TaskEngine::new(db.clone(), dispatcher);
+        engine.startup_recovery().await.unwrap();
+
+        let rows = db
+            .get_audit_event_rows_by_tool_name(RECURRING_RESTART_RESTORE_AUDIT)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let (target_key, before, after, reasoning) = &rows[0];
+        assert_eq!(target_key, "recurring:worktree_reap");
+        assert_eq!(before.as_deref(), Some("in_progress"));
+        assert_eq!(after.as_deref(), Some(RECURRING_RESTORE_OUTCOME_REARMED));
+        let reasoning = reasoning.as_deref().expect("un reasoning doit être posé");
+        assert!(
+            reasoning.contains("cron:0 */10 * * * *") && reasoning.contains("next_fire_at:"),
+            "le reasoning porte le cron et l'instant recalculé : {reasoning}"
+        );
     }
 
     #[tokio::test]

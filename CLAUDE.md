@@ -494,6 +494,184 @@ Optional (startup behavior):
   couvre un tenant famille ou champion (les quatre existantes sont des rôles
   d'ingénierie) — **ticket de suivi**, seule voie vers une mesure répétable.
 
+### Une récurrente en vol au démarrage est ré-armée, jamais échouée (mika#2575)
+
+**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
+déplacée.** Cette entrée est ici parce que l'opérateur qui constate qu'un scan
+récurrent a cessé de tirer cherche dans ce voisinage.
+
+- **Le défaut, mesuré deux fois.** `wip_rescue` mort **~28 h** : la ligne
+  `ce90ad84` avait tiré à 2026-09-28T17:00:00Z, le restart n°11 l'a surprise
+  `in_progress`, elle est passée `failed` à 17:01:21Z — **une seconde après**
+  `mika-spirit starting` — et six restarts successifs ont été **refusés** par la
+  garde anti-zombie mika#1742 jusqu'à expiration de sa fenêtre de 24 h (le n°18
+  l'a ratée de 37 s). Seconde occurrence, autre label et autre agent : le
+  `heartbeat` de **mika-arch** (`2b71969e`), ~24,5 h le 2026-09-25. La classe
+  « toute récurrente » est donc **mesurée**, pas inférée.
+
+- **La chaîne, et aucun maillon n'est fautif isolément.** L'enregistrement des
+  récurrentes tourne **avant** le balayage de démarrage ; la garde anti-zombie
+  ne cherche que `('failed','cancelled','expired')`, donc `in_progress` lui est
+  invisible et elle ne refuse rien ; l'`INSERT OR IGNORE` entre en collision
+  avec l'index unique, qui couvre `in_progress`, donc « existe déjà », **aucune
+  ligne neuve** ; le balayage passe ensuite la ligne vivante à `failed` ; le tas
+  ne charge que `('pending','recurring_active')`, donc elle n'y entre pas ; et
+  **au démarrage suivant la garde voit ce `failed` dans sa fenêtre et refuse
+  pendant 24 h**. C'est un **ordre**, et le dernier maillon transforme une panne
+  d'un cycle en panne d'une journée.
+
+- **Le remède : cesser d'écrire un état terminal sur cette classe.** Pour une
+  récurrente, `in_progress` est un **état de tir transitoire** — `claim_and_fire_task`
+  le pose le temps du tir, `update_task_rescheduled` repose `recurring_active` au
+  retour. Le balayage la **ré-arme** donc (instant recalculé depuis le cron,
+  `recurring_active`), **dans le même démarrage**, par le même primitif que le
+  tir nominal. La garde mika#1742 n'est ni modifiée, ni exemptée, ni contournée :
+  elle cesse simplement d'avoir une population que le démarrage fabriquait.
+
+- **Repli nommé.** Cron absent ou illisible ⇒ la ligne retombe sur `failed`,
+  comportement d'avant le correctif, avec un motif — et la garde s'arme alors
+  **légitimement** : une récurrente dont le cron ne se calcule pas ne doit pas se
+  ré-inscrire toutes les minutes.
+
+- **Mode CLI : aucune écriture.** `mika chat` exécute le même balayage contre la
+  base **partagée** avec le démon ; il ne peut pas savoir si celui-ci tire en ce
+  moment et n'exécutera de toute façon pas le scan qu'il replanifierait. La ligne
+  est laissée `in_progress`, intacte — amélioration stricte sur le `failed`
+  d'aujourd'hui, qui tuait le scan du démon depuis le CLI.
+
+- **Aucune réparation rétroactive.** `ce90ad84` et ses semblables restent
+  `failed` : réécrire après coup un état terminal rendrait faux ce que la ligne a
+  dit à l'instant où elle a été écrite (motif mika#2361). Le geste existe :
+  `mika tasks rearm <label>` (mika#2446).
+
+### Surfaces opérateur
+
+```bash
+# 1. Quelles récurrentes le démarrage a-t-il ré-armées ?
+grep recurring_restored_after_restart "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, label, cron_expr, previous_next_fire_at, next_fire_at}'
+
+# 2. CONTRÔLE NÉGATIF — un cron illisible a-t-il fait retomber une ligne ?
+grep recurring_restore_failed_no_cron "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — la garde mika#1742 s'arme-t-elle encore sur ce chemin ?
+grep 'mika#1742: refusing to re-register' "$MIKA_SPIRIT_LOG_FILE" | tail
+```
+
+```sql
+-- La sonde du ticket, mot pour mot
+SELECT label FROM tasks
+ WHERE trigger_type = 'recurring' AND status = 'recurring_active'
+   AND agent_id = 'mika-dev';
+-- doit contenir wip_rescue, auto_pull_groomed, qa_review_reconcile, worktree_reap
+
+-- Les deux issues du ré-armement, soustractibles en une requête
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'recurring_restart_restore' GROUP BY 1;
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `recurring_restored_after_restart` | INFO | **non vide, faible** | une ligne par récurrente en vol au restart — chacune est un scan que le redémarrage n'a pas tué |
+| `recurring_restore_failed_no_cron` | WARN | **vide** | le cron est cassé, et c'est *lui* qu'il faut lire |
+| `recurring_restore_skipped_cli` | DEBUG | — | population CLI, sans conduite associée : non instrumentée |
+
+Les deux populations sont soustractibles parce que `recurring_restart_restore` a
+un **écrivain unique** (scan de source, allowlist livrée vide) — motif
+`ready_label_outcome` (mika#2323) : un seul nom, l'issue dans `after_value`,
+plutôt que deux noms, parce que les deux issues appartiennent au même site et à
+la même population. La ligne INFO porte `last_fire` et **non** `fired_at` : ce
+site replanifie, il ne tire pas, et mika#2133 réserve `fired_at` au dernier tir.
+
+### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi**. Après `make deploy`,
+> vérifier que le `mika-spirit` qui tourne est bien celui qu'on vient de bâtir
+> avant toute conclusion (classe mika#2340).
+
+**S1 — le défaut fondateur ne se rejoue pas (premier restart en vol).**
+Redémarrer `mika-spirit` pendant qu'une récurrente est `in_progress` (le plus
+simple : un restart dans la fenêtre de 900 s d'un tir `wip_rescue`). Attendu :
+une ligne `recurring_restored_after_restart` pour ce label, les quatre labels
+dans la requête SQL, et le tick suivant du scan a lieu.
+**Halte 1 — la ligne est absente et le scan est mort.** Ne pas toucher au
+prédicat : vérifier d'abord que le binaire servi porte le correctif, puis que la
+ligne était bien `in_progress` et non déjà `failed` d'un restart antérieur — une
+ligne déjà empoisonnée relève de `mika tasks rearm`, pas de ce correctif.
+
+**S2 — la garde mika#1742 ne s'arme plus sur ce chemin (7 jours).** Aucun
+`refusing to re-register` sur un label dont le dernier état était `in_progress`
+à l'arrêt.
+**Halte 2 — elle s'arme encore.** Lire l'`after_value` de la ligne d'audit : un
+`failed_no_cron` explique le refus et il est **légitime** ; en son absence, un
+autre site écrit un état terminal sur ces lignes — l'établir **avant** d'élargir
+quoi que ce soit.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun
+`recurring_restore_failed_no_cron`, et aucune récurrente ré-armée avec un
+`next_fire_at` **passé**.
+**Halte 3 — un `next_fire_at` passé apparaît.** Le calcul ne passe pas par le
+lecteur unique ou la timezone n'est pas lue : réparer le calcul, ne pas compenser
+à l'affichage.
+
+**S4 — contrôle négatif de la population non récurrente (7 jours).** Une tâche
+`time`, `event` ou `callback` interrompue au démarrage reste `failed`.
+**Halte 4 — une tâche à un coup ressort `recurring_active`.** La branche mord
+trop large ; désarmer par revert **avant** diagnostic — un tir à un coup rejoué
+est un effet de bord qu'aucun seuil ne corrige.
+
+**S5 — le régime de ré-armement reste faible (30 jours).** Le compte
+`recurring_restart_restore` groupé par label, rapporté au nombre de restarts.
+**Halte 5 — un label domine largement les autres.** Ce n'est pas une panne de ce
+correctif : c'est la mesure qui conditionne le suivi « borner les interruptions
+répétées ». L'ouvrir **avec ce compte**, et surtout ne pas rétablir le `failed`
+par réflexe — il ne fermerait rien et rouvrirait mika#2575.
+
+**Halte transverse — les sondes muettes.** Zéro ligne de ré-armement **et** zéro
+refus de mika#1742 ne prouve rien tant qu'aucun restart n'est tombé pendant un
+tir. Vérifier qu'un tel restart s'est produit avant toute conclusion : *une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+Aucun scan n'est rendu plus fiable : ce qui change est qu'un redémarrage cesse de
+le tuer, et rien ici ne rend le processus plus stable. Aucun compteur
+d'interruptions n'est ajouté — refus mesuré : aucun mécanisme n'existe par lequel
+un scan tuerait le process (`fire_task` dispatche dans un `tokio::spawn`, les
+scans shellent via `tokio::process`), la cause réelle est externe (SIGTERM de
+déploiement, opérateur, OOM killer), et un compteur à seuil bas se déclencherait
+sur le régime **sain** — `wip_rescue` a un cron de 5 min et un tir pouvant durer
+~900 s, donc sur un hôte qui redémarre plusieurs fois dans l'heure trois
+interruptions consécutives sont banales, et un budget de 3 tuerait le scan pour
+24 h un jour de déploiement, c'est-à-dire **rouvrirait ce défaut sous un autre
+nom**. Les deux occurrences mesurées ne sont pas rattrapées : fabriquer une ligne
+décrivant un ré-armement qui n'a pas eu lieu serait l'inverse de ce que ce
+travail défend. Et le champ devient lisible, il ne devient pas surveillé — les
+seuls instruments sont les greps et la requête ci-dessus, dont **le silence ne
+prouve rien tant que personne ne les exécute**.
+
+### Hors périmètre, délibérément
+
+- **La garde mika#1742 et ses quatre exemptions** (config-cancel mika#2271,
+  unknown-trigger mika#2337, relèvement opérateur mika#2446,
+  `RECURRING_ZOMBIE_GRACE_HOURS`) : inchangées.
+- **Le réordonnancement de `run_server`** : refusé — déplacer le balayage avant
+  l'enregistrement ferait lire à la garde un `failed` vieux de quelques
+  millisecondes, donc déclencherait le refus **dans le même démarrage** au lieu
+  du suivant, convertissant une panne d'un cycle en panne immédiate de 24 h.
+- **Le gating CLI de la boucle générique pour les tâches NON récurrentes.**
+  `mika chat` peut encore marquer `failed` une tâche `time` / `event` /
+  `callback` vivante du démon. Population distincte, rayon de souffle distinct, et
+  le remède demande de décider ce qu'un CLI a le droit de balayer dans la base
+  d'un démon vivant. **Ticket de suivi**, précondition : une mesure montrant
+  qu'une tâche vivante a été fauchée par une invocation CLI.
+- **Les récurrentes portant un `timeout_at`.** L'étape 1 (`mark_tasks_expired`)
+  précède le balayage et écrit `expired`, que la garde compte aussi. Les sept
+  récurrentes du démarrage ont `timeout_at: None`, donc cette population est vide
+  pour elles ; une récurrente créée par l'outil de planification avec un
+  `timeout_at` échapperait à ce correctif. Limite **nommée**, non couverte.
+
 Optional (callback watchdog):
 - `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
 - `MIKA_CHILDLESS_PARENT_REAPER_GRACE_SECS` — Grace window (seconds) before the childless-parent reaper transitions a `self_dev` **issue** parent left `in_progress` with **zero** callback children to `failed` (default: 1800, 30 min). The deterministic backstop for silent pilot death (#1687): a parent that reached `in_progress` without ever recording a callback child falls through both orphan reapers (they INNER-JOIN a delivered callback child) and the watchdog (it keys off the callback child's PID). Deliberately far larger than the orphan reaper's 600s grace because a legitimately-dispatching parent is childless only for the sub-second window between its `pending → in_progress` transition and the callback-child row commit. Invalid/≤0 values fall back to the default (WARN-logged). Runs every 60-tick DB scan. Grep `task_engine_childless_reaper.reaped` in `$MIKA_SPIRIT_LOG_FILE` for each silent-pilot death made visible + terminal; sustained >5/day signals an upstream dispatch-path root cause (this reaper is the visibility/terminal backstop, not the primary fix).
