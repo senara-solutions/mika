@@ -1,9 +1,16 @@
 //! Cadence — event-driven + 6h plancher heartbeat orchestration.
 //!
-//! **LECTURE SEULE.** The only outbound side effect is a `POST` to a
+//! **LECTURE SEULE.** The outbound side effect of *this file* is a `POST` to a
 //! well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2
 //! pattern), or an offline sink write when the URL is unset. No GitHub
 //! writes, no dispatch, no ticket mutations.
+//!
+//! Since mika#1990 the module has a **second** outbound channel, and it does not
+//! live here: the liveness beat of [`super::liveness`], one light `POST` per
+//! successful poll tick. Distinct endpoint, distinct cadence (5 min against 6 h),
+//! distinct body — which is why `DeliveryBody` gained no field. The LECTURE-SEULE
+//! contract is unchanged: a beat writes on no forge and says nothing about a
+//! ticket.
 //!
 //! Cadence contract per brief § Ratification verdict 2:
 //! - Event-driven: fires when observed milestone state differs from last snapshot.
@@ -61,6 +68,18 @@ pub struct ManagerConfig {
     /// en vigueur — et une provenance fausse est strictement pire qu'aucune
     /// provenance (mika#2293).
     pub sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource,
+    /// Endpoint du battement de vivacité, **déclaré** par
+    /// `MIKA_MANAGER_LIVENESS_URL` (mika#1990).
+    ///
+    /// Jamais composé depuis `delivery_url` ni depuis `health_url` : les trois
+    /// URLs désignent trois routes de formes et de sémantiques distinctes, et
+    /// `health_url` est même de sens **inverse** (on y lit la santé de
+    /// l'exécuteur ; ici on écrit la nôtre). Voir
+    /// [`super::liveness`] pour le raisonnement complet.
+    ///
+    /// Absente ou vide ⇒ canal désarmé : zéro POST, zéro erreur. C'est aussi le
+    /// rollback — retirer la variable désarme sans redéploiement.
+    pub liveness_url: Option<String>,
 }
 
 // ---- mika#2267 C4 — `route` est un format de fil ---------------------------
@@ -813,6 +832,9 @@ mod tests {
             checkpoint_dir: dir.join("checkpoints"),
             offline_sink_dir: dir.join("sink"),
             sink_dir_source: crate::milestone_manager::sink_dir::SinkDirSource::Default,
+            // Le battement de liveness (mika#1990) est un canal distinct du POST
+            // de rapport : aucun test de cadence ne l'exerce, d'où `None`.
+            liveness_url: None,
         }
     }
 

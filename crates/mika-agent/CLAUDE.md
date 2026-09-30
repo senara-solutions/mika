@@ -895,6 +895,28 @@ signal that would show it.
 
 **It evaluates; it does not merge (mika#2248).** On every gate cleared it emits a `MergeReadySignal` and returns; the merge belongs to `server::merge_ready_handler` (next section). The reason is the routing table, not style: `check_suite.completed(success)` routes to `mika-dev` **and** fans out to `mika-qa` (`secondary_targets`, mika#1711), both run this handler, and a `gh pr merge` issued here runs under the token of whichever agent won the race. Measured 2026-09-08 on mika#2244 — `mergedBy = mika-platform-qa`, the reviewer closing its own approval, with no handoff to the dispatcher that owns the cycle. The absence of a `run_gh_merge` callsite in this file is asserted by `tests/eval/test_ci_success_handler.rs`, and `tests/eval/test_merge_identity_2248.rs` asserts the gates still precede the signal. **Operator grep signal:** `ci_success_merge_ready` (INFO + `audit_events` row keyed `pr:{repo}#{n}@{head_sha}`). Note the prompt layer was already right here and could not help: `qa-review-webhook-success` tells mika-qa "never … merge tools", and mika-qa's allowlist carries neither `self-dev-webhook-ci` nor `self-dev-webhook-qa` — this handler runs before the LLM turn and is unaffected by either.
 
+**Entry gate — only the dispatcher evaluates (mika#2260).** `try_handle_ci_success` refuses in its own head when `owns_merge_transition(db.agent_id())` is false: `Passthrough { enrichment: None }`, one `ci_success_handler_skipped_not_merge_actor` audit row, and nothing else. The placement is the deliverable — after the event-type selection, **before** the `evaluating` log line, the token requirement, the first `gh` call, the dedup write and every existing audit row.
+
+**What it closes, and why the mika#2248 belt was not enough.** #2248 put identity at the **exit** (who merges) and left it absent from the **entry** (who this evaluation exists for). So the reviewer walked the whole evaluator — up to emitting the signal — and was only held at the actor. Measured 2026-09-09/10 on `audit_events`: mika-qa traversed the evaluator **81 times**, held the DECISION-CORE gate **6 times** (six duplicate operator notifications), emitted the signal once on mika#2259, then was stopped. A race resolved by a **late** guard depends on order; this one removes the race.
+
+**The consequence the ticket feared without naming it, and it is a loop-stop class.** The in-memory dedup key one hop below is **process-global** and keyed `{repo}:{branch}:{head_sha}` with **no `agent_id`** (`check_suite_dedup::DEDUP_MAP`), so the reviewer entering first *consumed the dispatcher's slot*. On #2259, head `047e9eea`: mika-qa evaluated at 09:08:11 and registered the key; mika-dev's deferred replay at 09:08:26 came back `ci_success_dedup.skip`. Harmless there (checks still `pending`) — but at 09:12:36 every gate was green, and the dispatcher only evaluated because its copy landed **60.005 s** after the reviewer's registration against a 60 s window: **5 ms**. A deferral at 59.9 s instead, and mika-dev skips, no signal is emitted under an identity that can act, no further `check_suite` arrives on that head (all workflows are done), and **the PR stays green and open with nothing to close it.**
+
+**Four other side effects the reviewer exercised before the belt:** five `gh` calls per event under its PAT (`find_open_pr`, `find_pass_verdict`, `run_gh_checks`, `run_gh_pr_view`, `is_behind_main`); a `PUT /repos/{repo}/pulls/{n}/update-branch` **write** on the forge at step 5c if the PR was behind main — posted by the agent that must never act on that PR; the duplicate DECISION-CORE operator notification; and the evaluator's pre-digest **replacing** `req.text` in mika-qa's turn, so the reviewer received "Merge-ready signal emitted…" in place of the raw event `qa-review-webhook-success` is written for.
+
+**`Passthrough { enrichment: None }`, never `Handled`** — the reviewer's turn must see the **raw event**, which is that last effect. And no enrichment either: the reviewer's prompt already knows it does not merge, and telling it again only adds a second text to follow.
+
+**One whitelist, two names, two questions.** `owns_merge_transition` is `merge_disposition(agent) == Act` and lives next to it in `mika_common::forge_identity`; adding an actor stays one explicit gesture there and the entry gate inherits it with no second table. `merge_disposition` answers *who merges* (an actor decision); this one answers *does my evaluation have a consumer* (an entry decision). `forge_identity`'s layer table now carries four rows, not three.
+
+**The mika#2248 belt is untouched.** `merge_ready_handler::authorize_merge` (`WouldMergeAsReviewer` then `NotDispatcher`) and the `pr_merge_with_gate_reviewer_refused` tool refusal are unchanged. After this gate the reviewer's hold is unreachable in production; it remains the defence if a signal ever arrived by a path this evaluator did not post — which the module already says.
+
+**Three refusals this ticket declined**, each with its own reason: putting the gate in `handlers.rs` around the evaluator+actor pair (it would keep the evaluator literally "identity-free", but `handle_message`'s body is not unit-testable, so the gate would only be pinnable by a source scan — here the per-agent self-selection sits where the per-type self-selection already does, and T1 exercises it without network); removing mika-qa from the gateway fan-out (the reviewer needs the raw event to start the review — mika#1711, 14 h of dead QA window before it; the gate is agent-side, not routing-side); and adding `agent_id` to the dedup key (once the gate is posted a single agent reaches the dedup, so a multi-agent key would only re-authorise N evaluations if a second actor were ever whitelisted — which the whitelist makes deliberately costly. **T3, the gate-before-dedup scan, is the protection — not the key.**)
+
+**Operator grep signal:** `ci_success_handler_skipped_not_merge_actor` (INFO + an `audit_events` row of the same name — **SOLE WRITER**, pinned by `canonical_tokens::tests::mika2260_the_entry_gate_skip_name_has_a_single_writer` with an allowlist shipped empty, because AC6's measurement is only exact while one site writes it). `target_key = event:{repo}@{branch}` — the PR number is **not** known at that point and must not be: knowing it costs the first `gh` call, i.e. the side effect the gate removes; consequence worth knowing, the key carries no `head_sha`, so repeated refusals across distinct pushes on one branch are separable by `created_at` / `trace_id` rather than by `target_key`. Expected regime: **one line per non-dispatcher agent per event** — this is a counter, not an anomaly, and it is what AC6 measures. No dedup on it, deliberately.
+
+**The halt that matters, and it is the inverse of the obvious one.** Because the expected regime is non-zero, the failure mode *"the dispatcher itself is being turned away, so nothing merges any more and nothing errors"* lands **inside** the nominal counter. The shape that separates them is a **conjunction**: a non-zero skip count together with **zero** `ci_success_merge_ready` over a window in which PRs did go green means the loop has stopped merging. Read the skip rows' `agent_id` (in `reasoning`) before anything else: `mika-qa` is nominal, `mika-dev` is the halt. **Do not widen the whitelist reflexively** — a dispatcher being refused means `DISPATCHER_AGENT` no longer names the agent the gateway routes `check_suite` to, and the remedy is the routing or the provisioning, not the predicate. Note the actor-side row this displaces, `merge_ready_hold_not_dispatcher`, had an expected regime of **zero** and was therefore loud on its own; that loudness is what the entry gate trades away for the removed side effects, so the conjunction above is what replaces it.
+
+**Guards.** `tests/eval/test_ci_success_handler.rs`: T1 drives the three agents (`mika-qa`, `mika`, `mika-dev`) through one test — the positive control in the same breath, because a handler always returning `Passthrough { None }` would satisfy both negatives and be indistinguishable from the fix; T3 is a source scan pinning the gate's index strictly below `match github_token {`, `find_open_pr(`, `try_dedup_check_suite(` and `count_recent_audit_events_for_target(`, and it carries its **anti-vacuity** assertion (it fails when the symbol is absent from the body, because a scan aiming at a dead name reads exactly like a clean tree — class mika#2103/#2205). That scan is not decorative: rewriting the predicate inline as `merge_disposition(agent) != Act` leaves T1 and T2 **green** and only T3 red — verified by mutation. `tests/eval/test_ci_success_fanout_2260.rs`: T2 measures the attribution on `MultiAgentHarness` (mika#2265) in **both** patterns its doc-comment prescribes — deterministic order and `tokio::join!` race, *"#2248 is an order and #2260 is a race"* — with `cross_read_count` as the positive control of the mount itself, since two disjoint in-memory databases would make every assertion green while measuring nothing. **One rectification the implementation forced on the plan:** `audit_counts_by_agent` always returns one entry per mounted agent, zeros included, so the discrimination reads on the **values**, never on the map's cardinality; and with `token = None` nobody reaches `ci_success_handler_processed`, so that count is asserted as a non-regression control and explicitly **not** as a discriminant.
+
 **Burst dedup (mika#1869):** a single push fans out to up to 8 workflows, each firing its own `check_suite.completed(success)` webhook → N redundant walks of the full handler path that saturated mika-qa's mailbox (41 `rate_limit_trip`/h baseline). Two `head_sha`-keyed layers, placed right after `find_open_pr` resolves `head_sha`, collapse the burst to one merge evaluation: (1) an in-memory precise gate (`server::check_suite_dedup::try_dedup_check_suite`, bounded 1000-entry DashMap, 10-min TTL, 60s window) and (2) an audit-durable gate (`ci_success_handler_processed` marker rows queried via `count_recent_audit_events_for_target`, keyed `pr:{repo}#{n}@{head_sha}`) that survives a process restart the in-memory map cannot. Both key on `(repo, branch, head_sha)`, so genuine distinct pushes (new `head_sha`) are never conflated; the audit read fails open. **Operator grep signals:** `ci_success_dedup.skip` (in-memory gate fired) and `ci_success_handler.dedup_skip` (audit gate fired) in `$MIKA_SPIRIT_LOG_FILE`.
 
 ### Merge Actor (mika#2248)
@@ -904,6 +926,8 @@ signal that would show it.
 Four conditions, all necessary, in order: (1) a re-parseable signal (`mika_common::forge_identity::parse_merge_ready_signal`); (2) the running agent is not the reviewer named **in the signal** (`would_merge_as_reviewer` — AC1 enforced at runtime, not only in a routing table); (3) the running agent is the dispatcher (`merge_disposition`, an **allowlist** — an unknown agent holds, it does not merge); (4) the perimeter re-verified here, fail-closed and bounded at 60s, so a signal arriving by any other path still cannot close a DECISION-CORE PR. The merge then runs under the running agent's own token, which is what makes `mergedBy` deterministic.
 
 The policy itself lives in `mika_common::forge_identity` — shared with `mika-gateway`, whose `QA_REVIEWER_LOGIN` is the same constant, because the login that decides who may *review* is the login that must not *merge*.
+
+**Entry gate (mika#2260) — this belt is now the second line, not the first.** Since the evaluator refuses in its own head for any agent outside the merge whitelist (§ *Structural CI Success Handler* above), conditions (2) and (3) here are **unreachable in production**: no non-dispatcher gets far enough to emit a signal. They are kept because they guard a different population — a signal arriving by a path the evaluator did not post — and because the mika#2248 tests exercise them by calling the actor directly, which the gate does not touch. Read the two together as *the gate removes the race, the belt survives it*: a `merge_ready_hold_reviewer_is_not_merge_actor` row appearing after mika#2260 is deployed is no longer a nominal race outcome but a signal from an unaccounted-for producer, and worth reading as such.
 
 **Why the signal is not a `merge-ready` label.** Two measured reasons. Permission: a label write under the resolved PAT fails (`Resource not accessible by personal access token (addLabelsToLabelable)`, 29 refusals measured 2026-09-07, mika#2228), so the signal would need a second token and therefore a second failure mode on the critical path. Authority: a label is human-writable, which would turn an interface gesture into a merge authorization able to bypass the DECISION-CORE gate.
 
@@ -1339,6 +1363,139 @@ Config, the operator surfaces, the four probes (starting with *run in `observe`
 first*) and the four halts: root `CLAUDE.md` § *Optional (purge du `target/` d'un
 worktree vif — mika#2497)*.
 
+### Un hold explicite tient contre `wip_rescue` (mika#2597)
+
+**Le défaut, mesuré le 2026-09-29.** `wip_rescue` a repris une PR maintenue en
+**brouillon de hold**, l'a rebasée puis **sortie du brouillon** — deux fois en
+35 minutes sur PR #2589, la seconde après une remise en draft explicite de
+l'orchestrateur. La Fire-Disposition du plan interdisait la fusion (rebuild
++190 %, au-delà du seuil de renoncement de +50 %). **Le merge autonome n'a été
+empêché que parce que le diff touchait des fichiers decision-core** : sur un
+autre jeu de fichiers la PR était CLEAN et APPROVED. La défense en profondeur a
+tenu par coïncidence de périmètre, pas par conception.
+
+**Le discriminant que le démon n'avait pas.** Un *draft de rescue* est l'état de
+**départ** — `dispatch-lib` fait `gh pr create --draft` — et le promouvoir est la
+raison d'être de mika#1852. Un *draft de hold* est un état **remis après** le
+travail. Les deux se lisent `isDraft: true` et rien ne les séparait.
+
+**Le prédicat ne compare aucun instant, et c'est le cœur.** La timeline d'une PR
+de rescue ne porte **aucun** `ConvertToDraftEvent` à la naissance ; les deux
+seules transitions d'état draft sont `ConvertToDraftEvent` et
+`ReadyForReviewEvent` ; et le listing filtre déjà `--draft`. Donc une PR qui
+porte ≥ 1 `ConvertToDraftEvent` **et** qui est brouillon *maintenant* a
+forcément eu son dernier basculement **vers** le brouillon : c'est un hold.
+Aucune date, aucun ordre, aucune pagination. *Fragilité nommée* : retirer
+`--draft` du listing casse l'équivalence — le sens de la casse est l'inertie, pas
+la violation, et `mika2597_le_listing_filtre_toujours_draft` refuse l'édition.
+
+**Les deux pistes du ticket sont réfutées par le code.** (a) *« un
+`ConvertToDraftEvent` postérieur au dernier push »* s'auto-annule :
+`prepare_branch` **pousse lui-même** en `--force-with-lease` à l'étape 4, avant
+l'un-draft de l'étape 7, dans la même chaîne — le prédicat serait voidé par le
+push du démon en train de violer le hold ; et un push ultérieur ne lève pas une
+décision d'opérateur. (b) *un label porteur* exigerait que l'opérateur apprenne
+un **nouveau** geste alors que celui qui a échoué deux fois est « je remets en
+draft », et il faudrait le déclarer dans `.github/labels.yml` sous peine de
+suppression silencieuse par `delete-other-labels: true` (classe à cinq
+occurrences). `human-review-required` est refusé comme support : il porte **sa
+propre cause** (« le démon a bailé »), et y router un hold d'opérateur
+fusionnerait deux populations que le dépôt compte séparément.
+
+**Le placement EST le livrable.** Le terme vit dans `select_eligible`, en
+**troisième et dernière** exclusion (après le marqueur de bail mika#2199 et le
+marqueur de park mika#2286), **jamais** dans `resume_chain`. Le scan traite au
+plus **un brouillon par tick** (AC6 de mika#1852, cap = 1, le plus vieux
+d'abord) : un hold placé dans la chaîne consommerait ce créneau unique à chaque
+tick, indéfiniment — et un brouillon de hold est *vieux par nature*, donc il
+reste le plus ancien candidat pour toujours. C'est la forme de livelock que
+mika#2199 a mesurée (14 bails sur une PR en six heures) et que mika#2286 a dû
+refermer une seconde fois. Coût : **un** appel GraphQL par tick en régime
+nominal, grâce au court-circuit sur le premier candidat non exclu.
+
+**GraphQL et pas la timeline REST**, qui a pourtant un lecteur maison
+(`ready_label::TimelinePageFetcher`) : c'est mika#2315 qui l'écarte. Son défaut
+B1 mesuré est que REST rend ses événements en ordre **ascendant**, donc un
+événement récent vit en dernière page — d'où sa pagination explicite et son
+plafond de 20 pages. Transposé ici : jusqu'à 20 `gh api` par candidat et par tick
+(cron 5 min). Le `last: 1` retire d'un coup le piège de l'ordre, la pagination et
+le plafond. Réutilisation : `github_graphql::fetch_convert_to_draft_events`, dans
+la forme exacte de `fetch_open_blockers` (même client, même classification
+401/403/429).
+
+**Trois états, jamais un `bool` (`HoldVerdict`).** `NotHeld` (comportement
+d'aujourd'hui, octet pour octet) / `Held { since, actor }` / `Unreadable`. Deux
+des trois excluent et appellent des remèdes **opposés** : l'un dit que le
+mécanisme marche, l'autre que `wip_rescue` est gelé par son propre fail-closed et
+que la cause est le jeton ou l'API. Un booléen ferait lire le second comme le
+premier. **Fail-closed vers « tenu »** — *un terme qu'on ne peut pas lire n'est
+jamais un terme satisfait* (mika#2277), ici appliqué au terme « ce brouillon
+n'est **pas** tenu ». C'est aussi la politique **uniforme** du module :
+`has_bailed_marker`, `has_parked_marker`, `classify_route` et
+`fresh_pipeline_verified` sont tous les quatre fail-closed. Coût nommé : une
+panne durable de l'API GitHub gèle `wip_rescue` en entier, d'où le nom
+d'événement distinct pour l'inertie.
+
+**Pas de filtre d'acteur machine, et c'est une décision.** mika#2315 en porte un
+parce que son propre `remove → add` se parquerait lui-même ; ici **aucun** chemin
+n'écrit de `ConvertToDraftEvent`, donc le terme aurait une population vide — et
+si une machine s'y mettait, lire son geste comme un hold est le sens **sûr**.
+L'acteur et l'instant sont **rapportés** sur la ligne d'observabilité sans rien
+décider, ce qui rend visible le jour où cette population cesse d'être vide.
+
+**Sortie du hold : aucun geste à apprendre, aucun état à nettoyer.** L'opérateur
+sort la PR du brouillon ; elle quitte le listing `--draft` et donc la population
+entière. Le hold n'existe que tant que la PR *est* un brouillon — il se lève de
+lui-même, comme le park de mika#2315. C'est ce qui distingue ce remède d'un
+marqueur durable : il n'y a rien à effacer.
+
+**Deux noms, comptables séparément.** `wip_rescue_hold_respected` (INFO + ligne
+d'audit, **régime attendu non vide** — chaque ligne est un hold que le démon n'a
+pas violé) et `wip_rescue_hold_unreadable` (WARN + ligne d'audit, **régime
+attendu vide**). Motif `phantom_aged_out` / `phantom_sweep_spared` (mika#2156) :
+les fondre ferait lire une panne comme un succès. Dédupliqués par `(PR, motif)`
+sur 24 h — un hold est un **état**, pas un événement, et un brouillon tenu trois
+semaines écrirait sinon 288 lignes/jour (doctrine mika#2131, forme exacte de
+`worktree_reap_skipped`). La clé porte le motif après un `@`, ce qui rend un
+`LIKE` de préfixe sûr (mika#2361 : `#234` ne doit pas apparier `#2343`). La ligne
+INFO suit la **même** porte que la ligne d'audit, comme chez son voisin
+`worktree_reaper::record_main_checkout_dirty` — coût nommé : une base illisible
+est aussi un hold non rapporté, ce qui est un incident en soi et ne change
+**jamais** la décision.
+
+**Deux scans de source, allowlists livrées vides.**
+`mika2597_un_seul_site_dundraft_en_production` refuse un second `gh pr ready` en
+production — aucun test comportemental ne peut voir cette classe : un second site
+ne rend **aucune** décision fausse le jour où il est écrit, toutes les assertions
+restent vertes pendant qu'un chemin un-drafte sans consulter le hold. L'aiguille
+est cherchée sur une source **normalisée en espaces**, donc rustfmt ne peut pas
+la cacher ; `validate_pr_ready_undraft_scope` (mika#1682) compare
+`verb == "ready"` à une variable et sort de la population **par sa forme**, pas
+par une exemption. Quand il tire, **on route le nouveau site par la garde ; on
+n'ajoute pas de ligne** (doctrine mika#2201).
+`mika2597_le_listing_filtre_toujours_draft` épingle la prémisse ci-dessus.
+
+**Le contrôle négatif V3 est porteur** : sans lui, « la garde décide » est
+indistinguable de « la garde bloque tout », et le mécanisme mika#1852 pourrait
+être mort avec tous les tests au vert. Chaque terme a été vu **rouge par
+mutation**, un à la fois — une conjonction de termes fail-safe ne se prouve pas
+en les neutralisant tous ensemble (leçon mika#2277).
+
+**Ce que ce travail ne fait PAS.** Il ne rattrape pas l'incident fondateur :
+mika#2589 a été sortie du brouillon deux fois et **rien ici ne réécrit une ligne
+d'audit datée d'un hold qu'on n'a pas observé** — la sonde est la **prochaine**
+occurrence. Il ne ferme pas le chemin `gh pr ready` d'un modèle sur une PR **hors
+signature `wip-rescue`** : mika#1682 le couvre déjà sur la population mesurée
+(#2589 porte le label), et l'élargir coûterait un appel timeline sur *chaque*
+`gh pr ready` pour une population dont aucune violation n'est mesurée — armer un
+détecteur sur du vide est ce que mika#2520 refuse (**suivi nommé**, précondition
+écrite). Il ne retire pas le palliatif à trois couches, et il ne touche pas le
+bypass admin de l'identité du pilote — les deux moitiés tombent séparément.
+Aucune valeur de réglage ne bouge, aucune migration, aucune variable neuve.
+
+Surfaces opérateur, régimes attendus, sondes et haltes : racine `CLAUDE.md`
+§ Signal N.
+
 ### Unknown-Trigger Veto Lift (mika#2337)
 
 **The failure this closes is a veto, not a missing wire.** A `run_skill` recurrence
@@ -1418,7 +1575,19 @@ through the gateway's `GET /admin/tenants/{customer_id}/recurring-tasks`
 
 ### Structural CI Failure Handler
 
-`server::ci_failure_handler` — intercepts `check_suite.completed(failure|timed_out)` webhook events **before** the LLM turn. Failure-side companion to `ci_success_handler`. Matches CI failures to open PRs and existing work items, fetches failing-job context (up to 3 jobs, 100 lines each), and constructs a pre-digest instructing the LLM to dispatch `run_claude_pilot` for an autonomous fix. Circuit breaker: `ci_fix_count >= 2` in task metadata triggers escalation instead of dispatch — the handler increments `ci_fix_count` deterministically (not reliant on LLM). Checks both task-level callback children and global dispatch guard, including results in the pre-digest. Reuses `VerdictAction`, `find_open_pr`, `run_gh_checks`/`classify_checks`, and `has_active_callback_child` from sibling modules. Also fixes `CHECK_SUITE_RE` regex in `webhook_queue.rs` to match actual gateway format (was `Check suite (failure)`, corrected to `Check suite failure`). Order-independent with other handlers. 30s timeout per subprocess call. See #594.
+`server::ci_failure_handler` — intercepts `check_suite.completed(failure|timed_out)` webhook events **before** the LLM turn. Failure-side companion to `ci_success_handler`.
+
+**Surface-for-adoption on the no-task arm (mika#1745).** Step 4's `None` arm — a CI failure on an open PR that no mika task matches — used to return `Passthrough { enrichment: None }`, i.e. hand the model the raw webhook text under a prompt whose decision table says *"ignore: this CI failure is not from our work"*. `surface_for_adoption` replaces that silence, and it is written **here** rather than in the prompt for the reason mika#2120 measured (nine recurrences under prompt enforcement against zero when the fact is posed by code).
+
+**Additive, and `Passthrough` never `Handled`** — `Handled` would tell the LLM an action was taken, and AC3 forbids automatic adoption: no task is created, no dispatch is triggered, no status is written, no process is signalled. Three surfaces, of which the first two hold whatever the model does: an `audit_events` row, an operator notification, and an `enrichment` the LLM reads (the intent half).
+
+**The ownership list is `DISPATCHABLE_REPOS`, and that is a decision.** Two lists exist and they answer different questions: the gateway's `INTERNAL_REPOS` decides which repositories **route** to mika-dev (it carries `claude-pilot-py` and `wizzard`), `DISPATCHABLE_REPOS` decides where the loop may **dispatch**. AC1's list is the second, because the surface *proposes an action* — "create a task from this event and engage" — and that list is the one answering whether the proposal is executable. Surfacing `claude-pilot-py` would put a proposal in front of the operator that the mika#2046 gate refuses structurally, so that repository belongs to **AC4 (silent-stop)**. No third list: that would be the programmed divergence this repo has paid for twice (dispatch seats mika#2092, `DISPATCHABLE_REPOS` ↔ `labels.yml`).
+
+**Every term is fail-safe towards today's silence**, and each was seen red by individual mutation — a conjunction of fail-safe terms is not proven by neutralising them all at once (the mika#2277 lesson). A repository that is not dispatchable, an unreadable `head_sha`, an unreadable `audit_events`: each falls back on the pre-mika#1745 behaviour. `is_already_surfaced` takes the `Result` rather than a count so the fail-open half is a property of a pure function instead of a branch no in-memory test can reach.
+
+**Detection is unconditional; only the notification is gated** (`MIKA_SURFACE_FOR_ADOPTION`, default armed, motif mika#2249/#2272). **SOLE WRITER** of `surface_for_adoption` in the log and in `audit_events`, held by `canonical_tokens::tests::mika1745_the_surface_name_has_a_single_writer` with an allowlist shipped empty — that property is what makes the operator's `GROUP BY target_key` exact, and that count is the explicit precondition of the auto-adoption decision AC3 defers. **Named blind spot, inherited:** `production_sources()` truncates each file at the first textual `#[cfg(test)]` *wherever it is*, including inside a doc-comment, so a second writer planted in `webhook_dispatch.rs` (which cites one on line 110) is invisible to that scan — verified by mutation. The limit is shared by every scan in that module and is not mika#1745's perimeter; what makes it bearable is `mika1745_the_writer_predicate_sees_a_bare_literal`, which attests the **predicate** bites independently of what the enumerator feeds it.
+
+Doctrine, the three verification cases with their rectified status (AC-R), operator surfaces and the four post-deploy halts: `docs/architecture/mika-dev-work-assignment.md`. Matches CI failures to open PRs and existing work items, fetches failing-job context (up to 3 jobs, 100 lines each), and constructs a pre-digest instructing the LLM to dispatch `run_claude_pilot` for an autonomous fix. Circuit breaker: `ci_fix_count >= 2` in task metadata triggers escalation instead of dispatch — the handler increments `ci_fix_count` deterministically (not reliant on LLM). Checks both task-level callback children and global dispatch guard, including results in the pre-digest. Reuses `VerdictAction`, `find_open_pr`, `run_gh_checks`/`classify_checks`, and `has_active_callback_child` from sibling modules. Also fixes `CHECK_SUITE_RE` regex in `webhook_queue.rs` to match actual gateway format (was `Check suite (failure)`, corrected to `Check suite failure`). Order-independent with other handlers. 30s timeout per subprocess call. See #594.
 
 ### Webhook Deferral Queue
 
@@ -1631,7 +1800,7 @@ worse than the silence it replaces.
 
 ## Milestone Manager (Phase 1)
 
-`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge; the only outbound side effect is a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset.
+`src/milestone_manager/` — milestone-scope operational coordinator (`mika-manager` entity, distinct from `mika-prime`). Ratified 2026-08-21 by Vincent + Prime (5 verdicts, brief at `mika-platform/docs/brainstorms/2026-08-21-mika-manager-de-milestones-design-brief.md`). **LECTURE seule** — zero dispatch, zero ticket mutation, zero PR merge. **Two** outbound side effects, both towards the control-monitor and neither a forge write: a report `POST` to a well-known delivery endpoint (Prime→sami→Vincent per D8 subsystem-2 pattern) or an offline sink write when the URL is unset, and — since mika#1990 — a **liveness beat**, one light `POST` per successful poll tick (§ *Liveness beat* below). Both are declared in `docs/egress/egress-manifest.toml`.
 
 **Three composers + one loop.** `Reader` (`reader.rs`) wraps `gh` CLI (`api`/`issue list`/`pr list`) mirroring the `auto_pull::gh_list_open_issues` subprocess shape and composes `MilestoneState` (sub-issues + progress counts + recent activity). `Assessor` (`assessor.rs`) applies four rules (stale-blocker, silent-progress, silence-in-JOURS, priority ranking) and classifies `Severity` (Healthy/Attention/Blocked). `Reporter` (`reporter.rs`) formats the § 2d Markdown report. `run_manager_cycle` in `cadence.rs` orchestrates read→assess→deliver with hybrid cadence: event-driven trigger on `state_digest` change + 6h plancher heartbeat (« l'absence d'event EST l'event »).
 
@@ -1661,7 +1830,104 @@ worse than the silence it replaces.
 
 **Out of scope, named.** The sink has **no rotation** and grows unbounded; the reader makes the volume visible, which is the precondition for deciding on rotation — a follow-up ticket if the probe shows a problematic volume. And `emit_auth_alarm` (`spawn.rs`) still writes **nothing** to the sink when `escalation_url` is unset: it returns early and only the `error!` survives. A real hole, found on the way and deliberately **distinct** — a lost report is not a lost alarm, and fixing it requires deciding what an alarm in a well even means. **Follow-up ticket.**
 
-**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`). **All ten are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
+### Liveness beat — the freshness beats at the poll's pace (mika#1990)
+
+`milestone_manager/liveness.rs` — one light `POST` per **successful** poll tick on
+`MIKA_MANAGER_LIVENESS_URL`, so the cm registry sees a 5-min sign of life instead of
+one every 6 hours.
+
+**The defect.** The manager polls every 5 min and posted **nothing** until it
+delivered — delivery being hybrid (`state_changed || heartbeat_fired`, the second on
+a **6 h** floor). Between two legitimate beats the registry received no sign of life,
+the entity's freshness went RED, and the nudge-scanner would cry wolf on its first
+scan while the cadence was running perfectly.
+
+**A distinct channel, never a field on `DeliveryBody`.** That struct is a wire format
+cm consumes, and the *freshness* does not read in a 30 KB report posted four times a
+day. Distinct endpoint, minimal body, one beat per tick — and `reason` says *why this
+beat happened*, which is what makes AC3 readable literally: N poll ticks + 1 delivery
+= N+1 beats, exactly one carrying `delivery:<severity>`.
+
+**The URL is DECLARED, never derived** (mika#2249 / mika#2368 doctrine). Not composed
+from `delivery_url` (`…/api/v1/messages/dispatch` — unrelated shape), nor from
+`health_url` (`…/agents/mika-dev/health`), whose entity is not ours and whose meaning
+is **inverse**: there we *read* the executor's health, here we *write* our own.
+
+**Why not `…HEARTBEAT_URL`.** `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` already exists and
+names the **6 h delivery floor**. Side by side in the same `EnvironmentFile`, a
+`…HEARTBEAT_URL` would read as *"the heartbeat to that URL beats every 6 hours"* —
+precisely the false belief this ticket exists to kill. The endpoint path keeps the word
+(the ticket names it); the variable does not. Pinned by
+`mika1990_le_nom_de_la_variable_ne_dit_pas_heartbeat`.
+
+**On the `Ok` arm, and only there.** A cycle that fails — typically `gh` in 401 — is a
+**broken** manager; posting *"I am alive"* there would be the exact lie freshness must
+not tell. That half already has its channel (`manager_cycle_error`, and the mika#2013
+`manager_auth_persistent_failure` alarm). The beat says *"the cadence runs **and** reads
+GitHub"*, which is stronger than *"the process exists"*.
+
+**`<n>` counts loop iterations, not beats emitted.** Incremented at the head of the
+iteration, **by the call site** rather than by `beat` — otherwise a failing cycle, which
+does not beat, would not increment and the holes would vanish. A run of `poll:5` →
+`poll:9` therefore says *"four cycles failed"*. The counter restarts at `1` on process
+start, so `poll:1` marks a restart — useful, not a defect.
+
+**`reason` is a wire format.** The values land in the cm registry and an operator will
+`GROUP BY` them, so two spellings of one motive would split a population without saying
+so. Two constants, **one composition site** (`liveness_reason`), `severity` rendered by
+the same `snake_case` as `serde` — pinned against serde's real output by
+`mika1990_la_severite_du_motif_suit_serde`, because the `match` alone could drift from
+the `rename_all` attribute.
+
+**The failure class comes from the STATUS, never from the message text** (mika#2179
+rule): `CredentialRefused` (401 | 403), `Unreachable` (`is_connect() || is_timeout()`),
+`Other`.
+
+**Best-effort, and the signature is what guarantees it (AC1).** `beat` returns nothing,
+so no caller has any way to let a lost beat break its loop. Bounded by `LIVENESS_TIMEOUT`
+(5 s, aligned on `probe_executor_health` — same nature, a liveness probe runs short),
+i.e. at worst **1.7 %** of a 300 s poll. Emitted **after** the cycle, so it delays no
+cycle of its own; it can delay the *next* one, and `tokio::time::interval` catches up a
+late tick. A detached `tokio::spawn` was declined: it would make AC1 trivially true at
+the cost of the beats' ordering (two `poll:<n>` could reach cm inverted) and of a
+deterministic AC3.
+
+**No beat is ever retried.** No queue, no replay: a missed beat is lost and the next one
+arrives in 5 minutes. That is the right trade for a liveness signal — replaying a stale
+*"I am alive"* is at best useless, at worst a dated lie.
+
+**The auth reuses `delivery_token` but the beat does NOT feed the auth-boundary ledger**
+(D6). That population counts **report-delivery** failures — on the order of 4
+attempts/day — and pouring **288 attempts/day** into it would change what the operator
+query `… WHERE tool_name = 'auth_boundary'` measures and drown the signal mika#1949
+exists to raise. The class information is not lost: it rides the transition WARN.
+
+**`no_dispatch_test.rs` forbids the literal `"POST"` in every file of the module**, so
+the sink writes `client.post(url)` — a `Method::POST` or string construction would carry
+it and redden the LECTURE-SEULE guard. The contract itself is untouched: what is added is
+an **outbound liveness** side effect, the same family as the report `POST` that has
+existed since day one — no forge write, no ticket mutation.
+
+**Guards.** `mika1990_le_battement_a_un_seul_ecrivain` — a source scan asserting **one**
+composition site for `reason` and **one** call site to the sink in production, allowlist
+shipped **empty**, with its anti-vacuity assertion (it reddens if the name it looks for
+is written nowhere — a scan aiming at a dead name verifies zero things and reads exactly
+like a clean tree, class mika#2205) and its good-faith control
+`mika1990_le_scan_du_battement_voit_un_second_site`. No behavioural test can see that
+class: a second beat writer makes **no decision wrong** the day it is written — the cycle
+keeps running, every assertion stays green, and only the freshness becomes uncountable
+(two interleaved `<n>` runs at cm). **When it fires, remove the second site — do not
+allowlist it** (doctrine mika#2201).
+
+**Egress.** Declared as `control-monitor-liveness` in `docs/egress/egress-manifest.toml`,
+`logged = true` at field granularity: a **successful** beat writes nothing (AC4), but the
+two **transition** lines carry `reason` and the milestone reference.
+
+Operator surfaces (`manager_delivery_resolved.liveness_url_set`,
+`manager_liveness_failed`, `manager_liveness_recovered`), expected regimes, the four
+probes and their halts: root `CLAUDE.md` § *Optional (battement de vivacité du manager)*.
+
+**Env vars.** All optional with three-tier fallback: `MIKA_MANAGER_TARGET_MILESTONE` (Phase 1 single-target — loop disabled when unset), `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` (default 21600 = 6h), `MIKA_MANAGER_POLL_INTERVAL_SECS` (default 300 = 5min; clamped to `min(poll, heartbeat)`), `MIKA_MANAGER_SILENCE_THRESHOLD_DAYS` (default 3), `MIKA_MANAGER_DELIVERY_URL` / `MIKA_MANAGER_DELIVERY_TOKEN`, `MIKA_MANAGER_ESCALATION_URL`, `MIKA_MANAGER_HEALTH_URL` (optional cm executor liveness endpoint), `MIKA_MANAGER_CHECKPOINT_DIR` (default `$HOME/.mika/manager/checkpoints`), `MIKA_MANAGER_OFFLINE_SINK_DIR` (default `$HOME/.mika/manager/sink`), `MIKA_MANAGER_LIVENESS_URL` (mika#1990, no default — absent ⇒ the beat channel is disarmed). **All eleven are declared in `.env.example` since mika#2267** — before it, not one `MIKA_MANAGER_*` variable was declared anywhere in the repo (`.env.example`, `docker-compose.yml`, `packaging/`), so no review had ever been in a position to notice their absence or their misspelling. `mika2267_every_manager_env_const_is_declared_in_env_example` keeps it that way.
 
 **Cadence spawn.** `spawn.rs` (`manager_config_from_env` + `spawn_manager_cycle_task`, the latter taking an `Arc<dyn TokenResolver>` since mika#2013) wires the cycle as a background tokio task at `server::run_server` startup. Env-gated on `MIKA_MANAGER_TARGET_MILESTONE`: unset → INFO `manager_cadence_disabled` and no spawn; set-and-valid → INFO `manager_cadence_start` + spawn; set-and-malformed → ERROR `manager_cadence_config_invalid` and no spawn (startup continues). The loop polls at `cfg.poll_interval` and calls `run_manager_cycle`; the cycle body itself decides whether to deliver (state-change OR heartbeat-elapsed) and is a no-op otherwise. Cycle failures log at WARN and do not stop the loop — except a sustained authentication failure, which escalates per the token-renewal note below (mika#2013). Graceful shutdown responds to a dedicated `manager_shutdown_token` (sibling to `kg_shutdown_token` and `webhook_queue_shutdown`) — cancelled at the same `.with_graceful_shutdown` site. Structurally mirrors `kg::resolver_tick::spawn_resolver_tick_task` (same `tokio::select!` shape, same fail-open discipline, same `info!/warn!` lifecycle events). Injection-verified per `todos/mika-manager-cadence-wiring-injection-verification.md`.
 
@@ -2907,6 +3173,199 @@ indicator.
 - **Fire-and-forget**, like its four siblings: a failed audit write warns and returns. Measuring a cost must not be able to break delivery of the callback that carries it.
 - **`PILOT_COST_OVERRUN_TOOL` is SOLE WRITER**, pinned by the source scan `canonical_tokens::tests::mika2496_the_cost_overrun_name_has_a_single_writer` (allowlist shipped empty, and `…_the_sole_writer_allowlist_is_empty` keeps it that way — an allowlist born empty is a place to drop the next infraction, mika#2323). The property is what makes the operator's `SELECT count(*), round(avg(CAST(after_value AS REAL)), 2) FROM audit_events WHERE tool_name = 'pilot_cost_overrun';` an **exact** count rather than a number two writers can disagree about — and that count is the explicit precondition of the follow-up ticket on `senara-solutions/claude-pilot`, which has to size the missing dollar brake. A second writer would make no decision wrong; it would make that count inexact, which is invisible to every behavioural test, hence a source scan. The scan carries its own anti-vacuity assertion (it fails if the name is written nowhere in `dispatcher.rs`), because a scan aiming at a dead name reads exactly like a clean one (mika#2103 / mika#2205). **When it fires, remove the second site — do not allowlist it.**
 - **Row shape:** `tool_name = 'pilot_cost_overrun'`, `target_key = 'task:<callback-id>'`, `after_value` = the cost **and nothing else** (it is what the operator averages), `reasoning` = `repo:… issue:… turns:… threshold_usd:…` as free text. Log side: a `pilot_cost_overrun` WARN in `$MIKA_SPIRIT_LOG_FILE`, expected regime **non-empty**. Its halt: a nil count while runs are known to exceed 40 USD means `Cost:` parsing returns nothing on that population — check `extract_callback_fields` against a real `status: terminated` before concluding the fleet is under threshold. Tests: `mika2496_a_cost_above_the_threshold_is_counted`, `…_below_… is_not_counted`, `…_the_threshold_is_what_decides`, `…_an_absent_cost_is_not_a_zero_cost`, `…_an_orphan_dispatch_still_counts`.
+
+### A recurring task caught mid-fire is re-armed, never failed (mika#2575)
+
+`startup_recovery` step 2 marks every orphaned `in_progress` row `failed`. For a
+**recurring** row that write is wrong, and the damage is not the row: it is what
+the next startup makes of it.
+
+**For a recurring task, `in_progress` is a transitory FIRING state, not a
+registry state.** `claim_and_fire_task` sets it for the duration of the fire and
+`update_task_rescheduled` restores `recurring_active` on return. So a recurring
+row found `in_progress` at startup does not say *this scan failed*, it says *a
+fire was interrupted* — and writing `failed` confuses the failure of a **fire**
+with the death of a **registration**. That confusion, and nothing else, is what
+arms the mika#1742 anti-zombie guard.
+
+**The chain, read in the code rather than deduced.** (1) The seven
+`ensure_recurring_task` calls run **before** `startup_recovery`
+(`server/mod.rs`); (2) the guard in `create_recurring_task_if_absent` looks for
+`status IN ('failed','cancelled','expired')` — `in_progress` is **invisible** to
+it, so no refusal; (3) its `INSERT OR IGNORE` then collides with
+`idx_tasks_unique_recurring`, whose predicate covers `in_progress`, so `n = 0`
+and the call returns "already existed" — **no new row**; (4) step 2 marks the
+live row `failed`; (5) `get_schedulable_tasks` selects only
+`('pending','recurring_active')`, so that row never enters the heap; (6) **at the
+next startup the guard now sees a `failed` inside its window and refuses
+re-registration for 24 h.** No single decision is wrong — it is an *ordering*,
+and link 6 turns a one-cycle outage into a day-long one.
+
+**Measured twice.** `wip_rescue` dead ~28 h (row `ce90ad84`, fired
+2026-09-28T17:00:00Z, `failed` at 17:01:21Z — one second after `mika-spirit
+starting` — six restarts refused, re-armed only when the grace expired); and
+mika-arch's `heartbeat` (`2b71969e`) dead ~24,5 h on 2026-09-25 by the same
+chain. The second occurrence is what makes "any recurring task" a *measurement*
+rather than an inference.
+
+**Two remedies refused, each on its own cost.** *Reordering* (`startup_recovery`
+before the registrations), which the ticket body proposes: alone it makes the
+guard read a `failed` a few milliseconds old, so link 6 fires **within the same
+startup** — it converts a one-cycle outage into an immediate 24 h one. *A
+distinct status* (`interrupted_by_restart`), which the ticket comment proposes:
+a new value of the `CHECK` on `tasks.status`, which SQLite cannot alter in place
+— a table rebuild on `tasks`, referenced by `tasks.parent_task_id` and
+`sessions.task_id`, plus a review of every query enumerating statuses (four
+indexes, the dashboard, the CLI). Both remedies also share a premise worth
+retiring: that the row **must** receive a terminal state. It must not.
+
+**The fix.** `restore_recurring_after_restart` re-arms instead — `next_fire_at`
+recomputed from the cron, `status = 'recurring_active'` — through the same
+primitive as the nominal fire, `Database::update_task_rescheduled`. Three
+properties follow, none of which needs a mechanism: the re-arm happens **in the
+same startup** (step 2 precedes step 3, and `get_schedulable_tasks` selects
+`recurring_active`, so the row enters the heap without waiting for the 60-tick
+scan or another restart); the anti-zombie guard is **never armed** for this class
+(no terminal state is written, so mika#1742 is neither modified, exempted nor
+bypassed — it simply stops having a population manufactured by startup); and
+`recurring_active` keeps **one writer**, since the re-arm and the nominal
+rescheduling become one textual act rather than two formulations free to diverge.
+
+**Fallback, already the house rule.** No computable cron ⇒ the row falls back to
+`failed` with a named reason — exactly what `fire_task` already does in the same
+case (*"cannot reschedule recurring task, marking failed"*), so the fallback
+introduces no new semantics; and there the mika#1742 guard arms **legitimately**,
+a recurring task whose cron will not compute having no business re-registering
+every minute.
+
+**CLI mode is the second door of the same defect, and it is closed by
+abstention.** `mika chat` runs this same recovery (`cli_mode: true`) against the
+database it **shares** with a possibly-live daemon. Step 2a (the A2A sweep) is
+already gated `!cli_mode` with its reasoning written on site; the generic loop was
+not, so launching `mika chat` while a recurring task fired killed that scan
+exactly like the measured restart. The re-arm is therefore **not applied** in CLI
+mode: the row is left `in_progress`, untouched. Two reasons, in order — the CLI
+cannot know whether the daemon is firing right now, and it will not run the scan
+it would be rescheduling anyway. If the daemon is dead, its own startup re-arms.
+Strictly better than today's `failed`, and non-recurring rows keep their current
+CLI treatment word for word.
+
+**One reader for the fire-time computation.** The `metadata → timezone →
+next_fire_from_cron{,_tz}` triplet existed twice (`fire_task`,
+`enqueue_queued_task`) and the re-arm would have been a third.
+`task_engine::cron::next_fire_for_recurring` is extracted and all **three** sites
+call it; each keeps its own error disposition (`fire_task` and the re-arm mark
+`failed`, `enqueue_queued_task` declines to enqueue). Pure extraction, no
+behaviour change.
+
+**No interruption counter, and the refusal is measured.** The legitimate question
+is what bounds a recurring task that would kill the process on every fire, once
+we stop writing `failed`. There is **no mechanism by which a scan kills the
+process** (`fire_task` dispatches inside a `tokio::spawn`, where a panic is
+collected as a `JoinError`; the scans shell out through `tokio::process`); the
+real cause of an `in_progress` at startup is **external** (deployment SIGTERM,
+operator, OOM killer) and is measured — this ticket documents restarts n°11 and
+n°13 in one evening; and a low-threshold counter would fire on the **healthy**
+regime (`wip_rescue` has a 5-minute cron and a fire that can last ~900 s, so on a
+host restarting several times an hour — the regime this ticket documents — three
+consecutive interruptions without an intervening complete fire are ordinary, and a
+budget of 3 would mute the scan for 24 h on a deployment day, i.e. **reopen this
+defect under another name**). A counter would also need a reset site on the
+successful fire (`reset_stuck_rearm_count` pattern, mika#2413, whose written
+lesson is *a counter the success never clears ends up bounding something else*),
+hence a second writer on the recurring success path. What replaces it is a
+**measurement**: one log event and one audit row per re-arm, single-writer, so
+that if a label starts appearing several times a day the follow-up opens **with a
+count** rather than an intuition.
+
+*What is given up by saying it:* today's `failed` behaves like a circuit breaker
+— it mutes the scan for 24 h after an interruption. But it trips on the **common**
+case (a restart) and not on the rare one (a pathological scan, for which no
+mechanism is identified): that is not a brake, it is a false classifier. Removing
+it removes no real protection.
+
+**No retroactive repair.** `ce90ad84` and its kin stay `failed`. Rewriting a
+terminal state after the fact would falsify what the row said when it was written
+(mika#2361 motif), and the gesture already exists: `mika tasks rearm <label>`
+(mika#2446), which sets the `operator_rearm` marker the guard excludes.
+
+**Guards.** Seven behavioural tests in `task_engine::engine::tests::mika2575_*`
+(six of them **seen red** before the fix, with the one-shot negative control
+staying green), five in `task_engine::cron::tests::mika2575_*`, and two source
+scans. `mika2575_le_statut_recurring_active_a_un_ecrivain_unique` carries **two
+terms**: T1 the literal `UPDATE … SET status = 'recurring_active'` outside
+`update_task_rescheduled`, and T2 the dynamic-status write — three DB functions
+take the status as a **parameter** (`db/tasks.rs` `update_task_status`,
+`update_manual_task_status`, `terminal_mark_tracking_row_upstream_closed`, all of
+the form `SET status = ?1`), so a future writer could set `recurring_active`
+through one of them **without any `UPDATE … SET status = 'recurring_active'`
+appearing in the tree**. Formulated on T1 alone, the scan would be blind to the
+likelier route. T2's anti-vacuity cannot rest on the presence of the name —
+`task_status::RECURRING_ACTIVE` is consumed nowhere today, so T2 is green by
+**empty population**, which reads exactly like a clean tree (mika#2205); its
+control is therefore on the **shape of the predicate**, by a negative fixture
+**seen red** (including the multi-line form rustfmt produces past 100 columns,
+which a line-anchored predicate would miss). T1 keeps its anti-vacuity by name,
+and its own good-faith control **seen green** covers the doc-comment of
+`db/tasks.rs::update_task_rescheduled`, which writes *"set next_fire_at and
+status = 'recurring_active'"* — the loose predicate a future editor would reach
+for "to be sure to catch everything" would count that prose as a second writer,
+the false positive mika#2050 measured on Signal S. Both allowlists ship **empty**:
+when the scan fires, remove the second site, do not exempt it (doctrine
+mika#2201).
+
+**The scan enumerates its own sources rather than reusing
+`canonical_tokens::production_sources()`**, and the difference is load-bearing:
+that enumerator truncates at the first `#[cfg(test)]` **wherever it is**, including
+indented — and `engine.rs` carries one on a helper method far above
+`startup_recovery`. Reusing it would cut the file before the fix itself, leaving
+the scan green by not looking at the one file it exists to watch. The anchor on
+`"\n#[cfg(test)]"` is taken from
+`mika2405_the_settled_event_has_exactly_one_writer_in_production`, in this same
+module for this same reason. Both helpers report the **text** of a site and never
+a line number: `strip_comment_lines` *removes* the lines it discards, so any
+number computed after it is off — and a wrong number in a failure message sends
+the reader to the wrong place, which is why `canonical-tokens.tsv` already refuses
+line numbers in as many words.
+
+**`fired_at` is deliberately NOT stamped here, and the log field is named
+accordingly.** The re-arm reschedules, it does not fire; mika#2133 reserves
+`fired_at` for the last fire, which `claim_and_fire_task` will set at the next
+one. Writing it here would state a false fact. The INFO line therefore carries
+`last_fire` rather than `fired_at` — the guard
+`mika2133_fired_at_has_a_single_literal_definition` is lexical on `fired_at` + `=`
+and would count the field as a fifth writer; its message offers interpolating the
+constant or refining the guard, and both are declined (the first poses the false
+fact, the second widens a neighbouring ticket's predicate for a log field).
+
+**Operator surfaces.** `recurring_restored_after_restart` (INFO — expected regime
+**non-empty and low**: one line per recurring task that was in flight at shutdown,
+each one a scan the restart did not kill); `recurring_restore_failed_no_cron`
+(WARN — expected **empty**); `recurring_restore_skipped_cli` (DEBUG, not
+instrumented: CLI population, no associated conduct). Audit: a single `tool_name`,
+`recurring_restart_restore`, with the outcome in `after_value`
+(`recurring_active` | `failed_no_cron`) — the `ready_label_outcome` motif
+(mika#2323) rather than the two-name motif of `phantom_aged_out` /
+`phantom_sweep_spared` (mika#2156), which applies when each name carries its own
+cause; here both outcomes belong to the **same site** and the **same population**.
+Both values are a **wire format**, frozen by test. Queries, expected regimes, the
+five probes and their halts: root `CLAUDE.md` § *Une récurrente en vol au
+démarrage est ré-armée, jamais échouée*.
+
+**Out of scope, deliberately.** The mika#1742 guard and its four exemptions
+(config-cancel mika#2271, unknown-trigger mika#2337, operator lift mika#2446,
+`RECURRING_ZOMBIE_GRACE_HOURS`) are untouched — this removes a population startup
+was manufacturing, it does not touch the predicate that read it. The CLI gating of
+step 2's generic loop for **non-recurring** tasks: `mika chat` can still mark a
+live `time` / `event` / `callback` task `failed`; distinct population, distinct
+blast radius, and the remedy requires deciding what a CLI may sweep in a live
+daemon's database — **follow-up ticket**, precondition being a measurement showing
+a live task reaped by a CLI invocation. And **recurring tasks carrying a
+`timeout_at`**: step 1 (`mark_tasks_expired`) precedes the sweep and writes
+`expired`, which the guard also counts; the seven startup recurring tasks have
+`timeout_at: None` (`task_engine/mod.rs`), so that population is empty for them,
+but one created through the scheduling tool with a `timeout_at` would escape this
+fix — a **named**, uncovered limit.
 
 **Callback process liveness watchdog (#959):** `check_callback_process_liveness()` runs every 60-tick cycle and detects when a long-running subprocess (e.g., `run_claude_pilot`) has crashed without delivering its callback result. Detection: queries `in_progress` callback tasks with `process_id IS NOT NULL`, checks PID liveness via `kill(pid, 0)` + `/proc/<pid>/stat` field 22 (process start time) comparison to guard against PID reuse. On first detection of a dead process, records `first_dead_at` in task metadata; after `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` (default 120s) elapses, re-checks task status (race guard) then marks the task `failed` with `error_reason = "subprocess_exited_without_delivery"`. Process start time is stored in callback task metadata at spawn time by `spawn_long_running_exec()`. The watchdog detects death in ~60s (one tick) + 120s grace = ~3 minutes total, vs the previous 6-hour `timeout_at` fallback. Platform: Linux only (`/proc` filesystem). The existing `timeout_at` mechanism serves as a panic-fallback for edge cases where PID tracking fails.
 

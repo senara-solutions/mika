@@ -16,13 +16,23 @@
 //! Le handler n'est plus un acteur. Il **signale** qu'une PR est mergeable
 //! (toutes les portes franchies : verdict, CI agrégée, périmètre, behind-main),
 //! et **seul le dispatcher** consomme ce signal et merge sous sa propre
-//! identité. Trois couches indépendantes, chacune à usage unique :
+//! identité. Quatre couches indépendantes, chacune à usage unique :
 //!
 //! | couche | garantie |
 //! |---|---|
 //! | le handler de succès CI n'appelle plus `gh pr merge` | aucun agent ne merge depuis l'évaluation |
 //! | [`merge_disposition`] — liste blanche | seul le dispatcher agit ; tout autre agent se contente de signaler |
 //! | [`would_merge_as_reviewer`] + refus outil | le relecteur n'atteint jamais le chemin de merge |
+//! | [`owns_merge_transition`] — porte d'entrée de l'évaluateur (mika#2260) | seul le dispatcher **évalue** ; les autres agents restent transparents à l'événement |
+//!
+//! La quatrième couche est arrivée après les trois autres, et pour une raison
+//! qu'elles ne couvraient pas : #2248 a mis l'identité à la **sortie** (qui
+//! merge) et l'a laissée absente de l'**entrée** (pour qui cette évaluation
+//! existe). Le relecteur parcourait donc l'évaluateur complet — cinq appels `gh`
+//! sous son PAT, une écriture `update-branch`, une clé de dedup globale au
+//! processus qui avalait le créneau du dispatcher — avant d'être retenu à
+//! l'acteur. Une course résolue par une garde tardive dépend de l'ordre ; celle-ci
+//! la supprime.
 //!
 //! La liste blanche est le gate porteur ; la correspondance de login est une
 //! seconde ceinture, indépendante, qui attrape le cas où un relecteur
@@ -104,6 +114,36 @@ pub fn merge_disposition(agent_id: &str) -> MergeDisposition {
     } else {
         MergeDisposition::SignalOnly
     }
+}
+
+/// Vrai quand `agent_id` possède la transition évaluer→signaler→merger, et peut
+/// donc consommer sa propre évaluation de mergeabilité (mika#2260).
+///
+/// # Pourquoi un nom plutôt qu'un [`merge_disposition`] en ligne
+///
+/// Les deux questions ne sont pas la même, même si la table sous-jacente l'est.
+/// [`merge_disposition`] répond *qui merge* — une décision d'**acteur**, prise au
+/// moment de merger, et qui ne bouge pas. Celle-ci répond *est-ce que mon
+/// évaluation a un consommateur* — une décision d'**entrée**, prise avant tout
+/// travail. Un agent qui ne peut pas consommer le signal n'a aucune raison de
+/// l'émettre : ses appels `gh` sont payés pour rien, ses écritures de dedup
+/// avalent le créneau de celui qui peut agir, et sa notification opérateur fait
+/// doublon.
+///
+/// Deux noms, deux sites d'appel, **une seule liste blanche** : ajouter un acteur
+/// reste un geste explicite dans [`merge_disposition`], et la porte d'entrée en
+/// hérite sans seconde table à tenir en phase.
+///
+/// # Ce que ce prédicat n'est PAS
+///
+/// Ce n'est pas [`forge_login_for_agent`], qui cartographie un `agent_id` vers un
+/// login de forge et sert uniquement à attraper une égalité d'identité prouvée
+/// sur le chemin de merge. Et il ne **se substitue pas** à l'acteur : la garde
+/// [`would_merge_as_reviewer`] et la liste blanche restent en place derrière lui,
+/// en série. Une porte d'entrée retire une course ; elle ne dispense pas de la
+/// ceinture qui la résolvait.
+pub fn owns_merge_transition(agent_id: &str) -> bool {
+    merge_disposition(agent_id) == MergeDisposition::Act
 }
 
 /// Le login de forge sous lequel les credentials de `agent_id` écrivent, quand
@@ -231,6 +271,64 @@ mod tests {
                 merge_disposition(agent),
                 MergeDisposition::SignalOnly,
                 "{agent} ne doit pas être acteur d'un merge autonome"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2260_seul_le_dispatcher_possede_la_transition_de_merge() {
+        assert!(owns_merge_transition("mika-dev"));
+        // Le relecteur, un agent hors liste, un nom vide, et un voisin lexical du
+        // dispatcher : aucun n'hérite du droit d'évaluer.
+        for agent in [
+            "mika-qa",
+            "mika",
+            "mika-arch",
+            "customer-42",
+            "",
+            "mika-dev-2",
+        ] {
+            assert!(
+                !owns_merge_transition(agent),
+                "`{agent}` ne peut pas consommer un signal merge-ready : il ne doit pas l'évaluer"
+            );
+        }
+        // La normalisation est celle de la maison, héritée de `merge_disposition`.
+        assert!(owns_merge_transition("  MIKA-DEV "));
+    }
+
+    #[test]
+    fn mika2260_la_porte_dentree_et_lacteur_ne_peuvent_pas_diverger() {
+        // Deux noms, deux questions, **une** table. Ce test est ce qui rougit le
+        // jour où l'une des deux fonctions bouge sans l'autre — le mode de panne
+        // qu'une seconde liste blanche rendrait silencieux.
+        //
+        // **Ce qu'il vaut, et ce qu'il ne vaut pas.** Tant que
+        // `owns_merge_transition` est défini *par délégation* à
+        // `merge_disposition`, cette égalité est une tautologie et ce test ne peut
+        // pas échouer. Sa valeur est conditionnelle et future : il mord le jour où
+        // quelqu'un réécrit le prédicat autrement. Et même alors il ne mord que
+        // sur les entrées échantillonnées — une réimplémentation en
+        // `trim().eq_ignore_ascii_case(DISPATCHER_AGENT)` les satisfait toutes les
+        // huit et resterait verte. L'idiome maison pour fermer cela entièrement
+        // serait un scan de source refusant un second lecteur de la liste blanche ;
+        // il n'est pas livré, parce qu'un seul site consomme ce prédicat
+        // aujourd'hui et qu'un scan sur une population d'un est un détecteur dont
+        // le silence ne prouve rien. C'est dit ici plutôt que découvert plus tard.
+        for agent in [
+            "mika-dev",
+            "mika-qa",
+            "mika",
+            "mika-arch",
+            "customer-42",
+            "",
+            "mika-dev-2",
+            "  MIKA-DEV ",
+        ] {
+            assert_eq!(
+                owns_merge_transition(agent),
+                merge_disposition(agent) == MergeDisposition::Act,
+                "`{agent}` : la porte d'entrée et l'acteur doivent lire la même liste blanche"
             );
         }
     }

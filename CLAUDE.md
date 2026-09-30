@@ -265,6 +265,44 @@ After KG-related deploys, four signals tell you the fix is working. The second r
 - **Signal L — identical-diff circuit breaker (#1563).** `grep identical_diff_circuit_breaker server.log` — any hits indicate the circuit breaker fired. The `head_sha` and `identical_count` fields show the convergence failure details. Investigate the PR and plan for the root cause of the stuck fix loop.
 - **Signal M — pilot push guard (#1318). ⚠️ THIS COMMAND CANNOT FIRE — see the halt below before relying on it (established by mika#2050).** `grep pilot_push_guard server.log` — two sub-events emitted by dispatch-lib to stderr on every dev-groom dispatch: `pilot_push_guard.clean` (no remote-ref change during pilot session — expected on every dispatch) and `pilot_push_guard.violation` (pilot pushed to the remote — scope-of-authority violation, should never appear; investigate immediately if it does). The guard compares `PRE_RUN_REMOTE_HEAD` (captured via `git ls-remote` before pilot launch) with the post-run remote HEAD. Any change indicates the pilot pushed, which is a content-only scope violation for dev-groom. On violation, the dispatch is marked `PIPELINE_INCOMPLETE — push violation` and the iterate loop + push are skipped. **Halt (mika#2050): the grep above returns nothing, whatever the state, and `pilot_push_guard.violation` — "should never appear" — structurally *cannot* appear.** `_check_pilot_force_push` is called at the top level of `dispatch_claude_pilot`, **after** `_run_claude_pilot` and therefore outside the `2>"$STDERR_FILE"` redirection that captures the rest of dispatch-lib's stderr; what it inherits is the `Stdio::piped()` handle from `spawn_long_running_exec`, which the executor reads **only** inside `if !status.success()`. On a dispatch that succeeds, the pipe is dropped unread and the lines land in no file at all — so this is a safety signal reading "nothing to report" independently of reality, not a healthy regime. The `PIPELINE_INCOMPLETE` marking on the callback body is unaffected and remains the trustworthy half. Do not repair this by changing the documented sink: there is no file to point at, and the fix is a substrate change (redirect these lines to the per-dispatch forensic sink used by Signal S) — **follow-up ticket**.
 - **Signal N — wip-rescue staleness probe (#1631).** `grep stale-against-main` in GitHub PR labels — any open draft PR with this label has a type-incompatible rebase against current main. The `wip-staleness-check` workflow runs on every push to main and probes all `wip(` titled or `wip-rescue` labelled draft PRs. Operator action: rebase the branch, fix clippy errors, then promote from draft.
+- **Signal N-bis — un hold explicite tient contre `wip_rescue` (mika#2597).** Le 2026-09-29, `wip_rescue` a sorti du brouillon **deux fois en 35 minutes** une PR (#2589) maintenue en draft de hold par la Fire-Disposition de son plan. Le merge autonome n'a été empêché que parce que le diff touchait des fichiers decision-core — **par coïncidence de périmètre, pas par conception**. Depuis, un brouillon portant au moins un `ConvertToDraftEvent` n'est ni sélectionné, ni rebasé, ni poussé, ni sorti du brouillon, et son `$.wip_rescue.depth` n'est pas incrémenté. Le prédicat ne compare **aucun instant** : le listing filtrant déjà `--draft`, la simple présence de l'événement suffit. Le raisonnement complet (les deux pistes du ticket réfutées, le placement dans `select_eligible` plutôt que dans `resume_chain`, le refus d'un label et d'un filtre d'acteur) est dans `crates/mika-agent/CLAUDE.md` § *Un hold explicite tient contre `wip_rescue`*.
+
+  ```bash
+  # 1. Un hold a-t-il été tenu ? (régime attendu : NON VIDE)
+  grep wip_rescue_hold_respected "$MIKA_SPIRIT_LOG_FILE" \
+    | jq -c '{pr_number, held_since, held_by}'
+
+  # 2. La timeline est-elle lisible ? (régime attendu : VIDE)
+  grep wip_rescue_hold_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{pr_number, error}'
+
+  # 3. CONTRÔLE POSITIF — le scan tourne-t-il seulement ?
+  grep -c wip_rescue_resume_attempt "$MIKA_SPIRIT_LOG_FILE"
+  ```
+  ```sql
+  -- Les holds tenus, datés, un par (PR, motif) et par 24 h
+  SELECT target_key, created_at, after_value FROM audit_events
+   WHERE tool_name = 'wip_rescue_hold_respected' ORDER BY created_at DESC;
+
+  -- Contrôle négatif : les promotions nominales continuent-elles ?
+  SELECT count(*) FROM audit_events
+   WHERE tool_name = 'wip_rescue' AND target_key = 'wip_rescue_success';
+  ```
+
+  | surface | niveau | régime attendu | lecture |
+  |---|---|---|---|
+  | `wip_rescue_hold_respected` | INFO | **non vide** | chaque ligne est un hold que le démon n'a pas violé — la mesure directe que la garde mord |
+  | `wip_rescue_hold_unreadable` | WARN | **vide** | toute occurrence gèle `wip_rescue` par fail-closed ; la cause est le jeton ou l'API, **pas le prédicat** |
+  | `wip_rescue_success` | INFO | non vide, faible | le mécanisme mika#1852 vit toujours — le contrôle négatif de la sonde S2 |
+  | `held_by` ≠ une identité humaine | INFO | **vide** | une machine remet en draft : population inexistante aujourd'hui, et c'est pourquoi l'acteur est *rapporté* sans décider de rien |
+
+  **Sondes post-déploiement, et leurs quatre haltes.** *Préalable :* `wip_rescue` tourne dans **mika-spirit**, pas dans un handler seedé — la sonde décrit le binaire servi, donc établir le déploiement avant toute conclusion (classe mika#2340).
+  **S1 — le hold tient (premier tick après déploiement).** mika#2589 est tenue sur trois couches (draft, `human-review-required` sur la PR, `blocked` sur mika#2105) : la sonde 1 doit rendre une ligne la nommant, et aucun `ReadyForReviewEvent` ne doit apparaître sur sa timeline. *Halte 1 — aucune ligne et la PR ressort du brouillon :* **ne pas élargir le prédicat par réflexe**. Lire d'abord la sonde 3 : si le scan ne tourne pas du tout, la question n'est pas le prédicat. Vérifier ensuite que la PR est bien dans le listing (`--label wip-rescue`, `--state open`, `--draft`).
+  **S2 — le mécanisme n'est pas gelé (7 jours).** Le compte SQL de contrôle négatif doit **continuer à croître**. *Halte 2 — il est figé et `wip_rescue_hold_unreadable` est non vide :* le fail-closed gèle tout ; lire `wip_rescue_no_token` (mika#2205) **avant** de toucher quoi que ce soit.
+  **S3 — contrôle négatif de faux positif (7 jours).** Aucun `wip_rescue_hold_respected` sur une PR de rescue que personne n'a remise en draft. *Halte 3 — une occurrence :* la prémisse « une PR de rescue naît sans `ConvertToDraftEvent` » est fausse, donc `dispatch-lib` ne crée plus la PR en brouillon ou un chemin machine re-drafte. Lire `held_by`, il nomme l'auteur. **Désarmer d'abord** (revert du terme), diagnostiquer ensuite — un brouillon de rescue gelé à tort casse le mécanisme mika#1852 en entier.
+  **S4 — coût.** Un seul appel GraphQL par tick en régime nominal. *Halte 4 — le quota GitHub se dégrade :* le court-circuit par âge ne fonctionne pas. Réparer l'ordre de la boucle, **pas** mettre le prédicat en cache — un cache réintroduirait la fenêtre pendant laquelle un hold fraîchement posé n'est pas vu.
+  **Halte transverse — les deux sondes muettes.** Zéro hold **et** zéro promotion ne prouve rien : il faut qu'un brouillon `wip-rescue` ait existé depuis le déploiement. *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
+
+  **Ce que ça n'achète PAS.** L'incident fondateur n'est pas rattrapé — **rien ne rétro-écrit une ligne d'audit datée d'un hold qu'on n'a pas observé**, et la sonde est la prochaine occurrence. Le palliatif à trois couches n'est pas retiré : c'est le geste de l'opérateur, quand S1 est verte. Le chemin `gh pr ready` d'un modèle sur une PR **hors** signature `wip-rescue` reste ouvert — mika#1682 le couvre sur la population mesurée, et l'élargir est un **suivi nommé** dont la précondition est une mesure montrant qu'un `gh pr ready` de modèle a franchi un hold là. Et le bypass admin de l'identité du pilote n'est pas touché : les deux moitiés de la défense en profondeur tombent séparément.
 - **Signal P — phantom sweep telemetry (mika#1712, mika#2156).** `grep phantom_sweep_complete $MIKA_SPIRIT_LOG_FILE | jq '{source, count, spared_count, lookup_error_count, agent_id}'` — one INFO line per sweep pass with `source` in `{"startup_sweep","watchdog_tick"}` (startup fires once per restart; watchdog fires on every 60-tick DB scan when at least one row was swept, spared, errored, or skipped). **Since mika#2156, `count: 0` with `spared_count > 0` is the healthy shape, not an anomaly** — it means the liveness guard withheld a transition because the row's dispatch is still running. A spared row is re-selected and re-spared on every pass (sparing writes no status change), so one dispatch running past the grace window emits one line pair per minute until it finishes; that is expected, not a leak. Steady state with no dispatch in flight: mostly silent, occasional non-zero `count` as genuine orphans age past the grace window then get swept. Anomaly signal: `grep phantom_sweep_large_backlog $MIKA_SPIRIT_LOG_FILE` should return zero lines after the first post-deploy startup — any hit means a single sweep pass transitioned > 100 rows, which feeds mika#1934's cause-racine investigation immediately. Audit-events SQL surface: `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'phantom_aged_out'` (rows actually transitioned since deploy) and its mika#2156 sibling `... WHERE tool_name = 'phantom_sweep_spared'` (transitions the liveness guard withheld). The two names are deliberately distinct so the first keeps meaning "swept". Config surface: `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default `14400` since mika#2156) tunes the AC3 watchdog grace window; startup sweep (AC5) always runs at age=0 and is unaffected. Both paths spare a row whose dispatch child process is still alive — `grep phantom_sweep_spared $MIKA_SPIRIT_LOG_FILE | jq '{source, task_id, child_task_id, process_id}'` shows each withheld transition. Anomaly signal for the guard itself: a non-zero `unusable_child_count` means a dispatch child carried a PID but no readable `process_start_time`, so the guard could not rule out PID reuse and fell back to sweeping — that is the one path that silently returns the sweeper to its pre-mika#2156 behaviour, so a persistent non-zero count there deserves investigation. A non-zero `lookup_error_count` means rows were skipped because the child lookup failed; they are re-examined on the next pass.
 - **Signal Q — pilot secret-channel delivery (mika#2039, sink corrected by mika#2050).** `grep -l '^dispatch-lib: sandbox secret' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — emitted by the sandbox entrypoint prologue when a secret file bound into the pilot sandbox is unreadable or empty. **The sink is the per-dispatch stderr file, never `$MIKA_SPIRIT_LOG_FILE`** — this entry named the latter until mika#2050 and the command returned nothing whatever the state. `$_PILOT_SECRET_PROLOGUE` is prepended to the `bwrap` invocation inside `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` and then persists to `$_PILOT_LOG_DIR/<task-id>.stderr`; Signal S below carries the full trajectory and the same two halts apply. Steady state: zero lines. Any hit names a secret the pilot started **without** — the diagnostic exists so that a late failure is traceable to the channel rather than misread as pilot drift. **Since mika#2056 the secret allowlist is empty, so this signal has no population in the shipped configuration:** `GH_TOKEN` no longer travels through this channel at all (the GitHub credential is injected host-side by the egress proxy, and the sandbox carries only the mika#2572 placeholder, see `GH_TOKEN` below). A secret that is added back travels as a `0600` file under `/run/mika-pilot-secrets/`, never through `bwrap --setenv` (that put it in the world-readable process argv). Two CI guards hold the invariant — `make test-sandbox-secret-argv` (no credential-shaped value reaches the argv or the `BASH_XTRACEFD` trace) and `make verify-no-secret-in-setenv` (deny-by-default over the `--setenv` allowlist) — and `scripts/canary-pilot-containment` PART 0 probes a live sandbox's argv on the host after a deploy.
   - **Since mika#2578 the canary no longer writes the host GitHub credential, and it ATTESTS so on exit.** Until then, every run overwrote `~/.mika/pilot-gh-token` — the host-side file the mika#2056 addon reads — with the canary's own decoy, because `_stage_pilot_gh_token` fires on each of its five `_run_pilot_sandboxed` calls. Measured 2026-09-28: 49 bytes at 20:33:03Z against 93 at 17:32, and `curl_github=401` in the same run, while the pilot of mika#2565 was in flight. **Every in-flight pilot sent the decoy to `api.github.com` and `github.com`, `git push` included, until the next real dispatch restaged.** The staging path is now redirected to a `mktemp` dir of the canary's own (`_PILOT_GH_TOKEN_FILE`, an internal name deliberately outside `SANDBOX_ENV_CORE_ALLOWLIST` and `PILOT_DISPATCH_ENV` — relaying it would hand the service environment a lever over where a **real** dispatch writes its GitHub credential), and the staging itself is **redirected, never neutralised**: the canary still traverses the real code it exists to exercise.
@@ -493,6 +531,184 @@ Optional (startup behavior):
   (`#[ignore]` + `MIKA_EVAL_REAL_PROVIDERS`), et aucune suite `calibrate-*` ne
   couvre un tenant famille ou champion (les quatre existantes sont des rôles
   d'ingénierie) — **ticket de suivi**, seule voie vers une mesure répétable.
+
+### Une récurrente en vol au démarrage est ré-armée, jamais échouée (mika#2575)
+
+**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
+déplacée.** Cette entrée est ici parce que l'opérateur qui constate qu'un scan
+récurrent a cessé de tirer cherche dans ce voisinage.
+
+- **Le défaut, mesuré deux fois.** `wip_rescue` mort **~28 h** : la ligne
+  `ce90ad84` avait tiré à 2026-09-28T17:00:00Z, le restart n°11 l'a surprise
+  `in_progress`, elle est passée `failed` à 17:01:21Z — **une seconde après**
+  `mika-spirit starting` — et six restarts successifs ont été **refusés** par la
+  garde anti-zombie mika#1742 jusqu'à expiration de sa fenêtre de 24 h (le n°18
+  l'a ratée de 37 s). Seconde occurrence, autre label et autre agent : le
+  `heartbeat` de **mika-arch** (`2b71969e`), ~24,5 h le 2026-09-25. La classe
+  « toute récurrente » est donc **mesurée**, pas inférée.
+
+- **La chaîne, et aucun maillon n'est fautif isolément.** L'enregistrement des
+  récurrentes tourne **avant** le balayage de démarrage ; la garde anti-zombie
+  ne cherche que `('failed','cancelled','expired')`, donc `in_progress` lui est
+  invisible et elle ne refuse rien ; l'`INSERT OR IGNORE` entre en collision
+  avec l'index unique, qui couvre `in_progress`, donc « existe déjà », **aucune
+  ligne neuve** ; le balayage passe ensuite la ligne vivante à `failed` ; le tas
+  ne charge que `('pending','recurring_active')`, donc elle n'y entre pas ; et
+  **au démarrage suivant la garde voit ce `failed` dans sa fenêtre et refuse
+  pendant 24 h**. C'est un **ordre**, et le dernier maillon transforme une panne
+  d'un cycle en panne d'une journée.
+
+- **Le remède : cesser d'écrire un état terminal sur cette classe.** Pour une
+  récurrente, `in_progress` est un **état de tir transitoire** — `claim_and_fire_task`
+  le pose le temps du tir, `update_task_rescheduled` repose `recurring_active` au
+  retour. Le balayage la **ré-arme** donc (instant recalculé depuis le cron,
+  `recurring_active`), **dans le même démarrage**, par le même primitif que le
+  tir nominal. La garde mika#1742 n'est ni modifiée, ni exemptée, ni contournée :
+  elle cesse simplement d'avoir une population que le démarrage fabriquait.
+
+- **Repli nommé.** Cron absent ou illisible ⇒ la ligne retombe sur `failed`,
+  comportement d'avant le correctif, avec un motif — et la garde s'arme alors
+  **légitimement** : une récurrente dont le cron ne se calcule pas ne doit pas se
+  ré-inscrire toutes les minutes.
+
+- **Mode CLI : aucune écriture.** `mika chat` exécute le même balayage contre la
+  base **partagée** avec le démon ; il ne peut pas savoir si celui-ci tire en ce
+  moment et n'exécutera de toute façon pas le scan qu'il replanifierait. La ligne
+  est laissée `in_progress`, intacte — amélioration stricte sur le `failed`
+  d'aujourd'hui, qui tuait le scan du démon depuis le CLI.
+
+- **Aucune réparation rétroactive.** `ce90ad84` et ses semblables restent
+  `failed` : réécrire après coup un état terminal rendrait faux ce que la ligne a
+  dit à l'instant où elle a été écrite (motif mika#2361). Le geste existe :
+  `mika tasks rearm <label>` (mika#2446).
+
+### Surfaces opérateur
+
+```bash
+# 1. Quelles récurrentes le démarrage a-t-il ré-armées ?
+grep recurring_restored_after_restart "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, label, cron_expr, previous_next_fire_at, next_fire_at}'
+
+# 2. CONTRÔLE NÉGATIF — un cron illisible a-t-il fait retomber une ligne ?
+grep recurring_restore_failed_no_cron "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — la garde mika#1742 s'arme-t-elle encore sur ce chemin ?
+grep 'mika#1742: refusing to re-register' "$MIKA_SPIRIT_LOG_FILE" | tail
+```
+
+```sql
+-- La sonde du ticket, mot pour mot
+SELECT label FROM tasks
+ WHERE trigger_type = 'recurring' AND status = 'recurring_active'
+   AND agent_id = 'mika-dev';
+-- doit contenir wip_rescue, auto_pull_groomed, qa_review_reconcile, worktree_reap
+
+-- Les deux issues du ré-armement, soustractibles en une requête
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'recurring_restart_restore' GROUP BY 1;
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `recurring_restored_after_restart` | INFO | **non vide, faible** | une ligne par récurrente en vol au restart — chacune est un scan que le redémarrage n'a pas tué |
+| `recurring_restore_failed_no_cron` | WARN | **vide** | le cron est cassé, et c'est *lui* qu'il faut lire |
+| `recurring_restore_skipped_cli` | DEBUG | — | population CLI, sans conduite associée : non instrumentée |
+
+Les deux populations sont soustractibles parce que `recurring_restart_restore` a
+un **écrivain unique** (scan de source, allowlist livrée vide) — motif
+`ready_label_outcome` (mika#2323) : un seul nom, l'issue dans `after_value`,
+plutôt que deux noms, parce que les deux issues appartiennent au même site et à
+la même population. La ligne INFO porte `last_fire` et **non** `fired_at` : ce
+site replanifie, il ne tire pas, et mika#2133 réserve `fired_at` au dernier tir.
+
+### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi**. Après `make deploy`,
+> vérifier que le `mika-spirit` qui tourne est bien celui qu'on vient de bâtir
+> avant toute conclusion (classe mika#2340).
+
+**S1 — le défaut fondateur ne se rejoue pas (premier restart en vol).**
+Redémarrer `mika-spirit` pendant qu'une récurrente est `in_progress` (le plus
+simple : un restart dans la fenêtre de 900 s d'un tir `wip_rescue`). Attendu :
+une ligne `recurring_restored_after_restart` pour ce label, les quatre labels
+dans la requête SQL, et le tick suivant du scan a lieu.
+**Halte 1 — la ligne est absente et le scan est mort.** Ne pas toucher au
+prédicat : vérifier d'abord que le binaire servi porte le correctif, puis que la
+ligne était bien `in_progress` et non déjà `failed` d'un restart antérieur — une
+ligne déjà empoisonnée relève de `mika tasks rearm`, pas de ce correctif.
+
+**S2 — la garde mika#1742 ne s'arme plus sur ce chemin (7 jours).** Aucun
+`refusing to re-register` sur un label dont le dernier état était `in_progress`
+à l'arrêt.
+**Halte 2 — elle s'arme encore.** Lire l'`after_value` de la ligne d'audit : un
+`failed_no_cron` explique le refus et il est **légitime** ; en son absence, un
+autre site écrit un état terminal sur ces lignes — l'établir **avant** d'élargir
+quoi que ce soit.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun
+`recurring_restore_failed_no_cron`, et aucune récurrente ré-armée avec un
+`next_fire_at` **passé**.
+**Halte 3 — un `next_fire_at` passé apparaît.** Le calcul ne passe pas par le
+lecteur unique ou la timezone n'est pas lue : réparer le calcul, ne pas compenser
+à l'affichage.
+
+**S4 — contrôle négatif de la population non récurrente (7 jours).** Une tâche
+`time`, `event` ou `callback` interrompue au démarrage reste `failed`.
+**Halte 4 — une tâche à un coup ressort `recurring_active`.** La branche mord
+trop large ; désarmer par revert **avant** diagnostic — un tir à un coup rejoué
+est un effet de bord qu'aucun seuil ne corrige.
+
+**S5 — le régime de ré-armement reste faible (30 jours).** Le compte
+`recurring_restart_restore` groupé par label, rapporté au nombre de restarts.
+**Halte 5 — un label domine largement les autres.** Ce n'est pas une panne de ce
+correctif : c'est la mesure qui conditionne le suivi « borner les interruptions
+répétées ». L'ouvrir **avec ce compte**, et surtout ne pas rétablir le `failed`
+par réflexe — il ne fermerait rien et rouvrirait mika#2575.
+
+**Halte transverse — les sondes muettes.** Zéro ligne de ré-armement **et** zéro
+refus de mika#1742 ne prouve rien tant qu'aucun restart n'est tombé pendant un
+tir. Vérifier qu'un tel restart s'est produit avant toute conclusion : *une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+Aucun scan n'est rendu plus fiable : ce qui change est qu'un redémarrage cesse de
+le tuer, et rien ici ne rend le processus plus stable. Aucun compteur
+d'interruptions n'est ajouté — refus mesuré : aucun mécanisme n'existe par lequel
+un scan tuerait le process (`fire_task` dispatche dans un `tokio::spawn`, les
+scans shellent via `tokio::process`), la cause réelle est externe (SIGTERM de
+déploiement, opérateur, OOM killer), et un compteur à seuil bas se déclencherait
+sur le régime **sain** — `wip_rescue` a un cron de 5 min et un tir pouvant durer
+~900 s, donc sur un hôte qui redémarre plusieurs fois dans l'heure trois
+interruptions consécutives sont banales, et un budget de 3 tuerait le scan pour
+24 h un jour de déploiement, c'est-à-dire **rouvrirait ce défaut sous un autre
+nom**. Les deux occurrences mesurées ne sont pas rattrapées : fabriquer une ligne
+décrivant un ré-armement qui n'a pas eu lieu serait l'inverse de ce que ce
+travail défend. Et le champ devient lisible, il ne devient pas surveillé — les
+seuls instruments sont les greps et la requête ci-dessus, dont **le silence ne
+prouve rien tant que personne ne les exécute**.
+
+### Hors périmètre, délibérément
+
+- **La garde mika#1742 et ses quatre exemptions** (config-cancel mika#2271,
+  unknown-trigger mika#2337, relèvement opérateur mika#2446,
+  `RECURRING_ZOMBIE_GRACE_HOURS`) : inchangées.
+- **Le réordonnancement de `run_server`** : refusé — déplacer le balayage avant
+  l'enregistrement ferait lire à la garde un `failed` vieux de quelques
+  millisecondes, donc déclencherait le refus **dans le même démarrage** au lieu
+  du suivant, convertissant une panne d'un cycle en panne immédiate de 24 h.
+- **Le gating CLI de la boucle générique pour les tâches NON récurrentes.**
+  `mika chat` peut encore marquer `failed` une tâche `time` / `event` /
+  `callback` vivante du démon. Population distincte, rayon de souffle distinct, et
+  le remède demande de décider ce qu'un CLI a le droit de balayer dans la base
+  d'un démon vivant. **Ticket de suivi**, précondition : une mesure montrant
+  qu'une tâche vivante a été fauchée par une invocation CLI.
+- **Les récurrentes portant un `timeout_at`.** L'étape 1 (`mark_tasks_expired`)
+  précède le balayage et écrit `expired`, que la garde compte aussi. Les sept
+  récurrentes du démarrage ont `timeout_at: None`, donc cette population est vide
+  pour elles ; une récurrente créée par l'outil de planification avec un
+  `timeout_at` échapperait à ce correctif. Limite **nommée**, non couverte.
 
 Optional (callback watchdog):
 - `MIKA_CALLBACK_WATCHDOG_GRACE_PERIOD_SECS` — Grace period (seconds) after subprocess death detection before marking a callback task `failed` (default: 120). The watchdog runs every 60s in the engine tick loop and detects dead subprocesses via `/proc/<pid>/stat` process start time comparison. Prevents stale long-running callbacks from blocking the dispatch queue indefinitely (#959).
@@ -2214,6 +2430,67 @@ publier cherche dans le voisinage des gardes de dispatch.
   « durcissement ruleset no-bypass main », seconde moitié de l'incident, et les
   deux moitiés tombent séparément.
 
+Optional (battement de vivacité du manager — mika#1990) :
+- **Le défaut que ça ferme.** `mika-manager` poll toutes les 5 min et ne POSTait **rien** tant que le cycle ne délivrait pas — la delivery étant hybride (`state_changed || heartbeat_fired`, le second sur un plancher de **6 h**). Entre deux battements légitimes, le registre cm ne recevait aucun signe de vie, la freshness de l'entité passait RED, et le nudge-scanner criait au loup alors que la cadence tournait parfaitement.
+- `MIKA_MANAGER_LIVENESS_URL` — l'endpoint du battement, **déclaré** et jamais dérivé. Absente ou vide ⇒ **canal désarmé** : zéro POST, zéro erreur, zéro ligne par tick — et c'est aussi le **rollback**, retirer la variable désarme sans redéploiement. Posée ⇒ un POST léger par tick **réussi**, borné à 5 s.
+  ```
+  MIKA_MANAGER_LIVENESS_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
+  ```
+- **Pourquoi ce nom et pas `…HEARTBEAT_URL`.** `MIKA_MANAGER_HEARTBEAT_INTERVAL_SECS` existe déjà et désigne le **plancher de delivery 6 h**. Côte à côte dans le même `EnvironmentFile`, un `…HEARTBEAT_URL` se lirait « le heartbeat vers cette URL bat toutes les 6 heures » — très exactement la croyance fausse que ce ticket existe pour tuer. Le chemin de l'endpoint garde le mot, la variable non.
+- **L'URL est déclarée, jamais composée** depuis `MIKA_MANAGER_DELIVERY_URL` (forme sans rapport) ni depuis `MIKA_MANAGER_HEALTH_URL`, dont l'entité n'est pas la nôtre et dont la sémantique est **inverse** — on y *lit* la santé de l'exécuteur, ici on *écrit* la nôtre. Doctrine maison, pas une invention : mika#2249 et mika#2368.
+- **Deux motifs, distincts et figés** : `poll:<n>` quand le cycle n'a rien délivré, `delivery:<healthy|attention|blocked>` quand il a délivré. **Jamais deux POST sur le même tick** — la freshness est un instant, pas un compte. `<n>` compte les **itérations de boucle**, pas les battements émis : une suite `poll:5` → `poll:9` dit « quatre cycles ont échoué », information qu'un compteur de battements effacerait. Le compteur repart à `1` au démarrage du process, donc **`poll:1` est le marqueur d'un redémarrage** — utile, pas un défaut.
+- **Un cycle en échec ne bat pas, et c'est une décision.** Un cycle qui échoue — typiquement `gh` en 401 — est un manager **cassé** ; y poster « je suis vivant » serait le mensonge exact que la freshness ne doit pas raconter. Cette moitié a déjà son canal : `manager_cycle_error` et l'alarme `manager_auth_persistent_failure` (mika#2013).
+
+### Surfaces opérateur
+
+```bash
+# 1. Le canal est-il armé ? (une ligne par démarrage)
+grep manager_delivery_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{milestone, liveness_url_set, route_normal, delivery_token_present}'
+
+# 2. Le canal est-il tombé ? (régime attendu : VIDE)
+grep manager_liveness_failed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{milestone, class, consecutive_failures, reason}'
+
+# 3. S'est-il rétabli ?
+grep manager_liveness_recovered "$MIKA_SPIRIT_LOG_FILE"
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `manager_delivery_resolved` avec `liveness_url_set: true` | INFO | **1 / démarrage** | le canal est armé. Son **absence** pendant que la cadence tourne = binaire antérieur au correctif (classe mika#2340) — **jamais** « tout va bien » |
+| `liveness_url_set: false` | INFO | — | canal désarmé : c'est une **configuration**, pas une panne ; la freshness restera RED et c'est attendu |
+| `manager_liveness_failed` | WARN | **vide** | chaque ligne est un battement perdu ; `class` (`credential_refused` / `unreachable` / `other`) dit lequel des trois remèdes |
+| `manager_liveness_recovered` | INFO | vide | le pendant du précédent |
+| ligne par battement réussi | — | **aucune** | AC4 : à 288 battements/jour et par milestone, une ligne par battement serait exactement le churn que la doctrine mika#2131 borne |
+
+**Pas de ligne `audit_events`, et c'est une décision** : l'information durable (« le canal est tombé à telle heure ») est déjà portée par les deux lignes de transition, et la population des battements **réussis** se lit chez cm — c'est son registre, c'est tout l'objet du ticket. La détection de transition est un état **en mémoire**, perdu au redémarrage à dessein : un process neuf re-photographie ce qu'il trouve (motif `auto_pull_stop`, mika#2329).
+
+### Sondes post-déploiement, et leurs haltes
+
+> **Préalable.** Établir que le binaire servi porte le correctif : la ligne `manager_delivery_resolved` doit porter le champ `liveness_url_set`. **Sans cette vérification, chacune des sondes ci-dessous décrit le binaire d'hier** (classe mika#2340).
+
+**S1 — le symptôme (~15 min après le déploiement).** Côté cm, la freshness de l'entité `mika-manager` reste verte en continu, avec un battement toutes les ~5 min, et le nudge-scanner cesse de la signaler entre deux deliveries.
+**Halte 1 — la freshness reste RED alors que `manager_liveness_failed` est vide.** Le POST part et n'atteint pas le registre : **ne pas élargir l'émetteur par réflexe** — vérifier d'abord `liveness_url_set` (sonde 1), puis que l'endpoint cm existe et lit ce corps. C'est la moitié `control-monitor` du travail, et elle a son propre dépôt.
+
+**S2 — contrôle positif de non-vacuité (24 h).** Le registre cm doit montrer les deux motifs : beaucoup de `poll:*` et quelques `delivery:*`.
+**Halte 2 — uniquement des `poll:*` sur 24 h.** C'est **attendu** si aucune delivery n'a eu lieu (état stable, moins de 6 h écoulées) — vérifier `manager_cycle_delivered` **avant** de conclure à un défaut. Zéro des deux ne prouve rien.
+
+**S3 — AC1 sur le terrain (48 h).** Aucune régression de cadence : `manager_cycle_delivered` continue d'apparaître à son rythme, aucun `manager_cycle_error` neuf.
+**Halte 3 — les cycles ralentissent.** Lire `manager_liveness_failed` : un `class = unreachable` soutenu signifie que le timeout est atteint à chaque tick, soit 5 s perdues toutes les 5 min. **Désarmer d'abord** (retirer `MIKA_MANAGER_LIVENESS_URL` de l'environnement du service — le rollback, sans redéploiement), diagnostiquer ensuite.
+
+**S4 — contrôle négatif de bruit (7 jours).** `manager_liveness_failed` reste vide.
+**Halte 4 — flot soutenu.** Ce n'est pas un seuil à régler : c'est l'endpoint cm qui refuse, et `class` dit lequel des trois remèdes. Un `credential_refused` renvoie au `delivery_token` et **pas** à ce code.
+
+**Halte transverse — les trois greps muets et la freshness verte.** On ne peut rien conclure : vérifier que la cadence a réellement tourné (`manager_cadence_start`, puis au moins un `manager_cycle_delivered` ou une erreur) avant toute conclusion. *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas exister l'endpoint cm.** `control-monitor` est hors de ce workspace. Si `/api/v1/agents/mika-manager/heartbeat` n'existe pas encore, chaque battement part en 404, `manager_liveness_failed` le dit **une fois**, et la freshness reste RED. La moitié cm est un **ticket frère**, et les deux moitiés tombent indépendamment : émettre avant que l'endpoint existe est **sûr** (un 404 est borné, journalisé, non bloquant), et un endpoint sans émetteur est simplement inerte.
+- **Il ne rend pas la delivery plus fréquente.** Le plancher 6 h et le déclencheur `state_changed` ne bougent pas d'un octet. Ce qui change est **ce que cm sait de notre vivacité** entre deux rapports.
+- **Il ne rattrape aucun battement perdu.** Pas de file, pas de réessai : un battement raté est perdu, le suivant arrive dans 5 min. C'est le bon arbitrage pour un signal de vivacité — réessayer un « je suis vivant » périmé est au mieux inutile, au pire un mensonge daté.
+- **Il n'ajoute aucun compteur et aucune ligne d'audit** : les seuls instruments neufs sont les deux lignes de transition et le booléen de configuration, et **leur silence ne prouve rien tant que personne n'exécute les sondes**.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
 
@@ -3215,7 +3492,7 @@ Optional (réconciliation des demandes de revue — mika#2334):
 - **Hors périmètre, délibérément.** Le maillon 2 du commentaire opérateur — le faux-étiquetage rescue-class (mika#1282/#1618), qui fait refuser QA en `hold[review]` sur du travail complet — touche `_compose_rescue_pr_body` et le Step 1.5 de qa-review, et son remède n'a rien à voir avec celui-ci : **ticket de suivi à ouvrir**, avec les maillons 3 et 4 (geste opérateur de vérification bloqué par le classifier en self-approval). L'option 2 du ticket (sandbox-compatibiliser `/ce-code-review`) appartient au plugin `compound-engineering`, hors de ce dépôt. Le trou « draft sans label `wip-rescue` » est réel mais relève de la voie draft. `isDraft` illisible par qa-review (`qa_pr_view.sh` ne l'expose pas et `QA_REVIEW_GH_ALLOWED` interdit `gh pr view`, ce qui rend le Step 1.5.4 inexécutable dans son propre périmètre) est un défaut réel trouvé en chemin, sans rapport : **ticket de suivi à ouvrir**. Et les pertes amont elles-mêmes : ce scan les rend rattrapables, il ne les fait pas disparaître.
 
 Optional (wip-rescue auto-resume — mika#1852):
-- `MIKA_DEV_WIP_RESCUE` — Set to `0` to disable the wip-rescue auto-resume scan for mika-dev (default: enabled). Same env-gated shape as `MIKA_DEV_AUTO_PULL`; disabling cancels the recurring `wip_rescue` task. The scan (`wip_rescue::auto_resume_wip_rescue_drafts`, cron `0 */5 * * * *`, low-priority fond-de-file per AC7) picks up open `wip-rescue`-labelled draft PRs (created by dispatch-lib's mika#1282/#1396 recovery), rebases them onto `main`, runs a clippy gate, reuses the mika#1831 perimeter classifier, and un-drafts (`gh pr ready`) — driving the draft back to qa-review. Handles at most **one draft per tick** (concurrency cap = 1, AC6), oldest-first. Any uncertain condition (rebase conflict, clippy errors, un-draft failure, rescue-depth exhausted) **bails to human**: adds the `human-review-required` label + a PR comment naming the reason, and ends the chain (AC3). Emits five structured events (`wip_rescue_resume_attempt`, `wip_rescue_bail_to_human`, `wip_rescue_success`, `wip_rescue_skipped`, `wip_rescue_error`) plus a `log_audit_event` (`tool_name = "wip_rescue"`) per action (AC8).
+- `MIKA_DEV_WIP_RESCUE` — Set to `0` to disable the wip-rescue auto-resume scan for mika-dev (default: enabled). Same env-gated shape as `MIKA_DEV_AUTO_PULL`; disabling cancels the recurring `wip_rescue` task. The scan (`wip_rescue::auto_resume_wip_rescue_drafts`, cron `0 */5 * * * *`, low-priority fond-de-file per AC7) picks up open `wip-rescue`-labelled draft PRs (created by dispatch-lib's mika#1282/#1396 recovery), rebases them onto `main`, runs a clippy gate, reuses the mika#1831 perimeter classifier, and un-drafts (`gh pr ready`) — driving the draft back to qa-review. Handles at most **one draft per tick** (concurrency cap = 1, AC6), oldest-first. Any uncertain condition (rebase conflict, clippy errors, un-draft failure, rescue-depth exhausted) **bails to human**: adds the `human-review-required` label + a PR comment naming the reason, and ends the chain (AC3). Emits five structured events (`wip_rescue_resume_attempt`, `wip_rescue_bail_to_human`, `wip_rescue_success`, `wip_rescue_skipped`, `wip_rescue_error`) plus a `log_audit_event` (`tool_name = "wip_rescue"`) per action (AC8). **Since mika#2597 the selection carries a third exclusion**: a draft carrying at least one `ConvertToDraftEvent` is a **hold** — somebody put it back into draft after the work — and the scan does not touch it (two more events, `wip_rescue_hold_respected` / `wip_rescue_hold_unreadable`; see Signal N-bis above).
   - **The bail's exclusion no longer lives on GitHub (mika#2199).** It used to: the `human-review-required` label was the *only* thing the eligibility filter read, `bail_to_human` swallowed the failure of the single `gh pr edit` that applied it, and the label was declared nowhere in `.github/labels.yml`. Since the scan takes **one PR per tick, oldest first**, an unparkable PR stayed the oldest and was re-elected for ever. Measured 2026-09-05 (counts deduplicated — every line of the spirit log is written twice, so raw greps read double): 17 bails, **17 `wip_rescue_error`** — one per bail, all `gh exit code 1: 'human-review-required' not found` — **14 of them on PR #2197 alone** between 09:43 and 16:05, the remaining 3 on #2187; the queue only moved when #2197 was closed by hand, and neither #2187 nor #2197 ever carried the label. Two independent routes now: (a) `apply_human_review_label` tries, runs an idempotent `gh label create`, retries once — the `_stamp_pr_origin` sequence (mika#2026) — and the outcome is **returned** (`ChainOutcome::Bailed { reason, parked }`, surfaced as `parked` on the `wip_rescue: bailed` line) rather than swallowed; (b) a durable `audit_events` marker, `tool_name = 'wip_rescue_bailed'`, `target_key = 'pr:{repo}#{n}'`, written **unconditionally and before any GitHub call**. The filter reads (b), so a bail whose label write fails still excludes the draft — and, because the marker is consulted *during* filtering with a short-circuit on the first non-bailed candidate, the next draft is picked up on the **same** tick. The read is **fail-closed** (an unreadable audit trail reads as already-bailed: a bailed PR is destined for a human, so excluding it wrongly loses nothing while re-attempting it costs the whole queue) — the deliberate inverse of `ci_success_handler`'s fail-open on the same primitive. Half-life of the exclusion, named: `compact_old_audit_events(90)` purges the marker after **90 days**; a draft still open past that is re-attempted **once**, which is not a livelock and whose age is itself the signal. Operator surfaces: `SELECT * FROM audit_events WHERE tool_name = 'wip_rescue_bailed'` (one row per bailed PR); `grep 'wip_rescue: bailed' $MIKA_SPIRIT_LOG_FILE | jq .parked` — a `false` means the draft is excluded but carries no label on GitHub, so the human who must pick it up will not find it by label; and `grep wip_rescue_marker_write_failed $MIKA_SPIRIT_LOG_FILE`, which **should be empty** — any hit is a PR whose exclusion fell back to the label alone, i.e. the one condition that restores the livelock. It has its own event name rather than the module's shared `wip_rescue_error` (written at ten sites since mika#2286) precisely so it cannot hide among routine `gh` failures. **The bail's PR comment no longer tells the human to remove the label to re-arm the scan**: that gesture worked when the label was the gate and does nothing now, so the comment says the draft is permanently out of the scan and a human owns it. **`human-review-required` is now declared in `.github/labels.yml`** and a unit test (`wip_rescue::tests::labels_this_module_writes_are_declared_in_labels_yml`, asserting on the constants) keeps it there: `delete-other-labels: true` would otherwise prune it on the next push touching that file. Third occurrence of this class after `dispatch:ssc` and `operator-review`/`blocked` — see `docs/solutions/best-practices/un-label-denforcement-non-declare-echoue-en-silence-2026-09-01.md`. Still true and deliberately not fixed here: a bail does **not** increment `wip_rescue.depth` (only the `Resumed` path does), which the durable marker makes moot — the bail is terminal by the marker.
   - **A DECISION-CORE draft is only un-drafted once verified (mika#2286).** The scan used to classify a draft and then un-draft it **whatever the class** — the classification conditioned only the hand-merge comment that followed. So on 2026-09-10 the daemon un-drafted PR #2285, classified DECISION-CORE, with `<!-- rescue-pipeline-verified: no -->` still in its body: `grep -c rescue-pipeline-verified crates/mika-agent/src/wip_rescue.rs` returned **0**, i.e. the daemon did not know that marker existed. That is a fail-open on the decision core, and it also broke a premise one file away: `qa-review` Step 1.5 item 4 reads `isDraft: false` as *"operator un-drafted it — a stronger signal than any body marker"*, which was true only while a human was the sole possible author of that gesture (the LLM tool is blocked on `wip-rescue` PRs by mika#1682). Measured on #2285: QA held the door at 17:43 (`hold[review]`, marker `no` + draft) and opened it at 18:08 (`pass`) **with no human having touched the PR in between** — the only state change was the daemon's un-draft. **This revises step 6 of the mika#1852 spec rather than contradicting it:** that spec placed the un-draft *after* step 5, *"re-run pilot"*; the v1 descoped steps 4-fix and 5 and kept the un-draft, so what the spec treated as verified no longer was. Now `undraft_decision(route, verified)` gates it: MECHANICAL is **unchanged** at marker `no` (that auto-path is the mika#1852 design, held by perimeter + QA + CI + forge-gate, and closing it too is a separate ticket), DECISION-CORE un-drafts only on the literal `yes`, otherwise it is **parked**. The marker read is fail-closed (`no`, absent, any other value, an empty body, two markers that disagree → not verified; the "absent marker = pre-mika#1618 PR" fallback qa-review allows itself has no place here, since every `wip-rescue` draft comes from dispatch-lib, which has stamped it since 2026-06-29) and it **composes** with the fail-closed classification — an unreadable diff classifies DECISION-CORE, so it parks instead of un-drafting. The body is read twice: once off the listing (to decide eligibility) and once fresh via `gh pr view --json body` at decision time, because steps 2–5 can take minutes and the operator may flip the marker inside that window.
   - **A park is not a bail, and it re-arms itself.** No `human-review-required` label, no `wip_rescue_bailed` marker, no "a human owns this PR from here" — nothing went wrong, the class simply requires a verification that has not happened. Collapsing the two vocabularies would send the operator looking for a conflict or a red clippy that do not exist, and make the two populations uncountable apart. Durable exclusion via a **second** audit marker, `tool_name = 'wip_rescue_parked_unverified'`, `target_key = 'pr:{repo}#{n}'`, written unconditionally **before** any GitHub call — same load-bearing order as the bail's, and for the same reason: without a durable state a parked draft would be re-elected every 5-minute tick (fetch → rebase → clippy, budgeted up to 900 s → push → classify → *still `no`*), holding the single slot (cap = 1, oldest first) and starving everything behind it. That is the mika#2199 livelock shape, measured there as 14 bails on one PR in six hours. Unlike the bail, the exclusion **lifts itself**: the eligibility predicate is `has_parked_marker(n) && !pipeline_verified(&pr.body)`, the body test first because it is free, so writing `yes` in the body re-elects the draft on the next tick with nobody clearing anything. A human who un-drafts it directly takes the PR out of the `--draft` listing, so there is no state to clean either. `has_parked_marker` is fail-closed like its sibling (a parked draft excluded in error stays open, a draft and commented; re-attempting it in a loop costs the whole queue), and the park does **not** increment `wip_rescue.depth` — no resume happened; the resume that follows the `yes` will. **Operator surfaces:** `SELECT * FROM audit_events WHERE tool_name = 'wip_rescue_parked_unverified'` (one row per parked PR) and `grep wip_rescue_parked_unverified $MIKA_SPIRIT_LOG_FILE` (INFO, one line per park — the durable marker guarantees a single pass, hence a single PR comment, so a repeat on the same PR means the marker write is failing; check `wip_rescue_marker_write_failed`, which now carries a `marker` field naming which of the two could not be written).
@@ -4541,6 +4818,28 @@ donc hors de la redirection `2>"$STDERR_FILE"`, et son stderr est le `Stdio::pip
 que l'exécuteur ne lit que dans la branche `if !status.success()` — or un dispatch de
 groom sort **toujours en 0**, donc le tuyau est lâché sans être lu (classe mika#2050,
 Signaux M et Q). **La cause fournisseur des coupures** — voisinage mika#2522 / #2342.
+
+Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
+- `surface_for_adoption` (`config.toml`) / `MIKA_SURFACE_FOR_ADOPTION` — la **notification opérateur** d'un signal surface-for-adoption peut-elle partir ? **Défaut : armé.** Trois paliers plus la pente du quatrième : absent ou vide → armé ; `1`/`true`/`on`/`yes` → armé ; `0`/`false`/`off`/`no` → désarmé ; **non reconnu → armé, avec un WARN nommant la valeur entre guillemets** (`surface_for_adoption_unrecognized_value`). La pente suit celle de `MIKA_TELEGRAM_HTML_RENDER` et non celle de `MIKA_SEARCH_REQUIRED`, et le coût la décide : une notification dont personne ne voulait coûte une ligne Telegram ; une notification coupée par une coquille rétablit le silence exact que mika#1745 ferme — **et le rétablit pendant que l'opérateur croit le signal armé**. `Option<String>` et **jamais `bool`** : sous config-rs un `bool` ferait d'une coquille une erreur dure de `Settings::load`, donc un mika-spirit qui refuse de démarrer sur un drapeau d'observabilité (raison F8 de mika#2291).
+- **Il gate la notification et RIEN d'autre.** La détection est inconditionnelle — la ligne `audit_events` et la ligne INFO `surface_for_adoption` sont écrites quelle que soit la valeur, parce qu'elles **sont** la mesure et qu'elle doit rester lisible précisément quand on a coupé le bruit (motif mika#2249/#2272 : *la détection est inconditionnelle, seule la disposition est gatée*). Désarmé est donc le **mode d'observation** que la sonde S2 prescrit, pas un bandeau sur les yeux.
+
+  **Le défaut que ça ferme.** Un CI failure sur une PR ouverte d'un dépôt que la boucle a le droit de dispatcher, sans tâche mika correspondante, était écarté en silence : `ci_failure_handler` rendait `Passthrough { enrichment: None }` — le modèle recevait le texte brut du webhook, sans un mot du moteur, puis son prompt lui disait d'ignorer. Le signal est désormais **additif** : aucune tâche créée, aucun dispatch déclenché, aucun statut modifié, aucun processus signalé. `Passthrough`, jamais `Handled` (AC3).
+
+  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot-py` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
+
+  **Surfaces opérateur.** `grep surface_for_adoption "$MIKA_SPIRIT_LOG_FILE" | jq -c '{event, repo, pr_number, branch, head_sha, dedup_skipped, notified}'` — le grep est un **préfixe**, donc il rend le signal et ses frères de saut ensemble ; `.event` discrimine. SQL : `SELECT target_key, count(*) FROM audit_events WHERE tool_name = 'surface_for_adoption' GROUP BY 1 ORDER BY 2 DESC;` — exact parce que `surface_for_adoption` est **SOLE WRITER** de son nom (scan de source, allowlist livrée vide), et ce compte **est** la précondition explicite de la décision d'auto-adoption qu'AC3 diffère (« until we have enough n »).
+
+  | surface | régime attendu | lecture |
+  |---|---|---|
+  | `surface_for_adoption`, `dedup_skipped: false` | **non vide, faible** | chaque ligne est du travail légitime que la boucle ignorait |
+  | une clé `target_key` comptée > 1 | **anomalie** | la dédup ne mord pas |
+  | `surface_for_adoption_skipped`, `reason = repo_not_dispatchable` | non vide | AC4 fait son travail — un silence légitime, désormais attribuable |
+  | `surface_for_adoption_skipped`, `reason = unreadable_head_sha` | **vide** | aucune clé de dédup dérivable ; l'événement quitte la population |
+  | `surface_for_adoption_audit_failed` | **vide** | la ligne INFO est passée, la ligne d'audit non — le `GROUP BY` sous-compte |
+
+  **Dédup : condition de viabilité, pas raffinement.** Un push produit jusqu'à **8** `check_suite.completed` (un par workflow, mesuré par mika#1869 qui a fermé la même classe côté succès), donc sans dédup un seul fait produirait huit notifications Telegram — et une notification en rafale est une notification qu'on finit par museler. Clé `pr:{repo}#{n}@{head_sha}`, fenêtre une heure, **fail-open** : une base illisible laisse passer le signal (un doublon coûte une ligne, un signal perdu rouvre le défaut) — l'inverse du fail-closed de `wip_rescue` sur le même primitif, où un rejeu coûtait la file entière.
+
+  **Sondes et haltes, la doctrine complète, et le tableau des trois cas de vérification du ticket avec leur statut rectifié** : `docs/architecture/mika-dev-work-assignment.md`. Deux points à connaître avant d'y aller : **S2 (dimensionnement, 30 j) n'était pas disponible à l'implémenteur** — `~/.mika/data/mika.db` n'est pas lisible depuis le bac à sable de dispatch, donc le volume réel est **inconnu à la livraison** ; et si ce compte porte du trafic nominal, ce n'est pas le prédicat qui est trop large, **c'est le résultat que le ticket cherchait** (noter le compte, désarmer la notification pour garder la mesure sans le bruit).
 
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 

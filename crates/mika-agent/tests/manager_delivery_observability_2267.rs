@@ -174,6 +174,9 @@ fn mk_config(dir: &Path) -> ManagerConfig {
         checkpoint_dir: dir.join("checkpoints"),
         offline_sink_dir: dir.join("puits"),
         sink_dir_source: SinkDirSource::Default,
+        // mika#1990 — canal de liveness désarmé : ce fichier atteste la surface
+        // de configuration de la DELIVERY, et un battement est un autre canal.
+        liveness_url: None,
     }
 }
 

@@ -911,6 +911,84 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2260 — le nom d'audit de la porte d'entrée a un écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// Rien à excepter à la livraison : le nom
+    /// `ci_success_handler_skipped_not_merge_actor` est **neuf**. Quand ce scan
+    /// tire, **on retire le second écrivain**, on ne l'excepte pas (doctrine
+    /// mika#2201).
+    const ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom d'audit de la porte d'entrée de l'évaluateur n'a qu'un écrivain.
+    ///
+    /// La propriété est porteuse parce que `CLAUDE.md` déclare ce nom **compteur
+    /// mesuré** — c'est la population qu'AC6 interroge après déploiement, et son
+    /// comparaison avec `ci_success_handler_processed` sous le même `agent_id` est
+    /// ce qui dit « un seul agent entre ». Deux écrivains rendraient ce compte
+    /// inexact, et aucun test comportemental ne peut voir cette classe : un second
+    /// site ne rendrait **aucune** décision fausse le jour où il est écrit.
+    #[test]
+    fn mika2260_the_entry_gate_skip_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("ci_success_handler_skipped{}", "_not_merge_actor");
+        let owner = "crates/mika-agent/src/server/ci_success_handler.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2260 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2260 — le nom d'audit de la porte d'entrée a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS — la mesure d'AC6 (« un seul \
+             agent entre ») n'est exacte que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2260_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "ENTRY_GATE_SKIP_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2522 — le nom d'audit du tour A2A échoué a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 
@@ -2716,6 +2794,279 @@ mod tests {
             "BRIEF_SIZE_THRESHOLD_READERS_ALLOWED est livrée vide et doit le \
              rester : quand le scan tire, on retire le second lecteur (doctrine \
              mika#2201)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2575 — le nom d'audit du ré-armement d'une récurrente en vol.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Le nom `recurring_restart_restore` est **neuf** : il n'y a rien à
+    /// excepter à la livraison, et c'est vérifiable. Quand ce scan tire, **on
+    /// retire le second écrivain** (doctrine mika#2201) — une allowlist née vide
+    /// est un emplacement où déposer la prochaine infraction (mika#2323).
+    const RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le nom sert de `tool_name` d'audit aux **deux** issues du ré-armement,
+    /// l'issue étant portée par `after_value` (motif `ready_label_outcome`,
+    /// mika#2323). C'est ce qui rend soustractible le `GROUP BY after_value` de
+    /// la sonde S5 — et donc ce qui distingue « le ré-armement a tenu » de « le
+    /// cron était cassé » par une requête plutôt que par un grep.
+    ///
+    /// Aucun test comportemental ne peut voir cette classe : un second écrivain
+    /// ne rendrait **aucune** décision fausse le jour où il est écrit, il
+    /// rendrait le compte inexact, en silence, tous les tests au vert.
+    #[test]
+    fn mika2575_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("recurring_restart{}", "_restore");
+        let owner = "crates/mika-agent/src/task_engine/engine.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2575 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2575 — le nom d'audit du ré-armement a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `task_engine::engine`'s `RECURRING_RESTART_RESTORE_AUDIT`, ou le \
+             retirer. Ne PAS l'ajouter à \
+             RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS — le `GROUP BY \
+             after_value` de la sonde S5 n'est exact que tant qu'un seul site \
+             l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2575_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "RECURRING_RESTART_RESTORE_SOLE_WRITER_EXCEPTIONS est livrée vide et \
+             doit le rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// Les deux `after_value` du ré-armement sont un **format de fil** : ils
+    /// atterrissent dans `audit_events.after_value` et l'opérateur en fait des
+    /// `GROUP BY`. Deux orthographes couperaient une population en deux sans le
+    /// dire — c'est ce que la scission datée de mika#2361 a dû écrire une fois.
+    ///
+    /// Les valeurs sont figées ici plutôt que dans `engine.rs` pour la même
+    /// raison que les autres formats de fil de ce fichier : un renommage est une
+    /// **rupture à dater**, jamais une mise à jour de test en silence.
+    #[test]
+    fn mika2575_les_valeurs_daudit_sont_un_format_de_fil() {
+        let owner = repo_root().join("crates/mika-agent/src/task_engine/engine.rs");
+        let src = std::fs::read_to_string(&owner).expect("engine.rs lisible");
+
+        for (konst, value) in [
+            ("RECURRING_RESTORE_OUTCOME_REARMED", "recurring_active"),
+            ("RECURRING_RESTORE_OUTCOME_NO_CRON", "failed_no_cron"),
+        ] {
+            let decl = format!("const {konst}: &str = \"{value}\";");
+            assert!(
+                src.contains(&decl),
+                "mika#2575 — `{konst}` ne vaut plus `{value}`.\n\n\
+                 Ces deux valeurs sont un FORMAT DE FIL : l'opérateur en fait des \
+                 `GROUP BY after_value`. Les changer est une rupture à dater dans \
+                 `CLAUDE.md`, pas une mise à jour de test."
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#1745 — le nom du signal surface-for-adoption a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable plutôt que cru : le nom
+    /// `surface_for_adoption` est **créé par mika#1745**, donc la population
+    /// des violations préexistantes est vide par construction. Il n'y a rien à
+    /// excepter — et une allowlist née non vide serait un emplacement où
+    /// déposer la prochaine infraction (doctrine mika#2323).
+    ///
+    /// **Quand le scan tire, on retire le second site d'écriture ; on n'ajoute
+    /// pas d'entrée** (doctrine mika#2201).
+    const SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le prédicat du scan mika#1745, extrait pour être exerçable sur un contenu
+    /// fabriqué.
+    ///
+    /// Sans cette extraction, « le scan est propre » et « le scan ne regarde
+    /// rien » rendent le même vert, et la seule façon de les distinguer est une
+    /// mutation à la main que personne ne rejoue (classe mika#2205, appliquée au
+    /// scan lui-même).
+    fn carries_bare_surface_literal(content: &str, needle: &str) -> bool {
+        content
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            })
+            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
+    }
+
+    /// Le nom du signal est écrit à **un** endroit, dans le journal comme dans
+    /// `audit_events`.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rend **aucune décision fausse** le jour où il est
+    /// écrit : le handler continue de surfacer, la notification continue de
+    /// partir, et toutes les assertions restent vertes. Ce qu'il casse est la
+    /// requête opérateur — `SELECT count(*) … WHERE tool_name =
+    /// 'surface_for_adoption' GROUP BY target_key` — qui **est** la mesure de la
+    /// population, et donc la précondition explicite de la décision
+    /// d'auto-adoption qu'AC3 diffère (« until we have enough n »). Elle
+    /// cesserait de compter un fait pour compter deux populations mêlées, en
+    /// silence. C'est très exactement la classe qu'aucun test de comportement ne
+    /// peut voir.
+    ///
+    /// # Le prédicat est l'ÉGALITÉ, jamais la sous-chaîne
+    ///
+    /// Trois faux positifs mesurés l'imposent, et ils ne vont pas tous dans le
+    /// même sens : `surface_for_adoption_skipped` et
+    /// `surface_for_adoption_audit_failed` (dans le fichier propriétaire) sont
+    /// des noms d'événement **voisins** qui portent le nom sans être lui, et
+    /// `surface_for_adoption_unrecognized_value` (`mika-common/src/config.rs`,
+    /// la moitié réglage) est dans un **autre crate** — un prédicat par
+    /// `contains` l'accuserait comme second écrivain alors qu'il ne touche ni le
+    /// journal du signal ni `audit_events`. Ce qu'un second écrivain porterait
+    /// réellement est le littéral nu.
+    ///
+    /// # Angle mort HÉRITÉ, mesuré, et nommé plutôt que découvert
+    ///
+    /// [`production_sources`] tronque chaque fichier à la **première**
+    /// occurrence textuelle de `#[cfg(test)]`, « où qu'elle soit » — y compris
+    /// dans un doc-comment. `webhook_dispatch.rs` en cite une ligne 110, donc un
+    /// second écrivain planté ligne 266 de ce fichier-là est **invisible** à ce
+    /// scan : vérifié par mutation pendant l'écriture de mika#1745, où la sonde
+    /// n'a pas rougi. La mutation équivalente dans `ci_success_handler.rs` (dont
+    /// le premier `#[cfg(test)]` est son vrai module de test) rougit bien.
+    ///
+    /// La limite est partagée par tous les scans de ce fichier et n'est pas le
+    /// périmètre de mika#1745 — la réparer veut dire changer l'énumérateur pour
+    /// tous. Ce qui la rend supportable est
+    /// [`mika1745_the_writer_predicate_sees_a_bare_literal`], qui atteste que le
+    /// **prédicat** mord indépendamment de ce que l'énumérateur lui donne à
+    /// lire : quand la garde se taira, on saura lequel des deux interroger.
+    #[test]
+    fn mika1745_the_surface_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("surface_for{}", "_adoption");
+        let owner = "crates/mika-agent/src/server/ci_failure_handler.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if carries_bare_surface_literal(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#1745 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#1745 — le nom du signal surface-for-adoption a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS — le compte qui \
+             conditionne la décision d'auto-adoption (AC3) n'est exact que tant \
+             qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Contrôle de bonne foi : le prédicat voit un second écrivain, et il ne voit
+    /// **pas** les trois formes voisines qui lui ressemblent.
+    ///
+    /// Les quatre cas négatifs sont ceux mesurés pendant l'écriture, et chacun
+    /// serait un faux positif permanent — donc une garde qu'on finit par museler.
+    #[test]
+    fn mika1745_the_writer_predicate_sees_a_bare_literal() {
+        let needle = format!("surface_for{}", "_adoption");
+
+        assert!(
+            carries_bare_surface_literal(
+                &format!("    db.log_audit_event(sid, \"{needle}\", &key).await;"),
+                &needle
+            ),
+            "un second écrivain porte le littéral nu — le prédicat doit le voir"
+        );
+        assert!(
+            carries_bare_surface_literal(
+                &format!("    info!(event = \"{needle}\", x = 1);"),
+                &needle
+            ),
+            "le journal compte autant que la base"
+        );
+
+        for benign in [
+            // Noms d'événement voisins, dans le fichier propriétaire.
+            format!("    info!(event = \"{needle}_skipped\", reason = \"x\");"),
+            format!("    warn!(event = \"{needle}_audit_failed\");"),
+            // La moitié réglage, dans un AUTRE crate.
+            format!("    tracing::warn!(event = \"{needle}_unrecognized_value\");"),
+            // Une mention n'est pas une instruction (classe mika#2050).
+            format!("    /// Voir `{needle}` pour le contrat."),
+        ] {
+            assert!(
+                !carries_bare_surface_literal(&benign, &needle),
+                "faux positif sur une forme voisine : {benign}"
+            );
+        }
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika1745_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
+             le rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
         );
     }
 }

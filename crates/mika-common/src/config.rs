@@ -1114,6 +1114,30 @@ pub struct Settings {
     #[serde(default)]
     pub brief_size_alert_bytes: Option<i64>,
 
+    /// Kill-switch for the **operator notification** of a surface-for-adoption
+    /// signal (mika#1745).
+    ///
+    /// Env override: `MIKA_SURFACE_FOR_ADOPTION`. The `MIKA_` prefix is correct
+    /// for the same reason as `pilot_cost_alert_usd` above: this key is read by
+    /// **mika-spirit** through the config-rs `MIKA_` cascade, whose process env
+    /// nothing clears.
+    ///
+    /// **It gates the notification and nothing else.** Detection is
+    /// unconditional — the `audit_events` row and the `surface_for_adoption`
+    /// INFO line are written whatever this value is, because they *are* the
+    /// measurement and it has to stay readable exactly when the operator cut the
+    /// noise (motif mika#2249/#2272: *detection is unconditional, only the
+    /// disposition is gated*). Disarmed, the handler still measures and simply
+    /// writes nothing to the operator. See
+    /// [`Self::surface_for_adoption_notifications_armed`].
+    ///
+    /// `Option<String>` and **never `bool`**: under config-rs a `bool` makes any
+    /// non-boolean value a hard [`Settings::load`] error, so a typo on an
+    /// observability flag would stop mika-spirit from booting — the same F8
+    /// reasoning the gateway wrote for `MIKA_TELEGRAM_HTML_RENDER` (mika#2291).
+    #[serde(default)]
+    pub surface_for_adoption: Option<String>,
+
     /// First backoff step after a failed callback delivery, in seconds
     /// (mika#2179). Doubles per attempt up to
     /// [`Self::callback_delivery_backoff_max_secs`].
@@ -1577,6 +1601,54 @@ fn classify_brief_size_alert_bytes(raw: Option<i64>) -> BriefSizeAlertTier {
         Some(v) if v > 0 => BriefSizeAlertTier::Configured(v),
         Some(invalid) => BriefSizeAlertTier::Invalid(invalid),
         None => BriefSizeAlertTier::Default,
+    }
+}
+
+/// Resolve `MIKA_SURFACE_FOR_ADOPTION` (mika#1745). Three tiers, and the lean of
+/// the fourth is the decision.
+///
+/// | value | resolution |
+/// |---|---|
+/// | absent or empty | **armed** — the signal is the ticket's deliverable, not an option |
+/// | `1` / `true` / `on` / `yes` | armed, explicitly |
+/// | `0` / `false` / `off` / `no` | **disarmed** — the handler still measures, it writes nothing to the operator |
+/// | non-empty and unrecognized | **armed**, with a `warn!` naming the value between quotes |
+///
+/// **The fourth tier leans the same way as `MIKA_TELEGRAM_HTML_RENDER`'s and the
+/// opposite way to `MIKA_SEARCH_REQUIRED`'s, and each lean is right for its own
+/// surface.** Here the cost asymmetry is: a notification nobody wanted costs one
+/// Telegram line; a notification silently switched off by a typo restores the
+/// exact silence mika#1745 was filed to end, and restores it *while the operator
+/// believes the signal is on*. So a typo must not disarm.
+///
+/// **Pure and non-emitting is the whole point of splitting it out.** Absent and
+/// unrecognized both resolve to `true`, so a caller reading the boolean alone
+/// cannot tell "nothing was configured" from "a typo was refused" — and that is
+/// precisely the pair the operator needs told apart, hence the WARN here rather
+/// than at the consumer. The WARN quotes the **trimmed original**, never the
+/// lowercased match subject: folding the case throws away part of what the
+/// operator typed, and the quotes are what make a stray space visible
+/// (mika#2220).
+pub fn parse_surface_for_adoption(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            tracing::warn!(
+                event = "surface_for_adoption_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#1745: MIKA_SURFACE_FOR_ADOPTION carries an unrecognized value — \
+                 the operator notification stays ARMED (the default). Use 0/false/off/no \
+                 to disarm; detection and the audit row are unconditional either way."
+            );
+            true
+        }
     }
 }
 
@@ -2218,6 +2290,21 @@ impl Settings {
         }
     }
 
+    /// May a surface-for-adoption signal reach the operator? (mika#1745)
+    ///
+    /// **Default: armed.** The signal is the point of the ticket, not an option:
+    /// a CI failure on a dispatchable repo with no matching task was written off
+    /// in silence, and the fix is that somebody hears about it. See
+    /// [`parse_surface_for_adoption`] for the tier table and for why an
+    /// unrecognized value stays armed.
+    ///
+    /// This gates the **notification only**. The `audit_events` row and the
+    /// `surface_for_adoption` log line are unconditional — see the field's
+    /// doc-comment.
+    pub fn surface_for_adoption_notifications_armed(&self) -> bool {
+        parse_surface_for_adoption(self.surface_for_adoption.as_deref())
+    }
+
     /// Effective first backoff step after a failed delivery (mika#2179).
     ///
     /// Returns the configured value or
@@ -2656,6 +2743,7 @@ impl Settings {
             callback_delivery_max_attempts: None,
             pilot_cost_alert_usd: None,
             brief_size_alert_bytes: None,
+            surface_for_adoption: None,
             callback_delivery_backoff_base_secs: None,
             callback_delivery_backoff_max_secs: None,
             kg_docs_root: None,
@@ -4527,6 +4615,96 @@ mod tests {
         assert!(
             settings.effective_brief_size_alert_bytes() > 0,
             "a threshold of 0 would report every turn; it must fall back instead"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#1745 — MIKA_SURFACE_FOR_ADOPTION
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Absent, empty and whitespace-only all mean **armed** — the signal is the
+    /// ticket's deliverable, and an operator who set nothing gets it.
+    #[test]
+    fn mika1745_the_notification_is_armed_by_default() {
+        assert!(parse_surface_for_adoption(None));
+        assert!(parse_surface_for_adoption(Some("")));
+        assert!(parse_surface_for_adoption(Some("   ")));
+
+        // And through `Settings`, which is the surface the handler reads.
+        assert!(
+            Settings::test_defaults().surface_for_adoption_notifications_armed(),
+            "a Settings that configured nothing must be armed"
+        );
+    }
+
+    /// The four disarming forms, case-insensitively, whitespace tolerated.
+    #[test]
+    fn mika1745_the_four_disarming_forms_are_honoured() {
+        for raw in [
+            "0",
+            "false",
+            "off",
+            "no",
+            "FALSE",
+            "Off",
+            "NO",
+            " 0 ",
+            "\tfalse\n",
+        ] {
+            assert!(
+                !parse_surface_for_adoption(Some(raw)),
+                "{raw:?} must disarm the notification"
+            );
+        }
+
+        let mut settings = Settings::test_defaults();
+        settings.surface_for_adoption = Some("0".to_string());
+        assert!(!settings.surface_for_adoption_notifications_armed());
+    }
+
+    /// The affirming forms, for symmetry — a `1` posed explicitly must not read
+    /// as unrecognized and emit a WARN on a correct configuration.
+    #[test]
+    fn mika1745_the_four_arming_forms_are_honoured() {
+        for raw in ["1", "true", "on", "yes", "TRUE", "On", " yes "] {
+            assert!(
+                parse_surface_for_adoption(Some(raw)),
+                "{raw:?} must arm the notification"
+            );
+        }
+    }
+
+    /// **The lean of the fourth tier**: a typo must not silently switch a safety
+    /// signal off. This is the negative control that separates "disarmed on
+    /// purpose" from "disarmed by accident" — without it, a body copied from a
+    /// sibling that absorbs unknown values into `false` would look correct.
+    #[test]
+    fn mika1745_an_unrecognized_value_stays_armed() {
+        for raw in ["plif", "disabled", "2", "of", "non", "nope", "-1"] {
+            assert!(
+                parse_surface_for_adoption(Some(raw)),
+                "{raw:?} is unrecognized and must leave the notification ARMED"
+            );
+        }
+    }
+
+    /// Under config-rs the field must stay `Option<String>`: a `bool` would turn
+    /// a typo on an observability flag into a hard `Settings::load` error, i.e.
+    /// a mika-spirit that refuses to boot. Only a deserialization test can see
+    /// that class — the parse function above never meets the loader.
+    #[test]
+    fn mika1745_an_unrecognized_value_does_not_break_settings_load() {
+        let settings: Settings = config::Config::builder()
+            .set_override("surface_for_adoption", "plif")
+            .and_then(|b| b.build())
+            .expect("builder")
+            .try_deserialize()
+            .expect("an unrecognized value must deserialize, not abort the load");
+
+        assert_eq!(settings.surface_for_adoption.as_deref(), Some("plif"));
+        assert!(
+            settings.surface_for_adoption_notifications_armed(),
+            "and it must resolve to armed"
         );
     }
 }
