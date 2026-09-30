@@ -1132,8 +1132,13 @@ mod tests {
     #[test]
     fn behind_main_enrichment_contains_both_shas() {
         let info = behind_info();
-        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &info)
-            .expect("an updated branch must still enrich the turn");
+        let text = format_behind_main_enrichment(
+            &BehindMainRemediation::Updated {
+                observed_base_sha: "0bserved0bserved0bserved0bserved0bserved".to_string(),
+            },
+            &info,
+        )
+        .expect("an updated branch must still enrich the turn");
         assert!(
             text.contains(&info.pr_base_sha),
             "Enrichment missing pr_base_sha: {text}"
@@ -1150,7 +1155,10 @@ mod tests {
         // one of them must clear the completion-claim guard — not just the
         // shape that happened to exist when the guard was written.
         for remediation in [
-            BehindMainRemediation::Updated,
+            BehindMainRemediation::Updated {
+                observed_base_sha: "0bserved0bserved0bserved0bserved0bserved".to_string(),
+            },
+            BehindMainRemediation::AcceptedNotLanded,
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict between base and head".to_string()),
             BehindMainRemediation::Failed("HTTP 403: Resource not accessible".to_string()),
@@ -1174,7 +1182,10 @@ mod tests {
         // reach the worktree, so an agent that obeys it either fails or edits
         // its own sandbox. Every shape must instead route to the operator.
         for remediation in [
-            BehindMainRemediation::Updated,
+            BehindMainRemediation::Updated {
+                observed_base_sha: "0bserved0bserved0bserved0bserved0bserved".to_string(),
+            },
+            BehindMainRemediation::AcceptedNotLanded,
             BehindMainRemediation::AlreadyAttempted,
             BehindMainRemediation::Conflict("merge conflict".to_string()),
             BehindMainRemediation::Failed("gh exit code 1".to_string()),
@@ -1217,8 +1228,13 @@ mod tests {
         // longer matches and this handler will hold the PR on the next pass.
         // Saying "the webhook finishes the merge" would be a promise the gate
         // right above refuses to keep.
-        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &behind_info())
-            .expect("an updated branch must enrich the turn");
+        let text = format_behind_main_enrichment(
+            &BehindMainRemediation::Updated {
+                observed_base_sha: "0bserved0bserved0bserved0bserved0bserved".to_string(),
+            },
+            &behind_info(),
+        )
+        .expect("an updated branch must enrich the turn");
         assert!(
             text.contains("fresh QA review"),
             "the updated enrichment must say the PR returns to QA: {text}"
@@ -1230,8 +1246,13 @@ mod tests {
         // R3, handler side. An update-branch creates a new head commit that no
         // CI run has validated; an LLM that merges it anyway re-opens #1577
         // through the door mika#2238 opened.
-        let text = format_behind_main_enrichment(&BehindMainRemediation::Updated, &behind_info())
-            .expect("an updated branch must enrich the turn");
+        let text = format_behind_main_enrichment(
+            &BehindMainRemediation::Updated {
+                observed_base_sha: "0bserved0bserved0bserved0bserved0bserved".to_string(),
+            },
+            &behind_info(),
+        )
+        .expect("an updated branch must enrich the turn");
         assert!(
             text.contains("Do NOT merge"),
             "Updated enrichment must forbid merging in this turn: {text}"
