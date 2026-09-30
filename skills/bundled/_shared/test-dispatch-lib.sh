@@ -1535,7 +1535,11 @@ assert_contains "provenance compares the branch blob against main's" \
 # only on the bare-numeric shapes, which is this ticket's own failure class one
 # notch later. A behavioural test cannot catch the class: recopying the prefix
 # makes no decision wrong on the day it is written.
-CLAIMED_SRC_2606=$(declare -f _plan_header_claimed_issues)
+# `|| true` so a rename produces a NAMED failure instead of an unexplained
+# abort: under `set -e`, `declare -f` on a missing function kills the suite
+# before the anti-vacuity assertion below can say what went wrong. Verified by
+# renaming the function — without it the run stops with exit 1 and no diagnostic.
+CLAIMED_SRC_2606=$(declare -f _plan_header_claimed_issues || true)
 
 # Anti-vacuity FIRST. Without it, a rename or deletion makes every assertion
 # below pass against an empty string, and a scan that looks at nothing reads
