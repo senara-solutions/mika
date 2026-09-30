@@ -1442,6 +1442,7 @@ async fn run_agent_for_message(
             Some(&sender_arc),
             &session_id,
             &req.request_id,
+            &a.settings,
         )
         .await;
         match ci_failure_action {

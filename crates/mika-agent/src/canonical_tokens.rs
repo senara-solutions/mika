@@ -2761,4 +2761,169 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#1745 — le nom du signal surface-for-adoption a un seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable plutôt que cru : le nom
+    /// `surface_for_adoption` est **créé par mika#1745**, donc la population
+    /// des violations préexistantes est vide par construction. Il n'y a rien à
+    /// excepter — et une allowlist née non vide serait un emplacement où
+    /// déposer la prochaine infraction (doctrine mika#2323).
+    ///
+    /// **Quand le scan tire, on retire le second site d'écriture ; on n'ajoute
+    /// pas d'entrée** (doctrine mika#2201).
+    const SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// Le prédicat du scan mika#1745, extrait pour être exerçable sur un contenu
+    /// fabriqué.
+    ///
+    /// Sans cette extraction, « le scan est propre » et « le scan ne regarde
+    /// rien » rendent le même vert, et la seule façon de les distinguer est une
+    /// mutation à la main que personne ne rejoue (classe mika#2205, appliquée au
+    /// scan lui-même).
+    fn carries_bare_surface_literal(content: &str, needle: &str) -> bool {
+        content
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            })
+            .any(|line| string_literals(line).iter().any(|lit| lit.trim() == needle))
+    }
+
+    /// Le nom du signal est écrit à **un** endroit, dans le journal comme dans
+    /// `audit_events`.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rend **aucune décision fausse** le jour où il est
+    /// écrit : le handler continue de surfacer, la notification continue de
+    /// partir, et toutes les assertions restent vertes. Ce qu'il casse est la
+    /// requête opérateur — `SELECT count(*) … WHERE tool_name =
+    /// 'surface_for_adoption' GROUP BY target_key` — qui **est** la mesure de la
+    /// population, et donc la précondition explicite de la décision
+    /// d'auto-adoption qu'AC3 diffère (« until we have enough n »). Elle
+    /// cesserait de compter un fait pour compter deux populations mêlées, en
+    /// silence. C'est très exactement la classe qu'aucun test de comportement ne
+    /// peut voir.
+    ///
+    /// # Le prédicat est l'ÉGALITÉ, jamais la sous-chaîne
+    ///
+    /// Trois faux positifs mesurés l'imposent, et ils ne vont pas tous dans le
+    /// même sens : `surface_for_adoption_skipped` et
+    /// `surface_for_adoption_audit_failed` (dans le fichier propriétaire) sont
+    /// des noms d'événement **voisins** qui portent le nom sans être lui, et
+    /// `surface_for_adoption_unrecognized_value` (`mika-common/src/config.rs`,
+    /// la moitié réglage) est dans un **autre crate** — un prédicat par
+    /// `contains` l'accuserait comme second écrivain alors qu'il ne touche ni le
+    /// journal du signal ni `audit_events`. Ce qu'un second écrivain porterait
+    /// réellement est le littéral nu.
+    ///
+    /// # Angle mort HÉRITÉ, mesuré, et nommé plutôt que découvert
+    ///
+    /// [`production_sources`] tronque chaque fichier à la **première**
+    /// occurrence textuelle de `#[cfg(test)]`, « où qu'elle soit » — y compris
+    /// dans un doc-comment. `webhook_dispatch.rs` en cite une ligne 110, donc un
+    /// second écrivain planté ligne 266 de ce fichier-là est **invisible** à ce
+    /// scan : vérifié par mutation pendant l'écriture de mika#1745, où la sonde
+    /// n'a pas rougi. La mutation équivalente dans `ci_success_handler.rs` (dont
+    /// le premier `#[cfg(test)]` est son vrai module de test) rougit bien.
+    ///
+    /// La limite est partagée par tous les scans de ce fichier et n'est pas le
+    /// périmètre de mika#1745 — la réparer veut dire changer l'énumérateur pour
+    /// tous. Ce qui la rend supportable est
+    /// [`mika1745_the_writer_predicate_sees_a_bare_literal`], qui atteste que le
+    /// **prédicat** mord indépendamment de ce que l'énumérateur lui donne à
+    /// lire : quand la garde se taira, on saura lequel des deux interroger.
+    #[test]
+    fn mika1745_the_surface_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("surface_for{}", "_adoption");
+        let owner = "crates/mika-agent/src/server/ci_failure_handler.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if carries_bare_surface_literal(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#1745 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#1745 — le nom du signal surface-for-adoption a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS — le compte qui \
+             conditionne la décision d'auto-adoption (AC3) n'est exact que tant \
+             qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// Contrôle de bonne foi : le prédicat voit un second écrivain, et il ne voit
+    /// **pas** les trois formes voisines qui lui ressemblent.
+    ///
+    /// Les quatre cas négatifs sont ceux mesurés pendant l'écriture, et chacun
+    /// serait un faux positif permanent — donc une garde qu'on finit par museler.
+    #[test]
+    fn mika1745_the_writer_predicate_sees_a_bare_literal() {
+        let needle = format!("surface_for{}", "_adoption");
+
+        assert!(
+            carries_bare_surface_literal(
+                &format!("    db.log_audit_event(sid, \"{needle}\", &key).await;"),
+                &needle
+            ),
+            "un second écrivain porte le littéral nu — le prédicat doit le voir"
+        );
+        assert!(
+            carries_bare_surface_literal(
+                &format!("    info!(event = \"{needle}\", x = 1);"),
+                &needle
+            ),
+            "le journal compte autant que la base"
+        );
+
+        for benign in [
+            // Noms d'événement voisins, dans le fichier propriétaire.
+            format!("    info!(event = \"{needle}_skipped\", reason = \"x\");"),
+            format!("    warn!(event = \"{needle}_audit_failed\");"),
+            // La moitié réglage, dans un AUTRE crate.
+            format!("    tracing::warn!(event = \"{needle}_unrecognized_value\");"),
+            // Une mention n'est pas une instruction (classe mika#2050).
+            format!("    /// Voir `{needle}` pour le contrat."),
+        ] {
+            assert!(
+                !carries_bare_surface_literal(&benign, &needle),
+                "faux positif sur une forme voisine : {benign}"
+            );
+        }
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika1745_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "SURFACE_FOR_ADOPTION_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
+             le rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
 }
