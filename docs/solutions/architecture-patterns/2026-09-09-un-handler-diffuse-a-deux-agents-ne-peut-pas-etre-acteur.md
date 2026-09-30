@@ -112,9 +112,78 @@ bouge. D'où une assertion structurelle sur l'ordre de câblage dans `handlers.r
 C'est la contrepartie assumée d'un handoff en bande ; elle est bon marché tant qu'elle
 est épinglée.
 
+## Le résidu (mika#2260) — une garde tardive résout la course, elle ne la supprime pas
+
+Le correctif ci-dessus a corrigé **qui merge**. Il n'a pas corrigé **qui évalue**. La
+re-preuve du 2026-09-09 a réussi (`mergedBy = mika-platform-dev` sur mika#2259,
+`human_gate_events = 0`) et pourtant les deux agents entraient encore dans
+l'évaluateur : le relecteur le parcourait en entier — jusqu'à émettre le signal — et
+n'était retenu qu'à l'acteur. Comptes sur `audit_events` entre le déploiement et le
+lendemain : **81** parcours complets sous mika-qa, **6** tenues DECISION-CORE (donc six
+notifications opérateur en double), un signal émis, puis l'arrêt.
+
+Une course résolue par une garde **tardive** est fragile parce qu'elle dépend de
+l'ordre, et le prix de l'ordre n'était pas cosmétique. Cinq effets étaient exercés
+**avant** la garde, dans l'ordre d'exécution :
+
+1. **La clé de dedup mémoire**, globale au processus et clé sur
+   `{repo}:{branch}:{head_sha}` **sans `agent_id`**. Le relecteur entrant en premier
+   consommait le créneau du dispatcher. Sur #2259, head `047e9eea` : mika-qa évalue à
+   09:08:11 et enregistre la clé, le replay différé de mika-dev rend
+   `ci_success_dedup.skip` à 09:08:26. Sans conséquence là (checks encore `pending`) —
+   mais à 09:12:36, toutes portes vertes, le dispatcher n'a évalué que parce que sa
+   copie est arrivée **60,005 s** après l'enregistrement du relecteur contre une
+   fenêtre de 60 s : **5 ms**. Un deferral à 59,9 s, et plus aucun signal n'est émis
+   sous une identité qui peut agir, plus aucun `check_suite` n'arrive sur ce head
+   (tous les workflows sont terminés), et **la PR reste verte et ouverte sans que rien
+   ne la ferme**. C'est une classe d'arrêt de boucle à un timing près.
+2. **Cinq appels `gh` par événement sous le PAT du relecteur** — quota et latence pour
+   un signal qui, par construction, n'a aucun consommateur : il voyage en bande dans
+   `req.text`, relu par le handler suivant *du même agent*, où l'acteur le retient.
+3. **Une écriture sur la forge** — `PUT /repos/{repo}/pulls/{n}/update-branch` — posée
+   par l'agent qui ne doit jamais agir sur cette PR, dès qu'elle est en retard sur main.
+4. **La notification opérateur DECISION-CORE en double** (six mesurées).
+5. **Le pré-digest de l'évaluateur remplaçait `req.text`** dans le tour du relecteur,
+   qui recevait « Merge-ready signal emitted… » à la place de l'événement brut que son
+   propre prompt attend pour corréler la PR.
+
+Le remède est une **porte d'entrée** au premier point où l'agent est connu et avant
+tout travail : après la sélection par type d'événement, avant l'exigence de token,
+avant le premier appel `gh`, avant l'écriture de dedup. Elle rend
+`Passthrough { enrichment: None }` — l'événement **brut**, ce que l'effet 5 avait
+emporté — et laisse une ligne d'audit. La ceinture de l'acteur n'est pas retirée : elle
+devient inatteignable en production et reste la défense d'un signal arrivé par un
+chemin que l'évaluateur n'a pas posé.
+
+**Deux noms, une seule liste blanche.** `merge_disposition` répond *qui merge* — une
+décision d'acteur. `owns_merge_transition` répond *est-ce que mon évaluation a un
+consommateur* — une décision d'entrée. Deux questions, deux sites d'appel, une table :
+ajouter un acteur reste un geste explicite à un seul endroit.
+
+**Et la garde qui tient ce nom unique est un scan de source, pas un test de
+comportement** — parce que réécrire le prédicat en ligne (`merge_disposition(agent) !=
+Act`) laisse tous les tests comportementaux **verts** et ne casse que le scan, ce qui a
+été vérifié par mutation. Même famille que la divergence que `grooming_marker` a dû
+engraver une fois : *un lecteur écrit une seconde fois est un lecteur qui peut
+diverger, en silence, avec toutes les assertions au vert.*
+
+## La règle, généralisée
+
+Le correctif de 2026-09-09 disait : *un handler diffusé à deux agents ne peut pas être
+acteur.* C'était vrai et insuffisant. La forme complète est :
+
+> **Un handler diffusé à N agents n'évalue que dans l'agent qui peut consommer son
+> évaluation.**
+
+Un agent qui ne peut pas consommer le signal n'a aucune raison de l'émettre, et le
+prix de le lui laisser émettre n'est pas nul : ce sont les cinq effets ci-dessus. Mettre
+l'identité à la sortie borne le **résultat** ; la mettre à l'entrée borne le **travail**.
+
 ## Où chercher la même forme
 
 Tout handler structurel appelé depuis la chaîne `channel == "github"` de
 `handlers.rs`, croisé avec `secondary_targets` du gateway. Aujourd'hui un seul
-événement fait l'objet d'un fan-out ; le jour où un second apparaît, la question à
-poser est : *ce handler agit-il sur une surface qui enregistre son auteur ?*
+événement fait l'objet d'un fan-out ; le jour où un second apparaît, les questions à
+poser sont **deux**, et la seconde est celle que mika#2260 a coûtée : *ce handler
+agit-il sur une surface qui enregistre son auteur ?* et *son évaluation a-t-elle un
+consommateur dans l'agent qui la fait ?*

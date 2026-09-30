@@ -135,6 +135,23 @@ async fn cascade_never_dispatches_into_milestone_manager() -> Result<()> {
 
     // ── Step 4 — CI_success ──────────────────────────────────────────────────
     // The CI-success race path (mika#1851's founding breach) issues no merge.
+    //
+    // **What this step exercises, and what it does not (mika#2260).** `AGENT_ID`
+    // is `"mika"`, which is outside the merge-transition whitelist, so since
+    // mika#2260 the evaluator turns this event away at its entry gate — before
+    // the token requirement and before the perimeter classification. The two
+    // assertions below therefore hold on a handler that did nothing, and they did
+    // so **before** mika#2260 too, for a different reason (`find_open_pr` bailed
+    // with no network). What changed is only the reason; no coverage was lost
+    // here, because none was ever exercised.
+    //
+    // It is kept and annotated rather than repaired: giving it a `mika-dev`
+    // handle would make it a test of the *dispatcher*, which is not this file's
+    // subject — it measures that a **manager**-surface PR cannot be merged by any
+    // path. The forge-gate behaviour of this callsite is covered where it belongs,
+    // in `test_ci_success_handler::ci_success_milestone_manager_pr_holds_for_operator`
+    // (Layer C, a source scan on the gate ordering), and the entry gate itself by
+    // the `mika2260_*` tests next to it.
     let ci_text = "[GitHub] Check suite success on senara-solutions/mika \
                    (branch: test/1947/perimeter-manager-forge-gate-loop-r)";
     let ci_action = try_handle_ci_success(
