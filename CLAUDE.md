@@ -3400,6 +3400,189 @@ d'autre du déploiement, cherche dans ce voisinage.
   **aucune décision fausse** le jour où on l'écrit : la purge continue de purger,
   toute la suite reste verte, et seule la fenêtre se rouvre, en silence.
 
+### `pr_unknown` cesse de confondre deux populations (mika#2482)
+
+`pr_unknown` (T3 du faucheur) veut dire « aucune PR résolvable pour cette
+branche », et il couvrait deux populations que rien ne séparait : le **travail
+vivant récent** (groomé, PR imminente) et le **vieux groomé-jamais-implémenté**
+(mesurés le 22/09 : `incident/1696` — issue du 30/06 —, `fix/1719`, `chore/1964`,
+`investigation/2051`, `test/2266`, `bug/2260`). Le faucheur conserve les deux, et
+c'est correct : **un `pr_unknown` sort à T3, donc T7 (`dirty` /
+`unpushed_commits`) n'est jamais évalué sur lui** — on ne sait pas s'il porte du
+travail non poussé, et le faucher détruirait du travail sous un prédicat qui n'a
+pas regardé. Ce n'est pas une précaution, c'est une contrainte : **rien n'est
+fauché ici**, jamais.
+
+Trois briques, et une seule sonde les tient toutes :
+
+- **La purge `target/` couvre `pr_unknown`.** Le bras mika#2497 filtrait sur le
+  seul motif `pr_open` ; or son asymétrie fondatrice — *« le faucheur supprime du
+  travail potentiel, ce bras supprime du dérivé pur »* — est **indifférente à la
+  raison pour laquelle le worktree est conservé**. Un `target/` de `pr_unknown`
+  est exactement aussi reconstructible que celui d'un `pr_open`. La population
+  passe de deux noms à trois par une constante unique (`PURGE_ELIGIBLE_REASONS`)
+  et un prédicat unique (`is_purge_eligible_reason`), lus par les **deux** sites —
+  la décision et le calcul des états. **Les deux doivent bouger ensemble** :
+  élargir la décision seule ferait tomber les nouveaux worktrees sur
+  `unwrap_or(TargetState::Present { idle_secs: None })`, c'est-à-dire un bras qui
+  se lit comme élargi et ne purge rien (classe mika#2205). Aucun des cinq termes
+  P1–P5 ne bouge ; le verrou de build (mika#2511) couvre la population élargie à
+  l'identique. `pr_number` vaut naturellement `null` sur cette population.
+- **Une sonde ciblée ferme l'angle mort de pagination.** `list_prs` borne à 300 :
+  la fenêtre s'arrêtait à la PR **#1917** le 22/09 et à **#2067** le 29/09 — **la
+  borne recule d'environ 21 numéros par jour**. Le défaut est donc **structurel,
+  pas dimensionnel** : doubler la limite achète ~28 jours puis rouvre le trou, et
+  paginer coûte O(total PR) à chaque tick pour une poignée de worktrees. La
+  requête `gh pr list --head <branche>` **contourne** la limite (vérifié :
+  `--head feat/1888/…` rend `#1900` sous une fenêtre dont le minimum était
+  `#2067`) et rend les mêmes champs, donc se désérialise sans une ligne de
+  structure nouvelle. Une PR trouvée fait **re-screener** le worktree sous la
+  **même conjonction de sept termes**, sans exception : la provenance d'une PR ne
+  change pas sa vérité.
+- **Un signal nomme la file vieille.** `worktree_stale_no_pr`, **SOLE WRITER**,
+  dédupliqué 24 h. **Rien n'est supprimé par cette brique** — c'est de
+  l'observabilité.
+
+**La sonde est ciblée sur les vieux, et c'est ce qui fait de ce travail un
+mécanisme et non deux.** Un `pr_unknown` **récent** est nominal : sa PR entrera
+dans l'index de masse dès qu'elle existera, et la sonder serait un appel `gh`
+pour rien, 144 fois par jour. Un `pr_unknown` **vieux** est soit un abandon, soit
+un faux `pr_unknown` par angle mort — et la même sonde tranche les deux.
+
+**La datation porte sur le WORKTREE, pas sur l'issue.** Le dernier commit de la
+branche (`git log -1 --format=%cI`), lisible sans réseau. Lire l'état de l'issue
+coûterait un `gh` par worktree et par tick pour une information dont **aucune
+décision ne dépend** (rien n'est fauché), et le filtre irait dans le mauvais
+sens : un worktree dont l'issue est *fermée* sans PR est **encore plus** un
+candidat au signalement.
+
+**Aucun motif de refus n'est ajouté, renommé ni retiré.** `REASON_PR_UNKNOWN_STALE`
+était tentant et est **refusé** : il scinderait `pr_unknown` en deux noms et
+casserait en silence les `GROUP BY` publiés ci-dessus. C'est la scission datée
+dont mika#2361 a dû écrire le coût. `ALL_RESOLUTIONS` gagne `branch_probe` **en
+queue** et rien d'autre — une addition, jamais un renommage, donc aucune requête
+publiée ne change de sens.
+
+- `MIKA_WORKTREE_STALE_DAYS` — âge du dernier commit de branche au-delà duquel un
+  `pr_unknown` est vieux (défaut **7**). Bornes mesurées : la vie nominale d'un
+  `pr_unknown` est de l'ordre de l'heure à la journée et un `ready` abandonné est
+  borné à trois re-drives (mika#2020), donc 7 j laisse un ordre de grandeur ; la
+  population du 22/09 va de ~3 semaines à ~84 jours et est intégralement
+  attrapée. Le seuil peut être généreux, l'asymétrie penchant du bon côté : un
+  faux « stale » coûte une ligne de journal et **un** appel `gh`/jour, un faux
+  « pas stale » laisse le worktree invisible un jour de plus.
+- `MIKA_WORKTREE_STALE_PROBE_MAX_PER_TICK` — cap de sondes par tick (défaut
+  **3**). **Plus** la déduplication 24 h : au plus **un appel `gh` par worktree
+  stale et par jour**. Population mesurée le 22/09 : 6.
+
+Les deux suivent les trois paliers maison (absent/vide → défaut ; illisible, `0`
+ou négatif → défaut **plus** un `warn!` nommant la valeur **entre guillemets**).
+**Le `0` ne désarme pas** : sur un scan qui déclenche une suppression de dérivé,
+une coquille ne doit pas être un désarmement silencieux — les leviers de
+désarmement sont `MIKA_TARGET_PURGE` (le bras) et la sentinelle STOP partagée
+`~/.mika/state/worktree-reap-stop` (le tick entier).
+
+#### Surfaces opérateur
+
+```bash
+# 1. Des `target/` de worktrees SANS PR sont-ils purgés ? (la brique 1)
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.pr_number == null) | {worktree_path, branch, idle_secs, bytes_reclaimed}'
+
+# 2. Quels worktrees sont vieux et sans PR ? — CONTRÔLE POSITIF de la sonde
+grep worktree_stale_no_pr "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{worktree_path, branch, issue, branch_idle_days, probe}'
+```
+
+```sql
+-- 3. Combien de worktrees l'angle mort aurait-il conservés à tort ?
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'worktree_reaped' AND reasoning LIKE 'resolution=branch_probe%';
+
+-- 4. La file vieille, datée et comptable
+SELECT target_key, created_at FROM audit_events
+ WHERE tool_name = 'worktree_stale_no_pr' ORDER BY created_at DESC;
+
+-- 5. AC6 — la distribution des motifs, INCHANGÉE de part et d'autre du déploiement
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'worktree_reap_skipped' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `target_purged` avec `pr_number: null` | **non vide** après déploiement | chaque ligne est du disque rendu que ni le faucheur ni le bras ne rendaient |
+| `worktree_stale_no_pr` | **non vide, faible et stable** (~6 mesurés le 22/09) | la file groomée-jamais-implémentée, enfin nommée |
+| `resolution=branch_probe` | **rare** | chaque ligne est un faux `pr_unknown` fermé. Zéro ⇒ voir Halte 2 |
+| `worktree_stale_probe_unreadable` | **vide** | toute occurrence est une sonde qui n'a pas su regarder |
+| `worktree_reap_skipped` / `pr_unknown` | **inchangé en sens** | AC6 : la scission a été refusée pour que cette requête reste exacte |
+
+**`issue` n'est jamais inventé.** C'est le deuxième segment de la branche, et le
+premier doit être non vide : `/2482/x` porte bien `2482` en deuxième position,
+mais une branche sans type n'est pas une branche de dispatch, donc le nombre
+qu'on y lirait serait deviné plutôt que porté. Toute forme non conforme rend
+`None` — un numéro fabriqué sur une surface d'observabilité enverrait l'opérateur
+lire le mauvais ticket, ce qui est pire qu'un champ vide.
+
+#### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces sondes lisent l'hôte. Établir d'abord que le binaire servi
+> porte le correctif — une ligne absente ne prouve rien tant qu'on n'a pas établi
+> que le binaire qui tourne sait l'écrire (classe mika#2340).
+
+**S1 — la purge mord (48 h).** La requête 1 est non vide, et `/data` cesse de
+retrouver 80 % au rythme observé.
+*Halte 1 —* si des purges surviennent sur des worktrees **fraîchement groomés**,
+lire `idle_secs` **avant** de rallonger la fenêtre : un worktree qui vient d'être
+groomé n'a pas de `target/` du tout (P2 le refuse), donc une purge là signifie
+qu'un `target/` est réellement resté inactif au-delà de la fenêtre — le contrat,
+pas un défaut.
+
+**S2 — la sonde mord (30 jours).** La requête 3 rend au moins une ligne.
+*Halte 2 —* **zéro ligne ne prouve rien** tant que le contrôle positif n'est pas
+établi : il faut qu'une sonde ait réellement tourné, et c'est la requête 2 qui le
+dit (une ligne `worktree_stale_no_pr` prouve qu'une sonde a tourné et rendu « pas
+de PR »). Zéro des deux ⇒ la population stale est vide, ce qui est un **résultat**
+et non une panne. *Une garde que personne n'a exercée se lit exactement comme une
+garde qui marche* (mika#2205).
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun `worktree_stale_no_pr` sur un
+worktree dont la branche a bougé dans les `N` jours.
+*Halte 3 —* une occurrence signifie que la datation lit autre chose que ce qu'on
+croit (un `fetch` qui touche un mtime, une branche rebasée non détectée) :
+**réparer la datation, pas relever le seuil.**
+
+**S4 — AC6, la non-régression des comptes.** La requête 5 doit garder le même
+vocabulaire de part et d'autre du déploiement.
+*Halte 4 —* l'apparition d'une valeur nouvelle signifie qu'un motif a été ajouté
+contre la décision ci-dessus : **désarmer d'abord** (`MIKA_TARGET_PURGE=0` puis
+revert), les requêtes publiées étant cassées en silence pendant ce temps.
+
+**Halte transverse — la file stale croît sans borne.** Si la requête 4 grossit de
+semaine en semaine, le remède n'est **pas** dans ce module : c'est que le grooming
+produit plus de worktrees que l'implémentation n'en consomme. Ouvrir le suivi
+**avec ce compte**, jamais avec une intuition.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fauche aucun `pr_unknown`.** Ce qui est retiré est le `target/` — du
+  dérivé pur — jamais le worktree, jamais une branche, jamais un commit.
+- **Il ne ferme aucune issue et ne réveille aucun ticket.** Le signal dit « ce
+  worktree est vieux » ; décider quoi en faire est un geste d'opérateur.
+- **Il ne borne pas la production.** Si N pilotes compilent simultanément, aucun
+  n'est stale et rien n'est purgé pendant la montée — limite héritée de
+  mika#2497, inchangée.
+- **Il ne rend pas la pagination exacte.** L'index de masse reste borné à 300 ; ce
+  qui est ajouté est un rattrapage **ciblé** sur les non-résolus vieux. Un faux
+  `pr_unknown` **récent** — PR hors fenêtre **et** branche mue dans les 7 jours —
+  reste invisible. Combinaison improbable (une PR hors fenêtre a des semaines) et
+  **nommée plutôt que masquée**.
+- **La population réelle n'est PAS mesurable depuis un pilote**, et les sondes
+  ci-dessus sont pour cette raison toutes post-déploiement, sur l'hôte : le bac à
+  sable de dispatch ne monte que le worktree courant et `~/.mika/data/mika.db`
+  n'y est pas montée, donc les 13 `pr_unknown` du 22/09 y sont invisibles et
+  aucune requête `audit_events` n'y est exécutable. Les chiffres cités viennent du
+  ticket (22/09) et de `gh` (29/09).
+
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
 **Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
