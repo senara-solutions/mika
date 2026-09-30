@@ -7,22 +7,35 @@
 //!
 //! ```text
 //!   scan drafts (age > threshold)
-//!     └─ RESCUE_DEPTH gate  (bail-to-human at max)          ── F2
-//!        └─ git ≥ 2.38 guard (bail: git-too-old-for-dry-run) ── F3
-//!           └─ dry-run rebase (merge-tree, non-mutating)     ── AC2
-//!              └─ live rebase onto origin/main
-//!                 └─ clippy gate (bail on errors)
-//!                    └─ push rebased branch (force-with-lease)
-//!                       └─ substrate-diff perimeter classify  ── AC4 (reuse #1831)
-//!                          ├─ MECHANICAL, or DECISION-CORE whose body reads
-//!                          │  `rescue-pipeline-verified: yes`
-//!                          │   └─ un-draft (gh pr ready)      ── F1
-//!                          └─ DECISION-CORE, marker not `yes`
-//!                              └─ park unverified, stay draft ── mika#2286
+//!    ├─ bailed marker?  → skip                              ── mika#2199
+//!    ├─ parked marker (and body not `yes`)? → skip          ── mika#2286
+//!    ├─ HELD? (≥1 ConvertToDraftEvent on the timeline) → skip ─ mika#2597
+//!    └─ oldest survivor → resume_chain:
+//!        └─ RESCUE_DEPTH gate  (bail-to-human at max)       ── F2
+//!           └─ git ≥ 2.38 guard (bail: git-too-old-for-dry-run) ── F3
+//!              └─ dry-run rebase (merge-tree, non-mutating)  ── AC2
+//!                 └─ live rebase onto origin/main
+//!                    └─ clippy gate (bail on errors)
+//!                       └─ push rebased branch (force-with-lease)
+//!                          └─ substrate-diff perimeter classify ── AC4 (#1831)
+//!                             ├─ MECHANICAL, or DECISION-CORE whose body reads
+//!                             │  `rescue-pipeline-verified: yes`
+//!                             │   └─ un-draft (gh pr ready)  ── F1
+//!                             └─ DECISION-CORE, marker not `yes`
+//!                                 └─ park unverified, stay draft ── mika#2286
 //! ```
 //!
 //! ## Safety invariants
 //!
+//! - **An explicit hold is respected (mika#2597).** A draft this daemon may
+//!   promote is one that was *born* a draft. A draft somebody **put back** is a
+//!   hold, and the daemon does not touch it: not selected, not rebased, not
+//!   pushed, not un-drafted, `$.wip_rescue.depth` not incremented. The
+//!   discriminant is the presence of a `ConvertToDraftEvent` on the timeline —
+//!   see [`HoldVerdict`] for why presence alone suffices and why no instant is
+//!   compared. Measured twice in 35 minutes on PR #2589 (2026-09-29): the
+//!   autonomous merge was only stopped by the forge gate's decision-core
+//!   perimeter, i.e. by coincidence of file set rather than by design.
 //! - **Never mutate before a clean dry-run.** The `git merge-tree --write-tree`
 //!   dry-run (non-mutating: writes only loose objects, never the worktree or a
 //!   ref) runs before the live rebase. If the deploy host's git predates 2.38
@@ -153,6 +166,53 @@ const MARKER_LOOKUP_SINCE: &str = "1970-01-01T00:00:00Z";
 /// draft without either needing to know about the other.
 fn pr_marker_key(pr_number: u64) -> String {
     format!("pr:{DEFAULT_REPO}#{pr_number}")
+}
+
+// -- Hold observability (mika#2597) -----------------------------------------
+
+/// `audit_events.tool_name` written once per 24 h per held draft.
+///
+/// **Expected regime: non-empty.** Each row is a hold the daemon did *not*
+/// violate — the direct measure that the guard bites, which nothing gave
+/// before. Its silence under a PR that keeps leaving draft is the halt: read
+/// the positive control (`wip_rescue_resume_attempt`) before touching the
+/// predicate.
+const HOLD_RESPECTED_TOOL: &str = "wip_rescue_hold_respected";
+
+/// `audit_events.tool_name` written once per 24 h per draft whose timeline
+/// could not be read.
+///
+/// **Expected regime: empty.** A separate name from [`HOLD_RESPECTED_TOOL`]
+/// because the two call for opposite remedies: one is the mechanism working,
+/// the other is `wip_rescue` frozen by its own fail-closed rule and the cause is
+/// the token or the API. Merging them would make an outage read as a success —
+/// the `phantom_aged_out` / `phantom_sweep_spared` motif (mika#2156).
+const HOLD_UNREADABLE_TOOL: &str = "wip_rescue_hold_unreadable";
+
+/// Deduplication horizon of the two hold surfaces above (doctrine mika#2131).
+///
+/// A hold is a **state**, not an event: a draft held for three weeks would
+/// otherwise write 288 lines a day. Same value and same reasoning as
+/// `worktree_reaper`'s `REFUSAL_DEDUP_SECS`. The first observation is written
+/// immediately, so the operator sees their hold acknowledged on the next tick
+/// (≤ 5 min); the 289th is not.
+const HOLD_DEDUP_SECS: i64 = 86_400;
+
+/// `audit_events.target_key` of a hold observability row: `pr:{repo}#{n}@{motif}`.
+///
+/// The `@` separator is what makes a prefix `LIKE` safe — `pr:…#234@…` cannot be
+/// matched by a query aimed at `#2343` (mika#2361). The motif rides in the key
+/// **as well as** in the `tool_name` so a change of motif on the same PR writes
+/// a distinct row rather than being swallowed by the first one's window.
+fn hold_audit_key(pr_number: u64, motif: &str) -> String {
+    format!("pr:{DEFAULT_REPO}#{pr_number}@{motif}")
+}
+
+/// `(owner, repo)` of [`DEFAULT_REPO`], split once rather than at each call.
+fn default_repo_parts() -> (&'static str, &'static str) {
+    DEFAULT_REPO
+        .split_once('/')
+        .expect("DEFAULT_REPO is `owner/repo`")
 }
 
 // -- Env-var knobs (three-tier: absent → default, invalid → WARN + default) --
@@ -611,6 +671,7 @@ pub async fn auto_resume_wip_rescue_drafts(
         threshold,
         |pr_number| has_bailed_marker(db, pr_number, trace_id),
         |pr_number| has_parked_marker(db, pr_number, trace_id),
+        |pr_number| hold_verdict(db, github_token, pr_number, trace_id, session_id),
     )
     .await;
 
@@ -700,18 +761,31 @@ pub async fn auto_resume_wip_rescue_drafts(
 ///
 /// The body test comes **first** on purpose: it is free, and a re-armed draft
 /// must not pay a database read to discover it is eligible again.
-async fn select_eligible<F, Fut, G, GFut>(
+///
+/// **Held drafts (mika#2597).** A third exclusion sits last, for two reasons.
+/// Cost: it is the only term that costs a network call, so it is paid on the
+/// survivors of the two cheap ones, and the short-circuit bounds the nominal
+/// regime to one GraphQL call per tick. Placement: putting a hold inside
+/// [`resume_chain`] instead would consume the single per-tick slot (mika#1852
+/// AC6, cap = 1, oldest first) **every tick, indefinitely**, starving everything
+/// behind it — a hold draft is old by nature, so it stays the oldest candidate
+/// for ever. That is exactly the livelock shape mika#2199 measured and mika#2286
+/// had to close a second time.
+async fn select_eligible<F, Fut, G, GFut, H, HFut>(
     drafts: Vec<DraftPr>,
     now: &str,
     threshold: i64,
     is_bailed: F,
     is_parked: G,
+    is_held: H,
 ) -> Option<(i64, DraftPr)>
 where
     F: Fn(u64) -> Fut,
     Fut: std::future::Future<Output = bool>,
     G: Fn(u64) -> GFut,
     GFut: std::future::Future<Output = bool>,
+    H: Fn(u64) -> HFut,
+    HFut: std::future::Future<Output = HoldVerdict>,
 {
     let mut ranked: Vec<(i64, DraftPr)> = drafts
         .into_iter()
@@ -738,6 +812,14 @@ where
                 reason = "parked_unverified",
                 "wip_rescue_skipped"
             );
+            continue;
+        }
+        // Third and last (mika#2597): the only term costing a network call, so
+        // it is paid on the survivors of the two cheap ones, and — thanks to the
+        // short-circuit below — on at most one draft per tick in the nominal
+        // regime. Its two excluding states are reported by the predicate itself,
+        // at a collected level, so no `debug!` here would be read (mika#2131).
+        if is_held(pr.number).await.excludes() {
             continue;
         }
         return Some((age, pr));
@@ -783,6 +865,225 @@ async fn has_marker(db: &AsyncDatabase, tool_name: &str, pr_number: u64, trace_i
             warn!(pr_number, marker = tool_name, error = %e, trace_id, "wip_rescue_error");
             true
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The hold predicate (mika#2597)
+// ---------------------------------------------------------------------------
+
+/// Whether a draft is a **hold** — something a human or the orchestrator put
+/// back into draft after the work — rather than a **rescue draft**, the state
+/// `dispatch-lib` creates it in and which this daemon exists to promote.
+///
+/// Three states, never a `bool`: two of them exclude, and they call for opposite
+/// remedies. `Held` means the mechanism worked; `Unreadable` means the mechanism
+/// is frozen and the cause is the token or the API. A boolean would make the
+/// second read as the first.
+///
+/// # Why the mere presence of a `ConvertToDraftEvent` suffices
+///
+/// A rescue PR is **created** a draft (`gh pr create --draft`), so its timeline
+/// carries **no** `ConvertToDraftEvent` at birth. The only two draft-state
+/// transitions are `ConvertToDraftEvent` and `ReadyForReviewEvent`. The listing
+/// already filters `--draft`, so a PR carrying ≥ 1 `ConvertToDraftEvent` **and**
+/// being a draft *now* necessarily had its last transition towards draft: that
+/// is a hold. No date to compare, no ordering to establish, no pagination.
+///
+/// **Named fragility:** removing `--draft` from
+/// [`list_wip_rescue_drafts`] breaks that equivalence. The direction of the
+/// breakage is inertia (a ready PR would carry a phantom hold and be excluded
+/// from a population it is not part of anyway), never a violation — and
+/// [`tests::mika2597_le_listing_filtre_toujours_draft`] refuses the edit.
+///
+/// # Why the ticket's "posterior to the last push" is refused
+///
+/// mika#2597's option (b) compares the hold's instant to the last push. Two
+/// measurements refuse it. (1) **`wip_rescue` pushes by itself** —
+/// [`prepare_branch`] rebases and force-pushes at step 4, *before* the un-draft
+/// of step 7, in the same chain: a "hold posterior to the last push" predicate
+/// would be voided by the push of the very daemon about to violate the hold.
+/// (2) A later push does not lift an operator's decision — a hold of renunciation
+/// holds until the operator lifts it, not until the next commit.
+///
+/// # Why no machine-actor filter
+///
+/// mika#2315 carries one because its own `remove → add` would park itself. Here
+/// **no** path writes a `ConvertToDraftEvent` (exhaustive search over `crates/`,
+/// `skills/`, `scripts/`), so the term would have an empty population — and if a
+/// machine ever did, reading its gesture as a hold is the **safe** side. The
+/// actor and the instant are therefore *reported* on the observability line
+/// without deciding anything, which is what makes the day it stops being empty
+/// visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HoldVerdict {
+    /// No `ConvertToDraftEvent`: a rescue draft. Byte-for-byte the pre-mika#2597
+    /// behaviour.
+    NotHeld,
+    /// At least one `ConvertToDraftEvent`. Excluded.
+    Held {
+        since: Option<String>,
+        actor: Option<String>,
+    },
+    /// The timeline could not be read. **Excluded**, see [`hold_verdict`].
+    Unreadable { error: String },
+}
+
+impl HoldVerdict {
+    /// Whether this verdict takes the draft out of the candidate set.
+    ///
+    /// `NotHeld` is the only selectable state: *a term one cannot read is never
+    /// a satisfied term* (mika#2277), applied here to the term "this draft is
+    /// **not** held".
+    fn excludes(&self) -> bool {
+        !matches!(self, HoldVerdict::NotHeld)
+    }
+
+    /// The `audit_events` name this verdict writes, or `None` when it writes
+    /// nothing. Exhaustive `match`, no `_` arm: a fourth state must decide.
+    fn observability_tool(&self) -> Option<&'static str> {
+        match self {
+            HoldVerdict::NotHeld => None,
+            HoldVerdict::Held { .. } => Some(HOLD_RESPECTED_TOOL),
+            HoldVerdict::Unreadable { .. } => Some(HOLD_UNREADABLE_TOOL),
+        }
+    }
+}
+
+/// Read the hold state of a draft and **report** it (R4), in that order.
+///
+/// This is the predicate production injects into [`select_eligible`]. Reading
+/// and reporting live together because the report must name the *verdict*, and
+/// the selection loop is deliberately free of a database and of a trace id — the
+/// property that makes the whole fix testable without a network.
+///
+/// **Fail-closed towards "held".** An unreachable API, a 401/403/429, an
+/// unparseable payload, a shape we do not recognise: all exclude. The asymmetry
+/// is measured, not supposed — a false "held" leaves a rescue draft waiting for
+/// an operator gesture (visible, recoverable, and the pre-mika#1852 behaviour),
+/// while a false "not held" un-drafts a PR whose merge is forbidden. It is also
+/// this module's **uniform** policy: `has_bailed_marker`, `has_parked_marker`,
+/// `classify_route` and `fresh_pipeline_verified` are all four fail-closed.
+///
+/// **Named cost:** a durable GitHub API outage freezes `wip_rescue` entirely.
+/// That is why `Unreadable` carries its own event name — the inertia must be
+/// greppable and must not be confused with a nominal hold.
+async fn hold_verdict(
+    db: &AsyncDatabase,
+    token: &str,
+    pr_number: u64,
+    trace_id: &str,
+    session_id: &str,
+) -> HoldVerdict {
+    let (owner, repo) = default_repo_parts();
+    let verdict =
+        match crate::github_graphql::fetch_convert_to_draft_events(token, owner, repo, pr_number)
+            .await
+        {
+            Ok(events) => match events.last() {
+                None => HoldVerdict::NotHeld,
+                Some(last) => HoldVerdict::Held {
+                    since: last.created_at.clone(),
+                    actor: last.actor_login.clone(),
+                },
+            },
+            Err(error) => HoldVerdict::Unreadable { error },
+        };
+    report_hold(db, session_id, pr_number, trace_id, &verdict).await;
+    verdict
+}
+
+/// Emit the hold observability for one verdict, deduplicated per `(PR, motif)`
+/// over [`HOLD_DEDUP_SECS`] (R4/R5).
+///
+/// `NotHeld` writes nothing at all: an observability that logs everybody
+/// distinguishes nobody (mika#2131 AC7, the rule this module's siblings follow).
+///
+/// The log line goes through the **same** gate as the audit row, deliberately —
+/// the neighbouring precedent (`worktree_reaper`'s main-checkout dirtiness
+/// probe, mika#2449) does the same, and splitting them would give the two
+/// surfaces two different populations for one fact. (That probe's name is
+/// deliberately not spelled out here: it is SOLE WRITER of its own module and
+/// its guard counts a doc-comment mention as a hit — correctly.) Named cost:
+/// when the dedup read itself fails, both
+/// are skipped, so a database that cannot be read is also a hold that cannot be
+/// reported. That is an incident of its own, and the *decision* never depends on
+/// it — the draft is excluded either way.
+async fn report_hold(
+    db: &AsyncDatabase,
+    session_id: &str,
+    pr_number: u64,
+    trace_id: &str,
+    verdict: &HoldVerdict,
+) {
+    let Some(tool) = verdict.observability_tool() else {
+        return;
+    };
+    let key = hold_audit_key(pr_number, tool);
+    let since = crate::timestamp::now_minus(chrono::Duration::seconds(HOLD_DEDUP_SECS));
+    match db
+        .count_recent_audit_events_for_target(tool, &key, &since)
+        .await
+    {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(e) => {
+            debug!(
+                pr_number,
+                marker = tool,
+                error = %e,
+                trace_id,
+                "wip_rescue: hold marker re-read failed, observability skipped"
+            );
+            return;
+        }
+    }
+
+    let detail = match verdict {
+        HoldVerdict::Held { since, actor } => {
+            let held_since = since.as_deref().unwrap_or("unknown");
+            let held_by = actor.as_deref().unwrap_or("unknown");
+            info!(
+                event = HOLD_RESPECTED_TOOL,
+                pr_number,
+                held_since,
+                held_by,
+                trace_id,
+                "wip_rescue: this draft was put back into draft — it is a hold, \
+                 not a rescue draft; not selected, not rebased, not un-drafted \
+                 (mika#2597)"
+            );
+            format!("held_since={held_since} held_by={held_by}")
+        }
+        HoldVerdict::Unreadable { error } => {
+            warn!(
+                event = HOLD_UNREADABLE_TOOL,
+                pr_number,
+                error = %error,
+                trace_id,
+                "wip_rescue: the PR timeline could not be read — excluded \
+                 fail-closed; `wip_rescue` is frozen on this draft until the API \
+                 answers (mika#2597)"
+            );
+            format!("error={error}")
+        }
+        // Unreachable: `observability_tool` answered `None` above.
+        HoldVerdict::NotHeld => return,
+    };
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            tool,
+            &key,
+            None,
+            Some(&detail),
+            Some("wip_rescue hold observability (mika#2597)"),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(pr_number, marker = tool, error = %e, trace_id, "wip_rescue_error");
     }
 }
 
@@ -1813,6 +2114,12 @@ mod tests {
     async fn never_parked(_pr_number: u64) -> bool {
         false
     }
+    /// The mika#2597 axis at rest: a rescue draft, born a draft, nobody put it
+    /// back. Every pre-existing test holds this axis constant so its assertions
+    /// keep measuring what they were written for.
+    async fn never_held(_pr_number: u64) -> HoldVerdict {
+        HoldVerdict::NotHeld
+    }
 
     /// The queue of the incident: two `wip-rescue` drafts, neither carrying
     /// `human-review-required` — because the label write never succeeded.
@@ -1835,6 +2142,7 @@ mod tests {
             900,
             |n| async move { n == OLDEST },
             never_parked,
+            never_held,
         )
         .await;
 
@@ -1854,8 +2162,15 @@ mod tests {
     #[tokio::test]
     async fn without_the_marker_the_same_draft_is_re_elected_forever() {
         for tick in 0..3 {
-            let selected =
-                select_eligible(incident_queue(), NOW, 900, never_bailed, never_parked).await;
+            let selected = select_eligible(
+                incident_queue(),
+                NOW,
+                900,
+                never_bailed,
+                never_parked,
+                never_held,
+            )
+            .await;
             assert_eq!(
                 selected.map(|(_, pr)| pr.number),
                 Some(OLDEST),
@@ -1869,8 +2184,15 @@ mod tests {
     /// selection here means the queue is genuinely drained, not blocked.
     #[tokio::test]
     async fn all_bailed_selects_nothing() {
-        let selected =
-            select_eligible(incident_queue(), NOW, 900, |_| async { true }, never_parked).await;
+        let selected = select_eligible(
+            incident_queue(),
+            NOW,
+            900,
+            |_| async { true },
+            never_parked,
+            never_held,
+        )
+        .await;
         assert!(selected.is_none());
     }
 
@@ -1885,7 +2207,7 @@ mod tests {
             &[WIP_RESCUE_LABEL, HUMAN_REVIEW_LABEL],
         )];
         assert!(
-            select_eligible(parked, NOW, 900, never_bailed, never_parked)
+            select_eligible(parked, NOW, 900, never_bailed, never_parked, never_held)
                 .await
                 .is_none()
         );
@@ -1893,7 +2215,7 @@ mod tests {
         // Not a wip-rescue draft → never a candidate.
         let unrelated = vec![draft(OLDEST, OLDEST_CREATED, &["p1-important"])];
         assert!(
-            select_eligible(unrelated, NOW, 900, never_bailed, never_parked)
+            select_eligible(unrelated, NOW, 900, never_bailed, never_parked, never_held)
                 .await
                 .is_none()
         );
@@ -1901,7 +2223,7 @@ mod tests {
         // Younger than the threshold → waits.
         let fresh = vec![draft(NEXT, "2026-09-05T15:59:00Z", &[WIP_RESCUE_LABEL])];
         assert!(
-            select_eligible(fresh, NOW, 900, never_bailed, never_parked)
+            select_eligible(fresh, NOW, 900, never_bailed, never_parked, never_held)
                 .await
                 .is_none()
         );
@@ -2139,6 +2461,7 @@ mod tests {
             900,
             |n| has_bailed_marker(&db, n, TRACE),
             never_parked,
+            never_held,
         )
         .await;
         assert_eq!(
@@ -2360,9 +2683,14 @@ mod tests {
     /// after tick. Without it, the assertion above measures nothing.
     #[tokio::test]
     async fn mika2286_a_parked_draft_is_not_re_elected_and_the_scan_advances() {
-        let selected = select_eligible(park_queue(), PARK_NOW, 900, never_bailed, |n| async move {
-            n == PARKED_PR
-        })
+        let selected = select_eligible(
+            park_queue(),
+            PARK_NOW,
+            900,
+            never_bailed,
+            |n| async move { n == PARKED_PR },
+            never_held,
+        )
         .await;
         assert_eq!(
             selected.map(|(_, pr)| pr.number),
@@ -2372,8 +2700,15 @@ mod tests {
         );
 
         for tick in 0..3 {
-            let selected =
-                select_eligible(park_queue(), PARK_NOW, 900, never_bailed, never_parked).await;
+            let selected = select_eligible(
+                park_queue(),
+                PARK_NOW,
+                900,
+                never_bailed,
+                never_parked,
+                never_held,
+            )
+            .await;
             assert_eq!(
                 selected.map(|(_, pr)| pr.number),
                 Some(PARKED_PR),
@@ -2397,9 +2732,16 @@ mod tests {
             MARKER_NO,
         )];
         assert!(
-            select_eligible(still_no, PARK_NOW, 900, never_bailed, parked_pred)
-                .await
-                .is_none(),
+            select_eligible(
+                still_no,
+                PARK_NOW,
+                900,
+                never_bailed,
+                parked_pred,
+                never_held
+            )
+            .await
+            .is_none(),
             "the marker alone excludes while the body is unverified"
         );
 
@@ -2412,9 +2754,16 @@ mod tests {
             MARKER_YES,
         )];
         assert_eq!(
-            select_eligible(now_yes, PARK_NOW, 900, never_bailed, parked_pred)
-                .await
-                .map(|(_, pr)| pr.number),
+            select_eligible(
+                now_yes,
+                PARK_NOW,
+                900,
+                never_bailed,
+                parked_pred,
+                never_held
+            )
+            .await
+            .map(|(_, pr)| pr.number),
             Some(PARKED_PR),
             "`yes` in the body must re-arm the draft without anyone clearing the \
              marker — otherwise the park is a bail wearing another name"
@@ -2500,6 +2849,372 @@ mod tests {
         assert!(
             !log.contains("owns this PR"),
             "the bail's wording must not leak into a park: {log}"
+        );
+    }
+
+    // =======================================================================
+    // mika#2597 — an explicit hold holds against `wip_rescue`.
+    // =======================================================================
+
+    /// PR #2589, the rescue of mika#2105: held in draft by the plan's
+    /// Fire-Disposition (rebuild +190 %, past the +50 % renunciation threshold),
+    /// and un-drafted by this daemon **twice in 35 minutes** on 2026-09-29.
+    const HELD_PR: u64 = 2589;
+    /// A second draft waiting behind it — the queue #2589 would hold for ever if
+    /// the hold lived in `resume_chain` instead of in the selection.
+    const BEHIND_HELD_PR: u64 = 2591;
+    /// `ReadyForReviewEvent by mika-platform-dev`, second occurrence.
+    const HOLD_NOW: &str = "2026-09-29T21:36:55Z";
+    const HELD_CREATED: &str = "2026-09-29T19:10:00Z";
+    const BEHIND_HELD_CREATED: &str = "2026-09-29T19:20:00Z";
+
+    /// The hold as GitHub reports it: the orchestrator put the PR back at 21:31Z.
+    fn held() -> HoldVerdict {
+        HoldVerdict::Held {
+            since: Some("2026-09-29T21:31:00Z".to_string()),
+            actor: Some("samidarko".to_string()),
+        }
+    }
+
+    fn unreadable() -> HoldVerdict {
+        HoldVerdict::Unreadable {
+            error: "GitHub GraphQL API error: rate limit exceeded".to_string(),
+        }
+    }
+
+    /// The two drafts of the incident, both past the 900 s threshold.
+    fn hold_queue() -> Vec<DraftPr> {
+        vec![
+            draft(HELD_PR, HELD_CREATED, &[WIP_RESCUE_LABEL]),
+            draft(BEHIND_HELD_PR, BEHIND_HELD_CREATED, &[WIP_RESCUE_LABEL]),
+        ]
+    }
+
+    /// V1 / AC1 / AC2. A held draft is **not selected** — so it is not rebased,
+    /// not pushed, not un-drafted, and its `$.wip_rescue.depth` is not bumped,
+    /// all four of which live downstream of this return.
+    ///
+    /// Reddens on `main`: with no third predicate the draft is returned.
+    #[tokio::test]
+    async fn mika2597_un_brouillon_tenu_nest_pas_selectionne() {
+        let only_held = vec![draft(HELD_PR, HELD_CREATED, &[WIP_RESCUE_LABEL])];
+        assert!(
+            select_eligible(only_held, HOLD_NOW, 900, never_bailed, never_parked, |_| {
+                async { held() }
+            })
+            .await
+            .is_none(),
+            "a draft somebody put back into draft is a hold, and the daemon does \
+             not touch it — this is the two 2026-09-29 un-drafts of #2589"
+        );
+    }
+
+    /// V2. The hold must not eat the single per-tick slot: the draft behind it is
+    /// returned **on the same tick**. This is the property the placement in
+    /// `select_eligible` buys, and which the same predicate in `resume_chain`
+    /// would destroy — a hold draft is old by nature, so it stays the oldest
+    /// candidate for ever (the mika#2199 livelock shape).
+    #[tokio::test]
+    async fn mika2597_un_brouillon_tenu_ne_bloque_pas_le_suivant() {
+        let selected = select_eligible(
+            hold_queue(),
+            HOLD_NOW,
+            900,
+            never_bailed,
+            never_parked,
+            |n| async move {
+                if n == HELD_PR {
+                    held()
+                } else {
+                    HoldVerdict::NotHeld
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(BEHIND_HELD_PR),
+            "the held draft must leave the candidate set and the next one be \
+             returned in the same pass"
+        );
+    }
+
+    /// V3, **the negative control, and it is the load-bearing one**. Without it,
+    /// "the guard decides" is indistinguishable from "the guard blocks
+    /// everything", and the whole mika#1852 mechanism could be dead with every
+    /// test green.
+    #[tokio::test]
+    async fn mika2597_un_brouillon_de_rescue_reste_selectionne() {
+        let selected = select_eligible(
+            hold_queue(),
+            HOLD_NOW,
+            900,
+            never_bailed,
+            never_parked,
+            |_| async { HoldVerdict::NotHeld },
+        )
+        .await;
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(HELD_PR),
+            "a draft born a draft — no ConvertToDraftEvent — is still promoted: \
+             that is what wip_rescue exists for (mika#1852)"
+        );
+    }
+
+    /// V4, fail-closed. *A term one cannot read is never a satisfied term*
+    /// (mika#2277), applied to the term « this draft is **not** held ».
+    #[tokio::test]
+    async fn mika2597_une_timeline_illisible_exclut() {
+        let only_held = vec![draft(HELD_PR, HELD_CREATED, &[WIP_RESCUE_LABEL])];
+        assert!(
+            select_eligible(only_held, HOLD_NOW, 900, never_bailed, never_parked, |_| {
+                async { unreadable() }
+            })
+            .await
+            .is_none(),
+            "a false « held » makes a rescue draft wait for an operator gesture; \
+             a false « not held » un-drafts a PR whose merge is forbidden"
+        );
+    }
+
+    /// V5. The three exclusions compose without any of them knowing about the
+    /// others: three drafts, one per motif, and the fourth — clean on all three
+    /// axes — is the one returned.
+    #[tokio::test]
+    async fn mika2597_les_trois_exclusions_composent() {
+        const BAILED: u64 = 2101;
+        const PARKED: u64 = 2102;
+        const CLEAN: u64 = 2104;
+
+        // Oldest first, so the three excluded ones are consulted before the
+        // clean one: the selection really has to walk past all three.
+        let queue = vec![
+            draft(BAILED, "2026-09-29T10:00:00Z", &[WIP_RESCUE_LABEL]),
+            draft(PARKED, "2026-09-29T11:00:00Z", &[WIP_RESCUE_LABEL]),
+            draft(HELD_PR, "2026-09-29T12:00:00Z", &[WIP_RESCUE_LABEL]),
+            draft(CLEAN, "2026-09-29T13:00:00Z", &[WIP_RESCUE_LABEL]),
+        ];
+
+        let selected = select_eligible(
+            queue,
+            HOLD_NOW,
+            900,
+            |n| async move { n == BAILED },
+            |n| async move { n == PARKED },
+            |n| async move {
+                if n == HELD_PR {
+                    held()
+                } else {
+                    HoldVerdict::NotHeld
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(CLEAN),
+            "bail, park and hold must each exclude their own draft and none of \
+             the others"
+        );
+    }
+
+    /// V6 / AC3. Three states, **two** names — and `NotHeld` writes nothing.
+    ///
+    /// The two names must stay countable apart: one says the mechanism worked,
+    /// the other that `wip_rescue` is frozen by its own fail-closed rule. Merging
+    /// them would make an outage read as a success.
+    #[tokio::test]
+    async fn mika2597_le_verdict_a_trois_etats_et_deux_noms() {
+        let db = bail_db();
+        let count = async |tool: &str, pr: u64| {
+            db.count_recent_audit_events_for_target(
+                tool,
+                &hold_audit_key(pr, tool),
+                "1970-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap()
+        };
+
+        report_hold(&db, "test-session", HELD_PR, TRACE, &held()).await;
+        assert_eq!(count(HOLD_RESPECTED_TOOL, HELD_PR).await, 1);
+        assert_eq!(
+            count(HOLD_UNREADABLE_TOOL, HELD_PR).await,
+            0,
+            "a respected hold must not be counted as an unreadable timeline"
+        );
+
+        report_hold(&db, "test-session", BEHIND_HELD_PR, TRACE, &unreadable()).await;
+        assert_eq!(count(HOLD_UNREADABLE_TOOL, BEHIND_HELD_PR).await, 1);
+        assert_eq!(
+            count(HOLD_RESPECTED_TOOL, BEHIND_HELD_PR).await,
+            0,
+            "an unreadable timeline must not be counted as a hold held"
+        );
+
+        // The nominal case is silent: an observability that logs everybody
+        // distinguishes nobody (mika#2131 AC7).
+        report_hold(&db, "test-session", CLEAN_PR, TRACE, &HoldVerdict::NotHeld).await;
+        assert_eq!(count(HOLD_RESPECTED_TOOL, CLEAN_PR).await, 0);
+        assert_eq!(count(HOLD_UNREADABLE_TOOL, CLEAN_PR).await, 0);
+    }
+
+    /// A draft nobody held, used by V6 and V7 as the silent control.
+    const CLEAN_PR: u64 = 2593;
+
+    /// V7 / R5. A hold lasting weeks writes **one** row a day, not 288 — and a
+    /// change of motif on the same PR still writes its own row, because the key
+    /// carries the motif.
+    #[tokio::test]
+    async fn mika2597_la_dedup_borne_a_une_ligne_par_24h() {
+        let db = bail_db();
+        let count = async |tool: &str| {
+            db.count_recent_audit_events_for_target(
+                tool,
+                &hold_audit_key(HELD_PR, tool),
+                "1970-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap()
+        };
+
+        for _tick in 0..3 {
+            report_hold(&db, "test-session", HELD_PR, TRACE, &held()).await;
+        }
+        assert_eq!(
+            count(HOLD_RESPECTED_TOOL).await,
+            1,
+            "three ticks, one row — a hold is a state, not an event (mika#2131)"
+        );
+
+        // Same PR, different motif → its own row. Without the motif in the key,
+        // the first window would swallow it and the two populations would stop
+        // being subtractable.
+        report_hold(&db, "test-session", HELD_PR, TRACE, &unreadable()).await;
+        assert_eq!(count(HOLD_UNREADABLE_TOOL).await, 1);
+        assert_eq!(count(HOLD_RESPECTED_TOOL).await, 1);
+    }
+
+    /// Sites allowed to hold a `gh pr ready` call besides [`resume_chain`]'s
+    /// step 7. **Shipped empty and pinned empty** — when the scan below fires,
+    /// route the new site through the guard; do not add a line here (doctrine
+    /// mika#2201; an allowlist born empty is a drawer to drop the next
+    /// infraction in, mika#2323).
+    const UNDRAFT_SITES_ALLOWED: &[&str] = &[];
+
+    #[test]
+    fn mika2597_lallowlist_dundraft_est_livree_vide() {
+        assert!(
+            UNDRAFT_SITES_ALLOWED.is_empty(),
+            "an un-draft site is a site to route through the hold guard, never \
+             one to exempt"
+        );
+    }
+
+    /// V8 / R6. The un-draft and the selection cannot divorce: exactly **one**
+    /// production site issues `gh pr ready`, and it is the one this module's
+    /// selection gates.
+    ///
+    /// A source scan, because no behavioural test can see this class: a second
+    /// un-draft site makes **no** existing decision wrong the day it is written
+    /// — every assertion stays green while a path un-drafts without ever
+    /// consulting the hold.
+    ///
+    /// The needle is searched on **whitespace-normalised** source so rustfmt's
+    /// line breaks cannot hide it. `validate_pr_ready_undraft_scope`
+    /// (`builtin_handlers.rs`, mika#1682) inspects an argv and un-drafts nothing
+    /// — it compares `verb == "ready"` against a variable and is out of the
+    /// population by shape, not by exemption.
+    #[test]
+    fn mika2597_un_seul_site_dundraft_en_production() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_module = src_root.join("wip_rescue.rs");
+        let needle = format!("{}{}", "\"pr\",", "\"ready\"");
+
+        let mut sites: Vec<(String, usize)> = Vec::new();
+        let mut scanned = 0usize;
+        let mut stack = vec![src_root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read of src/").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).expect("read of a source file");
+                scanned += 1;
+                // Production half only: a fixture argv in a `#[cfg(test)]` block
+                // is not a site that un-drafts anything.
+                let production = match content.find("#[cfg(test)]") {
+                    Some(i) => &content[..i],
+                    None => &content[..],
+                };
+                let normalised: String = crate::source_scan::strip_comment_lines(production)
+                    .split_whitespace()
+                    .collect();
+                let hits = normalised.matches(&needle).count();
+                if hits > 0 {
+                    let name = path.strip_prefix(&src_root).unwrap_or(&path);
+                    sites.push((name.display().to_string(), hits));
+                }
+            }
+        }
+
+        assert!(scanned > 0, "the guard scanned no file at all");
+        // Anti-vacuity: a scan aiming at a dead needle reads exactly like a clean
+        // tree (mika#2205).
+        let total: usize = sites.iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            total, 1,
+            "exactly one production site may issue `gh pr ready`; found {sites:?}"
+        );
+
+        let offenders: Vec<_> = sites
+            .iter()
+            .filter(|(name, _)| {
+                name != &this_module
+                    .strip_prefix(&src_root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    && !UNDRAFT_SITES_ALLOWED.contains(&name.as_str())
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "mika#2597 — the un-draft lives in `wip_rescue.rs`, behind the hold \
+             gate. Route the new site through it; do not allowlist it.\n{offenders:?}"
+        );
+    }
+
+    /// V9. `--draft` in the listing is the **premise** of the simple predicate:
+    /// it is what makes "carries a ConvertToDraftEvent" equivalent to "was put
+    /// back into draft" without comparing a single instant (see [`HoldVerdict`]).
+    ///
+    /// Not decorative: a future editor widening the population by dropping the
+    /// filter makes a test redden instead of making the predicate silently false.
+    #[test]
+    fn mika2597_le_listing_filtre_toujours_draft() {
+        let src = include_str!("wip_rescue.rs");
+        let (_, body) = crate::source_scan::fn_bodies(src)
+            .into_iter()
+            .find(|(name, _)| name == "list_wip_rescue_drafts")
+            .expect("list_wip_rescue_drafts must exist — it is the listing");
+
+        assert!(
+            body.contains("\"--draft\""),
+            "the listing must keep `--draft`: it is what makes the presence of a \
+             ConvertToDraftEvent equivalent to a hold, with no instant compared"
+        );
+        assert!(
+            body.contains("\"open\""),
+            "…and `--state open`, the other half of the same premise"
         );
     }
 }

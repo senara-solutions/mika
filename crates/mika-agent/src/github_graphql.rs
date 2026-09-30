@@ -367,6 +367,142 @@ pub(crate) fn extract_open_blocker_numbers(body: &serde_json::Value) -> Vec<u64>
 }
 
 // ---------------------------------------------------------------------------
+// Draft-hold detection (mika#2597)
+// ---------------------------------------------------------------------------
+
+/// A `ConvertToDraftEvent` read off a pull request's timeline (mika#2597).
+///
+/// Both fields are optional and **neither decides anything**: the hold predicate
+/// keys on the *presence* of the event, never on its date or its author. They
+/// ride on the observability line so that the day a machine starts converting
+/// PRs to draft is visible — which is the whole reason the actor is reported
+/// rather than filtered on (population empty today).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConvertToDraftEvent {
+    /// ISO 8601 instant GitHub stamped on the event. `None` when absent or not
+    /// a string — reported as unknown, never invented.
+    pub created_at: Option<String>,
+    /// Login of whoever converted the PR to draft. `None` for a deleted account.
+    pub actor_login: Option<String>,
+}
+
+/// Fetch the most recent `ConvertToDraftEvent` of a pull request.
+///
+/// **Why GraphQL and not the REST timeline**, which already has a reader in this
+/// crate (`ready_label::TimelinePageFetcher`): mika#2315 measured that REST
+/// returns timeline events in **ascending** order, so a recent event lives on
+/// the last page — hence its explicit pagination, its 20-page ceiling and its
+/// refusal beyond. Transposed here that would be up to 20 `gh api` calls per
+/// candidate per 5-minute tick. `last: 1` removes the ordering trap, the
+/// pagination and the ceiling in one stroke.
+///
+/// Same shape as [`fetch_open_blockers`]: one `reqwest` client, a 10-second
+/// timeout, GraphQL variables rather than string interpolation, and the same
+/// 401/403/429 classification.
+pub(crate) async fn fetch_convert_to_draft_events(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Result<Vec<ConvertToDraftEvent>, String> {
+    let query_str = "query($owner:String!,$repo:String!,$number:Int!) { \
+         repository(owner:$owner,name:$repo) { \
+         pullRequest(number:$number) { \
+         timelineItems(itemTypes:[CONVERT_TO_DRAFT_EVENT], last:1) { \
+         nodes { ... on ConvertToDraftEvent { createdAt actor { login } } } \
+         } } } }";
+    let body = serde_json::json!({
+        "query": query_str,
+        "variables": {
+            "owner": owner,
+            "repo": repo,
+            "number": number,
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let response = client
+        .post("https://api.github.com/graphql")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "mika-agent")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("GitHub GraphQL request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let msg = match status.as_u16() {
+            401 => "token invalid or expired".to_string(),
+            403 => "token lacks required permissions".to_string(),
+            429 => "rate limit exceeded".to_string(),
+            _ => format!("HTTP {status}"),
+        };
+        return Err(format!("GitHub GraphQL API error: {msg}"));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse GraphQL response: {e}"))?;
+
+    if let Some(errors) = body.get("errors") {
+        let msg = errors
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown GraphQL error");
+        return Err(format!("GitHub GraphQL error: {msg}"));
+    }
+
+    extract_convert_to_draft_events(&body)
+}
+
+/// Extract the `ConvertToDraftEvent` nodes from a GraphQL response.
+///
+/// **Fail-closed on the shape, unlike [`extract_open_blocker_numbers`]**, and
+/// the divergence is the point. There, an absent `blockedBy` path legitimately
+/// means "this repository does not do sub-issues", so an empty vector is the
+/// true answer. Here an absent path means the query shape changed under us, and
+/// answering "no hold event" would be the one reading that lets the daemon
+/// un-draft a PR a human deliberately held. The decision is on `nodes`
+/// **non-empty**, never on a `totalCount` whose semantics under an `itemTypes`
+/// filter this predicate would have to assume.
+pub(crate) fn extract_convert_to_draft_events(
+    body: &serde_json::Value,
+) -> Result<Vec<ConvertToDraftEvent>, String> {
+    let nodes = body
+        .pointer("/data/repository/pullRequest/timelineItems/nodes")
+        .and_then(|n| n.as_array())
+        .ok_or_else(|| {
+            "unexpected GraphQL shape: data.repository.pullRequest.timelineItems.nodes absent"
+                .to_string()
+        })?;
+
+    Ok(nodes
+        .iter()
+        // A node with no field at all is an inline fragment that did not match;
+        // it carries no information and must not be read as a hold.
+        .filter(|node| node.is_object() && node.as_object().is_some_and(|o| !o.is_empty()))
+        .map(|node| ConvertToDraftEvent {
+            created_at: node
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            actor_login: node
+                .pointer("/actor/login")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Phase label helpers (mika#1153)
 // ---------------------------------------------------------------------------
 
@@ -636,6 +772,75 @@ pub(crate) async fn add_label_to_issue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // mika#2597 — V10: the hold reader parses what GitHub returns, and refuses
+    // to answer "no hold" on a payload it does not recognise.
+    // -----------------------------------------------------------------------
+
+    /// The shape GitHub returns for a PR an operator has converted to draft.
+    #[test]
+    fn mika2597_a_convert_to_draft_event_is_read_with_its_instant_and_actor() {
+        let body = serde_json::json!({
+            "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
+                {"createdAt": "2026-09-29T21:31:00Z", "actor": {"login": "samidarko"}}
+            ]}}}}
+        });
+        let events = extract_convert_to_draft_events(&body).expect("well-formed payload");
+        assert_eq!(
+            events,
+            vec![ConvertToDraftEvent {
+                created_at: Some("2026-09-29T21:31:00Z".to_string()),
+                actor_login: Some("samidarko".to_string()),
+            }]
+        );
+    }
+
+    /// A rescue draft is **created** a draft, so its timeline carries no such
+    /// event. That empty array is what makes the "presence suffices" predicate
+    /// correct, and it is the nominal case — it must never be an error.
+    #[test]
+    fn mika2597_an_empty_timeline_is_not_a_hold() {
+        let body = serde_json::json!({
+            "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": []}}}}
+        });
+        assert_eq!(
+            extract_convert_to_draft_events(&body).expect("an empty timeline is well-formed"),
+            Vec::<ConvertToDraftEvent>::new()
+        );
+    }
+
+    /// A deleted account leaves `actor: null`. The event still happened, so it
+    /// still holds — the actor is reported, never required.
+    #[test]
+    fn mika2597_a_missing_actor_degrades_the_line_and_not_the_verdict() {
+        let body = serde_json::json!({
+            "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": [
+                {"createdAt": "2026-09-29T21:31:00Z", "actor": null}
+            ]}}}}
+        });
+        let events = extract_convert_to_draft_events(&body).unwrap();
+        assert_eq!(events.len(), 1, "the hold survives an unknown author");
+        assert_eq!(events[0].actor_login, None);
+    }
+
+    /// Fail-closed on the shape: a payload whose path is absent means the query
+    /// changed under us, and answering "no hold" there is exactly the reading
+    /// that un-drafts a PR a human held.
+    #[test]
+    fn mika2597_an_unrecognised_payload_is_an_error_not_an_absence() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"data": {"repository": null}}),
+            serde_json::json!({"data": {"repository": {"pullRequest": {"timelineItems": {}}}}}),
+            serde_json::json!({"data": {"repository": {"pullRequest": {"timelineItems": {"nodes": "oops"}}}}}),
+        ] {
+            assert!(
+                extract_convert_to_draft_events(&body).is_err(),
+                "a payload we cannot read must never answer `no hold`: {body}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_blockers_all_closed() {
