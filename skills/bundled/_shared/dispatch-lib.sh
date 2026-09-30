@@ -6204,11 +6204,51 @@ _plan_header_claimed_issues() {
     # Header zone is the first 20 lines, the same scope tier 2 uses: body prose
     # quoting another ticket's header must not be read as a claim (the
     # false-positive mika#1421's v1 self-test hit).
+    #
+    # mika#2606 — what the narrowings above do NOT describe is what the pattern
+    # could not REACH. This comment carefully said what the pattern refuses and
+    # never once what it misses, and that is why the defect survived: measured on
+    # the 165 plans of 2026-09, the reader saw 39 headers and missed 126, of which
+    # 112 carry a real label line. The guard above therefore refuted nothing on
+    # most recent plans — it did not fail, it was mute, which is the mika#2205
+    # class (a guard nobody has exercised reads exactly like a guard that works).
+    # Our plans are written in French and put a space before the colon, and they
+    # often sit their header in a quote block. Three shapes were unreachable:
+    #   - `Ticket :` — the space before the colon (French typography);
+    #   - `**Ticket** :` — the bold CLOSES before the colon, a second and
+    #     distinct shape from `**Ticket :**` where the space is inside the bold;
+    #   - `> Ticket :`, `> - **Ticket :**` — the header in a quote block.
+    #
+    # The prefix and the label/value separator are therefore defined ONCE, as
+    # `hdr` and `sep`, and interpolated into BOTH patterns. That single site is
+    # the load-bearing part, not an elegance: the `grep` reads `#N` while the
+    # `sed` strips the prefix to expose a bare numeric value, so each carried its
+    # own copy of the prefix. Widening the `grep` alone leaves the `sed` blind on
+    # the very lines the `grep` just admitted — measured, `issue : 1679`,
+    # `> issue: 1679` and `> issue : 1679` all return empty while every `#N`
+    # fixture stays green. A half-fix is green on every `#N` shape and silently
+    # broken on the bare-numeric ones: this ticket's own failure class, one notch
+    # later. One variable consumed by both makes the desynchronisation
+    # inexpressible rather than detected afterwards — the single-reader doctrine
+    # the house had to engrave for `grooming_marker` (mika#2158) and for
+    # `parse_log_llm_bodies` (mika#2220).
+    #
+    # Widening can only ADD lines, so it can only GROW the claimed set; and
+    # refutation requires that NONE of the claimed numbers is the target. A
+    # larger set therefore makes refutation LESS likely, never more — which is
+    # why a legitimate plan cannot be refuted by this widening, and why a header
+    # transcribing its ticket's title (`… issue#2606 — … #2038 …`, ~50 plans)
+    # claiming both numbers is neutral. Measured: 0 lost tier-1 selections across
+    # 482 canonical issue slots, 0 new refutations across 983 plans.
     local candidate="$1"
     [ -n "$candidate" ] && [ -r "$candidate" ] || return 0
+    # POSIX classes, not `\s`: this function is already written in them, and two
+    # different tools share these patterns.
+    local hdr='^[[:space:]]*(>[[:space:]]*)*(-[[:space:]]+)?(\*\*)?'
+    local sep='(\*\*)?[[:space:]]*(:\*\*|:)'
     local label_lines
     label_lines=$(head -n 20 "$candidate" 2>/dev/null \
-        | grep -iE '^[[:space:]]*(-[[:space:]]+)?(\*\*)?(ticket|issue|number)(:\*\*|:)')
+        | grep -iE "${hdr}(ticket|issue|number)${sep}")
     [ -n "$label_lines" ] || return 0
     {
         # Every `#N` on a label line, not just the last: a header may name two
@@ -6216,7 +6256,7 @@ _plan_header_claimed_issues() {
         printf '%s\n' "$label_lines" | grep -oE '#[0-9]+' | tr -d '#'
         # A bare numeric value sitting directly after the label (`issue: 1679`).
         printf '%s\n' "$label_lines" \
-            | sed -E 's/^[[:space:]]*(-[[:space:]]+)?(\*\*)?[A-Za-z]+(:\*\*|:)[[:space:]]*//' \
+            | sed -E "s/${hdr}[A-Za-z]+${sep}[[:space:]]*//" \
             | grep -oE '^[0-9]+'
     } | sort -u
 }
