@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{Instrument, debug, info, info_span, warn};
 
-use super::error::LlmError;
+use super::error::{LlmError, blank_response_body};
 use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
 use super::types::*;
 use super::{LlmProvider, ProviderKind};
@@ -369,6 +369,40 @@ impl OpenAiCompatibleProvider {
                 ));
             }
         };
+
+        // mika#1781 — a body made only of whitespace is an EMPTY response, so it
+        // is transitory: `Transport`, never `ParseError`. Measured once, on
+        // 2026-08-28T20:53:23Z against `openrouter`: 1320 bytes, 240 newlines,
+        // not one JSON character, which serde reported as `EOF while parsing a
+        // value at line 241 column 0`. The body arrived WHOLE — so this is not a
+        // cut stream, an HTML page or a changed schema, but keepalive padding
+        // emitted while an upstream backend expires.
+        //
+        // The order is the criterion (AC1): after the body is read, before
+        // `from_str`. Placed after the deserialization this call would be inert,
+        // which is what V2's source scan asserts by comparing offsets rather
+        // than mere presence.
+        //
+        // n=1 in 12 days. What keeps it worth classifying is the invariant, not
+        // the volume: a cycle cannot be counted successful on empty or
+        // unreadable output (bearing Prime, RT#009) — retried, or surfaced
+        // loudly, never swallowed.
+        if let Some(e) = blank_response_body(&body) {
+            warn!(
+                target: "mika::llm",
+                provider = %self.provider_kind,
+                body_len = body.len(),
+                "LLM response body was whitespace-only (retryable transport, mika#1781)"
+            );
+            // `cap_exhausted = false`, via `plain` (mika#2280 R2): the body
+            // FINISHED arriving — `response.text()` returned `Ok`. It is not a
+            // cut, therefore not a plafond guillotine, and letting a complete
+            // body into the population that asserts "the model was still
+            // generating" is exactly the false attribution mika#2280 wrote
+            // itself to avoid — the same reasoning its own comment applies to
+            // the `response.text()` of non-2xx responses above.
+            return Err(plain(e));
+        }
 
         let resp: OpenAiResponse = serde_json::from_str(&body).map_err(|e| {
             // serde_json names the offending line, column and field — unlike the
@@ -1285,6 +1319,85 @@ fn parse_json_tool_call(json_str: &str, index: usize) -> Option<LlmResponseConte
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The body of `send_once`, isolated from this module's own source.
+    ///
+    /// Bounded on purpose: the `use super::error::{…, blank_response_body}`
+    /// import at the top of the file names the classifier too, so an unbounded
+    /// search would report the import and the scan below would pass on a site
+    /// that no longer calls anything.
+    fn send_once_body() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("llm")
+            .join("openai.rs");
+        let text = std::fs::read_to_string(&path).expect("readable own source");
+        let start = text
+            .find("    async fn send_once(")
+            .expect("send_once must exist — if this fires, the anchor moved, not the rule");
+        let rest = &text[start + 1..];
+        let end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .or_else(|| rest.find("\n    pub fn "))
+            .map_or(text.len(), |o| start + 1 + o);
+        text[start..end].to_string()
+    }
+
+    /// V2 — the call site consults the classifier, and does so BEFORE
+    /// deserializing (mika#1781).
+    ///
+    /// A source scan, because no behavioural test can see this class of
+    /// regression. Deleting the `if let` from `send_once` makes **no** assertion
+    /// go red: the `blank_response_body` unit tests stay green, the success path
+    /// stays green, `from_str` quietly takes the blank body back, and the defect
+    /// returns in silence. That is the lesson this repo has already written
+    /// twice — mika#1883 ("testing the helper attests that `None + Some(n) =
+    /// Some(n)`; it does not attest that both sites go through it") and
+    /// mika#2511 ("removing the acquisition makes no decision wrong the day it
+    /// is written … only the window reopens, in silence").
+    ///
+    /// The **order** is asserted, not merely the presence: a call placed after
+    /// the deserialization would be inert, since `from_str` fails first.
+    ///
+    /// Scope: the body of this rail's `send_once` and nothing else. `ollama.rs`
+    /// carries the identical latent class (its `serde_json::from_str`) and is a
+    /// declared out-of-scope follow-up, not a disguised exemption — see the plan
+    /// of mika#1781, R3, whose precondition is a measurement showing a blank
+    /// body on that rail.
+    ///
+    /// Allowlist: none, and no constant to add one to. When this fires the
+    /// resolution is to **re-arm the site** (doctrine mika#2201); a
+    /// deserialization site one does not want preceded by the classifier is a
+    /// site to discuss, not one to except.
+    #[test]
+    fn mika1781_the_site_calls_the_classifier_before_deserialising() {
+        let body = send_once_body();
+
+        let classifier = body.find("blank_response_body(&body)");
+        let deserialise = body.find("let resp: OpenAiResponse = serde_json::from_str(&body)");
+
+        // Anti-vacuity, and it is load-bearing: a scan that finds neither anchor
+        // (rename, refactor, extraction) would otherwise pass by looking at
+        // nothing, and a silently inert scan reads exactly like a clean tree
+        // (class mika#2205).
+        let classifier = classifier.expect(
+            "`send_once` must consult `blank_response_body(&body)` — if the call was removed, \
+             a whitespace-only body reaches `serde_json` again and becomes a non-retryable \
+             ParseError (mika#1781 AC1). Re-arm the site; do not relax this scan.",
+        );
+        let deserialise = deserialise.expect(
+            "the `let resp: OpenAiResponse = serde_json::from_str(&body)` anchor is gone — this \
+             scan is now looking at nothing. Repair the anchor, never delete the assertion.",
+        );
+
+        assert!(
+            classifier < deserialise,
+            "the classifier must be consulted BEFORE deserialization (mika#1781 AC1); placed \
+             after, it is inert because `from_str` fails first. Offsets: classifier at \
+             {classifier}, from_str at {deserialise}."
+        );
+    }
 
     /// Pins the ceiling the retry chain of this rail runs under (mika#2189
     /// AC3-b).
