@@ -386,6 +386,26 @@ CACHEDIR	B	crates/mika-agent/src/worktree_reaper.rs::CACHEDIR_TAG_MARKER	exact:l
 REFUSED	B	crates/mika-cli/src/commands/plan_callout.rs::REFUSAL_PREFIX	exact:prefix
 REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	exact:prefix
 
+# ── mika#2627 — le préfixe du refus doctrinal côté outils.
+#
+# `REFUS (testimony-access, mika#2627)` ouvre le `ToolOutput::error` que rendent
+# `send_message`, `create_reminder` et `create_scheduled_task` quand leur corps
+# sortant propose un accès testimony-grade. Ce n'est pas un aîné de `cwd-guard.sh`
+# (qui compose sans relire) : ce préfixe est un FORMAT DE FIL, choisi comme tel
+# pour qu'aucune table ne soit créée. Son lecteur est la requête opérateur
+# `SELECT tool_name, count(*) FROM tool_calls WHERE output LIKE
+# 'REFUS (testimony-access, mika#2627)%'` — un ancrage en TÊTE de `output` — et
+# les tests des trois outils l'épinglent par `starts_with`. Un préfixe reformulé
+# (« REFUSED », un autre ordre dans la parenthèse) sortirait la ligne de la
+# population sans un mot : c'est la classe B.
+#
+# `exact:prefix` et non `ci:…` : SQLite `LIKE` replie la casse ASCII, mais le
+# lecteur que le code porte est le `starts_with` des tests, et c'est lui que la
+# constante doit satisfaire. Déclaré plutôt qu'allowlisté (§ D5/D6), et pas
+# renommé pour sortir de la population — le précédent `REFUSAL_PREFIX` ci-dessus
+# a écrit pourquoi ce serait cacher un lecteur réel derrière un nom.
+REFUS	B	crates/mika-agent/src/tools/mod.rs::TESTIMONY_ACCESS_REFUSAL_PREFIX	exact:prefix
+
 # ═══ Labels. Out of the survey's perimeter (not source), so never compared.
 #
 # Their own exhaustiveness guards are `scripts/check-dispatch-seats-declared.sh`
