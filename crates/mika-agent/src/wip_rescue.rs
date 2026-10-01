@@ -3050,6 +3050,39 @@ mod tests {
         );
     }
 
+    /// mika#2624 — the extracted classifier, tested directly (review of PR
+    /// #2628, testing). Two production readers depend on it (`hold_verdict` and
+    /// `run_gh`'s hold term), so its three arms are pinned here rather than only
+    /// through one caller: no event → `NotHeld`; events → `Held` carrying the
+    /// **last** event's instant and actor; a read error → `Unreadable`, never
+    /// `NotHeld` (fail-closed is a property of this function).
+    #[test]
+    fn mika2624_classify_hold_verdict_a_trois_bras() {
+        use crate::github_graphql::ConvertToDraftEvent;
+        let event = |at: &str, by: &str| ConvertToDraftEvent {
+            created_at: Some(at.to_string()),
+            actor_login: Some(by.to_string()),
+        };
+
+        assert_eq!(classify_hold_verdict(Ok(vec![])), HoldVerdict::NotHeld);
+        assert_eq!(
+            classify_hold_verdict(Ok(vec![
+                event("2026-09-29T10:00:00Z", "first"),
+                event("2026-10-01T14:00:41Z", "samidarko"),
+            ])),
+            HoldVerdict::Held {
+                since: Some("2026-10-01T14:00:41Z".to_string()),
+                actor: Some("samidarko".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_hold_verdict(Err("GitHub API error 503".to_string())),
+            HoldVerdict::Unreadable {
+                error: "GitHub API error 503".to_string()
+            }
+        );
+    }
+
     /// V6 / AC3. Three states, **two** names — and `NotHeld` writes nothing.
     ///
     /// The two names must stay countable apart: one says the mechanism worked,
