@@ -13,26 +13,46 @@ Quatre faits corrigent ou complètent l'énoncé, et chacun change le plan.
 **R1 — La suggestion du commentaire 1/2 est caduque, et dans le bon sens.**
 mika#2131 + mika#2132 sont **livrés** : `ExclusionLedger`, les seize constantes
 `FILTER_*`, la table de ledger `auto_pull_exclusion` et le test de format de fil
-`mika2131_filter_names_are_a_wire_format` sont tous à HEAD (`auto_pull.rs:1202-1445`).
+`mika2131_filter_names_are_a_wire_format` sont tous à HEAD (`auto_pull.rs`, du bloc
+des constantes `FILTER_*` jusqu'à `ExclusionLedger::flush`).
 Le plan de mika#2131 avait d'ailleurs **écarté #2161 par écrit** (« invariant
 DIFFÉRENT, ticket séparé »). La moitié muette est donc fermée ; ce ticket ferme
 la moitié bavarde, et l'état « à moitié fiable » que le commentaire craignait est
 derrière nous, pas devant.
 
 **R2 — Et cette livraison donne le vocabulaire à réutiliser, ce qui n'est pas une
-coïncidence.** `FILTER_OPEN_PR` (`open_pr_closing`), `FILTER_IN_FLIGHT`
-(`in_flight_self_dev`) et `FILTER_OPERATOR_HELD` (`operator_review_or_blocked`)
-sont déjà des valeurs de fil épinglées, employées par `groomed_candidate_exclusion`
-sur le bassin **`!ready`**. Le bassin **`ready`**, lui, n'enregistre rien : c'est
-exactement le trou de AC2. Le recensement livré ici étend le même vocabulaire au
-bassin `ready`, donc un opérateur qui fait `GROUP BY after_value` sur
-`auto_pull_exclusion` et un opérateur qui lit les compteurs de `auto_feeder`
-parlent la même langue. Deux orthographes du même filtre couperaient une
-population en deux sans le dire — la leçon que mika#2131 a dû graver une fois.
+coïncidence — et il couvre les QUATRE seaux, pas trois.** `FILTER_OPEN_PR`
+(`open_pr_closing`), `FILTER_IN_FLIGHT` (`in_flight_self_dev`),
+`FILTER_OPERATOR_HELD` (`operator_review_or_blocked`) **et `FILTER_PROBE_ERROR`
+(`state_probe_failed`)** sont déjà des valeurs de fil épinglées, employées par
+`groomed_candidate_exclusion` et les trois sites de Phase 2 sur le bassin
+**`!ready`**. Le bassin **`ready`**, lui, n'enregistre rien : c'est exactement le
+trou de AC2.
 
-**R3 — Les numéros de ligne du ticket ont dérivé**, et le dire évite une chasse :
-`count_pullable_ready` est à **1904-1916** (et non 1050-1062), le bloc fautif à
-**3185-3206** (et non 1995-1998).
+La quatrième est la découverte qui corrige le plan sur lui-même : le seau que la
+première rédaction appelait `probe_failed` **a déjà un nom de fil**, et il décrit
+exactement la même chose (« la sonde d'état n'a pas répondu »). En inventer un
+second serait la faute que ce même R2 dénonce une ligne plus haut — deux
+orthographes d'un filtre coupant une population en deux sans le dire, la leçon que
+mika#2131 a dû graver une fois. Le recensement n'étend donc **aucun** vocabulaire :
+il applique le vocabulaire existant au bassin `ready`, de sorte qu'un opérateur qui
+fait `GROUP BY after_value` sur `auto_pull_exclusion` et un opérateur qui lit les
+compteurs de `auto_feeder` parlent la même langue.
+
+**R3 — Les numéros de ligne du ticket avaient dérivé ; ils ont dérivé une SECONDE
+fois pendant la vie de ce plan**, et c'est cette seconde dérive qui tranche la
+question plutôt que la première. Le ticket citait 1050-1062 et 1995-1998 ; la
+première rédaction de ce plan a corrigé en 1904-1916 et 3185-3206 ; au 2026-10-01
+les sites réels sont **1928** et **3221-3242**. Trois jeux de nombres pour deux
+sites en un mois.
+
+Conséquence pour l'implémentation : **ce plan ne cite plus aucun numéro de ligne**,
+il nomme des symboles — `count_pullable_ready`, le bloc `if candidates.is_empty()`
+de `phase0_feed_ready_pool`, et la boucle de sonde `has_active_self_dev_task_for_issue`
+du même corps. C'est la règle que `scripts/canonical-tokens.tsv` applique déjà à ses
+propres sites de match (*« jamais un numéro de ligne, qui pourrit en silence »*), et
+elle vaut pour un plan au moins autant que pour un registre : un numéro faux envoie
+le lecteur au mauvais endroit avec l'autorité d'une mesure.
 
 **R4 — AC3 n'est répondable avec un nombre vrai que depuis mika#2335.** « Les
 tickets en vol et depuis combien de temps » suppose un instant de départ. Or
@@ -69,12 +89,13 @@ pas pu aider, même si le backlog avait été vide **et** qu'il l'était.
 | cause | prédicat | remède nommé | régime attendu |
 |---|---|---|---|
 | **(b)** `PoolInFlight` | `in_flight > 0` | débloquer — les tickets et leurs âges sont dans l'événement | non nul pendant un blocage |
-| **(c)** `InFlightUnreadable` | sinon, `probe_failed > 0` | réparer la sonde — ni (a) ni (b) n'est établi | **zéro** |
+| **(c)** `InFlightUnreadable` | sinon, `state_probe_failed > 0` | réparer la sonde — ni (a) ni (b) n'est établi | **zéro** |
 | **(a)** `NoGroomedBacklog` | sinon | groomer davantage | nominal |
 
 **(c) n'est pas de la sur-ingénierie, c'est le fail-safe existant rendu
 lisible.** La boucle de sonde traite déjà une erreur DB comme « en vol »
-(`auto_pull.rs:3142-3145`, `treating as in-flight`) — fail-safe correct pour le
+(le bras `Err` de `has_active_self_dev_task_for_issue` dans `phase0_feed_ready_pool`,
+`treating as in-flight`) — fail-safe correct pour le
 *seuil*, puisqu'il vaut mieux ne pas promouvoir dans le doute. Mais versé tel
 quel dans le message de (b), il ferait **nommer comme en vol des tickets qui ne
 le sont peut-être pas**, c'est-à-dire donner un remède faux avec l'autorité d'une
@@ -93,8 +114,16 @@ fonction **pure**, attribuant chaque ticket `ready` à **exactement un** seau, d
 l'ordre même où `count_pullable_ready` applique ses `.filter()` :
 
 ```
-raw_ready = pullable + open_pr + in_flight + probe_failed + operator_held
+raw_ready = pullable + open_pr + in_flight + state_probe_failed + operator_held
 ```
+
+Les cinq champs portent les noms de fil de R2 — aucun nom neuf. Et
+`state_probe_failed` est un **sous-ensemble d'attribution** de `in_flight` :
+l'ensemble que `count_pullable_ready` reçoit reste l'union exacte d'aujourd'hui
+(fail-safe inchangé), seule la ventilation du compte est affinée. D'où l'additivité
+ci-dessous, qui exige que les deux seaux soient **disjoints** dans le recensement
+alors qu'ils sont **confondus** dans le filtre : c'est le point que l'implémentation
+doit tenir, et le test V1 est ce qui le tient.
 
 **L'additivité est le livrable, pas une élégance.** AC2 demande de « trancher sans
 aller lire ailleurs » : des seaux qui se recouvriraient donneraient une somme
@@ -199,7 +228,9 @@ pendant un blocage la vivacité *est* l'information — même raison que
 **U1 — Recensement (pure).** `ReadyPoolCensus` + `census_ready_pool`, dans
 `auto_pull.rs` à côté de `count_pullable_ready`. Réutilise
 `feeder_exclusion_label` pour le seau `operator_held`, donc la raison d'exclusion
-du bassin `ready` ne peut pas décrire une règle que la boucle a cessé d'appliquer.
+du bassin `ready` ne peut pas décrire une règle que la boucle a cessé d'appliquer —
+et les quatre noms de seaux sont les constantes `FILTER_*` de R2, jamais des
+littéraux recopiés.
 
 **U2 — Classification (pure).** `EmptyBacklogCause` (trois variantes) +
 `classify_empty_backlog(&ReadyPoolCensus) -> EmptyBacklogCause`. `match` exhaustif
@@ -230,7 +261,11 @@ corrigés (AC4).
 **U5 — Gardes.** Matrice pure ; test hermétique `#[tokio::test]` sur
 `emit_empty_backlog_signal` avec `Database::open_in_memory()` + relecture de
 `audit_events` (modèle `mika2361_phase2_names_an_abandoned_held_ticket_under_its_own_filter`,
-déjà dans ce fichier) ; scan de source SOLE WRITER sur les trois noms.
+déjà dans ce fichier) ; scan de source SOLE WRITER sur les trois noms. Les trois
+valeurs rejoignent le test de format de fil **existant**
+(`mika2131_filter_names_are_a_wire_format`) plutôt qu'un test neuf : c'est là que
+l'opérateur et le relecteur vont déjà lire le vocabulaire d'`auto_pull`, et un
+second test de fil au même sujet laisserait les deux libres de diverger.
 
 **U6 — `CLAUDE.md` racine.** L'entrée `MIKA_AUTO_FEEDER_MIN_READY` décrit
 `auto_feeder_no_backlog` comme « a **grooming-throughput** bottleneck signal » —
@@ -249,16 +284,25 @@ branches, (3) le scan de source SOLE WRITER sur les trois noms d'événement.
 - (1) et (2) ne portent que sur du code neuf et n'ont **aucune donnée préexistante**
   sur laquelle tirer : `census_ready_pool` et `classify_empty_backlog` n'existent
   pas avant ce ticket.
-- (3) **peut** tirer sur l'existant, et le cas est réel : `auto_feeder_no_backlog`
-  apparaît aujourd'hui dans **trois doc-comments** (`auto_pull.rs:132`, `:1128`,
-  `:1136`) en plus de son unique site d'écriture. Un scan lexical naïf les
-  compterait comme des écrivains — c'est exactement le piège que mika#2329 a dû
-  nommer (« nommer le chemin de la sentinelle dans un doc-comment est un hit
-  aussi ») et le faux positif de prose du Signal S (mika#2050). **Le scan
-  dépouille donc les commentaires avant de chercher**, comme le fait déjà
-  `no_dispatch_test.rs` (« Comments are stripped before scanning so doc prose can
-  describe what's forbidden »). Après dépouillement, l'inventaire est de **un**
-  site par nom.
+- (3) **peut** tirer sur l'existant, et le cas est réel — à une mesure près que la
+  première rédaction de ce plan avait fausse. `auto_feeder_no_backlog` apparaît
+  aujourd'hui à **sept** endroits : **quatre** en prose de production, **un** en
+  prose de test, et **deux** écritures (`info!` et `log_audit_event`) qui sont
+  **dans la même fonction**. Le plan annonçait « trois doc-comments » et « son
+  unique site d'écriture » : les deux moitiés étaient fausses, et la seconde est
+  celle qui compte — un scan écrit sur la prémisse *un site par nom* rougirait au
+  premier `cargo test`, c'est-à-dire serait désarmé avant d'avoir servi.
+
+  Donc **le scan dépouille les commentaires avant de chercher** (comme le fait déjà
+  `no_dispatch_test.rs` : *« Comments are stripped before scanning so doc prose can
+  describe what's forbidden »*) — c'est le piège que mika#2329 a dû nommer
+  (« nommer le chemin de la sentinelle dans un doc-comment est un hit aussi ») et le
+  faux positif de prose du Signal S (mika#2050) — **et il compte des fonctions
+  écrivantes, non des occurrences** : exactement une par nom. Formulé sur les
+  occurrences, il faudrait y écrire le nombre `2`, que la prochaine ligne de
+  journal ferait mentir ; formulé sur la fonction, il dit la propriété qui compte
+  (les deux surfaces d'un même nom ne peuvent pas diverger, puisqu'un seul site
+  décide). Motif `outcome_for(disposition)` du faucheur mika#2420.
 - **Allowlist livrée vide.** Il n'y a rien à exempter, donc aucun créneau où
   déposer le prochain manquement (règle mika#2323). Si le scan tire un jour, la
   résolution est **halt-and-surface** et jamais une entrée d'allowlist : « ce
@@ -276,7 +320,7 @@ branches, (3) le scan de source SOLE WRITER sur les trois noms d'événement.
 | V4 | `mika2161_un_bassin_vraiment_vide_rend_no_backlog` | idem |
 | V5 | `mika2161_une_sonde_illisible_naffirme_ni_lun_ni_lautre` | fondant `probe_failed` dans `in_flight` |
 | V6 | `mika2161_les_deux_branches_ecrivent_deux_target_key` (hermétique, DB mémoire) | fusionnant les deux noms |
-| V7 | `mika2161_les_noms_devenements_sont_un_format_de_fil` | changeant une valeur |
+| V7 | les trois noms ajoutés à `mika2131_filter_names_are_a_wire_format` (test **existant**, pas un nouveau) | changeant une valeur |
 | V8 | `mika2161_chaque_nom_a_un_seul_ecrivain` (scan, commentaires dépouillés) | dupliquant un littéral |
 | V9 | `mika2161_le_booleen_en_vol_delegue_au_lecteur_unique` | laissant les deux SQL diverger |
 
@@ -287,17 +331,37 @@ c'est-à-dire par le défaut qu'on répare.
 
 `make test` + `make lint` + `make fmt` verts.
 
-## Sonde post-déploiement, et ses trois haltes
+## Sonde post-déploiement, et ses quatre haltes
 
 ```bash
+# 1. Le cas (b) — la mesure que rien ne donnait
 grep auto_feeder_pool_in_flight "$MIKA_SPIRIT_LOG_FILE" \
-  | jq '{raw_ready, pullable, in_flight, open_pr, operator_held, stuck}'
+  | jq -c '{raw_ready, pullable, in_flight, open_pr, operator_held, stuck}'
+
+# 2. Contrôle négatif — la sonde d'état tient-elle ? (régime attendu : VIDE)
 grep auto_feeder_in_flight_unreadable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — Phase 0 tourne-t-elle seulement ?
+grep -cE 'auto_feeder_(skip|promoted|no_backlog|pool_in_flight|in_flight_unreadable)' \
+  "$MIKA_SPIRIT_LOG_FILE"
 ```
 ```sql
+-- Les trois causes, soustractibles en une requête
 SELECT target_key, count(*) FROM audit_events
  WHERE tool_name = 'auto_feeder' GROUP BY 1;
 ```
+
+**Le contrôle positif (3) n'est pas décoratif, et c'est l'ajout le plus important de
+cette révision.** *Zéro ligne des trois noms* a **trois** causes, dont deux sont des
+configurations parfaitement saines et aucune n'est distinguable des autres sans lui :
+le bassin est au-dessus du seuil (nominal, `auto_feeder_skip`) ; `MIKA_AUTO_FEEDER_MIN_READY=0`
+désarme Phase 0 avant toute sonde ; et depuis mika#2329/#2498 la sentinelle
+`~/.mika/state/auto-pull-stop` court-circuite `dispatch_auto_pull_groomed` **en tête**,
+donc Phase 0 ne tourne pas du tout. Lire les deux ensemble : zéro `pool_in_flight`
+**avec** un compte non nul est un bassin sain ; zéro des deux ne prouve **rien** sur le
+classifieur. C'est la classe mika#2205 appliquée à la sonde de ce ticket plutôt qu'à
+celle d'un voisin : *une garde que personne n'a exercée se lit exactement comme une
+garde qui marche.*
 
 **Halte 1 — `auto_feeder_in_flight_unreadable` non vide.** Régime attendu zéro. Une
 occurrence est une sonde DB qui échoue, donc un diagnostic que le feeder ne peut
@@ -309,12 +373,37 @@ heures.** La cause n'est pas ici : ce sont mika#2158 / mika#2160 / mika#2156,
 explicitement hors périmètre. L'événement a fait son travail en le disant ; le
 remède est en amont.
 
-**Halte 3 — `auto_feeder_no_backlog` reste dominant après déploiement alors que le
-bassin `ready` est visiblement coincé.** Le classifieur ne voit pas les exclus
-`in_flight`. **Ne pas ajuster de seuil** : vérifier d'abord que la boucle de sonde
-remplit bien `in_flight_issue_numbers` (un `MIKA_AUTO_FEEDER_MIN_READY` à `0`
-court-circuite Phase 0 avant toute sonde), puis que le binaire déployé porte le
-correctif — classe mika#2340.
+**Halte 3 — `auto_feeder_no_backlog` reste dominant alors que le bassin `ready` est
+visiblement coincé.** Le classifieur ne voit pas les exclus `in_flight`. **Ne pas
+ajuster de seuil** : vérifier d'abord que la boucle de sonde remplit bien
+`in_flight_issue_numbers`, puis que le binaire déployé porte le correctif — classe
+mika#2340.
+
+**Halte 4 — le contrôle positif (3) rend zéro.** Ne toucher ni au classifieur ni au
+recensement : Phase 0 n'a pas tourné. Lire dans cet ordre la sentinelle
+(`grep auto_pull_stop_armed "$MIKA_SPIRIT_LOG_FILE"`, un INFO par tick
+court-circuité), puis `MIKA_AUTO_FEEDER_MIN_READY`. Les deux sont des gestes
+d'opérateur, et confondre l'un avec un défaut de ce ticket est la façon la plus
+rapide de « réparer » du code qui n'a jamais été exécuté.
+
+## Ce que ce travail n'achète PAS
+
+- **Il ne débloque rien.** Les tickets coincés le restent ; ce qui change est qu'on
+  sait **lequel des deux remèdes** s'applique. C'est la formulation du ticket
+  lui-même (« il fait en sorte qu'on sache quoi débloquer »), et la tenir est ce qui
+  garde le périmètre petit.
+- **Il ne rattrape pas la nuit du 2026-09-03.** Les lignes déjà écrites sous
+  `auto_feeder_no_backlog` mêlent (a) et (b) pour toujours : rien ne rétro-classe un
+  événement qu'on n'a pas observé, et le faire rendrait faux ce que ces lignes
+  disaient quand elles ont été écrites (motif mika#2361). La sonde est la
+  **prochaine** occurrence.
+- **Il ne surveille rien.** Les seuls instruments sont les greps et la requête SQL
+  ci-dessus, et **leur silence ne prouve rien tant que personne ne les exécute** —
+  d'où le contrôle positif, sans lequel « Phase 0 n'a pas tourné » et « le bassin est
+  sain » rendent exactement les mêmes octets.
+- **Il ne mesure pas la cause du blocage.** `stuck` donne les tickets et leurs âges,
+  pas *pourquoi* ils ne bougent pas. Les trois causes connues (mika#2158, mika#2160,
+  mika#2156) ont chacune leurs propres surfaces.
 
 ## Hors périmètre
 
