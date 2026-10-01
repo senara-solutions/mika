@@ -3402,15 +3402,21 @@ mod tests {
 
     /// **Un PÉRIMÈTRE, pas une allowlist d'exemption** (sens de mika#2536).
     ///
-    /// Ces deux sites consomment `ctx.message_sender` et **n'émettent aucun
-    /// texte du modèle** :
+    /// Ces deux sites consomment `ctx.message_sender` sans appeler la garde, et
+    /// pour deux raisons **différentes** :
     ///
     /// - `delegate_task` passe le sender au délégué et n'envoie rien lui-même —
     ///   le délégué appelle `send_message`, donc il est couvert
     ///   **transitivement** ;
-    /// - `run_team` envoie une notification de fin de run dont le texte est
-    ///   composé par `teams::notification::build_run_completion_message`,
-    ///   c'est-à-dire par le **moteur** et non par le modèle.
+    /// - `run_team` envoie une notification de fin de run qui enveloppe
+    ///   `run.deliverable` — la **sortie LLM** de l'agent rédacteur
+    ///   (`TeamEngine::deliver`), la réponse de la porte conversationnelle, ou
+    ///   le repli workspace sur timeout. **C'est du texte du modèle, NON
+    ///   couvert** : un **canal ouvert nommé**, pas une exemption « texte du
+    ///   moteur » (la prémisse du recensement du plan était fausse, revue de
+    ///   code mika#2627). Le bon site de garde est le livrable dans
+    ///   `TeamEngine::deliver` (un site, les deux chemins sync et async) —
+    ///   ticket de suivi, hors de ce périmètre.
     ///
     /// `tools/mod.rs` est hors population par une autre raison : il **déclare**
     /// le champ, il ne le consomme pas. Et c'est aussi le site du helper, donc

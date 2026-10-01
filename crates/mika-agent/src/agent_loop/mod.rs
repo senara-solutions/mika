@@ -8524,13 +8524,15 @@ pub(crate) const REFLECTION_EVIDENCE_GATED_TOOLS: &[&str] =
 /// with no caller means a surface declared guarded and guarded by nothing, which
 /// is strictly worse than an unguarded one because it reads as covered.
 ///
-/// The census behind it (mika#2627 R2) found **three** emitters and two
-/// non-emitters: `delegate_task` hands its `message_sender` to the delegate and
-/// sends nothing itself (covered transitively, since the delegate calls
-/// `send_message`), and `run_team`'s completion text is composed by
-/// `teams::notification`, i.e. by the **engine** and not by the model. Both are
-/// out of population by nature, and the scan in
-/// `canonical_tokens::tests::mika2627_*` holds that perimeter in both directions.
+/// The census behind it (mika#2627 R2) found **three** guarded emitters and two
+/// other `message_sender` consumers: `delegate_task` hands its sender to the
+/// delegate and sends nothing itself (covered transitively, since the delegate
+/// calls `send_message`); `run_team` sends a completion notification wrapping
+/// `run.deliverable`, which is **model text** (the writer agent's output in
+/// `TeamEngine::deliver`), so it is a **named open channel**, not an
+/// engine-text exemption — the census's "composed by the engine" was wrong.
+/// The scan in `canonical_tokens::tests::mika2627_*` holds that perimeter in
+/// both directions.
 ///
 /// **Its only consumer is that parity test, and that is a difference from its
 /// reflection-mode sibling worth naming.** `REFLECTION_EVIDENCE_GATED_TOOLS` is

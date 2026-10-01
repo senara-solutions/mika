@@ -99,8 +99,14 @@ tool's outgoing body (`tools::check_testimony_access_proposal`). Three emitters
 go through it: `send_message`, and `create_reminder` /
 `create_scheduled_task` when their `action_type` is `send_message`, since a
 deferred send is still a send. `delegate_task` relays its sender and emits
-nothing itself (covered transitively, its delegate calls `send_message`), and
-`run_team`'s completion text is composed by the engine rather than the model.
+nothing itself (covered transitively, its delegate calls `send_message`).
+**`run_team` is NOT covered, and it is not engine text either**: its completion
+notification wraps `run.deliverable`, which is the LLM output of the team's
+writer agent (`TeamEngine::deliver`), the conversational gate's reply, or the
+workspace files read on timeout — sent verbatim through `message_sender` on both
+the sync (`tools/run_team.rs`) and async (`task_engine::dispatcher`) paths. A
+team agent can therefore deliver a proposal no testimony refusal reads, and the
+workspace fallback never traverses 5h at all. That channel is named open below.
 
 Two properties of that refusal, both load-bearing. It precedes the Telegram
 length guard, because that guard's remedy is a split and **splitting a text that
@@ -116,6 +122,9 @@ the false positive that segmentation exists to avoid — same class as mika#2237
 which left its own degradation path open with its reason); and rows **scheduled
 before** the mika#2627 deploy, whose firing site has no model to return a reason
 to. Both are bounded and measurable — see the root `CLAUDE.md` for the queries.
+And the **team deliverable** (`run_team`, above): the right guard site is the
+deliverable itself in `TeamEngine::deliver` — one site covers both notification
+paths — not the tool, and it is a follow-up, not a line of mika#2627.
 
 Two properties worth knowing before touching it. The discriminant is the
 **direction of the access movement**, never the vocabulary: Layer 1 *prescribes*

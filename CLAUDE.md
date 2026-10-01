@@ -566,7 +566,7 @@ garde 5h.
   | 2 | `create_reminder` + `action_type = "send_message"` | `action_config = {"text": …}`, tiré plus tard par le dispatcher | **oui** |
   | 3 | `create_scheduled_task` + `action_type = "send_message"` | idem | **oui**, mais **inerte** — voir ci-dessous |
   | 4 | `delegate_task` | passe le sender au délégué, n'envoie **rien** lui-même | non — couvert **transitivement** (le délégué appelle `send_message`) |
-  | 5 | `run_team` | notification de fin de run composée par `teams::notification` | non — le texte est du **moteur**, pas du modèle |
+  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), ou le repli workspace | **non couvert — canal ouvert nommé.** Le recensement du plan le disait « texte du moteur » : c'est faux (revue de code). Bon site de garde : le livrable dans `TeamEngine::deliver` — suivi |
   | 6 | le dispatcher du tir planifié | **consommateur** du différé | non — voir « au moment de la création » |
 
   **Rectification au recensement du ticket, trouvée en lisant le code :** la
@@ -709,6 +709,12 @@ pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), 
   envoyé, et **rien n'est rétro-estampillé** : la sonde est la **prochaine**
   occurrence.
 - **Il ne couvre pas les rows planifiées avant le déploiement.**
+- **Il ne couvre pas le livrable d'équipe (`run_team`).** Le livrable est du
+  texte du modèle envoyé tel quel à la personne ; le recensement du plan l'avait
+  classé « texte du moteur » à tort. Le bon site de garde est
+  `TeamEngine::deliver` (un site couvre les chemins sync et async) — **suivi
+  nommé**, dont la précondition est de décider ce que devient un livrable refusé
+  (re-rédaction une fois, puis ligne neutre « livrable retenu »).
 - **Il ne ferme pas RK5** (la proposition étalée sur deux appels), nommé
   ci-dessus avec sa précondition de suivi.
 - **Il n'ajoute aucune ligne `audit_events` et aucun compteur.** Les seuls
