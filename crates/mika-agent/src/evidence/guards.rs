@@ -7585,6 +7585,38 @@ mod tests {
             .expect("the second sentence is a proposal and must still be caught");
     }
 
+    /// The refusal markers are the ONLY variable here. Every other refusal-shaped
+    /// control passes because Layer B is absent, so deleting
+    /// `TESTIMONY_REFUSAL_MARKERS` left the suite green: the suppressor was
+    /// shipped and never exercised. Each pair below carries A ∧ B in one
+    /// sentence, and its twin differs by the marker alone.
+    #[test]
+    fn mika1960_a_refusal_marker_is_what_cancels_a_matched_proposal() {
+        for (refused, proposed) in [
+            (
+                "Je ne peux pas le faire seule, donne-moi accès à ta boîte Gmail.",
+                "Pour le faire, donne-moi accès à ta boîte Gmail.",
+            ),
+            (
+                "I can't do it alone, give me access to your inbox.",
+                "To do it, give me access to your inbox.",
+            ),
+            (
+                "I don't have access to your mailbox, you could give me access to it.",
+                "To sort your mailbox, you could give me access to it.",
+            ),
+        ] {
+            assert!(
+                detect_testimony_access_proposal(proposed).is_some(),
+                "control: without a marker the sentence is a proposal: {proposed}"
+            );
+            assert!(
+                detect_testimony_access_proposal(refused).is_none(),
+                "the refusal marker must cancel a sentence carrying A and B: {refused}"
+            );
+        }
+    }
+
     /// A model writes the typographic apostrophe (U+2019) as readily as the ASCII
     /// one, and French typesets it by default. Every contraction the layers read
     /// — `n'ai`, `can't`, `won't`, `m'`, `j'`, `t'` — must read the same either
