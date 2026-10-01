@@ -1726,7 +1726,7 @@ const ACCESS_OPENING_ALTERNATION: &str = r"(?:
 static TESTIMONY_MOVE_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<movement>{ACCESS_OPENING_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})"
+            r"(?ix)\b(?P<movement>{ACCESS_OPENING_ALTERNATION})(?P<gap>[^.!?\n;:—–]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})"
         ))
         .expect("testimony access-proposal movement-then-subject regex must compile")
     },
@@ -1735,7 +1735,7 @@ static TESTIMONY_MOVE_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::
 static TESTIMONY_SUBJECT_THEN_MOVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<movement>{ACCESS_OPENING_ALTERNATION})"
+            r"(?ix)\b(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n;:—–]{{0,{CLAIM_GAP_MAX}}}?)(?P<movement>{ACCESS_OPENING_ALTERNATION})"
         ))
         .expect("testimony access-proposal subject-then-movement regex must compile")
     },
@@ -1820,7 +1820,12 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
 /// [`CLAIM_GAP_MAX`] non-terminator characters, and Layer C does not cover it.
 /// "Same sentence" is enforced by the gap's character class rather than by a
 /// second pass — the [`CLAIM_GAP_MAX`] precedent, which 5e already reuses for a
-/// promise. Both orders are recognized for 5e's grammatical reason: « si tu me
+/// promise. **Narrower than 5d/5f's class, deliberately:** the gap also refuses
+/// `;`, `:`, `—` and `–`, because the prescribed answer is a refusal followed
+/// by an operational substitute in the *next clause* (« … ta boîte Gmail ;
+/// donne-moi accès à ton agenda »), and bridging that clause would predicate
+/// the refused subject of the substitute's movement. Cost, named: « ta boîte
+/// Gmail — tu peux m'y donner accès » is missed, the fail-safe direction. Both orders are recognized for 5e's grammatical reason: « si tu me
 /// donnais accès à ta boîte Gmail » is B→A, « ta boîte Gmail, tu peux m'y
 /// donner accès » is A→B, and matching one order only would miss the literal
 /// shape of the founding incident.
@@ -7633,6 +7638,31 @@ mod tests {
                 "the refusal marker must cancel a sentence carrying A and B: {refused}"
             );
         }
+    }
+
+    /// A semicolon, a colon or a dash between the subject and the movement
+    /// separates two clauses: « je ne lirai pas ta boîte Gmail ; donne-moi
+    /// accès à ton agenda » refuses the testimony-grade surface and asks for an
+    /// operational one — the shape Layer 1 prescribes. The gap must not bridge
+    /// those clauses, or the subject of the first is predicated of the movement
+    /// of the second.
+    #[test]
+    fn mika1960_a_clause_break_separates_the_subject_from_the_movement() {
+        for text in [
+            "Je ne lirai pas ta boîte Gmail ; donne-moi accès à ton agenda pour les rappels.",
+            "Ta messagerie, non : donne-moi plutôt accès à ton agenda.",
+            "Your inbox stays yours \u{2014} give me access to your calendar instead.",
+            "Your inbox stays yours \u{2013} give me access to your calendar instead.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a clause break separates the refused subject from the operational ask: {text}"
+            );
+        }
+        // Control: a comma does not break the clause — the incident's A→B form.
+        assert!(
+            detect_testimony_access_proposal("Ta boîte Gmail, tu peux m'y donner accès.").is_some()
+        );
     }
 
     /// A negated grant is a refusal, not a request. `give me access` is an
