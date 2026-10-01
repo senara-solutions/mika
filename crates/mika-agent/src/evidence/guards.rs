@@ -1864,9 +1864,13 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
 /// Phase 2 wires this at position 5h of `run_loop`'s EndTurn chain, so the five
 /// `#[allow(dead_code)]` of phase 1 are gone: the chain is reachable, and leaving
 /// one would be an annotation that lies. V4 now requires **exactly one**
-/// production call site — "shipped disarmed" and "armed in passing" returned
-/// identical bytes before, and it is now "armed" and "wired twice" that must stay
-/// separable (RK6).
+/// production wiring site — the 5h block of `run_loop` — which calls this
+/// function **twice by design**: once to fire, once to name the `_uncorrected`
+/// residue when the single-retry budget is spent (the 5d/5f/5g shape). So the
+/// `grep` of V4 returns two call expressions in `agent_loop/mod.rs`, both inside
+/// that block; a call anywhere else is the double wiring RK6 names. "Shipped
+/// disarmed" and "armed in passing" returned identical bytes before, and it is
+/// now "armed" and "wired twice" that must stay separable.
 pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAccessProposalMatch> {
     // Every contraction the three layers and the refusal markers read is
     // written with the ASCII apostrophe; a model writes U+2019 as readily, and
