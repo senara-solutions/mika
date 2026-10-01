@@ -3778,7 +3778,19 @@ pub fn discover_build_dirs(worktree: &Path) -> Vec<PathBuf> {
         found.push(target);
     }
 
-    let mut level = vec![worktree.join(PILOT_SCRATCH_DIRNAME)];
+    // La racine est soumise à la même règle que ses enfants : `read_dir` suit
+    // un lien, donc un `.pilot-scratch` qui serait un lien vers celui d'un
+    // worktree voisin ferait entrer les caches du voisin dans **cette**
+    // population — et P3 n'interroge que les processus de ce worktree-ci.
+    let scratch = worktree.join(PILOT_SCRATCH_DIRNAME);
+    let scratch_is_real_dir = scratch
+        .symlink_metadata()
+        .is_ok_and(|m| !m.is_symlink() && m.is_dir());
+    let mut level = if scratch_is_real_dir {
+        vec![scratch]
+    } else {
+        Vec::new()
+    };
     for _ in 0..BUILD_DIR_SCAN_DEPTH {
         let mut next = Vec::new();
         for dir in &level {
@@ -4183,6 +4195,20 @@ pub fn build_dir_disposition(dir: &Path) -> Result<(), &'static str> {
     }
 }
 
+/// Le répertoire de build est-il, **après canonicalisation des deux côtés**,
+/// strictement sous `worktree` ?
+///
+/// [`build_dir_disposition`] prouve qu'un chemin est un cache sous **un**
+/// worktree géré ; celle-ci prouve que c'est sous **celui-ci** — le seul dont
+/// les processus ont été interrogés (P3). Une canonicalisation qui échoue rend
+/// `false` : pas de preuve, pas de suppression.
+pub fn build_dir_is_inside_worktree(dir: &Path, worktree: &Path) -> bool {
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(worktree)) {
+        (Ok(d), Ok(w)) => d != w && d.starts_with(&w),
+        _ => false,
+    }
+}
+
 /// La forme booléenne de [`build_dir_disposition`] — un **wrapper d'un seul
 /// lecteur**, jamais une seconde vérité.
 pub fn target_path_is_disposable(target: &Path) -> bool {
@@ -4311,7 +4337,16 @@ async fn purge_stale_target_dirs(
         // ce que `armed` retirerait, et la sonde S0 de mika#2497 — « commencer
         // en observe et lire la population qui serait retirée » — mentirait sur
         // son propre objet.
+        //
+        // Avant elles, l'appartenance : le répertoire doit être, après
+        // canonicalisation, **sous le worktree dont P3 a interrogé les
+        // processus**. `build_dir_disposition` n'exige qu'« un » worktree géré ;
+        // un composant parent remplacé par un lien entre la découverte et ce
+        // point ferait viser le cache d'un voisin dont personne n'a regardé la
+        // vie.
+        let owned = build_dir_is_inside_worktree(target, Path::new(&candidate.worktree_path));
         let acquisition = match build_dir_disposition(target) {
+            Ok(()) if !owned => Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT),
             Ok(()) => match acquire_cargo_build_locks(target) {
                 LockAcquisition::Acquired(guard) => Ok(guard),
                 LockAcquisition::Held => Err(PURGE_REASON_BUILD_LOCK_RACED),
@@ -9950,6 +9985,113 @@ branch refs/heads/fix/live/x
              entrer sa cible"
         );
         assert!(cible.join("debug/deps/libfoo.rlib").exists());
+    }
+
+    /// **V7 ter** — la **racine** de la marche n'est pas suivie non plus.
+    ///
+    /// V7 bis ne pose le lien qu'**à l'intérieur** de `.pilot-scratch/` ; si
+    /// `.pilot-scratch` est lui-même un lien vers celui d'un worktree voisin,
+    /// `read_dir` le suivait, et les caches du voisin entraient dans la
+    /// population **du piège** — P3 n'interrogeant alors que les processus du
+    /// piège, jamais ceux du voisin qui possède réellement le répertoire. La
+    /// garde tardive ne le rattrapait pas : le chemin canonique est géré (sous
+    /// `.claude/worktrees/`) et porte un marqueur.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mika2619_v7_la_racine_de_la_marche_nest_pas_suivie() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victime = fake_worktree(tmp.path(), "fix-2619-voisin");
+        let cible = fake_build_dir(&victime.join(".pilot-scratch/vrai"), CARGO_INFO_MARKER);
+        age_tree(
+            &victime.join(".pilot-scratch"),
+            PURGE_IDLE_DEFAULT_SECS as u64 + 600,
+        );
+
+        let piege = fake_worktree(tmp.path(), "fix-2619-racine-liee");
+        std::os::unix::fs::symlink(victime.join(".pilot-scratch"), piege.join(".pilot-scratch"))
+            .unwrap();
+
+        assert!(
+            discover_build_dirs(&piege).is_empty(),
+            "un `.pilot-scratch` qui est un lien ne doit pas être parcouru"
+        );
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 5usize;
+        let mut stats = TargetPurgeStats::default();
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v7ter",
+            "trace-2619-v7ter",
+            &[],
+            &[refusal_with(&piege, "fix/2619/piege", REASON_DIRTY)],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+        assert_eq!(stats.purged, 0, "rien n'est purgé par le piège: {stats:?}");
+        assert!(
+            cible.join("debug/deps/libfoo.rlib").exists(),
+            "le cache du voisin survit"
+        );
+
+        // Contrôle positif : le même cache est bien purgeable **par son
+        // propriétaire** — sans cela, « survit » serait indistinguable de « ce
+        // cache n'est jamais purgeable ».
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v7ter",
+            "trace-2619-v7ter",
+            &[],
+            &[refusal_with(&victime, "fix/2619/voisin", REASON_DIRTY)],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+        assert_eq!(stats.purged, 1, "{stats:?}");
+        assert!(!cible.exists());
+    }
+
+    /// **V7 quater** — la garde tardive d'appartenance : un répertoire n'est
+    /// supprimable qu'au titre du worktree qui le contient **après
+    /// canonicalisation**, jamais au titre d'un voisin atteint par un parent lié.
+    #[cfg(unix)]
+    #[test]
+    fn mika2619_v7_le_repertoire_appartient_a_son_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let voisin = fake_worktree(tmp.path(), "fix-2619-proprio");
+        let cache = fake_build_dir(&voisin.join(".pilot-scratch/vrai"), CARGO_INFO_MARKER);
+        let piege = fake_worktree(tmp.path(), "fix-2619-parent-lie");
+        std::os::unix::fs::symlink(voisin.join(".pilot-scratch"), piege.join(".pilot-scratch"))
+            .unwrap();
+        let par_le_lien = piege.join(".pilot-scratch/vrai");
+
+        assert!(
+            build_dir_is_inside_worktree(&cache, &voisin),
+            "contrôle positif"
+        );
+        assert_eq!(
+            build_dir_disposition(&par_le_lien),
+            Ok(()),
+            "la garde de disposition seule l'accepte — d'où la garde d'appartenance"
+        );
+        assert!(!build_dir_is_inside_worktree(&par_le_lien, &piege));
+        assert!(
+            !build_dir_is_inside_worktree(&voisin, &voisin),
+            "le worktree lui-même"
+        );
+        assert!(!build_dir_is_inside_worktree(
+            &voisin.join("target-absent"),
+            &voisin
+        ));
     }
 
     // -- V8 : la garde tardive, dans les deux sens ---------------------------
