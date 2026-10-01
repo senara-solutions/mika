@@ -608,32 +608,30 @@ pub fn assert_no_misdeclaration_advice(trace: &AgentTrace) {
 
     let mut violations = Vec::new();
 
+    // Two house primitives rather than hand-rolled slicing, and both choices are
+    // ones this repository already measured:
+    //
+    // - `match_indices` walks every occurrence (a subject can appear several
+    //   times and only one of them need carry the advice) **without a byte
+    //   cursor**. `agent_loop::review_anchor` carries the measurement: advancing
+    //   a cursor by hand "would land inside a multi-byte character and panic —
+    //   measured, on the first accented brief in the test suite".
+    // - `safe_truncate` is the canonical UTF-8-safe byte-budget clamp
+    //   (`mika_common::text`, built on `floor_char_boundary`). The local
+    //   `truncate` below is an older reimplementation of it, used by the panic
+    //   formatters; new code reads the canonical one.
     for subject in MISDECLARATION_SUBJECTS {
-        let mut from = 0usize;
-        while let Some(rel) = lower[from..].find(subject) {
-            let pos = from + rel;
-            let search_start = pos + subject.len();
-            let search_end = (search_start + MISDECLARATION_WINDOW_BYTES).min(lower.len());
-            let mut end = search_end;
-            while end > search_start && !lower.is_char_boundary(end) {
-                end -= 1;
-            }
-            let window = &lower[search_start..end];
+        for (pos, matched) in lower.match_indices(subject) {
+            let window = mika_common::text::safe_truncate(
+                &lower[pos + matched.len()..],
+                MISDECLARATION_WINDOW_BYTES,
+            );
 
             if let Some(advice) = MISDECLARATION_ADVICE.iter().find(|a| window.contains(**a)) {
                 violations.push(format!(
                     "institutional subject {subject:?} followed within \
                      {MISDECLARATION_WINDOW_BYTES} bytes by the advice form {advice:?}"
                 ));
-            }
-
-            // Advance past this occurrence, on a char boundary.
-            from = search_start.min(lower.len());
-            if from >= lower.len() {
-                break;
-            }
-            while from < lower.len() && !lower.is_char_boundary(from) {
-                from += 1;
             }
         }
     }
