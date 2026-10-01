@@ -205,6 +205,152 @@ fn write_mika_doctrine_section(prompt: &mut String, persona: PersonaProfile) {
     prompt.push_str("\n\n");
 }
 
+// ---------------------------------------------------------------------------
+// mika#1983 — Truthful-Declaration Doctrine (the advice is inside sovereignty)
+// ---------------------------------------------------------------------------
+
+/// Heading for the code-managed Truthful-Declaration Doctrine section
+/// (mika#1983).
+///
+/// Rendered by [`write_truthful_declaration_section`] into every
+/// `build_system_prompt` and `build_silent_prompt` output, immediately after
+/// [`MIKA_DOCTRINE_HEADING`] and before the identity heading — the slot its two
+/// sisters occupy, which binds the doctrine before any per-turn context.
+///
+/// English, like its two sisters: the heading is a prompt-structure marker, not
+/// text served to a user.
+///
+/// **What it closes.** Measured 2026-08-24, T0 report of the MSC passport
+/// mission. Facing a likely refusal of the renewal ground at the counter, the
+/// agent advised the operator to **declare a different ground** — one that did
+/// not match their actual situation. The sovereignty guardrail in force ("do not
+/// act in the person's place") covers the **act** and not the **advice**; and the
+/// ticket names the aggravation, which is the real content of the finding: the
+/// guided-gesture mode makes this defect **more** likely, because the agent knows
+/// a human will execute and therefore never meets the barrier of the act itself.
+/// The distance to the counter lowers the subjective cost of the shortcut — for
+/// the agent. It lowers it by nothing at all for the person who will carry it
+/// alone.
+///
+/// **Why code-managed, for the third time.** Same three refusals mika#1814 and
+/// mika#2292 each had to write, and each is measured: a skill cannot reach the
+/// population (`FAMILY_AGENT_SKILL_ALLOWLIST` carries six entries and every
+/// bundled skill is denied by default, mika#2027 evicts the lot on an unreadable
+/// `identity.toml`, mika#2363 withdraws one for a turn) and is keyword-triggered
+/// where the defect is **situational**; `soul.md` reaches **no existing tenant**
+/// (`write_default_if_missing` never rewrites a present file, which is the
+/// inertia mika#2023 had to name in writing); memory is per-agent, unprovisioned
+/// and invisible at deploy. Code-managed reaches every tenant at the next
+/// deployment with no provisioning gesture — the only property that counts here,
+/// since the defect was measured on a tenant that already exists.
+///
+/// **No EndTurn guard, and that refusal is the central decision of mika#1983.**
+/// The house reflex is to double the intent with a structural half
+/// (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`). Here
+/// the predicate **cannot decide**: the harm is not "advising to declare X", it
+/// is "advising to declare X *while X is false*", and the falsity does not live
+/// in the outgoing text — it depends on the person's real situation, which the
+/// engine does not know and cannot know. Every one of the four sibling guards
+/// (5c `doctrine_public_promo`, 5d `false_local_hosting_claim`, 5f
+/// `response_language_drift`, 5g `time_of_day_greeting_mismatch`) has a second
+/// term the engine **holds**: a surface prohibited in itself, a resolved
+/// `Deployment`, a declared `language`, a computed local hour. This one has
+/// none. And its layer B would be made of **ordinary family-register words**, so
+/// its false-positive rate would be catastrophic on precisely the tier it claims
+/// to protect — the refusal mika#2292 already had to write for its own
+/// hypothetical guard. The regression eval (AC2) carries the predicate that
+/// production refuses, and the two are coherent: in a test a false positive
+/// costs a red test to repair, in production it costs a broken turn for a guest
+/// of the campaign.
+///
+/// The compact-provider variant renders an abbreviated form without a heading —
+/// see [`TRUTHFUL_DECLARATION_COMPACT`], which diverges from the three sibling
+/// carve-outs on the criterion mika#2292 wrote for them.
+pub const TRUTHFUL_DECLARATION_HEADING: &str = "## Truthful-Declaration Doctrine";
+
+/// Canonical body of the Truthful-Declaration Doctrine section (mika#1983).
+///
+/// **One body, not two registers, and that is a decision with its reason.**
+/// mika#2292 shipped `_OPERATOR` / `_FAMILY` and wrote its discriminant: *"what
+/// the family register drops is the part of the doctrine that has no meaning for
+/// someone who owns no infrastructure."* Here **nothing is to be dropped**.
+/// "Counter", "supporting document", "declaration", "application" are ordinary
+/// words, not infrastructure jargon — and `FAMILY_SOUL` forbids only the second
+/// ("aucun jargon technique ni mention ... de l'infrastructure sous-jacente").
+/// The invariant has exactly the same meaning and the same urgency in both
+/// registers: an operator needs no less than a family not to be advised into a
+/// false declaration. So this follows the [`DISTRIBUTION_DOCTRINE_BODY`]
+/// mono-body pattern rather than the `MIKA_DOCTRINE_BODY_*` bi-body one.
+/// Consequence, accepted: no exhaustive `match` on `PersonaProfile` at this
+/// site. The absence is the decision, not an oversight — a future
+/// `PersonaProfile` has nothing to decide here, which is the point.
+///
+/// **ASCII punctuation only, and it is pinned by test.**
+/// `DISTRIBUTION_DOCTRINE_BODY` carries em-dashes and is out of mika#2247's
+/// scope, whose test targets `FAMILY_SOUL` alone. But mika#2247's measurement is
+/// that *the prompt prescribes what it contains* — "the persona did not merely
+/// fail to forbid the em-dash, it prescribed it" through an approved example.
+/// This section is served to the family tier; it will not add an eleventh site
+/// of prescription. Hence `--` where its sister writes `\u{2014}`: the ASCII
+/// transcription of the apposition dash, not an impoverishment of the house
+/// register. Pinned by `mika1983_the_body_is_ascii_only`.
+///
+/// **The stop is topical, never enumerative.** Writing "never say «declare a
+/// different ground»" **supplies the very template** it claims to withdraw — the
+/// central inversion of mika#2292, transposed. The body names the *property*
+/// (what is declared must match the real situation) and never a formula for
+/// getting around it. Pinned by `mika1983_the_body_names_no_workaround_template`,
+/// whose denylist lives under `#[cfg(test)]` for the same reason mika#2292's
+/// referent list does.
+///
+/// **It names the aggravation of the mode**, because that is the ticket's
+/// analysis and it is what an agent that never meets the barrier of the act is
+/// missing.
+///
+/// **It prescribes the three legitimate paths** of the ticket's `Attendu` — a
+/// different ground **if and only if** the real situation carries it, the
+/// supporting documents that would make the true ground hold, asking the
+/// institution — and requires saying which are certain and which are not.
+/// Without that last clause the first path reads as permission.
+///
+/// **Bearing (AC3).** `payment-last-sovereign-gesture` is cited **as the ticket
+/// writes it** (kebab-case). The memory *file* is operator-authored
+/// institutional memory and a merge-gate precondition, not a code-PR deliverable
+/// — the memory directory is not reachable from a dispatch worktree (verified:
+/// `~/.claude/projects/-data-workspace-mika-platform/memory/` does not exist
+/// here), exactly as mika#1814 AC11 established. If the memory carries it in
+/// `snake_case` (`payment_last_sovereign_gesture`, the form of
+/// `project_mika_invitation_only_no_public_launch`), that is the form this
+/// constant must carry, and the operator settles it at review.
+pub const TRUTHFUL_DECLARATION_BODY: &str = "When you help someone through a step they will carry out themselves (a form, a counter, an appointment, an application, a claim), what they declare must match their actual situation. **You never recommend declaring something that is not true**, and a likely refusal is not a reason to: an optimisation that needs a false statement is not an optimisation, it is a liability handed to the person who will carry it alone.\n\nYou are not the one at the counter, so you never meet the barrier of the act yourself. Treat that distance as a reason for more care, not less.\n\nWhen a declaration looks likely to be refused, say so plainly, then name what is genuinely open: a different ground **if and only if the person's real situation supports it**; the supporting documents that would make the true ground hold; asking the institution directly rather than guessing around it. Say which of these you are sure of and which you are not. An honest \"I do not know whether that will be accepted, here is how to find out\" is worth more than a confident workaround.\n\nBearing: `payment-last-sovereign-gesture` -- the person stays the actor, AND the person stays in the true. See agent's institutional memory.";
+
+/// Write the Truthful-Declaration Doctrine section (mika#1983).
+///
+/// Called from [`build_system_prompt`] **and** [`build_silent_prompt`]: a silent
+/// turn that spontaneously advises a workaround is exactly as grave as a
+/// conversational one (the word-for-word argument of guard 5c), and the
+/// compacted history hands it to the next conversational turn.
+///
+/// **Rendered unconditionally — no trigger, no persona condition, no skill, no
+/// mission.** That is the reading of AC1 ("engraved at the level of the
+/// guided-gesture mode, not per-mission") the code allows, and it is stronger
+/// rather than weaker than the literal one. A grep for `geste.guid` /
+/// `guided.gesture` over this repository returns **zero**: the mode is a concept
+/// of the MSC corpus (`mika-secretary`), outside this workspace, so there is no
+/// *mode* object to engrave into. What does exist is the reading that matters:
+/// **on a family or champion tenant everything is guided-gesture** — Mika has no
+/// administrative arm, no account at the counter, no capacity to file or to
+/// sign. The mode is not one mode among others, it is that population's
+/// **permanent regime**. So "at the level of the mode, not per-mission" reads
+/// *unconditional in the base prompt, served on every turn*, and conditioning it
+/// on anything would be the very fault the AC forbids.
+fn write_truthful_declaration_section(prompt: &mut String) {
+    prompt.push_str(TRUTHFUL_DECLARATION_HEADING);
+    prompt.push('\n');
+    prompt.push_str(TRUTHFUL_DECLARATION_BODY);
+    prompt.push_str("\n\n");
+}
+
 /// Filter a `search_preferences` result set down to strict stop-topic rows
 /// (mika#1813).
 ///
@@ -1368,6 +1514,52 @@ fn write_data_grade_doctrine_section_compact(prompt: &mut String) {
     prompt.push_str(DATA_GRADE_DOCTRINE_COMPACT);
 }
 
+/// Abbreviated truthful-declaration rule for the compact provider (mika#1983).
+///
+/// **This path carries a form of the section, against the default carve-out, and
+/// the criterion is the one mika#2292 wrote in order to decide its own.** That
+/// criterion: *"the compact path does render a doctrine — the mika#1798
+/// abbreviated data-grade one — because that one carries a HARD-NO invariant
+/// whose violation is irreversible and therefore worth its bytes."* A false
+/// declaration to an authority **is irreversible for the person**: refusal, a
+/// flagged file, a report, and in some cases a criminal qualification. That is
+/// the same order as the data-grade HARD-NO, so joining the three mika#1925
+/// carve-outs here would apply their reasoning to a case it does not cover.
+///
+/// **It carries no `## ` heading**, on the model of
+/// [`STOP_SIGNAL_PERSIST_COMPACT`]: *it is a rule, not a section*. So the
+/// `section_count <= 5` assertion of `test_build_compact_system_prompt_size_bound`
+/// stays intact — and that is not an avoidance trick: that count is, as the site
+/// itself says, *"the barrier this builder actually has"* (the byte budget is
+/// ~91 % unused), and raising it requires the justification paragraph mika#1925
+/// demands. A rule with no section does not consume that barrier.
+///
+/// ASCII punctuation only and no workaround template, exactly as the full body —
+/// both properties are pinned over **both** constants, because both are served to
+/// the model.
+///
+/// Budget: const-asserted below at 500 bytes, on this constant alone, like its
+/// 400-byte sister — *any future edit that busts the budget fails to compile*.
+/// The bearing citation is deliberately absent: AC3 bears on
+/// [`TRUTHFUL_DECLARATION_BODY`], and a memory reference is of no use to a model
+/// that has no tool to read it.
+const TRUTHFUL_DECLARATION_COMPACT: &str = "Truthful declaration: when you help someone through a step they carry out \
+     themselves (a form, a counter, an application), what they declare must match \
+     their actual situation. You never recommend declaring something that is not \
+     true, and a likely refusal is not a reason to. Say the risk plainly, then name \
+     the legitimate options and which of them you are sure of.\n\n";
+
+// Compile-time budget assertion — same shape and same reason as its 400-byte
+// sister above (mika#1798): a future edit that busts the budget fails to compile.
+const _: () = assert!(
+    TRUTHFUL_DECLARATION_COMPACT.len() < 500,
+    "TRUTHFUL_DECLARATION_COMPACT exceeds 500-byte budget — see mika#1983 plan"
+);
+
+fn write_truthful_declaration_section_compact(prompt: &mut String) {
+    prompt.push_str(TRUTHFUL_DECLARATION_COMPACT);
+}
+
 // ---------------------------------------------------------------------------
 // mika#1925 — stop-signal contract on the compact-provider path
 // ---------------------------------------------------------------------------
@@ -1651,6 +1843,13 @@ pub fn build_system_prompt(ctx: &PromptContext<'_>) -> String {
     // mitigated by the citation naming it by heading, which is also why the test
     // asserts *order* rather than adjacency.
     write_mika_doctrine_section(&mut prompt, ctx.persona_profile);
+    // mika#1983 — the third of the family, docked to its two sisters for the same
+    // reason mika#2292 wrote at its own slot: the doctrines read together, and a
+    // doctrine section binds before any per-turn context. Unconditional, with no
+    // persona crossing: the invariant has the same meaning and the same urgency
+    // in both registers, so there is nothing to drop (see
+    // `TRUTHFUL_DECLARATION_BODY`, § one body not two registers).
+    write_truthful_declaration_section(&mut prompt);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — placed between Identity and Current Time
     // so the "who am I / what am I running on" block reads coherently. The
@@ -2167,6 +2366,17 @@ pub fn build_compact_system_prompt(ctx: &PromptContext<'_>) -> String {
     // 400. Preserves the HARD-NO invariant even in the compact budget.
     write_data_grade_doctrine_section_compact(&mut prompt);
 
+    // mika#1983 — NOT a carve-out, and the divergence from the four above is
+    // reasoned rather than inherited. It rides on the criterion mika#2292 wrote
+    // to settle its own case: a doctrine pays its bytes on this path when it
+    // carries an invariant whose violation is irreversible. A false declaration
+    // to an authority is irreversible *for the person* (refusal, flagged file,
+    // report, sometimes a criminal qualification), which is the data-grade
+    // HARD-NO's order of magnitude. It carries no `## ` heading — a rule, not a
+    // section — so the section-count barrier is untouched. See
+    // `TRUTHFUL_DECLARATION_COMPACT`.
+    write_truthful_declaration_section_compact(&mut prompt);
+
     // mika#1925 — stop-signal contract (mika#1813), in the shape of the two
     // other builders: the block first (context), the rule after (instruction).
     //
@@ -2278,6 +2488,12 @@ pub fn build_silent_prompt(ctx: &SilentPromptContext<'_>) -> String {
     // spiritual register would poison every later turn through core memory,
     // which is re-injected into every prompt. Same section, same slot.
     write_mika_doctrine_section(&mut prompt, ctx.persona_profile);
+    // mika#1983 — rendered on silent turns too, and for its own reason rather
+    // than by symmetry: a heartbeat that spontaneously advises a declarative
+    // workaround is exactly as grave as a conversational one (the argument guard
+    // 5c already had to write), and the compacted history hands that advice to
+    // the next conversational turn.
+    write_truthful_declaration_section(&mut prompt);
     write_identity_section(&mut prompt, ctx.identity);
     // Runtime ground truth (mika#1815) — heartbeat/callback/reflection turns
     // may still be asked "which model are you?" via a subsequent user message
@@ -7067,5 +7283,445 @@ inject = false
             prompt.contains("## Self-Identity Discipline"),
             "Silent prompt must include the Self-Identity Discipline block"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#1983 — Truthful-Declaration Doctrine
+    //
+    // The section is text, and text is only ever verified on two axes: that it
+    // is **served** where it claims to be, and that it does not carry the
+    // properties it exists to withdraw. There is no third axis available here —
+    // no deterministic test establishes an LLM's answer, which is why the
+    // behavioural half ships disarmed (see
+    // `tests/eval/doctrine_regressions/truthful_declaration_replayed.rs`).
+    // -----------------------------------------------------------------------
+
+    /// The workaround templates. This list lives **here and only here**, under
+    /// `#[cfg(test)]`, exactly where the scan that enforces it reads it — the
+    /// form mika#2292 established for a structural list: not compiled in
+    /// release, not served, not readable by the tenant. A prompt that enumerates
+    /// the template in order to forbid it is a leak with one extra step.
+    ///
+    /// **It holds templates and nothing else, and that boundary IS the
+    /// decision** — mika#2292 learned it the hard way on its own list. A template
+    /// is an *imperative formula telling someone what to declare with no
+    /// condition of truth*; the **domain vocabulary** ("declaration", "ground",
+    /// "counter", "supporting document") is not one: it is precisely what the
+    /// topical stop needs in order to be expressible. A denylist that forbade
+    /// naming the subject would make the stop inexpressible and leave only the
+    /// enumerative stop this whole mechanism refuses.
+    ///
+    /// Note what is deliberately **absent**: "a different ground". That is the
+    /// first of the three legitimate paths the ticket's `Attendu` prescribes, and
+    /// forbidding it would make the remedy unsayable. The template is not the
+    /// ground, it is the ground **without the condition**.
+    const MIKA1983_WORKAROUND_TEMPLATES: &[&str] = &[
+        // EN
+        "say instead",
+        "declare another",
+        "put another",
+        "tick another",
+        "no need to mention",
+        "nobody will check",
+        "nobody checks",
+        // FR — a future editor may well reach for the register of the measured
+        // incident, which was French.
+        "déclare un autre",
+        "mets plutôt",
+        "indique à la place",
+        "pas la peine de préciser",
+        "personne ne vérifie",
+    ];
+
+    /// V1 — the section is served on both non-compact builders, in both
+    /// registers. Same discipline as
+    /// `mika2292_doctrine_section_is_served_on_both_builders_in_both_registers`,
+    /// minus its last assertion: there is **one** body here, by decision, so
+    /// there is no `assert_ne!` between two registers to make. What is asserted
+    /// instead is that the single body is served *identically* to both — which is
+    /// the property the mono-body choice buys (see `TRUTHFUL_DECLARATION_BODY`,
+    /// § one body not two registers).
+    #[test]
+    fn mika1983_the_section_is_served_on_both_builders_in_both_registers() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+
+        for persona in [PersonaProfile::Operator, PersonaProfile::Family] {
+            let ctx = hosting_ctx(&identity, &memory, Deployment::Cloud, persona);
+            let conversation = build_system_prompt(&ctx);
+            assert!(
+                conversation.contains(TRUTHFUL_DECLARATION_HEADING),
+                "{persona:?}: build_system_prompt must render the truthful-declaration \
+                 heading — AC1 asks for an invariant engraved at the level of the mode, \
+                 which on this population means unconditional in the base prompt"
+            );
+            assert!(
+                conversation.contains(TRUTHFUL_DECLARATION_BODY),
+                "{persona:?}: build_system_prompt must render the body"
+            );
+
+            let silent = build_silent_prompt(&mika1983_silent_ctx(&identity, persona));
+            assert!(
+                silent.contains(TRUTHFUL_DECLARATION_HEADING),
+                "{persona:?}: build_silent_prompt must render the heading — a heartbeat \
+                 that spontaneously advises a declarative workaround is exactly as grave \
+                 as a conversational one, and the compacted history hands it to the next \
+                 conversational turn"
+            );
+            assert!(
+                silent.contains(TRUTHFUL_DECLARATION_BODY),
+                "{persona:?}: build_silent_prompt must render the body"
+            );
+        }
+    }
+
+    /// V9 — the section precedes `## Identity`, i.e. it binds before any
+    /// per-turn context, which is the slot its two sisters occupy. **Order, not
+    /// adjacency** (the formulation mika#2292 had to write for its own
+    /// assertion): what matters is that the three doctrines read together and
+    /// ahead of the turn's context, not that nothing may ever be inserted
+    /// between two of them.
+    #[test]
+    fn mika1983_the_section_sits_with_its_sisters_before_the_identity_block() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        for persona in [PersonaProfile::Operator, PersonaProfile::Family] {
+            let ctx = hosting_ctx(&identity, &memory, Deployment::Cloud, persona);
+            let prompt = build_system_prompt(&ctx);
+
+            let distribution_pos = prompt
+                .find(DISTRIBUTION_DOCTRINE_HEADING)
+                .expect("the distribution doctrine section must be present");
+            let doctrine_pos = prompt
+                .find(MIKA_DOCTRINE_HEADING)
+                .expect("the mika doctrine section must be present");
+            let truthful_pos = prompt
+                .find(TRUTHFUL_DECLARATION_HEADING)
+                .expect("the truthful-declaration section must be present");
+            let identity_pos = prompt
+                .find("## Identity")
+                .expect("the identity section must be present");
+
+            assert!(
+                distribution_pos < doctrine_pos && doctrine_pos < truthful_pos,
+                "{persona:?}: the three doctrines must read together, in the order their \
+                 tickets docked them"
+            );
+            assert!(
+                truthful_pos < identity_pos,
+                "{persona:?}: the doctrine must bind before any per-turn context"
+            );
+        }
+
+        // The silent builder carries the same ordering — asserted rather than
+        // assumed, because the two builders are two independent call sequences
+        // and nothing but a test keeps them in step.
+        let silent = build_silent_prompt(&mika1983_silent_ctx(&identity, PersonaProfile::Operator));
+        let truthful_pos = silent
+            .find(TRUTHFUL_DECLARATION_HEADING)
+            .expect("the truthful-declaration section must be present on the silent path");
+        let identity_pos = silent
+            .find("## Identity")
+            .expect("the identity section must be present on the silent path");
+        assert!(
+            truthful_pos < identity_pos,
+            "the silent builder must keep the same ordering as the conversational one"
+        );
+    }
+
+    /// V2 — the compact path carries the **rule** and no `## ` section, so the
+    /// `section_count <= 5` barrier of `test_build_compact_system_prompt_size_bound`
+    /// is untouched.
+    ///
+    /// This is the one place where mika#1983 **diverges** from the four
+    /// mika#1925 carve-outs, and it diverges on their own criterion rather than
+    /// against it: a doctrine pays its bytes here when it carries an invariant
+    /// whose violation is irreversible. The section-count assertion is
+    /// re-asserted locally — not as a duplicate of the sibling test, but because
+    /// *this* change is the one that would have broken it, and a reader of this
+    /// test must be able to see that it did not.
+    #[test]
+    fn mika1983_compact_prompt_carries_the_rule_without_a_section() {
+        let identity = test_identity();
+        let memory = test_core_memory();
+        let ctx = hosting_ctx(
+            &identity,
+            &memory,
+            Deployment::Cloud,
+            PersonaProfile::Operator,
+        );
+        let compact = build_compact_system_prompt(&ctx);
+
+        assert!(
+            compact.contains(TRUTHFUL_DECLARATION_COMPACT),
+            "the compact path must carry the abbreviated rule: a false declaration to \
+             an authority is irreversible for the person, which is the data-grade \
+             HARD-NO's order of magnitude (mika#2292's own criterion for when a \
+             doctrine pays its bytes here)"
+        );
+        assert!(
+            !compact.contains(TRUTHFUL_DECLARATION_HEADING),
+            "the compact rule must carry no `## ` heading — it is a rule, not a \
+             section (model: STOP_SIGNAL_PERSIST_COMPACT)"
+        );
+        assert!(
+            !TRUTHFUL_DECLARATION_COMPACT.contains("## "),
+            "the constant itself must carry no `## `: `section_count` counts every \
+             occurrence in the prompt, wherever it sits"
+        );
+
+        let section_count = compact.matches("## ").count();
+        assert!(
+            section_count <= 5,
+            "the compact prompt has {section_count} sections — mika#1983 must not \
+             consume the barrier this builder actually has; raising it requires the \
+             justification paragraph mika#1925 demands, at \
+             `test_build_compact_system_prompt_size_bound`"
+        );
+        assert!(
+            compact.len() <= 5120,
+            "the compact prompt is {} bytes, over the 5 KB budget",
+            compact.len()
+        );
+    }
+
+    /// Constraint 1 — ASCII punctuation only, on **both** served constants.
+    ///
+    /// `DISTRIBUTION_DOCTRINE_BODY` carries em-dashes and is out of mika#2247's
+    /// scope, whose test targets `FAMILY_SOUL` alone. But mika#2247's measurement
+    /// is that *the prompt prescribes what it contains*, and this section is
+    /// served to the family tier — so it will not become an eleventh site of
+    /// prescription.
+    ///
+    /// The predicate is `is_ascii()`, which strictly subsumes
+    /// `mika_common::text::has_nonascii_typography` (the mika#2247 reader,
+    /// covering U+2014 / U+2013 / U+2026 and deliberately not the curly quotes).
+    /// Calling both would be a second definition of the same thing for no gain;
+    /// the body is English, so the stronger predicate costs nothing.
+    #[test]
+    fn mika1983_the_body_is_ascii_only() {
+        for (name, text) in [
+            ("TRUTHFUL_DECLARATION_BODY", TRUTHFUL_DECLARATION_BODY),
+            ("TRUTHFUL_DECLARATION_COMPACT", TRUTHFUL_DECLARATION_COMPACT),
+            ("TRUTHFUL_DECLARATION_HEADING", TRUTHFUL_DECLARATION_HEADING),
+        ] {
+            let offender = text.chars().find(|c| !c.is_ascii());
+            assert!(
+                offender.is_none(),
+                "{name} carries the non-ASCII character {:?} — this section is served \
+                 to the family tier and a prompt prescribes what it contains \
+                 (mika#2247). Use the ASCII transcription.",
+                offender.unwrap()
+            );
+        }
+    }
+
+    /// Constraint 2 — **the load-bearing test of this ticket.** It does not check
+    /// that a decision was taken correctly; it refuses the *inverse* decision a
+    /// future editor will take naturally (finding the stop "vague" and
+    /// enumerating it to make it concrete). No behavioural test can stand in for
+    /// it: the enumeration would make no answer wrong, it would supply the
+    /// template in silence.
+    #[test]
+    fn mika1983_the_body_names_no_workaround_template() {
+        for (name, text) in [
+            ("TRUTHFUL_DECLARATION_BODY", TRUTHFUL_DECLARATION_BODY),
+            ("TRUTHFUL_DECLARATION_COMPACT", TRUTHFUL_DECLARATION_COMPACT),
+        ] {
+            let lowered = text.to_lowercase();
+            for template in MIKA1983_WORKAROUND_TEMPLATES {
+                assert!(
+                    !lowered.contains(template),
+                    "{name} names the workaround template `{template}` — the stop is \
+                     topical, never enumerative: writing the formula in order to forbid \
+                     it supplies the very template it withdraws. Reformulate by \
+                     property; do NOT add an exception to the denylist."
+                );
+            }
+        }
+    }
+
+    /// Positive control for the scan above — **mandatory**, and it is what
+    /// separates a scan from an attestation. A denylist emptied by accident, or a
+    /// scan wired to the wrong constant, yields a green test that checks nothing
+    /// at all: exactly the silent failure the scan exists to prevent.
+    #[test]
+    fn mika1983_the_template_scan_actually_catches_a_planted_template() {
+        assert!(
+            !MIKA1983_WORKAROUND_TEMPLATES.is_empty(),
+            "the denylist is empty — the scan would read nothing and attest nothing"
+        );
+        let decoy = "If the ground looks risky, declare another one and nobody will check.";
+        let lowered = decoy.to_lowercase();
+        let caught: Vec<&&str> = MIKA1983_WORKAROUND_TEMPLATES
+            .iter()
+            .filter(|t| lowered.contains(**t))
+            .collect();
+        assert!(
+            caught.len() >= 2,
+            "the scan found {} template(s) in a decoy carrying two — it is not \
+             scanning what it claims to scan",
+            caught.len()
+        );
+    }
+
+    /// Negative control of the denylist's **boundary** — the half mika#2292 had
+    /// to discover by going red.
+    ///
+    /// The domain vocabulary and the first legitimate path must stay sayable. A
+    /// future editor who adds "a different ground" or "declaration" to the
+    /// denylist makes the remedy inexpressible and leaves only the enumerative
+    /// stop this mechanism refuses — so the list is asserted *not* to carry them.
+    #[test]
+    fn mika1983_the_denylist_does_not_forbid_the_domain_vocabulary() {
+        // What the topical stop needs in order to exist, plus the first of the
+        // three legitimate paths. A template is the ground WITHOUT the condition.
+        let must_stay_sayable = [
+            "declaration",
+            "declaring",
+            "ground",
+            "counter",
+            "supporting document",
+            "institution",
+            "a different ground",
+        ];
+        for word in must_stay_sayable {
+            for template in MIKA1983_WORKAROUND_TEMPLATES {
+                assert!(
+                    !word.contains(template),
+                    "the denylist entry `{template}` forbids the domain word `{word}`, \
+                     which the topical stop needs in order to be expressible at all. \
+                     The boundary is: a template is an imperative formula with no \
+                     condition of truth; the vocabulary of the subject is not one."
+                );
+            }
+        }
+        // And the body really does use that vocabulary — without which the
+        // assertion above would be guarding an empty property.
+        let lowered = TRUTHFUL_DECLARATION_BODY.to_lowercase();
+        assert!(
+            lowered.contains("declare") && lowered.contains("a different ground"),
+            "the body must name the subject and the first legitimate path, or the \
+             boundary test above guards nothing"
+        );
+    }
+
+    /// Constraints 3 and 4 — the two properties the plan declares non-negotiable
+    /// where the exact wording is not.
+    ///
+    /// Constraint 3 (the mode's aggravation) is the ticket's own analysis, and it
+    /// is what an agent that never meets the barrier of the act is missing.
+    /// Constraint 4 (the three legitimate paths) is its `Attendu`, and the
+    /// "say which you are sure of" clause is what stops the first path reading as
+    /// permission.
+    ///
+    /// Asserted on **properties expressed as several accepted variants**, never
+    /// on one sentence: the wording belongs to whoever edits the body next, the
+    /// properties do not.
+    #[test]
+    fn mika1983_the_body_carries_the_aggravation_and_the_three_legitimate_paths() {
+        let lowered = TRUTHFUL_DECLARATION_BODY.to_lowercase();
+
+        // Constraint 3 — the distance to the act is a reason for MORE care.
+        assert!(
+            lowered.contains("barrier of the act") || lowered.contains("not the one at the"),
+            "the body must name the mode's aggravation: the agent never meets the \
+             barrier of the act itself (the ticket's Analyse)"
+        );
+        assert!(
+            lowered.contains("more care, not less") || lowered.contains("reason for more care"),
+            "the body must turn that distance into a reason for MORE care — naming the \
+             distance without the conclusion states the defect and prescribes nothing"
+        );
+
+        // Constraint 4 — the three legitimate paths, each by its own marker.
+        for (path, markers) in [
+            (
+                "a different ground, under condition",
+                &["if and only if"][..],
+            ),
+            (
+                "the supporting documents",
+                &["supporting document", "documents that would make"][..],
+            ),
+            (
+                "asking the institution",
+                &["asking the institution", "ask the institution"][..],
+            ),
+        ] {
+            assert!(
+                markers.iter().any(|m| lowered.contains(m)),
+                "the body must name the legitimate path `{path}` — the ticket's Attendu \
+                 requires exposing the risk AND naming what is genuinely open"
+            );
+        }
+
+        // And the clause that keeps path 1 from reading as permission.
+        assert!(
+            lowered.contains("which of these you are sure of")
+                || lowered.contains("which you are sure of"),
+            "the body must require saying which paths are certain and which are not"
+        );
+    }
+
+    /// AC3 — the bearing is cited in the body, by name.
+    ///
+    /// The **string** is what a code PR can assert; the existence of the memory
+    /// *file* is an operator precondition before the `ready` label, exactly as
+    /// mika#1814 AC11 established (the memory directory is not reachable from a
+    /// dispatch worktree). The name is carried as the ticket writes it; if the
+    /// memory holds it in `snake_case`, that is the form this constant must take
+    /// and the operator settles it at review.
+    #[test]
+    fn mika1983_the_body_cites_the_bearing() {
+        assert!(
+            TRUTHFUL_DECLARATION_BODY.contains("payment-last-sovereign-gesture"),
+            "the body must cite the bearing by name (AC3)"
+        );
+        assert!(
+            TRUTHFUL_DECLARATION_BODY.contains("institutional memory"),
+            "the citation must point at the agent's institutional memory, in the shape \
+             DISTRIBUTION_DOCTRINE_BODY established"
+        );
+        // The crossing the bearing names: the person stays the actor AND stays in
+        // the true. Citing the name without its content would make the reference
+        // decorative.
+        let lowered = TRUTHFUL_DECLARATION_BODY.to_lowercase();
+        assert!(
+            lowered.contains("stays the actor") && lowered.contains("stays in the true"),
+            "the citation must carry both halves of the bearing — the sovereignty half \
+             alone is what mika#1983 exists to extend"
+        );
+    }
+
+    /// Build a silent-mode context for the mika#1983 assertions. Kept local to
+    /// this block rather than widening `mika2292_silent_ctx`, whose callers are
+    /// the mika#2292 series.
+    fn mika1983_silent_ctx<'a>(
+        identity: &'a Identity,
+        persona: PersonaProfile,
+    ) -> SilentPromptContext<'a> {
+        SilentPromptContext {
+            soul_content: "",
+            identity,
+            core_memory: &[],
+            pending_commitments: &[],
+            trigger_context: "heartbeat",
+            current_utc: test_time(),
+            timezone: None,
+            telegram_configured: false,
+            has_message_sender: true,
+            recent_conversations: None,
+            recent_audit_events: None,
+            home_dir: None,
+            task_health: None,
+            stored_preferences: &[],
+            stopped_topics: &[],
+            runtime_provider: "test-provider",
+            runtime_model: "test-model",
+            deployment: Deployment::Cloud,
+            persona_profile: persona,
+            tenant_language: None,
+        }
     }
 }
