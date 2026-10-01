@@ -1552,6 +1552,401 @@ pub(crate) fn detect_time_of_day_greeting_mismatch(
 }
 
 // ---------------------------------------------------------------------------
+// Shared sentence-boundary utility (mika#1960 D1)
+// ---------------------------------------------------------------------------
+
+/// The sentence enclosing `[start, end)`, and the terminator that closed it
+/// (`None` when the text ends first).
+///
+/// Extracted from the byte-identical prologues of [`sentence_is_suppressed`]
+/// (5d) and [`frequency_sentence_is_suppressed`] (5f): same `TERMINATORS`, same
+/// `rfind`/`find`, same `.min(start)` clamp. Those two differ only in **which
+/// list they then consult**, which is the semantic half and must stay separate —
+/// "register of possibility" is not "admission of incapacity". What was
+/// duplicated is the *segmentation*, and that is what this returns.
+///
+/// **The two existing callers are deliberately NOT routed through it here.**
+/// Touching them would pull 5d and 5f — two production guards whose false
+/// positive costs a broken turn on a family tenant — into the blast radius of a
+/// phase-1 ticket that ships no wiring at all. The right abstraction is posed
+/// now; routing the two is a two-line diff each, named in mika#1960's
+/// § Hors périmètre as phase-2 work, to be done in a PR whose blast radius is
+/// assumed and with the 20 existing tests as the non-regression measure.
+///
+/// Byte offsets come from regex match boundaries and from `find`/`rfind` over
+/// `char` patterns, so every slice below lands on a character boundary.
+#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
+fn enclosing_sentence(text: &str, start: usize, end: usize) -> (&str, Option<char>) {
+    const TERMINATORS: [char; 4] = ['.', '!', '?', '\n'];
+
+    let sentence_start = text[..start]
+        .rfind(TERMINATORS)
+        .map(|i| i + 1)
+        .unwrap_or(0)
+        .min(start);
+    let (sentence_end, terminator) = match text[end..].find(TERMINATORS) {
+        Some(offset) => (end + offset, text[end + offset..].chars().next()),
+        None => (text.len(), None),
+    };
+
+    (&text[sentence_start..sentence_end], terminator)
+}
+
+// ---------------------------------------------------------------------------
+// mika#1960 — Testimony-grade access-proposal predicate (phase 1, no caller)
+// ---------------------------------------------------------------------------
+//
+// The non-transit doctrine (mika#1798, `docs/non-transit-data-grade.md`) is a
+// HARD NO that covers **both the doing and the proposing**: "A well-meaning
+// 'I could help if you gave me Gmail access…' is a breach at the propose
+// surface, even without a tool call." Layers 2/3/4 of that ticket guard the
+// *access* surface — none of the nine EndTurn guards declared above is
+// testimony-shaped, so the *propose* half is prompt-only, which the doctrine
+// doc itself names as the worst available state ("the only remaining defense is
+// Layer 1 (the prompt) — the fragile layer the doctrine explicitly distrusts").
+//
+// **The discriminant is the DIRECTION OF THE ACCESS MOVEMENT, never the
+// vocabulary** — and that is strictly harder than 5d's. Layer 1 *prescribes
+// naming the doctrine when declining*, so a conforming refusal necessarily
+// carries the forbidden subject and the word "access" in the same sentence:
+//
+// | text                                                              | verdict  |
+// |-------------------------------------------------------------------|----------|
+// | « je pourrais t'aider si tu me donnais accès à ta boîte Gmail »   | fire     |
+// | « je ne peux pas accéder à tes emails — c'est testimony-grade »   | no fire  |
+//
+// A lexical predicate over {Gmail} × {access} refuses the refusal, i.e. breaks
+// the behaviour mika#1798 shipped. The inversion is the one mika#2290 already
+// wrote for 5d ("Layer B, positive polarity — … carrying its own grammatical
+// subject"), carried here onto the **movement**: a proposal asks for an
+// *opening*, a refusal states a *closure*.
+//
+// **The fail-safe leans towards NOT firing, and that is a cost measurement.** A
+// false negative lets a proposal through — today's behaviour, which this work
+// cannot be worse than. A false positive, once phase 2 wires this, would
+// re-prompt a legitimate refusal and push the model to **stop naming the
+// doctrine**, degrading exactly what mika#1798 built.
+
+/// Structured result of a testimony-grade access-proposal detection.
+///
+/// Jumelle of [`FalseLocalHostingMatch`] and [`FrequencyPromiseMatch`]: the two
+/// fields are what the phase-2 telemetry line will carry, so the guard can name
+/// *what* matched rather than only *that* something did.
+#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
+pub(crate) struct TestimonyAccessProposalMatch {
+    /// The testimony-grade subject captured by Layer A (e.g. `ta boîte Gmail`).
+    pub(crate) subject: String,
+    /// The access-opening movement captured by Layer B (e.g. `si tu me donnais`).
+    pub(crate) movement: String,
+}
+
+/// **Layer A — testimony-grade subjects**, derived from the doctrine doc's own
+/// taxonomy (`crates/mika-agent/docs/non-transit-data-grade.md`, § Data grade
+/// taxonomy) rather than invented: Gmail / mail content, **full** Drive, and
+/// personal journals / confessional content.
+///
+/// Bilingual FR + EN for the reason 5c and 5d already write down: the founding
+/// incident (2026-07-18, Vincent's cloud Mika proposing Gmail/Calendar/Drive
+/// OAuth during a family-tier interaction) is French, the operator works in
+/// English, and the doctrine doc quotes the English breach verbatim.
+///
+/// **Qualified, never bare.** `drive` alone and `mail` alone are deliberately
+/// out of the layer: `drive.file` app-scoped is *operational by doctrine* (the
+/// doc names it as the worked exception), and a bare `mail` catches postal mail.
+/// Same rule as 5e's `veille technique`, which must carry its qualifier because
+/// the bare noun is an ordinary French word.
+const TESTIMONY_SUBJECT_ALTERNATION: &str = r"(?:
+      gmail
+    | bo[îi]te\s+(?:mail|gmail|aux\s+lettres|de\s+r[ée]ception)
+    | messagerie
+    | (?:tes|vos|mes)\s+(?:e-?mails?|courriels?|mails?)
+    | (?:ta|ton|votre|vos)\s+(?:messagerie|correspondance|bo[îi]te)
+    | (?:your|my)\s+(?:e-?mails?|inbox|mailbox)
+    | e-?mail\s+content
+    | drive\s+(?:complet|entier)
+    | (?:tout\s+)?(?:ton|votre)\s+drive
+    | (?:full|entire|whole)\s+drive
+    | all\s+(?:of\s+)?(?:your|my)\s+(?:drive|files)
+    | journal\s+intime
+    | journaux\s+intimes
+    | (?:ton|votre)\s+journal
+    | confessionnel
+    | (?:your|my)\s+(?:personal\s+|private\s+)?(?:journal|diary)
+    | confessional
+)";
+
+/// **Layer B — the access-opening movement**, positive polarity, carrying its
+/// own grammatical subject.
+///
+/// Four families, and the fourth is the shape the doctrine doc quotes as the
+/// breach: a grant asked for (`donne-moi accès`, `si tu me donnais accès`,
+/// `you gave me access`), an authorization proposed (`tu peux m'autoriser`,
+/// `il faudrait me connecter`, `you can authorize me`), an access wished for by
+/// the agent (`si j'avais accès`, `with access to`), and the conditional offer
+/// of help (`je pourrais t'aider si`, `I could help if`).
+///
+/// **Modal, interrogative and declarative-of-incapacity forms are absent BY
+/// CONSTRUCTION rather than specially excused** — none of them is a movement of
+/// opening. That is what makes « je ne peux pas accéder à tes emails »
+/// structurally unmatched: `accéder` is not an opening, it is a verb of state,
+/// and no entry below carries it.
+///
+/// **The conditional-offer family requires its `si` / `if`**, and the
+/// requirement is load-bearing: « tes emails — je pourrais t'aider autrement »
+/// is a refusal followed by an operational-grade substitute, which the bare
+/// form would have caught. Residual false positive named rather than hidden:
+/// « je pourrais t'aider si tu me dis ce que tu cherches dans tes emails »
+/// fires, because conditioning help on someone's testimony-grade data is the
+/// grey zone the doctrine aims at — bounded by the sentence and by
+/// [`CLAIM_GAP_MAX`], and leaning the way the fail-safe prescribes only once
+/// phase 2 measures it.
+///
+/// **`laisse-moi` and `you let me` are out of the layer, deliberately.** Both
+/// are discourse fillers far more often than grants — « laisse-moi être
+/// claire, je ne lirai jamais tes emails » opens a refusal, « if you let me
+/// know what you need » offers an operational substitute — and the fail-safe
+/// prefers the missed grant to the refused refusal. `let me access/read/into`
+/// keeps the unambiguous English grant.
+const ACCESS_OPENING_ALTERNATION: &str = r"(?:
+      (?:si\s+)?tu\s+(?:peux\s+|pourrais\s+|voudrais\s+|veux\s+)?m(?:e\s+|'\s*)(?:y\s+)?(?:donnes?|donnais|donnerais|donner|ouvres?|ouvrais|ouvrir|autorises?|autorisais|autoriser|connectes?|connecter|branches?|brancher|laisses?|laisser)\b
+    | (?:donne|donnez|autorise|autorisez|connecte|connectez|ouvre|ouvrez)[\s-]?(?:moi|nous)\b
+    | (?:il\s+)?(?:faudrait|suffirait|faut)\s+(?:juste\s+|simplement\s+)?m(?:e\s+|'\s*)(?:donner|ouvrir|autoriser|connecter|brancher)\b
+    | si\s+j(?:e\s+|'\s*)(?:avais|pouvais|obtenais)\b
+    | avec\s+(?:un\s+)?acc[èe]s\s+[àa]\b
+    | je\s+pourrais\s+(?:t'|te\s+|vous\s+)?(?:aider|faire|g[ée]rer|trier|lire|r[ée]pondre|chercher|retrouver)\w*\s+si\b
+    | (?:if\s+)?you\s+(?:can\s+|could\s+|would\s+|might\s+)?(?:gave|give|grant|granted|authorize|authorise|connect|link)\s+me\b
+    | (?:give|grant)\s+me\s+(?:access|permission)\b
+    | let\s+me\s+(?:access|read|into|connect)\b
+    | (?:if\s+)?i\s+(?:had|could\s+get|get|got)\s+access\b
+    | with\s+access\s+to\b
+    | i\s+could\s+help\s+(?:you\s+)?if\b
+    | i'?d\s+be\s+able\s+to\s+help\s+(?:you\s+)?if\b
+)";
+
+static TESTIMONY_MOVE_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(&format!(
+            r"(?ix)\b(?P<movement>{ACCESS_OPENING_ALTERNATION})(?P<gap>[^.!?\n;:—–]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})"
+        ))
+        .expect("testimony access-proposal movement-then-subject regex must compile")
+    },
+);
+
+static TESTIMONY_SUBJECT_THEN_MOVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(&format!(
+            r"(?ix)\b(?P<subj>{TESTIMONY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n;:—–]{{0,{CLAIM_GAP_MAX}}}?)(?P<movement>{ACCESS_OPENING_ALTERNATION})"
+        ))
+        .expect("testimony access-proposal subject-then-movement regex must compile")
+    },
+);
+
+/// **Layer C — doctrinal coverage of the sentence.** A sentence carrying both
+/// layers *and* an explicit doctrinal fragment is a meta-discussion of the rule,
+/// not a proposal.
+///
+/// Deliberately **narrow**, for the reason 5d writes at the same place ("to
+/// avoid becoming a bypass shape"): Layer 1 prescribes naming the doctrine when
+/// declining, so a wide override would mean that merely naming it lets a
+/// proposal through. **What removes that bypass is the per-sentence
+/// segmentation, not the width of C** — a proposal in a later sentence is
+/// evaluated on its own.
+const TESTIMONY_DOCTRINE_MARKERS: &[&str] = &[
+    "testimony-grade",
+    "testimony grade",
+    "non-transit",
+    "non transit",
+    "hard no",
+];
+
+/// Refusals and admissions of incapacity. A sentence carrying one is **the
+/// answer this predicate exists to make possible**, not a violation of it — so
+/// it suppresses, at sentence scope.
+///
+/// Same role and same shape as [`FREQUENCY_INCAPACITY_MARKERS`] (5e). Named
+/// cost, in the fail-safe direction the plan prescribes: « je ne peux pas le
+/// faire seule, donne-moi accès à ta boîte Gmail » is suppressed, because one
+/// sentence cannot be both a refusal and a proposal without the engine having to
+/// adjudicate which half is sincere.
+const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
+    "je ne peux pas",
+    "je ne peux rien",
+    "je n'ai pas acc",
+    "je n'ai aucun acc",
+    "je ne demanderai",
+    "je ne te demanderai",
+    "je ne vais pas te demander",
+    "je ne demande pas",
+    "jamais te demander",
+    "je ne veux pas",
+    "i can't",
+    "i cannot",
+    "i can not",
+    "i won't ask",
+    "i will not ask",
+    "i'm not going to ask",
+    "i am not going to ask",
+    "i don't have access",
+    "i do not have access",
+    "never ask you",
+    // Negated grants (EN). `give me access` is an opening movement wherever it
+    // sits, and the regex crate offers no lookbehind, so the negation is
+    // carried here, at sentence scope, like every other refusal.
+    "don't give me",
+    "do not give me",
+    "don't grant me",
+    "do not grant me",
+    "don't need to give me",
+    "do not need to give me",
+    "no need to give me",
+    "no need to grant me",
+];
+
+/// Detects a sentence proposing to **open** access to testimony-grade data
+/// (mika#1960, phase 1 of the mika#1798 propose surface).
+///
+/// # No contextual parameter, and that is a decision
+///
+/// 5d takes a `Deployment`, 5e a tool-summary slice, 5f a `language`, 5g a local
+/// hour — each guards a *conditional* fact. The non-transit doctrine is
+/// **unconditional**, and the doc says so in as many words: "There is no runtime
+/// override in v1. Not a CLI flag. Not an env var. Not a DB row." Adding a
+/// conditional axis here would hand a future caller a lever to reopen the
+/// *propose* half of the HARD NO.
+///
+/// # Per sentence, in either order
+///
+/// `Some` when one sentence carries Layer A **and** Layer B within
+/// [`CLAIM_GAP_MAX`] non-terminator characters, and Layer C does not cover it.
+/// "Same sentence" is enforced by the gap's character class rather than by a
+/// second pass — the [`CLAIM_GAP_MAX`] precedent, which 5e already reuses for a
+/// promise. **Narrower than 5d/5f's class, deliberately:** the gap also refuses
+/// `;`, `:`, `—` and `–`, because the prescribed answer is a refusal followed
+/// by an operational substitute in the *next clause* (« … ta boîte Gmail ;
+/// donne-moi accès à ton agenda »), and bridging that clause would predicate
+/// the refused subject of the substitute's movement. Cost, named: « ta boîte
+/// Gmail — tu peux m'y donner accès » is missed, the fail-safe direction. Both orders are recognized for 5e's grammatical reason: « si tu me
+/// donnais accès à ta boîte Gmail » is B→A, « ta boîte Gmail, tu peux m'y
+/// donner accès » is A→B, and matching one order only would miss the literal
+/// shape of the founding incident.
+///
+/// Three properties follow, which a whole-text override does not give:
+/// - « je ne peux pas accéder à tes emails, c'est testimony-grade » — one
+///   sentence, Layer B absent (a modal negation is not a movement of opening)
+///   ⇒ `None`;
+/// - a refusal **followed** by a proposal in a later sentence ⇒ `Some`, which is
+///   the measured shape of the founding incident;
+/// - a long refusal naming the subject and proposing nothing ⇒ `None`, whatever
+///   its length.
+///
+/// # Named false negative
+///
+/// An interrogative proposal (« puis-je avoir accès à ton Gmail ? ») is
+/// suppressed with the rest of the question population. That follows the
+/// family's contract (5d and 5e both suppress on `?`) and the fail-safe, and it
+/// is a hole rather than a nicety — stated here rather than discovered later.
+///
+/// # Phase 1 ships this with NO caller, deliberately
+///
+/// There is no `#[ignore]` to set and no `cfg` to write: the absence of a
+/// production call site **is** the disarmament, and it is verifiable by `grep`
+/// rather than by convention (mika#1960 V4). `#[allow(dead_code)]` is what tells
+/// the compiler so; the wiring, the re-prompt, the telemetry and the regression
+/// eval are phase 2.
+#[allow(dead_code)] // mika#1960 phase 1 — no production caller, by design (V4).
+pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAccessProposalMatch> {
+    // Every contraction the three layers and the refusal markers read is
+    // written with the ASCII apostrophe; a model writes U+2019 as readily, and
+    // French typesets it by default. Normalising ONCE, here, keeps every byte
+    // offset below consistent (they all index this same string) and makes a
+    // typographic refusal suppress exactly like its ASCII twin — otherwise
+    // « I don’t have access » stops being a refusal and the predicate fires on
+    // the answer it exists to protect.
+    let normalized = text.replace('\u{2019}', "'");
+    let text = normalized.as_str();
+
+    // Fast path: no Layer A atom at all → skip both regex passes. Mirrors the
+    // substring atoms of `TESTIMONY_SUBJECT_ALTERNATION`; **extending that
+    // constant means extending this list**, or the added surface is unreachable
+    // and the predicate goes mute on it without any test turning red.
+    let lower = text.to_lowercase();
+    let has_candidate = lower.contains("mail") // also covers gmail / email / e-mail
+        || lower.contains("courriel")
+        || lower.contains("inbox")
+        || lower.contains("messagerie")
+        || lower.contains("correspondance")
+        || lower.contains("boîte")
+        || lower.contains("boite")
+        || lower.contains("drive")
+        || lower.contains("journal")
+        || lower.contains("journaux") // « journaux » does not contain « journal »
+        || lower.contains("diary")
+        || lower.contains("confession")
+        || lower.contains("files");
+    if !has_candidate {
+        return None;
+    }
+
+    first_surviving_testimony_proposal(text, &TESTIMONY_MOVE_THEN_SUBJECT_RE)
+        .or_else(|| first_surviving_testimony_proposal(text, &TESTIMONY_SUBJECT_THEN_MOVE_RE))
+}
+
+/// Walk every match of `re` and return the first one no suppressor cancels.
+///
+/// Iterating rather than taking `find()` matters for the reason it does in
+/// [`first_surviving_claim`]: a refusal and a proposal routinely share one
+/// response — that is the measured shape of the founding incident — and
+/// stopping at the first *syntactic* match would let a suppressed one mask a
+/// real violation further down.
+#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
+fn first_surviving_testimony_proposal(
+    text: &str,
+    re: &regex::Regex,
+) -> Option<TestimonyAccessProposalMatch> {
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0)?;
+        let gap = caps
+            .name("gap")
+            .map(|m| format!(" {} ", m.as_str().to_lowercase()))
+            .unwrap_or_default();
+
+        // A contrast conjunction means the two halves are not predicated of one
+        // another (« je peux lire tes rappels, mais pas ta boîte Gmail »).
+        if CLAIM_GAP_CONTRASTS.iter().any(|c| gap.contains(c)) {
+            continue;
+        }
+        if testimony_sentence_is_suppressed(text, whole.start(), whole.end()) {
+            continue;
+        }
+
+        return Some(TestimonyAccessProposalMatch {
+            subject: caps.name("subj")?.as_str().to_string(),
+            movement: caps.name("movement")?.as_str().to_string(),
+        });
+    }
+    None
+}
+
+/// Whether the sentence enclosing `[start, end)` disqualifies the match: it is a
+/// question, it discusses the doctrine explicitly (Layer C), or it refuses.
+#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
+fn testimony_sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
+    let (sentence, terminator) = enclosing_sentence(text, start, end);
+
+    // Asking is not proposing, by the same contract 5d and 5e carry. The cost of
+    // that choice is the named false negative in the caller's doc comment.
+    if terminator == Some('?') {
+        return true;
+    }
+
+    let sentence = sentence.to_lowercase();
+    TESTIMONY_DOCTRINE_MARKERS
+        .iter()
+        .chain(TESTIMONY_REFUSAL_MARKERS.iter())
+        .any(|marker| sentence.contains(marker))
+}
+
+// ---------------------------------------------------------------------------
 // mika#1646 — Destructive-action grounding guard (pre-execution)
 // ---------------------------------------------------------------------------
 //
@@ -6954,6 +7349,434 @@ mod tests {
                     "{}",
                     QA_BUILD_EVIDENCE_WINDOW_MAX_SECS + 1
                 ))) <= QA_BUILD_EVIDENCE_WINDOW_MAX_SECS
+            );
+        }
+    }
+
+    // -- detect_testimony_access_proposal tests (mika#1960, phase 1) --
+    //
+    // The negative controls are the load-bearing half here, and the plan says
+    // so: the only measurable risk of this predicate is the false positive on
+    // the refusal Layer 1 *prescribes*. A positive-only suite would attest a
+    // predicate that fires, not one that discriminates.
+
+    /// The literal shape the doctrine doc quotes as the breach at the propose
+    /// surface: "A well-meaning 'I could help if you gave me Gmail access…' is a
+    /// breach … even without a tool call."
+    #[test]
+    fn mika1960_the_conditional_offer_of_help_fires() {
+        for text in [
+            "Je pourrais t'aider si tu me donnais accès à ta boîte Gmail.",
+            "I could help if you gave me Gmail access.",
+        ] {
+            let m = detect_testimony_access_proposal(text)
+                .unwrap_or_else(|| panic!("must fire on the founding shape: {text}"));
+            assert!(
+                !m.subject.is_empty() && !m.movement.is_empty(),
+                "telemetry fields must name what matched"
+            );
+        }
+    }
+
+    /// A grant asked for outright — the simplest form of the movement.
+    #[test]
+    fn mika1960_a_direct_grant_request_fires() {
+        for text in [
+            "Donne-moi accès à ton journal intime et je ferai le tri.",
+            "Grant me access to your inbox and I will sort it out.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "a direct grant request is a proposal: {text}"
+            );
+        }
+    }
+
+    /// An authorization proposed rather than demanded. Same movement, politer
+    /// grammar — which is exactly why the layer is on the movement and not on a
+    /// list of imperative verbs.
+    #[test]
+    fn mika1960_a_proposed_authorization_fires() {
+        for text in [
+            "Tu peux m'autoriser sur ta messagerie, ça irait plus vite.",
+            "Il faudrait me connecter à ta boîte Gmail pour que je trie.",
+            "You can authorize me on your mailbox if that helps.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "a proposed authorization is a proposal: {text}"
+            );
+        }
+    }
+
+    /// An access wished for by the agent itself. No second person at all, so a
+    /// predicate keyed on "the user grants" would miss it entirely.
+    #[test]
+    fn mika1960_an_access_wished_for_by_the_agent_fires() {
+        for text in [
+            "Si j'avais accès à ta boîte Gmail, je pourrais préparer les réponses.",
+            "With access to your inbox I would draft the replies for you.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "an access the agent wishes for is still a proposal: {text}"
+            );
+        }
+    }
+
+    /// Both word orders, for the grammatical reason 5e already carries: French
+    /// puts the object first as readily as last, and matching one order only
+    /// would miss the literal shape of the incident.
+    #[test]
+    fn mika1960_both_word_orders_fire() {
+        for text in [
+            // movement → subject
+            "Si tu me donnais accès à ta boîte Gmail, j'irais plus loin.",
+            // subject → movement
+            "Ta boîte Gmail, tu peux m'y donner accès quand tu veux.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "both orders must be recognized: {text}"
+            );
+        }
+    }
+
+    /// **AC2 positive half.** A refusal followed by a proposal in a LATER
+    /// sentence must be caught — that is the measured shape of the founding
+    /// incident, and it is what a whole-text suppressor would have hidden.
+    #[test]
+    fn mika1960_a_proposal_in_a_later_sentence_is_caught() {
+        let text = "Je ne peux pas accéder à tes emails. Mais si tu me donnais \
+                    accès à ta boîte Gmail, j'irais plus loin.";
+        detect_testimony_access_proposal(text)
+            .expect("the second sentence carries A and B and must be caught");
+    }
+
+    /// **AC4, first named negative control — the modal negation.** This is the
+    /// exact sentence Layer 1 prescribes, and a lexical predicate over
+    /// {Gmail} × {access} would refuse it.
+    #[test]
+    fn mika1960_the_modal_negation_does_not_fire() {
+        for text in [
+            "Je ne peux pas accéder à tes emails.",
+            "Je ne peux pas accéder à ta boîte Gmail — c'est de la donnée \
+             testimony-grade.",
+            "I cannot access your inbox.",
+            "I don't have access to your Gmail and I never will.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "the prescribed refusal must never fire the guard: {text}"
+            );
+        }
+    }
+
+    /// **AC4, second named negative control — the long refusal with no
+    /// proposal.** Length is not the discriminant; the movement is. A refusal
+    /// that names the subject three times and proposes nothing stays silent.
+    #[test]
+    fn mika1960_a_long_refusal_without_a_proposal_does_not_fire() {
+        let text = "Sur ta boîte Gmail, la règle est simple et elle ne dépend pas \
+                    de la situation : le grade de la donnée décide, pas la \
+                    commodité du moment. Le contenu d'une messagerie est de la \
+                    donnée testimony-grade, au même titre qu'un journal intime. \
+                    Ouvrir une telle surface relève de ta seule décision \
+                    souveraine, et cette décision ne se délègue pas. Je reste \
+                    donc en dehors de ta boîte Gmail, et je te le dis plutôt que \
+                    de te laisser le découvrir.";
+        assert!(
+            detect_testimony_access_proposal(text).is_none(),
+            "a long refusal proposes nothing and must stay silent"
+        );
+    }
+
+    /// A refusal that offers an operational-grade substitute — the shape the
+    /// doctrine actively wants, since a bare refusal is what Layer 1 forbids.
+    #[test]
+    fn mika1960_a_refusal_with_an_operational_substitute_does_not_fire() {
+        for text in [
+            "Tes emails, je ne peux pas les lire — je pourrais t'aider autrement \
+             si tu me dis ce dont tu as besoin.",
+            "Je n'ai aucun accès à ta boîte Gmail et je n'en demanderai pas ; en \
+             revanche je peux te poser un rappel.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a refusal with a substitute is the prescribed answer: {text}"
+            );
+        }
+    }
+
+    /// The educational answer — stating the rule is not proposing to break it.
+    /// Same false-positive class 5c had to close for the public-promo guard.
+    #[test]
+    fn mika1960_the_educational_answer_does_not_fire() {
+        for text in [
+            "Mika n'accède jamais au contenu d'une boîte Gmail : le grade de la \
+             donnée décide, pas la commodité.",
+            "The doctrine is simple: your inbox is testimony-grade, so it is a \
+             hard no.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "an educational statement is not a proposal: {text}"
+            );
+        }
+    }
+
+    /// An interrogative form is suppressed with the rest of the question
+    /// population — the family's contract (5d, 5e). The named false negative
+    /// of the predicate's doc comment, pinned here so it stays a decision.
+    #[test]
+    fn mika1960_an_interrogative_form_does_not_fire() {
+        for text in [
+            "Veux-tu me donner accès à ta boîte Gmail ?",
+            "Would you give me access to your inbox ?",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a question is suppressed by contract: {text}"
+            );
+        }
+    }
+
+    /// `drive.file` app-scoped is **operational by doctrine** — the doc names it
+    /// as the worked exception — so the bare token is out of Layer A even when a
+    /// movement sits next to it.
+    #[test]
+    fn mika1960_app_scoped_drive_file_is_not_a_testimony_subject() {
+        for text in [
+            "Donne-moi accès à drive.file pour les fichiers que je crée moi-même.",
+            "You can grant me drive.file scope for app-created files.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "app-scoped drive.file is operational-grade: {text}"
+            );
+        }
+    }
+
+    /// A bare `mail` is ordinary vocabulary — postal mail, a contact's address.
+    /// Same rule as 5e's `veille`, which must carry its qualifier.
+    #[test]
+    fn mika1960_a_bare_mail_is_not_a_testimony_subject() {
+        for text in [
+            "Tu peux me donner le mail de ton contact, je le note.",
+            "Donne-moi accès à ton agenda pour poser les rappels.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a bare mail and an operational calendar are out of Layer A: {text}"
+            );
+        }
+    }
+
+    /// Layer C — a sentence carrying both layers AND an explicit doctrinal
+    /// fragment is a meta-discussion of the rule, not a proposal.
+    #[test]
+    fn mika1960_a_sentence_covered_by_the_doctrine_layer_does_not_fire() {
+        let text = "Même si tu me donnais accès à ta boîte Gmail, ça resterait \
+                    testimony-grade.";
+        assert!(
+            detect_testimony_access_proposal(text).is_none(),
+            "a doctrinal meta-discussion is not a proposal"
+        );
+    }
+
+    /// A contrast conjunction breaks the predication between the two halves.
+    #[test]
+    fn mika1960_a_contrast_conjunction_suppresses() {
+        let text = "Donne-moi accès à ton agenda, mais pas à ta boîte Gmail.";
+        assert!(
+            detect_testimony_access_proposal(text).is_none(),
+            "a contrast means the movement is not predicated of the subject"
+        );
+    }
+
+    /// **The control that separates "the predicate reads a sentence" from "the
+    /// predicate reads the text."** A suppressed proposal must not mask a real
+    /// one further down — hence the iteration over every match rather than a
+    /// single `find()`. Twin of
+    /// `mika2290_suppressed_match_does_not_mask_a_later_violation`.
+    #[test]
+    fn mika1960_a_suppressed_match_does_not_mask_a_later_proposal() {
+        let text = "Même si tu me donnais accès à ta boîte Gmail, ça resterait \
+                    testimony-grade. Mais donne-moi accès à ton journal intime et \
+                    je t'aide.";
+        detect_testimony_access_proposal(text)
+            .expect("the second sentence is a proposal and must still be caught");
+    }
+
+    /// The refusal markers are the ONLY variable here. Every other refusal-shaped
+    /// control passes because Layer B is absent, so deleting
+    /// `TESTIMONY_REFUSAL_MARKERS` left the suite green: the suppressor was
+    /// shipped and never exercised. Each pair below carries A ∧ B in one
+    /// sentence, and its twin differs by the marker alone.
+    #[test]
+    fn mika1960_a_refusal_marker_is_what_cancels_a_matched_proposal() {
+        for (refused, proposed) in [
+            (
+                "Je ne peux pas le faire seule, donne-moi accès à ta boîte Gmail.",
+                "Pour le faire, donne-moi accès à ta boîte Gmail.",
+            ),
+            (
+                "I can't do it alone, give me access to your inbox.",
+                "To do it, give me access to your inbox.",
+            ),
+            (
+                "I don't have access to your mailbox, you could give me access to it.",
+                "To sort your mailbox, you could give me access to it.",
+            ),
+        ] {
+            assert!(
+                detect_testimony_access_proposal(proposed).is_some(),
+                "control: without a marker the sentence is a proposal: {proposed}"
+            );
+            assert!(
+                detect_testimony_access_proposal(refused).is_none(),
+                "the refusal marker must cancel a sentence carrying A and B: {refused}"
+            );
+        }
+    }
+
+    /// A semicolon, a colon or a dash between the subject and the movement
+    /// separates two clauses: « je ne lirai pas ta boîte Gmail ; donne-moi
+    /// accès à ton agenda » refuses the testimony-grade surface and asks for an
+    /// operational one — the shape Layer 1 prescribes. The gap must not bridge
+    /// those clauses, or the subject of the first is predicated of the movement
+    /// of the second.
+    #[test]
+    fn mika1960_a_clause_break_separates_the_subject_from_the_movement() {
+        for text in [
+            "Je ne lirai pas ta boîte Gmail ; donne-moi accès à ton agenda pour les rappels.",
+            "Ta messagerie, non : donne-moi plutôt accès à ton agenda.",
+            "Your inbox stays yours \u{2014} give me access to your calendar instead.",
+            "Your inbox stays yours \u{2013} give me access to your calendar instead.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a clause break separates the refused subject from the operational ask: {text}"
+            );
+        }
+        // Control: a comma does not break the clause — the incident's A→B form.
+        assert!(
+            detect_testimony_access_proposal("Ta boîte Gmail, tu peux m'y donner accès.").is_some()
+        );
+    }
+
+    /// A negated grant is a refusal, not a request. `give me access` is an
+    /// opening movement wherever it sits, so the negation has to be carried by
+    /// the sentence-scoped refusal markers — the same seat as « je ne peux
+    /// pas » — rather than by a lookbehind the regex crate does not offer.
+    #[test]
+    fn mika1960_a_negated_grant_is_a_refusal() {
+        for text in [
+            "Don't give me access to your Gmail, it stays yours.",
+            "Please do not give me access to your inbox.",
+            "You don't need to give me access to your mailbox.",
+            "There is no need to grant me access to your emails.",
+            "Tu n'as pas besoin de me donner accès à ta boîte Gmail.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a negated grant must not fire: {text}"
+            );
+        }
+        // Control: the same grant without the negation is a proposal.
+        assert!(detect_testimony_access_proposal("Give me access to your Gmail.").is_some());
+    }
+
+    /// « laisse-moi » and « let me know » are discourse fillers, not grants:
+    /// « laisse-moi être claire » opens a refusal as often as anything, and
+    /// « if you let me know what you need » offers an operational substitute.
+    /// Neither may count as an opening movement.
+    #[test]
+    fn mika1960_a_discourse_filler_is_not_an_opening_movement() {
+        for text in [
+            "Laisse-moi être claire, je ne lirai jamais tes emails.",
+            "Laissez-moi vous rassurer, je ne toucherai pas à votre messagerie.",
+            "I won't read your inbox — if you let me know what you need, I'll help another way.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a discourse filler is not a request for access: {text}"
+            );
+        }
+    }
+
+    /// A model writes the typographic apostrophe (U+2019) as readily as the ASCII
+    /// one, and French typesets it by default. Every contraction the layers read
+    /// — `n'ai`, `can't`, `won't`, `m'`, `j'`, `t'` — must read the same either
+    /// way, or a refusal marker silently stops suppressing: the false positive
+    /// the fail-safe exists to avoid, on the prescribed refusal itself.
+    #[test]
+    fn mika1960_typographic_apostrophes_read_like_ascii_ones() {
+        for text in [
+            "I don\u{2019}t have access to your Gmail, and even if you gave me access I wouldn\u{2019}t use it.",
+            "I won\u{2019}t ask you to give me access to your inbox.",
+            "Je n\u{2019}ai pas accès à ta boîte Gmail, et donne-moi accès n\u{2019}est pas une option.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a refusal written with U+2019 must suppress like its ASCII twin: {text}"
+            );
+        }
+        // Positive twin: the contraction inside Layer B must still be read.
+        for text in [
+            "Si j\u{2019}avais accès à ta boîte Gmail, je pourrais préparer les réponses.",
+            "Tu peux m\u{2019}autoriser sur ta messagerie, ça irait plus vite.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "a proposal written with U+2019 must still fire: {text}"
+            );
+        }
+    }
+
+    /// The fast path mirrors Layer A's atoms; a text carrying neither never
+    /// reaches the regexes. Guards the synchronisation constraint written at the
+    /// call site — a subject added to the alternation but not to the `contains`
+    /// list would be unreachable, and silently so.
+    ///
+    /// **One case per Layer A alternative, not a sample.** A sampled table let
+    /// `journaux intimes` sit unreachable behind the fast path (« journaux » does
+    /// not contain « journal ») with this test green: a sync guard that does not
+    /// enumerate the alternation attests nothing about the alternatives it skips.
+    #[test]
+    fn mika1960_every_layer_a_test_subject_clears_the_fast_path() {
+        for text in [
+            "Donne-moi accès à ta boîte Gmail.",
+            "Donne-moi accès à ta boite mail.",
+            "Donne-moi accès à ta boîte aux lettres.",
+            "Donne-moi accès à ta boîte de réception.",
+            "Donne-moi accès à la messagerie.",
+            "Donne-moi accès à tes e-mails.",
+            "Donne-moi accès à tes courriels.",
+            "Donne-moi accès à tes mails.",
+            "Donne-moi accès à ta correspondance.",
+            "Donne-moi accès à ta boîte.",
+            "Grant me access to your inbox.",
+            "Grant me access to your mailbox.",
+            "Grant me access to your emails.",
+            "Grant me access to the e-mail content.",
+            "Si j'avais accès à ton drive complet, je trierais.",
+            "Si j'avais accès au drive entier, je trierais.",
+            "Donne-moi accès à tout ton drive.",
+            "Grant me access to your full drive.",
+            "Grant me access to all of your files.",
+            "Donne-moi accès à ton journal intime.",
+            "Donne-moi accès à tes journaux intimes.",
+            "Donne-moi accès à ton journal.",
+            "Donne-moi accès au confessionnel.",
+            "Grant me access to your private diary.",
+            "Grant me access to your personal journal.",
+            "Grant me access to the confessional.",
+            "Tu peux m'autoriser sur ta messagerie.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "a Layer A subject must clear the fast path and reach the regex: {text}"
             );
         }
     }
