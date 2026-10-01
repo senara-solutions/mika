@@ -23,8 +23,9 @@ use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
     RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL,
-    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
-    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
+    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
+    asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_response_language_drift, detect_testimony_access_proposal,
@@ -3019,10 +3020,20 @@ async fn run_loop(
                     // guard never sees — nor does it see a `send_message` sent
                     // during a conversation turn, including through the #771
                     // send-message boundary exit that traverses no EndTurn guard.
-                    // A proposal carried by `send_message` is therefore an
-                    // uncovered bypass of the *propose* surface, named here rather
-                    // than claimed closed. In silent mode 5h still keeps the
-                    // proposal out of the compacted history handed to later turns.
+                    // In silent mode 5h still keeps the proposal out of the
+                    // compacted history handed to later turns.
+                    //
+                    // **That channel is CLOSED since mika#2627**, by a pre-hoc
+                    // refusal on the tool's input
+                    // (`tools::check_testimony_access_proposal`, the mika#933
+                    // shape this comment used to name as a distinct change). The
+                    // two compose and do not duplicate: different texts, different
+                    // moments, and the tool refusal does not spend this guard's
+                    // single-retry budget. What remains open on the *propose*
+                    // surface is named in `docs/non-transit-data-grade.md`: a
+                    // proposal split across two `send_message` calls such that no
+                    // single sentence carries both layers (RK5), and rows
+                    // scheduled before that deploy.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains(TESTIMONY_ACCESS_PROPOSAL_LABEL)
                         && let Some(proposal) = detect_testimony_access_proposal(&text)
@@ -3045,6 +3056,16 @@ async fn run_loop(
                             matched_movement = %proposal.movement,
                             guard_correlation_id = %corr_id,
                             label = mode.label(),
+                            // mika#2627 AC4 — which surface caught it. The tool
+                            // channels emit the same event name under their own
+                            // value, so a `GROUP BY channel` sizes each
+                            // population. Dated cost: a `jq 'select(.channel ==
+                            // "end_turn")'` spanning the deploy returns empty on
+                            // the older lines, where the field does not exist.
+                            // They are not rewritten (motif mika#2361), so the
+                            // query that is right on both sides is
+                            // `select(.channel == null or .channel == "end_turn")`.
+                            channel = TestimonyProposalChannel::EndTurn.as_wire(),
                             event = "guard.testimony_access_proposal",
                             "Testimony access-proposal guard fired — re-prompting"
                         );
@@ -8490,6 +8511,37 @@ fn effective_disabled_tools<'a>(
 /// so a fourth guarded tool cannot silently keep a schema that lies.
 pub(crate) const REFLECTION_EVIDENCE_GATED_TOOLS: &[&str] =
     &["update_fact", "store_fact", "update_core_memory"];
+
+/// The builtin tools whose outgoing body is passed to
+/// [`crate::tools::check_testimony_access_proposal`] before delivery or before
+/// the row is created (mika#2627 AC1).
+///
+/// **Sole site** where this list is written, for the reason its reflection-mode
+/// sibling above states: a predicate written twice is a predicate that can
+/// diverge, and the divergence makes no decision wrong the day it is written.
+/// `tools::tests::mika2627_gated_tools_match_the_testimony_contract_constant`
+/// compares this list to the actual callers, **in both directions** — an entry
+/// with no caller means a surface declared guarded and guarded by nothing, which
+/// is strictly worse than an unguarded one because it reads as covered.
+///
+/// The census behind it (mika#2627 R2) found **three** emitters and two
+/// non-emitters: `delegate_task` hands its `message_sender` to the delegate and
+/// sends nothing itself (covered transitively, since the delegate calls
+/// `send_message`), and `run_team`'s completion text is composed by
+/// `teams::notification`, i.e. by the **engine** and not by the model. Both are
+/// out of population by nature, and the scan in
+/// `canonical_tokens::tests::mika2627_*` holds that perimeter in both directions.
+///
+/// **Its only consumer is that parity test, and that is a difference from its
+/// reflection-mode sibling worth naming.** `REFLECTION_EVIDENCE_GATED_TOOLS` is
+/// read by production code (it rewrites the served JSON schema); this list has
+/// nothing to rewrite — the guard call is at each tool's own site. So it is a
+/// *declared census* whose value is to be confronted with reality, and
+/// `#[allow(dead_code)]` says so rather than letting a reader assume a runtime
+/// role it does not have.
+#[allow(dead_code)]
+pub(crate) const TESTIMONY_GATED_TOOLS: &[&str] =
+    &["send_message", "create_reminder", "create_scheduled_task"];
 
 /// Make the served JSON schema tell the truth in reflection mode: declare
 /// `evidence` in the `required` array of every tool listed in

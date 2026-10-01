@@ -189,3 +189,19 @@ pub mod truthful_declaration_replayed;
 // therefore ships disarmed with its reasoning at the site.
 pub mod testimony_access_proposal_caught;
 pub mod testimony_access_proposal_replayed;
+
+// --- mika#2627: the *propose* surface on the silent turn's only channel ---
+//
+// Sixth time in this module, and the criterion is unchanged. What this file adds
+// is a **distinct population**, deliberately filed apart from its 5h sibling:
+// "did not propose on the final text" and "did not SEND the proposal" are two
+// things one wants to count apart — exactly the rule this `mod.rs` has already
+// written twice, for mika#1983 and for mika#1960 itself.
+//
+// Its assertion lands on the **transport**, not on a re-prompt: the refusal is
+// pre-hoc on the tool's input, so there is no `llm_call_count > 1` to measure and
+// a reader expecting one would mistake the shape for a broken test. The tag set
+// is shared with the 5h file (`doctrine:testimony-access-*`), since the cause and
+// the operator conduct are the same; it is the channel that differs, and the
+// `channel` field of `guard.testimony_access_proposal` is what separates them.
+pub mod testimony_access_proposal_send_message_refused;

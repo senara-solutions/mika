@@ -535,6 +535,197 @@ Optional (startup behavior):
   - **The manual gesture is no longer the standard one** for well-known agents: the section lands at the next mika-spirit startup (the startup is what writes; an identity already written is re-read every turn). It remains the only route for agents with no spec.
   - **What this costs, named:** a hand edit inside a code-owned section is now overwritten at the next startup. `reconciled_paths` on `identity_reconcile.complete` names each overwritten path, so the loss is legible rather than silent. Operator grep: `identity_reconcile` in `$MIKA_SPIRIT_LOG_FILE` — `complete` on the first startup after deploy, `in_sync` afterwards.
 
+### La surface « propose » est fermée sur le canal des tours silencieux (mika#2627)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit un `send_message` refusé — ou qui
+cherche pourquoi un rappel n'a pas été créé — cherche dans le voisinage de la
+garde 5h.
+
+- **Le trou, que le code nommait déjà.** La garde 5h (mika#1960) refuse un tour
+  dont le **texte final** propose d'ouvrir un accès testimony-grade. Dans un tour
+  silencieux (heartbeat, callback, rappel) ce texte n'est montré à personne : ce
+  qui parvient à la personne passe par l'outil `send_message`, que 5h ne lit pas.
+  Le bloc 5h portait ce constat mot pour mot — *« named here rather than claimed
+  closed (closing it means reading the tool input pre-hoc, the mika#933 shape,
+  which is a distinct change) »*. **Ce ticket EST ce changement distinct**, nommé
+  par la phase 2 elle-même : il n'y avait rien à établir sur l'existence du trou.
+
+- **Un refus AVANT l'envoi, et avant la persistance.** Le même prédicat pur est
+  appliqué au corps sortant ; détecté, l'outil est refusé et la raison est rendue
+  au modèle. Ce n'est pas un re-prompt de fin de tour. Avant la persistance parce
+  qu'une proposition écrite dans `messages` est reservie au tour suivant par la
+  compaction — un refus qui persisterait quand même laisserait la doctrine violée
+  dans l'historique.
+
+- **Trois émetteurs, et le recensement EST le livrable (AC1).**
+
+  | # | outil | comment le texte atteint la personne | dans le périmètre ? |
+  |---|---|---|---|
+  | 1 | `send_message` | `ctx.message_sender.send(&cleaned)` — immédiat | **oui**, le vecteur du ticket |
+  | 2 | `create_reminder` + `action_type = "send_message"` | `action_config = {"text": …}`, tiré plus tard par le dispatcher | **oui** |
+  | 3 | `create_scheduled_task` + `action_type = "send_message"` | idem | **oui**, mais **inerte** — voir ci-dessous |
+  | 4 | `delegate_task` | passe le sender au délégué, n'envoie **rien** lui-même | non — couvert **transitivement** (le délégué appelle `send_message`) |
+  | 5 | `run_team` | notification de fin de run composée par `teams::notification` | non — le texte est du **moteur**, pas du modèle |
+  | 6 | le dispatcher du tir planifié | **consommateur** du différé | non — voir « au moment de la création » |
+
+  **Rectification au recensement du ticket, trouvée en lisant le code :** la
+  ligne 3 décrit un outil que le modèle **ne peut pas appeler en production** —
+  `CreateScheduledTaskTool` n'est construit qu'à un site `#[cfg(test)]` et n'est
+  enregistré dans aucun registre. La garde y est câblée et **inerte** : aucune
+  ligne `channel = "create_scheduled_task"` ne peut être émise aujourd'hui.
+  L'inertie est nommée sur la variante d'enum plutôt que laissée à découvrir —
+  une couverture inerte qui se lit comme une couverture est la classe mika#2205.
+
+- **Le refus est à la CRÉATION, jamais au tir, et c'est pourquoi les deux outils
+  de planification sont gardés ici.** Le dispatcher qui tire un `send_message`
+  planifié n'a **aucun modèle à qui rendre une raison** : il devrait soit
+  supprimer en silence (un rappel que la personne a demandé disparaît sans un
+  mot), soit laisser passer. **Conséquence nommée : les rows créées avant ce
+  déploiement ne sont pas couvertes.**
+
+- **Le discriminant `action_type` est porteur, pas décoratif.** Sur
+  `resume_agent`, le `message` est une **instruction à l'agent**, pas un texte
+  vers la personne : « rappelle-moi de vérifier si j'ai ouvert l'accès à ma
+  messagerie » est une note à soi-même, pas une proposition, et appliquer le
+  prédicat là serait un faux positif sur une population légitime. Contrôle
+  négatif épinglé aux deux sites.
+
+- **Le refus ne pose AUCUN `DeliveryVerdict`, et c'est le point le plus subtil.**
+  La garde 6f `unacknowledged_send_failure` lit ces verdicts et refuse un EndTurn
+  qui se clôt sur un envoi non réparé, en comptant `RefusedTooLong` comme une
+  non-livraison à réparer **par un découpage**. Un refus doctrinal n'est
+  réparable ni par un renvoi ni par un découpage : **découper un texte qui
+  propose un accès Gmail produit quatre messages qui le proposent.** Poser un
+  verdict ici ferait re-prompter le tour pour un envoi que la doctrine refuse, en
+  lui suggérant la réparation exactement inverse.
+
+- **Il précède aussi la garde de longueur (mika#2134)**, pour la même raison : un
+  texte à la fois trop long et porteur d'une proposition doit être refusé **par
+  la doctrine**, le remède de la garde de longueur étant un découpage.
+
+- **Les deux gardes composent et ne se dupliquent pas.** Sur un tour de
+  conversation le prédicat peut tourner deux fois — le corps de l'outil, puis le
+  texte final — et le refus d'outil ne touche **pas** `intent_guard_retries`,
+  donc 5h garde son budget d'un coup pour le texte final.
+
+### Surfaces opérateur
+
+```bash
+# 1. Une proposition a-t-elle été arrêtée, et par quel canal ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{channel, matched_subject, matched_movement, agent_id, session_id}'
+
+# 2. La population du canal outil, seule
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel != "end_turn") | {channel, matched_subject}'
+
+# 3. CONTRÔLE POSITIF — la garde 5h tourne-t-elle encore ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel == null or .channel == "end_turn")' | wc -l
+```
+
+```sql
+-- La population du refus, par outil (sans surface neuve : un `ToolOutput::error`
+-- atterrit dans `tool_calls.output`, persisté et scrubé)
+SELECT tool_name, count(*) FROM tool_calls
+ WHERE output LIKE 'REFUS (testimony-access, mika#2627)%' GROUP BY 1;
+
+-- Les rows planifiées AVANT le déploiement, hors périmètre
+SELECT id, label FROM tasks
+ WHERE action_type = 'send_message' AND status IN ('pending','recurring_active');
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `channel = "end_turn"` | WARN | **zéro** | inchangé par ce ticket |
+| `channel = "send_message"` | WARN | **zéro** | chaque ligne est une proposition arrêtée avant la personne, sur le canal des tours silencieux |
+| `channel = "create_reminder"` | WARN | **zéro** | une proposition différée arrêtée à la création |
+| `channel = "create_scheduled_task"` | WARN | **zéro par construction** | l'outil n'est enregistré nulle part en production : une occurrence signifie qu'il a été réenregistré |
+| une même session portant plusieurs refus | WARN | **anomalie** | le modèle insiste : lire le prompt servi **avant** de toucher au prédicat |
+
+**Le préfixe de refus est un format de fil lui aussi**, à constante unique
+(`tools::TESTIMONY_ACCESS_REFUSAL_PREFIX`, motif `REFUSED (cwd-guard,
+mika#2536)`), et la requête SQL ci-dessus est ce qui justifie de ne créer **ni
+table ni ligne `audit_events`** — en cohérence explicite avec 5h, qui a tranché
+que la famille #953 est journal-only.
+
+**Coût daté, nommé plutôt que découvert :** un
+`grep guard.testimony_access_proposal | jq 'select(.channel == "end_turn")'` qui
+enjambe le déploiement rend **vide** sur les lignes antérieures, où le champ
+n'existe pas. Les lignes historiques ne sont pas réécrites (motif mika#2361 : les
+réécrire rendrait faux ce qu'elles ont dit quand elles ont été écrites). La
+requête juste de part en part est
+`jq 'select(.channel == null or .channel == "end_turn")'`.
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+**Préalable.** Ces sondes décrivent le **binaire servi** : établir après
+`make deploy` que le `mika-spirit` qui tourne porte le correctif avant toute
+conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte — la
+base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (premier tour silencieux qui
+tente). Une ligne `channel = "send_message"`, et **aucun** message reçu par la
+personne.
+*Halte 1 — aucune ligne alors qu'une proposition est partie :* **ne pas élargir
+le prédicat par réflexe.** Établir d'abord le déploiement, puis lire le contrôle
+positif (sonde 3) : zéro ligne des deux côtés ne prouve rien du tout — *une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+**S2 — RK5, 30 jours.** Chercher une proposition étalée sur deux `send_message`
+consécutifs du même tour.
+*Halte 2 — une occurrence :* c'est le contournement **nommé**, pas un défaut du
+prédicat. Ouvrir le suivi **avec cette occurrence**, et surtout ne pas élargir le
+prédicat au-delà de la phrase — ce serait reprendre le faux positif que la
+segmentation par phrase existe pour éviter (même classe que mika#2237, qui a
+laissé son propre contournement ouvert avec sa raison : la garde ne peut pas
+arbitrer l'intention).
+
+**S3 — contrôle négatif de bruit, 7 jours.** Aucun refus sur un `send_message`
+ordinaire, et en particulier aucun sur un **refus que la doctrine prescrit**.
+*Halte 3 — une occurrence :* c'est un faux positif, et son coût change de nature
+par rapport à 5h — là c'était un re-prompt, ici c'est **un message qui ne part
+pas**. **Désarmer d'abord** (revert de l'appel au helper sur le site concerné),
+diagnostiquer ensuite : un message légitime refusé est un arbitrage de prédicat,
+pas un seuil à régler.
+
+**S4 — la population hors périmètre.** La requête SQL n°2, une fois, après
+déploiement.
+*Halte 4 — elle rend des lignes portant une proposition :* ce sont les rows
+pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), pas un
+élargissement de la garde au tir.
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne rend pas la surface *propose* structurelle au sens des Layers 2/3/4.**
+  Le refus lit un texte sortant : il **rattrape** avant l'envoi, il ne rend pas
+  l'agent incapable de formuler la proposition. La doctrine maison est *construis
+  l'incapacité, ne promets pas la retenue* (mika#1991) ; elle n'est **pas
+  applicable ici** et il faut l'écrire plutôt que le contourner — il n'existe
+  aucune capacité à retirer, le livrable est du texte en langue naturelle.
+- **Il ne rattrape aucune proposition déjà partie.** Rien ne réécrit un message
+  envoyé, et **rien n'est rétro-estampillé** : la sonde est la **prochaine**
+  occurrence.
+- **Il ne couvre pas les rows planifiées avant le déploiement.**
+- **Il ne ferme pas RK5** (la proposition étalée sur deux appels), nommé
+  ci-dessus avec sa précondition de suivi.
+- **Il n'ajoute aucune ligne `audit_events` et aucun compteur.** Les seuls
+  instruments sont le grep et la requête SQL ci-dessus, et **leur silence ne
+  prouve rien tant que personne ne les exécute**.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.** Le
+  précédent le plus proche, mika#1646 (garde d'action destructive), n'en a pas non
+  plus, pour la raison qu'il écrit : un désarmement par variable sur un chemin de
+  doctrine serait un désarmement par coquille. Le geste de désarmement est un
+  **revert**, et le coût d'un faux positif le supporte.
+- **Il ne touche ni la garde 5h, ni le prédicat, ni le re-prompt, ni le budget
+  d'un coup, ni la moitié désarmée de la phase 2** — la seule modification de 5h
+  est l'ajout du champ `channel = "end_turn"` sur sa ligne.
+
+Raisonnement complet, les trois gardes structurelles et leurs allowlists livrées
+vides : `crates/mika-agent/CLAUDE.md` § 5h-bis.
+
 ### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
 
 - **Le défaut, mesuré le 2026-09-11 (tenant champion, canary Al).** À « Qu'est-ce

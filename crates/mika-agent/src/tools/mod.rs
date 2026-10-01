@@ -662,6 +662,122 @@ pub(crate) fn check_reflection_evidence(
     None
 }
 
+/// Prefix every testimony-access refusal body opens with (mika#2627 D5).
+///
+/// **A wire format, with a single definition site.** A `ToolOutput::error` lands
+/// in `tool_calls.output` (persisted and scrubbed), so this prefix is what makes
+///
+/// ```sql
+/// SELECT tool_name, count(*) FROM tool_calls
+///  WHERE output LIKE 'REFUS (testimony-access, mika#2627)%' GROUP BY 1;
+/// ```
+///
+/// an exact count — and that query is what justifies creating no `audit_events`
+/// row and no table (D5, coherent with 5h, which settled that the #953 family is
+/// journal-only). Motif: `REFUSED (cwd-guard, mika#2536)`.
+pub(crate) const TESTIMONY_ACCESS_REFUSAL_PREFIX: &str = "REFUS (testimony-access, mika#2627)";
+
+/// Refuse an outgoing body that proposes to **open** access to testimony-grade
+/// data, before it is sent or persisted (mika#2627).
+///
+/// `Some(ToolOutput::error(…))` when the text proposes such an opening, `None`
+/// otherwise. Motif: [`check_reflection_evidence`] above — same signature shape,
+/// same place, same mirror constant, same bidirectional parity test.
+///
+/// # Why it lives here and not in `evidence::guards`
+///
+/// `guards` does not know `ToolOutput`, and the phase-1 predicate
+/// [`crate::evidence::guards::detect_testimony_access_proposal`] stays **pure**.
+/// What is shared between the three call sites is the *composition* — refusal
+/// body plus telemetry — so there are three callers and **one** composition.
+///
+/// # It posts NO `DeliveryVerdict`, and that is the subtlest point (D4/RK2)
+///
+/// `send_message` carries six exits, five of which post a `DeliveryVerdict`
+/// (mika#2136). Guard 6f `unacknowledged_send_failure` reads those verdicts and
+/// **refuses an EndTurn** that closes over an unrepaired send, counting
+/// `RefusedTooLong` as a non-delivery to be repaired *by splitting*.
+///
+/// A doctrinal refusal is repairable by neither a resend nor a split:
+/// **splitting a text that proposes Gmail access yields four texts that propose
+/// it.** Posting a verdict here would therefore re-prompt the turn for a send
+/// the doctrine refuses, suggesting the exact inverse of the right repair.
+///
+/// So the refusal follows the two exits `send_message` already has for "nothing
+/// was attempted" (`'text' is required`, `empty-after-strip`), whose reason
+/// `mika2136_les_sorties_sans_tentative_ne_posent_rien` writes down: *"Nothing
+/// was attempted, so there is no failure for the turn to acknowledge — and a
+/// record here would make `failed_count` lie."* Bare `ToolOutput::error`,
+/// `delivery: None`, pinned by a test.
+///
+/// # Telemetry, and the three fields it does NOT fabricate
+///
+/// One name, `guard.testimony_access_proposal`, plus a `channel` field — the
+/// letter of AC4, and the house motif `ready_label_outcome` (mika#2323): *one
+/// name, the outcome in a field*, because the four populations share the same
+/// cause (a testimony-grade access proposal) and call for the same operator
+/// conduct. `guard_correlation_id` (there is no re-prompt here, so no
+/// `guard.correction_accepted` to join), `step` and `label` are **absent**: a
+/// field asserting what was not measured is the mika#2304 defect, and `null` is
+/// never a value (mika#2331).
+///
+/// The list of tools that call this is mirrored by
+/// [`crate::agent_loop::TESTIMONY_GATED_TOOLS`], and
+/// `mika2627_gated_tools_match_the_testimony_contract_constant` fails if the two
+/// diverge in either direction.
+pub(crate) fn check_testimony_access_proposal(
+    ctx: &ToolContext<'_>,
+    text: &str,
+    channel: crate::evidence::guards::TestimonyProposalChannel,
+) -> Option<ToolOutput> {
+    let proposal = crate::evidence::guards::detect_testimony_access_proposal(text)?;
+
+    tracing::warn!(
+        target: "mika::otel",
+        trace_id = %ctx.trace_id,
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        channel = channel.as_wire(),
+        matched_subject = %proposal.subject,
+        matched_movement = %proposal.movement,
+        event = "guard.testimony_access_proposal",
+        "Testimony access-proposal refused before delivery"
+    );
+
+    // **Two branches, and the second one is load-bearing.** Layer 1 prescribes
+    // offering operational-grade help *instead of* a bare refusal, so a refusal
+    // pushing only towards declining would degrade what mika#1798 shipped — RK3
+    // of phase 2, and it applies here word for word.
+    //
+    // It also says what 5h has no need to say, because here the tool **failed**:
+    // nothing was sent, the person received nothing — the formula mika#2136
+    // established for every undelivered exit, without which the turn could
+    // announce a delivery that did not happen.
+    //
+    // **It names no workaround.** A refusal that hands over the template is a
+    // leak with one more step (doctrine mika#2520, mika#2292).
+    Some(ToolOutput::error(format!(
+        "{TESTIMONY_ACCESS_REFUSAL_PREFIX} — NOTHING WAS SENT; the person has \
+         received nothing. This text proposes to open access to `{subject}` \
+         (`{movement}`). That data is testimony-grade, and the non-transit \
+         doctrine is a HARD NO on **proposing** it as much as on doing it: \
+         opening such a surface is the person's own sovereign decision and it is \
+         not yours to solicit. There is no runtime override.\n\n\
+         Re-send the message, keeping everything else as it is, along one of \
+         these two lines — both are correct:\n\
+         1. Decline and name why, in the person's register: the grade of the \
+         data decides, not the convenience of the moment.\n\
+         2. Decline and offer, in its place, what you CAN do without opening \
+         anything — an operational-grade or non-transit substitute (a reminder, \
+         a draft from what they dictate to you, a question that narrows the \
+         need).\n\n\
+         Naming the doctrine while declining is expected, not a violation. What \
+         must disappear is the proposal to open the surface.",
+        subject = proposal.subject,
+        movement = proposal.movement,
+    )))
+}
+
 /// Validate that a string is a well-formed UUID.
 ///
 /// Returns `Ok(Uuid)` on success or `Err(ToolOutput::error(...))` with a structured
@@ -1436,6 +1552,114 @@ mod tests {
              update_core_memory). A fourth is not an allowlist entry: decide whether its \
              declared schema, its field description and the reflection prompt say the same \
              thing, then update this count. Found: {callers:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2627 V11 — the gated-tool list mirrors the testimony guard's callers
+    // -----------------------------------------------------------------------
+
+    /// The tools calling [`check_testimony_access_proposal`] are exactly the
+    /// tools named in [`crate::agent_loop::TESTIMONY_GATED_TOOLS`].
+    ///
+    /// Divergence is caught in **both** directions, and each direction is a
+    /// different defect. A fourth emitter adopting the guard without joining the
+    /// constant leaves a surface the docs do not name as covered. An entry with
+    /// no caller is worse: it declares a surface guarded where nothing guards
+    /// it, i.e. it **reads as coverage while covering nothing** — the class
+    /// mika#2205 names.
+    ///
+    /// **No behavioural test can see this class.** A new emitter would work; it
+    /// would simply be unprotected, with every assertion about the three
+    /// existing tools staying green.
+    #[test]
+    fn mika2627_gated_tools_match_the_testimony_contract_constant() {
+        let tools_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tools");
+
+        // Composed at runtime so `mod.rs` — the definition site — cannot
+        // denounce itself as a caller.
+        let needle = format!("check_testimony_access{}(", "_proposal");
+
+        let mut callers: HashSet<String> = HashSet::new();
+        let mut unnamed: Vec<String> = Vec::new();
+
+        for entry in std::fs::read_dir(&tools_dir).expect("src/tools is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            if crate::source_scan::is_test_source_path(&path) {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("readable source file");
+            let production = mika_common::source_guard::mask_test_regions(&src);
+
+            // The definition site is not a caller, and neither is a doc comment
+            // that merely names the function.
+            let calls_guard = production.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//")
+                    && line.contains(needle.as_str())
+                    && !line.contains("fn check_testimony_access_proposal(")
+            });
+            if !calls_guard {
+                continue;
+            }
+
+            let names = declared_tool_names(&production);
+            match names.len() {
+                1 => {
+                    callers.insert(names[0].clone());
+                }
+                _ => unnamed.push(format!(
+                    "{}: {} tool name(s) declared — {names:?}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    names.len()
+                )),
+            }
+        }
+
+        assert!(
+            unnamed.is_empty(),
+            "mika#2627 — a file calling the testimony guard must declare exactly one tool \
+             name via `fn name(&self) -> &str`, so this guard can attribute the call. \
+             Could not attribute:\n  {}",
+            unnamed.join("\n  ")
+        );
+
+        // Anti-vacuity: a scan that finds NOBODY reads exactly like a clean one
+        // (mika#2103 / mika#2205).
+        assert!(
+            !callers.is_empty(),
+            "mika#2627 — the testimony guard is called from no tool at all: this scan \
+             is aiming at a dead name and verifies nothing"
+        );
+
+        let declared: HashSet<String> = crate::agent_loop::TESTIMONY_GATED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut missing: Vec<&String> = callers.difference(&declared).collect();
+        let mut extra: Vec<&String> = declared.difference(&callers).collect();
+        missing.sort();
+        extra.sort();
+
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "mika#2627 AC1 — `TESTIMONY_GATED_TOOLS` must mirror the callers of \
+             `check_testimony_access_proposal`, exactly.\n\
+             \n\
+             Calls the guard but is NOT in the constant: {missing:?}\n\
+             → a guarded emitter the documented census does not name. Add it to \
+             `TESTIMONY_GATED_TOOLS` (crates/mika-agent/src/agent_loop/mod.rs).\n\
+             \n\
+             In the constant but does NOT call the guard: {extra:?}\n\
+             → the constant declares a surface guarded where nothing guards it, which \
+             reads as coverage while covering nothing. Either restore the guard call, or \
+             remove the name from the constant."
         );
     }
 

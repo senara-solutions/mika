@@ -3299,4 +3299,202 @@ mod tests {
              infraction (mika#2323)."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2627 — le prédicat testimony a DEUX lecteurs de production
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les deux lecteurs nommés : la garde 5h et le helper d'outil.
+    const TESTIMONY_PREDICATE_READERS: &[&str] = &[
+        "crates/mika-agent/src/agent_loop/mod.rs",
+        "crates/mika-agent/src/tools/mod.rs",
+    ];
+
+    /// **Livrée vide, et le test frère l'assert.**
+    ///
+    /// Quand ce scan tire, **on route le site vers le helper** ; on ne
+    /// l'allowliste pas (doctrine mika#2201). Un troisième lecteur direct du
+    /// prédicat est un site qui refait la composition refus + télémétrie à sa
+    /// façon, c'est-à-dire qui peut en diverger.
+    const TESTIMONY_PREDICATE_READERS_ALLOWED: &[&str] = &[];
+
+    /// Scan A — `detect_testimony_access_proposal` n'est lu qu'à deux endroits
+    /// de production (mika#2627 R3).
+    ///
+    /// **Il remplace la V4 par-`grep` de la phase 2, qui s'inverse une seconde
+    /// fois.** Le doc-comment du prédicat affirmait « V4 now requires **exactly
+    /// one** production wiring site […] a call anywhere else is the double wiring
+    /// RK6 names » ; après mika#2627 il y en a deux, et cette V4 n'était pas un
+    /// test automatisé — donc rien ne rougissait, et laissée en place elle aurait
+    /// prescrit de supprimer le second site comme un doublon.
+    ///
+    /// Aucun test comportemental ne voit cette classe : un troisième lecteur ne
+    /// rend **aucune** décision fausse le jour où il est écrit — tout reste vert
+    /// et seule la couverture se perd, en silence (classe `grooming_marker`,
+    /// mika#2158).
+    #[test]
+    fn mika2627_le_predicat_na_que_deux_lecteurs_de_production() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("detect_testimony_access{}(", "_proposal");
+
+        let mut readers = Vec::new();
+        for (rel, content) in production_sources() {
+            if TESTIMONY_PREDICATE_READERS_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            // La définition n'est pas un lecteur, et un commentaire qui NOMME la
+            // fonction n'en est pas un non plus — le prédicat porte trois
+            // paragraphes de prose à son sujet (classe mika#2050, le faux
+            // positif mesuré sur le Signal S).
+            let reads = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    line.contains(needle.as_str())
+                        && !line.contains("fn detect_testimony_access_proposal(")
+                });
+            if reads {
+                readers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve personne se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        for expected in TESTIMONY_PREDICATE_READERS {
+            assert!(
+                readers.iter().any(|r| r == expected),
+                "mika#2627 — `{needle}` n'est lu nulle part dans {expected} : ce scan \
+                 vise un nom mort, il ne vérifie rien. Lecteurs trouvés : {readers:?}"
+            );
+        }
+
+        let strangers: Vec<&String> = readers
+            .iter()
+            .filter(|r| !TESTIMONY_PREDICATE_READERS.contains(&r.as_str()))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2627 R3 — un troisième lecteur du prédicat testimony : {strangers:?}\n\n\
+             RÉSOLUTION : router ce site vers `tools::check_testimony_access_proposal`, \
+             qui porte la composition refus + télémétrie. Ne PAS l'ajouter à \
+             TESTIMONY_PREDICATE_READERS_ALLOWED — trois compositions, c'est trois \
+             formulations de refus libres de diverger."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist du scan A.
+    #[test]
+    fn mika2627_lallowlist_du_scan_a_est_vide() {
+        assert!(
+            TESTIMONY_PREDICATE_READERS_ALLOWED.is_empty(),
+            "TESTIMONY_PREDICATE_READERS_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on route le site vers le helper. Une allowlist née \
+             vide est un emplacement où déposer la prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2627 — tout émetteur de texte sous `tools/` est gardé, ou nommé
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Un PÉRIMÈTRE, pas une allowlist d'exemption** (sens de mika#2536).
+    ///
+    /// Ces deux sites consomment `ctx.message_sender` et **n'émettent aucun
+    /// texte du modèle** :
+    ///
+    /// - `delegate_task` passe le sender au délégué et n'envoie rien lui-même —
+    ///   le délégué appelle `send_message`, donc il est couvert
+    ///   **transitivement** ;
+    /// - `run_team` envoie une notification de fin de run dont le texte est
+    ///   composé par `teams::notification::build_run_completion_message`,
+    ///   c'est-à-dire par le **moteur** et non par le modèle.
+    ///
+    /// `tools/mod.rs` est hors population par une autre raison : il **déclare**
+    /// le champ, il ne le consomme pas. Et c'est aussi le site du helper, donc
+    /// l'y compter serait compter la garde comme un trou.
+    ///
+    /// Comparé **dans les deux sens** : une entrée dont le site a disparu fait
+    /// rougir (assertion auto-nettoyante), sans quoi elle exempterait en silence
+    /// un futur homonyme.
+    const TESTIMONY_SENDER_PERIMETER: &[&str] = &[
+        "crates/mika-agent/src/tools/delegate_task.rs",
+        "crates/mika-agent/src/tools/run_team.rs",
+        "crates/mika-agent/src/tools/mod.rs",
+    ];
+
+    /// Scan B — tout consommateur de `ctx.message_sender` sous `tools/` appelle
+    /// la garde, ou figure au périmètre ci-dessus (mika#2627 RK4).
+    ///
+    /// Ce que ce scan **ne** couvre pas, nommé plutôt que découvert : un outil
+    /// qui atteindrait l'utilisateur sans passer par `ctx.message_sender` ni par
+    /// un `action_type` planifiable. Aucun n'existe aujourd'hui, et armer un
+    /// détecteur sur une population vide est ce que mika#2520 refuse.
+    #[test]
+    fn mika2627_tout_emetteur_sous_tools_est_garde_ou_nomme() {
+        let guard_call = format!("check_testimony_access{}(", "_proposal");
+
+        let mut unguarded = Vec::new();
+        let mut consumers = Vec::new();
+
+        for (rel, content) in production_sources() {
+            if !rel.starts_with("crates/mika-agent/src/tools/") {
+                continue;
+            }
+            let lines: Vec<&str> = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .collect();
+
+            if !lines.iter().any(|l| l.contains("message_sender")) {
+                continue;
+            }
+            consumers.push(rel.clone());
+
+            let guarded = lines.iter().any(|l| l.contains(guard_call.as_str()));
+            if !guarded && !TESTIMONY_SENDER_PERIMETER.contains(&rel.as_str()) {
+                unguarded.push(rel);
+            }
+        }
+
+        // Anti-vacuité : sans ça, un renommage de répertoire rendrait ce scan
+        // muet et un arbre vide se lirait comme un arbre propre (mika#2205).
+        assert!(
+            consumers.len() >= 4,
+            "mika#2627 — moins de quatre consommateurs de `message_sender` trouvés \
+             sous `tools/` ({consumers:?}) : ce scan ne regarde plus la population \
+             qu'il existe pour surveiller"
+        );
+
+        assert!(
+            unguarded.is_empty(),
+            "mika#2627 RK4 — un émetteur de texte sous `tools/` ne passe pas par la \
+             garde testimony : {unguarded:?}\n\n\
+             RÉSOLUTION : appeler `tools::check_testimony_access_proposal` sur le corps \
+             sortant AVANT l'envoi, et ajouter le nom de l'outil à \
+             `agent_loop::TESTIMONY_GATED_TOOLS`. S'il n'émet aucun texte DU MODÈLE \
+             (sender relayé, texte composé par le moteur), le déclarer dans \
+             TESTIMONY_SENDER_PERIMETER avec sa raison."
+        );
+
+        // L'autre sens : une entrée de périmètre dont le site a disparu, ou qui
+        // ne consomme plus le sender, est un tiroir — pas un périmètre.
+        let stale: Vec<&&str> = TESTIMONY_SENDER_PERIMETER
+            .iter()
+            .filter(|p| !consumers.iter().any(|c| c == *p))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "mika#2627 — une entrée de périmètre ne consomme plus `message_sender` : \
+             {stale:?}\n\n\
+             RÉSOLUTION : retirer la ligne. Une entrée qui survit à son site exempterait \
+             en silence un futur homonyme (c'est la différence entre un périmètre et un \
+             tiroir, mika#2536)."
+        );
+    }
 }

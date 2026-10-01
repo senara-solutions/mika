@@ -125,10 +125,37 @@ impl Tool for CreateScheduledTaskTool {
                 action_config_str.len()
             )));
         }
-        if serde_json::from_str::<serde_json::Value>(action_config_str).is_err() {
-            return Ok(ToolOutput::error(
-                "'action_config' must be a valid JSON string.",
-            ));
+        let action_config_json: serde_json::Value = match serde_json::from_str(action_config_str) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(ToolOutput::error(
+                    "'action_config' must be a valid JSON string.",
+                ));
+            }
+        };
+
+        // mika#2627 — same reasoning as `create_reminder`: a deferred
+        // `send_message` is still a `send_message`, and the creation site is the
+        // only one with a model to answer.
+        //
+        // Read **after** the JSON validation above, so the value is already
+        // parseable. An absent or non-string `text` key means there is nothing to
+        // test — `None`, behaviour unchanged — rather than an error: this tool's
+        // `action_config` shape is the caller's to get right, and inventing a
+        // second validation here would refuse calls the tool accepts today.
+        //
+        // `run_skill` / `inject_context` / `resume_agent` are out of population
+        // for the reason written at the sibling site: none of them emits a text
+        // towards the person.
+        if action_type_val == action_type::SEND_MESSAGE
+            && let Some(text) = action_config_json.get("text").and_then(|t| t.as_str())
+            && let Some(refusal) = crate::tools::check_testimony_access_proposal(
+                ctx,
+                text,
+                crate::evidence::guards::TestimonyProposalChannel::CreateScheduledTask,
+            )
+        {
+            return Ok(refusal);
         }
 
         let (next_fire_at, cron_expr) = match trigger_type_str {
@@ -448,5 +475,104 @@ mod tests {
             .unwrap();
         assert!(result.is_error);
         assert!(result.content.contains("valid JSON"));
+    }
+
+    // --- mika#2627: a deferred `send_message` is still a `send_message` ---
+
+    /// A scheduled `send_message` whose `action_config.text` proposes to open
+    /// testimony-grade access is refused at creation.
+    ///
+    /// **Note what this test does and does not establish.** It exercises the
+    /// guard on a real call, so the wiring is attested — but this tool is
+    /// registered in no production registry (its own doc-comment says so:
+    /// "Removed from `default_tools()` … Retained for tests"), so the model
+    /// cannot reach this channel today. The coverage is in place and inert; that
+    /// inertia is named on `TestimonyProposalChannel::CreateScheduledTask`
+    /// rather than left to be discovered.
+    #[tokio::test]
+    async fn mika2627_un_envoi_planifie_proposant_un_acces_est_refuse() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateScheduledTaskTool
+            .execute(
+                serde_json::json!({
+                    "label": "Proposition différée",
+                    "trigger_type": "callback",
+                    "action_type": "send_message",
+                    "action_config": "{\"text\": \"Je pourrais t'aider si tu me \
+                                       donnais accès à ta boîte Gmail.\"}"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "the proposal must be refused");
+        assert!(
+            result
+                .content
+                .starts_with(crate::tools::TESTIMONY_ACCESS_REFUSAL_PREFIX),
+            "the refusal must carry the wire prefix: {}",
+            result.content
+        );
+    }
+
+    /// Negative control — `resume_agent` carries an instruction to the agent,
+    /// not a text towards the person, so the same words are not refused.
+    #[tokio::test]
+    async fn mika2627_resume_agent_planifie_nest_pas_refuse() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateScheduledTaskTool
+            .execute(
+                serde_json::json!({
+                    "label": "Note à moi-même",
+                    "trigger_type": "callback",
+                    "action_type": "resume_agent",
+                    "action_config": "{\"text\": \"Je pourrais t'aider si tu me \
+                                       donnais accès à ta boîte Gmail.\"}"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error,
+            "a `resume_agent` task must not be refused: {}",
+            result.content
+        );
+    }
+
+    /// An absent or non-string `text` key leaves the behaviour unchanged — there
+    /// is nothing to test, so the guard abstains rather than inventing a second
+    /// validation of this tool's `action_config` shape.
+    #[tokio::test]
+    async fn mika2627_une_cle_text_absente_ne_change_rien() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        for config in ["{}", "{\"text\": 42}", "{\"other\": \"x\"}"] {
+            let result = CreateScheduledTaskTool
+                .execute(
+                    serde_json::json!({
+                        "label": format!("sans texte {config}"),
+                        "trigger_type": "callback",
+                        "action_type": "send_message",
+                        "action_config": config
+                    }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !result.is_error,
+                "an unreadable `text` key must leave the behaviour unchanged, \
+                 not refuse the call: {config} → {}",
+                result.content
+            );
+        }
     }
 }
