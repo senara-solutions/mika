@@ -45,6 +45,8 @@ pub fn assert_per_line_verification_qualification(
 );
 ```
 
+> **Superseded as written (mika#1984, 2026-09-30).** The two-state enum above is the shape this ticket shipped; it is kept here because the reasoning that follows is about it. The taxonomy now has **three ordered states** — `VerifiedRule(&'a str)` / `SourceNotProbative(&'a str)` / `SnippetOnly` — and `Verified` no longer exists under that name. The rename is the correction, not a tidy-up: `Verified` answers "was something verified?" where the question is "was the RULE verified?". See `docs/solutions/best-practices/une-case-manquante-dans-une-taxonomie-force-a-encoder-un-mensonge-2026-09-30.md`.
+
 For each `(element, tier)`, scan a bounded window (200 chars) after the element name for a bracketed qualification tag (`[vérifié: ...]` or `[non vérifié ...]` — plus English `[verified:` / `[unverified` for future bilingual scenarios). Enforce tier-match: a `SnippetOnly` element with a `[vérifié: ...]` tag adjacent is the merged-verified-and-inferred anti-pattern; panic descriptively.
 
 Two properties matter:
@@ -73,7 +75,9 @@ Skip any surface and grep-based sweeps of the vocabulary miss the new tags — s
 
 ## Why this shape survives a model swap
 
-The four hard assertions (element-present, per-line qualification tag with tier match, hedge form, no snippet-only-as-verified) test the *shape of the answer*, not its exact wording. A GLM-5.3 family model that phrases the qualification differently (`(source: ...)` instead of `[vérifié: ...]`) would fail the helper — surfacing an eval regression rather than silently drifting. When that happens, the fix is: (a) extend the helper to accept the new bracket shape if the model's new phrasing is equivalent, or (b) reinforce the prompt to lock the original shape. Both moves are cheaper than diagnosing "why did Mika stop qualifying evidence?" in production traffic.
+The four hard assertions (element-present, per-line qualification tag with tier match, hedge form, no snippet-only-as-verified) test the *shape of the answer*, not its exact wording. A GLM-5.3 family model that phrases the qualification differently (`(source: ...)` instead of `[vérifié: ...]`) would fail the helper — surfacing an eval regression rather than silently drifting. When that happens, the fix is: (a) extend the helper to accept the new bracket shape **only if the new phrasing is equivalent** — widening the marker set to make a red test pass is explicitly refused, the red *is* the signal — or (b) create a prompt that prescribes the shape.
+
+**Correction (mika#1984, 2026-09-30): (b) said "reinforce the prompt", and that presupposed a prompt that does not exist.** No prompt anywhere prescribes any of these markers — not in `prompt.rs`, not in `skills/bundled/`, not in `templates/skills/`. An exhaustive search for the tag literals returns three files, all under `tests/eval/`. So (b) is not an eval gesture with a known site; it is a **product decision** — whether a user-facing answer should carry bracketed machine tags at all, and for which persona — of the same family as the register arbitrations mika#2290 and mika#2292 had to defer. The consequence to carry forward: **this helper locks a contract and measures drift; it does not create the behaviour.** Its silence proves nothing about what a tenant emits, because at the mock tier the answer is a fixture.
 
 ## Reference
 
