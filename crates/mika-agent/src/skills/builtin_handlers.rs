@@ -12562,6 +12562,66 @@ mod tests {
         assert_eq!(pr_url_repo("2621"), None);
     }
 
+    /// Bout en bout à travers `validate_pr_ready_undraft_scope`, sans réseau
+    /// (revue de PR #2628, testing) : un sélecteur non adressable sort du terme
+    /// mika#1682 (aucun numéro, donc pas de `gh pr view`) et le terme hold le
+    /// refuse avant tout appel. Assert sur les deux surfaces — le `ToolOutput`
+    /// et la ligne `audit_events` — parce qu'un refus qui ne s'écrit pas se lit
+    /// comme un refus qui n'a pas eu lieu.
+    #[tokio::test]
+    async fn mika2624_le_garde_refuse_et_ecrit_sa_ligne_daudit() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let args = str_args(&["pr", "ready", "fix/2624/branche"]);
+        let refused = validate_pr_ready_undraft_scope(&args, None, &ctx)
+            .await
+            .expect_err("an unaddressable pr ready is refused");
+        assert!(refused.is_error);
+        assert!(
+            refused
+                .content
+                .contains(PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR),
+            "{}",
+            refused.content
+        );
+        assert_eq!(
+            harness
+                .db
+                .count_audit_events_by_tool_name(PR_READY_UNDRAFT_AUDIT_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "the refusal writes exactly one audit row"
+        );
+
+        // Contrôles négatifs, sans réseau eux aussi : `--undo` remet en draft et
+        // un renommage par branche ne touche pas l'état draft — ni refus, ni
+        // ligne. Sans eux, « le garde décide » serait indistinguable de « le
+        // garde refuse tout ».
+        for argv in [
+            vec!["pr", "ready", "fix/2624/branche", "--undo"],
+            vec!["pr", "edit", "fix/2624/branche", "--title", "t"],
+            vec!["pr", "view", "fix/2624/branche"],
+        ] {
+            assert!(
+                validate_pr_ready_undraft_scope(&str_args(&argv), None, &ctx)
+                    .await
+                    .is_ok(),
+                "{argv:?} is not an un-draft"
+            );
+        }
+        assert_eq!(
+            harness
+                .db
+                .count_audit_events_by_tool_name(PR_READY_UNDRAFT_AUDIT_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "the negative controls write no row"
+        );
+    }
+
     #[test]
     fn mika2624_un_refus_sans_jeton_nomme_le_jeton_et_pas_le_depot() {
         // Revue mika#2628 : le refus `hold_no_token` partageait la prose de
