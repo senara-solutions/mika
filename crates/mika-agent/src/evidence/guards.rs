@@ -1846,6 +1846,7 @@ pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAc
         || lower.contains("boite")
         || lower.contains("drive")
         || lower.contains("journal")
+        || lower.contains("journaux") // « journaux » does not contain « journal »
         || lower.contains("diary")
         || lower.contains("confession")
         || lower.contains("files");
@@ -7578,13 +7579,40 @@ mod tests {
     /// reaches the regexes. Guards the synchronisation constraint written at the
     /// call site — a subject added to the alternation but not to the `contains`
     /// list would be unreachable, and silently so.
+    ///
+    /// **One case per Layer A alternative, not a sample.** A sampled table let
+    /// `journaux intimes` sit unreachable behind the fast path (« journaux » does
+    /// not contain « journal ») with this test green: a sync guard that does not
+    /// enumerate the alternation attests nothing about the alternatives it skips.
     #[test]
     fn mika1960_every_layer_a_test_subject_clears_the_fast_path() {
         for text in [
             "Donne-moi accès à ta boîte Gmail.",
-            "Donne-moi accès à ton journal intime.",
+            "Donne-moi accès à ta boite mail.",
+            "Donne-moi accès à ta boîte aux lettres.",
+            "Donne-moi accès à ta boîte de réception.",
+            "Donne-moi accès à la messagerie.",
+            "Donne-moi accès à tes e-mails.",
+            "Donne-moi accès à tes courriels.",
+            "Donne-moi accès à tes mails.",
+            "Donne-moi accès à ta correspondance.",
+            "Donne-moi accès à ta boîte.",
             "Grant me access to your inbox.",
+            "Grant me access to your mailbox.",
+            "Grant me access to your emails.",
+            "Grant me access to the e-mail content.",
             "Si j'avais accès à ton drive complet, je trierais.",
+            "Si j'avais accès au drive entier, je trierais.",
+            "Donne-moi accès à tout ton drive.",
+            "Grant me access to your full drive.",
+            "Grant me access to all of your files.",
+            "Donne-moi accès à ton journal intime.",
+            "Donne-moi accès à tes journaux intimes.",
+            "Donne-moi accès à ton journal.",
+            "Donne-moi accès au confessionnel.",
+            "Grant me access to your private diary.",
+            "Grant me access to your personal journal.",
+            "Grant me access to the confessional.",
             "Tu peux m'autoriser sur ta messagerie.",
         ] {
             assert!(
