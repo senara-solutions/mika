@@ -3683,6 +3683,23 @@ pub fn should_stop_repo_loop(
 /// vit dans une fonction qui shelle `git` et `gh` — et il est l'endroit où le
 /// raisonnement est écrit. Son co-site est tenu par
 /// [`tests::mika2619_la_condition_de_t7_passe_par_le_predicat`].
+///
+/// # Ce que cette condition ne fait PAS, écrit plutôt que découvert
+///
+/// Elle est le **complément exact** de [`should_stop_repo_loop`] sur le même
+/// triplet (asserté par
+/// [`tests::mika2619_v5_le_predicat_de_t7_a_ses_quatre_coins`]), et rien ne
+/// modifie ces budgets entre la tête de boucle et ce point — donc dans le corps
+/// de la boucle **elle est vraie, et ce `if` ne refuse jamais rien**. Ce n'est pas
+/// une redondance accidentelle : ce que le changement déplace est **qui est
+/// admis**, pas combien de fois on refuse. L'ancienne condition `budget > 0`
+/// excluait l'état `budget == 0 && purge_budget > 0 && enabled` — atteignable dès
+/// que le faucheur épuise son budget sur un dépôt antérieur — et dans cet état la
+/// boucle **continue** tandis que T7 n'était plus calculé : les survivants de
+/// T1–T6 n'apparaissaient alors dans aucun vecteur. L'équivalence est donc la
+/// propriété recherchée, et c'est elle que le test épingle : une divergence
+/// ferait payer deux `git` par candidat sur un dépôt qu'on ne regarde plus, ou
+/// l'inverse.
 pub fn t7_is_needed(reaper_budget: usize, purge_budget: usize, purge_enabled: bool) -> bool {
     reaper_budget > 0 || (purge_enabled && purge_budget > 0)
 }
