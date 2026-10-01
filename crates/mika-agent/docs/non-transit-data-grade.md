@@ -89,6 +89,12 @@ retry. No tool call is needed for it to fire, which is the whole point: the
 breach this document quotes ("A well-meaning 'I could help if you gave me Gmail
 access…'") is invisible to Layers 2/3/4 because nothing is ever called.
 
+Its reach is the turn's **final assistant text**, and only that. A proposal
+sent through the `send_message` tool — the only user channel of a silent turn
+(heartbeat, callback, reminder), and also reachable from a conversation turn —
+is not read by this guard, so that path of the *propose* surface is still
+Layer 1 alone.
+
 Two properties worth knowing before touching it. The discriminant is the
 **direction of the access movement**, never the vocabulary: Layer 1 *prescribes*
 naming the doctrine when declining, so a conforming refusal necessarily carries
@@ -336,6 +342,14 @@ closed above, it still does NOT cover:
   `mcp__gmail__*` tool reaches Gmail with zero doctrine layer firing.
   Forward-compat requires MCP manifests to gain a `data_grade` field AND
   the MCP dispatch site to consult the same map.
+- **Propose surface via `send_message`** (named by mika#1960 phase 2) — the
+  EndTurn guard 5h reads the turn's final assistant text only. A proposal
+  delivered through the `send_message` tool (the sole user channel of a
+  silent turn, also reachable from a conversation turn and through the #771
+  send-message boundary exit) is not read by it, so on that path the
+  *propose* half is still Layer 1 alone. Closing it means running the 5h
+  predicate on the tool's `text` input before delivery — a pre-hoc refusal
+  of the mika#933 shape, a change of its own.
 
 ## Cross-references
 

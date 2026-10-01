@@ -3004,15 +3004,25 @@ async fn run_loop(
                     // 5g a local hour — each guards a *conditional* fact. This
                     // doctrine is unconditional ("There is no runtime override in
                     // v1. Not a CLI flag. Not an env var. Not a DB row."), so the
-                    // predicate threads nothing to the three callers of `run_loop`
-                    // and the three modes are covered by construction.
+                    // predicate threads nothing to the three callers of `run_loop`.
                     //
-                    // Uniform across modes and **not** skipped by
+                    // Evaluated in every mode and **not** skipped by
                     // `skip_remaining_guards` (#1178), for the literal reason 5c,
                     // 5d and 5e each write at their own site: a posted PR review
-                    // grants licence to nothing. A heartbeat that spontaneously
-                    // proposes a Gmail grant is exactly as grave as a conversation
-                    // turn, and the compacted history hands it to the next one.
+                    // grants licence to nothing.
+                    //
+                    // **What it reads is the turn's final assistant text, and only
+                    // that — which bounds its coverage.** In conversation mode that
+                    // text is what the user reads. In silent mode (heartbeat,
+                    // callback, reminder) it is delivered to nobody: the user
+                    // channel there is the `send_message` tool's input, which this
+                    // guard never sees — nor does it see a `send_message` sent
+                    // during a conversation turn, including through the #771
+                    // send-message boundary exit that traverses no EndTurn guard.
+                    // A proposal carried by `send_message` is therefore an
+                    // uncovered bypass of the *propose* surface, named here rather
+                    // than claimed closed. In silent mode 5h still keeps the
+                    // proposal out of the compacted history handed to later turns.
                     if matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !intent_guard_retries.contains(TESTIMONY_ACCESS_PROPOSAL_LABEL)
                         && let Some(proposal) = detect_testimony_access_proposal(&text)
