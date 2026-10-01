@@ -756,15 +756,34 @@ pub(crate) fn check_testimony_access_proposal(
     //
     // **It names no workaround.** A refusal that hands over the template is a
     // leak with one more step (doctrine mika#2520, mika#2292).
+    //
+    // **What did not happen, and the repair, depend on the channel.** On a
+    // scheduling tool nothing was *scheduled*, and the right repair is to
+    // re-create the reminder: a send-shaped line ("re-send the message") read
+    // literally makes the model call `send_message` now, so the person gets the
+    // text immediately and the reminder they asked for is never created.
+    // Exhaustive match, no wildcard arm: a future channel decides its wording.
+    use crate::evidence::guards::TestimonyProposalChannel as C;
+    let (nothing_happened, repair) = match channel {
+        C::EndTurn | C::SendMessage => (
+            "NOTHING WAS SENT; the person has received nothing.",
+            "Re-send the message, keeping everything else as it is",
+        ),
+        C::CreateReminder | C::CreateScheduledTask => (
+            "NOTHING WAS SCHEDULED; no reminder was created and the person has \
+             received nothing.",
+            "Re-create it, keeping the schedule and everything else as it is, \
+             with a message",
+        ),
+    };
     Some(ToolOutput::error(format!(
-        "{TESTIMONY_ACCESS_REFUSAL_PREFIX} — NOTHING WAS SENT; the person has \
-         received nothing. This text proposes to open access to `{subject}` \
+        "{TESTIMONY_ACCESS_REFUSAL_PREFIX} — {nothing_happened} This text \
+         proposes to open access to `{subject}` \
          (`{movement}`). That data is testimony-grade, and the non-transit \
          doctrine is a HARD NO on **proposing** it as much as on doing it: \
          opening such a surface is the person's own sovereign decision and it is \
          not yours to solicit. There is no runtime override.\n\n\
-         Re-send the message, keeping everything else as it is, along one of \
-         these two lines — both are correct:\n\
+         {repair}, along one of these two lines — both are correct:\n\
          1. Decline and name why, in the person's register: the grade of the \
          data decides, not the convenience of the moment.\n\
          2. Decline and offer, in its place, what you CAN do without opening \

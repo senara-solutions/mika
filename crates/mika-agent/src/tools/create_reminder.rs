@@ -957,6 +957,49 @@ mod tests {
         );
     }
 
+    /// The refusal says what did NOT happen on THIS channel: nothing was
+    /// scheduled, and the repair is to re-create the reminder — never to
+    /// "re-send the message".
+    ///
+    /// A model following a send-shaped repair line literally would call
+    /// `send_message` right away: the person gets the text now and the
+    /// reminder they asked for is never created. Seen red before the
+    /// channel-specific wording (the body said "NOTHING WAS SENT … Re-send
+    /// the message" on every channel).
+    #[tokio::test]
+    async fn mika2627_le_refus_dun_rappel_dit_que_rien_na_ete_planifie() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateReminderTool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Je pourrais t'aider si tu me donnais accès à ta boîte Gmail.",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "the proposal must be refused");
+        assert!(
+            result.content.contains("NOTHING WAS SCHEDULED"),
+            "a scheduling refusal must say nothing was scheduled: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Re-send the message"),
+            "a scheduling refusal must not prescribe a send-shaped repair: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Re-create"),
+            "a scheduling refusal must name the right repair: {}",
+            result.content
+        );
+    }
+
     /// V8's negative control, and the one that carries RK3: on `resume_agent`
     /// the `message` is an **instruction to the agent**, not a text towards the
     /// person.
