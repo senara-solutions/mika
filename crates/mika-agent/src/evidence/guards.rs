@@ -1575,7 +1575,6 @@ pub(crate) fn detect_time_of_day_greeting_mismatch(
 ///
 /// Byte offsets come from regex match boundaries and from `find`/`rfind` over
 /// `char` patterns, so every slice below lands on a character boundary.
-#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
 fn enclosing_sentence(text: &str, start: usize, end: usize) -> (&str, Option<char>) {
     const TERMINATORS: [char; 4] = ['.', '!', '?', '\n'];
 
@@ -1627,12 +1626,18 @@ fn enclosing_sentence(text: &str, start: usize, end: usize) -> (&str, Option<cha
 // re-prompt a legitimate refusal and push the model to **stop naming the
 // doctrine**, degrading exactly what mika#1798 built.
 
+/// Label used for `intent_guard_retries` tracking of the testimony access-proposal
+/// guard (mika#1960). Inline guard at position 5h, immediately after 5g
+/// (`time_of_day_greeting_mismatch`), whose shape, single-retry budget and
+/// `guard.*` telemetry it reuses. Same family as 5c/5d/5e/5f/5g: the defect is
+/// the shape of the agent's own text against a load-bearing product invariant.
+pub(crate) const TESTIMONY_ACCESS_PROPOSAL_LABEL: &str = "testimony_access_proposal";
+
 /// Structured result of a testimony-grade access-proposal detection.
 ///
 /// Jumelle of [`FalseLocalHostingMatch`] and [`FrequencyPromiseMatch`]: the two
 /// fields are what the phase-2 telemetry line will carry, so the guard can name
 /// *what* matched rather than only *that* something did.
-#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
 pub(crate) struct TestimonyAccessProposalMatch {
     /// The testimony-grade subject captured by Layer A (e.g. `ta boîte Gmail`).
     pub(crate) subject: String,
@@ -1853,7 +1858,15 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
 /// rather than by convention (mika#1960 V4). `#[allow(dead_code)]` is what tells
 /// the compiler so; the wiring, the re-prompt, the telemetry and the regression
 /// eval are phase 2.
-#[allow(dead_code)] // mika#1960 phase 1 — no production caller, by design (V4).
+///
+/// # Phase 2 armed it, and V4 inverted with it
+///
+/// Phase 2 wires this at position 5h of `run_loop`'s EndTurn chain, so the five
+/// `#[allow(dead_code)]` of phase 1 are gone: the chain is reachable, and leaving
+/// one would be an annotation that lies. V4 now requires **exactly one**
+/// production call site — "shipped disarmed" and "armed in passing" returned
+/// identical bytes before, and it is now "armed" and "wired twice" that must stay
+/// separable (RK6).
 pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAccessProposalMatch> {
     // Every contraction the three layers and the refusal markers read is
     // written with the ASCII apostrophe; a model writes U+2019 as readily, and
@@ -1898,7 +1911,6 @@ pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAc
 /// response — that is the measured shape of the founding incident — and
 /// stopping at the first *syntactic* match would let a suppressed one mask a
 /// real violation further down.
-#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
 fn first_surviving_testimony_proposal(
     text: &str,
     re: &regex::Regex,
@@ -1929,7 +1941,6 @@ fn first_surviving_testimony_proposal(
 
 /// Whether the sentence enclosing `[start, end)` disqualifies the match: it is a
 /// question, it discusses the doctrine explicitly (Layer C), or it refuses.
-#[allow(dead_code)] // mika#1960 phase 1 — see `detect_testimony_access_proposal`.
 fn testimony_sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
     let (sentence, terminator) = enclosing_sentence(text, start, end);
 

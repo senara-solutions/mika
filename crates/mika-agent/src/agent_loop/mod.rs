@@ -22,14 +22,15 @@ use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
     DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
-    RESPONSE_LANGUAGE_DRIFT_LABEL, TIME_OF_DAY_GREETING_LABEL, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
-    UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
-    asserted_unavailability_satisfied, detect_affirmative_state_claim,
+    RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL,
+    UNACKNOWLEDGED_SEND_FAILURE_LABEL, UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends,
+    assert_grounded_satisfied, asserted_unavailability_satisfied, detect_affirmative_state_claim,
     detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
     detect_fabricated_action_claim, detect_false_local_hosting_claim,
-    detect_response_language_drift, detect_time_of_day_greeting_mismatch,
-    detect_unactioned_frequency_promise, detect_unverified_callback_state_claim,
-    equivalence_claim_satisfied, undelivered_send_correction, undelivered_sends,
+    detect_response_language_drift, detect_testimony_access_proposal,
+    detect_time_of_day_greeting_mismatch, detect_unactioned_frequency_promise,
+    detect_unverified_callback_state_claim, equivalence_claim_satisfied,
+    undelivered_send_correction, undelivered_sends,
 };
 use crate::mcp::McpManager;
 use crate::messaging::MessageSender;
@@ -2979,6 +2980,129 @@ async fn run_loop(
                             label = mode.label(),
                             event = "guard.time_of_day_greeting_mismatch_uncorrected",
                             "Time-of-day greeting guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
+                    // 5h. Testimony-grade access-proposal guard (mika#1960) —
+                    // refuse a turn whose text proposes to **open** access to
+                    // testimony-grade data.
+                    //
+                    // The non-transit doctrine (mika#1798,
+                    // `crates/mika-agent/docs/non-transit-data-grade.md`) is a HARD
+                    // NO covering **both the doing and the proposing**, and its own
+                    // words are the shape this catches: "A well-meaning 'I could
+                    // help if you gave me Gmail access…' is a breach at the propose
+                    // surface, **even without a tool call**." Layers 2/3/4 of that
+                    // ticket guard the *access* surface, so until this guard the
+                    // *propose* half was Layer 1 alone — which that doc names as
+                    // the worst available state, "the fragile layer the doctrine
+                    // explicitly distrusts".
+                    //
+                    // **No contextual parameter, and that is a decision inherited
+                    // from phase 1.** 5d takes a `Deployment`, 5f a `language`,
+                    // 5g a local hour — each guards a *conditional* fact. This
+                    // doctrine is unconditional ("There is no runtime override in
+                    // v1. Not a CLI flag. Not an env var. Not a DB row."), so the
+                    // predicate threads nothing to the three callers of `run_loop`
+                    // and the three modes are covered by construction.
+                    //
+                    // Uniform across modes and **not** skipped by
+                    // `skip_remaining_guards` (#1178), for the literal reason 5c,
+                    // 5d and 5e each write at their own site: a posted PR review
+                    // grants licence to nothing. A heartbeat that spontaneously
+                    // proposes a Gmail grant is exactly as grave as a conversation
+                    // turn, and the compacted history hands it to the next one.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(TESTIMONY_ACCESS_PROPOSAL_LABEL)
+                        && let Some(proposal) = detect_testimony_access_proposal(&text)
+                    {
+                        intent_guard_retries.insert(TESTIMONY_ACCESS_PROPOSAL_LABEL);
+                        let corr_id =
+                            format!("{}:{}:testimony_access_proposal", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "testimony_access_proposal",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            matched_subject = %proposal.subject,
+                            matched_movement = %proposal.movement,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.testimony_access_proposal",
+                            "Testimony access-proposal guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        // **Two branches, and the second one is load-bearing.** Layer 1
+                        // prescribes offering operational-grade help *instead of* a bare
+                        // refusal, so a correction that only pushed towards refusing
+                        // would degrade the behaviour mika#1798 shipped — worse than the
+                        // violation it catches (RK3).
+                        let correction = format!(
+                            "[mika-engine] Your response proposes to open access to \
+                             `{subject}` (`{movement}`). That data is testimony-grade, \
+                             and the non-transit doctrine is a HARD NO on **proposing** \
+                             it as much as on doing it: opening such a surface is the \
+                             person's own sovereign decision and it is not yours to \
+                             solicit. There is no runtime override.\n\n\
+                             Rewrite your response, keeping everything else as it is, \
+                             along one of these two lines — both are correct:\n\
+                             1. Decline and name why, in the person's register: the \
+                             grade of the data decides, not the convenience of the \
+                             moment.\n\
+                             2. Decline and offer, in its place, what you CAN do \
+                             without opening anything — an operational-grade or \
+                             non-transit substitute (a reminder, a draft from what \
+                             they dictate to you, a question that narrows the need).\n\n\
+                             Naming the doctrine while declining is expected, not a \
+                             violation. What must disappear is the proposal to open \
+                             the surface.",
+                            subject = proposal.subject,
+                            movement = proposal.movement,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#1960 — the residue of 5h's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d/5e/5f/5g above: the budget
+                    // is spent, the proposal goes out, and without this event that
+                    // population would be indistinguishable from a healthy turn —
+                    // the hole the mika#1574 Fire-Disposition gate exists to close.
+                    // It is **not** a second correction: the family grants one
+                    // re-prompt, and a guard diverging from its neighbours on that
+                    // point would become the one everybody re-reads to find out
+                    // why. Expected regime: zero lines.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(TESTIMONY_ACCESS_PROPOSAL_LABEL)
+                        && let Some(proposal) = detect_testimony_access_proposal(&text)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            matched_subject = %proposal.subject,
+                            matched_movement = %proposal.movement,
+                            label = mode.label(),
+                            event = "guard.testimony_access_proposal_uncorrected",
+                            "Testimony access-proposal guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
                     }
