@@ -3454,7 +3454,13 @@ _set_up_worktree() {
             # diagnostic so the operator sees WHY instead of a silent exit-128 trap.
             local wt_err_1="/tmp/wt-add-1-err.$$" wt_err_2="/tmp/wt-add-2-err.$$"
             local wt_add_ok=0
-            if git -C "$SUB_REPO_DIR" ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+            # mika#2626: ce site posait DÉJÀ la bonne question — c'est l'autre
+            # moitié qui en déduisait la réponse d'une ref locale. Il délègue
+            # maintenant au lecteur unique, sans changer de valeur de vérité :
+            # l'issue indéterminée (rc 2, le distant n'a pas répondu) rend `if`
+            # faux, exactement comme l'échec en rc 128 d'`ls-remote --exit-code`
+            # le faisait ici, donc on retombe sur origin/main comme avant.
+            if _remote_branch_exists "$SUB_REPO_DIR" "$BRANCH"; then
                 git -C "$SUB_REPO_DIR" fetch origin "$BRANCH" 2>/dev/null || true
                 if git -C "$SUB_REPO_DIR" worktree add -b "$BRANCH" "$WORKTREE_DIR" "origin/$BRANCH" 2>"$wt_err_1"; then
                     wt_add_ok=1
@@ -5758,6 +5764,68 @@ _check_pilot_force_push() {
     return 1
 }
 
+# `_remote_branch_exists <repo_dir> <branch>` — le distant porte-t-il cette
+# branche, MAINTENANT ? (mika#2626)
+#
+# Lecteur UNIQUE de ce fait. Deux sites le posaient, par deux prédicats
+# différents : `_set_up_worktree` demandait au distant (`ls-remote`) et
+# `_push_branch` demandait à la ref de suivi LOCALE (`rev-parse --verify
+# origin/$BRANCH`). Le 2026-10-01, dans le MÊME dispatch, les deux ont répondu
+# différemment — « absente » pour le worktree, basé sur origin/main, et
+# « présente » pour le push, qui en a déduit `diverged`, a posé un
+# `--force-with-lease` sur une ref que personne n'avait avancée, et a laissé
+# 90,40 USD de travail local-only. C'est le motif que la maison a documenté deux
+# fois : mika#2158 (promotion et routage de dispatch répondaient différemment à
+# la même question, pendant des mois, sans que rien casse) et mika#2484 (une
+# divergence à quatre étapes d'écart dans le même handler).
+#
+# Une ref de suivi LOCALE ne répond PAS à cette question. `fetch origin
+# "$BRANCH"` ne l'élague jamais, et `--prune` n'y change rien — mesuré sur git
+# 2.53.0 : git échoue d'abord sur `couldn't find remote ref`, donc le prune
+# n'est jamais atteint, et la ref orpheline est encore là après. Seul `fetch
+# --prune origin` NU élague, et il est écarté pour trois raisons dont la
+# troisième décide : il fetche toutes les branches du dépôt à chaque dispatch ;
+# il mute les refs de suivi du common dir, partagé par tous les worktrees du
+# checkout, donc il prunerait aussi celles d'autres dispatches en vol ; et il ne
+# répond pas à la question posée — `ls-remote` la pose directement, pruner est
+# un moyen détourné d'y répondre en modifiant l'état local.
+#
+# TROIS issues, et la sémantique du rc est CONTRACTUELLE, pas observée par
+# accident (`git ls-remote --help` : « Exit with status "2" when no matching
+# refs are found in the remote repository. Usually the command exits with status
+# "0" to indicate it successfully talked with the remote repository ») :
+#
+#   rc de ls-remote --exit-code | rend | sens
+#   ---------------------------- | ---- | ------------------------------------
+#   0                            | 0    | PRÉSENTE
+#   2                            | 1    | ABSENTE
+#   autre (128, …)               | 2    | INDÉTERMINÉE — le distant n'a pas répondu
+#
+# L'issue indéterminée est NOMMÉE plutôt que choisie par défaut : l'appelant
+# retombe sur le prédicat d'aujourd'hui (la ref de suivi locale). C'est la règle
+# maison « un signal qu'on ne peut pas lire n'est jamais un terme satisfait »
+# (mika#2277) appliquée dans les DEUX sens — traiter un réseau coupé comme
+# « absente » serait affirmer une mesure qu'on n'a pas faite, et pousser en
+# first-push sur une branche que le distant porte peut-être. Le coût du repli
+# est borné, et il est exactement le comportement courant.
+#
+# Le répertoire est un ARGUMENT : les deux appelants n'opèrent pas sur le même
+# ($SUB_REPO_DIR pour le setup du worktree, $WORKTREE_DIR pour le push).
+#
+# NE PAS unifier avec les deux autres `ls-remote` du fichier
+# (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`) : ils lisent le SHA, pas
+# l'existence. Question différente, prédicat différent.
+_remote_branch_exists() {
+    local repo_dir="$1" branch="$2"
+    local rc=0
+    git -C "$repo_dir" ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
 _push_branch() {
     # Canonical push step in dispatch-lib's git workflow (mika#1271 contract
     # refactor; introduced as _post_flight_push in mika#1268). After
@@ -5797,10 +5865,98 @@ Push: SKIPPED — duplicate-commit guard detected patch-equivalent commits on br
     #
     # Branch on remote-ref existence (F1 fix from architect review on mika#1268):
     # Determine push mode: first-push, fast-forward, or diverged (mika#1364).
+    #
+    # mika#2626: l'existence de la branche sur le distant est établie en
+    # DEMANDANT AU DISTANT, jamais en lisant la ref de suivi locale. Cette
+    # ligne demandait `rev-parse --verify "origin/$BRANCH"`, et une ref orpheline
+    # — la branche d'une phase précédente, supprimée par la forge au merge de sa
+    # PR, jamais élaguée du checkout partagé — y répondait OUI. Le lease partait
+    # alors sur un SHA que le distant ne portait plus, échouait en `stale info`,
+    # et le travail restait local. Le lecteur et son raisonnement complet :
+    # `_remote_branch_exists` ci-dessus.
     local push_mode="first-push"
-    if git -C "$WORKTREE_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    local remote_rc=0
+    _remote_branch_exists "$WORKTREE_DIR" "$BRANCH" || remote_rc=$?
+
+    # La ref de suivi locale est lue pour ce qu'elle est : un fait LOCAL, qui
+    # sert à nommer l'anomalie et à borner le bloc ci-dessous, jamais à conclure
+    # sur le distant.
+    local local_ref_sha=""
+    local_ref_sha=$(git -C "$WORKTREE_DIR" rev-parse --verify "origin/$BRANCH" 2>/dev/null || true)
+
+    # DEUX drapeaux, et le second n'est pas un luxe : `remote_has_branch` répond
+    # « faut-il traiter ce distant comme portant la branche ? » (une décision, qui
+    # retombe sur le prédicat local quand on n'a pas pu mesurer), tandis que
+    # `remote_known_absent` répond « l'absence a-t-elle été MESURÉE ? » (un fait).
+    # Les confondre ferait dire au diagnostic « remote has no branch » sur un
+    # `ls-remote` qui n'a pas répondu — c'est-à-dire affirmer une mesure qu'on n'a
+    # pas faite, le défaut mika#2304 que ce ticket existe pour fermer, reproduit
+    # une cellule plus loin. Seul le bras `1)` arme ce second drapeau.
+    local remote_has_branch=0
+    local remote_known_absent=0
+    case "$remote_rc" in
+        0) remote_has_branch=1 ;;
+        1) remote_has_branch=0; remote_known_absent=1 ;;
+        *)
+            # INDÉTERMINÉE : le distant n'a pas répondu. On retombe sur le
+            # prédicat d'aujourd'hui et on le DIT — un repli silencieux se
+            # lirait comme une mesure.
+            #
+            # Forme `if` plutôt que `[ … ] && x=y`, et la raison est mesurée
+            # plutôt que supposée : les handlers sourcent ce fichier sous
+            # `set -e`, où une telle chaîne rend non-zéro quand le test échoue.
+            # Elle TRAVERSE à cette position — une liste `&&` au milieu d'une
+            # fonction est exemptée — et elle mordrait si un éditeur la
+            # déplaçait en dernière commande de fonction, où son rc devient
+            # celui de la fonction (mesuré : rc=1). La forme `if` retire la
+            # question au lieu de la faire dépendre de la position de la ligne.
+            if [ -n "$local_ref_sha" ]; then remote_has_branch=1; fi
+            echo "push_branch: remote existence undetermined for $BRANCH (ls-remote rc=$remote_rc) — falling back to the local tracking ref (mika#2626)" >&2
+            # …et dans le RESULT, pour la MÊME raison que la ligne `Stale-ref:`
+            # plus bas : le stderr d'avant-pilote est structurellement perdu sur
+            # un dispatch qui réussit (classe mika#2050), donc une ligne qui n'y
+            # vit que sur stderr n'est lue par personne. Ce chemin est le seul
+            # où l'ancien prédicat décide encore du mode, et quand la ref
+            # orpheline égale HEAD le court-circuit `ahead == 0` rend 0 sans
+            # écrire une seule ligne — un silence total là où le réseau a
+            # échoué. Citer la doctrine pour une ligne et l'ignorer pour sa
+            # sœur, c'était la citer sans l'appliquer.
+            RESULT="${RESULT}
+Remote-probe: existence of origin/$BRANCH could not be measured (ls-remote rc=$remote_rc) — push mode decided from the local tracking ref (mika#2626)"
+            ;;
+    esac
+
+    # mika#2626 R-c, première moitié : une ref de suivi locale que le distant ne
+    # porte plus est une anomalie d'hygiène du checkout partagé, et elle est
+    # nommée MÊME QUAND LE PUSH ABOUTIT — c'est ce qui permettra de compter la
+    # population avant de décider s'il faut l'élaguer (suivi nommé au plan).
+    # La ligne va dans le RESULT et pas seulement sur stderr : le stderr
+    # d'avant-pilote est structurellement perdu sur un dispatch qui réussit
+    # (classe mika#2050, Signaux M et Q), donc une surface que personne ne lit
+    # reproduirait ce défaut-là.
+    if [ "$remote_has_branch" -eq 0 ] && [ -n "$local_ref_sha" ]; then
+        echo "push_branch: stale local tracking ref origin/$BRANCH at $local_ref_sha — remote has no such branch (mika#2626)" >&2
+        RESULT="${RESULT}
+Stale-ref: origin/$BRANCH points at $local_ref_sha locally but the remote has no such branch (mika#2626) — pushing as first-push"
+    fi
+
+    # Deux termes, et la CONJONCTION est le correctif. Le premier est la question
+    # réellement posée (le distant porte-t-il la branche ?). Le second est que la
+    # ref de suivi locale existe, puisque tout le bloc ci-dessous la LIT
+    # (`origin/$BRANCH..HEAD`, `merge-base --is-ancestor`) : un distant qui porte
+    # la branche sans ref locale correspondante — fetch partiel — entrerait sinon
+    # dans un bloc qui compte contre une ref absente, rendrait ahead=0 et
+    # produirait un `return 0` muet. Sur l'issue indéterminée les deux termes se
+    # réduisent au prédicat d'aujourd'hui, par construction.
+    if [ "$remote_has_branch" -eq 1 ] && [ -n "$local_ref_sha" ]; then
         # Existing-remote case — state (a)/(b). Push only if HEAD is ahead of
         # the remote-tracking branch; ahead==0 is state (a), a clean no-op.
+        #
+        # mika#2626: ce court-circuit vit SOUS la branche « distant présent »,
+        # et c'est la seconde moitié silencieuse du défaut. Sur un distant
+        # absent, `origin/$BRANCH..HEAD` compte contre une ref orpheline et peut
+        # rendre 0 alors qu'il y a tout à pousser : un correctif qui n'aurait
+        # déplacé que le choix de mode aurait laissé cette population en no-op.
         local ahead
         ahead=$(git -C "$WORKTREE_DIR" rev-list "origin/$BRANCH..HEAD" --count 2>/dev/null || echo 0)
         [ "${ahead:-0}" -eq 0 ] && return 0
@@ -5863,7 +6019,34 @@ Push: pushed to origin/$BRANCH (mode=$push_mode)"
         # After the retry-with-rebase loop, if we still see race-shaped errors,
         # the retry either exhausted or the rebase failed — either way, the
         # commits are stranded and the FAILED semantics stand.
-        if grep -q -- "stale info\|expected old/new\|failed to push" <<<"$push_err_content"; then
+        #
+        # mika#2626 R-c, seconde moitié (AC4) : cette classification est
+        # CONDITIONNÉE à l'existence distante. « remote advanced since fetch »
+        # était un énoncé FAUX sur l'incident du 2026-10-01 — le distant ne
+        # portait aucune ref, donc rien n'avait pu avancer — et un message qui
+        # affirme avec autorité ce qui n'a pas eu lieu est la classe mika#2304.
+        # Le qualificatif de ref orpheline est conditionnel : un vrai first-push
+        # rejeté n'en a pas, et lui en prêter une serait le même défaut inversé.
+        #
+        # Forme `if` plutôt que `[ … ] && x=y`, même raison mesurée qu'au site
+        # de résolution du mode ci-dessus, et elle pèse plus ici : ce bloc est
+        # sur le chemin de RÉCUPÉRATION d'un push échoué, donc l'endroit du
+        # fichier où une mort au déplacement coûterait le plus cher.
+        #
+        # Le prédicat est `remote_known_absent`, jamais `remote_has_branch` : sur
+        # un `ls-remote` qui n'a pas répondu, l'absence n'a pas été mesurée, et
+        # cette ligne retomberait alors sur le message d'avant le correctif —
+        # qui n'affirme rien de non mesuré. Les deux sites au-dessus lisent bien
+        # `remote_has_branch`, eux : ils portent un second terme
+        # (`-n "$local_ref_sha"`) qui les rend justes des deux côtés.
+        local orphan_note=""
+        if [ -n "$local_ref_sha" ]; then
+            orphan_note=" (local origin/$BRANCH is a stale tracking ref at $local_ref_sha)"
+        fi
+        if [ "$remote_known_absent" -eq 1 ]; then
+            RESULT="${RESULT}
+Push: FAILED — remote has no branch $BRANCH${orphan_note}; commits remain local-only on $BRANCH"
+        elif grep -q -- "stale info\|expected old/new\|failed to push" <<<"$push_err_content"; then
             RESULT="${RESULT}
 Push: FAILED — remote advanced since fetch (lease aborted); commits remain local-only on $BRANCH"
         else
