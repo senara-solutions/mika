@@ -238,9 +238,15 @@ async fn mika1833_the_founding_livelock_no_longer_recurs() {
         seed_chunk_subject(&db, chunk_id, subject).await;
     }
 
-    // Un modèle de résolution EST configuré — c'est la condition qui rendait
-    // `SkippedNoLlm` (qui, lui, draine) inatteignable, et donc l'interblocage
-    // possible. Ici il n'a pas à être appelé : la phase ne démarre pas.
+    // Ce résolveur est construit SANS modèle de résolution (`llm = None`). Ce
+    // n'est donc pas le chemin fondateur exact — en production un modèle EST
+    // configuré, ce qui rend `SkippedNoLlm` inatteignable et l'escalade en
+    // `SkippedBudget` possible. Ce que ce test épingle est plus étroit et
+    // suffit : avant le correctif, `resolve_pending(0)` sélectionnait quand
+    // même ces entités et, faute de modèle, les drainait en `SkippedNoLlm` en
+    // écrivant une ligne `kg_resolutions_log` — ce sont les assertions
+    // d'absence de ligne ci-dessous qui rougissent sur l'ancien code. Après le
+    // correctif la phase ne démarre pas : aucune sélection, aucune écriture.
     let stats = resolver(&db)
         .resolve_pending(0)
         .await
@@ -248,9 +254,9 @@ async fn mika1833_the_founding_livelock_no_longer_recurs() {
 
     assert!(
         !stats.aborted_budget,
-        "mika#1833 — c'est l'assertion qui échoue avant le correctif : \
-         l'ancien chemin sélectionnait 50 entités, escaladait celle à 0.9 en \
-         Stage-2 et posait `aborted_budget = true` sans rien écrire"
+        "mika#1833 — une phase désarmée n'a rien consommé : `aborted_budget` \
+         décrit un budget épuisé en route, pas une phase que l'opérateur a \
+         coupée"
     );
     assert_eq!(stats.llm_calls, 0);
 
