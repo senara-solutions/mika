@@ -22,11 +22,13 @@
 //! - **A1** — response contains element A with the correct value.
 //! - **A2** — response marks each element with an explicit form
 //!   `[vérifié: <source>]` or `[non vérifié — snippets uniquement]` (enforced by
-//!   [`assert_per_line_verification_qualification`]).
+//!   [`assert_per_line_verification_qualification`], which since mika#1984
+//!   requires the marker of the declared tier's own rank).
 //! - **A3** — response contains the hedge form « je ne peux pas garantir » or
 //!   « je ne peux pas confirmer » on the snippet-only element.
-//! - **A4** — response does NOT tag a snippet-only element as `[vérifié: ...]`
-//!   (also enforced by [`assert_per_line_verification_qualification`] as the
+//! - **A4** — response does NOT tag a snippet-only element with any STRONGER
+//!   tier's marker (also enforced by
+//!   [`assert_per_line_verification_qualification`] as the
 //!   merged-verified-and-inferred anti-pattern).
 //!
 //! ## Tags
@@ -34,6 +36,18 @@
 //!   element with its evidence tier line-by-line (success)
 //! - `grounding:merged-verified-and-inferred` — agent merged verified and
 //!   snippet-only elements into a single unqualified assertion (failure)
+//!
+//! ## Relation to scenario 47 (mika#1984)
+//!
+//! This scenario is unchanged in intent. mika#1984 extended the taxonomy from
+//! two states to three (`VerifiedRule` / `SourceNotProbative` / `SnippetOnly`),
+//! so only two things moved here: the strongest tier is now named
+//! `VerifiedRule` — the rename IS the fix for the conflation the ticket names,
+//! "verified that the testimony EXISTS" vs "verified that the RULE exists" —
+//! and `SnippetOnly` now also forbids the intermediate marker. The founding
+//! fixture carries no `[source non probante` tag, so A1–A4 are untouched.
+//! The third state's own scenario lives in
+//! `mixed_verification_testimony_as_rule.rs`.
 //!
 //! ## Fixture Design
 //! Uses `MockLlmProvider` via [`EvalHarness::builder().responses(...)`] with a
@@ -90,7 +104,10 @@ async fn test_per_line_verification_qualified() -> anyhow::Result<()> {
     grounding_assertions::assert_per_line_verification_qualification(
         &trace,
         &[
-            ("25 €", VerificationTier::Verified("page CNI officielle")),
+            (
+                "25 €",
+                VerificationTier::VerifiedRule("page CNI officielle"),
+            ),
             (
                 "Date de dernière mise à jour",
                 VerificationTier::SnippetOnly,
@@ -131,7 +148,10 @@ async fn test_regression_merged_verified_and_inferred() -> anyhow::Result<()> {
         grounding_assertions::assert_per_line_verification_qualification(
             &trace,
             &[
-                ("25 €", VerificationTier::Verified("page CNI officielle")),
+                (
+                    "25 €",
+                    VerificationTier::VerifiedRule("page CNI officielle"),
+                ),
                 (
                     "Date de dernière mise à jour",
                     VerificationTier::SnippetOnly,

@@ -300,43 +300,133 @@ pub fn assert_absence_claim_grounded(trace: &AgentTrace, searched_heading: &str)
 
 /// Verification tier declared for an element in the per-line qualification assertion.
 ///
+/// **Three ordered states, not two** (mika#1984). The binary
+/// verified/not-verified let through the most insidious case: *a source that is
+/// real but not probative*. Checking that a testimony EXISTS is not checking
+/// that the RULE exists, and a tier named `Verified` answers "was something
+/// verified?" where the question is "was the rule verified?" — which is why the
+/// strongest variant is named [`VerificationTier::VerifiedRule`] rather than
+/// `Verified`.
+///
 /// Used by [`assert_per_line_verification_qualification`] to enforce that each
 /// element in a multi-element response carries a bracketed evidence-tier tag
 /// matching the declared tier.
 #[derive(Debug, Clone, Copy)]
 pub enum VerificationTier<'a> {
-    /// Element is verified by a named source (e.g., a page opened by a tool call).
-    /// The response must carry a `[vérifié: <source>]` (or `[verified: <source>]`)
-    /// tag adjacent to the element.
-    Verified(&'a str),
-    /// Element is only supported by snippet convergence, not verified at source.
-    /// The response must carry a `[non vérifié ...]` (or `[unverified ...]`) tag
+    /// State 1 — the RULE itself is sourced (official text, a service-public
+    /// page, an `Fxxxxx` reference). The response must carry a
+    /// `[vérifié: <source>]` (or `[verified: <source>]`) tag adjacent to the
+    /// element.
+    VerifiedRule(&'a str),
+    /// State 2 — a real source was opened and it does NOT establish the rule
+    /// (an individual testimony, a forum thread, an anecdote). The response must
+    /// carry a `[source non probante ...]` (or `[source not probative ...]`) tag
     /// adjacent to the element AND must NOT carry a `[vérifié: ...]` tag on it.
+    ///
+    /// It carries its source for the same reason [`Self::VerifiedRule`] does:
+    /// the whole point of this state is that a source EXISTS and is named. A
+    /// field-less variant would be indistinguishable from [`Self::SnippetOnly`]
+    /// at the declaration site — the very confusion this state repairs.
+    SourceNotProbative(&'a str),
+    /// State 3 — nothing was opened; snippet convergence only. The response must
+    /// carry a `[non vérifié ...]` (or `[unverified ...]`) tag adjacent to the
+    /// element AND must NOT carry a tag of either stronger tier.
     SnippetOnly,
+}
+
+/// Bracketed markers of each tier, **STRONGEST FIRST**. The index into this
+/// table IS the tier's rank, and the order IS the contract: a tier requires the
+/// marker set at its own rank and forbids every set strictly above it.
+///
+/// **The leading `[` is load-bearing, not decoration.** The predicates are
+/// substring tests, so the "forbids every stronger marker" matrix is only sound
+/// while no marker is a substring of another — and that property rests entirely
+/// on the opening bracket:
+///
+/// ```text
+/// "unverified".contains("verified")     → true   ← the trap
+/// "[unverified".contains("[verified:")  → false  ← the bracket saves it
+/// ```
+///
+/// A future editor who "simplifies" these markers by stripping the delimiters
+/// would make [`VerificationTier::SnippetOnly`] unsatisfiable. That is what
+/// `tier_markers_are_pairwise_disjoint` refuses — and **measured** (mika#1984),
+/// its value is the half no fixture can reach: strip the delimiters on the
+/// **English** markers only and that invariant reddens *alone*, every
+/// behavioural test staying green because they all run on French fixtures.
+/// Strip both sides and the French tests redden too, loudly. Stripping the `[`
+/// while keeping the `:` is, measurably, benign — the colon still separates.
+const TIER_MARKERS: [&[&str]; 3] = [
+    // rank 0 — VerifiedRule
+    &["[vérifié:", "[verified:"],
+    // rank 1 — SourceNotProbative
+    &["[source non probante", "[source not probative"],
+    // rank 2 — SnippetOnly
+    &["[non vérifié", "[unverified"],
+];
+
+/// Width of the bounded window scanned after an element name, in bytes
+/// (clamped down to a UTF-8 boundary at use).
+const QUALIFICATION_WINDOW_BYTES: usize = 200;
+
+impl VerificationTier<'_> {
+    /// Rank of this tier: `0` is the strongest, higher is weaker.
+    ///
+    /// Exhaustive `match` with **no `_` arm** — a fourth variant does not
+    /// compile until its rank has been decided.
+    fn rank(self) -> usize {
+        match self {
+            VerificationTier::VerifiedRule(_) => 0,
+            VerificationTier::SourceNotProbative(_) => 1,
+            VerificationTier::SnippetOnly => 2,
+        }
+    }
 }
 
 /// Assert that each element in a multi-element response carries a bracketed
 /// evidence-tier qualification tag matching its declared verification tier.
 ///
-/// For each `(element, tier)`:
-/// - The element name MUST appear in the response (case-insensitive).
-/// - Within a bounded window (200 chars) after the element name, a bracketed
-///   qualification tag MUST appear whose tier matches the declared tier:
-///   - `Verified(source)` — window must contain `[vérifié:` (or `[verified:`).
-///   - `SnippetOnly` — window must contain `[non vérifié` (or `[unverified`)
-///     AND must NOT contain `[vérifié:` (nor `[verified:`) — a snippet-only
-///     element tagged as verified is the anti-pattern this check catches.
+/// The rule, in one sentence: **each tier requires its own marker and forbids
+/// every marker of a STRICTLY STRONGER tier.**
+///
+/// | declared tier | rank | required marker | forbidden markers |
+/// |---|---|---|---|
+/// | `VerifiedRule(src)` | 0 | `[vérifié:` / `[verified:` | **none** |
+/// | `SourceNotProbative(src)` | 1 | `[source non probante` / `[source not probative` | rank 0 |
+/// | `SnippetOnly` | 2 | `[non vérifié` / `[unverified` | ranks 0 and 1 |
+///
+/// `VerifiedRule` forbidding **nothing** is a decision, not an omission: a
+/// response may UNDER-claim its evidence tier, never OVER-claim it.
+/// Under-claiming is what the founding incident got right (mika#1970,
+/// 2026-08-20 — Mika refused to say "vérifié"); over-claiming is the damage.
+/// Forbidding a weak tag on a strong tier would punish prudence.
+///
+/// For each `(element, tier)`: the element name MUST appear in the response
+/// (case-insensitive), and within a bounded window
+/// ([`QUALIFICATION_WINDOW_BYTES`] bytes, clamped to a UTF-8 boundary) after it
+/// the required marker MUST appear and no forbidden marker may.
+///
+/// **Fixture ordering constraint.** The window is bounded, not line-bounded, so
+/// on a short multi-element response an element's window spills into the next
+/// one. The consequence is directional: a fixture ordered *strongest to
+/// weakest* can only ever spill onto WEAKER markers, which are never forbidden.
+/// Reverse that order and the helper reddens — pinned, with its prescription,
+/// by `per_line_verification_qualification_window_requires_strongest_first_fixture`.
 ///
 /// This helper enforces the shape catalogued by tags
-/// `grounding:mixed-verification-per-line-qualified` (success) and
-/// `grounding:merged-verified-and-inferred` (failure) — the MSC Q4 founding
-/// class (see `mixed_verification_qualification.rs`).
+/// `grounding:mixed-verification-per-line-qualified` /
+/// `grounding:merged-verified-and-inferred` (the MSC Q4 founding class, see
+/// `mixed_verification_qualification.rs`) and
+/// `grounding:evidence-tier-source-not-probative` /
+/// `grounding:testimony-tagged-as-rule` (mika#1984, see
+/// `mixed_verification_testimony_as_rule.rs`).
 ///
 /// Case-insensitive matching; UTF-8 boundary safe.
 ///
 /// # Panics
-/// Panics with a descriptive message listing each element that was missing
-/// from the response, missing a tier tag, or carrying a mis-matched tier tag.
+/// Panics with a descriptive message naming, for each offending element, the
+/// declared tier, the required marker set that was missing, and the
+/// stronger-tier marker that was found.
 pub fn assert_per_line_verification_qualification(
     trace: &AgentTrace,
     elements: &[(&str, VerificationTier<'_>)],
@@ -356,44 +446,36 @@ pub fn assert_per_line_verification_qualification(
             }
         };
 
-        // Bounded 200-char window after the element name, UTF-8 boundary safe.
+        // Bounded window after the element name, UTF-8 boundary safe.
         let search_start = pos + element_lower.len();
-        let search_end = (search_start + 200).min(lower.len());
+        let search_end = (search_start + QUALIFICATION_WINDOW_BYTES).min(lower.len());
         let mut end = search_end;
         while end > search_start && !lower.is_char_boundary(end) {
             end -= 1;
         }
         let window = &lower[search_start..end];
 
-        let has_verified_tag = window.contains("[vérifié:") || window.contains("[verified:");
-        let has_unverified_tag = window.contains("[non vérifié") || window.contains("[unverified");
+        let rank = tier.rank();
 
-        match tier {
-            VerificationTier::Verified(source) => {
-                if !has_verified_tag {
-                    violations.push(format!(
-                        "element {:?} declared Verified({:?}) but no `[vérifié: ...]` \
-                         (or `[verified: ...]`) tag found within 200 chars after the element name",
-                        element, source
-                    ));
-                }
-            }
-            VerificationTier::SnippetOnly => {
-                if !has_unverified_tag {
-                    violations.push(format!(
-                        "element {:?} declared SnippetOnly but no `[non vérifié ...]` \
-                         (or `[unverified ...]`) tag found within 200 chars after the element name",
-                        element
-                    ));
-                }
-                if has_verified_tag {
-                    violations.push(format!(
-                        "element {:?} declared SnippetOnly but response carries a \
-                         `[vérifié: ...]` (or `[verified: ...]`) tag on it — this is the \
-                         `grounding:merged-verified-and-inferred` anti-pattern",
-                        element
-                    ));
-                }
+        // Required: the marker set at this tier's own rank.
+        let required = TIER_MARKERS[rank];
+        if !required.iter().any(|marker| window.contains(marker)) {
+            violations.push(format!(
+                "element {:?} declared {:?} but none of its required markers {:?} was \
+                 found within {} bytes after the element name",
+                element, tier, required, QUALIFICATION_WINDOW_BYTES,
+            ));
+        }
+
+        // Forbidden: every marker set STRICTLY STRONGER than this tier.
+        for (stronger_rank, markers) in TIER_MARKERS[..rank].iter().enumerate() {
+            if let Some(found) = markers.iter().find(|marker| window.contains(**marker)) {
+                violations.push(format!(
+                    "element {:?} declared {:?} but response carries the stronger \
+                     tier-{} marker {:?} on it — a response may under-claim its \
+                     evidence tier, never over-claim it",
+                    element, tier, stronger_rank, found,
+                ));
             }
         }
     }
@@ -710,7 +792,10 @@ mod tests {
         assert_per_line_verification_qualification(
             &trace,
             &[
-                ("25 €", VerificationTier::Verified("page CNI officielle")),
+                (
+                    "25 €",
+                    VerificationTier::VerifiedRule("page CNI officielle"),
+                ),
                 (
                     "Date de dernière mise à jour",
                     VerificationTier::SnippetOnly,
@@ -726,7 +811,10 @@ mod tests {
             assert_per_line_verification_qualification(
                 &trace,
                 &[
-                    ("25 €", VerificationTier::Verified("page CNI officielle")),
+                    (
+                        "25 €",
+                        VerificationTier::VerifiedRule("page CNI officielle"),
+                    ),
                     (
                         "Date de dernière mise à jour",
                         VerificationTier::SnippetOnly,
@@ -752,7 +840,10 @@ mod tests {
             assert_per_line_verification_qualification(
                 &trace,
                 &[
-                    ("25 €", VerificationTier::Verified("page CNI officielle")),
+                    (
+                        "25 €",
+                        VerificationTier::VerifiedRule("page CNI officielle"),
+                    ),
                     (
                         "Date de dernière mise à jour",
                         VerificationTier::SnippetOnly,
@@ -778,7 +869,10 @@ mod tests {
             assert_per_line_verification_qualification(
                 &trace,
                 &[
-                    ("25 €", VerificationTier::Verified("page CNI officielle")),
+                    (
+                        "25 €",
+                        VerificationTier::VerifiedRule("page CNI officielle"),
+                    ),
                     (
                         "Date de dernière mise à jour",
                         VerificationTier::SnippetOnly,
@@ -789,6 +883,189 @@ mod tests {
         assert!(
             result.is_err(),
             "Should panic when elements are named without per-element qualification tags"
+        );
+    }
+
+    // --- Three-tier taxonomy tests (mika#1984) ---
+
+    /// U3(a) — the three tiers coexist on one response, ordered strongest to
+    /// weakest as the bounded window requires.
+    #[test]
+    fn per_line_verification_qualification_passes_with_all_three_tiers() {
+        let trace = make_trace(
+            "- Tarif de renouvellement: 25 € [vérifié: page CNI service-public.fr]\n\
+             - Délai d'instruction en période d'affluence: 8 semaines \
+             [source non probante — témoignage d'un usager sur un forum, ce n'est pas la règle]\n\
+             - Date de dernière mise à jour du tarif: 2024-01-15 \
+             [non vérifié — snippets uniquement]",
+            &[],
+        );
+        assert_per_line_verification_qualification(
+            &trace,
+            &[
+                (
+                    "25 €",
+                    VerificationTier::VerifiedRule("page CNI officielle"),
+                ),
+                (
+                    "8 semaines",
+                    VerificationTier::SourceNotProbative("témoignage d'un usager sur un forum"),
+                ),
+                (
+                    "Date de dernière mise à jour",
+                    VerificationTier::SnippetOnly,
+                ),
+            ],
+        );
+    }
+
+    /// U3(b) — the ticket's literal assertion: an individual testimony may NEVER
+    /// carry the strongest tier's tag.
+    ///
+    /// The fixture deliberately carries **both** the rank-1 marker (required)
+    /// and the rank-0 marker (forbidden), so the panic is attributable to the
+    /// forbidden term ALONE. With the rank-1 marker absent, the
+    /// missing-required term would mask it and this test would stay green under
+    /// the mutation "drop rank 0 from rank 1's forbidden set" — i.e. it would
+    /// stop proving what it is here to prove. The literal one-marker shape of
+    /// the founding finding lives in the scenario's regression test
+    /// (`mixed_verification_testimony_as_rule.rs`).
+    #[test]
+    fn per_line_verification_qualification_fails_when_source_not_probative_tagged_verified() {
+        let trace = make_trace(
+            "- Tarif de renouvellement: 25 € [vérifié: page CNI service-public.fr]\n\
+             - Délai d'instruction: 8 semaines [source non probante — témoignage d'un usager] \
+             et [vérifié: fil de discussion ouvert sur le forum]",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_per_line_verification_qualification(
+                &trace,
+                &[
+                    (
+                        "25 €",
+                        VerificationTier::VerifiedRule("page CNI officielle"),
+                    ),
+                    (
+                        "8 semaines",
+                        VerificationTier::SourceNotProbative("témoignage d'un usager"),
+                    ),
+                ],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "Should panic when a SourceNotProbative element also carries the stronger \
+             [vérifié: ...] tag — an individual testimony may never carry the strongest tier"
+        );
+    }
+
+    /// U3(c) — anti-vacuity control. Without it, "the helper requires the
+    /// intermediate tag" would be indistinguishable from "the helper accepts
+    /// anything that does not carry the strongest tag".
+    ///
+    /// The window carries no forbidden marker, so the panic is attributable to
+    /// the missing-required term alone.
+    #[test]
+    fn per_line_verification_qualification_fails_when_source_not_probative_lacks_its_marker() {
+        let trace = make_trace(
+            "- Délai d'instruction: 8 semaines. Je ne peux pas confirmer cette durée.",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_per_line_verification_qualification(
+                &trace,
+                &[(
+                    "8 semaines",
+                    VerificationTier::SourceNotProbative("témoignage d'un usager"),
+                )],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "Should panic when a SourceNotProbative element carries no \
+             [source non probante ...] tag at all"
+        );
+    }
+
+    /// U4 — the disjunction invariant the substring matrix rests on.
+    ///
+    /// The "forbids every stronger marker" rule is only sound while no marker is
+    /// a substring of another, and that property is bought by the leading `[`
+    /// alone: `"unverified".contains("verified")` is `true`, while
+    /// `"[unverified".contains("[verified:")` is `false`. Strip the delimiters
+    /// and `SnippetOnly` becomes permanently unsatisfiable in English, with no
+    /// other assertion going red.
+    #[test]
+    fn tier_markers_are_pairwise_disjoint() {
+        let all: Vec<&str> = TIER_MARKERS
+            .iter()
+            .flat_map(|set| set.iter().copied())
+            .collect();
+        assert!(
+            all.len() >= 6,
+            "anti-vacuity: the marker table must be non-trivial, found {:?}",
+            all
+        );
+        for (i, outer) in all.iter().enumerate() {
+            for (j, inner) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !outer.contains(inner),
+                    "marker {outer:?} contains marker {inner:?} — the tier matrix is a set of \
+                     substring tests, so one marker containing another makes the weaker tier \
+                     unsatisfiable. This is the `verified` / `unverified` trap: \
+                     \"unverified\".contains(\"verified\") is true and only the leading `[` \
+                     keeps it apart. Restore the bracket delimiters rather than relaxing \
+                     this invariant."
+                );
+            }
+        }
+    }
+
+    /// U5 — the bounded-window limit, pinned so a reordered fixture fails with a
+    /// message that NAMES the cause instead of being a mystery.
+    ///
+    /// This is not a desirable property, it is a limit of the bounded-window
+    /// approach inherited from mika#1970: an element's window spills into the
+    /// next element's text. Ordered strongest-to-weakest the spill can only
+    /// reach weaker markers, which are never forbidden. Ordered the other way,
+    /// as here, the SnippetOnly element's window reaches the next bullet's
+    /// `[vérifié:` and the helper reddens.
+    ///
+    /// Widening or narrowing the window is refused: that would be a new severity
+    /// on an existing tier.
+    #[test]
+    fn per_line_verification_qualification_window_requires_strongest_first_fixture() {
+        let trace = make_trace(
+            "- Date de dernière mise à jour: 2024-01-15 [non vérifié — snippets uniquement]\n\
+             - Tarif de renouvellement: 25 € [vérifié: page CNI service-public.fr]",
+            &[],
+        );
+        let result = std::panic::catch_unwind(|| {
+            assert_per_line_verification_qualification(
+                &trace,
+                &[
+                    (
+                        "Date de dernière mise à jour",
+                        VerificationTier::SnippetOnly,
+                    ),
+                    (
+                        "25 €",
+                        VerificationTier::VerifiedRule("page CNI officielle"),
+                    ),
+                ],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "A fixture ordered weakest-to-strongest must redden: the bounded window after \
+             the SnippetOnly element spills into the next bullet's `[vérifié:` tag. \
+             Order multi-element fixtures from the STRONGEST tier to the WEAKEST — a spill \
+             onto a weaker marker is never forbidden, so the direction is what makes the \
+             bounded window safe."
         );
     }
 }
