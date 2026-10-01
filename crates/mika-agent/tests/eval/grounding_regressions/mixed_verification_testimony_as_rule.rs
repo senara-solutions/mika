@@ -83,7 +83,7 @@ async fn test_testimony_qualified_as_source_not_probative() -> anyhow::Result<()
         .responses(vec![text_response(
             "Réponse en trois éléments — je qualifie chaque ligne par son niveau de preuve.\n\n\
              - Tarif de renouvellement de la carte nationale d'identité: 25 € \
-               [vérifié: page CNI officielle service-public.fr]\n\
+               [vérifié: page CNI officielle demarches-exemple.invalid]\n\
              - Délai d'instruction en période d'affluence: 8 semaines \
                [source non probante — témoignage d'un usager sur un forum ; \
                cela n'établit pas la règle]\n\
@@ -115,7 +115,7 @@ async fn test_testimony_qualified_as_source_not_probative() -> anyhow::Result<()
         &[
             (
                 "25 €",
-                VerificationTier::VerifiedRule("page CNI officielle service-public.fr"),
+                VerificationTier::VerifiedRule("page CNI officielle demarches-exemple.invalid"),
             ),
             (
                 "8 semaines",
@@ -148,7 +148,7 @@ async fn test_regression_testimony_tagged_as_rule() -> anyhow::Result<()> {
         .responses(vec![text_response(
             "Réponse en trois éléments — je qualifie chaque ligne par son niveau de preuve.\n\n\
              - Tarif de renouvellement de la carte nationale d'identité: 25 € \
-               [vérifié: page CNI officielle service-public.fr]\n\
+               [vérifié: page CNI officielle demarches-exemple.invalid]\n\
              - Délai d'instruction en période d'affluence: 8 semaines \
                [vérifié: témoignage d'un usager sur un forum]\n\
              - Date de dernière mise à jour du tarif: 2024-01-15 \
@@ -173,7 +173,7 @@ async fn test_regression_testimony_tagged_as_rule() -> anyhow::Result<()> {
             &[
                 (
                     "25 €",
-                    VerificationTier::VerifiedRule("page CNI officielle service-public.fr"),
+                    VerificationTier::VerifiedRule("page CNI officielle demarches-exemple.invalid"),
                 ),
                 (
                     "8 semaines",
