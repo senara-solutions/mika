@@ -242,9 +242,145 @@ Optional (Knowledge Graph LLM):
 - `MIKA_KG_INGESTION_MODEL` — Shared fallback model for KG extraction and resolution. Format: `provider/model`. **OpenRouter is recommended** — Anthropic direct is ~10× more expensive for bulk NER and triggers a `kg_anthropic_provider` WARN at startup. Example: `openrouter/deepseek/deepseek-v3`. If unset, KG features requiring LLM calls are disabled.
 - `MIKA_KG_EXTRACTION_MODEL` — Model for NER + fact-triple extraction (#690). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Task is mechanical JSON extraction — cheap/fast tier recommended.
 - `MIKA_KG_RESOLUTION_MODEL` — Model for entity resolution disambiguation (#691). Falls back to `MIKA_KG_INGESTION_MODEL` if unset. Mid-tier model recommended for better judgment on ambiguous matches.
-- `MIKA_KG_BATCH_BUDGET` — Per-batch LLM call cap on KG startup extraction and resolution (#757). Default `500` per #757 burst-defense invariant ("no silent multi-thousand-call bursts"). Budget is distributed fairly across corpora for both extraction (#962) and resolution (#927) using two-pass allocation (`kg::budget::allocate_fair_budget`), so array order no longer starves secondary corpora. Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch, one of each per agent). The 30-min periodic tick (#906, #1052) runs both extraction and resolution at the same budget, adding up to `2 × N_agents × budget` LLM calls per tick (48 ticks/day). Once extraction coverage reaches 100%, the tick's extraction phase is a no-op (zero pending = zero budget allocated). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next tick. `0` disables the phase entirely. Extraction idempotency uses `ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE` upsert (#1052) — NULL-hash rows and content-changed docs are re-extracted; identical-content re-extractions are no-ops. See `docs/solutions/architecture-patterns/kg-extraction-trigger-semantics-2026-05-09.md` for the full trigger model.
+- `MIKA_KG_BATCH_BUDGET` — Per-batch LLM call cap on KG startup extraction and resolution (#757). Default `500` per #757 burst-defense invariant ("no silent multi-thousand-call bursts"). Budget is distributed fairly across corpora for both extraction (#962) and resolution (#927) using two-pass allocation (`kg::budget::allocate_fair_budget`), so array order no longer starves secondary corpora. Worst-case per-startup cost is `2 × N_agents × budget` (extraction batch + resolution batch, one of each per agent). The 30-min periodic tick (#906, #1052) runs both extraction and resolution at the same budget, adding up to `2 × N_agents × budget` LLM calls per tick (48 ticks/day). Once extraction coverage reaches 100%, the tick's extraction phase is a no-op (zero pending = zero budget allocated). Overflow emits a `kg_budget_exhausted` WARN and leaves remaining work for the next tick. **`0` disables the phase entirely — literally, and for both phases, since mika#1833** : le court-circuit précède **toute** requête, les requêtes de comptage comprises, et `aborted_budget` reste **faux** (une phase que l'opérateur a désarmée n'a rien consommé). Cette phrase était **fausse pour la résolution** avant ce correctif : le Stage-2 était bloqué pendant que le Stage-1 continuait, et l'écart **interbloquait** la file au lieu de la vider — un exact match à la confiance modale `0.9` ne passe pas le seuil `> 0.9` strict, escalade en Stage-2, y est jeté sans qu'aucune ligne `kg_resolutions_log` soit écrite, donc la même tête de file revient au tick suivant (mesuré le 2026-07-26 sur chaque agent : `pending` 1288-1493, `resolved_in_tick: 0`, `duration_ms` 26000-48000, `aborted_budget: true`, `llm_calls: 0`). **Le mode exact-match-seul a son levier propre, et c'est celui qui termine** : ne configurer **aucun** modèle de résolution (laisser `MIKA_KG_RESOLUTION_MODEL` et `MIKA_KG_INGESTION_MODEL` absents) — les matches au-dessus du seuil résolvent, tout le reste draine en `skipped_no_llm`, et la file se vide. **Coût du changement, nommé :** un opérateur qui avait posé `0` pour obtenir ce mode le perd ; le remède est le levier ci-dessus. Le budget réellement en vigueur est dit une fois par agent et par démarrage par `kg_budget_resolved` (champs `budget`, `budget_source` ∈ `{config, default}`, `kg_enabled`, `resolution_armed`, `extraction_armed`, `resolution_model_configured`), et son **absence** signifie « binaire antérieur au correctif » (classe mika#2340), jamais « le budget va bien ». Extraction idempotency uses `ON CONFLICT(docs_root_hash, source_doc_path) DO UPDATE` upsert (#1052) — NULL-hash rows and content-changed docs are re-extracted; identical-content re-extractions are no-ops. See `docs/solutions/architecture-patterns/kg-extraction-trigger-semantics-2026-05-09.md` for the full trigger model.
 - `MIKA_KG_DOCS_ROOT` — Absolute path to the docs root the `LexicalIngestor` reads (#738). Defaults to `<CWD>/docs/solutions` when unset — works in containers where the Dockerfile copies `docs/` into the workdir. Needed on hosts where the service starts with CWD ≠ repo root (e.g., OpenRC `supervise-daemon` launches with CWD=`/`). Also settable as `kg_docs_root` in config.toml. If set to an empty string, lexical ingestion skips with a distinct warn.
 - `MIKA_KG_DOCS_ROOTS` — Optional colon-separated list of docs-root paths for multi-corpus agents (e.g., mika-arch reasoning across multiple repos). Global fallback; per-agent `[kg].docs_roots` in identity.toml takes precedence. Linux/macOS only. **Required for mika-arch in dev mode** — at provision time, `MIKA_ARCH_IDENTITY` is computed from this env so `[kg].docs_roots` always contains absolute paths (mika-spirit runs with CWD=`/` under OpenRC/systemd). When unset, mika-arch is skipped at provision with an explicit `error!` log; other well-known agents (mika-dev/qa/relay) come up normally.
+
+### STOP à chaud du tick d'ingestion KG, et la ré-activation de mika-arch (mika#1833)
+
+**Aucune variable d'environnement.** Cette entrée est ici parce que l'opérateur
+qui veut arrêter l'ingestion KG pendant un incident — ou qui veut la rendre à
+mika-arch — cherche dans le voisinage de `MIKA_KG_BATCH_BUDGET`.
+
+```bash
+mkdir -p ~/.mika/state                 # sur une installation neuve seulement
+touch ~/.mika/state/kg-tick-stop       # STOP    — effectif au tick suivant (≤ 30 min)
+rm    ~/.mika/state/kg-tick-stop       # REPRISE — idem
+```
+
+- **Troisième usage du mécanisme mika#2329**, après `auto-pull-stop` et
+  `worktree-reap-stop`. Son **existence** vaut STOP ; son contenu n'est jamais
+  lu (un fichier vide est un STOP valide). Lu **en tête du corps du tick**, avant
+  toute requête et avant la résolution du moindre modèle.
+- **Le besoin est mesuré, pas anticipé.** `auto_pull_stop.rs` refuse d'étendre
+  le mécanisme sans besoin mesuré ; un scan qui a brûlé 26 à 48 s par tick sur
+  cinq agents et affamé la boucle de développement est ce besoin. Et il satisfait
+  le critère de mika#2420 — *une décision distincte mérite un fichier distinct* :
+  arrêter l'ingestion KG n'est ni arrêter le feeder de dispatch, ni arrêter le
+  faucheur de worktrees, et aucune des trois ne se déduit d'une autre.
+- **`MIKA_KG_RESOLVER_DISABLED=1` est refusé**, et la raison est celle que
+  `auto_pull_stop.rs` a déjà dû écrire : `load_dotenv` est appelé **une fois** au
+  démarrage, et l'environnement d'un process Linux vivant n'est pas mutable de
+  l'extérieur — éditer `~/.mika/.env` ne change donc rien à ce que
+  `std::env::var` renverra, **même relu à chaque tick**.
+- **Aucune ligne n'est touchée** : le tick continue de tourner, c'est son corps
+  qui rend la main. La réversibilité est l'absence de machinerie — aucun contact
+  avec la garde anti-zombie mika#1742 ni avec l'exemption config-cancel
+  mika#2271. Le palliatif alternatif, lui, demandait d'éditer cinq
+  `identity.toml` **et** de redémarrer mika-spirit : précisément le geste qu'on
+  veut le moins poser pendant un incident.
+
+```bash
+# La sentinelle est-elle armée ? (une ligne INFO par tick court-circuité)
+grep kg_tick_stop_armed "$MIKA_SPIRIT_LOG_FILE" | jq -c '{agent_id, stop_file}'
+# …et a-t-elle été levée ? (pas de `stop_file` sur cette ligne : rien n'est plus lu)
+grep kg_tick_stop_lifted "$MIKA_SPIRIT_LOG_FILE" | jq -c '{agent_id}'
+```
+```sql
+-- Les transitions, datées — une ligne par transition, jamais par tick
+SELECT created_at, after_value FROM audit_events
+ WHERE tool_name = 'kg_tick_stop' ORDER BY created_at DESC;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `kg_tick_stop_armed` | INFO | une ligne **par tick** pendant un STOP | pour un interrupteur, la vivacité **est** l'information (doctrine mika#2329). Poser le fichier et ne pas voir la ligne sous 30 min dit que le lecteur regarde ailleurs que là où l'opérateur écrit — vérifier `MIKA_HOME` |
+| `kg_tick_stop_lifted` | INFO | une ligne à la reprise | le pendant du précédent |
+| `tool_name = 'kg_tick_stop'` | audit | une ligne par **transition** | `tool_name` distinct de ceux des deux autres scans, pour que les trois populations restent comptables séparément (motif mika#2156) |
+| `kg_tick_stop_audit_failed` | WARN | **vide** | la ligne INFO est passée, l'audit non — le compte SQL sous-compte alors |
+
+**Fail-open, nommé.** `Path::exists()` rend `false` sur toute erreur d'accès,
+donc un fichier illisible laisse le tick tourner. Ce qui rend l'arbitrage
+acceptable est la **visibilité**, pas le raisonnement : l'opérateur constate
+l'effet au journal en ≤ 30 min. Corollaire pour le diagnostic — le fail-open ne
+peut produire que l'inverse d'un faux positif (un STOP non vu), donc une ligne
+`kg_tick_stop_armed` **de trop** est une erreur de **chemin**, jamais de
+prédicat.
+
+#### Ré-activer le KG sur mika-arch
+
+**Ce geste n'est PAS exécuté par mika#1833, et c'est une décision :** tant que
+les sondes ci-dessous ne sont pas vertes, le palliatif du 2026-07-26 (`[kg]
+enabled = false` posé à la main dans cinq `identity.toml`) est ce qui protège la
+flotte. Aucune ligne de cette PR ne ré-active le KG sur un agent.
+
+**Le périmètre réel est mika-arch seul.** Par topologie #800, mika-dev et mika-qa
+**doivent rester désactivés** et le code les déclare déjà ainsi ; `mika` est déjà
+actif ; `mikamodel-probe` est un agent client dont l'identité appartient
+entièrement à l'opérateur. Le seul agent où le palliatif contredit la topologie
+déclarée est mika-arch. Pourquoi la déclaration du code ne l'a jamais atteint —
+et pourquoi le palliatif survit aux redémarrages : `crates/mika-agent/CLAUDE.md`
+§ *Well-known agent KG topology (#800)*.
+
+**Préalable non négociable.** Ces mesures décrivent le **binaire servi**. Après
+`make deploy`, la ligne `kg_budget_resolved` doit exister **avant toute
+conclusion** (classe mika#2340).
+
+**S0 — établir la configuration AVANT de conclure quoi que ce soit.**
+`grep kg_budget_resolved "$MIKA_SPIRIT_LOG_FILE" | jq -c '{agent_id, budget, budget_source, kg_enabled, resolution_armed, resolution_model_configured}'`.
+Un `budget: 0` avec `budget_source: "config"` confirme que **la cause est la
+configuration**, pas le graphe de domaine. *Halte 1 —* si `budget` vaut 500 en
+production, le diagnostic de mika#1833 est faux pour l'hôte courant et **tout est
+à refaire** : lire S2 avant de toucher à quoi que ce soit.
+
+**S1 — le coût a disparu (48 h).** Aucun `kg_resolver_tick.complete` avec
+`duration_ms > 20000`. *Halte 2 —* la durée reste haute : lancer `EXPLAIN QUERY
+PLAN` sur la sous-requête corrélée de `kg_chunk_subjects` et lire si
+`idx_kg_cs_entity_recent` est retenu. **Ne pas augmenter le budget par
+réflexe** — ça déplace le coût vers les appels LLM sans toucher les requêtes.
+
+**S2 — l'hypothèse « graphe de domaine vide » est tranchée (premier démarrage).**
+`grep domain_rebuild_complete "$MIKA_SPIRIT_LOG_FILE" | jq -c '{entities_total, per_type}'`,
+et le contrôle négatif `grep domain_graph_empty "$MIKA_SPIRIT_LOG_FILE"` (**régime
+attendu : vide**). **Les deux issues sont des résultats** : un compte non nul
+*réfute* l'hypothèse du ticket, un compte nul la *confirme* et ouvre un ticket sur
+`domain_builder` — avec une mesure plutôt qu'une intuition. Un
+`domain_census_unreadable` (WARN) dit que les champs de recensement ne sont **pas**
+à lire comme une mesure. *Halte 3 —* `domain_graph_empty` non vide : défaut
+**amont** de tout ceci, **ne pas ré-activer** mika-arch avant de l'avoir fermé.
+
+**S3 — le geste, uniquement après S0, S1 et S2 vertes.** Poser
+`MIKA_KG_BATCH_BUDGET=500` (ou retirer la variable) **sur l'environnement du
+service**, retirer `enabled = false` de
+`~/.mika/agents/mika-arch/identity.toml`, redémarrer. Attendu sur 24 h :
+`pending_after` décroît d'un tick au suivant, `aborted_budget` reste `false` ou
+devient `true` **avec** un `llm_calls` non nul, et `duration_ms` reste sous la
+seconde hors appels LLM. *Halte 4 —* `resolved_in_tick: 0` avec `llm_calls: 0`
+réapparaît : **le défaut fondateur est revenu**. `touch
+~/.mika/state/kg-tick-stop` — effectif en ≤ 30 min, sans redémarrage, ce qui est
+exactement ce que la sentinelle achète — **puis** diagnostiquer. *Halte 5 —* le
+coût LLM explose sur le premier drain (~1300 appels) : ce n'est pas une panne,
+c'est le seuil `> 0.9` strict, hors périmètre et nommé ci-dessous. Le mesurer et
+ouvrir le suivi ; **ne pas remettre le budget à zéro**, ce qui rouvrirait
+l'interblocage.
+
+**Halte transverse — les sondes muettes.** Zéro ligne de tick **et** zéro ligne
+de recensement ne prouve rien : il faut qu'un démarrage ait eu lieu depuis le
+déploiement et qu'un agent porte le KG actif. *Une garde que personne n'a exercée
+se lit exactement comme une garde qui marche* (mika#2205).
+
+**Ce que mika#1833 n'achète PAS.** Il ne résout aucune entité de plus par appel
+LLM : le seuil `> 0.9` **strict** continue d'envoyer au Stage-2 des exact matches
+parfaits à la confiance modale — un gaspillage réel, mesuré, et **hors
+périmètre** (le changer est une modification de la *sémantique de résolution*,
+dont la précondition est la distribution des confiances d'extraction). Il ne
+rattrape pas l'incident du 2026-07-26 : rien ne rétro-écrit une ligne décrivant
+un drain qui n'a pas eu lieu, et la sonde est la **prochaine** occurrence. Il ne
+borne pas le coût LLM du premier drain à la ré-activation (halte 5). Et il rend le
+champ **lisible**, pas **surveillé** : les seuls instruments sont les greps
+ci-dessus, et **leur silence ne prouve rien tant que personne ne les exécute** —
+sur un tick de 30 minutes, l'absence de ligne peut simplement vouloir dire
+qu'aucun agent n'a le KG actif.
 
 ### Post-restart safety check (#757)
 
