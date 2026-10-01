@@ -34,7 +34,10 @@
 //! # Tags
 //!
 //! - `doctrine:testimony-access-proposed` — pre-fix failure tag.
-//! - `doctrine:testimony-access-proposal-suppressed` — post-fix success tag.
+//! - `doctrine:testimony-access-send-refused` — post-fix success tag (the
+//!   proposal never reached the transport). Deliberately NOT the 5h
+//!   `doctrine:testimony-access-proposal-suppressed`: "did not propose on the
+//!   final text" and "did not SEND the proposal" are counted apart.
 //! - `doctrine:testimony-refusal-preserved` — post-fix success tag (the refusal
 //!   formulations Layer 1 prescribes traverse the tool path untouched).
 //!
