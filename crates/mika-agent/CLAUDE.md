@@ -1281,12 +1281,12 @@ test green. All seven terms were mutated one at a time and each was observed red
 #### The `target/` of a live-but-idle worktree (mika#2497)
 
 A **third arm of the same tick**, after the reaper, in the same module. Its
-population is **exactly** the reaper's `pr_open` refusals of that tick — the
-worktrees T4 turns away because their PR is open, and whose `target/` therefore
-lives as long as the PR (15 to 50 Go per pilot; +90 Go in 8 h on the night of
-2026-09-22, `/data` at 83 %). It is the *HALT-2 follow-up* mika#2420 names in
-its own body, and the two populations are **disjoint by construction**: T4 is
-"no open PR", this one is "open PR".
+population is **exactly** the reaper's **eligible** refusals of that tick —
+`pr_open` to begin with (the worktrees T4 turns away because their PR is open,
+and whose `target/` therefore lives as long as the PR: 15 to 50 Go per pilot,
++90 Go in 8 h on the night of 2026-09-22, `/data` at 83 %), two motives since
+mika#2482, **nine since mika#2619** (§ *Nine motives, N build dirs* below). It is
+the *HALT-2 follow-up* mika#2420 names in its own body.
 
 **The ordering is necessary, not tidy.** What the reaper has just removed no
 longer exists; considering it for a purge would be a no-op at best and a race at
@@ -1362,6 +1362,117 @@ exists to close.
 Config, the operator surfaces, the four probes (starting with *run in `observe`
 first*) and the four halts: root `CLAUDE.md` § *Optional (purge du `target/` d'un
 worktree vif — mika#2497)*.
+
+#### Nine motives, N build dirs (mika#2619)
+
+**The arm stopped reading *why* a worktree is kept.** The population was defined
+by *keep motive* while the asymmetry that founds the arm is **indifferent** to it:
+keeping the worktree protects the **work** (commits, working tree), it says
+nothing about its build cache. Measured 2026-10-01, `/data` at 85 %, **64 Go**
+freed by hand across three worktrees the arm could not see — `detached_head_pr_unknown`
+(40 Go, a motive born of mika#2518 that nobody added to the list),
+`unpushed_commits` (17 Go under `.pilot-scratch/ac6/`, failing on **three**
+independent counts: the motive, the path, **and the vector**), `too_young` (8 Go,
+legitimately refused by P4).
+
+**`ALL_REFUSAL_REASONS` is now partitioned, and that is what closes the CLASS
+rather than the occurrence.** Inverting the polarity to a denylist was refused —
+the predicate is fail-closed on the unknown, and a denylist returns `true` for any
+unlisted string — but the polarity was never the cause: a two-name list had simply
+**fallen behind**. `PURGE_ELIGIBLE_REASONS` (9) and `PURGE_INELIGIBLE_REASONS` (3,
+each carrying the reason for its exclusion in a doc-comment) partition the
+reaper's vocabulary, and `mika2619_la_partition_des_motifs_est_exacte` requires
+every motive to sit in **exactly one** of them, with a non-vacuity assertion
+(without which two empty lists would satisfy the partition). A motive added
+tomorrow reddens that test until somebody classifies it: the defect is no longer
+"purgeable by oversight" nor "unpurgeable by oversight", it is **"no decision, no
+build"**. The three exclusions are **redundancies** with P1/P3, never safety
+reserves.
+
+**Widening the list alone would have been INERT on three motives.** `dirty`,
+`unpushed_commits` and `work_state_unreadable` come out of `apply_work_states`
+(T7), whose output lived in a vector this arm **never received** —
+`purge_stale_target_dirs` now takes **both** and concatenates caller-side, so the
+pure functions keep their `&[ReapRefusal]` and every pre-existing test stays
+valid. A second hole, unnamed by the ticket: at zero reaper budget T7 was **not
+evaluated at all**, so the survivors of T1–T6 appeared in **no** vector and
+escaped both arms. `t7_is_needed(reaper, purge, enabled)` is the named predicate —
+*the arm that needs the computation pays for it* — and it is the **exact
+complement** of `should_stop_repo_loop` on the same triple, asserted as such: a
+divergence would pay `git` for a repo nobody looks at any more, or the reverse.
+It is a pure predicate rather than an inline conjunction for `should_stop_repo_loop`'s
+own reason — the site lives in a function that shells `git` and `gh`, so no
+behavioural test reaches it.
+
+**`discover_build_dirs` is the single site that composes a build-dir path**
+(source scan, allowlist shipped empty): `<worktree>/target` if it exists — with
+**no marker condition**, so today's population does not shrink, and returned even
+when it is not a directory so the `target_not_a_dir` motive survives instead of
+silently becoming `no_target_dir` — then a **bounded** walk under
+`.pilot-scratch/` (depth 3, symlinks never followed — **the `.pilot-scratch` root
+included**: `read_dir` follows a link, so a root symlinked to a neighbour's scratch
+used to pull the neighbour's caches into a population whose P3 only asks about
+*this* worktree's processes) keeping any directory that
+carries a marker **without descending into it**: a build cache contains
+subdirectories, and enumerating them would be an unbounded walk inside the very
+tree just identified as a cache.
+
+**The marker is a declaration of cache, and it completes the name without
+replacing it.** `.rustc_info.json` **or** `CACHEDIR.TAG` at the root — the second
+being the standard by which a tool declares *itself* a cache, exactly the
+information the founding asymmetry asks for. So `build_dir_disposition` is **name
+OR marker**: keeping `ends_with("/target")` avoids shrinking the current
+population, adding the marker **replaces proof-by-name** for everything else — and
+it is the stronger proof. **A marker is proof only as a regular file, and
+`CACHEDIR.TAG` only with the spec's signature** (`CACHEDIR_TAG_SIGNATURE`, what
+cargo writes): `is_file` followed links, and any file merely *named*
+`CACHEDIR.TAG` made its whole directory disposable. `.rustc_info.json` content
+is not validated (named residual). And the late guard now also requires
+`build_dir_is_inside_worktree` — the canonical build dir strictly under the
+canonical worktree P3 asked about, not merely under *a* managed worktree, which
+also covers a parent component swapped for a symlink between discovery and
+deletion. A directory carrying neither is **not recognised**, so it
+enters no population and **produces neither candidate nor refusal**: that is what
+keeps a text draft under `.pilot-scratch/` out of reach, and it is why the mika#2548
+dispatch rule is not in tension with this arm (that rule addresses the **pilot**
+mid-session; this is engine code, outside any session, on a directory idle for at
+least four hours in a worktree **with no live process** — and a dispatched pilot has
+`cwd == root`, so P3 removes its whole worktree from the population).
+
+**Three keys moved to the build directory**, because the cardinality went from one
+`target/` per worktree to N: `states` is keyed by build dir (and `build_dirs` says
+*which* dirs a worktree carries — the two absences are both fail-safe and say
+different things: no dir discovered ⇒ `no_target_dir`, a dir with no state ⇒
+`mtime_unreadable`), `TargetPurgeCandidate.target_path` carries the build dir
+(same field name — renaming it would break `jq '.target_path'`, a published
+query), and `purge_refusal_audit_key` takes `TargetPurgeRefusal::audit_path()`.
+That last one is load-bearing: with the worktree in the key, **two build dirs of
+one worktree refused under the same motive deduplicated each other** and the
+second refusal was lost in silence. `build_dir_path: Option<String>` is `None` for
+the worktree-scoped refusals (P1, P3, no dir discovered), and **P3 is evaluated
+before the per-dir loop** on purpose — it is a property of the worktree, and
+refusing N times for one cause is the noise the ineligibility of `live_process`
+already refuses.
+
+**`keep_reason` is a field, never a second `tool_name`** (motif `RESOLUTION_BRANCH`
+mika#2518, `ready_label_outcome` mika#2323): the removals are made by the same arm,
+under the same five-term conjunction, with the same lethality — only the keep
+motive differs, and a second `tool_name` would silently truncate
+`SELECT … WHERE tool_name = 'target_purged'`, a published query. It rides the INFO
+line and `reasoning`, which is what makes the widened population countable apart.
+
+**`not_a_build_dir` is a TARDY refusal and no test reproduces it deterministically.**
+It only fires if the marker disappears between the discovery (internal to
+`purge_stale_target_dirs`) and the guard a few instructions later — a race. The
+motive is covered at the decider by `mika2619_v8_la_garde_tardive_accepte_le_nom_ou_le_marqueur`;
+claiming a production test for it would fabricate coverage, which is why
+`mika2619_v8_un_marqueur_absent_sort_le_repertoire_de_la_population` asserts the
+**honest** outcome instead (`no_target_dir`, worktree-scoped key, directory intact).
+That is also what makes the root `CLAUDE.md`'s "expected regime: empty" readable.
+
+Nine motives, the two datable surface changes, the operator probes and their five
+halts: root `CLAUDE.md` § *Le bras cesse de lire pourquoi un worktree est
+conservé*.
 
 ### Un hold explicite tient contre `wip_rescue` (mika#2597)
 
