@@ -120,6 +120,22 @@ fn tout_fichier_dun_sous_repertoire_de_tests_eval_est_declare_dans_son_mod_rs() 
         .collect();
     subdirs.sort();
 
+    // Le sous-répertoire lui-même doit être déclaré dans `tests/eval.rs`. Sans ce
+    // terme, un `tests/eval/foo/` au `mod.rs` complet mais absent de `eval.rs`
+    // n'est jamais compilé, et les deux portes restent vertes : celle du premier
+    // niveau ne voit pas les répertoires, et celle-ci comptait le répertoire dans
+    // ses planchers d'anti-vacuité — elle se rembourrait avec le trou qu'elle
+    // devait fermer.
+    let top_level = declared_modules(EVAL_RS);
+    let dir_names: Vec<String> = subdirs
+        .iter()
+        .filter_map(|d| d.file_name().and_then(|s| s.to_str()).map(str::to_owned))
+        .collect();
+    let dir_refs: Vec<&str> = dir_names.iter().map(String::as_str).collect();
+    for orphan in undeclared_stems(&top_level, &dir_refs) {
+        reports.push(format!("{orphan}/ → absent de tests/eval.rs"));
+    }
+
     for dir in subdirs {
         dirs_scanned += 1;
         let mod_rs = std::fs::read_to_string(dir.join("mod.rs")).expect("lire le mod.rs");
@@ -166,10 +182,10 @@ fn tout_fichier_dun_sous_repertoire_de_tests_eval_est_declare_dans_son_mod_rs() 
 
     assert!(
         reports.is_empty(),
-        "fichier(s) présent(s) dans un sous-répertoire de crates/mika-agent/tests/eval/ \
-         mais NON déclaré(s) dans le mod.rs de ce répertoire, donc jamais compilé(s) ni \
-         exécuté(s) : {reports:?}\n\
-         Ajouter `pub mod <nom>;` dans le mod.rs concerné. Ne pas mettre ce fichier en \
+        "fichier(s) ou sous-répertoire(s) de crates/mika-agent/tests/eval/ NON \
+         déclaré(s) — dans le mod.rs de leur répertoire, ou dans tests/eval.rs pour un \
+         sous-répertoire — donc jamais compilé(s) ni exécuté(s) : {reports:?}\n\
+         Ajouter la ligne `pub mod <nom>;` manquante. Ne pas mettre ce fichier en \
          exception : c'est le trou que cette porte ferme."
     );
 }
@@ -192,6 +208,15 @@ fn la_porte_des_sous_repertoires_voit_un_orphelin_synthetique() {
         undeclared_stems(&declared, &["scenario_a", "scenario_oublie"]),
         vec!["scenario_oublie".to_owned()],
         "contrôle négatif : un fichier non déclaré DOIT être signalé"
+    );
+
+    // Même décision au niveau du répertoire : un sous-répertoire absent de
+    // `tests/eval.rs` est un orphelin, quel que soit l'état de son propre mod.rs.
+    let top_level = declared_modules("mod eval {\n    pub mod declare;\n}\n");
+    assert_eq!(
+        undeclared_stems(&top_level, &["declare", "repertoire_oublie"]),
+        vec!["repertoire_oublie".to_owned()],
+        "contrôle négatif : un sous-répertoire non déclaré dans eval.rs DOIT être signalé"
     );
 }
 
