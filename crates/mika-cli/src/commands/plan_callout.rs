@@ -94,8 +94,35 @@ pub enum CalloutOutcome {
 /// forgé sur disque — sans lancer un process.
 pub fn decide(body: &str, raw_form: bool) -> CalloutOutcome {
     // `Keep` : la parité EXACTE avec le comportement du bash d'avant la
-    // bascule. Demander `Strip` ici serait une correction de comportement, que
-    // les bornes du ticket interdisent pendant la migration.
+    // bascule — et, depuis mika#2609, une DÉCISION plutôt qu'une borne de
+    // ticket. La raison écrite ici jusque-là (« les bornes du ticket
+    // interdisent une correction de comportement pendant la migration ») est
+    // devenue fausse au merge des phases 1 et 2 : la migration est finie, donc
+    // plus rien n'interdit `Strip` — ce qui le retient est un arbitrage.
+    //
+    // Ce site est le SEUL choix de politique de fences que voient les lecteurs
+    // bash, qui passent tous par `mika plan-callout`. Un futur lecteur qui
+    // envisage l'alignement lit donc celui-ci, et voici ce qui a été tranché
+    // (décision MPC du 2026-10-01) :
+    //
+    // - la population que `Keep` laisse passer et que le `-f` en aval ne
+    //   rattrape pas — un callout cité dans un bloc clôturé pointant un plan
+    //   qui EXISTE — vaut 2 tickets fermés et **0 ticket ouvert** sur 1 261
+    //   mesurés, et seuls les tickets ouverts sont dispatchables ;
+    // - la direction du fail-safe est défavorable à l'alignement : `Keep` se
+    //   trompe en faux POSITIF, rattrapé par le `-f` sauf sur cette population
+    //   vide, là où `Strip` se tromperait en faux NÉGATIF — un callout vivant
+    //   seulement dans un bloc serait ignoré et `_detect_plan_on_branch`
+    //   lancerait `/mika` au lieu de `/ce-work <plan>`, c'est-à-dire la mort du
+    //   dispatch ;
+    // - citer un callout dans un bloc est le geste d'un ticket qui DOCUMENTE le
+    //   format, lequel n'est pas un ticket à dispatcher : la population a une
+    //   raison mécanique de rester vide.
+    //
+    // Condition de réveil et procédure d'alignement (qui n'est PAS celle que
+    // décrit l'AC2 de mika#2609) : `docs/dormeurs.md`, et le bloc de commentaire
+    // de `fences-quoted-callout.md` dans
+    // `crates/mika-agent/tests/fixtures/plan_callout_bodies/expectations.tsv`.
     let Some(callout) = plan_callout(body, FenceHandling::Keep) else {
         return CalloutOutcome::Absent;
     };

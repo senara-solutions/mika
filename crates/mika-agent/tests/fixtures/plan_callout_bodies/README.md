@@ -57,15 +57,34 @@ n'étaient nommées ni dans le ticket ni dans le plan.**
 
 | fixture | divergence | corrigée ? |
 |---|---|---|
-| `fences-quoted-callout.md` | le bash lit un callout **cité dans un bloc clôturé**, le Rust non | **non** — asymétrie assumée par écrit en production côté bash ; le rattrapage par `-f` qu'elle invoque est **partiel** (il couvre un chemin *inexistant*, pas un chemin *existant cité*) |
+| `fences-quoted-callout.md` | le bash lit un callout **cité dans un bloc clôturé**, le Rust non | **non — tranché par mika#2609** : le rattrapage par `-f` est *partiel* (il couvre un chemin inexistant, pas un chemin existant cité), mais la population que ce trou laisse passer est **vide côté tickets ouverts** (mesure du 2026-10-01 : 9 callouts cités dans un bloc, 2 pointant un plan existant, **0 sur un ticket ouvert**), et `dispatch-lib` ne lit le corps que d'un ticket qu'il dispatche |
 | `backtick-unterminated.md` | le PCRE bash lisait un callout dont le **backtick fermant** manque ; le motif Rust l'exige | **non** — le lecteur unique garde la forme stricte, et le resserrement du bash est **dit** plutôt que découvert |
 | `backtick-late-close.md` | `[^`]+` n'exclut pas `\n` en Rust, donc un backtick apparaissant plus loin fait **traverser les lignes** à la capture ; `grep` travaillait ligne à ligne | **non** — le motif est conservé à l'identique (B1) ; c'est le **canal** qui borne (`mika plan-callout` refuse un chemin qui n'est pas d'une seule ligne) |
 
 **L'assertion auto-nettoyante** porte sur la première : un cas déclaré
 `divergent-fences` dont les deux politiques de fence rendraient la **même** valeur fait
-**échouer** le test. Le jour où la divergence est tranchée, la ligne rougit et doit être
-retirée — elle ne peut pas devenir périmée en silence. C'est ce qui distingue une exception
-d'un contournement.
+**échouer** le test — la ligne ne peut pas devenir périmée en silence. C'est ce qui distingue
+une exception d'un contournement.
+
+**Ce qu'elle ne mesure PAS, et c'était écrit de travers ici jusqu'à mika#2609.** Ce paragraphe
+prescrivait « le jour où la divergence est tranchée, la ligne rougit et doit être retirée ». La
+divergence **est** tranchée (mika#2609, décision MPC du 2026-10-01 : le rattrapage partiel
+suffit, le canal garde `FenceHandling::Keep`) et la ligne est **toujours là**, verte. Elle ne
+rougit pas, parce que `parity` décrit une propriété du **corps** — `Keep(corps) ≠ Strip(corps)`
+— et non la politique d'un lecteur : changer la politique du canal ne change donc rien à cette
+relation. La colonne qui basculerait, le jour d'un alignement, est **`rc`** (`0` → `1`), et ce
+qui l'attesterait est `mika2194_le_canal_repond_comme_le_lecteur_sur_le_corpus_dore` plus les
+quatre passages `rc` de `test-dispatch-lib.sh`. La séquence complète est écrite dans le bloc de
+commentaire de cette ligne, dans `expectations.tsv`.
+
+**Et ce que la fixture ne porte pas, non plus.** `fences-quoted-callout.md` exerce la divergence
+de **lecture** (`Keep ≠ Strip`), qui est exactement ce que l'assertion auto-nettoyante demande
+— mais **pas** le cas dangereux de bout en bout : le plan qu'elle cite,
+`docs/plans/2026-09-30-001-fix-2194-exemple-cite-plan.md`, n'existe pas dans le dépôt, donc sur
+cette fixture le test `-f` *rattraperait*. Elle est correcte pour son usage, et un lecteur pressé
+croira le contraire. Lui faire pointer un plan réel est délibérément **refusé** : ça changerait
+son objet sans rien acheter (aucune assertion du corpus n'exerce le `-f`) et la suppression de ce
+plan un jour la casserait pour une raison sans rapport.
 
 ## Les trois corps de la phase 2 (mika#2608)
 
