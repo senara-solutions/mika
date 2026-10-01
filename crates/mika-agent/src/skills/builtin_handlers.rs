@@ -2717,20 +2717,47 @@ fn pr_ready_hold_rejection_body(
     since: Option<&str>,
     actor: Option<&str>,
 ) -> String {
-    let reason = if motif == PR_READY_HOLD_MOTIF_OPERATOR_HOLD {
-        format!(
-            "Pull request #{pr_num} on {repo} carries at least one \
-             ConvertToDraftEvent: somebody put it back into draft after the work \
-             was done. That draft state is a deliberate hold, not the state a \
-             rescue PR is created in."
+    // Detail and remedy follow the motif. Only `operator_hold` establishes a
+    // hold; the unreadable motifs establish nothing, and telling the agent a
+    // hold exists — or sending it after a parameter that is not the cause —
+    // would misdirect the one gesture each refusal calls for.
+    let (reason, remedy) = if motif == PR_READY_HOLD_MOTIF_OPERATOR_HOLD {
+        (
+            format!(
+                "Pull request #{pr_num} on {repo} carries at least one \
+                 ConvertToDraftEvent: somebody put it back into draft after the \
+                 work was done. That draft state is a deliberate hold, not the \
+                 state a rescue PR is created in."
+            ),
+            "Leave this pull request in draft. A hold is lifted by a human and \
+             by nobody else — do not look for another route: this refusal is not \
+             lifted by retrying under a different shape. If you believe the hold \
+             should go, say so to the operator with `send_message` and stop.",
+        )
+    } else if motif == PR_READY_HOLD_MOTIF_NO_TOKEN {
+        (
+            format!(
+                "The engine has no GitHub token in this context, so the \
+                 draft-state history of pull request #{pr_num} on {repo} cannot be \
+                 read and it cannot be established that this PR is not held."
+            ),
+            "Leave this pull request in draft and tell the operator with \
+             `send_message` that the hold state could not be checked; do not \
+             retry under a different shape.",
         )
     } else {
-        format!(
-            "The draft-state history of pull request #{pr_num} on {repo} could \
-             not be read, so it cannot be established that this PR is not held. \
-             A term that cannot be read is not a satisfied term. If this pull \
-             request does not live on {repo}, pass the `repo` parameter: the \
-             history was looked up on the wrong repository."
+        (
+            format!(
+                "The draft-state history of pull request #{pr_num} on {repo} could \
+                 not be read, so it cannot be established that this PR is not \
+                 held. A term that cannot be read is not a satisfied term. If this \
+                 pull request does not live on {repo}, pass the `repo` parameter: \
+                 the history was looked up on the wrong repository."
+            ),
+            "Leave this pull request in draft. The only retry that can change \
+             this answer is the same call with the correct `repo`; otherwise tell \
+             the operator with `send_message` that the hold state could not be \
+             read, and stop.",
         )
     };
 
@@ -2741,11 +2768,7 @@ fn pr_ready_hold_rejection_body(
         "repo": repo,
         "reason": motif,
         "detail": reason,
-        "remedy":
-            "Leave this pull request in draft. A hold is lifted by a human and by \
-             nobody else — do not look for another route: this refusal is not \
-             lifted by retrying under a different shape. If you believe the hold \
-             should go, say so to the operator with `send_message` and stop.",
+        "remedy": remedy,
     });
 
     // `since` / `actor` ride along only when GitHub gave them, and are never
@@ -12313,6 +12336,34 @@ mod tests {
             None,
         );
         assert!(!held.contains("`repo`"));
+    }
+
+    #[test]
+    fn mika2624_un_refus_sans_jeton_nomme_le_jeton_et_pas_le_depot() {
+        // Revue mika#2628 : le refus `hold_no_token` partageait la prose de
+        // `hold_unreadable` et envoyait l'agent corriger un `repo` qui n'y est
+        // pour rien — aucune timeline n'a été lue, faute de jeton.
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_NO_TOKEN,
+            "senara-solutions/mika",
+            None,
+            None,
+        );
+        assert!(
+            !body.contains("`repo`"),
+            "a no-token refusal must not blame the repo parameter: {body}"
+        );
+        assert!(body.contains("token"), "it names the missing token: {body}");
+        // …et aucun des deux refus « illisibles » n'affirme qu'un hold existe :
+        // le remède d'un hold n'est pas celui d'une lecture impossible.
+        for motif in [PR_READY_HOLD_MOTIF_NO_TOKEN, PR_READY_HOLD_MOTIF_UNREADABLE] {
+            let body = pr_ready_hold_rejection_body("2621", motif, "o/r", None, None);
+            assert!(
+                !body.contains("A hold is lifted"),
+                "`{motif}` established no hold and must not say one exists: {body}"
+            );
+        }
     }
 
     #[test]
