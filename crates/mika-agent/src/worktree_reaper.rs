@@ -10703,4 +10703,169 @@ branch refs/heads/fix/live/x
         );
         assert_eq!(scan_purge_refusal_key_callers(fixture, &[]), Ok(1));
     }
+
+    // =======================================================================
+    // mika#2623 — un cwd vivant sous `.pilot-scratch/<x>` vu par le bras
+    // =======================================================================
+    //
+    // `mika2619_v6` ci-dessus atteste la moitié **positive** sur cette
+    // population : deux caches sous `.pilot-scratch/ac6/` sont purgés. Ce qui
+    // manquait est la moitié **négative** — qu'un processus vivant dedans
+    // conserve — et la lacune n'est pas cosmétique : `mika2497_v2` teste P3 à la
+    // racine du worktree (`cwd == root`), pas sous un sous-répertoire de mesure,
+    // et `discover_build_dirs` ne consulte **aucun** cwd. Rien ne reliait donc
+    // la découverte sous `.pilot-scratch/` au terme qui la protège.
+    //
+    // # Le sens du code est plus étroit que l'AC ne le suggère
+    //
+    // AC3 dit « protège ce cache ». Le code dit **« le worktree entier sort de
+    // la population »** : P3 est évalué dans `screen_target_purges` **avant** la
+    // boucle des répertoires (mika#2619 R6), et pousse **un seul** refus, de
+    // portée worktree (`build_dir_path: None`, motif `live_process`). Asserter
+    // un refus par cache figerait une sémantique que le code ne porte pas — et
+    // la ligne `v6` juste au-dessus explique pourquoi c'est le bon sens : un
+    // refus par sous-répertoire serait le bruit que l'inéligibilité de
+    // `live_process` refuse déjà.
+
+    /// L'arbre des deux tests ci-dessous : un `target/` et deux caches sous
+    /// `.pilot-scratch/ac6/{a,b}`, tous vieillis au-delà de la fenêtre.
+    ///
+    /// Un helper plutôt que deux copies, pour que le cas négatif et son contrôle
+    /// positif portent sur un arbre **identique** : c'est la seule façon que
+    /// « P3 décide » se distingue de « la purge ne marche pas ici ».
+    fn arbre_2623(tmp: &Path) -> (PathBuf, Vec<PathBuf>) {
+        let wt = fake_worktree(tmp, "fix-2623-scratch");
+        let target = fake_target(&wt);
+        let a = fake_build_dir(&wt.join(".pilot-scratch/ac6/a"), CARGO_INFO_MARKER);
+        let b = fake_build_dir(&wt.join(".pilot-scratch/ac6/b"), CACHEDIR_TAG_MARKER);
+        age_tree(
+            &wt.join(".pilot-scratch"),
+            PURGE_IDLE_DEFAULT_SECS as u64 + 600,
+        );
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+        assert_eq!(
+            discover_build_dirs(&wt),
+            vec![a.clone(), b.clone(), target.clone()],
+            "précondition : les trois répertoires sont bien dans la population"
+        );
+        (wt, vec![a, b, target])
+    }
+
+    /// **AC3 / cas négatif** — un cwd vivant sous `.pilot-scratch/ac6/a`
+    /// conserve **les trois** répertoires, par un refus **unique** de portée
+    /// worktree.
+    #[tokio::test]
+    async fn mika2623_un_cwd_vivant_sous_pilot_scratch_conserve_le_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, dirs) = arbre_2623(tmp.path());
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 5usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2623-neg",
+            "trace-2623-neg",
+            &[],
+            &[refusal_with(&wt, "fix/2623/x", REASON_UNPUSHED_COMMITS)],
+            &index(vec![]),
+            // Le cwd est sous le **cache**, pas à la racine du worktree : c'est
+            // la population que `mika2497_v2` ne couvre pas.
+            &LiveCwds::Enumerated(vec![wt.join(".pilot-scratch/ac6/a")]),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0, "rien n'est purgé: {stats:?}");
+        assert_eq!(budget, 5, "aucun budget n'est consommé par un refus");
+        for d in &dirs {
+            assert!(
+                d.exists(),
+                "{} doit survivre — P3 sort le worktree entier",
+                d.display()
+            );
+        }
+        assert!(wt.join("src/main.rs").exists());
+
+        let events = db.get_audit_events("session-2623-neg").await.unwrap();
+        let refus: Vec<&crate::evidence::AuditEvent> = events
+            .iter()
+            .filter(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .collect();
+        assert_eq!(
+            refus.len(),
+            1,
+            "**un seul** refus, de portée worktree — pas un par cache: {refus:?}"
+        );
+        assert_eq!(
+            refus[0].after_value.as_deref(),
+            Some(PURGE_REASON_LIVE_PROCESS)
+        );
+        assert_eq!(
+            refus[0].target_key,
+            purge_refusal_audit_key(&wt.to_string_lossy(), PURGE_REASON_LIVE_PROCESS),
+            "la clé porte le **worktree**, pas un répertoire de build"
+        );
+        assert!(
+            refus[0]
+                .reasoning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("build_dir=null"),
+            "le refus est de portée worktree, donc `build_dir_path` est absent: {:?}",
+            refus[0].reasoning
+        );
+        assert!(
+            !events.iter().any(|e| e.tool_name == TARGET_PURGED_TOOL),
+            "aucune ligne de purge"
+        );
+    }
+
+    /// **AC3 / contrôle positif** — le **même** arbre, sans cwd vivant, est
+    /// purgé.
+    ///
+    /// C'est lui qui sépare « le terme P3 décide » de « la purge ne marche pas
+    /// sous `.pilot-scratch/` » : sans ce test, le cas négatif ci-dessus serait
+    /// satisfait par un bras qui ne purge jamais rien.
+    #[tokio::test]
+    async fn mika2623_le_meme_arbre_sans_cwd_vivant_est_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, dirs) = arbre_2623(tmp.path());
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 5usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2623-pos",
+            "trace-2623-pos",
+            &[],
+            &[refusal_with(&wt, "fix/2623/x", REASON_UNPUSHED_COMMITS)],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(
+            stats.purged, 3,
+            "les trois répertoires sont purgés: {stats:?}"
+        );
+        assert_eq!(budget, 2, "le budget est **par répertoire**");
+        for d in &dirs {
+            assert!(!d.exists(), "{} doit être retiré", d.display());
+        }
+        assert!(
+            wt.join("src/main.rs").exists(),
+            "seul le dérivé est retiré, jamais le travail"
+        );
+    }
 }
