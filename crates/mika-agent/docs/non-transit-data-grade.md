@@ -78,6 +78,36 @@ abbreviated 4-line variant hard-capped at 400 chars via
 
 **Coverage:** grounds the *propose* surface for every LLM-driven turn.
 
+**Since mika#1960, Layer 1 is no longer alone on the *propose* surface.** An
+EndTurn post-condition guard at position **5h**
+(`crates/mika-agent/src/agent_loop/mod.rs`, predicate
+`evidence::guards::detect_testimony_access_proposal`) refuses a turn whose text
+proposes to **open** access to testimony-grade data, re-prompts once, and emits
+`guard.testimony_access_proposal` — with
+`guard.testimony_access_proposal_uncorrected` for the residue of that single
+retry. No tool call is needed for it to fire, which is the whole point: the
+breach this document quotes ("A well-meaning 'I could help if you gave me Gmail
+access…'") is invisible to Layers 2/3/4 because nothing is ever called.
+
+Its reach is the turn's **final assistant text**, and only that. A proposal
+sent through the `send_message` tool — the only user channel of a silent turn
+(heartbeat, callback, reminder), and also reachable from a conversation turn —
+is not read by this guard, so that path of the *propose* surface is still
+Layer 1 alone.
+
+Two properties worth knowing before touching it. The discriminant is the
+**direction of the access movement**, never the vocabulary: Layer 1 *prescribes*
+naming the doctrine when declining, so a conforming refusal necessarily carries
+the forbidden subject and the word "access" in the same sentence, and a lexical
+predicate over {Gmail} × {access} would refuse the refusal — i.e. break what
+mika#1798 shipped. And the guard **rattrape, it does not prevent**: a
+post-condition guard reads outgoing text, so what changed is that the *propose*
+half stopped being prompt-only and gained a second net with its telemetry.
+Regression coverage: `tests/eval/doctrine_regressions/testimony_access_proposal_caught.rs`
+(the measured turn, the retry-budget boundary, and three negative controls on the
+prescribed refusals) plus the thirteen predicate controls in
+`evidence::guards::tests::mika1960_*`.
+
 ### Layer 2 — Skill registry ban (`crates/mika-agent/src/skills/mod.rs`)
 
 `SkillRegistry::apply_testimony_grade_ban()` runs as Phase 2 (after
@@ -312,6 +342,14 @@ closed above, it still does NOT cover:
   `mcp__gmail__*` tool reaches Gmail with zero doctrine layer firing.
   Forward-compat requires MCP manifests to gain a `data_grade` field AND
   the MCP dispatch site to consult the same map.
+- **Propose surface via `send_message`** (named by mika#1960 phase 2) — the
+  EndTurn guard 5h reads the turn's final assistant text only. A proposal
+  delivered through the `send_message` tool (the sole user channel of a
+  silent turn, also reachable from a conversation turn and through the #771
+  send-message boundary exit) is not read by it, so on that path the
+  *propose* half is still Layer 1 alone. Closing it means running the 5h
+  predicate on the tool's `text` input before delivery — a pre-hoc refusal
+  of the mika#933 shape, a change of its own.
 
 ## Cross-references
 
@@ -339,6 +377,15 @@ closed above, it still does NOT cover:
 
 ## Change log
 
+- **2026-10-01** — mika#1960 phase 2: the *propose* surface gained a structural
+  half. EndTurn guard **5h** (`testimony_access_proposal`) is armed, with its
+  single-retry budget, its `_uncorrected` residue event and a regression eval
+  under `tests/eval/doctrine_regressions/`. Phase 1 (PR #2620) had shipped the
+  predicate with no caller — "disarmed by construction", verifiable by `grep`
+  rather than by convention. Layers 2/3/4 are untouched: this adds a net on the
+  half Layer 1 held alone, it does not change any access path. § *Vigilance
+  surface* is deliberately unchanged — no access path is added, so the axis of
+  vigilance does not move.
 - **2026-08-27** — mika#1957: `shell-exec` bypass class closed by a lexical
   command-string scan in the skill's `run.sh`; moved from § Known bypass
   classes to § Applied hardening. Corrected this document's own tier

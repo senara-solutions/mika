@@ -61,6 +61,23 @@
 //!   **result**, not a success — and a guardrail that stops the démarche légitime
 //!   is one that gets removed.
 //!
+//! - `doctrine:testimony-access-proposed` — **failure** (mika#1960: the agent
+//!   proposed to *open* access to testimony-grade data — a Gmail grant, a full
+//!   Drive, a personal journal — which the non-transit doctrine forbids as a HARD
+//!   NO on the *propose* surface, **even without a tool call**).
+//! - `doctrine:testimony-access-proposal-suppressed` — success (guard 5h caught
+//!   the proposal and the corrected turn no longer carries the grant movement).
+//! - `doctrine:testimony-refusal-preserved` — success (the refusal formulations
+//!   Layer 1 *prescribes* do not fire the guard, including the ones that name the
+//!   forbidden subject and the word "access" in the same sentence).
+//!
+//!   Three names rather than two, and the split follows the one mika#1983 had to
+//!   write just above: *"did not propose"* and *"preserved the refusal"* are two
+//!   populations one wants to count apart. The second is the measurement of
+//!   mika#1960's only real risk — a guard that refused the prescribed refusal
+//!   would degrade what mika#1798 shipped, by pushing the model to stop naming
+//!   the doctrine.
+//!
 //! Namespace convention per `docs/architecture/kg-implementation-conventions.md`
 //! § C3 — parallel to `#741 grounding:*` and `#740 self-knowledge:*`.
 //!
@@ -156,3 +173,19 @@ pub mod tenant_register_held;
 // be inferred.
 pub mod truthful_declaration_held;
 pub mod truthful_declaration_replayed;
+
+// --- mika#1960: the *propose* surface of the non-transit doctrine ---
+//
+// Same module, fifth time, and the criterion is the one mika#2290 wrote here:
+// the failure class is the **shape of the agent's own text** against a
+// load-bearing product invariant, with no fabrication of evidence involved. The
+// non-transit doctrine (mika#1798) is such an invariant, and it is explicitly a
+// HARD NO on *both the doing and the proposing* — Layers 2/3/4 of that ticket
+// guard the access surface, so until mika#1960 the propose half was prompt-only.
+//
+// Two files, one axis each — the split is the plan's Fire-Disposition decision,
+// not a filing convenience. The first is deterministic and gates CI; the second
+// is the behavioural half, which no deterministic test can establish and which
+// therefore ships disarmed with its reasoning at the site.
+pub mod testimony_access_proposal_caught;
+pub mod testimony_access_proposal_replayed;
