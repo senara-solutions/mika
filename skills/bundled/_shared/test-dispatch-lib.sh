@@ -10326,6 +10326,708 @@ if [ -f "$M2608_TOKENS_TSV" ]; then
             | grep -cE 'dispatch-lib\.sh::(_committed_plan_on_branch|_set_up_worktree)' || true)"
 fi
 
+# ============================================================================
+# Test mika#2626 — `_push_branch` cesse de déduire l'existence DISTANTE d'une
+# ref de suivi LOCALE
+# ============================================================================
+#
+# Incident fondateur : 2026-10-01, pilote `624656b1` (mika#1960 phase 2). Le
+# rescue a commité le travail du pilote (90,40 USD, ~770 lignes), l'a rebasé
+# sur main, puis :
+#
+#   Push: FAILED — remote advanced since fetch (lease aborted); commits remain
+#   local-only on test/1960/eval-propose-surface-doctrine-regression
+#
+# Or la branche n'existait PAS sur origin : celle de la phase 1 avait été
+# supprimée au merge de PR #2620, et personne n'avait « avancé » le distant. Le
+# checkout partagé gardait `origin/test/1960/…` à l'ancienne tête, jamais
+# élaguée — `fetch origin "$BRANCH"` ne la touche pas, et `--prune` n'y change
+# rien (mesuré : git échoue d'abord sur `couldn't find remote ref`, donc le
+# prune n'est jamais atteint).
+#
+# Le fixture reproduit cet état exact. La branche est supprimée **dans le
+# bare**, par `update-ref -d` — JAMAIS par `git push origin --delete` depuis le
+# clone : git y supprimerait aussi la ref de suivi locale, c'est-à-dire
+# précisément le fixture qu'on veut construire. C'est aussi la forme la plus
+# fidèle à l'incident : GitHub supprime la branche, le checkout partagé ne le
+# sait pas.
+echo ""
+echo "Test mika#2626: une ref origin/\$BRANCH orpheline ne produit plus 'diverged'"
+echo "----------------------------------------------------------------------------"
+
+# Helper de fixture : amène le clone dans l'état de l'incident et rend 0, ou
+# écrit la raison sur stdout et rend 1. Paramètre $1 = nom de branche,
+# $2 = "rewrite" pour réécrire l'historique (le rescue a rebasé), "keep" pour
+# le laisser intact (le cas ahead==0 de V6).
+_t2626_make_orphaned_ref() {
+    local br="$1" history="$2"
+
+    # 1. La phase 1 : une branche poussée. `origin/$br` existe des deux côtés.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "phase 1" > "$FIXTURE_CLONE/phase1.txt"
+    git -C "$FIXTURE_CLONE" add phase1.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "phase 1"
+    git -C "$FIXTURE_CLONE" push -q -u origin "$br"
+
+    # 2. Le merge de la PR de la phase 1 : la forge supprime la branche. Le
+    #    checkout partagé ne le sait pas, sa ref de suivi reste.
+    git -C "$FIXTURE_BARE" update-ref -d "refs/heads/$br"
+
+    if [ "$history" = "rewrite" ]; then
+        # 3. main avance, puis le rescue rebase la branche : HEAD est réécrite,
+        #    donc la ref orpheline n'en est plus un ancêtre → `diverged`.
+        git -C "$FIXTURE_CLONE" checkout -q main
+        echo "main advance" > "$FIXTURE_CLONE/main-only.txt"
+        git -C "$FIXTURE_CLONE" add main-only.txt
+        git -C "$FIXTURE_CLONE" commit -q -m "advance main"
+        git -C "$FIXTURE_CLONE" push -q origin main
+        git -C "$FIXTURE_CLONE" checkout -q "$br"
+        git -C "$FIXTURE_CLONE" fetch -q origin main
+        git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 \
+            || { echo "fixture: rebase échoué; "; return 1; }
+        echo "phase 2" > "$FIXTURE_CLONE/phase2.txt"
+        git -C "$FIXTURE_CLONE" add phase2.txt
+        git -C "$FIXTURE_CLONE" commit -q -m "phase 2 (pilot work)"
+    fi
+
+    # Préconditions : la ref de suivi locale existe, le distant ne l'a plus.
+    # Sans ces deux assertions, un fixture cassé se lirait comme un correctif
+    # qui marche (le piège que V1 existe pour fermer).
+    local pre=""
+    git -C "$FIXTURE_CLONE" rev-parse --verify "origin/$br" >/dev/null 2>&1 \
+        || pre="${pre}fixture: la ref de suivi locale devrait exister; "
+    if git -C "$FIXTURE_CLONE" ls-remote --exit-code origin "refs/heads/$br" >/dev/null 2>&1; then
+        pre="${pre}fixture: le distant ne devrait PAS porter la branche; "
+    fi
+    if [ -n "$pre" ]; then echo "$pre"; return 1; fi
+    return 0
+}
+
+# --- AC1/AC2/V2 : ref locale périmée + branche absente du distant → first-push
+test_2626_orphaned_ref_is_first_push() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/phase"
+    local failures=""
+    local pre_failures
+    pre_failures=$(_t2626_make_orphaned_ref "$br" rewrite) || failures="$pre_failures"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    # AC1 : une ref locale orpheline ne peut plus produire `diverged`.
+    if grep -qF -- "mode=diverged" <<<"$RESULT"; then
+        failures="${failures}LE DÉFAUT: mode=diverged sur une ref orpheline; "
+    fi
+    if ! grep -qF -- "mode=first-push" <<<"$RESULT"; then
+        failures="${failures}attendu mode=first-push; "
+    fi
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
+        failures="${failures}RESULT sans 'Push: pushed'; "
+    fi
+    # AC4, première moitié : aucune avance distante n'a eu lieu, donc le RESULT
+    # ne peut pas l'affirmer (classe mika#2304).
+    if grep -qF -- "remote advanced since fetch" <<<"$RESULT"; then
+        failures="${failures}RESULT affirme une avance distante qui n'a pas eu lieu; "
+    fi
+    # AC4, seconde moitié : la ref orpheline est NOMMÉE, même sur le chemin de
+    # succès — un checkout partagé qui en porte une est une anomalie d'hygiène
+    # qui mérite d'être comptée.
+    if ! grep -qF -- "Stale-ref: origin/$br" <<<"$RESULT"; then
+        failures="${failures}RESULT ne nomme pas la ref orpheline; "
+    fi
+    # V2 : la tête distante égale la HEAD locale. Lue par `ls-remote` et non par
+    # `rev-parse origin/...` : la ref de suivi locale est précisément ce dont on
+    # refuse de croire la parole.
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    remote_head=$(git -C "$FIXTURE_CLONE" ls-remote origin "refs/heads/$br" 2>/dev/null | cut -f1)
+    [ "$local_head" = "$remote_head" ] \
+        || failures="${failures}tête distante ≠ HEAD (local=$local_head remote=${remote_head:-<none>}); "
+
+    # Le mode observé voyage dans le message d'échec : V1 exige de vérifier que
+    # le rouge d'avant le correctif dit bien `mode=diverged` / `Push: FAILED`.
+    local observed
+    observed=$(grep -oE 'mode=[a-z-]+|Push: FAILED[^;]*' <<<"$RESULT" | tr '\n' ' ')
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures[observé: ${observed:-<rien>}]"; fi
+}
+
+RESULT_2626A=$(test_2626_orphaned_ref_is_first_push 2>/dev/null)
+if [ "$RESULT_2626A" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626 (AC1/AC2): ref orpheline → first-push, push réussi"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (AC1/AC2): $RESULT_2626A"
+fi
+
+# --- V6 : le court-circuit `ahead == 0` ne s'applique plus à une ref orpheline
+#
+# Seconde moitié SILENCIEUSE du défaut, et elle est distincte de V2 : sur un
+# distant absent, `origin/$BRANCH..HEAD` compte contre une ref orpheline et peut
+# rendre 0 alors qu'il y a TOUT à pousser. Un correctif qui ne déplacerait que
+# le choix de mode laisserait cette population en `return 0` muet — un no-op qui
+# se lit comme « rien à pousser ».
+test_2626_zero_ahead_against_orphan_still_pushes() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/zero-ahead"
+    local failures=""
+    local pre_failures
+    pre_failures=$(_t2626_make_orphaned_ref "$br" keep) || failures="$pre_failures"
+
+    # Précondition propre à V6 : HEAD == la ref orpheline, donc ahead == 0.
+    local ahead
+    ahead=$(git -C "$FIXTURE_CLONE" rev-list "origin/$br..HEAD" --count 2>/dev/null || echo -1)
+    [ "${ahead:-0}" -eq 0 ] \
+        || failures="${failures}fixture: ahead devrait être 0 contre la ref orpheline (vu $ahead); "
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    local rc=0
+    _push_branch || rc=$?
+
+    [ "$rc" -eq 0 ] || failures="${failures}attendu rc=0, vu $rc; "
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
+        failures="${failures}LE DÉFAUT: no-op silencieux, rien n'a été poussé; "
+    fi
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    remote_head=$(git -C "$FIXTURE_CLONE" ls-remote origin "refs/heads/$br" 2>/dev/null | cut -f1)
+    [ "$local_head" = "$remote_head" ] \
+        || failures="${failures}tête distante ≠ HEAD (local=$local_head remote=${remote_head:-<none>}); "
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626B=$(test_2626_zero_ahead_against_orphan_still_pushes 2>/dev/null)
+if [ "$RESULT_2626B" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626 (V6): ahead==0 contre une ref orpheline pousse quand même"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (V6): $RESULT_2626B"
+fi
+
+# --- AC4/V4 : la branche FAILED cesse d'affirmer une avance distante
+#
+# Le faux énoncé de l'incident vit dans la branche FAILED, pas dans le chemin de
+# succès, donc il faut un push qui ÉCHOUE sur un distant qui ne porte pas la
+# branche. Un hook `pre-receive` qui décline produit exactement cette
+# conjonction : le push est rejeté, `failed to push` matche le prédicat de
+# classification mika#1364, et aucune ref distante n'existe pour avoir avancé.
+test_2626_failed_push_names_the_orphan_not_a_remote_advance() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/declined"
+    local failures=""
+    local pre_failures
+    pre_failures=$(_t2626_make_orphaned_ref "$br" rewrite) || failures="$pre_failures"
+
+    # Le hook est posé APRÈS la construction du fixture : les pushes de mise en
+    # place doivent aboutir, c'est le push mesuré qui doit être refusé.
+    printf '#!/bin/sh\nexit 1\n' > "$FIXTURE_BARE/hooks/pre-receive"
+    chmod +x "$FIXTURE_BARE/hooks/pre-receive"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch || true
+
+    if ! grep -qF -- "Push: FAILED" <<<"$RESULT"; then
+        failures="${failures}fixture: le push aurait dû échouer (hook pre-receive); "
+    fi
+    # AC4 : plus aucune invention d'avance distante sur un distant sans branche.
+    if grep -qF -- "remote advanced since fetch" <<<"$RESULT"; then
+        failures="${failures}LE DÉFAUT: 'remote advanced since fetch' sur un distant sans branche; "
+    fi
+    # …et le diagnostic nomme ce qui est vrai : la ref orpheline.
+    if ! grep -qF -- "stale tracking ref" <<<"$RESULT"; then
+        failures="${failures}le diagnostic FAILED ne nomme pas la ref orpheline; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626C=$(test_2626_failed_push_names_the_orphan_not_a_remote_advance 2>/dev/null)
+if [ "$RESULT_2626C" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626 (AC4): un push refusé sur distant absent nomme la ref orpheline"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (AC4): $RESULT_2626C"
+fi
+
+# --- AC3 : le distant PRÉSENT et réellement avancé garde son lease ----------
+#
+# Contrôle négatif du prédicat. Le Test 12c couvre déjà la divergence nominale
+# et reste le domicile de cette non-régression (V3) ; ce qui est vérifié ICI est
+# plus étroit et n'existe nulle part ailleurs : que la nouvelle consultation du
+# distant ne renverse pas le verdict quand la branche existe bel et bien. Sans
+# lui, « `diverged` est préservé » et « le prédicat ne regarde rien » rendraient
+# les mêmes octets (classe mika#2205).
+test_2626_present_remote_keeps_diverged() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/present"
+    local failures=""
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "work" > "$FIXTURE_CLONE/work.txt"
+    git -C "$FIXTURE_CLONE" add work.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+    git -C "$FIXTURE_CLONE" push -q -u origin "$br"
+
+    git -C "$FIXTURE_CLONE" checkout -q main
+    echo "main advance" > "$FIXTURE_CLONE/main-only.txt"
+    git -C "$FIXTURE_CLONE" add main-only.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "advance main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q "$br"
+    git -C "$FIXTURE_CLONE" fetch -q origin main
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 \
+        || failures="${failures}fixture: rebase échoué; "
+    echo "pilot" > "$FIXTURE_CLONE/impl.txt"
+    git -C "$FIXTURE_CLONE" add impl.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "pilot implementation"
+
+    # Ici le distant PORTE la branche — c'est tout le discriminant.
+    git -C "$FIXTURE_CLONE" ls-remote --exit-code origin "refs/heads/$br" >/dev/null 2>&1 \
+        || failures="${failures}fixture: le distant devrait porter la branche; "
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    if ! grep -qF -- "mode=diverged" <<<"$RESULT"; then
+        failures="${failures}AC3 cassé: le lease a été perdu sur une divergence légitime; "
+    fi
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
+        failures="${failures}RESULT sans 'Push: pushed'; "
+    fi
+    # Un distant présent n'est pas une ref orpheline : pas de ligne de stale-ref.
+    if grep -qF -- "Stale-ref:" <<<"$RESULT"; then
+        failures="${failures}faux positif: ligne stale-ref sur un distant présent; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626D=$(test_2626_present_remote_keeps_diverged 2>/dev/null)
+if [ "$RESULT_2626D" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626 (AC3): un distant présent et avancé garde son force-with-lease"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (AC3): $RESULT_2626D"
+fi
+
+# --- L'issue INDÉTERMINÉE retombe sur le prédicat d'aujourd'hui -------------
+#
+# Troisième issue du lecteur, et la plus délicate : le distant n'a pas répondu
+# (rc 128 — réseau, authentification, remote injoignable). Elle est NOMMÉE
+# plutôt que choisie par défaut, et elle ne devient PAS « absente » : traiter un
+# réseau coupé comme une branche absente serait affirmer une mesure qu'on n'a
+# pas faite, et pousser en first-push sur une branche que le distant porte
+# peut-être. Le repli est le prédicat local, donc exactement le comportement
+# d'avant ce correctif — coût borné, et c'est ce qui rend la disposition
+# acceptable. Sans ce test, « le repli marche » ne serait pas établi : les
+# quatre cas ci-dessus n'exercent que rc 0 et rc 2.
+test_2626_undetermined_falls_back_to_the_local_ref() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/undetermined"
+    local failures=""
+
+    # Une divergence légitime d'abord : branche poussée, main avancée, rebase.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "work" > "$FIXTURE_CLONE/work.txt"
+    git -C "$FIXTURE_CLONE" add work.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+    git -C "$FIXTURE_CLONE" push -q -u origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    echo "advance" > "$FIXTURE_CLONE/main-only.txt"
+    git -C "$FIXTURE_CLONE" add main-only.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "advance main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" checkout -q "$br"
+    git -C "$FIXTURE_CLONE" fetch -q origin main
+    git -C "$FIXTURE_CLONE" rebase origin/main >/dev/null 2>&1 \
+        || failures="${failures}fixture: rebase échoué; "
+
+    # Puis le distant devient injoignable. Les refs de suivi LOCALES survivent —
+    # c'est précisément l'état où le prédicat local est tout ce qui reste.
+    git -C "$FIXTURE_CLONE" remote set-url origin "file://$FIXTURE_BARE-does-not-exist"
+    git -C "$FIXTURE_CLONE" rev-parse --verify "origin/$br" >/dev/null 2>&1 \
+        || failures="${failures}fixture: la ref de suivi locale devrait survivre; "
+
+    local stderr_file="$FIXTURE_BARE/push-stderr"
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch 2>"$stderr_file" || true
+
+    # Le repli est DIT, pas silencieux : un repli muet se lirait comme une mesure.
+    if ! grep -qF -- "remote existence undetermined" "$stderr_file"; then
+        failures="${failures}le repli indéterminé n'est pas annoncé; "
+    fi
+    # …et il est dit sur une surface que QUELQU'UN LIT. Le stderr d'avant-pilote
+    # est perdu sur un dispatch qui réussit (classe mika#2050), donc l'assertion
+    # ci-dessus seule attesterait un echo, pas une surface.
+    if ! grep -qF -- "Remote-probe: existence of origin/$br" <<<"$RESULT"; then
+        failures="${failures}le repli n'atteint pas le RESULT; "
+    fi
+    # Et il ne se fait pas passer pour une absence mesurée.
+    if grep -qF -- "Stale-ref:" <<<"$RESULT"; then
+        failures="${failures}une absence est affirmée sans avoir été mesurée; "
+    fi
+    if grep -qF -- "remote has no branch" <<<"$RESULT"; then
+        failures="${failures}l'indéterminé a été traité comme 'absente'; "
+    fi
+    # Comportement d'avant le correctif : le push est tenté et échoue sur le
+    # réseau, pas court-circuité en first-push.
+    if ! grep -qF -- "Push: FAILED" <<<"$RESULT"; then
+        failures="${failures}RESULT sans 'Push: FAILED'; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626E=$(test_2626_undetermined_falls_back_to_the_local_ref 2>/dev/null)
+if [ "$RESULT_2626E" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626: l'issue indéterminée retombe sur le prédicat local, et le dit"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (indéterminé): $RESULT_2626E"
+fi
+
+# --- Un VRAI first-push rejeté : aucune ref de suivi locale ------------------
+#
+# Contrôle négatif du diagnostic AC4, sur la SEULE population où
+# `local_ref_sha` est vide en atteignant le chemin FAILED : une branche jamais
+# poussée, refusée par la forge. Il n'y a pas de ref orpheline ici, donc le
+# diagnostic ne doit pas en inventer une — lui en prêter une serait le défaut
+# mika#2304 (affirmer avec autorité ce qui n'a pas eu lieu) inversé, et c'est
+# pour cela que le qualificatif est conditionnel plutôt que constant.
+#
+# Partout ailleurs dans ce bloc la ref de suivi existe, donc aucun autre cas ne
+# ferait rougir un qualificatif rendu inconditionnel.
+#
+# `_push_branch` est appelée NUE : la fonction se termine par `rm -f` et rend
+# donc 0 même en FAILED (contrat préexistant — elle ne rend non-zéro que sur le
+# guard dedup), il n'y a aucun rc à capturer, et la preuve est la composition du
+# RESULT.
+test_2626_true_first_push_rejected_invents_no_orphan() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/never-pushed"
+    local failures=""
+
+    # Une branche JAMAIS poussée : aucune ref `origin/$br`, ni locale ni distante.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "work" > "$FIXTURE_CLONE/work.txt"
+    git -C "$FIXTURE_CLONE" add work.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+
+    if git -C "$FIXTURE_CLONE" rev-parse --verify "origin/$br" >/dev/null 2>&1; then
+        failures="${failures}fixture: aucune ref de suivi ne devrait exister; "
+    fi
+
+    # Le push est refusé par la forge, pas par le réseau : c'est la conjonction
+    # « distant absent + push échoué + aucune ref locale ».
+    printf '#!/bin/sh\nexit 1\n' > "$FIXTURE_BARE/hooks/pre-receive"
+    chmod +x "$FIXTURE_BARE/hooks/pre-receive"
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    if ! grep -qF -- "Push: FAILED" <<<"$RESULT"; then
+        failures="${failures}le RESULT n'a pas été composé; "
+    fi
+    # Aucune ref orpheline n'existe : ni la ligne de détection, ni le qualificatif.
+    if grep -qF -- "stale tracking ref" <<<"$RESULT"; then
+        failures="${failures}une ref orpheline est inventée sur un vrai first-push; "
+    fi
+    if grep -qF -- "Stale-ref:" <<<"$RESULT"; then
+        failures="${failures}ligne stale-ref sur un vrai first-push; "
+    fi
+    # Et toujours pas d'avance distante affirmée (AC4).
+    if grep -qF -- "remote advanced since fetch" <<<"$RESULT"; then
+        failures="${failures}avance distante affirmée sur une branche jamais poussée; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626F=$(test_2626_true_first_push_rejected_invents_no_orphan 2>/dev/null)
+if [ "$RESULT_2626F" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626: un vrai first-push rejeté n'invente aucune ref orpheline"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (vrai first-push): $RESULT_2626F"
+fi
+
+# --- INDÉTERMINÉ x aucune ref locale : l'absence non mesurée n'est pas affirmée
+#
+# La cellule que la revue adversariale a trouvée, et la seule où le diagnostic
+# FAILED pourrait affirmer un fait distant qu'aucune mesure ne porte. Les deux
+# autres fixtures ne l'atteignent pas : celle du distant injoignable pousse la
+# branche d'abord (donc `local_ref_sha` est toujours peuplé), et celle sans ref
+# de suivi a un distant joignable.
+#
+# C'est pour cette cellule que `remote_known_absent` existe à côté de
+# `remote_has_branch` : le premier est un FAIT (l'absence a été mesurée), le
+# second une DÉCISION (faut-il traiter le distant comme portant la branche).
+# Les confondre reproduirait le défaut mika#2304 que ce ticket ferme, une
+# cellule plus loin — et sans ce test, rien ne le dirait.
+test_2626_undetermined_without_local_ref_asserts_nothing() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/undetermined-no-ref"
+    local failures=""
+
+    # Une branche jamais poussée : aucune ref de suivi.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "work" > "$FIXTURE_CLONE/work.txt"
+    git -C "$FIXTURE_CLONE" add work.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+
+    # …et un distant injoignable : `ls-remote` ne peut rien mesurer.
+    git -C "$FIXTURE_CLONE" remote set-url origin "file://$FIXTURE_BARE-does-not-exist"
+
+    if git -C "$FIXTURE_CLONE" rev-parse --verify "origin/$br" >/dev/null 2>&1; then
+        failures="${failures}fixture: aucune ref de suivi ne devrait exister; "
+    fi
+
+    local stderr_file="$FIXTURE_BARE/push-stderr-no-ref"
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch 2>"$stderr_file" || true
+
+    if ! grep -qF -- "remote existence undetermined" "$stderr_file"; then
+        failures="${failures}le repli indéterminé n'est pas annoncé; "
+    fi
+    if ! grep -qF -- "Remote-probe: existence of origin/$br" <<<"$RESULT"; then
+        failures="${failures}le repli n'atteint pas le RESULT; "
+    fi
+    if ! grep -qF -- "Push: FAILED" <<<"$RESULT"; then
+        failures="${failures}RESULT sans 'Push: FAILED'; "
+    fi
+    # LE POINT DU TEST : rien n'a été mesuré, donc rien n'est affirmé.
+    if grep -qF -- "remote has no branch" <<<"$RESULT"; then
+        failures="${failures}une absence NON MESURÉE est affirmée; "
+    fi
+    if grep -qF -- "Stale-ref:" <<<"$RESULT"; then
+        failures="${failures}ligne stale-ref sans ref de suivi; "
+    fi
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626G=$(test_2626_undetermined_without_local_ref_asserts_nothing 2>/dev/null)
+if [ "$RESULT_2626G" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626: indéterminé sans ref locale n'affirme aucune absence"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (indéterminé sans ref): $RESULT_2626G"
+fi
+
+# --- DISTANT PRÉSENT x ref de suivi ABSENTE : le second terme de la conjonction
+#
+# `if [ "$remote_has_branch" -eq 1 ] && [ -n "$local_ref_sha" ]` porte deux
+# termes, et celui de droite n'était testé par rien. Il est pourtant porteur :
+# tout le bloc qu'il garde LIT la ref de suivi (`origin/$BRANCH..HEAD`,
+# `merge-base --is-ancestor`), donc sans lui un distant qui porte la branche
+# sans ref locale correspondante entrerait dans un bloc qui compte contre une
+# ref absente — `rev-list` échoue, `|| echo 0` rend 0, et `return 0` rend un
+# no-op MUET sur une branche qui a tout à pousser. C'est la forme même du
+# défaut fondateur, atteinte par l'autre bout.
+#
+# Le fixture retire le refspec de fetch avant de supprimer la ref de suivi :
+# sans refspec, le `git fetch origin "$BRANCH"` de `_push_branch` n'écrit que
+# FETCH_HEAD et ne peut pas la recréer, donc la cellule est déterministe. Le
+# distant, lui, porte bien la branche.
+test_2626_present_remote_without_tracking_ref_still_pushes() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    local br="test/1960/no-tracking-ref"
+    local failures=""
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    echo "work" > "$FIXTURE_CLONE/work.txt"
+    git -C "$FIXTURE_CLONE" add work.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "branch work"
+    git -C "$FIXTURE_CLONE" push -q -u origin "$br"
+
+    # Un commit de plus, pour qu'il y ait réellement quelque chose à pousser.
+    echo "more" > "$FIXTURE_CLONE/more.txt"
+    git -C "$FIXTURE_CLONE" add more.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "more work"
+
+    # Le distant garde la branche ; la ref de suivi LOCALE disparaît, et le
+    # refspec est retiré pour qu'aucun fetch ne la ressuscite.
+    git -C "$FIXTURE_CLONE" config --unset remote.origin.fetch
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/remotes/origin/$br"
+
+    git -C "$FIXTURE_CLONE" ls-remote --exit-code origin "refs/heads/$br" >/dev/null 2>&1 \
+        || failures="${failures}fixture: le distant devrait porter la branche; "
+    if git -C "$FIXTURE_CLONE" rev-parse --verify "origin/$br" >/dev/null 2>&1; then
+        failures="${failures}fixture: la ref de suivi locale devrait être absente; "
+    fi
+
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$br"
+    REPO="mika"
+    RESULT=""
+    _push_branch
+
+    # LE POINT DU TEST : pas de no-op muet.
+    if ! grep -qF -- "Push: pushed" <<<"$RESULT"; then
+        failures="${failures}no-op muet: rien n'a été poussé alors que le distant porte la branche; "
+    fi
+    # Aucune ref orpheline ici : le distant est présent et la ref locale absente.
+    if grep -qF -- "Stale-ref:" <<<"$RESULT"; then
+        failures="${failures}ligne stale-ref sur un distant présent sans ref locale; "
+    fi
+    local local_head remote_head
+    local_head=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    remote_head=$(git -C "$FIXTURE_CLONE" ls-remote origin "refs/heads/$br" 2>/dev/null | cut -f1)
+    [ "$local_head" = "$remote_head" ] \
+        || failures="${failures}tête distante ≠ HEAD (local=$local_head remote=${remote_head:-<none>}); "
+
+    _fixture_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+RESULT_2626H=$(test_2626_present_remote_without_tracking_ref_still_pushes 2>/dev/null)
+if [ "$RESULT_2626H" = "PASS" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2626: distant présent sans ref de suivi pousse quand même"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2626 (présent sans ref de suivi): $RESULT_2626H"
+fi
+
+# --- V5 : lecteur unique du fait « le distant porte cette branche » ---------
+#
+# Deux prédicats divergents sur un même fait, c'est le motif que la maison a
+# documenté deux fois : mika#2158 (promotion et routage répondaient
+# différemment, pendant des mois, sans que rien casse) et mika#2484 (une
+# divergence à quatre étapes d'écart dans le même handler). Dans l'incident,
+# `_set_up_worktree` a répondu « absente » — c'est pourquoi le worktree a été
+# basé sur origin/main — et `_push_branch`, même fichier et même dispatch, a
+# répondu « présente ».
+#
+# Le prédicat porte sur `--exit-code`, la question d'EXISTENCE, et non sur
+# `ls-remote` en général : les deux autres sites du fichier lisent un **SHA**
+# (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`), question différente,
+# prédicat différent — et un scan qui les dénoncerait à tort se fait désarmer.
+echo ""
+echo "Test mika#2626 (V5): lecteur unique de l'existence distante"
+echo "-----------------------------------------------------------"
+
+M2626_READER_SRC=$(sed -n '/^_remote_branch_exists() {/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2626 (V5, anti-vacuité): le lecteur \`_remote_branch_exists\` existe" "yes" \
+    "$(if [ -n "$M2626_READER_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Les trois issues sont contractuelles, pas observées par accident :
+# `git ls-remote --help` — « Exit with status "2" when no matching refs are
+# found ». L'issue INDÉTERMINÉE (rc 128, le distant n'a pas répondu) retombe sur
+# le prédicat d'aujourd'hui : un signal qu'on ne peut pas lire n'est jamais un
+# terme satisfait (mika#2277), appliqué dans les DEUX sens — traiter un réseau
+# coupé comme « absente » serait affirmer une mesure qu'on n'a pas faite.
+M2626_DOC_SRC=$(sed -n '/^# `_remote_branch_exists /,/^_remote_branch_exists() {/p' "$DISPATCH_LIB")
+assert_contains "mika#2626 (V5): le doc-comment porte la table de rc" \
+    "rc de ls-remote --exit-code" "$M2626_DOC_SRC"
+assert_contains "mika#2626 (V5): et il NOMME l'issue indéterminée plutôt que de la subir" \
+    "INDÉTERMINÉE" "$M2626_DOC_SRC"
+
+# Un seul site LIT `ls-remote --exit-code`, et c'est le lecteur.
+#
+# Le prédicat exclut les lignes de commentaire, et ce terme est load-bearing :
+# le fichier MENTIONNE légitimement la forme en prose — la table de rc du
+# doc-comment et la note de délégation de `_set_up_worktree` — et un grep nu
+# compte ces deux mentions comme des lecteurs. Mesuré pendant cette
+# implémentation : 3 occurrences, dont 2 en prose. C'est le faux positif que
+# mika#2050 a mesuré sur le Signal S, où la prose d'un pilote qui *discutait* le
+# signal se lisait comme une émission.
+#
+# Le prédicat est défini UNE fois et appelé aux quatre sites, contrôles de
+# bonne foi compris. Le recomposer à la main dans les contrôles les rendrait
+# muets au resserrement du prédicat réel : ils attesteraient leur propre copie,
+# ce qui est la forme exacte d'un contrôle de bonne foi qui ne contrôle rien.
+_m2626_count_exitcode_readers() {
+    grep -v '^[[:space:]]*#' | grep -cF -- 'ls-remote --exit-code' || true
+}
+
+M2626_EXITCODE_SITES=$(_m2626_count_exitcode_readers < "$DISPATCH_LIB")
+assert_eq "mika#2626 (V5): EXACTEMENT un site lit \`ls-remote --exit-code\`" "1" \
+    "$M2626_EXITCODE_SITES"
+
+M2626_EXITCODE_IN_READER=$(printf '%s\n' "$M2626_READER_SRC" | _m2626_count_exitcode_readers)
+assert_eq "mika#2626 (V5): et ce site est DANS le lecteur" "1" \
+    "$M2626_EXITCODE_IN_READER"
+
+# Anti-vacuité, et c'est une ASSERTION, pas un commentaire : un prédicat devenu
+# trop étroit passerait sinon en ne regardant rien (classe mika#2205).
+# EXACTEMENT deux appelants — l.3457 (`_set_up_worktree`, qui délègue) et
+# `_push_branch` (nouveau). Les deux n'opèrent pas sur le même répertoire
+# (`$SUB_REPO_DIR` contre `$WORKTREE_DIR`), d'où l'argument de répertoire.
+#
+# Le filtre de commentaires est load-bearing ici AUSSI, et son absence a été
+# mesurée : le compte brut rend 3 — les deux appelants (l.3463, l.5879) plus la
+# première ligne du doc-comment, qui porte `_remote_branch_exists <repo_dir>`.
+# La soustraction d'une ligne de définition ramenait à 2 par COÏNCIDENCE : la
+# ligne `_remote_branch_exists() {` est suivie de `(`, donc le regex ne l'a
+# jamais comptée, et deux erreurs s'annulaient. Le guard aurait été vert avec
+# TROIS vrais appelants — un détecteur d'anti-vacuité vert par accident, qui est
+# la classe de panne qu'il existe pour empêcher (mika#2205).
+M2626_CALLERS=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" \
+    | grep -cE '^[[:space:]]*(if |local |[A-Za-z_]+=)?.*_remote_branch_exists[[:space:]]' || true)
+assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT deux appelants du lecteur" "2" \
+    "$M2626_CALLERS"
+
+# Contrôle de bonne foi, DANS LES DEUX SENS, et chaque sens exerce le prédicat
+# réel (filtre de commentaires compris) plutôt qu'une approximation.
+#
+# Sens 1 : un second site remis DOIT être accusé. Sans lui, « exactement un
+# site » est indistinguable de « le prédicat ne regarde rien » (mika#2205).
+M2626_FX_SECOND_READER='    if git -C "$WORKTREE_DIR" ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then'
+assert_eq "mika#2626 (V5, contrôle négatif): le prédicat accuse un second lecteur remis" "1" \
+    "$(printf '%s\n' "$M2626_FX_SECOND_READER" | _m2626_count_exitcode_readers)"
+
+# Sens 2 : une MENTION en prose ne doit PAS l'être. C'est le terme qui vient
+# d'être ajouté, et sans ce contrôle on ne saurait pas qu'il mord — un scan
+# permanemment rouge sur du travail légitime se fait désarmer.
+M2626_FX_PROSE_MENTION='            # faux, exactement comme l échec en rc 128 d `ls-remote --exit-code`'
+assert_eq "mika#2626 (V5, contrôle négatif): une mention en prose n'est PAS accusée" "0" \
+    "$(printf '%s\n' "$M2626_FX_PROSE_MENTION" | _m2626_count_exitcode_readers)"
+
+# Structurel : la décision de mode consulte le distant, et le court-circuit
+# `ahead == 0` ne s'applique plus qu'à un distant présent. `declare -f` strippe
+# les commentaires, donc on lit la source.
+M2626_PUSH_SRC=$(sed -n '/^_push_branch() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2626: \`_push_branch\` consulte le lecteur avant de choisir son mode" \
+    "_remote_branch_exists" "$M2626_PUSH_SRC"
+
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
