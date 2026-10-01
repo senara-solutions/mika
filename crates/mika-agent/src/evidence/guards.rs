@@ -1700,14 +1700,21 @@ const TESTIMONY_SUBJECT_ALTERNATION: &str = r"(?:
 /// grey zone the doctrine aims at — bounded by the sentence and by
 /// [`CLAIM_GAP_MAX`], and leaning the way the fail-safe prescribes only once
 /// phase 2 measures it.
+///
+/// **`laisse-moi` and `you let me` are out of the layer, deliberately.** Both
+/// are discourse fillers far more often than grants — « laisse-moi être
+/// claire, je ne lirai jamais tes emails » opens a refusal, « if you let me
+/// know what you need » offers an operational substitute — and the fail-safe
+/// prefers the missed grant to the refused refusal. `let me access/read/into`
+/// keeps the unambiguous English grant.
 const ACCESS_OPENING_ALTERNATION: &str = r"(?:
       (?:si\s+)?tu\s+(?:peux\s+|pourrais\s+|voudrais\s+|veux\s+)?m(?:e\s+|'\s*)(?:y\s+)?(?:donnes?|donnais|donnerais|donner|ouvres?|ouvrais|ouvrir|autorises?|autorisais|autoriser|connectes?|connecter|branches?|brancher|laisses?|laisser)\b
-    | (?:donne|donnez|autorise|autorisez|connecte|connectez|ouvre|ouvrez|laisse|laissez)[\s-]?(?:moi|nous)\b
+    | (?:donne|donnez|autorise|autorisez|connecte|connectez|ouvre|ouvrez)[\s-]?(?:moi|nous)\b
     | (?:il\s+)?(?:faudrait|suffirait|faut)\s+(?:juste\s+|simplement\s+)?m(?:e\s+|'\s*)(?:donner|ouvrir|autoriser|connecter|brancher)\b
     | si\s+j(?:e\s+|'\s*)(?:avais|pouvais|obtenais)\b
     | avec\s+(?:un\s+)?acc[èe]s\s+[àa]\b
     | je\s+pourrais\s+(?:t'|te\s+|vous\s+)?(?:aider|faire|g[ée]rer|trier|lire|r[ée]pondre|chercher|retrouver)\w*\s+si\b
-    | (?:if\s+)?you\s+(?:can\s+|could\s+|would\s+|might\s+)?(?:gave|give|grant|granted|authorize|authorise|connect|link|let)\s+me\b
+    | (?:if\s+)?you\s+(?:can\s+|could\s+|would\s+|might\s+)?(?:gave|give|grant|granted|authorize|authorise|connect|link)\s+me\b
     | (?:give|grant)\s+me\s+(?:access|permission)\b
     | let\s+me\s+(?:access|read|into|connect)\b
     | (?:if\s+)?i\s+(?:had|could\s+get|get|got)\s+access\b
@@ -7613,6 +7620,24 @@ mod tests {
             assert!(
                 detect_testimony_access_proposal(refused).is_none(),
                 "the refusal marker must cancel a sentence carrying A and B: {refused}"
+            );
+        }
+    }
+
+    /// « laisse-moi » and « let me know » are discourse fillers, not grants:
+    /// « laisse-moi être claire » opens a refusal as often as anything, and
+    /// « if you let me know what you need » offers an operational substitute.
+    /// Neither may count as an opening movement.
+    #[test]
+    fn mika1960_a_discourse_filler_is_not_an_opening_movement() {
+        for text in [
+            "Laisse-moi être claire, je ne lirai jamais tes emails.",
+            "Laissez-moi vous rassurer, je ne toucherai pas à votre messagerie.",
+            "I won't read your inbox — if you let me know what you need, I'll help another way.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a discourse filler is not a request for access: {text}"
             );
         }
     }
