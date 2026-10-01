@@ -1919,7 +1919,7 @@ mod tests {
         let mut sites: Vec<(String, usize, usize)> = Vec::new();
         let mut total_calls = 0usize;
 
-        for (rel, content) in production_sources() {
+        for (rel, content) in production_sources_to_test_module() {
             if HOLD_CLASSIFICATION_EXCEPTIONS.contains(&rel.as_str()) {
                 continue;
             }
@@ -2001,7 +2001,7 @@ mod tests {
         let owner = "crates/mika-agent/src/skills/builtin_handlers.rs";
 
         let mut writers = Vec::new();
-        for (rel, content) in production_sources() {
+        for (rel, content) in production_sources_to_test_module() {
             let carries = content
                 .lines()
                 .filter(|l| {
