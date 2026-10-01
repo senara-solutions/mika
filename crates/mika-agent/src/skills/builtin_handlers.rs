@@ -2531,8 +2531,11 @@ fn detect_pr_ready_undraft(args: &[String]) -> Option<UndraftSelector<'_>> {
         return None;
     }
 
-    Some(match extract_pr_number_positional(args) {
-        Some(number) => UndraftSelector::Number(number),
+    Some(match extract_pr_positional(args) {
+        Some(raw) => UndraftSelector::Number {
+            number: normalize_pr_identifier(raw),
+            url_repo: pr_url_repo(raw),
+        },
         None => UndraftSelector::Unresolved,
     })
 }
@@ -2541,10 +2544,44 @@ fn detect_pr_ready_undraft(args: &[String]) -> Option<UndraftSelector<'_>> {
 /// (mika#2624).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndraftSelector<'a> {
-    /// A PR number, bare or extracted from a PR URL.
-    Number(&'a str),
+    /// A PR number, bare or extracted from a PR URL — and, for a URL, the
+    /// `owner/repo` the URL itself names, which the number alone forgets.
+    Number {
+        number: &'a str,
+        url_repo: Option<&'a str>,
+    },
     /// A selector the term cannot turn into a number: refused fail-closed.
     Unresolved,
+}
+
+/// `owner/repo` named by a GitHub PR URL selector, or `None` for anything else
+/// (a bare number, a branch, a malformed URL).
+fn pr_url_repo(selector: &str) -> Option<&str> {
+    let after_host = &selector[selector.find("github.com/")? + "github.com/".len()..];
+    let repo = &after_host[..after_host.find("/pull/")?];
+    let (owner, name) = repo.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some(repo)
+}
+
+/// The repository whose timeline the hold term must read, or `None` when the
+/// call does not name one coherently (review of PR #2628).
+///
+/// A PR URL names its own repository, and `normalize_pr_identifier` keeps only
+/// the number: without this, `pr ready https://github.com/o/other/pull/12` with
+/// no `repo` parameter read PR #12 of the default repository — a different PR
+/// whose hold state says nothing about the one being un-drafted. A declared
+/// `repo` that disagrees with the URL's is ambiguous and refused, never
+/// arbitrated.
+fn resolve_hold_target_repo<'a>(
+    declared: Option<&'a str>,
+    url_repo: Option<&'a str>,
+) -> Option<&'a str> {
+    match (declared, url_repo) {
+        (Some(d), Some(u)) if !d.eq_ignore_ascii_case(u) => None,
+        (Some(d), _) => Some(d),
+        (None, Some(u)) => Some(u),
+        (None, None) => Some(crate::wip_rescue::DEFAULT_REPO),
+    }
 }
 
 /// Extract the first positional PR number from a `gh pr <verb> ...` argv.
@@ -2553,6 +2590,14 @@ enum UndraftSelector<'a> {
 /// and their values so a numeric `--title 123` is not mistaken for the PR number.
 /// Normalizes GitHub PR URLs to bare numbers via `normalize_pr_identifier`.
 fn extract_pr_number_positional(args: &[String]) -> Option<&str> {
+    extract_pr_positional(args).map(normalize_pr_identifier)
+}
+
+/// The raw positional argument [`extract_pr_number_positional`] reads its
+/// number from — kept whole so a PR URL's `owner/repo` is still readable
+/// (mika#2624, review of PR #2628). One scan, two readers: the two cannot
+/// disagree on which argument is the PR.
+fn extract_pr_positional(args: &[String]) -> Option<&str> {
     /// Flags on `gh pr ready`/`gh pr edit` that consume the next argument as a value.
     const VALUE_FLAGS: &[&str] = &[
         "--title",
@@ -2585,9 +2630,8 @@ fn extract_pr_number_positional(args: &[String]) -> Option<&str> {
             }
             continue;
         }
-        let normalized = normalize_pr_identifier(arg);
-        if normalized.parse::<u32>().is_ok() {
-            return Some(normalized);
+        if normalize_pr_identifier(arg).parse::<u32>().is_ok() {
+            return Some(arg.as_str());
         }
     }
     None
@@ -3112,13 +3156,29 @@ async fn validate_pr_ready_undraft_scope(
     let Some(selector) = detect_pr_ready_undraft(args) else {
         return Ok(());
     };
-    let target_repo = repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO);
+    let declared_repo = repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO);
 
     // A `pr ready` the term cannot address is refused before anything else:
     // no token, no network call is needed to know the check cannot run.
-    let pr_num = match selector {
-        UndraftSelector::Number(pr_num) => pr_num,
+    let (pr_num, target_repo) = match selector {
+        UndraftSelector::Number { number, url_repo } => {
+            match resolve_hold_target_repo(repo, url_repo) {
+                Some(target_repo) => (number, target_repo),
+                None => {
+                    return Err(refuse_pr_ready_hold(
+                        ctx,
+                        number,
+                        PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                        declared_repo,
+                        (None, None),
+                        "refused un-draft: the PR URL names another repository than the declared one",
+                    )
+                    .await);
+                }
+            }
+        }
         UndraftSelector::Unresolved => {
+            let target_repo = declared_repo;
             return Err(refuse_pr_ready_hold(
                 ctx,
                 "unresolved",
@@ -3149,11 +3209,12 @@ async fn validate_pr_ready_undraft_scope(
 
     // `fetch_convert_to_draft_events` wants `(owner, repo)`. The tool's `repo`
     // parameter is the declared one (`--repo` inside the argv is refused upstream
-    // by `validate_gh_input`); absent, we fall back on the default repo exactly
-    // as `wip_rescue::default_repo_parts` does.
+    // by `validate_gh_input`); a PR URL selector names its own repository
+    // (`resolve_hold_target_repo`); with neither, we fall back on the default
+    // repo exactly as `wip_rescue::default_repo_parts` does.
     //
-    // Named cost: a `pr ready` on a PR of another repository with no `repo`
-    // passed queries the wrong repository's timeline. GraphQL then answers
+    // Named cost: a bare-number `pr ready` on a PR of another repository with
+    // no `repo` passed queries the wrong repository's timeline. GraphQL then answers
     // `pullRequest: null`, the fail-closed extractor returns `Err`, and the
     // refusal lands under `hold_unreadable`. That is a false positive whose
     // remedy is **named in the refusal body**: pass `repo`. Acceptable because
@@ -12290,7 +12351,10 @@ mod tests {
         let args = str_args(&["pr", "ready", "2621"]);
         assert_eq!(
             detect_pr_ready_undraft(&args),
-            Some(UndraftSelector::Number("2621"))
+            Some(UndraftSelector::Number {
+                number: "2621",
+                url_repo: None
+            })
         );
 
         let view = normal_pr_view();
@@ -12454,6 +12518,48 @@ mod tests {
         // Contrôle négatif : `--undo` et un renommage de titre restent dehors.
         assert!(detect_pr_ready_undraft(&str_args(&["pr", "ready", "x", "--undo"])).is_none());
         assert!(detect_pr_ready_undraft(&str_args(&["pr", "edit", "x", "--title", "t"])).is_none());
+    }
+
+    #[test]
+    fn mika2624_une_url_de_pr_lit_la_timeline_de_son_propre_depot() {
+        // Revue mika#2628 (security, adversarial, reliability) : l'URL d'une PR
+        // d'un autre dépôt était réduite à son numéro, et le terme hold lisait
+        // la PR du même numéro sur le dépôt par défaut — une autre PR.
+        let args = str_args(&[
+            "pr",
+            "ready",
+            "https://github.com/senara-solutions/mika-cloud/pull/12",
+        ]);
+        let Some(UndraftSelector::Number { number, url_repo }) = detect_pr_ready_undraft(&args)
+        else {
+            panic!("a PR URL is an addressable un-draft");
+        };
+        assert_eq!(number, "12");
+        assert_eq!(url_repo, Some("senara-solutions/mika-cloud"));
+        assert_eq!(
+            resolve_hold_target_repo(None, url_repo),
+            Some("senara-solutions/mika-cloud"),
+            "with no declared repo, the URL's repository is the one read"
+        );
+        // Un repo déclaré qui contredit l'URL est ambigu : refusé, jamais
+        // arbitré.
+        assert_eq!(
+            resolve_hold_target_repo(Some("senara-solutions/mika"), url_repo),
+            None
+        );
+        // Contrôles positifs : déclaré et URL d'accord, numéro nu, rien du tout.
+        assert_eq!(
+            resolve_hold_target_repo(Some("Senara-Solutions/Mika-Cloud"), url_repo),
+            Some("Senara-Solutions/Mika-Cloud")
+        );
+        assert_eq!(resolve_hold_target_repo(Some("o/r"), None), Some("o/r"));
+        assert_eq!(
+            resolve_hold_target_repo(None, None),
+            Some(crate::wip_rescue::DEFAULT_REPO)
+        );
+        // Une URL malformée ne nomme aucun dépôt.
+        assert_eq!(pr_url_repo("https://github.com/only/pull/12"), None);
+        assert_eq!(pr_url_repo("2621"), None);
     }
 
     #[test]
