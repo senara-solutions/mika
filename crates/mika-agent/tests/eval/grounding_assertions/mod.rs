@@ -381,17 +381,6 @@ impl VerificationTier<'_> {
             VerificationTier::SnippetOnly => 2,
         }
     }
-
-    /// Human-readable form of the declared tier, for panic messages.
-    fn declared(self) -> String {
-        match self {
-            VerificationTier::VerifiedRule(source) => format!("VerifiedRule({source:?})"),
-            VerificationTier::SourceNotProbative(source) => {
-                format!("SourceNotProbative({source:?})")
-            }
-            VerificationTier::SnippetOnly => "SnippetOnly".to_string(),
-        }
-    }
 }
 
 /// Assert that each element in a multi-element response carries a bracketed
@@ -472,12 +461,9 @@ pub fn assert_per_line_verification_qualification(
         let required = TIER_MARKERS[rank];
         if !required.iter().any(|marker| window.contains(marker)) {
             violations.push(format!(
-                "element {:?} declared {} but none of its required markers {:?} was \
+                "element {:?} declared {:?} but none of its required markers {:?} was \
                  found within {} bytes after the element name",
-                element,
-                tier.declared(),
-                required,
-                QUALIFICATION_WINDOW_BYTES,
+                element, tier, required, QUALIFICATION_WINDOW_BYTES,
             ));
         }
 
@@ -485,13 +471,10 @@ pub fn assert_per_line_verification_qualification(
         for (stronger_rank, markers) in TIER_MARKERS[..rank].iter().enumerate() {
             if let Some(found) = markers.iter().find(|marker| window.contains(**marker)) {
                 violations.push(format!(
-                    "element {:?} declared {} but response carries the stronger \
+                    "element {:?} declared {:?} but response carries the stronger \
                      tier-{} marker {:?} on it — a response may under-claim its \
                      evidence tier, never over-claim it",
-                    element,
-                    tier.declared(),
-                    stronger_rank,
-                    found,
+                    element, tier, stronger_rank, found,
                 ));
             }
         }
