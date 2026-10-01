@@ -1789,6 +1789,17 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
     "i don't have access",
     "i do not have access",
     "never ask you",
+    // Negated grants (EN). `give me access` is an opening movement wherever it
+    // sits, and the regex crate offers no lookbehind, so the negation is
+    // carried here, at sentence scope, like every other refusal.
+    "don't give me",
+    "do not give me",
+    "don't grant me",
+    "do not grant me",
+    "don't need to give me",
+    "do not need to give me",
+    "no need to give me",
+    "no need to grant me",
 ];
 
 /// Detects a sentence proposing to **open** access to testimony-grade data
@@ -7622,6 +7633,28 @@ mod tests {
                 "the refusal marker must cancel a sentence carrying A and B: {refused}"
             );
         }
+    }
+
+    /// A negated grant is a refusal, not a request. `give me access` is an
+    /// opening movement wherever it sits, so the negation has to be carried by
+    /// the sentence-scoped refusal markers — the same seat as « je ne peux
+    /// pas » — rather than by a lookbehind the regex crate does not offer.
+    #[test]
+    fn mika1960_a_negated_grant_is_a_refusal() {
+        for text in [
+            "Don't give me access to your Gmail, it stays yours.",
+            "Please do not give me access to your inbox.",
+            "You don't need to give me access to your mailbox.",
+            "There is no need to grant me access to your emails.",
+            "Tu n'as pas besoin de me donner accès à ta boîte Gmail.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a negated grant must not fire: {text}"
+            );
+        }
+        // Control: the same grant without the negation is a proposal.
+        assert!(detect_testimony_access_proposal("Give me access to your Gmail.").is_some());
     }
 
     /// « laisse-moi » and « let me know » are discourse fillers, not grants:
