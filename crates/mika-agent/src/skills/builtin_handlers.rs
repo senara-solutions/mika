@@ -2728,7 +2728,9 @@ fn pr_ready_hold_rejection_body(
         format!(
             "The draft-state history of pull request #{pr_num} on {repo} could \
              not be read, so it cannot be established that this PR is not held. \
-             A term that cannot be read is not a satisfied term."
+             A term that cannot be read is not a satisfied term. If this pull \
+             request does not live on {repo}, pass the `repo` parameter: the \
+             history was looked up on the wrong repository."
         )
     };
 
@@ -12281,6 +12283,36 @@ mod tests {
                 "the refusal must not name `{forbidden}` as a route"
             );
         }
+    }
+
+    #[test]
+    fn mika2624_un_refus_illisible_nomme_le_parametre_repo() {
+        // Plan § Résolution du dépôt : sans `repo`, une PR d'un autre dépôt
+        // interroge la timeline du dépôt par défaut, GraphQL rend
+        // `pullRequest: null` et le refus tombe sous `hold_unreadable`. Ce faux
+        // positif n'est acceptable que parce que son remède est à un argument de
+        // distance — encore faut-il que le corps du refus le nomme.
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_UNREADABLE,
+            "senara-solutions/mika",
+            None,
+            None,
+        );
+        assert!(
+            body.contains("`repo`"),
+            "an unreadable-timeline refusal must name the `repo` parameter: {body}"
+        );
+        // …et le motif d'un hold réel ne le suggère pas : la timeline a été
+        // lue, le dépôt était le bon.
+        let held = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            "senara-solutions/mika",
+            None,
+            None,
+        );
+        assert!(!held.contains("`repo`"));
     }
 
     #[test]
