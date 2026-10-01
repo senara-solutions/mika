@@ -93,6 +93,26 @@ async fn test_testimony_access_proposal_caught_and_corrected() -> anyhow::Result
         trace.llm_call_count
     );
 
+    // Hard: the re-prompt is 5h's, not any guard's. `llm_call_count > 1` alone is
+    // satisfied by whichever EndTurn guard fires first on this text, so a guard
+    // added later that matched the mock would keep this test green with 5h
+    // unwired. The second captured request ends on the correction the engine
+    // pushed — and only 5h writes this one.
+    let reprompt = trace
+        .captured_requests
+        .get(1)
+        .expect("a re-prompted turn must have a second captured request");
+    let correction = reprompt
+        .messages
+        .last()
+        .expect("the re-prompt carries the engine's correction as its last message");
+    assert!(
+        format!("{:?}", correction.content).contains("Your response proposes to open access"),
+        "the re-prompt was not 5h's testimony-access correction — another guard \
+         fired on this turn. Last message was: {:?}",
+        correction.content
+    );
+
     assert_has_output(&trace);
 
     // Hard: the corrected turn no longer carries the grant movement.
