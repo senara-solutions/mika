@@ -142,32 +142,42 @@ READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
 # about the PATH shape, not about the key (grooming_marker.rs).
 > - **Branch:**	B	crates/mika-agent/src/skills/executor.rs::check_grooming_markers	exact:literal
 > - **Grooming history:**	B	crates/mika-agent/src/grooming_marker.rs::CALLOUT_LINE_RE	exact:line-anchored
-# mika#2194 phase 1 — DEUX lignes ont fusionné vers un site unique, et deux
-# restent. Ce n'est pas un nettoyage : c'est le périmètre du maillon.
+# mika#2194 phase 1 puis mika#2608 phase 2 — QUATRE lignes ont fusionné vers un
+# site unique. Ce n'est pas un nettoyage : c'est le périmètre du maillon, deux
+# fois de suite.
 #
-# Le motif vivait deux fois, dans deux langues — `auto_pull::PLAN_CALLOUT_RE` en
-# Rust et `dispatch-lib::_extract_plan_path` en PCRE — et les deux n'avaient
-# JAMAIS été exécutés sur la même entrée. Ils portent désormais un seul site,
-# `plan_callout.rs`, que les deux appellent sans en garder de copie ; les deux
-# anciennes lignes disparaissent parce qu'aucun des deux n'est plus un site de
-# match. Un appelant qui délègue n'en est pas un, et le déclarer ferait mentir
-# l'inventaire avec l'autorité d'un inventaire.
+# Le motif vivait quatre fois, dans deux langues — `auto_pull::PLAN_CALLOUT_RE`
+# et `dispatch-lib::_extract_plan_path` (phase 1), puis
+# `dispatch-lib::_committed_plan_on_branch` et le `elif` de
+# `dispatch-lib::_set_up_worktree` (phase 2) — et aucun n'avait JAMAIS été
+# exécuté sur la même entrée que les autres. Les quatre portent désormais un seul
+# site, `plan_callout.rs`, qu'ils appellent sans en garder de copie ; leurs
+# lignes disparaissent parce qu'aucun n'est plus un site de match. Un appelant
+# qui délègue n'en est pas un, et le déclarer ferait mentir l'inventaire avec
+# l'autorité d'un inventaire.
 #
-# Les deux lecteurs bash de dispatch-lib restent DÉLIBÉRÉMENT : ils lisent le
-# callout pour d'autres questions, sur d'autres chemins, et les migrer
-# élargirait ce maillon au-delà de son unique appelant. Ils sont la phase 2, et
-# `test-dispatch-lib.sh` fige leur inventaire (exactement deux, nommés) plutôt
-# qu'un zéro qui serait rouge à la naissance.
+# L'INVENTAIRE EST DÉSORMAIS FERMÉ À UNE LIGNE, et c'est `test-dispatch-lib.sh`
+# qui le tient — pas ce fichier, et pas les deux gardes mika#2201. C'est la
+# correction que mika#2608 M5 apporte à la lecture naïve de son AC5 : le survey
+# ne vérifie qu'UNE direction (tout site strict de l'arbre est déclaré) et son
+# propre commentaire nomme ce qu'il laisse passer — « a row whose file and symbol
+# both still exist but which no longer reads the token ». Les deux fonctions
+# existent encore, donc `mika2201_every_declared_symbol_still_exists` serait
+# resté vert sur deux lignes devenues fausses. « Les deux gardes sont vertes »
+# n'était donc pas une preuve ; l'assertion bornée au jeton l'est.
 #
-# Quatrième tolérance, trouvée en implémentant et absente de la borne B1 du
-# plan, qui n'en nommait que trois : `milestone_manager::reader.rs` lit
-# `**Plan:**` par `contains`, SANS le préfixe `> - `, pour répondre à une
-# question booléenne de présence (LECTURE seule, aucun chemin rendu). Il est
-# hors de ce jeton par sa forme, donc hors de cet inventaire — et il est nommé
-# ici pour qu'un futur maillon ne le croie ni oublié ni autorisé à l'absorber.
+# Quatrième tolérance, trouvée en implémentant la phase 1 et TRANCHÉE par la
+# phase 2 : `milestone_manager::reader::plan_callout_present` lit `**Plan:**` par
+# `contains`, SANS le préfixe `> - `, pour répondre à une question booléenne de
+# présence (LECTURE seule, aucun chemin rendu). **Décision mika#2608 : tolérance
+# CONSERVÉE**, et la raison est structurelle plutôt que prudentielle — sa
+# première branche est un sur-ensemble strict du lecteur unique, donc un appel au
+# lecteur strict y serait PROUVABLEMENT inerte (aucun corps que le strict accepte
+# n'est refusé par elle). Il est hors de ce jeton par sa forme, donc hors de cet
+# inventaire — et il est nommé ici pour qu'un futur maillon ne le croie ni
+# oublié ni autorisé à l'absorber. Détail : `plan_callout.rs` § table des
+# tolérances, et `reader.rs` au site.
 > - **Plan:**	B	crates/mika-agent/src/plan_callout.rs::PLAN_CALLOUT_RE	exact:line-anchored
-> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_committed_plan_on_branch	exact:line-anchored
-> - **Plan:**	B	skills/bundled/_shared/dispatch-lib.sh::_set_up_worktree	exact:literal
 
 # ── Verdict tokens. Case-sensitive by written decision: `GROOMED` is a token the
 # pipeline produces, "groomed" in prose is not one (grooming_marker.rs).

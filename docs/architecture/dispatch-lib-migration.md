@@ -1,12 +1,20 @@
-# Migrer `dispatch-lib.sh` — la doctrine, bornée à ce que la phase 1 a établi
+# Migrer `dispatch-lib.sh` — la doctrine, bornée à ce que les phases 1 et 2 ont établi
 
 **Ticket parent :** [mika#2194](https://github.com/senara-solutions/mika/issues/2194).
-**État :** phase 1 livrée (`_extract_plan_path` → `crates/mika-agent/src/plan_callout.rs`).
-Les phases 2 à 4 sont nommées ici et **aucune n'est ouverte**.
+**État :** phases **1** ([mika#2194](https://github.com/senara-solutions/mika/issues/2194))
+et **2** ([mika#2608](https://github.com/senara-solutions/mika/issues/2608)) livrées.
+Les **quatre** lecteurs bash et Rust du callout `Plan` délèguent à
+`crates/mika-agent/src/plan_callout.rs`, l'inventaire des lecteurs bash est un
+**zéro** tenu par un scan, et la tolérance du quatrième
+(`milestone_manager::reader::plan_callout_present`) est **conservée par décision**
+avec sa raison structurelle. Les phases 3 et 4 sont nommées ici et **aucune n'est
+ouverte**.
 
-Ce document ne décrit pas un programme souhaitable : il décrit ce qu'**un** maillon
-a établi, pour que le suivant ne redécouvre pas les mêmes bornes. Tout ce qui n'a
-pas été mesuré en phase 1 est marqué comme tel.
+Ce document ne décrit pas un programme souhaitable : il décrit ce que **deux**
+maillons ont établi, pour que le suivant ne redécouvre pas les mêmes bornes. Tout
+ce qui n'a pas été mesuré est marqué comme tel — au premier rang le coût réel d'un
+démarrage de `mika`, que la phase 2 porte à trois par dispatch (§ 2) sans l'avoir
+chronométré.
 
 ---
 
@@ -65,11 +73,25 @@ n'est pas ce maillon.
 | une fois par dispatch | **sous-commande `mika`** | un démarrage de process sur un dispatch qui dure des minutes à des heures est négligeable |
 | en boucle | **arbitrage ouvert** | non préjugé par la phase 1 |
 
-`_extract_plan_path` est appelée **une fois par dispatch**, d'où
+`_extract_plan_path` est appelée **une fois par dispatch** en phase 1, d'où
 `mika plan-callout`. Le raisonnement ne repose sur aucun chiffre mesuré : le coût
 réel d'un démarrage de `mika` n'était pas mesurable depuis le bac à sable de
 dispatch (`mika --version` y est refusé par la permission-policy), et c'est une
 **sonde post-déploiement** (§ 7, S3), pas un acquis.
+
+**La phase 2 porte ce compte à TROIS par dispatch dev-groom**, et le chiffre est
+écrit plutôt que laissé à découvrir : `_committed_plan_on_branch` depuis
+`_set_up_worktree`, le `elif` de `_set_up_worktree`, puis
+`_committed_plan_on_branch` depuis la composition du `RESULT` d'un groom non
+convergé. La même arithmétique tient — trois démarrages contre un dispatch qui
+dure des minutes à des heures — mais elle **consomme** la marge que ce tableau
+décrivait, donc la sonde S3 cesse d'être une curiosité et devient la précondition
+de la phase suivante.
+
+**Si S3 rend un chiffre au-delà de ce que trois démarrages tolèrent, le remède est
+le PLACEMENT dans `main.rs`, jamais un cache.** Un cache sur un prédicat pur est
+une seconde source de vérité, c'est-à-dire très exactement la duplication que ces
+deux phases viennent de retirer.
 
 Un prédicat appelé en boucle est un autre arbitrage. Ne pas transporter la
 conclusion de la phase 1 vers lui sans mesurer : ce serait exactement l'erreur que
@@ -139,19 +161,78 @@ la main, et il faut qu'il soit lisible plutôt que silencieux.
 > que ce ticket ferme.
 
 **Il y a QUATRE tolérances sur ce jeton, pas trois.** Le plan de la phase 1 en
-nommait trois ; la quatrième a été trouvée en implémentant :
+nommait trois ; la quatrième a été trouvée en implémentant, et **tranchée par la
+phase 2 (mika#2608)** :
 
 | lecteur | tolérance | question posée | statut |
 |---|---|---|---|
 | `plan_callout.rs` | strict, ancré, fences au choix de l'appelant | quel chemin, sous quelle forme ? | **le lecteur unique** (phase 1) |
 | `executor::check_grooming_markers` | sous-chaîne `docs/plans/`, non ancrée | ce corps a-t-il un plan ? (routage) | intouché, B1 |
-| `dispatch-lib::_committed_plan_on_branch` | strict, ancré (`sed`) | ce plan est-il committé sur la branche ? | **phase 2** |
-| `dispatch-lib::_set_up_worktree` | littéral (`grep -qE`) | callout périmé ? (porte de dispatch) | **phase 2** |
-| `milestone_manager::reader::plan_callout_present` | `contains("**Plan:**")` **sans** le préfixe `> - `, ou `contains("docs/plans/")` | ce corps porte-t-il un callout ? (booléen, LECTURE seule) | intouché, hors jeton par sa forme |
+| `dispatch-lib::_committed_plan_on_branch` | — | ce plan est-il committé sur la branche ? | **délègue** (phase 2) |
+| `dispatch-lib::_set_up_worktree` | — | callout périmé ? (ligne de journal) | **délègue** (phase 2) |
+| `milestone_manager::reader::plan_callout_present` | `contains("**Plan:**")` **sans** le préfixe `> - `, ou `contains("docs/plans/")` | ce corps porte-t-il un callout ? (booléen, LECTURE seule) | tolérance **conservée, DÉCIDÉE** par mika#2608 |
 
-La phase 1 a unifié l'**implémentation** de deux de ces lecteurs. Elle n'a unifié
-**aucune tolérance**, et un maillon futur qui écraserait les cinq vers la plus
-stricte fermerait un défaut en ouvrant son miroir.
+Les phases 1 et 2 ont unifié l'**implémentation** de **quatre** de ces lecteurs.
+Elles n'ont unifié **aucune tolérance**, et un maillon futur qui écraserait les
+cinq vers la plus stricte fermerait un défaut en ouvrant son miroir.
+
+#### La décision de la phase 2 sur le quatrième, et pourquoi elle est structurelle
+
+Le refus de le migrer ne repose pas sur une préférence de prudence. Sa première
+branche est un **sur-ensemble strict** du lecteur unique : toute ligne que
+`PLAN_CALLOUT_RE` accepte commence par `> - **Plan:** `, donc — `trim_start`
+appliqué — commence par `> ` et contient `**Plan:**`. **Il n'existe aucun corps
+que le lecteur strict accepte et que cette branche refuse.**
+
+Donc la réparation tentante — appeler `plan_callout` en première branche et
+garder les branches lâches en repli — ajouterait un appel qui **ne peut jamais
+décider de rien** : une unification apparente et inerte, c'est-à-dire la classe
+mika#2205 appliquée à un chemin de code. La propriété est **assertée** sur le
+corpus doré
+(`milestone_manager::reader::tests::mika2608_la_branche_lache_est_un_surensemble_du_lecteur_strict`),
+et la décision est **épinglée** par son voisin, de sorte qu'un futur éditeur qui
+« harmonise » fasse rougir un test au lieu de changer un rapport opérateur en
+silence.
+
+Trois raisons secondaires, dans l'ordre : ce n'est pas la même question (booléen
+contre chemin) ; la forme lâche est **prescrite** par le contrat de cascade
+milestone ; et le coût des deux erreurs penche du bon côté — le manager est
+LECTURE seule, son `plan_present` alimente un **rapport à un humain**, donc un
+resserrement produirait des faux négatifs qui lui diraient de groomer un ticket
+groomé.
+
+**La faiblesse réelle est nommée et NON corrigée** : la seconde branche lit une
+citation en prose comme un callout. Faux positif plausible, **aucune mesure ne
+l'établit** — suivi avec sa précondition (un rapport dont `plan_present` est
+mesurément faux), parce qu'armer un resserrement sur une population non mesurée
+est ce que mika#2520 refuse.
+
+#### Les trois deltas que la bascule de la phase 2 a produits
+
+Le `sed` de `_committed_plan_on_branch` était décrit comme « strict, ancré » — y
+compris dans le corps du ticket de la phase 2 — et ne l'était pas :
+
+| axe | le `sed` | le lecteur unique | sens | conséquence sur la porte |
+|---|---|---|---|---|
+| littéral `docs/plans/` | **non exigé** | exigé | resserre | **ferme un faux positif latent** |
+| espaces après `**Plan:**` | ` *` (zéro ou plus) | exactement un | resserre | fail-open |
+| `../docs/plans/`, `a/b/docs/plans/` | acceptés | refusés | resserre | fail-open |
+| normalisation | `${plan_path#"${repo}/"}` — ce dépôt seul | premier segment quelconque | **élargit** | borné par mika#2034 |
+
+Le faux positif latent est réel : un corps portant ``> - **Plan:** `README.md` ``
+en extrayait `README.md`, `cat-file -t` rendait `blob` (tout dépôt a un README),
+la liaison mika#2034 — dont le contrat est la **réfutation** — ne trouvait aucun
+`issue:` et ne réfutait pas, donc la porte **tirait** et le ticket restait bloqué
+en `already_groomed` de façon permanente. C'est la classe exacte que mika#2034 a
+ouverte pour fermer (#1887, #2026). Fermeture **collatérale**, nommée plutôt que
+découverte.
+
+**Le sens de tous les resserrements est fail-open pour cette porte**, sans
+exception : un callout que le nouveau lecteur refuse fait que la porte **ne tire
+pas**, donc que le grooming procède — la doctrine écrite de la fonction, appliquée
+à un changement de tolérance. Le seul élargissement (un préfixe de dépôt
+**étranger** résout désormais) est borné par la liaison mika#2034, dont l'en-tête
+du plan réfuterait le ticket. Chacun des quatre axes a son cas de corpus.
 
 ### B2 — Le critère de sélection C3 ci-dessus
 
@@ -252,25 +333,62 @@ chemin tronqué, sans que personne l'ait mesuré.
 
 ---
 
-## 5. Le scan anti-copie : un inventaire fermé, pas un zéro
+## 5. Le scan anti-copie : un inventaire fermé, devenu un ZÉRO en phase 2
 
 Le scan de mika#2120 couvrait **une** fonction. La phase 1 l'étend à tout
-`dispatch-lib.sh` — et **pas** sous la forme d'un zéro, ce qui est la deuxième
-correction que l'exécution impose au plan.
+`dispatch-lib.sh` — et **pas** sous la forme d'un zéro, ce qui était la deuxième
+correction que l'exécution imposait à son plan : un scan exigeant « aucun motif du
+callout » aurait été **rouge à la naissance**, la phase 1 gardant délibérément deux
+lecteurs. Un lint rouge le jour où il naît se fait désarmer, et la régression qu'il
+existe pour attraper passe ensuite dans le bruit.
 
-Un scan exigeant « aucun motif du callout » serait **rouge à la naissance**, parce
-que la phase 2 garde délibérément deux lecteurs (§ 3, B1). Un lint rouge le jour où
-il naît se fait désarmer, et la régression qu'il existe pour attraper passe ensuite
-dans le bruit.
+**La phase 2 retire ces deux lecteurs, donc le zéro est devenu atteignable** — et
+c'est le gain principal de cette phase sur l'axe des gardes. Ce n'est pas un
+durcissement gratuit : c'est la forme que le scan aurait prise si la phase 1 avait
+pu la prendre. Les assertions en vigueur :
 
-**Un inventaire fermé est plus fort qu'un zéro impossible** : il refuse un
-*troisième* lecteur — la classe visée — et il rougit aussi si l'un des deux
-disparaît sans que le TSV bouge. Les assertions en vigueur :
+1. **ZÉRO** lecteur du motif dans `dispatch-lib.sh` ;
+2. les deux fonctions bascules sont **nommées**, et chacune est assertée deux
+   fois — elle ne lit plus le motif **et** elle délègue à `_extract_plan_path`.
+   Un zéro global ne dirait pas lesquelles ; et une fonction qui aurait cessé
+   d'exister satisferait le zéro sans avoir migré ;
+3. `_extract_plan_path` n'est pas un lecteur non plus (assertion de la phase 1,
+   conservée) ;
+4. l'anti-vacuité passe de « au moins trois occurrences » à « au moins une », et
+   cette population est désormais **l'écrivain seul** — `_write_canonical_callout`.
+   Elle est **nommée** par une assertion à elle : un jeton entièrement disparu
+   (renommage du callout, écrivain retiré) rendrait zéro offender, donc un vert
+   sur rien. Le zéro de la phase 2 ne vaut que si le motif existe encore quelque
+   part.
 
-1. exactement **deux** lecteurs dans `dispatch-lib.sh` ;
-2. ce sont bien `_committed_plan_on_branch` et `_set_up_worktree`, nommés (un
-   inventaire qui compte sans nommer laisse un intrus passer pour un attendu) ;
-3. `_extract_plan_path` n'en est **plus** un.
+Les **trois contrôles de bonne foi** ci-dessous sont conservés à l'identique, et
+le zéro les rend **plus** nécessaires, pas moins : ce sont eux qui distinguent
+« zéro lecteur » de « le prédicat ne regarde rien », et sur un zéro il n'y a plus
+de population positive pour le faire à leur place.
+
+### La rouille que les gardes mika#2201 ne voient pas, et ce qui la couvre
+
+`canonical-tokens-survey.sh --check` ne vérifie **qu'une direction** — tout site
+strict de l'arbre est déclaré — et son commentaire nomme ce qu'il laisse passer :
+
+> « Residual rot it does not catch, named rather than hidden: a row whose file and
+> symbol both still exist but which no longer reads the token. »
+
+C'est exactement la rouille que la phase 2 produit : les deux fonctions existent
+encore, donc `mika2201_every_declared_symbol_still_exists` serait resté **vert**
+sur deux lignes du TSV devenues fausses. **« Les deux gardes sont vertes » n'est
+donc pas une preuve que le TSV est à jour** — correction que la phase 2 apporte à
+la lecture naïve de son propre AC5. D'où une assertion supplémentaire, dans
+`test-dispatch-lib.sh` : le TSV porte **exactement une** ligne pour le jeton
+`> - **Plan:**`, c'est `plan_callout.rs::PLAN_CALLOUT_RE`, et aucune ligne du jeton
+ne déclare plus un site bascule (avec son contrôle négatif sur une ligne remise).
+
+La direction générale « toute ligne déclarée matche encore » est **refusée avec sa
+mesure** par le survey : le TSV porte légitimement des lignes qu'il ne peut pas
+produire (une alternance `(?i)`, un palier flou, un lecteur par `contains`), et la
+comparer ainsi ferait rougir le build sur des lignes **correctes** — 14 fausses
+contre 2 vraies. L'assertion est donc bornée **au jeton**, ce qui attrape
+exactement la rouille de cette phase sans importer ce coût.
 
 ### Trois pièges du prédicat, tous mesurés
 
@@ -315,13 +433,68 @@ raison d'être de ces deux scans.
 
 | phase | périmètre | précondition | état |
 |---|---|---|---|
-| **1** | `_extract_plan_path` → Rust, de bout en bout, **plus cette doctrine** | — | **livrée** |
-| 2 | les deux autres lecteurs du même jeton : `_committed_plan_on_branch`, `_set_up_worktree` | phase 1 mergée | ticket à ouvrir |
+| **1** | `_extract_plan_path` → Rust, de bout en bout, **plus cette doctrine** | — | **livrée** (mika#2194) |
+| **2** | les deux autres lecteurs du même jeton : `_committed_plan_on_branch`, `_set_up_worktree` — **plus la décision sur le quatrième** | phase 1 mergée | **livrée** (mika#2608) |
 | 3 | `_parse_disposition` / `_parse_verdict` | décider ce que devient le canal de retour par fichier (`$_DISPOSITION_FUZZY_FILE`) | ticket à ouvrir |
 | 4 | la glue d'orchestration (bwrap / git / gh / trap / worktree / callback) → Python | un maillon dont la nature est de la **glue** et non une décision | ticket à ouvrir |
 
-**Aucune de ces phases n'est ouverte par la phase 1**, et c'est délibéré : les
-ouvrir avant que la phase 1 ait établi sa doctrine serait instruire sans mesure.
+**Ni la phase 3 ni la phase 4 n'est ouverte par la phase 2**, et c'est délibéré,
+pour la même raison que la phase 1 l'avait écrit : les ouvrir avant qu'une mesure
+les demande serait instruire sans mesure. Leurs préconditions ci-dessus sont
+inchangées.
+
+### Ce que la phase 2 a établi sur le maillon migrable, et qui sert aux suivantes
+
+**Le maillon est l'EXPRESSION, jamais la fonction.** Lu sur les fonctions, C2
+(« un seul appelant ») aurait écarté les deux sites : `_committed_plan_on_branch` a
+deux appelants de production et quinze appels de test, et `_set_up_worktree` est la
+fonction la moins pure du fichier. Lu sur les expressions, les deux maillons font
+2 et 1 lignes, entrée → sortie. C'est la même lecture que la phase 1, qui n'a pas
+migré `_detect_plan_on_branch` (impure) mais `_extract_plan_path` (12 lignes).
+
+**C2 ne contraint pas le fan-in d'un site de délégation déjà migré.**
+`_extract_plan_path` passe de un à trois appelants, et ce n'est pas une infraction :
+le coût de la preuve de parité croît avec le nombre de **maillons**, jamais avec le
+nombre d'appelants d'un lecteur unique — c'est le contraire qui est vrai, chaque
+appelant de plus étant une copie de moins. Le doc-comment de la fonction nomme ses
+trois appelants, sans quoi un futur lecteur croirait C2 enfreint et
+re-dupliquerait le motif pour le « respecter ».
+
+**La normalisation bash est RETIRÉE, et c'est le cœur d'une bascule plutôt qu'un
+confort.** `${plan_path#"${repo}/"}` **était** une seconde implémentation —
+partielle — de `plan_callout::normalize`. La préserver (en appelant le canal une
+seconde fois avec `--raw`) aurait gardé dans bash la moitié de la logique que la
+migration existe pour retirer. La boucle à deux candidats n'existait que parce que
+bash devait **deviner** la normalisation ; le lecteur la rend. Corollaire pour la
+phase 3 : un canal qui ne rend qu'une des formes dont un appelant a besoin force
+l'appelant à en dériver l'autre, c'est-à-dire à garder une copie.
+
+**Le drapeau `--raw` n'a toujours aucun appelant de production**, et la phase 2
+aurait pu lui donner le premier en préservant cette boucle. Elle ne l'a pas fait,
+pour la raison ci-dessus. Il est conservé avec sa raison écrite au site (il est le
+miroir CLI des deux champs de `PlanCallout`, et le retirer ferait du canal un
+miroir partiel du lecteur) ; son absence d'appelant est **dite** plutôt que
+découverte.
+
+**La famille de sous-commandes reste PLATE, et le critère de bascule est écrit.**
+La phase 2 n'ajoute **aucune** sous-commande et **aucun** drapeau : ses deux usages
+nouveaux sont le **même** prédicat, réutilisé — la distinction 0/1 du canal *est* la
+réponse booléenne du second site. La population des sous-commandes de prédicat est
+donc encore **un**, et nommer une famille pour une population de un est le geste que
+ce dépôt a refusé deux fois par écrit (mika#2329, le fichier sentinelle paramétré
+livré avec un seul usage ; mika#2201, les allowlists livrées vides). **Critère de
+bascule, pour que la phase 3 n'ait pas à le redériver : la seconde sous-commande de
+prédicat distincte.** Tant qu'il n'y en a qu'une, la famille n'a rien à grouper.
+
+Le coût du report est borné et lisible : un renommage ultérieur produit l'état
+« dispatch-lib neuf + `mika` ancien » pendant une fenêtre de déploiement, où `mika`
+sort non-zéro sur une sous-commande inconnue ⇒ code `≥ 2` ⇒ refus **bruyant et
+nommé** (`subcommand_error`), jamais un chemin vide — et cet état n'est pas produit
+par `make deploy` (le binaire qui seede est celui qui est installé). L'alternative
+refusée, pour qu'elle ne soit pas re-proposée à l'aveugle : `mika predicate <nom>`
+dirait « ceci n'est pas pour vous » sur un namespace de tête qui porte déjà 22
+sous-commandes d'opérateur. C'est un vrai argument, et il devient décisif au
+**deuxième** prédicat, pas au premier.
 
 La phase 3 est la plus tentante — `_parse_disposition` et `_parse_verdict` sont les
 plus mordus du lot (mika#1421, #2037, #2338) — et elle est écartée sur mesure : ils

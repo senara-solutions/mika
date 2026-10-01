@@ -39,20 +39,50 @@
 //! > l'alignement recréerait le défaut symétrique de celui que ce ticket ferme.
 //!
 //! Il y a **quatre** tolérances sur ce jeton, délibérément inégales — et non
-//! trois, comme le plan de ce ticket le disait : la quatrième a été trouvée en
-//! implémentant.
+//! trois, comme le plan de la phase 1 le disait : la quatrième a été trouvée en
+//! implémentant, et **tranchée par mika#2608**.
 //!
-//! | lecteur | tolérance | question |
-//! |---|---|---|
-//! | ce module | strict, ancré, fences au choix de l'appelant | quel chemin, sous quelle forme ? |
-//! | `executor::check_grooming_markers` | sous-chaîne `docs/plans/`, non ancrée | ce corps a-t-il un plan ? (routage) |
-//! | `dispatch-lib::{_committed_plan_on_branch, _set_up_worktree}` | strict, ancré | deux autres questions, deux autres chemins (phase 2) |
-//! | `milestone_manager::reader::plan_callout_present` | `contains("**Plan:**")` **sans** le préfixe `> - ` | ce corps porte-t-il un callout ? (booléen, LECTURE seule) |
+//! | lecteur | tolérance | question | statut |
+//! |---|---|---|---|
+//! | ce module | strict, ancré, fences au choix de l'appelant | quel chemin, sous quelle forme ? | **le lecteur unique** |
+//! | `executor::check_grooming_markers` | sous-chaîne `docs/plans/`, non ancrée | ce corps a-t-il un plan ? (routage) | intouché — resserrement **interdit** par le doc-comment de `auto_pull::is_groomed` |
+//! | `dispatch-lib::{_committed_plan_on_branch, _set_up_worktree}` | — | « quel chemin ce corps nomme-t-il ? » et « en porte-t-il un ? » | **délègue au lecteur unique** (phase 2, mika#2608) |
+//! | `milestone_manager::reader::plan_callout_present` | `contains("**Plan:**")` **sans** le préfixe `> - `, plus une branche sur `docs/plans/` en prose | ce corps porte-t-il un callout ? (booléen, LECTURE seule) | tolérance **conservée, décidée** par mika#2608 |
 //!
-//! Ce module unifie l'**implémentation** de deux d'entre elles (`auto_pull` et
-//! `dispatch-lib::_extract_plan_path`). Il n'unifie **aucune tolérance**, et un
-//! maillon futur qui écraserait les quatre vers la plus stricte fermerait un
-//! défaut en ouvrant son miroir.
+//! Ce module unifie l'**implémentation** de **quatre** lecteurs : `auto_pull`
+//! (phase 1), `dispatch-lib::_extract_plan_path` (phase 1), puis
+//! `dispatch-lib::_committed_plan_on_branch` et le `elif` de
+//! `dispatch-lib::_set_up_worktree` (phase 2). Aucun d'eux n'en garde de copie,
+//! et l'inventaire bash est désormais un **zéro** que `test-dispatch-lib.sh`
+//! tient — le scan de la phase 1 comptait deux et disait en commentaire pourquoi
+//! un zéro aurait été « rouge à la naissance ».
+//!
+//! Il n'unifie **aucune tolérance**, et un maillon futur qui écraserait les
+//! quatre vers la plus stricte fermerait un défaut en ouvrant son miroir. La
+//! quatrième ligne est là pour être lue avant d'essayer : la raison de la
+//! conserver est **structurelle**, pas prudentielle — sa première branche est un
+//! sur-ensemble strict de ce module, donc un appel strict-first y serait
+//! *prouvablement inerte*, ce qui est la classe mika#2205 appliquée à un chemin
+//! de code. La propriété est épinglée par
+//! `milestone_manager::reader::tests::mika2608_la_branche_lache_est_un_surensemble_du_lecteur_strict`
+//! sur le corpus doré, et la décision par son voisin
+//! `…::mika2608_la_tolerance_lache_est_une_decision_epinglee`.
+//!
+//! # Trois deltas de tolérance que la phase 2 a produits, et leur direction
+//!
+//! Le `sed` de `_committed_plan_on_branch` était décrit comme « strict, ancré »
+//! et ne l'était pas : il n'exigeait **pas** le littéral `docs/plans/`, tolérait
+//! zéro espace ou plus après `**Plan:**`, et acceptait `../docs/plans/`. Les
+//! trois sont des **resserrements**, et pour cette porte leur direction est
+//! fail-open — un callout refusé fait que la porte ne tire pas, donc que le
+//! grooming procède.
+//!
+//! Le premier ferme un **faux positif latent** : un corps portant
+//! ``> - **Plan:** `README.md` `` en extrayait `README.md`, `cat-file -t` rendait
+//! `blob` (tout dépôt a un README), la liaison mika#2034 ne réfutait rien — son
+//! contrat est la réfutation — et la porte **tirait**, bloquant le ticket en
+//! `already_groomed` de façon permanente. Corpus : `gate-non-plan-path.md`,
+//! `gate-double-space.md`, `gate-foreign-prefix-resolves.md`.
 //!
 //! # Les trois divergences entre les anciens lecteurs, mesurées
 //!

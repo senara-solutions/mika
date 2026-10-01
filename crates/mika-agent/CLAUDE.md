@@ -2443,6 +2443,25 @@ rien à dire et que le feeder pose légitimement sans elle. Deux questions, deux
 noms ; la seconde appelle la première, jamais l'inverse (ce serait une
 régression de mika#2120).
 
+**Voisinage à ne pas confondre : le callout `Plan` a lui aussi un lecteur unique,
+et il en a QUATRE appelants depuis mika#2608.** `crates/mika-agent/src/plan_callout.rs`
+est la source de vérité du **chemin** porté par `> - **Plan:**`, et
+`auto_pull::plan_ownership`, `dispatch-lib::_extract_plan_path` (phase 1, mika#2194),
+`dispatch-lib::_committed_plan_on_branch` et le `elif` de
+`dispatch-lib::_set_up_worktree` (phase 2, mika#2608) l'appellent tous sans en
+garder de copie — l'inventaire des lecteurs bash est un **zéro** que
+`test-dispatch-lib.sh` tient, et la seule occurrence du motif qui reste dans ce
+fichier est son **écrivain**, `_write_canonical_callout`. C'est un axe distinct de
+celui-ci : ici on demande *ce ticket a-t-il une preuve de grooming en base ?*, là
+*quel chemin ce corps nomme-t-il ?* — et `check_grooming_markers`, qui lit la
+**forme** par sous-chaîne, reste hors des deux unifications, par la même borne B1
+dans les deux cas. Les deux sites bash que mika#2608 a basculés portaient une
+tolérance décrite comme « strict, ancré » qui ne l'était pas : ils n'exigeaient
+pas le littéral `docs/plans/`, ce qui faisait **tirer** la porte de grooming sur
+un callout nommant `README.md` et bloquait le ticket en `already_groomed` de façon
+permanente. Détail des quatre tolérances et de leurs deltas :
+`docs/architecture/dispatch-lib-migration.md` § 3.
+
 **Le feeder n'est pas touché non plus, et le DoD du ticket est écarté avec sa
 raison.** Gater la promotion `ready` sur la preuve retirerait au ticket
 callouté-sans-preuve **la seule route qui peut produire la preuve manquante** :
