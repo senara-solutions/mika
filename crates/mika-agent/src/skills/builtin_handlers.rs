@@ -2695,7 +2695,29 @@ const PR_READY_HOLD_MOTIF_UNREADABLE: &str = "hold_unreadable";
 /// apart: `gh` can authenticate from `~/.config/gh/hosts.yml`, so a `pr ready`
 /// with no engine token **succeeds today** — letting it through would keep a
 /// door open for exactly the population the engine cannot measure.
-const PR_READY_HOLD_MOTIF_NO_TOKEN: &str = "hold_no_token";
+///
+/// The identifier says `NO_CREDENTIAL` while the wire value keeps
+/// `hold_no_token`: a `*_TOKEN` identifier reads as an env var to
+/// `scripts/check-substrate-leak.sh` rule 2, and the wire value is frozen
+/// (`mika2624_les_trois_motifs_sont_distincts`). The value reaches the audit
+/// row and the log line only — never the model: this refusal's body is the
+/// neutral fallback of [`pr_ready_hold_no_credential_fallback`] (mika#1783).
+const PR_READY_HOLD_MOTIF_NO_CREDENTIAL: &str = "hold_no_token";
+
+/// Operator half of the no-credential refusal (mika#2624, doctrine mika#1783).
+///
+/// Never reaches the model on family/champion tier — `dispatch_substrate_diagnostic`
+/// routes it to `audit_events` there; on operator tier it is folded back into the
+/// content, because the operator IS its reader. Also the log message of the
+/// refusal, so the two operator surfaces cannot spell the cause two ways.
+// substrate-diagnostic: the operator channel by construction (mika#2624) — naming
+// the missing engine credential and its host fallback is what makes the refusal
+// actionable. `dispatch_substrate_unavailable` routes it.
+const PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC: &str = "Operator detail (mika#2624): run_gh has no engine GitHub token in this context \
+     (ToolContext.github_token is None), so the ConvertToDraftEvent timeline of the PR could not be \
+     read and the un-draft was refused fail-closed under motif `hold_no_token`. `gh` could still \
+     authenticate from the host's hosts.yml, which is why letting it through would leave open the \
+     population the engine cannot measure (mika#2205).";
 
 /// `reason` of a refusal caused by a `pr ready` whose target the hold term
 /// cannot address: a branch name, `#N`, no selector at all, or a declared
@@ -2779,9 +2801,12 @@ fn pr_ready_hold_attribution(
 /// more step (doctrine mika#2520).
 /// Takes `(since, actor)` already extracted rather than the verdict itself, so
 /// no caller has to **construct** a `HoldVerdict` just to describe a refusal —
-/// the no-token branch has no timeline read behind it and would otherwise have
-/// had to fabricate one, which is a second construction site for a type whose
-/// classification must have exactly one.
+/// the unresolved-selector branch has no timeline read behind it and would
+/// otherwise have had to fabricate one, which is a second construction site for
+/// a type whose classification must have exactly one.
+///
+/// Not the no-credential refusal: its cause is substrate, so its body is the
+/// neutral [`pr_ready_hold_no_credential_fallback`] (doctrine mika#1783).
 fn pr_ready_hold_rejection_body(
     pr_num: &str,
     motif: &str,
@@ -2816,17 +2841,6 @@ fn pr_ready_hold_rejection_body(
             "Leave the pull request in draft. If you must ask for this check \
              again, name the pull request by its number and pass the `repo` \
              parameter; otherwise tell the operator with `send_message` and stop.",
-        )
-    } else if motif == PR_READY_HOLD_MOTIF_NO_TOKEN {
-        (
-            format!(
-                "The engine has no GitHub token in this context, so the \
-                 draft-state history of pull request #{pr_num} on {repo} cannot be \
-                 read and it cannot be established that this PR is not held."
-            ),
-            "Leave this pull request in draft and tell the operator with \
-             `send_message` that the hold state could not be checked; do not \
-             retry under a different shape.",
         )
     } else {
         (
@@ -2866,6 +2880,31 @@ fn pr_ready_hold_rejection_body(
         }
     }
     payload.to_string()
+}
+
+/// Model-visible half of the no-credential refusal (mika#2624, doctrine mika#1783).
+///
+/// Neutral by construction: no credential, no env var, no motif — the cause is
+/// the operator's and travels in [`PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC`]. What
+/// the model keeps is the conduct: the PR stays in draft, the refusal is not
+/// lifted by retrying, and the operator is told. Same shape as the other hold
+/// refusals minus `reason`, which would carry `hold_no_token` into the context.
+fn pr_ready_hold_no_credential_fallback(pr_num: &str, repo: &str) -> String {
+    serde_json::json!({
+        "error": "pr_ready_undraft_refused",
+        "doctrine": "mika#2597 + mika#2624",
+        "pr": pr_num,
+        "repo": repo,
+        "detail": format!(
+            "The draft-state history of pull request #{pr_num} on {repo} could \
+             not be checked in this context, so it cannot be established that \
+             this PR is not held."
+        ),
+        "remedy": "Leave this pull request in draft and tell the operator with \
+                   `send_message` that the hold state could not be checked; do \
+                   not retry under a different shape.",
+    })
+    .to_string()
 }
 
 /// Pure decision for the **explicit-hold** term of the un-draft guard (mika#2624).
@@ -3195,16 +3234,12 @@ async fn validate_pr_ready_undraft_scope(
     // `gh` can authenticate from `~/.config/gh/hosts.yml`, so a token-less
     // `pr ready` succeeds today, and that is exactly the population the engine
     // cannot measure.
+    //
+    // The cause is substrate, so the two halves split (doctrine mika#1783): the
+    // motif goes to the audit row, the diagnostic to the operator channel, and
+    // the model receives the neutral fallback only.
     let Some(token) = ctx.github_token else {
-        return Err(refuse_pr_ready_hold(
-            ctx,
-            pr_num,
-            PR_READY_HOLD_MOTIF_NO_TOKEN,
-            target_repo,
-            (None, None),
-            "refused un-draft: no engine GitHub token, so the hold state cannot be read",
-        )
-        .await);
+        return Err(refuse_pr_ready_no_credential(ctx, pr_num, target_repo).await);
     };
 
     // `fetch_convert_to_draft_events` wants `(owner, repo)`. The tool's `repo`
@@ -3272,9 +3307,10 @@ async fn validate_pr_ready_undraft_scope(
 
 /// Report a hold-term refusal on both surfaces and build its body (mika#2624).
 ///
-/// One site for the refusals that have no verdict behind them — unresolved
-/// selector, no token — so the reported motif and the body's motif cannot be
-/// spelled two ways.
+/// One site for the unresolved-selector refusals, which have no verdict behind
+/// them, so the reported motif and the body's motif cannot be spelled two ways.
+/// The no-credential refusal does not come through here: its body must stay
+/// neutral (doctrine mika#1783).
 async fn refuse_pr_ready_hold(
     ctx: &ToolContext<'_>,
     pr_num: &str,
@@ -3292,6 +3328,36 @@ async fn refuse_pr_ready_hold(
         since,
         actor,
     ))
+}
+
+/// Fail-closed refusal of a `pr ready` the engine cannot check for want of a
+/// GitHub credential (mika#2624), split by doctrine mika#1783.
+///
+/// The motif lands in the audit row (`hold_no_token`, countable apart), the
+/// diagnostic in the operator channel, and the model receives the neutral
+/// fallback only — on family/champion tier, byte for byte.
+async fn refuse_pr_ready_no_credential(
+    ctx: &ToolContext<'_>,
+    pr_num: &str,
+    target_repo: &str,
+) -> ToolOutput {
+    report_pr_ready_undraft_refusal(
+        ctx,
+        pr_num,
+        PR_READY_HOLD_MOTIF_NO_CREDENTIAL,
+        Some(target_repo),
+        None,
+        None,
+        PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC,
+    )
+    .await;
+    crate::tools::dispatch_substrate_unavailable(
+        pr_ready_hold_no_credential_fallback(pr_num, target_repo),
+        PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC,
+        "run_gh",
+        ctx,
+    )
+    .await
 }
 
 /// Emit the two surfaces of an un-draft refusal — the log line and its audit row
@@ -12425,7 +12491,7 @@ mod tests {
         let motifs = [
             PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
             PR_READY_HOLD_MOTIF_UNREADABLE,
-            PR_READY_HOLD_MOTIF_NO_TOKEN,
+            PR_READY_HOLD_MOTIF_NO_CREDENTIAL,
             PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
             PR_READY_UNDRAFT_MOTIF_WIP_RESCUE,
         ];
@@ -12435,7 +12501,7 @@ mod tests {
         // never a silent test update.
         assert_eq!(PR_READY_HOLD_MOTIF_OPERATOR_HOLD, "operator_hold");
         assert_eq!(PR_READY_HOLD_MOTIF_UNREADABLE, "hold_unreadable");
-        assert_eq!(PR_READY_HOLD_MOTIF_NO_TOKEN, "hold_no_token");
+        assert_eq!(PR_READY_HOLD_MOTIF_NO_CREDENTIAL, "hold_no_token");
         assert_eq!(
             PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
             "hold_unresolved_selector"
@@ -12622,32 +12688,112 @@ mod tests {
         );
     }
 
+    /// Substrings that must never reach the model in the no-credential refusal
+    /// (doctrine mika#1783, lint `scripts/check-substrate-leak.sh` rule 2).
+    const NO_CREDENTIAL_LEAKS: &[&str] = &[
+        "token",
+        "Token",
+        "GitHub token",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "MIKA_",
+        "hosts.yml",
+        "hold_no_token",
+    ];
+
     #[test]
-    fn mika2624_un_refus_sans_jeton_nomme_le_jeton_et_pas_le_depot() {
-        // Revue mika#2628 : le refus `hold_no_token` partageait la prose de
+    fn mika2624_un_refus_sans_jeton_est_neutre_et_ne_blame_pas_le_depot() {
+        // Revue mika#2628 : le refus sans jeton partageait la prose de
         // `hold_unreadable` et envoyait l'agent corriger un `repo` qui n'y est
-        // pour rien — aucune timeline n'a été lue, faute de jeton.
-        let body = pr_ready_hold_rejection_body(
-            "2621",
-            PR_READY_HOLD_MOTIF_NO_TOKEN,
-            "senara-solutions/mika",
-            None,
-            None,
-        );
+        // pour rien. Doctrine mika#1783 : sa cause est du substrat, donc le
+        // modèle ne reçoit qu'un texte neutre — ni jeton, ni variable, ni motif.
+        let body = pr_ready_hold_no_credential_fallback("2621", "senara-solutions/mika");
         assert!(
             !body.contains("`repo`"),
-            "a no-token refusal must not blame the repo parameter: {body}"
+            "a no-credential refusal must not blame the repo parameter: {body}"
         );
-        assert!(body.contains("token"), "it names the missing token: {body}");
-        // …et aucun des deux refus « illisibles » n'affirme qu'un hold existe :
-        // le remède d'un hold n'est pas celui d'une lecture impossible.
-        for motif in [PR_READY_HOLD_MOTIF_NO_TOKEN, PR_READY_HOLD_MOTIF_UNREADABLE] {
-            let body = pr_ready_hold_rejection_body("2621", motif, "o/r", None, None);
+        for leak in NO_CREDENTIAL_LEAKS {
             assert!(
-                !body.contains("A hold is lifted"),
-                "`{motif}` established no hold and must not say one exists: {body}"
+                !body.contains(leak),
+                "the model must not read `{leak}`: {body}"
             );
         }
+        // La conduite, elle, reste : brouillon, opérateur, pas de nouvel essai.
+        assert!(body.contains("pr_ready_undraft_refused"), "{body}");
+        assert!(body.contains("send_message"), "the correct exit: {body}");
+        assert!(body.contains("do not retry"), "{body}");
+        // …et aucun des deux refus « illisibles » n'affirme qu'un hold existe :
+        // le remède d'un hold n'est pas celui d'une lecture impossible.
+        let unreadable =
+            pr_ready_hold_rejection_body("2621", PR_READY_HOLD_MOTIF_UNREADABLE, "o/r", None, None);
+        for body in [&body, &unreadable] {
+            assert!(
+                !body.contains("A hold is lifted"),
+                "no hold was established, none may be claimed: {body}"
+            );
+        }
+        // Contrôle positif : le diagnostic opérateur, lui, nomme la cause.
+        assert!(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC.contains("GitHub token"));
+        assert!(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC.contains("hold_no_token"));
+    }
+
+    /// Les deux moitiés du refus sans jeton, sans réseau (mika#2624, doctrine
+    /// mika#1783) : sur tier famille le modèle lit le repli neutre octet pour
+    /// octet, le motif distinct reste dans l'audit, et le diagnostic part au
+    /// canal opérateur. Sur tier opérateur il est replié dans le contenu —
+    /// contrôle qui distingue « routé par tier » de « jamais émis ».
+    #[tokio::test]
+    async fn mika2624_un_refus_sans_jeton_garde_son_motif_dans_laudit() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        assert!(
+            ctx.github_token.is_none(),
+            "the path under test is token-less"
+        );
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let refused = refuse_pr_ready_no_credential(&ctx, "2621", "senara-solutions/mika").await;
+        assert!(refused.is_error, "fail-closed");
+        assert_eq!(
+            refused.content,
+            pr_ready_hold_no_credential_fallback("2621", "senara-solutions/mika"),
+            "family tier reads the neutral fallback and nothing else"
+        );
+        for leak in NO_CREDENTIAL_LEAKS {
+            assert!(
+                !refused.content.contains(leak),
+                "the model must not read `{leak}`: {}",
+                refused.content
+            );
+        }
+
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
+        let refusal: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == PR_READY_UNDRAFT_AUDIT_TOOL)
+            .collect();
+        assert_eq!(refusal.len(), 1, "one refusal row");
+        assert_eq!(
+            refusal[0].after_value.as_deref(),
+            Some(PR_READY_HOLD_MOTIF_NO_CREDENTIAL),
+            "the distinct motif stays in the audit"
+        );
+        assert!(
+            events.iter().any(|e| e.tool_name == "substrate_unavailable"
+                && e.after_value.as_deref() == Some(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC)),
+            "the diagnostic reaches the operator channel"
+        );
+
+        ctx.tier = mika_common::home::AgentTier::Default;
+        let operator = refuse_pr_ready_no_credential(&ctx, "2621", "senara-solutions/mika").await;
+        assert!(operator.is_error);
+        assert!(
+            operator
+                .content
+                .contains(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC),
+            "operator tier: the diagnostic is folded back: {}",
+            operator.content
+        );
     }
 
     #[test]
