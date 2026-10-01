@@ -2507,8 +2507,13 @@ fn detect_ready_promote_pr(args: &[String]) -> Option<&str> {
 /// mika#2624's AC1 and a false positive on a harmless gesture.
 ///
 /// `--undo` converts **to** draft and is allowed, as in the sibling detector.
-/// Returns `None` when no PR number can be parsed from a positional argument
-/// (fail-open: a current-branch `gh pr ready` carries none).
+///
+/// Returns `None` only when the call is not an un-draft. A `pr ready` whose
+/// selector is not a PR number — a branch name, `#N`, or no selector at all
+/// (the current-branch form) — is [`UndraftSelector::Unresolved`], **never**
+/// `None`: `gh` un-drafts through all of those shapes, and the hold term cannot
+/// read a timeline it cannot address. Reading them as "not an un-draft" was a
+/// fail-open inside a fail-closed term (review of PR #2628).
 ///
 /// Deliberately written as a comparison against a variable rather than a
 /// literal argv slice: `wip_rescue::tests::mika2597_un_seul_site_dundraft_en_production`
@@ -2516,7 +2521,7 @@ fn detect_ready_promote_pr(args: &[String]) -> Option<&str> {
 /// requires **exactly one** site, which is `wip_rescue`'s own un-draft. This
 /// term refuses and un-drafts nothing, so it stays out of that population **by
 /// shape, not by exemption** — and must keep that shape.
-fn detect_pr_ready_undraft(args: &[String]) -> Option<&str> {
+fn detect_pr_ready_undraft(args: &[String]) -> Option<UndraftSelector<'_>> {
     let subcommand = args.first().map(String::as_str)?;
     if subcommand != "pr" {
         return None;
@@ -2526,7 +2531,20 @@ fn detect_pr_ready_undraft(args: &[String]) -> Option<&str> {
         return None;
     }
 
-    extract_pr_number_positional(args)
+    Some(match extract_pr_number_positional(args) {
+        Some(number) => UndraftSelector::Number(number),
+        None => UndraftSelector::Unresolved,
+    })
+}
+
+/// The target of an un-draft call, as far as the hold term can address it
+/// (mika#2624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndraftSelector<'a> {
+    /// A PR number, bare or extracted from a PR URL.
+    Number(&'a str),
+    /// A selector the term cannot turn into a number: refused fail-closed.
+    Unresolved,
 }
 
 /// Extract the first positional PR number from a `gh pr <verb> ...` argv.
@@ -2635,6 +2653,16 @@ const PR_READY_HOLD_MOTIF_UNREADABLE: &str = "hold_unreadable";
 /// door open for exactly the population the engine cannot measure.
 const PR_READY_HOLD_MOTIF_NO_TOKEN: &str = "hold_no_token";
 
+/// `reason` of a refusal caused by a `pr ready` whose target the hold term
+/// cannot address: a branch name, `#N`, no selector at all, or a declared
+/// repository that does not name one (review of PR #2628).
+///
+/// **Expected regime: empty.** The bundled prompts forbid every `pr ready`, so
+/// any line here is a model reaching for a shape the guard cannot read. Its own
+/// motif because the remedy differs from `hold_unreadable`: the call is
+/// rewritable (a PR number plus `repo`), whereas an unreadable timeline is not.
+const PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR: &str = "hold_unresolved_selector";
+
 /// `reason` of the mika#1682 wip-rescue refusal, named so the two populations
 /// are separable from the first audit row rather than retroactively.
 const PR_READY_UNDRAFT_MOTIF_WIP_RESCUE: &str = "wip_rescue_contract";
@@ -2733,6 +2761,17 @@ fn pr_ready_hold_rejection_body(
              by nobody else — do not look for another route: this refusal is not \
              lifted by retrying under a different shape. If you believe the hold \
              should go, say so to the operator with `send_message` and stop.",
+        )
+    } else if motif == PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR {
+        (
+            format!(
+                "This `pr ready` call does not name a pull request the hold check \
+                 can address on {repo} (a branch name, `#N` or no selector at \
+                 all), so it cannot be established that the PR is not held."
+            ),
+            "Leave the pull request in draft. If you must ask for this check \
+             again, name the pull request by its number and pass the `repo` \
+             parameter; otherwise tell the operator with `send_message` and stop.",
         )
     } else if motif == PR_READY_HOLD_MOTIF_NO_TOKEN {
         (
@@ -3070,8 +3109,26 @@ async fn validate_pr_ready_undraft_scope(
     //
     // Narrower population than term 1: `pr edit --title` is deliberately out
     // (see `detect_pr_ready_undraft`).
-    let Some(pr_num) = detect_pr_ready_undraft(args) else {
+    let Some(selector) = detect_pr_ready_undraft(args) else {
         return Ok(());
+    };
+    let target_repo = repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO);
+
+    // A `pr ready` the term cannot address is refused before anything else:
+    // no token, no network call is needed to know the check cannot run.
+    let pr_num = match selector {
+        UndraftSelector::Number(pr_num) => pr_num,
+        UndraftSelector::Unresolved => {
+            return Err(refuse_pr_ready_hold(
+                ctx,
+                "unresolved",
+                PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                target_repo,
+                (None, None),
+                "refused un-draft: the pr ready selector is not a PR number",
+            )
+            .await);
+        }
     };
 
     // Fail-closed, under its own motif so the population stays countable apart:
@@ -3079,23 +3136,15 @@ async fn validate_pr_ready_undraft_scope(
     // `pr ready` succeeds today, and that is exactly the population the engine
     // cannot measure.
     let Some(token) = ctx.github_token else {
-        report_pr_ready_undraft_refusal(
+        return Err(refuse_pr_ready_hold(
             ctx,
             pr_num,
             PR_READY_HOLD_MOTIF_NO_TOKEN,
-            repo,
-            None,
-            None,
+            target_repo,
+            (None, None),
             "refused un-draft: no engine GitHub token, so the hold state cannot be read",
         )
-        .await;
-        return Err(ToolOutput::error(pr_ready_hold_rejection_body(
-            pr_num,
-            PR_READY_HOLD_MOTIF_NO_TOKEN,
-            repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO),
-            None,
-            None,
-        )));
+        .await);
     };
 
     // `fetch_convert_to_draft_events` wants `(owner, repo)`. The tool's `repo`
@@ -3109,16 +3158,30 @@ async fn validate_pr_ready_undraft_scope(
     // refusal lands under `hold_unreadable`. That is a false positive whose
     // remedy is **named in the refusal body**: pass `repo`. Acceptable because
     // the error leans the safe way and the remedy is one argument away.
-    let target_repo = repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO);
-    let (owner, repo_name) = target_repo
-        .split_once('/')
-        .unwrap_or_else(|| crate::wip_rescue::default_repo_parts());
-
-    let Ok(number) = pr_num.parse::<u64>() else {
-        // `extract_pr_number_positional` already parsed it as `u32`, so this is
-        // unreachable in practice; fail-open rather than refuse on a shape the
-        // detector says cannot occur.
-        return Ok(());
+    //
+    // A declared `repo` that does not split into `owner/name`, or a number that
+    // does not parse, leaves the term with nothing it can address: refused
+    // under the same motif as a non-numeric selector, never defaulted to
+    // another repository (the label would then name one repo while the
+    // timeline read was another's) and never waved through.
+    let (owner, repo_name, number) = match (
+        target_repo
+            .split_once('/')
+            .filter(|(o, r)| !o.is_empty() && !r.is_empty()),
+        pr_num.parse::<u64>(),
+    ) {
+        (Some((owner, repo_name)), Ok(number)) => (owner, repo_name, number),
+        _ => {
+            return Err(refuse_pr_ready_hold(
+                ctx,
+                pr_num,
+                PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                target_repo,
+                (None, None),
+                "refused un-draft: the target repository or PR number cannot be addressed",
+            )
+            .await);
+        }
     };
 
     // The discriminant of mika#2597, **called** and never transcribed: the fetch
@@ -3144,6 +3207,30 @@ async fn validate_pr_ready_undraft_scope(
     }
 
     Ok(())
+}
+
+/// Report a hold-term refusal on both surfaces and build its body (mika#2624).
+///
+/// One site for the refusals that have no verdict behind them — unresolved
+/// selector, no token — so the reported motif and the body's motif cannot be
+/// spelled two ways.
+async fn refuse_pr_ready_hold(
+    ctx: &ToolContext<'_>,
+    pr_num: &str,
+    motif: &'static str,
+    target_repo: &str,
+    (since, actor): (Option<&str>, Option<&str>),
+    message: &'static str,
+) -> ToolOutput {
+    report_pr_ready_undraft_refusal(ctx, pr_num, motif, Some(target_repo), since, actor, message)
+        .await;
+    ToolOutput::error(pr_ready_hold_rejection_body(
+        pr_num,
+        motif,
+        target_repo,
+        since,
+        actor,
+    ))
 }
 
 /// Emit the two surfaces of an un-draft refusal — the log line and its audit row
@@ -12201,7 +12288,10 @@ mod tests {
         // that PR, so the mika#1682 term allows — it is the hold term that must
         // refuse.
         let args = str_args(&["pr", "ready", "2621"]);
-        assert_eq!(detect_pr_ready_undraft(&args), Some("2621"));
+        assert_eq!(
+            detect_pr_ready_undraft(&args),
+            Some(UndraftSelector::Number("2621"))
+        );
 
         let view = normal_pr_view();
         assert!(decide_pr_ready_undraft("2621", Some(&view)).is_ok());
@@ -12272,6 +12362,7 @@ mod tests {
             PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
             PR_READY_HOLD_MOTIF_UNREADABLE,
             PR_READY_HOLD_MOTIF_NO_TOKEN,
+            PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
             PR_READY_UNDRAFT_MOTIF_WIP_RESCUE,
         ];
         let unique: std::collections::HashSet<_> = motifs.iter().collect();
@@ -12281,6 +12372,10 @@ mod tests {
         assert_eq!(PR_READY_HOLD_MOTIF_OPERATOR_HOLD, "operator_hold");
         assert_eq!(PR_READY_HOLD_MOTIF_UNREADABLE, "hold_unreadable");
         assert_eq!(PR_READY_HOLD_MOTIF_NO_TOKEN, "hold_no_token");
+        assert_eq!(
+            PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+            "hold_unresolved_selector"
+        );
         assert_eq!(PR_READY_UNDRAFT_MOTIF_WIP_RESCUE, "wip_rescue_contract");
     }
 
@@ -12336,6 +12431,29 @@ mod tests {
             None,
         );
         assert!(!held.contains("`repo`"));
+    }
+
+    #[test]
+    fn mika2624_un_selecteur_non_numerique_reste_dans_la_population() {
+        // Revue mika#2628 (security, adversarial) : `gh pr ready` accepte une
+        // branche, `#N` ou aucun sélecteur (branche courante). Le terme hold ne
+        // sait pas lire la timeline de ces formes ; les laisser passer était un
+        // fail-open au cœur d'un terme fail-closed.
+        for argv in [
+            vec!["pr", "ready", "fix/2624/branche"],
+            vec!["pr", "ready", "#2621"],
+            vec!["pr", "ready"],
+        ] {
+            let args = str_args(&argv);
+            assert_eq!(
+                detect_pr_ready_undraft(&args),
+                Some(UndraftSelector::Unresolved),
+                "{argv:?} un-drafts a PR and must stay in the hold term's population"
+            );
+        }
+        // Contrôle négatif : `--undo` et un renommage de titre restent dehors.
+        assert!(detect_pr_ready_undraft(&str_args(&["pr", "ready", "x", "--undo"])).is_none());
+        assert!(detect_pr_ready_undraft(&str_args(&["pr", "edit", "x", "--title", "t"])).is_none());
     }
 
     #[test]

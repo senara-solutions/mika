@@ -1699,6 +1699,7 @@ SELECT after_value, count(*) FROM audit_events
 | `operator_hold` | non vide, faible | un hold que le moteur n'a pas levé |
 | `hold_unreadable` | **vide** | lire d'abord si `repo` était passé, puis le jeton — **ne pas basculer en fail-open** |
 | `hold_no_token` | **vide** | `run_gh` tourne sans jeton résolu (mika#2205) |
+| `hold_unresolved_selector` | **vide** | `pr ready` sur une branche, `#N`, sans sélecteur, ou `repo` déclaré illisible : le terme ne peut pas adresser la timeline, il refuse (revue de PR #2628) |
 | `wip_rescue_contract` | inchangé en sens | la population mika#1682, comptable séparément |
 
 **Gardes structurelles**, allowlists livrées vides :
