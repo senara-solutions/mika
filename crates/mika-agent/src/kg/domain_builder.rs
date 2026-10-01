@@ -223,13 +223,39 @@ pub struct RebuildStats {
     /// `kg_entities` row count post-boot »* — c'est ce nombre-là, et il rend
     /// l'hypothèse « graphe de domaine vide » **mesurable** au lieu de
     /// tranchable à l'aveugle.
-    pub entities_total: usize,
+    ///
+    /// `None` quand le recensement n'a pas pu être lu : un comptage qui n'a
+    /// pas eu lieu n'est jamais rapporté comme `0` (même règle que
+    /// `pending_before`, mika#2331).
+    pub entities_total: Option<usize>,
     /// Le même recensement, ventilé par type d'entité.
     ///
     /// Une carte vide pour un type déclaré signifie qu'aucune entité de ce
     /// type n'existe — ce qui est précisément ce qu'un Stage-1 exact-match
     /// à zéro sur 50 candidats laisserait supposer.
-    pub entities_total_per_type: HashMap<String, usize>,
+    ///
+    /// `None` quand le recensement n'a pas pu être lu, comme
+    /// [`Self::entities_total`].
+    pub entities_total_per_type: Option<HashMap<String, usize>>,
+}
+
+/// Le prédicat de `domain_graph_empty` (mika#1833 R6).
+///
+/// Vrai seulement pour un recensement **lu** qui rend zéro. Un recensement
+/// illisible (`None`) ne dit rien du graphe : crier « graphe vide » dessus
+/// rejouerait le diagnostic erroné sur lequel mika#1833 a été ouvert (motif
+/// mika#2277 : un terme qu'on ne peut pas lire n'est jamais un terme
+/// satisfait).
+pub(crate) fn census_reads_empty(entities_total: Option<usize>) -> bool {
+    entities_total == Some(0)
+}
+
+/// Le champ `per_type` de `domain_rebuild_complete`, partagé par ses deux
+/// émetteurs (`DomainGraphBuilder::rebuild` et `server/mod.rs`) pour qu'ils
+/// ne divergent pas. `None` — champ absent — quand le recensement n'a pas pu
+/// être lu.
+pub(crate) fn census_json(census: Option<&HashMap<String, usize>>) -> Option<String> {
+    census.map(|c| serde_json::to_string(c).unwrap_or_default())
 }
 
 /// Information about an agent to include in the domain graph.
@@ -536,12 +562,12 @@ impl<'a> DomainGraphBuilder<'a> {
         // qu'on veut recenser est l'état final, pas un état intermédiaire.
         //
         // Échec fail-open : un recensement illisible ne doit pas faire échouer
-        // un rebuild qui a réussi. Le champ retombe à zéro et le WARN
-        // ci-dessous ne tire pas — on ne crie pas « graphe vide » sur une
+        // un rebuild qui a réussi. Les champs sont alors ABSENTS (jamais `0`)
+        // et le WARN ci-dessous ne tire pas — on ne crie pas « graphe vide » sur une
         // requête qu'on n'a pas su lire (motif mika#2277 : un terme qu'on ne
         // peut pas lire n'est jamais un terme satisfait).
         let entities_total_per_type = match self.census_entities_by_type().await {
-            Ok(census) => census,
+            Ok(census) => Some(census),
             Err(e) => {
                 warn!(
                     trace_id = %self.trace_id,
@@ -550,10 +576,12 @@ impl<'a> DomainGraphBuilder<'a> {
                     "could not census kg_entities after rebuild — the census fields \
                      of domain_rebuild_complete are not to be read as a measurement"
                 );
-                HashMap::new()
+                None
             }
         };
-        let entities_total: usize = entities_total_per_type.values().sum();
+        let entities_total: Option<usize> = entities_total_per_type
+            .as_ref()
+            .map(|census| census.values().sum());
 
         let duration_ms = start.elapsed().as_millis();
 
@@ -600,12 +628,12 @@ impl<'a> DomainGraphBuilder<'a> {
         // Son absence est donc elle-même de l'information : un journal qui
         // tourne sans ces champs dit que le binaire servi est antérieur au
         // correctif (classe mika#2340), jamais que le graphe est sain.
-        let per_type_json = serde_json::to_string(&entities_total_per_type).unwrap_or_default();
+        let per_type_json = census_json(entities_total_per_type.as_ref());
         info!(
             trace_id = %self.trace_id,
             event = "domain_rebuild_complete",
             entities_total,
-            per_type = %per_type_json,
+            per_type = per_type_json.as_deref(),
             duration_ms,
         );
 
@@ -613,7 +641,7 @@ impl<'a> DomainGraphBuilder<'a> {
         // **Régime attendu : zéro ligne.** Sans cet événement, « le graphe est
         // vide » resterait inférable et jamais observé — et c'est l'hypothèse
         // sur laquelle mika#1833 a été ouvert.
-        if entities_total == 0 {
+        if census_reads_empty(entities_total) {
             warn!(
                 trace_id = %self.trace_id,
                 event = "domain_graph_empty",
@@ -1237,16 +1265,17 @@ mod tests {
             .expect("census query");
 
         assert_eq!(
-            stats.entities_total_per_type, observed,
+            stats.entities_total_per_type.as_ref(),
+            Some(&observed),
             "le recensement par type doit coïncider avec la table"
         );
         assert_eq!(
             stats.entities_total,
-            observed.values().sum::<usize>(),
+            Some(observed.values().sum::<usize>()),
             "le total doit être la somme du recensement par type"
         );
         assert!(
-            stats.entities_total > 0,
+            stats.entities_total.is_some_and(|n| n > 0),
             "un rebuild qui a écrit 29 entités ne peut pas recenser un graphe vide"
         );
 
@@ -1270,7 +1299,7 @@ mod tests {
     /// Sans lui, « la garde détecte le vide » est indistinguable de « la garde
     /// crie toujours ». Le prédicat est testé directement plutôt qu'en
     /// capturant le journal : ce qui doit être vrai est *le graphe n'est pas
-    /// vide*, et `entities_total == 0` est la condition littérale du WARN.
+    /// vide*, et [`census_reads_empty`] est la condition littérale du WARN.
     #[tokio::test]
     async fn mika1833_a_populated_graph_does_not_emit_the_empty_warning() {
         let db = make_async_db();
@@ -1286,7 +1315,7 @@ mod tests {
         let stats = builder.rebuild().await.expect("rebuild should succeed");
 
         assert!(
-            stats.entities_total > 0,
+            stats.entities_total.is_some_and(|n| n > 0),
             "même sans skill déclarée, les seeds de problem_type et de concept \
              peuplent le graphe — le WARN ne doit donc pas pouvoir tirer ici"
         );
@@ -1294,12 +1323,48 @@ mod tests {
         // évite qu'un futur retrait des seeds transforme ce contrôle en
         // assertion vide sans que rien ne rougisse.
         assert!(
-            stats.entities_total_per_type.contains_key("problem_type"),
+            stats
+                .entities_total_per_type
+                .as_ref()
+                .is_some_and(|m| m.contains_key("problem_type")),
             "les seeds de problem_type sont ce qui peuple le graphe de ce test"
         );
         assert!(
-            stats.entities_total_per_type.contains_key("concept"),
+            stats
+                .entities_total_per_type
+                .as_ref()
+                .is_some_and(|m| m.contains_key("concept")),
             "idem pour les seeds de concept"
+        );
+    }
+
+    /// V10 — un recensement illisible n'est pas un graphe vide (mika#1833 R6).
+    ///
+    /// Le bras `Err` de `rebuild` rend `None` ; avant ce garde il rendait une
+    /// carte vide, dont la somme valait `0` et faisait tirer
+    /// `domain_graph_empty` sur un graphe peuplé — le diagnostic erroné même
+    /// de mika#1833. Les trois branches du prédicat sont épinglées : sans le
+    /// contrôle positif (`Some(0)`), « le WARN ne tire pas sur `None` » serait
+    /// indistinguable de « le WARN ne tire jamais ».
+    #[test]
+    fn mika1833_an_unreadable_census_is_not_an_empty_graph() {
+        assert!(
+            !census_reads_empty(None),
+            "un recensement qu'on n'a pas su lire ne dit rien du graphe"
+        );
+        assert!(
+            census_reads_empty(Some(0)),
+            "contrôle positif : un recensement lu à zéro EST un graphe vide"
+        );
+        assert!(
+            !census_reads_empty(Some(29)),
+            "un graphe peuplé n'est pas vide"
+        );
+        assert_eq!(
+            census_json(None),
+            None,
+            "le champ `per_type` est absent, jamais `{{}}`, quand le recensement \
+             n'a pas été lu"
         );
     }
 

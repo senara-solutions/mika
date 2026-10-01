@@ -1134,19 +1134,22 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             // recensement : sans quoi le `jq '{entities_total, per_type}'` de
             // la sonde S2 rendrait `null` une fois sur deux, ce qui se lit
             // exactement comme un binaire antérieur au correctif.
-            Ok(stats) => info!(
-                event = "domain_rebuild_complete",
-                added = stats.entities_added,
-                updated = stats.entities_updated,
-                removed = stats.entities_removed,
-                depends_on = stats.edges_depends_on,
-                provides = stats.edges_provides,
-                entities_total = stats.entities_total,
-                per_type = %serde_json::to_string(&stats.entities_total_per_type)
-                    .unwrap_or_default(),
-                duration_ms = stats.duration_ms,
-                "domain graph ready"
-            ),
+            Ok(stats) => {
+                let per_type =
+                    crate::kg::domain_builder::census_json(stats.entities_total_per_type.as_ref());
+                info!(
+                    event = "domain_rebuild_complete",
+                    added = stats.entities_added,
+                    updated = stats.entities_updated,
+                    removed = stats.entities_removed,
+                    depends_on = stats.edges_depends_on,
+                    provides = stats.edges_provides,
+                    entities_total = stats.entities_total,
+                    per_type = per_type.as_deref(),
+                    duration_ms = stats.duration_ms,
+                    "domain graph ready"
+                )
+            }
             Err(e) => warn!(
                 error = %e,
                 "domain graph rebuild failed; KG queries may return stale results until next restart"
