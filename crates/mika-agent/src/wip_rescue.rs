@@ -970,8 +970,8 @@ impl HoldVerdict {
 /// **fail-closed** half is a property of this function instead of a branch at
 /// each caller: an unreachable API, a 401/403/429, an unparseable payload or a
 /// shape the extractor does not recognise all land on `Unreadable`.
-/// [`tests::mika2624_la_classification_est_le_lecteur_unique`] refuses a second
-/// site.
+/// `canonical_tokens::tests::mika2624_le_predicat_de_hold_a_un_lecteur_unique`
+/// refuses a second site.
 ///
 /// The three states and the reasoning behind "mere presence suffices" live on
 /// [`HoldVerdict`]; this function only decides, it does not re-argue.
