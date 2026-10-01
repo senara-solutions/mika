@@ -878,19 +878,44 @@ mod tests {
         }
 
         // La ligne d'audit n'est écrite qu'une fois, sur la transition.
-        let rows: i64 = db
-            .with_db(|db| {
-                db.conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM audit_events WHERE tool_name = 'kg_tick_stop'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(Into::into)
-            })
-            .await
-            .expect("audit query");
-        assert_eq!(rows, 1, "une ligne d'audit par transition, jamais par tick");
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string()],
+            "une ligne d'audit par transition"
+        );
+
+        // Second tick, sentinelle TOUJOURS posée, même `armed` : la ligne INFO
+        // se répète (la vivacité est l'information), la ligne d'audit NON.
+        // Sans ce second tick, retirer la garde `if !was_armed` laissait ce
+        // test vert — un seul tick ne distingue pas « par transition » de
+        // « par tick ».
+        {
+            let (_guard, events) = capture();
+            tick_body(
+                "test-agent",
+                &db,
+                &None,
+                &None,
+                &[PathBuf::from("/nonexistent")],
+                &["abcdef1234567890".to_string()],
+                500,
+                home.path(),
+                &armed,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                events_named(&events, "kg_tick_stop_armed").len(),
+                1,
+                "chaque tick court-circuité le dit"
+            );
+        }
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string()],
+            "une ligne d'audit par transition, jamais par tick : un second tick \
+             armé ne doit rien écrire"
+        );
 
         // Contrôle négatif : la sentinelle retirée, le tick reprend.
         std::fs::remove_file(&stop_path).unwrap();
@@ -924,6 +949,27 @@ mod tests {
             "le tick reprend réellement son travail — sans ce contrôle, « la \
              sentinelle décide » serait indistinguable de « le tick est mort »"
         );
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string(), "lifted".to_string()],
+            "la levée est une transition, donc une seconde ligne d'audit, et la \
+             seule"
+        );
+    }
+
+    /// Les `after_value` des lignes d'audit `kg_tick_stop`, dans l'ordre
+    /// d'écriture.
+    async fn stop_transitions(db: &AsyncDatabase) -> Vec<String> {
+        db.with_db(|db| {
+            let mut stmt = db.conn.prepare(
+                "SELECT after_value FROM audit_events \
+                 WHERE tool_name = 'kg_tick_stop' ORDER BY rowid",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+        .expect("audit query")
     }
 
     /// Test that `spawn_resolver_tick_task` with a disabled KG config
