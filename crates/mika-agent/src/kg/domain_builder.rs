@@ -298,10 +298,6 @@ impl<'a> DomainGraphBuilder<'a> {
         }
     }
 
-    /// Run the full rebuild: enumerate → upsert → rebuild edges → prune stale.
-    ///
-    /// The entire operation runs in a single transaction. If any step fails,
-    /// the whole rebuild rolls back and the graph remains in its previous state.
     /// Recense `kg_entities` par type, après rebuild (mika#1833 R6).
     ///
     /// Scopé à [`KG_DOMAIN_ENTITY_TYPES`] — les types que ce module projette
@@ -344,6 +340,10 @@ impl<'a> DomainGraphBuilder<'a> {
             .await
     }
 
+    /// Run the full rebuild: enumerate → upsert → rebuild edges → prune stale.
+    ///
+    /// The entire operation runs in a single transaction. If any step fails,
+    /// the whole rebuild rolls back and the graph remains in its previous state.
     pub async fn rebuild(&self) -> Result<RebuildStats> {
         let start = Instant::now();
         info!(trace_id = %self.trace_id, event = "domain_rebuild_start");
