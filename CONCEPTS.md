@@ -26,6 +26,8 @@ The same holds one level up, and more quietly: a harness nothing invokes is that
 
 It proves the predicate that was written, not the perimeter that was intended. Every input reaching the mutated predicate had already been admitted as something to judge, so going red establishes that the decision is load-bearing and says nothing about what never got that far. Coverage of the detection step is a separate question, asked against the consumer rather than against the guard.
 
+Its cheaper sibling is a population floor: a minimum on how much a scan examined, so that a scan quietly looking at nothing cannot read as a clean result. A floor counts only members the gate has qualified as legitimate. An element that is outside the contract but still raises the count lets the very defect the gate exists to catch satisfy the proof that the gate is looking. And a floor stays a floor: set at today's exact size it turns every legitimate reorganisation into a red, which is how floors get lowered by reflex until they protect nothing. What a floor cannot bound loosely, it names: the member the gate exists for is required by name.
+
 ### Parity corpus
 
 One set of inputs and expected results read by every implementation of the same decision, so that two readers can disagree only where a row says they do. A known difference is declared as a row property the test *requires*: a declared divergence that stops diverging turns the test red and has to be removed, so the exception cannot outlive its cause — unlike a difference tolerated in a comment.
