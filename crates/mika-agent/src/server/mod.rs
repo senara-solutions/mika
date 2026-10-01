@@ -1345,6 +1345,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
                     let extraction_agent = agent_name_clone.clone();
                     let handle = tokio::spawn(async move {
+                        // mika#1833 — sous budget nul la phase est désarmée, et
+                        // le court-circuit précède les requêtes de comptage
+                        // ci-dessous, comme au tick. `kg_budget_resolved` dit
+                        // déjà `extraction_armed = false` pour cet agent.
+                        if crate::kg::budget::phase_is_disabled(budget) {
+                            return;
+                        }
+
                         // Phase 1: Count pending docs per corpus.
                         let mut corpus_pending: Vec<u32> = Vec::new();
                         let mut extractors: Vec<crate::kg::subject_extractor::SubjectExtractor> =
