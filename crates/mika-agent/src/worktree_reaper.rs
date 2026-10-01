@@ -1763,34 +1763,59 @@ pub async fn reap_terminal_worktrees(
         )
         .await;
 
-        for refusal in &screened.refusals {
+        // Déstructuré pour que `candidates` soit consommé par
+        // `apply_work_states` sans emprunter `refusals`, dont la purge a besoin
+        // après (mika#2619 E2).
+        let ReapSelection {
+            candidates: screened_candidates,
+            refusals: screened_refusals,
+        } = screened;
+
+        for refusal in &screened_refusals {
             refused += 1;
             record_refusal(db, session_id, refusal, now, trace_id).await;
         }
 
         // T7, puis **le cap, appliqué après le filtre** (leçon mika#2347).
         //
-        // Enveloppé dans `budget > 0` depuis mika#2511 : la boucle des dépôts ne
-        // casse plus sur le seul budget du faucheur, donc sans cette garde un
-        // budget épuisé ferait payer deux `git` par candidat
-        // (`collect_work_state`) pour une boucle de disposition qui casserait
-        // aussitôt. Tout ce qui **précède** reste inconditionnel —
-        // `probe_main_checkout` (la sonde de saleté mika#2449), le registre, le
-        // remote, `list_prs`, `screen_worktrees` et l'écriture de ses refus :
-        // `screened.refusals` et `pr_index` sont exactement les deux entrées
-        // dont la purge a besoin.
-        if budget > 0 {
+        // La condition est élargie depuis mika#2619 : **le bras qui a besoin du
+        // calcul le paie**. Enveloppé dans `budget > 0` seul (mika#2511), T7
+        // n'était pas évalué du tout quand le budget du faucheur était épuisé —
+        // donc les survivants de T1–T6 n'apparaissaient dans **aucun** vecteur,
+        // et un worktree `dirty` ou `unpushed_commits` échappait à la purge une
+        // seconde fois, par le budget d'un autre bras. C'est le motif
+        // `should_stop_repo_loop` appliqué un cran plus bas.
+        //
+        // **Coût nommé, et c'est le seul que ce changement crée :** deux
+        // sous-processus `git` par candidat T1–T6 même quand le faucheur n'a plus
+        // de budget, à condition que la purge soit armée et ait du budget. Borné
+        // par le nombre de worktrees dont la PR est terminale, hors grâce, sans
+        // processus vivant — petit par construction, et nul quand il n'y en a
+        // aucun.
+        //
+        // **Changement de population comptable, à dater :** les refus `dirty` /
+        // `unpushed_commits` / `work_state_unreadable` étaient **tronqués par le
+        // budget du faucheur** ; ils sont désormais écrits à chaque tick où la
+        // purge tourne. Le compte `worktree_reap_skipped` sur ces trois motifs
+        // **monte** après déploiement, et ce n'est pas une dégradation : la
+        // population devient complète.
+        let t7_needed = t7_is_needed(budget, purge_budget, purge_cfg.enabled);
+        let mut t7_refusals: Vec<ReapRefusal> = Vec::new();
+        if t7_needed {
             let mut work_states = HashMap::new();
-            for candidate in &screened.candidates {
+            for candidate in &screened_candidates {
                 let state = collect_work_state(Path::new(&candidate.path), &candidate.branch).await;
                 work_states.insert(candidate.path.clone(), state);
             }
-            let selection = apply_work_states(screened.candidates, &work_states);
-            for refusal in &selection.refusals {
+            let selection = apply_work_states(screened_candidates, &work_states);
+            t7_refusals = selection.refusals;
+            for refusal in &t7_refusals {
                 refused += 1;
                 record_refusal(db, session_id, refusal, now, trace_id).await;
             }
 
+            // La **boucle de disposition du faucheur** reste sous `budget > 0` :
+            // ce qui est élargi est le calcul, jamais la disposition.
             for candidate in selection.candidates {
                 if budget == 0 {
                     break;
@@ -1881,14 +1906,23 @@ pub async fn reap_terminal_worktrees(
         // mika#2497 — le troisième bras, **après** la disposition du faucheur.
         // L'ordre est nécessaire : ce que le faucheur vient de retirer n'existe
         // plus, et le considérer pour une purge serait au mieux un no-op, au
-        // pire une course. `screened.refusals` — et pas `selection.refusals` —
-        // est le vecteur qui porte `pr_open` (voir le doc-comment de
+        // pire une course. **Les deux vecteurs** depuis mika#2619 : T1–T6 porte
+        // `pr_open` / `pr_unknown` / `detached_head*`, T7 porte `dirty` /
+        // `unpushed_commits` / `work_state_unreadable` (voir le doc-comment de
         // `purge_stale_target_dirs`).
+        //
+        // **Trou résiduel, nommé et non fermé :** si le budget du faucheur
+        // s'épuise *en cours* de boucle de disposition, les candidats `Clean`
+        // restants ne sont ni fauchés ni refusés, donc leur répertoire de build
+        // échappe à ce tick. Transitoire (≤ 10 min), borné, et fermer ce cas
+        // demanderait de pousser un refus synthétique pour un worktree que rien
+        // ne refuse — une ligne d'audit fausse.
         purge_stale_target_dirs(
             db,
             session_id,
             trace_id,
-            &screened.refusals,
+            &screened_refusals,
+            &t7_refusals,
             &pr_index,
             &live,
             now,
@@ -3008,6 +3042,20 @@ pub const PURGE_REASON_BUILD_LOCK_RACED: &str = "build_lock_raced";
 pub const PURGE_REASON_BUILD_LOCK_UNREADABLE: &str = "build_lock_unreadable";
 /// Chemin hors de `.claude/worktrees/` (P1) — **doit rester vide**, HALTE 4.
 pub const PURGE_REASON_OUTSIDE_MANAGED_ROOT: &str = "outside_managed_root";
+/// Un répertoire découvert dont le marqueur de cache a disparu **entre la
+/// découverte et la garde tardive** (mika#2619).
+///
+/// Délibérément **distinct** de [`PURGE_REASON_OUTSIDE_MANAGED_ROOT`], qui
+/// serait une ligne d'audit **fausse** : le chemin est bien sous la racine
+/// gérée, c'est la **preuve** qui manque (doctrine
+/// `pilot_stall_signal_unavailable`, mika#2277 ; `unknown_provider`, mika#2328).
+///
+/// **Régime attendu : vide.** Aucun refus n'est écrit pour un répertoire **non
+/// reconnu à la découverte** — ce serait une ligne par sous-répertoire de
+/// `.pilot-scratch/`, c'est-à-dire du bruit sur une population qui n'a jamais
+/// été candidate (même raison que l'exclusion du checkout primaire côté
+/// faucheur, HALTE 4).
+pub const PURGE_REASON_NOT_A_BUILD_DIR: &str = "not_a_build_dir";
 
 /// Tous les motifs de refus de la purge, en un seul lieu.
 ///
@@ -3022,7 +3070,8 @@ pub const PURGE_REASON_OUTSIDE_MANAGED_ROOT: &str = "outside_managed_root";
 ///
 /// mika#2511 y ajoute [`PURGE_REASON_BUILD_LOCK_RACED`] **en queue** : un ajout,
 /// jamais un renommage — aucune population existante ne change de nom ni de
-/// sens, et les `GROUP BY` publiés restent exacts.
+/// sens, et les `GROUP BY` publiés restent exacts. mika#2619 y ajoute
+/// [`PURGE_REASON_NOT_A_BUILD_DIR`], **en queue** et pour la même raison.
 pub const ALL_PURGE_REFUSAL_REASONS: &[&str] = &[
     PURGE_REASON_NO_TARGET_DIR,
     PURGE_REASON_TARGET_NOT_A_DIR,
@@ -3034,34 +3083,92 @@ pub const ALL_PURGE_REFUSAL_REASONS: &[&str] = &[
     PURGE_REASON_BUILD_LOCK_UNREADABLE,
     PURGE_REASON_OUTSIDE_MANAGED_ROOT,
     PURGE_REASON_BUILD_LOCK_RACED,
+    PURGE_REASON_NOT_A_BUILD_DIR,
 ];
 
-/// Les motifs de refus du faucheur dont le `target/` est **purgeable**
-/// (mika#2482 B1).
+/// Les motifs de refus du faucheur dont le répertoire de build est
+/// **purgeable** (mika#2482 B1, élargi à la partition par mika#2619).
 ///
-/// # Ce que ça élargit, et pourquoi c'est gratuit en sûreté
+/// # Le bras ne lit plus *pourquoi* le worktree est conservé
 ///
-/// Le bras de purge ne voyait que [`REASON_PR_OPEN`]. Or la condition de réveil
-/// de mika#2482 est *« `/data` refranchit régulièrement 80 % »*, et ce qui coûte
-/// ce disque n'est pas le worktree mais son `target/` — 15 à 50 Go par pilote.
 /// L'asymétrie écrite qui autorise ce bras — *« le faucheur supprime du travail
-/// potentiel, ce bras supprime du dérivé pur »* — est **indifférente à la raison
-/// pour laquelle le worktree est conservé** : un `target/` de `pr_unknown` est
-/// exactement aussi reconstructible par `cargo build` qu'un `target/` de
-/// `pr_open`. La moitié disque du constat 1 du ticket ne demande donc **aucune
-/// règle N-jours** : elle demande d'élargir une population de deux noms à trois.
+/// potentiel, ce bras supprime du dérivé pur »* — est **indifférente au motif
+/// de conservation** : un `target/` de `detached_head` est exactement aussi
+/// reconstructible par `cargo build` qu'un `target/` de `pr_open`. Conserver le
+/// worktree protège le **travail** (commits, arbre de travail) ; cela ne dit
+/// rien de son cache de build. Les cinq termes P1–P5 suffisent à protéger un
+/// build en cours, quel que soit le motif.
 ///
-/// **Les cinq termes P1–P5 ne bougent pas**, verrou de build compris : le seul
-/// danger de ce bras est la **concurrence** avec un `cargo build`, et P5
-/// (mika#2511) la couvre identiquement sur la population élargie.
+/// # Pourquoi une partition, et pas une denylist
+///
+/// Le ticket mika#2619 proposait d'inverser la polarité (« tout motif sauf
+/// `live_process` »). **Refusé** : le prédicat est fail-closed sur l'inconnu
+/// (`is_purge_eligible_reason("")` et `("pr_unknown_")` rendent `false`,
+/// épinglé), et une denylist pure rendrait `true` pour toute chaîne non listée.
+///
+/// Mais la polarité n'était pas la cause du défaut. La cause est qu'une liste
+/// de deux noms a **pris du retard** : [`REASON_DETACHED_HEAD_PR_UNKNOWN`] est
+/// né de mika#2518 et personne ne l'y a ajouté — 40 Go sur `refactor-2194`,
+/// mesurés le 2026-10-01. Le remède qui ferme la **classe** est donc une
+/// partition exacte de [`ALL_REFUSAL_REASONS`] en deux listes déclarées, dont
+/// [`tests::mika2619_la_partition_des_motifs_est_exacte`] exige qu'elle couvre
+/// chaque motif **exactement une fois**. Un motif ajouté demain fait rougir ce
+/// test jusqu'à ce que quelqu'un le classe : le défaut n'est plus « purgeable
+/// par oubli » ni « non purgeable par oubli », c'est **« pas de décision, pas de
+/// build »**.
+///
+/// [`REASON_TOO_YOUNG`] est **quasi inerte et inclus par cohérence plutôt que
+/// par exception** : une PR close depuis moins que la grâce a presque toujours
+/// un répertoire de build plus récent que la fenêtre d'inactivité, donc P4 le
+/// refuse. L'exclure demanderait d'argumenter « le faucheur va le retirer en
+/// entier dans ≤ 10 min », ce qui est vrai *tant que le faucheur est armé* —
+/// une dépendance que l'asymétrie fondatrice ne demande pas.
 ///
 /// # Ce que ça n'élargit PAS
 ///
-/// La **fauche** d'un `pr_unknown` reste refusée, et pas seulement par prudence :
-/// un `pr_unknown` sort à T3, donc **T7 n'est jamais évalué sur lui** — on ne
-/// sait pas s'il porte du travail non poussé. Ce qui est retiré ici est le
-/// `target/`, jamais le worktree, jamais une branche, jamais un commit.
-pub const PURGE_ELIGIBLE_REASONS: &[&str] = &[REASON_PR_OPEN, REASON_PR_UNKNOWN];
+/// La **fauche** d'un `pr_unknown`, d'un `dirty` ou d'un `unpushed_commits`
+/// reste refusée, et pas seulement par prudence : un `pr_unknown` sort à T3,
+/// donc **T7 n'est jamais évalué sur lui** — on ne sait pas s'il porte du
+/// travail non poussé ; un `dirty` porte un arbre de travail. Ce qui est retiré
+/// ici est le répertoire de build, jamais le worktree, jamais une branche,
+/// jamais un commit.
+pub const PURGE_ELIGIBLE_REASONS: &[&str] = &[
+    REASON_PR_OPEN,
+    REASON_PR_UNKNOWN,
+    // mika#2619 — les sept ajouts, chacun pour une raison mesurée ou écrite.
+    // `detached_head_pr_unknown` porte les 40 Go de `refactor-2194` : né de
+    // mika#2518, jamais ajouté ici.
+    REASON_DETACHED_HEAD_PR_UNKNOWN,
+    REASON_DETACHED_HEAD,
+    REASON_DIRTY,
+    REASON_UNPUSHED_COMMITS,
+    REASON_WORK_STATE_UNREADABLE,
+    REASON_PR_CLOSED_AT_UNREADABLE,
+    REASON_TOO_YOUNG,
+];
+
+/// Les motifs dont le répertoire de build n'est **pas** purgeable — et chacun
+/// porte la raison de son exclusion (mika#2619 AC1).
+///
+/// Les trois exclusions sont des **redondances**, jamais des réserves de
+/// sûreté : aucune ne protège un worktree que P1–P5 laisseraient passer. C'est
+/// ce qui autorise à les écrire comme telles plutôt qu'à les regretter.
+///
+/// - [`REASON_LIVE_PROCESS`] — **P3 re-décide.** L'inclure écrirait une ligne
+///   `target_purge_skipped` de motif `live_process` doublant celle du faucheur,
+///   sous un autre `tool_name` : du bruit sans information neuve.
+/// - [`REASON_PROCESS_SCAN_UNREADABLE`] — même tick, même cause : `live` vaut
+///   [`LiveCwds::Unavailable`], donc **P3 refuse tout le monde**. L'inclure
+///   produirait une ligne de refus par worktree de la population, toutes pour
+///   une seule cause déjà nommée côté faucheur.
+/// - [`REASON_OUTSIDE_MANAGED_ROOT`] — **P1 refuse**, et ce motif doit rester
+///   vide côté faucheur (HALTE 4 du `CLAUDE.md` racine). Le faire traverser
+///   rendrait une HALTE illisible.
+pub const PURGE_INELIGIBLE_REASONS: &[&str] = &[
+    REASON_LIVE_PROCESS,
+    REASON_PROCESS_SCAN_UNREADABLE,
+    REASON_OUTSIDE_MANAGED_ROOT,
+];
 
 /// Le **lecteur unique** de [`PURGE_ELIGIBLE_REASONS`] (mika#2482 B1.1).
 ///
@@ -3249,21 +3356,66 @@ pub enum TargetState {
     Present { idle_secs: Option<i64> },
 }
 
-/// Un `target/` retenu pour la purge.
+/// Un répertoire de build retenu pour la purge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPurgeCandidate {
     pub worktree_path: String,
+    /// Le répertoire de build — **champ de la ligne INFO, donc format de fil**.
+    ///
+    /// Sa sémantique s'élargit depuis mika#2619 : « le `target/` du worktree »
+    /// devient « le répertoire de build », qui peut vivre sous
+    /// `.pilot-scratch/`. Le nom du champ ne change pas : le renommer casserait
+    /// `jq '.target_path'`, une requête publiée.
     pub target_path: String,
     pub branch: Option<String>,
     pub idle_secs: i64,
+    /// Le motif de **conservation du faucheur** qui a mis ce worktree dans la
+    /// population (mika#2619 AC4).
+    ///
+    /// C'est ce qui rend la population élargie **comptable séparément** :
+    /// `jq 'select(.keep_reason == "unpushed_commits")'`. Un champ, **jamais un
+    /// second `tool_name`** — les retraits sont faits par le même bras, sous la
+    /// même conjonction de cinq termes, avec la même létalité ; seul le motif de
+    /// conservation diffère. Créer un second `tool_name` tronquerait en silence
+    /// `SELECT … WHERE tool_name = 'target_purged'`, une requête publiée
+    /// (motif `RESOLUTION_BRANCH`, mika#2518 ; `ready_label_outcome`,
+    /// mika#2323).
+    pub keep_reason: &'static str,
 }
 
-/// Un `target/` conservé, et le motif nommé qui l'a conservé.
+/// Un répertoire de build conservé, et le motif nommé qui l'a conservé.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPurgeRefusal {
     pub worktree_path: String,
+    /// Le répertoire de build sur lequel porte le refus, quand il y en a un.
+    ///
+    /// `None` pour les refus qui portent sur le **worktree** et non sur un
+    /// répertoire : P1 (`outside_managed_root`), P3 et l'absence de tout
+    /// répertoire découvert (`no_target_dir`). C'est ce qui donne à
+    /// [`TargetPurgeRefusal::audit_path`] le chemin le plus spécifique
+    /// disponible — sans quoi deux répertoires du même worktree refusés sous le
+    /// même motif se dédupliqueraient mutuellement (mika#2619 R5).
+    pub build_dir_path: Option<String>,
     pub branch: Option<String>,
     pub reason: &'static str,
+    /// Le motif de conservation du faucheur — même rôle que sur le candidat.
+    pub keep_reason: &'static str,
+}
+
+impl TargetPurgeRefusal {
+    /// Le chemin que porte la clé d'audit : le répertoire de build quand il y en
+    /// a un, le worktree sinon.
+    ///
+    /// **Lecteur unique** de cette dérivation, épinglé par
+    /// [`tests::mika2619_la_cle_de_refus_a_un_site_dappel_unique`] : un second
+    /// site pourrait passer `worktree_path` directement et ré-ouvrir la
+    /// déduplication mutuelle de R5, sans rendre aucune décision fausse le jour
+    /// où il est écrit.
+    pub fn audit_path(&self) -> &str {
+        self.build_dir_path
+            .as_deref()
+            .unwrap_or(&self.worktree_path)
+    }
 }
 
 /// La sortie de la décision de purge.
@@ -3274,24 +3426,39 @@ pub struct TargetPurgeSelection {
 }
 
 /// P1 à P4, sur les refus **éligibles** du faucheur du **même tick**
-/// ([`PURGE_ELIGIBLE_REASONS`] : `pr_open` et, depuis mika#2482, `pr_unknown`).
+/// ([`PURGE_ELIGIBLE_REASONS`], neuf motifs depuis mika#2619).
 ///
-/// | # | terme | source de vérité | illisible ⇒ |
-/// |---|---|---|---|
-/// | P1 | le chemin est un worktree géré | le chemin lui-même | conserver |
-/// | P2 | `<worktree>/target/` existe et est un **répertoire** | `symlink_metadata` | conserver |
-/// | P3 | aucun processus vivant n'a son cwd sous le worktree | `/proc/*/cwd` | conserver |
-/// | P4 | inactivité : le mtime le plus récent est plus vieux que la fenêtre | `stat`, profondeur bornée | conserver |
+/// | # | terme | portée | source de vérité | illisible ⇒ |
+/// |---|---|---|---|---|
+/// | P1 | le chemin est un worktree géré | worktree | le chemin lui-même | conserver |
+/// | P3 | aucun processus vivant n'a son cwd sous le worktree | worktree | `/proc/*/cwd` | conserver |
+/// | P2 | le répertoire de build existe et est un **répertoire** | répertoire | `symlink_metadata` | conserver |
+/// | P4 | inactivité : le mtime le plus récent est plus vieux que la fenêtre | répertoire | `stat`, profondeur bornée | conserver |
+///
+/// **P3 est évalué avant la boucle sur les répertoires, et c'est voulu** : c'est
+/// une propriété du **worktree**, pas d'un cache. Refuser N fois pour une cause
+/// unique serait le bruit que D1 refuse déjà en excluant `live_process` de la
+/// population.
 ///
 /// P5 (le verrou de build) est **délibérément absent d'ici** : il coûte un
 /// `open` + un `flock` par profil, et ne se paie que sur les survivants de
 /// P1-P4 — motif de maison de mika#2184, *le proxy filtre d'abord, la mesure
 /// directe tranche ensuite*. Voir [`apply_lock_probes`].
 ///
+/// # N répertoires par worktree (mika#2619)
+///
+/// `build_dirs` dit **quels** répertoires un worktree porte (découverts par
+/// [`discover_build_dirs`], jamais composés ici), `states` dit **dans quel
+/// état** chacun se trouve — clé par **répertoire de build**, plus par
+/// worktree. Les deux absences sont fail-safe et disent deux choses
+/// différentes : aucun répertoire découvert ⇒ `no_target_dir` (il n'y a rien à
+/// purger), un répertoire sans état ⇒ `mtime_unreadable` (on n'a pas pu lire).
+///
 /// Invariant : **un terme illisible conserve ; il n'existe aucune exception.**
 pub fn screen_target_purges(
     reaper_refusals: &[ReapRefusal],
     live: &LiveCwds,
+    build_dirs: &HashMap<String, Vec<String>>,
     states: &HashMap<String, TargetState>,
     cfg: &TargetPurgeConfig,
 ) -> TargetPurgeSelection {
@@ -3308,70 +3475,98 @@ pub fn screen_target_purges(
             continue;
         }
 
-        let push_refusal = |out: &mut TargetPurgeSelection, reason: &'static str| {
+        // Un refus de portée **worktree** : aucun répertoire de build n'est en
+        // cause, donc la clé d'audit porte le worktree.
+        let push_worktree_refusal = |out: &mut TargetPurgeSelection, reason: &'static str| {
             out.refusals.push(TargetPurgeRefusal {
                 worktree_path: refusal.path.clone(),
+                build_dir_path: None,
                 branch: refusal.branch.clone(),
                 reason,
+                keep_reason: refusal.reason,
             });
         };
 
         // P1 — chemin géré (garde syntaxique ; la garde après canonicalisation
         // est re-vérifiée juste avant la disposition).
         if !is_managed_worktree_path(&refusal.path) {
-            push_refusal(&mut out, PURGE_REASON_OUTSIDE_MANAGED_ROOT);
+            push_worktree_refusal(&mut out, PURGE_REASON_OUTSIDE_MANAGED_ROOT);
             continue;
         }
 
-        // P2 — un `target/` qui est bien un répertoire. Une entrée absente de
-        // `states` vaut « on n'a pas pu établir la récence » : conserver.
-        let state = states
-            .get(&refusal.path)
-            .copied()
-            .unwrap_or(TargetState::Present { idle_secs: None });
-        let idle_secs = match state {
-            TargetState::Absent => {
-                push_refusal(&mut out, PURGE_REASON_NO_TARGET_DIR);
-                continue;
-            }
-            TargetState::NotADirectory => {
-                push_refusal(&mut out, PURGE_REASON_TARGET_NOT_A_DIR);
-                continue;
-            }
-            TargetState::Present { idle_secs } => idle_secs,
-        };
-
-        // P3 — aucun processus vivant dedans.
+        // P3 — aucun processus vivant dedans. Un pilote dispatché travaille à la
+        // racine de son worktree, donc `cwd == root` : le worktree entier — et
+        // tous ses répertoires de build, `.pilot-scratch/` compris — sort de la
+        // population (mika#2619 R6).
         match live {
             LiveCwds::Unavailable => {
-                push_refusal(&mut out, PURGE_REASON_PROCESS_SCAN_UNREADABLE);
+                push_worktree_refusal(&mut out, PURGE_REASON_PROCESS_SCAN_UNREADABLE);
                 continue;
             }
             LiveCwds::Enumerated(cwds) => {
                 let root = Path::new(&refusal.path);
                 if cwds.iter().any(|cwd| cwd == root || cwd.starts_with(root)) {
-                    push_refusal(&mut out, PURGE_REASON_LIVE_PROCESS);
+                    push_worktree_refusal(&mut out, PURGE_REASON_LIVE_PROCESS);
                     continue;
                 }
             }
         }
 
-        // P4 — inactivité.
-        let Some(idle_secs) = idle_secs else {
-            push_refusal(&mut out, PURGE_REASON_MTIME_UNREADABLE);
-            continue;
-        };
-        if idle_secs < cfg.idle_secs {
-            push_refusal(&mut out, PURGE_REASON_RECENTLY_ACTIVE);
+        // Aucun répertoire de build découvert : rien à purger. Un seul refus
+        // pour le worktree, sous le motif que ce cas portait déjà.
+        let dirs = build_dirs.get(&refusal.path).map_or(&[][..], Vec::as_slice);
+        if dirs.is_empty() {
+            push_worktree_refusal(&mut out, PURGE_REASON_NO_TARGET_DIR);
             continue;
         }
 
-        out.candidates.push(TargetPurgeCandidate {
-            worktree_path: refusal.path.clone(),
-            target_path: target_dir_of(&refusal.path),
-            branch: refusal.branch.clone(),
-            idle_secs,
-        });
+        for dir in dirs {
+            let push_dir_refusal = |out: &mut TargetPurgeSelection, reason: &'static str| {
+                out.refusals.push(TargetPurgeRefusal {
+                    worktree_path: refusal.path.clone(),
+                    build_dir_path: Some(dir.clone()),
+                    branch: refusal.branch.clone(),
+                    reason,
+                    keep_reason: refusal.reason,
+                });
+            };
+
+            // P2 — un répertoire de build qui est bien un répertoire. Une entrée
+            // absente de `states` vaut « on n'a pas pu établir la récence ».
+            let state = states
+                .get(dir)
+                .copied()
+                .unwrap_or(TargetState::Present { idle_secs: None });
+            let idle_secs = match state {
+                TargetState::Absent => {
+                    push_dir_refusal(&mut out, PURGE_REASON_NO_TARGET_DIR);
+                    continue;
+                }
+                TargetState::NotADirectory => {
+                    push_dir_refusal(&mut out, PURGE_REASON_TARGET_NOT_A_DIR);
+                    continue;
+                }
+                TargetState::Present { idle_secs } => idle_secs,
+            };
+
+            // P4 — inactivité.
+            let Some(idle_secs) = idle_secs else {
+                push_dir_refusal(&mut out, PURGE_REASON_MTIME_UNREADABLE);
+                continue;
+            };
+            if idle_secs < cfg.idle_secs {
+                push_dir_refusal(&mut out, PURGE_REASON_RECENTLY_ACTIVE);
+                continue;
+            }
+
+            out.candidates.push(TargetPurgeCandidate {
+                worktree_path: refusal.path.clone(),
+                target_path: dir.clone(),
+                branch: refusal.branch.clone(),
+                idle_secs,
+                keep_reason: refusal.reason,
+            });
+        }
     }
 
     out
@@ -3417,8 +3612,10 @@ pub fn apply_lock_probes(
         };
         out.refusals.push(TargetPurgeRefusal {
             worktree_path: candidate.worktree_path,
+            build_dir_path: Some(candidate.target_path),
             branch: candidate.branch,
             reason,
+            keep_reason: candidate.keep_reason,
         });
     }
     out
@@ -3432,11 +3629,12 @@ pub fn apply_lock_probes(
 pub fn select_target_purges(
     reaper_refusals: &[ReapRefusal],
     live: &LiveCwds,
+    build_dirs: &HashMap<String, Vec<String>>,
     states: &HashMap<String, TargetState>,
     probes: &HashMap<String, LockProbe>,
     cfg: &TargetPurgeConfig,
 ) -> TargetPurgeSelection {
-    let screened = screen_target_purges(reaper_refusals, live, states, cfg);
+    let screened = screen_target_purges(reaper_refusals, live, build_dirs, states, cfg);
     let mut final_pass = apply_lock_probes(screened.candidates, probes);
     let mut refusals = screened.refusals;
     refusals.append(&mut final_pass.refusals);
@@ -3470,12 +3668,129 @@ pub fn should_stop_repo_loop(
     reaper_budget == 0 && (purge_budget == 0 || !purge_enabled)
 }
 
-/// `<worktree>/target`, en chaîne — un seul site le compose.
+/// T7 doit-il être évalué ? (mika#2619 R2)
+///
+/// **Le bras qui a besoin du calcul le paie.** Enveloppé dans `budget > 0` seul
+/// (mika#2511), T7 n'était pas évalué du tout quand le budget du faucheur était
+/// épuisé — donc les survivants de T1–T6 n'apparaissaient dans **aucun**
+/// vecteur, et un worktree `dirty` ou `unpushed_commits` échappait à la purge
+/// **deux fois** : par la liste d'éligibilité, et par le budget d'un autre bras.
+/// Le second ne se réparerait pas tout seul en élargissant la première.
+///
+/// Prédicat pur nommé plutôt qu'une conjonction en ligne, exactement comme son
+/// voisin [`should_stop_repo_loop`] : il est testable à ses quatre coins sans
+/// monter de dépôt factice — ce que la condition en ligne n'est pas, puisqu'elle
+/// vit dans une fonction qui shelle `git` et `gh` — et il est l'endroit où le
+/// raisonnement est écrit. Son co-site est tenu par
+/// [`tests::mika2619_la_condition_de_t7_passe_par_le_predicat`].
+pub fn t7_is_needed(reaper_budget: usize, purge_budget: usize, purge_enabled: bool) -> bool {
+    reaper_budget > 0 || (purge_enabled && purge_budget > 0)
+}
+
+/// `<worktree>/target`, en chaîne — **le seul site qui compose ce chemin**.
+///
+/// Son unique appelant de production est [`discover_build_dirs`] (mika#2619 D3),
+/// tenu par [`tests::mika2619_la_composition_dun_chemin_de_build_a_un_site_unique`] :
+/// un second compositeur ne rendrait aucune décision fausse le jour où il est
+/// écrit, et divergerait plus tard en silence.
 pub fn target_dir_of(worktree_path: &str) -> String {
     Path::new(worktree_path)
         .join("target")
         .to_string_lossy()
         .into_owned()
+}
+
+/// Le répertoire des brouillons de pilote, où vivent les `CARGO_TARGET_DIR` de
+/// mesure (mika#2548).
+pub const PILOT_SCRATCH_DIRNAME: &str = ".pilot-scratch";
+
+/// Profondeur de la marche de découverte sous `.pilot-scratch/`.
+///
+/// Trois niveaux couvrent `.pilot-scratch/<nom>/<cible>` et un niveau de
+/// regroupement de plus (les 17 Go mesurés vivaient sous
+/// `.pilot-scratch/ac6/<deux cibles>`). **Bornée**, parce qu'une marche non
+/// bornée dans un worktree est ce que mika#2497 refuse déjà pour sa mesure de
+/// taille.
+pub const BUILD_DIR_SCAN_DEPTH: usize = 3;
+
+/// Marqueur spécifique à cargo, posé à la racine d'un répertoire de build.
+pub const CARGO_INFO_MARKER: &str = ".rustc_info.json";
+
+/// Marqueur standard par lequel un outil **déclare lui-même** « ceci est un
+/// cache » — exactement l'information que l'asymétrie fondatrice demande.
+pub const CACHEDIR_TAG_MARKER: &str = "CACHEDIR.TAG";
+
+/// Un répertoire est-il un **cache de build déclaré** ? (mika#2619 D4)
+///
+/// La reconnaissance est la **présence d'un marqueur à sa racine**, jamais son
+/// nom ni sa taille : un répertoire qui n'en porte aucun n'est **pas reconnu**,
+/// donc n'entre pas dans la population — la direction sûre. C'est aussi une
+/// preuve plus forte que le nom : un répertoire *nommé* `target` qui n'est pas
+/// un cache est aujourd'hui supprimable, alors qu'un répertoire porteur d'un
+/// marqueur est un cache **par déclaration de son producteur**.
+pub fn is_cargo_build_dir(dir: &Path) -> bool {
+    dir.join(CARGO_INFO_MARKER).is_file() || dir.join(CACHEDIR_TAG_MARKER).is_file()
+}
+
+/// Les répertoires de build d'un worktree, **découverts et jamais devinés**.
+///
+/// Deux sources, et une seule compose un chemin :
+///
+/// 1. `<worktree>/target` **s'il existe** — sans condition de marqueur, pour ne
+///    pas rétrécir la population d'aujourd'hui. Il est rendu même quand ce n'est
+///    pas un répertoire (fichier, lien symbolique) : [`inspect_build_dir`] en
+///    fera un `NotADirectory`, ce qui **préserve le motif `target_not_a_dir`** —
+///    le taire ici le transformerait en `no_target_dir`, c'est-à-dire changerait
+///    une population comptable en silence.
+/// 2. une marche **bornée** sous `.pilot-scratch/`, profondeur
+///    [`BUILD_DIR_SCAN_DEPTH`], retenant tout répertoire porteur d'un marqueur
+///    (D4) **sans y descendre** une fois reconnu : un répertoire de build
+///    contient des sous-répertoires, et les énumérer serait une marche non
+///    bornée dans l'arborescence qu'on vient d'identifier comme un cache.
+///
+/// Les liens symboliques ne sont **jamais** suivis dans la marche : un lien vers
+/// le cache d'un worktree voisin ne doit pas y faire entrer sa cible.
+///
+/// Ordre déterministe (tri), pour que le budget soit consommé de façon
+/// reproductible et que les tests n'aient pas à ordonner.
+pub fn discover_build_dirs(worktree: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+
+    let target = PathBuf::from(target_dir_of(&worktree.to_string_lossy()));
+    if target.symlink_metadata().is_ok() {
+        found.push(target);
+    }
+
+    let mut level = vec![worktree.join(PILOT_SCRATCH_DIRNAME)];
+    for _ in 0..BUILD_DIR_SCAN_DEPTH {
+        let mut next = Vec::new();
+        for dir in &level {
+            let Ok(read) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let Ok(meta) = path.symlink_metadata() else {
+                    continue;
+                };
+                if meta.is_symlink() || !meta.is_dir() {
+                    continue;
+                }
+                if is_cargo_build_dir(&path) {
+                    found.push(path);
+                } else {
+                    next.push(path);
+                }
+            }
+        }
+        level = next;
+        if level.is_empty() {
+            break;
+        }
+    }
+
+    found.sort();
+    found
 }
 
 /// Le mtime le plus récent sur un ensemble **borné et déclaré** : `root`, ses
@@ -3520,14 +3835,17 @@ pub fn newest_mtime_bounded(root: &Path, depth: usize) -> Option<SystemTime> {
     Some(newest)
 }
 
-/// P2 + P4, en une seule lecture du disque.
+/// P2 + P4, en une seule lecture du disque, sur un répertoire **déjà découvert**.
+///
+/// Prend le répertoire plutôt que le worktree depuis mika#2619 : composer
+/// `worktree.join("target")` ici ferait de cette fonction un second
+/// compositeur de chemin, alors que [`discover_build_dirs`] est le seul site.
 ///
 /// Un mtime **dans le futur** (dérive d'horloge) rend `idle_secs = None`,
-/// exactement comme un `stat` refusé : les deux sortent le worktree de la
+/// exactement comme un `stat` refusé : les deux sortent le répertoire de la
 /// population, aucun ne l'y fait entrer.
-pub fn inspect_target_dir(worktree: &Path, now: SystemTime) -> TargetState {
-    let target = worktree.join("target");
-    let meta = match target.symlink_metadata() {
+pub fn inspect_build_dir(dir: &Path, now: SystemTime) -> TargetState {
+    let meta = match dir.symlink_metadata() {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TargetState::Absent,
         // On ne sait pas s'il est là : conserver, jamais « absent ».
@@ -3536,7 +3854,7 @@ pub fn inspect_target_dir(worktree: &Path, now: SystemTime) -> TargetState {
     if meta.is_symlink() || !meta.is_dir() {
         return TargetState::NotADirectory;
     }
-    let idle_secs = newest_mtime_bounded(&target, TARGET_MTIME_SCAN_DEPTH)
+    let idle_secs = newest_mtime_bounded(dir, TARGET_MTIME_SCAN_DEPTH)
         .and_then(|m| now.duration_since(m).ok())
         .and_then(|d| i64::try_from(d.as_secs()).ok());
     TargetState::Present { idle_secs }
@@ -3808,25 +4126,50 @@ pub fn cargo_build_lock_is_free(target: &Path) -> LockProbe {
     }
 }
 
-/// Les trois gardes de la suppression, vérifiées **dans cet ordre**.
+/// Les gardes de la suppression, vérifiées **dans cet ordre** — et le motif du
+/// refus, pour que l'appelant n'ait pas à le deviner.
 ///
 /// 1. ce n'est pas un lien symbolique — testé sur le chemin **d'origine**, la
 ///    canonicalisation le résoudrait et la question deviendrait muette ;
-/// 2. le chemin canonicalisé se termine par `/target` ;
-/// 3. il est sous [`MANAGED_WORKTREE_SEGMENT`] après canonicalisation.
+/// 2. il est sous [`MANAGED_WORKTREE_SEGMENT`] après canonicalisation ;
+/// 3. **le nom OU le marqueur** : le chemin canonicalisé se termine par
+///    `/target`, **ou** il porte un marqueur de cache (D4), re-vérifié après
+///    canonicalisation.
 ///
-/// `canonicalize` qui échoue rend `false` : pas de preuve, pas de suppression.
-pub fn target_path_is_disposable(target: &Path) -> bool {
-    if target.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-        return false;
+/// **La disjonction du terme 3 est voulue dans les deux sens.** Garder
+/// `ends_with("/target")` évite de rétrécir la population actuelle — un
+/// `target/` fraîchement créé, encore sans marqueur, reste purgeable comme
+/// aujourd'hui. Ajouter le marqueur est ce qui **remplace la preuve par le nom**
+/// pour tout le reste.
+///
+/// `canonicalize` qui échoue refuse : pas de preuve, pas de suppression. Les
+/// trois premiers refus portent `outside_managed_root` — le comportement
+/// d'avant mika#2619, inchangé pour ne pas déplacer une population comptable ;
+/// seul le terme 3 introduit [`PURGE_REASON_NOT_A_BUILD_DIR`].
+pub fn build_dir_disposition(dir: &Path) -> Result<(), &'static str> {
+    if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT);
     }
-    let Ok(canonical) = std::fs::canonicalize(target) else {
-        return false;
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT);
     };
-    let Some(canonical) = canonical.to_str() else {
-        return false;
+    let Some(canonical_str) = canonical.to_str() else {
+        return Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT);
     };
-    canonical.ends_with("/target") && is_managed_worktree_path(canonical)
+    if !is_managed_worktree_path(canonical_str) {
+        return Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT);
+    }
+    if canonical_str.ends_with("/target") || is_cargo_build_dir(&canonical) {
+        Ok(())
+    } else {
+        Err(PURGE_REASON_NOT_A_BUILD_DIR)
+    }
+}
+
+/// La forme booléenne de [`build_dir_disposition`] — un **wrapper d'un seul
+/// lecteur**, jamais une seconde vérité.
+pub fn target_path_is_disposable(target: &Path) -> bool {
+    build_dir_disposition(target).is_ok()
 }
 
 /// Ce qu'un tick a fait côté purge.
@@ -3851,27 +4194,26 @@ struct TargetPurgeStats {
 /// Trois choses doivent être vivantes ensemble à ce point, et c'est ce qui fixe
 /// le site de branchement :
 ///
-/// - `screened.refusals` — **et pas `selection.refusals`** : T3 et T4 poussent
-///   [`REASON_PR_UNKNOWN`] et [`REASON_PR_OPEN`] dans [`screen_worktrees`],
-///   tandis que les refus de [`apply_work_states`] ne portent que `dirty` /
-///   `unpushed_commits`. Filtrer le mauvais vecteur rendrait une population
-///   vide, c'est-à-dire un bras qui se lit comme sain en ne faisant rien (classe
-///   mika#2205).
+/// - **les deux vecteurs de refus, `screened` ET T7** (mika#2619 R1). T1–T6
+///   poussent `pr_open`, `pr_unknown`, `detached_head*`, `too_young` et
+///   `pr_closed_at_unreadable` dans [`screen_worktrees`] ; `dirty`,
+///   `unpushed_commits` et `work_state_unreadable` ne sortent que de
+///   [`apply_work_states`], dont la sortie vit dans `selection.refusals`. Ce
+///   site ne recevait **que le premier** : élargir
+///   [`PURGE_ELIGIBLE_REASONS`] à ces trois motifs sans élargir le vecteur
+///   produirait un bras qui se lit comme élargi et ne purgerait pas un octet de
+///   plus, avec tous les tests verts (classe mika#2205). Les **deux** sont
+///   nécessaires.
 /// - l'index des PR — nécessaire au `pr_number` de la surface opérateur. Depuis
-///   mika#2518 il porte aussi la population détachée : un worktree détaché dont
-///   la PR est **ouverte** était refusé `detached_head`, donc son `target/`
-///   n'était purgé **ni** par le faucheur **ni** par ce bras ; il est maintenant
-///   refusé `pr_open` et devient purgeable. Élargissement voulu et **gratuit en
-///   sûreté** — les cinq termes P1–P5 s'appliquent inchangés, verrou de build
-///   compris — et, grâce à R-6, la ligne porte désormais son `pr_number` au lieu
-///   d'un trou.
+///   mika#2518 il porte aussi la population détachée.
 /// - le budget — **celui de la purge**, distinct de celui du faucheur.
 #[allow(clippy::too_many_arguments)]
 async fn purge_stale_target_dirs(
     db: &AsyncDatabase,
     session_id: &str,
     trace_id: &str,
-    reaper_refusals: &[ReapRefusal],
+    screened_refusals: &[ReapRefusal],
+    t7_refusals: &[ReapRefusal],
     prs: &PrIndex,
     live: &LiveCwds,
     now: DateTime<Utc>,
@@ -3883,23 +4225,38 @@ async fn purge_stale_target_dirs(
         return;
     }
 
-    // P2 + P4, une lecture de disque par worktree de la population.
+    // La concaténation est une affaire d'**appelant** : les fonctions pures
+    // gardent leur `&[ReapRefusal]`, donc tous les tests existants restent
+    // valides et un test pur peut passer un vecteur contenant un `dirty`.
+    let reaper_refusals: Vec<ReapRefusal> = screened_refusals
+        .iter()
+        .chain(t7_refusals.iter())
+        .cloned()
+        .collect();
+
+    // La découverte, puis P2 + P4 — une lecture de disque par **répertoire de
+    // build** de la population.
     let system_now = SystemTime::now();
+    let mut build_dirs: HashMap<String, Vec<String>> = HashMap::new();
     let mut states: HashMap<String, TargetState> = HashMap::new();
-    for refusal in reaper_refusals {
+    for refusal in &reaper_refusals {
         // Même prédicat que [`screen_target_purges`], par le même lecteur : les
         // deux sites décident de la même population et doivent bouger ensemble
         // (mika#2482 B1.2).
         if !is_purge_eligible_reason(refusal.reason) || !is_managed_worktree_path(&refusal.path) {
             continue;
         }
-        states.insert(
-            refusal.path.clone(),
-            inspect_target_dir(Path::new(&refusal.path), system_now),
-        );
+        let dirs: Vec<String> = discover_build_dirs(Path::new(&refusal.path))
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        for dir in &dirs {
+            states.insert(dir.clone(), inspect_build_dir(Path::new(dir), system_now));
+        }
+        build_dirs.insert(refusal.path.clone(), dirs);
     }
 
-    let screened = screen_target_purges(reaper_refusals, live, &states, cfg);
+    let screened = screen_target_purges(&reaper_refusals, live, &build_dirs, &states, cfg);
     for refusal in &screened.refusals {
         stats.refused += 1;
         record_purge_refusal(db, session_id, refusal, now, trace_id).await;
@@ -3937,14 +4294,13 @@ async fn purge_stale_target_dirs(
         // ce que `armed` retirerait, et la sonde S0 de mika#2497 — « commencer
         // en observe et lire la population qui serait retirée » — mentirait sur
         // son propre objet.
-        let acquisition = if target_path_is_disposable(target) {
-            match acquire_cargo_build_locks(target) {
+        let acquisition = match build_dir_disposition(target) {
+            Ok(()) => match acquire_cargo_build_locks(target) {
                 LockAcquisition::Acquired(guard) => Ok(guard),
                 LockAcquisition::Held => Err(PURGE_REASON_BUILD_LOCK_RACED),
                 LockAcquisition::Unevaluable => Err(PURGE_REASON_BUILD_LOCK_UNREADABLE),
-            }
-        } else {
-            Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT)
+            },
+            Err(reason) => Err(reason),
         };
         let guard = match acquisition {
             Ok(guard) => guard,
@@ -3955,8 +4311,10 @@ async fn purge_stale_target_dirs(
                     session_id,
                     &TargetPurgeRefusal {
                         worktree_path: candidate.worktree_path.clone(),
+                        build_dir_path: Some(candidate.target_path.clone()),
                         branch: candidate.branch.clone(),
                         reason,
+                        keep_reason: candidate.keep_reason,
                     },
                     now,
                     trace_id,
@@ -4036,6 +4394,9 @@ async fn purge_stale_target_dirs(
             branch = candidate.branch.as_deref().unwrap_or("(detached)"),
             pr_number,
             idle_secs = candidate.idle_secs,
+            // mika#2619 AC4 — le motif de conservation du faucheur, pour que la
+            // population élargie se compte séparément.
+            keep_reason = candidate.keep_reason,
             bytes_reclaimed = size.bytes,
             bytes_reclaimed_truncated = size.truncated,
             disposition = cfg.disposition.as_str(),
@@ -4061,13 +4422,28 @@ pub fn purged_audit_key(target_path: &str) -> String {
     format!("target:{target_path}")
 }
 
-/// Clé d'audit d'un refus : `target:<chemin du worktree>@<motif>`.
+/// Clé d'audit d'un refus : `target:<chemin>@<motif>`.
 ///
 /// Le motif est **dans la clé** pour que la déduplication soit par
-/// `(worktree, motif)` : un worktree qui **change** de motif réécrit, parce que
+/// `(chemin, motif)` : un chemin qui **change** de motif réécrit, parce que
 /// c'est un changement d'état (doctrine mika#2131).
-pub fn purge_refusal_audit_key(worktree_path: &str, reason: &str) -> String {
-    format!("target:{worktree_path}@{reason}")
+///
+/// # Le chemin est celui du répertoire de build quand il y en a un (mika#2619 R5)
+///
+/// Avant, la clé portait toujours le worktree — donc **deux répertoires de build
+/// du même worktree refusés sous le même motif se dédupliquaient mutuellement**,
+/// et le second refus était perdu en silence. L'appelant passe
+/// [`TargetPurgeRefusal::audit_path`], qui rend le répertoire quand le refus
+/// porte sur un répertoire et le worktree quand il porte sur le worktree (P1,
+/// P3, aucun répertoire découvert).
+///
+/// **Coût daté :** pour un refus de portée répertoire la clé passe de
+/// `target:<worktree>@<motif>` à `target:<worktree>/target@<motif>`. Les
+/// requêtes publiées dans le `CLAUDE.md` groupent par `after_value` (le motif)
+/// et ne sont **pas** affectées ; seule une requête `WHERE target_key = …`
+/// exacte l'est.
+pub fn purge_refusal_audit_key(path: &str, reason: &str) -> String {
+    format!("target:{path}@{reason}")
 }
 
 async fn record_purged(
@@ -4080,11 +4456,12 @@ async fn record_purged(
     trace_id: &str,
 ) {
     let reasoning = format!(
-        "pr={} branch={} idle_secs={} bytes_reclaimed={} truncated={} disposition={}",
+        "pr={} branch={} keep_reason={} idle_secs={} bytes_reclaimed={} truncated={} disposition={}",
         pr_number
             .map(|n| n.to_string())
             .unwrap_or_else(|| "null".to_string()),
         candidate.branch.as_deref().unwrap_or("(detached)"),
+        candidate.keep_reason,
         candidate.idle_secs,
         size.bytes
             .map(|b| b.to_string())
@@ -4129,7 +4506,7 @@ async fn record_purge_refusal(
     now: DateTime<Utc>,
     trace_id: &str,
 ) {
-    let key = purge_refusal_audit_key(&refusal.worktree_path, refusal.reason);
+    let key = purge_refusal_audit_key(refusal.audit_path(), refusal.reason);
     let since = crate::timestamp::format(
         &now.checked_sub_signed(chrono::TimeDelta::seconds(REFUSAL_DEDUP_SECS))
             .unwrap_or(DateTime::<Utc>::MIN_UTC),
@@ -4152,9 +4529,11 @@ async fn record_purge_refusal(
     }
 
     let reasoning = format!(
-        "branch={} motif={}",
+        "branch={} motif={} keep_reason={} build_dir={}",
         refusal.branch.as_deref().unwrap_or("(detached)"),
-        refusal.reason
+        refusal.reason,
+        refusal.keep_reason,
+        refusal.build_dir_path.as_deref().unwrap_or("null"),
     );
     if let Err(e) = db
         .log_audit_event(
@@ -6131,8 +6510,19 @@ branch refs/heads/fix/live/x
         }
     }
 
+    /// L'inventaire d'un worktree portant son seul `target/` — depuis mika#2619,
+    /// `screen_target_purges` demande *quels* répertoires avant *dans quel
+    /// état*.
+    fn purge_dirs(wt: &Path) -> HashMap<String, Vec<String>> {
+        HashMap::from([(
+            wt.to_string_lossy().into_owned(),
+            vec![target_dir_of(&wt.to_string_lossy())],
+        )])
+    }
+
+    /// Les états, **clés par répertoire de build** depuis mika#2619.
     fn purge_states(wt: &Path, state: TargetState) -> HashMap<String, TargetState> {
-        HashMap::from([(wt.to_string_lossy().into_owned(), state)])
+        HashMap::from([(target_dir_of(&wt.to_string_lossy()), state)])
     }
 
     fn free_lock(target: &str) -> HashMap<String, LockProbe> {
@@ -6155,6 +6545,7 @@ branch refs/heads/fix/live/x
         select_target_purges(
             &[pr_open_refusal(wt, "fix/2497/x")],
             live,
+            &purge_dirs(wt),
             &purge_states(wt, state),
             &HashMap::from([(target, probe)]),
             &TargetPurgeConfig::default(),
@@ -6186,6 +6577,7 @@ branch refs/heads/fix/live/x
             "session-2497-v1",
             "trace-v1",
             &[pr_open_refusal(&wt, "fix/2497/x")],
+            &[],
             &index(vec![open_pr(2497, "fix/2497/x")]),
             &no_processes(),
             now(),
@@ -6238,9 +6630,13 @@ branch refs/heads/fix/live/x
         let wt = fake_worktree(tmp.path(), "fix-2497-x");
         std::fs::write(wt.join("target"), b"pas un repertoire").unwrap();
         assert_eq!(
-            inspect_target_dir(&wt, SystemTime::now()),
+            inspect_build_dir(&wt.join("target"), SystemTime::now()),
             TargetState::NotADirectory
         );
+        // mika#2619 — la découverte le rend **quand même** : sans cela le motif
+        // `target_not_a_dir` deviendrait `no_target_dir`, c'est-à-dire un
+        // changement de population comptable en silence.
+        assert_eq!(discover_build_dirs(&wt), vec![wt.join("target")]);
         let s = purge_select(
             &wt,
             TargetState::NotADirectory,
@@ -6345,10 +6741,14 @@ branch refs/heads/fix/live/x
         );
         assert_eq!(purge_reasons(&s), vec![PURGE_REASON_BUILD_LOCK_UNREADABLE]);
 
-        // Et une entrée **absente** de la carte conserve, jamais l'inverse.
+        // Et une entrée **absente de la carte des états** conserve, jamais
+        // l'inverse. Le répertoire est bien **découvert** (sans quoi le motif
+        // serait `no_target_dir`) : les deux absences disent deux choses
+        // différentes (mika#2619).
         let s = select_target_purges(
             &[pr_open_refusal(&wt, "fix/2497/x")],
             &no_processes(),
+            &purge_dirs(&wt),
             &HashMap::new(),
             &HashMap::new(),
             &TargetPurgeConfig::default(),
@@ -6413,7 +6813,7 @@ branch refs/heads/fix/live/x
         let target = fake_target(&wt);
         age_tree(&target, 100_000);
 
-        let state = inspect_target_dir(&wt, SystemTime::now());
+        let state = inspect_build_dir(&target, SystemTime::now());
         match state {
             TargetState::Present {
                 idle_secs: Some(idle),
@@ -6423,7 +6823,7 @@ branch refs/heads/fix/live/x
 
         // Contrôle négatif : une recompilation touche `target/debug/deps/`.
         std::fs::write(target.join("debug/deps/libbar.rlib"), b"neuf").unwrap();
-        match inspect_target_dir(&wt, SystemTime::now()) {
+        match inspect_build_dir(&target, SystemTime::now()) {
             TargetState::Present {
                 idle_secs: Some(idle),
             } => assert!(idle < 60, "une écriture récente doit rajeunir: idle={idle}"),
@@ -6547,7 +6947,7 @@ branch refs/heads/fix/live/x
         assert!(is_managed_worktree_path(&canonique.to_string_lossy()));
 
         assert_eq!(
-            inspect_target_dir(&piege, SystemTime::now()),
+            inspect_build_dir(&piege.join("target"), SystemTime::now()),
             TargetState::NotADirectory,
             "un lien symbolique n'est jamais un répertoire à purger"
         );
@@ -6572,6 +6972,7 @@ branch refs/heads/fix/live/x
         let s = select_target_purges(
             &[pr_open_refusal(&dehors, "fix/2497/x")],
             &no_processes(),
+            &purge_dirs(&dehors),
             &purge_states(
                 &dehors,
                 TargetState::Present {
@@ -6593,15 +6994,30 @@ branch refs/heads/fix/live/x
         assert!(target_path_is_disposable(&target));
     }
 
-    /// Un répertoire dont le nom n'est pas `target` n'est pas disposable, même
-    /// sous la racine gérée : la première garde porte sur le **nom**.
+    /// La preuve de la garde tardive est **le nom OU le marqueur**.
+    ///
+    /// # Renommé et augmenté par mika#2619, comme une décision datée
+    ///
+    /// Ce test s'appelait `…_seul_un_repertoire_nomme_target_est_disposable`, et
+    /// ses deux assertions d'origine **restent vraies** (ni `src` ni
+    /// `src/target-ish` ne portent de marqueur) — c'est son **titre** qui est
+    /// devenu trompeur : la garde accepte désormais un répertoire hors `/target`
+    /// porteur d'un marqueur de cache. Il est donc renommé et **augmenté** du cas
+    /// qui porte la nouvelle moitié, plutôt que laissé à mentir ou supprimé.
     #[test]
-    fn mika2497_v4_seul_un_repertoire_nomme_target_est_disposable() {
+    fn mika2497_v4_la_preuve_est_le_nom_ou_le_marqueur() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = fake_worktree(tmp.path(), "fix-2497-x");
         std::fs::create_dir_all(wt.join("src/target-ish")).unwrap();
         assert!(!target_path_is_disposable(&wt.join("src")));
         assert!(!target_path_is_disposable(&wt.join("src/target-ish")));
+
+        // mika#2619 — la seconde moitié, dans les deux sens : hors `/target`,
+        // **avec** marqueur c'est disposable, **sans** marqueur ce ne l'est pas.
+        let marque = fake_build_dir(&wt.join(".pilot-scratch/mesure"), CARGO_INFO_MARKER);
+        assert!(target_path_is_disposable(&marque));
+        std::fs::remove_file(marque.join(CARGO_INFO_MARKER)).unwrap();
+        assert!(!target_path_is_disposable(&marque));
     }
 
     // -- V5 : observe ne supprime rien --------------------------------------
@@ -6635,6 +7051,7 @@ branch refs/heads/fix/live/x
             "session-2497-v5",
             "trace-v5",
             &[pr_open_refusal(&wt, "fix/2497/x")],
+            &[],
             &index(vec![open_pr(2497, "fix/2497/x")]),
             &no_processes(),
             now(),
@@ -6687,6 +7104,7 @@ branch refs/heads/fix/live/x
             "session-2497-off",
             "trace-off",
             &[pr_open_refusal(&wt, "fix/2497/x")],
+            &[],
             &index(vec![open_pr(2497, "fix/2497/x")]),
             &no_processes(),
             now(),
@@ -6711,9 +7129,20 @@ branch refs/heads/fix/live/x
 
     // -- V6 : disjonction avec mika#2420 ------------------------------------
 
-    /// **V6 / AC4** — les deux populations ne s'intersectent pas, et c'est
-    /// **par construction** : T4 du faucheur est « aucune PR ouverte », la
-    /// population d'ici est « PR ouverte ».
+    /// **V6 / AC4** — les deux bras ne visent jamais le même worktree **au même
+    /// tick**.
+    ///
+    /// # La propriété a été re-énoncée par mika#2619
+    ///
+    /// Elle se lisait « par construction : T4 du faucheur est *aucune PR
+    /// ouverte*, la population d'ici est *PR ouverte* ». Cette formulation ne
+    /// survit pas à l'élargissement : `dirty` et `unpushed_commits` sont des
+    /// refus **de T7**, donc des worktrees dont la PR peut être terminale. La
+    /// propriété exacte est **topologique, et plus générale** : la purge
+    /// travaille les *refus* (T1–T7) et le faucheur les *survivants* de T7 — deux
+    /// ensembles complémentaires par la forme même de la sélection, quel que soit
+    /// le motif. C'est aussi pourquoi le cas `dirty` ci-dessous est ajouté : c'est
+    /// précisément la forme où l'ancienne formulation cesserait d'être évidente.
     #[test]
     fn mika2497_v6_les_deux_populations_sont_disjointes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6753,6 +7182,7 @@ branch refs/heads/fix/live/x
         let purge = screen_target_purges(
             &screened.refusals,
             &no_processes(),
+            &purge_dirs(&vif),
             &purge_states(
                 &vif,
                 TargetState::Present {
@@ -6773,12 +7203,59 @@ branch refs/heads/fix/live/x
             !reaped.iter().any(|p| purged.contains(p)),
             "les deux bras ne doivent jamais viser le même worktree"
         );
+
+        // mika#2619 — le cas `dirty` : un **survivant** de T1–T6 que T7 refuse.
+        // Le faucheur ne le retient pas (il est dans ses refus T7), la purge le
+        // voit (il est dans le vecteur T7), et l'intersection reste vide. C'est
+        // la forme où « T4 dit *pas de PR ouverte*, nous disons *PR ouverte* »
+        // cesserait d'expliquer la disjonction.
+        let apres_t7 = apply_work_states(
+            screened.candidates,
+            &HashMap::from([(mort_s.clone(), WorkState::Dirty)]),
+        );
+        assert!(
+            apres_t7.candidates.is_empty(),
+            "le faucheur ne retient pas un worktree sale"
+        );
+        assert_eq!(only_reason(&apres_t7), vec![REASON_DIRTY]);
+
+        let purge_t7 = screen_target_purges(
+            &apres_t7.refusals,
+            &no_processes(),
+            &purge_dirs(&mort),
+            &purge_states(
+                &mort,
+                TargetState::Present {
+                    idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
+                },
+            ),
+            &TargetPurgeConfig::default(),
+        );
+        assert_eq!(
+            purge_t7
+                .candidates
+                .iter()
+                .map(|c| c.worktree_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![mort_s.as_str()],
+            "la purge voit le refus T7 — c'est R1"
+        );
     }
 
-    /// Le vecteur de refus est **porteur** : `apply_work_states` ne produit que
-    /// `dirty` / `unpushed_commits`, donc filtrer `selection.refusals` au lieu
-    /// de `screened.refusals` rendrait une population vide — un bras qui se lit
-    /// comme sain en ne faisant rien (classe mika#2205).
+    /// Les deux vecteurs de refus sont **disjoints par motif**, et c'est ce qui
+    /// fait qu'il faut **les deux**.
+    ///
+    /// # Re-énoncé par mika#2619
+    ///
+    /// Ce test disait « filtrer `selection.refusals` au lieu de
+    /// `screened.refusals` rendrait une population vide ». Son assertion —
+    /// `pr_open` ne transite **jamais** par `apply_work_states` — reste vraie mot
+    /// pour mot ; ce qui change est la conclusion qu'on en tire. La production
+    /// reçoit désormais **les deux** vecteurs, précisément parce qu'ils sont
+    /// disjoints : T1–T6 porte `pr_open` et ses voisins, T7 porte `dirty` /
+    /// `unpushed_commits` / `work_state_unreadable`, et n'en prendre qu'un laisse
+    /// l'autre moitié de la population invisible — un bras qui se lit comme
+    /// élargi en ne faisant rien de plus (classe mika#2205).
     #[test]
     fn mika2497_le_vecteur_de_refus_est_celui_de_lecran() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6884,6 +7361,11 @@ branch refs/heads/fix/live/x
                 // population existante ne change de nom ni de sens, et les
                 // `GROUP BY` publiés restent exacts. Daté dans CLAUDE.md.
                 "build_lock_raced",
+                // mika#2619 : idem, en queue. Le refus **tardif** d'un
+                // répertoire dont le marqueur a disparu entre la découverte et
+                // la garde — distinct de `outside_managed_root`, qui serait une
+                // ligne d'audit fausse.
+                "not_a_build_dir",
             ],
             "renommer un motif est une rupture de format de fil : la dater dans \
              CLAUDE.md, jamais mettre ce test à jour en silence"
@@ -7266,6 +7748,7 @@ branch refs/heads/fix/live/x
             "session-2511-v7",
             "trace-v7",
             &[pr_open_refusal(&wt, "fix/2511/x")],
+            &[],
             &index(vec![open_pr(2511, "fix/2511/x")]),
             &no_processes(),
             now(),
@@ -7376,6 +7859,7 @@ branch refs/heads/fix/live/x
             "session-2511-v7b",
             "trace-v7b",
             &[pr_open_refusal(&wt, "fix/2511/raced")],
+            &[],
             &index(vec![open_pr(2511, "fix/2511/raced")]),
             &no_processes(),
             now(),
@@ -7451,6 +7935,7 @@ branch refs/heads/fix/live/x
             "session-2511-v9",
             "trace-v9",
             &[pr_open_refusal(&wt, "fix/2511/x")],
+            &[],
             &index(vec![open_pr(2511, "fix/2511/x")]),
             &no_processes(),
             now(),
@@ -7491,6 +7976,7 @@ branch refs/heads/fix/live/x
             "session-2511-v10",
             "trace-v10",
             &[pr_open_refusal(&wt, "fix/2511/x")],
+            &[],
             &index(vec![open_pr(2511, "fix/2511/x")]),
             &no_processes(),
             now(),
@@ -7781,6 +8267,7 @@ branch refs/heads/fix/live/x
             "session-2482-v1",
             "trace-2482-v1",
             &[pr_unknown_refusal(&wt, "incident/1696/x")],
+            &[],
             // L'index ne connaît pas cette branche — c'est la définition de
             // `pr_unknown`.
             &index(vec![]),
@@ -7802,32 +8289,38 @@ branch refs/heads/fix/live/x
         assert!(wt.join(".git").exists(), "`.git` doit être intact");
     }
 
-    /// **V2 / contrôle négatif de V1** — un refus non éligible n'entre pas.
+    /// **V2 / contrôle négatif** — un refus **inéligible** n'entre pas, et les
+    /// neuf éligibles entrent tous.
     ///
-    /// Sans lui, « la population est élargie » est indistinguable de « la
-    /// population est devenue tout le monde » — et `dirty` est le motif le plus
-    /// dangereux à admettre : il signale du travail non committé.
+    /// # Ce test a changé de sens avec mika#2619, et c'est le cœur du ticket
+    ///
+    /// Il affirmait que `dirty`, `unpushed_commits`, `too_young`,
+    /// `work_state_unreadable`, `detached_head` et `detached_head_pr_unknown`
+    /// restaient **hors** population — six motifs que mika#2619 vient d'y faire
+    /// entrer, sur l'argument que l'asymétrie fondatrice est **indifférente au
+    /// motif de conservation** : garder le worktree protège le travail, cela ne
+    /// dit rien de son cache de build. Les six assertions sont donc **inversées**,
+    /// pas supprimées, et le contrôle négatif porte désormais sur les trois
+    /// inéligibles — dont l'exclusion est une **redondance** avec P1/P3, jamais
+    /// une réserve de sûreté.
+    ///
+    /// La boucle lit [`PURGE_ELIGIBLE_REASONS`] plutôt que d'énumérer : un
+    /// dixième motif ajouté demain est couvert sans qu'on y pense.
     #[test]
     fn mika2482_v2_un_refus_non_eligible_reste_hors_population() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = fake_worktree(tmp.path(), "fix-2482-x");
         let path = wt.to_string_lossy().into_owned();
 
-        for reason in [
-            REASON_DIRTY,
-            REASON_UNPUSHED_COMMITS,
-            REASON_TOO_YOUNG,
-            REASON_WORK_STATE_UNREADABLE,
-            REASON_DETACHED_HEAD,
-            REASON_DETACHED_HEAD_PR_UNKNOWN,
-        ] {
-            let selection = select_target_purges(
+        let select = |reason: &'static str| {
+            select_target_purges(
                 &[ReapRefusal {
                     path: path.clone(),
                     branch: Some("fix/2482/x".to_string()),
                     reason,
                 }],
                 &no_processes(),
+                &purge_dirs(&wt),
                 &purge_states(
                     &wt,
                     TargetState::Present {
@@ -7836,37 +8329,32 @@ branch refs/heads/fix/live/x
                 ),
                 &free_lock(&target_dir_of(&path)),
                 &TargetPurgeConfig::default(),
-            );
+            )
+        };
+
+        for reason in PURGE_INELIGIBLE_REASONS {
+            let selection = select(reason);
             assert!(
                 selection.candidates.is_empty() && selection.refusals.is_empty(),
-                "`{reason}` ne doit produire ni candidat ni refus de purge — il \
-                 relève d'une autre question"
+                "`{reason}` ne doit produire ni candidat ni refus de purge — son \
+                 terme de purge le refuse déjà, et l'inclure doublerait une \
+                 ligne du faucheur sous un autre `tool_name`"
             );
         }
 
-        // Et les deux éligibles, eux, produisent bien un candidat : sans ce
-        // miroir, le test ci-dessus passerait sur un bras entièrement mort.
-        for reason in [REASON_PR_OPEN, REASON_PR_UNKNOWN] {
-            let selection = select_target_purges(
-                &[ReapRefusal {
-                    path: path.clone(),
-                    branch: Some("fix/2482/x".to_string()),
-                    reason,
-                }],
-                &no_processes(),
-                &purge_states(
-                    &wt,
-                    TargetState::Present {
-                        idle_secs: Some(99_999),
-                    },
-                ),
-                &free_lock(&target_dir_of(&path)),
-                &TargetPurgeConfig::default(),
-            );
+        // Et les éligibles, eux, produisent bien un candidat : sans ce miroir, le
+        // test ci-dessus passerait sur un bras entièrement mort.
+        for reason in PURGE_ELIGIBLE_REASONS {
+            let selection = select(reason);
             assert_eq!(
                 selection.candidates.len(),
                 1,
-                "`{reason}` doit être éligible"
+                "`{reason}` doit être éligible, refus: {:?}",
+                purge_reasons(&selection)
+            );
+            assert_eq!(
+                selection.candidates[0].keep_reason, *reason,
+                "le motif de conservation doit être propagé tel quel (AC4)"
             );
         }
     }
@@ -7892,6 +8380,7 @@ branch refs/heads/fix/live/x
             "session-2482-v3",
             "trace-2482-v3",
             &[pr_unknown_refusal(&wt, "chore/1964/x")],
+            &[],
             // Une PR existe, mais sur une AUTRE branche : l'index est non vide
             // et ne résout toujours pas celle-ci.
             &index(vec![open_pr(9999, "feat/9999/autre")]),
@@ -7921,11 +8410,26 @@ branch refs/heads/fix/live/x
     }
 
     /// **Format de fil** — la liste des motifs éligibles à la purge.
+    ///
+    /// Élargie de deux à **neuf** entrées par mika#2619, et daté dans le
+    /// `CLAUDE.md` racine dans le même commit — ce que le message de cette
+    /// assertion exige par écrit.
     #[test]
     fn mika2482_les_motifs_eligibles_a_la_purge_sont_un_format_de_fil() {
         assert_eq!(
             PURGE_ELIGIBLE_REASONS,
-            &["pr_open", "pr_unknown"],
+            &[
+                "pr_open",
+                "pr_unknown",
+                // mika#2619 — les sept ajouts.
+                "detached_head_pr_unknown",
+                "detached_head",
+                "dirty",
+                "unpushed_commits",
+                "work_state_unreadable",
+                "pr_closed_at_unreadable",
+                "too_young",
+            ],
             "élargir cette liste change ce que la boucle supprime : le dater dans \
              CLAUDE.md, jamais mettre ce test à jour en silence"
         );
@@ -7938,9 +8442,11 @@ branch refs/heads/fix/live/x
             );
             assert!(is_purge_eligible_reason(reason));
         }
-        // Et le prédicat refuse ce qui n'y est pas.
-        assert!(!is_purge_eligible_reason(REASON_DIRTY));
-        assert!(!is_purge_eligible_reason(REASON_TOO_YOUNG));
+        // Et le prédicat refuse ce qui n'y est pas — **fail-closed sur
+        // l'inconnu**, ce qui est la raison pour laquelle mika#2619 a gardé une
+        // allowlist plutôt que d'inverser la polarité.
+        assert!(!is_purge_eligible_reason(REASON_LIVE_PROCESS));
+        assert!(!is_purge_eligible_reason(REASON_OUTSIDE_MANAGED_ROOT));
         assert!(!is_purge_eligible_reason("pr_unknown_"));
         assert!(!is_purge_eligible_reason(""));
     }
@@ -8942,5 +9448,995 @@ branch refs/heads/fix/live/x
              requête opérateur inexacte sans rien casser.\n{}",
             offenders.join("\n")
         );
+    }
+
+    // =======================================================================
+    // mika#2619 — le bras cesse de lire *pourquoi* un worktree est conservé
+    // =======================================================================
+
+    /// Un refus du faucheur sous un motif arbitraire.
+    fn refusal_with(path: &Path, branch: &str, reason: &'static str) -> ReapRefusal {
+        ReapRefusal {
+            path: path.to_string_lossy().into_owned(),
+            branch: Some(branch.to_string()),
+            reason,
+        }
+    }
+
+    /// Un répertoire de build **déclaré** par son marqueur, sous le chemin donné.
+    fn fake_build_dir(parent: &Path, marker: &str) -> PathBuf {
+        std::fs::create_dir_all(parent.join("debug/deps")).unwrap();
+        std::fs::write(parent.join("debug/deps/libfoo.rlib"), vec![0u8; 2048]).unwrap();
+        std::fs::write(parent.join(marker), b"Signature: factice\n").unwrap();
+        parent.to_path_buf()
+    }
+
+    /// L'inventaire et les états d'un worktree, **lus du disque** — la forme que
+    /// la production emploie, pour que les tests purs n'inventent pas une
+    /// population que la découverte ne rendrait pas.
+    fn discovered(wt: &Path) -> (HashMap<String, Vec<String>>, Vec<String>) {
+        let dirs: Vec<String> = discover_build_dirs(wt)
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        (
+            HashMap::from([(wt.to_string_lossy().into_owned(), dirs.clone())]),
+            dirs,
+        )
+    }
+
+    // -- V1 : contrôle positif d'AC3, la forme de `refactor-2194` -------------
+
+    /// **V1 / AC3** — HEAD détaché, `target/` inactif, verrou libre ⇒ **purgé**,
+    /// et la ligne porte le motif de conservation du faucheur.
+    ///
+    /// Les 40 Go mesurés le 2026-10-01 : `detached_head_pr_unknown` est né de
+    /// mika#2518 et personne ne l'avait ajouté à la liste d'éligibilité.
+    #[tokio::test]
+    async fn mika2619_v1_un_head_detache_inactif_est_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "refactor-2194-x");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v1",
+            "trace-2619-v1",
+            &[refusal_with(
+                &wt,
+                "refactor/2194/x",
+                REASON_DETACHED_HEAD_PR_UNKNOWN,
+            )],
+            &[],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 1, "refus inattendu: {stats:?}");
+        assert!(!target.exists(), "`target/` doit avoir été retiré");
+        assert!(
+            wt.join("src/main.rs").exists(),
+            "le reste du worktree doit être intact"
+        );
+
+        let events = db.get_audit_events("session-2619-v1").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .expect("une ligne `target_purged` doit exister");
+        let reasoning = row.reasoning.as_deref().unwrap_or_default();
+        assert!(
+            reasoning.contains("keep_reason=detached_head_pr_unknown"),
+            "AC4 — le motif de conservation doit être lisible: {reasoning}"
+        );
+    }
+
+    // -- V2 : contrôle négatif d'AC3, le verrou tenu gagne sur les NEUF -------
+
+    /// **V2 / AC3** — pour **chacun** des neuf motifs éligibles, un verrou de
+    /// build tenu conserve.
+    ///
+    /// La boucle lit [`PURGE_ELIGIBLE_REASONS`] plutôt que d'énumérer : un
+    /// dixième motif ajouté demain est couvert sans qu'on y pense.
+    #[test]
+    fn mika2619_v2_le_verrou_tenu_gagne_quel_que_soit_le_motif() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-verrou");
+        let target = fake_target(&wt);
+        let (dirs, flat) = discovered(&wt);
+        assert_eq!(flat, vec![target.to_string_lossy().into_owned()]);
+
+        for reason in PURGE_ELIGIBLE_REASONS {
+            let selection = select_target_purges(
+                &[refusal_with(&wt, "fix/2619/verrou", reason)],
+                &no_processes(),
+                &dirs,
+                &HashMap::from([(
+                    flat[0].clone(),
+                    TargetState::Present {
+                        idle_secs: Some(PURGE_IDLE_DEFAULT_SECS + 600),
+                    },
+                )]),
+                &HashMap::from([(flat[0].clone(), LockProbe::Held)]),
+                &TargetPurgeConfig::default(),
+            );
+            assert!(
+                selection.candidates.is_empty(),
+                "`{reason}` — un verrou tenu doit conserver"
+            );
+            assert_eq!(
+                purge_reasons(&selection),
+                vec![PURGE_REASON_BUILD_LOCK_HELD]
+            );
+            assert_eq!(
+                selection.refusals[0].keep_reason, *reason,
+                "le refus porte aussi le motif de conservation"
+            );
+        }
+    }
+
+    // -- V3 / D-1 : la partition est exacte ----------------------------------
+
+    /// **V3 / D-1 / AC1** — chaque motif du faucheur est dans **exactement une**
+    /// des deux listes.
+    ///
+    /// C'est le détecteur qui ferme la **classe** plutôt que l'occurrence : un
+    /// motif ajouté demain fait rougir ce test jusqu'à ce que quelqu'un le
+    /// classe. Le défaut n'est plus « purgeable par oubli » ni « non purgeable
+    /// par oubli », c'est **« pas de décision, pas de build »** — et c'est
+    /// exactement ce qui a manqué quand `detached_head_pr_unknown` est né de
+    /// mika#2518.
+    ///
+    /// L'assertion de **non-vacuité** est porteuse : sans elle, deux listes vides
+    /// satisferaient la partition.
+    #[test]
+    fn mika2619_la_partition_des_motifs_est_exacte() {
+        assert!(
+            !PURGE_ELIGIBLE_REASONS.is_empty() && !PURGE_INELIGIBLE_REASONS.is_empty(),
+            "non-vacuité : deux listes vides satisferaient la partition en ne \
+             classant rien"
+        );
+
+        for reason in ALL_REFUSAL_REASONS {
+            let eligible = PURGE_ELIGIBLE_REASONS.contains(reason);
+            let ineligible = PURGE_INELIGIBLE_REASONS.contains(reason);
+            assert!(
+                eligible ^ ineligible,
+                "`{reason}` doit être dans **exactement une** des deux listes \
+                 (éligible: {eligible}, inéligible: {ineligible}) — un motif non \
+                 classé est un motif dont personne n'a décidé s'il mérite une \
+                 purge"
+            );
+        }
+
+        // Et les deux listes ne portent que des motifs réels : une faute de
+        // frappe satisferait la partition en laissant un motif réel non classé,
+        // ce que la boucle ci-dessus attrape — mais pas l'inverse.
+        for reason in PURGE_ELIGIBLE_REASONS
+            .iter()
+            .chain(PURGE_INELIGIBLE_REASONS)
+        {
+            assert!(
+                ALL_REFUSAL_REASONS.contains(reason),
+                "`{reason}` n'est pas un motif de refus du faucheur"
+            );
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for reason in PURGE_ELIGIBLE_REASONS
+            .iter()
+            .chain(PURGE_INELIGIBLE_REASONS)
+        {
+            assert!(seen.insert(*reason), "motif dupliqué: {reason}");
+        }
+    }
+
+    // -- V4 : `dirty` traverse réellement la PRODUCTION ----------------------
+
+    /// **V4 / R1** — un worktree dont le seul refus est `dirty`, passé dans le
+    /// vecteur **T7**, voit son `target/` purgé.
+    ///
+    /// # C'est le test qui compte, et un test pur ne suffirait pas
+    ///
+    /// Un test sur [`screen_target_purges`] resterait **vert** si l'appelant
+    /// oubliait le second vecteur : `dirty` ne sort que de [`apply_work_states`],
+    /// dont la sortie vivait dans un vecteur que ce site ne recevait **jamais**.
+    /// Ajouter les motifs à la liste d'éligibilité sans changer le vecteur
+    /// produirait un bras qui se lit comme élargi et ne purgerait pas un octet de
+    /// plus, avec toutes les assertions vertes (classe mika#2205). C'est la forme
+    /// exacte de R1.
+    #[tokio::test]
+    async fn mika2619_v4_un_refus_t7_traverse_la_production() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2105-ac6");
+        let target = fake_target(&wt);
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v4",
+            "trace-2619-v4",
+            // Le vecteur T1–T6 est **vide** : tout passe par T7.
+            &[],
+            &[refusal_with(&wt, "fix/2105/x", REASON_DIRTY)],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(
+            stats.purged, 1,
+            "un refus T7 doit atteindre la purge — sinon le vecteur n'est pas \
+             concaténé: {stats:?}"
+        );
+        assert!(!target.exists());
+
+        let events = db.get_audit_events("session-2619-v4").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .expect("une ligne `target_purged` doit exister");
+        assert!(
+            row.reasoning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("keep_reason=dirty"),
+            "la ligne doit nommer le motif T7: {:?}",
+            row.reasoning
+        );
+    }
+
+    // -- V5 / R2 : T7 est évalué quand la purge en a besoin -------------------
+
+    /// **V5 / R2** — le prédicat de T7, à ses quatre coins.
+    ///
+    /// La ligne qui compte est la deuxième : **budget faucheur nul, purge armée
+    /// avec budget ⇒ T7 est quand même évalué**. Sans elle, les survivants de
+    /// T1–T6 n'apparaissent dans aucun vecteur et leur répertoire de build
+    /// échappe aux deux bras.
+    #[test]
+    fn mika2619_v5_le_predicat_de_t7_a_ses_quatre_coins() {
+        assert!(
+            t7_is_needed(1, 0, true),
+            "le faucheur a du budget : T7 lui est dû, comme avant mika#2619"
+        );
+        assert!(
+            t7_is_needed(0, 2, true),
+            "R2 — budget faucheur nul mais purge armée avec budget : le bras qui \
+             a besoin du calcul le paie"
+        );
+        assert!(
+            !t7_is_needed(0, 2, false),
+            "purge désarmée : personne n'a besoin du calcul"
+        );
+        assert!(
+            !t7_is_needed(0, 0, true),
+            "aucun budget : personne n'a besoin du calcul — et la boucle des \
+             dépôts casse de toute façon"
+        );
+
+        // Et le prédicat est le **complément exact** de l'arrêt de boucle sur ce
+        // même triplet : ce qui n'a pas besoin de T7 est ce sur quoi la boucle
+        // cesse. Une divergence ferait payer `git` pour un dépôt qu'on ne
+        // regarde plus, ou l'inverse.
+        for reaper in [0usize, 1] {
+            for purge in [0usize, 2] {
+                for enabled in [false, true] {
+                    assert_eq!(
+                        t7_is_needed(reaper, purge, enabled),
+                        !should_stop_repo_loop(reaper, purge, enabled),
+                        "({reaper}, {purge}, {enabled})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **D-2 bis / R2** — la condition de T7 passe par le prédicat nommé.
+    ///
+    /// Pourquoi un scan : réécrire la conjonction en ligne ne rendrait **aucune
+    /// décision fausse** le jour où on l'écrit, et le site vit dans une fonction
+    /// qui shelle `git` et `gh`, donc aucun test comportemental ne l'atteint.
+    #[test]
+    fn mika2619_la_condition_de_t7_passe_par_le_predicat() {
+        let here = include_str!("worktree_reaper.rs");
+        let production = here
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("le module porte un `mod tests`");
+        assert!(production.len() < here.len());
+
+        let calls = production.matches("t7_is_needed(").count();
+        assert_eq!(
+            calls, 2,
+            "attendu exactement deux occurrences en production : la déclaration \
+             et l'unique site d'appel. Une conjonction réécrite en ligne dans la \
+             boucle des dépôts ferait tomber ce compte à 1."
+        );
+        assert!(
+            production.contains("let t7_needed = t7_is_needed("),
+            "le site d'appel doit lire le prédicat, jamais une conjonction en \
+             ligne"
+        );
+    }
+
+    // -- V6 : un répertoire sous `.pilot-scratch/` est purgé ------------------
+
+    /// **V6 / AC2** — les répertoires de mesure sous `.pilot-scratch/` entrent
+    /// dans la population, avec les mêmes termes.
+    ///
+    /// Les 17 Go de `fix-2105` : deux `CARGO_TARGET_DIR` sous
+    /// `.pilot-scratch/ac6/`, hors `target/` et sous un motif que la liste
+    /// n'admettait pas. Trois répertoires, trois `target_path` distincts, trois
+    /// clés d'audit distinctes.
+    #[tokio::test]
+    async fn mika2619_v6_un_repertoire_sous_pilot_scratch_est_purge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2105-scratch");
+        let target = fake_target(&wt);
+        let a = fake_build_dir(&wt.join(".pilot-scratch/ac6/a"), CARGO_INFO_MARKER);
+        let b = fake_build_dir(&wt.join(".pilot-scratch/ac6/b"), CACHEDIR_TAG_MARKER);
+
+        // Contrôle négatif de la **découverte** : un brouillon qui n'est pas un
+        // cache n'entre dans aucune population, et n'écrit aucun refus.
+        std::fs::create_dir_all(wt.join(".pilot-scratch/draft")).unwrap();
+        std::fs::write(wt.join(".pilot-scratch/draft/notes.md"), b"# notes").unwrap();
+        std::fs::create_dir_all(wt.join(".pilot-scratch/vide")).unwrap();
+
+        age_tree(
+            &wt.join(".pilot-scratch"),
+            PURGE_IDLE_DEFAULT_SECS as u64 + 600,
+        );
+        age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+        let discovered = discover_build_dirs(&wt);
+        assert_eq!(
+            discovered,
+            vec![a.clone(), b.clone(), target.clone()],
+            "trois répertoires découverts, dans un ordre déterministe ; ni le \
+             brouillon de texte ni le répertoire vide n'en sont"
+        );
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 5usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v6",
+            "trace-2619-v6",
+            &[],
+            &[refusal_with(&wt, "fix/2105/x", REASON_UNPUSHED_COMMITS)],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 3, "trois répertoires purgés: {stats:?}");
+        assert_eq!(budget, 2, "le budget est **par répertoire**");
+        assert!(!target.exists());
+        assert!(!a.exists());
+        assert!(!b.exists());
+        assert!(
+            wt.join(".pilot-scratch/draft/notes.md").exists(),
+            "un brouillon non-cache ne doit jamais être touché (mika#2548)"
+        );
+        assert!(wt.join(".pilot-scratch/vide").exists());
+        assert!(wt.join("src/main.rs").exists());
+
+        let events = db.get_audit_events("session-2619-v6").await.unwrap();
+        let mut keys: Vec<&str> = events
+            .iter()
+            .filter(|e| e.tool_name == TARGET_PURGED_TOOL)
+            .map(|e| e.target_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                purged_audit_key(&a.to_string_lossy()),
+                purged_audit_key(&b.to_string_lossy()),
+                purged_audit_key(&target.to_string_lossy()),
+            ],
+            "trois clés d'audit **distinctes**"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.tool_name != TARGET_PURGE_SKIPPED_TOOL),
+            "aucun refus n'est écrit pour un répertoire non reconnu — ce serait \
+             une ligne par sous-répertoire de `.pilot-scratch/`"
+        );
+    }
+
+    // -- V7 : la marche de découverte est bornée -----------------------------
+
+    /// **V7** — un répertoire reconnu n'est pas descendu, et rien au-delà de
+    /// [`BUILD_DIR_SCAN_DEPTH`] n'est découvert.
+    #[test]
+    fn mika2619_v7_la_marche_de_decouverte_est_bornee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-borne");
+
+        // Un cache à la profondeur 1, portant **lui-même** un sous-répertoire
+        // marqué : un répertoire de build contient des sous-répertoires, et les
+        // énumérer serait une marche non bornée dans l'arborescence qu'on vient
+        // d'identifier comme un cache.
+        let cache = fake_build_dir(&wt.join(".pilot-scratch/mesure"), CARGO_INFO_MARKER);
+        fake_build_dir(&cache.join("debug/imbrique"), CARGO_INFO_MARKER);
+
+        // Et un cache **au-delà** de la profondeur déclarée.
+        let trop_loin = wt.join(".pilot-scratch/a/b/c/d");
+        fake_build_dir(&trop_loin, CARGO_INFO_MARKER);
+
+        let found = discover_build_dirs(&wt);
+        assert_eq!(
+            found,
+            vec![cache.clone()],
+            "seul le cache de la profondeur 1 est découvert"
+        );
+        assert!(
+            !found.iter().any(|p| p.starts_with(&cache) && *p != cache),
+            "un répertoire reconnu n'est pas descendu"
+        );
+        assert!(
+            !found.contains(&trop_loin),
+            "rien au-delà de BUILD_DIR_SCAN_DEPTH={BUILD_DIR_SCAN_DEPTH}"
+        );
+
+        // Contrôle de bonne foi : la profondeur déclarée est bien atteinte,
+        // sinon « la marche est bornée » serait indistinguable de « la marche ne
+        // descend pas ».
+        let wt2 = fake_worktree(tmp.path(), "fix-2619-borne-2");
+        let juste_dedans = wt2.join(".pilot-scratch/x/y/z");
+        fake_build_dir(&juste_dedans, CARGO_INFO_MARKER);
+        assert_eq!(discover_build_dirs(&wt2), vec![juste_dedans]);
+    }
+
+    /// **V7 bis** — la marche ne suit **jamais** un lien symbolique.
+    #[cfg(unix)]
+    #[test]
+    fn mika2619_v7_la_marche_ne_suit_pas_un_lien() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victime = fake_worktree(tmp.path(), "fix-2619-victime");
+        let cible = fake_build_dir(&victime.join(".pilot-scratch/vrai"), CARGO_INFO_MARKER);
+
+        let piege = fake_worktree(tmp.path(), "fix-2619-piege");
+        std::fs::create_dir_all(piege.join(".pilot-scratch")).unwrap();
+        std::os::unix::fs::symlink(&cible, piege.join(".pilot-scratch/lien")).unwrap();
+
+        assert!(
+            discover_build_dirs(&piege).is_empty(),
+            "un lien vers le cache d'un worktree voisin ne doit pas y faire \
+             entrer sa cible"
+        );
+        assert!(cible.join("debug/deps/libfoo.rlib").exists());
+    }
+
+    // -- V8 : la garde tardive, dans les deux sens ---------------------------
+
+    /// **V8 / AC2** — le nom **ou** le marqueur, et le reste est refusé.
+    #[test]
+    fn mika2619_v8_la_garde_tardive_accepte_le_nom_ou_le_marqueur() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-garde");
+
+        // 1. `target/` **sans** marqueur : compat, la population d'aujourd'hui
+        //    ne rétrécit pas.
+        let target = fake_target(&wt);
+        assert!(
+            !is_cargo_build_dir(&target),
+            "le fixture ne pose aucun marqueur"
+        );
+        assert_eq!(build_dir_disposition(&target), Ok(()));
+
+        // 2. hors `/target` **avec** marqueur : la preuve remplace le nom.
+        let marque = fake_build_dir(&wt.join(".pilot-scratch/ac6/a"), CARGO_INFO_MARKER);
+        assert_eq!(build_dir_disposition(&marque), Ok(()));
+        let tagge = fake_build_dir(&wt.join(".pilot-scratch/ac6/b"), CACHEDIR_TAG_MARKER);
+        assert_eq!(build_dir_disposition(&tagge), Ok(()));
+
+        // 3. hors `/target` **sans** marqueur : refusé, et sous son propre motif
+        //    — `outside_managed_root` serait une ligne d'audit **fausse**, le
+        //    chemin étant bien sous la racine gérée.
+        std::fs::create_dir_all(wt.join(".pilot-scratch/draft")).unwrap();
+        assert_eq!(
+            build_dir_disposition(&wt.join(".pilot-scratch/draft")),
+            Err(PURGE_REASON_NOT_A_BUILD_DIR)
+        );
+
+        // 4. hors racine gérée : refusé, motif inchangé.
+        let dehors = tmp.path().join("pas-un-worktree/target");
+        std::fs::create_dir_all(&dehors).unwrap();
+        assert_eq!(
+            build_dir_disposition(&dehors),
+            Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT)
+        );
+
+        // 5. un chemin inexistant : pas de preuve, pas de suppression.
+        assert_eq!(
+            build_dir_disposition(&wt.join(".pilot-scratch/jamais")),
+            Err(PURGE_REASON_OUTSIDE_MANAGED_ROOT)
+        );
+    }
+
+    /// **V8 bis** — un marqueur retiré **avant** la découverte sort le répertoire
+    /// de la population, et il est **toujours là**.
+    ///
+    /// # Ce que ce test atteste, et ce qu'il ne peut PAS atteindre
+    ///
+    /// [`PURGE_REASON_NOT_A_BUILD_DIR`] est un refus **tardif** : il ne se
+    /// produit que si le marqueur disparaît entre la découverte, interne à
+    /// [`purge_stale_target_dirs`], et la garde quelques instructions plus loin.
+    /// C'est une **course**, et aucun test ne la reproduit de façon
+    /// déterministe ; le motif est couvert au niveau du décideur par
+    /// [`mika2619_v8_la_garde_tardive_accepte_le_nom_ou_le_marqueur`] (cas 3).
+    /// Dire l'inverse ici fabriquerait une couverture : le marqueur retiré avant
+    /// l'appel donne `no_target_dir`, ce qui est le **bon** motif — le répertoire
+    /// n'est pas un cache quand on regarde, donc il n'est jamais candidat.
+    ///
+    /// C'est bien ce régime-là qui rend l'attente « `not_a_build_dir` reste
+    /// vide » lisible dans le `CLAUDE.md` racine.
+    #[tokio::test]
+    async fn mika2619_v8_un_marqueur_absent_sort_le_repertoire_de_la_population() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-disparu");
+        let cache = fake_build_dir(&wt.join(".pilot-scratch/mesure"), CARGO_INFO_MARKER);
+        age_tree(
+            &wt.join(".pilot-scratch"),
+            PURGE_IDLE_DEFAULT_SECS as u64 + 600,
+        );
+
+        // Le candidat est bien découvert tant que le marqueur est là…
+        assert_eq!(discover_build_dirs(&wt), vec![cache.clone()]);
+        // …et plus du tout une fois le marqueur retiré.
+        std::fs::remove_file(cache.join(CARGO_INFO_MARKER)).unwrap();
+        assert!(discover_build_dirs(&wt).is_empty());
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 2usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v8",
+            "trace-2619-v8",
+            &[refusal_with(&wt, "fix/2619/x", REASON_PR_OPEN)],
+            &[],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0);
+        assert_eq!(stats.refused, 1);
+        assert!(cache.exists(), "rien n'est supprimé sans preuve");
+        assert!(cache.join("debug/deps/libfoo.rlib").exists());
+
+        let events = db.get_audit_events("session-2619-v8").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .expect("un refus doit être écrit");
+        assert_eq!(
+            row.after_value.as_deref(),
+            Some(PURGE_REASON_NO_TARGET_DIR),
+            "aucun répertoire de build n'est découvert : c'est bien le motif de \
+             portée worktree, pas le refus tardif"
+        );
+        assert_eq!(
+            row.target_key,
+            purge_refusal_audit_key(&wt.to_string_lossy(), PURGE_REASON_NO_TARGET_DIR),
+            "un refus de portée worktree porte le chemin du worktree"
+        );
+    }
+
+    // -- V9 : la déduplication des refus est par répertoire -------------------
+
+    /// **V9 / R5** — deux répertoires du même worktree refusés sous le **même**
+    /// motif produisent **deux** lignes d'audit.
+    ///
+    /// Avant mika#2619 la clé portait le worktree, donc les deux se
+    /// dédupliquaient mutuellement et le second refus était perdu en silence.
+    #[tokio::test]
+    async fn mika2619_v9_la_deduplication_des_refus_est_par_repertoire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-dedup");
+        let target = fake_target(&wt);
+        let cache = fake_build_dir(&wt.join(".pilot-scratch/mesure"), CARGO_INFO_MARKER);
+        // Les deux sont **récents** : même motif, `recently_active`.
+
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let mut budget = 5usize;
+        let mut stats = TargetPurgeStats::default();
+
+        purge_stale_target_dirs(
+            &db,
+            "session-2619-v9",
+            "trace-2619-v9",
+            &[refusal_with(&wt, "fix/2619/x", REASON_PR_OPEN)],
+            &[],
+            &index(vec![]),
+            &no_processes(),
+            now(),
+            &TargetPurgeConfig::default(),
+            &mut budget,
+            &mut stats,
+        )
+        .await;
+
+        assert_eq!(stats.purged, 0);
+        assert_eq!(stats.refused, 2, "un refus par répertoire");
+
+        let events = db.get_audit_events("session-2619-v9").await.unwrap();
+        let mut keys: Vec<&str> = events
+            .iter()
+            .filter(|e| e.tool_name == TARGET_PURGE_SKIPPED_TOOL)
+            .map(|e| e.target_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                purge_refusal_audit_key(&cache.to_string_lossy(), PURGE_REASON_RECENTLY_ACTIVE),
+                purge_refusal_audit_key(&target.to_string_lossy(), PURGE_REASON_RECENTLY_ACTIVE),
+            ],
+            "deux clés distinctes — sinon le second refus est perdu en silence"
+        );
+    }
+
+    /// **V9 bis** — un refus de portée **worktree** porte le chemin du worktree.
+    ///
+    /// P1, P3 et « aucun répertoire découvert » ne portent sur aucun répertoire :
+    /// y mettre un chemin de build dir serait inventer une cible.
+    #[test]
+    fn mika2619_v9_un_refus_de_portee_worktree_porte_le_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-portee");
+        let path = wt.to_string_lossy().into_owned();
+
+        // Aucun `target/`, aucun `.pilot-scratch/` : rien à purger.
+        let selection = screen_target_purges(
+            &[refusal_with(&wt, "fix/2619/x", REASON_PR_OPEN)],
+            &no_processes(),
+            &HashMap::from([(path.clone(), vec![])]),
+            &HashMap::new(),
+            &TargetPurgeConfig::default(),
+        );
+        assert_eq!(purge_reasons(&selection), vec![PURGE_REASON_NO_TARGET_DIR]);
+        assert_eq!(selection.refusals[0].build_dir_path, None);
+        assert_eq!(selection.refusals[0].audit_path(), path.as_str());
+
+        // P3 est de portée worktree aussi : **un** refus, pas un par répertoire.
+        let (dirs, _) = discovered(&wt);
+        let live = LiveCwds::Enumerated(vec![wt.clone()]);
+        let selection = screen_target_purges(
+            &[refusal_with(&wt, "fix/2619/x", REASON_PR_OPEN)],
+            &live,
+            &dirs,
+            &HashMap::new(),
+            &TargetPurgeConfig::default(),
+        );
+        assert_eq!(purge_reasons(&selection), vec![PURGE_REASON_LIVE_PROCESS]);
+        assert_eq!(selection.refusals[0].audit_path(), path.as_str());
+    }
+
+    // -- V10 : `keep_reason` est sur les deux surfaces -----------------------
+
+    /// **V10 / AC4** — pour chacun des neuf motifs, la valeur rendue est celle du
+    /// refus d'origine, sur le candidat **et** dans `reasoning`.
+    #[tokio::test]
+    async fn mika2619_v10_keep_reason_est_celui_du_refus_dorigine() {
+        for reason in PURGE_ELIGIBLE_REASONS {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = fake_worktree(tmp.path(), "fix-2619-keep");
+            let target = fake_target(&wt);
+            age_tree(&target, PURGE_IDLE_DEFAULT_SECS as u64 + 600);
+
+            let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+            let mut budget = 2usize;
+            let mut stats = TargetPurgeStats::default();
+
+            purge_stale_target_dirs(
+                &db,
+                "session-2619-v10",
+                "trace-2619-v10",
+                &[refusal_with(&wt, "fix/2619/keep", reason)],
+                &[],
+                &index(vec![]),
+                &no_processes(),
+                now(),
+                &TargetPurgeConfig::default(),
+                &mut budget,
+                &mut stats,
+            )
+            .await;
+
+            assert_eq!(stats.purged, 1, "`{reason}` doit purger: {stats:?}");
+            let events = db.get_audit_events("session-2619-v10").await.unwrap();
+            let row = events
+                .iter()
+                .find(|e| e.tool_name == TARGET_PURGED_TOOL)
+                .expect("une ligne `target_purged` doit exister");
+            assert!(
+                row.reasoning
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(&format!("keep_reason={reason}")),
+                "`{reason}` — attendu dans `reasoning`: {:?}",
+                row.reasoning
+            );
+        }
+    }
+
+    // -- D-2 : la composition d'un chemin de build a un site unique -----------
+
+    /// Allowlist du scan de composition — **livrée vide, et elle le reste**.
+    const BUILD_DIR_COMPOSITION_ALLOWED: &[&str] = &[];
+
+    /// Quand le scan tire, on route le site vers [`discover_build_dirs`] — on ne
+    /// l'allowliste pas (doctrine mika#2201).
+    #[test]
+    fn mika2619_lallowlist_de_la_composition_est_vide() {
+        assert!(
+            BUILD_DIR_COMPOSITION_ALLOWED.is_empty(),
+            "mika#2201 — la résolution est de router le site vers le découvreur"
+        );
+    }
+
+    /// Les fonctions de production qui **composent** un chemin de répertoire de
+    /// build.
+    ///
+    /// Rend `Ok(n)` avec `n` = le nombre de fonctions portant une composition
+    /// (contrôle de non-vacuité), ou `Err(fonctions fautives)`.
+    fn scan_build_dir_compositions(src: &str, allowed: &[&str]) -> Result<usize, Vec<String>> {
+        // Écrit en deux morceaux pour que le scan ne se dénonce pas lui-même.
+        let needle = format!(".join(\"tar{}\")", "get");
+        let legit = ["target_dir_of", "discover_build_dirs"];
+
+        let lines: Vec<&str> = src
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect();
+
+        let mut current = String::from("?");
+        let mut found = 0usize;
+        let mut offenders = Vec::new();
+        for line in &lines {
+            let t = line.trim_start();
+            let is_fn = ["fn ", "pub fn ", "async fn ", "pub async fn "]
+                .iter()
+                .any(|p| t.starts_with(p))
+                || (t.starts_with("pub(") && t.contains(") fn "));
+            if is_fn {
+                current = t
+                    .split("fn ")
+                    .nth(1)
+                    .unwrap_or(t)
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+            }
+            if !line.contains(needle.as_str()) {
+                continue;
+            }
+            found += 1;
+            if allowed.contains(&current.as_str()) || legit.contains(&current.as_str()) {
+                continue;
+            }
+            offenders.push(current.clone());
+        }
+        if offenders.is_empty() {
+            Ok(found)
+        } else {
+            Err(offenders)
+        }
+    }
+
+    /// **D-2 / D3** — la composition d'un chemin de répertoire de build a **un
+    /// seul site**.
+    ///
+    /// Pourquoi un scan et pas un test comportemental : un second compositeur ne
+    /// rendrait **aucune décision fausse** le jour où il est écrit. Il
+    /// divergerait plus tard, en silence — et la divergence de cette classe est
+    /// exactement celle que mika#2482 a dû fermer pour son prédicat
+    /// d'éligibilité (décision élargie, calcul d'états non élargi).
+    #[test]
+    fn mika2619_la_composition_dun_chemin_de_build_a_un_site_unique() {
+        let here = include_str!("worktree_reaper.rs");
+        let production = here
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("le module porte un `mod tests`");
+        assert!(
+            production.len() < here.len(),
+            "le module de test doit être tronqué — sinon les fixtures du scan \
+             seraient lues comme de la production"
+        );
+
+        match scan_build_dir_compositions(production, BUILD_DIR_COMPOSITION_ALLOWED) {
+            Ok(found) => assert!(
+                found >= 1,
+                "contrôle de non-vacuité : aucune composition en position \
+                 exécutable — le scan ne vérifie plus rien"
+            ),
+            Err(offenders) => panic!(
+                "mika#2619 — un site compose un chemin de répertoire de build \
+                 hors de `discover_build_dirs`: {}. Router le site vers le \
+                 découvreur, jamais l'allowlister.",
+                offenders.join(" | ")
+            ),
+        }
+    }
+
+    /// **Contrôle négatif du scan, vu rouge.** Sans lui, « le scan lit les
+    /// compositions » est indistinguable de « le scan ne lit rien ».
+    #[test]
+    fn mika2619_le_scan_de_composition_est_vu_rouge_sur_un_second_site() {
+        let fixture = concat!(
+            "fn autre_bras(wt: &Path) -> PathBuf {\n",
+            "    wt.join(\"tar",
+            "get\")\n",
+            "}\n"
+        );
+        assert_eq!(
+            scan_build_dir_compositions(fixture, &[]),
+            Err(vec!["autre_bras".to_string()])
+        );
+    }
+
+    /// **Contrôle négatif miroir, vu vert.** Sans lui, « le scan lit les
+    /// compositions » est indistinguable de « le scan rougit sur toute mention ».
+    #[test]
+    fn mika2619_le_scan_de_composition_est_vert_sur_les_deux_sites_legitimes() {
+        let fixture = concat!(
+            "pub fn target_dir_of(p: &str) -> String {\n",
+            "    Path::new(p).join(\"tar",
+            "get\").to_string_lossy().into_owned()\n",
+            "}\n",
+            "pub fn discover_build_dirs(wt: &Path) -> Vec<PathBuf> {\n",
+            "    let _ = wt.join(\"tar",
+            "get\");\n",
+            "    vec![]\n",
+            "}\n"
+        );
+        assert_eq!(scan_build_dir_compositions(fixture, &[]), Ok(2));
+    }
+
+    // -- D-3 : la clé de refus a un site d'appel unique ----------------------
+
+    /// Allowlist du scan de clé — **livrée vide, et elle le reste**.
+    const PURGE_REFUSAL_KEY_CALLERS_ALLOWED: &[&str] = &[];
+
+    #[test]
+    fn mika2619_lallowlist_de_la_cle_de_refus_est_vide() {
+        assert!(
+            PURGE_REFUSAL_KEY_CALLERS_ALLOWED.is_empty(),
+            "mika#2201 — la résolution est de router le site vers `audit_path()`"
+        );
+    }
+
+    /// Les sites de production qui **appellent** la clé de refus avec autre chose
+    /// que [`TargetPurgeRefusal::audit_path`].
+    fn scan_purge_refusal_key_callers(src: &str, allowed: &[&str]) -> Result<usize, Vec<String>> {
+        // Écrit en deux morceaux pour que le scan ne se dénonce pas lui-même.
+        let needle = format!("purge_refusal_audit{}(", "_key");
+        let mut found = 0usize;
+        let mut offenders = Vec::new();
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if !line.contains(needle.as_str()) {
+                continue;
+            }
+            // La déclaration n'est pas un appel.
+            if t.starts_with("pub fn ") || t.starts_with("fn ") {
+                continue;
+            }
+            found += 1;
+            let label = t.trim_end().to_string();
+            if allowed.contains(&label.as_str()) {
+                continue;
+            }
+            if !line.contains("audit_path()") {
+                offenders.push(label);
+            }
+        }
+        if offenders.is_empty() {
+            Ok(found)
+        } else {
+            Err(offenders)
+        }
+    }
+
+    /// **D-3 / R5** — tout refus de purge passe par la clé avec le chemin le plus
+    /// spécifique disponible.
+    ///
+    /// Pourquoi un scan : un second site qui passerait `worktree_path`
+    /// directement ré-ouvrirait la déduplication mutuelle de R5 **sans rendre
+    /// aucune décision fausse** le jour où il est écrit — V9 resterait vert, et
+    /// seul le second refus d'un worktree à N répertoires serait perdu.
+    #[test]
+    fn mika2619_la_cle_de_refus_a_un_site_dappel_unique() {
+        let here = include_str!("worktree_reaper.rs");
+        let production = here
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("le module porte un `mod tests`");
+        assert!(production.len() < here.len());
+
+        match scan_purge_refusal_key_callers(production, PURGE_REFUSAL_KEY_CALLERS_ALLOWED) {
+            Ok(found) => assert_eq!(
+                found, 1,
+                "contrôle de non-vacuité et de cardinalité : exactement un site \
+                 d'appel est attendu en production"
+            ),
+            Err(offenders) => panic!(
+                "mika#2619 — un site compose la clé de refus sans passer par \
+                 `audit_path()`: {}. Deux répertoires du même worktree refusés \
+                 sous le même motif se dédupliqueraient mutuellement.",
+                offenders.join(" | ")
+            ),
+        }
+    }
+
+    /// **Contrôle négatif, vu rouge.**
+    #[test]
+    fn mika2619_le_scan_de_cle_est_vu_rouge_sur_un_chemin_de_worktree() {
+        let fixture = concat!(
+            "async fn autre_refus(r: &TargetPurgeRefusal) {\n",
+            "    let key = purge_refusal_audit",
+            "_key(&r.worktree_path, r.reason);\n",
+            "}\n"
+        );
+        assert!(scan_purge_refusal_key_callers(fixture, &[]).is_err());
+    }
+
+    /// **Contrôle négatif miroir, vu vert.**
+    #[test]
+    fn mika2619_le_scan_de_cle_est_vert_sur_le_site_conforme() {
+        let fixture = concat!(
+            "async fn record(r: &TargetPurgeRefusal) {\n",
+            "    let key = purge_refusal_audit",
+            "_key(r.audit_path(), r.reason);\n",
+            "}\n"
+        );
+        assert_eq!(scan_purge_refusal_key_callers(fixture, &[]), Ok(1));
     }
 }
