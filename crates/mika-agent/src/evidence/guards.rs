@@ -1832,6 +1832,16 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
 /// eval are phase 2.
 #[allow(dead_code)] // mika#1960 phase 1 — no production caller, by design (V4).
 pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAccessProposalMatch> {
+    // Every contraction the three layers and the refusal markers read is
+    // written with the ASCII apostrophe; a model writes U+2019 as readily, and
+    // French typesets it by default. Normalising ONCE, here, keeps every byte
+    // offset below consistent (they all index this same string) and makes a
+    // typographic refusal suppress exactly like its ASCII twin — otherwise
+    // « I don’t have access » stops being a refusal and the predicate fires on
+    // the answer it exists to protect.
+    let normalized = text.replace('\u{2019}', "'");
+    let text = normalized.as_str();
+
     // Fast path: no Layer A atom at all → skip both regex passes. Mirrors the
     // substring atoms of `TESTIMONY_SUBJECT_ALTERNATION`; **extending that
     // constant means extending this list**, or the added surface is unreachable
@@ -7573,6 +7583,35 @@ mod tests {
                     je t'aide.";
         detect_testimony_access_proposal(text)
             .expect("the second sentence is a proposal and must still be caught");
+    }
+
+    /// A model writes the typographic apostrophe (U+2019) as readily as the ASCII
+    /// one, and French typesets it by default. Every contraction the layers read
+    /// — `n'ai`, `can't`, `won't`, `m'`, `j'`, `t'` — must read the same either
+    /// way, or a refusal marker silently stops suppressing: the false positive
+    /// the fail-safe exists to avoid, on the prescribed refusal itself.
+    #[test]
+    fn mika1960_typographic_apostrophes_read_like_ascii_ones() {
+        for text in [
+            "I don\u{2019}t have access to your Gmail, and even if you gave me access I wouldn\u{2019}t use it.",
+            "I won\u{2019}t ask you to give me access to your inbox.",
+            "Je n\u{2019}ai pas accès à ta boîte Gmail, et donne-moi accès n\u{2019}est pas une option.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_none(),
+                "a refusal written with U+2019 must suppress like its ASCII twin: {text}"
+            );
+        }
+        // Positive twin: the contraction inside Layer B must still be read.
+        for text in [
+            "Si j\u{2019}avais accès à ta boîte Gmail, je pourrais préparer les réponses.",
+            "Tu peux m\u{2019}autoriser sur ta messagerie, ça irait plus vite.",
+        ] {
+            assert!(
+                detect_testimony_access_proposal(text).is_some(),
+                "a proposal written with U+2019 must still fire: {text}"
+            );
+        }
     }
 
     /// The fast path mirrors Layer A's atoms; a text carrying neither never
