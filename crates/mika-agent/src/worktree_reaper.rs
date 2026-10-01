@@ -3737,6 +3737,10 @@ pub const CARGO_INFO_MARKER: &str = ".rustc_info.json";
 /// cache » — exactement l'information que l'asymétrie fondatrice demande.
 pub const CACHEDIR_TAG_MARKER: &str = "CACHEDIR.TAG";
 
+/// L'en-tête qu'un `CACHEDIR.TAG` **doit** porter (spécification Cache
+/// Directory Tagging, <https://bford.info/cachedir/>) — celui qu'écrit cargo.
+pub const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
 /// Un répertoire est-il un **cache de build déclaré** ? (mika#2619 D4)
 ///
 /// La reconnaissance est la **présence d'un marqueur à sa racine**, jamais son
@@ -3745,8 +3749,30 @@ pub const CACHEDIR_TAG_MARKER: &str = "CACHEDIR.TAG";
 /// preuve plus forte que le nom : un répertoire *nommé* `target` qui n'est pas
 /// un cache est aujourd'hui supprimable, alors qu'un répertoire porteur d'un
 /// marqueur est un cache **par déclaration de son producteur**.
+///
+/// **Un marqueur ne se falsifie pas par son seul nom** : le marqueur est ce qui
+/// autorise un `remove_dir_all` sans preuve par le nom, donc il doit être un
+/// **fichier régulier** à la racine (jamais un lien — `is_file` suivrait un lien
+/// vers le marqueur d'un autre cache), et `CACHEDIR.TAG` doit commencer par
+/// [`CACHEDIR_TAG_SIGNATURE`], que la spécification impose précisément pour
+/// qu'un fichier homonyme ne soit pas pris pour une déclaration. Toute lecture
+/// impossible rend `false` : la direction sûre.
 pub fn is_cargo_build_dir(dir: &Path) -> bool {
-    dir.join(CARGO_INFO_MARKER).is_file() || dir.join(CACHEDIR_TAG_MARKER).is_file()
+    let is_regular_file = |name: &str| {
+        dir.join(name)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_file())
+    };
+    if is_regular_file(CARGO_INFO_MARKER) {
+        return true;
+    }
+    if !is_regular_file(CACHEDIR_TAG_MARKER) {
+        return false;
+    }
+    let mut head = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::fs::File::open(dir.join(CACHEDIR_TAG_MARKER))
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok_and(|()| head == CACHEDIR_TAG_SIGNATURE)
 }
 
 /// Les répertoires de build d'un worktree, **découverts et jamais devinés**.
@@ -9519,7 +9545,12 @@ branch refs/heads/fix/live/x
     fn fake_build_dir(parent: &Path, marker: &str) -> PathBuf {
         std::fs::create_dir_all(parent.join("debug/deps")).unwrap();
         std::fs::write(parent.join("debug/deps/libfoo.rlib"), vec![0u8; 2048]).unwrap();
-        std::fs::write(parent.join(marker), b"Signature: factice\n").unwrap();
+        let contenu: &[u8] = if marker == CACHEDIR_TAG_MARKER {
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# fixture\n"
+        } else {
+            b"{\"rustc_fingerprint\":0,\"outputs\":{},\"successes\":{}}"
+        };
+        std::fs::write(parent.join(marker), contenu).unwrap();
         parent.to_path_buf()
     }
 
@@ -10092,6 +10123,80 @@ branch refs/heads/fix/live/x
             &voisin.join("target-absent"),
             &voisin
         ));
+    }
+
+    // -- V7 quinquies : le marqueur ne se falsifie pas ------------------------
+
+    /// **V7 quinquies** — un marqueur n'est une preuve que s'il est un **fichier
+    /// régulier** à la racine du répertoire, et, pour `CACHEDIR.TAG`, s'il porte
+    /// la signature que la spécification impose.
+    ///
+    /// Le marqueur est ce qui autorise un `remove_dir_all` **sans** preuve par le
+    /// nom : un fichier quelconque nommé `CACHEDIR.TAG` (un fixture, une note, un
+    /// lien vers le marqueur d'un autre cache) ne doit pas suffire à rendre tout
+    /// son répertoire jetable.
+    #[cfg(unix)]
+    #[test]
+    fn mika2619_v7_le_marqueur_ne_se_falsifie_pas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = fake_worktree(tmp.path(), "fix-2619-marqueur");
+        let scratch = wt.join(".pilot-scratch");
+        const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+
+        // Contrôle positif : un tag signé, fichier régulier.
+        let signe = scratch.join("signe");
+        std::fs::create_dir_all(&signe).unwrap();
+        std::fs::write(signe.join(CACHEDIR_TAG_MARKER), SIGNATURE).unwrap();
+        assert!(is_cargo_build_dir(&signe), "contrôle positif");
+
+        // 1. un `CACHEDIR.TAG` d'au moins la longueur de la signature, mais pas
+        //    la signature — sinon le test épinglerait « trop court », pas
+        //    « mauvaise signature ».
+        let faux = scratch.join("faux");
+        std::fs::create_dir_all(&faux).unwrap();
+        std::fs::write(
+            faux.join(CACHEDIR_TAG_MARKER),
+            b"Signature: 0000000000000000000000000000000000\n# un brouillon qui se dit cache\n",
+        )
+        .unwrap();
+        std::fs::write(faux.join("notes.md"), b"# brouillon").unwrap();
+
+        // 2. un `CACHEDIR.TAG` qui est un lien vers un tag signé ailleurs.
+        let lien_tag = scratch.join("lien-tag");
+        std::fs::create_dir_all(&lien_tag).unwrap();
+        std::os::unix::fs::symlink(
+            signe.join(CACHEDIR_TAG_MARKER),
+            lien_tag.join(CACHEDIR_TAG_MARKER),
+        )
+        .unwrap();
+
+        // 3. un `.rustc_info.json` qui est un lien.
+        let lien_info = scratch.join("lien-info");
+        std::fs::create_dir_all(&lien_info).unwrap();
+        std::fs::write(tmp.path().join("ailleurs.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("ailleurs.json"),
+            lien_info.join(CARGO_INFO_MARKER),
+        )
+        .unwrap();
+
+        for (nom, dir) in [
+            ("faux", &faux),
+            ("lien-tag", &lien_tag),
+            ("lien-info", &lien_info),
+        ] {
+            assert!(!is_cargo_build_dir(dir), "{nom} n'est pas un cache déclaré");
+            assert_eq!(
+                build_dir_disposition(dir),
+                Err(PURGE_REASON_NOT_A_BUILD_DIR),
+                "{nom} est refusé par la garde tardive"
+            );
+        }
+        assert_eq!(
+            discover_build_dirs(&wt),
+            vec![signe],
+            "seul le cache signé entre dans la population"
+        );
     }
 
     // -- V8 : la garde tardive, dans les deux sens ---------------------------
