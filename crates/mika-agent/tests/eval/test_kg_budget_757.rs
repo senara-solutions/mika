@@ -3,13 +3,37 @@
 //! Covers the Unit 2 acceptance criteria for the #757 rescue fix:
 //!
 //! - `extract_pending(budget)` honors the per-batch LLM call cap.
-//! - `budget == 0` short-circuits with zero LLM calls and `aborted_budget = true`.
+//! - `budget == 0` short-circuits with zero LLM calls.
 //! - The pending-doc query matches on `(docs_root_hash, source_doc_path,
 //!   source_doc_hash)` so stale markers re-fire only on actual content drift.
 //! - `record_extraction` persists `source_doc_hash` so subsequent runs see a
 //!   populated marker.
 //!
 //! These tests use `MockLlmProvider` only — no real-provider traffic.
+//!
+//! # Ce que mika#1833 a changé dans ce fichier, et pourquoi
+//!
+//! Quatre tests épinglaient ici le comportement **« budget nul laisse passer
+//! gratuitement les exact matches de Stage-1 »**, ajouté délibérément par la
+//! revue de #757 (finding P1). mika#1833 le retire : `budget == 0` est
+//! désormais un no-op déclaré, court-circuité **avant toute requête**. Le
+//! raisonnement complet — les deux mesures qui condamnent l'ancien
+//! comportement, et le levier qui reste pour l'intention « exact-match
+//! seulement » — vit à un seul endroit,
+//! [`mika_agent::kg::budget::phase_is_disabled`], et n'est pas recopié ici.
+//!
+//! Deux des quatre gardent toute leur valeur et ne perdent que leur budget
+//! nul : la non-starvation après un skip (le finding P1 lui-même) et la
+//! composition exact-match / sans-LLM sont **orthogonales au budget**, donc
+//! elles sont rejouées sous un budget non nul, où elles restent vraies et
+//! toujours gardées contre une régression. Les deux autres portaient le
+//! contrat retiré : ils épinglent maintenant son retrait, **à l'endroit même
+//! où l'ancien contrat vivait** — un futur éditeur qui vient chercher
+//! « pourquoi les exact matches ne passent plus » y trouve la réponse plutôt
+//! qu'une absence.
+//!
+//! Le rejeu du défaut fondateur et le contrôle négatif « R2 décide ≠ R2 casse
+//! la résolution » vivent dans `test_kg_zero_budget_1833.rs`.
 
 use std::sync::Arc;
 
@@ -199,7 +223,10 @@ async fn pending_query_treats_drifted_hash_as_stale() {
 
 #[tokio::test]
 async fn extract_pending_with_zero_budget_short_circuits_cleanly() {
-    // 3 pending docs, but budget=0 → no LLM calls and aborted_budget=true.
+    // 3 pending docs, budget=0 → zéro appel LLM. Le contrat de #757 sur ce
+    // point tient inchangé ; ce que mika#1833 déplace, c'est **où** le
+    // court-circuit a lieu, et les deux assertions ci-dessous sont les deux
+    // conséquences observables de ce déplacement.
     let db = test_db("agent-f");
     insert_chunk(&db, 0, "docs/f1.md", "HASH-F1").await;
     insert_chunk(&db, 0, "docs/f2.md", "HASH-F2").await;
@@ -213,17 +240,37 @@ async fn extract_pending_with_zero_budget_short_circuits_cleanly() {
 
     let stats = extractor_ref.extract_pending(0).await.unwrap();
 
-    assert!(stats.aborted_budget, "zero budget must set aborted_budget");
     assert_eq!(stats.llm_calls, 0, "zero budget must not consume LLM calls");
     assert_eq!(stats.docs_extracted, 0);
-    assert_eq!(
-        stats.docs_total, 3,
-        "docs_total still reflects the pending set"
-    );
     assert_eq!(
         llm.calls_made(),
         0,
         "MockLlmProvider must never be called when budget=0"
+    );
+
+    // mika#1833 — `aborted_budget` reste FAUX. « Épuisé » décrit un budget
+    // consommé en route ; une phase que l'opérateur a désarmée n'a rien
+    // consommé, et le WARN `kg_budget_exhausted` que l'ancien chemin émettait
+    // ici disait donc le contraire de ce qui se passait. C'est aussi le champ
+    // qui a fait lire l'incident du 2026-07-26 comme un épuisement.
+    assert!(
+        !stats.aborted_budget,
+        "mika#1833 — un budget nul désarme la phase, il ne l'épuise pas"
+    );
+
+    // mika#1833 — et c'est l'assertion porteuse : trois documents sont
+    // pending, et `docs_total` vaut malgré tout zéro. Un court-circuit placé
+    // APRÈS `get_pending_docs` rendrait 3 ici tout en satisfaisant chacune
+    // des assertions ci-dessus ; seule celle-ci distingue les deux
+    // placements, et donc atteste que la requête de détection du pending
+    // n'est pas payée pour rien. Le contrôle positif de ce silence est la
+    // ligne de journal `kg_phase_disabled_by_zero_budget` émise au site du
+    // court-circuit — sans elle, « la phase est désarmée » et « la phase n'a
+    // pas tourné » rendraient des octets identiques (classe mika#2205).
+    assert_eq!(
+        stats.docs_total, 0,
+        "mika#1833 — aucune requête de pending n'est émise sous budget nul, \
+         donc `docs_total` ne peut pas refléter les 3 documents en attente"
     );
 }
 
@@ -316,10 +363,24 @@ async fn count_resolution_log(db: &AsyncDatabase) -> i64 {
     .unwrap()
 }
 
+/// mika#1833 — sous budget nul, **rien** ne résout, exact matches compris.
+///
+/// Ce test portait le contrat inverse (`..._still_processes_exact_matches`,
+/// #757 finding P1) et il est conservé renommé plutôt que supprimé : c'est
+/// l'endroit où un éditeur vient chercher « pourquoi les exact matches ne
+/// passent plus sous budget nul », et un test supprimé ne dit pas pourquoi.
+///
+/// Le seeding est **inchangé** — deux exact matches parfaits, aux confiances
+/// 0.95 et 0.92, donc tous deux au-dessus du seuil `> 0.9` strict. C'est la
+/// population la plus favorable qui existe à l'ancien comportement, et c'est
+/// ce qui fait de ce test la mesure exacte du retrait.
+///
+/// Le contrôle négatif — avec un budget non nul ces deux entités résolvent
+/// toujours, donc « R2 décide » n'est pas « R2 casse la résolution » — vit en
+/// V2 de `test_kg_zero_budget_1833.rs`, et `..._does_not_starve_...`
+/// ci-dessous le rejoue sur ce seeding même.
 #[tokio::test]
-async fn resolve_pending_with_zero_budget_still_processes_exact_matches() {
-    // Stage-1 exact matches do NOT consume the budget. Even with budget=0,
-    // entities whose name matches a domain entity exactly should resolve.
+async fn resolve_pending_with_zero_budget_resolves_nothing_at_all() {
     let db = test_db("agent-rx1");
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
     seed_exact_match_pair(&db, "tool", "run_gh", 0.92).await;
@@ -332,16 +393,31 @@ async fn resolve_pending_with_zero_budget_still_processes_exact_matches() {
     );
     let stats = resolver.resolve_pending(0).await.unwrap();
 
-    assert_eq!(stats.matched_exact, 2, "two exact matches should resolve");
-    assert_eq!(stats.llm_calls, 0, "exact matches do not debit the budget");
+    assert_eq!(
+        stats.matched_exact, 0,
+        "mika#1833 — la phase est désarmée avant la sélection, donc aucun \
+         exact match n'est même examiné"
+    );
+    assert_eq!(stats.llm_calls, 0);
     assert!(
         !stats.aborted_budget,
-        "budget=0 with all exact matches should not abort"
+        "un budget nul désarme la phase, il ne l'épuise pas"
     );
+
+    // L'assertion porteuse, et elle est porteuse dans les DEUX sens. Avant
+    // mika#1833 ce compte valait 2 ; après, zéro — mais surtout, zéro ligne
+    // écrite est ce qui rend le no-op sûr : la tête de file n'est pas
+    // consommée, donc rien n'est marqué résolu qui ne l'a pas été (le défaut
+    // « la colonne devient pleine et reste muette », refusé en D3 du plan).
     assert_eq!(
         count_resolution_log(&db).await,
-        2,
-        "both resolution log rows should be written"
+        0,
+        "mika#1833 — aucune ligne `kg_resolutions_log` : la phase n'a pas tourné"
+    );
+    assert_eq!(
+        stats.total, 0,
+        "mika#1833 — `total` compte les entités sélectionnées, et la \
+         sélection n'a pas eu lieu"
     );
 }
 
@@ -401,16 +477,23 @@ async fn resolve_pending_empty_set_returns_zero_calls() {
 #[tokio::test]
 async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches() {
     // Regression test for the #757 code review P1 finding: the resolver
-    // must continue past a SkippedBudget entity so that later Stage-1
-    // exact matches still resolve for free. The previous `break`-on-first
-    // SkippedBudget contradicted the contract stated in CLAUDE.md
-    // ("even budget=0 lets exact matches resolve"). This test seeds a
-    // 3-entity batch where the MIDDLE entity would need Stage-2 (no
+    // must continue past a skipped entity so that later Stage-1 exact
+    // matches still resolve. The previous `break`-on-first-skip starved
+    // every entity behind the first one that could not resolve. This test
+    // seeds a 3-entity batch where the MIDDLE entity would need Stage-2 (no
     // matching domain) and the bookending entities are exact matches.
-    // With no LLM configured (so Stage-2 returns SkippedNoLlm not
-    // SkippedBudget), budget=0 is irrelevant — but this structure
-    // documents the contract for the resolver-with-LLM path too, where
-    // the middle entity returns SkippedBudget instead of SkippedNoLlm.
+    //
+    // mika#1833 — ce test tournait sous `resolve_pending(0)` et tourne
+    // désormais sous un budget non nul. **La propriété testée ne change
+    // pas** : la non-starvation est une propriété de la BOUCLE (elle
+    // `continue` au lieu de `break`), pas du budget, et le commentaire
+    // d'origine le disait déjà en toutes lettres — « budget=0 is irrelevant
+    // […] the test's value is not in this particular variant but in the
+    // ordering ». Sous budget nul la boucle n'est plus atteinte du tout, donc
+    // le test n'aurait plus gardé le finding P1 : il aurait gardé le
+    // court-circuit, que trois autres tests gardent déjà. Le budget est pris
+    // large (10 contre 3 entités) pour que l'épuisement ne soit jamais le
+    // sujet — ce que ces trois lignes mesurent est l'ordre, et rien d'autre.
     let db = test_db("agent-rx5");
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
 
@@ -446,7 +529,7 @@ async fn resolve_pending_budget_exhaustion_does_not_starve_later_exact_matches()
         vec![test_docs_root_hash()],
         Some("trace-rx5"),
     );
-    let stats = resolver.resolve_pending(0).await.unwrap();
+    let stats = resolver.resolve_pending(10).await.unwrap();
 
     // Both exact matches must resolve — the middle SkippedNoLlm entity
     // does not starve the third entity.
@@ -507,12 +590,19 @@ async fn null_hash_populates_on_successful_extraction() {
 }
 
 #[tokio::test]
-async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
-    // Mix exact-match (budget-free) and potential LLM-entity (budget-gated).
-    // budget=0 → exact matches resolve; LLM-entity never gets to Stage-2
-    // because there's no LLM configured (SubjectEntityResolver built with
-    // None). So SkippedNoLlm fires, not SkippedBudget. Budget is orthogonal
-    // here — the test documents the composition.
+async fn resolve_pending_mixed_batch_logs_exact_and_no_llm() {
+    // Mix exact-match and potential LLM-entity in one batch: the exact match
+    // resolves in Stage-1, and the LLM-entity never gets to Stage-2 because
+    // there's no LLM configured (SubjectEntityResolver built with None), so
+    // SkippedNoLlm fires. The test documents that composition.
+    //
+    // mika#1833 — renommé (il s'appelait `..._zero_budget_...`) et rejoué
+    // sous un budget non nul. Le budget était déjà **orthogonal** à ce que ce
+    // test mesure, et son propre commentaire le disait ; ce qui a changé est
+    // qu'un budget nul ne laisse plus rien atteindre Stage-1, donc le test
+    // aurait cessé de mesurer la composition. Le nom perd `zero_budget`
+    // plutôt que de le garder : un nom qui annonce un budget nul alors que le
+    // test en passe un autre est la forme de test qu'on ne relit plus.
     let db = test_db("agent-rx4");
     seed_exact_match_pair(&db, "skill", "self-dev", 0.95).await;
     db.with_db(move |db| {
@@ -536,7 +626,7 @@ async fn resolve_pending_zero_budget_with_exact_match_mix_still_logs_exact() {
 
     let resolver =
         SubjectEntityResolver::new(db, None, vec![test_docs_root_hash()], Some("trace-rx4"));
-    let stats = resolver.resolve_pending(0).await.unwrap();
+    let stats = resolver.resolve_pending(10).await.unwrap();
 
     assert_eq!(stats.matched_exact, 1);
     assert_eq!(stats.skipped_no_llm, 1);
