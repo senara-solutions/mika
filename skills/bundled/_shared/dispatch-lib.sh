@@ -9018,6 +9018,17 @@ _deliver_callback() {
 # bloc de code — cette moitié-là n'existe que côté Rust, où elle garde une
 # promotion ; ici un faux positif est déjà rattrapé par le test `-f` qui suit.
 #
+# Ce rattrapage est PARTIEL, et mika#2609 l'a tranché plutôt que corrigé : le
+# `-f` couvre un chemin inexistant, pas un chemin existant cité dans un bloc.
+# Mesure du 2026-10-01 sur 1 261 tickets — 639 callouts `Plan`, 9 cités dans un
+# bloc, 2 pointant un plan existant, **0 sur un ticket ouvert**, et cette
+# fonction ne lit le corps que d'un ticket qu'on dispatche, donc ouvert. La
+# population est vide ; aligner la politique de fences sur le Rust achèterait une
+# garde sur rien, et l'échangerait contre un faux NÉGATIF — un callout qui
+# n'existe que dans un bloc serait ignoré, `_detect_plan_on_branch` partirait sur
+# `/mika` au lieu de `/ce-work <plan>`, c'est-à-dire la mort du dispatch décrite
+# juste au-dessus. Condition de réveil : `docs/dormeurs.md`, entrée mika#2609.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 # mika#2194 — CE LECTEUR DÉLÈGUE. IL NE PORTE PLUS DE MOTIF.
 #

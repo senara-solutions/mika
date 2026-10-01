@@ -9,9 +9,16 @@ Rust retire les blocs avant de matcher (`FenceHandling::Strip`,
 d'équivalent (`FenceHandling::Keep`), et son commentaire de production l'assume
 par écrit : « un faux positif est déjà rattrapé par le test `-f` qui suit ».
 
-Cette raison n'est vraie qu'à moitié, et c'est ce que le ticket de suivi doit
-trancher : le `-f` rattrape un chemin *inexistant*, pas un chemin *existant cité
-dans un bloc*. Ce corps-ci est celui qui rend cette population mesurable.
+Cette raison n'est vraie qu'à moitié : le `-f` rattrape un chemin *inexistant*,
+pas un chemin *existant cité dans un bloc*. Ce corps-ci est celui qui rend cette
+population mesurable.
+
+**mika#2609** l'a tranché (décision MPC, 2026-10-01) : le rattrapage partiel
+suffit, la divergence reste en place, le canal garde `FenceHandling::Keep` — la
+population que le trou laisse passer est vide côté tickets ouverts, seuls ceux-là
+étant dispatchables. Ce corps exerce donc la divergence de **lecture**
+(`Keep ≠ Strip`) et **non** le cas dangereux de bout en bout : le plan qu'il cite
+n'existe pas dans le dépôt, donc ici le `-f` rattraperait.
 
 Aucun callout hors du bloc, délibérément : avec un second callout le fichier ne
 mesurerait plus rien.

@@ -298,6 +298,325 @@ fn mika2194_une_ligne_pre_switch_declare_une_divergence() {
     println!("mika#2194 — {pre_switch} ligne(s) hors de la passe post-bascule");
 }
 
+/// Le ticket qui a **tranché** la divergence `divergent-fences`, et vers lequel
+/// les trois surfaces qui en parlent doivent pointer (mika#2609 AC3).
+///
+/// Figé ici plutôt que déduit : c'est l'ancrage. Un futur réveil qui change le
+/// ticket de référence met cette constante à jour, et les trois surfaces avec.
+const DIVERGENCE_FENCES_TRANCHEE_PAR: &str = "mika#2609";
+
+/// La formule d'un renvoi qui ne nomme personne.
+///
+/// C'est **la** forme de la référence croisée morte que mika#2609 ferme : le
+/// TSV renvoyait à « Ticket de suivi » et aucun ticket n'existait. Une
+/// occurrence est tolérée **seulement** si un `mika#<n>` l'accompagne sur la
+/// même ligne.
+const FORMULE_SANS_NUMERO: &str = "ticket de suivi";
+
+/// Les surfaces exemptées du contrôle de référence croisée. **LIVRÉE VIDE.**
+///
+/// Matérialisée — nommée, grep-visible, à côté du test — précisément pour que
+/// son absence de contenu soit un fait lisible et non un oubli, et pour qu'une
+/// future exemption soit un ajout visible en revue. Doctrine mika#2201 :
+/// **quand le détecteur tire, on corrige la référence, on n'ajoute pas une
+/// ligne ici.**
+///
+/// Gardée vide par l'assertion auto-nettoyante de
+/// [`mika2609_le_renvoi_au_suivi_de_la_divergence_porte_un_numero`] : une
+/// entrée qui ne désigne plus une surface réelle (fichier absent, ou surface
+/// devenue conforme) fait **échouer** le test. Une exemption ne peut donc pas
+/// devenir périmée en silence.
+const CROSS_REFERENCE_EXEMPTIONS: &[CrossReferenceExemption] = &[];
+
+struct CrossReferenceExemption {
+    /// Nom de fichier, relatif au répertoire du corpus.
+    file: &'static str,
+    /// Pourquoi cette surface est exemptée. Jamais vide.
+    #[allow(dead_code, reason = "lu par l'humain en revue, pas par le test")]
+    reason: &'static str,
+}
+
+/// Une référence de la forme `README.md § <titre>` trouvée dans le TSV.
+#[derive(Debug)]
+struct SectionReference {
+    lineno: usize,
+    title: String,
+}
+
+/// Le texte porte-t-il un `mika#<n>` (un `#` suivi d'au moins un chiffre) ?
+///
+/// Écrit à la main plutôt qu'avec `regex` : les `dependencies` du crate ne sont
+/// pas accessibles depuis un test d'intégration, et le prédicat tient en six
+/// lignes.
+fn cites_a_ticket_number(text: &str) -> bool {
+    text.match_indices("mika#")
+        .any(|(i, m)| text[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Les lignes portant [`FORMULE_SANS_NUMERO`] **sans** `mika#<n>` sur la même
+/// ligne, avec leur numéro de ligne (1-indexé).
+fn lignes_sans_numero_adjacent(content: &str) -> Vec<(usize, String)> {
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.to_lowercase().contains(FORMULE_SANS_NUMERO) && !cites_a_ticket_number(line)
+        })
+        .map(|(i, line)| (i + 1, line.trim().to_string()))
+        .collect()
+}
+
+/// Le bloc de commentaire qui **précède immédiatement** la ligne de données de
+/// `file` dans le TSV, lignes `#` jointes.
+///
+/// Le site que mika#2609 R1 cible est ce bloc, pas le fichier entier : un
+/// renvoi laissé dans un bloc voisin ne nomme pas cette divergence-ci.
+fn bloc_de_commentaire_precedant(tsv: &str, file: &str) -> String {
+    let lines: Vec<&str> = tsv.lines().collect();
+    let Some(data_idx) = lines
+        .iter()
+        .position(|l| l.split('\t').next() == Some(file))
+    else {
+        return String::new();
+    };
+
+    let mut start = data_idx;
+    while start > 0 && lines[start - 1].trim_start().starts_with('#') {
+        start -= 1;
+    }
+    lines[start..data_idx].join("\n")
+}
+
+/// Les titres de section du README voisin, dans l'ordre.
+fn readme_headings(readme: &str) -> Vec<String> {
+    readme
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start_matches('#');
+            let hashes = line.len() - rest.len();
+            if (1..=6).contains(&hashes) && rest.starts_with(' ') {
+                Some(normalize_section_title(rest))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Normalise un titre de section pour la comparaison : espaces rognés,
+/// ponctuation finale retirée, casse repliée.
+fn normalize_section_title(title: &str) -> String {
+    title
+        .trim()
+        .trim_end_matches(['.', ',', ';', ':', '»', '"', '\''])
+        .trim()
+        .to_lowercase()
+}
+
+/// Les références `README.md § <titre>` portées par le TSV.
+///
+/// Le titre court jusqu'à la fin de la ligne : c'est la forme que la référence
+/// morte avait (« `README.md § La divergence fences.` »), et borner plus tôt
+/// demanderait un délimiteur que rien ne garantit.
+fn section_references(tsv: &str) -> Vec<SectionReference> {
+    const NEEDLE: &str = "README.md §";
+    tsv.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            line.find(NEEDLE).map(|at| SectionReference {
+                lineno: i + 1,
+                title: normalize_section_title(&line[at + NEEDLE.len()..]),
+            })
+        })
+        .collect()
+}
+
+/// Les fichiers déclarés `divergent-fences` dans le TSV.
+fn fixtures_divergent_fences() -> Vec<String> {
+    read_expectations()
+        .into_iter()
+        .filter(|e| e.parity == "divergent-fences")
+        .map(|e| e.file)
+        .collect()
+}
+
+/// R6(a) — **tant qu'une divergence `divergent-fences` est déclarée, les trois
+/// surfaces qui en parlent nomment le ticket qui l'a tranchée.**
+///
+/// Ferme la **classe** plutôt que l'instance. La référence morte du 2026-09-30
+/// (« voir « Ticket de suivi » dans README.md § La divergence fences », alors
+/// que ni la section ni le ticket n'existaient) a survécu à un refactor du
+/// fichier qui la portait — mika#2608 a inséré trois fixtures et décalé la
+/// ligne de 112 à 132 — **sans qu'aucun test ne rougisse**. Ce n'est pas une
+/// coquille, c'est une classe : un renvoi qui ne nomme personne ne peut pas
+/// devenir faux, il l'est déjà.
+///
+/// Deux termes, et le second est celui qui a mordu à l'écriture :
+/// 1. les trois surfaces citent [`DIVERGENCE_FENCES_TRANCHEE_PAR`] ;
+/// 2. aucune ne porte [`FORMULE_SANS_NUMERO`] sans `mika#<n>` sur la ligne.
+#[test]
+fn mika2609_le_renvoi_au_suivi_de_la_divergence_porte_un_numero() {
+    let tsv_path = corpus_dir().join("expectations.tsv");
+    let readme_path = corpus_dir().join("README.md");
+
+    let tsv = std::fs::read_to_string(&tsv_path)
+        .unwrap_or_else(|e| panic!("TSV illisible : {} ({e})", tsv_path.display()));
+    let readme = std::fs::read_to_string(&readme_path).unwrap_or_else(|e| {
+        panic!(
+            "README du corpus illisible : {} ({e}).\n\
+             Un détecteur de référence croisée qui ne peut pas lire la cible \
+             de la référence ne vérifie rien (classe mika#2205).",
+            readme_path.display()
+        )
+    });
+
+    let divergentes = fixtures_divergent_fences();
+    assert!(
+        !divergentes.is_empty(),
+        "aucune ligne `divergent-fences` dans le TSV — ce détecteur n'exerce \
+         plus aucune surface.\n\n\
+         Si la divergence a été retirée du corpus, retirez ce test avec elle ; \
+         s'il reste, il est vert sans rien regarder (classe mika#2205)."
+    );
+
+    // L'allowlist est auto-nettoyante : une entrée doit désigner un fichier
+    // réel ET non conforme, sinon elle est périmée et le dit.
+    for ex in CROSS_REFERENCE_EXEMPTIONS {
+        assert!(
+            !ex.reason.trim().is_empty(),
+            "exemption de {:?} sans raison écrite",
+            ex.file
+        );
+        let path = corpus_dir().join(ex.file);
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "l'exemption nomme une surface absente : {} ({e}).\n\n\
+                 ASSERTION AUTO-NETTOYANTE : retirez l'entrée de \
+                 CROSS_REFERENCE_EXEMPTIONS.",
+                path.display()
+            )
+        });
+        let non_conforme =
+            !cites_a_ticket_number(&body) || !lignes_sans_numero_adjacent(&body).is_empty();
+        assert!(
+            non_conforme,
+            "{} est exempté mais il est devenu CONFORME.\n\n\
+             ASSERTION AUTO-NETTOYANTE : retirez l'entrée de \
+             CROSS_REFERENCE_EXEMPTIONS — une exemption ne doit pas devenir \
+             périmée en silence.",
+            ex.file
+        );
+    }
+    let exempte = |file: &str| CROSS_REFERENCE_EXEMPTIONS.iter().any(|e| e.file == file);
+
+    let mut surfaces: Vec<(String, String)> = Vec::new();
+    if !exempte("expectations.tsv") {
+        // Le site est le bloc de commentaire de la divergence, pas le TSV
+        // entier : un numéro laissé dans un bloc voisin ne nomme pas celle-ci.
+        for file in &divergentes {
+            surfaces.push((
+                format!("expectations.tsv (bloc de {file})"),
+                bloc_de_commentaire_precedant(&tsv, file),
+            ));
+        }
+    }
+    if !exempte("README.md") {
+        surfaces.push(("README.md".to_string(), readme.clone()));
+    }
+    for file in &divergentes {
+        if !exempte(file) {
+            surfaces.push((file.clone(), read_body(file)));
+        }
+    }
+
+    assert!(
+        !surfaces.is_empty(),
+        "toutes les surfaces sont exemptées — le détecteur ne regarde rien"
+    );
+
+    for (name, content) in &surfaces {
+        assert!(
+            content.contains(DIVERGENCE_FENCES_TRANCHEE_PAR),
+            "{name} ne cite pas {DIVERGENCE_FENCES_TRANCHEE_PAR}, le ticket qui \
+             a tranché la divergence `divergent-fences`.\n\n\
+             Une surface qui décrit une divergence assumée doit nommer la \
+             décision qui l'assume, par son NUMÉRO — jamais par un renvoi à une \
+             section (un numéro de ligne et un titre de section pourrissent en \
+             silence ; un numéro de ticket, non)."
+        );
+
+        let orphelines = lignes_sans_numero_adjacent(content);
+        assert!(
+            orphelines.is_empty(),
+            "{name} porte la formule {FORMULE_SANS_NUMERO:?} sans \
+             `mika#<n>` sur la même ligne : {orphelines:?}\n\n\
+             C'est exactement la référence morte que mika#2609 a fermée. \
+             Nommez le ticket sur la ligne."
+        );
+    }
+
+    println!(
+        "mika#2609 — {} surface(s) vérifiée(s) pour {} divergence(s) \
+         `divergent-fences`, {} exemption(s)",
+        surfaces.len(),
+        divergentes.len(),
+        CROSS_REFERENCE_EXEMPTIONS.len()
+    );
+}
+
+/// R6(b) — **un renvoi `README.md § <titre>` désigne un heading qui existe.**
+///
+/// C'est l'assertion qui **aurait rougi le 2026-09-30** : le TSV renvoyait à
+/// « README.md § La divergence fences » et le README voisin, 111 lignes, n'avait
+/// aucune section de ce nom. Et elle aurait survécu au refactor de mika#2608,
+/// parce qu'elle ne porte ni numéro de ligne ni ordre.
+///
+/// L'anti-vacuité porte sur le **parseur de headings**, non sur le nombre de
+/// références : zéro référence est l'état **sain** depuis mika#2609 (R1 renvoie
+/// au ticket, pas à une section), tandis qu'un parseur qui ne trouverait aucun
+/// heading laisserait passer n'importe quel renvoi.
+#[test]
+fn mika2609_un_renvoi_a_une_section_du_readme_designe_un_heading_reel() {
+    let tsv_path = corpus_dir().join("expectations.tsv");
+    let readme_path = corpus_dir().join("README.md");
+
+    let tsv = std::fs::read_to_string(&tsv_path)
+        .unwrap_or_else(|e| panic!("TSV illisible : {} ({e})", tsv_path.display()));
+    let readme = std::fs::read_to_string(&readme_path)
+        .unwrap_or_else(|e| panic!("README illisible : {} ({e})", readme_path.display()));
+
+    let headings = readme_headings(&readme);
+    assert!(
+        !headings.is_empty(),
+        "aucun heading lu dans {} — le parseur de sections ne voit rien, donc \
+         ce test laisserait passer N'IMPORTE QUEL renvoi (classe mika#2205).",
+        readme_path.display()
+    );
+
+    let refs = section_references(&tsv);
+    for r in &refs {
+        assert!(
+            headings.contains(&r.title),
+            "ligne {} du TSV renvoie à « README.md § {} », qui ne correspond à \
+             aucune section du README voisin.\n\n\
+             Sections disponibles : {:?}\n\n\
+             Un renvoi vers une section inexistante pointe dans le vide sans \
+             jamais échouer — c'est le défaut que mika#2609 a mesuré. Nommez la \
+             section telle qu'elle est écrite, ou renvoyez au TICKET.",
+            r.lineno,
+            r.title,
+            headings
+        );
+    }
+
+    println!(
+        "mika#2609 — {} renvoi(s) `README.md § …` confronté(s) à {} section(s) \
+         du README (zéro renvoi est l'état sain : R1 renvoie au ticket)",
+        refs.len(),
+        headings.len()
+    );
+}
+
 /// Le corpus et le TSV se recouvrent exactement.
 ///
 /// Sans ça, un fixture ajouté et jamais déclaré est un cas que **personne**

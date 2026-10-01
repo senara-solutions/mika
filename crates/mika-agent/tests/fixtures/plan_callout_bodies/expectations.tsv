@@ -129,8 +129,34 @@ neg-inline-prose.md	1	-	-	equal	both
 #    déjà rattrapé par le test `-f` qui suit ».
 #    Ce rattrapage est PARTIEL — il couvre un chemin inexistant, pas un chemin
 #    existant cité dans un bloc.
-#    Suivi : voir « Ticket de suivi » dans README.md § La divergence fences.
+#
+#    TRANCHÉ par mika#2609 (décision MPC, 2026-10-01) : le rattrapage partiel
+#    SUFFIT. La divergence reste assumée, documentée et EN PLACE ; le canal
+#    garde `FenceHandling::Keep`. Mesure sur 1 261 tickets : 639 callouts
+#    `Plan`, 9 cités dans un bloc clôturé, 2 pointant un plan EXISTANT (#1204,
+#    #1144), 0 sur un ticket OUVERT — et `dispatch-lib` ne lit le corps que d'un
+#    ticket qu'il dispatche, donc ouvert. Aligner achèterait une garde sur une
+#    population vide, et l'échangerait contre un faux NÉGATIF sur
+#    `_detect_plan_on_branch`, dont la panne est la mort du dispatch.
+#    Condition de réveil : `docs/dormeurs.md`, entrée mika#2609.
 #    `parity` vaut `divergent-fences` : le test EXIGE la divergence.
+#
+#    SI l'alignement se fait un jour, la séquence est celle-ci — et ce n'est PAS
+#    celle que décrit l'AC2 de mika#2609, qui est inexacte (voir M3) :
+#      1. `crates/mika-cli/src/commands/plan_callout.rs` : `Keep` → `Strip`.
+#         C'est un mot, à un site unique.
+#      2. ICI : `rc` passe de `0` à `1`. C'est la SEULE colonne qui bascule.
+#      3. `parity` RESTE `divergent-fences` et la ligne N'EST PAS retirée.
+#         `parity` décrit une propriété du CORPS, pas la politique d'un lecteur :
+#         `Keep(corps) ≠ Strip(corps)` reste vrai après l'alignement, donc passer
+#         la ligne à `equal` ferait échouer l'assertion auto-nettoyante, et la
+#         retirer ferait échouer l'anti-vacuité `divergences_declarees > 0` —
+#         cette ligne est la seule à la porter.
+#      4. Ce qui ATTESTE l'alignement est
+#         `mika2194_le_canal_repond_comme_le_lecteur_sur_le_corpus_dore` (dans
+#         `mika-cli`, qui compare à la colonne `rc`) plus les quatre passages
+#         `rc` de `test-dispatch-lib.sh` — JAMAIS
+#         `mika2194_les_divergences_declarees_sont_reelles_et_les_autres_absentes`.
 fences-quoted-callout.md	0	docs/plans/2026-09-30-001-fix-2194-exemple-cite-plan.md	docs/plans/2026-09-30-001-fix-2194-exemple-cite-plan.md	divergent-fences	both
 
 # ── EXCEPTION mika#2194 n°2 — le backtick fermant est exigé.
