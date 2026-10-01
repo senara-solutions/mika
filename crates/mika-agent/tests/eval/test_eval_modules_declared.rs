@@ -163,12 +163,20 @@ fn tout_fichier_dun_sous_repertoire_de_tests_eval_est_declare_dans_son_mod_rs() 
         }
     }
 
-    // Anti-vacuité : sans ces deux bornes, un renommage de répertoire rendrait la
+    // Anti-vacuité : sans ces bornes, un renommage de répertoire rendrait la
     // porte silencieusement inerte, ce qui se lit exactement comme un arbre
     // propre. Les seuils sont des planchers larges, pas des comptes exacts — la
-    // porte ne doit pas rougir chaque fois qu'on ajoute un scénario.
+    // porte ne doit pas rougir chaque fois qu'on ajoute ou fusionne un
+    // sous-répertoire (8 en portaient un `mod.rs` à l'écriture : un plancher à 8
+    // était un compte exact déguisé). Ce qui est exigé nommément, c'est le
+    // répertoire pour lequel la porte existe.
     assert!(
-        dirs_scanned >= 8,
+        dir_names.iter().any(|d| d == "doctrine_regressions"),
+        "la porte n'a pas trouvé doctrine_regressions/ parmi {dir_names:?} — elle ne \
+         regarde plus le répertoire pour lequel elle existe (mika#1960 D5)."
+    );
+    assert!(
+        dirs_scanned >= 4,
         "la porte n'a trouvé que {dirs_scanned} sous-répertoire(s) portant un mod.rs \
          dans tests/eval/ — elle ne regarde plus ce qu'elle prétend regarder. \
          Réparer l'énumération, ne pas baisser ce plancher."
