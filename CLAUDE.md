@@ -3898,9 +3898,9 @@ Optional (le checkout principal est un checkout de déploiement, et `run_shell` 
 
 Optional (purge du `target/` d'un worktree vif — mika#2497):
 - **Le défaut que ça ferme, mesuré.** Chaque pilote / QA reconstruit un `target/` Rust de 15 à 50 Go dans son worktree, et **rien ne le purge tant que le worktree vit**. Nuit du 2026-09-22 : **+90 Go en 8 h**, `/data` à **83 %**, worktrees à **165 Go** — à un cheveu de casser moteur, QA et builds. Nettoyé à la main. Le faucheur terminal (mika#2420) ne voit pas cette population : son terme T4 exige **« aucune PR ouverte »**, donc un worktree dont la PR est ouverte lui est refusé sous le motif `pr_open` et son `target/` vit aussi longtemps que la PR. C'est le *suivi HALT-2* que mika#2420 nomme dans son propre corps.
-- **Troisième bras du tick `worktree_reap`, après le faucheur**, et l'ordre est nécessaire : ce que le faucheur vient de retirer n'existe plus. La population est **exactement** l'ensemble de ses refus `pr_open` du même tick — une donnée déjà en mémoire, sans une requête de plus, et tout le coût (`git worktree list`, l'unique `gh pr list` par dépôt, l'énumération de `/proc`, la sentinelle STOP, la déduplication des refus) est déjà payé. Cadence inchangée, aucun `PeriodicScan` nouveau, aucune row récurrente, aucune migration.
+- **Troisième bras du tick `worktree_reap`, après le faucheur**, et l'ordre est nécessaire : ce que le faucheur vient de retirer n'existe plus. La population est **exactement** l'ensemble de ses refus **éligibles** du même tick — `pr_open` à l'origine, deux motifs depuis mika#2482, **neuf depuis mika#2619** (§ *Le bras cesse de lire pourquoi un worktree est conservé* ci-dessous) — une donnée déjà en mémoire, sans une requête de plus, et tout le coût (`git worktree list`, l'unique `gh pr list` par dépôt, l'énumération de `/proc`, la sentinelle STOP, la déduplication des refus) est déjà payé. Cadence inchangée, aucun `PeriodicScan` nouveau, aucune row récurrente, aucune migration.
 - **L'asymétrie est INVERSE de celle du faucheur, et c'est ce qui autorise à toucher un worktree vif.** *Le faucheur supprime du travail potentiel ; ce bras supprime du dérivé pur.* Un `target/` est intégralement reconstructible par `cargo build`, donc le coût d'un faux positif est **borné à du temps de rebuild**, jamais à une perte — l'exact inverse du *« un faux positif détruit des heures de travail, irréversiblement »* qui gouverne mika#2420. **Ce que l'asymétrie n'autorise PAS :** supprimer `target/` **pendant** un `cargo build` casse ce build. Le danger n'est pas la perte de données, c'est la **concurrence**, et tout le prédicat porte là-dessus.
-- **Cinq termes conjonctifs, tous fail-safe vers *conserver*, sans exception.** P1 le chemin est managé (re-vérifié **après canonicalisation** juste avant la disposition) ; P2 `<worktree>/target/` existe et est un **répertoire**, jamais un lien symbolique ; P3 aucun processus vivant n'a son cwd sous le worktree ; P4 inactivité, sur le mtime maximum d'un ensemble **borné et déclaré** (`target/`, ses enfants directs, et les enfants de ceux-ci — profondeur 2, quelques centaines de `stat`, aucune troncature possible) ; P5 **aucun cargo ne travaille ici**, par `flock` non bloquant. `LiveCwds::Unavailable` conserve tout, exactement comme chez le faucheur.
+- **Cinq termes conjonctifs, tous fail-safe vers *conserver*, sans exception.** P1 le chemin est managé (re-vérifié **après canonicalisation** juste avant la disposition) ; P2 le répertoire de build existe et est un **répertoire**, jamais un lien symbolique ; P3 aucun processus vivant n'a son cwd sous le worktree ; P4 inactivité, sur le mtime maximum d'un ensemble **borné et déclaré** (le répertoire, ses enfants directs, et les enfants de ceux-ci — profondeur 2, quelques centaines de `stat`, aucune troncature possible) ; P5 **aucun cargo ne travaille ici**, par `flock` non bloquant. `LiveCwds::Unavailable` conserve tout, exactement comme chez le faucheur. **Les cinq sont inchangés par mika#2619**, qui n'élargit que la population et la cardinalité (N répertoires par worktree, `target/` **et** les caches sous `.pilot-scratch/`).
 - **Pourquoi P5 existe.** P3 est **connu pour être troué**, et mika#2420 l'écrit lui-même : un processus peut travailler dans un worktree sans y avoir son cwd (`cargo --manifest-path`, `git -C`, un éditeur lancé ailleurs). Chez le faucheur ce trou était couvert **par la conjonction** — un tel processus travaille sur une branche dont la PR est ouverte (exclu par T4) ou produit des modifications non committées (exclu par T7). **Ici cette couverture disparaît : la PR est ouverte par définition de la population.** P5 rend ce que T4 apportait, indépendamment du cwd et de tout délai. P4 et P5 ne sont pas redondants et leur ordre est le motif de mika#2184 : **le proxy filtre d'abord** (P4, quelques `stat`, écarte la quasi-totalité), **la mesure directe tranche ensuite** (P5, sur le seul candidat retenu, dernier point où le refus est gratuit).
 - **Le verrou est DÉCOUVERT, jamais deviné.** Cargo pose son verrou sur `<target>/<profil>/.cargo-lock` et le profil est une donnée de l'invocation, donc le terme énumère les enfants directs de `target/` et sonde chaque `.cargo-lock` trouvé ; **un seul verrou tenu suffit à refuser**. Deviner `target/debug/.cargo-lock` raterait un build `--release`, c'est-à-dire échouerait exactement sur le cas qu'on veut voir.
 - **Deux absences, deux dispositions OPPOSÉES — et c'est ce qui se confond.** Aucun `.cargo-lock` sous `target/` ⇒ cargo n'a jamais construit ici ⇒ terme **satisfait**, purge permise. L'appel `flock` indisponible (non-Linux) ⇒ on ne peut pas regarder ⇒ **inévaluable**, conserve. Traiter la première comme la seconde rend le bras **inerte sur une population saine** tout en se lisant comme un disque sain (classe mika#2205) ; traiter la seconde comme la première purge à l'aveugle.
@@ -4286,6 +4286,249 @@ produit plus de worktrees que l'implémentation n'en consomme. Ouvrir le suivi
   n'y est pas montée, donc les 13 `pr_unknown` du 22/09 y sont invisibles et
   aucune requête `audit_events` n'y est exécutable. Les chiffres cités viennent du
   ticket (22/09) et de `gh` (29/09).
+
+### Le bras cesse de lire *pourquoi* un worktree est conservé (mika#2619)
+
+**Aucune variable d'environnement nouvelle, aucune migration, aucune valeur de
+réglage déplacée** — ni `MIKA_TARGET_PURGE_IDLE_SECS` (14400), ni
+`MIKA_TARGET_PURGE_MAX_PER_TICK` (2), ni `MIKA_WORKTREE_REAP_*`. **Les cinq
+termes P1–P5 ne bougent pas**, verrou de build compris.
+
+- **Le défaut, mesuré le 2026-10-01.** `/data` à **85 %** (299/371 Go),
+  redescendu à **67 %** après purge manuelle de trois répertoires de build de
+  worktrees **finis** : **64 Go** libérés à la main. Aucun des trois n'était dans
+  la population du bras.
+
+  | worktree | motif du faucheur | volume | pourquoi la purge ne le voyait pas |
+  |---|---|---|---|
+  | `refactor-2194-…` (PR #2607 mergée) | `detached_head_pr_unknown` | 40 Go `target/` | le motif n'était pas dans la liste d'éligibilité — **né de mika#2518, jamais ajouté** |
+  | `fix-2105-…` (ticket clos) | `unpushed_commits` | 17 Go sous `.pilot-scratch/ac6/` | **trois** échecs indépendants : le motif, le chemin, **et le vecteur** |
+  | `fix-2616-…` (PR mergée 07:17Z) | `too_young` | 8 Go `target/` | P4 le refuse légitimement (`target/` récent) |
+
+- **La cause est que la population était définie par *motif de conservation*,
+  alors que l'asymétrie qui fonde le bras est indifférente à ce motif.** *Garder
+  le worktree protège le travail (commits, arbre de travail) ; cela ne dit rien de
+  son cache de build.* Un `target/` est reconstructible par `cargo build`, que le
+  worktree soit tenu pour `pr_open`, `detached_head`, `unpushed_commits` ou
+  `dirty`.
+
+- **Une partition exacte, et c'est ce qui ferme la CLASSE plutôt que
+  l'occurrence.** Le ticket proposait d'inverser la polarité (« tout motif sauf
+  `live_process` ») ; **refusé**, le prédicat étant fail-closed sur l'inconnu
+  (`is_purge_eligible_reason("")` rend `false`, épinglé) et une denylist rendant
+  `true` pour toute chaîne non listée. Mais la polarité n'était pas la cause : une
+  liste de deux noms avait **pris du retard**. `ALL_REFUSAL_REASONS` est donc
+  partitionné en deux listes déclarées, et un test exige que **chaque** motif
+  figure dans **exactement une** des deux. Un motif ajouté demain fait rougir ce
+  test jusqu'à ce que quelqu'un le classe : le défaut n'est plus « purgeable par
+  oubli » ni « non purgeable par oubli », c'est **« pas de décision, pas de
+  build »**.
+
+  **Les neuf éligibles :** `pr_open`, `pr_unknown` (mika#2482), puis
+  `detached_head_pr_unknown`, `detached_head`, `dirty`, `unpushed_commits`,
+  `work_state_unreadable`, `pr_closed_at_unreadable`, `too_young`. Ce dernier est
+  **quasi inerte et inclus par cohérence plutôt que par exception** : une PR close
+  depuis moins que la grâce a presque toujours un cache plus récent que la fenêtre
+  de 4 h, donc P4 le refuse ; l'exclure demanderait d'argumenter « le faucheur va
+  le retirer en entier dans ≤ 10 min », ce qui est vrai *tant que le faucheur est
+  armé* — une dépendance que l'asymétrie fondatrice ne demande pas.
+
+  **Les trois inéligibles, chacun parce que son terme de purge le refuse déjà** —
+  des **redondances**, jamais des réserves de sûreté : `live_process` (P3
+  re-décide ; l'inclure doublerait une ligne du faucheur sous un autre
+  `tool_name`), `process_scan_unreadable` (même tick, même cause : P3 refuse tout
+  le monde), `outside_managed_root` (P1 refuse, et ce motif doit rester vide côté
+  faucheur — HALTE 4 ci-dessus ; le faire traverser rendrait une HALTE illisible).
+
+- **Élargir la liste seule aurait été INERTE sur trois motifs, et l'inertie aurait
+  été invisible.** `dirty`, `unpushed_commits` et `work_state_unreadable` ne
+  sortent pas de l'écran T1–T6 mais de `apply_work_states` (T7), dont la sortie
+  vivait dans **un vecteur que le bras ne recevait jamais**. Il reçoit désormais
+  **les deux**. Et un second trou, non nommé par le ticket : à budget faucheur
+  nul, T7 n'était **pas évalué du tout**, donc les survivants de T1–T6
+  n'apparaissaient dans aucun vecteur et échappaient aux deux bras. Le prédicat
+  `t7_is_needed` dit maintenant *le bras qui a besoin du calcul le paie*.
+  **Coût nommé :** deux `git` par candidat T1–T6 même quand le faucheur n'a plus
+  de budget, à condition que la purge soit armée et ait du budget — borné par le
+  nombre de worktrees à PR terminale, hors grâce, sans processus vivant.
+
+- **N répertoires de build par worktree, découverts et jamais devinés.**
+  `discover_build_dirs` est le **site unique** de composition d'un tel chemin :
+  `<worktree>/target` s'il existe (**sans condition de marqueur**, pour ne pas
+  rétrécir la population d'aujourd'hui), puis une marche **bornée** (profondeur 3,
+  liens jamais suivis — **racine `.pilot-scratch` comprise**, qui doit être un vrai
+  répertoire : `read_dir` suit un lien, et un `.pilot-scratch` lié à celui d'un
+  voisin faisait entrer ses caches dans la population d'un worktree dont P3
+  n'interroge que les processus) sous `.pilot-scratch/`, retenant tout répertoire porteur
+  d'un marqueur **sans y descendre** — un cache contient des sous-répertoires, et
+  les énumérer serait une marche non bornée dans l'arborescence qu'on vient
+  d'identifier comme un cache.
+
+- **Le marqueur est une déclaration de cache, et il complète le nom sans le
+  remplacer.** Reconnaissance : `.rustc_info.json` **ou** `CACHEDIR.TAG` à la
+  racine — le second est le standard par lequel un outil déclare lui-même « ceci
+  est un cache », exactement l'information que l'asymétrie demande. La garde
+  tardive devient donc **nom OU marqueur** : garder `ends_with("/target")` évite de
+  rétrécir la population actuelle, ajouter le marqueur **remplace la preuve par le
+  nom** pour tout le reste — et c'est une preuve plus forte. Un répertoire qui n'en
+  porte aucun n'est **pas reconnu**, donc n'entre dans aucune population : un
+  brouillon de texte sous `.pilot-scratch/` ne produit **ni candidat ni refus**.
+  **Un marqueur n'est une preuve que comme fichier régulier**, jamais un lien
+  (`is_file` suivait un lien vers le marqueur d'un autre cache), et
+  `CACHEDIR.TAG` seulement s'il porte la signature de la spécification
+  (`CACHEDIR_TAG_SIGNATURE`, celle qu'écrit cargo) — un fichier simplement
+  *nommé* ainsi (fixture, note) rendait jetable tout son répertoire. Résidu nommé :
+  le contenu de `.rustc_info.json` n'est pas validé.
+
+- **Le répertoire supprimé appartient au worktree dont P3 a interrogé les
+  processus.** Garde tardive `build_dir_is_inside_worktree`, avant l'acquisition :
+  après canonicalisation des deux côtés, le répertoire doit être strictement sous
+  **ce** worktree, pas seulement sous un worktree géré. Elle couvre aussi un
+  composant parent remplacé par un lien entre la découverte et la suppression.
+  Refus sous `outside_managed_root`, aucun motif nouveau.
+
+- **La tension avec la règle de dispatch mika#2548 (« ne supprime JAMAIS un
+  brouillon de `.pilot-scratch/` ») n'existe pas.** Cette règle s'adresse au
+  **pilote**, contre un réflexe de rangement en cours de session. La purge est du
+  code **moteur**, hors session, sur un répertoire inactif depuis au moins quatre
+  heures dans un worktree **sans processus vivant** — et un pilote dispatché
+  travaille à la racine de son worktree, donc `cwd == root`, donc P3 sort le
+  worktree entier de la population. `_seed_pilot_scratch_dir` **vide** d'ailleurs
+  ce répertoire à chaque préparation : la purge ne retire aucune garantie que le
+  seed ne retire déjà. La population réelle est celle des worktrees **non
+  repris**.
+
+- **Le budget est par répertoire** : un worktree portant trois répertoires de
+  build consomme trois unités. Cohérent avec ce que le cap borne — les tempêtes
+  d'E/S viennent des suppressions, pas des worktrees.
+
+- **Deux changements de surface, datés.** `ALL_PURGE_REFUSAL_REASONS` gagne
+  `not_a_build_dir` **en queue** (un ajout, jamais un renommage : les `GROUP BY`
+  publiés restent exacts) — refus **tardif** d'un répertoire dont le marqueur a
+  disparu entre la découverte et la garde, délibérément distinct de
+  `outside_managed_root`, qui serait une ligne d'audit **fausse** (le chemin est
+  bien sous la racine gérée, c'est la *preuve* qui manque). Et la clé d'audit d'un
+  refus de portée répertoire passe de `target:<worktree>@<motif>` à
+  `target:<worktree>/target@<motif>` : sans quoi deux répertoires du même worktree
+  refusés sous le même motif **se dédupliquaient mutuellement** et le second refus
+  était perdu en silence. Les requêtes publiées groupent par `after_value` et ne
+  sont **pas** affectées ; seule une requête `WHERE target_key = …` exacte l'est.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Qu'a-t-on purgé, pour quel motif de CONSERVATION, et combien ça a rendu ?
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{worktree_path, target_path, keep_reason, idle_secs, bytes_reclaimed}'
+
+# 2. La population ÉLARGIE, comptée séparément (AC4)
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.keep_reason != "pr_open" and .keep_reason != "pr_unknown")
+           | {target_path, keep_reason, bytes_reclaimed}'
+
+# 3. Les répertoires hors `target/` (AC2)
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.target_path | test("\\.pilot-scratch/"))'
+
+# 4. CONTRÔLE POSITIF — le bras tourne-t-il seulement ?
+grep target_purge_tick "$MIKA_SPIRIT_LOG_FILE" | tail
+```
+
+```sql
+-- La population élargie, datée. `keep_reason` vit dans `reasoning`.
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'target_purged' ORDER BY created_at DESC;
+```
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `target_purged` avec `keep_reason` hors `{pr_open, pr_unknown}` | **non vide** après déploiement | la mesure directe que l'élargissement mord — les 40 Go de `refactor-2194` sont dans cette population |
+| `target_purged` avec `target_path` sous `.pilot-scratch/` | non vide, **faible** | les 17 Go de `fix-2105` ; faible parce que seuls les worktrees **non repris** en portent |
+| `target_purge_skipped` / `recently_active` | **doit dominer** | la fenêtre protège le travail en cours — inchangé |
+| `target_purge_skipped` / `not_a_build_dir` | **vide** | la course découverte→garde ; toute occurrence est à lire, pas à ignorer |
+| `worktree_reap_skipped` / `dirty`, `unpushed_commits`, `work_state_unreadable` | **en hausse** | conséquence attendue du calcul de T7 élargi, **non une dégradation** : la population n'est plus tronquée par le budget du faucheur |
+
+#### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : établir après
+> `make deploy` que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). **Et ce sont des gestes d'opérateur sur l'hôte :**
+> la base n'est pas montée dans le bac à sable de dispatch, donc aucune de ces
+> requêtes n'est exécutable par un pilote.
+
+**S0 — commencer en `observe`.** Poser `MIKA_TARGET_PURGE_DISPOSITION=observe` et
+lire la population qui *serait* retirée (`target_purge_would_dispose`). Le cap par
+tick vaut **aussi** en observation, et la population est désormais **par
+répertoire**, donc plus large : laisser tourner jusqu'à ce qu'un tick ne nomme
+plus de répertoire que `SELECT DISTINCT target_key` n'ait déjà rendu, puis armer.
+
+**S1 — le symptôme (7 jours).** `df -h /data` cesse de rapprocher 85 % ; `du -sh`
+sur la racine des worktrees se stabilise nettement sous les 299 Go mesurés.
+*Halte 1 —* `/data` remplit encore alors qu'aucun répertoire inactif ne subsiste ⇒
+la cause est le **pic de production simultanée**, que ce travail ne borne pas.
+**Ne pas raccourcir la fenêtre par réflexe** — ouvrir le suivi `CARGO_TARGET_DIR`
+partagé **avec la mesure**.
+
+**S2 — l'attribution (48 h).** La sonde 2 est non vide, et la sonde 3 l'est aussi
+dès qu'un worktree non repris porte un répertoire de mesure.
+*Halte 2 —* la sonde 2 est **vide** alors que des worktrees `detached_head` /
+`unpushed_commits` existent : vérifier d'abord le **contrôle positif** (sonde 4).
+Zéro purge avec un tick qui agit est sain ; zéro des deux ne prouve rien (classe
+mika#2205). Si le tick agit et que la sonde 2 reste vide **pour les motifs T7**,
+le défaut du vecteur est revenu — c'est le **vecteur** qu'il faut lire, pas la
+liste.
+
+**S3 — contrôle négatif de la cardinalité (7 jours).** Aucun
+`target_purge_skipped` de portée répertoire dont le `target_key` ne porte pas de
+chemin de répertoire de build.
+
+**S4 — contrôle négatif de sûreté (7 jours).** Aucune plainte de rebuild
+intempestif sur une itération QA → CI-fix, et **aucun brouillon de
+`.pilot-scratch/` perdu**.
+*Halte 4 —* un fixture non-cache disparu sous `.pilot-scratch/` :
+`MIKA_TARGET_PURGE=0` **immédiatement**, puis diagnostiquer le prédicat de
+reconnaissance. C'est le seul mode de panne de ce travail qui coûte autre chose
+que du temps de rebuild, et il ne se règle pas en bougeant un seuil.
+*Halte 5 —* un build cassé pendant une purge : même geste, puis établir lequel de
+P3, P4 ou P5 a lu vrai alors qu'il était faux. La fenêtre résiduelle du verrou
+(unlink → fin de suppression) est **nommée et inchangée** par mika#2511.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne borne pas le pic.** Si N worktrees compilent simultanément, aucun n'est
+  inactif et la purge n'attrape rien **pendant** la montée — elle attrape le
+  résidu. Limite héritée de mika#2497, **inchangée**, et c'est la Halte 1.
+- **Il ne mesure pas le disque.** Aucun seuil de remplissage : le bras ne sait pas
+  que `/data` est à 85 %, il sait qu'un répertoire de build est inactif.
+- **Il ne fauche aucun worktree de plus.** Ce qui est retiré reste du **dérivé
+  pur** : jamais le worktree, jamais une branche, jamais un commit. Un
+  `unpushed_commits` garde ses commits ; un `dirty` garde son arbre de travail.
+  Les sept termes du faucheur sont inchangés.
+- **Il ne rattrape pas les 64 Go du 2026-10-01** : ils ont été purgés à la main et
+  **rien ne rétro-écrit** une ligne d'audit décrivant un retrait qu'on n'a pas
+  observé. La sonde est la **prochaine** occurrence.
+- **Il ne ferme pas la fenêtre résiduelle de mika#2511** (unlink → fin de
+  suppression), ni le trou nommé ci-dessus (budget faucheur épuisé **en cours** de
+  boucle de disposition : les candidats `Clean` restants ne sont ni fauchés ni
+  refusés, donc échappent à ce tick — transitoire ≤ 10 min, et le fermer
+  demanderait un refus synthétique pour un worktree que rien ne refuse,
+  c'est-à-dire une ligne d'audit fausse).
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les
+  greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
+  personne ne les exécute**.
+
+#### Hors périmètre, délibérément
+
+- **Les répertoires de build hors `target/` et hors `.pilot-scratch/`** (un
+  `CARGO_TARGET_DIR` posé ailleurs dans le worktree) : hors population. Armer une
+  découverte sur tout le worktree serait une marche non bornée, et aucune mesure
+  ne montre cette population.
+- **`CARGO_TARGET_DIR` partagé** et **une purge à la fin de chaque dispatch** —
+  refusés par mika#2497 avec leurs motifs écrits, inchangés.
+- **Rendre `rm`/`rmdir` sous `.pilot-scratch/` survivable côté politique
+  claude-pilot** — suivi déjà nommé par mika#2548, sans rapport avec ce code.
+- **Le vocabulaire du faucheur** (`ALL_REFUSAL_REASONS`) — aucun motif ajouté,
+  retiré ni renommé. Seule leur **classification** est nouvelle.
 
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 

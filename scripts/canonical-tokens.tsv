@@ -335,6 +335,35 @@ rescue-pipeline-verified	B	crates/mika-agent/src/wip_rescue.rs::PIPELINE_VERIFIE
 # declare before it existed — creating it and declaring it belong to one commit.
 PLATFORM_DIR	B	crates/mika-agent/src/skills/executor.rs::PLATFORM_DIR_RELAY_KEY	exact:literal
 
+# ── Marqueur de cache de build (mika#2619). Le nom par lequel un outil DÉCLARE
+#    lui-même « ceci est un cache », et que le bras de purge lit pour reconnaître
+#    un répertoire de build hors `target/`.
+#
+# Classe B, et le lecteur est l'argument : `dir.join(CACHEDIR_TAG_MARKER).is_file()`
+# fait comparer le nom par le SYSTÈME DE FICHIERS, octet pour octet. Une variante
+# de casse n'est pas mal lue bruyamment — elle n'est pas lue du tout,
+# `is_cargo_build_dir` rend `false`, et le répertoire quitte la population en
+# silence, c'est-à-dire des dizaines de Go que plus rien ne voit. Même forme et
+# même raison que `PLATFORM_DIR` ci-dessus, où `std::env::var` compare de la même
+# manière et retombe sur son défaut sans rien dire. D'où `exact:literal`.
+#
+# Le jeton est écrit `CACHEDIR` et non `CACHEDIR.TAG` parce que c'est ce que le
+# survey produit : sa règle ALL-CAPS ne joint qu'à travers ` ` ou `-`, donc elle
+# s'arrête au `.`. Même écart que `SURFACE` pour `API-SURFACE:` (classe A) et que
+# `VERDICT` pour `DEADLINE_VERDICT_LINE` — la ligne est écrite comme le survey la
+# rend, jamais comme un humain la lirait.
+#
+# `CARGO_INFO_MARKER` (`.rustc_info.json`), le marqueur frère lu par la MÊME
+# fonction, n'est PAS déclaré : il est en minuscules, donc il ne forme aucun jeton
+# ALL-CAPS et il est hors de la population du survey. Nommé ici pour qu'un futur
+# lecteur ne le croie ni oublié ni autorisé à sortir de l'inventaire — sa
+# tolérance est la même, seule sa forme l'en exclut.
+#
+# Déclaré plutôt qu'allowlisté (§ D5/D6) : la constante est NEUVE dans ce ticket,
+# donc il n'y avait rien à déclarer avant qu'elle existe — la créer et la déclarer
+# appartiennent à un seul commit, exactement comme `PLATFORM_DIR` en mika#2536.
+CACHEDIR	B	crates/mika-agent/src/worktree_reaper.rs::CACHEDIR_TAG_MARKER	exact:literal
+
 # ── mika#2194 — le préfixe de refus du lecteur de callout, et pourquoi il est
 #    dans cet inventaire alors que ses deux aînés n'y sont pas.
 #
