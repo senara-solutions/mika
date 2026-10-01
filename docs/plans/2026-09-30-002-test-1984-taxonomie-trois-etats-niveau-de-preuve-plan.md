@@ -213,7 +213,7 @@ tier existant, hors du périmètre d'AC1.
 | refus | motif |
 |---|---|
 | **Détecter le témoignage dans le texte de la source** (« si la source cite un forum, refuser le tier fort quelle que soit la déclaration ») | Un lexique sur de la prose libre. `« le texte officiel mentionne les témoignages recevables »` le déclencherait. Dans un **helper de test** c'est pire que dans une garde : il rougirait une fixture correcte pour une raison que l'auteur ne voit pas. La classe refusée par mika#2292, mesurée par mika#2247 5f. |
-| **Vérifier que la source déclarée apparaît dans le tag** | Nouvelle sévérité sur un tier existant, non demandée. Et le coût penche du mauvais côté : un modèle nommant la même source autrement (`service-public.fr/…/F1050` au lieu de `page CNI officielle`) donnerait un **rouge sur une meilleure réponse**. |
+| **Vérifier que la source déclarée apparaît dans le tag** | Nouvelle sévérité sur un tier existant, non demandée. Et le coût penche du mauvais côté : un modèle nommant la même source autrement (`demarches-exemple.invalid/…/F1050` au lieu de `page CNI officielle`) donnerait un **rouge sur une meilleure réponse**. |
 | **Une garde EndTurn pour l'état 2** | Voir R2 motif 4 — lexique de mots ordinaires sur le registre famille. |
 | **Ajouter une séquence d'appel `web_search` à la fixture** | Le move 1 de la doc-solution mika#1970 : le tier mock teste la *forme de la réponse*, le tier real-provider teste le *séquencement d'outils*. ~40 lignes de fixture pour zéro pouvoir d'assertion. |
 | **Rejouer le cas passeport de FINDINGS** | Le move 3 de la même doc : corpus de recherche privé. La fixture prend une forme neutre de la même classe (renouvellement de CNI), pas une reconstitution. |
