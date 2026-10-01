@@ -4,7 +4,7 @@
 //!
 //! `db.rs` a deux régions dont la taille est **monotone** : le module de test
 //! (sorti par le volet A) et cette échelle. Une migration n'est jamais
-//! supprimée — v1 à v54, ajout pur, pour toujours. Les sections `impl Database`
+//! supprimée — v1 à v55, ajout pur, pour toujours. Les sections `impl Database`
 //! restantes croissent aussi, mais elles *churnent* : une méthode y est
 //! réécrite, remplacée, supprimée. Borner `db.rs` voulait donc dire sortir ses
 //! deux régions monotones, et cette phrase reste vraie quel que soit le taux de
