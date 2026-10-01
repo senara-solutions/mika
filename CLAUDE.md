@@ -4356,7 +4356,10 @@ termes P1–P5 ne bougent pas**, verrou de build compris.
   `discover_build_dirs` est le **site unique** de composition d'un tel chemin :
   `<worktree>/target` s'il existe (**sans condition de marqueur**, pour ne pas
   rétrécir la population d'aujourd'hui), puis une marche **bornée** (profondeur 3,
-  liens jamais suivis) sous `.pilot-scratch/`, retenant tout répertoire porteur
+  liens jamais suivis — **racine `.pilot-scratch` comprise**, qui doit être un vrai
+  répertoire : `read_dir` suit un lien, et un `.pilot-scratch` lié à celui d'un
+  voisin faisait entrer ses caches dans la population d'un worktree dont P3
+  n'interroge que les processus) sous `.pilot-scratch/`, retenant tout répertoire porteur
   d'un marqueur **sans y descendre** — un cache contient des sous-répertoires, et
   les énumérer serait une marche non bornée dans l'arborescence qu'on vient
   d'identifier comme un cache.
@@ -4370,6 +4373,19 @@ termes P1–P5 ne bougent pas**, verrou de build compris.
   nom** pour tout le reste — et c'est une preuve plus forte. Un répertoire qui n'en
   porte aucun n'est **pas reconnu**, donc n'entre dans aucune population : un
   brouillon de texte sous `.pilot-scratch/` ne produit **ni candidat ni refus**.
+  **Un marqueur n'est une preuve que comme fichier régulier**, jamais un lien
+  (`is_file` suivait un lien vers le marqueur d'un autre cache), et
+  `CACHEDIR.TAG` seulement s'il porte la signature de la spécification
+  (`CACHEDIR_TAG_SIGNATURE`, celle qu'écrit cargo) — un fichier simplement
+  *nommé* ainsi (fixture, note) rendait jetable tout son répertoire. Résidu nommé :
+  le contenu de `.rustc_info.json` n'est pas validé.
+
+- **Le répertoire supprimé appartient au worktree dont P3 a interrogé les
+  processus.** Garde tardive `build_dir_is_inside_worktree`, avant l'acquisition :
+  après canonicalisation des deux côtés, le répertoire doit être strictement sous
+  **ce** worktree, pas seulement sous un worktree géré. Elle couvre aussi un
+  composant parent remplacé par un lien entre la découverte et la suppression.
+  Refus sous `outside_managed_root`, aucun motif nouveau.
 
 - **La tension avec la règle de dispatch mika#2548 (« ne supprime JAMAIS un
   brouillon de `.pilot-scratch/` ») n'existe pas.** Cette règle s'adresse au

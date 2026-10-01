@@ -1409,7 +1409,10 @@ behavioural test reaches it.
 **no marker condition**, so today's population does not shrink, and returned even
 when it is not a directory so the `target_not_a_dir` motive survives instead of
 silently becoming `no_target_dir` — then a **bounded** walk under
-`.pilot-scratch/` (depth 3, symlinks never followed) keeping any directory that
+`.pilot-scratch/` (depth 3, symlinks never followed — **the `.pilot-scratch` root
+included**: `read_dir` follows a link, so a root symlinked to a neighbour's scratch
+used to pull the neighbour's caches into a population whose P3 only asks about
+*this* worktree's processes) keeping any directory that
 carries a marker **without descending into it**: a build cache contains
 subdirectories, and enumerating them would be an unbounded walk inside the very
 tree just identified as a cache.
@@ -1420,7 +1423,15 @@ being the standard by which a tool declares *itself* a cache, exactly the
 information the founding asymmetry asks for. So `build_dir_disposition` is **name
 OR marker**: keeping `ends_with("/target")` avoids shrinking the current
 population, adding the marker **replaces proof-by-name** for everything else — and
-it is the stronger proof. A directory carrying neither is **not recognised**, so it
+it is the stronger proof. **A marker is proof only as a regular file, and
+`CACHEDIR.TAG` only with the spec's signature** (`CACHEDIR_TAG_SIGNATURE`, what
+cargo writes): `is_file` followed links, and any file merely *named*
+`CACHEDIR.TAG` made its whole directory disposable. `.rustc_info.json` content
+is not validated (named residual). And the late guard now also requires
+`build_dir_is_inside_worktree` — the canonical build dir strictly under the
+canonical worktree P3 asked about, not merely under *a* managed worktree, which
+also covers a parent component swapped for a symlink between discovery and
+deletion. A directory carrying neither is **not recognised**, so it
 enters no population and **produces neither candidate nor refusal**: that is what
 keeps a text draft under `.pilot-scratch/` out of reach, and it is why the mika#2548
 dispatch rule is not in tension with this arm (that rule addresses the **pilot**
