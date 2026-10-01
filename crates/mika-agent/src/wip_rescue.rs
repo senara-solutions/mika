@@ -3180,12 +3180,12 @@ mod tests {
                 }
                 let content = std::fs::read_to_string(&path).expect("read of a source file");
                 scanned += 1;
-                // Production half only: a fixture argv in a `#[cfg(test)]` block
-                // is not a site that un-drafts anything.
-                let production = match content.find("#[cfg(test)]") {
-                    Some(i) => &content[..i],
-                    None => &content[..],
-                };
+                // Production half only: a fixture argv in the test module is not
+                // a site that un-drafts anything. Cut at the test MODULE, not at
+                // the first `#[cfg(test)]` — `builtin_handlers.rs` carries one on
+                // a constant at line ~674, and cutting there hid `run_gh` from
+                // this scan (review of PR #2628).
+                let production = crate::source_scan::production_half(&content);
                 let normalised: String = crate::source_scan::strip_comment_lines(production)
                     .split_whitespace()
                     .collect();

@@ -1811,15 +1811,14 @@ mod tests {
     /// Un garde de ce même fichier (`run_gh`'s argv scan) avait déjà dû écrire ce
     /// contournement ; mika#2575 l'a écrit une seconde fois dans son module.
     ///
-    /// L'ancre est la **déclaration du module**, pas l'attribut seul : c'est ce
-    /// qui distingue un bloc `#[cfg(test)]` sur une constante — qui appartient à
-    /// la production — du module de test, qui n'y appartient pas.
+    /// La coupe est celle de [`crate::source_scan::production_half`] — ancrée
+    /// sur la **déclaration du module** de test, pas sur l'attribut seul — que
+    /// le scan mika#2597 emploie aussi : un découpage, deux lecteurs.
     ///
     /// Déliberément local : corriger [`production_sources`] élargirait la
     /// population des cinq scans voisins (mika#2573, mika#2522, mika#2405, …),
     /// ce qui est un changement de leur périmètre et non du nôtre.
     fn production_sources_to_test_module() -> Vec<(String, String)> {
-        const TEST_MODULE_ANCHOR: &str = "\n#[cfg(test)]\nmod tests {";
         let crates_dir = repo_root().join("crates");
         let mut out = Vec::new();
         let mut stack = vec![crates_dir];
@@ -1853,10 +1852,7 @@ mod tests {
                 let Ok(content) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                let production = match content.find(TEST_MODULE_ANCHOR) {
-                    Some(i) => content[..i].to_string(),
-                    None => content,
-                };
+                let production = crate::source_scan::production_half(&content).to_string();
                 out.push((rel, production));
             }
         }
