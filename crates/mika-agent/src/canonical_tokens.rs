@@ -1054,6 +1054,101 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#1833 — les deux noms de recensement KG ont UN écrivain chacun.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Les deux noms naissent avec mika#1833 : il n'y a rien à exempter.
+    /// **Quand le scan tire, on retire le second écrivain ; on n'ajoute pas
+    /// de ligne** (doctrine mika#2201).
+    const KG_CENSUS_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// U3 — `domain_graph_empty` et `kg_budget_resolved` ont un écrivain
+    /// unique (mika#1833).
+    ///
+    /// C'est cette propriété qui rend les comptes de la §4 du plan **exacts**
+    /// plutôt que discutables entre deux sites. `domain_graph_empty` est la
+    /// sonde S2 — *l'hypothèse « graphe vide » est-elle vraie ?* — et son
+    /// régime attendu est zéro : un second écrivain rendrait une occurrence
+    /// inattribuable, c'est-à-dire ferait de la seule ligne qui tranche le
+    /// ticket une ligne qu'il faut d'abord enquêter. `kg_budget_resolved` est
+    /// la sonde S0, dont l'opérateur lit le `budget_source` pour choisir entre
+    /// trois remèdes.
+    ///
+    /// Aucun test comportemental ne voit cette classe : un second écrivain ne
+    /// rend **aucune décision fausse** le jour où il est écrit.
+    #[test]
+    fn mika1833_the_census_event_names_have_a_single_writer() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas
+        // lui-même quand un scan de source le lit.
+        let owners: &[(String, &str)] = &[
+            (
+                format!("domain_graph{}", "_empty"),
+                "crates/mika-agent/src/kg/domain_builder.rs",
+            ),
+            (
+                format!("kg_budget{}", "_resolved"),
+                "crates/mika-agent/src/server/mod.rs",
+            ),
+        ];
+
+        let sources = production_sources();
+
+        for (needle, owner) in owners {
+            let mut writers = Vec::new();
+            for (rel, content) in &sources {
+                if KG_CENSUS_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                    continue;
+                }
+                let carries = content
+                    .lines()
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                    })
+                    .any(|line| {
+                        string_literals(line)
+                            .iter()
+                            .any(|lit| lit.contains(needle.as_str()))
+                    });
+                if carries {
+                    writers.push(rel.clone());
+                }
+            }
+
+            // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement
+            // comme un scan propre (mika#2103 / mika#2205).
+            assert!(
+                writers.iter().any(|w| w == owner),
+                "mika#1833 — `{needle}` n'est écrit nulle part dans {owner} : \
+                 ce scan vise un nom mort, il ne vérifie rien"
+            );
+
+            let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+            assert!(
+                strangers.is_empty(),
+                "mika#1833 — `{needle}` a un second écrivain : {strangers:?}\n\n\
+                 RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+                 KG_CENSUS_SOLE_WRITER_EXCEPTIONS — le compte que ce nom \
+                 existe pour servir n'est exact que tant qu'un seul site \
+                 l'écrit."
+            );
+        }
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika1833_the_census_sole_writer_allowlist_is_empty() {
+        assert!(
+            KG_CENSUS_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "KG_CENSUS_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : une allowlist née vide est un emplacement où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
     /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
     #[test]
     fn mika2522_the_sole_writer_allowlist_is_empty() {

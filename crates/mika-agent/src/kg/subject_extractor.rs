@@ -850,14 +850,43 @@ impl SubjectExtractor {
     /// Enumerate and extract all pending docs for the agent (D7), capped by
     /// `budget` LLM calls.
     ///
-    /// `budget == 0` returns immediately with no LLM calls — the extraction
-    /// phase is effectively disabled for this invocation. On overflow the
-    /// method aborts cleanly, emits a `kg_budget_exhausted` WARN, and leaves
-    /// remaining docs pending for the next run (#757 R2). The aborted flag is
-    /// surfaced via `BatchStats::aborted_budget`.
+    /// **`budget == 0` est un no-op déclaré (mika#1833) :** la méthode rend
+    /// `BatchStats::default()` **avant** `get_pending_docs`. Le prédicat a un
+    /// lecteur unique, [`crate::kg::budget::phase_is_disabled`], dont la doc
+    /// porte le raisonnement.
+    ///
+    /// Deux choses changent par rapport à #757, et toutes deux vont dans le
+    /// sens de ce que la documentation prétendait déjà. La requête de
+    /// détection du pending n'est plus payée pour rien — c'était un coût
+    /// mesurable sur un corpus de plusieurs milliers de documents. Et
+    /// `aborted_budget` reste **faux** : « épuisé » décrit un budget consommé
+    /// en route, pas une phase que l'opérateur a désarmée, et le WARN
+    /// `kg_budget_exhausted` disait donc le contraire de ce qui se passait.
+    ///
+    /// Au-dessus de zéro, le comportement est inchangé : sur dépassement la
+    /// méthode abandonne proprement, émet un `kg_budget_exhausted` WARN et
+    /// laisse les documents restants en attente (#757 R2).
     pub async fn extract_pending(&self, budget: u32) -> Result<BatchStats> {
         let start = Instant::now();
         let agent_id = self.db.agent_id.clone();
+
+        if crate::kg::budget::phase_is_disabled(budget) {
+            // Le contrôle positif : sans cette ligne, « la phase est
+            // désarmée » et « la phase n'a pas tourné » rendraient des octets
+            // identiques (classe mika#2205).
+            info!(
+                trace_id = %self.trace_id,
+                agent_id = %agent_id,
+                scope = "extraction",
+                budget = 0,
+                event = "kg_phase_disabled_by_zero_budget",
+                "extraction phase disabled by a zero budget — no pending query issued"
+            );
+            return Ok(BatchStats {
+                duration_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            });
+        }
 
         // Query pending docs via kg_extractions tracking table.
         let pending_docs = self.get_pending_docs().await?;
@@ -871,11 +900,12 @@ impl SubjectExtractor {
         );
 
         // Batch-start operator-visibility log (#761).
-        let expected_cycles = if budget == 0 {
-            0u32
-        } else {
-            ((pending_docs.len() as u32).saturating_sub(1) / budget).saturating_add(1)
-        };
+        // Le garde `budget == 0` d'avant mika#1833 est retiré plutôt que
+        // conservé : le court-circuit au-dessus rend la branche inatteignable,
+        // et un second site testant le budget nul serait le second lecteur que
+        // `budget::phase_is_disabled` existe pour refuser.
+        let expected_cycles =
+            ((pending_docs.len() as u32).saturating_sub(1) / budget).saturating_add(1);
         info!(
             trace_id = %self.trace_id,
             agent_id = %agent_id,
@@ -898,20 +928,11 @@ impl SubjectExtractor {
             ..Default::default()
         };
 
-        if budget == 0 {
-            warn!(
-                trace_id = %self.trace_id,
-                agent_id = %agent_id,
-                scope = "extraction",
-                budget = 0,
-                pending_docs = pending_docs.len(),
-                event = "kg_budget_exhausted",
-                "MIKA_KG_BATCH_BUDGET=0 — skipping extraction (all docs stay pending)"
-            );
-            stats.aborted_budget = true;
-            stats.duration_ms = start.elapsed().as_millis() as u64;
-            return Ok(stats);
-        }
+        // Le second garde `budget == 0` d'avant mika#1833 vivait ici, APRÈS
+        // `get_pending_docs`. Il est remonté en tête de la fonction, avant la
+        // requête : c'est le déplacement qui achète la propriété de R2 (« un
+        // no-op déclaré, avant toute requête »), et non le simple fait de
+        // rendre tôt.
 
         // Load the domain roster once per batch (#1158). The roster is
         // identical across all docs in a batch (rebuilt only at server boot).

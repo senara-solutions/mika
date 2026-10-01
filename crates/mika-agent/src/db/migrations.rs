@@ -4,7 +4,7 @@
 //!
 //! `db.rs` a deux régions dont la taille est **monotone** : le module de test
 //! (sorti par le volet A) et cette échelle. Une migration n'est jamais
-//! supprimée — v1 à v54, ajout pur, pour toujours. Les sections `impl Database`
+//! supprimée — v1 à v55, ajout pur, pour toujours. Les sections `impl Database`
 //! restantes croissent aussi, mais elles *churnent* : une méthode y est
 //! réécrite, remplacée, supprimée. Borner `db.rs` voulait donc dire sortir ses
 //! deux régions monotones, et cette phrase reste vraie quel que soit le taux de
@@ -298,6 +298,85 @@ impl Database {
             info!(version = 54, "database migrated to v54");
         }
 
+        if (3..=54).contains(&version) {
+            self.migrate_v54_to_v55()?;
+            info!(version = 55, "database migrated to v55");
+        }
+
+        Ok(())
+    }
+
+    /// v54→v55 : l'index qui sert la détection du pending KG (mika#1833 R4).
+    ///
+    /// **Le coût que ça ferme.** Les trois requêtes de détection du pending
+    /// (`count_pending`, `count_pending_for_corpus`,
+    /// `get_pending_entities_for_corpus`) portent toutes la même sous-requête
+    /// corrélée, évaluée **une fois par ligne candidate** :
+    ///
+    /// ```sql
+    /// SELECT cs.extraction_trace_id
+    ///   FROM kg_chunk_subjects cs
+    ///  WHERE cs.subject_entity_id = e.id
+    ///  ORDER BY cs.created_at DESC LIMIT 1
+    /// ```
+    ///
+    /// L'index disponible est `idx_kg_cs_entity(docs_root_hash,
+    /// subject_entity_id)`, dont la **colonne de tête n'apparaît pas** dans ce
+    /// `WHERE` : SQLite ne peut donc pas l'utiliser en *seek* et retombe sur un
+    /// parcours de `kg_chunk_subjects`. Avec 1300-1500 entités sujettes et
+    /// plusieurs milliers de lignes de provenance, cela fait des millions de
+    /// visites de ligne — trois fois par tick pour un agent mono-corpus, six
+    /// fois plus pour mika-arch, qui déclare six corpora. C'est l'intégralité
+    /// des `duration_ms: 26000-48000` mesurés le 2026-07-26 : sous budget nul
+    /// il n'y avait aucun appel LLM à payer.
+    ///
+    /// **Ce second défaut survit au correctif du premier** : dès la
+    /// ré-activation du KG avec un budget non nul, les ticks de 26-48 s
+    /// reviendraient sans lui.
+    ///
+    /// L'index couvre la sous-requête sur ses deux colonnes et dans son ordre,
+    /// donc SQLite la sert en `SEARCH … USING INDEX` au lieu d'un `SCAN`.
+    ///
+    /// **Coût nommé** : un index de plus à maintenir à l'insertion dans
+    /// `kg_chunk_subjects`, donc une amplification d'écriture sur le chemin
+    /// d'extraction, bornée par le budget d'extraction.
+    ///
+    /// `idx_kg_cs_entity` n'est **pas** retiré : il sert les requêtes scopées
+    /// par corpus, qui sont une autre population. Retirer un index pour en
+    /// ajouter un autre serait un arbitrage que rien ici ne mesure.
+    ///
+    /// Additive, `CREATE INDEX IF NOT EXISTS`, aucune reconstruction de table.
+    ///
+    /// Renumérotée de v53→v54 à v54→v55 : mika#2192 (`worktree_claims`) a pris
+    /// le slot v54 entre le grooming et le merge. Même geste et même raison que
+    /// la renumérotation de mika#2202 quelques migrations plus haut.
+    fn migrate_v54_to_v55(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 55 {
+            return Ok(());
+        }
+        if version != 54 {
+            anyhow::bail!(
+                "migrate_v54_to_v55 called with unexpected baseline version {version} \
+                 (expected 54) — refusing to apply migration; investigate migration order"
+            );
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        tx.execute_batch(
+            "-- v55: mika#1833 — sert la sous-requête corrélée de détection du pending.
+             CREATE INDEX IF NOT EXISTS idx_kg_cs_entity_recent
+                 ON kg_chunk_subjects(subject_entity_id, created_at DESC);",
+        )?;
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (55)", [])?;
+        tx.commit()?;
+
+        info!("v54→v55: added idx_kg_cs_entity_recent (mika#1833)");
+
         Ok(())
     }
 
@@ -352,7 +431,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (54);
+            INSERT INTO schema_version (version) VALUES (55);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -936,6 +1015,13 @@ impl Database {
             );
             CREATE INDEX idx_kg_cs_chunk ON kg_chunk_subjects(docs_root_hash, chunk_id);
             CREATE INDEX idx_kg_cs_entity ON kg_chunk_subjects(docs_root_hash, subject_entity_id);
+            -- v55 (mika#1833) : sert la sous-requête corrélée de détection du
+            -- pending, dont le `WHERE` ne porte QUE `subject_entity_id` —
+            -- l'index juste au-dessus ne peut donc pas la servir en seek, sa
+            -- colonne de tête n'y apparaissant pas. Le clean slate doit le
+            -- porter : une base neuve naît directement à v55, donc
+            -- `migrate_v54_to_v55` ne la rattraperait jamais.
+            CREATE INDEX idx_kg_cs_entity_recent ON kg_chunk_subjects(subject_entity_id, created_at DESC);
             CREATE INDEX idx_kg_cs_trace ON kg_chunk_subjects(docs_root_hash, extraction_trace_id);
 
             -- KG relationship provenance: chunk -> subject relationship (shared by docs_root_hash — v27)

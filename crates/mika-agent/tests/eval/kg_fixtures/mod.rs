@@ -45,7 +45,15 @@ use mika_agent::db::{CURRENT_SCHEMA_VERSION, Database};
 // v53→v54 (mika#2192, renuméroté depuis v52→v53 par mika#2202 après collision
 // avec le v53 de #2189) ajoute la table `worktree_claims`. Table KG-indépendante,
 // aucun `seed_*` ne la touche ; seul le pin avance.
-const PINNED_SCHEMA_VERSION: i64 = 54;
+//
+// v54→v55 (mika#1833, renuméroté depuis v53→v54 après collision avec le v54 de
+// #2192) ajoute l'index `idx_kg_cs_entity_recent` sur
+// `kg_chunk_subjects(subject_entity_id, created_at DESC)`, qui sert la
+// sous-requête corrélée de détection du pending. **Additif et transparent pour
+// les fixtures** : aucune colonne, aucune contrainte, aucun `seed_*` à changer
+// — `seed_chunk_subject` écrit les deux colonnes indexées comme avant. Seul le
+// pin avance.
+const PINNED_SCHEMA_VERSION: i64 = 55;
 
 const _: () = assert!(
     CURRENT_SCHEMA_VERSION == PINNED_SCHEMA_VERSION,

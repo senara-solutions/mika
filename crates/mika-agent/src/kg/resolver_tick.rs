@@ -40,6 +40,14 @@ use tracing::{info, warn};
 /// Future tunable: `MIKA_KG_RESOLVER_TICK_INTERVAL_SECS`.
 const RESOLVER_TICK_INTERVAL_SECS: u64 = 30 * 60;
 
+/// Le motif porté par la ligne de complétion d'une phase désarmée (mika#1833).
+///
+/// **Format de fil** : il atterrit dans le journal que l'opérateur filtre
+/// (`jq 'select(.skipped_reason == "zero_budget")'`), donc deux orthographes
+/// couperaient une population en deux sans le dire. Un seul site de
+/// définition, épinglé par test.
+const ZERO_BUDGET_SKIP_REASON: &str = "zero_budget";
+
 /// Spawns a background tokio task that runs extraction + resolution every
 /// [`RESOLVER_TICK_INTERVAL_SECS`] for a single KG-enabled agent.
 ///
@@ -57,6 +65,10 @@ const RESOLVER_TICK_INTERVAL_SECS: u64 = 30 * 60;
 /// * `kg_config` — Agent's KG configuration. If `Disabled`, the task exits
 ///   immediately.
 /// * `budget` — Per-batch LLM call cap (from `MIKA_KG_BATCH_BUDGET`).
+/// * `global_home` — Home **global** (`~/.mika`), d'où le tick lit la
+///   sentinelle d'arrêt à chaud [`auto_pull_stop::KG_TICK_SCAN`] (mika#1833).
+///   Un paramètre, jamais une `Option` : un home absent serait un retour
+///   silencieux au comportement d'avant le correctif.
 /// * `interval_secs` — Tick interval override (for testing). Pass `None` to
 ///   use the default 30-minute interval.
 #[allow(clippy::too_many_arguments)]
@@ -67,6 +79,7 @@ pub fn spawn_resolver_tick_task(
     resolution_llm: Option<Arc<dyn LlmProvider>>,
     kg_config: &KgAgentConfig,
     budget: u32,
+    global_home: PathBuf,
     interval_secs: Option<u64>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -88,6 +101,14 @@ pub fn spawn_resolver_tick_task(
         let mut interval = tokio::time::interval(Duration::from_secs(secs));
         // Skip the first immediate fire — startup spawn covers it.
         interval.tick().await;
+
+        // Dernier état connu de la sentinelle, pour n'écrire une ligne
+        // d'audit que sur **transition** (mika#1833, doctrine mika#2131 :
+        // l'information durable est « le STOP a été armé à telle heure »,
+        // pas qu'il l'était encore à 14 h 32 — la vivacité est le rôle de la
+        // ligne INFO par tick). Perdu au redémarrage, à dessein : un process
+        // neuf re-photographie l'état qu'il trouve.
+        let stop_armed = std::sync::atomic::AtomicBool::new(false);
 
         loop {
             // Cooperative cancellation: exit between ticks on SIGTERM (#802).
@@ -114,6 +135,8 @@ pub fn spawn_resolver_tick_task(
                 &corpora_roots,
                 &docs_root_hashes,
                 budget,
+                &global_home,
+                &stop_armed,
                 &cancel,
             )
             .await;
@@ -130,9 +153,62 @@ async fn tick_body(
     corpora_roots: &[PathBuf],
     docs_root_hashes: &[String],
     budget: u32,
+    global_home: &std::path::Path,
+    stop_armed: &std::sync::atomic::AtomicBool,
     cancel: &CancellationToken,
 ) {
+    use std::sync::atomic::Ordering;
+
     let trace_id = mika_common::trace::generate_trace_id();
+
+    // mika#1833 — STOP à chaud, lu **en tête du corps**, avant toute requête
+    // et avant la résolution du moindre modèle. Le geste opérateur (`touch` /
+    // `rm` du fichier sentinelle) est documenté dans le `CLAUDE.md` racine :
+    // le chemin littéral est réservé à `auto_pull_stop.rs`, y compris en
+    // commentaire, et sa garde structurelle est délibérément littérale.
+    // Effectif au tick suivant (≤ 30 min), sans redémarrage et sans édition
+    // d'identité.
+    //
+    // Une ligne INFO par tick court-circuité, à dessein : pour un
+    // interrupteur, la vivacité **est** l'information (doctrine mika#2329,
+    // Signal P de mika#2156). Poser le fichier et ne pas voir la ligne dans
+    // les 30 minutes est un signal immédiat que le lecteur regarde ailleurs
+    // que là où l'opérateur écrit. La ligne d'audit, elle, n'est écrite que
+    // sur transition.
+    //
+    // **Aucune row n'est touchée** : le tick continue de tourner, c'est son
+    // corps qui rend la main.
+    let stopped =
+        crate::auto_pull_stop::is_stopped(global_home, crate::auto_pull_stop::KG_TICK_SCAN);
+    let was_armed = stop_armed.swap(stopped, Ordering::Relaxed);
+    if stopped {
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            stop_file = %crate::auto_pull_stop::stop_file_path(
+                global_home,
+                crate::auto_pull_stop::KG_TICK_SCAN,
+            )
+            .display(),
+            event = "kg_tick_stop_armed",
+            "KG ingestion tick short-circuited by the stop sentinel — no row touched"
+        );
+        if !was_armed {
+            record_stop_transition(agent_id, db, global_home, "armed").await;
+        }
+        return;
+    }
+    if was_armed {
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            event = "kg_tick_stop_lifted",
+            "KG ingestion tick resumed — stop sentinel removed"
+        );
+        record_stop_transition(agent_id, db, global_home, "lifted").await;
+    }
 
     // --- Phase 1: Extraction (#1052) ---
     // Run extraction before resolution so newly-extracted entities are
@@ -181,6 +257,55 @@ async fn tick_body(
     }
 }
 
+/// Une transition de la sentinelle d'arrêt du tick KG, écrite en
+/// `audit_events` (mika#1833).
+///
+/// Un `tool_name` **distinct** de ceux des deux autres scans
+/// (`auto_pull_stop`, `worktree_reap_stop`) : c'est ce qui laisse l'opérateur
+/// compter trois populations séparément — motif `phantom_aged_out` /
+/// `phantom_sweep_spared` (mika#2156). Une ligne par transition, jamais par
+/// tick (doctrine mika#2131).
+///
+/// Fire-and-forget : une écriture d'audit qui échoue ne doit pas pouvoir
+/// changer ce que la sentinelle décide.
+async fn record_stop_transition(
+    agent_id: &str,
+    db: &AsyncDatabase,
+    global_home: &std::path::Path,
+    state: &str,
+) {
+    if let Err(e) = db
+        .log_audit_event(
+            // Underscores, comme le `tool_name` — et surtout pas le littéral
+            // du chemin du fichier, que la garde structurelle de
+            // `auto_pull_stop.rs` réserve à ce module-là.
+            &format!("kg_tick_stop-{agent_id}"),
+            "kg_tick_stop",
+            "scan:kg_tick",
+            None,
+            Some(state),
+            Some(&format!(
+                "fichier sentinelle : {}",
+                crate::auto_pull_stop::stop_file_path(
+                    global_home,
+                    crate::auto_pull_stop::KG_TICK_SCAN,
+                )
+                .display()
+            )),
+            None,
+        )
+        .await
+    {
+        warn!(
+            agent_id = %agent_id,
+            state = %state,
+            error = %e,
+            event = "kg_tick_stop_audit_failed",
+            "failed to record KG tick stop transition"
+        );
+    }
+}
+
 /// Extraction phase of the periodic tick (#1052).
 ///
 /// Counts pending docs per corpus, allocates budget fairly, then runs
@@ -196,6 +321,23 @@ async fn tick_extraction(
     trace_id: &str,
     cancel: &CancellationToken,
 ) {
+    // mika#1833 — court-circuit **avant** `count_pending_docs`, qui est là où
+    // le coût vit. La ligne de complétion est conservée : sans elle, « le tick
+    // tourne et ne fait rien » et « le tick ne tourne pas » rendraient des
+    // octets identiques (classe mika#2205).
+    if crate::kg::budget::phase_is_disabled(budget) {
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            total_pending = Option::<u32>::None,
+            skipped_reason = ZERO_BUDGET_SKIP_REASON,
+            event = "kg_extraction_tick.complete",
+            "extraction phase disabled by a zero budget — no counting query issued"
+        );
+        return;
+    }
+
     // Phase 1: Count pending docs per corpus.
     let mut corpus_pending: Vec<u32> = Vec::new();
     let mut extractors: Vec<SubjectExtractor> = Vec::new();
@@ -301,6 +443,25 @@ async fn tick_resolution(
     trace_id: &str,
     cancel: &CancellationToken,
 ) {
+    // mika#1833 — même court-circuit que la phase d'extraction, et pour la
+    // même raison : `count_pending` porte la sous-requête corrélée sur
+    // `kg_chunk_subjects` mesurée à 26-48 s par tick sous budget nul.
+    //
+    // `pending_before` est **absent**, jamais `0` : le comptage n'a pas eu
+    // lieu, il n'a pas rendu zéro (motif mika#2331 — `null` n'est jamais `0`).
+    if crate::kg::budget::phase_is_disabled(budget) {
+        info!(
+            target: "mika::otel",
+            trace_id = %trace_id,
+            agent_id = %agent_id,
+            pending_before = Option::<u64>::None,
+            skipped_reason = ZERO_BUDGET_SKIP_REASON,
+            event = "kg_resolver_tick.complete",
+            "resolution phase disabled by a zero budget — no counting query issued"
+        );
+        return;
+    }
+
     let resolver = SubjectEntityResolver::new(
         db.clone(),
         llm.clone(),
@@ -525,6 +686,291 @@ async fn check_no_match_rate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    // -- capture tracing (même forme que `tests/llm_call_attempt_2342.rs`) --
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        fields: HashMap<String, String>,
+    }
+
+    struct CapturingLayer {
+        events: StdArc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            let mut visitor = FieldVisitor(&mut fields);
+            event.record(&mut visitor);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(CapturedEvent { fields });
+            }
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn capture() -> (
+        tracing::subscriber::DefaultGuard,
+        StdArc<Mutex<Vec<CapturedEvent>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = StdArc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer {
+            events: StdArc::clone(&events),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+        (guard, events)
+    }
+
+    fn events_named(events: &StdArc<Mutex<Vec<CapturedEvent>>>, name: &str) -> Vec<CapturedEvent> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.fields.get("event").map(String::as_str) == Some(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Une base neuve plus un home global neuf, pour les tests de tick.
+    ///
+    /// L'agent est inséré : `audit_events.agent_id` porte une clé étrangère
+    /// vers `agents(id)`, donc sans lui la ligne d'audit du STOP échouerait —
+    /// et le test lirait « aucune transition écrite » alors que le défaut
+    /// serait dans la fixture.
+    fn tick_fixture() -> (tempfile::NamedTempFile, tempfile::TempDir, AsyncDatabase) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Database::open(tmp.path()).unwrap();
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO agents (id, name, home_dir) VALUES (?1, ?1, '')",
+                rusqlite::params!["test-agent"],
+            )
+            .expect("seed agent row");
+        let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+        let home = tempfile::tempdir().unwrap();
+        (tmp, home, async_db)
+    }
+
+    /// V4 — le tick désarmé émet quand même sa ligne de complétion
+    /// (mika#1833 R2).
+    ///
+    /// Sans elle, R2 rendrait le tick **muet** et le contrôle positif serait
+    /// perdu : « le tick tourne et ne fait rien » et « le tick ne tourne pas »
+    /// rendraient des octets identiques (classe mika#2205). Et
+    /// `pending_before` doit être **absent**, jamais `0` — le comptage n'a pas
+    /// eu lieu, il n'a pas rendu zéro (motif mika#2331).
+    #[tokio::test]
+    async fn mika1833_zero_budget_tick_still_emits_its_completion_line() {
+        let (_tmp, home, db) = tick_fixture();
+        let (_guard, events) = capture();
+
+        tick_body(
+            "test-agent",
+            &db,
+            &None,
+            &None,
+            &[PathBuf::from("/nonexistent")],
+            &["abcdef1234567890".to_string()],
+            0, // budget nul
+            home.path(),
+            &std::sync::atomic::AtomicBool::new(false),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let completions = events_named(&events, "kg_resolver_tick.complete");
+        assert_eq!(
+            completions.len(),
+            1,
+            "le tick désarmé doit rester audible — une ligne de complétion, \
+             exactement"
+        );
+        assert_eq!(
+            completions[0]
+                .fields
+                .get("skipped_reason")
+                .map(String::as_str),
+            Some(ZERO_BUDGET_SKIP_REASON),
+            "…et dire pourquoi il n'a rien fait"
+        );
+        // `tracing` n'enregistre AUCUN champ pour un `Option::None`, donc la
+        // clé est absente de l'événement et sort `null` en JSON. C'est très
+        // exactement ce que R2 demande : `pending_before: null`, jamais `0` —
+        // le comptage n'a pas eu lieu, il n'a pas rendu zéro (mika#2331).
+        assert!(
+            !completions[0].fields.contains_key("pending_before"),
+            "`pending_before` doit être ABSENT (donc `null` en JSON), jamais \
+             `0` : annoncer zéro serait affirmer un comptage qui n'a pas eu \
+             lieu. Champs observés : {:?}",
+            completions[0].fields.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// V5 — la sentinelle court-circuite le tick, et son retrait le reprend
+    /// (mika#1833 R5).
+    ///
+    /// Le contrôle négatif — la seconde moitié — est ce qui distingue « la
+    /// sentinelle décide » de « le tick est mort ».
+    #[tokio::test]
+    async fn mika1833_the_stop_sentinel_short_circuits_the_tick() {
+        let (_tmp, home, db) = tick_fixture();
+        let stop_path =
+            crate::auto_pull_stop::stop_file_path(home.path(), crate::auto_pull_stop::KG_TICK_SCAN);
+        std::fs::create_dir_all(stop_path.parent().unwrap()).unwrap();
+        std::fs::write(&stop_path, "").unwrap();
+
+        let armed = std::sync::atomic::AtomicBool::new(false);
+
+        {
+            let (_guard, events) = capture();
+            tick_body(
+                "test-agent",
+                &db,
+                &None,
+                &None,
+                &[PathBuf::from("/nonexistent")],
+                &["abcdef1234567890".to_string()],
+                500, // budget non nul : seule la sentinelle peut couper
+                home.path(),
+                &armed,
+                &CancellationToken::new(),
+            )
+            .await;
+
+            assert_eq!(
+                events_named(&events, "kg_tick_stop_armed").len(),
+                1,
+                "un tick court-circuité doit le dire — pour un interrupteur, \
+                 la vivacité EST l'information (mika#2329)"
+            );
+            assert!(
+                events_named(&events, "kg_resolver_tick.start").is_empty(),
+                "…et ne doit avoir émis aucune requête de résolution"
+            );
+        }
+
+        // La ligne d'audit n'est écrite qu'une fois, sur la transition.
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string()],
+            "une ligne d'audit par transition"
+        );
+
+        // Second tick, sentinelle TOUJOURS posée, même `armed` : la ligne INFO
+        // se répète (la vivacité est l'information), la ligne d'audit NON.
+        // Sans ce second tick, retirer la garde `if !was_armed` laissait ce
+        // test vert — un seul tick ne distingue pas « par transition » de
+        // « par tick ».
+        {
+            let (_guard, events) = capture();
+            tick_body(
+                "test-agent",
+                &db,
+                &None,
+                &None,
+                &[PathBuf::from("/nonexistent")],
+                &["abcdef1234567890".to_string()],
+                500,
+                home.path(),
+                &armed,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                events_named(&events, "kg_tick_stop_armed").len(),
+                1,
+                "chaque tick court-circuité le dit"
+            );
+        }
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string()],
+            "une ligne d'audit par transition, jamais par tick : un second tick \
+             armé ne doit rien écrire"
+        );
+
+        // Contrôle négatif : la sentinelle retirée, le tick reprend.
+        std::fs::remove_file(&stop_path).unwrap();
+        let (_guard, events) = capture();
+        tick_body(
+            "test-agent",
+            &db,
+            &None,
+            &None,
+            &[PathBuf::from("/nonexistent")],
+            &["abcdef1234567890".to_string()],
+            500,
+            home.path(),
+            &armed,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            events_named(&events, "kg_tick_stop_armed").is_empty(),
+            "sentinelle retirée : plus de court-circuit"
+        );
+        assert_eq!(
+            events_named(&events, "kg_tick_stop_lifted").len(),
+            1,
+            "…et la levée est dite, une fois"
+        );
+        assert_eq!(
+            events_named(&events, "kg_resolver_tick.start").len(),
+            1,
+            "le tick reprend réellement son travail — sans ce contrôle, « la \
+             sentinelle décide » serait indistinguable de « le tick est mort »"
+        );
+        assert_eq!(
+            stop_transitions(&db).await,
+            vec!["armed".to_string(), "lifted".to_string()],
+            "la levée est une transition, donc une seconde ligne d'audit, et la \
+             seule"
+        );
+    }
+
+    /// Les `after_value` des lignes d'audit `kg_tick_stop`, dans l'ordre
+    /// d'écriture.
+    async fn stop_transitions(db: &AsyncDatabase) -> Vec<String> {
+        db.with_db(|db| {
+            let mut stmt = db.conn.prepare(
+                "SELECT after_value FROM audit_events \
+                 WHERE tool_name = 'kg_tick_stop' ORDER BY rowid",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+        .expect("audit query")
+    }
 
     /// Test that `spawn_resolver_tick_task` with a disabled KG config
     /// exits immediately and produces a completed handle.
@@ -535,6 +981,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::Database::open(tmp.path()).unwrap();
         let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+        let home = tempfile::tempdir().unwrap();
 
         let kg_config = KgAgentConfig::Disabled {
             reason: DisabledReason::OperatorOptOut,
@@ -547,6 +994,7 @@ mod tests {
             None, // resolution_llm
             &kg_config,
             500,
+            home.path().to_path_buf(),
             Some(1), // 1-second interval (won't fire since task exits)
             CancellationToken::new(),
         );
@@ -567,6 +1015,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::Database::open(tmp.path()).unwrap();
         let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+        let home = tempfile::tempdir().unwrap();
 
         let kg_config = KgAgentConfig::Enabled {
             corpora: vec![CorpusConfig {
@@ -582,6 +1031,7 @@ mod tests {
             None, // resolution_llm
             &kg_config,
             500,
+            home.path().to_path_buf(),
             Some(3600), // long interval so we can abort before it fires
             CancellationToken::new(),
         );
@@ -603,6 +1053,7 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = crate::db::Database::open(tmp.path()).unwrap();
         let async_db = AsyncDatabase::new_with_agent(db, "test-agent");
+        let home = tempfile::tempdir().unwrap();
 
         let kg_config = KgAgentConfig::Enabled {
             corpora: vec![CorpusConfig {
@@ -619,6 +1070,7 @@ mod tests {
             None,
             &kg_config,
             500,
+            home.path().to_path_buf(),
             Some(3600), // long interval
             cancel.clone(),
         );

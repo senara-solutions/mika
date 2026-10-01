@@ -1129,16 +1129,27 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             &agent_infos,
         );
         match builder.rebuild().await {
-            Ok(stats) => info!(
-                event = "domain_rebuild_complete",
-                added = stats.entities_added,
-                updated = stats.entities_updated,
-                removed = stats.entities_removed,
-                depends_on = stats.edges_depends_on,
-                provides = stats.edges_provides,
-                duration_ms = stats.duration_ms,
-                "domain graph ready"
-            ),
+            // mika#1833 R6 — ce site porte le même nom d'événement que celui
+            // de `DomainGraphBuilder::rebuild`, et donc les mêmes champs de
+            // recensement : sans quoi le `jq '{entities_total, per_type}'` de
+            // la sonde S2 rendrait `null` une fois sur deux, ce qui se lit
+            // exactement comme un binaire antérieur au correctif.
+            Ok(stats) => {
+                let per_type =
+                    crate::kg::domain_builder::census_json(stats.entities_total_per_type.as_ref());
+                info!(
+                    event = "domain_rebuild_complete",
+                    added = stats.entities_added,
+                    updated = stats.entities_updated,
+                    removed = stats.entities_removed,
+                    depends_on = stats.edges_depends_on,
+                    provides = stats.edges_provides,
+                    entities_total = stats.entities_total,
+                    per_type = per_type.as_deref(),
+                    duration_ms = stats.duration_ms,
+                    "domain graph ready"
+                )
+            }
             Err(e) => warn!(
                 error = %e,
                 "domain graph rebuild failed; KG queries may return stale results until next restart"
@@ -1334,6 +1345,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
                     let extraction_agent = agent_name_clone.clone();
                     let handle = tokio::spawn(async move {
+                        // mika#1833 — sous budget nul la phase est désarmée, et
+                        // le court-circuit précède les requêtes de comptage
+                        // ci-dessous, comme au tick. `kg_budget_resolved` dit
+                        // déjà `extraction_armed = false` pour cet agent.
+                        if crate::kg::budget::phase_is_disabled(budget) {
+                            return;
+                        }
+
                         // Phase 1: Count pending docs per corpus.
                         let mut corpus_pending: Vec<u32> = Vec::new();
                         let mut extractors: Vec<crate::kg::subject_extractor::SubjectExtractor> =
@@ -1478,6 +1497,49 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 None => None,
             };
 
+            // mika#1833 — le budget en vigueur est DIT, une fois par agent et
+            // par démarrage, sur **toutes** les branches y compris saine.
+            //
+            // Doctrine mika#2293, citée parce qu'elle décrit ce ticket mot
+            // pour mot : *un réglage qu'on ne peut pas observer n'est pas un
+            // réglage, c'est un espoir.* `MIKA_KG_BATCH_BUDGET=0` était en
+            // vigueur sur l'hôte depuis deux mois sans qu'aucune ligne ne le
+            // dise, et c'est ce qui a fait chercher la cause dans le graphe de
+            // domaine plutôt que dans la configuration.
+            //
+            // La boucle est **distincte** de celle du spawn ci-dessous, et
+            // délibérément **sans** son `continue` sur `KgAgentConfig::Disabled` :
+            // un agent dont le KG est coupé est précisément celui dont
+            // l'opérateur se demande pourquoi il ne tique pas. C'est la
+            // question §1.6 du plan — pourquoi `mika` tique encore et pas les
+            // quatre autres — et `kg_enabled` la tranche en une ligne.
+            //
+            // **Son absence signifie « binaire antérieur au correctif »**
+            // (classe mika#2340), jamais « tout va bien ».
+            for entry in agents.iter() {
+                let agent_name = entry.key();
+                let agent_state = entry.value();
+                let kg_enabled = matches!(agent_state.kg_config, KgAgentConfig::Enabled { .. });
+                let armed = kg_enabled && !crate::kg::budget::phase_is_disabled(kg_batch_budget);
+                info!(
+                    agent_id = agent_name.as_str(),
+                    budget = kg_batch_budget,
+                    // `config` ⇒ quelqu'un l'a posé, la cause est la
+                    // configuration ; `default` ⇒ c'est le défaut 500, et la
+                    // cause est ailleurs. Deux remèdes opposés.
+                    budget_source = if settings.kg_batch_budget.is_some() {
+                        "config"
+                    } else {
+                        "default"
+                    },
+                    kg_enabled,
+                    resolution_armed = armed,
+                    extraction_armed = armed && extraction_llm_for_tick.is_some(),
+                    resolution_model_configured = resolution_llm.is_some(),
+                    event = "kg_budget_resolved",
+                );
+            }
+
             for entry in agents.iter() {
                 let agent_name = entry.key();
                 let agent_state = entry.value();
@@ -1578,6 +1640,9 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     resolution_llm.clone(),
                     &agent_state.kg_config,
                     kg_batch_budget,
+                    // mika#1833 — d'où le tick lit sa sentinelle d'arrêt à
+                    // chaud (`auto_pull_stop::KG_TICK_SCAN`).
+                    global_home.clone(),
                     None, // default 30-min interval
                     kg_shutdown_token.child_token(),
                 );
