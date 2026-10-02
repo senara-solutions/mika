@@ -770,6 +770,7 @@ une ligne neutre cherche dans le voisinage de 5h-bis.
   | provenance | détection positive ⇒ |
   |---|---|
   | `writer` | **une** re-rédaction (nomme la doctrine, modèle du re-prompt 5h) ; re-test ; encore sale, vide, ou en erreur ⇒ ligne neutre |
+  | `workspace_fallback` | ligne neutre directement — le rédacteur a dépassé son enveloppe, le texte est le repli workspace (#1128) et **aucun rédacteur ne l'a écrit** (constat de revue) |
   | `conversational_gate` | ligne neutre directement |
   | `no_delegation` | ligne neutre directement |
 
@@ -830,7 +831,7 @@ SELECT r.id, t.name AS team_name, r.status, r.started_at
 |---|---|---|---|
 | `channel = "team_deliverable"` | WARN | **zéro** | chaque ligne est un livrable arrêté avant la personne **et** avant la base |
 | `_uncorrected`, `deliverable_source = "writer"` | WARN | **zéro** | la re-rédaction a échoué **après** que 5h a aussi échoué : lire le prompt servi au rédacteur **avant** de toucher au prédicat |
-| `_uncorrected`, `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
+| `_uncorrected`, `workspace_fallback` \| `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
 | un même `team_run_id` portant plusieurs refus | WARN | **anomalie** | un seul retry est prévu, donc deux lignes signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
 | `channel != "team_deliverable"` | — | **non vide** | le contrôle positif : zéro partout ne prouve rien |
 

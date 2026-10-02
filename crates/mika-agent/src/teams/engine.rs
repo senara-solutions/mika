@@ -84,9 +84,19 @@ pub(crate) const TEAM_DELIVERABLE_WITHHELD: &str = "The team finished its work, 
 /// `prompt::hosting_ground_truth_line`, mika#2290): a fifth site of pose will
 /// not compile until it decides its disposition.
 enum DeliverableSource {
-    /// Site 1 — `deliver_phase`, from [`TeamEngine::deliver`]. A writer agent
-    /// exists and is nameable, so a re-write can be asked of it.
+    /// Site 1 — `deliver_phase`, from [`TeamEngine::deliver`] when the writer's
+    /// turn **completed**. A writer agent exists, is nameable, and wrote this
+    /// text, so a re-write can be asked of it.
     Writer { agent_name: String },
+    /// Site 1 — `deliver_phase`, from [`TeamEngine::deliver`] when the writer's
+    /// turn **timed out**: the text is the #1128 workspace fallback (the
+    /// specialist outputs concatenated) or, with an empty workspace, the
+    /// timeout reason. **No writer wrote it**, so a re-write would tell the
+    /// agent that just exhausted its envelope a false fact about its own turn
+    /// ("the deliverable you just produced"), and spend a second full envelope
+    /// inside the run's 900 s. Neutral line directly (review finding,
+    /// adversarial P2).
+    WorkspaceFallback,
     /// Sites 2 and 3 — `GateOutcome::Conversational`, first pass and after the
     /// critic. The text is a **decomposition reply**, there is no writer, and
     /// `apply_delegation_gate` already practises a reinforced retry on that very
@@ -109,6 +119,7 @@ impl DeliverableSource {
     fn as_wire(&self) -> &'static str {
         match self {
             Self::Writer { .. } => "writer",
+            Self::WorkspaceFallback => "workspace_fallback",
             Self::ConversationalGate => "conversational_gate",
             Self::NoDelegation => "no_delegation",
         }
@@ -699,14 +710,12 @@ impl TeamEngine {
         self.emit_event(TeamEvent::Progress(
             "Producing final deliverable...".to_string(),
         ));
-        let produced = self.deliver().await?;
-        // Site 1 of four. The writer is resolved by the one reader both this
-        // site and `deliver` share, so the name carried into the re-write
-        // request cannot drift from the agent that produced the text.
-        let agent_name = self.resolve_writer_agent();
-        let deliverable = self
-            .commit_deliverable(produced, DeliverableSource::Writer { agent_name })
-            .await;
+        // Site 1 of four. `deliver` reports which arm produced the text: the
+        // writer (re-write possible) or the workspace fallback (no writer wrote
+        // it, so no re-write). The writer name is the one `deliver` ran, so it
+        // cannot drift from the agent that produced the text.
+        let (produced, source) = self.deliver().await?;
+        let deliverable = self.commit_deliverable(produced, source).await;
 
         // Write deliverable metadata. **The committed text, never the produced
         // one** — the workspace file is re-read by `read_workspace_fallback` on
@@ -789,7 +798,9 @@ impl TeamEngine {
                 self.attempt_deliverable_rewrite(agent_name, &proposal)
                     .await
             }
-            DeliverableSource::ConversationalGate | DeliverableSource::NoDelegation => None,
+            DeliverableSource::WorkspaceFallback
+            | DeliverableSource::ConversationalGate
+            | DeliverableSource::NoDelegation => None,
         };
 
         let committed = match rewritten {
@@ -915,11 +926,10 @@ impl TeamEngine {
     /// The writer agent for the deliver phase: a `communicator`/`writer` role if
     /// the team has one, else the orchestrator.
     ///
-    /// **One reader, two callers** ([`Self::deliver`] and
-    /// [`Self::deliver_phase`]). `deliver_phase` needs the name to carry it into
-    /// [`DeliverableSource::Writer`], and re-resolving it there would be a
-    /// second copy free to disagree with the agent that actually produced the
-    /// text — the `grooming_marker` class (mika#2158).
+    /// **One reader, one caller** ([`Self::deliver`]), which carries the name
+    /// it ran into [`DeliverableSource::Writer`] itself — so the provenance
+    /// cannot name an agent other than the one that produced the text, the
+    /// `grooming_marker` class (mika#2158).
     fn resolve_writer_agent(&self) -> String {
         self.team
             .agents
@@ -2035,9 +2045,13 @@ impl TeamEngine {
     ///
     /// On timeout, falls back to workspace content (#1128) rather than
     /// surfacing a misleading "Agent timed out" message.
-    async fn deliver(&self) -> Result<String> {
-        // Writer/communicator if the team has one, else the orchestrator — via
-        // the one reader `deliver_phase` also uses (mika#2633).
+    ///
+    /// Returns the text **and its provenance** (mika#2633): whether the writer
+    /// wrote it or the workspace fallback assembled it decides whether a
+    /// refusal may ask for a re-write, and only this function knows which arm
+    /// ran.
+    async fn deliver(&self) -> Result<(String, DeliverableSource)> {
+        // Writer/communicator if the team has one, else the orchestrator.
         let agent_name = self.resolve_writer_agent();
 
         let context = prompt::build_deliverable_context(&self.run);
@@ -2045,8 +2059,13 @@ impl TeamEngine {
             .run_agent(&agent_name, "Produce the final deliverable.", &context)
             .await?;
 
-        let response = match outcome {
-            TeamAgentOutcome::Done { text, .. } => text.unwrap_or_default(),
+        let (response, source) = match outcome {
+            TeamAgentOutcome::Done { text, .. } => (
+                text.unwrap_or_default(),
+                DeliverableSource::Writer {
+                    agent_name: agent_name.clone(),
+                },
+            ),
             TeamAgentOutcome::TimedOut(reason) => {
                 warn!(
                     target: "mika::otel",
@@ -2057,7 +2076,10 @@ impl TeamEngine {
                 );
                 // Workspace-content fallback (#1128): specialist outputs are already
                 // on disk — use them rather than surfacing a misleading timeout message.
-                self.read_workspace_fallback().unwrap_or(reason)
+                (
+                    self.read_workspace_fallback().unwrap_or(reason),
+                    DeliverableSource::WorkspaceFallback,
+                )
             }
         };
 
@@ -2083,7 +2105,7 @@ impl TeamEngine {
             warn!(error = %e, "failed to persist deliverable message");
         }
 
-        Ok(response)
+        Ok((response, source))
     }
 
     /// Read workspace files and format them as a fallback deliverable (#1128).
@@ -2903,6 +2925,7 @@ mod tests {
                 DeliverableSource::Writer {
                     agent_name: "scribe".to_string(),
                 },
+                DeliverableSource::WorkspaceFallback,
                 DeliverableSource::ConversationalGate,
                 DeliverableSource::NoDelegation,
             ] {
@@ -2926,15 +2949,16 @@ mod tests {
         }
     }
 
-    /// V3 — les deux provenances **sans** re-rédaction posent la ligne neutre,
-    /// et aucune proposition n'atteint `run.deliverable`.
+    /// V3 — les provenances **sans** re-rédaction posent la ligne neutre, et
+    /// aucune proposition n'atteint `run.deliverable`.
     ///
-    /// Deux cas distincts plutôt qu'un seul : une conjonction de provenances ne
+    /// Un cas par provenance plutôt qu'un seul : une conjonction de provenances ne
     /// se prouve pas en en convertissant une (leçon mika#2277, qui a dû livrer
     /// quatre contrôles négatifs à terme unique pour la même raison).
     #[tokio::test]
     async fn mika2633_v3_les_provenances_sans_redaction_posent_la_ligne_neutre() {
         for source in [
+            DeliverableSource::WorkspaceFallback,
             DeliverableSource::ConversationalGate,
             DeliverableSource::NoDelegation,
         ] {
@@ -3116,6 +3140,52 @@ mod tests {
         assert_eq!(committed, TEAM_DELIVERABLE_WITHHELD);
     }
 
+    /// Constat de revue (adversarial, P2) — un livrable **reconstitué depuis le
+    /// workspace** (#1128) n'est pas la sortie du rédacteur, donc il n'a pas de
+    /// re-rédaction.
+    ///
+    /// Le rédacteur vient de dépasser son enveloppe : lui demander de
+    /// « re-rédiger le livrable que tu viens de produire » lui affirme un fait
+    /// faux sur son propre tour, et dépense une seconde enveloppe entière à
+    /// l'intérieur des 900 s du run. La troisième réponse ci-dessous est propre :
+    /// si une re-rédaction était tentée, elle deviendrait le livrable et ce test
+    /// échouerait — c'est le discriminant.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mika2633_un_repli_workspace_na_pas_de_redaction() {
+        use mika_common::llm::mock::{delayed_response, text_response, tool_call_response};
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Deux appels de 250 s virtuelles chacun : le second rend la main au-delà
+        // de l'enveloppe de 300 s, donc le tour sort en `TimedOut` et `deliver`
+        // prend le repli workspace. Chaque appel reste sous le watchdog de
+        // mika#2342 (2 × 120 + 60 = 300 s), sinon le tour sortirait en erreur
+        // transport et le test changerait de sujet.
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![
+                delayed_response(
+                    250_000,
+                    tool_call_response("list_workspace", serde_json::json!({})),
+                ),
+                delayed_response(
+                    250_000,
+                    tool_call_response("list_workspace", serde_json::json!({})),
+                ),
+                text_response("Un rapport propre."),
+            ],
+        );
+        std::fs::write(tmp.path().join("workspace").join("specialist.md"), PROPOSAL).unwrap();
+
+        engine.deliver_phase().await.unwrap();
+
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD),
+            "un repli workspace porteur d'une proposition doit donner la ligne \
+             neutre directement, sans re-rédaction demandée au rédacteur"
+        );
+    }
+
     /// La ligne neutre est `Some(…)`, jamais `None` — sinon
     /// `teams::notification` rend « completed (no deliverable produced) », ce
     /// qui serait **faux** et rendrait un refus indistinguable d'un run sans
@@ -3148,6 +3218,10 @@ mod tests {
             }
             .as_wire(),
             "writer"
+        );
+        assert_eq!(
+            DeliverableSource::WorkspaceFallback.as_wire(),
+            "workspace_fallback"
         );
         assert_eq!(
             DeliverableSource::ConversationalGate.as_wire(),
