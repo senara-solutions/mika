@@ -1840,6 +1840,94 @@ dont le RESULT cite déjà la valeur — mais ça mériterait une ligne
   **désarmer le confinement bwrap** — arbitrage de sûreté qui appartient à un
   ticket qui le pèse. Suivi porté par l'umbrella mika#2491.
 
+### `shell-exec` refuse d'installer dans l'environnement Python de l'hôte (mika#2639)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce qu'elle garde **le même fichier** que mika#2536 et que
+l'opérateur qui lit un `REFUS (python-installer-guard, …)` cherche dans ce
+voisinage.
+
+- **Le défaut, mesuré le 2026-10-02** (trace `e9432d40-bdff-11f1-837b-27cfaa9b231b`).
+  mika-qa a lancé par `run_shell` (**hors bwrap**), en revue de cpp#273,
+  `pip install -e . -q --break-system-packages` ; le `[console_scripts]` de
+  claude-pilot a **réécrit `~/.local/bin/claude-pilot`** avec le shebang du
+  Python système : **2 h 45 de rail mort** (mika#2634). Sur 48 h, 43 `run_shell`
+  de mika-qa portaient `pip install` ; seuls les 5 avec ce drapeau ont pu
+  écrire, les 38 autres butant sur PEP 668. La protection tenait **par
+  accident**.
+
+- **Le site répond à l'AC4.** Quatrième scan lexical de
+  `templates/skills/shell-exec/handlers/run.sh`, après mika#1957 et mika#1991,
+  avant mika#2449 : le refus vaut pour **tout** agent qui porte `shell-exec`,
+  sans énumération. Le pourquoi (et pourquoi pas `BUILD_COMMAND_FAMILY`,
+  mika#2423, dont le prédicat est conditionné au budget) est au commentaire du
+  bloc ; le recensement des agents, la population ouverte et le canal `tmux` non
+  couvert : `crates/mika-agent/CLAUDE.md` § *The refusal is universal BY SITE*.
+  Harnais : `make test-python-installer-guard` (job CI
+  `python-installer-guard-lint`), contrôle négatif inclus.
+
+### Surfaces opérateur
+
+Aucun événement de journal neuf : le stderr d'avant-`eval` atteint déjà
+`tool_calls.output` (`execute_exec` combine les deux flux sur exit non nul et
+préfixe `Exit code: 1`).
+
+```sql
+-- 1. La garde a-t-elle mordu, et sur quel agent ? NON ancré en tête.
+SELECT agent_id, count(*) FROM tool_calls
+ WHERE tool_name = 'run_shell'
+   AND output LIKE '%REFUS (python-installer-guard, mika#2639)%'
+ GROUP BY 1 ORDER BY 2 DESC;
+
+-- 2. Par motif — deux LIKE explicites, jamais un substr sur un offset calculé.
+SELECT
+  sum(output LIKE '%mika#2639): host_installer%')   AS host_installer,
+  sum(output LIKE '%mika#2639): host_target_flag%') AS host_target_flag
+ FROM tool_calls WHERE tool_name = 'run_shell';
+
+-- 3. CONTRÔLE POSITIF — `run_shell` tourne-t-il seulement ?
+SELECT count(*) FROM tool_calls WHERE tool_name = 'run_shell';
+```
+
+| motif | régime attendu | lecture |
+|---|---|---|
+| `host_installer` | **non vide et DÉCROISSANT** | les premiers jours il porte le trafic mesuré (les 38 commandes que PEP 668 arrêtait), puis le substitut de `qa-review` doit le tarir — ce n'est pas une tempête de faux positifs. Couvre aussi `uv tool install\|upgrade`, la commande d'installation documentée de claude-pilot |
+| `host_target_flag` | proche de zéro | une forme venv portant `--user`/`--target`/… (ou son jumeau `PIP_*=`, ou `pip config set …break-system-packages`, ou `setup.py install\|develop --user`) : bonne recette, mauvais drapeau |
+| un pip de venv refusé derrière un enrobeur | faux positif **nommé** | le venv n'est neutralisé qu'en **position de commande** (début de ligne ou après `;` `&` `\|` `(`) ; `env X=1 .venv/bin/pip …` ou `sh -c "…"` refuse, fail-closed. Le geste est de le lancer en tête de commande |
+| flot soutenu d'un même agent après 7 jours | **anomalie** | le prompt ne l'atteint pas : lire `~/.mika/skills/.manifest-writer` **avant** de toucher au prédicat |
+| une ligne sur un `grep` de prose | faux positif **nommé** | contournement `grep 'pip[ ]install'`, rappelé par le corps du refus ; ne pas rétrécir la frontière arrière, elle ferme `pip install;` |
+
+### Sondes post-déploiement, et leurs haltes
+
+> **Préalable.** `templates/skills/` est une projection du **binaire** :
+> `cat ~/.mika/skills/.manifest-writer` doit porter le sha qu'on vient de bâtir,
+> sinon chaque sonde décrit le binaire d'hier (classe mika#2340).
+
+- **S1 — rejeu du défaut** (prochaine revue QA d'une PR claude-pilot). Attendu :
+  une ligne `host_installer` et `sha256sum < ~/.local/bin/claude-pilot`
+  identique avant/après. *Halte : le digest a bougé* — établir **par quelle
+  porte** (`tmux`, script du dépôt, évasion nommée, geste humain) avant
+  d'élargir le prédicat.
+- **S2 — décroissance sur 30 jours.** *Halte : plateau* — le prompt n'atteint
+  pas ce chemin ; vérifier le seed avant de toucher au bloc.
+- **S3 — bruit sur 7 jours** : aucun refus sur un `uv run pytest`. *Halte : une
+  occurrence* — désarmer d'abord (revert du bloc), diagnostiquer ensuite.
+- **S4 — canal `tmux`** (30 jours), précondition du suivi :
+  `SELECT id, created_at, substr(input,1,200) FROM tool_calls WHERE tool_name LIKE 'tmux%' AND (input LIKE '%pip install%' OR input LIKE '%uv pip%' OR input LIKE '%pipx install%');`
+  *Halte : des lignes* — le suivi s'ouvre avec ce compte. Zéro est un résultat,
+  pas une preuve de fermeture.
+- **Halte transverse.** Zéro refus **et** zéro `run_shell` ne prouve rien :
+  requête 3 d'abord (mika#2205).
+
+**Ce que ça n'achète pas :** ni le canal `tmux`, ni les évasions nommées
+(découpage de token, assemblage par variable dont `${IFS}`, continuation
+`\`-retour à la ligne, base64), ni le bac à sable de
+`shell-exec` (mika#2141, le mur). Il n'y avait aucun prompt fautif à corriger :
+les 43 commandes ont été composées par le modèle dans un vide de prescription,
+et `qa-review` reçoit une recette **absente**. La cause amont (un
+`pip install -e` qui écrase le lanceur) est une propriété du paquet
+claude-pilot.
+
 Optional (callback delivery bounds — mika#2179):
 - **The failure this bounds.** A `resume_agent` turn that errors on a callback used to write a `warn!` and nothing else: no counter, no audit event, no `next_fire_at`. The row stayed `status='completed'`, so `get_undelivered_callback_tasks` re-selected it on the very next 60s scan (`DB_SCAN_INTERVAL_TICKS`), and each attempt held the agent lock for up to `AGENT_TOTAL_TIMEOUT_SECS` (300s). The only stop condition was the LLM eventually succeeding. Measured on the night of 2026-09-03/04: 19 transport timeouts in four hours against callback `800d739f`, delivered **5 h 06** after it completed — an hour after its own parent (`ready-label: mika#2140`) had already died `phantom_aged_out` waiting for that return.
 - `MIKA_CALLBACK_DELIVERY_SLOW_THRESHOLD_SECS` — latency (seconds) above which a *successful* delivery is additionally warned about (default `3600`). **The measurement is unconditional and this variable does not gate it**: every delivery writes a `callback_delivered` audit event carrying `wait_secs` whatever the threshold. The value is chosen against a measurement rather than a feeling — over the 1628 callbacks delivered since 2026-08-01, `p50 = 377 s`, `p90 = 9585 s`; the ticket's proposed 900 s would have alerted on **33,7 %** of all deliveries, and a threshold that fires on a third of the population gets muted rather than acted on. 3600 s still fires on ~18 %, deliberately: that 18 % *is* the starvation. It is a threshold on a sick population, so if the provider-side cause is ever fixed this wants lowering.

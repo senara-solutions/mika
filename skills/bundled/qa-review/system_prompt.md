@@ -328,7 +328,7 @@ For each AC bullet, choose ONE classification:
 
 - **Behavioral** — testable by running the **already-built** binary or invoking a runtime surface. Heuristics: contains `mika ...` command names, references CLI output, JSON/text rendering, HTTP responses, runtime behavior verbs ("emits", "renders", "returns", "responds with").
 
-> **Never compile inside the review turn (mika#2276).** `cargo build/test/clippy`, `npm run build` and their kin are **not** available here, whatever an AC seems to ask. Measured on PR #2275: two `cargo test --release` calls ate 469 s of a ~506 s envelope and the turn died with no verdict. The engine now **refuses** such a command before it spawns (`"policy": "refusal"`, `build_command_exceeds_tool_budget`, mika#2423) — a guardrail, not a budget, and not a tool failure (Data Integrity Rules). Do NOT retry or rewrite the command. If a Behavioral AC needs a build, classify it from the **injected diff** (Step 3), with no tool call:
+> **Never compile inside the review turn (mika#2276).** `cargo build/test/clippy`, `npm run build` and their kin are **not** available here, whatever an AC seems to ask. The engine now **refuses** such a command before it spawns (`"policy": "refusal"`, `build_command_exceeds_tool_budget`, mika#2423) — a guardrail, not a budget, and not a tool failure (Data Integrity Rules). Do NOT retry or rewrite the command. If a Behavioral AC needs a build, classify it from the **injected diff** (Step 3), with no tool call:
 >
 > | diff state | classification | verdict |
 > |---|---|---|
@@ -336,7 +336,13 @@ For each AC bullet, choose ONE classification:
 > | present but `#[ignore]` or behind a `#[cfg(feature = …)]` CI does not cover | `[❌]` | `block[ac]` |
 > | no test for this AC in the diff | `[❌]` | `block[ac]` |
 >
-> The first row is safe because CI runs this build with no time limit, and `verdict_handler` refuses to merge a `pass` whose checks are failing (`server/verdict_handler.rs`, `CheckClassification::HasFailures`): deferring execution here does not defer the gate. Say so in the verdict. **Do NOT reclassify it CI-deferred** — 2.5.3's perimeter closure still applies.
+> The first row is safe because CI runs this build with no time limit, and `verdict_handler` refuses to merge a `pass` whose checks are failing: deferring execution here does not defer the gate. Say so in the verdict. **Do NOT reclassify it CI-deferred** — 2.5.3's perimeter closure still applies.
+>
+> **A Python repo is exercised from a venv under the worktree, never the host
+> (mika#2639).** `uv run pytest` from the worktree, or `python -m venv <worktree>/.venv
+> && <worktree>/.venv/bin/pip install -e <worktree>`. A host-wide install is refused before it
+> spawns (`REFUS (python-installer-guard, mika#2639)`) — a declared guardrail like the above, so it does NOT cap the verdict:
+> take one of those two routes and continue.
 - **Structural** — testable by grepping the diff or reading source. Heuristics: "field added to struct X", "function `foo` exists", "type signature contains Y", path-specific assertions.
 - **Documentation** — testable by reading a file path. Heuristics: "doc updated at `path`", "README mentions Z", "changelog entry added".
 - **CI-deferred** — explicitly defers to CI: "no test regressions", "lints clean", "tests pass". Heuristics: references `cargo test`, `npm test`, `cargo clippy`, generic test/lint verbs.

@@ -2962,6 +2962,62 @@ either, it just goes back to the default.
 Config, the four named `cwd` refusals, the operator query and the four halts: root
 `CLAUDE.md` § *`MIKA_PLATFORM_DIR` traverse enfin*.
 
+### The refusal is universal BY SITE, never by enumeration (mika#2639 AC4)
+
+`run_shell` refuses to install into the host's Python environment — the fourth
+lexical scan of `shell-exec/handlers/run.sh`, after mika#1957 and mika#1991,
+before the shared-checkout guard (mika#2449). Measured producer: mika-qa ran
+`pip install -e . --break-system-packages` against a claude-pilot worktree on
+2026-10-02; its `[console_scripts]` entry point rewrote
+`~/.local/bin/claude-pilot` and killed every pilot at launch for 2 h 45
+(mika#2634).
+
+**AC4 is answered by the SITE.** Which agents carry `shell-exec`:
+
+| allowlist | site | agent |
+|---|---|---|
+| `DEFAULT_AGENT_SKILL_ALLOWLIST` | `mika-common/src/home.rs` | `mika` personal / customer (tier `default`) |
+| `DEFAULT_IDENTITY` (TOML mirror; `home.rs` tests pin the equality) | `mika-common/src/home.rs` | idem |
+| `MIKA_DEV_IDENTITY` | `well_known_agents.rs` | mika-dev |
+| `MIKA_QA_IDENTITY` | `well_known_agents.rs` | mika-qa |
+
+Absent from `FAMILY_AGENT_SKILL_ALLOWLIST` (tiers `family`, `champion`),
+`MIKA_TEST_IDENTITY` and `MIKA_ARCH_SKILL_ALLOWLIST`. The plan's fifth row,
+`MIKA_RELAY_IDENTITY`, exists nowhere in `crates/` and is dropped; § *Skills
+System* still names it (pre-existing staleness, out of scope).
+
+**The real population is wider than those rows**, and that decided the site: an
+`identity.toml` with no `[skills].allowlist` is a no-op in
+`apply_identity_allowlist`, so every bundled skill — `shell-exec` included — is
+active (mika#1596 class). A per-agent refusal would be false by construction;
+the table is documentation, never a mechanism.
+
+**Two motifs, one definition site** (`_refuse_python_installer`, stderr +
+`exit 1`): `host_installer` (`pip`/`pipx`/`python -m pip` + install
+subcommand, or `uv tool install|upgrade`, after venv-qualified forms **in
+command position** are neutralised — a venv path passed as an option value,
+`python3 -X .venv/bin/python -m pip`, is not the interpreter invoked) and
+`host_target_flag` (`--break-system-packages`/`--user`/`--target`/`--prefix`/
+`--system` or its `PIP_*=` environment twin, **and** an install/develop verb
+**and** a named installer — `pip`/`pipx`/`uv`/`setup.py`; two terms refused
+`./configure --prefix=/usr && make install` — plus the persistent
+`pip config set <section>.break-system-packages|user|target|prefix`). The
+gap between binary and subcommand admits one separate option argument
+(`pip --cache-dir X install`); the review of the first version found each of
+these escapes, and `scripts/test-python-installer-guard.sh` pins every one.
+
+**`tmux` stays uncovered.** `tmux/handlers/create_session.sh` sends a
+model-supplied `$COMMAND` through `send-keys`, outside `run.sh`, and `tmux` is
+in mika-dev's and mika-qa's allowlists. Population unmeasured; follow-up gated
+on root probe S4.
+
+The substitute (`uv run`, or a venv under the worktree) is in
+`qa-review/system_prompt.md` next to **Never compile inside the review turn**;
+the prompt expresses the intent, this block holds it. Harness
+`scripts/test-python-installer-guard.sh`; operator surfaces and probes: root
+`CLAUDE.md` § *`shell-exec` refuse d'installer dans l'environnement Python de
+l'hôte*.
+
 ## MCP (Model Context Protocol) Client
 
 Connects to external MCP servers at startup via `McpManager`. Configured in `{agent_home}/mcp.json`. Supports stdio and Streamable HTTP transports. Tools namespaced as `mcp__{server}__{tool}`. Dispatch chain: builtins -> skills -> MCP -> unknown error. MCP tools excluded from silent/heartbeat mode. Child processes use `env_clear()` + allowlist.
