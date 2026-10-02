@@ -89,11 +89,42 @@ retry. No tool call is needed for it to fire, which is the whole point: the
 breach this document quotes ("A well-meaning 'I could help if you gave me Gmail
 access…'") is invisible to Layers 2/3/4 because nothing is ever called.
 
-Its reach is the turn's **final assistant text**, and only that. A proposal
-sent through the `send_message` tool — the only user channel of a silent turn
-(heartbeat, callback, reminder), and also reachable from a conversation turn —
-is not read by this guard, so that path of the *propose* surface is still
-Layer 1 alone.
+Its reach is the turn's **final assistant text**, and only that.
+
+**Since mika#2627 that bound is no longer a hole.** A proposal sent through the
+`send_message` tool — the only user channel of a silent turn (heartbeat,
+callback, reminder), and also reachable from a conversation turn — is refused
+**before delivery and before persistence** by the same predicate, applied to the
+tool's outgoing body (`tools::check_testimony_access_proposal`). Three emitters
+go through it: `send_message`, and `create_reminder` /
+`create_scheduled_task` when their `action_type` is `send_message`, since a
+deferred send is still a send. `delegate_task` relays its sender and emits
+nothing itself (covered transitively, its delegate calls `send_message`).
+**`run_team` is NOT covered, and it is not engine text either**: its completion
+notification wraps `run.deliverable`, which is the LLM output of the team's
+writer agent (`TeamEngine::deliver`), the conversational gate's reply, or the
+workspace files read on timeout — sent verbatim through `message_sender` on both
+the sync (`tools/run_team.rs`) and async (`task_engine::dispatcher`) paths. A
+team agent can therefore deliver a proposal no testimony refusal reads, and the
+workspace fallback never traverses 5h at all. That channel is named open below.
+
+Two properties of that refusal, both load-bearing. It precedes the Telegram
+length guard, because that guard's remedy is a split and **splitting a text that
+proposes Gmail access yields four texts that propose it**. And it posts **no
+`DeliveryVerdict`** (mika#2136): guard 6f counts a `RefusedTooLong` as a
+non-delivery to repair by splitting, so a verdict here would re-prompt the turn
+with the exact inverse of the right repair.
+
+What is left open on the *propose* surface, named rather than implied: a proposal
+**split across two calls** such that no single sentence carries both layers (the
+predicate segments by sentence, and widening it past the sentence would reopen
+the false positive that segmentation exists to avoid — same class as mika#2237,
+which left its own degradation path open with its reason); and rows **scheduled
+before** the mika#2627 deploy, whose firing site has no model to return a reason
+to. Both are bounded and measurable — see the root `CLAUDE.md` for the queries.
+And the **team deliverable** (`run_team`, above): the right guard site is the
+deliverable itself in `TeamEngine::deliver` — one site covers both notification
+paths — not the tool, and it is a follow-up, not a line of mika#2627.
 
 Two properties worth knowing before touching it. The discriminant is the
 **direction of the access movement**, never the vocabulary: Layer 1 *prescribes*
@@ -342,14 +373,16 @@ closed above, it still does NOT cover:
   `mcp__gmail__*` tool reaches Gmail with zero doctrine layer firing.
   Forward-compat requires MCP manifests to gain a `data_grade` field AND
   the MCP dispatch site to consult the same map.
-- **Propose surface via `send_message`** (named by mika#1960 phase 2) — the
-  EndTurn guard 5h reads the turn's final assistant text only. A proposal
-  delivered through the `send_message` tool (the sole user channel of a
-  silent turn, also reachable from a conversation turn and through the #771
-  send-message boundary exit) is not read by it, so on that path the
-  *propose* half is still Layer 1 alone. Closing it means running the 5h
-  predicate on the tool's `text` input before delivery — a pre-hoc refusal
-  of the mika#933 shape, a change of its own.
+- **Propose surface via `send_message`** (named by mika#1960 phase 2,
+  **closed by mika#2627**) — the EndTurn guard 5h reads the turn's final
+  assistant text only, so a proposal delivered through `send_message` (the
+  sole user channel of a silent turn, also reachable from a conversation
+  turn and through the #771 send-message boundary exit) escaped it. The
+  predicate now runs on that tool's outgoing body before delivery, plus on
+  the two scheduling tools that defer one. **Residue, which is not the same
+  hole:** a proposal split across two calls so that no single sentence
+  carries both layers, and rows scheduled before that deploy. See the
+  mika#2627 paragraph above.
 
 ## Cross-references
 

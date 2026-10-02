@@ -63,6 +63,38 @@ impl Tool for SendMessageTool {
             return Ok(ToolOutput::success("Message was empty after processing."));
         }
 
+        // mika#2627 — the *propose* surface of the non-transit doctrine, on the
+        // only user channel a silent turn has.
+        //
+        // Guard 5h reads the turn's final assistant text; in a heartbeat or
+        // callback that text reaches nobody, and what the person receives passes
+        // through here. The 5h block names this bypass in its own comment rather
+        // than claiming it closed; this is its closing.
+        //
+        // **Three properties of this placement, each load-bearing.**
+        //
+        // *(a) On `cleaned`, never on the raw argument.* `cleaned` is what would
+        // actually leave; reading the raw text would feed the predicate the
+        // contents of internal tags, i.e. noise the recipient never sees.
+        //
+        // *(b) Before persistence.* The reasoning the length guard below already
+        // writes ("so a message we refuse to send never enters conversation
+        // history"), and it is *stronger* here: a proposal persisted in
+        // `messages` is re-served to the next turn by compaction, so a refusal
+        // that persisted anyway would leave the doctrine violated in the
+        // history. That is exactly the half-property 5h keeps in silent mode.
+        //
+        // *(c) Before the length guard.* A text both too long and carrying a
+        // proposal must be refused **by the doctrine**: the length guard's remedy
+        // is a split, and splitting a proposal multiplies it.
+        if let Some(refusal) = crate::tools::check_testimony_access_proposal(
+            ctx,
+            &cleaned,
+            crate::evidence::guards::TestimonyProposalChannel::SendMessage,
+        ) {
+            return Ok(refusal);
+        }
+
         // Enforce Telegram's per-message ceiling on the text as it will actually be
         // sent (`cleaned`, after tag-stripping), measured in UTF-16 units the way
         // Telegram counts — not bytes. This runs before persistence so a message we
@@ -1094,6 +1126,257 @@ mod tests {
                 len_utf16: 9_000,
                 limit: mika_common::telegram::MAX_TEXT_UTF16_UNITS,
             }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2627 — the *propose* surface, refused before delivery
+    // -----------------------------------------------------------------------
+
+    /// The founding shape, carried by `send_message` instead of the final text.
+    const PROPOSAL: &str = "Pour trier tout ça, je pourrais t'aider si tu me donnais \
+                            accès à ta boîte Gmail.";
+
+    /// AC1 — the proposal is refused, nothing reaches the transport, and the
+    /// reason names the doctrine.
+    #[tokio::test]
+    async fn mika2627_une_proposition_est_refusee_avant_le_transport() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+
+        let result = SendMessageTool
+            .execute(serde_json::json!({ "text": PROPOSAL }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "the proposal must be refused");
+        assert!(
+            mock.sent().is_empty(),
+            "the proposal must NOT reach the transport: {:?}",
+            mock.sent()
+        );
+        assert!(
+            result
+                .content
+                .starts_with(crate::tools::TESTIMONY_ACCESS_REFUSAL_PREFIX),
+            "the refusal must open on the wire prefix the operator SQL groups \
+             on: {}",
+            result.content
+        );
+        for needle in ["testimony-grade", "non-transit", "NOTHING WAS SENT"] {
+            assert!(
+                result.content.contains(needle),
+                "the refusal must name {needle:?}: {}",
+                result.content
+            );
+        }
+    }
+
+    /// V5 / R4 — the refusal posts **no** `DeliveryVerdict`.
+    ///
+    /// This is the costliest risk of mika#2627 (RK2). Guard 6f
+    /// `unacknowledged_send_failure` reads those verdicts and refuses an EndTurn
+    /// that closes over an unrepaired send, counting `RefusedTooLong` as a
+    /// non-delivery to be repaired **by splitting** — and splitting a text that
+    /// proposes Gmail access yields four texts that propose it. A verdict here
+    /// would make the engine re-prompt the turn for a send the doctrine refuses,
+    /// suggesting the exact inverse of the right repair.
+    #[tokio::test]
+    async fn mika2627_le_refus_ne_pose_aucun_verdict() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+
+        let result = SendMessageTool
+            .execute(serde_json::json!({ "text": PROPOSAL }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            result.delivery.is_none(),
+            "a doctrinal refusal states no delivery verdict — it is repairable \
+             neither by a resend nor by a split, and guard 6f would prescribe \
+             the latter"
+        );
+    }
+
+    /// V6 / D3(c) — the doctrine precedes the length guard.
+    ///
+    /// A text both too long and carrying a proposal must be refused **by the
+    /// doctrine**: the length guard's remedy is a split, and splitting a
+    /// proposal multiplies it. Asserted on the absence of `RefusedTooLong`, not
+    /// merely on `is_error`, which both guards satisfy.
+    #[tokio::test]
+    async fn mika2627_la_doctrine_precede_la_garde_de_longueur() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+
+        // 12 000 characters — the measured length of the 2026-09-01 document —
+        // carrying the proposal.
+        let long = format!("{PROPOSAL}{}", "a".repeat(12_000));
+        assert!(
+            mika_common::telegram::text_len_utf16(&long)
+                > mika_common::telegram::MAX_TEXT_UTF16_UNITS,
+            "sanity: the text must also cross the length guard"
+        );
+
+        let result = SendMessageTool
+            .execute(serde_json::json!({ "text": long }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .starts_with(crate::tools::TESTIMONY_ACCESS_REFUSAL_PREFIX),
+            "the doctrinal refusal must win over the length refusal: {}",
+            result.content
+        );
+        assert!(
+            result.delivery.is_none(),
+            "the length guard's `RefusedTooLong` verdict must not be posted — \
+             its remedy is a split, which multiplies the proposal"
+        );
+        assert!(mock.sent().is_empty());
+    }
+
+    /// V7 / D3(b) — a refused text never enters conversation history.
+    ///
+    /// Stronger here than for the length guard whose placement reasoning this
+    /// borrows: a proposal persisted in `messages` is re-served to the next turn
+    /// by compaction, so a refusal that persisted anyway would leave the
+    /// doctrine violated in the history — the half-property 5h keeps even in
+    /// silent mode.
+    #[tokio::test]
+    async fn mika2627_le_texte_refuse_nentre_pas_dans_lhistorique() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+
+        SendMessageTool
+            .execute(serde_json::json!({ "text": PROPOSAL }), &ctx)
+            .await
+            .unwrap();
+
+        let persisted = harness
+            .db
+            .get_messages_by_trace_id("00000000000000000000000000000000")
+            .await
+            .expect("messages readable");
+        assert!(
+            !persisted
+                .iter()
+                .any(|m| m.content.contains("donnais accès")),
+            "the refused proposal was persisted and will be re-served by \
+             compaction: {persisted:?}"
+        );
+
+        // Positive control on the same reader: a delivered message IS persisted,
+        // so the assertion above is about the refusal and not about a reader
+        // that returns nothing.
+        SendMessageTool
+            .execute(serde_json::json!({ "text": "Rendez-vous à 14h." }), &ctx)
+            .await
+            .unwrap();
+        let persisted = harness
+            .db
+            .get_messages_by_trace_id("00000000000000000000000000000000")
+            .await
+            .expect("messages readable");
+        assert!(
+            persisted.iter().any(|m| m.content.contains("14h")),
+            "the delivered message must be persisted — otherwise the negative \
+             assertion above proves nothing: {persisted:?}"
+        );
+    }
+
+    /// V2 / AC2 — the refusal formulations Layer 1 **prescribes** traverse the
+    /// tool path and are delivered.
+    ///
+    /// The load-bearing half: a guard that refused the prescribed refusal would
+    /// push the model to stop naming the doctrine, degrading exactly what
+    /// mika#1798 shipped. The assertion is on `mock.sent()`, i.e. on delivery,
+    /// not merely on the absence of an error.
+    #[tokio::test]
+    async fn mika2627_les_trois_formulations_prescrites_sont_delivrees() {
+        let harness = TestHarness::new();
+        let mock = Arc::new(MockSender::new());
+        let skills_dirty = std::sync::atomic::AtomicBool::new(false);
+        let pr_review_posted = std::sync::atomic::AtomicBool::new(false);
+        let tool_arg_suffix_rejected = std::sync::atomic::AtomicBool::new(false);
+        let ctx = ctx_with_sender(
+            &harness,
+            mock.clone(),
+            &skills_dirty,
+            &pr_review_posted,
+            &tool_arg_suffix_rejected,
+        );
+
+        let prescribed = [
+            "Je ne peux pas accéder à tes emails — c'est de la donnée testimony-grade.",
+            "Je n'ai pas accès à ta boîte Gmail et je ne te le demanderai pas. \
+             Je peux te poser un rappel à la place.",
+            "I can't access your inbox and I won't ask you to open it — that is \
+             testimony-grade data. I can set a reminder instead.",
+        ];
+
+        for text in prescribed {
+            let result = SendMessageTool
+                .execute(serde_json::json!({ "text": text }), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                !result.is_error,
+                "a refusal Layer 1 prescribes was itself refused — this breaks \
+                 what mika#1798 shipped: {text:?} → {}",
+                result.content
+            );
+        }
+
+        assert_eq!(
+            mock.sent().len(),
+            prescribed.len(),
+            "all three prescribed refusals must actually be delivered: {:?}",
+            mock.sent()
         );
     }
 

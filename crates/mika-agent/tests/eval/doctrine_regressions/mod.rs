@@ -77,6 +77,13 @@
 //!   mika#1960's only real risk — a guard that refused the prescribed refusal
 //!   would degrade what mika#1798 shipped, by pushing the model to stop naming
 //!   the doctrine.
+//! - `doctrine:testimony-access-send-refused` — success (mika#2627: a proposal
+//!   carried by `send_message` on a silent turn was refused BEFORE it reached
+//!   the transport). Distinct from `doctrine:testimony-access-proposal-suppressed`
+//!   because the two count different populations: *"did not propose on the final
+//!   text"* (guard 5h) and *"did not SEND the proposal"* (the tool refusal). The
+//!   split follows the rule this module already wrote twice, for mika#1983 and
+//!   mika#1960.
 //!
 //! Namespace convention per `docs/architecture/kg-implementation-conventions.md`
 //! § C3 — parallel to `#741 grounding:*` and `#740 self-knowledge:*`.
@@ -189,3 +196,22 @@ pub mod truthful_declaration_replayed;
 // therefore ships disarmed with its reasoning at the site.
 pub mod testimony_access_proposal_caught;
 pub mod testimony_access_proposal_replayed;
+
+// --- mika#2627: the *propose* surface on the silent turn's only channel ---
+//
+// Sixth time in this module, and the criterion is unchanged. What this file adds
+// is a **distinct population**, deliberately filed apart from its 5h sibling:
+// "did not propose on the final text" and "did not SEND the proposal" are two
+// things one wants to count apart — exactly the rule this `mod.rs` has already
+// written twice, for mika#1983 and for mika#1960 itself.
+//
+// Its assertion lands on the **transport**, not on a re-prompt: the refusal is
+// pre-hoc on the tool's input, so there is no `llm_call_count > 1` to measure and
+// a reader expecting one would mistake the shape for a broken test. Its success
+// tag is therefore its own, `doctrine:testimony-access-send-refused`, and not the
+// 5h `doctrine:testimony-access-proposal-suppressed`: sharing it would merge the
+// two populations this paragraph exists to keep apart. The pre-fix failure tag
+// (`doctrine:testimony-access-proposed`) and the refusal-preserved tag stay
+// shared — the failure and the negative control are the same facts on both
+// channels; only the success is channel-specific.
+pub mod testimony_access_proposal_send_message_refused;
