@@ -2293,11 +2293,19 @@ mod tests {
     /// mika#2103 / mika#2205.
     #[test]
     fn mika2617_the_exemption_scan_reddens_on_a_fixture() {
-        let fixture = "\
-pub(crate) const ADVISORY_CHECKS: &[&str] = &[\"Docker Build\"];
-const KNOWN_CHECK_BUCKETS: &[&str] = &[\"pass\"];
-const DISPATCH_SKIP_REASONS: &[&str] = &[\"x\"];
-";
+        // Chaîne BRUTE, et ce n'est pas un choix de style : les lignes de cette
+        // fixture sont en colonne zéro et portent `const`, donc
+        // `production_resumes_after_cut` (scripts/lib/egress_manifest_lint.py)
+        // les lit comme de la production redevenue frère du module de test —
+        // puis rapporte les URL github.com des fixtures voisines comme des
+        // sinks hors inventaire (N15 de `scripts/test-verify-egress-manifest.sh`).
+        // Ce détecteur saute les régions `r#"…"#` et c'est la forme que les six
+        // autres fichiers embarquant des fixtures Rust emploient déjà. La valeur
+        // de la chaîne est inchangée.
+        let fixture = r#"pub(crate) const ADVISORY_CHECKS: &[&str] = &["Docker Build"];
+const KNOWN_CHECK_BUCKETS: &[&str] = &["pass"];
+const DISPATCH_SKIP_REASONS: &[&str] = &["x"];
+"#;
         let hits = declares_a_check_exemption_list(fixture);
         assert_eq!(
             hits,
@@ -2368,11 +2376,16 @@ const DISPATCH_SKIP_REASONS: &[&str] = &[\"x\"];
     /// Contrôle de bonne foi du scan de label.
     #[test]
     fn mika2617_the_label_scan_reddens_on_a_fixture() {
-        let fixture = "\
-let labels = pr.labels.iter().map(|l| l.name.clone());
+        // Chaîne brute pour la même raison que la fixture du scan d'exemptions
+        // ci-dessus. Celle-ci ne porte aujourd'hui que des `let` / `if`, qui ne
+        // sont pas des items au sens de `COLUMN_ZERO_ITEM_RE` — elle ne fait
+        // donc PAS rougir N15 en l'état. Elle le ferait à la première ligne
+        // `const`/`fn` ajoutée ici, et le détecteur rend la PREMIÈRE reprise
+        // trouvée : la panne réapparaîtrait sur l'autre fixture. Valeur inchangée.
+        let fixture = r#"let labels = pr.labels.iter().map(|l| l.name.clone());
 let task_id_label = task.label.clone();
 if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
-";
+"#;
         let hits = reads_a_github_label(fixture);
         assert_eq!(
             hits.len(),
