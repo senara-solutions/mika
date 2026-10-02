@@ -4528,4 +4528,295 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              la moitié qu'il existe pour confronter (mika#2201)."
         );
     }
+
+    // ───────────────── mika#2638 — `reference_url` délimitée ─────────────────
+
+    /// Les lignes `reference_url` + `LIKE` que le scan D4 tolère, avec leur
+    /// donnée précise et sa raison.
+    ///
+    /// **Quand D4 tire sur un site neuf, on DÉLIMITE ce site ; on n'ajoute pas
+    /// de ligne ici** (doctrine mika#2201). Une entrée de cette table décrit un
+    /// prédicat qui n'a **aucun numéro d'issue en jeu** — pas un prédicat sur
+    /// une URL d'issue qu'on aurait renoncé à réparer.
+    const REFERENCE_URL_LIKE_ALLOWED: &[(&str, &str)] = &[(
+        "reference_url LIKE '%github.com%'",
+        "anomalies de santé (`db/tasks.rs`, « cette tâche manuelle est-elle liée à \
+         GitHub ? ») — prédicat sur le DOMAINE, aucun numéro d'issue en jeu, donc \
+         hors de la population de mika#2638. Pas de ticket de suivi : ce site est \
+         correct, pas toléré.",
+    )];
+
+    /// Les fichiers de production de la couche DB, c'est-à-dire la population de
+    /// D4 : `db.rs` **et** le répertoire `db/`. Le scan y est borné parce que
+    /// c'est là que vivent les requêtes — et parce qu'une prose qui *parle* du
+    /// `LIKE` retiré, ailleurs dans l'arbre, n'est pas une requête (classe
+    /// mika#2050, dont le faux positif a été mesuré sur le Signal S).
+    ///
+    /// Le prédicat **délimite** le segment de chemin au lieu de tester un
+    /// préfixe nu : `starts_with("…/src/db")` attraperait un futur `src/dbus.rs`
+    /// ou `src/db_admin.rs`. L'erreur serait fail-safe (sur-inclusion, donc le
+    /// scan rougirait plus souvent qu'il ne devrait) — mais sur le ticket dont
+    /// le sujet *est* « un préfixe ne délimite pas », la laisser serait une
+    /// farce.
+    fn db_layer_sources() -> Vec<(String, String)> {
+        production_sources()
+            .into_iter()
+            .filter(|(rel, _)| {
+                rel == "crates/mika-agent/src/db.rs" || rel.starts_with("crates/mika-agent/src/db/")
+            })
+            .collect()
+    }
+
+    /// **D4 — aucune requête de la couche DB ne compare `reference_url` par
+    /// préfixe (mika#2638).**
+    ///
+    /// Le défaut mesuré est un **faux appariement** : `reference_url LIKE
+    /// '…/issues/216%'` matche les tâches de `…/issues/2160` à `…/issues/2169`
+    /// et `…/issues/21600`. La maison avait déjà tranché cette classe trois fois
+    /// en délimitant (`degroom_marker_key`, mika#2347, qui écrit le piège `#234`
+    /// vs `#2343` mot pour mot ; `hold_audit_key`, mika#2199 ; le faucheur de
+    /// mika#2420) ; les deux sondes de vol ne l'avaient pas appliquée.
+    ///
+    /// **Aucun test comportemental ne peut voir cette classe.** Un quatrième
+    /// site écrit demain par préfixe ne rend *aucune* décision fausse le jour où
+    /// il est écrit : il répond juste sur chaque ticket dont aucun voisin
+    /// numérique n'existe, c'est-à-dire la quasi-totalité, et faux le jour où
+    /// la réponse compte. C'est la leçon que `grooming_marker` a dû graver une
+    /// fois (mika#2158) et que `live_pilot` a payée une seconde (mika#2335).
+    ///
+    /// **Ce que ce scan n'attrape pas, nommé :** un `GLOB`, un `instr`, ou une
+    /// comparaison écrite dans un `format!` dont les deux termes sont sur des
+    /// lignes différentes. Le prédicat porte sur la **forme réelle du défaut**
+    /// (les deux sites mesurés tenaient sur une ligne), et l'élargir à du SQL
+    /// multi-ligne demanderait de parser le SQL plutôt que de le lire.
+    #[test]
+    fn mika2638_la_couche_db_ne_compare_pas_une_url_dissue_par_prefixe() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas
+        // lui-même — motif `mika2590_le_marqueur_de_convergence_na_quun_lecteur`.
+        let colonne = format!("reference{}", "_url");
+        let operateur = format!("LI{}KE", "");
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut population_in = 0usize;
+        let mut fichiers_vus = 0usize;
+
+        // Un seul parcours d'arbre : `production_sources()` lit 376 fichiers,
+        // et l'anti-vacuité se tire d'un compteur plutôt que d'une seconde
+        // lecture — qui prouverait que l'arbre est non vide, pas que le corps de
+        // la boucle a tourné, c'est-à-dire l'inverse de ce qu'on veut établir.
+        for (rel, content) in db_layer_sources() {
+            fichiers_vus += 1;
+            // `source_scan::strip_comment_lines` est **le lecteur unique** de ce
+            // prédicat, et son doc-comment refuse par écrit le `starts_with('*')`
+            // d'un filtre local naïf (`*guard = x;` est du Rust valide). Dix
+            // sites de ce fichier l'appellent déjà ; en réécrire un onzième à la
+            // main serait la classe que ce fichier a déjà tranchée.
+            //
+            // Pas de re-troncature au `#[cfg(test)]` : `production_sources`
+            // coupe déjà au premier, donc un second `find` ne peut que rendre
+            // `None` — un garde qui se lit comme actif et ne filtre rien.
+            let production = crate::source_scan::strip_comment_lines(content.as_str());
+            for line in production.lines() {
+                let t = line.trim_start();
+                if !t.contains(&colonne) {
+                    continue;
+                }
+                // La moitié POSITIVE : les sites déjà délimités. Elle sert
+                // l'anti-vacuité plus bas.
+                if t.contains(" IN (") {
+                    population_in += 1;
+                }
+                if !t.contains(&operateur) {
+                    continue;
+                }
+                if REFERENCE_URL_LIKE_ALLOWED
+                    .iter()
+                    .any(|(donnee, _)| t.contains(donnee))
+                {
+                    continue;
+                }
+                offenders.push(format!("{rel}: {}", t.trim()));
+            }
+        }
+
+        // Anti-vacuité, les deux moitiés. Sans elles, un répertoire renommé ou
+        // un SQL reformaté rendrait ce scan silencieusement inerte, ce qui se
+        // lit exactement comme un arbre propre (classe mika#2205).
+        assert!(
+            fichiers_vus > 0,
+            "mika#2638 — la population examinée est vide : ce scan ne regarde rien"
+        );
+        assert!(
+            population_in >= 5,
+            "mika#2638 — seulement {population_in} comparaison(s) `{colonne} IN (…)` \
+             vue(s), attendu au moins 5 : les deux sondes de vol, le nettoyage de \
+             mika#1934, et les deux lecteurs de verdict de groom \
+             (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`). \
+             Ce scan ne voit plus les sites qu'il existe pour protéger.\n\n\
+             NOTE : ce seuil est un PLANCHER sur la population que le scan compte, \
+             pas sur les appelants du helper — c'est `mika2638_le_lecteur_unique_\
+             des_variantes_a_trois_appelants` qui tient la seconde moitié."
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2638 — la couche DB compare une URL d'issue par préfixe : \
+             {offenders:#?}\n\n\
+             RÉSOLUTION : passer par \
+             `task_state::tasks::issue_url_variants` et comparer \
+             `{colonne} IN (?n, ?n+1)`. Ne PAS ajouter le site à \
+             REFERENCE_URL_LIKE_ALLOWED — un préfixe ne délimite pas un numéro, \
+             donc la sonde de `…/issues/216` répond aussi sur `…/issues/2161`, \
+             et elle est en plus plus permissive que `idx_tasks_manual_active_ref_url`, \
+             l'index de dédup qui est, lui, une égalité stricte."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist de D4.
+    ///
+    /// Une exception périmée exempterait silencieusement un futur homonyme :
+    /// elle rougit le jour de la réparation, pas des mois après.
+    #[test]
+    fn mika2638_lallowlist_du_scan_ne_porte_que_des_entrees_vivantes() {
+        assert!(
+            !REFERENCE_URL_LIKE_ALLOWED.is_empty(),
+            "REFERENCE_URL_LIKE_ALLOWED est livrée avec UNE entrée déclarée \
+             (le prédicat sur le domaine). Une table vide signifie qu'elle a été \
+             purgée sans que le scan soit relu."
+        );
+
+        let arbre = db_layer_sources();
+        for (donnee, raison) in REFERENCE_URL_LIKE_ALLOWED {
+            assert!(
+                !raison.trim().is_empty(),
+                "l'entrée {donnee:?} n'a pas de raison : une exception sans motif \
+                 est une exemption"
+            );
+            // La donnée est cherchée dans le CODE, jamais dans la prose : le
+            // même lecteur unique que la boucle de D4. Sans ça, un commentaire
+            // décrivant le prédicat retiré suffirait à garder l'entrée vivante,
+            // c'est-à-dire exactement l'exemption silencieuse que ce test
+            // existe pour empêcher (classe mika#2050).
+            assert!(
+                arbre.iter().any(|(_, content)| {
+                    crate::source_scan::strip_comment_lines(content.as_str()).contains(donnee)
+                }),
+                "mika#2638 — l'entrée d'allowlist {donnee:?} n'apparaît plus dans le \
+                 CODE de la couche DB (la prose ne compte pas).\n\n\
+                 RÉSOLUTION : retirer cette ligne de REFERENCE_URL_LIKE_ALLOWED. \
+                 Une exception périmée exempte silencieusement un futur homonyme — \
+                 c'est-à-dire qu'elle rouvre la classe sous le couvert d'une \
+                 décision prise pour un autre site."
+            );
+        }
+    }
+
+    /// **D5 — toute requête qui compare `reference_url` à l'ensemble des
+    /// variantes passe par `issue_url_variants` (mika#2638).**
+    ///
+    /// La garde qui empêche qu'un site soit « réparé » à la main — en épelant
+    /// `format!("{base}{GROOM_PHASE_SUFFIX}")` sur place — et sorte du lecteur
+    /// unique. Un site pour une définition : c'est ce qui empêche deux requêtes
+    /// d'épeler différemment l'ensemble des variantes.
+    ///
+    /// # Deux directions, parce qu'un plancher seul est aveugle au bypass
+    ///
+    /// Un **plancher sur le nombre d'appelants** attrape la *suppression* d'un
+    /// appelant et rien d'autre : un site qui épelle les variantes à la main
+    /// n'enlève aucun appelant et n'en ajoute aucun, donc le compte ne bouge
+    /// pas. Mesuré sur ce ticket même — la première version de ce scan était
+    /// **verte** avec deux bypasses dans l'arbre
+    /// (`has_completed_groom_for_issue` et `latest_groom_verdict_for_issue`
+    /// faisaient `format!("{}{}", issue_url, GROOM_PHASE_SUFFIX)` puis
+    /// `IN (?2, ?3)`), c'est-à-dire exactement l'état que son propre message de
+    /// RÉSOLUTION demandait au lecteur d'aller chercher. Une garde dont le
+    /// prédicat ne peut pas atteindre la faute qu'elle nomme est une
+    /// décoration.
+    ///
+    /// D'où **l'exhaustivité** : dans la couche DB, tout corps de fonction qui
+    /// porte une comparaison `reference_url IN (` doit appeler le helper. Le
+    /// plancher est conservé à côté — il couvre la direction que l'exhaustivité
+    /// ne voit pas (un appelant hors de `db/`, comme un futur lecteur dans
+    /// `auto_pull`).
+    #[test]
+    fn mika2638_le_lecteur_unique_des_variantes_a_trois_appelants() {
+        let symbole = format!("issue_url{}", "_variants");
+        let appel = format!("{symbole}(");
+        let colonne = format!("reference{}", "_url");
+        let owner = "crates/mika-agent/src/task_state/tasks.rs";
+
+        let mut appelants: Vec<String> = Vec::new();
+        let mut owner_definit = false;
+
+        for (rel, content) in production_sources() {
+            let production = crate::source_scan::strip_comment_lines(content.as_str());
+            let lignes: Vec<&str> = production
+                .lines()
+                .filter(|l| l.contains(&symbole))
+                .collect();
+
+            if rel == owner {
+                owner_definit = lignes.iter().any(|l| l.contains("pub fn"));
+                continue;
+            }
+            // Un appel, jamais une mention : le `(` est ce qui les sépare. Le
+            // site est rendu avec sa ligne, pour qu'un échec dise LEQUEL des
+            // appels a disparu plutôt que de répéter trois fois le fichier.
+            appelants.extend(
+                lignes
+                    .iter()
+                    .filter(|l| l.contains(&appel))
+                    .map(|l| format!("{rel}: {}", l.trim())),
+            );
+        }
+
+        assert!(
+            owner_definit,
+            "mika#2638 — `{symbole}` n'est plus défini dans {owner} : ce scan vise \
+             un mort, il ne vérifie rien"
+        );
+        assert!(
+            appelants.len() >= 3,
+            "mika#2638 — `{symbole}` n'a que {} site(s) d'appel, attendu au moins 3 : \
+             {appelants:#?}\n\n\
+             RÉSOLUTION : un appelant a été retiré. Le faire repasser par le helper — \
+             deux requêtes libres d'épeler l'ensemble des variantes différemment sont \
+             deux requêtes qui finiront par le faire (mika#2158, mika#2335).",
+            appelants.len()
+        );
+
+        // La seconde direction : l'exhaustivité sur la couche DB.
+        let mut bypasses: Vec<String> = Vec::new();
+        let mut corps_vus = 0usize;
+        for (rel, content) in db_layer_sources() {
+            for (nom, corps) in crate::source_scan::fn_bodies(content.as_str()) {
+                let code = crate::source_scan::strip_comment_lines(corps.as_str());
+                if !code.contains(&format!("{colonne} IN (")) {
+                    continue;
+                }
+                corps_vus += 1;
+                if !code.contains(&appel) {
+                    bypasses.push(format!("{rel}::{nom}"));
+                }
+            }
+        }
+
+        assert!(
+            corps_vus >= 5,
+            "mika#2638 — seulement {corps_vus} corps de fonction comparant \
+             `{colonne} IN (` vu(s), attendu au moins 5 : ce scan ne voit plus les \
+             sites qu'il existe pour protéger (classe mika#2205)"
+        );
+        assert!(
+            bypasses.is_empty(),
+            "mika#2638 — une requête de la couche DB compare `{colonne}` à \
+             l'ensemble des variantes SANS passer par `{symbole}` : {bypasses:#?}\n\n\
+             RÉSOLUTION : `let [exact, groom] = \
+             task_state::tasks::{symbole}(issue_url);` puis \
+             `params![agent_id, exact, groom]`. Épeler `format!(\"{{}}{{}}\", url, \
+             GROOM_PHASE_SUFFIX)` sur place est délimité AUJOURD'HUI et libre de \
+             diverger demain — c'est la forme exacte du défaut que ce ticket a \
+             trouvée dans deux lecteurs de verdict de groom."
+        );
+    }
 }

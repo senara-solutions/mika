@@ -30,6 +30,17 @@
 //! cancelled parent keeps the predicate false for the next round. Measured on
 //! #2276, 2026-09-10: one full turn every ~20 minutes, no human involved.
 //!
+//! # The URL side of that conjunction is an enumeration, not a prefix
+//!
+//! `reference_url` is compared against the **closed variant set**
+//! ([`crate::task_state::tasks::issue_url_variants`], `IN (?2, ?3)`) since
+//! mika#2638. Until then it was a prefix `LIKE`, so this module's sole reader
+//! answered about a **numeric neighbour**: the probe for `…/issues/216` found
+//! the dispatch of `…/issues/2161`, and gate 2c refused a `labeled ready` on
+//! the strength of another ticket's pilot. A predicate written to stop a
+//! duplicate dispatch was freezing a healthy ticket instead — the inverse of
+//! its job, and the wider of that defect's two blast radii.
+//!
 //! # Fail-safe direction, and why it is not symmetric
 //!
 //! **A signal that cannot be read is never a satisfied term.**
@@ -303,8 +314,10 @@ mod tests {
         }
     }
 
-    /// The `?phase=groom` variant rides on the same prefix rule as
-    /// `has_active_self_dev_task_for_issue`.
+    /// The `?phase=groom` variant rides on the same closed-variant-set rule as
+    /// `has_active_self_dev_task_for_issue` (mika#2638). It is the half of that
+    /// fix that must keep passing: the enumeration narrows the match to a
+    /// delimited number **without** dropping the declared variant.
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn the_groom_phase_url_variant_is_covered() {
@@ -315,7 +328,10 @@ mod tests {
 
         assert!(
             live_pilot_for_issue(&db, URL).await.is_alive(),
-            "le LIKE préfixe doit couvrir la variante ?phase=groom"
+            "l'énumération de l'ensemble clos doit couvrir la variante \
+             ?phase=groom (mika#2638 — ce message disait « le LIKE préfixe », \
+             et remis en l'état il réinstallerait le modèle mental qui a \
+             produit le faux appariement sur le voisin numérique)"
         );
     }
 

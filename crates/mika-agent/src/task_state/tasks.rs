@@ -250,6 +250,100 @@ pub fn strip_groom_phase_suffix(reference_url: &str) -> &str {
         .unwrap_or(reference_url)
 }
 
+/// Les deux — et seulement les deux — écritures de `reference_url` qui
+/// désignent une issue donnée (mika#2638).
+///
+/// `base_url` DOIT être canonique (sans `?phase=groom`). Les appelants y
+/// arrivent par deux chemins et un seul nettoie : les sondes de vol
+/// **construisent** l'URL depuis `owner/repo` + numéro, donc elle est canonique
+/// par construction ; les surfaces de nettoyage de mika#1934 reçoivent une
+/// `reference_url` de la base et la nettoient via [`strip_groom_phase_suffix`].
+/// Dire « les appelants nettoient » tout court ferait croire à un futur
+/// cinquième appelant que le nettoyage est assuré en amont.
+///
+/// # Pourquoi une énumération, et jamais un préfixe `LIKE`
+///
+/// **Un préfixe ne délimite pas un numéro.** La sonde de
+/// `…/issues/216` écrite `reference_url LIKE '…/issues/216%'` matche aussi les
+/// tâches de `…/issues/2160` à `…/issues/2169`, et `…/issues/21600` — le défaut
+/// mesuré par la revue de PR #2635, dont la conséquence était que le message
+/// « le bassin est coincé en vol » de mika#2161 **nommait la tâche d'un autre
+/// ticket**. La maison avait déjà tranché cette classe trois fois en délimitant
+/// (`degroom_marker_key` de mika#2347, qui écrit le piège `#234` vs `#2343` mot
+/// pour mot ; `hold_audit_key` de mika#2199 et le faucheur de mika#2420, tous
+/// deux bornés par un séparateur `@`) ; les sondes de vol ne l'avaient pas
+/// appliquée.
+///
+/// Le préfixe portait **deux** élargissements de plus, tous deux fermés
+/// gratuitement par l'égalité :
+///
+/// - **`_` est un joker `LIKE` d'un caractère.** GitHub autorise `_` dans un nom
+///   de dépôt, donc une sonde pour `…/my_repo/issues/42` matchait
+///   `…/myXrepo/issues/42`. Population vide aujourd'hui, réelle demain.
+/// - **`LIKE` est insensible à la casse en ASCII** alors que `reference_url` est
+///   déclarée `TEXT` sans `COLLATE NOCASE`. Conséquence de **justesse**, pas de
+///   performance : `…/ISSUES/216` matchait, et l'égalité le refuse. Population
+///   vide par construction (tout écrivain bâtit l'URL depuis des littéraux
+///   minuscules et la casse canonique de GitHub), donc nommée plutôt
+///   qu'invisible.
+///
+/// **Ce que le changement n'achète PAS, et il faut le dire ici parce que
+/// l'intuition dit le contraire :** aucun gain de plan d'exécution. Le plan de
+/// mika#2638 affirmait qu'un `LIKE 'préfixe%'` ne peut pas utiliser
+/// `idx_tasks_manual_active_ref_url` là où un `IN (…)` peut ; c'est **faux**, et
+/// mesuré tel quel (SQLite 3.53, `EXPLAIN QUERY PLAN` sur le DDL réel) : les
+/// deux formes rendent le même plan, `SEARCH tasks USING INDEX
+/// idx_tasks_agent_status` plus un B-tree temporaire. L'index partiel est en
+/// fait **inatteignable** pour ces requêtes — sa clause exige
+/// `trigger_type = 'manual'` et `status NOT IN ('completed', …)`, qu'aucune
+/// d'elles ne porte, et un `status IN ('pending','in_progress')` n'implique pas
+/// syntaxiquement le `NOT IN`. Laisser l'affirmation debout enverrait la
+/// prochaine personne qui règle ce chemin dans un cul-de-sac.
+///
+/// # Un site de définition, cinq appelants
+///
+/// Les cinq requêtes qui posent une question sur l'issue d'une tâche passent
+/// par ici :
+///
+/// | site | question |
+/// |---|---|
+/// | `Database::find_active_self_dev_task_for_issue` | « une tâche self_dev active référence-t-elle ce ticket ? » — `auto_pull` Phase 0/2 |
+/// | `Database::find_dispatch_children_for_issue_url` | « un pilote est-il vif pour ce ticket ? » — lecteur unique de [`crate::live_pilot`] (mika#2279) |
+/// | `Database::find_active_tracking_rows_by_reference_url_and_variants` | « quelles lignes de suivi nettoyer ? » (mika#1934) |
+/// | `Database::has_completed_groom_for_issue` | « ce ticket a-t-il un groom convergé ? » (mika#1620 / mika#2287) |
+/// | `Database::latest_groom_verdict_for_issue` | « quel est son dernier verdict de groom ? » |
+///
+/// Les **trois derniers étaient déjà délimités** et sont réécrits à travers ce
+/// helper **sans changement de comportement** : leur sortie est octet pour
+/// octet la même. Le but est que les cinq ne puissent plus diverger, pas de
+/// modifier ceux qui étaient justes — et les deux derniers épelaient l'ensemble
+/// à la main, c'est-à-dire étaient exactement la forme que le détecteur D5 de
+/// mika#2638 existe pour refuser.
+///
+/// Cinq appelants pour une définition : c'est ce qui empêche deux requêtes
+/// d'épeler différemment l'ensemble des variantes — la leçon que
+/// [`crate::grooming_marker`] a dû graver une fois (mika#2158, où promotion et
+/// routage répondaient différemment à la même question pendant des mois sans
+/// que rien ne casse) et que `live_pilot` a payée une seconde fois (mika#2335).
+///
+/// # L'ensemble est CLOS, et le rétrécissement est nommé
+///
+/// Passer du préfixe à l'énumération **rétrécit** : une ligne portant
+/// `…/issues/2638/` ou `…/issues/2638#issuecomment-1` était vue en vol hier et
+/// ne l'est plus. C'est borné parce qu'une telle ligne est **déjà** hors de
+/// `idx_tasks_manual_active_ref_url` (`UNIQUE(agent_id, reference_url)`), donc
+/// déjà un défaut en amont et plus grave que celui-ci : une sonde plus
+/// permissive que son propre index de dédup est l'incohérence. La sonde
+/// opérateur qui établit que l'ensemble est bien clos vit dans
+/// `docs/plans/2026-10-02-002-fix-2638-reference-url-numero-delimite-plan.md`
+/// § 8 S1.
+pub fn issue_url_variants(base_url: &str) -> [String; 2] {
+    [
+        base_url.to_string(),
+        format!("{base_url}{GROOM_PHASE_SUFFIX}"),
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: String,
