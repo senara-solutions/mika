@@ -74,18 +74,33 @@ timeout_secs = 30
 #
 # **79.5 KB and not a round 79 KB**, which is the first non-round value in this
 # list and is worth the sentence: 80 896 (79 KB) puts the gate at 76 851, below
-# the 77 010 the prompt now measures, so the round value does not clear its own
-# gate. 81 408 clears it with 327 bytes and keeps 512 below the 81 920 ceiling
-# (`skills/index.rs:27`). The gate fires again at 77 337 bytes.
+# the 77 010 the prompt measured then, so the round value does not clear its own
+# gate. 81 408 cleared it with 327 bytes and keeps 512 below the 81 920 ceiling
+# (`skills/index.rs:27`). The gate fires at 77 337 bytes.
 #
 # **This prompt is now effectively at its ceiling, and the next rule cannot be
-# added by raising this number.** 327 bytes of gate headroom is under one
-# paragraph, and the remaining 512 to the hard ceiling is less than the smallest
-# of the five raises above. The next addition takes the third remediation the
-# gate offers — shard via `[dependencies]`, extracting a sibling skill — and
-# Step 1.6 is the natural seam, being a self-contained path with its own entry
-# condition. Doing it here was declined as out of scope and not risk-free: a
-# handler no one depends on is unreachable and silently mute (mika#2355).
+# added by raising this number.** The remaining 512 to the hard ceiling is less
+# than the smallest of the five raises above. The next addition takes the third
+# remediation the gate offers — shard via `[dependencies]`, extracting a sibling
+# skill — and Step 1.6 is the natural seam, being a self-contained path with its
+# own entry condition. Doing it here was declined as out of scope and not
+# risk-free: a handler no one depends on is unreachable and silently mute
+# (mika#2355).
+#
+# **mika#2639 is the first addition made UNDER that rule, and it took the
+# SECOND remediation instead, which is why this number did not move.** The
+# Python recipe (`uv run`, or a venv rooted under the worktree) is +363 bytes;
+# it was paid for by relocating 178 bytes of *why* that had become duplication
+# — the PR #2275 latency measurement, carried richer by
+# `skills/executor.rs` (the `BUILD_FLOOR_SECS` doc-comment) and by
+# `crates/mika-agent/CLAUDE.md` § Per-Tool Skill Budget, and a
+# `CheckClassification::HasFailures` citation the prompt already carries on its
+# CI-boundary line. Exactly the discipline stated nine lines above: the prompt
+# keeps the rule, the *why* moves to the surfaces that read it.
+#
+# **Prompt now 77 195 bytes, 94.82 % of the cap, 142 bytes of gate headroom.**
+# That is under one sentence. The second remediation is spent too: the next
+# addition shards.
 max_prompt_size = 81408
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =

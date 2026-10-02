@@ -124,6 +124,142 @@ if printf '%s\n' "$COMMAND" | grep -Eq '(^|[^A-Za-z0-9_.-])(curl|wget)([^A-Za-z0
 fi
 # --- end shell-exec egress containment ---
 
+# --- mika#2639: python installer containment ---
+# Measured producer (server.log, trace e9432d40-bdff-11f1-837b-27cfaa9b231b):
+# mika-qa, through this very handler, ran `pip install -e . -q
+# --break-system-packages` at 01:26:08/15/18Z on 2026-10-02 while reviewing the
+# claude-pilot PR cpp#273. `pip install -e` of a repo whose `[console_scripts]`
+# declares `claude-pilot` REWRITES ~/.local/bin/claude-pilot with the system
+# Python's shebang, so every pilot died at launch. Disk trace dated 01:26:20Z
+# (`dist-info`, `INSTALLER=pip`, `direct_url = file:///tmp/tmp.Eqlt2PdYwK`);
+# 2 h 45 of dead rail (mika#2634). Over 48 h, 43 run_shell calls from mika-qa
+# carried `pip install`, 19 of them aimed at claude-pilot; only the 5 carrying
+# `--break-system-packages` could write — the 38 others were refused by Gentoo's
+# externally-managed pip (PEP 668). THE HOST'S PROTECTION HELD BY ACCIDENT, NOT
+# BY DESIGN, until the agent learned to opt out of it.
+#
+# Why here and not in BUILD_COMMAND_FAMILY (mika#2423): that guard's predicate
+# is conditioned on the tool budget — `if timeout_secs >= BUILD_FLOOR_SECS {
+# return None; }` — and exempts `long_running` / `detaches_command` handlers by
+# construction. But `pip install` into the host's environment is no safer under
+# 300 s than under 30 s. Arming it there would cover the measured population BY
+# ACCIDENT (shell-exec declares timeout_secs = 30) and leave every
+# wider-budget handler uncovered — and the day somebody raises that budget the
+# pip half evaporates with no test going red. That is the mika#2205 class: a
+# guard inert over part of its population reads exactly like a guard that works.
+# The two compose; neither repairs the other. mika#2423 arbitrates a BUDGET,
+# this block arbitrates CONTAINMENT.
+#
+# The predicate INVERTS the obvious direction, and that inversion carries
+# everything: rather than expressing "a path that is not a venv" (inexpressible
+# in ERE without a lookbehind), step 1 replaces venv-qualified installers with a
+# sentinel, and steps 2-3 then scan what is LEFT. The sentinel carries no `pip`
+# substring, so it cannot be matched by the rules that follow.
+#
+# Three limits, named rather than discovered:
+#   - PROSE FALSE POSITIVE. The trailing boundary is `([^A-Za-z0-9_.-]|$)` and
+#     not `([[:space:]]|$)`, without which `pip install;` escapes trivially. The
+#     price: `grep -rn "pip install -e" docs/` is refused. Same property as the
+#     `gh` scan above, same assumed stance; the refusal body names the
+#     token-splitting workaround without ever handing over an install template.
+#   - VENV NAME OUTSIDE THE LIST. The root allowlist is
+#     {.venv, venv, .virtualenv, virtualenv, env} on an EXACT segment: a venv
+#     named otherwise (`myenv/bin/pip`, `/opt/conda/envs/x/bin/pip`) is REFUSED
+#     — fail-closed, with the universal `uv run` substitute left open. `env` is
+#     the loosest member (`/usr/local/env/bin/pip` would be neutralised); it is
+#     kept because `python -m venv env` is common, and its looseness is said
+#     here rather than left to be found.
+#   - THE mika#1957 EVASIONS REMAIN THE EVASIONS. Token splitting
+#     (`p""ip install`), variable assembly (`P=pip; $P install`), base64
+#     payloads: this reads a command line, not what it executes.
+# Defense-in-depth, NOT a sole gate. The wall is putting shell-exec itself
+# inside the sandbox (mika#2141) — its own ticket, named and out of scope.
+#
+# RULE SHAPE, and one correction to the plan's four-rule enumeration. The
+# enumerated `pip install` / `pip3 install` / `python -m pip install` /
+# `uv pip install` forms are ONE boundary-aware lexical fact, not four: in every
+# one of them the token `pip` is preceded by a non-identifier character and
+# followed by an install subcommand, so four separate rules would leave three of
+# them unable to fire alone — the dead-branch shape mika#2205 condemns. They are
+# therefore one rule. What genuinely needs a second rule is the adjacency form
+# `python -mpip install`, which Python accepts and whose missing space defeats
+# the left boundary. `pipx` needs no rule of its own: `pip` followed by `x`
+# fails the RIGHT boundary, so the installer alternation names it directly.
+_PY_SENTINEL='__MIKA_VENV_INSTALLER__'
+# Cheap pre-filter: every rule below requires the literal `pip`, `pipx` or `uv`,
+# so a command carrying none of them cannot match one. Deliberately a substring
+# test with no boundary — it must not be able to exclude anything a rule would
+# catch, and a false positive only costs the sed pipeline below.
+if printf '%s\n' "$COMMAND" | grep -Eq 'pip|uv'; then
+    # Step 1 — neutralise the PERMITTED form, then look for the forbidden one.
+    _PY_VENV_RE='(^|[^A-Za-z0-9_.-])([^[:space:]"'"'"']*/)?(\.venv|venv|\.virtualenv|virtualenv|env)/bin/(pip[0-9.]*|python[0-9.]*)'
+    # …and drop a `-m pip` / `-mpip` that follows a neutralised venv python:
+    # `"$W/.venv/bin/python" -m pip install -e "$W"` must PASS, because the
+    # discriminant is WHICH ENVIRONMENT, never which binary — and
+    # `python -m venv … && .venv/bin/python -m pip install` is a common idiom.
+    # The `--user` family still refuses that form (rule D below).
+    _PY_DASH_M_RE="${_PY_SENTINEL}"'["'"'"']?[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-m[[:space:]]*pip'
+    _PY_SCAN=$(printf '%s\n' "$COMMAND" \
+        | sed -E "s#${_PY_VENV_RE}#\\1${_PY_SENTINEL}#g" \
+        | sed -E "s#${_PY_DASH_M_RE}#${_PY_SENTINEL}#g")
+
+    # Step 2 — the installer token plus an install subcommand. A closing quote
+    # is OPTIONAL after the binary: without it `"/usr/bin/pip" install foo`
+    # walks past, i.e. the guard is bypassable with one quote character. Flags
+    # are tolerated between binary and subcommand (`pip --quiet install`).
+    _PY_INSTALLER_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx)["'"'"']?([[:space:]]+-[^[:space:]]+)*[[:space:]]+install([^A-Za-z0-9_.-]|$)'
+    # …and the no-space adjacency the boundary above cannot see.
+    _PY_DASH_MPIP_RE='(^|[^A-Za-z0-9_.-])python[0-9.]*["'"'"']?[[:space:]]+-m[[:space:]]*pip([[:space:]]+-[^[:space:]]+)*[[:space:]]+install([^A-Za-z0-9_.-]|$)'
+
+    # Step 3 — a flag aimed at the HOST, even on a venv-qualified form. Read on
+    # the RAW command, never on $_PY_SCAN: a venv pip is neutralised there while
+    # `--user` still writes to ~/.local.
+    #
+    # THREE terms in conjunction, where the plan carried two — and the third is a
+    # measured correction, not a refinement. With flag+verb alone,
+    # `./configure --prefix=/usr && make install` is refused: both terms are
+    # true and neither is a Python install. Requiring that an installer also be
+    # NAMED in the raw command keeps the plan's motivating case
+    # (`"$W/.venv/bin/pip" install --user -e .`, which writes to ~/.local
+    # despite its venv pip) and drops that false positive.
+    _PY_HOST_FLAG_RE='(^|[^A-Za-z0-9_.-])--(break-system-packages|user|target|prefix|system)([^A-Za-z0-9_.-]|$)'
+    _PY_INSTALL_VERB_RE='(^|[^A-Za-z0-9_.-])install([^A-Za-z0-9_.-]|$)'
+    _PY_TOOL_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx|uv)([^A-Za-z0-9_.-]|$)'
+
+    # SOLE WRITER of the refusal token, so `tool_calls.output LIKE '%REFUS
+    # (python-installer-guard, mika#2639)%'` counts one population and not two.
+    # The two motifs are a WIRE FORMAT (an operator GROUPs BY them); a third
+    # would make the reading table in the root CLAUDE.md false in silence.
+    # Refusal goes to STDERR with exit 1 — the channel of this file's two elders
+    # (the gws/gh scan and the egress containment), so a reader finds the fourth
+    # scan where the first two are. It reaches `tool_calls.output` all the same:
+    # on a non-zero exit `execute_exec` combines stdout and stderr and prefixes
+    # `Exit code: 1`. The body names the SUBSTITUTE and never an install
+    # template (doctrine mika#2520 / mika#2292).
+    _refuse_python_installer() {
+        echo "REFUS (python-installer-guard, mika#2639): $1" >&2
+        echo "shell-exec refuses to install into the host's Python environment." >&2
+        echo "To exercise a Python repo, run it from the worktree with 'uv run <cmd>'" >&2
+        echo "(e.g. 'uv run pytest'), or from a venv explicitly rooted under that" >&2
+        echo "worktree. Never the host's environment: on 2026-10-02 a '[console_scripts]'" >&2
+        echo "entry point rewrote ~/.local/bin and killed the production claude-pilot" >&2
+        echo "launcher for 2 h 45 (mika#2634)." >&2
+        echo "If you were only SEARCHING for this string, split the token: grep 'pip[ ]install'." >&2
+        exit 1
+    }
+
+    if printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_INSTALLER_RE" \
+        || printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_DASH_MPIP_RE"; then
+        _refuse_python_installer host_installer
+    fi
+    if printf '%s\n' "$COMMAND" | grep -Eq "$_PY_HOST_FLAG_RE" \
+        && printf '%s\n' "$COMMAND" | grep -Eq "$_PY_INSTALL_VERB_RE" \
+        && printf '%s\n' "$COMMAND" | grep -Eq "$_PY_TOOL_RE"; then
+        _refuse_python_installer host_target_flag
+    fi
+fi
+# --- end python installer containment ---
+
 # --- mika#2449: shared-checkout guard — the primary checkout is a deployment
 # checkout, and run_shell must be UNABLE to break its invariant.
 #
