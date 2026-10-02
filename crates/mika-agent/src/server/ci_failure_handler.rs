@@ -784,6 +784,31 @@ struct FailureContext {
 }
 
 /// Fetch failing checks and job logs for a PR.
+///
+/// **This site COLLECTS, it does not decide — and that is why mika#2617 changed
+/// it without touching a line of it.** The four consumers that decide through
+/// `classify_checks` inherit U1's widening for free; this one filters
+/// `fail|cancel` by hand, so its population silently grew from "the red
+/// *required* checks" to "every red check of the head".
+///
+/// Two gains and one cost, named here rather than left to be rediscovered:
+///
+/// 1. A non-required lint that is red now enters the repair context, where the
+///    model used to receive a context mute about the very failure it had to fix.
+/// 2. The `classification != HasFailures` arm ("CI might have recovered between
+///    the event and our check") becomes rarer — it used to fire whenever the red
+///    check was not a required one.
+/// 3. **Cost.** `MAX_FAILING_JOBS` bounds how many job logs are fetched, in the
+///    order `gh` returns them. A real build failure sitting behind several red
+///    lints therefore **loses its log**: the repair context degrades on exactly
+///    the case where it matters most.
+///
+/// Prioritising the list is deliberately **not** done: ranking checks by
+/// importance would reintroduce a notion of "a check that counts more", which is
+/// the divergence mika#2617 exists to close. Raising the bound trades a truncated
+/// context for a larger prompt with no measurement asking for it. The follow-up
+/// is conditioned on a measurement showing a repair context whose useful log was
+/// missing because lints occupied the `MAX_FAILING_JOBS` slots.
 async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> FailureContext {
     let mut ctx = FailureContext {
         failing_checks: Vec::new(),

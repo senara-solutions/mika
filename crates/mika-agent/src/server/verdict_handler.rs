@@ -589,14 +589,48 @@ async fn handle_pass_verdict(
         };
     }
 
+    // A PR whose CI is still running is held here, not handed to GitHub
+    // (mika#2617 U2). `--auto` merges as soon as the **required** checks pass,
+    // which is the definition of "green" this gate stopped using at U1 — arming
+    // it would have left the fix inert on precisely this path. The wait is not
+    // lost: `ci_success_handler` re-enters on `check_suite.completed(success)`
+    // with a strict `AllPassed` (mika#571).
+    //
+    // Placed before the behind-main step for the same reason the CI-failure arm
+    // is: a PR that is both behind and pending must report what it is waiting
+    // on, not "branch updated, awaiting fresh CI".
+    if classification == CheckClassification::HasPending {
+        let pending: Vec<String> = checks
+            .iter()
+            .filter(|c| c.bucket == "pending")
+            .map(|c| format!("  - {} ({})", c.name, c.state))
+            .collect();
+
+        info!(
+            event = "verdict_handler_checks_pending",
+            pr_number = event.pr_number,
+            pending_count = pending.len(),
+            "VERDICT: pass but CI checks still running — holding, no auto-merge (mika#2617)"
+        );
+
+        return VerdictAction::Passthrough {
+            enrichment: Some(format!(
+                "[verdict_handler] VERDICT: pass received but CI checks are still running:\n{}\n\
+                 The structural merge handler did NOT merge and did NOT enable auto-merge \
+                 (mika#2617: GitHub auto-merge fires on required checks only). Nothing is \
+                 wrong with this PR. Do NOT merge by hand and do NOT retry — the merge \
+                 re-enters by itself on the next `check_suite.completed(success)`.\n\n",
+                pending.join("\n")
+            )),
+        };
+    }
+
     // Behind-main assertion (#1577) + remediation (mika#2238).
     // Fetch the PR's baseRefOid via gh pr view, then compare against main HEAD.
     // When behind, GitHub is asked to update the branch and this turn ENDS.
     //
-    // Placed after the perimeter gate (above) and the CI-failure arm, and before
-    // the merge/auto-merge arm — the same order as the other two sites. The last
-    // part matters most here: `--auto` on a behind PR would let GitHub merge it
-    // behind once its pending checks go green, which is the #1577 defect.
+    // Placed after the perimeter gate (above) and the CI arms, and before the
+    // merge arm — the same order as the other two sites.
     //
     // Fail-open on the DETECTION API error, as before.
     match run_gh_pr_view(event.pr_number, &event.repo, token).await {
@@ -639,19 +673,19 @@ async fn handle_pass_verdict(
     }
 
     match classification {
-        // Handled above, which returns.
+        // Both handled above, which return.
         CheckClassification::HasFailures => {
             unreachable!("HasFailures returns before the behind-main step")
         }
-        CheckClassification::HasPending | CheckClassification::AllPassed => {
-            let is_auto = classification == CheckClassification::HasPending;
-
+        CheckClassification::HasPending => {
+            unreachable!("HasPending returns before the behind-main step (mika#2617)")
+        }
+        CheckClassification::AllPassed => {
             let merge_future = run_gh_merge(
                 event.pr_number,
                 &event.repo,
                 "squash",
                 true, // delete_branch
-                is_auto,
                 token,
             );
             let merge_result =
@@ -671,11 +705,10 @@ async fn handle_pass_verdict(
 
             match merge_result {
                 Ok(_output) => {
-                    let action_desc = if is_auto {
-                        "auto_merge_enabled"
-                    } else {
-                        "merge_initiated"
-                    };
+                    // Always an immediate merge since mika#2617 U2 — the
+                    // `auto_merge_enabled` disposition left this site with the
+                    // `--auto` flag it armed.
+                    let action_desc = "merge_initiated";
 
                     // Update task metadata
                     if let Err(e) = update_verdict_metadata(
@@ -711,20 +744,11 @@ async fn handle_pass_verdict(
 
                     // Send notification
                     if let Some(sender) = message_sender {
-                        let notification = if is_auto {
-                            format!(
-                                "PR #{} on {} — VERDICT: pass from @{}. \
-                                 Auto-merge enabled (CI checks still pending). \
-                                 GitHub will finalize when all checks pass.",
-                                event.pr_number, event.repo, event.reviewer
-                            )
-                        } else {
-                            format!(
-                                "PR #{} on {} — VERDICT: pass from @{}. \
-                                 Merge initiated (squash, delete branch).",
-                                event.pr_number, event.repo, event.reviewer
-                            )
-                        };
+                        let notification = format!(
+                            "PR #{} on {} — VERDICT: pass from @{}. \
+                             Merge initiated (squash, delete branch).",
+                            event.pr_number, event.repo, event.reviewer
+                        );
                         send_notification(sender, &notification).await;
                     }
 

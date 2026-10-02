@@ -48,10 +48,7 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
       - Notify Vincent via `send_message`: "{repo}#{number} merged. ✅" (use "passed QA and merged" for `merged`, "already merged" for `already_merged`). Include PR URL.
       - Proceed to Step 5 with `completed`.
 
-      **`"auto_merge_enabled"`** — CI checks pending, auto-merge activated:
-      - Correlate to task (Step 4).
-      - Notify Vincent via `send_message`: "{repo}#{number} passed QA. CI pending — auto-merge enabled. {PR URL}"
-      - Proceed to Step 5 with `in_progress` and note "QA passed, auto-merge enabled, awaiting CI. PR: {url}".
+      **`"auto_merge_enabled"`** — **retired since mika#2617.** No call produces it any more; the gate now returns `blocked` / `reason.reason = "checks_pending"` instead (see the `blocked` branch below). Kept here only so an old record stays readable.
 
       **`"branch_updated"`** (mika#2238) — PR was behind main; GitHub accepted an update of its branch:
       - The PR is **NOT** merged, no merge was attempted, and none must be attempted in this turn. The update moves the head to a new commit that no CI run has validated; merging it now would put unvalidated code on main — the failure mika#1577 was written to close.
@@ -63,7 +60,13 @@ The message contains the review body, PR URL, repo, and reviewer. mika-qa posts 
 
       **`"blocked"`** — PR cannot merge. Branch on the `reason` field:
 
-        **`reason.reason = "required_check_failed"`** — Required CI checks failing:
+        **`reason.reason = "checks_pending"`** (mika#2617) — CI is still running. **This is a HOLD, not a failure.** Nothing is wrong with the PR; the gate refuses rather than arming GitHub auto-merge, which fires on *required* checks only and is the second definition of "green" that merged a red PR on 2026-10-01.
+        - Do NOT call `pr_merge_with_gate` again in this turn. Do NOT call `run_gh pr merge`. Do NOT rebase.
+        - Correlate to task (Step 4).
+        - Notify Vincent via `send_message`: "{repo}#{number} passed QA. CI still running — merge held until every check is green. {PR URL}"
+        - Proceed to Step 5 with `in_progress` and note "QA passed, CI pending, merge held. PR: {url}". **End the turn** — the merge re-enters by itself on the next `check_suite.completed(success)`.
+
+        **`reason.reason = "required_check_failed"`** — A CI check failed or was cancelled (**every** check of the head since mika#2617, not only the ones branch protection marks required; the wire name keeps the word as a dated vestige):
         - Correlate to task (Step 4).
         - Check `ci_fix_count` in task metadata (default 0). If >= 2: escalate — notify Vincent "CI blocked after {n} fix attempts on QA-passed {repo}#{number}. Sprint paused. {PR URL}". Proceed to Step 5 with `blocked`.
         - Otherwise: notify Vincent "{repo}#{number} passed QA but CI failing — attempting fix ({n}/2). {PR URL}"
@@ -284,7 +287,7 @@ If you find yourself tempted to "quickly fix" a CI failure via `write_agent_file
 
 Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR. Always use `pr_merge_with_gate` with `pr_number` (integer) and `repo` (owner/repo string). The tool checks required CI statuses and returns a structured `action` — act on it.
 
-**Structural enforcement:** `pr_merge_with_gate` returns **six** typed variants — `merged`, `auto_merge_enabled`, `blocked`, `already_merged`, `gate_errored`, `branch_updated`. The `blocked` variant carries a `reason` field with **eight** sub-variants — `merge_conflict`, `required_check_failed`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`, `reviewer_cannot_merge`. Every one of them has a branch in Step 2 above; that list is the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`.
+**Structural enforcement:** `pr_merge_with_gate` returns **five** typed variants — `merged`, `blocked`, `already_merged`, `gate_errored`, `branch_updated` (`auto_merge_enabled` is retired since mika#2617 — no call produces it any more). The `blocked` variant carries a `reason` field with **nine** sub-variants — `merge_conflict`, `required_check_failed`, `checks_pending`, `missing_approval`, `pr_closed`, `draft`, `behind_main`, `human_gate_required`, `reviewer_cannot_merge`. Every one of them has a branch in Step 2 above; that list is the exhaustive handling surface. On ANY error or blocked state, do NOT fall back to `run_gh pr merge`.
 
 **Why this list used to be short:** until mika#2238 this prompt named five of the seven `blocked.reason` values while instructing you to branch "exhaustively". An agent that met an unlisted variant had no defined move, and the observed behaviour was a silent stop — the mika#2236 shape, where an APPROVED, CI-green, behind-main PR sat until the operator merged it by hand.
 

@@ -1176,6 +1176,13 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
     // Named cost: the MECHANICAL-PR-with-a-non-active-task path (handler line
     // ~504) loses the coverage it was getting by accident here. Covering it
     // deterministically needs an injectable fetch, which is a separate change.
+    //
+    // mika#2617 (PR#2642) hit the same trap independently and moved this test to
+    // #424242; the merge keeps #999 because an issue number stays non-resolvable
+    // forever, while a missing number only stays so until the repo grows. Its
+    // note on the siblings still holds for #50 (below): that one is a real PR
+    // and passes only because its diff classifies DECISION-CORE — the same
+    // latent dependency.
     let db = test_db().await;
     let pr_url = "https://github.com/senara-solutions/mika/pull/999";
     let task_id = create_task_with_pr_url(&db, pr_url).await;
