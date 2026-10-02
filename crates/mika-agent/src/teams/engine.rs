@@ -77,6 +77,11 @@ pub(crate) const TEAM_DELIVERABLE_WITHHELD: &str = "The team finished its work, 
      written. Nothing has been sent in its place. Ask again and it will be \
      re-written.";
 
+/// The workspace-root file the writer is told to write its deliverable to
+/// (`prompt::build_deliverable_context`, step 3). Rewritten with the committed
+/// text when a deliverable is refused (mika#2633 W2).
+const WORKSPACE_DELIVERABLE_FILE: &str = "deliverable.md";
+
 /// Where a `run.deliverable` came from — and therefore what a refusal does with
 /// it (mika#2633 U1/U2).
 ///
@@ -718,9 +723,13 @@ impl TeamEngine {
         let deliverable = self.commit_deliverable(produced, source).await;
 
         // Write deliverable metadata. **The committed text, never the produced
-        // one** — the workspace file is re-read by `read_workspace_fallback` on
-        // a later timeout, so writing the refused text here would re-serve it.
-        self.write_metadata_file("deliverable.md", &deliverable);
+        // one** — `.meta/deliverable.md` is the operator-facing copy of the
+        // run's deliverable and must agree with `team_runs.deliverable` and the
+        // completion notification. It is NOT what closes the re-serve loop:
+        // `build_workspace_fallback` skips `.meta/`. The file that loop does
+        // read is the workspace-root `deliverable.md` the writer wrote itself,
+        // and `commit_deliverable` rewrites that one on a refusal.
+        self.write_metadata_file(WORKSPACE_DELIVERABLE_FILE, &deliverable);
 
         self.emit_event(TeamEvent::Deliverable(deliverable));
         Ok(())
@@ -828,8 +837,42 @@ impl TeamEngine {
             }
         };
 
+        self.overwrite_workspace_deliverable(&committed);
         self.run.deliverable = Some(committed.clone());
         committed
+    }
+
+    /// On a refusal, make the workspace-root deliverable file carry the
+    /// committed text (review finding, mika#2633 W2).
+    ///
+    /// `build_deliverable_context` tells the writer to write `deliverable.md`
+    /// at the workspace root itself, during `deliver()` — i.e. **before** this
+    /// site sees the text. After a refusal that file kept the proposal, readable
+    /// by `read_workspace` within the run and, through `reference_run_id`, by
+    /// any later run — the "reaches the next run" class this ticket closes for
+    /// `team_runs.deliverable`, reopened one notch. It is also the one file
+    /// `build_workspace_fallback` does re-read (it skips `.meta/`).
+    ///
+    /// Only an **existing** file is rewritten: a site that never wrote it
+    /// (sites 2–4, or a writer that did not follow the instruction) gets no
+    /// new artefact. Best-effort, like `write_metadata_file`: a failed write
+    /// warns and never changes the committed text.
+    fn overwrite_workspace_deliverable(&self, committed: &str) {
+        let path = self.workspace_dir.join(WORKSPACE_DELIVERABLE_FILE);
+        if !path.is_file() {
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, committed) {
+            warn!(
+                target: "mika::otel",
+                trace_id = %self.trace_id,
+                team_run_id = %self.run.run_id,
+                error = %e,
+                event = "team_deliverable_workspace_overwrite_failed",
+                "could not overwrite the workspace deliverable after a refusal — \
+                 the refused text may remain readable by `read_workspace`"
+            );
+        }
     }
 
     /// Ask the writer agent for **one** re-write, modelled on guard 5h's
@@ -3183,6 +3226,74 @@ mod tests {
             Some(TEAM_DELIVERABLE_WITHHELD),
             "un repli workspace porteur d'une proposition doit donner la ligne \
              neutre directement, sans re-rédaction demandée au rédacteur"
+        );
+    }
+
+    /// Constat de revue (correctness, reliability, agent-native — W2) : le
+    /// rédacteur écrit lui-même `deliverable.md` à la racine du workspace
+    /// (`build_deliverable_context`, étape 3) **avant** que `commit_deliverable`
+    /// voie le texte. Sur un refus, ce fichier gardait la proposition, lisible
+    /// par `read_workspace` dans le run et par tout run ultérieur lancé avec
+    /// `reference_run_id` — la classe « atteint le prochain run » que ce ticket
+    /// ferme pour `team_runs.deliverable`, rouverte d'un cran.
+    ///
+    /// Deux volets : sur la ligne neutre **et** sur une re-rédaction aboutie, le
+    /// fichier porte le texte engagé, jamais le texte produit.
+    #[tokio::test]
+    async fn mika2633_le_fichier_livrable_du_workspace_porte_le_texte_engage() {
+        for (responses, attendu) in [
+            (vec![], TEAM_DELIVERABLE_WITHHELD),
+            (
+                vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+                PRESCRIBED_REFUSAL,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut engine = engine_with_mock(tmp.path(), responses);
+            let fichier = tmp.path().join("workspace").join("deliverable.md");
+            std::fs::write(&fichier, PROPOSAL).unwrap();
+
+            let committed = engine
+                .commit_deliverable(
+                    PROPOSAL.to_string(),
+                    DeliverableSource::Writer {
+                        agent_name: "scribe".to_string(),
+                    },
+                )
+                .await;
+
+            assert_eq!(committed, attendu);
+            assert_eq!(
+                std::fs::read_to_string(&fichier).unwrap(),
+                attendu,
+                "le `deliverable.md` du workspace doit porter le texte engagé, \
+                 pas la proposition refusée"
+            );
+        }
+    }
+
+    /// Le contrôle négatif du test ci-dessus : sans refus, le fichier écrit par
+    /// le rédacteur n'est pas touché (il peut légitimement différer du texte
+    /// rendu, et rien ne justifie de le réécrire).
+    #[tokio::test]
+    async fn mika2633_sans_refus_le_fichier_du_workspace_est_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        let fichier = tmp.path().join("workspace").join("deliverable.md");
+        std::fs::write(&fichier, "Version longue du rapport.").unwrap();
+
+        engine
+            .commit_deliverable(
+                "Version courte du rapport.".to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&fichier).unwrap(),
+            "Version longue du rapport."
         );
     }
 
