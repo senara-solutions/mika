@@ -831,6 +831,7 @@ SELECT r.id, t.name AS team_name, r.status, r.started_at
 |---|---|---|---|
 | `channel = "team_deliverable"` | WARN | **zéro** | chaque ligne est un livrable arrêté avant la personne **et** avant la base |
 | `_uncorrected`, `deliverable_source = "writer"` | WARN | **zéro** | la re-rédaction a échoué **après** que 5h a aussi échoué : lire le prompt servi au rédacteur **avant** de toucher au prédicat |
+| `team_deliverable_rewrite_skipped_no_budget` | WARN | **zéro** | la re-rédaction n'a pas été tentée faute de place avant le mur de 900 s du run : la ligne neutre est posée au lieu d'un run coupé en plein tour qui aurait persisté « no deliverable produced ». Couvre le mur du run, **pas** celui de l'outil `run_team` synchrone (300 s), que le moteur ne connaît pas — limite nommée |
 | `_uncorrected`, `workspace_fallback` \| `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
 | un même `team_run_id` portant plusieurs refus | WARN | **anomalie** | un seul retry est prévu, donc deux lignes signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
 | `channel != "team_deliverable"` | — | **non vide** | le contrôle positif : zéro partout ne prouve rien |

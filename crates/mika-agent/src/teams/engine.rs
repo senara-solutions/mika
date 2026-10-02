@@ -221,6 +221,17 @@ pub struct TeamEngine {
     /// (mika#2290). Threaded into every member's `TeamAgentParams` so the
     /// hosting ground truth and the 5d guard reach team turns too.
     deployment: mika_common::home::Deployment,
+    /// The instant the run's own wall (`TEAM_RUN_TIMEOUT_SECS`) cuts it, set by
+    /// [`TeamEngine::execute`] next to its `tokio::time::timeout` (mika#2633).
+    /// `None` on the resumed path (`execute_from_phase`), which has no wall.
+    ///
+    /// Read by the deliverable re-write alone: that turn starts a FRESH agent
+    /// envelope at the very end of a run, so without this bound it could be cut
+    /// by the outer wall mid-turn — the commit then never lands and the run
+    /// persists `None`, i.e. "no deliverable produced", the false statement
+    /// `TEAM_DELIVERABLE_WITHHELD` exists to prevent. Same shape as `run_loop`'s
+    /// continuation gate (mika#848 F3a).
+    run_deadline: Option<std::time::Instant>,
 }
 
 /// Outcome of an `execute_tasks` iteration (mika#1671). Replaces the previous
@@ -406,6 +417,7 @@ impl TeamEngine {
             pr_reviews_posted,
             tier,
             deployment,
+            run_deadline: None,
         })
     }
 
@@ -463,6 +475,7 @@ impl TeamEngine {
             pr_reviews_posted,
             tier,
             deployment,
+            run_deadline: None,
         })
     }
 
@@ -648,6 +661,8 @@ impl TeamEngine {
             Err(e) => warn!(error = %e, "failed to persist goal message"),
         }
 
+        self.run_deadline =
+            Some(std::time::Instant::now() + Duration::from_secs(TEAM_RUN_TIMEOUT_SECS));
         let result = match tokio::time::timeout(
             Duration::from_secs(TEAM_RUN_TIMEOUT_SECS),
             self.execute_inner(),
@@ -892,6 +907,38 @@ impl TeamEngine {
         agent_name: &str,
         proposal: &crate::evidence::guards::TestimonyAccessProposalMatch,
     ) -> Option<String> {
+        // Remaining-budget gate (review finding, reliability P2) — the
+        // re-write is a full agent turn with a FRESH envelope, at the very end
+        // of a run. If that envelope does not fit before the run's own wall,
+        // the wall would cut the turn mid-flight, the commit would never land,
+        // and the run would persist `None` — "no deliverable produced", the
+        // false statement the neutral line exists to prevent. Refusing the
+        // re-write here turns that cancellation arm into the enumerated
+        // neutral-line arm. Mirrors `run_loop`'s continuation gate
+        // (mika#848 F3a). No deadline (the resumed path) ⇒ no gate.
+        if let (Some(deadline), Some(resources)) = (self.run_deadline, self.agents.get(agent_name))
+        {
+            let envelope = Duration::from_secs(crate::planning::policy::team_agent_timeout_secs(
+                resources.llm.as_ref(),
+            ));
+            if std::time::Instant::now() + envelope > deadline {
+                warn!(
+                    target: "mika::otel",
+                    trace_id = %self.trace_id,
+                    team_run_id = %self.run.run_id,
+                    agent = %agent_name,
+                    envelope_secs = envelope.as_secs(),
+                    remaining_secs = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs(),
+                    event = "team_deliverable_rewrite_skipped_no_budget",
+                    "deliverable re-write skipped — no room left in the run for a \
+                     full agent envelope; withholding the deliverable"
+                );
+                return None;
+            }
+        }
+
         // **Two branches, and the second is load-bearing.** Layer 1 of
         // mika#1798 prescribes offering an operational-grade substitute instead
         // of a bare refusal, so a request pushing only towards declining would
@@ -2949,6 +2996,7 @@ mod tests {
             pr_reviews_posted: None,
             tier: mika_common::home::AgentTier::Default,
             deployment: mika_common::home::Deployment::Unknown,
+            run_deadline: None,
         }
     }
 
@@ -3227,6 +3275,68 @@ mod tests {
             "un repli workspace porteur d'une proposition doit donner la ligne \
              neutre directement, sans re-rédaction demandée au rédacteur"
         );
+    }
+
+    /// Constat de revue (reliability, P2) — la re-rédaction ouvre une enveloppe
+    /// d'agent NEUVE à la fin d'un run qui a déjà dépensé son budget. Sans garde,
+    /// le mur des 900 s du run la coupe en plein tour : le commit ne pose jamais
+    /// rien, le run persiste `None`, et la notification dit « no deliverable
+    /// produced » — l'énoncé faux que la ligne neutre existe pour empêcher.
+    ///
+    /// La réponse propre configurée est le discriminant : si la re-rédaction
+    /// était tentée malgré l'échéance trop proche, elle deviendrait le livrable.
+    #[tokio::test]
+    async fn mika2633_une_redaction_sans_budget_restant_nest_pas_tentee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+        );
+        // Dix secondes avant le mur : moins qu'une enveloppe d'agent (300 s).
+        engine.run_deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
+
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            committed, TEAM_DELIVERABLE_WITHHELD,
+            "une re-rédaction qui ne tient pas dans le budget restant du run ne \
+             doit pas être tentée : la ligne neutre est posée directement"
+        );
+        assert_eq!(
+            engine.run.deliverable.as_deref(),
+            Some(TEAM_DELIVERABLE_WITHHELD)
+        );
+    }
+
+    /// Le contrôle positif : avec un budget suffisant, la re-rédaction a lieu.
+    /// Sans lui, « la garde refuse quand le budget manque » serait
+    /// indistinguable de « la garde refuse toujours ».
+    #[tokio::test]
+    async fn mika2633_une_redaction_avec_budget_restant_est_tentee() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(
+            tmp.path(),
+            vec![mika_common::llm::mock::text_response(PRESCRIBED_REFUSAL)],
+        );
+        engine.run_deadline = Some(std::time::Instant::now() + Duration::from_secs(900));
+
+        let committed = engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        assert_eq!(committed, PRESCRIBED_REFUSAL);
     }
 
     /// Constat de revue (correctness, reliability, agent-native — W2) : le
