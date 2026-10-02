@@ -3438,6 +3438,31 @@ pub async fn auto_pull_groomed_ticket(
 /// disagree with its own `in_flight` number. That arm is now defensive rather
 /// than routine — every member of `in_flight_issues` is, by construction, a
 /// number the probe resolved `Ok(Some(_))` on.
+/// The (b) remedy while every in-flight dispatch is younger than the stuck
+/// threshold: the tickets and their ages are named, nothing is ordered.
+const POOL_IN_FLIGHT_NOT_YET_STUCK_REMEDY: &str = "the `ready` pool is held by live dispatches, all younger than the stuck-ready \
+     threshold — not stuck yet; check their ages below before grooming more";
+
+/// Is at least one in-flight `ready` ticket stuck by the house's definition
+/// (`stuck_ready_threshold_secs`)?
+///
+/// Fail-safe towards the original (b) message: a ticket with no captured row or
+/// an unparseable instant cannot be shown to be young, so it counts as stuck —
+/// softening the remedy needs a measurement, keeping it does not.
+fn pool_in_flight_is_stuck(
+    in_flight_issues: &[u64],
+    probed: &HashMap<u64, InFlightSelfDevTask>,
+    now: chrono::DateTime<chrono::Utc>,
+    threshold_secs: i64,
+) -> bool {
+    in_flight_issues.iter().any(|n| match probed.get(n) {
+        Some(task) => crate::timestamp::parse(&task.in_flight_since)
+            .map(|since| (now - since).num_seconds() >= threshold_secs)
+            .unwrap_or(true),
+        None => true,
+    })
+}
+
 fn resolve_stuck_ready_tickets(
     in_flight_issues: &[u64],
     probed: &HashMap<u64, InFlightSelfDevTask>,
@@ -3512,6 +3537,27 @@ async fn emit_empty_backlog_signal(
         }
     };
 
+    // The (b) classification is kept whatever the ages (the plan's priority), but
+    // "stuck … do NOT groom" is only asserted once a dispatch has actually been in
+    // flight past the house's own definition of stuck. Below it, the nominal
+    // regime — one pilot started minutes ago — would be ordered not to groom on
+    // every tick, the inverse of the remedy due (review of PR #2635).
+    let remedy = match cause {
+        EmptyBacklogCause::PoolInFlight
+            if !pool_in_flight_is_stuck(
+                &census.in_flight_issues,
+                probed,
+                chrono::Utc::now(),
+                stuck_ready_threshold_secs(),
+            ) =>
+        {
+            POOL_IN_FLIGHT_NOT_YET_STUCK_REMEDY
+        }
+        EmptyBacklogCause::PoolInFlight
+        | EmptyBacklogCause::InFlightUnreadable
+        | EmptyBacklogCause::NoGroomedBacklog => cause.remedy(),
+    };
+
     info!(
         event,
         raw_ready = census.raw_ready,
@@ -3523,7 +3569,7 @@ async fn emit_empty_backlog_signal(
         candidate_probe_failed = census.candidate_probe_failed,
         min_ready,
         stuck = %stuck,
-        remedy = cause.remedy(),
+        remedy,
         "{event}"
     );
 
@@ -3538,7 +3584,7 @@ async fn emit_empty_backlog_signal(
         census.state_probe_failed,
         census.operator_held,
         census.candidate_probe_failed,
-        cause.remedy(),
+        remedy,
     );
 
     if let Err(e) = db
@@ -8717,11 +8763,12 @@ This ticket has been GROOMED and is ready.
             &HashSet::new(),
         );
         let stuck_cause = classify_empty_backlog(&stuck);
-        // The rows the probe loop would have captured for those four tickets.
+        // The rows the probe loop would have captured for those four tickets —
+        // an hour old, past the stuck-ready threshold, like the founding night.
         let probed: HashMap<u64, InFlightSelfDevTask> = stuck
             .in_flight_issues
             .iter()
-            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 600)))
+            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 3600)))
             .collect();
         emit_empty_backlog_signal(&db, &stuck, stuck_cause, &probed, 3, "trace", "session").await;
 
@@ -8805,6 +8852,87 @@ This ticket has been GROOMED and is ready.
             "(a) names nobody — an empty pool has no in-flight population; \
              detail = {empty_detail}"
         );
+    }
+
+    /// **A fresh dispatch is not a stuck pool** (review of PR #2635).
+    ///
+    /// The nominal regime — one pilot started two minutes ago, nothing groomed
+    /// behind it — classifies (b) by design (the plan's (b) > (a) priority is
+    /// kept), but the remedy used to assert "stuck … do NOT groom more" on every
+    /// tick: the inverse of the remedy due. The house already defines "stuck":
+    /// `STUCK_READY_THRESHOLD_DEFAULT_SECS`. Below it the message names the
+    /// tickets and their ages without ordering anything.
+    ///
+    /// Red-before: the young row rendered "do NOT groom more".
+    #[tokio::test]
+    async fn mika2161_un_dispatch_frais_nest_pas_un_bassin_coince() {
+        use crate::db::Database;
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let issues = vec![make_issue(70, GROOMED_BODY, &["ready"], "t")];
+        let census = census_ready_pool(&issues, &HashSet::new(), &numbers(&[70]), &HashSet::new());
+        let cause = classify_empty_backlog(&census);
+        assert_eq!(
+            cause,
+            EmptyBacklogCause::PoolInFlight,
+            "the priority is kept"
+        );
+
+        let young: HashMap<u64, InFlightSelfDevTask> =
+            [(70u64, probed_row("task-70", "in_progress", 60))].into();
+        emit_empty_backlog_signal(&db, &census, cause, &young, 3, "trace", "session").await;
+
+        let detail = db
+            .get_audit_events("session")
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .find(|e| e.tool_name == "auto_feeder")
+            .and_then(|e| e.after_value)
+            .unwrap_or_default();
+        assert!(
+            detail.contains("#70(in_progress,60s,task-70)"),
+            "the ticket and its age are still named; detail = {detail}"
+        );
+        assert!(
+            !detail.contains("do NOT groom"),
+            "a 60 s dispatch is not stuck — ordering not to groom is the inverse \
+             of the remedy due; detail = {detail}"
+        );
+    }
+
+    /// The age predicate behind the (b) remedy, at its boundaries and on its two
+    /// fail-safe arms: no captured row, or an unreadable instant, keeps the
+    /// original "stuck" message rather than softening it on no measurement.
+    #[test]
+    fn mika2161_le_seuil_de_blocage_et_ses_bras_fail_safe() {
+        let now = chrono::Utc::now();
+        let rows = |secs: i64| -> HashMap<u64, InFlightSelfDevTask> {
+            [(1u64, probed_row("t1", "in_progress", secs))].into()
+        };
+        assert!(!pool_in_flight_is_stuck(&[1], &rows(60), now, 900));
+        assert!(pool_in_flight_is_stuck(&[1], &rows(901), now, 900));
+        assert!(
+            pool_in_flight_is_stuck(&[1], &HashMap::new(), now, 900),
+            "no captured row cannot be shown young"
+        );
+        let mut bad = HashMap::new();
+        bad.insert(
+            1u64,
+            InFlightSelfDevTask {
+                task_id: "t1".to_string(),
+                status: "pending".to_string(),
+                in_flight_since: "not-a-timestamp".to_string(),
+            },
+        );
+        assert!(
+            pool_in_flight_is_stuck(&[1], &bad, now, 900),
+            "an unreadable instant cannot be shown young"
+        );
+        assert!(!pool_in_flight_is_stuck(&[], &HashMap::new(), now, 900));
     }
 
     /// A captured probe row, dated `secs` ago.

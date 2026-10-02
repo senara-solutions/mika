@@ -4019,7 +4019,7 @@ SELECT target_key, count(*) FROM audit_events
 
 | surface | niveau | régime attendu | lecture |
 |---|---|---|---|
-| `auto_feeder_pool_in_flight` | INFO | **non nul pendant un blocage** | chaque ligne est un bassin coincé nommé ; `stuck` donne les tickets, leur statut et leur âge en secondes |
+| `auto_feeder_pool_in_flight` | INFO | **non nul pendant un blocage** | chaque ligne est un bassin coincé nommé ; `stuck` donne les tickets, leur statut et leur âge en secondes. Tant qu'aucun dispatch n'a dépassé `MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS` (900 s), `remedy` nomme les âges sans ordonner « do NOT groom » : un pilote parti il y a deux minutes n'est pas un bassin coincé |
 | `auto_feeder_in_flight_unreadable` | INFO | **vide** | la sonde DB échoue, donc le feeder ne peut plus poser de diagnostic |
 | `auto_feeder_no_backlog` | INFO | nominal | désormais véridique : le grooming **est** le goulot |
 | `stuck` sur une ligne (a) ou (c) | INFO | **toujours `[]`** | (a) n'a pas de population en vol, (c) en a une que le moteur n'a pas su lire — la nommer serait le remède faux |
