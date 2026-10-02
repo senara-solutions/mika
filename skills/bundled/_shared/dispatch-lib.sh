@@ -611,6 +611,13 @@ _emit_pilot_budget_line() {
 # un `PILOT_*` nu qu'un `MIKA_*` — le nom nu est une convention sur le relais
 # `inject_pilot_dispatch_env`, jamais un contournement de scrub (mika#2508).
 #
+# ET C'EST L'INSCRIPTION DANS CE RELAIS QUI LE FAIT TRAVERSER, pas la forme du
+# nom. `PLAN_SIZE_MAX_LOC` est déclaré dans `PILOT_DISPATCH_ENV`
+# (`crates/mika-agent/src/skills/executor.rs`) aux côtés de ses deux voisins ;
+# sans cette ligne, le palier `source=env` serait inerte dans tout child de
+# dispatch — le résolveur retomberait toujours sur le défaut in-file — et les
+# deux prompts architecte annonceraient un réglage que rien ne peut changer.
+#
 # ASSIGNE, n'imprime pas, et pour les deux raisons de `_pilot_max_turns` : une
 # surcharge lue une seule fois au chargement répondrait le défaut à tout
 # appelant qui la pose après le `source`, et un accesseur imprimant se lirait
@@ -676,28 +683,70 @@ _plan_size_max_loc() {
 # FENCE NON TERMINÉ : rien n'est strippé, le corps entier est évalué. Le sens de
 # l'arbitrage est celui de mika#2120 — un faux positif coûte une relance de
 # revise, un faux négatif a coûté quinze heures de boucle.
+# Les deux formes de clôture sont retirées (``` et ~~~). Un plan qui documente
+# le format dans un bloc `~~~markdown` est exactement aussi « documenté sans
+# être rempli » qu'avec des accents graves ; ne reconnaître qu'une des deux
+# laisserait un trou sur une forme Markdown parfaitement valide.
 _plan_size_strip_fences() {
     local _f="$1" _n
-    _n=$(grep -cE '^[[:space:]]*```' "$_f" 2>/dev/null || true)
+    _n=$(grep -cE '^[[:space:]]*(```|~~~)' "$_f" 2>/dev/null || true)
     if [ $(( _n % 2 )) -ne 0 ]; then
         cat "$_f"
         return 0
     fi
-    awk '/^[[:space:]]*```/ { _inf = 1 - _inf; next } !_inf' "$_f"
+    awk '/^[[:space:]]*(```|~~~)/ { _inf = 1 - _inf; next } !_inf' "$_f"
 }
 
-# SITE UNIQUE de lecture de `$_PLAN_SIZE_HEADING_RE`. Les deux consommateurs —
-# le terme 2 du rattrapage et le re-test de journalisation — passent par ici,
-# donc ils ne peuvent pas diverger sur le strip des fences ni sur les drapeaux
-# de `grep`. C'est un cran plus fort que les deux lecteurs co-mutés de
-# `_FD_HEADING_RE` (mika#2544), et pour la même raison : perdre `-E` en écrivant
-# `-qi` rendrait le groupe et les quantificateurs littéraux, le motif
-# n'apparierait plus rien, le terme 2 deviendrait toujours vrai et le rattrapage
-# tirerait sur tout plan dont les findings mentionnent la chaîne.
+# SITE UNIQUE de lecture de `$_PLAN_SIZE_HEADING_RE`, et **site unique de
+# fenêtrage de la section**. Les trois consommateurs — le terme 2 du
+# rattrapage, le re-test de journalisation et l'extraction du total — passent
+# par ici, donc ils ne peuvent pas diverger sur le strip des fences, sur les
+# drapeaux de `grep`, ni sur les bornes de la section.
+#
+# Rend sur stdout le CORPS DE LA SECTION, titre compris, ou RIEN. La borne de
+# fin est le prochain titre de niveau 2 (`^## `), exclu.
+#
+# **AUCUN PIPE, et c'est un correctif mesuré, pas une préférence.** La première
+# rédaction faisait `_plan_size_strip_fences "$_f" | grep -qiE …`. `grep -q`
+# sort au PREMIER match et ferme le tuyau ; le producteur (`awk`/`cat`), qui
+# écrit encore, prend SIGPIPE et sort en 141 ; sous `set -o pipefail` ce 141
+# devient le statut du pipeline — donc la fonction rendait « section ABSENTE »
+# pour un plan qui la porte. Mesuré : rc=141 et `total_loc=absent` sur un plan
+# de 320 Ko portant `## 6. Taille estimée` et `Total estimé : 530 lignes`, et
+# déterministe dès ~48 Ko de queue après le titre, c'est-à-dire sur le décile
+# supérieur de la distribution que ce ticket existe pour mesurer.
+#
+# Les deux moitiés cassaient ensemble : le terme 2 du rattrapage tirait sur un
+# plan CONFORME (relance de revise inutile, exactement la régression que
+# mika#2544 a dû fermer), et la ligne de journal annonçait `absent` pour un plan
+# dimensionné — donc les plus gros plans disparaissaient de la distribution qui
+# doit recalibrer le seuil. `scripts/verify-no-sigpipe-grep.sh` garde cette
+# forme et nomme ce fichier `pipefail: oui` ; son motif n'apparie que les
+# producteurs `printf`/`echo`, donc un producteur en fonction est passé dessous.
+# Le remède est celui que ce lint prescrit : une chaîne ici-document (`<<<`),
+# qui n'a pas de pipeline et donc pas de SIGPIPE.
+_plan_size_section_body() {
+    local _f="$1" _body _hits _start
+    [ -r "$_f" ] || return 0
+    _body=$(_plan_size_strip_fences "$_f")
+    # `|| true` : `grep` sort en 1 quand il ne trouve rien, et l'absence de
+    # section est un résultat, pas une erreur.
+    _hits=$(grep -niE -- "$_PLAN_SIZE_HEADING_RE" <<<"$_body" || true)
+    [ -n "$_hits" ] || return 0
+    # La sortie de `grep -n` commence par `<ligne>:` ; on prend le PREMIER match
+    # par expansion de paramètre plutôt que par `| head -1`, qui serait un
+    # second pipeline à SIGPIPE.
+    _start=${_hits%%:*}
+    awk -v s="$_start" '
+        NR < s  { next }
+        NR == s { print; next }
+        /^##[[:space:]]/ { exit }
+                { print }
+    ' <<<"$_body"
+}
+
 _plan_size_section_present() {
-    local _f="$1"
-    [ -r "$_f" ] || return 1
-    _plan_size_strip_fences "$_f" | grep -qiE -- "$_PLAN_SIZE_HEADING_RE"
+    [ -n "$(_plan_size_section_body "$1")" ]
 }
 
 # Rend sur stdout EXACTEMENT un de trois jetons, et ils sont DISTINCTS :
@@ -712,23 +761,36 @@ _plan_size_section_present() {
 # Et aucun des deux n'est `0` : un total de zéro serait une valeur plausible,
 # présentée avec autorité, fausse (*un `null` n'est jamais un `0`*, mika#2331).
 #
-# APRÈS LE STRIP, LE DERNIER MATCH GAGNE, jamais le premier : un plan peut
-# légitimement porter un total par phase avant son total global, et le dernier
-# est celui qui conclut.
+# LE TOTAL EST CHERCHÉ DANS LA SECTION, jamais dans tout le document — et c'est
+# une correction mesurée. La règle injectée au groomeur ORDONNE, au-dessus du
+# seuil, de « découper en phases » et de « renvoyer explicitement la suite à un
+# ticket de suivi ou à une phase nommée », et le gate architecte fait passer ce
+# plan en jugeant « le périmètre de CETTE PR, jamais la somme des phases ». Un
+# plan conforme à cette prescription porte donc légitimement un second
+# `Total estimé :` plus loin, hors section — pour la suite différée. Lu sur tout
+# le document, le dernier match gagnant, le lecteur rapportait ce total différé :
+# mesuré, une section annonçant 850 et un § hors périmètre annonçant 1900
+# rendaient `1900`, donc `verdict=over_threshold` sur un périmètre de 850. Le
+# commentaire d'origine supposait que les totaux par phase PRÉCÈDENT le total
+# global ; c'est faux de la population que la règle prescrit.
+#
+# DANS la section, le dernier match gagne toujours : un plan peut porter un
+# sous-total par livrable avant son total, et le dernier est celui qui conclut.
 #
 # Borne NOMMÉE : l'appariement du total est sensible à la casse, là où celui du
 # titre replie la casse. La forme prescrite est exacte sur cette ligne, et
 # replier la casse ici n'achèterait rien de mesuré.
 _plan_size_total_loc() {
-    local _f="$1" _n
+    local _f="$1" _section _n
     [ -r "$_f" ] || { printf 'absent'; return 0; }
-    _plan_size_section_present "$_f" || { printf 'absent'; return 0; }
+    _section=$(_plan_size_section_body "$_f")
+    [ -n "$_section" ] || { printf 'absent'; return 0; }
     # Le motif est ancré sur la ligne ENTIÈRE, donc `s/…/\1/` remplace la ligne
     # par la capture : la sortie ne porte que le nombre, sans résidu de texte.
-    # Le corps strippé est tubé directement plutôt que matérialisé dans une
-    # variable : un seul consommateur, donc la variable intermédiaire coûtait un
-    # sous-shell et une re-sérialisation de tout le plan pour rien.
-    _n=$(_plan_size_strip_fences "$_f" | sed -nE "s/${_PLAN_SIZE_TOTAL_RE}/\1/p" | tail -1)
+    # Chaîne ici-document et non pipeline : `tail -1` ne court-circuite pas,
+    # mais la forme sans pipe est celle que le lint SIGPIPE prescrit et elle
+    # retire la question.
+    _n=$(sed -nE "s/${_PLAN_SIZE_TOTAL_RE}/\1/p" <<<"$_section" | tail -1)
     if [ -n "$_n" ]; then printf '%s' "$_n"; else printf 'unparsable'; fi
     return 0
 }

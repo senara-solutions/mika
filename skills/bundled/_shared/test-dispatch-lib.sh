@@ -11599,11 +11599,38 @@ assert_contains "S7: le compteur de garde existe et est armé AVANT l'action" \
     "_PLAN_SIZE_REVISE_RETRIED=1" "$T2636_GUARD_SRC"
 assert_contains "S7: et il est remis à zéro à chaque entrée de _launch_revise_pilot" \
     "_PLAN_SIZE_REVISE_RETRIED=0" "$T2636_REVISE_SRC"
-assert_eq "S7: un second appel avec le compteur déjà armé est un no-op" "0" \
-    "$( (source "$DISPATCH_LIB" 2>/dev/null || true
-         _PLAN_SIZE_REVISE_RETRIED=1
-         _plan_size_retry_if_section_still_missing "$T2636_PLAN" "$T2636_PLAN" 2>&1 \
-           | grep -c 'plan_size_revise_retried' || true) )"
+
+# Le no-op du compteur se mesure sur une paire où TOUS LES AUTRES TERMES SONT
+# VRAIS, sinon l'assertion est vide. La première rédaction passait ce plan-ci
+# des deux côtés : S16 asserte qu'il porte la section, donc le terme 2
+# court-circuitait AVANT le compteur et l'assertion ne distinguait pas un
+# compteur armé d'un compteur absent (vérifié : retirer la ligne de budget
+# laissait le test vert). La sonde construit donc une paire dont les deux
+# `grep` sont vrais, et porte son CONTRÔLE POSITIF — compteur à zéro ⇒ une
+# relance — sans lequel « le compteur arrête » serait indistinguable de « la
+# garde n'a jamais rien fait ».
+_t2636_budget_probe() {
+    local t2636_armed="$1" t2636_dir t2636_out
+    t2636_dir=$(mktemp -d)
+    printf 'F1 — ajoute une section `## Taille estimée`.\n' > "$t2636_dir/findings-1.md"
+    printf '# plan\n\n## Livrables\n\nL1 — rien.\n' > "$t2636_dir/plan.md"
+    t2636_out=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _run_pilot_sandboxed() { return 0; }
+        _PLAN_SIZE_REVISE_RETRIED="$t2636_armed"
+        LOG_ID=t2636-budget REPO=mika ISSUE_NUM=2636 CWD_ARGS="" \
+            _plan_size_retry_if_section_still_missing \
+                "$t2636_dir/findings-1.md" "$t2636_dir/plan.md" 2>&1 >/dev/null \
+          | grep -c 'plan_size_revise_retried' || true
+    )
+    rm -rf "$t2636_dir"
+    printf '%s' "$t2636_out"
+}
+assert_eq "S7: compteur déjà armé ⇒ aucune relance (le budget arrête)" "0" \
+    "$(_t2636_budget_probe 1)"
+assert_eq "S7 contrôle positif: compteur à zéro ⇒ une relance (la garde mord)" "1" \
+    "$(_t2636_budget_probe 0)"
 assert_eq "S7: et AUCUNE troisième relance sur le chemin S1" "2" "$(_t2636_field 2 "$T2636_S1")"
 assert_eq "S7: l'événement d'échec est émis exactement une fois" "1" \
     "$(_t2636_err "$T2636_S1" | grep -c 'plan_size_still_missing_after_retry' || true)"
@@ -11691,8 +11718,11 @@ Total estimé : 1 400 lignes')"
 T2636_S9_ABSENT=$(_t2636_emit_probe "absent")
 assert_contains "S9: la ligne porte 'absent', jamais 0" "total_loc=absent" "$T2636_S9_ABSENT"
 assert_contains "S9: 'absent' rend verdict=unknown" "verdict=unknown" "$T2636_S9_ABSENT"
-assert_contains "S9: 'unparsable' rend verdict=unknown, distinct d''absent'" "total_loc=unparsable" \
-    "$(_t2636_emit_probe "unparsable")"
+T2636_S9_UNPARSABLE=$(_t2636_emit_probe "unparsable")
+assert_contains "S9: 'unparsable' est distinct d''absent' sur la ligne" "total_loc=unparsable" \
+    "$T2636_S9_UNPARSABLE"
+assert_contains "S9: et 'unparsable' rend verdict=unknown lui aussi" "verdict=unknown" \
+    "$T2636_S9_UNPARSABLE"
 # Contrôle négatif de porte 3 : aucun plan détecté ⇒ AUCUNE ligne d'estimation.
 # Et TOUJOURS une ligne quand il l'a été, sinon zéro ligne se lirait « tous les
 # plans sont dimensionnés » alors qu'elle voudrait dire « aucun ne l'est »
@@ -11724,6 +11754,30 @@ assert_eq "S10 contre-vacuité: _emit_pilot_budget_line a été trouvée" "yes" 
 # donc sous la redirection `2>"$STDERR_FILE"` du site de lancement.
 assert_contains "S10: l'émetteur est appelé depuis _run_pilot_sandboxed" \
     "_emit_pilot_budget_line" "$(sed -n '/^_run_pilot_sandboxed() {/,/^}/p' "$DISPATCH_LIB")"
+
+# --- S10-bis : le PRODUCTEUR de la porte 3, et pas seulement son émetteur ----
+#
+# L'émetteur ne peut rien dire si personne ne pose les deux globales. La
+# première rédaction extrayait `_detect_plan_on_branch` dans `T2636_DETECT_SRC`
+# et ne l'assertait JAMAIS : supprimer les deux lignes de pose laissait les
+# 1355 assertions vertes et la porte 3 muette, parce que `_t2636_emit_probe`
+# pose `_PLAN_SIZE_PLAN_PATH` / `_PLAN_SIZE_TOTAL` À LA MAIN. Même forme que
+# mika#2492 T5, qui tient la pose sœur `PILOT_SHIPPING_TAIL` de cette même
+# fonction.
+assert_eq "S10-bis contre-vacuité: _detect_plan_on_branch a bien été extraite" "non-vide" \
+    "$([ -n "$T2636_DETECT_SRC" ] && echo non-vide || echo vide)"
+assert_contains "S10-bis: le producteur pose le discriminant d'émission" \
+    '_PLAN_SIZE_PLAN_PATH="$PLAN_PATH"' "$T2636_DETECT_SRC"
+assert_contains "S10-bis: et il pose le total depuis le lecteur unique" \
+    '_PLAN_SIZE_TOTAL=$(_plan_size_total_loc' "$T2636_DETECT_SRC"
+# Site unique de pose : une seconde pose ailleurs ferait émettre la ligne sur un
+# dispatch qui n'a pas de plan, ou la ferait porter le total d'un autre.
+assert_eq "S10-bis: la pose du discriminant a un site unique" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '_PLAN_SIZE_PLAN_PATH="$PLAN_PATH"' || true)"
+# Et elle vit sur la branche où le fichier plan est CONFIRMÉ dans le worktree :
+# posée sur le bras `else`, elle annoncerait un plan que le pilote ne lira pas.
+assert_eq "S10-bis: la pose suit la bascule de l'ENTRY_COMMAND" "yes" \
+    "$(_t2178_after '_PLAN_SIZE_PLAN_PATH="$PLAN_PATH"' 'ENTRY_COMMAND="/ce-work $PLAN_PATH"')"
 
 # --- S11 : co-location, le coût de l'accesseur assignant -------------------
 #
@@ -11855,15 +11909,22 @@ assert_eq "S13: la règle de taille est la DERNIÈRE règle du prompt du groomeu
     "$( [ -n "$T2636_LN_FD" ] && [ -n "$T2636_LN_PS" ] && [ "$T2636_LN_PS" -gt "$T2636_LN_FD" ] && echo yes || echo no)"
 assert_eq "S13: et l'injection source suit celle de mika#2306" "yes" \
     "$(_t2178_after '"$PROMPT" "$_PLAN_SIZE_RULE")' '"$PROMPT" "$_FIRE_DISPOSITION_RULE")')"
-# La garde est lue par POSITION dans les lignes de CODE : une ligne de
-# commentaire ajoutée demain entre les deux déplacerait une fenêtre fixe.
-T2636_SUW_CODE=$(printf '%s\n' "$T2636_SUW_SRC" | grep -v '^[[:space:]]*#')
-T2636_PS_INJ_LN=$(printf '%s\n' "$T2636_SUW_CODE" | grep -n '_PLAN_SIZE_RULE' | head -1 | cut -d: -f1)
-assert_eq "S13: l'injection vit bien dans la branche gardée sur le skill" "yes" \
-    "$( [ -n "$T2636_PS_INJ_LN" ] \
-        && printf '%s\n' "$T2636_SUW_CODE" | sed -n "1,${T2636_PS_INJ_LN}p" \
-             | grep -qF 'if [ "$SKILL" = "dev-groom" ]; then' \
-        && echo yes || echo no)"
+# La conditionnalité se lit par APPARTENANCE AU BLOC, jamais par un préfixe.
+# La première rédaction scannait « la garde apparaît-elle AVANT l'injection ? » :
+# un préfixe, donc vert même en déplaçant l'injection d'une ligne APRÈS le `fi`
+# — c'est-à-dire sur la régression exacte que S13 existe pour attraper (vérifié
+# par mutation : verdict `yes`, ligne précédente devenue `fi`). Et la moitié
+# comportementale ne peut pas la voir non plus, `_t2636_inject` étant un miroir
+# qui porte la condition en dur. Forme reprise du bloc mika#2548 déjà en place
+# plus haut dans ce fichier.
+T2636_GROOM_BLOCK=$(printf '%s\n' "$T2636_SUW_SRC" \
+    | sed -n '/if \[ "\$SKILL" = "dev-groom" \]; then/,/^        fi/p')
+assert_eq "S13 contre-vacuité: le bloc gardé sur le skill a bien été extrait" "non-vide" \
+    "$([ -n "$T2636_GROOM_BLOCK" ] && echo non-vide || echo vide)"
+assert_contains "S13: l'injection vit DANS la branche gardée sur le skill" \
+    '_PLAN_SIZE_RULE' "$T2636_GROOM_BLOCK"
+assert_contains "S13: et son aînée mika#2306 y vit aussi" \
+    '_FIRE_DISPOSITION_RULE' "$T2636_GROOM_BLOCK"
 
 # --- S14 : le seuil vit DEUX fois, et c'est le test qui tient R4 -----------
 #
@@ -12008,6 +12069,104 @@ assert_eq "S16: un fence non terminé ne strippe RIEN (le corps entier est éval
 
 ```markdown
 Total estimé : 395 lignes')"
+
+# Un fence en TILDES est une clôture Markdown valide, donc un plan qui
+# documente le format en `~~~markdown` le documente sans le remplir, exactement
+# comme en accents graves. Mesuré avant le correctif : la même entrée rendait
+# `section=présente` et `total=395`, donc le rattrapage ne tirait pas ET
+# l'exemple 395 entrait dans la distribution de calibration.
+T2636_TILDE_ONLY='# Plan
+
+## Format prescrit
+
+~~~markdown
+## Taille estimée
+
+Total estimé : 395 lignes
+~~~
+
+## Livrables
+
+L1 — rien.'
+assert_eq "S16: un fence en TILDES est strippé comme un fence en backticks" "non" \
+    "$(_t2636_present_probe "$T2636_TILDE_ONLY")"
+assert_eq "S16: et son total d'exemple n'entre pas dans la mesure" "absent" \
+    "$(_t2636_total_probe "$T2636_TILDE_ONLY")"
+
+# --- S17 : le lecteur ne se tait pas sur un GROS plan (régression SIGPIPE) ---
+#
+# Mesuré : `_plan_size_strip_fences … | grep -qiE …` faisait sortir `grep` au
+# premier match, le producteur prenait SIGPIPE, `pipefail` promouvait le 141, et
+# la fonction rendait « section ABSENTE » pour un plan qui la porte — rc=141 sur
+# un plan de 320 Ko, déterministe dès ~48 Ko de queue après le titre. Aucune
+# fixture du bloc ne pouvait le voir : toutes tiennent dans un tampon de pipe.
+# C'est le décile supérieur de la distribution que ce ticket existe pour
+# mesurer, donc la population la plus coûteuse à perdre.
+_t2636_big_plan_probe() {
+    local t2636_dir t2636_f t2636_i t2636_out
+    t2636_dir=$(mktemp -d)
+    t2636_f="$t2636_dir/big.md"
+    {
+        printf '# Gros plan\n\n## 6. Taille estimée\n\nTotal estimé : 530 lignes\n\n## Suite\n\n'
+        t2636_i=0
+        while [ "$t2636_i" -lt 4000 ]; do
+            printf 'Ligne de remplissage %s, pour depasser le tampon de pipe du noyau.\n' "$t2636_i"
+            t2636_i=$(( t2636_i + 1 ))
+        done
+    } > "$t2636_f"
+    t2636_out=$(
+        # shellcheck disable=SC1090
+        set -o pipefail
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        printf '%s|' "$(_plan_size_total_loc "$t2636_f")"
+        if _plan_size_section_present "$t2636_f"; then printf 'oui'; else printf 'non'; fi
+    )
+    rm -rf "$t2636_dir"
+    printf '%s' "$t2636_out"
+}
+T2636_S17=$(_t2636_big_plan_probe)
+assert_eq "S17: un plan de ~320 Ko rend son total, jamais 'absent'" "530" "${T2636_S17%%|*}"
+assert_eq "S17: et sa section est lue PRÉSENTE sous pipefail" "oui" "${T2636_S17##*|}"
+
+# --- S18 : le total est cherché DANS la section, pas dans tout le document ---
+#
+# La règle injectée ORDONNE, au-dessus du seuil, de découper en phases et de
+# renvoyer la suite à un ticket de suivi ; le gate architecte fait passer ce
+# plan en jugeant le périmètre de CETTE PR. Un plan conforme porte donc un
+# second `Total estimé :` hors section. Lu sur tout le document avec « dernier
+# match gagne », le lecteur rapportait le total différé : mesuré, 850 en section
+# et 1900 hors périmètre rendaient 1900, donc `verdict=over_threshold` sur un
+# périmètre de 850.
+assert_eq "S18: un total différé hors section ne gagne pas" "850" \
+    "$(_t2636_total_probe '# Plan
+
+## 6. Taille estimée
+
+| livrable | lignes |
+|---|---|
+| `a.rs` | 850 |
+
+Total estimé : 850 lignes
+
+## 7. Hors périmètre, délibérément
+
+La phase 2 est renvoyée à un ticket de suivi.
+
+Total estimé : 1900 lignes')"
+# DANS la section, le dernier match gagne toujours — un sous-total par livrable
+# peut précéder le total qui conclut.
+assert_eq "S18: mais dans la section, le dernier match gagne toujours" "900" \
+    "$(_t2636_total_probe '# Plan
+
+## Taille estimée
+
+Total estimé : 300 lignes (livrable 1)
+
+Total estimé : 900 lignes
+
+## Autre chose
+
+rien')"
 
 # --- Fire-Disposition, option (a) : les trois tables d'exceptions sont VIDES -
 #

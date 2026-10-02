@@ -1651,8 +1651,21 @@ Optional (pilot turn budget, armed at the source — mika#2496):
   l'inverse de `PILOT_MAX_TURNS`, où le `0` *est* le rollback, et l'asymétrie
   est délibérée (là le `0` rend la main à un plafond amont qui existe, ici il
   n'existe rien en dessous). Nom **nu**, par le précédent de `PILOT_LOG_DIR` et
-  `PILOT_MAX_TURNS` dans le même fichier (mika#2508 : une convention sur le
-  relais `inject_pilot_dispatch_env`, jamais un contournement de scrub).
+  `PILOT_MAX_TURNS` dans le même fichier.
+
+  **Et le nom nu n'achète rien par lui-même : c'est l'inscription dans
+  `PILOT_DISPATCH_ENV` qui le fait traverser** (mika#2508). Le résolveur vit
+  dans `dispatch-lib.sh`, donc dans le child de dispatch, que
+  `sandboxed_pilot_env` bâtit par `env_clear()` + allowlist **positive** :
+  aucun nom ne traverse par héritage, préfixé ou non. `PLAN_SIZE_MAX_LOC` est
+  donc déclaré dans ce relais aux côtés de ses deux voisins. La première
+  rédaction de ce ticket ne l'y avait pas mis, et le palier `source=env` était
+  **inerte dans tout child de dispatch** — mesuré : `grep -rn 'PLAN_SIZE'
+  crates/` rendait zéro ligne, donc le résolveur retombait toujours sur son
+  défaut in-file pendant que les deux prompts architecte annonçaient un réglage
+  que rien ne pouvait changer. La garde
+  `mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`
+  refuse cet orphelin et prescrit ce remède dans son propre message d'erreur.
 
 - **Le défaut, mesuré n=2 sur compteur corrigé (cpp#259).** Deux implements
   consécutifs coupés au plafond de tours sur le seul critère du **volume** :
@@ -1715,9 +1728,42 @@ Optional (pilot turn budget, armed at the source — mika#2496):
   présenté avec autorité, faux. Pire, le terme 2 du rattrapage apparierait le
   titre cité et un plan qui *documente* le format sans le remplir passerait la
   garde. Même geste qu'`auto_pull::is_groomed` pour ses trois prédicats de
-  callout (mika#2120), **fence non terminé compris : rien n'est strippé**, le
-  corps entier est évalué. Après le strip, **le dernier match gagne** — un plan
-  peut légitimement porter un total par phase avant son total global.
+  callout (mika#2120). **Les deux formes de clôture sont retirées** (```` ``` ````
+  et `~~~`) : un plan qui documente le format en `~~~markdown` le documente
+  aussi sans le remplir. **Fence non terminé : rien n'est strippé**, le corps
+  entier est évalué — un faux positif coûte une relance de revise, un faux
+  négatif a coûté quinze heures de boucle (mika#2120).
+
+- **Le total est cherché DANS la section, et c'est une correction mesurée.** La
+  règle injectée *ordonne*, au-dessus du seuil, de découper en phases et de
+  « renvoyer explicitement la suite à un ticket de suivi ou à une phase
+  nommée » ; le gate architecte fait passer ce plan en jugeant **le périmètre de
+  cette PR, jamais la somme des phases**. Un plan conforme à cette prescription
+  porte donc légitimement un second `Total estimé :` plus loin, hors section,
+  pour la suite différée. Lu sur tout le document avec « le dernier match
+  gagne », le lecteur rapportait ce total différé : mesuré, une section
+  annonçant 850 et un § hors périmètre annonçant 1900 rendaient **1900**, donc
+  `verdict=over_threshold` sur un périmètre de 850. La borne de fin de section
+  est le prochain titre de niveau 2. **Dans** la section, le dernier match gagne
+  toujours : un sous-total par livrable peut précéder le total qui conclut.
+
+- **Aucun pipe dans les deux lecteurs, et c'est un correctif, pas un style.** La
+  première rédaction faisait `_plan_size_strip_fences "$f" | grep -qiE …`.
+  `grep -q` sort au **premier match** et ferme le tuyau ; le producteur, qui
+  écrit encore, prend SIGPIPE et sort en 141 ; sous `set -o pipefail` ce 141
+  devient le statut du pipeline — donc la fonction rendait « section
+  **ABSENTE** » pour un plan qui la porte. Mesuré : `rc=141` et
+  `total_loc=absent` sur un plan de 320 Ko portant `## 6. Taille estimée` et
+  `Total estimé : 530 lignes`, déterministe dès ~48 Ko de queue après le titre —
+  c'est-à-dire **sur le décile supérieur de la distribution que ce ticket existe
+  pour mesurer**. Les deux moitiés cassaient ensemble : le rattrapage tirait sur
+  un plan **conforme** (la régression exacte que mika#2544 a dû fermer) et la
+  ligne annonçait `absent` pour un plan dimensionné, donc les plus gros plans
+  disparaissaient de la distribution censée recalibrer le seuil.
+  `scripts/verify-no-sigpipe-grep.sh` garde cette forme et nomme ce fichier
+  `pipefail: oui` ; son motif n'apparie que les producteurs `printf`/`echo`,
+  donc un producteur **en fonction** est passé dessous. Le remède est celui que
+  ce lint prescrit : une chaîne ici-document, qui n'a pas de pipeline.
 
 #### Surfaces opérateur
 
@@ -1807,6 +1853,21 @@ la **formulation** du gate, jamais un seuil. Le désarmement est un revert du bl
   sur un plan qui en annonçait 400. C'est la limite honnête, et c'est pourquoi
   AC5 existe : la comparaison estimé/mesuré est ce qui dira si l'estimation vaut
   quelque chose.
+- **Le rattrapage structurel ne peut PAS attraper le gate qui échoue, et c'est
+  sa borne la plus importante.** Son terme 1 exige que l'architecte ait
+  **réclamé** la section (le findings de première passe contient la chaîne),
+  donc il ne peut aider que lorsque la porte 2 a **fonctionné**. Il est
+  structurellement incapable de voir le cas fondateur : la seconde passe de
+  mika#2161 a rendu `PLAN_GROOMED` parce que *rien ne demandait la taille*. La
+  moitié qui couvre ce cas est donc le **prompt** des deux gates architecte, et
+  `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate` dit ce
+  que vaut une moitié prompt seule. Deux populations restent non couvertes en
+  conséquence : un `GROOMED` sur un plan sans section (retour à l'état
+  d'avant-correctif, vert-alors-que-rouge), et un `ESCALATE` de seconde passe
+  sans recours sur un ticket qui aurait été groomé avant. **Suivi nommé** — un
+  contrôle de section sur la branche `READY` avant la seconde passe, avec son
+  propre compteur d'un coup ; précondition : que la sonde S2 montre que cette
+  population existe.
 - **Il ne re-mesure pas le plafond de tours.** Il livre le matériau (V4), pas la
   conclusion, et il ne touche à aucune valeur de `PILOT_MAX_TURNS`.
 - **Il ne rattrape ni mika#2161 ni mika#2633.** Les deux sont morts, leurs PR de
