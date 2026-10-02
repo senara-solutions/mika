@@ -424,23 +424,43 @@ mod tests {
     /// sans quoi le contrôle cesse d'attester le prédicat sans rien rougir.
     const INSTALLER_SITE: &str = "test_utils.rs";
 
-    /// L'aiguille, assemblée par `concat!` plutôt qu'écrite d'un bloc.
+    /// Les orthographes d'une installation d'abonné par défaut.
     ///
-    /// `concat!` produit le littéral à la compilation, donc la chaîne cherchée
-    /// **n'apparaît nulle part dans ce fichier**. Écrite d'un bloc, elle ferait
-    /// de la garde son propre second site : le scan n'exclut pas le code de
-    /// test (voir [`all_sources`] pour pourquoi), donc il se compterait
-    /// lui-même et serait rouge au jour de sa naissance — c'est-à-dire désarmé
-    /// le lendemain.
+    /// **Six, pas une, et c'est une correction de revue.** La première version
+    /// ne cherchait que `tracing::subscriber::set_default` — une des **quatre**
+    /// orthographes publiques du même acte, toutes rendant un `DefaultGuard`.
+    /// Un scan qui n'en voit qu'une accuse un proxy, pas le fait : le
+    /// contournement est à **une ligne `use` près**, puisque les quatre
+    /// helpers de capture importent déjà `SubscriberExt` du module qui exporte
+    /// aussi `SubscriberInitExt` (`tracing-subscriber-0.3.23/src/util.rs:41`,
+    /// `fn set_default(self) -> dispatcher::DefaultGuard`). C'est très
+    /// exactement le mode de panne vert-pendant-que-le-vrai-est-rouge que
+    /// cette garde existe pour refuser.
     ///
-    /// **Borne du prédicat, nommée plutôt que découverte.** Il cherche le
-    /// chemin **pleinement qualifié**. `use tracing::subscriber::set_default;`
-    /// reste attrapé par sa ligne `use`, mais une forme aliasée
-    /// (`use tracing::subscriber as ts; ts::set_default(…)`) passerait. Aucune
-    /// n'existe sous `src/` aujourd'hui ; c'est un faux négatif réparable en
-    /// élargissant l'aiguille, pas un trou qu'une allowlist comblerait.
-    fn needle() -> &'static str {
-        concat!("tracing::subscriber::", "set_default")
+    /// Chaque entrée est assemblée par `concat!` : le littéral est produit à
+    /// la compilation, donc **aucune des chaînes cherchées n'apparaît dans ce
+    /// fichier**. Écrites d'un bloc, elles feraient de la garde son propre
+    /// second site — le scan n'exclut pas le code de test (voir
+    /// [`all_sources`]), donc il se compterait lui-même et serait rouge au
+    /// jour de sa naissance, c'est-à-dire désarmé le lendemain.
+    ///
+    /// **Deux bornes, nommées plutôt que découvertes.** (1) Les formes
+    /// qualifiées sont cherchées littéralement, donc une forme **aliasée**
+    /// (`use tracing::subscriber as ts; ts::set_default(…)`) passerait ;
+    /// aucune n'existe sous `src/` aujourd'hui. (2) `.set_default(` est un
+    /// jeton de **réception**, donc un futur `autre_chose.set_default(…)`
+    /// serait accusé à tort. Le sens de l'erreur est le bon : un faux positif
+    /// coûte une ligne à router, un faux négatif laisse la course ouverte.
+    /// Mesuré avant élargissement — zéro occurrence de ce jeton sous `src/`.
+    fn needles() -> Vec<&'static str> {
+        vec![
+            concat!("tracing::subscriber::", "set_default"),
+            concat!("tracing::subscriber::", "with_default"),
+            concat!("tracing::dispatcher::", "set_default"),
+            concat!("tracing::dispatcher::", "with_default"),
+            concat!("Subscriber", "InitExt"),
+            concat!(".set_", "default("),
+        ]
     }
 
     fn src_root() -> PathBuf {
@@ -465,11 +485,28 @@ mod tests {
     /// qui est exactement ce qu'il faut ici, et il trie, ce qui rend l'ordre
     /// des fautifs déterministe d'une machine à l'autre.
     ///
-    /// **Portée : `src/` seulement, et c'est une décision du plan.** Les neuf
-    /// fichiers de `crates/mika-agent/tests/` qui installent un abonné sont des
-    /// **binaires distincts** — un processus chacun, donc un cache d'`Interest`
-    /// chacun — et sont hors de la population mesurée. Le silence du scan sur
-    /// eux n'est pas une couverture.
+    /// **Portée : `src/` seulement — et la raison que le plan donnait est
+    /// FAUSSE pour la majorité de la population qu'elle écartait.** Le plan
+    /// disait « neuf binaires distincts, un processus chacun, donc un cache
+    /// d'`Interest` chacun ». Vérifié : **deux** des neuf fichiers de
+    /// `crates/mika-agent/tests/` sont des binaires autonomes
+    /// (`manager_delivery_observability_2267.rs`, `llm_call_attempt_2342.rs`),
+    /// et les **sept** autres sont des `mod` du binaire unique
+    /// `--test eval` (`tests/eval.rs`). Ces sept partagent donc **un seul**
+    /// cache de callsites, et `grep serial` sous `tests/eval/` ne rend rien :
+    /// la course y est vivante, sur un job de CI requis. Un indice en
+    /// arbre le dit déjà — `test_context_scope_observability_2305.rs` porte un
+    /// `KEEPER` fait main dont le commentaire parle d'un `never` mis en cache
+    /// avant son démarrage.
+    ///
+    /// Ils restent **hors scan**, parce qu'ils ne peuvent pas atteindre
+    /// l'installateur (`test_helpers` est `#[cfg(test)]`, donc invisible depuis
+    /// un binaire d'intégration) et que les y router demande de le remonter
+    /// dans `mika-common` — un rayon de souffle de trois crates, que ce ticket
+    /// tient hors périmètre. **Le silence du scan sur eux n'est donc pas une
+    /// couverture, et la raison n'est pas celle que le plan donnait :** c'est
+    /// une population connue, non couverte, dont le suivi a pour précondition
+    /// un rouge mesuré dans le binaire `eval`.
     ///
     /// Un fichier illisible **panique** plutôt que d'être sauté : une garde qui
     /// saute un fichier en silence est une garde qui a cessé de regarder, et le
@@ -509,14 +546,22 @@ mod tests {
     /// peut écarter que des fichiers qui n'auraient pas pu matcher. Il évite
     /// d'allouer une copie dépouillée des ~12 Mo de l'arbre pour trouver un
     /// seul fichier (mesuré : 87,5 ms → 2,3 ms).
-    fn sites_carrying_the_needle(sources: &[(String, String)]) -> Vec<String> {
+    ///
+    /// Rend `(fichier, nombre d'installations)` : le **compte** est ce qui
+    /// permet d'exempter un *site* plutôt qu'un *fichier* — sans lui, un
+    /// second appel nu ajouté dans `test_utils.rs`, où le message d'échec de
+    /// la garde envoie précisément les gens, serait invisible.
+    fn sites_carrying_the_needle(sources: &[(String, String)]) -> Vec<(String, usize)> {
         sources
             .iter()
-            .filter(|(_, src)| {
-                src.contains(needle())
-                    && crate::source_scan::strip_comment_lines(src).contains(needle())
+            .filter_map(|(rel, src)| {
+                if !needles().iter().any(|n| src.contains(n)) {
+                    return None;
+                }
+                let stripped = crate::source_scan::strip_comment_lines(src);
+                let count: usize = needles().iter().map(|n| stripped.matches(n).count()).sum();
+                (count > 0).then(|| (rel.clone(), count))
             })
-            .map(|(rel, _)| rel.clone())
             .collect()
     }
 
@@ -539,20 +584,30 @@ mod tests {
 
         let sites = sites_carrying_the_needle(&sources);
 
-        // ANTI-VACUITÉ. Un scan qui vise un nom mort (module renommé, helper
-        // déplacé) rend zéro infraction et se lit exactement comme un arbre
-        // sain — motif de la cardinalité de mika#2496 et du `!declared.is_empty()`
-        // de mika#2201.
-        assert!(
-            sites.iter().any(|s| s == INSTALLER_SITE),
-            "le site de l'installateur est introuvable : la garde vise un nom mort. \
+        // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ, pas sur la présence.
+        // Un scan qui vise un nom mort rend zéro infraction et se lit comme un
+        // arbre sain (motif mika#2496, `!declared.is_empty()` de mika#2201) ;
+        // et une exemption par *fichier* rendrait un second appel nu ajouté
+        // dans `test_utils.rs` — là même où le message d'échec ci-dessous
+        // envoie les gens — indistinguable du premier.
+        let installer_count = sites
+            .iter()
+            .find(|(rel, _)| rel == INSTALLER_SITE)
+            .map(|(_, n)| *n);
+        assert_eq!(
+            installer_count,
+            Some(1),
+            "l'installateur doit porter exactement UNE installation ; vu {installer_count:?}. \
+             Zéro = la garde vise un nom mort (module renommé, helper déplacé) ; \
+             plus d'une = un second site s'est glissé dans le fichier exempté. \
              Sites vus : {sites:?}"
         );
 
         let offenders: Vec<&String> = sites
             .iter()
-            .filter(|rel| rel.as_str() != INSTALLER_SITE)
-            .filter(|rel| !SET_DEFAULT_SITES_ALLOWED.contains(&rel.as_str()))
+            .filter(|(rel, _)| rel.as_str() != INSTALLER_SITE)
+            .filter(|(rel, _)| !SET_DEFAULT_SITES_ALLOWED.contains(&rel.as_str()))
+            .map(|(rel, _)| rel)
             .collect();
 
         assert!(
@@ -568,35 +623,62 @@ mod tests {
         );
     }
 
-    /// Contrôle de bonne foi : le prédicat mord sur un second site.
+    /// Contrôle de bonne foi : le prédicat mord sur un second site, **pour
+    /// chacune des six orthographes**.
     ///
     /// Sans lui, « la garde décide » est indistinguable de « la garde ne
-    /// regarde rien » — et c'est exactement l'état qu'un dépouillement de
-    /// commentaires trop large produirait.
+    /// regarde rien ». Et sans la boucle sur `needles()`, il serait
+    /// indistinguable de « la garde reconnaît *cette chaîne-là* » — ce qui
+    /// était exactement l'état de la première version, dont le contrôle
+    /// construisait sa fixture à partir de la seule orthographe qu'elle
+    /// connaissait déjà.
     #[test]
     fn mika2646_le_scan_voit_un_second_site() {
-        let synthetic = vec![
-            (
-                INSTALLER_SITE.to_string(),
-                format!("let g = {}(s);", needle()),
-            ),
-            (
-                "voisin.rs".to_string(),
-                format!("    let _guard = {}(subscriber);\n", needle()),
-            ),
-            (
-                "prose.rs".to_string(),
-                format!("    /// On n'appelle plus {} ici.\n", needle()),
-            ),
-        ];
+        for spelling in needles() {
+            let synthetic = vec![
+                (INSTALLER_SITE.to_string(), format!("let g = {spelling}s);")),
+                (
+                    "voisin.rs".to_string(),
+                    format!("    let _guard = {spelling}subscriber);\n"),
+                ),
+                (
+                    "prose.rs".to_string(),
+                    format!("    /// On n'appelle plus {spelling} ici.\n"),
+                ),
+            ];
+            let sites = sites_carrying_the_needle(&synthetic);
+            assert!(
+                sites.iter().any(|(rel, _)| rel == "voisin.rs"),
+                "le scan doit accuser un second site pour {spelling:?} : {sites:?}"
+            );
+            assert!(
+                !sites.iter().any(|(rel, _)| rel == "prose.rs"),
+                "une prose qui DÉCRIT le motif n'en est pas une violation \
+                 ({spelling:?}) : {sites:?}"
+            );
+        }
+    }
+
+    /// Le compte par site est ce qui rend l'exemption *par site* possible.
+    ///
+    /// Contrôle de bonne foi de la cardinalité : deux installations dans le
+    /// fichier exempté doivent être distinguables d'une seule, sans quoi la
+    /// garde est aveugle là où son propre message d'échec envoie les gens.
+    #[test]
+    fn mika2646_le_scan_compte_les_sites_dun_meme_fichier() {
+        let n = needles()[0];
+        let synthetic = vec![(
+            INSTALLER_SITE.to_string(),
+            format!("let a = {n}(x);\nlet b = {n}(y);\n"),
+        )];
         let sites = sites_carrying_the_needle(&synthetic);
-        assert!(
-            sites.contains(&"voisin.rs".to_string()),
-            "le scan doit accuser un second site : {sites:?}"
-        );
-        assert!(
-            !sites.contains(&"prose.rs".to_string()),
-            "une prose qui DÉCRIT le motif n'en est pas une violation : {sites:?}"
+        assert_eq!(
+            sites
+                .iter()
+                .find(|(rel, _)| rel == INSTALLER_SITE)
+                .map(|(_, c)| *c),
+            Some(2),
+            "deux installations dans un fichier doivent compter 2 : {sites:?}"
         );
     }
 
