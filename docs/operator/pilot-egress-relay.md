@@ -240,6 +240,37 @@ Si vous ne voulez pas attendre, un `ready` reposé à la main (`remove` **puis**
 `add` — GitHub n'émet `issues.labeled` que sur une transition) déclenche un
 dispatch immédiatement.
 
+### 4.4 Mode du socket et environnement du relais
+
+Le relais crée son socket en **`0600`** : le bac à sable qui s'y connecte tourne
+sous le même uid, les bits propriétaire suffisent. Le mode est fixé **à la
+création** (umask restreint autour du `bind()`), pas corrigé après.
+
+Le lanceur (`_ensure_pilot_egress_proxy`, donc aussi `--ensure-relay` et
+`--restart-relay`) démarre le relais sous `env -i` avec la liste blanche
+`_PILOT_EGRESS_RELAY_ENV_ALLOWLIST` de `dispatch-lib.sh` : `PATH`, `HOME`,
+`LANG`, `MIKA_EGRESS_DEBUG`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, chacune seulement
+si elle est définie. Une variable dont le relais a besoin pour sa fonction
+s'ajoute à cette liste ; les variables de diagnostic qui écrivent des secrets
+(`SSLKEYLOGFILE`) en restent exclues.
+
+**Activation : un déploiement ne suffit pas.** `make deploy` remplace le binaire,
+mais un relais déjà en service garde le mode et l'environnement avec lesquels il
+a démarré, et `--ensure-relay` ne relance qu'un relais injoignable. Après le
+déploiement de ce changement, une fois :
+
+```bash
+scripts/canary-pilot-containment --restart-relay
+stat -c %a /tmp/mika-pilot-egress.sock                       # attendu : 600
+pid=$(fuser /tmp/mika-pilot-egress.sock 2>/dev/null | tr -d ' ')
+tr '\0' '\n' < "/proc/$pid/environ" | cut -d= -f1 | sort    # que des noms de la liste blanche
+```
+
+**Halte — `600` sans que le relais ne réponde aux pilotes** : un consommateur du
+socket ne tourne pas sous l'uid du relais. Revenir au binaire précédent
+(`--restart-relay` après réinstallation), puis établir lequel avant toute
+correction ; ne pas élargir le mode par réflexe.
+
 ## 5. Le canal d'alerte fonctionne-t-il ? — à faire AVANT l'incident
 
 **C'est la section dont l'absence coûte l'alerte entière**, et elle n'a de chance
@@ -302,7 +333,7 @@ Ne cherchez pas le défaut dans la garde.**
 | Variable | Défaut | Rôle |
 |---|---|---|
 | `MIKA_PILOT_EGRESS_DOWN_TTL_SECS` | `1800` | péremption du marqueur de panne |
-| `MIKA_PILOT_EGRESS_LOG_DIR` | `/var/log/mika` | où le proxy journalise |
+| `MIKA_PILOT_EGRESS_LOG_DIR` | `/var/log/mika` | où le proxy journalise (lu par le lanceur, pas transmis au relais) |
 
 **Le TTL n'est pas libre.** Il doit rester **strictement supérieur** au seuil de
 stuck-ready (`MIKA_AUTO_PULL_STUCK_READY_THRESHOLD_SECS`, défaut 900 s), avec
