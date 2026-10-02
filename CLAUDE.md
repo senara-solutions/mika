@@ -1640,6 +1640,217 @@ Optional (pilot turn budget, armed at the source — mika#2496):
 - **Out of scope, deliberately:** the missing dollar brake itself (`_sdk_guardrail_kwargs`'s `pass`) and the real-time per-boundary turn count, both follow-ups on `senara-solutions/claude-pilot` — this repo cannot create either; the V2 measurement, an operator gesture on the host that gates the default's value; and the revise path's stderr, whose line is persisted nowhere (inherited from Signal S).
 
 
+### L'estimation de taille est une section obligatoire du plan (mika#2636)
+
+- `PLAN_SIZE_MAX_LOC` — seuil de lignes de code hors `docs/` au-delà duquel un
+  plan doit être découpé en phases (défaut `1000`). Trois paliers maison :
+  absent ou vide → défaut ; entier positif → cette valeur ; **illisible, `0` ou
+  négatif → défaut, plus un `plan_size_threshold_invalid` nommant la valeur
+  entre guillemets**. Le `0` **ne désarme pas** — sur une garde qui borne un
+  coût, une coquille ne doit pas être un désarmement silencieux ; c'est
+  l'inverse de `PILOT_MAX_TURNS`, où le `0` *est* le rollback, et l'asymétrie
+  est délibérée (là le `0` rend la main à un plafond amont qui existe, ici il
+  n'existe rien en dessous). Nom **nu**, par le précédent de `PILOT_LOG_DIR` et
+  `PILOT_MAX_TURNS` dans le même fichier (mika#2508 : une convention sur le
+  relais `inject_pilot_dispatch_env`, jamais un contournement de scrub).
+
+- **Le défaut, mesuré n=2 sur compteur corrigé (cpp#259).** Deux implements
+  consécutifs coupés au plafond de tours sur le seul critère du **volume** :
+  mika#2161 (pilote `73720a14`, 151 tours, ≈ 1 470 lignes hors `docs/`) et
+  mika#2633 (pilote `2bd6fca0`, 151 tours, ≈ 1 170 lignes). **Aucun de leurs
+  plans ne portait d'estimation de taille**, et la seconde passe architecte a
+  validé celui de mika#2161 en `PLAN_GROOMED` sans que rien ne demande la
+  taille. À l'inverse, le plan de mika#1960 phase 2 en portait une (≈ 515
+  estimées, 716 mesurées) et n'est pas mort de volume. Chaque mort coûte un
+  pilote entier (35 à 90 USD) puis un spawn de reprise.
+
+- **Trois portes, une seule refuse** — et c'est la répartition canonique de la
+  maison, *détection permissive, décision stricte*.
+
+  | porte | site | rôle |
+  |---|---|---|
+  | 1 | `_PLAN_SIZE_RULE`, injectée à chaque dispatch `dev-groom` | **intention** |
+  | 2 | Plan-Size Gate des deux prompts architecte (+ rattrapage structurel) | **REFUS** |
+  | 3 | `plan_size_estimate` au dispatch implement | **MESURE** |
+
+  Ce qu'un `grep` peut juger : la section est-elle **présente**, le total est-il
+  **parsable**. Ce qu'il ne peut pas : le total est-il **crédible**, le découpage
+  est-il **réel**. Ces deux-là appartiennent à l'architecte, et c'est pourquoi la
+  porte 2 est la seule qui refuse — avec les verdicts qui existent déjà (ITERATE
+  en première passe, ESCALATE en seconde), donc **sans aucun mode d'échec neuf
+  dans la boucle**. La moitié architecte seule serait de l'enforcement de prompt,
+  que `feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`
+  borne ; la moitié `grep` seule ne saurait rien juger.
+
+- **La porte 3 ne refuse JAMAIS, et la file groomée entière le lui doit.** Les
+  deux plans morts étaient groomés **avant** ce correctif. Un plan déjà groomé
+  sur disque, dont le corps de ticket porte les trois signaux du gate, **ne
+  repasse par aucune porte de groom** au dispatch suivant :
+  `_detect_plan_on_branch` lit le callout, bascule `ENTRY_COMMAND` sur
+  `/ce-work <plan>`, et le pilote part. Refuser un dispatch dont le plan ne porte
+  pas la section gèlerait d'un coup **la totalité des plans existants de
+  `docs/plans/`**. L'absence est **nommée** (`total_loc=absent`), pas refusée.
+
+- **Le seuil vit deux fois, et il faut le dire.** Le jugement vit chez
+  l'architecte, dont le prompt est un `system_prompt.md` **statique** (aucune
+  interpolation au dispatch). Conséquence écrite plutôt que découverte : **un
+  opérateur qui baisse `PLAN_SIZE_MAX_LOC` change ce que le groomeur VISE, pas ce
+  que l'architecte REFUSE.** Doublon assumé, du même type que `_FD_HEADING_RE` /
+  `AC_HEADING_RE`, et tenu par le même moyen : S14 lit le littéral des deux
+  prompts et le défaut de `_plan_size_max_loc`, et rougit sur une divergence.
+
+- **Trois issues du lecteur, et elles sont distinctes.** `absent` (aucune
+  section), `unparsable` (section présente, ligne `Total estimé :` non appariée),
+  `<n>`. Les confondre rendrait « le plan n'a pas été dimensionné » et « le plan
+  a été dimensionné dans une forme que le lecteur ne sait pas lire »
+  indiscernables, alors que les remèdes sont **opposés** — groomer le plan, ou
+  réparer le motif. Et aucune des deux n'est `0` : *un `null` n'est jamais un
+  `0`* (mika#2331).
+
+- **Les blocs clôturés sont strippés avant toute lecture, et c'est mesuré.** Le
+  plan de ce ticket documente le format dans un bloc ```` ```markdown ```` qui
+  porte un titre `## Taille estimée` **et** une ligne `Total estimé : 395
+  lignes` — l'exemple, pas la mesure. Un lecteur naïf qui prend le premier match
+  rapporte **395** pour un plan qui en annonce **530** : un nombre plausible,
+  présenté avec autorité, faux. Pire, le terme 2 du rattrapage apparierait le
+  titre cité et un plan qui *documente* le format sans le remplir passerait la
+  garde. Même geste qu'`auto_pull::is_groomed` pour ses trois prédicats de
+  callout (mika#2120), **fence non terminé compris : rien n'est strippé**, le
+  corps entier est évalué. Après le strip, **le dernier match gagne** — un plan
+  peut légitimement porter un total par phase avant son total global.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Sous quelle taille estimée ce dispatch a-t-il tourné ? (ancre obligatoire)
+grep -h '^dispatch-lib: plan_size_estimate' \
+     "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail
+
+# 2. CONTRÔLE POSITIF — combien de dispatches ont résolu un seuil du tout ?
+grep -lc '^dispatch-lib: plan_size_threshold_resolved' \
+     "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | wc -l
+
+# 3. La corrélation que Prime attend, SANS jointure : deux lignes consécutives
+grep -hE '^dispatch-lib: (pilot_budget_armed|plan_size_estimate)' \
+     "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail -20
+
+# 4. Un rattrapage a-t-il tiré ? (sillon du pilote de groom)
+grep -h 'plan_size_revise_retried\|plan_size_still_missing_after_retry' \
+     "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr | tail
+```
+
+| surface | sink | régime attendu | lecture |
+|---|---|---|---|
+| `plan_size_estimate` | `.stderr` per-dispatch | **une par dispatch plan-on-branch** | son absence = binaire antérieur au correctif (classe mika#2340), **jamais** « le plan n'a pas de taille » |
+| `verdict=over_threshold` | idem | **non vide, faible** | chaque ligne est un dispatch que le groom aurait dû découper ; c'est la mesure de la couverture de la porte 2 |
+| `verdict=unknown` | idem | **décroissant** | la file groomée **avant** ce correctif ; elle ne décroît que lorsque les plans sont re-groomés |
+| `total_loc=unparsable` | idem | **vide** | la section existe et le motif ne la lit pas — c'est le **motif** qu'il faut réparer, pas le plan qu'il faut groomer |
+| `plan_size_threshold_invalid` | idem | **vide** | une coquille dans la variable, nommée entre guillemets |
+| `plan_size_threshold_resolved` | idem | **une par lancement** | le contrôle positif ; doctrine mika#2293 |
+| `plan_size_revise_retried` | `.stderr` du groom | **rare** | un revise qui n'avait pas traité le finding |
+| `plan_size_still_missing_after_retry` | idem | **vide** | voir la halte V5 |
+
+**L'ancre `^dispatch-lib: ` n'est pas négociable.** Ce `.stderr` porte aussi la
+prose du pilote, et mika#2050 a mesuré le faux positif : une session *discutant*
+du signal se lisait comme une émission. Toute session qui groome ou implémente ce
+ticket recrée ce faux positif.
+
+**Limite héritée, non refermée :** les pilotes de revise redirigent vers un
+`mktemp` qu'ils suppriment quelques lignes plus bas, donc la ligne de la sonde 4
+n'est persistée **nulle part** sur ce chemin (Signal S, § *Limit — the revise
+path captures nothing*). La sonde 4 ne lit que ce qui fuit sur un chemin
+persisté.
+
+#### Sondes post-déploiement, et leurs cinq haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340) : `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir, sinon chaque sonde décrit le binaire d'hier. Ce sont des
+> **gestes d'opérateur** sur l'hôte.
+
+**V3 — la ligne atterrit (premier dispatch plan-on-branch).** La sonde 1 rend une
+ligne.
+*Halte 1 — zéro ligne :* **ne pas élargir l'émission par réflexe.** Établir
+d'abord le déploiement (préalable ci-dessus), puis lire le **contrôle positif**
+(sonde 2). Zéro des deux ne prouve rien : *une garde que personne n'a exercée se
+lit exactement comme une garde qui marche* (mika#2205).
+
+**V4 — AC5, le matériau de la re-mesure, 30 jours.** Croiser `total_loc` avec le
+volume mesuré du diff de la PR correspondante. **C'est le livrable que Prime
+attend**, et ce travail livre le thermomètre, pas la conclusion.
+*Halte 2 — la distribution montre que 1 000 est mal placé :* c'est le **seuil**
+qui bouge, jamais la mesure qui est désarmée. Le `1000` est **posé** par le
+ticket sur n=2, pas mesuré sur une distribution.
+
+**V5 — contrôle négatif de bruit, 7 jours.** `plan_size_threshold_invalid` et
+`plan_size_still_missing_after_retry` restent vides.
+*Halte 3 — le second est soutenu :* le pilote de revise **ne sait pas écrire la
+section**, donc le correctif est côté `/mika-revise-plan` (suivi
+`mika-platform`), **PAS une troisième relance ici**. C'est mot pour mot la halte
+que mika#2306 a écrite pour son jumeau.
+
+**V2 — le rattrapage ne tire pas sur un plan conforme, 7 jours.** Aucun
+`plan_size_revise_retried` sur un plan portant déjà la section, numérotée ou non.
+*Halte 4 — une occurrence :* c'est la régression que mika#2544 a dû fermer
+(un rattrapage relançant un pilote pour rien sur un plan conforme). Lire le motif
+de titre **avant** de toucher au prédicat.
+
+**Halte 5 — un plan conforme est refusé par la porte 2.** C'est un faux positif
+de **jugement**, pas de prédicat : le gate vit dans un prompt, et son remède est
+la **formulation** du gate, jamais un seuil. Le désarmement est un revert du bloc
+`### Plan-Size Gate` du prompt concerné.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne borne pas le volume d'une implémentation.** Il rend l'estimation
+  obligatoire et la mesure lisible ; un pilote peut toujours écrire 1 400 lignes
+  sur un plan qui en annonçait 400. C'est la limite honnête, et c'est pourquoi
+  AC5 existe : la comparaison estimé/mesuré est ce qui dira si l'estimation vaut
+  quelque chose.
+- **Il ne re-mesure pas le plafond de tours.** Il livre le matériau (V4), pas la
+  conclusion, et il ne touche à aucune valeur de `PILOT_MAX_TURNS`.
+- **Il ne rattrape ni mika#2161 ni mika#2633.** Les deux sont morts, leurs PR de
+  rescue sont ouvertes, et **rien ici ne rétro-estampille un plan** : fabriquer
+  une estimation datée d'un dispatch qu'on n'a pas observé serait l'inverse de ce
+  que ce travail défend. La sonde est le **prochain** dispatch.
+- **Il ne couvre pas un dispatch sans plan-on-branch.** Un `/mika` sur un ticket
+  non groomé n'émet aucune ligne de taille, par construction : il n'y a pas de
+  plan à lire. Population nommée, hors mesure.
+- **Il ne refuse rien au dispatch**, et la file groomée existante le lui doit.
+- **Il ne surveille rien.** Les seuls instruments sont les greps ci-dessus et la
+  corrélation de V4, et **leur silence ne prouve rien tant que personne ne les
+  exécute** — d'où le contrôle positif obligatoire de la sonde 2.
+
+#### Hors périmètre, délibérément
+
+- **`scripts/verify-pipeline.sh`**, le gate CI. Il porte déjà `AC_HEADING_RE`
+  (mika#1600/#2516), donc il est le précédent exact pour « une section
+  obligatoire dans un plan, vérifiée en CI ». Y ajouter `## Taille estimée`
+  ferait rougir **toute** PR touchant un plan antérieur à ce correctif,
+  c'est-à-dire la population entière ; le fermer demanderait une borne d'époque ou
+  une allowlist sur un gate bloquant. **Ticket de suivi**, et AC2 ne nomme pas la
+  CI.
+- **La moitié `.claude/commands/`** — `/mika-groom-plan-only.md`,
+  `/mika-groom-ticket.md`, `/mika-revise-plan.md` vivent dans
+  `senara-solutions/mika-platform` et sont structurellement hors d'atteinte d'un
+  ticket ouvert sur `senara-solutions/mika` (mika#1415). **Suivi nommé**, comme
+  mika#2306 l'a nommé pour sa propre moitié.
+- **`scripts/canonical-tokens.tsv`** — non touché, et la raison est mesurée :
+  `Fire-Disposition` n'y est **pas** déclaré non plus, et le commentaire de
+  `_FD_HEADING_RE` dit que le survey « ne voit PAS … un motif porté par une
+  variable ». Les deux motifs livrés ici sont portés par variable, donc hors
+  population des deux lecteurs de mika#2201.
+- **Le seuil du jugement architecte rendu configurable** — demanderait
+  d'interpoler un `system_prompt.md` statique au dispatch, donc de changer le
+  contrat de chargement des prompts bundled. S14 empêche la divergence
+  silencieuse ; c'est tout ce que ce travail achète sur cet axe.
+- **Les séparateurs de milliers** dans `Total estimé` (`1 400`, `1,400`) — non
+  appariés, forme non prescrite, élargissement sur devinette refusé (mika#2544).
+  La ligne les rend `unparsable`, jamais un nombre partiel.
+- **La mesure automatique du diff** pour clore la boucle estimé/mesuré sans geste
+  humain — demande de lire le diff d'une PR fusionnée depuis le moteur. **Suivi**,
+  précondition : que V4 montre que la corrélation vaut d'être automatisée.
+
 ### Un lanceur `claude-pilot` mort est un fait estampillé, exit 79 (mika#2634, phase A)
 
 **Aucune variable d'environnement, aucune migration, aucune valeur de réglage
