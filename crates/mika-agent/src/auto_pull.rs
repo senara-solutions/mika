@@ -75,6 +75,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
+use crate::db::InFlightSelfDevTask;
 use crate::ready_label::{
     self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
 };
@@ -151,9 +152,16 @@ const AUTO_FEEDER_MIN_READY_MAX: u32 = 10;
 /// Working-set cap on the groomed-not-ready backlog the feeder ranks per tick
 /// (mika#1863 R4/D6/F4). A pagination + grooming-signal bound, not an arbitrary
 /// limit: a dispatchable backlog exceeding this is itself a grooming-throughput
-/// signal (surfaced via `auto_feeder_no_backlog` and AC9 pool-sampling) rather
-/// than a feeder-visibility problem. Single-line raise if real operation ever
-/// shows a legitimate >50 dispatchable backlog.
+/// signal rather than a feeder-visibility problem. Single-line raise if real
+/// operation ever shows a legitimate >50 dispatchable backlog.
+///
+/// mika#2161 AC4 removed this doc-comment's claim that the signal is "surfaced
+/// via `auto_feeder_no_backlog`". It is not, and could not be: that event fires
+/// only when the candidate set is **empty**, i.e. exactly when there is no
+/// backlog to exceed the cap. A backlog of 80 promotable tickets truncates here
+/// in silence and emits no event at all. The surface AC9 names is pool sampling;
+/// the only thing this cap makes observable on its own is that `candidates` was
+/// built from at most 50 rows.
 const FEEDER_WORKING_SET_CAP: usize = 50;
 
 /// Pure parse of the stuck-ready threshold from an optional env value. Returns
@@ -1295,6 +1303,42 @@ const REENTRY_BLOCKED_TOOL_NAME: &str = "auto_pull_reentry_blocked";
 /// writer the structural guard did not see.
 const REENTRY_AUDIT_TOOL_NAME: &str = "auto_pull_redrive_reentry";
 
+// The three empty-backlog cause names (mika#2161 AC1). They are the `target_key`
+// of an `auto_feeder` audit row **and** the log line's message, so an operator
+// greps one and `GROUP BY target_key`s the other — two surfaces, one vocabulary.
+//
+// # Three names, and the refusal of one name with a `cause` field
+//
+// AC1 allows "two distinct events, **or** a field carrying the reason". The field
+// is refused, and not for style: **the existing name asserts (a) in its own
+// text**. Keeping `auto_feeder_no_backlog` as an umbrella with
+// `cause: "pool_in_flight"` would make `grep auto_feeder_no_backlog` return
+// case-(b) lines — the false assertion AC4 corrects, reinstalled in the event's
+// name. Direct precedent: mika#2368, "two names, and that is what saves the
+// probes".
+//
+// # The split is dated from the deploy, and that is deliberate
+//
+// Lines already written under `auto_feeder_no_backlog` mix (a) and (b);
+// rewriting them would falsify what they said when they were written. An
+// operator comparing across the deploy **must sum the three names**. Same
+// gesture and same reason as mika#2361 on
+// `operator_review_or_blocked` / `abandoned_operator_held`.
+
+/// (a) No groomed, dispatchable backlog exists — **kept**, now truthful.
+const EVENT_NO_GROOMED_BACKLOG: &str = "auto_feeder_no_backlog";
+/// (b) The `ready` pool is not empty, it is stuck behind live dispatches.
+const EVENT_POOL_IN_FLIGHT: &str = "auto_feeder_pool_in_flight";
+/// (c) The in-flight probe could not answer, so no cause is established.
+/// Expected regime: **zero**.
+const EVENT_IN_FLIGHT_UNREADABLE: &str = "auto_feeder_in_flight_unreadable";
+
+/// How many in-flight tickets the (b) message names before truncating.
+///
+/// Ten is enough to act on and short enough to read; past it the message says it
+/// truncated rather than letting the reader believe the list is the population.
+const EMPTY_BACKLOG_STUCK_NAMED_MAX: usize = 10;
+
 /// Ceiling on the dedup map. Bounds a theoretical leak: the real population is
 /// (open issues × filters), a few hundred at most, so reaching this means
 /// something is generating unbounded distinct keys. Clearing and starting over
@@ -1937,6 +1981,256 @@ fn count_pullable_ready(
         .filter(|i| !in_flight_issue_numbers.contains(&i.number))
         .filter(|i| !is_feeder_excluded(i))
         .count()
+}
+
+/// The `ready` pool of one feeder tick, broken down into the five buckets
+/// [`count_pullable_ready`] applies in order (mika#2161 AC2).
+///
+/// # Why this exists next to the count it explains
+///
+/// The feeder's threshold signal is `pullable`, and `pullable` alone cannot say
+/// *why* it is low. AC2 asks the empty-backlog event to carry the numbers that
+/// settle the question "groom more, or unblock?" without reading anything else,
+/// and those numbers are exactly this breakdown.
+///
+/// # Additivity is the deliverable, not an elegance
+///
+/// ```text
+/// raw_ready == pullable + open_pr + in_flight() + state_probe_failed + operator_held
+/// ```
+///
+/// Every `ready` ticket lands in **exactly one** bucket, attributed to the
+/// **first** filter that drops it, **in the order `count_pullable_ready` applies
+/// them**. Buckets that overlapped would sum past the raw count and leave the
+/// operator who adds them up with nothing to hold on to; attributing in another
+/// order would yield counts individually true that explain a pipeline nobody
+/// runs.
+///
+/// # `state_probe_failed` is an attribution subset, never a threshold change
+///
+/// The probe loop in [`phase0_feed_ready_pool`] treats a DB error as in-flight —
+/// correct fail-safe for the *threshold*, since not promoting on doubt is the
+/// cheap mistake. So the set [`count_pullable_ready`] receives is the **union**
+/// of genuinely-in-flight and probe-failed tickets, and it is unchanged by this
+/// census: only the ventilation of the count is refined. That is why the two
+/// buckets must be **disjoint here** while being **merged there**, and it is the
+/// one property an implementer can get wrong without any test noticing — hence
+/// the additivity and equivalence tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ReadyPoolCensus {
+    /// Every open issue carrying the `ready` label, whatever its fate.
+    raw_ready: usize,
+    /// Survived every filter: the feeder's threshold signal.
+    pullable: usize,
+    /// An open PR already closes it ([`FILTER_OPEN_PR`]).
+    open_pr: usize,
+    /// The `ready` tickets attributed to [`FILTER_IN_FLIGHT`], ascending.
+    ///
+    /// The numbers rather than a count, because AC3 asks the (b) message to
+    /// **name** them — and one field rather than a count beside a list, so the
+    /// two cannot drift apart. Read the count through [`Self::in_flight`].
+    in_flight_issues: Vec<u64>,
+    /// The in-flight probe could not answer ([`FILTER_PROBE_ERROR`]).
+    state_probe_failed: usize,
+    /// Someone else holds the ticket ([`FILTER_OPERATOR_HELD`]).
+    ///
+    /// The predicate is [`is_feeder_excluded`], verbatim, so additivity with
+    /// `count_pullable_ready` is textual rather than argued. Named cost: that
+    /// predicate also absorbs a seat refusal ([`FILTER_SEAT_REFUSED`]), so this
+    /// bucket is "held by someone else" rather than strictly
+    /// `blocked`/`operator-review`. Splitting it would add a sixth number and a
+    /// wire name AC2 does not ask for, and that population is empty for the
+    /// feeder's own seat.
+    operator_held: usize,
+    /// Probe failures on groomed, non-`ready` **candidates** — outside the pool,
+    /// hence outside the additive identity above.
+    ///
+    /// The probe loop also probes candidates, and an `Err` there drops the
+    /// candidate from selection exactly like a pool member. Counting only the
+    /// pool made an empty pool plus an unreadable candidate read (a) "no groomed
+    /// backlog" — a false cause on an unreadable signal (review of PR #2635).
+    candidate_probe_failed: usize,
+}
+
+impl ReadyPoolCensus {
+    /// How many `ready` tickets are held by a live dispatch of their own.
+    fn in_flight(&self) -> usize {
+        self.in_flight_issues.len()
+    }
+
+    /// The sum of the five buckets. Equal to [`Self::raw_ready`] by
+    /// construction — which is what the additivity test measures rather than
+    /// assumes.
+    ///
+    /// Test-only: production reads the buckets it needs. The invariant exists to
+    /// be *checked*, and a production caller would have to decide what to do when
+    /// it fails, which is a question additivity-by-construction does not have.
+    #[cfg(test)]
+    fn attributed(&self) -> usize {
+        self.pullable
+            + self.open_pr
+            + self.in_flight()
+            + self.state_probe_failed
+            + self.operator_held
+    }
+}
+
+/// Break the `ready` pool down into [`ReadyPoolCensus`] (mika#2161 AC2).
+///
+/// Pure/in-memory, and deliberately a **sibling** of [`count_pullable_ready`]
+/// rather than a replacement: AC6 keeps that function unmodified, unmoved and
+/// unwrapped, because it carries the correction of a founding incident
+/// (mika#1863 R3/D2). What pins the two together is the equivalence test
+/// `census.pullable == count_pullable_ready(..)`, on the model of
+/// `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`: a
+/// census that diverged from the count it claims to explain is worse than no
+/// census.
+///
+/// `probe_failed_issue_numbers` is the subset of `in_flight_issue_numbers` the
+/// probe loop could not actually resolve. A number present in it but absent from
+/// `in_flight_issue_numbers` cannot occur in production (the loop inserts into
+/// both on the `Err` arm) and is attributed to nothing: this function reports
+/// what the filters did, it does not repair their input.
+fn census_ready_pool(
+    issues: &[Issue],
+    open_pr_issue_numbers: &HashSet<u64>,
+    in_flight_issue_numbers: &HashSet<u64>,
+    probe_failed_issue_numbers: &HashSet<u64>,
+) -> ReadyPoolCensus {
+    let mut census = ReadyPoolCensus::default();
+
+    for issue in issues
+        .iter()
+        .filter(|i| i.labels.iter().any(|l| l.name == "ready"))
+    {
+        census.raw_ready += 1;
+        let n = issue.number;
+
+        // The order below mirrors `count_pullable_ready`'s `.filter()` chain
+        // exactly. Reordering it keeps every count individually true and makes
+        // the breakdown explain a pipeline that does not exist.
+        if open_pr_issue_numbers.contains(&n) {
+            census.open_pr += 1;
+        } else if in_flight_issue_numbers.contains(&n) {
+            if probe_failed_issue_numbers.contains(&n) {
+                census.state_probe_failed += 1;
+            } else {
+                census.in_flight_issues.push(n);
+            }
+        } else if is_feeder_excluded(issue) {
+            census.operator_held += 1;
+        } else {
+            census.pullable += 1;
+        }
+    }
+
+    // Probe failures on everything the pool did not claim: the groomed
+    // candidates the probe loop also probes. Counted apart so the additive
+    // identity over `raw_ready` is untouched.
+    census.candidate_probe_failed = issues
+        .iter()
+        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
+        .filter(|i| probe_failed_issue_numbers.contains(&i.number))
+        .count();
+
+    census.in_flight_issues.sort_unstable();
+    census
+}
+
+/// Why the feeder found no candidate to promote (mika#2161 AC1).
+///
+/// The three causes call for **opposite** remedies, which is the whole reason
+/// the single `auto_feeder_no_backlog` line was a defect rather than a
+/// shorthand: it named (a) in every case, and on the founding night the answer
+/// was (b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyBacklogCause {
+    /// The `ready` pool is not empty — it is **stuck**. Remedy: unblock. Do not
+    /// groom.
+    PoolInFlight,
+    /// The in-flight probe failed, so neither (a) nor (b) is established.
+    /// Remedy: repair the probe.
+    InFlightUnreadable,
+    /// No groomed, dispatchable backlog exists. Remedy: groom more.
+    NoGroomedBacklog,
+}
+
+impl EmptyBacklogCause {
+    /// The event name and `audit_events.target_key` for this cause.
+    ///
+    /// Exhaustive `match` with **no `_ =>` arm**, deliberately: a fourth cause
+    /// must not compile until it has decided both its name and its remedy
+    /// ([`Self::remedy`]). Model: `tools::dispatch_substrate_diagnostic`
+    /// (mika#2290).
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::PoolInFlight => EVENT_POOL_IN_FLIGHT,
+            Self::InFlightUnreadable => EVENT_IN_FLIGHT_UNREADABLE,
+            Self::NoGroomedBacklog => EVENT_NO_GROOMED_BACKLOG,
+        }
+    }
+
+    /// The remedy this cause actually calls for — the half the single message
+    /// got wrong (AC3/AC4).
+    ///
+    /// Exhaustive, no `_ =>`, for the reason given on [`Self::event_name`]: the
+    /// two decisions are the whole content of a cause, and a fourth one that
+    /// compiled while naming no remedy would reopen mika#2161 under a new name.
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::PoolInFlight => {
+                "the `ready` pool is NOT empty, it is stuck behind live dispatches — \
+                 unblock them; do NOT groom more (promoting into a pool whose \
+                 consumers are wedged produces nothing)"
+            }
+            Self::InFlightUnreadable => {
+                "the in-flight probe failed, so neither a grooming shortage nor a \
+                 stuck pool is established — repair the probe before acting on \
+                 either"
+            }
+            Self::NoGroomedBacklog => {
+                "no groomed, dispatchable backlog exists — grooming throughput is \
+                 the bottleneck"
+            }
+        }
+    }
+}
+
+/// Classify an empty candidate set from the census (mika#2161 AC1).
+///
+/// # (b) outranks (a) when both hold — the central arbitration
+///
+/// The ticket presents (a) and (b) as two situations. **They are not
+/// exclusive**, and the founding night is precisely the case where both held:
+/// six `ready` of which four in flight, **and** no dispatchable groomed
+/// candidate in front. A classifier written as either/or could therefore have
+/// answered (a) that night — i.e. reproduced the defect it exists to close.
+///
+/// So the rule is a **priority, not an alternative**: if the `ready` pool
+/// carries in-flight exclusions, the remedy is to unblock, *whatever the backlog
+/// says*, because promoting into a pool whose consumers are wedged produces
+/// nothing. That is literally the measured error — four grooming sessions
+/// launched at 23:28 while the dispatch slot was taken.
+///
+/// # Why (c) is not over-engineering
+///
+/// It is the existing fail-safe made legible. A probe error is already counted
+/// as in-flight for the threshold; poured as-is into the (b) message it would
+/// **name as in-flight tickets that may not be**, i.e. hand out a false remedy
+/// with the authority of a measurement. Same family, same arbitration, as
+/// `pilot_stall_signal_unavailable` (mika#2277), `unknown_provider`
+/// (mika#2328), and the `below_threshold` / `no_ready_label_event` pair
+/// (mika#2131): *a signal one cannot read is never a satisfied term.* That holds
+/// for a probe failure on a groomed candidate as much as on a pool member: an
+/// unreadable candidate is not evidence of an empty backlog.
+fn classify_empty_backlog(census: &ReadyPoolCensus) -> EmptyBacklogCause {
+    if census.in_flight() > 0 {
+        EmptyBacklogCause::PoolInFlight
+    } else if census.state_probe_failed > 0 || census.candidate_probe_failed > 0 {
+        EmptyBacklogCause::InFlightUnreadable
+    } else {
+        EmptyBacklogCause::NoGroomedBacklog
+    }
 }
 
 /// Ledger-free view of [`select_feeder_candidates_recording`], for the selection
@@ -3111,19 +3405,276 @@ pub async fn auto_pull_groomed_ticket(
     promoted
 }
 
+/// Name the `ready` tickets that are stuck, with how long they have been so
+/// (mika#2161 AC3).
+///
+/// **Pure and synchronous**, from the rows the probe loop already resolved. It
+/// used to take `&AsyncDatabase` and re-query up to ten rows the same tick had
+/// just fetched and thrown away — which is also why the doc-comments at the probe
+/// site claimed an economy the code did not have, the shape mika#2304 names (*a
+/// field that asserts, with authority, the override that did not happen*). The
+/// probe now keeps its payload and this renders it: ten round trips removed on
+/// the (b) path, and the claim made true.
+///
+/// Consequence worth stating: the age is computed from `now` against the
+/// `in_flight_since` the probe read, so it is **identical** to what a re-query
+/// would give — that column does not move. What the cache does change is that the
+/// `status` reported is the probe's view rather than one taken milliseconds later,
+/// which is *more* consistent, not less: the census counted the ticket in flight
+/// on that same reading, so the message and its own `in_flight` number now
+/// describe one observation instead of two.
+///
+/// `status` rides alongside the age because the two clocks are different facts:
+/// a `pending` row has not been dispatched, so its age is measured from its
+/// creation, and reporting that as "dispatched N seconds ago" would be a false
+/// statement wearing a measurement's authority (mika#2133 R4). `task_id` rides
+/// along because it is what makes the line *actionable* — the operator's next
+/// gesture is `mika tasks get <id>` or `mika tasks cancel <id>`, and without it
+/// they have to resolve the row by `reference_url` first (the friction mika#2335
+/// removed from the sibling surface).
+///
+/// A ticket the census counted but for which no row was captured is reported as
+/// such rather than dropped: silently shortening the list would make the message
+/// disagree with its own `in_flight` number. That arm is now defensive rather
+/// than routine — every member of `in_flight_issues` is, by construction, a
+/// number the probe resolved `Ok(Some(_))` on.
+/// The (b) remedy while every in-flight dispatch is younger than the stuck
+/// threshold: the tickets and their ages are named, nothing is ordered.
+const POOL_IN_FLIGHT_NOT_YET_STUCK_REMEDY: &str = "the `ready` pool is held by live dispatches, all younger than the stuck-ready \
+     threshold — not stuck yet; check their ages below before grooming more";
+
+/// Is at least one in-flight `ready` ticket stuck by the house's definition
+/// (`stuck_ready_threshold_secs`)?
+///
+/// Fail-safe towards the original (b) message: a ticket with no captured row or
+/// an unparseable instant cannot be shown to be young, so it counts as stuck —
+/// softening the remedy needs a measurement, keeping it does not.
+fn pool_in_flight_is_stuck(
+    in_flight_issues: &[u64],
+    probed: &HashMap<u64, InFlightSelfDevTask>,
+    now: chrono::DateTime<chrono::Utc>,
+    threshold_secs: i64,
+) -> bool {
+    in_flight_issues.iter().any(|n| match probed.get(n) {
+        Some(task) => crate::timestamp::parse(&task.in_flight_since)
+            .map(|since| (now - since).num_seconds() >= threshold_secs)
+            .unwrap_or(true),
+        None => true,
+    })
+}
+
+fn resolve_stuck_ready_tickets(
+    in_flight_issues: &[u64],
+    probed: &HashMap<u64, InFlightSelfDevTask>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let mut rendered: Vec<String> = Vec::new();
+
+    for n in in_flight_issues.iter().take(EMPTY_BACKLOG_STUCK_NAMED_MAX) {
+        let detail = match probed.get(n) {
+            Some(task) => {
+                // The unit lives in the numeric branch: glued to the fallback it
+                // rendered `unknowns`, a unit on a non-numeric value reading as a
+                // plural noun.
+                let age = crate::timestamp::parse(&task.in_flight_since)
+                    .map(|since| format!("{}s", (now - since).num_seconds().max(0)))
+                    .unwrap_or_else(|_| "age-unparseable".to_string());
+                format!("#{n}({},{},{})", task.status, age, task.task_id)
+            }
+            None => format!("#{n}(not-captured)"),
+        };
+        rendered.push(detail);
+    }
+
+    if in_flight_issues.len() > EMPTY_BACKLOG_STUCK_NAMED_MAX {
+        // Say that the list is truncated rather than letting the reader take it
+        // for the population — the `in_flight` count above is the population.
+        rendered.push(format!(
+            "(+{} more)",
+            in_flight_issues.len() - EMPTY_BACKLOG_STUCK_NAMED_MAX
+        ));
+    }
+
+    rendered.join(" ")
+}
+
+/// Write the one line and the one audit row that say why the feeder found no
+/// candidate (mika#2161 AC1/AC2/AC3).
+///
+/// # Cadence: unchanged, and that is deliberate
+///
+/// One line plus one audit row per tick for as long as the condition holds (up to
+/// 144/day during a wedge). That is **exactly** the current cadence of
+/// `auto_feeder_no_backlog`; changing it would break the comparability of the
+/// existing population and no AC asks for it. The mika#2131 doctrine
+/// (deduplicate the **per-ticket** detail) does not apply: this is a per-tick
+/// aggregate, and during a wedge the liveness *is* the information — the same
+/// reason `auto_pull_stop_armed` (mika#2329) and Signal P (mika#2156) write one
+/// line per tick.
+///
+/// `auto_feeder` stays the audit `tool_name` and the cause rides in `target_key`,
+/// so the existing operator surface (`WHERE tool_name = 'auto_feeder'`) is
+/// preserved verbatim and a `GROUP BY target_key` now separates the three causes.
+async fn emit_empty_backlog_signal(
+    db: &AsyncDatabase,
+    census: &ReadyPoolCensus,
+    cause: EmptyBacklogCause,
+    probed: &HashMap<u64, InFlightSelfDevTask>,
+    min_ready: u32,
+    trace_id: &str,
+    session_id: &str,
+) {
+    let event = cause.event_name();
+    let stuck = match cause {
+        EmptyBacklogCause::PoolInFlight => {
+            resolve_stuck_ready_tickets(&census.in_flight_issues, probed, chrono::Utc::now())
+        }
+        // (a) and (c) name no ticket: (a) has no in-flight population, and (c)
+        // has one the engine could not read — naming it would hand out the false
+        // remedy this ticket exists to remove.
+        EmptyBacklogCause::InFlightUnreadable | EmptyBacklogCause::NoGroomedBacklog => {
+            String::new()
+        }
+    };
+
+    // The (b) classification is kept whatever the ages (the plan's priority), but
+    // "stuck … do NOT groom" is only asserted once a dispatch has actually been in
+    // flight past the house's own definition of stuck. Below it, the nominal
+    // regime — one pilot started minutes ago — would be ordered not to groom on
+    // every tick, the inverse of the remedy due (review of PR #2635).
+    let remedy = match cause {
+        EmptyBacklogCause::PoolInFlight
+            if !pool_in_flight_is_stuck(
+                &census.in_flight_issues,
+                probed,
+                chrono::Utc::now(),
+                stuck_ready_threshold_secs(),
+            ) =>
+        {
+            POOL_IN_FLIGHT_NOT_YET_STUCK_REMEDY
+        }
+        EmptyBacklogCause::PoolInFlight
+        | EmptyBacklogCause::InFlightUnreadable
+        | EmptyBacklogCause::NoGroomedBacklog => cause.remedy(),
+    };
+
+    info!(
+        event,
+        raw_ready = census.raw_ready,
+        pullable = census.pullable,
+        open_pr = census.open_pr,
+        in_flight = census.in_flight(),
+        state_probe_failed = census.state_probe_failed,
+        operator_held = census.operator_held,
+        candidate_probe_failed = census.candidate_probe_failed,
+        min_ready,
+        stuck = %stuck,
+        remedy,
+        "{event}"
+    );
+
+    let detail = format!(
+        "no candidate to promote: raw_ready={} pullable={} open_pr={} in_flight={} \
+         state_probe_failed={} operator_held={} candidate_probe_failed={} \
+         min_ready={min_ready} stuck=[{stuck}] — {}",
+        census.raw_ready,
+        census.pullable,
+        census.open_pr,
+        census.in_flight(),
+        census.state_probe_failed,
+        census.operator_held,
+        census.candidate_probe_failed,
+        remedy,
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_feeder",
+            event,
+            None,
+            Some(&detail),
+            None,
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(error = %e, event, "auto_feeder: failed to write empty-backlog audit event");
+    }
+}
+
+/// What the in-flight probe loop of Phase 0 learned in one tick (mika#2161 U3).
+struct InFlightProbe {
+    /// Every target the feeder must treat as in flight: a live row **or** a
+    /// probe failure. This is the set `count_pullable_ready` and
+    /// `select_feeder_candidates_recording` receive, byte for byte the
+    /// pre-mika#2161 one (AC6).
+    in_flight: HashSet<u64>,
+    /// The probe failures, a subset of `in_flight` kept apart **for attribution
+    /// only**: the empty-backlog message must refuse to name as in flight a
+    /// ticket the engine could not actually read.
+    probe_failed: HashSet<u64>,
+    /// The resolved rows, KEPT rather than discarded: the (b) message needs the
+    /// age and status they carry, and re-querying them at emission time would
+    /// fetch the same data twice in one tick through the single DB worker.
+    rows: HashMap<u64, InFlightSelfDevTask>,
+}
+
+/// Probe each target once and sort it into [`InFlightProbe`].
+///
+/// The probe is injected so the three arms — live row, no row, error — are
+/// testable without a failing database (review of PR #2635: the loop used to
+/// be inline and no test reached its `Err` arm). A failure is treated as in
+/// flight: not promoting on doubt is the cheap mistake.
+async fn probe_in_flight<F, Fut>(targets: Vec<u64>, probe: F) -> InFlightProbe
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<InFlightSelfDevTask>>>,
+{
+    let mut out = InFlightProbe {
+        in_flight: HashSet::new(),
+        probe_failed: HashSet::new(),
+        rows: HashMap::new(),
+    };
+    for n in targets {
+        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
+        match probe(issue_url).await {
+            Ok(Some(task)) => {
+                out.in_flight.insert(n);
+                out.rows.insert(n, task);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_feeder: in-flight probe failed; treating as in-flight");
+                out.in_flight.insert(n);
+                out.probe_failed.insert(n);
+            }
+        }
+    }
+    out
+}
+
 /// Phase 0 (mika#1863): auto-feeder — keep the **pullable**-ready pool topped up
 /// to `MIN_READY` from the groomed-dispatchable backlog. Runs before Phase 1 on
 /// every tick, independent of queue depth.
 ///
 /// Reuses the shared `issues` + `open_pr` fetches (D1), `is_groomed`,
-/// `gh_apply_label`, the per-issue circuit breaker, and
-/// `has_active_self_dev_task_for_issue` verbatim. Returns the number of tickets
-/// promoted this tick.
+/// `gh_apply_label` and the per-issue circuit breaker verbatim. The in-flight
+/// probe goes through `find_active_self_dev_task_for_issue` — same cardinality as
+/// the `has_active_…` boolean it replaced (one query per target), and its payload
+/// is kept so the empty-backlog message does not have to fetch it a second time
+/// (mika#2161 U3). Returns the number of tickets promoted this tick.
 ///
-/// Emits three `auto_feeder` audit events (R7/AC6): `auto_feeder_skip` when the
-/// pool already meets the threshold, `auto_feeder_no_backlog` when the pool is
-/// under threshold but no dispatchable backlog exists (true starvation signal),
-/// and `auto_feeder_promoted` per successful apply.
+/// Emits `auto_feeder` audit events (R7/AC6): `auto_feeder_skip` when the pool
+/// already meets the threshold, `auto_feeder_promoted` per successful apply, and
+/// — when nothing is promotable — **one of the three** cause names
+/// [`EmptyBacklogCause`] distinguishes (mika#2161 AC4).
+///
+/// That last point used to read "`auto_feeder_no_backlog` when the pool is under
+/// threshold but no dispatchable backlog exists (true starvation signal)", which
+/// asserted a cause this function cannot measure: the empty-candidate branch is
+/// equally reached by a `ready` pool that is full and wedged, and the remedies
+/// are opposite.
 #[allow(clippy::too_many_arguments)]
 async fn phase0_feed_ready_pool(
     db: &AsyncDatabase,
@@ -3142,7 +3693,7 @@ async fn phase0_feed_ready_pool(
         return 0;
     }
 
-    // Build the in-flight set (D4): probe `has_active_self_dev_task_for_issue`
+    // Build the in-flight set (D4): probe `find_active_self_dev_task_for_issue`
     // over the union of ready tickets (for the pullable count) and pre-in-flight
     // groomed-not-ready candidates (for selection). Bounded by FEEDER_WORKING_SET_CAP
     // on the candidate side; the ready side is bounded by the small pool. A probe
@@ -3167,20 +3718,16 @@ async fn phase0_feed_ready_pool(
         }
     }
 
-    let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
-    for n in probe_targets {
-        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
-        match db.has_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(true) => {
-                in_flight_issue_numbers.insert(n);
-            }
-            Ok(false) => {}
-            Err(e) => {
-                warn!(error = %e, issue = n, "auto_feeder: in-flight probe failed; treating as in-flight");
-                in_flight_issue_numbers.insert(n);
-            }
-        }
-    }
+    // The `find_` form rather than the boolean: same single round trip, and its
+    // answer carries the age AC3 needs (mika#2161 U3).
+    let InFlightProbe {
+        in_flight: in_flight_issue_numbers,
+        probe_failed: probe_failed_issue_numbers,
+        rows: probed_in_flight,
+    } = probe_in_flight(probe_targets, |issue_url| async move {
+        db.find_active_self_dev_task_for_issue(&issue_url).await
+    })
+    .await;
 
     // R3/D2: pullable-ready count is the threshold signal, not raw `ready` count.
     let pullable = count_pullable_ready(issues, open_pr_issue_numbers, &in_flight_issue_numbers);
@@ -3219,25 +3766,30 @@ async fn phase0_feed_ready_pool(
     );
 
     if candidates.is_empty() {
-        // R7: pool is under threshold but no dispatchable backlog — the grooming
-        // pipeline (not the feeder) is the bottleneck. Surface it explicitly.
-        info!(pullable, min_ready, "auto_feeder_no_backlog");
-        if let Err(e) = db
-            .log_audit_event(
-                session_id,
-                "auto_feeder",
-                "auto_feeder_no_backlog",
-                None,
-                Some(&format!(
-                    "under threshold but no dispatchable backlog: pullable={pullable}, min_ready={min_ready}"
-                )),
-                None,
-                Some(trace_id),
-            )
-            .await
-        {
-            warn!(error = %e, "auto_feeder: failed to write no-backlog audit event");
-        }
+        // R7 (mika#1863), corrected by mika#2161 AC4: the pool is under threshold
+        // and nothing is promotable — but **this code cannot know why**, and the
+        // line it used to write asserted one of three causes unconditionally.
+        // `candidates.is_empty()` holds whether no groomed backlog exists, or the
+        // `ready` pool is full and wedged, or the in-flight probe simply failed —
+        // three situations whose remedies are opposite. `classify_empty_backlog`
+        // names the one that was measured.
+        let census = census_ready_pool(
+            issues,
+            open_pr_issue_numbers,
+            &in_flight_issue_numbers,
+            &probe_failed_issue_numbers,
+        );
+        let cause = classify_empty_backlog(&census);
+        emit_empty_backlog_signal(
+            db,
+            &census,
+            cause,
+            &probed_in_flight,
+            min_ready,
+            trace_id,
+            session_id,
+        )
+        .await;
         return 0;
     }
 
@@ -7727,6 +8279,32 @@ This ticket has been GROOMED and is ready.
             "mika#2049 — the two surfaces must name the same outage identically; \
              pinning each side alone would let them drift apart in silence"
         );
+        // mika#2161 V7 — the three empty-backlog cause names join the SAME wire
+        // test rather than getting one of their own: this is where an operator
+        // and a reviewer already come to read auto_pull's vocabulary, and a
+        // second wire test on the same subject would leave the two free to
+        // diverge.
+        assert_eq!(EVENT_NO_GROOMED_BACKLOG, "auto_feeder_no_backlog");
+        assert_eq!(EVENT_POOL_IN_FLIGHT, "auto_feeder_pool_in_flight");
+        assert_eq!(
+            EVENT_IN_FLIGHT_UNREADABLE,
+            "auto_feeder_in_flight_unreadable"
+        );
+        // (a) keeps its historic value, which is what makes the split *dated*
+        // rather than a rename: the pre-deploy population stays comparable to
+        // itself and only gains two siblings.
+        assert_eq!(
+            EmptyBacklogCause::NoGroomedBacklog.event_name(),
+            EVENT_NO_GROOMED_BACKLOG
+        );
+        assert_eq!(
+            EmptyBacklogCause::PoolInFlight.event_name(),
+            EVENT_POOL_IN_FLIGHT
+        );
+        assert_eq!(
+            EmptyBacklogCause::InFlightUnreadable.event_name(),
+            EVENT_IN_FLIGHT_UNREADABLE
+        );
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
         // mika#2361 — the audit `tool_name`s are wire format too: an operator
         // greps them by hand, so a rename silently empties their query.
@@ -7779,6 +8357,795 @@ This ticket has been GROOMED and is ready.
             StuckReadyVerdict::Skip {
                 reason: FILTER_LIVE_PILOT
             }
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2161 — the empty-backlog signal names the cause it measured.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A `ready` pool of six, shaped like the founding night: four tickets in
+    /// flight (#2127, #2108, #1772, #2140) and two pullable.
+    fn founding_night_pool() -> Vec<Issue> {
+        [2127u64, 2108, 1772, 2140, 2200, 2201]
+            .iter()
+            .map(|n| make_issue(*n, GROOMED_BODY, &["ready"], "t"))
+            .collect()
+    }
+
+    fn numbers(ns: &[u64]) -> HashSet<u64> {
+        ns.iter().copied().collect()
+    }
+
+    /// **V1 — additivity.** Every `ready` ticket lands in exactly one bucket, so
+    /// the five buckets sum to the raw count. An operator who adds them up has
+    /// something to hold on to only while this holds (AC2: *"trancher sans aller
+    /// lire ailleurs"*).
+    ///
+    /// Red-before obtained by dropping a bucket from [`ReadyPoolCensus::attributed`].
+    #[test]
+    fn mika2161_le_recensement_est_additif() {
+        // One ticket per bucket, plus a non-`ready` one that must not be counted
+        // at all.
+        let mut issues = vec![
+            make_issue(10, GROOMED_BODY, &["ready"], "t"), // pullable
+            make_issue(11, GROOMED_BODY, &["ready"], "t"), // open PR
+            make_issue(12, GROOMED_BODY, &["ready"], "t"), // in flight
+            make_issue(13, GROOMED_BODY, &["ready"], "t"), // probe failed
+            make_issue(14, GROOMED_BODY, &["ready", "blocked"], "t"), // held
+        ];
+        issues.push(make_issue(15, GROOMED_BODY, &["p1-important"], "t"));
+
+        let census = census_ready_pool(
+            &issues,
+            &numbers(&[11]),
+            &numbers(&[12, 13]),
+            &numbers(&[13]),
+        );
+
+        assert_eq!(
+            census.raw_ready, 5,
+            "the non-`ready` ticket is not a member"
+        );
+        assert_eq!(census.pullable, 1);
+        assert_eq!(census.open_pr, 1);
+        assert_eq!(census.in_flight(), 1);
+        assert_eq!(census.state_probe_failed, 1);
+        assert_eq!(census.operator_held, 1);
+        assert_eq!(
+            census.attributed(),
+            census.raw_ready,
+            "buckets that overlap or leak sum past the raw count, and the \
+             operator who adds them up has nothing left to hold on to"
+        );
+    }
+
+    /// **V2 — the census explains the count it claims to explain (AC6), and
+    /// attributes in that count's own order.**
+    ///
+    /// Two distinct properties, and they need two distinct assertions — the plan
+    /// asked for one and it cannot cover both:
+    ///
+    /// 1. `census.pullable == count_pullable_ready(..)` on every input shape. A
+    ///    census that diverged from its own count is worse than no census, and
+    ///    this doubles as the AC6 guard: touching `count_pullable_ready` reddens
+    ///    it. Model:
+    ///    `mika2293_reconstruction_equals_load_for_agent_on_every_cascade_position`.
+    ///    **Red-before obtained by dropping or widening a filter in the census**
+    ///    (e.g. removing the `is_feeder_excluded` arm), which makes `pullable`
+    ///    disagree.
+    /// 2. An overlapping ticket lands in the bucket of the **first** filter
+    ///    `count_pullable_ready` applies. **Red-before obtained by reordering the
+    ///    census's chain.**
+    ///
+    /// # Why (1) cannot cover (2) — measured, not assumed
+    ///
+    /// The plan prescribes a single red-before for this test, *"changing the order
+    /// of the census's filters"*. Verified against the implementation: reordering
+    /// the chain leaves this test **green** on assertion (1) alone.
+    /// `count_pullable_ready`'s four filters are **conjunctive**, so a ticket that
+    /// is both `open_pr` and `operator_held` is non-pullable whichever one is
+    /// tested first — `pullable` is order-**invariant** by construction. The order
+    /// only decides which *exclusion* bucket such a ticket is attributed to, which
+    /// is exactly the property AC2 rests on and exactly what assertion (1) cannot
+    /// see. Hence (2), on a ticket built to overlap.
+    #[test]
+    fn mika2161_le_recensement_explique_le_compte_pullable() {
+        // (2) The attribution order, pinned on a ticket that trips BOTH
+        // `open_pr` and `operator_held`. `count_pullable_ready` tests `open_pr`
+        // first, so that is the bucket — otherwise the breakdown explains a
+        // pipeline nobody runs.
+        let overlapping = vec![make_issue(19, GROOMED_BODY, &["ready", "blocked"], "t")];
+        let census = census_ready_pool(
+            &overlapping,
+            &numbers(&[19]),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            (census.open_pr, census.operator_held),
+            (1, 0),
+            "a ticket that is both must be attributed to the FIRST filter \
+             `count_pullable_ready` applies (`open_pr`), not to a later one — the \
+             counts would stay individually true and explain a pipeline nobody \
+             runs"
+        );
+        // Same reasoning one filter down: `in_flight` precedes `operator_held`.
+        let census = census_ready_pool(
+            &overlapping,
+            &HashSet::new(),
+            &numbers(&[19]),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            (census.in_flight(), census.operator_held),
+            (1, 0),
+            "`in_flight` precedes `operator_held` in the chain this census mirrors"
+        );
+
+        // Overlapping shapes on purpose: these are the inputs where an attribution
+        // order other than `count_pullable_ready`'s own produces a different
+        // `pullable`.
+        let issues = vec![
+            make_issue(20, GROOMED_BODY, &["ready"], "t"),
+            make_issue(21, GROOMED_BODY, &["ready", "blocked"], "t"),
+            make_issue(22, GROOMED_BODY, &["ready", "operator-review"], "t"),
+            make_issue(23, UNGROOMED_BODY, &["ready"], "t"),
+            make_issue(24, GROOMED_BODY, &[], "t"),
+        ];
+
+        let shapes: &[(&[u64], &[u64], &[u64])] = &[
+            (&[], &[], &[]),
+            (&[20], &[], &[]),
+            (&[], &[20, 23], &[]),
+            (&[], &[20, 23], &[23]),
+            // A ticket in BOTH `open_pr` and `operator_held`: the order decides
+            // which bucket it lands in, and only one order explains the pipeline.
+            (&[21, 22], &[21], &[]),
+            (&[20, 21, 22, 23], &[20, 21, 22, 23], &[20, 21, 22, 23]),
+        ];
+
+        for (open_pr, in_flight, probe_failed) in shapes {
+            let open_pr = numbers(open_pr);
+            let in_flight = numbers(in_flight);
+            let census = census_ready_pool(&issues, &open_pr, &in_flight, &numbers(probe_failed));
+            assert_eq!(
+                census.pullable,
+                count_pullable_ready(&issues, &open_pr, &in_flight),
+                "the census must explain the very count the feeder thresholds on \
+                 — shape open_pr={open_pr:?} in_flight={in_flight:?}"
+            );
+            assert_eq!(
+                census.attributed(),
+                census.raw_ready,
+                "and stay additive on every shape"
+            );
+        }
+    }
+
+    /// **V3 — the founding night renders (b), and this is the central
+    /// arbitration.**
+    ///
+    /// Six `ready` of which four in flight **and** no groomed candidate in front:
+    /// (a) and (b) both hold. An either/or classifier could legitimately have
+    /// answered (a) that night — i.e. reproduced the defect — so the rule is a
+    /// priority, not an alternative.
+    ///
+    /// Red-before obtained by inverting the (a)/(b) priority in
+    /// [`classify_empty_backlog`].
+    #[test]
+    fn mika2161_la_nuit_fondatrice_rend_pool_in_flight() {
+        let issues = founding_night_pool();
+        let in_flight = numbers(&[2127, 2108, 1772, 2140]);
+        let census = census_ready_pool(&issues, &HashSet::new(), &in_flight, &HashSet::new());
+
+        assert_eq!(
+            census.pullable, 2,
+            "the ticket's own measurement: pullable=2"
+        );
+        assert_eq!(census.in_flight(), 4);
+        assert_eq!(
+            census.in_flight_issues,
+            vec![1772, 2108, 2127, 2140],
+            "AC3 needs the numbers, sorted, so the message can name them"
+        );
+        assert_eq!(
+            classify_empty_backlog(&census),
+            EmptyBacklogCause::PoolInFlight,
+            "unblocking outranks grooming whenever the pool carries in-flight \
+             exclusions — promoting into a pool whose consumers are wedged \
+             produces nothing, which is exactly the 23:28 error"
+        );
+    }
+
+    /// **V4 — a genuinely empty pool renders (a).**
+    ///
+    /// The negative control without which "(b) outranks (a)" would be
+    /// indistinguishable from a classifier that always answers (b).
+    #[test]
+    fn mika2161_un_bassin_vraiment_vide_rend_no_backlog() {
+        let census = census_ready_pool(
+            &[make_issue(30, GROOMED_BODY, &["ready"], "t")],
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(census.in_flight(), 0);
+        assert_eq!(census.state_probe_failed, 0);
+        assert_eq!(
+            classify_empty_backlog(&census),
+            EmptyBacklogCause::NoGroomedBacklog,
+            "with nothing in flight and no probe failure, grooming throughput IS \
+             the bottleneck and (a) is the true answer"
+        );
+
+        // And an empty repository: no ticket at all is still (a).
+        let empty = census_ready_pool(&[], &HashSet::new(), &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            classify_empty_backlog(&empty),
+            EmptyBacklogCause::NoGroomedBacklog
+        );
+    }
+
+    /// **V5 — an unreadable probe asserts neither one.**
+    ///
+    /// The fail-safe that already existed, made legible. A probe error counts as
+    /// in-flight for the *threshold* (correct: not promoting on doubt is the cheap
+    /// mistake), but poured into the (b) message it would name as in-flight
+    /// tickets that may not be — a false remedy with a measurement's authority.
+    ///
+    /// Red-before obtained by folding `probe_failed` into the `in_flight` bucket
+    /// of the census: the classifier then answers (b).
+    #[test]
+    fn mika2161_une_sonde_illisible_naffirme_ni_lun_ni_lautre() {
+        let issues = vec![
+            make_issue(40, GROOMED_BODY, &["ready"], "t"),
+            make_issue(41, GROOMED_BODY, &["ready"], "t"),
+        ];
+        // Both probes failed, so both are in the set `count_pullable_ready`
+        // receives — the threshold is unchanged — but neither is *known* to be in
+        // flight.
+        let census = census_ready_pool(
+            &issues,
+            &HashSet::new(),
+            &numbers(&[40, 41]),
+            &numbers(&[40, 41]),
+        );
+
+        assert_eq!(census.state_probe_failed, 2);
+        assert_eq!(
+            census.in_flight(),
+            0,
+            "a probe failure is an attribution subset of in-flight, kept DISJOINT \
+             here while staying MERGED in the set the filters receive"
+        );
+        assert_eq!(
+            census.pullable,
+            count_pullable_ready(&issues, &HashSet::new(), &numbers(&[40, 41])),
+            "AC6: the threshold does not move an inch"
+        );
+        assert_eq!(
+            classify_empty_backlog(&census),
+            EmptyBacklogCause::InFlightUnreadable
+        );
+
+        // One real in-flight ticket outranks the unreadable ones: (b) is still
+        // actionable, (c) only fires when nothing is established.
+        let mixed = census_ready_pool(
+            &issues,
+            &HashSet::new(),
+            &numbers(&[40, 41]),
+            &numbers(&[41]),
+        );
+        assert_eq!(
+            classify_empty_backlog(&mixed),
+            EmptyBacklogCause::PoolInFlight
+        );
+    }
+
+    /// **V5-bis — a probe failure on a CANDIDATE asserts no grooming shortage
+    /// either** (review of PR #2635).
+    ///
+    /// The probe loop of `phase0_feed_ready_pool` also probes groomed,
+    /// non-`ready` candidates, and an `Err` there drops the candidate from
+    /// selection. A census that walked the `ready` pool alone saw zero failures,
+    /// so an empty pool plus one unreadable candidate rendered (a) "no groomed
+    /// backlog" — a false cause on an unreadable signal, the exact shape (c)
+    /// exists to stop.
+    ///
+    /// Red-before: without the candidate-side count this returns
+    /// `NoGroomedBacklog`.
+    #[test]
+    fn mika2161_une_sonde_candidat_illisible_naffirme_pas_labsence_de_backlog() {
+        // Groomed, not `ready`: a feeder candidate, not a pool member.
+        let issues = vec![make_issue(60, GROOMED_BODY, &["p1-important"], "t")];
+        let census = census_ready_pool(&issues, &HashSet::new(), &numbers(&[60]), &numbers(&[60]));
+
+        assert_eq!(census.raw_ready, 0, "the candidate is not a pool member");
+        assert_eq!(
+            census.attributed(),
+            census.raw_ready,
+            "the candidate-side count stays outside the additive identity"
+        );
+        assert_eq!(
+            classify_empty_backlog(&census),
+            EmptyBacklogCause::InFlightUnreadable,
+            "an unreadable candidate establishes neither a shortage nor a stuck pool"
+        );
+
+        // Negative control: the same candidate genuinely absent from the probe
+        // failures is a real (a).
+        //
+        // (The loop that fills those sets in production is pinned separately,
+        // by `mika2161_la_boucle_de_sonde_trie_les_trois_bras`.)
+        let readable =
+            census_ready_pool(&issues, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            classify_empty_backlog(&readable),
+            EmptyBacklogCause::NoGroomedBacklog
+        );
+    }
+
+    /// **The probe loop sorts its three arms** (review of PR #2635).
+    ///
+    /// V5/V6 hand-build the in-flight, probe-failed and row sets; nothing reached
+    /// the loop that fills them in production. Dropping the `probe_failed`
+    /// insert would reopen (c) → (b) — a DB outage named as stuck tickets — and
+    /// dropping the row insert would render every stuck ticket `not-captured`,
+    /// both with the suite green. The probe is injected, so the `Err` arm needs
+    /// no failing database.
+    #[tokio::test]
+    async fn mika2161_la_boucle_de_sonde_trie_les_trois_bras() {
+        let live = 1u64;
+        let absent = 2u64;
+        let unreadable = 3u64;
+        let url_of = |n: u64| format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+
+        let probe = probe_in_flight(vec![live, absent, unreadable], |url| {
+            let live_url = url_of(live);
+            let unreadable_url = url_of(unreadable);
+            async move {
+                if url == live_url {
+                    Ok(Some(probed_row("task-live", "in_progress", 120)))
+                } else if url == unreadable_url {
+                    Err(anyhow!("database is locked"))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            probe.in_flight,
+            numbers(&[live, unreadable]),
+            "a live row AND a probe failure are both in flight for the threshold (AC6)"
+        );
+        assert_eq!(
+            probe.probe_failed,
+            numbers(&[unreadable]),
+            "only the failure is attributed to the unreadable bucket"
+        );
+        assert_eq!(probe.rows.len(), 1, "only the live row is captured");
+        assert_eq!(probe.rows[&live].task_id, "task-live");
+        assert!(
+            !probe.rows.contains_key(&unreadable),
+            "a failed probe carries no row: naming it would invent an age"
+        );
+    }
+
+    /// **V6 — the two branches write two different `target_key`s** (hermetic:
+    /// in-memory DB, no `gh`, no network).
+    ///
+    /// # The negative control is the load-bearing half
+    ///
+    /// This test does not merely assert that each branch writes *something*: it
+    /// asserts the two keys **differ**. A non-vacuity assertion alone would be
+    /// satisfied by a constant classifier — that is, by the very defect being
+    /// repaired.
+    ///
+    /// Red-before obtained by merging the two event names.
+    #[tokio::test]
+    async fn mika2161_les_deux_branches_ecrivent_deux_target_key() {
+        use crate::db::Database;
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+
+        // Branch (b): the founding night.
+        let issues = founding_night_pool();
+        let stuck = census_ready_pool(
+            &issues,
+            &HashSet::new(),
+            &numbers(&[2127, 2108, 1772, 2140]),
+            &HashSet::new(),
+        );
+        let stuck_cause = classify_empty_backlog(&stuck);
+        // The rows the probe loop would have captured for those four tickets —
+        // an hour old, past the stuck-ready threshold, like the founding night.
+        let probed: HashMap<u64, InFlightSelfDevTask> = stuck
+            .in_flight_issues
+            .iter()
+            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 3600)))
+            .collect();
+        emit_empty_backlog_signal(&db, &stuck, stuck_cause, &probed, 3, "trace", "session").await;
+
+        // Branch (a): a genuinely empty pool.
+        let empty = census_ready_pool(&[], &HashSet::new(), &HashSet::new(), &HashSet::new());
+        let empty_cause = classify_empty_backlog(&empty);
+        emit_empty_backlog_signal(
+            &db,
+            &empty,
+            empty_cause,
+            &HashMap::new(),
+            3,
+            "trace",
+            "session",
+        )
+        .await;
+
+        let rows: Vec<_> = db
+            .get_audit_events("session")
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .filter(|e| e.tool_name == "auto_feeder")
+            .collect();
+
+        assert_eq!(rows.len(), 2, "one row per emission; rows = {rows:?}");
+        let keys: HashSet<&str> = rows.iter().map(|e| e.target_key.as_str()).collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "THE assertion: the two causes must not share a `target_key`, or a \
+             `GROUP BY target_key` cannot separate \"groom more\" from \
+             \"unblock\" — keys = {keys:?}"
+        );
+        assert!(keys.contains(EVENT_POOL_IN_FLIGHT), "keys = {keys:?}");
+        assert!(keys.contains(EVENT_NO_GROOMED_BACKLOG), "keys = {keys:?}");
+
+        // AC2 — the numbers travel with the row, so the operator does not have to
+        // read anything else to decide.
+        let stuck_row = rows
+            .iter()
+            .find(|e| e.target_key == EVENT_POOL_IN_FLIGHT)
+            .expect("the (b) row");
+        let detail = stuck_row.after_value.as_deref().unwrap_or_default();
+        for expected in [
+            "raw_ready=6",
+            "pullable=2",
+            "in_flight=4",
+            "open_pr=0",
+            "state_probe_failed=0",
+            "operator_held=0",
+            "min_ready=3",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "AC2: `{expected}` must be on the row; detail = {detail}"
+            );
+        }
+        // AC3 — the message names the tickets and refuses to blame grooming.
+        for n in ["#1772", "#2108", "#2127", "#2140"] {
+            assert!(
+                detail.contains(n),
+                "AC3: the (b) message names the stuck tickets; detail = {detail}"
+            );
+        }
+        assert!(
+            detail.contains("do NOT groom more"),
+            "AC3: the (b) remedy is the opposite of the one the old line implied; \
+             detail = {detail}"
+        );
+
+        // And the negative control on the remedy: the (a) row must not name a
+        // stuck ticket, since it has none.
+        let empty_detail = rows
+            .iter()
+            .find(|e| e.target_key == EVENT_NO_GROOMED_BACKLOG)
+            .and_then(|e| e.after_value.clone())
+            .unwrap_or_default();
+        assert!(
+            empty_detail.contains("stuck=[]"),
+            "(a) names nobody — an empty pool has no in-flight population; \
+             detail = {empty_detail}"
+        );
+    }
+
+    /// **A fresh dispatch is not a stuck pool** (review of PR #2635).
+    ///
+    /// The nominal regime — one pilot started two minutes ago, nothing groomed
+    /// behind it — classifies (b) by design (the plan's (b) > (a) priority is
+    /// kept), but the remedy used to assert "stuck … do NOT groom more" on every
+    /// tick: the inverse of the remedy due. The house already defines "stuck":
+    /// `STUCK_READY_THRESHOLD_DEFAULT_SECS`. Below it the message names the
+    /// tickets and their ages without ordering anything.
+    ///
+    /// Red-before: the young row rendered "do NOT groom more".
+    #[tokio::test]
+    async fn mika2161_un_dispatch_frais_nest_pas_un_bassin_coince() {
+        use crate::db::Database;
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let issues = vec![make_issue(70, GROOMED_BODY, &["ready"], "t")];
+        let census = census_ready_pool(&issues, &HashSet::new(), &numbers(&[70]), &HashSet::new());
+        let cause = classify_empty_backlog(&census);
+        assert_eq!(
+            cause,
+            EmptyBacklogCause::PoolInFlight,
+            "the priority is kept"
+        );
+
+        let young: HashMap<u64, InFlightSelfDevTask> =
+            [(70u64, probed_row("task-70", "in_progress", 60))].into();
+        emit_empty_backlog_signal(&db, &census, cause, &young, 3, "trace", "session").await;
+
+        let detail = db
+            .get_audit_events("session")
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .find(|e| e.tool_name == "auto_feeder")
+            .and_then(|e| e.after_value)
+            .unwrap_or_default();
+        assert!(
+            detail.contains("#70(in_progress,60s,task-70)"),
+            "the ticket and its age are still named; detail = {detail}"
+        );
+        assert!(
+            !detail.contains("do NOT groom"),
+            "a 60 s dispatch is not stuck — ordering not to groom is the inverse \
+             of the remedy due; detail = {detail}"
+        );
+    }
+
+    /// The age predicate behind the (b) remedy, at its boundaries and on its two
+    /// fail-safe arms: no captured row, or an unreadable instant, keeps the
+    /// original "stuck" message rather than softening it on no measurement.
+    #[test]
+    fn mika2161_le_seuil_de_blocage_et_ses_bras_fail_safe() {
+        let now = chrono::Utc::now();
+        let rows = |secs: i64| -> HashMap<u64, InFlightSelfDevTask> {
+            [(1u64, probed_row("t1", "in_progress", secs))].into()
+        };
+        assert!(!pool_in_flight_is_stuck(&[1], &rows(60), now, 900));
+        assert!(pool_in_flight_is_stuck(&[1], &rows(901), now, 900));
+        assert!(
+            pool_in_flight_is_stuck(&[1], &HashMap::new(), now, 900),
+            "no captured row cannot be shown young"
+        );
+        let mut bad = HashMap::new();
+        bad.insert(
+            1u64,
+            InFlightSelfDevTask {
+                task_id: "t1".to_string(),
+                status: "pending".to_string(),
+                in_flight_since: "not-a-timestamp".to_string(),
+            },
+        );
+        assert!(
+            pool_in_flight_is_stuck(&[1], &bad, now, 900),
+            "an unreadable instant cannot be shown young"
+        );
+        assert!(!pool_in_flight_is_stuck(&[], &HashMap::new(), now, 900));
+    }
+
+    /// A captured probe row, dated `secs` ago.
+    fn probed_row(task_id: &str, status: &str, secs: i64) -> InFlightSelfDevTask {
+        InFlightSelfDevTask {
+            task_id: task_id.to_string(),
+            status: status.to_string(),
+            in_flight_since: crate::timestamp::format(
+                &(chrono::Utc::now() - chrono::Duration::seconds(secs)),
+            ),
+        }
+    }
+
+    /// **The (b) message renders status, age and task id, from the probe's own
+    /// rows** (DoD 4, AC3) — and says when it truncates.
+    ///
+    /// Eleven stuck tickets against a cap of ten: the list names ten and then says
+    /// how many it left out. Without that, a reader would take the list for the
+    /// population — and the population is the `in_flight` count on the same line,
+    /// which would then silently disagree with it.
+    ///
+    /// Pure and synchronous since the probe keeps its payload: no DB, which is
+    /// also the measure that the ten re-queries are gone.
+    #[test]
+    fn mika2161_le_message_dit_quand_il_tronque() {
+        let over_cap: Vec<u64> = (3000..3000 + EMPTY_BACKLOG_STUCK_NAMED_MAX as u64 + 1).collect();
+        let probed: HashMap<u64, InFlightSelfDevTask> = over_cap
+            .iter()
+            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 8234)))
+            .collect();
+        let rendered = resolve_stuck_ready_tickets(&over_cap, &probed, chrono::Utc::now());
+
+        assert!(
+            rendered.contains("(+1 more)"),
+            "the message must say it truncated; rendered = {rendered}"
+        );
+        assert_eq!(
+            rendered.matches('#').count(),
+            EMPTY_BACKLOG_STUCK_NAMED_MAX,
+            "exactly `EMPTY_BACKLOG_STUCK_NAMED_MAX` tickets are named; \
+             rendered = {rendered}"
+        );
+        // AC3: status, age in seconds, and the task id that makes the line
+        // actionable (`mika tasks get <id>`).
+        assert!(
+            rendered.contains("#3000(in_progress,8234s,task-3000)"),
+            "rendered = {rendered}"
+        );
+        // The unit belongs to the numeric branch: glued to a fallback it rendered
+        // `unknowns`.
+        assert!(!rendered.contains("unknowns"), "rendered = {rendered}");
+
+        // Negative control: at or under the cap, nothing is announced.
+        let under_cap: Vec<u64> = (3000..3000 + EMPTY_BACKLOG_STUCK_NAMED_MAX as u64).collect();
+        let rendered = resolve_stuck_ready_tickets(&under_cap, &probed, chrono::Utc::now());
+        assert!(
+            !rendered.contains("more)"),
+            "a complete list must not claim a truncation; rendered = {rendered}"
+        );
+
+        // A census member with no captured row is named, never dropped — else the
+        // list would disagree with the `in_flight` count beside it. Defensive: the
+        // probe resolves every member before the census can push it.
+        let rendered = resolve_stuck_ready_tickets(&[4242], &HashMap::new(), chrono::Utc::now());
+        assert_eq!(rendered, "#4242(not-captured)");
+
+        // An unparseable stored instant degrades the age and keeps the row.
+        let mut bad = HashMap::new();
+        bad.insert(
+            77u64,
+            InFlightSelfDevTask {
+                task_id: "task-77".to_string(),
+                status: "pending".to_string(),
+                in_flight_since: "not-a-timestamp".to_string(),
+            },
+        );
+        assert_eq!(
+            resolve_stuck_ready_tickets(&[77], &bad, chrono::Utc::now()),
+            "#77(pending,age-unparseable,task-77)"
+        );
+    }
+
+    /// **V9 — the in-flight boolean delegates to the single reader.**
+    ///
+    /// `has_active_self_dev_task_for_issue` is derived from
+    /// `find_active_self_dev_task_for_issue`, so the `WHERE` clause exists once.
+    /// Two SQL sites would be free to disagree, and the divergence shows up as a
+    /// feeder that counts a ticket in flight while the message about it says
+    /// there is none — the `grooming_marker` lesson (mika#2158).
+    ///
+    /// Red-before obtained by letting the two queries diverge (e.g. dropping
+    /// `status IN (…)` from one of them).
+    #[tokio::test]
+    async fn mika2161_le_booleen_en_vol_delegue_au_lecteur_unique() {
+        use crate::db::{Database, NewTask};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/2161");
+
+        // Nothing yet: both answers agree on absence.
+        assert!(
+            !db.has_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("boolean probe")
+        );
+        assert!(
+            db.find_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("find probe")
+                .is_none()
+        );
+
+        let seed = |label: &str, suffix: &str| {
+            let db = db.clone();
+            let label = label.to_string();
+            let reference = format!("{url}{suffix}");
+            async move {
+                db.create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: None,
+                    depth: 0,
+                    label,
+                    trigger_type: "manual".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "none".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    source: Some("self_dev".to_string()),
+                    reference_url: Some(reference),
+                    r#type: Some("issue".to_string()),
+                    dispatch_class: None,
+                    created_by_session: None,
+                    created_trace_id: None,
+                    metadata: None,
+                })
+                .await
+                .expect("seed a self_dev task")
+            }
+        };
+
+        // The `?phase=groom` variant must be covered by the same prefix `LIKE` —
+        // the rule the sibling query already carries.
+        let newer = seed("ready-label: newer", "?phase=groom").await;
+        // The OLDER row is seeded SECOND and backdated an hour: `created_at` has
+        // one-second resolution, so two rows seeded back to back tie and scan
+        // order decides — an `ASC`/`DESC` swap stayed green (review of PR #2635).
+        // Seeding it second also rules out insertion order answering in its place.
+        let older = seed("ready-label: older", "").await;
+        let backdated =
+            crate::timestamp::format(&(chrono::Utc::now() - chrono::Duration::seconds(3600)));
+        {
+            let id = older.clone();
+            let at = backdated.clone();
+            db.with_db(move |d| {
+                d.conn.execute(
+                    "UPDATE tasks SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![at, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("backdate the older row");
+        }
+
+        assert!(
+            db.has_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("boolean probe")
+        );
+        let found = db
+            .find_active_self_dev_task_for_issue(&url)
+            .await
+            .expect("find probe")
+            .expect("a row is in flight");
+        assert_eq!(
+            found.task_id, older,
+            "the OLDEST row answers, because the diagnostic question AC3 asks is \
+             \"for how long\""
+        );
+        assert_eq!(found.status, "pending");
+        assert_eq!(
+            found.in_flight_since, backdated,
+            "with no fired_at, the age is measured from created_at (COALESCE)"
+        );
+
+        // A terminal row leaves the population — and both answers must leave it
+        // together, which is the whole point of one SQL site.
+        for id in [&older, &newer] {
+            db.update_task_completed(id, Some("done"))
+                .await
+                .expect("complete the task");
+        }
+        assert!(
+            !db.has_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("boolean probe"),
+            "a terminal row must leave BOTH answers together — one SQL site is \
+             what makes that true rather than hoped for"
+        );
+        assert!(
+            db.find_active_self_dev_task_for_issue(&url)
+                .await
+                .expect("find probe")
+                .is_none()
         );
     }
 
