@@ -28,12 +28,14 @@ import pathlib
 import re
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import time
 import sys
 import types
 import unittest
+import unittest.mock
 from importlib.machinery import SourceFileLoader
 
 # mika#2030: every line the proxy writes to `pilot-egress-proxy.log` now leads
@@ -1590,6 +1592,43 @@ class HostSocketLifecycleTests(unittest.TestCase):
             "the retiring proxy deleted its successor's live socket",
         )
         self.assertIsNone(second.poll())
+
+    def test_bound_socket_is_owner_only(self) -> None:
+        # The sandbox reaches this socket through a bwrap bind-mount and runs
+        # under the same uid as the relay, so the owner bits are all it needs.
+        # Read on the real process, after it announced readiness: this is the
+        # mode every later client sees.
+        self._spawn_host()
+        self.assertTrue(self._wait_connectable())
+        st = os.stat(self.sock)
+        self.assertTrue(stat.S_ISSOCK(st.st_mode), "bound path is not a socket")
+        self.assertEqual(
+            stat.S_IMODE(st.st_mode), 0o600,
+            f"socket mode is {oct(stat.S_IMODE(st.st_mode))}, expected 0o600",
+        )
+
+    def test_socket_is_born_owner_only_without_chmod(self) -> None:
+        # The test above cannot tell "created 0600" from "created wider, then
+        # narrowed by the chmod that follows bind()" -- and only the first
+        # leaves no window in which the path is more permissive. So neutralise
+        # the chmod and bind under a permissive caller umask: the mode at
+        # creation must already be 0600, i.e. the umask around bind() alone
+        # carries the property.
+        previous = os.umask(0o022)
+        try:
+            with unittest.mock.patch.object(proxy.os, "chmod", lambda *a, **k: None):
+                sock = proxy._bind_owner_only_unix_socket(self.sock)
+            restored = os.umask(0o022)
+        finally:
+            os.umask(previous)
+        try:
+            self.assertEqual(
+                stat.S_IMODE(os.stat(self.sock).st_mode), 0o600,
+                "socket is not owner-only at creation",
+            )
+            self.assertEqual(restored, 0o022, "the caller's umask was not restored")
+        finally:
+            sock.close()
 
     def test_startup_emits_a_begin_breadcrumb_before_bind(self) -> None:
         # mika#2051: the 2026-08-29 incident left 1569 log lines with nothing
