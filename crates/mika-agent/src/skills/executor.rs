@@ -12477,11 +12477,26 @@ Harness ticket.
         use super::*;
         use crate::async_db::AsyncDatabase;
         use crate::db::Database;
+        use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
 
         /// Same budget and same reasoning as its mika#2532 sibling: long enough
         /// that a green run says something, short enough that a red one does not
         /// hang CI.
         const SETTLE_MS: u64 = 4_000;
+
+        /// Residual window the two negative controls leave between the barrier
+        /// ([`require_handler_failure`]) and their absence assertion.
+        ///
+        /// **It is NOT a settle delay** — the barrier has already established
+        /// that the failure path ran. It covers only the handful of instructions
+        /// between `set_task_handler_failure` returning and the
+        /// `if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)` block posting its
+        /// `log_audit_event`: both writes travel the same `AsyncDatabase`
+        /// channel, so they are ordered, but the spawned task yields at the
+        /// `await` in between and a loaded worker can be pre-empted there.
+        /// 250 ms is ~three orders of magnitude over the need and 16× cheaper
+        /// than the blind 4 s these controls used to sleep.
+        const NEGATIVE_CONTROL_MARGIN_MS: u64 = 250;
 
         fn db() -> AsyncDatabase {
             AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
@@ -12511,26 +12526,69 @@ Harness ticket.
             path
         }
 
-        /// Poll the audit trail for a `pilot_launcher_health` row.
+        /// Read the audit trail ONCE for a `pilot_launcher_health` row.
         ///
-        /// Returns `None` when none appeared within [`SETTLE_MS`] — which is the
-        /// assertion the two negative controls make, not a failure per se. The
-        /// session key is the one the production site composes, so a change of
-        /// that composition makes these tests red rather than silently blind.
-        async fn await_launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
+        /// The session key is the one the production site composes, so a change
+        /// of that composition makes these tests red rather than silently blind.
+        async fn launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
             let session = format!("callback-{task_id}");
+            db.get_audit_events(&session)
+                .await
+                .unwrap()
+                .iter()
+                .find(|e| e.tool_name == PILOT_LAUNCHER_HEALTH_TOOL)
+                .and_then(|row| row.after_value.clone())
+        }
+
+        /// Poll for the `pilot_launcher_health` row — the POSITIVE assertion
+        /// (T1). Returns `None` when none appeared within [`SETTLE_MS`].
+        async fn await_launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
             let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
             loop {
-                let events = db.get_audit_events(&session).await.unwrap();
-                if let Some(row) = events
-                    .iter()
-                    .find(|e| e.tool_name == PILOT_LAUNCHER_HEALTH_TOOL)
-                {
-                    return row.after_value.clone();
+                if let Some(value) = launcher_health(db, task_id).await {
+                    return Some(value);
                 }
                 if std::time::Instant::now() >= deadline {
                     return None;
                 }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// **Barrier for the two negative controls — it panics rather than
+        /// returning, and that is the point.**
+        ///
+        /// `set_task_handler_failure` (mika#2532) is written **unconditionally**
+        /// on every non-zero exit and **before** the launcher-dead block, so its
+        /// `$.handler_failure` key is the positive proof that the failure path
+        /// has been traversed for this row.
+        ///
+        /// Without it, a negative control that merely slept could conclude
+        /// "absent" from a path that had not yet run — green by **default of
+        /// observation**, which reads exactly like a control that looked (class
+        /// mika#2205). A loaded CI runner is precisely where that happens, so the
+        /// control meant to catch a false positive would be the first thing to
+        /// stop catching anything. Panicking on the budget turns that silence
+        /// into a red.
+        async fn require_handler_failure(db: &AsyncDatabase, task_id: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
+            loop {
+                let task = db.get_task(task_id).await.unwrap().expect("row exists");
+                if let Some(raw) = task.metadata.as_deref()
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(raw)
+                    && map.contains_key(HANDLER_FAILURE_METADATA_KEY)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "mika#2634 — the failure path never ran for task {task_id} within \
+                     {SETTLE_MS} ms: `$.{HANDLER_FAILURE_METADATA_KEY}` never appeared. This \
+                     control cannot conclude anything about the ABSENCE of a \
+                     `pilot_launcher_health` row until it has established that the handler \
+                     exited and the engine processed it."
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
@@ -12612,8 +12670,13 @@ Harness ticket.
                 None,
             );
 
+            // Establish that the failure path RAN before concluding on an
+            // absence — see [`require_handler_failure`].
+            require_handler_failure(&db, &task_id).await;
+            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+
             assert_eq!(
-                await_launcher_health(&db, &task_id).await,
+                launcher_health(&db, &task_id).await,
                 None,
                 "an exit 1 from a pilot that ran is NOT a dead launcher — classifying it \
                  as one would make the population unreadable and would freeze the loop \
@@ -12653,8 +12716,11 @@ Harness ticket.
                 None,
             );
 
+            require_handler_failure(&db, &task_id).await;
+            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+
             assert_eq!(
-                await_launcher_health(&db, &task_id).await,
+                launcher_health(&db, &task_id).await,
                 None,
                 "exit 78 is the containment refusal, not a dead launcher — its cause is \
                  the egress relay and its own text says so (R4)"
