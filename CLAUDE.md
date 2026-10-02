@@ -3661,6 +3661,14 @@ dans le voisinage de mika#2545.
   | `verdict` (défaut, comportement d'hier **octet pour octet**) | `GROOM ESCALATED (terminal): mika-arch escalated at <stage>.` + `Verdict: ESCALATE — human review required.` |
   | `architect_unreadable` | `… answered at <stage> without a parsable verdict line.` + `Groom-halt-cause: architect_unreadable <stage> — …` ; **aucune ligne `Verdict:`** |
 
+- **Une `ITERATE` explicite n'est pas un illisible non plus.** `_parse_verdict`
+  n'a délibérément pas de bras ITERATE en seconde passe, donc une
+  `Disposition: ITERATE` y rend la même chaîne vide qu'une troncature. AC1
+  l'exclut nommément : `_second_pass_explicit_iterate` (lu ancré en début de
+  ligne) la route **sans relance** vers le terminal `verdict` d'avant, octet pour
+  octet. Une ITERATE **citée en prose** dans un préambule garde sa relance.
+  Leçon : `docs/solutions/logic-errors/une-chaine-vide-de-parseur-fusionne-plusieurs-populations.md`.
+
 - **Un échec de transport n'est JAMAIS un illisible, ni un `.content` vide.**
   « N'a pas répondu » et « a répondu sans disposition » restent deux populations,
   et le fail-safe va dans le sens du rejeu dans les deux cas — la première par le
@@ -3811,6 +3819,11 @@ tourné depuis le déploiement. Vérifier le contrôle positif avant toute concl
   `_run_claude_pilot`, c'est-à-dire un changement de substrat d'exécution.
   **Ticket de suivi** ; c'est aussi pourquoi aucune instrumentation de ce travail
   n'y passe.
+- **Résidu OUVERT, trouvé en revue et non fermé ici :** le prompt de relance
+  passe sous le seuil d'armement de la garde d'ancrage, donc un
+  `Verdict: GROOMED` nu **au tour de relance** n'est pas attesté par mika#2037.
+  Le piège ci-dessus ne pesait que le sens inverse. Le fermer renverse D7/V4 du
+  plan (relance courte par contrat) : décision routée, pas prise ici.
 - **Il ne durcit pas `_parse_verdict`.** Rien n'est ajouté ni retiré à ses cinq
   tiers. Élargir le fuzzy pour attraper un préambule français serait l'inverse du
   remède : il faudrait **deviner** un verdict là où il n'y en a pas.
