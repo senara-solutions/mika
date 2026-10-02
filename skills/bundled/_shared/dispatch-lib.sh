@@ -1893,6 +1893,37 @@ _set_outcome_line() {
 ${1}"
 }
 
+# mika#2634 — the exit code under which the pre-flight stamps "the LAUNCHER did
+# not start", as opposed to "a pilot failed".
+#
+# **The fact is stamped by its producer, never inferred by the engine.** The
+# ticket proposed the conjunction "non-zero exit AND no claude-pilot log", and
+# that predicate has four measurable false positives in this repo: the
+# containment refusal (exit 78, mika#2049 — no log either, and a cause the
+# refusal text already names), the mika#2012 `already_groomed` refusal and the
+# dry-run (both exit 0, so the conjunction only looks safe), and the mika#2536
+# `cwd-guard` refusal on a sibling skill. It would also create a SECOND reader
+# of `<pilot_log_dir>/<task-id>.log`, whose first is
+# `task_engine::engine::probe_pilot_log_signal` (mika#2277) — the duplication
+# class mika#2158 had to close. House doctrine, written three times: *PR origin
+# is a fact stamped by its producer, never reconstructed afterwards* (mika#2026),
+# *the engine is told, never derives* (mika#2249), *la cible PR est dite, jamais
+# dérivée* (mika#2368, which condemns the LATE derivation by name — the one made
+# at the instant the failure is no longer recoverable).
+#
+# **79 is free, and the neighbourhood is why.** 78 is taken by the containment
+# refusal — same semantic family, "nothing was launched" — 64..78 are the
+# `sysexits.h` range, and 126/127/128+ are reserved by the shell.
+#
+# **Named cost:** the value is written twice, here and in Rust
+# (`skills::executor::EXIT_PILOT_LAUNCHER_DEAD`). No cross-language
+# single-source exists; this is the same duplication mika#2520 had to accept for
+# `GIT_OPS_PROTECTED_BRANCHES`. It is **guarded** by a Rust source scan that
+# reads this literal from this file, in BOTH directions
+# (`skills::executor::tests::mika2634::*`) — the shape
+# `check-dispatch-seats-declared.sh` already uses.
+_EXIT_LAUNCHER_DEAD=79
+
 # mika#749: TERM trap writes cancel discriminator before exit.
 # Convention: reason file at /tmp/mika-cancel-reason-$$ (PID-based).
 # cancel_task pre-writes CANCELLED_BY_OPERATOR before SIGTERM; this trap
@@ -1953,8 +1984,18 @@ ${_STDERR_TAIL}"
     # Scrub secrets from trace tail to prevent PAT leakage in callback delivery (mika#903).
     if [ -f "$TRACE_FILE" ]; then
         case "$RESULT" in
-            "HANDLER CRASH"*)
+            "HANDLER CRASH"*|"LAUNCHER DEAD"*)
                 # Crash path: append trace tail, preserve file for forensics
+                #
+                # mika#2634 — `LAUNCHER DEAD` joins the pattern, and it is the
+                # half of AC3 that carries the cause rather than the remedy.
+                # The pre-flight smoke test runs `claude-pilot --help … 2>&9`,
+                # so the interpreter's own diagnosis (the measured
+                # `ModuleNotFoundError: No module named 'claude_pilot'`) is
+                # ALREADY on disk in `$TRACE_FILE` — the ticket's AC3 is a
+                # question of ORDER, not of instrumentation. Without this arm
+                # the `*)` branch below deletes that file and the cause is lost
+                # exactly on the path that was filed for losing it.
                 _TRACE_TAIL=$(tail -50 "$TRACE_FILE" 2>/dev/null \
                     | _scrub_secrets_from_output \
                     | sed 's/^/    /')
@@ -4150,6 +4191,19 @@ _gate_non_empty_cycle() {
     # document mika-dev and the audit dashboard parse), not prose to annotate,
     # and calling a deliberate decision "empty" would be exactly the false red
     # this gate exists to avoid — a false red trains people to ignore red.
+    #
+    # mika#2634 — THIS short-circuit is also what covers `Outcome: LAUNCHER_DEAD`,
+    # and that is a rectification of the plan rather than an omission. The plan
+    # (U2-6) prescribed adding `^Outcome: LAUNCHER_DEAD` to the alternation
+    # below, by analogy with what mika#2545 had to pay for `ESCALATE`. Reading
+    # the code refuses it: `PILOT_RAN=1` is set inside `_run_claude_pilot`, and
+    # the launcher smoke test exits long before — so this guard's own comment
+    # ("a crash before launch") already names the population, by a STRONGER
+    # term than a RESULT grep. Adding the pattern would be a defence on an
+    # unreachable population, i.e. a guard whose silence proves nothing
+    # (mika#2205). The verifiable half is the other one: that the launcher-dead
+    # RESULT matches NONE of the six retryable patterns below — asserted by
+    # test-dispatch-lib.sh, not left to a reading.
     if [ "${PILOT_RAN:-0}" != "1" ]; then
         echo "cycle_output.not_applicable: no pilot session ran — nothing to judge (task=${TASK_ID:-unknown} skill=${SKILL:-unknown})" >&2
         return 0
@@ -9851,28 +9905,23 @@ dispatch_claude_pilot() {
     command -v mika >/dev/null 2>&1 || { echo "Error: mika CLI is required but not in PATH" >&2; exit 1; }
     command -v claude-pilot >/dev/null 2>&1 || { echo "Error: claude-pilot CLI is required but not in PATH" >&2; exit 1; }
 
-    # claude-pilot venv smoke test (mika#1200): force the import chain that imports
-    # yaml (and all other dependencies) to actually execute. Relies on cli.py keeping
-    # its imports at module top level — if cli.py is ever refactored to lazy-import
-    # .agent / .permissions inside main(), THIS smoke test silently stops detecting
-    # the failure class. See
-    # mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
-    # § Phase 0 Pin / cli.py invariant.
-    if ! timeout 15 claude-pilot --help >/dev/null 2>&9; then
-        cat >&2 <<'EOF'
-Error: claude-pilot venv is broken — `claude-pilot --help` exited non-zero.
-Most likely cause: pyproject.toml changed in claude-pilot-py without an
-accompanying `uv tool install` to re-sync dependencies. Editable installs pick
-up new source automatically but do NOT auto-install new declared dependencies.
-
-To restore the loop:
-    cd <mika-platform-root> && uv tool install --force --editable ./claude-pilot-py
-
-Reference: mika#1200 +
-mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
-EOF
-        exit 1
-    fi
+    # The claude-pilot venv smoke test (mika#1200) used to sit HERE, and that
+    # placement is the whole of mika#2634. It now runs AFTER the EXIT trap is
+    # armed — see `_launcher_smoke_test` below, called a few lines down.
+    #
+    # The three `command -v` checks above deliberately STAY before the trap: the
+    # trap delivers its callback through the `mika` CLI (completion flag
+    # included) and its body uses `jq`. Moving them after would give a trap that
+    # fails silently on a host missing `jq` or `mika` — one mute failure traded
+    # for another. The smoke test has neither dependency at the moment it runs,
+    # which is what makes it the one block that can move.
+    #
+    # The flag is named here in prose rather than quoted verbatim, on purpose:
+    # the mika#1996 delivery-site guard in test-dispatch-lib.sh scans function
+    # bodies for that literal WITHOUT stripping comments, so quoting it inside
+    # `dispatch_claude_pilot` makes this function read as a third callback
+    # emitter. Measured on this very edit — the mika#2050 class, where a text
+    # *about* a signal is counted as the signal.
 
     # mika-platform root — base for sub-repo resolution.
     #
@@ -9901,6 +9950,143 @@ EOF
     trap '_dispatch_lib_exit_trap' EXIT
     # Install TERM trap for cancel discriminator (mika#749)
     trap '_dispatch_lib_term_trap' TERM
+
+    # claude-pilot venv smoke test (mika#1200), AFTER the trap since mika#2634.
+    #
+    # It forces the import chain that imports yaml (and every other dependency)
+    # to actually execute. Relies on cli.py keeping its imports at module top
+    # level — if cli.py is ever refactored to lazy-import .agent / .permissions
+    # inside main(), THIS smoke test silently stops detecting the failure class.
+    # See mika/docs/plans/2026-05-18-001-bug-dev-groom-pilot-empty-handed-plan.md
+    # § Phase 0 Pin / cli.py invariant.
+    #
+    # ── mika#2634: why this block sits HERE and not thirteen lines up ────────
+    #
+    # It used to run BEFORE `trap '_dispatch_lib_exit_trap' EXIT`, and that is
+    # the whole of the measured defect. On 2026-10-02 a pip-user install
+    # rewrote `~/.local/bin/claude-pilot`'s shebang to the SYSTEM python, so
+    # `claude-pilot` raised `ModuleNotFoundError` at startup. A broken shebang
+    # does NOT fail `command -v claude-pilot` — the file exists and is
+    # executable — it fails `claude-pilot --help`, i.e. exactly this block. The
+    # old `exit 1` therefore fired before any trap existed: **no callback was
+    # delivered**, the task stayed non-terminal, and the engine wrote
+    # `tasks.result = "Process Exit code: 1: "` with an empty stderr. Three
+    # dispatches died that way over 2 h 45 and nothing raised an alarm; the
+    # diagnostic below — written word for word for this failure in mika#1200 —
+    # reached nobody.
+    #
+    # Now the trap is armed, so the callback IS delivered, the task becomes
+    # terminal, and the `RESULT` posed below carries both halves of AC3: the
+    # prescriptive remedy, and (via the trap's trace tail) the interpreter's
+    # own `ModuleNotFoundError`.
+    # The interpreter's own diagnosis goes to a FILE this block owns, not to the
+    # trace window — and `timeout` stays in command position.
+    #
+    # Two measurements shaped this line, and both are worth keeping.
+    #
+    # (1) `2>&9` — sending the smoke test's stderr to the trace file and letting
+    # the EXIT trap's `tail -50` carry it to the callback — is INSUFFICIENT.
+    # `set -x` is active, so that window is consumed by the trace of this block
+    # itself (the `RESULT=` assignment below is ~30 traced lines) plus the trap's
+    # own commands before it reads the file (`_release_issue_seat` alone is 12).
+    # The traceback is written before all of that, so it falls out of the last
+    # fifty lines, and AC3's "the cause is persisted" half would have shipped
+    # broken while looking delivered.
+    #
+    # (2) The natural fix — `_VAR=$(timeout 15 claude-pilot --help 2>&1 >/dev/null)`
+    # — makes this site VANISH from the mika#2496 launch-site scan, whose
+    # predicate anchors `timeout` after `^` or `;` and counts the venv smoke test
+    # as one of its four chokepoints. Measured: the count fell 4 → 3 and the scan
+    # said so, which is that guard doing exactly its job ("a renamed, reordered,
+    # or added launch point turns red instead of evaporating"). A command
+    # substitution is neither anchor, so no capturing form keeps the site
+    # visible — hence the file.
+    _SMOKE_ERR_FILE="${TMPDIR:-/tmp}/mika-launcher-smoke-$$.err"
+    if ! timeout 15 claude-pilot --help >/dev/null 2>"$_SMOKE_ERR_FILE"; then
+        # Scrubbed because a Python traceback prints full module paths and the
+        # callback crosses a user-facing channel — the same discipline the trap
+        # applies to every tail it appends (mika#903).
+        _SMOKE_STDERR=$(tail -c 4000 "$_SMOKE_ERR_FILE" 2>/dev/null | _scrub_secrets_from_output)
+        rm -f "$_SMOKE_ERR_FILE"
+        # Absent, never rendered as an empty block: a launcher that said nothing
+        # and a capture that failed must not read as the same thing.
+        : "${_SMOKE_STDERR:=(the launcher wrote nothing on its stderr)}"
+        # Residual risk, NAMED rather than treated: this capture is interpolated
+        # into the RESULT below, so a launcher printing one of the six retryable
+        # patterns (`HANDLER CRASH`, `PIPELINE FAILURE:`, …) would put this
+        # terminal callback back into the replay population. The population is
+        # an interpreter's startup diagnostics, where none of those strings
+        # occurs, and filtering the capture to be safe would risk amputating the
+        # very cause it exists to carry — the worse trade of the two.
+
+        # fd 9 and NOT fd 2, for the forensic copy.
+        #
+        # `exec 9>>"$TRACE_FILE" 2>/dev/null` at the top of this function is an
+        # `exec` WITHOUT a command, so its redirections apply to the current
+        # shell PERMANENTLY: fd 2 has been `/dev/null` ever since. This is not a
+        # discovery — `_halt_family`'s comment states it textually (mika#903) —
+        # what was missing is the link to "the pre-flight writes its diagnostic
+        # into the void", which is why `stderr_bytes: 0` looked like "there was
+        # nothing to say".
+        echo "dispatch-lib: launcher_smoke_test FAILED — \`claude-pilot --help\` exited non-zero (mika#2634); cause carried in RESULT" >&9
+
+        # Terminal marker, NOT `HANDLER CRASH` — and that distinction is the
+        # measured half of this fix. `HANDLER CRASH` is in the population
+        # `self-dev-callback/system_prompt.md` invites to replay ("To retry,
+        # call `run_claude_pilot` normally") and that `_gate_non_empty_cycle`
+        # greps next to `PIPELINE FAILURE:`. A broken launcher replayed is
+        # exactly the loop mika#2545 had to close for an escalated groom: every
+        # retry dies the same way until the HOST is repaired, and no retry
+        # budget bounds it. The pattern reproduced here is mika#2545's, verbatim
+        # — a terminal `Outcome:` line, tested before the replay branches.
+        #
+        # `LAUNCHER DEAD` leads the RESULT so the EXIT trap's trace-tail `case`
+        # recognises it; none of the six retryable patterns
+        # (`PIPELINE FAILURE:`, `STRUCTURAL VIOLATION:`, `HANDLER CRASH`,
+        # `^STATUS=CANCELLED`, `^Outcome: PIPELINE_INCOMPLETE`,
+        # `^Outcome: ESCALATE`) appears anywhere below — asserted by
+        # test-dispatch-lib.sh rather than left to a reading.
+        RESULT="LAUNCHER DEAD (exit ${_EXIT_LAUNCHER_DEAD}, mika#2634) — the claude-pilot LAUNCHER did not start. No pilot ran, no work was attempted, and every further dispatch will die the same way until the HOST is repaired.
+
+Error: claude-pilot venv is broken — \`claude-pilot --help\` exited non-zero.
+
+What the launcher said (its own stderr, last 4 KB — this is the line that
+identifies the cause at a glance):
+${_SMOKE_STDERR}
+
+Two causes have been measured, and they have different remedies:
+
+  (a) pyproject.toml changed in claude-pilot-py without an accompanying
+      \`uv tool install\` to re-sync dependencies. Editable installs pick up new
+      source automatically but do NOT auto-install new declared dependencies.
+      Reference: mika#1200.
+
+  (b) the \`~/.local/bin/claude-pilot\` entry point was rewritten by a
+      \`pip install -e\` of the claude-pilot repo. Its entry_points.txt declares
+      \`claude-pilot\` as a console_script, so ANY pip-user editable install
+      re-writes that path with the shebang of whichever python ran pip —
+      silently taking the path over from \`uv tool\`. Measured 2026-10-02:
+      shebang \`#!/usr/bin/python3.14\` instead of the uv-tool venv python, and
+      \`ModuleNotFoundError: No module named 'claude_pilot'\` on every launch.
+      Reference: mika#2634.
+
+To restore the loop (covers both causes):
+    cd <mika-platform-root> && uv tool install --reinstall --force --editable ./claude-pilot-py
+
+Then verify the entry point points at the venv python, not the system one:
+    head -1 ~/.local/bin/claude-pilot
+
+This dispatch is TERMINAL: do not retry it. A retry cannot change the verdict
+and burns a dispatch slot.
+
+Outcome: LAUNCHER_DEAD"
+        exit "$_EXIT_LAUNCHER_DEAD"
+    fi
+    # Nominal path: the launcher answered, so the capture file is an empty
+    # leftover. Removed here rather than in the EXIT trap, which does not know
+    # this name and must not grow a fifth cleanup for a file whose whole life
+    # is these four lines.
+    rm -f "$_SMOKE_ERR_FILE"
 
     _validate_inputs
 

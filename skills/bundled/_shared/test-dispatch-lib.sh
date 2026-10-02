@@ -395,16 +395,36 @@ assert_contains "Smoke test runs claude-pilot --help" \
 # (b) Smoke test aborts with diagnostic on failure
 assert_contains "Smoke test error mentions venv is broken" \
     'claude-pilot venv is broken' "$DISPATCH_BODY"
+# mika#2634: `--reinstall` joins the command, and it is not cosmetic. The
+# remedy now has to cover TWO measured causes — a stale dependency set
+# (mika#1200) and an entry point taken over by a pip-user editable install
+# (mika#2634, which leaves the uv-tool venv intact and only rewrites the
+# shebang, so a plain `--force` can leave it in place).
 assert_contains "Smoke test error mentions uv tool install restoration command" \
-    'uv tool install --force --editable ./claude-pilot-py' "$DISPATCH_BODY"
+    'uv tool install --reinstall --force --editable ./claude-pilot-py' "$DISPATCH_BODY"
 assert_contains "Smoke test error references mika#1200" \
     'mika#1200' "$DISPATCH_BODY"
+# mika#2634: …and the second cause, with its own reference, so a reader who
+# lands on a broken shebang is not sent to re-sync dependencies that are fine.
+assert_contains "Smoke test error references mika#2634 (shebang takeover)" \
+    'mika#2634' "$DISPATCH_BODY"
 
 # (c) Smoke test fires BEFORE worktree mutation — verify ordering:
 #     The smoke test (claude-pilot --help) must appear before _set_up_worktree
 #     in the function body. Extract line numbers to confirm ordering.
+#
+# mika#2634 — the `_set_up_worktree` needle is ANCHORED on the call, and that
+# repair is load-bearing rather than cosmetic. The bare `grep -n
+# '_set_up_worktree'` matched the mika#2155 COMMENT twenty-five lines above the
+# call ("it must exist even when `_set_up_worktree` was never reached"), so this
+# probe compared the smoke test against a mention in prose. It passed only
+# because the smoke test happened to sit above that comment too; moving the
+# block thirty-nine lines down — the whole of mika#2634 — turned it red while
+# the property it claims to measure (smoke test before any worktree mutation)
+# stayed TRUE. A probe that reads prose is the mika#2050 class, and here it was
+# one line away from blocking a fix for the defect it exists to prevent.
 SMOKE_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -n 'claude-pilot --help' | head -1 | cut -d: -f1)
-WORKTREE_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -n '_set_up_worktree' | head -1 | cut -d: -f1)
+WORKTREE_LINE=$(printf '%s\n' "$DISPATCH_BODY" | grep -nE '^[[:space:]]*_set_up_worktree( |$)' | head -1 | cut -d: -f1)
 if [ -n "$SMOKE_LINE" ] && [ -n "$WORKTREE_LINE" ] && [ "$SMOKE_LINE" -lt "$WORKTREE_LINE" ]; then
     PASS=$((PASS + 1))
     echo "  ✓ Smoke test (line $SMOKE_LINE) fires before _set_up_worktree (line $WORKTREE_LINE)"
@@ -425,19 +445,211 @@ else
     echo "    command_v_line=$COMMAND_V_LINE smoke_line=$SMOKE_LINE"
 fi
 
-# (b2) Smoke test uses exit 1 (not return 1) — matches surrounding control flow
-SMOKE_BLOCK=$(printf '%s\n' "$DISPATCH_BODY" | sed -n '/claude-pilot --help/,/fi/p' | head -20)
-assert_contains "Smoke test uses exit 1 on failure" 'exit 1' "$SMOKE_BLOCK"
+# (b2..b5) The block itself. Bounded on the `exit` rather than on `/fi/`:
+# mika#2634 made the body long enough that `head -20` truncated it, and `/fi/`
+# matches the first line merely CONTAINING "fi" — the word "fired" in a comment
+# does it. Both bounds were loose, and a loose bound on an assertion block turns
+# it green by accident, which is what (b2) was before this repair (it matched
+# `exit 1` inside a comment while the code no longer exits 1 at all).
+SMOKE_BLOCK=$(printf '%s\n' "$DISPATCH_BODY" | sed -n '/claude-pilot --help/,/^[[:space:]]*exit /p')
 
-# (b3) Smoke test writes to stderr (lands in task result via EXIT trap)
-assert_contains "Smoke test error goes to stderr" '>&2' "$SMOKE_BLOCK"
+# (b2) mika#2634 — the pre-flight exits on the DEDICATED code, never 1.
+#
+# `exit 1` was what made this failure indistinguishable from every other handler
+# crash, and the engine had nothing to classify on. The literal is asserted here
+# AND cross-checked against Rust by
+# `skills::executor::tests::mika2634::*`, in both directions: this value is
+# written twice across two languages and no single-source exists for it (the
+# duplication mika#2520 had to accept for `GIT_OPS_PROTECTED_BRANCHES`).
+assert_contains "Smoke test exits on the dedicated launcher-dead code, not 1" \
+    'exit "$_EXIT_LAUNCHER_DEAD"' "$SMOKE_BLOCK"
+assert_contains "…and that code is 79" \
+    '_EXIT_LAUNCHER_DEAD=79' "$(cat "$DISPATCH_LIB")"
+# Negative control: the bare `exit 1` is GONE from the block. Without this, the
+# assertion above is satisfied by a block that carries both.
+M2634_SMOKE_EXITS=$(printf '%s\n' "$SMOKE_BLOCK" \
+    | grep -cE '^[[:space:]]*exit 1[[:space:]]*$' || true)
+assert_eq "mika#2634 (contrôle négatif): plus aucun \`exit 1\` nu dans le bloc" \
+    "0" "$M2634_SMOKE_EXITS"
 
-# (b4) Smoke test suppresses stdout and routes stderr to trace fd
+# (b3) mika#2634 — the diagnostic does NOT go to fd 2, and that is the fix.
+#
+# This probe used to assert `>&2` with the comment "lands in task result via
+# EXIT trap". Both halves were false. `exec 9>>"$TRACE_FILE" 2>/dev/null` at the
+# top of `dispatch_claude_pilot` is an `exec` WITHOUT a command, so its
+# redirections apply to the current shell permanently: fd 2 has been /dev/null
+# ever since (mika#903, stated textually in `_halt_family`'s own comment). The
+# diagnostic was written into the void — which is why the three measured
+# dispatches of 2026-10-02 reported `stderr_bytes: 0`, read as "there was
+# nothing to say". The channels that work are fd 9 (the trace the trap appends)
+# and `RESULT`.
+assert_contains "Smoke test marker goes to the trace fd, not to /dev/null fd 2" \
+    '>&9' "$SMOKE_BLOCK"
+assert_contains "Smoke test poses RESULT itself (the channel that reaches the callback)" \
+    'RESULT="LAUNCHER DEAD' "$SMOKE_BLOCK"
+
+# (b3-bis) mika#2634 — the launcher's OWN stderr reaches the RESULT.
+#
+# This is the half of AC3 that carries the CAUSE rather than the remedy, and it
+# is captured to a file this block owns instead of riding the trace window.
+# Measured: with `set -x` active, the `tail -50` the trap appends is consumed by
+# the trace of this block plus the trap's own commands, so a `2>&9` traceback
+# falls out of the window. The assertion is on the composition, not on the
+# intention — a `RESULT` that names the remedy and drops the cause looks
+# delivered and is not.
+assert_contains "Smoke test captures the launcher's own stderr" \
+    '2>"$_SMOKE_ERR_FILE"' "$SMOKE_BLOCK"
+assert_contains "…and that capture reaches the RESULT" \
+    '${_SMOKE_STDERR}' "$SMOKE_BLOCK"
+# …and the capture file is cleaned on BOTH paths. The failure path removes it
+# before composing the RESULT; the nominal path removes the empty leftover. A
+# per-dispatch temp file nobody removes is a slow leak in /tmp.
+M2634_SMOKE_CLEANUP=$(printf '%s\n' "$DISPATCH_BODY" \
+    | grep -cE '^[[:space:]]*rm -f "\$_SMOKE_ERR_FILE"[[:space:]]*$' || true)
+assert_eq "mika#2634: le fichier de capture est nettoyé sur les DEUX chemins" \
+    "2" "$M2634_SMOKE_CLEANUP"
+
+# (b4) Smoke test suppresses stdout
 assert_contains "Smoke test suppresses stdout" '>/dev/null' "$SMOKE_BLOCK"
-assert_contains "Smoke test routes stderr to trace fd 9" '2>&9' "$SMOKE_BLOCK"
 
 # (b5) Smoke test has a timeout guard against hung venvs
 assert_contains "Smoke test has timeout guard" 'timeout' "$SMOKE_BLOCK"
+
+# --- Test 9-bis: le lanceur mort est estampillé, terminal, et borné (mika#2634) ---
+
+echo ""
+echo "Test 9-bis: launcher-dead stamping and terminality (mika#2634)"
+echo "---------------------------------------------------------------"
+
+# (A) L'ORDRE, et c'est le défaut mesuré.
+#
+# Le smoke test doit tourner APRÈS `trap '_dispatch_lib_exit_trap' EXIT`. Avant,
+# il sortait treize lignes plus haut : aucun callback n'était livré, la tâche
+# restait non terminale, et le moteur écrivait `Process Exit code: 1: ` avec un
+# stderr vide. Trois dispatches sont morts comme ça en 2 h 45 le 2026-10-02 sans
+# qu'aucune alarme ne se lève.
+#
+# L'aiguille du trap est ancrée sur l'INSTALLATION (`trap '…' EXIT`), jamais sur
+# le nom de la fonction : celui-ci apparaît aussi en commentaire, et c'est très
+# exactement le faux positif que la réparation de (c) ci-dessus a dû corriger.
+M2634_TRAP_LINE=$(printf '%s\n' "$DISPATCH_BODY" \
+    | grep -nE "^[[:space:]]*trap '_dispatch_lib_exit_trap' EXIT" | head -1 | cut -d: -f1)
+assert_eq "mika#2634 (anti-vacuité): l'installation du trap EXIT est trouvée" \
+    "yes" "$([ -n "$M2634_TRAP_LINE" ] && echo yes || echo no)"
+if [ -n "$M2634_TRAP_LINE" ] && [ -n "$SMOKE_LINE" ] && [ "$M2634_TRAP_LINE" -lt "$SMOKE_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2634: le trap EXIT (ligne $M2634_TRAP_LINE) est armé AVANT le smoke test (ligne $SMOKE_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2634: le smoke test doit tourner APRÈS l'armement du trap EXIT"
+    echo "    trap_line=$M2634_TRAP_LINE smoke_line=$SMOKE_LINE"
+fi
+
+# (B) Les trois `command -v` restent AVANT le trap, et ce n'est pas un détail
+# d'ordonnancement. Le trap livre son callback par le CLI `mika` et son corps
+# emploie `jq` : les déplacer après donnerait un trap qui échoue en silence sur
+# un hôte où l'un des deux manque — une panne muette échangée contre une autre.
+M2634_CMDV_JQ=$(printf '%s\n' "$DISPATCH_BODY" | grep -n 'command -v jq' | head -1 | cut -d: -f1)
+if [ -n "$M2634_CMDV_JQ" ] && [ -n "$M2634_TRAP_LINE" ] && [ "$M2634_CMDV_JQ" -lt "$M2634_TRAP_LINE" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2634: \`command -v jq\` (ligne $M2634_CMDV_JQ) reste avant le trap (ligne $M2634_TRAP_LINE)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2634: les dépendances du trap doivent être vérifiées AVANT son armement"
+    echo "    jq_line=$M2634_CMDV_JQ trap_line=$M2634_TRAP_LINE"
+fi
+
+# (C) LE RESULT EST TERMINAL — il ne matche aucun motif de la famille retryable.
+#
+# C'est la moitié vérifiable d'U2, et le plan la demande explicitement plutôt
+# que de la laisser à une lecture. `HANDLER CRASH` générique serait un piège
+# mesuré : il est dans la population que `self-dev-callback/system_prompt.md`
+# invite à rejouer, et que `_gate_non_empty_cycle` grepe à côté de
+# `PIPELINE FAILURE:`. Un lanceur cassé rejoué est la boucle que mika#2545 a dû
+# refermer pour l'`ESCALATE` de groom : chaque rejeu meurt identiquement jusqu'à
+# réparation de l'HÔTE, et aucun budget ne la borne.
+#
+# Le RESULT est extrait du source (de son assignation jusqu'à sa ligne
+# `Outcome:`), puis confronté à l'alternation EXACTE de `_gate_non_empty_cycle`.
+M2634_RESULT_BLOCK=$(printf '%s\n' "$DISPATCH_BODY" \
+    | sed -n '/RESULT="LAUNCHER DEAD/,/^Outcome: LAUNCHER_DEAD"$/p')
+assert_eq "mika#2634 (anti-vacuité): le RESULT du lanceur mort est trouvé" \
+    "yes" "$([ -n "$M2634_RESULT_BLOCK" ] && echo yes || echo no)"
+M2634_RETRYABLE=$(printf '%s\n' "$M2634_RESULT_BLOCK" \
+    | grep -cE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE|^Outcome: ESCALATE)' || true)
+assert_eq "mika#2634: le RESULT ne matche AUCUN motif de la famille retryable" \
+    "0" "$M2634_RETRYABLE"
+# Contrôle de bonne foi : l'alternation ci-dessus accuse bel et bien quand on
+# lui donne un membre de la famille. Sans lui, « le RESULT est propre » est
+# indistinguable de « le prédicat ne regarde rien ».
+M2634_CTRL=$(printf '%s\n' 'HANDLER CRASH (exit code 79).' \
+    | grep -cE '(PIPELINE FAILURE:|STRUCTURAL VIOLATION:|HANDLER CRASH|^STATUS=CANCELLED|^Outcome: PIPELINE_INCOMPLETE|^Outcome: ESCALATE)' || true)
+assert_eq "mika#2634 (contrôle de bonne foi): l'alternation accuse un membre de la famille" \
+    "1" "$M2634_CTRL"
+
+# (D) La ligne `Outcome:` est ANCRÉE en début de ligne — les lecteurs le sont
+# tous (`grep -qE '^Outcome: '`), et une ligne posée en milieu de ligne est le
+# piège que mika#2590 a dû désamorcer.
+#
+# Le `"` terminal fait partie de l'aiguille parce que ce prédicat lit le SOURCE,
+# où ce guillemet ferme la chaîne ; à l'exécution la ligne du RESULT n'en porte
+# pas. Dit ici plutôt que découvert : l'ancrage à droite est aussi ce qui
+# garantit que la ligne est bien la DERNIÈRE du RESULT, donc qu'aucun texte ne
+# la suit sur sa ligne.
+M2634_OUTCOME=$(printf '%s\n' "$M2634_RESULT_BLOCK" | grep -cE '^Outcome: LAUNCHER_DEAD"$' || true)
+assert_eq "mika#2634: exactement une ligne \`Outcome: LAUNCHER_DEAD\` ancrée" \
+    "1" "$M2634_OUTCOME"
+
+# (E) Le RESULT mène par `LAUNCHER DEAD`, ce dont dépend le `case` du trap qui
+# append la queue de trace. Sans cette tête, le bras `*)` SUPPRIME le fichier et
+# la cause (`ModuleNotFoundError`, déjà écrite sur fd 9 par le smoke test) est
+# perdue exactement sur le chemin qui a été ouvert pour l'avoir perdue.
+assert_contains "mika#2634: le trap append la trace sur le marqueur LAUNCHER DEAD" \
+    '"HANDLER CRASH"*|"LAUNCHER DEAD"*' "$(sed -n '/^_dispatch_lib_exit_trap() {/,/^}/p' "$DISPATCH_LIB")"
+
+# (E-bis) LE TRAP SURVIT À CE NOUVEAU POINT D'ENTRÉE, et c'est le risque
+# principal du déplacement : un trap qui plante sur ce chemin remplacerait une
+# panne muette par une autre, ce qui est pire que le défaut.
+#
+# Quatre préconditions, épinglées plutôt que raisonnées — le raisonnement est
+# juste mais il n'est pas une garde.
+#
+# Les deux variables que le trap lit sans guard (`[ "$CALLBACK_SENT" -eq 1 ]`
+# échouerait sur une variable non définie) doivent être posées AVANT lui.
+M2634_CBSENT=$(printf '%s\n' "$DISPATCH_BODY" | grep -nE '^[[:space:]]*CALLBACK_SENT=0[[:space:]]*$' | head -1 | cut -d: -f1)
+M2634_SEAT=$(printf '%s\n' "$DISPATCH_BODY" | grep -nE '^[[:space:]]*ISSUE_SEAT_CLAIMED=0[[:space:]]*$' | head -1 | cut -d: -f1)
+M2634_PARSE=$(printf '%s\n' "$DISPATCH_BODY" | grep -nE '^[[:space:]]*_parse_input_json[[:space:]]*$' | head -1 | cut -d: -f1)
+for _pair in "CALLBACK_SENT:$M2634_CBSENT" "ISSUE_SEAT_CLAIMED:$M2634_SEAT" "_parse_input_json (pose TASK_ID):$M2634_PARSE"; do
+    _name="${_pair%%:*}"; _line="${_pair##*:}"
+    if [ -n "$_line" ] && [ -n "$M2634_TRAP_LINE" ] && [ "$_line" -lt "$M2634_TRAP_LINE" ]; then
+        PASS=$((PASS + 1))
+        echo "  ✓ mika#2634: $_name (ligne $_line) est posé avant le trap (ligne $M2634_TRAP_LINE)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ mika#2634: $_name doit être posé AVANT le trap — sinon le trap plante sur ce chemin"
+        echo "    line=$_line trap_line=$M2634_TRAP_LINE"
+    fi
+done
+
+# La quatrième : le trap découvre la PR, et sur ce chemin `REPO`/`BRANCH` sont
+# vides. `_classify_no_pr_reason` doit court-circuiter sur un repo vide SANS
+# appeler `gh` — sinon le trap pendrait sur un hôte sans réseau, au moment
+# précis où il porte le seul diagnostic disponible.
+M2634_NOPR_SRC=$(sed -n '/^_classify_no_pr_reason() {/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2634: _classify_no_pr_reason court-circuite sur un repo vide" \
+    'repo_unset' "$M2634_NOPR_SRC"
+M2634_NOPR_GH=$(printf '%s\n' "$M2634_NOPR_SRC" | grep -c 'gh ' || true)
+assert_eq "mika#2634: …et elle n'appelle aucun \`gh\`" "0" "$M2634_NOPR_GH"
+
+# (F) Le smoke test NE PEUT PAS être le producteur d'un faux `empty_completion`.
+# `PILOT_RAN=1` vit dans `_run_claude_pilot`, donc à ce point il est non défini
+# et `_gate_non_empty_cycle` court-circuite. Cette assertion épingle la prémisse
+# plutôt que de la supposer : si `PILOT_RAN` était un jour posé plus tôt, le
+# lanceur mort serait EN PLUS accusé de n'avoir rien produit.
+M2634_PILOT_RAN_SETTERS=$(grep -cE '^[[:space:]]*PILOT_RAN=1[[:space:]]*$' "$DISPATCH_LIB" || true)
+assert_eq "mika#2634: un seul site pose PILOT_RAN=1" "1" "$M2634_PILOT_RAN_SETTERS"
+assert_contains "mika#2634: …et ce site est dans _run_claude_pilot (donc après le smoke test)" \
+    "PILOT_RAN=1" "$(sed -n '/^_run_claude_pilot() {/,/^}/p' "$DISPATCH_LIB")"
 
 # --- Test 10: cli.py top-level import guard (mika#1200 Phase 2d) ---
 

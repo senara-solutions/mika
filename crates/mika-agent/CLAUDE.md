@@ -2557,11 +2557,40 @@ closed the door behind it.
 
 **R1 — the remedy is engine-side, and that is what makes it a class fix.** Five
 sites carry the `HANDLER CRASH` trap; the three that capture a `STDERR_FILE`
-capture **claude-pilot's** stderr, never their own (the handler's `echo … >&2`
-goes to the inherited fd 2, i.e. the executor's pipe) and create that file ~200
+capture **claude-pilot's** stderr, never their own, and create that file ~200
 lines *after* the trap. All five shared the hole; one site in Rust covers them
 and every handler written later, `_shared/dispatch-lib.sh` included — which is
 why that file is deliberately untouched.
+
+> **Rectification (mika#2634): for `dispatch-lib.sh` the parenthesis this
+> paragraph used to carry — *"the handler's `echo … >&2` goes to the inherited
+> fd 2, i.e. the executor's pipe"* — is FALSE, and that is why the engine-side
+> capture had nothing to persist on its pre-flight path.**
+> `dispatch_claude_pilot` opens its trace with
+> `exec 9>>"$TRACE_FILE" 2>/dev/null`, and an `exec` **without a command**
+> applies its redirections to the current shell **permanently**: that
+> `2>/dev/null` does not mask a failed fd-9 open, it replaces fd 2 for the whole
+> rest of the handler. So that handler's stderr reaches `/dev/null`, never the
+> executor's pipe, and `stderr_bytes: 0` on those rows is a property of the
+> handler rather than a mute process.
+>
+> This was not a discovery either: `_halt_family`'s own comment states it
+> textually (*"this function runs inside `dispatch_claude_pilot`, whose fd 2 is
+> `/dev/null` from the moment `exec 9>>"$TRACE_FILE" 2>/dev/null` runs
+> (mika#903)"*). What was missing was the link between that fact and *"the
+> pre-flight writes its diagnostic into the void"* — the link mika#2634 had to
+> make after three dispatches died over 2 h 45 reporting `stderr_bytes: 0`, read
+> as "there was nothing to say".
+>
+> The channels that do work on that path are **fd 9** (the trace, which the EXIT
+> trap appends to the callback on its crash arm) and **`RESULT`**, which the
+> pre-flight now poses itself. The mika#2532 mechanism is untouched and correct;
+> what changes is that it finally has something to persist here, because the
+> pre-flight no longer exits before the trap exists. **Removing that permanent
+> `2>/dev/null` is a named follow-up, not an oversight** — the executor reads
+> that stderr only after `child.wait()`, so a handler writing more than a pipe's
+> ~64 KiB on fd 2 would block indefinitely; lifting it means deciding where that
+> stderr goes, and `TASK_ID` is not yet known at the line that opens fd 9.
 
 The write is **unconditional**, not gated on the `Ok(false)` arm: *"what did this
 process put on fd 2"* has nothing to do with the row's status. The surface is
