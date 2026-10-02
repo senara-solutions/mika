@@ -138,8 +138,10 @@ fn mika2638_la_table_de_delimitation_du_site_en_vol() {
         ("", true),
         ("?phase=groom", true),
         // Les deux suffixes hors de l'ensemble clos des variantes : une telle
-        // ligne est DÉJÀ hors de `idx_tasks_manual_active_ref_url`, donc un
-        // défaut en amont et plus grave que celui-ci (plan § 5).
+        // ligne ne dédoublonne PAS contre la ligne canonique dans
+        // `idx_tasks_manual_active_ref_url` (elle y entre sous sa propre clé),
+        // donc un défaut en amont et plus grave que celui-ci (plan § 5 ; la
+        // formulation exacte est sur `issue_url_variants`).
         ("/", false),
         ("#issuecomment-1", false),
     ];
