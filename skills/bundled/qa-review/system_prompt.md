@@ -339,9 +339,9 @@ For each AC bullet, choose ONE classification:
 > The first row is safe because CI runs this build with no time limit, and `verdict_handler` refuses to merge a `pass` whose checks are failing: deferring execution here does not defer the gate. Say so in the verdict. **Do NOT reclassify it CI-deferred** — 2.5.3's perimeter closure still applies.
 >
 > **A Python repo is exercised from a venv under the worktree, never the host
-> (mika#2639).** `uv run pytest` from the worktree, or `python -m venv "$W/.venv"
-> && "$W/.venv/bin/pip" install -e "$W"`. A host-wide install is refused before it
-> spawns — a declared guardrail like the above, so it does NOT cap the verdict:
+> (mika#2639).** `uv run pytest` from the worktree, or `python -m venv <worktree>/.venv
+> && <worktree>/.venv/bin/pip install -e <worktree>`. A host-wide install is refused before it
+> spawns (`REFUS (python-installer-guard, mika#2639)`) — a declared guardrail like the above, so it does NOT cap the verdict:
 > take one of those two routes and continue.
 - **Structural** — testable by grepping the diff or reading source. Heuristics: "field added to struct X", "function `foo` exists", "type signature contains Y", path-specific assertions.
 - **Documentation** — testable by reading a file path. Heuristics: "doc updated at `path`", "README mentions Z", "changelog entry added".

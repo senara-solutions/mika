@@ -169,8 +169,17 @@ fi
 #     the loosest member (`/usr/local/env/bin/pip` would be neutralised); it is
 #     kept because `python -m venv env` is common, and its looseness is said
 #     here rather than left to be found.
+#   - VENV ONLY IN COMMAND POSITION. A venv installer is neutralised only at
+#     the start of the line or right after a separator (`;` `&` `|` `(` `{`
+#     backtick `!`), whitespace and one opening quote allowed. Anywhere else
+#     a venv path is an ARGUMENT, not the interpreter that runs:
+#     `python3 -X .venv/bin/python -m pip install` runs the HOST's pip, and a
+#     path-anywhere sentinel swallowed its `-m pip`. Price: a venv installer
+#     behind a wrapper (`env FOO=1 …`, `timeout 60 …`, `sh -c "…"`) is
+#     REFUSED — fail-closed, same stance as the venv-name allowlist above.
 #   - THE mika#1957 EVASIONS REMAIN THE EVASIONS. Token splitting
-#     (`p""ip install`), variable assembly (`P=pip; $P install`), base64
+#     (`p""ip install`), variable assembly (`P=pip; $P install`,
+#     `pip${IFS}install`), backslash-newline (grep reads line by line), base64
 #     payloads: this reads a command line, not what it executes.
 # Defense-in-depth, NOT a sole gate. The wall is putting shell-exec itself
 # inside the sandbox (mika#2141) — its own ticket, named and out of scope.
@@ -184,32 +193,52 @@ fi
 # therefore one rule. What genuinely needs a second rule is the adjacency form
 # `python -mpip install`, which Python accepts and whose missing space defeats
 # the left boundary. `pipx` needs no rule of its own: `pip` followed by `x`
-# fails the RIGHT boundary, so the installer alternation names it directly.
+# fails the RIGHT boundary, so the installer alternation names it directly —
+# which is why both neutralisers of step 1 carry a right boundary too, or
+# `.venv/bin/pipx install` would lose its `pip` before step 2 looked.
 _PY_SENTINEL='__MIKA_VENV_INSTALLER__'
-# Cheap pre-filter: every rule below requires the literal `pip`, `pipx` or `uv`,
-# so a command carrying none of them cannot match one. Deliberately a substring
-# test with no boundary — it must not be able to exclude anything a rule would
-# catch, and a false positive only costs the sed pipeline below.
-if printf '%s\n' "$COMMAND" | grep -Eq 'pip|uv'; then
+# Cheap pre-filter: every rule below requires the literal `pip`, `pipx`, `uv`
+# or `setup.py` (the env/config opt-outs of step 3 are conjoined with a named
+# installer), so a command carrying none of them cannot match one.
+# Deliberately a substring test with no boundary — it must not be able to
+# exclude anything a rule would catch, and a false positive only costs the sed
+# pipeline below.
+if printf '%s\n' "$COMMAND" | grep -Eq 'pip|uv|setup\.py'; then
     # Step 1 — neutralise the PERMITTED form, then look for the forbidden one.
-    _PY_VENV_RE='(^|[^A-Za-z0-9_.-])([^[:space:]"'"'"']*/)?(\.venv|venv|\.virtualenv|virtualenv|env)/bin/(pip[0-9.]*|python[0-9.]*)'
+    # Command position only (see the limits above). The right boundary is
+    # consumed and re-emitted, so the expression runs twice: a separator eaten
+    # by one match is the left boundary of the next.
+    _PY_VENV_RE='(^[[:space:]]*|[;&|({`!][[:space:]]*)(["'"'"']?)([^[:space:]"'"'"';&|()<>`]*/)?(\.venv|venv|\.virtualenv|virtualenv|env)/bin/(pip[0-9.]*|python[0-9.]*)([^A-Za-z0-9_.-]|$)'
     # …and drop a `-m pip` / `-mpip` that follows a neutralised venv python:
     # `"$W/.venv/bin/python" -m pip install -e "$W"` must PASS, because the
     # discriminant is WHICH ENVIRONMENT, never which binary — and
     # `python -m venv … && .venv/bin/python -m pip install` is a common idiom.
-    # The `--user` family still refuses that form (rule D below).
-    _PY_DASH_M_RE="${_PY_SENTINEL}"'["'"'"']?[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-m[[:space:]]*pip'
+    # The `--user` family still refuses that form (rule D below). `-m pipx`
+    # is not `-m pip`: the right boundary keeps it for step 2.
+    _PY_DASH_M_RE="${_PY_SENTINEL}"'["'"'"']?[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-m[[:space:]]*pip([^A-Za-z0-9_.-]|$)'
     _PY_SCAN=$(printf '%s\n' "$COMMAND" \
-        | sed -E "s#${_PY_VENV_RE}#\\1${_PY_SENTINEL}#g" \
-        | sed -E "s#${_PY_DASH_M_RE}#${_PY_SENTINEL}#g")
+        | sed -E -e "s#${_PY_VENV_RE}#\\1\\2${_PY_SENTINEL}\\6#g" \
+            -e "s#${_PY_VENV_RE}#\\1\\2${_PY_SENTINEL}\\6#g" \
+        | sed -E "s#${_PY_DASH_M_RE}#${_PY_SENTINEL}\\2#g")
 
     # Step 2 — the installer token plus an install subcommand. A closing quote
     # is OPTIONAL after the binary: without it `"/usr/bin/pip" install foo`
-    # walks past, i.e. the guard is bypassable with one quote character. Flags
-    # are tolerated between binary and subcommand (`pip --quiet install`).
-    _PY_INSTALLER_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx)["'"'"']?([[:space:]]+-[^[:space:]]+)*[[:space:]]+install([^A-Za-z0-9_.-]|$)'
+    # walks past, i.e. the guard is bypassable with one quote character. The
+    # gap tolerates options between binary and subcommand, each optionally
+    # followed by ONE separate argument (`pip --cache-dir /tmp/c install`,
+    # `pip --python /usr/bin/python3 install`) — without the argument term only
+    # `--flag=value` passed and a separate value stopped the match before
+    # `install`. The subcommand itself may be quoted (`pip 'install'`).
+    _PY_GAP='([[:space:]]+-[^[:space:]]+([[:space:]]+[^-[:space:]][^[:space:]]*)?)*[[:space:]]+["'"'"']?'
+    _PY_INSTALLER_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx)["'"'"']?'"$_PY_GAP"'install([^A-Za-z0-9_.-]|$)'
     # …and the no-space adjacency the boundary above cannot see.
-    _PY_DASH_MPIP_RE='(^|[^A-Za-z0-9_.-])python[0-9.]*["'"'"']?[[:space:]]+-m[[:space:]]*pip([[:space:]]+-[^[:space:]]+)*[[:space:]]+install([^A-Za-z0-9_.-]|$)'
+    _PY_DASH_MPIP_RE='(^|[^A-Za-z0-9_.-])python[0-9.]*["'"'"']?[[:space:]]+-m[[:space:]]*pip'"$_PY_GAP"'install([^A-Za-z0-9_.-]|$)'
+    # …and `uv tool install|upgrade`, which writes ~/.local/bin from any
+    # environment and ignores PEP 668. It is the workspace's own claude-pilot
+    # install command (`make deploy`), so a model refused on `pip install` that
+    # reaches for the next documented installer would replay mika#2634.
+    # `uvx` / `uv tool run` / `uv run` stay open: they install nothing on PATH.
+    _PY_UV_TOOL_RE='(^|[^A-Za-z0-9_.-])uv["'"'"']?'"$_PY_GAP"'tool[[:space:]]+(install|upgrade)([^A-Za-z0-9_.-]|$)'
 
     # Step 3 — a flag aimed at the HOST, even on a venv-qualified form. Read on
     # the RAW command, never on $_PY_SCAN: a venv pip is neutralised there while
@@ -222,9 +251,19 @@ if printf '%s\n' "$COMMAND" | grep -Eq 'pip|uv'; then
     # NAMED in the raw command keeps the plan's motivating case
     # (`"$W/.venv/bin/pip" install --user -e .`, which writes to ~/.local
     # despite its venv pip) and drops that false positive.
-    _PY_HOST_FLAG_RE='(^|[^A-Za-z0-9_.-])--(break-system-packages|user|target|prefix|system)([^A-Za-z0-9_.-]|$)'
-    _PY_INSTALL_VERB_RE='(^|[^A-Za-z0-9_.-])install([^A-Za-z0-9_.-]|$)'
-    _PY_TOOL_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx|uv)([^A-Za-z0-9_.-]|$)'
+    #
+    # The host opt-out has three spellings, not one: the flag, its PIP_*
+    # environment twin (`PIP_BREAK_SYSTEM_PACKAGES=1 pip install`), and the
+    # persistent `pip config set global.break-system-packages true`, which
+    # takes no install verb and is therefore its own conjunction below. The
+    # agent learned to opt out of PEP 668 once; the env and config routes are
+    # the same opt-out under another name. `setup.py install|develop --user`
+    # writes console_scripts into ~/.local/bin like pip does, so setuptools is
+    # a named installer here too.
+    _PY_HOST_FLAG_RE='(^|[^A-Za-z0-9_.-])(--(break-system-packages|user|target|prefix|system)([^A-Za-z0-9_.-]|$)|PIP_(BREAK_SYSTEM_PACKAGES|USER|TARGET|PREFIX)=)'
+    _PY_INSTALL_VERB_RE='(^|[^A-Za-z0-9_.-])(install|develop)([^A-Za-z0-9_.-]|$)'
+    _PY_TOOL_RE='(^|[^A-Za-z0-9_.-])(pip[0-9.]*|pipx|uv|setup\.py)([^A-Za-z0-9_.-]|$)'
+    _PY_PIP_CONFIG_RE='(^|[^A-Za-z0-9_.-])config([[:space:]]+-[^[:space:]]+)*[[:space:]]+set[[:space:]]+[A-Za-z0-9_-]+\.(break-system-packages|user|target|prefix)([^A-Za-z0-9_.-]|$)'
 
     # SOLE WRITER of the refusal token, so `tool_calls.output LIKE '%REFUS
     # (python-installer-guard, mika#2639)%'` counts one population and not two.
@@ -249,12 +288,14 @@ if printf '%s\n' "$COMMAND" | grep -Eq 'pip|uv'; then
     }
 
     if printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_INSTALLER_RE" \
-        || printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_DASH_MPIP_RE"; then
+        || printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_DASH_MPIP_RE" \
+        || printf '%s\n' "$_PY_SCAN" | grep -Eq "$_PY_UV_TOOL_RE"; then
         _refuse_python_installer host_installer
     fi
-    if printf '%s\n' "$COMMAND" | grep -Eq "$_PY_HOST_FLAG_RE" \
-        && printf '%s\n' "$COMMAND" | grep -Eq "$_PY_INSTALL_VERB_RE" \
-        && printf '%s\n' "$COMMAND" | grep -Eq "$_PY_TOOL_RE"; then
+    if printf '%s\n' "$COMMAND" | grep -Eq "$_PY_TOOL_RE" \
+        && { { printf '%s\n' "$COMMAND" | grep -Eq "$_PY_HOST_FLAG_RE" \
+            && printf '%s\n' "$COMMAND" | grep -Eq "$_PY_INSTALL_VERB_RE"; } \
+            || printf '%s\n' "$COMMAND" | grep -Eq "$_PY_PIP_CONFIG_RE"; }; then
         _refuse_python_installer host_target_flag
     fi
 fi

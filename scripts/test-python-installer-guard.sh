@@ -79,7 +79,7 @@ VENV_SENTINEL='__VENV_INSTALLER_RAN__'
 
 SHIMS="$TMPROOT/shims"
 mkdir -p "$SHIMS"
-for bin in pip pip3 uv pipx python python3 cmake make configure; do
+for bin in pip pip3 uv uvx pipx python python3 cmake make configure; do
 	printf '#!/bin/sh\nprintf %%s\\\\n "%s"\nexit 0\n' "$HOST_SENTINEL" >"$SHIMS/$bin"
 	chmod +x "$SHIMS/$bin"
 done
@@ -91,6 +91,16 @@ for bin in pip python; do
 	printf '#!/bin/sh\nprintf %%s\\\\n "%s"\nexit 0\n' "$VENV_SENTINEL" >"$W/.venv/bin/$bin"
 	chmod +x "$W/.venv/bin/$bin"
 done
+
+# Un chemin ABSOLU hors PATH, DANS la fixture (revue mika#2639) : les formes
+# « chemin absolu » visaient `/usr/bin/pip`, c'est-à-dire le VRAI pip de l'hôte
+# — un garde cassé l'aurait exécuté contre l'environnement du poste ou du
+# runner. Le prédicat apparie n'importe quel préfixe de chemin, donc viser un
+# shim de la fixture teste la même chose sans rien pouvoir installer.
+ABS="$TMPROOT/abs"
+mkdir -p "$ABS/bin"
+printf '#!/bin/sh\nprintf %%s\\\\n "%s"\nexit 0\n' "$HOST_SENTINEL" >"$ABS/bin/pip"
+chmod +x "$ABS/bin/pip"
 
 FAKE_HOME="$TMPROOT/home"
 SKILL_DIR="$TMPROOT/skill-dir"
@@ -109,7 +119,8 @@ run_handler() {
 	local script=${2:-$RUN_SH}
 	local errf="$TMPROOT/err.$$"
 	OUT=$(cd "$SKILL_DIR" && env -u MIKA_GUARD_SHARED_CHECKOUT \
-		HOME="$FAKE_HOME" MIKA_PLATFORM_DIR="$NO_PLATFORM" \
+		HOME="$FAKE_HOME" MIKA_PLATFORM_DIR="$NO_PLATFORM" TMPDIR="$TMPROOT" \
+		PIP_REQUIRE_VIRTUALENV=1 PIP_NO_INDEX=1 \
 		PATH="$SHIMS:$PATH" sh "$script" <<<"$json" 2>"$errf")
 	STATUS=$?
 	ERR=$(cat "$errf")
@@ -162,7 +173,7 @@ passed() {
 	fi
 }
 
-# Les deux verbatims MESURÉS, gelés. F2 est la commande du ticket, caractère
+# Les trois verbatims MESURÉS (F1-F3), gelés. F2 est la commande du ticket, caractère
 # pour caractère sauf la branche git (inatteignable depuis le bac à sable) et
 # le `…` de l'invocation pytest, remplacés par des équivalents inertes.
 F1='pip install -e . -q --break-system-packages'
@@ -187,23 +198,62 @@ refused 'F11 (RECONSTRUITE)  pip install --prefix' host_installer 'pip install -
 printf '\n== V4 — les cinq formes d'"'"'évasion d'"'"'AC1, une par une ==\n'
 refused 'F12 évasion  sh -c' host_installer "sh -c 'pip install -e .'"
 refused 'F13 évasion  eval' host_installer 'eval "pip install -e ."'
-refused 'F14 évasion  chemin absolu' host_installer '/usr/bin/pip install -e .'
+refused 'F14 évasion  chemin absolu' host_installer "$ABS/bin/pip install -e ."
 refused 'F15 évasion  séparateur ;' host_installer 'cd /tmp && pwd ; pip install -e .'
 refused 'F16 évasion  $( )' host_installer 'echo $(pip install -e .)'
 
 printf '\n== Les deux corrections que le prototype a imposées (§ Le prédicat) ==\n'
-refused 'F17 guillemet fermant  "/usr/bin/pip" install' host_installer '"/usr/bin/pip" install foo'
+refused 'F17 guillemet fermant  "<abs>/bin/pip" install' host_installer "\"$ABS/bin/pip\" install foo"
 refused 'F18 pip de venv + drapeau hôte' host_target_flag "W=$W; \"\$W/.venv/bin/pip\" install --user -e \"\$W\""
 
 printf '\n== Formes adjacentes que la frontière d'"'"'AC1 laisserait passer ==\n'
 refused 'F19 adjacence  python -mpip install' host_installer 'python -mpip install foo'
 refused 'F20 drapeaux intercalés  pip --quiet install' host_installer 'pip --quiet install foo'
 
+printf '\n== Revue de code mika#2639 — ce que la première version laissait passer ==\n'
+# #1 — l'installateur documenté de claude-pilot (Makefile, `make deploy`).
+refused 'F21 uv tool install --force --editable .' host_installer 'uv tool install --force --editable .'
+refused 'F22 uv tool install --reinstall … ./claude-pilot' host_installer 'uv tool install --reinstall --force --editable ./claude-pilot'
+refused 'F23 uv tool upgrade' host_installer 'uv tool upgrade claude-pilot'
+# #2 — un chemin de venv en VALEUR d'option n'est pas l'interpréteur invoqué.
+refused 'F24 python3 -X .venv/bin/python -m pip install' host_installer 'PIP_BREAK_SYSTEM_PACKAGES=1 python3 -X .venv/bin/python -m pip install -e .'
+refused 'F25 python3 -W ignore::.venv/bin/python -m pip' host_installer 'python3 -W ignore::.venv/bin/python -m pip install -e .'
+# #3 — option à argument séparé, sous-commande citée.
+refused 'F26 pip --cache-dir /tmp/c install (+PIP_ opt-out)' host_installer 'PIP_BREAK_SYSTEM_PACKAGES=1 pip --cache-dir /tmp/c install -e .'
+refused 'F27 pip --python /usr/bin/python3 install' host_installer 'pip --python /usr/bin/python3 install -e .'
+refused 'F28 python3 -m pip --cache-dir /tmp/c install' host_installer 'python3 -m pip --cache-dir /tmp/c install -e .'
+refused "F29 pip 'install' (sous-commande citée)" host_installer "pip 'install' -e ."
+# #3 — les deux autres orthographes de l'opt-out PEP 668, là où l'étape 2 est
+# aveugle (pip de venv en position de commande) : seule l'étape 3 peut mordre.
+refused 'F30 export PIP_USER=1 ; pip de venv install' host_target_flag "W=$W; export PIP_USER=1; \"\$W/.venv/bin/pip\" install -e \"\$W\""
+refused 'F31 pip config set global.break-system-packages' host_target_flag 'pip config set global.break-system-packages true'
+# Chaque drapeau hôte, épinglé seul sur une forme où l'étape 2 est aveugle.
+for flag in --break-system-packages --target --prefix --system; do
+	refused "F32 pip de venv install $flag" host_target_flag "W=$W; \"\$W/.venv/bin/pip\" install $flag x"
+done
+# #5 — setuptools écrit ses console_scripts dans ~/.local/bin lui aussi.
+refused 'F33 python3 setup.py install --user' host_target_flag 'python3 setup.py install --user'
+refused 'F34 python3 setup.py develop --user' host_target_flag 'python3 setup.py develop --user'
+# #8 — pipx installe dans ~/.local/bin quel que soit l'environnement qui le lance.
+refused 'F35 .venv/bin/pipx install' host_installer '.venv/bin/pipx install -e .'
+refused 'F36 "$W/.venv/bin/python" -m pipx install' host_installer "W=$W; \"\$W/.venv/bin/python\" -m pipx install ."
+# #4 — la frontière arrière que le commentaire du handler justifie par `pip install;`.
+refused 'F37 frontière arrière  pip install;' host_installer 'pip install;echo x'
+refused 'F38 frontière arrière  (pip install)' host_installer '(pip install)'
+
 printf '\n== V2 — contrôles POSITIFS d'"'"'AC3 : ils passent ET atteignent eval ==\n'
 passed 'P1 uv run pytest' "$HOST_SENTINEL" 'uv run pytest -q'
 passed 'P2 "$W/.venv/bin/pip" install -e "$W"' "$VENV_SENTINEL" "W=$W; \"\$W/.venv/bin/pip\" install -e \"\$W\""
 passed 'P3 "$W/.venv/bin/python" -m pip install' "$VENV_SENTINEL" "W=$W; \"\$W/.venv/bin/python\" -m pip install -e \"\$W\""
 passed 'P4 la recette complète d'"'"'AC2 (venv jetable)' "$VENV_SENTINEL" "W=$W; python -m venv \"\$W/.venv\" >/dev/null && \"\$W/.venv/bin/pip\" install -e \"\$W\""
+passed 'P5 venv relatif après && (position de commande)' "$VENV_SENTINEL" "cd \"$W\" && .venv/bin/pip install -e ."
+# Le séparateur mangé par une neutralisation est la frontière gauche de la
+# suivante : le handler passe l'expression DEUX fois, et P9 est ce qui rougit
+# s'il n'en passe plus qu'une.
+passed 'P9 deux venv collés  python;pip install' "$VENV_SENTINEL" "cd \"$W\" && .venv/bin/python;.venv/bin/pip install -e ."
+passed 'P6 uvx ruff' "$HOST_SENTINEL" 'uvx ruff --version'
+passed 'P7 uv tool run ruff' "$HOST_SENTINEL" 'uv tool run ruff'
+passed 'P8 pip config set d'"'"'une clé hors opt-out' "$HOST_SENTINEL" 'pip config set global.index-url https://example.invalid/simple'
 
 printf '\n== V3 — contrôles NÉGATIFS de bruit : ils passent ==\n'
 passed 'N1 pip list' "$HOST_SENTINEL" 'pip list'
@@ -211,6 +261,14 @@ passed 'N2 pip --version' "$HOST_SENTINEL" 'pip --version'
 passed 'N3 cmake --prefix /x' "$HOST_SENTINEL" 'cmake --prefix /x'
 passed 'N4 echo "pipeline install done"' '-' 'echo "pipeline install done"'
 passed 'N5 configure --prefix=… && make install' "$HOST_SENTINEL" 'configure --prefix=/usr >/dev/null && make install'
+# N6–N8 traversent le pré-filtre et tuent chacun un mutant que le corpus
+# laissait vivre (revue mika#2639) : N6 le terme « installateur NOMMÉ », N7–N8
+# le terme « verbe d'installation ». N5 seul ne contient ni `pip` ni `uv`, donc
+# le pré-filtre sautait le bloc et le troisième terme ne tournait jamais.
+passed 'N6 configure --with-uv-backend --prefix && make install' "$HOST_SENTINEL" 'configure --prefix=/usr --with-uv-backend >/dev/null && make install'
+passed 'N7 pip list --user' "$HOST_SENTINEL" 'pip list --user'
+passed 'N8 pip download --target /tmp/x foo' "$HOST_SENTINEL" 'pip download --target /tmp/x foo'
+passed 'N9 python3 setup.py build' "$HOST_SENTINEL" 'python3 setup.py build'
 
 printf '\n== Allowlist : LIVRÉE VIDE et épinglée vide (Fire-Disposition (a)) ==\n'
 if [ "${#PYTHON_INSTALLER_ALLOWED_FORMS[@]}" -eq 0 ]; then

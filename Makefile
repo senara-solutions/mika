@@ -240,7 +240,7 @@ test-sandbox-gh-usable: ## Verify gh leaves for the network inside the pilot san
 test-cwd-guard: ## Pin the four named cwd refusals, their ORDER, and the handler wiring — pre-fix negative control included (mika#2536)
 	@bash scripts/test-cwd-guard.sh
 
-test-python-installer-guard: ## Pin the run_shell refusal of host-Python installers — the two measured verbatims, the five AC1 evasions, the positive and noise controls, negative control included (mika#2639)
+test-python-installer-guard: ## Pin the run_shell refusal of host-Python installers — the three measured verbatims, the five AC1 evasions, the positive and noise controls, negative control included (mika#2639)
 	@bash scripts/test-python-installer-guard.sh
 
 test-issue-annotation-guard: ## Refuse a PATCH site that bypasses the comment-target guard, and pin its negative behaviour (mika#2552)

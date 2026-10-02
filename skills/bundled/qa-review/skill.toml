@@ -98,7 +98,11 @@ timeout_secs = 30
 # CI-boundary line. Exactly the discipline stated nine lines above: the prompt
 # keeps the rule, the *why* moves to the surfaces that read it.
 #
-# **Prompt now 77 195 bytes, 94.82 % of the cap, 142 bytes of gate headroom.**
+# **Prompt now 77 259 bytes, 94.90 % of the cap, 78 bytes of gate headroom.**
+# (The code review of mika#2639 spent 64 of them: the recipe named `$W`, which
+# no later `run_shell` call defines, so it now names `<worktree>`; and the
+# paragraph names the `REFUS (python-installer-guard, …)` token, since the
+# Data Integrity exemption otherwise reads only a structured `"policy"` refusal.)
 # That is under one sentence. The second remediation is spent too: the next
 # addition shards.
 max_prompt_size = 81408

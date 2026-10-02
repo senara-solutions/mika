@@ -1891,8 +1891,9 @@ SELECT count(*) FROM tool_calls WHERE tool_name = 'run_shell';
 
 | motif | régime attendu | lecture |
 |---|---|---|
-| `host_installer` | **non vide et DÉCROISSANT** | les premiers jours il porte le trafic mesuré (les 38 commandes que PEP 668 arrêtait), puis le substitut de `qa-review` doit le tarir — ce n'est pas une tempête de faux positifs |
-| `host_target_flag` | proche de zéro | une forme venv portant `--user`/`--target`/… : bonne recette, mauvais drapeau |
+| `host_installer` | **non vide et DÉCROISSANT** | les premiers jours il porte le trafic mesuré (les 38 commandes que PEP 668 arrêtait), puis le substitut de `qa-review` doit le tarir — ce n'est pas une tempête de faux positifs. Couvre aussi `uv tool install\|upgrade`, la commande d'installation documentée de claude-pilot |
+| `host_target_flag` | proche de zéro | une forme venv portant `--user`/`--target`/… (ou son jumeau `PIP_*=`, ou `pip config set …break-system-packages`, ou `setup.py install\|develop --user`) : bonne recette, mauvais drapeau |
+| un pip de venv refusé derrière un enrobeur | faux positif **nommé** | le venv n'est neutralisé qu'en **position de commande** (début de ligne ou après `;` `&` `\|` `(`) ; `env X=1 .venv/bin/pip …` ou `sh -c "…"` refuse, fail-closed. Le geste est de le lancer en tête de commande |
 | flot soutenu d'un même agent après 7 jours | **anomalie** | le prompt ne l'atteint pas : lire `~/.mika/skills/.manifest-writer` **avant** de toucher au prédicat |
 | une ligne sur un `grep` de prose | faux positif **nommé** | contournement `grep 'pip[ ]install'`, rappelé par le corps du refus ; ne pas rétrécir la frontière arrière, elle ferme `pip install;` |
 
@@ -1919,7 +1920,8 @@ SELECT count(*) FROM tool_calls WHERE tool_name = 'run_shell';
   requête 3 d'abord (mika#2205).
 
 **Ce que ça n'achète pas :** ni le canal `tmux`, ni les évasions nommées
-(découpage de token, assemblage par variable, base64), ni le bac à sable de
+(découpage de token, assemblage par variable dont `${IFS}`, continuation
+`\`-retour à la ligne, base64), ni le bac à sable de
 `shell-exec` (mika#2141, le mur). Il n'y avait aucun prompt fautif à corriger :
 les 43 commandes ont été composées par le modèle dans un vide de prescription,
 et `qa-review` reçoit une recette **absente**. La cause amont (un

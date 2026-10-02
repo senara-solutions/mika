@@ -2888,11 +2888,18 @@ active (mika#1596 class). A per-agent refusal would be false by construction;
 the table is documentation, never a mechanism.
 
 **Two motifs, one definition site** (`_refuse_python_installer`, stderr +
-`exit 1`): `host_installer` (installer token + install subcommand, after
-venv-qualified forms are neutralised) and `host_target_flag`
-(`--break-system-packages`/`--user`/`--target`/`--prefix`/`--system` **and** an
-install verb **and** a named installer — two terms refused
-`./configure --prefix=/usr && make install`).
+`exit 1`): `host_installer` (`pip`/`pipx`/`python -m pip` + install
+subcommand, or `uv tool install|upgrade`, after venv-qualified forms **in
+command position** are neutralised — a venv path passed as an option value,
+`python3 -X .venv/bin/python -m pip`, is not the interpreter invoked) and
+`host_target_flag` (`--break-system-packages`/`--user`/`--target`/`--prefix`/
+`--system` or its `PIP_*=` environment twin, **and** an install/develop verb
+**and** a named installer — `pip`/`pipx`/`uv`/`setup.py`; two terms refused
+`./configure --prefix=/usr && make install` — plus the persistent
+`pip config set <section>.break-system-packages|user|target|prefix`). The
+gap between binary and subcommand admits one separate option argument
+(`pip --cache-dir X install`); the review of the first version found each of
+these escapes, and `scripts/test-python-installer-guard.sh` pins every one.
 
 **`tmux` stays uncovered.** `tmux/handlers/create_session.sh` sends a
 model-supplied `$COMMAND` through `send-keys`, outside `run.sh`, and `tmux` is
