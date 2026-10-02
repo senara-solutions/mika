@@ -8647,9 +8647,10 @@ _rescue_touches_tracked_tree() {
 # there would bite a pilot that finished correctly, i.e. part of the nominal
 # traffic under another name. Pinned by T15q.
 #
-# Exact, like `[ "${PILOT_SHIPPING_TAIL:-}" = "absent" ]`: the scaffold-only path
-# sets `0`, the two hook-failure paths leave it unset, and dev-groom never sets it
-# at all. Anything unreadable, empty or `0` leaves today's behaviour — which is
+# Exact, like the shipping-tail stamp test in `_pilot_had_no_shipping_tail`
+# (spelled differently here on purpose: T5 of `test-dispatch-lib.sh` counts that
+# stamp's readers): the scaffold-only path sets `0`, the two hook-failure paths
+# leave it unset, and dev-groom never sets it at all. Anything unreadable, empty or `0` leaves today's behaviour — which is
 # the fail-safe direction here, since not measuring is the prior state and never a
 # new permission.
 _rescue_committed_in_the_pilots_place() {
