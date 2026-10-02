@@ -3238,7 +3238,11 @@ mod tests {
                     .to_string();
             }
             let carries = string_literals(line).iter().any(|lit| lit.contains(needle));
-            if carries && !out.contains(&current) {
+            // A function is one site however many times it spells the name; the
+            // module scope is NOT — each module-level literal is its own
+            // declaration, so deduplicating it hid a second `const` (review of
+            // PR #2635).
+            if carries && (current == MODULE_SCOPE || !out.contains(&current)) {
                 out.push(current.clone());
             }
         }
@@ -3395,6 +3399,30 @@ fn un_second_site() {
              fonction à signature MULTI-LIGNE, et une seconde fonction — et \
              IGNORER les deux commentaires. Un terme manquant le rend soit \
              aveugle, soit rouge sur la prose qu'il protège."
+        );
+    }
+
+    /// Contrôle de bonne foi n°2 : un SECOND littéral en portée de module est un
+    /// second site (revue de la PR #2635).
+    ///
+    /// Le scan dédoublonnait les portées : tous les littéraux de portée module
+    /// d'`auto_pull.rs` se fondaient dans l'unique `<module scope>` attendu, donc
+    /// `const LEGACY: &str = "auto_feeder_no_backlog";` posé à côté de la
+    /// déclaration laissait l'égalité stricte verte — exactement le second
+    /// écrivain que le scan interdit.
+    ///
+    /// Rouge-avant : avec la déduplication, la fixture rendait une seule entrée.
+    #[test]
+    fn mika2161_le_scan_compte_chaque_litteral_de_portee_module() {
+        let needle = "auto_feeder_pool_in_flight";
+        let fixture = "\
+const EVENT_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
+const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
+";
+        assert_eq!(
+            enclosing_fns_writing(fixture, needle),
+            vec!["<module scope>".to_string(), "<module scope>".to_string()],
+            "deux littéraux en portée de module sont deux sites, pas un"
         );
     }
 
