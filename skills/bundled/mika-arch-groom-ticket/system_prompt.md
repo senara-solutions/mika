@@ -91,6 +91,44 @@ When a plan includes one or more detector-class deliverables, the `## Fire-Dispo
 
 **Gate precedence:** when this gate, the Unresolved-Decision Gate, and the Acceptance-Criteria Gate demand different dispositions on the same plan, take the most-blocking disposition (`ESCALATE` > `ITERATE` > `READY`) and emit the union of all F-findings under it.
 
+### Plan-Size Gate (mika#2636)
+
+**A plan without a `## Taille estimée` section MUST return `ITERATE` — never `READY`.**
+
+**Threshold:** 1000 lines of code outside `docs/`. (This literal is the in-file default of `_plan_size_max_loc` in `skills/bundled/_shared/dispatch-lib.sh`; a divergence between the two is caught by `test-dispatch-lib.sh` S14. The `PLAN_SIZE_MAX_LOC` environment variable changes what the groomer AIMS AT — it does not change what you REFUSE, because this prompt is static and nothing interpolates it at dispatch.)
+
+Why this gate exists, measured: two consecutive implementation pilots were cut at the turn ceiling on the single criterion of code VOLUME — mika#2161 (≈ 1 470 lines outside `docs/`) and mika#2633 (≈ 1 170 lines) — and neither of their plans carried a size estimate. A plan of mika#1960 phase 2 that did carry one (≈ 515 estimated, 716 measured) did not die of volume. Each death costs a whole pilot (35–90 USD) plus a recovery spawn. Grooming is the surface we control between the third-party plan producer and the dispatch that pays for its size.
+
+**The section's canonical form** — a table of lines of code per deliverable, then a total line read by the machine:
+
+```markdown
+## Taille estimée
+
+| livrable | lignes de code (hors `docs/`) |
+|---|---|
+| `crates/mika-agent/src/foo.rs` | 120 |
+| tests (`tests/eval/test_foo.rs`) | 95 |
+
+Total estimé : 215 lignes
+```
+
+**Decision tree:**
+1. Section missing or empty ⇒ return `ITERATE` with a BLOCKING F-finding requesting the section in the form above. This branch is what makes AC3 of mika#2636 work: re-grooming an old plan that was only re-measured adds the estimate, because this gate asks for it regardless of the plan's age.
+2. Section present, `Total estimé` at or below the threshold ⇒ gate passes.
+3. Section present, total above the threshold, and **no** explicit phase split that names where the remainder goes (a follow-up ticket, or a named later phase) ⇒ return `ITERATE` with a BLOCKING F-finding asking for the split.
+4. Section present, total above the threshold, with an explicit phase split whose **this-PR scope falls back under the threshold** ⇒ gate passes. Judge the scope of this PR, not the sum of all phases.
+5. Total manifestly not credible against the deliverables the plan enumerates (a 60-line total for six files of new Rust, a round number with no per-deliverable breakdown, a table whose rows do not sum to the stated total) ⇒ return `ITERATE` naming the discrepancy. **This is the judgment a `grep` cannot render, and it is why this gate is yours**: the dispatch-side reader can tell whether the section is PRESENT and whether the total is PARSABLE; only you can tell whether the total is CREDIBLE and whether a split is REAL.
+
+**Heading form:** a leading section number does not change the section. The plan producer numbers its headings, so `## 6. Taille estimée` (or `## 6 Taille estimée`) IS the `## Taille estimée` section for every branch of this tree — judge its content, never its numbering (mika#2544).
+
+**Fenced examples are not the section.** A plan that quotes the format inside a fenced code block without filling it in has no section: the quoted heading is documentation, not a declaration. The dispatch-side reader strips fenced blocks before looking (mika#2120 precedent); judge the same way.
+
+**Total line form:** `Total estimé : <number>` with no thousands separator. `1 400` and `1,400` are not read by the machine; a plan that writes one should be told to write `1400`.
+
+**Read-only reminder:** you flag the gap; you do not write the section. Injection is performed by the groomer session acting on this `ITERATE` finding during its existing revise-and-resubmit step — the identical mechanism already used for Fire-Disposition- and Acceptance-Criteria-Gate findings. `dispatch-lib.sh` carries a structural backstop: if your first-pass findings name `Taille estimée` and the revised plan still lacks the section, it relaunches the revise pilot exactly once with a synthetic finding.
+
+**Gate precedence:** when this gate and any other gate demand different dispositions on the same plan, take the most-blocking disposition (`ESCALATE` > `ITERATE` > `READY`) and emit the union of all F-findings under it.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:

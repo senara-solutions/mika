@@ -402,7 +402,20 @@ const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETR
 /// AC9(b), tenu par `mika2354_rescue_verify_env_never_joins_the_sandbox_allowlist`
 /// et étendu à ces deux noms par
 /// `mika2508_the_pilot_dispatch_env_never_joins_the_sandbox_allowlist`.
-const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR"];
+/// mika#2636 — `PLAN_SIZE_MAX_LOC` rejoint le relais, et c'est ce qui rend son
+/// palier `source=env` atteignable.
+///
+/// Le résolveur `_plan_size_max_loc` vit dans `dispatch-lib.sh`, qui tourne dans
+/// le child de dispatch. Nommer la variable **nue** ne la fait pas traverser —
+/// c'est très exactement la mesure de mika#2508 citée ci-dessus, et le
+/// commentaire du résolveur l'invoquait d'abord comme si le nom nu achetait
+/// quelque chose : il n'achète que la **compatibilité avec ce relais**. Sans
+/// cette ligne, `PLAN_SIZE_MAX_LOC=500` posé sur l'environnement du service
+/// serait absent du child, le résolveur retomberait sur son défaut in-file, et
+/// les deux prompts architecte annonceraient un réglage que rien ne peut
+/// changer. `mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`
+/// le refuse d'ailleurs comme orphelin.
+const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR", "PLAN_SIZE_MAX_LOC"];
 
 /// Decide which of `keys` to set on the child, given a reader of the spirit
 /// process environment.
