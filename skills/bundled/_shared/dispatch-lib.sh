@@ -530,7 +530,11 @@ _emit_pilot_budget_line() {
     # pas un réglage, c'est un espoir*. D'autant plus nécessaire ici que la
     # borne R4 rend cette valeur gouvernante d'UNE SEULE moitié — elle décide ce
     # que le groomeur VISE, jamais ce que l'architecte REFUSE.
-    if _plan_size_max_loc; [ -n "${_PLAN_SIZE_MAX_LOC_INVALID:-}" ]; then
+    # La co-location ne porte que sur `$_PLAN_SIZE_MAX_LOC` lui-même ; les deux
+    # champs de diagnostic (`_INVALID`, `_SOURCE`) sont hors de son prédicat,
+    # donc le résolveur est appelé ici sur sa propre ligne, lisiblement.
+    _plan_size_max_loc
+    if [ -n "${_PLAN_SIZE_MAX_LOC_INVALID:-}" ]; then
         echo "dispatch-lib: plan_size_threshold_invalid PLAN_SIZE_MAX_LOC=\"${_PLAN_SIZE_MAX_LOC_INVALID}\" — valeur ignorée, le seuil retombe sur le défaut in-file (voir source= ci-dessous)" >&2
     fi
     _plan_size_max_loc; echo "dispatch-lib: plan_size_threshold_resolved threshold_loc=${_PLAN_SIZE_MAX_LOC} source=${_PLAN_SIZE_MAX_LOC_SOURCE:-unset}" >&2
@@ -716,13 +720,15 @@ _plan_size_section_present() {
 # titre replie la casse. La forme prescrite est exacte sur cette ligne, et
 # replier la casse ici n'achèterait rien de mesuré.
 _plan_size_total_loc() {
-    local _f="$1" _body _n
+    local _f="$1" _n
     [ -r "$_f" ] || { printf 'absent'; return 0; }
     _plan_size_section_present "$_f" || { printf 'absent'; return 0; }
-    _body=$(_plan_size_strip_fences "$_f")
     # Le motif est ancré sur la ligne ENTIÈRE, donc `s/…/\1/` remplace la ligne
     # par la capture : la sortie ne porte que le nombre, sans résidu de texte.
-    _n=$(printf '%s\n' "$_body" | sed -nE "s/${_PLAN_SIZE_TOTAL_RE}/\1/p" | tail -1)
+    # Le corps strippé est tubé directement plutôt que matérialisé dans une
+    # variable : un seul consommateur, donc la variable intermédiaire coûtait un
+    # sous-shell et une re-sérialisation de tout le plan pour rien.
+    _n=$(_plan_size_strip_fences "$_f" | sed -nE "s/${_PLAN_SIZE_TOTAL_RE}/\1/p" | tail -1)
     if [ -n "$_n" ]; then printf '%s' "$_n"; else printf 'unparsable'; fi
     return 0
 }
@@ -3360,14 +3366,16 @@ _PLAN_SIZE_TOTAL_RE='^Total estimé[[:space:]]*:[[:space:]]*([0-9]+)([[:space:]]
 #
 # Elle cite mika#2636 par référence ; elle ne reformule PAS la doctrine du
 # plafond de tours, pour que les deux ne puissent pas diverger.
-_PLAN_SIZE_RULE_TEMPLATE="RÈGLE DE GROOMING (mika#2636) — tout plan porte une section \`## Taille estimée\`.
-Deux implements consécutifs sont morts au plafond de tours sur le seul critère du VOLUME de
-code (mika#2161 ≈ 1 470 lignes, mika#2633 ≈ 1 170), et aucun de leurs plans ne portait
-d'estimation. Chaque mort coûte un pilote entier puis un spawn de reprise.
-La section est OBLIGATOIRE, même quand le plan n'est qu'un re-mesurage d'un plan ancien.
-Format exact — titre, tableau par livrable, puis la ligne de total :
-
-## Taille estimée
+# LE FORMAT PRESCRIT A UN SITE UNIQUE, et il en a un parce que la première
+# rédaction de ce correctif l'avait déjà fait DIVERGER : la règle de groom et le
+# finding synthétique du rattrapage portaient deux jeux de lignes d'exemple
+# différents. Ce bloc est ce que les deux prescrivent, et ce que
+# `_PLAN_SIZE_HEADING_RE` et `_PLAN_SIZE_TOTAL_RE` lisent. Une modification des
+# motifs doit bouger CE texte, et il n'y en a qu'un à bouger — contre deux avant
+# cette extraction (les deux prompts architecte restent hors d'atteinte, un
+# `.md` statique ne pouvant pas lire une constante shell : c'est la duplication
+# assumée que S14 tient par le seul nombre qui décide).
+_PLAN_SIZE_FORMAT_SPEC="## Taille estimée
 
 | livrable | lignes de code (hors \`docs/\`) |
 |---|---|
@@ -3377,7 +3385,17 @@ Format exact — titre, tableau par livrable, puis la ligne de total :
 Total estimé : 215 lignes
 
 Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne \`Total estimé :\`
-est lue par la machine : écris-la telle quelle, sans séparateur de milliers.
+est lue par la machine : écris-la telle quelle, sans séparateur de milliers."
+
+_PLAN_SIZE_RULE_TEMPLATE="RÈGLE DE GROOMING (mika#2636) — tout plan porte une section \`## Taille estimée\`.
+Deux implements consécutifs sont morts au plafond de tours sur le seul critère du VOLUME de
+code (mika#2161 ≈ 1 470 lignes, mika#2633 ≈ 1 170), et aucun de leurs plans ne portait
+d'estimation. Chaque mort coûte un pilote entier puis un spawn de reprise.
+La section est OBLIGATOIRE, même quand le plan n'est qu'un re-mesurage d'un plan ancien.
+Format exact — titre, tableau par livrable, puis la ligne de total :
+
+${_PLAN_SIZE_FORMAT_SPEC}
+
 Au-dessus de __PLAN_SIZE_MAX_LOC__ lignes, DÉCOUPE EN PHASES : borne le périmètre de cette PR
 sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une phase nommée.
 Un total au-dessus du seuil sans découpage explicite fait rendre ITERATE à mika-arch en
@@ -8009,18 +8027,7 @@ ESCALATE et le ticket ne sera jamais implémenté.
 Action demandée, et elle seule : ajouter au plan une section \`## Taille estimée\`
 au format exact ci-dessous — titre, tableau par livrable, puis la ligne de total.
 
-## Taille estimée
-
-| livrable | lignes de code (hors \`docs/\`) |
-|---|---|
-| \`chemin/du/livrable\` | 120 |
-| tests (\`chemin/du/test\`) | 95 |
-
-Total estimé : 215 lignes
-
-Compte les LIGNES DE CODE, hors \`docs/\` et hors \`CLAUDE.md\`. La ligne
-\`Total estimé :\` est lue par la machine : écris-la telle quelle, sans
-séparateur de milliers.
+${_PLAN_SIZE_FORMAT_SPEC}
 
 Au-dessus de ${_size_threshold} lignes, DÉCOUPE EN PHASES : borne le périmètre de cette
 PR sous le seuil et renvoie explicitement la suite à un ticket de suivi ou à une
