@@ -4280,4 +4280,169 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              ligne neutre, pas un renvoi."
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2641 — le motif d'un arrêt de groom illisible : un écrivain, et
+    // deux moitiés qui ne divergent pas.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Rien à excepter à la livraison, et c'est vérifiable : le nom
+    /// `groom_architect_unreadable` est **neuf**, donc aucune violation
+    /// préexistante ne peut exister. Quand ce scan tire, **on retire le second
+    /// écrivain**, on ne l'excepte pas (doctrine mika#2201) — une allowlist née
+    /// vide est un emplacement où déposer la prochaine infraction (mika#2323).
+    const ARCHITECT_UNREADABLE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **S-a — un seul écrivain du nom d'audit (mika#2641).**
+    ///
+    /// Le nom sert de nom d'événement de journal **et** de `tool_name` d'audit.
+    /// La propriété est porteuse pour une raison précise : le compte
+    /// `SELECT target_key, count(*) … WHERE tool_name = 'groom_architect_unreadable'`
+    /// **est** la précondition explicite du ticket de suivi sur le taux de
+    /// coupure architecte (R6 du plan — la mesure « aboutis / coupés / tronqués »
+    /// que le commentaire opérateur demande, dont ce ticket ne livre que le
+    /// troisième tiers). Un second écrivain ne rendrait **aucune** décision
+    /// fausse ; il rendrait ce compte inexact, en silence, et le suivi
+    /// s'ouvrirait sur un nombre que personne ne pourrait départager.
+    ///
+    /// Aucun test comportemental ne voit cette classe — d'où un scan de source.
+    #[test]
+    fn mika2641_the_architect_unreadable_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("groom_architect{}", "_unreadable");
+        let owner = "crates/mika-agent/src/task_engine/dispatcher.rs";
+
+        // `production_sources_to_test_module` et non `production_sources` : le
+        // second coupe au PREMIER `#[cfg(test)]` **où qu'il soit**, et
+        // `builtin_handlers.rs` en porte un sur une paire de constantes bien
+        // avant son module de test — ce qui cache ~5 500 lignes de production à
+        // la détection d'un second écrivain. Un scan aveugle sur une partie de
+        // l'arbre se lit exactement comme un scan propre (classe mika#2205).
+        //
+        // `strip_comment_lines` et non un filtre `starts_with('*')` écrit à la
+        // main : ce filtre-là compte `*guard = x;` pour un commentaire, donc une
+        // écriture sur une telle ligne lui est invisible. Le primitif partagé
+        // documente ce défaut exact.
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if ARCHITECT_UNREADABLE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = crate::source_scan::strip_comment_lines(&content)
+                .lines()
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2641 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2641 — le nom d'audit de la seconde passe illisible a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             ARCHITECT_UNREADABLE_SOLE_WRITER_EXCEPTIONS — le compte qui dimensionne \
+             le ticket de suivi n'est exact que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2641_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            ARCHITECT_UNREADABLE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "ARCHITECT_UNREADABLE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain."
+        );
+    }
+
+    /// **Livrée vide, et le test plus bas l'assert.** Même contrat que ci-dessus.
+    const ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS: &[&str] = &[];
+
+    /// **S-b — le format de fil ne diverge pas entre le shell et le Rust
+    /// (mika#2641 D4).**
+    ///
+    /// Le motif a DEUX moitiés : `dispatch-lib.sh` l'écrit dans `tasks.result`,
+    /// `dispatcher.rs` l'y lit et en fait une ligne `audit_events`. Les deux
+    /// littéraux doivent être le même octet. Une divergence ne casse **rien** le
+    /// jour où elle est écrite : le shell continue d'écrire, le lecteur continue
+    /// de ne rien trouver, et la population devient **vide en silence** — c'est
+    /// à dire indistinguable d'un champ sain (classe mika#2205). Aucun test
+    /// comportemental de l'un ou l'autre côté ne peut voir ça, puisque chacun
+    /// reste correct dans son propre monde.
+    #[test]
+    fn mika2641_the_halt_cause_wire_format_is_synchronised_shell_to_rust() {
+        use crate::task_engine::dispatcher::{
+            GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE, GROOM_HALT_CAUSE_LINE_PREFIX,
+        };
+
+        let shell = repo_root()
+            .join("skills")
+            .join("bundled")
+            .join("_shared")
+            .join("dispatch-lib.sh");
+        let rel = "skills/bundled/_shared/dispatch-lib.sh";
+        if ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS.contains(&rel) {
+            return;
+        }
+        // Un shell illisible ÉCHOUE plutôt que de rendre une comparaison vide :
+        // un scan qui ne lit rien se lit comme un scan d'accord.
+        let src = std::fs::read_to_string(&shell).unwrap_or_else(|e| {
+            panic!(
+                "mika#2641 — {rel} doit être lisible pour que ce scan vérifie quelque chose : {e}"
+            )
+        });
+
+        // L'écrivain shell déclare les deux valeurs par une affectation en
+        // colonne 0. C'est la forme que `test-dispatch-lib.sh` épingle aussi
+        // comme site de définition unique.
+        let expect_prefix =
+            format!("GROOM_HALT_CAUSE_LINE_PREFIX=\"{GROOM_HALT_CAUSE_LINE_PREFIX}\"");
+        let expect_cause = format!(
+            "GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE=\"{GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE}\""
+        );
+
+        assert!(
+            src.lines().any(|l| l == expect_prefix),
+            "mika#2641 — le préfixe de ligne a divergé : le Rust lit \
+             `{GROOM_HALT_CAUSE_LINE_PREFIX}` et {rel} ne porte pas la ligne \
+             `{expect_prefix}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux. Ne PAS élargir le lecteur \
+             Rust à une seconde orthographe — la population n'est exacte que tant \
+             que les deux moitiés sont le même octet."
+        );
+        assert!(
+            src.lines().any(|l| l == expect_cause),
+            "mika#2641 — la valeur de cause a divergé : le Rust lit \
+             `{GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE}` et {rel} ne porte pas la ligne \
+             `{expect_cause}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2641_the_wire_allowlist_is_empty() {
+        assert!(
+            ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS.is_empty(),
+            "ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS est livrée vide et doit le rester : \
+             excepter le fichier shell rendrait le scan vert en cessant de regarder \
+             la moitié qu'il existe pour confronter (mika#2201)."
+        );
+    }
 }
