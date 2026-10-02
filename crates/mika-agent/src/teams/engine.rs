@@ -3364,6 +3364,25 @@ mod tests {
         }
     }
 
+    /// Installe la capture et rend `(garde, événements)`.
+    ///
+    /// Même forme que `capture()` dans `kg/resolver_tick.rs` et
+    /// `capture_tracing_events()` dans `skills/builtin_handlers.rs` : ce
+    /// module était le seul des trois à inliner la mise en place, aux deux
+    /// seuls sites qui capturent.
+    #[allow(clippy::type_complexity)]
+    fn capture() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
     /// Constat de revue (correctness, P2) — la ligne de refus portait
     /// `agent_id = team_db.agent_id()`, c'est-à-dire la portée codée en dur de
     /// la base d'équipe (`"mika"` en production, `"planner"` ici), quel que
@@ -3375,12 +3394,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2633_la_ligne_de_refus_nomme_lequipe_et_le_redacteur() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
-        let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        let (_guard, events) = capture();
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);
@@ -3432,12 +3446,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mika2633_sans_redacteur_aucun_writer_agent_nest_invente() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
-        let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        let (_guard, events) = capture();
 
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = engine_with_mock(tmp.path(), vec![]);

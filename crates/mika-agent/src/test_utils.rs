@@ -417,14 +417,28 @@ mod tests {
     /// infraction (doctrine mika#2201, motif mika#2323).
     const SET_DEFAULT_SITES_ALLOWED: &[&str] = &[];
 
+    /// Le seul site d'installation autorisé, relatif à `src/`.
+    ///
+    /// Nommé plutôt que recopié : le prédicat (l'exemption du scan) et la
+    /// fixture du contrôle de bonne foi doivent désigner le **même** fichier,
+    /// sans quoi le contrôle cesse d'attester le prédicat sans rien rougir.
+    const INSTALLER_SITE: &str = "test_utils.rs";
+
     /// L'aiguille, assemblée par `concat!` plutôt qu'écrite d'un bloc.
     ///
     /// `concat!` produit le littéral à la compilation, donc la chaîne cherchée
     /// **n'apparaît nulle part dans ce fichier**. Écrite d'un bloc, elle ferait
     /// de la garde son propre second site : le scan n'exclut pas le code de
-    /// test (voir ci-dessous pourquoi), donc il se compterait lui-même et
-    /// serait rouge au jour de sa naissance — c'est-à-dire désarmé le
-    /// lendemain.
+    /// test (voir [`all_sources`] pour pourquoi), donc il se compterait
+    /// lui-même et serait rouge au jour de sa naissance — c'est-à-dire désarmé
+    /// le lendemain.
+    ///
+    /// **Borne du prédicat, nommée plutôt que découverte.** Il cherche le
+    /// chemin **pleinement qualifié**. `use tracing::subscriber::set_default;`
+    /// reste attrapé par sa ligne `use`, mais une forme aliasée
+    /// (`use tracing::subscriber as ts; ts::set_default(…)`) passerait. Aucune
+    /// n'existe sous `src/` aujourd'hui ; c'est un faux négatif réparable en
+    /// élargissant l'aiguille, pas un trou qu'une allowlist comblerait.
     fn needle() -> &'static str {
         concat!("tracing::subscriber::", "set_default")
     }
@@ -439,38 +453,44 @@ mod tests {
     /// écartent le code de test (`source_scan::is_test_source_path`,
     /// `production_half`) parce qu'elles cherchent dans la production un motif
     /// que la production ne doit pas porter. **Ici les sept sites vivent tous
-    /// dans du code de test.** Une garde bâtie sur `production_sources()`
-    /// trouverait **zéro** site et se lirait comme un arbre propre — la classe
+    /// dans du code de test.** Une garde bâtie sur `production_sources()` —
+    /// ou sur `ProductionScanner`, qui masque les régions `cfg(test)` —
+    /// trouverait **zéro** site et se lirait comme un arbre propre : la classe
     /// mika#2205 appliquée à la garde elle-même.
+    ///
+    /// L'énumération passe par [`mika_common::source_guard::rust_sources_under`],
+    /// le lecteur unique que quinze gardes écrivaient à l'identique — c'est la
+    /// règle que `source_scan` énonce pour lui-même (« un seul lecteur, pas une
+    /// copie par garde », mika#2158). Il n'applique aucun filtre de test, ce
+    /// qui est exactement ce qu'il faut ici, et il trie, ce qui rend l'ordre
+    /// des fautifs déterministe d'une machine à l'autre.
+    ///
+    /// **Portée : `src/` seulement, et c'est une décision du plan.** Les neuf
+    /// fichiers de `crates/mika-agent/tests/` qui installent un abonné sont des
+    /// **binaires distincts** — un processus chacun, donc un cache d'`Interest`
+    /// chacun — et sont hors de la population mesurée. Le silence du scan sur
+    /// eux n'est pas une couverture.
+    ///
+    /// Un fichier illisible **panique** plutôt que d'être sauté : une garde qui
+    /// saute un fichier en silence est une garde qui a cessé de regarder, et le
+    /// fichier sauté peut être le fautif — l'assertion d'anti-vacuité compte
+    /// les fichiers *après* le saut et ne le verrait pas.
     fn all_sources() -> Vec<(String, String)> {
         let root = src_root();
-        let mut out = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries {
-                let path = entry.expect("entrée de répertoire lisible").path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
+        mika_common::source_guard::rust_sources_under(&root)
+            .into_iter()
+            .map(|path| {
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("la garde doit pouvoir lire {} : {e}", path.display())
+                });
                 let rel = path
                     .strip_prefix(&root)
                     .expect("chemin sous src/")
                     .to_string_lossy()
                     .replace('\\', "/");
-                out.push((rel, content));
-            }
-        }
-        out
+                (rel, content)
+            })
+            .collect()
     }
 
     /// Les fichiers portant l'aiguille, commentaires retirés.
@@ -479,10 +499,23 @@ mod tests {
     /// `tracing-core` et décrit le mécanisme, et une prose qui décrit le motif
     /// interdit n'en est pas une violation (faux positif mesuré sur le Signal S,
     /// mika#2050).
+    ///
+    /// Le court-circuit sur la source brute est **exactement** préservant, et
+    /// la raison mérite d'être écrite pour que personne n'ait à la redériver :
+    /// `strip_comment_lines` ne fait que **supprimer des lignes entières** et
+    /// rejoindre par `"\n"`, donc toute sous-chaîne sans retour à la ligne de
+    /// sa sortie est une sous-chaîne d'une ligne de l'entrée. L'aiguille n'en
+    /// contient pas, donc `needle ∈ strip(s) ⟹ needle ∈ s` : le pré-filtre ne
+    /// peut écarter que des fichiers qui n'auraient pas pu matcher. Il évite
+    /// d'allouer une copie dépouillée des ~12 Mo de l'arbre pour trouver un
+    /// seul fichier (mesuré : 87,5 ms → 2,3 ms).
     fn sites_carrying_the_needle(sources: &[(String, String)]) -> Vec<String> {
         sources
             .iter()
-            .filter(|(_, src)| crate::source_scan::strip_comment_lines(src).contains(needle()))
+            .filter(|(_, src)| {
+                src.contains(needle())
+                    && crate::source_scan::strip_comment_lines(src).contains(needle())
+            })
             .map(|(rel, _)| rel.clone())
             .collect()
     }
@@ -511,14 +544,14 @@ mod tests {
         // sain — motif de la cardinalité de mika#2496 et du `!declared.is_empty()`
         // de mika#2201.
         assert!(
-            sites.contains(&"test_utils.rs".to_string()),
+            sites.iter().any(|s| s == INSTALLER_SITE),
             "le site de l'installateur est introuvable : la garde vise un nom mort. \
              Sites vus : {sites:?}"
         );
 
         let offenders: Vec<&String> = sites
             .iter()
-            .filter(|rel| rel.as_str() != "test_utils.rs")
+            .filter(|rel| rel.as_str() != INSTALLER_SITE)
             .filter(|rel| !SET_DEFAULT_SITES_ALLOWED.contains(&rel.as_str()))
             .collect();
 
@@ -544,7 +577,7 @@ mod tests {
     fn mika2646_le_scan_voit_un_second_site() {
         let synthetic = vec![
             (
-                "test_utils.rs".to_string(),
+                INSTALLER_SITE.to_string(),
                 format!("let g = {}(s);", needle()),
             ),
             (
