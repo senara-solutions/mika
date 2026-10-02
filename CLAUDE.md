@@ -3979,7 +3979,7 @@ Optional (auto-feeder ready-pool maintenance):
   | cause | prédicat | remède nommé | régime attendu |
   |---|---|---|---|
   | **(b)** `auto_feeder_pool_in_flight` | `in_flight > 0` | **débloquer** — les tickets et leurs âges sont dans l'événement | non nul pendant un blocage |
-  | **(c)** `auto_feeder_in_flight_unreadable` | sinon, `state_probe_failed > 0` | réparer la sonde — ni (a) ni (b) n'est établi | **zéro** |
+  | **(c)** `auto_feeder_in_flight_unreadable` | sinon, `state_probe_failed > 0` **ou** `candidate_probe_failed > 0` | réparer la sonde — ni (a) ni (b) n'est établi | **zéro** |
   | **(a)** `auto_feeder_no_backlog` | sinon | groomer davantage | nominal |
 
   (c) est le fail-safe **existant** rendu lisible : la boucle de sonde traite déjà une erreur DB comme « en vol » — arbitrage correct pour le *seuil*, puisqu'il vaut mieux ne pas promouvoir dans le doute — mais versé tel quel dans le message de (b) il ferait **nommer comme en vol des tickets qui ne le sont peut-être pas**, c'est-à-dire donner un remède faux avec l'autorité d'une mesure. Même famille et même arbitrage que `pilot_stall_signal_unavailable` (mika#2277), `unknown_provider` (mika#2328) et la paire `below_threshold` / `no_ready_label_event` (mika#2131) : *un signal qu'on ne peut pas lire n'est jamais un terme satisfait.*

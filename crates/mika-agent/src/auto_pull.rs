@@ -2042,6 +2042,14 @@ struct ReadyPoolCensus {
     /// wire name AC2 does not ask for, and that population is empty for the
     /// feeder's own seat.
     operator_held: usize,
+    /// Probe failures on groomed, non-`ready` **candidates** — outside the pool,
+    /// hence outside the additive identity above.
+    ///
+    /// The probe loop also probes candidates, and an `Err` there drops the
+    /// candidate from selection exactly like a pool member. Counting only the
+    /// pool made an empty pool plus an unreadable candidate read (a) "no groomed
+    /// backlog" — a false cause on an unreadable signal (review of PR #2635).
+    candidate_probe_failed: usize,
 }
 
 impl ReadyPoolCensus {
@@ -2115,6 +2123,15 @@ fn census_ready_pool(
             census.pullable += 1;
         }
     }
+
+    // Probe failures on everything the pool did not claim: the groomed
+    // candidates the probe loop also probes. Counted apart so the additive
+    // identity over `raw_ready` is untouched.
+    census.candidate_probe_failed = issues
+        .iter()
+        .filter(|i| !i.labels.iter().any(|l| l.name == "ready"))
+        .filter(|i| probe_failed_issue_numbers.contains(&i.number))
+        .count();
 
     census.in_flight_issues.sort_unstable();
     census
@@ -2203,11 +2220,13 @@ impl EmptyBacklogCause {
 /// with the authority of a measurement. Same family, same arbitration, as
 /// `pilot_stall_signal_unavailable` (mika#2277), `unknown_provider`
 /// (mika#2328), and the `below_threshold` / `no_ready_label_event` pair
-/// (mika#2131): *a signal one cannot read is never a satisfied term.*
+/// (mika#2131): *a signal one cannot read is never a satisfied term.* That holds
+/// for a probe failure on a groomed candidate as much as on a pool member: an
+/// unreadable candidate is not evidence of an empty backlog.
 fn classify_empty_backlog(census: &ReadyPoolCensus) -> EmptyBacklogCause {
     if census.in_flight() > 0 {
         EmptyBacklogCause::PoolInFlight
-    } else if census.state_probe_failed > 0 {
+    } else if census.state_probe_failed > 0 || census.candidate_probe_failed > 0 {
         EmptyBacklogCause::InFlightUnreadable
     } else {
         EmptyBacklogCause::NoGroomedBacklog
@@ -3501,6 +3520,7 @@ async fn emit_empty_backlog_signal(
         in_flight = census.in_flight(),
         state_probe_failed = census.state_probe_failed,
         operator_held = census.operator_held,
+        candidate_probe_failed = census.candidate_probe_failed,
         min_ready,
         stuck = %stuck,
         remedy = cause.remedy(),
@@ -3509,13 +3529,15 @@ async fn emit_empty_backlog_signal(
 
     let detail = format!(
         "no candidate to promote: raw_ready={} pullable={} open_pr={} in_flight={} \
-         state_probe_failed={} operator_held={} min_ready={min_ready} stuck=[{stuck}] — {}",
+         state_probe_failed={} operator_held={} candidate_probe_failed={} \
+         min_ready={min_ready} stuck=[{stuck}] — {}",
         census.raw_ready,
         census.pullable,
         census.open_pr,
         census.in_flight(),
         census.state_probe_failed,
         census.operator_held,
+        census.candidate_probe_failed,
         cause.remedy(),
     );
 
@@ -8542,6 +8564,46 @@ This ticket has been GROOMED and is ready.
         assert_eq!(
             classify_empty_backlog(&mixed),
             EmptyBacklogCause::PoolInFlight
+        );
+    }
+
+    /// **V5-bis — a probe failure on a CANDIDATE asserts no grooming shortage
+    /// either** (review of PR #2635).
+    ///
+    /// The probe loop of `phase0_feed_ready_pool` also probes groomed,
+    /// non-`ready` candidates, and an `Err` there drops the candidate from
+    /// selection. A census that walked the `ready` pool alone saw zero failures,
+    /// so an empty pool plus one unreadable candidate rendered (a) "no groomed
+    /// backlog" — a false cause on an unreadable signal, the exact shape (c)
+    /// exists to stop.
+    ///
+    /// Red-before: without the candidate-side count this returns
+    /// `NoGroomedBacklog`.
+    #[test]
+    fn mika2161_une_sonde_candidat_illisible_naffirme_pas_labsence_de_backlog() {
+        // Groomed, not `ready`: a feeder candidate, not a pool member.
+        let issues = vec![make_issue(60, GROOMED_BODY, &["p1-important"], "t")];
+        let census = census_ready_pool(&issues, &HashSet::new(), &numbers(&[60]), &numbers(&[60]));
+
+        assert_eq!(census.raw_ready, 0, "the candidate is not a pool member");
+        assert_eq!(
+            census.attributed(),
+            census.raw_ready,
+            "the candidate-side count stays outside the additive identity"
+        );
+        assert_eq!(
+            classify_empty_backlog(&census),
+            EmptyBacklogCause::InFlightUnreadable,
+            "an unreadable candidate establishes neither a shortage nor a stuck pool"
+        );
+
+        // Negative control: the same candidate genuinely absent from the probe
+        // failures is a real (a).
+        let readable =
+            census_ready_pool(&issues, &HashSet::new(), &HashSet::new(), &HashSet::new());
+        assert_eq!(
+            classify_empty_backlog(&readable),
+            EmptyBacklogCause::NoGroomedBacklog
         );
     }
 
