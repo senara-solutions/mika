@@ -4170,16 +4170,39 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             }
         }
 
-        // Anti-vacuité : un scan qui ne trouve aucun émetteur se lit exactement
-        // comme un scan propre (mika#2103 / mika#2205).
-        assert!(
-            emitters.len() >= 4,
-            "mika#2633 V7 — moins de quatre émetteurs de la famille trouvés \
-             ({emitters:?}) : ce scan ne regarde plus la population qu'il existe \
-             pour surveiller. Les émetteurs attendus sont la garde 5h (nominale et \
-             résidu), le helper d'outil, et le point de pose du livrable d'équipe \
-             (nominal et résidu)."
-        );
+        // Anti-vacuité par PRÉSENCE NOMMÉE, fichier par fichier (constat de
+        // revue, adversarial P3). Un plancher global `>= 4` laissait disparaître
+        // l'un des cinq émetteurs connus en silence — typiquement en hissant son
+        // nom d'événement dans une constante, ce qui le sort de la population
+        // du scan sans rien rougir. Chaque fichier connu doit garder au moins
+        // ses émetteurs ; un émetteur neuf dans un fichier neuf reste permis.
+        // Un plancher porte une présence nommée, jamais le compte du jour seul
+        // (« un plancher d'anti-vacuité peut se rembourrer avec le trou qu'il
+        // garde », 2026-10-01).
+        for (file, expected, who) in [
+            (
+                "crates/mika-agent/src/agent_loop/mod.rs",
+                2,
+                "la garde 5h, nominale et résidu",
+            ),
+            ("crates/mika-agent/src/tools/mod.rs", 1, "le helper d'outil"),
+            (
+                "crates/mika-agent/src/teams/engine.rs",
+                2,
+                "le point de pose du livrable d'équipe, nominal et résidu",
+            ),
+        ] {
+            let found = emitters.iter().filter(|rel| rel.as_str() == file).count();
+            assert!(
+                found >= expected,
+                "mika#2633 V7 — {file} porte {found} émetteur(s) de la famille au \
+                 lieu d'au moins {expected} ({who}) : un émetteur a quitté la \
+                 population de ce scan, et sa ligne n'est plus vérifiée. Si son nom \
+                 d'événement a été hissé dans une constante, c'est le scan qu'il \
+                 faut faire suivre, pas ce plancher qu'il faut baisser. Émetteurs \
+                 vus : {emitters:?}"
+            );
+        }
 
         assert!(
             channelless.is_empty(),
