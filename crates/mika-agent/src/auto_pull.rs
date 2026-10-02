@@ -3557,6 +3557,57 @@ async fn emit_empty_backlog_signal(
     }
 }
 
+/// What the in-flight probe loop of Phase 0 learned in one tick (mika#2161 U3).
+struct InFlightProbe {
+    /// Every target the feeder must treat as in flight: a live row **or** a
+    /// probe failure. This is the set `count_pullable_ready` and
+    /// `select_feeder_candidates_recording` receive, byte for byte the
+    /// pre-mika#2161 one (AC6).
+    in_flight: HashSet<u64>,
+    /// The probe failures, a subset of `in_flight` kept apart **for attribution
+    /// only**: the empty-backlog message must refuse to name as in flight a
+    /// ticket the engine could not actually read.
+    probe_failed: HashSet<u64>,
+    /// The resolved rows, KEPT rather than discarded: the (b) message needs the
+    /// age and status they carry, and re-querying them at emission time would
+    /// fetch the same data twice in one tick through the single DB worker.
+    rows: HashMap<u64, InFlightSelfDevTask>,
+}
+
+/// Probe each target once and sort it into [`InFlightProbe`].
+///
+/// The probe is injected so the three arms — live row, no row, error — are
+/// testable without a failing database (review of PR #2635: the loop used to
+/// be inline and no test reached its `Err` arm). A failure is treated as in
+/// flight: not promoting on doubt is the cheap mistake.
+async fn probe_in_flight<F, Fut>(targets: Vec<u64>, probe: F) -> InFlightProbe
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<InFlightSelfDevTask>>>,
+{
+    let mut out = InFlightProbe {
+        in_flight: HashSet::new(),
+        probe_failed: HashSet::new(),
+        rows: HashMap::new(),
+    };
+    for n in targets {
+        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
+        match probe(issue_url).await {
+            Ok(Some(task)) => {
+                out.in_flight.insert(n);
+                out.rows.insert(n, task);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_feeder: in-flight probe failed; treating as in-flight");
+                out.in_flight.insert(n);
+                out.probe_failed.insert(n);
+            }
+        }
+    }
+    out
+}
+
 /// Phase 0 (mika#1863): auto-feeder — keep the **pullable**-ready pool topped up
 /// to `MIN_READY` from the groomed-dispatchable backlog. Runs before Phase 1 on
 /// every tick, independent of queue depth.
@@ -3621,37 +3672,16 @@ async fn phase0_feed_ready_pool(
         }
     }
 
-    let mut in_flight_issue_numbers: HashSet<u64> = HashSet::new();
-    // mika#2161: the probe failures, kept apart **for attribution only**. They
-    // stay inside `in_flight_issue_numbers` above, so the set
-    // `count_pullable_ready` and `select_feeder_candidates_recording` receive is
-    // byte-for-byte the pre-mika#2161 one and the threshold does not move an inch
-    // (AC6). What this buys is that the empty-backlog message can refuse to name
-    // as in-flight a ticket the engine could not actually read.
-    let mut probe_failed_issue_numbers: HashSet<u64> = HashSet::new();
-    // mika#2161: the resolved rows, KEPT rather than discarded. The probe already
-    // pays a round trip per target; the (b) message needs the age and status those
-    // rows carry, so re-querying them at emission time would be the same data
-    // fetched twice in one tick — up to ten extra round trips through the single
-    // DB worker thread, on a path that previously made none.
-    let mut probed_in_flight: HashMap<u64, InFlightSelfDevTask> = HashMap::new();
-    for n in probe_targets {
-        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
-        // The `find_` form rather than the boolean: same single round trip, and
-        // its answer carries the age AC3 needs (mika#2161 U3).
-        match db.find_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(Some(task)) => {
-                in_flight_issue_numbers.insert(n);
-                probed_in_flight.insert(n, task);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(error = %e, issue = n, "auto_feeder: in-flight probe failed; treating as in-flight");
-                in_flight_issue_numbers.insert(n);
-                probe_failed_issue_numbers.insert(n);
-            }
-        }
-    }
+    // The `find_` form rather than the boolean: same single round trip, and its
+    // answer carries the age AC3 needs (mika#2161 U3).
+    let InFlightProbe {
+        in_flight: in_flight_issue_numbers,
+        probe_failed: probe_failed_issue_numbers,
+        rows: probed_in_flight,
+    } = probe_in_flight(probe_targets, |issue_url| async move {
+        db.find_active_self_dev_task_for_issue(&issue_url).await
+    })
+    .await;
 
     // R3/D2: pullable-ready count is the threshold signal, not raw `ready` count.
     let pullable = count_pullable_ready(issues, open_pr_issue_numbers, &in_flight_issue_numbers);
@@ -8599,11 +8629,62 @@ This ticket has been GROOMED and is ready.
 
         // Negative control: the same candidate genuinely absent from the probe
         // failures is a real (a).
+        //
+        // (The loop that fills those sets in production is pinned separately,
+        // by `mika2161_la_boucle_de_sonde_trie_les_trois_bras`.)
         let readable =
             census_ready_pool(&issues, &HashSet::new(), &HashSet::new(), &HashSet::new());
         assert_eq!(
             classify_empty_backlog(&readable),
             EmptyBacklogCause::NoGroomedBacklog
+        );
+    }
+
+    /// **The probe loop sorts its three arms** (review of PR #2635).
+    ///
+    /// V5/V6 hand-build the in-flight, probe-failed and row sets; nothing reached
+    /// the loop that fills them in production. Dropping the `probe_failed`
+    /// insert would reopen (c) → (b) — a DB outage named as stuck tickets — and
+    /// dropping the row insert would render every stuck ticket `not-captured`,
+    /// both with the suite green. The probe is injected, so the `Err` arm needs
+    /// no failing database.
+    #[tokio::test]
+    async fn mika2161_la_boucle_de_sonde_trie_les_trois_bras() {
+        let live = 1u64;
+        let absent = 2u64;
+        let unreadable = 3u64;
+        let url_of = |n: u64| format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+
+        let probe = probe_in_flight(vec![live, absent, unreadable], |url| {
+            let live_url = url_of(live);
+            let unreadable_url = url_of(unreadable);
+            async move {
+                if url == live_url {
+                    Ok(Some(probed_row("task-live", "in_progress", 120)))
+                } else if url == unreadable_url {
+                    Err(anyhow!("database is locked"))
+                } else {
+                    Ok(None)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            probe.in_flight,
+            numbers(&[live, unreadable]),
+            "a live row AND a probe failure are both in flight for the threshold (AC6)"
+        );
+        assert_eq!(
+            probe.probe_failed,
+            numbers(&[unreadable]),
+            "only the failure is attributed to the unreadable bucket"
+        );
+        assert_eq!(probe.rows.len(), 1, "only the live row is captured");
+        assert_eq!(probe.rows[&live].task_id, "task-live");
+        assert!(
+            !probe.rows.contains_key(&unreadable),
+            "a failed probe carries no row: naming it would invent an age"
         );
     }
 
