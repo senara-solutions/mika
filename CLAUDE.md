@@ -807,7 +807,9 @@ une ligne neutre cherche dans le voisinage de 5h-bis.
 # 1. Un livrable d'équipe a-t-il été arrêté ?
 grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
   | jq -c 'select(.channel == "team_deliverable")
-           | {team_run_id, deliverable_source, matched_subject, agent_id}'
+           | {team_run_id, team_name, deliverable_source, writer_agent, matched_subject}'
+# `writer_agent` est ABSENT hors `deliverable_source = "writer"`. Pas d'`agent_id` sur
+# ce canal : la portée de la base d'équipe n'est pas l'agent qui agit.
 
 # 2. La re-rédaction a-t-elle échoué ? (résidu)
 grep guard.testimony_access_proposal_uncorrected "$MIKA_SPIRIT_LOG_FILE" \

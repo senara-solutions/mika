@@ -129,6 +129,17 @@ impl DeliverableSource {
             Self::NoDelegation => "no_delegation",
         }
     }
+
+    /// The agent that wrote the text, when there is one — the `writer_agent`
+    /// telemetry field. `None` is rendered as an ABSENT field (tracing omits
+    /// a `None` value), never as an empty string: a field asserting a writer
+    /// nobody measured is the mika#2304 defect.
+    fn writer_agent(&self) -> Option<&str> {
+        match self {
+            Self::Writer { agent_name } => Some(agent_name.as_str()),
+            Self::WorkspaceFallback | Self::ConversationalGate | Self::NoDelegation => None,
+        }
+    }
 }
 
 /// Resources needed to run a specific agent.
@@ -801,10 +812,15 @@ impl TeamEngine {
         };
 
         let team_session_id = format!("team-{}", self.run.run_id);
+        // No `agent_id`: `team_db.agent_id()` is the team DB's hard-coded scope
+        // (`"mika"` on both production paths), not the acting agent, and the
+        // family's two other emitters carry the acting agent under that name.
+        // What this site does know is the team, and the writer when there is one.
         warn!(
             target: "mika::otel",
             trace_id = %self.trace_id,
-            agent_id = %self.team_db.agent_id(),
+            team_name = %self.run.team_name,
+            writer_agent = source.writer_agent(),
             session_id = %team_session_id,
             team_run_id = %self.run.run_id,
             deliverable_source = source.as_wire(),
@@ -836,7 +852,8 @@ impl TeamEngine {
                 warn!(
                     target: "mika::otel",
                     trace_id = %self.trace_id,
-                    agent_id = %self.team_db.agent_id(),
+                    team_name = %self.run.team_name,
+                    writer_agent = source.writer_agent(),
                     session_id = %team_session_id,
                     team_run_id = %self.run.run_id,
                     deliverable_source = source.as_wire(),
@@ -3275,6 +3292,120 @@ mod tests {
             "un repli workspace porteur d'une proposition doit donner la ligne \
              neutre directement, sans re-rédaction demandée au rédacteur"
         );
+    }
+
+    // -- capture tracing (même forme que `kg::resolver_tick::tests`) --
+
+    struct CapturingLayer(std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V<'a>(&'a mut HashMap<String, String>);
+            impl tracing::field::Visit for V<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.insert(field.name().to_string(), value.to_string());
+                }
+            }
+            let mut fields = HashMap::new();
+            event.record(&mut V(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    /// Constat de revue (correctness, P2) — la ligne de refus portait
+    /// `agent_id = team_db.agent_id()`, c'est-à-dire la portée codée en dur de
+    /// la base d'équipe (`"mika"` en production, `"planner"` ici), quel que
+    /// soit l'agent qui a écrit le texte. Dans la famille d'événements, les deux
+    /// émetteurs frères portent l'agent qui AGIT sous ce nom : un même champ
+    /// signifiait deux choses. La ligne porte désormais ce que le site sait
+    /// vraiment — l'équipe, et le rédacteur quand il y en a un — et ne porte
+    /// plus de champ qui affirme ce qu'il n'a pas mesuré (mika#2304).
+    #[tokio::test]
+    async fn mika2633_la_ligne_de_refus_nomme_lequipe_et_le_redacteur() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        engine
+            .commit_deliverable(
+                PROPOSAL.to_string(),
+                DeliverableSource::Writer {
+                    agent_name: "scribe".to_string(),
+                },
+            )
+            .await;
+
+        let events = events.lock().unwrap();
+        let refusals: Vec<_> = events
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.get("event").map(String::as_str),
+                    Some("guard.testimony_access_proposal")
+                        | Some("guard.testimony_access_proposal_uncorrected")
+                ) && f.get("channel").map(String::as_str) == Some("team_deliverable")
+            })
+            .collect();
+        assert_eq!(refusals.len(), 2, "la ligne nominale et son résidu");
+        for f in refusals {
+            assert_eq!(
+                f.get("writer_agent").map(String::as_str),
+                Some("scribe"),
+                "{f:?}"
+            );
+            assert_eq!(
+                f.get("team_name").map(String::as_str),
+                Some(engine.run.team_name.as_str()),
+                "{f:?}"
+            );
+            assert!(
+                !f.contains_key("agent_id"),
+                "`agent_id` affirmait la portée de la base d'équipe, pas l'agent qui \
+                 agit : {f:?}"
+            );
+        }
+    }
+
+    /// Le contrôle négatif : sans rédacteur, aucun `writer_agent` n'est inventé.
+    #[tokio::test]
+    async fn mika2633_sans_redacteur_aucun_writer_agent_nest_invente() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), vec![]);
+        engine
+            .commit_deliverable(PROPOSAL.to_string(), DeliverableSource::NoDelegation)
+            .await;
+
+        let events = events.lock().unwrap();
+        let refusal = events
+            .iter()
+            .find(|f| f.get("event").map(String::as_str) == Some("guard.testimony_access_proposal"))
+            .expect("la ligne de refus est émise");
+        assert!(!refusal.contains_key("writer_agent"), "{refusal:?}");
+        assert!(refusal.contains_key("team_name"), "{refusal:?}");
     }
 
     /// Constat de revue (reliability, P2) — la re-rédaction ouvre une enveloppe
