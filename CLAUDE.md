@@ -818,10 +818,12 @@ grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
 ```
 
 ```sql
--- La ligne neutre réellement servie, par run
-SELECT id, team_name, status, created_at FROM team_runs
- WHERE deliverable LIKE 'The team finished its work, but its deliverable%'
- ORDER BY created_at DESC;
+-- La ligne neutre réellement servie, par run. `team_runs` porte `team_id` et
+-- `started_at`, pas `team_name` ni `created_at` : le nom vient de `teams`.
+SELECT r.id, t.name AS team_name, r.status, r.started_at
+  FROM team_runs r JOIN teams t ON r.team_id = t.id
+ WHERE r.deliverable LIKE 'The team finished its work, but its deliverable%'
+ ORDER BY r.started_at DESC;
 ```
 
 | surface | niveau | régime attendu | lecture |
@@ -874,7 +876,7 @@ d'équipe entier dont le livrable est jeté**. **Désarmer d'abord** (revert de
 l'appel au prédicat dans `commit_deliverable`), diagnostiquer ensuite.
 
 **S4 — la population hors périmètre.** La requête SQL ci-dessus, une fois, plus
-`SELECT deliverable FROM team_runs ORDER BY created_at DESC LIMIT 10` pour lire ce
+`SELECT deliverable FROM team_runs ORDER BY started_at DESC LIMIT 10` pour lire ce
 que `history_deliverable` ressert.
 *Halte 4 — une proposition y figure :* ce sont les livrables **pré-déploiement**.
 Le remède est un geste d'opérateur sur la base, **pas** un élargissement de la
@@ -882,7 +884,7 @@ garde à la lecture.
 
 **Halte transverse — les deux sondes muettes.** Zéro refus **et** zéro run
 d'équipe ne prouve rien : il faut qu'un run ait tourné depuis le déploiement.
-Vérifier `SELECT count(*) FROM team_runs WHERE created_at > '<déploiement>'` avant
+Vérifier `SELECT count(*) FROM team_runs WHERE started_at > '<déploiement>'` avant
 toute conclusion.
 
 #### Ce que ce travail n'achète PAS
