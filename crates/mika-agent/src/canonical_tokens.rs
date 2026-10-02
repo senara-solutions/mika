@@ -4239,13 +4239,32 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     fn mika2633_le_bras_team_deliverable_est_inerte() {
         let guard_call = format!("check_testimony_access{}(", "_proposal");
 
-        let callers: Vec<String> = production_sources()
+        let scanned: Vec<(String, String)> = production_sources()
             .into_iter()
-            .filter(|(rel, content)| {
-                rel.starts_with("crates/mika-agent/src/teams/")
-                    && crate::source_scan::strip_comment_lines(content)
-                        .lines()
-                        .any(|l| l.contains(guard_call.as_str()))
+            .filter(|(rel, _)| rel.starts_with("crates/mika-agent/src/teams/"))
+            .collect();
+
+        // Anti-vacuité (constat de revue, testing P3) : un scan « doit rester
+        // vide » qui ne regarde aucun fichier est vert pour la mauvaise raison —
+        // un renommage de `teams/` ou une panne de l'énumérateur le rendrait
+        // muet, la classe mika#2205 que ce test invoque lui-même. Le fichier qui
+        // porte le point de pose est exigé nommément.
+        assert!(
+            scanned
+                .iter()
+                .any(|(rel, _)| rel == "crates/mika-agent/src/teams/engine.rs"),
+            "mika#2633 V6 — `teams/engine.rs` n'est pas dans la population de ce \
+             scan ({} fichier(s) vus sous `teams/`) : il ne regarde plus ce qu'il \
+             surveille (mika#2205).",
+            scanned.len()
+        );
+
+        let callers: Vec<String> = scanned
+            .into_iter()
+            .filter(|(_, content)| {
+                crate::source_scan::strip_comment_lines(content)
+                    .lines()
+                    .any(|l| l.contains(guard_call.as_str()))
             })
             .map(|(rel, _)| rel)
             .collect();
