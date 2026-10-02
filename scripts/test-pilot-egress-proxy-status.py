@@ -1630,6 +1630,24 @@ class HostSocketLifecycleTests(unittest.TestCase):
         finally:
             sock.close()
 
+    def test_bind_failure_is_named_and_leaves_no_socket(self) -> None:
+        # A path the kernel refuses (longer than sun_path) must end the relay
+        # with a named, timestamped FATAL line and exit 1 -- not a traceback,
+        # and not a half-created path.
+        long_sock = os.path.join(self._dir, "s" * 120)
+        proc = subprocess.Popen(
+            [sys.executable, str(_PROXY_PATH), "--host-unix", "--socket", long_sock],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self._procs.append(proc)
+        _, stderr = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        text = "\n".join(_strip_ts(self, stderr.decode().splitlines()))
+        self.assertIn("[egress] FATAL bind failed", text)
+        self.assertNotIn("Traceback", text)
+        self.assertFalse(os.path.exists(long_sock))
+
     def test_startup_emits_a_begin_breadcrumb_before_bind(self) -> None:
         # mika#2051: the 2026-08-29 incident left 1569 log lines with nothing
         # from the two dead proxies. The proxy must announce its own arrival so

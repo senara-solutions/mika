@@ -557,13 +557,13 @@ _PILOT_EGRESS_PROXY_BIN="$HOME/.local/bin/mika-pilot-egress-proxy"
 #   LANG               interpreter locale
 #   MIKA_EGRESS_DEBUG  the relay's own debug gate
 #   SSL_CERT_FILE/DIR  read by OpenSSL for the upstream TLS context, when a
-#                      host sets them
+#   OPENSSL_CONF       host sets them (OpenSSL loads its config at init)
 # Deliberately NOT here: `_MIKA_EGRESS_PREBIND_TEST_BARRIER` (a test seam the
 # relay's tests set directly, never through this launcher) and `SSLKEYLOGFILE`
 # (a diagnostic variable that would write upstream TLS secrets to disk).
 # MIKA_PILOT_EGRESS_LOG_DIR is read by this shell for the redirection, not by
 # the relay. A variable the relay comes to need for its function goes here.
-_PILOT_EGRESS_RELAY_ENV_ALLOWLIST=(PATH HOME LANG MIKA_EGRESS_DEBUG SSL_CERT_FILE SSL_CERT_DIR)
+_PILOT_EGRESS_RELAY_ENV_ALLOWLIST=(PATH HOME LANG MIKA_EGRESS_DEBUG SSL_CERT_FILE SSL_CERT_DIR OPENSSL_CONF)
 
 # mika#2049: the relay-down stamp. Written HERE (shell), read by the engine
 # (Rust) — the first file under `state/` to cross that boundary in this

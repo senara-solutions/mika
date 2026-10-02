@@ -24,8 +24,8 @@ origin: free-text dispatch (orchestrateur)
 
 Le relais est l'unique sortie réseau du bac à sable des pilotes. Deux de ses propriétés excèdent ce dont il a besoin :
 
-1. **Mode du socket.** `scripts/mika-pilot-egress-proxy:1312-1315` lie le socket via `asyncio.start_unix_server(path)` puis appelle `sock_path.chmod(0o666)`, avec le commentaire « World-writable so the sandbox (running as same uid, but env-cleared) can still connect ». La justification se contredit : si le bac à sable tourne sous le même uid, le propriétaire suffit, et 0666 ouvre le socket à tout uid local. De plus, entre `bind()` et `chmod()`, le socket existe avec le mode dérivé de l'umask du processus : le mode final n'est pas garanti pendant cette fenêtre.
-2. **Environnement hérité.** `skills/bundled/_shared/dispatch-lib.sh` (`_ensure_pilot_egress_proxy`) lance `nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix ...` avec l'environnement complet de la tâche de dispatch. Mesuré par l'orchestrateur : 15 variables, dont `MIKA_DISPATCH_WORKTREE_FILE` et un jeton GitHub. Le relais est un démon long qui survit à la tâche qui l'a lancé ; il conserve donc durablement des valeurs qu'il ne lit jamais.
+1. **Mode du socket.** `scripts/mika-pilot-egress-proxy:1312-1315` lie le socket via `asyncio.start_unix_server(path)` puis appelle `sock_path.chmod(0o666)`, avec le commentaire « World-writable so the sandbox (running as same uid, but env-cleared) can still connect ». Si le bac à sable tourne sous le même uid, les bits propriétaire suffisent : le mode accordé excède le besoin. De plus, entre `bind()` et `chmod()`, le socket existe avec le mode dérivé de l'umask du processus : le mode final n'est pas garanti pendant cette fenêtre.
+2. **Environnement hérité.** `skills/bundled/_shared/dispatch-lib.sh` (`_ensure_pilot_egress_proxy`) lance `nohup "$_PILOT_EGRESS_PROXY_BIN" --host-unix ...` avec l'environnement complet de la tâche de dispatch. Mesuré : une quinzaine de variables de la tâche, que le relais ne lit pas. Le relais est un démon long qui survit à la tâche qui l'a lancé ; il conserve donc durablement des valeurs qu'il ne lit jamais.
 
 ### Requirements
 
@@ -56,7 +56,7 @@ Lectures d'environnement du relais, inventaire exhaustif dans `scripts/mika-pilo
 | `os.environ.get` | 1292 | `_MIKA_EGRESS_PREBIND_TEST_BARRIER` | **non** transmise : seam de test, posée directement par `test-pilot-egress-proxy-status.py` qui lance le script sans le lanceur ; le commentaire l.1290 dit déjà « the launcher does not export it » |
 | `Path.home()` | 198 | `HOME` (implicite) | transmise : chemin de `~/.claude/.credentials.json` |
 | shebang `#!/usr/bin/env python3` | 1 | `PATH` | transmise |
-| `ssl.create_default_context()` | 1024 | `SSL_CERT_FILE`, `SSL_CERT_DIR` (lus par OpenSSL) | transmises si définies : un hôte qui les pose pour la TLS amont garde son comportement |
+| `ssl.create_default_context()` | 1024 | `SSL_CERT_FILE`, `SSL_CERT_DIR`, `OPENSSL_CONF` (lus par OpenSSL) | transmises si définies : un hôte qui les pose pour la TLS amont garde son comportement |
 | locale Python | — | `LANG` | transmise si définie |
 | `ssl.create_default_context()` | 1024 | `SSLKEYLOGFILE` | **non** transmise : variable de diagnostic qui écrirait les secrets de session TLS amont sur disque |
 

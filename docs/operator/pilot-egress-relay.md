@@ -249,7 +249,7 @@ création** (umask restreint autour du `bind()`), pas corrigé après.
 Le lanceur (`_ensure_pilot_egress_proxy`, donc aussi `--ensure-relay` et
 `--restart-relay`) démarre le relais sous `env -i` avec la liste blanche
 `_PILOT_EGRESS_RELAY_ENV_ALLOWLIST` de `dispatch-lib.sh` : `PATH`, `HOME`,
-`LANG`, `MIKA_EGRESS_DEBUG`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, chacune seulement
+`LANG`, `MIKA_EGRESS_DEBUG`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `OPENSSL_CONF`, chacune seulement
 si elle est définie. Une variable dont le relais a besoin pour sa fonction
 s'ajoute à cette liste ; les variables de diagnostic qui écrivent des secrets
 (`SSLKEYLOGFILE`) en restent exclues.

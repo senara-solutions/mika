@@ -100,6 +100,11 @@ probe() {
         export MIKA_PILOT_EGRESS_LOG_DIR="$root/logs"
         export MIKA_EGRESS_DEBUG=1
         export "$sname=$svalue"
+        # "Passed only when set": one allowlisted name set in the caller, one
+        # unset. The set one must arrive with its value; the unset one must
+        # not arrive at all (never as an empty string).
+        export SSL_CERT_FILE="$root/probe-ca.pem"
+        unset SSL_CERT_DIR
 
         launch=$(_ensure_pilot_egress_proxy 2>&1 >/dev/null)
         echo "launch_rc=$?"
@@ -114,6 +119,8 @@ probe() {
         echo "env_path=$(has PATH)"
         echo "env_home=$(has HOME)"
         echo "env_debug=$(printf "%s\n" "$env_dump" | sed -n "s/^MIKA_EGRESS_DEBUG=//p")"
+        echo "env_ssl_cert_file=$(printf "%s\n" "$env_dump" | sed -n "s/^SSL_CERT_FILE=//p")"
+        echo "env_ssl_cert_dir=$(has SSL_CERT_DIR)"
         # Names outside the launcher allowlist. Measured: `env -i` + exec adds
         # none of its own, so the comparison is exact.
         allowed=" ${_PILOT_EGRESS_RELAY_ENV_ALLOWLIST[*]:-} "
@@ -155,6 +162,8 @@ assert_eq "the caller's sentinel does NOT reach the relay" "no" "$(field env_sen
 assert_eq "PATH reaches the relay (its shebang resolves python3)" "yes" "$(field env_path "$OUT")"
 assert_eq "HOME reaches the relay (credentials path)" "yes" "$(field env_home "$OUT")"
 assert_eq "MIKA_EGRESS_DEBUG reaches the relay unchanged" "1" "$(field env_debug "$OUT")"
+assert_eq "a set allowlisted variable arrives with its value" "$TMPROOT/pos/probe-ca.pem" "$(field env_ssl_cert_file "$OUT")"
+assert_eq "an unset allowlisted variable does not arrive, not even empty" "no" "$(field env_ssl_cert_dir "$OUT")"
 assert_eq "a bwrap pilot, same uid, connects to the 0600 socket" "ok" "$(field connect "$OUT")"
 assert_eq "SIGTERM leaves no socket behind" "absent" "$(field sock_after "$OUT")"
 assert_eq "no variable outside the launcher allowlist reaches the relay" "none" "$(field env_outside_allowlist "$OUT")"
