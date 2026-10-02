@@ -3168,21 +3168,38 @@ mod tests {
     ///
     /// Le découpage est volontairement grossier — une `fn` au niveau d'un `impl`
     /// ou du module — parce que la propriété à tenir l'est aussi : *un seul site
-    /// décide*. Les commentaires sont **dépouillés avant** la recherche, sinon
-    /// `auto_pull.rs` se dénonce quatre fois sur sa propre prose (l'en-tête de
-    /// module cite le nom deux fois, le doc-comment de `FEEDER_WORKING_SET_CAP`
-    /// une, celui de `phase0_feed_ready_pool` une) — c'est le piège que mika#2329
-    /// a dû nommer et le faux positif de prose du Signal S (mika#2050).
+    /// décide*.
+    ///
+    /// # Les commentaires sont dépouillés par le lecteur unique, pas sur place
+    ///
+    /// [`crate::source_scan::strip_comment_lines`] et pas un prédicat local,
+    /// parce que le prédicat local naïf (`starts_with('*')`) est **exactement le
+    /// bug que le doc-comment de ce lecteur refuse par écrit** : `*guard = x;` est
+    /// du Rust valide, et `auto_pull.rs` en porte un
+    /// (`*counts.entry(…).or_insert(0) += 1;`). Un second écrivain posé sur une
+    /// ligne de cette forme aurait été sauté avant que `string_literals` ne le
+    /// voie, et ce scan serait resté vert. Sans dépouillement du tout, à l'inverse,
+    /// `auto_pull.rs` se dénonce quatre fois sur sa propre prose — le piège que
+    /// mika#2329 a dû nommer et le faux positif de prose du Signal S (mika#2050).
+    ///
+    /// # La détection de `fn` est indépendante de la position
+    ///
+    /// Le même prédicat que [`crate::source_scan::fn_bodies`], et pour la raison
+    /// que son doc-comment écrit : une énumération de préfixes rate les
+    /// permutations de visibilité × `async` × `const` × `unsafe`. Mesuré : un
+    /// `pub(super) async fn` en colonne 0 existe dans ce crate, et un `const fn`
+    /// indenté aussi. Le mode de panne est **silencieux dans le mauvais sens** —
+    /// une forme non reconnue en colonne 0 laisse la portée au module, donc le
+    /// littéral de son corps est imputé à `<module scope>`, se confond avec le site
+    /// attendu, et le scan passe.
     fn enclosing_fns_writing(content: &str, needle: &str) -> Vec<String> {
         const MODULE_SCOPE: &str = "<module scope>";
         let mut current = String::from(MODULE_SCOPE);
         let mut out: Vec<String> = Vec::new();
 
-        for line in content.lines() {
+        let stripped = crate::source_scan::strip_comment_lines(content);
+        for line in stripped.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
-                continue;
-            }
             // Une ligne en colonne 0 qui n'ouvre pas une `fn` est un item de
             // niveau module (`const`, `struct`, `impl`, ou le `}` qui ferme la
             // précédente) : la portée revient au module. Sans ce retour, un
@@ -3195,28 +3212,26 @@ mod tests {
             // lignes ferme sa signature par `) {` ou `) -> T {` **en colonne 0**,
             // donc sans cette exclusion tout son corps retombait en portée de
             // module. Mesuré : un littéral planté dans `emit_empty_backlog_signal`
-            // — dont la signature est multi-ligne — laissait le scan VERT.
+            // — dont la signature est multi-ligne — laissait le scan VERT. `>`
+            // couvre la continuation d'un générique ou d'un type de retour.
             let is_signature_continuation = trimmed.starts_with(')')
                 || trimmed.starts_with("where")
                 || trimmed.starts_with('{')
                 || trimmed.starts_with(',')
-                || trimmed.starts_with('+');
+                || trimmed.starts_with('+')
+                || trimmed.starts_with('>');
             if !trimmed.is_empty()
                 && !line.starts_with(char::is_whitespace)
                 && !is_signature_continuation
             {
                 current = String::from(MODULE_SCOPE);
             }
-            if let Some(rest) = trimmed
-                .strip_prefix("fn ")
-                .or_else(|| trimmed.strip_prefix("pub fn "))
-                .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
-                .or_else(|| trimmed.strip_prefix("pub(super) fn "))
-                .or_else(|| trimmed.strip_prefix("async fn "))
-                .or_else(|| trimmed.strip_prefix("pub async fn "))
-                .or_else(|| trimmed.strip_prefix("pub(crate) async fn "))
+            // `fn ` à n'importe quelle position, borné à gauche par une frontière
+            // de mot pour que `some_fn (` et `impl Fn(` ne comptent pas.
+            if let Some(i) = trimmed.find("fn ")
+                && (i == 0 || trimmed.as_bytes()[i - 1] == b' ')
             {
-                current = rest
+                current = trimmed[i + 3..]
                     .split(['(', '<', ' '])
                     .next()
                     .unwrap_or("<unnamed>")
@@ -3274,16 +3289,20 @@ mod tests {
         let expected_site = "crates/mika-agent/src/auto_pull.rs::<module scope>";
         let mut witnesses = 0usize;
 
+        // Lu UNE fois pour les trois aiguilles : la marche lit ~375 fichiers et
+        // 16 Mo, et les deux scans voisins de ce fichier l'appellent déjà au niveau
+        // supérieur. La coupe au module de test est obligatoire : le test de format
+        // de fil d'`auto_pull.rs` porte les trois noms en littéraux, et sans la
+        // coupe il compterait comme un second site.
+        let sources = production_sources_to_test_module();
+
         for needle in &names {
             let mut sites: Vec<String> = Vec::new();
-            // La coupe au module de test est obligatoire : le test de format de
-            // fil d'`auto_pull.rs` porte les trois noms en littéraux, et sans la
-            // coupe il compterait comme un second site.
-            for (rel, content) in production_sources_to_test_module() {
+            for (rel, content) in &sources {
                 if EMPTY_BACKLOG_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
                     continue;
                 }
-                for f in enclosing_fns_writing(&content, needle) {
+                for f in enclosing_fns_writing(content, needle) {
                     sites.push(format!("{rel}::{f}"));
                 }
             }

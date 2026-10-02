@@ -3388,37 +3388,55 @@ pub async fn auto_pull_groomed_ticket(
 /// Name the `ready` tickets that are stuck, with how long they have been so
 /// (mika#2161 AC3).
 ///
-/// One `find_active_self_dev_task_for_issue` per named ticket, capped at
-/// [`EMPTY_BACKLOG_STUCK_NAMED_MAX`] — paid only on cause (b), only when the
-/// candidate set is empty, so the nominal tick is unchanged.
+/// **Pure and synchronous**, from the rows the probe loop already resolved. It
+/// used to take `&AsyncDatabase` and re-query up to ten rows the same tick had
+/// just fetched and thrown away — which is also why the doc-comments at the probe
+/// site claimed an economy the code did not have, the shape mika#2304 names (*a
+/// field that asserts, with authority, the override that did not happen*). The
+/// probe now keeps its payload and this renders it: ten round trips removed on
+/// the (b) path, and the claim made true.
+///
+/// Consequence worth stating: the age is computed from `now` against the
+/// `in_flight_since` the probe read, so it is **identical** to what a re-query
+/// would give — that column does not move. What the cache does change is that the
+/// `status` reported is the probe's view rather than one taken milliseconds later,
+/// which is *more* consistent, not less: the census counted the ticket in flight
+/// on that same reading, so the message and its own `in_flight` number now
+/// describe one observation instead of two.
 ///
 /// `status` rides alongside the age because the two clocks are different facts:
 /// a `pending` row has not been dispatched, so its age is measured from its
 /// creation, and reporting that as "dispatched N seconds ago" would be a false
-/// statement wearing a measurement's authority (mika#2133 R4).
+/// statement wearing a measurement's authority (mika#2133 R4). `task_id` rides
+/// along because it is what makes the line *actionable* — the operator's next
+/// gesture is `mika tasks get <id>` or `mika tasks cancel <id>`, and without it
+/// they have to resolve the row by `reference_url` first (the friction mika#2335
+/// removed from the sibling surface).
 ///
-/// A ticket the probe found in flight a moment ago and that no longer resolves
-/// is reported **without** an age rather than dropped: the census counted it, and
-/// silently shortening the list would make the message disagree with its own
-/// `in_flight` number.
-async fn resolve_stuck_ready_tickets(db: &AsyncDatabase, in_flight_issues: &[u64]) -> String {
-    let now = chrono::Utc::now();
+/// A ticket the census counted but for which no row was captured is reported as
+/// such rather than dropped: silently shortening the list would make the message
+/// disagree with its own `in_flight` number. That arm is now defensive rather
+/// than routine — every member of `in_flight_issues` is, by construction, a
+/// number the probe resolved `Ok(Some(_))` on.
+fn resolve_stuck_ready_tickets(
+    in_flight_issues: &[u64],
+    probed: &HashMap<u64, InFlightSelfDevTask>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
     let mut rendered: Vec<String> = Vec::new();
 
     for n in in_flight_issues.iter().take(EMPTY_BACKLOG_STUCK_NAMED_MAX) {
-        let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
-        let detail = match db.find_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(Some(task)) => {
+        let detail = match probed.get(n) {
+            Some(task) => {
+                // The unit lives in the numeric branch: glued to the fallback it
+                // rendered `unknowns`, a unit on a non-numeric value reading as a
+                // plural noun.
                 let age = crate::timestamp::parse(&task.in_flight_since)
-                    .map(|since| (now - since).num_seconds().max(0).to_string())
-                    .unwrap_or_else(|_| "unknown".to_string());
-                format!("#{n}({},{}s)", task.status, age)
+                    .map(|since| format!("{}s", (now - since).num_seconds().max(0)))
+                    .unwrap_or_else(|_| "age-unparseable".to_string());
+                format!("#{n}({},{},{})", task.status, age, task.task_id)
             }
-            Ok(None) => format!("#{n}(no-longer-resolvable)"),
-            Err(e) => {
-                warn!(error = %e, issue = n, "auto_feeder: stuck-ticket age lookup failed");
-                format!("#{n}(age-unreadable)")
-            }
+            None => format!("#{n}(not-captured)"),
         };
         rendered.push(detail);
     }
@@ -3456,6 +3474,7 @@ async fn emit_empty_backlog_signal(
     db: &AsyncDatabase,
     census: &ReadyPoolCensus,
     cause: EmptyBacklogCause,
+    probed: &HashMap<u64, InFlightSelfDevTask>,
     min_ready: u32,
     trace_id: &str,
     session_id: &str,
@@ -3463,7 +3482,7 @@ async fn emit_empty_backlog_signal(
     let event = cause.event_name();
     let stuck = match cause {
         EmptyBacklogCause::PoolInFlight => {
-            resolve_stuck_ready_tickets(db, &census.in_flight_issues).await
+            resolve_stuck_ready_tickets(&census.in_flight_issues, probed, chrono::Utc::now())
         }
         // (a) and (c) name no ticket: (a) has no in-flight population, and (c)
         // has one the engine could not read — naming it would hand out the false
@@ -3520,9 +3539,11 @@ async fn emit_empty_backlog_signal(
 /// every tick, independent of queue depth.
 ///
 /// Reuses the shared `issues` + `open_pr` fetches (D1), `is_groomed`,
-/// `gh_apply_label`, the per-issue circuit breaker, and
-/// `has_active_self_dev_task_for_issue` verbatim. Returns the number of tickets
-/// promoted this tick.
+/// `gh_apply_label` and the per-issue circuit breaker verbatim. The in-flight
+/// probe goes through `find_active_self_dev_task_for_issue` — same cardinality as
+/// the `has_active_…` boolean it replaced (one query per target), and its payload
+/// is kept so the empty-backlog message does not have to fetch it a second time
+/// (mika#2161 U3). Returns the number of tickets promoted this tick.
 ///
 /// Emits `auto_feeder` audit events (R7/AC6): `auto_feeder_skip` when the pool
 /// already meets the threshold, `auto_feeder_promoted` per successful apply, and
@@ -3552,7 +3573,7 @@ async fn phase0_feed_ready_pool(
         return 0;
     }
 
-    // Build the in-flight set (D4): probe `has_active_self_dev_task_for_issue`
+    // Build the in-flight set (D4): probe `find_active_self_dev_task_for_issue`
     // over the union of ready tickets (for the pullable count) and pre-in-flight
     // groomed-not-ready candidates (for selection). Bounded by FEEDER_WORKING_SET_CAP
     // on the candidate side; the ready side is bounded by the small pool. A probe
@@ -3585,13 +3606,20 @@ async fn phase0_feed_ready_pool(
     // (AC6). What this buys is that the empty-backlog message can refuse to name
     // as in-flight a ticket the engine could not actually read.
     let mut probe_failed_issue_numbers: HashSet<u64> = HashSet::new();
+    // mika#2161: the resolved rows, KEPT rather than discarded. The probe already
+    // pays a round trip per target; the (b) message needs the age and status those
+    // rows carry, so re-querying them at emission time would be the same data
+    // fetched twice in one tick — up to ten extra round trips through the single
+    // DB worker thread, on a path that previously made none.
+    let mut probed_in_flight: HashMap<u64, InFlightSelfDevTask> = HashMap::new();
     for n in probe_targets {
         let issue_url = format!("https://github.com/{}/issues/{}", DEFAULT_REPO, n);
         // The `find_` form rather than the boolean: same single round trip, and
         // its answer carries the age AC3 needs (mika#2161 U3).
         match db.find_active_self_dev_task_for_issue(&issue_url).await {
-            Ok(Some(_)) => {
+            Ok(Some(task)) => {
                 in_flight_issue_numbers.insert(n);
+                probed_in_flight.insert(n, task);
             }
             Ok(None) => {}
             Err(e) => {
@@ -3653,7 +3681,16 @@ async fn phase0_feed_ready_pool(
             &probe_failed_issue_numbers,
         );
         let cause = classify_empty_backlog(&census);
-        emit_empty_backlog_signal(db, &census, cause, min_ready, trace_id, session_id).await;
+        emit_empty_backlog_signal(
+            db,
+            &census,
+            cause,
+            &probed_in_flight,
+            min_ready,
+            trace_id,
+            session_id,
+        )
+        .await;
         return 0;
     }
 
@@ -8536,12 +8573,27 @@ This ticket has been GROOMED and is ready.
             &HashSet::new(),
         );
         let stuck_cause = classify_empty_backlog(&stuck);
-        emit_empty_backlog_signal(&db, &stuck, stuck_cause, 3, "trace", "session").await;
+        // The rows the probe loop would have captured for those four tickets.
+        let probed: HashMap<u64, InFlightSelfDevTask> = stuck
+            .in_flight_issues
+            .iter()
+            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 600)))
+            .collect();
+        emit_empty_backlog_signal(&db, &stuck, stuck_cause, &probed, 3, "trace", "session").await;
 
         // Branch (a): a genuinely empty pool.
         let empty = census_ready_pool(&[], &HashSet::new(), &HashSet::new(), &HashSet::new());
         let empty_cause = classify_empty_backlog(&empty);
-        emit_empty_backlog_signal(&db, &empty, empty_cause, 3, "trace", "session").await;
+        emit_empty_backlog_signal(
+            &db,
+            &empty,
+            empty_cause,
+            &HashMap::new(),
+            3,
+            "trace",
+            "session",
+        )
+        .await;
 
         let rows: Vec<_> = db
             .get_audit_events("session")
@@ -8608,6 +8660,86 @@ This ticket has been GROOMED and is ready.
             empty_detail.contains("stuck=[]"),
             "(a) names nobody — an empty pool has no in-flight population; \
              detail = {empty_detail}"
+        );
+    }
+
+    /// A captured probe row, dated `secs` ago.
+    fn probed_row(task_id: &str, status: &str, secs: i64) -> InFlightSelfDevTask {
+        InFlightSelfDevTask {
+            task_id: task_id.to_string(),
+            status: status.to_string(),
+            in_flight_since: crate::timestamp::format(
+                chrono::Utc::now() - chrono::Duration::seconds(secs),
+            ),
+        }
+    }
+
+    /// **The (b) message renders status, age and task id, from the probe's own
+    /// rows** (DoD 4, AC3) — and says when it truncates.
+    ///
+    /// Eleven stuck tickets against a cap of ten: the list names ten and then says
+    /// how many it left out. Without that, a reader would take the list for the
+    /// population — and the population is the `in_flight` count on the same line,
+    /// which would then silently disagree with it.
+    ///
+    /// Pure and synchronous since the probe keeps its payload: no DB, which is
+    /// also the measure that the ten re-queries are gone.
+    #[test]
+    fn mika2161_le_message_dit_quand_il_tronque() {
+        let over_cap: Vec<u64> = (3000..3000 + EMPTY_BACKLOG_STUCK_NAMED_MAX as u64 + 1).collect();
+        let probed: HashMap<u64, InFlightSelfDevTask> = over_cap
+            .iter()
+            .map(|n| (*n, probed_row(&format!("task-{n}"), "in_progress", 8234)))
+            .collect();
+        let rendered = resolve_stuck_ready_tickets(&over_cap, &probed, chrono::Utc::now());
+
+        assert!(
+            rendered.contains("(+1 more)"),
+            "the message must say it truncated; rendered = {rendered}"
+        );
+        assert_eq!(
+            rendered.matches('#').count(),
+            EMPTY_BACKLOG_STUCK_NAMED_MAX,
+            "exactly `EMPTY_BACKLOG_STUCK_NAMED_MAX` tickets are named; \
+             rendered = {rendered}"
+        );
+        // AC3: status, age in seconds, and the task id that makes the line
+        // actionable (`mika tasks get <id>`).
+        assert!(
+            rendered.contains("#3000(in_progress,8234s,task-3000)"),
+            "rendered = {rendered}"
+        );
+        // The unit belongs to the numeric branch: glued to a fallback it rendered
+        // `unknowns`.
+        assert!(!rendered.contains("unknowns"), "rendered = {rendered}");
+
+        // Negative control: at or under the cap, nothing is announced.
+        let under_cap: Vec<u64> = (3000..3000 + EMPTY_BACKLOG_STUCK_NAMED_MAX as u64).collect();
+        let rendered = resolve_stuck_ready_tickets(&under_cap, &probed, chrono::Utc::now());
+        assert!(
+            !rendered.contains("more)"),
+            "a complete list must not claim a truncation; rendered = {rendered}"
+        );
+
+        // A census member with no captured row is named, never dropped — else the
+        // list would disagree with the `in_flight` count beside it. Defensive: the
+        // probe resolves every member before the census can push it.
+        let rendered = resolve_stuck_ready_tickets(&[4242], &HashMap::new(), chrono::Utc::now());
+        assert_eq!(rendered, "#4242(not-captured)");
+
+        // An unparseable stored instant degrades the age and keeps the row.
+        let mut bad = HashMap::new();
+        bad.insert(
+            77u64,
+            InFlightSelfDevTask {
+                task_id: "task-77".to_string(),
+                status: "pending".to_string(),
+                in_flight_since: "not-a-timestamp".to_string(),
+            },
+        );
+        assert_eq!(
+            resolve_stuck_ready_tickets(&[77], &bad, chrono::Utc::now()),
+            "#77(pending,age-unparseable,task-77)"
         );
     }
 

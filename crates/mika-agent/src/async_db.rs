@@ -912,8 +912,11 @@ impl AsyncDatabase {
     /// The oldest active self_dev task referencing this issue (mika#2161 U3).
     ///
     /// The sole SQL site behind [`Self::has_active_self_dev_task_for_issue`]; the
-    /// feeder's probe loop calls **this** one so the same round trip that answers
-    /// "is it in flight?" also carries the age the (b) message names.
+    /// feeder's probe loop calls **this** one and **keeps the row**, so the same
+    /// round trip that answers "is it in flight?" also carries the age the (b)
+    /// message names. Discarding the payload here is what would make that sentence
+    /// false — it was, briefly, and the message then re-queried ten rows the tick
+    /// had already fetched.
     pub async fn find_active_self_dev_task_for_issue(
         &self,
         issue_url: &str,
