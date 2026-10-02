@@ -4584,11 +4584,24 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// la réponse compte. C'est la leçon que `grooming_marker` a dû graver une
     /// fois (mika#2158) et que `live_pilot` a payée une seconde (mika#2335).
     ///
-    /// **Ce que ce scan n'attrape pas, nommé :** un `GLOB`, un `instr`, ou une
-    /// comparaison écrite dans un `format!` dont les deux termes sont sur des
-    /// lignes différentes. Le prédicat porte sur la **forme réelle du défaut**
-    /// (les deux sites mesurés tenaient sur une ligne), et l'élargir à du SQL
-    /// multi-ligne demanderait de parser le SQL plutôt que de le lire.
+    /// **Deux lectures, et la seconde existe parce qu'une revue a mesuré le
+    /// trou de la première.** (1) Ligne par ligne, sensible à la casse : la
+    /// colonne et `LIKE` sur la même ligne, dans n'importe quel ordre — la
+    /// forme réelle des deux sites mesurés. (2) Sur la source **normalisée**
+    /// (blancs fusionnés, casse repliée) : la colonne **immédiatement suivie**
+    /// du mot `LIKE`. C'est elle qui voit `AND reference_url\n  LIKE ?2` (un
+    /// littéral SQL reformaté sur deux lignes) et `reference_url like ?2` (les
+    /// mots-clés SQLite ne sont pas sensibles à la casse) — deux formes sur
+    /// lesquelles la lecture (1) restait verte. La frontière de mot après
+    /// `LIKE` est porteuse : sans elle, une ligne de code nommant
+    /// `reference_url likely_…` serait un faux positif.
+    ///
+    /// **Ce que ce scan n'attrape toujours pas, nommé :** un `GLOB`, un
+    /// `instr`, une comparaison d'égalité épelée à la main
+    /// (`reference_url = ?2 OR reference_url = ?3`, couverte en partie par D5
+    /// seulement si elle passe par `IN (`), ou un opérateur assemblé à
+    /// l'exécution. Les couvrir demanderait de parser le SQL plutôt que de le
+    /// lire.
     #[test]
     fn mika2638_la_couche_db_ne_compare_pas_une_url_dissue_par_prefixe() {
         // Composés à l'exécution pour que CE fichier ne se dénonce pas
@@ -4623,10 +4636,12 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
                 }
                 // La moitié POSITIVE : les sites déjà délimités. Elle sert
                 // l'anti-vacuité plus bas.
-                // Normalisé pour les mêmes raisons que D5 ci-dessous : `IN(`
-                // sans espace, ou la colonne et l'opérateur séparés par un
-                // retour à la ligne, sont des formes que `cargo fmt` ne touche
-                // pas dans un littéral SQL.
+                // Normalisé pour `IN(` sans espace, forme que `cargo fmt` ne
+                // touche pas dans un littéral SQL. La normalisation porte sur
+                // UNE ligne : une colonne et son `IN` sur deux lignes font
+                // baisser ce compte, et l'anti-vacuité rougit — bruyamment,
+                // donc acceptable. C'est la moitié NÉGATIVE qui ne pouvait pas
+                // se permettre ce trou, d'où la lecture (2) ci-dessous.
                 let compacte = t.split_whitespace().collect::<Vec<_>>().join(" ");
                 if compacte.contains(" IN (") || compacte.contains(" IN(") {
                     population_in += 1;
@@ -4641,6 +4656,37 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
                     continue;
                 }
                 offenders.push(format!("{rel}: {}", t.trim()));
+            }
+
+            // Lecture (2) : la source normalisée, casse repliée. Voit la
+            // colonne et `LIKE` séparés par un retour à la ligne, et un `like`
+            // minuscule — deux formes que la lecture (1) laisse passer.
+            let normalisee = production
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_uppercase();
+            let aiguille = format!("{} {}", colonne.to_ascii_uppercase(), operateur);
+            for (debut, _) in normalisee.match_indices(&aiguille) {
+                let suite = &normalisee[debut + aiguille.len()..];
+                // Frontière de mot : `LIKELY` n'est pas `LIKE`.
+                if suite
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let extrait: String = normalisee[debut..].chars().take(96).collect();
+                if REFERENCE_URL_LIKE_ALLOWED
+                    .iter()
+                    .any(|(donnee, _)| extrait.starts_with(&donnee.to_ascii_uppercase()))
+                {
+                    continue;
+                }
+                // Un site vu par les deux lectures apparaît deux fois dans le
+                // message d'échec : redondant, jamais faux.
+                offenders.push(format!("{rel} (normalisé): {extrait}"));
             }
         }
 
@@ -4659,9 +4705,9 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`).\n\n\
              DEUX LECTURES, et la seconde est la plus probable : soit une requête \
              protégée a disparu, soit ce seuil est à zéro marge et vous venez de \
-             REFORMATER un littéral SQL. La recherche est faite sur la forme \
-             normalisée en espaces simples, donc un retour à la ligne ne devrait \
-             pas suffire — mais renommer la colonne ou scinder la requête, oui. \
+             REFORMATER un littéral SQL. Ce compte se fait LIGNE PAR LIGNE : une \
+             colonne et son `IN (` posés sur deux lignes suffisent à le faire \
+             baisser, tout comme renommer la colonne ou scinder la requête. \
              Vérifiez d'abord les cinq sites avant de toucher au scan."
         );
 
