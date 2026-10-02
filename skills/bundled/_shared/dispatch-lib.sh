@@ -7962,6 +7962,23 @@ _second_pass_retry_prompt() {
     printf '%s' "$f"
 }
 
+# mika#2641 — une ligne de disposition ITERATE explicite en seconde passe.
+#
+# `_parse_verdict` n'a délibérément aucun bras ITERATE (pas de troisième passe),
+# donc une seconde passe qui écrit `Disposition: ITERATE` rend une chaîne vide,
+# exactement comme une réponse tronquée. Ce n'est pourtant PAS un illisible :
+# AC1 exclut nommément ITERATE (« ni READY, ni ITERATE, ni ESCALATE
+# explicite »). C'est une objection lisible, et elle garde le terminal d'avant
+# mika#2641 — cause `verdict`, sans relance — plutôt que d'être relancée puis
+# étiquetée « absence de signal ». Lu ancré en début de ligne (emphase markdown
+# tolérée) : un préambule qui CITE la disposition de première passe en prose ne
+# doit pas priver la réponse de sa relance.
+#
+# Stdin : la réponse de l'architecte. Retour : 0 si une telle ligne existe.
+_second_pass_explicit_iterate() {
+    grep -qE '^[[:space:]>*_`-]*(Verdict|Disposition)[*_`]*:[[:space:]*_`]*ITERATE([^[:alnum:]_]|$)'
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271).
     #
@@ -8109,7 +8126,7 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
             # terminal — groom perdu, et gel de tout re-dispatch par mika#2545.
             # Mesuré le 2026-10-02 sur le groom de mika#2617, dont le fichier de
             # constats préservé ne contenait qu'un préambule de deux phrases.
-            local resp2 content2 verdict attempt2 forensic2=""
+            local resp2 content2 verdict attempt2 forensic2="" explicit_iterate2=0
             for attempt2 in 1 2; do
                 local _pass_label2="second-pass"
                 if [ "$attempt2" -eq 1 ]; then
@@ -8180,12 +8197,22 @@ ${content2}"
                         break
                         ;;
                 esac
+                # Une ITERATE explicite est une objection lisible, pas un
+                # illisible : aucune relance (AC1 l'exclut nommément).
+                if printf '%s' "$content2" | _second_pass_explicit_iterate; then
+                    explicit_iterate2=1
+                    break
+                fi
                 if [ "$attempt2" -eq 1 ]; then
                     _groom_warn "second-pass verdict UNPARSED (after a READY first pass); retrying _arch_ask once with a corrective prompt (mika#2641)"
                 fi
             done
 
-            case "$verdict" in
+            # Une ITERATE explicite prend le terminal d'un refus — cause
+            # `verdict`, `RESULT` d'avant mika#2641 à l'octet près.
+            local route2="$verdict"
+            [ "$explicit_iterate2" -eq 1 ] && route2="ESCALATE"
+            case "$route2" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
@@ -8197,8 +8224,11 @@ ${content2}"
                 ESCALATE)
                     # AC3 — un refus EXPLICITE reste terminal, et son `RESULT`
                     # est identique à l'octet près au comportement d'avant.
+                    # `$forensic2` vaut `$content2` sans relance ; après une
+                    # relance il garde la 1ʳᵉ tentative dans le fichier de
+                    # constats, et `RESULT` ne porte que son chemin.
                     GROOM_LOOP_FAILURE_REASON="architect refused on second pass after a READY first pass"
-                    _escalate_groom "second-pass-after-ready" "$content2" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
+                    _escalate_groom "second-pass-after-ready" "$forensic2" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
                     return 1
                     ;;
                 *)
@@ -8241,7 +8271,7 @@ ${content2}"
             #
             # Deux `case` distincts, donc un seul corrigé se lirait exactement
             # comme deux : V6 épingle ce site séparément pour cette raison.
-            local resp2_iter content2_iter verdict_iter attempt2i forensic2i=""
+            local resp2_iter content2_iter verdict_iter attempt2i forensic2i="" explicit_iterate2i=0
             for attempt2i in 1 2; do
                 local _pass_label2i="second-pass (after revise)"
                 if [ "$attempt2i" -eq 1 ]; then
@@ -8295,12 +8325,19 @@ ${content2_iter}"
                         break
                         ;;
                 esac
+                # Une ITERATE explicite : voir le site after-ready.
+                if printf '%s' "$content2_iter" | _second_pass_explicit_iterate; then
+                    explicit_iterate2i=1
+                    break
+                fi
                 if [ "$attempt2i" -eq 1 ]; then
                     _groom_warn "second-pass verdict UNPARSED (after an ITERATE revise); retrying _arch_ask once with a corrective prompt (mika#2641)"
                 fi
             done
 
-            case "$verdict_iter" in
+            local route2i="$verdict_iter"
+            [ "$explicit_iterate2i" -eq 1 ] && route2i="ESCALATE"
+            case "$route2i" in
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
@@ -8311,7 +8348,7 @@ ${content2_iter}"
                     ;;
                 ESCALATE)
                     GROOM_LOOP_FAILURE_REASON="architect refused on second pass after an ITERATE revise"
-                    _escalate_groom "second-pass-after-iterate" "$content2_iter" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
+                    _escalate_groom "second-pass-after-iterate" "$forensic2i" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
                     return 1
                     ;;
                 *)

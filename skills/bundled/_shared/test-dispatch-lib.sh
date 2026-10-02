@@ -11209,6 +11209,10 @@ Disposition: ITERATE"
             "$(printf '%s\n' "$RESULT" | grep -c '^Outcome: ESCALATE' || true)"
         printf 'terminal_marker_lines=%s\n' \
             "$(printf '%s\n' "$RESULT" | grep -c '^GROOM ESCALATED (terminal):' || true)"
+        # Le fichier de constats préservé : combien de sections de relance il
+        # porte (0 = seule la dernière réponse a été écrite).
+        printf 'findings_retry_sections=%s\n' \
+            "$(cat "$wt"/.iterate/escalate-*.md 2>/dev/null | grep -c '^--- retry attempt' || true)"
         printf 'RESULT_BEGIN\n%s\nRESULT_END\n' "$RESULT"
         sed 's/^/stderr: /' "$tmp/err" 2>/dev/null || true
     )
@@ -11263,6 +11267,69 @@ assert_contains "mika#2641 (V2): un refus réel ne porte PAS de motif architect_
     "halt_cause_lines=0" "$M2641_EXPLICIT"
 assert_contains "mika#2641 (V2): le motif d'échec d'un refus réel est inchangé" \
     "reason=architect refused on second pass after a READY first pass" "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): sans relance, le fichier de constats n'a qu'une tentative" \
+    "findings_retry_sections=0" "$M2641_EXPLICIT"
+
+# --- V2-bis : la relance rend un ESCALATE explicite -------------------------
+#
+# Le refus est réel, donc cause `verdict` (ligne Verdict:, aucun motif) — et la
+# 1ʳᵉ tentative, la plus riche, reste dans le fichier de constats au lieu d'être
+# écrasée par la réponse au prompt correctif.
+M2641_RETRY_ESC=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" 'F1: le plan ne porte pas de contrat de sortie.
+
+Verdict: ESCALATE') || M2641_RETRY_ESC=""
+
+assert_contains "mika#2641 (V2-bis): la sonde a mené la boucle jusqu'au 3e appel" \
+    "arch_calls=3" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): un refus obtenu à la relance reste terminal" \
+    "rc=1" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): le trail porte UNPARSED puis ESCALATE-after-retry" \
+    "trail_outcomes=READY,UNPARSED,ESCALATE-after-retry" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): la ligne Verdict: est posée (refus réel)" \
+    "verdict_lines=1" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): aucun motif architect_unreadable" \
+    "halt_cause_lines=0" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): le fichier de constats garde les deux tentatives" \
+    "findings_retry_sections=1" "$M2641_RETRY_ESC"
+
+# --- V10 (AC1) : une ITERATE explicite n'est PAS un illisible ---------------
+#
+# AC1 : « ni READY, ni ITERATE, ni ESCALATE explicite ». `_parse_verdict` n'a
+# pas de bras ITERATE, donc sans terme dédié une objection lisible serait
+# relancée puis étiquetée « absence de signal » — l'inverse du défaut fondateur.
+M2641_ITER_EXPL=$(_groom_second_pass_probe_2641 ready 'F1: le contrat de sortie manque encore.
+
+Disposition: ITERATE' 'JAMAIS ATTEINT') || M2641_ITER_EXPL=""
+
+assert_contains "mika#2641 (V10): une ITERATE explicite ne déclenche AUCUNE relance" \
+    "arch_calls=2" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): elle reste terminale" \
+    "rc=1" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): cause verdict — la ligne Verdict: est posée" \
+    "verdict_lines=1" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): aucun motif architect_unreadable" \
+    "halt_cause_lines=0" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): le motif d'échec est celui d'un refus, comme avant" \
+    "reason=architect refused on second pass after a READY first pass" "$M2641_ITER_EXPL"
+
+M2641_ITER_EXPL_I=$(_groom_second_pass_probe_2641 iterate '**Verdict:** ITERATE' 'JAMAIS ATTEINT') \
+    || M2641_ITER_EXPL_I=""
+assert_contains "mika#2641 (V10): after-iterate — aucune relance sur une ITERATE explicite" \
+    "arch_calls=2" "$M2641_ITER_EXPL_I"
+assert_contains "mika#2641 (V10): after-iterate — cause verdict, aucun motif" \
+    "halt_cause_lines=0" "$M2641_ITER_EXPL_I"
+assert_contains "mika#2641 (V10): after-iterate — le motif d'échec est inchangé" \
+    "reason=architect refused on second pass after an ITERATE revise" "$M2641_ITER_EXPL_I"
+
+# Contrôle négatif de l'ANCRAGE : un préambule qui CITE la disposition de 1ʳᵉ
+# passe en prose n'est pas une ligne de disposition — il garde sa relance.
+M2641_ITER_PROSE=$(_groom_second_pass_probe_2641 ready 'Ma première passe rendait Disposition: ITERATE ; je relis le plan révisé.' 'A1: « Ligne de corps 3 — rembourrage rembourrage rembourrage. »
+
+Verdict: GROOMED') || M2641_ITER_PROSE=""
+assert_contains "mika#2641 (V10): une ITERATE citée en prose est relancée" \
+    "arch_calls=3" "$M2641_ITER_PROSE"
+assert_contains "mika#2641 (V10): et la relance converge" \
+    "rc=0" "$M2641_ITER_PROSE"
 
 # --- V3 (AC2) : deux illisibles d'affilée → ESCALATE à motif distinct -------
 
