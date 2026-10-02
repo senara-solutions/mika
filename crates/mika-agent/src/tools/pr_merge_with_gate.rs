@@ -41,12 +41,16 @@ impl Tool for PrMergeWithGateTool {
         ToolDefinition {
             name: "pr_merge_with_gate".to_string(),
             description: "Merge a GitHub pull request with a CI gate. Checks the status of \
-                required CI checks before merging. If any required check is failing, the merge \
-                is blocked and the failing checks are returned. If checks are still pending \
-                (but none failing), auto-merge is enabled so GitHub merges automatically when \
-                checks pass. If all required checks pass, the PR is merged immediately.\n\n\
-                IMPORTANT: 'auto_merge_enabled' means GitHub will merge when all checks pass — \
-                the PR is NOT yet merged. Do not claim the PR is merged until you confirm it.\n\n\
+                EVERY check on the PR head — not only the ones branch protection marks as \
+                required. If any check is failing or cancelled, the merge is blocked and the \
+                failing checks are named. If any check is still running (but none failing), \
+                the merge is blocked as 'checks_pending' and the gate WAITS — it does not \
+                enable GitHub auto-merge, which would fire on required checks only. If every \
+                check passed or was skipped, the PR is merged immediately.\n\n\
+                IMPORTANT: blocked/'checks_pending' is a HOLD, not a failure. Nothing is \
+                wrong with the PR; its CI is still running. Do NOT retry in a loop and do NOT \
+                fall back to `run_gh pr merge`. End the turn — the merge re-enters by itself \
+                when the next `check_suite.completed(success)` arrives.\n\n\
                 IMPORTANT: 'branch_updated' means the PR was behind main and GitHub accepted an \
                 update of its branch. No merge was attempted. Do NOT call this tool again for \
                 this PR in the same turn and do NOT rebase by hand — the update moves the head \
@@ -56,8 +60,9 @@ impl Tool for PrMergeWithGateTool {
                 After a successful merge (action: 'merged'), update the task status before \
                 reporting to the user.\n\n\
                 Returns a structured JSON response with an 'action' field. Possible actions: \
-                'merged', 'auto_merge_enabled', 'blocked', 'already_merged', 'gate_errored', \
-                'branch_updated'. Branch on 'action' to determine next steps."
+                'merged', 'blocked', 'already_merged', 'gate_errored', 'branch_updated'. \
+                ('auto_merge_enabled' is a retired action kept for old records — no call \
+                produces it any more.) Branch on 'action' to determine next steps."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -249,7 +254,7 @@ impl Tool for PrMergeWithGateTool {
             return emit_gate_result(result, ctx).await;
         }
 
-        // -- Step 2: Fetch required check statuses --
+        // -- Step 2: Fetch EVERY check status of the head (mika#2617) --
         let checks_result = run_gh_checks(pr_number, repo, token).await;
         let checks = match checks_result {
             Ok(c) => c,
@@ -266,29 +271,39 @@ impl Tool for PrMergeWithGateTool {
             }
         };
 
-        // -- Step 3: Classify and act --
-        let classification = classify_checks(&checks);
+        // -- Step 3: Decide (pure) and act --
+        //
+        // A bucket outside the known vocabulary is reported and left
+        // non-blocking (mika#2617, plan R6): refusing on it would break merging
+        // on another `gh` version, i.e. trade a red `main` for a stopped loop.
+        // Nothing is emitted on the nominal path (doctrine mika#2131).
+        for (name, bucket) in unknown_buckets(&checks) {
+            warn!(
+                event = "merge_gate_unknown_check_bucket",
+                repo,
+                pr = pr_number,
+                name,
+                bucket,
+                "gh returned a check bucket outside the known set — it is NOT blocking (mika#2617)"
+            );
+        }
+
+        let decision = decide_merge_gate(&checks);
 
         // -- Step 3a: A red PR is reported as red, before anything else --
         // This arm runs ahead of the behind-main step below so a PR that is both
         // behind and failing reports the failing checks, not "branch updated".
-        if classification == CheckClassification::HasFailures {
-            let failing: Vec<CheckInfo> = checks
-                .iter()
-                .filter(|c| matches!(c.bucket.as_str(), "fail" | "cancel"))
-                .map(|c| CheckInfo {
-                    name: c.name.clone(),
-                    state: c.state.clone(),
-                    link: c.link.clone(),
-                })
-                .collect();
-
+        if let MergeGateDecision::ChecksFailed { failing } = &decision {
             let result = MergeGateResult::Blocked {
                 reason: BlockReason::RequiredCheckFailed {
                     failing_checks: failing.clone(),
                 },
                 failing_checks: failing.clone(),
-                detail: format!("{} required check(s) failed", failing.len()),
+                detail: format!(
+                    "{} check(s) failed on this head: {}",
+                    failing.len(),
+                    describe_checks(failing)
+                ),
             };
             return emit_gate_result(result, ctx).await;
         }
@@ -329,57 +344,48 @@ impl Tool for PrMergeWithGateTool {
             }
         }
 
-        match classification {
+        match decision {
             // Handled above by step 3a, which returns.
-            CheckClassification::HasFailures => unreachable!("HasFailures returns at step 3a"),
-            CheckClassification::HasPending => {
-                // Enable auto-merge — GitHub merges when checks pass
-                let auto_result =
-                    run_gh_merge(pr_number, repo, merge_method, delete_branch, true, token).await;
-
-                match auto_result {
-                    Ok(_output) => {
-                        // mika#1211: persist pr_url on supervisor so the orphan
-                        // reaper (#871) doesn't flip it to `failed` and the
-                        // parent-completer (mika#1162) can promote it to
-                        // `completed` once the dispatch callback ages past
-                        // REAPER_GRACE_SECONDS. Mirrors the metadata-write
-                        // pattern in dispatcher::try_extract_callback_metadata.
-                        let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
-                        write_auto_merge_pr_url_to_supervisor(ctx, &pr_url).await;
-
-                        let pending: Vec<CheckInfo> = checks
-                            .iter()
-                            .filter(|c| c.bucket == "pending")
-                            .map(|c| CheckInfo {
-                                name: c.name.clone(),
-                                state: c.state.clone(),
-                                link: None,
-                            })
-                            .collect();
-
-                        let result = MergeGateResult::AutoMergeEnabled {
-                            pending_checks: pending,
-                        };
-                        emit_gate_result(result, ctx).await
-                    }
-                    Err(e) => {
-                        let result = classify_credential_scope_error(&e, repo).unwrap_or(
-                            MergeGateResult::GateError {
-                                kind: GateErrorKind::GhCliFailure {
-                                    exit_code: parse_exit_code_from_error(&e),
-                                },
-                                detail: format!("Auto-merge failed: {e}"),
-                            },
-                        );
-                        emit_gate_result(result, ctx).await
-                    }
-                }
+            MergeGateDecision::ChecksFailed { .. } => {
+                unreachable!("ChecksFailed returns at step 3a")
             }
-            CheckClassification::AllPassed => {
+            MergeGateDecision::ChecksPending { pending } => {
+                // mika#2617 U2: refuse and wait, never `--auto`. GitHub's
+                // auto-merge fires on the REQUIRED checks alone, so arming it
+                // here would hand the merge decision back to the definition of
+                // "green" this ticket exists to stop using.
+                //
+                // mika#1211: persist pr_url on supervisor so the orphan reaper
+                // (#871) doesn't flip it to `failed` and the parent-completer
+                // (mika#1162) can promote it to `completed` once the dispatch
+                // callback ages past REAPER_GRACE_SECONDS. The call MOVED here
+                // from the auto-merge arm — it is the same need (a supervisor
+                // whose child is waiting on a PR that is open and not merged),
+                // and dropping it with the arm would have let a healthy
+                // supervisor be reaped 600 s later.
+                let pr_url = format!("https://github.com/{repo}/pull/{pr_number}");
+                write_pending_pr_url_to_supervisor(ctx, &pr_url).await;
+
+                let result = MergeGateResult::Blocked {
+                    reason: BlockReason::ChecksPending {
+                        pending_checks: pending.clone(),
+                    },
+                    failing_checks: vec![],
+                    detail: format!(
+                        "{} check(s) still running on this head: {}. The gate waits: \
+                         GitHub auto-merge fires on required checks only, which is not \
+                         what this gate reads (mika#2617). The merge re-enters by itself \
+                         on the next `check_suite.completed(success)`.",
+                        pending.len(),
+                        describe_checks(&pending)
+                    ),
+                };
+                emit_gate_result(result, ctx).await
+            }
+            MergeGateDecision::AllChecksPassed => {
                 // Merge immediately
                 let merge_result =
-                    run_gh_merge(pr_number, repo, merge_method, delete_branch, false, token).await;
+                    run_gh_merge(pr_number, repo, merge_method, delete_branch, token).await;
 
                 // Unify success/error into a single string for "already merged" detection
                 let (output, is_err) = match merge_result {
@@ -517,6 +523,14 @@ const CREDENTIAL_SCOPE_NEUTRAL_DETAIL: &str = "This pull request cannot be merge
 pub(crate) enum MergeGateResult {
     #[serde(rename = "merged")]
     Merged,
+    /// **No site produces this since 2026-10-02 (mika#2617 U2).**
+    ///
+    /// Kept as a wire format, not renamed and not removed: a `tasks.result`
+    /// persisted before that date can carry it, and the three `self-dev*`
+    /// prompts still describe it. What replaced it is
+    /// [`BlockReason::ChecksPending`] — a refusal instead of a delegation of
+    /// the merge decision to branch protection.
+    #[allow(dead_code)]
     #[serde(rename = "auto_merge_enabled")]
     AutoMergeEnabled { pending_checks: Vec<CheckInfo> },
     #[serde(rename = "blocked")]
@@ -560,9 +574,33 @@ pub(crate) enum BlockReason {
     /// PR is CONFLICTING or mergeStateStatus is DIRTY.
     #[serde(rename = "merge_conflict")]
     MergeConflict,
-    /// One or more required CI checks failed.
+    /// One or more CI checks failed or were cancelled.
+    ///
+    /// **The wire name keeps the word "required" and that word is a vestige,
+    /// dated here rather than renamed (mika#2617).** It is carried by the
+    /// `BlockReason` taxonomy of the three `self-dev*` prompts (same precedent
+    /// as `reviewer_cannot_merge`, mika#2248), so renaming it would break a
+    /// contract for a cosmetic gain. Since mika#2617 the population is **every**
+    /// red check of the head, required by branch protection or not; what changed
+    /// to say so is the `detail`, which now names the checks instead of counting
+    /// "required" ones.
     #[serde(rename = "required_check_failed")]
     RequiredCheckFailed { failing_checks: Vec<CheckInfo> },
+    /// At least one check is still running, and the gate waits rather than
+    /// delegating the wait to GitHub (mika#2617 U2).
+    ///
+    /// This replaces [`MergeGateResult::AutoMergeEnabled`] on the tool path. The
+    /// old arm armed `gh pr merge --auto`, and GitHub then merges as soon as the
+    /// **required** checks pass — i.e. under the definition of "green" this
+    /// ticket exists to stop using. Reading every check and then arming `--auto`
+    /// would have left the fix inert on exactly that path.
+    ///
+    /// Nothing is lost by refusing here: `ci_success_handler` already re-enters
+    /// the merge path on `check_suite.completed(success)` and demands a strict
+    /// `AllPassed` (mika#571), so it is both the re-entry point and the only one
+    /// of the two that uses our own definition of green.
+    #[serde(rename = "checks_pending")]
+    ChecksPending { pending_checks: Vec<CheckInfo> },
     /// Branch protection requires approval reviews.
     #[serde(rename = "missing_approval")]
     MissingApproval,
@@ -780,6 +818,105 @@ pub(crate) fn classify_checks(checks: &[GhCheck]) -> CheckClassification {
     }
 }
 
+/// The bucket vocabulary [`classify_checks`] actually decides on.
+///
+/// `skipping` and `neutral`-shaped buckets fall into `AllPassed` by design —
+/// AC1 asks for it in as many words. What this constant exists for is the
+/// **fourth** case: a bucket `gh` adds tomorrow would be born non-blocking, a
+/// fail-open on a merge gate. The policy is deliberately unchanged (refusing on
+/// an unknown bucket would break merging on another `gh` version, i.e. trade a
+/// red `main` for a stopped loop); only its silence is.
+pub(crate) const KNOWN_CHECK_BUCKETS: &[&str] =
+    &["pass", "fail", "pending", "skipping", "cancel", "neutral"];
+
+/// `(name, bucket)` of every check whose bucket is outside [`KNOWN_CHECK_BUCKETS`].
+///
+/// Pure, so the WARN its caller emits is testable without a subprocess. Returns
+/// an empty vec on the nominal path — no line is emitted per evaluation
+/// (doctrine mika#2131).
+pub(crate) fn unknown_buckets(checks: &[GhCheck]) -> Vec<(&str, &str)> {
+    checks
+        .iter()
+        .filter(|c| !KNOWN_CHECK_BUCKETS.contains(&c.bucket.as_str()))
+        .map(|c| (c.name.as_str(), c.bucket.as_str()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Gate decision (pure function — mika#2617, plan R12)
+// ---------------------------------------------------------------------------
+
+/// What the check list alone says the gate must do.
+///
+/// **Extracted rather than tested through `execute`**, because `execute` offers
+/// no seam: it calls `run_gh_checks` and `run_gh_merge` directly, on free
+/// functions, with nothing substitutable. Opening one would move the confidence
+/// from a compiler-checked shape onto a subprocess fixture; the house motif is
+/// the opposite — pull the decision out and let `execute` be the plumbing
+/// (`decide_content_net` mika#2270, `classify_wrapper_activity` mika#2184,
+/// `screen_target_purges` mika#2619).
+///
+/// `execute` matches this **exhaustively, with no `_ =>` arm**, so a variant
+/// added by phase B or C cannot fall into a silent default.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum MergeGateDecision {
+    /// At least one check is red or cancelled — refuse, naming them.
+    ChecksFailed { failing: Vec<CheckInfo> },
+    /// No check is red and at least one is still running — refuse, naming them.
+    ///
+    /// This is the arm mika#2617 U2 turned from a merge into a refusal: it used
+    /// to arm `gh pr merge --auto`, which hands the decision back to branch
+    /// protection — the very definition of "green" this ticket exists to stop
+    /// using. See [`BlockReason::ChecksPending`].
+    ChecksPending { pending: Vec<CheckInfo> },
+    /// Every check passed, was skipped, or there is none — merge now.
+    AllChecksPassed,
+}
+
+/// Decide the gate's check arm from the check list and nothing else.
+pub(crate) fn decide_merge_gate(checks: &[GhCheck]) -> MergeGateDecision {
+    match classify_checks(checks) {
+        CheckClassification::HasFailures => MergeGateDecision::ChecksFailed {
+            failing: collect_checks(checks, &["fail", "cancel"], true),
+        },
+        CheckClassification::HasPending => MergeGateDecision::ChecksPending {
+            pending: collect_checks(checks, &["pending"], false),
+        },
+        CheckClassification::AllPassed => MergeGateDecision::AllChecksPassed,
+    }
+}
+
+/// Project the checks of the given buckets into the wire shape.
+///
+/// `keep_link` is false for pending checks: a run still in flight has no useful
+/// log to point at, and the historical `auto_merge_enabled` payload carried
+/// `link: None` there — keeping that shape means the field's absence stays
+/// "nothing to link", never "we stopped reading it".
+fn collect_checks(checks: &[GhCheck], buckets: &[&str], keep_link: bool) -> Vec<CheckInfo> {
+    checks
+        .iter()
+        .filter(|c| buckets.contains(&c.bucket.as_str()))
+        .map(|c| CheckInfo {
+            name: c.name.clone(),
+            state: c.state.clone(),
+            link: if keep_link { c.link.clone() } else { None },
+        })
+        .collect()
+}
+
+/// Human-readable list of check names, for the `detail` an operator reads.
+///
+/// AC3 asks that the refusal **name** the check. The count it replaced
+/// (`"{} required check(s) failed"`) carried neither the name nor, after
+/// mika#2617, a true adjective.
+pub(crate) fn describe_checks(checks: &[CheckInfo]) -> String {
+    checks
+        .iter()
+        .map(|c| format!("{} ({})", c.name, c.state))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ---------------------------------------------------------------------------
 // Subprocess helpers
 // ---------------------------------------------------------------------------
@@ -816,7 +953,7 @@ pub(crate) async fn run_gh_pr_view(
     })
 }
 
-/// Run `gh pr checks <number> --repo <repo> --required --json name,state,bucket,link`
+/// Run `gh pr checks <number> --repo <repo> --json name,state,bucket,link`
 /// and return the parsed check list.
 pub(crate) async fn run_gh_checks(
     pr_number: u64,
@@ -826,33 +963,62 @@ pub(crate) async fn run_gh_checks(
     parse_gh_checks(&run_gh_checks_raw(pr_number, repo, token).await?)
 }
 
+/// The single site that composes the `gh pr checks` argv (mika#2617).
+///
+/// A pure function rather than an inline `vec!` because the one assertion that
+/// can go red on the pre-mika#2617 tree is **structural**: `classify_checks`
+/// never saw the flag, so a fixture carrying "a red check in the list" was
+/// already refused before this ticket, and a behavioural test of the gate's
+/// decision is a positive control rather than proof of the fix (plan R9). The
+/// argv is the only surface where "which checks does the gate even look at?" is
+/// decidable without a network call.
+pub(crate) fn gh_checks_args(pr_number: u64, repo: &str) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "checks".to_string(),
+        pr_number.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+        "--json".to_string(),
+        "name,state,bucket,link".to_string(),
+    ]
+}
+
 /// The network half of [`run_gh_checks`]: raw stdout of
-/// `gh pr checks <n> --repo <r> --required --json name,state,bucket,link`.
+/// `gh pr checks <n> --repo <r> --json name,state,bucket,link`.
 ///
 /// Split out by mika#2455 so its guard can substitute the subprocess in a test
-/// while keeping the production parser and classifier on the path. The
-/// `--required` flag is what makes this the single reader of "which check
-/// blocks" (D6): `statusCheckRollup`, which the ticket's letter suggested,
-/// returns every check — required or not — and would refuse a `pass` over a red
-/// optional check.
+/// while keeping the production parser and classifier on the path. This stays
+/// the single reader of "which check blocks" (D6) — four consumers descend from
+/// it (`pr_merge_with_gate::execute`, `server::verdict_handler`,
+/// `server::ci_success_handler`, and the mika#2455 CI↔verdict guard), and all
+/// four decide through `classify_checks`, so they inherit whatever this call
+/// returns without a line of their own changing.
+///
+/// **`--required` was removed on 2026-10-02 (mika#2617), and the doc-comment it
+/// replaces asserted the opposite** — that the flag "is what makes this the
+/// single reader of which check blocks". Measured on 2026-10-01: PR #2614 was
+/// merged by the engine (`mergedBy: mika-platform-dev`, 02:54:59Z) with
+/// `Egress Uniqueness Lint` and `Egress Manifest Lint` already in FAILURE on its
+/// head `8ccaabc8`. Neither is a required check of `main`'s ruleset, so for a
+/// gate reading `--required` that PR was green — while the rest of the house,
+/// the orchestrator recipe included, never merges over a red check of any kind.
+/// `main` went red (`41a4a20e`) and every open PR inherited it (mika#2616, p0).
+///
+/// The gate is therefore now **stricter than branch protection**, deliberately:
+/// a lint added tomorrow is blocking by default instead of being born invisible
+/// to the engine. Do not restore the flag believing you are repairing a
+/// regression — the divergence between two definitions of "green" is the defect,
+/// and this side is the one that fails closed.
 pub(crate) async fn run_gh_checks_raw(
     pr_number: u64,
     repo: &str,
     token: &str,
 ) -> Result<String, String> {
-    let pr_str = pr_number.to_string();
-    let args = vec![
-        "pr",
-        "checks",
-        &pr_str,
-        "--repo",
-        repo,
-        "--required",
-        "--json",
-        "name,state,bucket,link",
-    ];
+    let args = gh_checks_args(pr_number, repo);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    run_gh_subprocess(&args, token).await
+    run_gh_subprocess(&argv, token).await
 }
 
 /// Prefix of the error [`parse_gh_checks`] returns when `gh` answered but its
@@ -874,9 +1040,11 @@ pub(crate) const GH_CHECKS_PARSE_ERROR_PREFIX: &str = "Failed to parse gh pr che
 /// substituted in a test while the parsing stays the production one — a second
 /// parser written for the test would attest the test's parser, not this one.
 ///
-/// Empty output or `[]` means **no required check**, which `classify_checks`
-/// then reads as `AllPassed` — a deliberate pre-existing semantics, carried
-/// here unchanged.
+/// Empty output or `[]` means **no check at all** — not "no required check",
+/// which is what this said until mika#2617 removed the `--required` flag from
+/// [`gh_checks_args`]. `classify_checks` reads it as `AllPassed`, a deliberate
+/// pre-existing semantics carried here unchanged: a repository that runs no CI
+/// is not a repository whose CI is red.
 pub(crate) fn parse_gh_checks(output: &str) -> Result<Vec<GhCheck>, String> {
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "[]" {
@@ -1705,14 +1873,27 @@ pub(crate) fn describe_behind_main_remediation(
     }
 }
 
-/// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch] [--auto]`
+/// Run `gh pr merge <number> --repo <repo> --<method> [--delete-branch]`
 /// and return stdout on success or stderr on failure.
+///
+/// **There is no `auto` parameter, and its absence is the mechanism (mika#2617
+/// U2).** `--auto` asks GitHub to merge as soon as the **required** checks
+/// pass — a second, laxer definition of "green" living inside the gate that
+/// U1 had just taught to read every check. Removing the parameter makes the
+/// flag inexpressible rather than discouraged: the compiler forced the three
+/// remaining call sites, where a lexical scan over a positional `bool` would
+/// have been fragile (doctrine mika#1991, *build the incapacity, do not promise
+/// the restraint*).
+///
+/// The wait it replaces is not lost. `ci_success_handler` re-enters the merge
+/// path on `check_suite.completed(success)` and requires a strict `AllPassed`
+/// (mika#571), so it was already the redundant half — and the only one of the
+/// two that reads our own definition of green.
 pub(crate) async fn run_gh_merge(
     pr_number: u64,
     repo: &str,
     merge_method: &str,
     delete_branch: bool,
-    auto_merge: bool,
     token: &str,
 ) -> Result<String, String> {
     let pr_str = pr_number.to_string();
@@ -1721,9 +1902,6 @@ pub(crate) async fn run_gh_merge(
 
     if delete_branch {
         args.push("--delete-branch");
-    }
-    if auto_merge {
-        args.push("--auto");
     }
 
     run_gh_subprocess(&args, token).await
@@ -1816,8 +1994,17 @@ pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<Stri
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Persist the supervisor's `$.claude_pilot.pr_url` after auto-merge is
-/// enabled (mika#1211). Mirror of `dispatcher::try_extract_callback_metadata`
+/// Persist the supervisor's `$.claude_pilot.pr_url` when the gate refuses on
+/// pending checks (mika#1211, moved here by mika#2617 U2).
+///
+/// **It is the same need under a new arm, not a new mechanism.** The write
+/// existed to neutralise the orphan reaper's `pr_url IS NULL` predicate (#871)
+/// for a supervisor whose child is waiting on a PR that is open and not merged.
+/// That state is now reached through `checks_pending` instead of
+/// `auto_merge_enabled`; dropping the call with the arm would have let a
+/// perfectly healthy supervisor be flipped to `failed` 600 s later.
+///
+/// Mirror of `dispatcher::try_extract_callback_metadata`
 /// — resolves the supervisor via `ToolContext.callback_task_id → parent`,
 /// gates on `trigger_type='manual' && source='self_dev'`, performs a
 /// two-level shallow merge with existing metadata, and persists via
@@ -1828,7 +2015,7 @@ pub(crate) async fn run_gh_subprocess(args: &[&str], token: &str) -> Result<Stri
 /// dispatch), callback not found, callback has no parent, parent is not a
 /// manual self_dev supervisor (milestone/project parent, operator task,
 /// etc.).
-async fn write_auto_merge_pr_url_to_supervisor(ctx: &ToolContext<'_>, pr_url: &str) {
+async fn write_pending_pr_url_to_supervisor(ctx: &ToolContext<'_>, pr_url: &str) {
     // 1. Conversation mode and other non-callback turns have no identifiable
     //    supervisor — skip without logging (expected, not anomalous).
     let callback_id = match ctx.callback_task_id {
@@ -1908,7 +2095,7 @@ async fn persist_supervisor_metadata(
         Ok(true) => info!(
             supervisor_task_id = %parent_id,
             pr_url = %pr_url,
-            "pr_merge_with_gate: wrote pr_url to supervisor metadata on auto_merge_enabled"
+            "pr_merge_with_gate: wrote pr_url to supervisor metadata on checks_pending"
         ),
         Ok(false) => warn!(
             supervisor_task_id = %parent_id,
@@ -1988,6 +2175,515 @@ fn parse_exit_code_from_error(err: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::test_utils::test_helpers::TestHarness;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2617 — la porte lit TOUS les checks (U1)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Le seul test de ce ticket qui rougit sur l'arbre d'avant (plan R9).**
+    ///
+    /// `classify_checks` ne voit pas le drapeau : une fixture « un check rouge
+    /// dans la liste » était déjà refusée avant mika#2617, donc aucun test de
+    /// comportement ne peut attester le correctif. La preuve est l'argv.
+    #[test]
+    fn mika2617_gh_checks_args_carries_no_required_flag() {
+        let args = gh_checks_args(2614, "senara-solutions/mika");
+        assert!(
+            !args.iter().any(|a| a == "--required"),
+            "mika#2617 — `gh pr checks` ne doit plus restreindre aux checks requis : \
+             la protection de branche de `main` ne couvrait ni `Egress Uniqueness Lint` \
+             ni `Egress Manifest Lint`, et la PR #2614 a été mergée par le moteur avec \
+             les deux en FAILURE. argv = {args:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2617 U4 — zéro liste d'exemptions (AC3)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les quatre fichiers où vit la décision de merge du moteur.
+    const MERGE_GATE_SOURCES: &[&str] = &[
+        "tools/pr_merge_with_gate.rs",
+        "server/verdict_handler.rs",
+        "server/ci_success_handler.rs",
+        "server/merge_ready_handler.rs",
+    ];
+
+    /// Mots qui, accolés à `CHECK` dans le nom d'une constante, désignent une
+    /// liste d'exemptions. **Livrée non vide : c'est le vocabulaire cherché,
+    /// pas une allowlist.**
+    const CHECK_WAIVER_WORDS: &[&str] = &["EXEMPT", "ADVISORY", "IGNORE", "SKIP", "ALLOW", "WAIVE"];
+
+    /// Allowlist du scan d'exemptions — **livrée vide, et épinglée vide**.
+    const ALLOWED_CHECK_EXEMPTION_SITES: &[&str] = &[];
+
+    /// Allowlist du scan de lecture de label — **livrée vide, et épinglée vide**.
+    const ALLOWED_LABEL_READING_SITES: &[&str] = &[];
+
+    fn merge_gate_production_half(rel: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join(rel);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("mika#2617 — {} illisible : {e}", path.display()));
+        crate::source_scan::strip_comment_lines(crate::source_scan::production_half(&content))
+    }
+
+    /// Le prédicat du scan d'exemptions, isolé pour que son contrôle de bonne
+    /// foi puisse l'exercer sur une fixture plutôt que sur l'arbre.
+    fn declares_a_check_exemption_list(src: &str) -> Vec<String> {
+        let mut hits = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed
+                .strip_prefix("const ")
+                .or_else(|| trimmed.strip_prefix("static "))
+                .or_else(|| trimmed.strip_prefix("pub const "))
+                .or_else(|| trimmed.strip_prefix("pub static "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) const "))
+                .or_else(|| trimmed.strip_prefix("pub(crate) static "))
+            else {
+                continue;
+            };
+            let ident: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            if ident.is_empty() || !ident.contains("CHECK") {
+                continue;
+            }
+            if CHECK_WAIVER_WORDS.iter().any(|w| ident.contains(w)) {
+                hits.push(ident);
+            }
+        }
+        hits
+    }
+
+    /// **AC3 — aucune constante ne peut exempter un check rouge.**
+    ///
+    /// Le prédicat porte sur le **nom**, quel que soit le type : une
+    /// `EXEMPT_CHECKS: &[&str]` et une `EXEMPT_CHECKS: HashSet<_>` disent la
+    /// même chose. Aucun test de comportement ne peut voir cette classe — une
+    /// liste ajoutée demain ne rend aucune décision fausse le jour où elle est
+    /// écrite, elle rend la porte plus laxiste en silence.
+    #[test]
+    fn mika2617_no_check_exemption_list_exists() {
+        let mut offenders = Vec::new();
+        for rel in MERGE_GATE_SOURCES {
+            for ident in declares_a_check_exemption_list(&merge_gate_production_half(rel)) {
+                if !ALLOWED_CHECK_EXEMPTION_SITES.contains(&ident.as_str()) {
+                    offenders.push(format!("{rel}: {ident}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "mika#2617 AC3 — une liste d'exemptions de checks a été déclarée : {offenders:?}\n\n\
+             RÉSOLUTION : la retirer. Un check qu'on ne veut pas voir bloquer est un check \
+             à retirer de la CI, pas à exempter ici — une liste nommée recrée très \
+             exactement la divergence entre deux définitions du vert que ce ticket ferme \
+             (doctrine mika#2201 : on route le site, on n'allowliste pas)."
+        );
+    }
+
+    /// Contrôle de bonne foi du scan ci-dessus : il mord sur une fixture.
+    ///
+    /// Sans lui, un prédicat devenu inopérant (renommage, changement de forme
+    /// de déclaration) se lirait exactement comme un arbre propre — classe
+    /// mika#2103 / mika#2205.
+    #[test]
+    fn mika2617_the_exemption_scan_reddens_on_a_fixture() {
+        let fixture = "\
+pub(crate) const ADVISORY_CHECKS: &[&str] = &[\"Docker Build\"];
+const KNOWN_CHECK_BUCKETS: &[&str] = &[\"pass\"];
+const DISPATCH_SKIP_REASONS: &[&str] = &[\"x\"];
+";
+        let hits = declares_a_check_exemption_list(fixture);
+        assert_eq!(
+            hits,
+            vec!["ADVISORY_CHECKS".to_string()],
+            "le prédicat doit voir la liste d'exemptions et ignorer ses deux voisines \
+             légitimes (une sans mot de renonciation, une sans CHECK)"
+        );
+    }
+
+    /// Les deux allowlists sont livrées vides et le restent.
+    ///
+    /// Sans ce test, « on déclare, on n'allowliste pas » ne vivrait que dans un
+    /// doc-comment — et un doc-comment n'a jamais fait rougir une CI. Le jour
+    /// où quelqu'un ajoute une entrée, il doit d'abord supprimer ce test, ce
+    /// qui est un geste visible en revue (mika#2323).
+    #[test]
+    fn mika2617_the_exemption_allowlists_are_empty() {
+        assert!(
+            ALLOWED_CHECK_EXEMPTION_SITES.is_empty(),
+            "ALLOWED_CHECK_EXEMPTION_SITES est livrée vide et doit le rester"
+        );
+        assert!(
+            ALLOWED_LABEL_READING_SITES.is_empty(),
+            "ALLOWED_LABEL_READING_SITES est livrée vide et doit le rester"
+        );
+    }
+
+    /// Les formes par lesquelles une étiquette **GitHub** entre dans le moteur.
+    ///
+    /// Délibérément distinctes de `Task.label` / `DEFERRED_DISPATCH_LABEL`, qui
+    /// sont des étiquettes **internes** et peuplent légitimement ces fichiers.
+    const GITHUB_LABEL_READS: &[&str] = &[".labels", "\"labels\"", "--add-label", "--remove-label"];
+
+    fn reads_a_github_label(src: &str) -> Vec<String> {
+        src.lines()
+            .filter(|l| GITHUB_LABEL_READS.iter().any(|n| l.contains(n)))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// **AC3 — aucun label de PR n'entre dans la décision de merge.**
+    ///
+    /// Un label est écrivable à la main par n'importe qui ayant accès au dépôt.
+    /// Le brancher ici transformerait un geste d'interface en **autorisation de
+    /// merge**, ce que mika#2248 a déjà dû refuser pour le signal
+    /// `merge-ready` : la porte franchirait alors sur un fait que la personne
+    /// qui le pose n'a pas qualifié.
+    #[test]
+    fn mika2617_no_label_is_read_in_the_merge_decision() {
+        let mut offenders = Vec::new();
+        for rel in MERGE_GATE_SOURCES {
+            for line in reads_a_github_label(&merge_gate_production_half(rel)) {
+                if !ALLOWED_LABEL_READING_SITES.contains(&line.as_str()) {
+                    offenders.push(format!("{rel}: {line}"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "mika#2617 AC3 — un label GitHub est lu dans la chaîne de décision de merge : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : le retirer. Un label est écrivable par un humain ; en faire un \
+             terme de la porte transforme un geste d'interface en autorisation de merge \
+             (refus déjà posé par mika#2248 pour `merge-ready`)."
+        );
+    }
+
+    /// Contrôle de bonne foi du scan de label.
+    #[test]
+    fn mika2617_the_label_scan_reddens_on_a_fixture() {
+        let fixture = "\
+let labels = pr.labels.iter().map(|l| l.name.clone());
+let task_id_label = task.label.clone();
+if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
+";
+        let hits = reads_a_github_label(fixture);
+        assert_eq!(
+            hits.len(),
+            1,
+            "le prédicat doit voir la lecture de `pr.labels` et ignorer les deux \
+             étiquettes internes : {hits:?}"
+        );
+    }
+
+    /// **AC3 — `classify_checks` refuse un check rouge QUEL QUE SOIT son nom.**
+    ///
+    /// Test de propriété sur les 22 noms du pont (b) ratifié par Vincent, plus
+    /// les quatre que le pont laisse volontairement hors ruleset et un nom
+    /// arbitraire. C'est la moitié comportementale de « zéro exemption » : un
+    /// filtre sur le nom se verrait ici même sans constante déclarée.
+    #[test]
+    fn mika2617_classify_checks_is_blind_to_the_check_name() {
+        const NAMES: &[&str] = &[
+            // Les 22 du pont (b).
+            "A2A Timeout Literal Lint",
+            "Byte Slice Lint",
+            "Canonical Token Lint",
+            "CTA Primitives Lint",
+            "Cwd Guard Lint",
+            "Dispatch Seat Declaration Lint",
+            "Egress Manifest Lint",
+            "Egress No-Log Lint",
+            "Egress Request Shape Lint",
+            "Egress Uniqueness Lint",
+            "Image Tag Immutability Lint",
+            "Issue Annotation Guard Lint",
+            "Landing Token Lint",
+            "Loop Select Lint",
+            "Pilot Push Site Lint",
+            "Pilot Turn-Ceiling Label Lint",
+            "Publish Verify Lint",
+            "Shared Checkout Guard Lint",
+            "SIGPIPE grep-q Lint",
+            "Substrate Leak Lint",
+            "Voice Non-Transit Lint",
+            "Secret Scan",
+            // Hors pont, volontairement — ils doivent bloquer tout autant.
+            "Docker Build",
+            "Pilot Egress Status Tap",
+            "validate",
+            // Et un nom que personne n'a prévu.
+            "zorglub",
+        ];
+
+        for name in NAMES {
+            let red = vec![GhCheck {
+                name: (*name).to_string(),
+                state: "FAILURE".to_string(),
+                bucket: "fail".to_string(),
+                link: None,
+            }];
+            assert_eq!(
+                classify_checks(&red),
+                CheckClassification::HasFailures,
+                "mika#2617 AC3 — le check `{name}` rouge doit bloquer"
+            );
+
+            let green = vec![GhCheck {
+                name: (*name).to_string(),
+                state: "SUCCESS".to_string(),
+                bucket: "pass".to_string(),
+                link: None,
+            }];
+            assert_eq!(
+                classify_checks(&green),
+                CheckClassification::AllPassed,
+                "contrôle positif — le check `{name}` vert ne doit pas bloquer"
+            );
+        }
+    }
+
+    /// **U2 — `run_gh_merge` a exactement trois sites d'appel (plan R15).**
+    ///
+    /// Le nombre est celui d'**après** U2 : le retrait du paramètre `auto` fait
+    /// disparaître la branche `HasPending` du tool, qui ne merge plus mais
+    /// refuse. L'assertion est donc autant une mesure d'U2 qu'une garde — si
+    /// elle rend quatre, U2 n'a pas pris.
+    #[test]
+    fn mika2617_run_gh_merge_has_exactly_three_call_sites() {
+        let mut sites = Vec::new();
+        for rel in [
+            "tools/pr_merge_with_gate.rs",
+            "server/verdict_handler.rs",
+            "server/merge_ready_handler.rs",
+            "server/ci_success_handler.rs",
+            "server/ci_failure_handler.rs",
+        ] {
+            for line in merge_gate_production_half(rel).lines() {
+                if line.contains("run_gh_merge(") && !line.contains("fn run_gh_merge(") {
+                    sites.push(format!("{rel}: {}", line.trim()));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            3,
+            "mika#2617 R15 — attendu trois sites d'appel de `run_gh_merge` après U2 \
+             (le tool sur sa seule branche `AllPassed`, `verdict_handler`, \
+             `merge_ready_handler`). Trouvés : {sites:#?}"
+        );
+
+        // Anti-vacuité : un scan qui ne regarderait plus rien rendrait aussi
+        // zéro, et `assert_eq!(0, 3)` est le seul garde-fou qu'un renommage de
+        // fichier laisserait debout. On exige les trois fichiers attendus.
+        for expected in [
+            "tools/pr_merge_with_gate.rs",
+            "server/verdict_handler.rs",
+            "server/merge_ready_handler.rs",
+        ] {
+            assert!(
+                sites.iter().any(|s| s.starts_with(expected)),
+                "mika#2617 — aucun appel trouvé dans {expected} : le scan vise un \
+                 chemin mort et ne vérifie rien. Trouvés : {sites:#?}"
+            );
+        }
+    }
+
+    /// Le `link` est la dépendance silencieuse de la relance (phase B, U3) et du
+    /// contexte de réparation de `ci_failure_handler`. Le perdre ne casserait
+    /// rien de visible ici et rendrait les deux inertes.
+    #[test]
+    fn mika2617_gh_checks_args_still_requests_the_link_field() {
+        let args = gh_checks_args(2614, "senara-solutions/mika");
+        let json_value = args
+            .iter()
+            .position(|a| a == "--json")
+            .and_then(|i| args.get(i + 1))
+            .expect("l'argv porte --json <champs>");
+        for field in ["name", "state", "bucket", "link"] {
+            assert!(
+                json_value.split(',').any(|f| f == field),
+                "mika#2617 — le champ `{field}` a disparu du --json : {json_value}"
+            );
+        }
+        assert_eq!(args[0], "pr");
+        assert_eq!(args[1], "checks");
+        assert_eq!(args[2], "2614");
+        assert!(args.iter().any(|a| a == "senara-solutions/mika"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2617 — les cas de la décision pure (plan § 4, périmètre phase A)
+    //
+    // Ils vivent ici et non sous `tests/eval/` : `decide_merge_gate` est
+    // `pub(crate)`, et élargir la visibilité d'une fonction de production pour
+    // l'emplacement d'un fichier de test est le mauvais arbitrage — précédent
+    // écrit de mika#2532 pour `spawn_long_running_exec`.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn check(name: &str, bucket: &str, state: &str) -> GhCheck {
+        GhCheck {
+            name: name.to_string(),
+            state: state.to_string(),
+            bucket: bucket.to_string(),
+            link: Some(format!(
+                "https://github.com/o/r/actions/runs/1/job/2#{name}"
+            )),
+        }
+    }
+
+    /// **T1 — un check rouge hors des six requis d'avant le pont bloque, et le
+    /// `detail` le NOMME.**
+    ///
+    /// Rejeu du défaut fondateur : `Egress Uniqueness Lint` et `Egress Manifest
+    /// Lint` étaient en FAILURE sur la tête `8ccaabc8` de la PR #2614, et la
+    /// porte a mergé.
+    #[test]
+    fn mika2617_t1_a_non_required_red_check_blocks_and_is_named() {
+        let checks = vec![
+            check("Check", "pass", "SUCCESS"),
+            check("Egress Uniqueness Lint", "fail", "FAILURE"),
+            check("Egress Manifest Lint", "fail", "FAILURE"),
+        ];
+        let MergeGateDecision::ChecksFailed { failing } = decide_merge_gate(&checks) else {
+            panic!("un check rouge doit fermer la porte");
+        };
+        assert_eq!(failing.len(), 2);
+
+        let detail = describe_checks(&failing);
+        assert!(detail.contains("Egress Uniqueness Lint"), "{detail}");
+        assert!(detail.contains("Egress Manifest Lint"), "{detail}");
+        assert!(
+            !detail.contains("required"),
+            "le `detail` ne doit plus qualifier les checks de « requis » : {detail}"
+        );
+        assert!(
+            failing[0].link.is_some(),
+            "le `link` d'un check rouge est conservé — la relance (phase B) en dérive le run_id"
+        );
+    }
+
+    /// **T2 — contrôle positif : tous verts, la porte s'ouvre.**
+    ///
+    /// Sans lui, « la porte décide » est indistinguable de « la porte bloque
+    /// tout » — et ce second état casserait la boucle en entier avec toutes les
+    /// autres assertions au vert (leçon mika#2277).
+    #[test]
+    fn mika2617_t2_all_green_opens_the_gate() {
+        let checks = vec![
+            check("Check", "pass", "SUCCESS"),
+            check("Egress Uniqueness Lint", "pass", "SUCCESS"),
+        ];
+        assert_eq!(
+            decide_merge_gate(&checks),
+            MergeGateDecision::AllChecksPassed
+        );
+        assert_eq!(decide_merge_gate(&[]), MergeGateDecision::AllChecksPassed);
+    }
+
+    /// **T3 — contrôle positif : `skipping` et `neutral` comptent comme passés
+    /// (AC1).**
+    #[test]
+    fn mika2617_t3_skipped_and_neutral_count_as_passed() {
+        let checks = vec![
+            check("Docker Build (self-hosted canary)", "skipping", "SKIPPED"),
+            check("Pilot Egress Status Tap", "neutral", "NEUTRAL"),
+            check("Check", "pass", "SUCCESS"),
+        ];
+        assert_eq!(
+            decide_merge_gate(&checks),
+            MergeGateDecision::AllChecksPassed
+        );
+    }
+
+    /// **T4 — un check en attente REFUSE, au lieu d'armer `--auto`.**
+    #[test]
+    fn mika2617_t4_a_pending_check_refuses_instead_of_arming_auto_merge() {
+        let checks = vec![
+            check("Check", "pass", "SUCCESS"),
+            check("Docker Build", "pending", "IN_PROGRESS"),
+        ];
+        let MergeGateDecision::ChecksPending { pending } = decide_merge_gate(&checks) else {
+            panic!("un check en attente doit fermer la porte (mika#2617 U2)");
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "Docker Build");
+        assert!(
+            pending[0].link.is_none(),
+            "un run en vol n'a pas de log utile à pointer — même forme que la \
+             charge `auto_merge_enabled` qu'il remplace"
+        );
+        assert!(describe_checks(&pending).contains("Docker Build"));
+    }
+
+    /// Un rouge l'emporte sur une attente : la porte rapporte ce qui est cassé,
+    /// pas ce qui tourne encore.
+    #[test]
+    fn mika2617_a_red_check_wins_over_a_pending_one() {
+        let checks = vec![
+            check("Docker Build", "pending", "IN_PROGRESS"),
+            check("Egress Manifest Lint", "fail", "FAILURE"),
+        ];
+        let MergeGateDecision::ChecksFailed { failing } = decide_merge_gate(&checks) else {
+            panic!("le rouge prime");
+        };
+        assert_eq!(failing.len(), 1);
+        assert_eq!(failing[0].name, "Egress Manifest Lint");
+    }
+
+    /// Le refus `checks_pending` porte son nom de fil, et il est lisible par un
+    /// prompt qui branche sur `reason.reason`.
+    #[test]
+    fn mika2617_checks_pending_serializes_under_its_wire_name() {
+        let result = MergeGateResult::Blocked {
+            reason: BlockReason::ChecksPending {
+                pending_checks: vec![CheckInfo {
+                    name: "Docker Build".to_string(),
+                    state: "IN_PROGRESS".to_string(),
+                    link: None,
+                }],
+            },
+            failing_checks: vec![],
+            detail: "1 check(s) still running".to_string(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(json["action"], "blocked");
+        assert_eq!(json["reason"]["reason"], "checks_pending");
+        assert_eq!(json["reason"]["pending_checks"][0]["name"], "Docker Build");
+    }
+
+    /// Un bucket hors du vocabulaire connu est **rapporté** et reste non
+    /// bloquant (plan R6) : refuser sur l'inconnu casserait le merge sur une
+    /// autre version de `gh`, c'est-à-dire échangerait un `main` rouge contre
+    /// une boucle arrêtée.
+    #[test]
+    fn mika2617_an_unknown_bucket_is_reported_and_stays_non_blocking() {
+        let checks = vec![
+            check("Check", "pass", "SUCCESS"),
+            check("Zorglub", "quantum", "WEIRD"),
+        ];
+        assert_eq!(
+            unknown_buckets(&checks),
+            vec![("Zorglub", "quantum")],
+            "le bucket inconnu doit être recensé pour la ligne WARN"
+        );
+        assert_eq!(
+            decide_merge_gate(&checks),
+            MergeGateDecision::AllChecksPassed,
+            "la politique ne change pas — seul son silence change"
+        );
+        assert!(
+            unknown_buckets(&[check("Check", "pass", "SUCCESS")]).is_empty(),
+            "contrôle négatif — rien n'est émis sur le chemin nominal (mika#2131)"
+        );
+    }
 
     // -- classify_checks tests --
 
@@ -3807,7 +4503,7 @@ mod tests {
 
     // -- mika#1211: supervisor pr_url write tests --
     //
-    // These tests exercise `write_auto_merge_pr_url_to_supervisor` directly
+    // These tests exercise `write_pending_pr_url_to_supervisor` directly
     // instead of `tool.execute(...)` — the full execute path requires `gh`
     // CLI subprocess calls. The helper is the entire surface this fix adds,
     // so direct unit coverage is sufficient.
@@ -4020,7 +4716,7 @@ mod tests {
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
         let pr_url = "https://github.com/senara-solutions/mika/pull/1206";
-        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+        write_pending_pr_url_to_supervisor(&ctx, pr_url).await;
 
         assert_eq!(read_pr_url(&db, &sup_id).await.as_deref(), Some(pr_url));
     }
@@ -4040,7 +4736,7 @@ mod tests {
         let tas = AtomicBool::new(false);
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, None);
 
-        write_auto_merge_pr_url_to_supervisor(
+        write_pending_pr_url_to_supervisor(
             &ctx,
             "https://github.com/senara-solutions/mika/pull/1206",
         )
@@ -4066,11 +4762,8 @@ mod tests {
         let tas = AtomicBool::new(false);
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
-        write_auto_merge_pr_url_to_supervisor(
-            &ctx,
-            "https://github.com/senara-solutions/mika/pull/9",
-        )
-        .await;
+        write_pending_pr_url_to_supervisor(&ctx, "https://github.com/senara-solutions/mika/pull/9")
+            .await;
 
         assert!(read_pr_url(&db, &sup_id).await.is_none());
     }
@@ -4092,11 +4785,8 @@ mod tests {
         let tas = AtomicBool::new(false);
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
-        write_auto_merge_pr_url_to_supervisor(
-            &ctx,
-            "https://github.com/senara-solutions/mika/pull/9",
-        )
-        .await;
+        write_pending_pr_url_to_supervisor(&ctx, "https://github.com/senara-solutions/mika/pull/9")
+            .await;
 
         assert!(read_pr_url(&db, &sup_id).await.is_none());
     }
@@ -4119,7 +4809,7 @@ mod tests {
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
         let pr_url = "https://github.com/senara-solutions/mika/pull/1206";
-        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+        write_pending_pr_url_to_supervisor(&ctx, pr_url).await;
 
         let parent = db.get_task_unscoped(&sup_id).await.unwrap().unwrap();
         let metadata: serde_json::Value =
@@ -4150,8 +4840,8 @@ mod tests {
         let tas = AtomicBool::new(false);
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
-        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
-        write_auto_merge_pr_url_to_supervisor(&ctx, pr_url).await;
+        write_pending_pr_url_to_supervisor(&ctx, pr_url).await;
+        write_pending_pr_url_to_supervisor(&ctx, pr_url).await;
 
         assert_eq!(read_pr_url(&db, &sup_id).await.as_deref(), Some(pr_url));
     }
@@ -4197,11 +4887,8 @@ mod tests {
         let ctx = make_ctx(&db, &counter, &sd, &pr, &tas, Some(&cb_id));
 
         // Should not panic or error — just returns early.
-        write_auto_merge_pr_url_to_supervisor(
-            &ctx,
-            "https://github.com/senara-solutions/mika/pull/9",
-        )
-        .await;
+        write_pending_pr_url_to_supervisor(&ctx, "https://github.com/senara-solutions/mika/pull/9")
+            .await;
     }
 
     // -- Behind-main assertion tests (#1577) --

@@ -677,9 +677,114 @@ sites — `disposition()`, `Display`, `engine.rs`'s column match, `notification.
 
 ### PR Merge Gate
 
-`pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing required CI checks. Registered in `default_tools()` (all agents, including delegates). Returns a tagged-union `MergeGateResult` via `#[serde(tag = "action")]` — the LLM branches on the `action` field. Five variants: `merged`, `auto_merge_enabled`, `blocked` (with `BlockReason` sub-enum and backward-compat `failing_checks`), `already_merged`, `gate_errored` (with `GateErrorKind` sub-enum: `gh_cli_failure`, `credential_scope`, `network_error`, `parse_error`, `unknown`). Preflight `gh pr view` detects CONFLICTING/CLOSED/DRAFT before attempting merge (#794). **Credential-scope diagnostic (mika#1616):** when a `gh` call fails with a 403 / "Resource not accessible by integration" / forbidden response (GitHub App not installed on the target repo, or PAT missing write scope), `classify_credential_scope_error()` returns `GateErrorKind::CredentialScope { repo }` with an actionable detail naming the repo + remediation, instead of an opaque `gh_cli_failure`. Wired into all four `gh` failure sites (preflight, checks, auto-merge, immediate-merge). Mirrors the `classify_gh_error()` heuristic in `builtin_handlers.rs`. This stops the LLM from paraphrasing an opaque exit code into a fabricated cause (the reported symptom on mika-cloud PRs #135/#136). Decision matrix: CONFLICTING/DIRTY -> blocked[merge_conflict]; fail/cancel -> blocked[required_check_failed]; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op; infra failure -> gate_errored. 60s timeout. Requires `ctx.github_token`. See #490, #794.
+`pr_merge_with_gate` builtin tool — structural backstop against merging PRs with failing CI checks. Registered in `default_tools()` (all agents, including delegates). Returns a tagged-union `MergeGateResult` via `#[serde(tag = "action")]` — the LLM branches on the `action` field. Five variants: `merged`, `blocked` (with `BlockReason` sub-enum and backward-compat `failing_checks`), `already_merged`, `gate_errored` (with `GateErrorKind` sub-enum: `gh_cli_failure`, `credential_scope`, `network_error`, `parse_error`, `unknown`), `branch_updated`; plus the retired `auto_merge_enabled`, which no site produces since mika#2617 and which is kept as a wire format. Preflight `gh pr view` detects CONFLICTING/CLOSED/DRAFT before attempting merge (#794).
 
-**Supervisor pr_url write on `auto_merge_enabled` (mika#1211):** On the `auto_merge_enabled` branch, the tool writes `$.claude_pilot.pr_url = "https://github.com/<owner>/<repo>/pull/<n>"` to the supervisor task's metadata (resolved via `ToolContext.callback_task_id → parent`, gated by `trigger_type='manual' && source='self_dev'`). This neutralises the orphan reaper's `pr_url IS NULL` predicate (#871) and arms the parent-completer (mika#1162), so the supervisor stays `in_progress` until the dispatch callback ages past `REAPER_GRACE_SECONDS` and is then promoted to `completed`. Mirrors `dispatcher::try_extract_callback_metadata` (#376): two-level shallow merge via `task_metadata::merge_metadata`, fire-and-forget on error. Conversation-mode invocations (no `callback_task_id`) skip the write silently. See `docs/solutions/best-practices/pr-merge-with-gate-supervisor-metadata-2026-05-20.md`.
+#### The gate reads every check, and no longer delegates "green" (mika#2617, phase A)
+
+**The failure, measured 2026-10-01.** PR #2614 was merged **by the engine**
+(`mergedBy: mika-platform-dev`, 02:54:59Z) with `Egress Uniqueness Lint` and
+`Egress Manifest Lint` **already in FAILURE** on its head `8ccaabc8`. `main`
+went red (`41a4a20e`) and every open PR inherited it — mika#2616, a p0. The
+cause is one flag: `gh pr checks --required` (mika#485/#490), which restricts
+the gate to the checks branch protection marks required. The two egress lints
+are not among them, so for the gate that PR was green — while the orchestrator
+recipe, which looks at every check, would never have merged it. **The engine
+gate was laxer than the human recipe, and it is the one that merged.**
+
+**U1 — one flag, four consumers.** `run_gh_checks_raw` is the single site of the
+`gh pr checks` argv, now composed by the pure `gh_checks_args`. Four consumers
+descend from it and **all four inherit for free, because they decide through
+`classify_checks`**, which does not change by a line: the tool, `verdict_handler`,
+`ci_success_handler`, and the mika#2455 CI↔verdict guard of qa-review. That last
+one is AC6, and it is free by construction — mika#2455 already paid for the single
+reader, writing why: *"a second definition of «required» is the class
+`grooming_marker` (mika#2158) had to close after months of silent divergence."*
+
+A **fifth** consumer does not decide, it **collects**:
+`ci_failure_handler::fetch_failure_context` filters `fail|cancel` by hand to build
+the repair context. Its population grew to every red check, which is two gains and
+one cost — see its doc-comment, where the cost (a build failure behind several red
+lints loses its log to `MAX_FAILING_JOBS`) is written rather than compensated.
+
+**U2 — `--auto` was the last divergent definition of green, and AC1 implies it.**
+On `HasPending`, two of the three merge paths armed `gh pr merge --auto`. GitHub
+then merges as soon as the **required** checks pass — i.e. under the definition
+U1 had just stopped using, which would have left the fix inert on that path.
+`run_gh_merge` **lost its `auto` parameter**: the flag is inexpressible, not
+discouraged, and the compiler forced the three remaining call sites (doctrine
+mika#1991; a lexical scan over a positional `bool` would have been fragile). The
+tool's pending arm became `BlockReason::ChecksPending` (wire name
+`checks_pending`), `verdict_handler`'s became a `Passthrough` naming the running
+checks.
+
+**What that costs, named.** A PR whose CI is in flight is no longer merged by
+GitHub behind us: it waits for a `check_suite.completed(success)`. If that webhook
+is lost — mika#2334 measured the four places where it can be — the PR stays
+**open**. The asymmetry decides: an open PR is visible and recoverable by hand, a
+red `main` blocks the whole loop and is worth a p0. The re-entry point already
+existed and already carried the right semantics: `ci_success_handler` requires a
+strict `AllPassed` and never arms `--auto` (mika#571), so `--auto` was redundant
+with it *and* the only one of the two using a foreign definition of green.
+
+**The `mika#1211` supervisor write MOVED with the arm.** It existed to neutralise
+the orphan reaper's `pr_url IS NULL` predicate (#871) for a supervisor whose child
+waits on an open PR — the same state, now reached through `checks_pending`.
+`write_pending_pr_url_to_supervisor` is the renamed call; dropping it with the arm
+would have let a healthy supervisor be flipped to `failed` 600 s later.
+
+**U4 — zero exemption list, and the detectors are structural because the class is
+invisible to a behavioural test.** A list added tomorrow makes no decision wrong
+the day it is written; it makes the gate laxer in silence.
+`mika2617_no_check_exemption_list_exists` refuses a constant whose name joins
+`CHECK` to a waiver word (`EXEMPT`/`ADVISORY`/`IGNORE`/`SKIP`/`ALLOW`/`WAIVE`) —
+on the **name**, whatever the type, since `&[&str]` and `HashSet` say the same
+thing. `mika2617_no_label_is_read_in_the_merge_decision` refuses a GitHub label
+read in the four gate files (`.labels`, `"labels"`, `--add-label`,
+`--remove-label` — deliberately distinct from `Task.label` /
+`DEFERRED_DISPATCH_LABEL`, which populate those files legitimately): a label is
+human-writable, and branching on it would turn an interface gesture into a merge
+authorization, the refusal mika#2248 already had to make for `merge-ready`. Both
+ship their **good-faith control** (a red fixture), without which a predicate gone
+inert reads exactly like a clean tree (class mika#2103 / mika#2205). Both
+allowlists ship **empty and are pinned empty** — when one fires, remove the site,
+do not add a line (doctrine mika#2201). The behavioural half is
+`mika2617_classify_checks_is_blind_to_the_check_name`, a property test over the 22
+names of Vincent's ratified bridge plus `Docker Build`, `validate`,
+`Pilot Egress Status Tap` and an arbitrary one.
+
+**An unknown bucket is reported, and stays non-blocking.** `classify_checks`
+refuses only `fail`/`cancel`, so any bucket `gh` adds tomorrow would be born
+non-blocking — a fail-open on a merge gate. The policy is **deliberately
+unchanged** (refusing on the unknown would break merging on another `gh` version,
+i.e. trade a red `main` for a stopped loop); only its silence is.
+`merge_gate_unknown_check_bucket` (WARN, fields `repo`, `pr`, `name`, `bucket`) is
+emitted per unknown bucket, and nothing per nominal evaluation (mika#2131).
+
+**The decision is a pure function, and that is what R12 imposes.** `execute` has
+no seam — it calls `run_gh_checks` and `run_gh_merge` directly, on free functions,
+with nothing substitutable — so `decide_merge_gate(checks) -> MergeGateDecision`
+is **extracted** rather than substituted (house motif: `decide_content_net`
+mika#2270, `classify_wrapper_activity` mika#2184, `screen_target_purges`
+mika#2619). `execute` matches it with **no `_ =>` arm**. The cases live in-crate
+rather than under `tests/eval/`: the function is `pub(crate)`, and widening a
+production function's visibility for a test file's location is the worse trade
+(precedent written by mika#2532 for `spawn_long_running_exec`).
+
+**What that does NOT attest:** that `execute` *calls* the decision, and calls it
+with the right arguments. No behavioural test can see it — an `execute` ignoring
+the decision would leave every case green. What covers it is the argv scan (U1),
+the cardinality assertion on `run_gh_merge`'s call sites (three after U2, so the
+assertion is as much a measure of U2 as a guard), and, in phase C, the
+`MergeClearance` type witness, which makes the bypass **non-compilable** rather
+than detectable.
+
+**Phases B and C are NOT in this change.** The rerun-once ledger (AC2) and the
+MPC gate trace (AC5) ship separately; the plan
+`docs/plans/2026-10-02-001-fix-2617-merge-gate-lit-tous-les-checks-plan.md` is the
+design reference for all three. Phase A is autonomous: with no rerun, a red check
+blocks, which is the safe behaviour. **Credential-scope diagnostic (mika#1616):** when a `gh` call fails with a 403 / "Resource not accessible by integration" / forbidden response (GitHub App not installed on the target repo, or PAT missing write scope), `classify_credential_scope_error()` returns `GateErrorKind::CredentialScope { repo }` with an actionable detail naming the repo + remediation, instead of an opaque `gh_cli_failure`. Wired into all four `gh` failure sites (preflight, checks, auto-merge, immediate-merge). Mirrors the `classify_gh_error()` heuristic in `builtin_handlers.rs`. This stops the LLM from paraphrasing an opaque exit code into a fabricated cause (the reported symptom on mika-cloud PRs #135/#136). Decision matrix: CONFLICTING/DIRTY -> blocked[merge_conflict]; fail/cancel -> blocked[required_check_failed]; pending -> auto-merge; all pass -> immediate merge; already merged -> no-op; infra failure -> gate_errored. 60s timeout. Requires `ctx.github_token`. See #490, #794.
+
+**Supervisor pr_url write on `checks_pending` (mika#1211, arm moved by mika#2617):** On the pending-checks branch — `auto_merge_enabled` until 2026-10-02 — the tool writes `$.claude_pilot.pr_url = "https://github.com/<owner>/<repo>/pull/<n>"` to the supervisor task's metadata (resolved via `ToolContext.callback_task_id → parent`, gated by `trigger_type='manual' && source='self_dev'`). This neutralises the orphan reaper's `pr_url IS NULL` predicate (#871) and arms the parent-completer (mika#1162), so the supervisor stays `in_progress` until the dispatch callback ages past `REAPER_GRACE_SECONDS` and is then promoted to `completed`. Mirrors `dispatcher::try_extract_callback_metadata` (#376): two-level shallow merge via `task_metadata::merge_metadata`, fire-and-forget on error. Conversation-mode invocations (no `callback_task_id`) skip the write silently. See `docs/solutions/best-practices/pr-merge-with-gate-supervisor-metadata-2026-05-20.md`.
 
 ### Issue Dependency Resolution
 

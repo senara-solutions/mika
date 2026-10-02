@@ -241,12 +241,16 @@ pub async fn try_handle_merge_ready(
         signal.repo, signal.pr_number
     );
 
+    // No auto-merge flag exists any more (mika#2617 U2): `run_gh_merge` lost
+    // the parameter, so `--auto` is inexpressible rather than merely avoided.
+    // The comment this replaces said the evaluator "already aggregated every
+    // required check" — true of the pre-mika#2617 reader, and the inverse of
+    // what `ci_success_handler` does now that it aggregates every check.
     let merge_future = run_gh_merge(
         signal.pr_number,
         &signal.repo,
         "squash",
-        true,  // delete_branch
-        false, // not auto — the evaluator already aggregated every required check
+        true, // delete_branch
         token,
     );
     let merge_result =

@@ -1155,8 +1155,18 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
     // fetch_pr_files errors in test env → fail-closed to DECISION-CORE →
     // Handled. Task-side metadata write is skipped (task is not in_progress),
     // but the notification + audit event + hold pre-digest still fire.
+    //
+    // **The PR number must not name a PR that exists** (found 2026-10-02 while
+    // running the suite for mika#2617; unrelated to it). This test used #42, a
+    // real PR of this repository. On a host whose egress proxy authenticates
+    // `gh` host-side (mika#2056), `fetch_pr_files` then SUCCEEDS, the perimeter
+    // classifies MECHANICAL, and execution falls through to the
+    // `task.status != "in_progress"` passthrough — so the test failed for a
+    // reason its own premise denies. Its two siblings (#999, #50) pass today by
+    // the luck of their diffs classifying DECISION-CORE; they carry the same
+    // latent dependency.
     let db = test_db().await;
-    let pr_url = "https://github.com/senara-solutions/mika/pull/42";
+    let pr_url = "https://github.com/senara-solutions/mika/pull/424242";
     let task_id = create_task_with_pr_url(&db, pr_url).await;
 
     // Transition to completed (terminal)
@@ -1167,7 +1177,7 @@ async fn verdict_pass_completed_task_perimeter_fail_closed_holds_for_operator() 
     let text = pr_review_text(
         "approved",
         "senara-solutions/mika",
-        42,
+        424242,
         "mika-qa",
         "VERDICT: pass\n\nAll good.",
     );
