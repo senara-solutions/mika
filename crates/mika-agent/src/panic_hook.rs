@@ -113,14 +113,29 @@ mod tests {
         let _ = std::panic::take_hook();
     }
 
+    /// `HOOK_MUTEX` is **not** a substitute for `#[serial]` here, and the two
+    /// guard different things (mika#2646). The mutex is module-local and
+    /// guards `std::panic::set_hook`, which is process-global; it says nothing
+    /// about the `tracing` callsite `process_panic`, whose `Interest` is
+    /// cached globally and decided by the first thread to reach it.
+    ///
+    /// **Named residual window, and it is NOT closed by either.** The hook is
+    /// process-global while the subscriber is thread-local, so a panic on
+    /// *another* thread during the window in which the hook is installed
+    /// reaches `process_panic` with no subscriber in view and can extinguish
+    /// the callsite. That population is thin but real (a `should_panic`
+    /// elsewhere in the binary, or any assertion that genuinely fails) and
+    /// cannot be serialised — those tests are not ours to annotate. Named
+    /// rather than discovered; follow-up precondition is a measured red.
     #[test]
+    #[serial_test::serial]
     fn test_str_payload_captured() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 
         let (subscriber, buf) = capturing_subscriber();
 
         // Scope the subscriber so it's active during the panic
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
 
         // Install a no-op previous hook so the default handler doesn't interfere
         std::panic::set_hook(Box::new(|_| {}));
@@ -145,11 +160,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_string_payload_captured() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 
         let (subscriber, buf) = capturing_subscriber();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
 
         std::panic::set_hook(Box::new(|_| {}));
         install_tracing_panic_hook();
@@ -173,11 +189,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_non_string_payload() {
         let _lock = HOOK_MUTEX.lock().unwrap();
 
         let (subscriber, buf) = capturing_subscriber();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
 
         std::panic::set_hook(Box::new(|_| {}));
         install_tracing_panic_hook();

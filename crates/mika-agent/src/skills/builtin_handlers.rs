@@ -11719,11 +11719,17 @@ mod tests {
             events: Arc::clone(&events),
         };
         let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
         (guard, events)
     }
 
+    // mika#2646 — les quatre appelants de `capture_tracing_events` sont
+    // `#[serial]`. Le `rebuild_interest_cache` de l'installateur ne suffit
+    // pas : la fenêtre qui casse est **postérieure** à l'installation (un
+    // voisin qui atteint le callsite en premier, sans abonné, l'éteint
+    // globalement). Voir `test_helpers::install_capturing_subscriber`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_emits_complete_log() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11769,6 +11775,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_run_gh_invocation_log_redacts_token() {
         let (_guard, events) = capture_tracing_events();
 
@@ -11815,6 +11822,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_handles_large_output() {
         // Verify that spawn_and_collect returns within a reasonable time
         // even when the subprocess produces output exceeding MAX_OUTPUT_LEN.
@@ -11853,6 +11861,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_spawn_and_collect_progress_ticker_fires() {
         // With PROGRESS_TICKER_INTERVAL = 100ms in test mode, a 500ms sleep
         // should produce at least 3 progress tick events.
