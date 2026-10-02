@@ -47,6 +47,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
 
+# dispatch-lib writes git noise to fd 9 (opened by the trace setup in a real
+# dispatch). Open it here so the `2>&9` redirects in `_rescue_dirty_worktree` —
+# which the mika#2631 cases drive for real — have a destination. Same line, same
+# reason, as `test_dev_groom_dirty_rescue.sh`: without it those cases die on a
+# closed descriptor rather than on an assertion.
+exec 9>/dev/null
+
 PASS=0
 FAIL=0
 
@@ -575,12 +582,18 @@ assert_eq "T15d a mid-line mention does not attest" "absent" "$(STATUS=terminate
 # indistinguishable from "the term bites everybody" — and the second reading
 # stops the drain, because `verify-pipeline.sh` is term 5 of this very
 # conjunction and every rescue would flip to `rescue-pipeline-verified: no`.
+#
+# mika#2631: `RESCUED_DIRTY_WORKTREE=0` is now posed EXPLICITLY rather than left
+# undefined. The case passed before because the variable happened to be unset in
+# this process; an implicit control is one a future edit breaks in silence. The
+# expectation is unchanged — a concluded session that committed its own work is
+# exempt — only the premise is now stated.
 echo "-- T15e: NEGATIVE CONTROL — a concluded session is exempt (AC4) --"
 R15E=$(make_repo t15e)
 add_work "$R15E"
 assert_eq "T15e the classifier reads \`not-applicable\`" \
-    "not-applicable" "$(STATUS=success traversal "$R15E")"
-if STATUS=success MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15E"; then
+    "not-applicable" "$(STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15E")"
+if STATUS=success RESCUED_DIRTY_WORKTREE=0 MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15E"; then
     PASS=$((PASS + 1)); echo "  ✓ T15e a concluded session with no learning is NOT refused"
 else
     FAIL=$((FAIL + 1)); echo "  ✗ T15e a concluded session with no learning is NOT refused"
@@ -595,7 +608,8 @@ assert_contains "T15e body still carries the marker" "$B15E" "<!-- compound-trav
 # `STATUS = success` by construction — `_pilot_had_no_shipping_tail` requires
 # it. Biting there would re-bite the 71 %, under another name (D3).
 assert_eq "T15e the no-shipping-tail route is exempt by its own STATUS" \
-    "not-applicable" "$(SKILL=dev-pilot PILOT_SHIPPING_TAIL=absent STATUS=success traversal "$R15E")"
+    "not-applicable" \
+    "$(SKILL=dev-pilot PILOT_SHIPPING_TAIL=absent STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15E")"
 
 # ── T15f (D7) — fail-closed: an unreadable conclusion is not a conclusion ───
 echo "-- T15f: fail-closed on every non-success status (D7) --"
@@ -698,6 +712,244 @@ for value in not-applicable attested-solution attested-trailer absent; do
     assert_contains "T15j the \`$value\` value reaches the marker verbatim" \
         "$BODY" "<!-- compound-traversal: ${value} -->"
 done
+
+# ═══════════════════════════════════════════════════════════════════════════
+# T15k … T15q (mika#2631) — a session that CONCLUDED is not a session that
+# DELIVERED
+#
+# The founding measurement: PR #2630, pilot `bb9163e1`, 2026-10-01. The pilot
+# launched its reviewers, wrote "waiting on them" and handed the turn back; the
+# session closed `[done] Success | 140 turns` (cpp#267). Nothing was finished —
+# no review collected, no compound, no commit, no PR. dispatch-lib SAW it
+# (`HEAD unchanged — dirty worktree detected and auto-committed`,
+# PIPELINE_INCOMPLETE) and still wrote `<!-- compound-traversal: not-applicable -->`,
+# so `MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1` did not park the draft.
+#
+# WHY THESE CASES DRIVE THE REAL RESCUE rather than setting a variable. The fact
+# the ticket names — "HEAD unchanged + dirty worktree" — has DISAPPEARED from
+# measurable state by the time the classifier runs: the rescue commit advanced
+# `POST_RUN_HEAD` and emptied the index, so both halves now read their own
+# opposite. Only the `RESCUED_DIRTY_WORKTREE` stamp survives. A case that posed
+# the stamp by hand would test the plan; T15k proves the stamp is really written
+# by its producer and really reaches the classifier.
+#
+# NUMBERING: the plan wrote these as T15i…T15o, counting from a suite that ended
+# at T15h. T15i (the disposition predicate) and T15j (the wire format) were
+# already taken, so the seven cases land at T15k…T15q. Content unchanged.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# rescue_in_pilots_place <dir> — set the globals `_rescue_dirty_worktree` reads
+# for the zero-commit shape it is scoped to, then call it for real. Patterned on
+# `test_dev_groom_dirty_rescue.sh::run_rescue`.
+#
+# `SESSION_ID` is deliberately NOT overwritten: the suite exports it and T15g's
+# byte-identity fixture depends on its value. The rescue only interpolates it
+# into a commit body.
+rescue_in_pilots_place() {
+    local repo="$1"
+    WORKTREE_DIR="$repo"
+    SKILL="dev-pilot"
+    REPO="mika"
+    ISSUE_NUM="2631"
+    BRANCH="fix/2631/dispatch-lib-compound-traversal-not"
+    PILOT_EXIT=0
+    RESULT="claude-pilot completed (status: success)."
+    RESCUED_DIRTY_WORKTREE=""
+    PRE_RUN_HEAD=$(git -C "$repo" rev-parse HEAD)
+    POST_RUN_HEAD="$PRE_RUN_HEAD"
+    _rescue_dirty_worktree || true
+}
+
+# ── T15k (AC1, AC3) — the founding defect, end to end, SEEN RED ──────────────
+echo "-- T15k: a rescue that committed in the pilot's place is not exempt (AC1/AC3, mika#2631) --"
+R15K=$(make_repo t15k)
+# The pilot's content, written and never committed. No `docs/solutions`, no
+# trailer — the shape of the founding incident.
+mkdir -p "$R15K/src" "$R15K/docs/plans"
+printf '%s' "$LIB_SRC" > "$R15K/src/lib.rs"
+printf '%s' "$PLAN_DOC" > "$R15K/docs/plans/2026-10-02-001-fix-2631-x-plan.md"
+PRE_RESCUE_HEAD=$(git -C "$R15K" rev-parse HEAD)
+rescue_in_pilots_place "$R15K"
+
+# The three facts of R1, asserted rather than assumed: this is the proof that the
+# predicate the ticket names in symptom terms would be UNMEASURABLE right here.
+assert_eq "T15k the producer wrote the stamp" "1" "$RESCUED_DIRTY_WORKTREE"
+assert_eq "T15k HEAD advanced, so \`PRE != POST\` now reads its own opposite" "1" \
+    "$( [ "$PRE_RESCUE_HEAD" != "$(git -C "$R15K" rev-parse HEAD)" ] && echo 1 || echo 0 )"
+assert_eq "T15k the worktree is clean, so \`git status\` reads its own opposite" "" \
+    "$(git -C "$R15K" status --porcelain)"
+
+# THE ASSERTION OF THE TICKET. Red before the fix: the `STATUS = success`
+# short-circuit returns `not-applicable` whatever the rescue just did.
+assert_eq "T15k the classifier reads \`absent\`, not \`not-applicable\`" \
+    "absent" "$(STATUS=success traversal "$R15K")"
+
+# ── T15k-bis (AC3) — armed, the term refuses, and it refuses FIRST ───────────
+echo "-- T15k-bis: armed, the term refuses a rescue-committed success (AC3) --"
+STATUS=success MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15K" \
+    && { FAIL=$((FAIL + 1)); echo "  ✗ T15k-bis refuses a rescue-committed success"; }
+assert_eq "T15k-bis names the \`compound-traversal\` term" "compound-traversal" "$MEASURE_TERM"
+assert_contains "T15k-bis excerpt names the status that was read" "$MEASURE_EXCERPT" "success"
+# The sentence must not contradict itself: this session DID conclude. Saying it
+# did not would trade a false marker for a false sentence — the very exchange
+# this ticket refuses to make at `_pilot_had_no_shipping_tail`.
+assert_not_contains "T15k-bis excerpt does not claim the session failed to conclude" \
+    "$MEASURE_EXCERPT" "did not conclude"
+assert_contains "T15k-bis excerpt names the intrinsic way out" "$MEASURE_EXCERPT" "docs/solutions"
+assert_contains "T15k-bis excerpt names the declarative way out" "$MEASURE_EXCERPT" "Compound: none"
+assert_eq "T15k-bis term 0 short-circuits: no cargo, no verifier ran" "" "$(cat "$STUB_LOG")"
+B15K=$(_compose_rescue_pr_body "$R15K" "dirty-worktree" "Class fact." "2631" "no" "compound-traversal" "excerpt" "absent")
+assert_contains "T15k-bis body carries the traversal marker" "$B15K" "<!-- compound-traversal: absent -->"
+assert_contains "T15k-bis body stays unverified" "$B15K" "<!-- rescue-pipeline-verified: no -->"
+
+# ── T15l (AC2) — POSITIVE CONTROL, the half that keeps the remedy from being
+#                worse than the defect
+# Without it, "the term bites" is indistinguishable from "the term bites
+# everybody" — and the second reading stops the drain, `verify-pipeline.sh` being
+# term 5 of this very conjunction.
+echo "-- T15l: POSITIVE CONTROL — a success that committed its own work stays exempt (AC2) --"
+R15L=$(make_repo t15l)
+add_work "$R15L"
+assert_eq "T15l the classifier reads \`not-applicable\`" \
+    "not-applicable" "$(STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15L")"
+if STATUS=success RESCUED_DIRTY_WORKTREE=0 MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15L"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15l armed, a self-committed success is NOT refused"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15l armed, a self-committed success is NOT refused"
+    echo "    term:    '$MEASURE_TERM'"
+    echo "    excerpt: '$MEASURE_EXCERPT'"
+fi
+
+# ── T15l-bis (AC2, D3) — the `no-shipping-tail` route stays exempt ───────────
+# The loop's NOMINAL route, and the 71 % of merges carrying no `docs/solutions`.
+# Biting here would re-bite the regime under another name.
+assert_eq "T15l-bis the no-shipping-tail route is still exempt" "not-applicable" \
+    "$(SKILL=dev-pilot PILOT_SHIPPING_TAIL=absent STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15L")"
+
+# ── T15m — the stamp does not mask a REAL attestation ────────────────────────
+# A rescue that committed the pilot's learning HAS executed the decision. This
+# fix removes an exemption; it does not manufacture a refusal.
+echo "-- T15m: a rescued learning still attests (AC1) --"
+R15M=$(make_repo t15m)
+add_work "$R15M"
+add_solution "$R15M"
+assert_eq "T15m a rescued \`docs/solutions\` file attests" "attested-solution" \
+    "$(STATUS=success RESCUED_DIRTY_WORKTREE=1 traversal "$R15M")"
+if STATUS=success RESCUED_DIRTY_WORKTREE=1 MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15M"; then
+    PASS=$((PASS + 1)); echo "  ✓ T15m the conjunction continues past term 0"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15m the conjunction continues past term 0"
+    echo "    term:    '$MEASURE_TERM'"
+fi
+assert_contains "T15m the cargo terms did run" "$(cat "$STUB_LOG")" "clippy"
+
+R15M2=$(make_repo t15m2)
+add_work "$R15M2"
+git -C "$R15M2" commit -q --allow-empty --no-verify \
+    -m "chore: no learning here" \
+    -m "Compound: none — mechanical fix, the diff and its test say everything"
+assert_eq "T15m a rescued anchored trailer still attests" "attested-trailer" \
+    "$(STATUS=success RESCUED_DIRTY_WORKTREE=1 traversal "$R15M2")"
+
+# ── T15n — the stamp's domain, exactly ──────────────────────────────────────
+# Same exactness as `[ "${PILOT_SHIPPING_TAIL:-}" = "absent" ]`, and the
+# fail-safe direction of D4: anything unreadable leaves today's behaviour, which
+# is the prior state and not a new permission.
+echo "-- T15n: only the literal \`1\` makes a concluded session measure (D4) --"
+R15N=$(make_repo t15n)
+add_work "$R15N"
+for stamp in "0" "yes" "true" " 1 " "1 " "01"; do
+    assert_eq "T15n stamp '$stamp' leaves the session exempt" "not-applicable" \
+        "$(STATUS=success RESCUED_DIRTY_WORKTREE="$stamp" traversal "$R15N")"
+done
+if (unset RESCUED_DIRTY_WORKTREE; [ "$(STATUS=success _rescue_compound_traversal "$R15N")" = "not-applicable" ]); then
+    PASS=$((PASS + 1)); echo "  ✓ T15n an absent stamp leaves the session exempt"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15n an absent stamp leaves the session exempt"
+fi
+assert_eq "T15n the literal \`1\` measures" "absent" \
+    "$(STATUS=success RESCUED_DIRTY_WORKTREE=1 traversal "$R15N")"
+# And the stamp changes nothing on a session that did NOT conclude: that
+# population was already measured, by `STATUS` alone.
+assert_eq "T15n a truncated session measures whatever the stamp says" "absent" \
+    "$(STATUS=terminated RESCUED_DIRTY_WORKTREE=0 traversal "$R15N")"
+
+# ── T15o (AC4) — the census is exhaustive, compared IN BOTH DIRECTIONS ───────
+# Source scan. Every site of `dispatch-lib.sh` reading `STATUS` against the
+# literal `success` appears in the census table, AND every entry of the table
+# names a site that still exists. Cardinality asserted at 3 — the one failure
+# shape no fixture sees: a predicate grown too narrow would pass by looking at
+# nothing (mika#2496 U3, class mika#2205).
+echo "-- T15o: the AC4 census covers every reader of \`STATUS = success\` (AC4) --"
+STATUS_SUCCESS_SITES=$(grep -nE '\[ "\$\{?STATUS(:-)?\}?" = "success" \]' "$DISPATCH_LIB" | cut -d: -f1)
+STATUS_SUCCESS_COUNT=$(printf '%s\n' "$STATUS_SUCCESS_SITES" | grep -c '[0-9]')
+assert_eq "T15o there are exactly 3 readers of \`STATUS = success\`" "3" "$STATUS_SUCCESS_COUNT"
+
+# The census lives on the file, above the new predicate, where it is exercised.
+CENSUS_BLOCK=$(sed -n '/AC4 CENSUS — every reader of `STATUS = success`/,/^# ─\{20,\}$/p' "$DISPATCH_LIB")
+if [ -n "$CENSUS_BLOCK" ]; then
+    PASS=$((PASS + 1)); echo "  ✓ T15o the census block is on the file"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ T15o the census block is on the file"
+fi
+# Direction 1 — every reader is named. The enclosing function of each hit.
+for _line in $STATUS_SUCCESS_SITES; do
+    _owner=$(awk -v n="$_line" '
+        /^[_a-zA-Z][_a-zA-Z0-9]*\(\) \{$/ { fn = $1; sub(/\(\)$/, "", fn) }
+        /^    # mika#940 Unit 1: post-flight PR-existence check\.$/ { fn = "mika#940 Unit 1" }
+        NR == n { print fn; exit }' "$DISPATCH_LIB")
+    assert_contains "T15o the census names the reader at line $_line (\`$_owner\`)" \
+        "$CENSUS_BLOCK" "$_owner"
+done
+# Direction 2 — every named site still exists. An entry whose site was renamed or
+# removed must REDDEN the build rather than silently exempt a future homonym.
+# Same shape as `FIRED_AT_LITERAL_WRITERS` (mika#2133) and `DISPATCH_ENV_KNOWN_INERT`
+# (mika#2536).
+CENSUS_ENTRIES=$(grep -oE '^# \| `?(_[a-z_]+|mika#940 Unit 1)`? ' <<<"$CENSUS_BLOCK" \
+    | sed -E 's/^# \| `?//; s/`? $//')
+CENSUS_ENTRY_COUNT=$(printf '%s\n' "$CENSUS_ENTRIES" | grep -c '.')
+assert_eq "T15o the census carries exactly 3 entries" "3" "$CENSUS_ENTRY_COUNT"
+while IFS= read -r _entry; do
+    [ -n "$_entry" ] || continue
+    case "$_entry" in
+        "mika#940 Unit 1")
+            assert_contains "T15o the \`$_entry\` site still exists" \
+                "$(cat "$DISPATCH_LIB")" "# mika#940 Unit 1: post-flight PR-existence check." ;;
+        *)
+            assert_contains "T15o the \`$_entry\` site still exists" \
+                "$(cat "$DISPATCH_LIB")" "${_entry}() {" ;;
+    esac
+done <<<"$CENSUS_ENTRIES"
+
+# ── T15p (AC4) — the two ORDERS that protect `_pilot_had_no_shipping_tail` ───
+# Structural, not behavioural, and that is the whole point: inverting either
+# order would make NO decision wrong in any existing case, and would reopen this
+# ticket in silence. What keeps site #2 correct is where its instructions sit.
+echo "-- T15p: the orders protecting \`_pilot_had_no_shipping_tail\` hold (AC4) --"
+_class_stamp_line=$(grep -n 'RECOVERY_CLASS="dirty-worktree"' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+_class_tail_line=$(grep -n 'RECOVERY_CLASS="no-shipping-tail"' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+assert_eq "T15p in the class computation, the stamp branch precedes the shipping-tail branch" "1" \
+    "$( [ -n "$_class_stamp_line" ] && [ -n "$_class_tail_line" ] \
+        && [ "$_class_stamp_line" -lt "$_class_tail_line" ] && echo 1 || echo 0 )"
+_unit3_failure_line=$(grep -n 'grep -qF -- "PIPELINE FAILURE:" <<<"\$RESULT"' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+_unit3_tail_line=$(grep -n 'elif _pilot_had_no_shipping_tail; then' "$DISPATCH_LIB" | head -1 | cut -d: -f1)
+assert_eq "T15p in Unit 3, the \`PIPELINE FAILURE:\` arm precedes the shipping-tail arm" "1" \
+    "$( [ -n "$_unit3_failure_line" ] && [ -n "$_unit3_tail_line" ] \
+        && [ "$_unit3_failure_line" -lt "$_unit3_tail_line" ] && echo 1 || echo 0 )"
+
+# ── T15q (R3) — `commit-pushed-no-pr` stays OUT of the population ────────────
+# AC1's parenthesis ("or any class that auto-commits in the pilot's place") would,
+# read literally, sweep in `commit-pushed-no-pr`, which does create a commit — the
+# empty `wip(mika#1383)` marker. It must stay out: on that class the pilot
+# committed ITS OWN work and only `gh pr create` failed. Letting it in would bite
+# part of the nominal traffic under another name.
+echo "-- T15q: commit-pushed-no-pr is not an auto-commit in the pilot's place (R3) --"
+R15Q=$(make_repo t15q)
+add_work "$R15Q"
+git -C "$R15Q" commit -q --allow-empty --no-verify \
+    -m "wip(mika#1383): auto-PR-create rescue for mika#2631"
+assert_eq "T15q the marker commit does not make the class measure" "not-applicable" \
+    "$(STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15Q")"
 
 echo ""
 echo "========================================"
