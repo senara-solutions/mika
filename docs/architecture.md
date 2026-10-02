@@ -242,7 +242,7 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `a2a_call` | Call a remote A2A agent via the A2A protocol's `message/send` method. Sends a message to an external agent endpoint and returns the response. Optional Bearer token auth. 120s timeout. | A2A |
 | `list_tasks` | List tasks with optional status and source filters. Returns up to 50, ordered by creation date. Includes status-count summary and filter guidance note (unfiltered calls only). | Tasks |
 | `check_task` | Read task details and check linked GitHub PR/issue status. Parses `reference_url` for GitHub URLs, calls GitHub REST API with `github_token`. Graceful degradation when no token. 15s timeout. | Tasks |
-| `pr_merge_with_gate` | Merge a GitHub PR with a CI gate. Checks required CI checks via `gh pr checks --required`, classifies by decision matrix (blocked/auto_merge_enabled/merged/already_merged). Spawns `gh` subprocess with `scrub_mika_env_vars` + `GH_TOKEN` re-injection. Requires `github_token`. 60s timeout. See #490. | PR Merge |
+| `pr_merge_with_gate` | Merge a GitHub PR with a CI gate. Checks **every** CI check of the head via `gh pr checks` (the `--required` restriction was removed by mika#2617 after a PR was merged over two red non-required lints), classifies by decision matrix (blocked[required_check_failed] / blocked[checks_pending] / merged / already_merged). Never arms `gh pr merge --auto`, which fires on required checks only. Spawns `gh` subprocess with `scrub_mika_env_vars` + `GH_TOKEN` re-injection. Requires `github_token`. 60s timeout. See #490, mika#2617. | PR Merge |
 
 ### Management Tools
 

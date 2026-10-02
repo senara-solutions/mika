@@ -3790,6 +3790,163 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
   le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
   contrôle positif n'est pas établi.**
 
+### La porte de merge lit TOUS les checks, et cesse de déléguer le vert (mika#2617, phase A)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit une PR refuser son merge sur
+`checks_pending` — ou qui cherche pourquoi `main` est passé rouge le
+2026-10-01 — cherche dans ce voisinage.
+
+- **Le défaut, mesuré (n=1, et il a cassé `main`).** PR #2614 a été **mergée par
+  le moteur** (`mergedBy: mika-platform-dev`, 2026-10-01T02:54:59Z) alors que
+  `Egress Uniqueness Lint` et `Egress Manifest Lint` étaient **déjà en FAILURE**
+  sur sa tête `8ccaabc8`. `main` est rouge depuis (`41a4a20e`) et toute PR
+  ouverte en a hérité → mika#2616 (p0).
+- **La cause, en un drapeau.** `tools/pr_merge_with_gate.rs` lisait
+  `gh pr checks --required` (mika#485/#490) et ne refusait que sur un bucket
+  `fail`/`cancel` **parmi les checks requis**. Les lints egress ne sont pas
+  requis par la protection de branche de `main` : pour la porte, cette PR était
+  **verte**. La recette orchestrateur, elle, regarde l'ensemble des checks et ne
+  merge jamais sur un rouge. *La porte moteur était plus laxiste que la recette
+  humaine, et c'est elle qui a mergé.*
+- **Ratifié par Vincent le 2026-10-02 sur bearing Prime**, verbatim : *« Deux
+  définitions du même vert produisent toujours un main rouge. »* Le remède a deux
+  moitiés : **(b)** un pont côté ruleset — rendre requis 21 lints déterministes
+  plus `Secret Scan`, geste de Vincent, **hors code** ; **(a)** la règle durable,
+  qui est ce livrable.
+- **La porte est désormais PLUS STRICTE que la protection de branche, et c'est
+  assumé.** Un lint ajouté demain est bloquant par défaut (fail-closed) au lieu
+  de naître invisible au moteur. Ne pas restaurer `--required` en croyant réparer
+  une régression : la divergence entre deux définitions du vert **est** le
+  défaut, et ce côté-ci est celui qui échoue fermé.
+- **`--auto` était la dernière définition divergente, et AC1 l'implique.** Deux
+  des trois chemins de merge armaient `gh pr merge --auto` sur un check en
+  attente ; GitHub merge alors dès que les checks **requis** passent. Lire tous
+  les checks puis armer `--auto` aurait laissé le correctif **inerte** sur ce
+  chemin. `run_gh_merge` a **perdu son paramètre `auto`** : le drapeau est
+  inexprimable, pas déconseillé.
+- **Coût nommé.** Une PR dont la CI est en vol n'est plus mergée par GitHub
+  derrière nous : elle attend un `check_suite.completed(success)`. Si ce webhook
+  est perdu — mika#2334 a mesuré les quatre endroits — la PR reste **ouverte**.
+  L'asymétrie tranche : une PR ouverte est visible et rattrapable à la main, un
+  `main` rouge bloque la boucle entière et vaut un p0.
+- **Zéro liste d'exemptions (AC3).** Aucune constante, aucune configuration,
+  aucun label ne permet de passer outre un check rouge. En particulier, **la
+  chaîne de décision ne lit aucun label de PR** : un label est écrivable à la
+  main, et le brancher là transformerait un geste d'interface en autorisation de
+  merge — refus déjà posé par mika#2248 pour `merge-ready`. Trois détecteurs
+  l'épinglent, allowlists livrées vides et épinglées vides.
+
+### Surfaces opérateur
+
+```bash
+# 1. Un bucket inconnu est-il apparu ? (régime attendu : VIDE)
+grep merge_gate_unknown_check_bucket "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{repo, pr, name, bucket}'
+
+# 2. Une PR a-t-elle été retenue sur une CI en vol ? (régime attendu : NON VIDE, faible)
+grep verdict_handler_checks_pending "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{pr_number, pending_count}'
+
+# 3. CONTRÔLE POSITIF — la porte s'évalue-t-elle seulement ?
+grep -cE 'verdict_handler_perimeter_cleared|pr_merge_with_gate' "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- Le résidu d'AC1 : combien de merges ont délégué le vert à GitHub ?
+-- Zéro APRÈS le déploiement — la ligne cesse d'être écrite parce que le site
+-- cesse d'exister. Cette requête est l'avant/après, pas un compteur.
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'verdict_handled' AND after_value = 'auto_merge_enabled';
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `checks_pending` dans `tasks.result` | — | **non vide** | le nouveau refus d'U2 ; son absence alors que des PR attendent est la halte 4 |
+| `verdict_handler_checks_pending` | INFO | non vide, faible | le pendant côté webhook de verdict |
+| `merge_gate_unknown_check_bucket` | WARN | **vide** | `gh` a ajouté un bucket : il naît **non bloquant** (fail-open assumé) |
+| `after_value = 'auto_merge_enabled'` | audit | **figé** | la population cesse de croître ; les lignes antérieures ne sont **pas** réécrites (motif mika#2361) |
+
+**Coût daté, nommé plutôt que découvert :** un `count(*)` sur
+`after_value = 'auto_merge_enabled'` qui enjambe le déploiement compare deux
+régimes — avant, la population existe ; après, elle est close par construction.
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi**. Après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). Et `skills/bundled/` est une projection du
+> binaire : `cat ~/.mika/skills/.manifest-writer` doit porter le sha bâti, sans
+> quoi les trois prompts `self-dev*` servis ignorent encore `checks_pending`.
+
+**S1 — le défaut fondateur est rejoué** (première PR dont un check non requis est
+rouge). La porte refuse, le `detail` **nomme** le check, aucun merge.
+*Halte 1 — la PR est mergée quand même :* **ne pas élargir le prédicat par
+réflexe.** Lire le contrôle positif (commande 3) : zéro ligne signifie que la
+porte ne s'évalue pas du tout, et la question n'est alors pas le prédicat.
+Établir ensuite **lequel des trois chemins** a mergé (`mergedBy`, plus
+`verdict_handled` / `ci_success_merge_ready` / `pr_merge_with_gate`) — les trois
+remèdes diffèrent.
+
+**S2 — contrôle négatif : une PR entièrement verte merge toujours (48 h).**
+*Halte 2 — plus rien ne merge :* la porte est passée de laxiste à bloquante, ce
+qui casse la boucle en entier. **Désarmer d'abord** (revert d'U1), diagnostiquer
+ensuite : lire quel bucket la porte compte comme rouge — un bucket inconnu
+(commande 1), ou un check `Expected — waiting` qu'un ruleset vient de rendre
+requis sans que le job tourne (le risque que Vincent nomme dans le pont (b)).
+
+**S3 — contrôle négatif d'U2 (7 jours).** Aucune PR verte et approuvée ne reste
+ouverte plus de 30 min.
+*Halte 3 — une PR reste ouverte :* le rendez-vous `check_suite.completed` n'a pas
+eu lieu (webhook perdu, les quatre endroits de mika#2334). **Ne pas remettre
+`--auto`** — ce serait rouvrir AC1. Lire d'abord si un `check_suite` est arrivé,
+puis si `ci_success_handler` a refusé et sur quel terme. Le remède est en amont,
+sur le canal, et il a son propre ticket.
+
+**S4 — le HOLD est compris par les prompts (première CI en vol).** Le tour qui
+reçoit `blocked` / `checks_pending` doit **terminer**, pas boucler ni retomber sur
+`run_gh pr merge`.
+*Halte 4 — le modèle reboucle :* vérifier le seed des prompts bundled avant de
+toucher au code (classe mika#2340), puis que la branche `checks_pending` est bien
+dans le prompt servi.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro évaluation ne
+prouve rien : il faut qu'une PR ait traversé la porte depuis le déploiement.
+*Une garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne rattrape pas #2614 ni mika#2616.** La PR est mergée, `main` a été rouge,
+  et **rien ici ne rétro-estampille** — fabriquer une ligne d'audit datée d'un
+  refus qu'on n'a pas observé est l'inverse de ce que ce travail défend. La sonde
+  est la **prochaine** occurrence.
+- **Il ne pose pas le pont (b).** Rendre 22 checks requis est le ruleset de
+  `main`, donc un geste Vincent. La règle (a) est sûre **sans** le pont ; le pont
+  reste utile parce qu'il réaligne les deux définitions du vert pour tout
+  consommateur **hors** de ce dépôt — un merge humain par l'interface GitHub
+  compris, que ce code ne traverse pas.
+- **Il ne couvre pas le merge par l'interface GitHub ni par `gh pr merge` tapé à
+  la main.** La porte garde le moteur. Un humain avec le bypass admin merge
+  toujours sur rouge, et c'est la moitié que le pont (b) ferme.
+- **Il ne relance aucun check flaky** (phase B, AC2) et n'exige aucune trace de
+  gate MPC (phase C, AC5). Sans relance, un check rouge bloque — c'est le
+  comportement sûr, et c'est ce qui rend la phase A autonome.
+- **Il ne ferme pas le fail-open sur un bucket inconnu** : il le rend visible.
+- **Il dégrade un cas du contexte de réparation, et c'est un coût assumé.**
+  `ci_failure_handler` collecte désormais les logs parmi **tous** les checks
+  rouges, bornés à `MAX_FAILING_JOBS` : un échec de build placé derrière
+  plusieurs lints rouges perd son log. Prioriser la liste réintroduirait une
+  notion de « check qui compte plus », c'est-à-dire la divergence que ce ticket
+  ferme ; relever la borne échange un contexte tronqué contre un prompt plus gros
+  sans mesure qui le demande.
+- **Il ne rend pas la porte surveillée.** Les seuls instruments sont les greps et
+  la requête ci-dessus, et **leur silence ne prouve rien tant que personne ne les
+  exécute**.
+
+Raisonnement complet, les cinq consommateurs et les trois détecteurs :
+`crates/mika-agent/CLAUDE.md` § *The gate reads every check*.
+
 ### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
