@@ -187,6 +187,7 @@ GROOMED	B	crates/mika-agent/src/grooming_marker.rs::grooming_verdict	exact:word-
 READY	B	crates/mika-agent/src/grooming_marker.rs::FIRST_PASS_READY_RE	exact:literal
 GROOMED	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:literal
 READY	B	skills/bundled/_shared/dispatch-lib.sh::_write_canonical_callout	exact:literal
+ITERATE	B	skills/bundled/_shared/dispatch-lib.sh::_second_pass_explicit_iterate	exact:line-anchored
 
 # ── Callback-envelope grammar. `^Outcome: <TOKEN>`, `^STATUS=<TOKEN>` and the
 # crash/violation markers — all line-anchored or literal, no fuzzy tier behind.

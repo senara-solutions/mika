@@ -8155,6 +8155,38 @@ _cleanup_iterate_findings() {
     echo "_cleanup_iterate_findings: swept $findings_dir on GROOMED" >&2
 }
 
+# ===========================================================================
+# mika#2641 — le motif d'un arrêt de groom est un FORMAT DE FIL
+# ===========================================================================
+#
+# Ces valeurs atterrissent dans `tasks.result` **et**, via le lecteur moteur
+# `try_report_groom_architect_unreadable` (`task_engine/dispatcher.rs`), dans
+# `audit_events.after_value` — où l'opérateur en fait des `GROUP BY`. Deux
+# orthographes couperaient une population en deux sans le dire, d'où une
+# constante nommée de chaque côté et un scan de synchronisation shell ↔ Rust
+# (`canonical_tokens::tests::mika2641_*`).
+#
+# La ligne porteuse est ANCRÉE EN DÉBUT DE LIGNE et lue ancrée — jamais un
+# `contains` : le `result` d'un callback porte la prose du pilote, qui peut
+# citer ce mécanisme même, et c'est le faux positif que mika#2050 a mesuré sur
+# le Signal S et que mika#2545 a dû éviter sur le sien.
+GROOM_HALT_CAUSE_LINE_PREFIX="Groom-halt-cause:"
+
+# Le défaut : l'architecte a rendu un verdict, et c'est un refus. Comportement
+# d'avant mika#2641, octet pour octet.
+GROOM_HALT_CAUSE_VERDICT="verdict"
+
+# L'architecte a répondu DEUX FOIS sans ligne de verdict lisible. Ce n'est pas
+# une objection au plan — c'est une absence de signal, et AC2 exige qu'elle soit
+# nommée comme telle plutôt que travestie en verdict.
+#
+# Le mot `unreadable` nu est DÉJÀ pris, à un autre sens :
+# `executor.rs::GROOM_ESCALATE_VERDICT_UNREADABLE` désigne « la preuve en base
+# n'a pas pu être lue » (colonne `result` NULL sur un callback terminal). Deux
+# sens, deux couches ; le préfixe `architect_` est ce qui évite de couper deux
+# populations sous un même mot.
+GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE="architect_unreadable"
+
 _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
@@ -8195,24 +8227,77 @@ _escalate_groom() {
     # plan-validation block may already have posed one by the time we get here.
     # Called LAST so the engine-reason block below stays inside the body.
     #
+    # mika#2641 — LA CAUSE DÉCIDE DU CORPS, et c'est tout le contenu d'AC2.
+    #
+    # Jusqu'ici cette fonction écrivait inconditionnellement
+    # `Verdict: ESCALATE — human review required`, y compris quand l'architecte
+    # n'avait rendu AUCUN verdict — une affirmation fausse, et littéralement ce
+    # qu'AC2 nomme (« un motif distinct, ET NON UN VERDICT »).
+    #
+    # Le défaut `verdict` garantit AC3 : un ESCALATE explicite reste terminal et
+    # son `RESULT` est identique à l'octet près.
+    #
     # Args:
     #   $1: stage label — "first-pass" | "second-pass-after-ready" | "second-pass-after-iterate"
     #   $2: architect content (the escalation rationale text)
     #   $3: architect session_id (for callback observability + log correlation)
+    #   $4: cause — "$GROOM_HALT_CAUSE_VERDICT" (défaut) |
+    #       "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE". Les CINQ sites d'appel la
+    #       passent explicitement ; le défaut existe pour qu'un appelant inconnu
+    #       reproduise le comportement d'hier, et le scan de cardinalité
+    #       (`test-dispatch-lib.sh`, S-c) refuse qu'un site l'omette — un appel
+    #       sans cause produirait un `RESULT` plausible, donc aucun test
+    #       comportemental ne verrait la classe.
     local stage="$1" content="$2" session_id="$3"
+    local cause="${4:-$GROOM_HALT_CAUSE_VERDICT}"
 
     local findings_dir="$WORKTREE_DIR/.iterate"
     mkdir -p "$findings_dir" 2>/dev/null || true
     local findings_file="$findings_dir/escalate-${stage}.md"
     printf '%s\n' "$content" > "$findings_file" 2>/dev/null || true
 
-    echo "iterate_groom_loop: ESCALATE at ${stage} — terminal, no auto-replay (mika#2545; findings at ${findings_file})" >&2
-
-    RESULT="${RESULT}
+    case "$cause" in
+        "$GROOM_HALT_CAUSE_VERDICT")
+            echo "iterate_groom_loop: ESCALATE at ${stage} — terminal, no auto-replay (mika#2545; findings at ${findings_file})" >&2
+            RESULT="${RESULT}
 GROOM ESCALATED (terminal): mika-arch escalated at ${stage}.
 Verdict: ESCALATE — human review required.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE} at ${stage} — the architect emitted no parsable verdict line, twice (mika#2641; findings at ${findings_file})" >&2
+            # AUCUNE ligne `Verdict:` — il n'y a pas de verdict à rapporter.
+            #
+            # La ligne de motif porte DEUX champs positionnels — la cause puis
+            # l'étape — avant sa prose. C'est ce qui évite au lecteur moteur un
+            # SECOND littéral à garder en phase : sans l'étape ici, il faudrait
+            # la relire sur la ligne `GROOM ESCALATED (terminal):` ci-dessus, et
+            # ce serait deux formats de fil au lieu d'un.
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): mika-arch answered at ${stage} without a parsable verdict line.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE} ${stage} — no READY/ITERATE/GROOMED/ESCALATE line in two attempts (initial + corrective retry). This is an absence of signal, NOT an objection to the plan.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        *)
+            # Bras BRUYANT, jamais muet (motif `dispatch_substrate_diagnostic`).
+            # Le shell n'a pas d'exhaustivité de compilateur, donc ce bras est ce
+            # qui en tient lieu : il NOMME la valeur non reconnue.
+            #
+            # Il n'affirme NI un verdict NI un motif. Les deux erreurs ne coûtent
+            # pas la même chose : écrire `Verdict: ESCALATE` pour une cause
+            # inconnue rejoue le défaut de mika#2641, et écrire
+            # `Groom-halt-cause: architect_unreadable` poserait une valeur
+            # d'audit FAUSSE dans la population que ce ticket crée. Ne rien
+            # affirmer sur la cause est la seule lecture honnête.
+            echo "WARN: iterate_groom_loop: _escalate_groom at ${stage} received an unrecognized cause '${cause}' — escalating without asserting a cause (mika#2641)" >&2
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): mika-arch halted at ${stage} for an unrecognized cause '${cause}'.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+    esac
 
     # mika#2338 — when the ESCALATE was written by the ENGINE (review-anchor
     # attestation withheld after the corrective re-prompt), say so: the cause
@@ -8459,6 +8544,59 @@ internal reasoning before emitting the verdict (mika#2296) — confirm with \
 output_tokens/max_tokens, and raise \`llm_max_tokens\` in that agent's config.toml if it fired."
 }
 
+# mika#2641 — le prompt correctif de SECONDE passe, à définition unique.
+#
+# R-b : deux copies divergeraient, et c'est la leçon que `grooming_marker.rs` a
+# dû engraver une fois (mika#2158) — un prédicat recopié prend du retard sans
+# que rien ne rougisse. Les deux sites de seconde passe appellent ceci.
+#
+# COURT PAR CONTRAT, ET C'EST ASSERTÉ (V4), pas espéré.
+# `mika-arch-second-review/skill.toml` déclare `review_anchor_min_brief_chars`,
+# le seuil d'armement de la garde d'ancrage mika#2037 : en dessous, la garde ne
+# fire pas. Un prompt de relance AU-DESSUS l'armerait — et l'architecte, qui n'a
+# pas le brief sous les yeux dans un re-prompt, ne peut produire aucune ancre.
+# Le moteur retire alors la disposition (tier 0) ou réécrit la réponse en
+# escalade (tier 0b, mika#2338), et `_parse_verdict` rend ESCALATE — donc le
+# correctif produirait EXACTEMENT le terminal qu'il existe pour empêcher.
+# Le test lit le seuil DEPUIS LE MANIFESTE plutôt qu'en le recopiant, donc un
+# seuil durci sans que ce corps rétrécisse fait rougir, au lieu de passer.
+#
+# Même gabarit que le prompt correctif de PREMIÈRE passe (mika#1823), dont le
+# commentaire du manifeste cite déjà les ~480 caractères comme une population
+# que la garde d'ancrage ne peut pas atteindre.
+#
+# Stdout : le chemin du fichier temporaire. L'APPELANT le supprime.
+# Retour : 0, ou 1 si `mktemp` échoue.
+_second_pass_retry_prompt() {
+    local f
+    f=$(mktemp -t mika-arch-second-retry-XXXXXX.md 2>/dev/null) || return 1
+    {
+        printf 'Your previous second-pass review response is missing the required `Verdict:` line.\n\n'
+        printf 'Please re-emit your findings and end with exactly ONE of these two lines as the last non-empty line of your response:\n\n'
+        printf '    Verdict: GROOMED\n'
+        printf '    Verdict: ESCALATE\n\n'
+        printf 'The routing engine parses this line as the verdict — its absence halts the groom (see mika#2641).\n'
+    } > "$f"
+    printf '%s' "$f"
+}
+
+# mika#2641 — une ligne de disposition ITERATE explicite en seconde passe.
+#
+# `_parse_verdict` n'a délibérément aucun bras ITERATE (pas de troisième passe),
+# donc une seconde passe qui écrit `Disposition: ITERATE` rend une chaîne vide,
+# exactement comme une réponse tronquée. Ce n'est pourtant PAS un illisible :
+# AC1 exclut nommément ITERATE (« ni READY, ni ITERATE, ni ESCALATE
+# explicite »). C'est une objection lisible, et elle garde le terminal d'avant
+# mika#2641 — cause `verdict`, sans relance — plutôt que d'être relancée puis
+# étiquetée « absence de signal ». Lu ancré en début de ligne (emphase markdown
+# tolérée) : un préambule qui CITE la disposition de première passe en prose ne
+# doit pas priver la réponse de sa relance.
+#
+# Stdin : la réponse de l'architecte. Retour : 0 si une telle ligne existe.
+_second_pass_explicit_iterate() {
+    grep -qE '^[[:space:]>*_`-]*(Verdict|Disposition)[*_`]*:[[:space:]*_`]*ITERATE([^[:alnum:]_]|$)'
+}
+
 _iterate_groom_loop() {
     # Phase D — the iterate-loop state machine (mika#1271).
     #
@@ -8541,8 +8679,17 @@ _iterate_groom_loop() {
                 printf '    Disposition: ESCALATE\n\n'
                 printf 'The routing engine parses this line as the verdict — its absence blocks the pipeline (see mika#1823).\n'
             } > "$retry_prompt"
-            resp1=$(_arch_ask_with_retry "mika-arch-groom-ticket" "$retry_prompt" "$session_id")
-            local _retry_status=$?
+            # Forme sûre sous `set -e` (mika#2641) : une affectation dont la
+            # substitution échoue avorte AVANT la ligne suivante, donc le
+            # `rm -f` et le WARN ne tourneraient pas. Les trois sites de relance
+            # de cette boucle portent la même forme — en corriger deux sur trois
+            # aurait laissé la trappe sous deux orthographes.
+            local _retry_status
+            if resp1=$(_arch_ask_with_retry "mika-arch-groom-ticket" "$retry_prompt" "$session_id"); then
+                _retry_status=0
+            else
+                _retry_status=$?
+            fi
             rm -f "$retry_prompt"
             [ "$_retry_status" -eq 0 ] || {
                 _groom_warn "retry _arch_ask failed$(_arch_ask_error_suffix)"
@@ -8583,18 +8730,107 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
     case "$disposition" in
         READY)
             echo "iterate_groom_loop: first-pass READY; invoking mika-arch second-pass" >&2
-            # Phase 2 — second-pass, continuing the architect session
-            local resp2; resp2=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
-                _groom_warn "second-pass _arch_ask failed$(_arch_ask_error_suffix)"; return 1; }
-            local content2; content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
-            [ -n "$content2" ] || {
-                _groom_warn_empty_content "second-pass"; return 1; }
-            local verdict; verdict=$(printf '%s' "$content2" | _parse_verdict)
-            local _trail_suffix_v=""
-            _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
-            _trail_append "second-review" "$session_id" "${verdict:-UNPARSED}${_trail_suffix_v}"
+            # Phase 2 — second-pass with UNPARSED retry (mika#2641).
+            #
+            # Le patron est celui de la PREMIÈRE passe (mika#1823, livré le
+            # 2026-07-25) porté ici : 1 essai initial + 1 relance, prompt
+            # correctif court en fichier, session portée (D6 — l'architecte doit
+            # voir son propre préambule pour le compléter), et le `-after-retry`
+            # au trail.
+            #
+            # Ce que ça ferme : avant mika#2641 le `*)` du `case` attrapait une
+            # chaîne vide AU MÊME TITRE qu'un `Verdict: ESCALATE`, donc une
+            # réponse tronquée côté modèle devenait un `Outcome: ESCALATE`
+            # terminal — groom perdu, et gel de tout re-dispatch par mika#2545.
+            # Mesuré le 2026-10-02 sur le groom de mika#2617, dont le fichier de
+            # constats préservé ne contenait qu'un préambule de deux phrases.
+            local resp2 content2 verdict attempt2 forensic2="" explicit_iterate2=0
+            for attempt2 in 1 2; do
+                local _pass_label2="second-pass"
+                if [ "$attempt2" -eq 1 ]; then
+                    resp2=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
+                        _groom_warn "second-pass _arch_ask failed$(_arch_ask_error_suffix)"; return 1; }
+                else
+                    _pass_label2="second-pass retry"
+                    local retry2; retry2=$(_second_pass_retry_prompt) || {
+                        _groom_warn "mktemp failed for second-pass retry prompt"
+                        return 1
+                    }
+                    # `if … then … else` plutôt que `local st=$?` : sous `set -e`
+                    # — et le handler `dev-groom` l'arme — une affectation dont
+                    # la substitution échoue AVORTE avant la ligne suivante, donc
+                    # le `rm -f` ci-dessous ne tournerait pas et le WARN non plus.
+                    # Ça ne mord pas aujourd'hui parce que `_iterate_groom_loop`
+                    # est appelée comme condition de `if` (errexit suspendu sur
+                    # toute son étendue dynamique), mais cette sûreté vit 2000
+                    # lignes plus loin et le premier refactor du site d'appel la
+                    # retire. C'est l'idiome que `_arch_ask_with_retry` emploie
+                    # déjà, une fonction plus haut.
+                    local _retry2_status
+                    if resp2=$(_arch_ask_with_retry "mika-arch-second-review" "$retry2" "$session_id"); then
+                        _retry2_status=0
+                    else
+                        _retry2_status=$?
+                    fi
+                    rm -f "$retry2"
+                    [ "$_retry2_status" -eq 0 ] || {
+                        _groom_warn "second-pass retry _arch_ask failed$(_arch_ask_error_suffix)"
+                        return 1
+                    }
+                fi
+                content2=$(printf '%s' "$resp2" | jq -r '.content // empty' 2>/dev/null)
+                # D5 — un `.content` vide n'est JAMAIS un unreadable : mika#2296
+                # a établi que c'est un défaut de BUDGET avec son propre remède,
+                # et le fondre ici effacerait un diagnostic qui a coûté trois
+                # tentatives et quatre tickets à établir.
+                [ -n "$content2" ] || {
+                    _groom_warn_empty_content "$_pass_label2"; return 1; }
+                # Les DEUX tentatives sont préservées pour les constats.
+                #
+                # Sans ça, la relance écraserait la réponse de la 1ʳᵉ tentative,
+                # qui est la plus riche : le mode d'échec mesuré est une
+                # troncature APRÈS des constats réels et avant la ligne de
+                # verdict. L'opérateur n'aurait plus que la réponse à un prompt
+                # correctif de 347 octets — une régression d'observabilité sur le
+                # fichier qui EST son artefact forensique principal (c'est celui
+                # que l'incident fondateur du 2026-10-02 a laissé derrière lui).
+                if [ -n "$forensic2" ]; then
+                    forensic2="${forensic2}
 
-            case "$verdict" in
+--- retry attempt ${attempt2} ---
+
+${content2}"
+                else
+                    forensic2="$content2"
+                fi
+                verdict=$(printf '%s' "$content2" | _parse_verdict)
+                local _trail_suffix_v=""
+                _disposition_was_fuzzy && _trail_suffix_v=" (fuzzy)"
+                local _attempt_marker_v=""
+                [ "$attempt2" -gt 1 ] && _attempt_marker_v="-after-retry"
+                _trail_append "second-review" "$session_id" "${verdict:-UNPARSED}${_trail_suffix_v}${_attempt_marker_v}"
+                case "$verdict" in
+                    GROOMED|ESCALATE)
+                        [ "$attempt2" -gt 1 ] && echo "INFO: iterate_groom_loop: second-pass verdict recovered on retry ($verdict) — mika#2641" >&2
+                        break
+                        ;;
+                esac
+                # Une ITERATE explicite est une objection lisible, pas un
+                # illisible : aucune relance (AC1 l'exclut nommément).
+                if printf '%s' "$content2" | _second_pass_explicit_iterate; then
+                    explicit_iterate2=1
+                    break
+                fi
+                if [ "$attempt2" -eq 1 ]; then
+                    _groom_warn "second-pass verdict UNPARSED (after a READY first pass); retrying _arch_ask once with a corrective prompt (mika#2641)"
+                fi
+            done
+
+            # Une ITERATE explicite prend le terminal d'un refus — cause
+            # `verdict`, `RESULT` d'avant mika#2641 à l'octet près.
+            local route2="$verdict"
+            [ "$explicit_iterate2" -eq 1 ] && route2="ESCALATE"
+            case "$route2" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
@@ -8603,9 +8839,25 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
                     GROOM_LOOP_FAILURE_REASON=""
                     return 0
                     ;;
-                *)
+                ESCALATE)
+                    # AC3 — un refus EXPLICITE reste terminal, et son `RESULT`
+                    # est identique à l'octet près au comportement d'avant.
+                    # `$forensic2` vaut `$content2` sans relance ; après une
+                    # relance il garde la 1ʳᵉ tentative dans le fichier de
+                    # constats, et `RESULT` ne porte que son chemin.
                     GROOM_LOOP_FAILURE_REASON="architect refused on second pass after a READY first pass"
-                    _escalate_groom "second-pass-after-ready" "$content2" "$session_id"
+                    _escalate_groom "second-pass-after-ready" "$forensic2" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
+                    return 1
+                    ;;
+                *)
+                    # AC2 — deux illisibles d'affilée. Terminal, mais à MOTIF
+                    # distinct : `_parse_verdict` rend GROOMED, ESCALATE ou rien,
+                    # donc ce bras ne fire que sur vide. R-f — ce motif voyage
+                    # dans `tasks.result` et c'est TOUT ce que l'opérateur voit
+                    # (PR#2028) ; dire « l'architecte a refusé » l'envoie lire une
+                    # objection qui n'existe pas, classe mika#1772 exactement.
+                    GROOM_LOOP_FAILURE_REASON="second pass (after READY) produced no parsable verdict line after ${attempt2} attempts (initial + mika#2641 corrective retry) — the architect never emitted a 'Verdict:' line; this is an absence of signal, not an objection to the plan"
+                    _escalate_groom "second-pass-after-ready" "$forensic2" "$session_id" "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE"
                     return 1
                     ;;
             esac
@@ -8633,21 +8885,77 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
             # continuing the architect session so findings stay in conversation
             # memory (per mika-arch-second-review session-continuity contract).
             echo "iterate_groom_loop: invoking mika-arch second-pass on revised plan" >&2
-            local resp2_iter; resp2_iter=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
-                _groom_warn "second-pass _arch_ask failed (after revise)$(_arch_ask_error_suffix)"
-                return 1
-            }
-            local content2_iter; content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)
-            [ -n "$content2_iter" ] || {
-                _groom_warn_empty_content "second-pass (after revise)"
-                return 1
-            }
-            local verdict_iter; verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
-            local _trail_suffix_vi=""
-            _disposition_was_fuzzy && _trail_suffix_vi=" (fuzzy)"
-            _trail_append "second-review" "$session_id" "${verdict_iter:-UNPARSED}${_trail_suffix_vi}"
+            # mika#2641 — MÊME patron de relance qu'au site after-ready.
+            #
+            # Deux `case` distincts, donc un seul corrigé se lirait exactement
+            # comme deux : V6 épingle ce site séparément pour cette raison.
+            local resp2_iter content2_iter verdict_iter attempt2i forensic2i="" explicit_iterate2i=0
+            for attempt2i in 1 2; do
+                local _pass_label2i="second-pass (after revise)"
+                if [ "$attempt2i" -eq 1 ]; then
+                    resp2_iter=$(_arch_ask_with_retry "mika-arch-second-review" "$plan_path" "$session_id") || {
+                        _groom_warn "second-pass _arch_ask failed (after revise)$(_arch_ask_error_suffix)"
+                        return 1
+                    }
+                else
+                    _pass_label2i="second-pass retry (after revise)"
+                    local retry2i; retry2i=$(_second_pass_retry_prompt) || {
+                        _groom_warn "mktemp failed for second-pass retry prompt (after revise)"
+                        return 1
+                    }
+                    # Forme sûre sous `set -e` — voir le site after-ready.
+                    local _retry2i_status
+                    if resp2_iter=$(_arch_ask_with_retry "mika-arch-second-review" "$retry2i" "$session_id"); then
+                        _retry2i_status=0
+                    else
+                        _retry2i_status=$?
+                    fi
+                    rm -f "$retry2i"
+                    [ "$_retry2i_status" -eq 0 ] || {
+                        _groom_warn "second-pass retry _arch_ask failed (after revise)$(_arch_ask_error_suffix)"
+                        return 1
+                    }
+                fi
+                content2_iter=$(printf '%s' "$resp2_iter" | jq -r '.content // empty' 2>/dev/null)
+                [ -n "$content2_iter" ] || {
+                    _groom_warn_empty_content "$_pass_label2i"
+                    return 1
+                }
+                # Les deux tentatives préservées — voir le site after-ready.
+                if [ -n "$forensic2i" ]; then
+                    forensic2i="${forensic2i}
 
-            case "$verdict_iter" in
+--- retry attempt ${attempt2i} ---
+
+${content2_iter}"
+                else
+                    forensic2i="$content2_iter"
+                fi
+                verdict_iter=$(printf '%s' "$content2_iter" | _parse_verdict)
+                local _trail_suffix_vi=""
+                _disposition_was_fuzzy && _trail_suffix_vi=" (fuzzy)"
+                local _attempt_marker_vi=""
+                [ "$attempt2i" -gt 1 ] && _attempt_marker_vi="-after-retry"
+                _trail_append "second-review" "$session_id" "${verdict_iter:-UNPARSED}${_trail_suffix_vi}${_attempt_marker_vi}"
+                case "$verdict_iter" in
+                    GROOMED|ESCALATE)
+                        [ "$attempt2i" -gt 1 ] && echo "INFO: iterate_groom_loop: second-pass verdict recovered on retry after revise ($verdict_iter) — mika#2641" >&2
+                        break
+                        ;;
+                esac
+                # Une ITERATE explicite : voir le site after-ready.
+                if printf '%s' "$content2_iter" | _second_pass_explicit_iterate; then
+                    explicit_iterate2i=1
+                    break
+                fi
+                if [ "$attempt2i" -eq 1 ]; then
+                    _groom_warn "second-pass verdict UNPARSED (after an ITERATE revise); retrying _arch_ask once with a corrective prompt (mika#2641)"
+                fi
+            done
+
+            local route2i="$verdict_iter"
+            [ "$explicit_iterate2i" -eq 1 ] && route2i="ESCALATE"
+            case "$route2i" in
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
@@ -8656,16 +8964,21 @@ is incomplete — this is NOT the mika#2296 empty-content case)"
                     GROOM_LOOP_FAILURE_REASON=""
                     return 0
                     ;;
-                *)
+                ESCALATE)
                     GROOM_LOOP_FAILURE_REASON="architect refused on second pass after an ITERATE revise"
-                    _escalate_groom "second-pass-after-iterate" "$content2_iter" "$session_id"
+                    _escalate_groom "second-pass-after-iterate" "$forensic2i" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
+                    return 1
+                    ;;
+                *)
+                    GROOM_LOOP_FAILURE_REASON="second pass (after an ITERATE revise) produced no parsable verdict line after ${attempt2i} attempts (initial + mika#2641 corrective retry) — the architect never emitted a 'Verdict:' line; this is an absence of signal, not an objection to the plan"
+                    _escalate_groom "second-pass-after-iterate" "$forensic2i" "$session_id" "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE"
                     return 1
                     ;;
             esac
             ;;
         ESCALATE)
             GROOM_LOOP_FAILURE_REASON="architect ESCALATE (first-pass)"
-            _escalate_groom "first-pass" "$content1" "$session_id"
+            _escalate_groom "first-pass" "$content1" "$session_id" "$GROOM_HALT_CAUSE_VERDICT"
             return 1
             ;;
         *)

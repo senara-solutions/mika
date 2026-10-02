@@ -1042,8 +1042,15 @@ assert_eq "_iterate_groom_loop calls _cleanup_iterate_findings on both GROOMED p
 
 # Session-id symmetry: second-pass invoked on both READY and ITERATE branches,
 # both threading session_id from first-pass response.
+#
+# mika#2641 — le compte passe de 2 à 4, et c'est la SYMÉTRIE qui est épinglée,
+# pas le nombre : chaque branche porte désormais un essai initial PLUS une
+# relance corrective (le patron mika#1823 de la première passe, porté sur la
+# seconde). Deux par branche, donc quatre, et un compte impair dirait qu'un seul
+# des deux sites a reçu la relance — ce qui se lirait exactement comme deux.
 SECOND_PASS_COUNT=$(printf '%s\n' "$ITERATE_FULL" | grep -c 'mika-arch-second-review')
-assert_eq "_iterate_groom_loop invokes second-pass twice (READY + ITERATE)" "2" "$SECOND_PASS_COUNT"
+assert_eq "_iterate_groom_loop invokes second-pass twice per branch (READY + ITERATE, chacune avec sa relance mika#2641)" \
+    "4" "$SECOND_PASS_COUNT"
 
 # ============================================================================
 # ESCALATE flow (mika#1271 sub-PR 5)
@@ -1126,11 +1133,27 @@ else
 fi
 rm -rf "$ESC_TMP2"
 
-# Code-shape: _iterate_groom_loop has exactly 3 _escalate_groom call sites
-# (first-pass ESCALATE + READY-then-second-pass-fail + ITERATE-then-second-pass-fail)
+# Code-shape: _iterate_groom_loop has exactly 5 _escalate_groom call sites.
+#
+# mika#2641 — le compte passe de 3 à 5. Les deux bras de seconde passe qui
+# escaladaient indistinctement (`*)`) se sont scindés en DEUX chacun :
+# `ESCALATE)` (un refus réel, cause `verdict`, `RESULT` inchangé à l'octet près)
+# et `*)` (chaîne vide, cause `architect_unreadable`, AUCUNE ligne `Verdict:`).
+# C'est cette scission qui EST le correctif : avant, une absence de signal
+# empruntait le bras d'un verdict.
+#
+#   1. first-pass ESCALATE                     → verdict
+#   2. after-ready, verdict ESCALATE           → verdict
+#   3. after-ready, verdict illisible ×2       → architect_unreadable
+#   4. after-iterate, verdict ESCALATE         → verdict
+#   5. after-iterate, verdict illisible ×2     → architect_unreadable
+#
+# Le scan de cardinalité du bloc mika#2641 (S-c) exige en plus que chacun des
+# cinq passe sa cause par la CONSTANTE : un site qui l'omettrait tomberait dans
+# le défaut et produirait un `RESULT` plausible.
 ITERATE_NOW=$(declare -f _iterate_groom_loop)
 ESCALATE_CALL_COUNT=$(printf '%s\n' "$ITERATE_NOW" | grep -c '_escalate_groom')
-assert_eq "_iterate_groom_loop has 3 _escalate_groom call sites" "3" "$ESCALATE_CALL_COUNT"
+assert_eq "_iterate_groom_loop has 5 _escalate_groom call sites (mika#2641)" "5" "$ESCALATE_CALL_COUNT"
 
 # Each stage label appears exactly once
 assert_contains "ESCALATE branch uses first-pass stage" '_escalate_groom "first-pass"' "$ITERATE_NOW"
@@ -7876,12 +7899,32 @@ _MIKA2305_SECOND=$(printf '%s\n' "$_MIKA2305_BODY" \
 assert_eq "mika#2305: les deux branches de 2ᵉ passe continuent la session" \
     "2" "$_MIKA2305_SECOND"
 
-# Aucun appel architecte n'échappe à l'inventaire ci-dessus : 1 + 1 + 2 = 4.
-# Un cinquième appel est un halt-and-surface — il porte ou ne porte pas la
+# Retry UNPARSED de SECONDE passe (mika#2641) : session portée, sur les deux
+# branches. LA DÉCISION, prise ici parce que le bloc ci-dessous l'exige — « un
+# cinquième appel est un halt-and-surface ; il porte ou ne porte pas la session,
+# et c'est une décision ».
+#
+# Elle porte la session, et pour la raison EXACTE déjà écrite pour le retry de
+# première passe : la relance ne re-demande pas la revue, elle demande à
+# l'architecte de COMPLÉTER sa propre réponse en y ajoutant la ligne `Verdict:`
+# manquante. Sans la session la demande serait inintelligible — le portage y est
+# la condition de correction du mécanisme, pas sa contamination. C'est aussi ce
+# que le contrat de continuité de `mika-arch-second-review` exige.
+#
+# Le prédicat ne nomme pas le fichier temporaire ($retry2 / $retry2i) mais la
+# POSITION du troisième argument : ce qui est épinglé est le portage, pas le nom
+# de la variable locale.
+_MIKA2641_SECOND_RETRY=$(printf '%s\n' "$_MIKA2305_BODY" \
+    | grep -cE '_arch_ask_with_retry "mika-arch-second-review" "\$retry2i?" "\$session_id"' || true)
+assert_eq "mika#2641: les deux relances de 2ᵉ passe continuent la session (D6)" \
+    "2" "$_MIKA2641_SECOND_RETRY"
+
+# Aucun appel architecte n'échappe à l'inventaire ci-dessus : 1 + 1 + 2 + 2 = 6.
+# Un septième appel est un halt-and-surface — il porte ou ne porte pas la
 # session, et c'est une décision, pas une ligne à ajouter au compte.
 _MIKA2305_TOTAL=$(printf '%s\n' "$_MIKA2305_BODY" | grep -c "$_MIKA2305_ANY_CALL" || true)
-assert_eq "mika#2305: inventaire clos des appels _arch_ask (1 neuf + 3 continués)" \
-    "4" "$_MIKA2305_TOTAL"
+assert_eq "mika#2305: inventaire clos des appels _arch_ask (1 neuf + 5 continués)" \
+    "6" "$_MIKA2305_TOTAL"
 
 # mika#2278 : la boucle passe TOUJOURS par le wrapper. Un appel direct à
 # `_arch_ask` y serait un site sans retry et sans capture stderr — exactement
@@ -8038,11 +8081,18 @@ _MIKA2278_SWALLOWED=$(printf '%s\n' "$_MIKA2278_LOOP_BODY" \
 assert_eq "mika#2278: aucun appel architecte ne jette plus stderr (D7)" \
     "0" "$_MIKA2278_SWALLOWED"
 
-# Et les quatre sites font remonter ce message dans leur WARN d'échec (R5).
+# Et les SIX sites font remonter ce message dans leur WARN d'échec (R5).
+#
+# mika#2641 — le compte passe de 4 à 6 : les deux relances de seconde passe sont
+# deux appels architecte de plus, donc deux sites d'échec de plus, et l'invariant
+# R5 s'applique à eux à l'identique. Un WARN de relance qui ne porterait pas le
+# message du CLI laisserait l'opérateur relire « second-pass retry _arch_ask
+# failed » sans jamais apprendre pourquoi — exactement la cécité que ce test
+# existe pour refuser.
 _MIKA2278_SUFFIXED=$(printf '%s\n' "$_MIKA2278_LOOP_BODY" \
     | grep -c '_groom_warn ".*_arch_ask failed.*_arch_ask_error_suffix' || true)
-assert_eq "mika#2278: les quatre WARN d'échec portent le message du CLI (R5)" \
-    "4" "$_MIKA2278_SUFFIXED"
+assert_eq "mika#2278: les six WARN d'échec portent le message du CLI (R5)" \
+    "6" "$_MIKA2278_SUFFIXED"
 
 # ===========================================================================
 # mika#2522 — les deux moitiés du code de sortie retryable sont le même nombre
@@ -12178,6 +12228,507 @@ rien')"
 T2636_SOURCE_SCAN_ALLOWLIST=()
 assert_eq "mika#2636: table d'exceptions des trois scans de source (S8, S10, S11) — zero entries" \
     "0" "${#T2636_SOURCE_SCAN_ALLOWLIST[@]}"
+
+# ===========================================================================
+# mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
+#
+# Le défaut mesuré le 2026-10-02 (groom de mika#2617) : la 2e passe rend un
+# préambule seul, `_parse_verdict` rend une chaîne vide, et le bras `*)` du
+# `case` l'escalade au MÊME titre qu'un `Verdict: ESCALATE` explicite —
+# `Outcome: ESCALATE`, terminal, gel du re-dispatch par mika#2545.
+#
+# La première passe, elle, relance depuis mika#1823. Ce bloc porte le même
+# patron sur les DEUX sites de seconde passe et épingle les deux moitiés :
+# l'illisible relance, l'explicite reste terminal.
+#
+# Les sondes font tourner le VRAI `_iterate_groom_loop` avec `_arch_ask` stubbé
+# au bord de processus (gabarit `_groom_signature_probe_1772`) : les parseurs,
+# l'enveloppe de retry, le trail et les états terminaux restent réels. Un grep
+# structurel passerait au-dessus des deux.
+# ===========================================================================
+
+echo ""
+echo "Test: une 2e passe illisible est relancée (mika#2641)"
+echo "------------------------------------------------------------"
+
+# Le verbatim du ticket. Vérifié contre les cinq tiers de `_parse_verdict` :
+# ni `escalate`/`cannot approve`/`human review needed`/`fundamental issues
+# remain`, ni `groomed`/`approved`/`plan is ready`/`ship it`/`no remaining
+# concerns` — le texte est en français, donc le fuzzy ne matche rien et le
+# verdict est VIDE. Sans cette vérification la fixture rejouerait une autre
+# classe que celle qu'elle nomme.
+M2641_UNREADABLE='Je relis le plan révisé mika#2617 pour second passe. Analyse en cours des contrats de sortie et de la résolution des 12 rectifications.'
+
+# $1 = chemin  : "ready" (1re passe READY) | "iterate" (1re passe ITERATE + revise)
+# $2 = réponse de la 2e passe        (appel architecte n°2)
+# $3 = réponse de la relance         (appel architecte n°3)
+# $4 = optionnel : le mode d'altération, sous la forme `<mode><n>` où `<n>` est
+#      le NUMÉRO D'APPEL architecte visé — `transport2`, `empty2` (contrôles
+#      négatifs de V5), `transport3`, `empty3` (les chemins d'échec de la
+#      RELANCE). Clé sur le numéro d'appel et non imbriqué sous `2)` : la
+#      première version ne pouvait faire échouer que l'appel n°2, donc deux
+#      chemins de sortie neufs — le WARN d'échec transport de la relance, et
+#      `_groom_warn_empty_content "second-pass retry"`, seul consommateur de la
+#      valeur de relance de `_pass_label2` — n'étaient exercés par aucun test.
+_groom_second_pass_probe_2641() {
+    local probe_path="$1" reply2="$2" reply3="$3" mode="${4:-normal}"
+    local tmp wt rc
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    {
+        echo "# Plan rejouant la signature mika#2641"
+        echo "**Ticket:** mika issue#2641"
+        for i in $(seq 1 14); do
+            echo "Ligne de corps $i — rembourrage rembourrage rembourrage."
+        done
+    } > "$wt/docs/plans/2026-10-02-002-fix-2641-signature-plan.md"
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+
+        # Le retry transport est désarmé : son délai nominal est de 30 s, et
+        # V5 n'interroge pas l'enveloppe transport — elle interroge le fait
+        # qu'un échec transport ne produit PAS d'unreadable.
+        export MIKA_ARCH_ASK_RETRY=0
+
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        M2641_FIRST="Disposition: READY"
+        if [ "$probe_path" = "iterate" ]; then
+            M2641_FIRST="F1: un constat de première passe.
+
+Disposition: ITERATE"
+        fi
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            # Le payload de chaque appel est conservé : V4 mesure la taille du
+            # prompt correctif (appel n°3) contre le seuil du manifeste.
+            cp -- "$2" "$tmp/prompt-$n" 2>/dev/null || true
+            # La session portée est un contrat (D6) : l'architecte doit voir son
+            # propre préambule pour le compléter.
+            printf '%s' "${3:-<none>}" > "$tmp/session-$n"
+            # Le mode est consulté AVANT le choix du corps, et il porte le
+            # numéro d'appel qu'il vise : c'est ce qui rend les chemins d'échec
+            # de la relance (appel n°3) atteignables.
+            case "$mode" in
+                "transport$n") return 75 ;;
+                "empty$n")     printf '{"content":"","metadata":{"session_id":"probe-session-2641"}}'; return 0 ;;
+            esac
+            case "$n" in
+                1) body="$M2641_FIRST" ;;
+                2) body="$reply2" ;;
+                3) body="$reply3" ;;
+                *) body="APPEL INATTENDU $n" ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-2641"}}'
+        }
+        # Les vrais shellent vers `gh` / claude-pilot.
+        _write_canonical_callout() { printf 'written\n' > "$tmp/callout"; return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2641" REPO="mika" BRANCH="probe-2641"
+        RESULT=""
+        if _iterate_groom_loop >/dev/null 2>"$tmp/err"; then rc=0; else rc=1; fi
+
+        printf 'rc=%s\n' "$rc"
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'reason=%s\n' "${GROOM_LOOP_FAILURE_REASON:-<none>}"
+        printf 'callout=%s\n' "$([ -f "$tmp/callout" ] && echo yes || echo no)"
+        # Champ 4 du trail, joint en une chaîne — la raison est écrite une seule
+        # fois, au site d'origine (`_groom_signature_probe_1772`) : la recopier
+        # ici ferait vivre une note de correction en deux exemplaires libres de
+        # diverger (classe mika#2158).
+        printf 'trail_outcomes=%s\n' \
+            "$(cut -f4 "$wt/.claude/groom-verdict-trail.log" 2>/dev/null | paste -sd, - || true)"
+        printf 'retry_prompt_bytes=%s\n' \
+            "$(if [ -f "$tmp/prompt-3" ]; then wc -c < "$tmp/prompt-3" | tr -d ' '; else echo 0; fi)"
+        printf 'retry_session=%s\n' "$(cat "$tmp/session-3" 2>/dev/null || echo '<no-call>')"
+        printf 'verdict_lines=%s\n' \
+            "$(printf '%s\n' "$RESULT" | grep -c '^Verdict:' || true)"
+        printf 'halt_cause_lines=%s\n' \
+            "$(printf '%s\n' "$RESULT" | grep -c '^Groom-halt-cause:' || true)"
+        printf 'outcome_escalate_lines=%s\n' \
+            "$(printf '%s\n' "$RESULT" | grep -c '^Outcome: ESCALATE' || true)"
+        printf 'terminal_marker_lines=%s\n' \
+            "$(printf '%s\n' "$RESULT" | grep -c '^GROOM ESCALATED (terminal):' || true)"
+        # Le fichier de constats préservé : combien de sections de relance il
+        # porte (0 = seule la dernière réponse a été écrite).
+        printf 'findings_retry_sections=%s\n' \
+            "$(cat "$wt"/.iterate/escalate-*.md 2>/dev/null | grep -c '^--- retry attempt' || true)"
+        printf 'RESULT_BEGIN\n%s\nRESULT_END\n' "$RESULT"
+        sed 's/^/stderr: /' "$tmp/err" 2>/dev/null || true
+    )
+    rm -rf "$tmp"
+}
+
+# --- V1 (AC1/AC4) : le verbatim relance, et la relance aboutit --------------
+
+M2641_RECOVERED=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" 'A1: « Ligne de corps 3 — rembourrage rembourrage rembourrage. »
+
+Verdict: GROOMED') || M2641_RECOVERED=""
+
+# Ancre d'anti-vacuité, en PREMIER (V9) : sans elle chaque assertion ci-dessous
+# passerait sur une chaîne vide si la sonde cessait de tourner.
+assert_contains "mika#2641 (V1): la sonde a mené la boucle jusqu'au 3e appel architecte" \
+    "arch_calls=3" "$M2641_RECOVERED"
+assert_contains "mika#2641 (V1): le verbatim CONVERGE au lieu d'escalader" \
+    "rc=0" "$M2641_RECOVERED"
+assert_contains "mika#2641 (V1): aucune ligne de disposition ESCALATE n'est posée" \
+    "outcome_escalate_lines=0" "$M2641_RECOVERED"
+assert_contains "mika#2641 (V1): le callout canonique est écrit sur convergence" \
+    "callout=yes" "$M2641_RECOVERED"
+assert_contains "mika#2641 (V1): un run convergé n'enregistre aucun motif d'échec" \
+    "reason=<none>" "$M2641_RECOVERED"
+# Le trail est ce qui distingue « convergé » de « convergé GRÂCE à la relance ».
+# Épinglé comme séquence entière : une boucle qui n'aurait jamais eu besoin d'un
+# second essai lirait `READY,GROOMED` et satisferait tout test par jeton.
+assert_contains "mika#2641 (V1): le trail porte UNPARSED puis le verdict de relance" \
+    "trail_outcomes=READY,UNPARSED,GROOMED-after-retry" "$M2641_RECOVERED"
+# D6 — la session est portée : l'architecte doit voir son propre préambule.
+assert_contains "mika#2641 (V1): la relance porte la session de la 2e passe" \
+    "retry_session=probe-session-2641" "$M2641_RECOVERED"
+
+# --- V2 (AC3) : contrôle positif — un ESCALATE explicite reste terminal -----
+
+M2641_EXPLICIT=$(_groom_second_pass_probe_2641 ready 'F1: le plan ne porte pas de contrat de sortie.
+F2: la section de vérification est absente.
+
+Verdict: ESCALATE' 'JAMAIS ATTEINT') || M2641_EXPLICIT=""
+
+assert_contains "mika#2641 (V2): un verdict explicite ne déclenche AUCUNE relance" \
+    "arch_calls=2" "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): un ESCALATE explicite reste terminal" \
+    "rc=1" "$M2641_EXPLICIT"
+# Le RESULT de ce chemin est inchangé à l'octet près — c'est AC3.
+assert_contains "mika#2641 (V2): le marqueur terminal est inchangé" \
+    "GROOM ESCALATED (terminal): mika-arch escalated at second-pass-after-ready." \
+    "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): la ligne Verdict: est TOUJOURS posée sur un refus réel" \
+    "Verdict: ESCALATE — human review required." "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): un refus réel ne porte PAS de motif architect_unreadable" \
+    "halt_cause_lines=0" "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): le motif d'échec d'un refus réel est inchangé" \
+    "reason=architect refused on second pass after a READY first pass" "$M2641_EXPLICIT"
+assert_contains "mika#2641 (V2): sans relance, le fichier de constats n'a qu'une tentative" \
+    "findings_retry_sections=0" "$M2641_EXPLICIT"
+
+# --- V2-bis : la relance rend un ESCALATE explicite -------------------------
+#
+# Le refus est réel, donc cause `verdict` (ligne Verdict:, aucun motif) — et la
+# 1ʳᵉ tentative, la plus riche, reste dans le fichier de constats au lieu d'être
+# écrasée par la réponse au prompt correctif.
+M2641_RETRY_ESC=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" 'F1: le plan ne porte pas de contrat de sortie.
+
+Verdict: ESCALATE') || M2641_RETRY_ESC=""
+
+assert_contains "mika#2641 (V2-bis): la sonde a mené la boucle jusqu'au 3e appel" \
+    "arch_calls=3" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): un refus obtenu à la relance reste terminal" \
+    "rc=1" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): le trail porte UNPARSED puis ESCALATE-after-retry" \
+    "trail_outcomes=READY,UNPARSED,ESCALATE-after-retry" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): la ligne Verdict: est posée (refus réel)" \
+    "verdict_lines=1" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): aucun motif architect_unreadable" \
+    "halt_cause_lines=0" "$M2641_RETRY_ESC"
+assert_contains "mika#2641 (V2-bis): le fichier de constats garde les deux tentatives" \
+    "findings_retry_sections=1" "$M2641_RETRY_ESC"
+
+# --- V10 (AC1) : une ITERATE explicite n'est PAS un illisible ---------------
+#
+# AC1 : « ni READY, ni ITERATE, ni ESCALATE explicite ». `_parse_verdict` n'a
+# pas de bras ITERATE, donc sans terme dédié une objection lisible serait
+# relancée puis étiquetée « absence de signal » — l'inverse du défaut fondateur.
+M2641_ITER_EXPL=$(_groom_second_pass_probe_2641 ready 'F1: le contrat de sortie manque encore.
+
+Disposition: ITERATE' 'JAMAIS ATTEINT') || M2641_ITER_EXPL=""
+
+assert_contains "mika#2641 (V10): une ITERATE explicite ne déclenche AUCUNE relance" \
+    "arch_calls=2" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): elle reste terminale" \
+    "rc=1" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): cause verdict — la ligne Verdict: est posée" \
+    "verdict_lines=1" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): aucun motif architect_unreadable" \
+    "halt_cause_lines=0" "$M2641_ITER_EXPL"
+assert_contains "mika#2641 (V10): le motif d'échec est celui d'un refus, comme avant" \
+    "reason=architect refused on second pass after a READY first pass" "$M2641_ITER_EXPL"
+
+M2641_ITER_EXPL_I=$(_groom_second_pass_probe_2641 iterate '**Verdict:** ITERATE' 'JAMAIS ATTEINT') \
+    || M2641_ITER_EXPL_I=""
+assert_contains "mika#2641 (V10): after-iterate — aucune relance sur une ITERATE explicite" \
+    "arch_calls=2" "$M2641_ITER_EXPL_I"
+assert_contains "mika#2641 (V10): after-iterate — cause verdict, aucun motif" \
+    "halt_cause_lines=0" "$M2641_ITER_EXPL_I"
+assert_contains "mika#2641 (V10): after-iterate — le motif d'échec est inchangé" \
+    "reason=architect refused on second pass after an ITERATE revise" "$M2641_ITER_EXPL_I"
+
+# Contrôle négatif de l'ANCRAGE : un préambule qui CITE la disposition de 1ʳᵉ
+# passe en prose n'est pas une ligne de disposition — il garde sa relance.
+M2641_ITER_PROSE=$(_groom_second_pass_probe_2641 ready 'Ma première passe rendait Disposition: ITERATE ; je relis le plan révisé.' 'A1: « Ligne de corps 3 — rembourrage rembourrage rembourrage. »
+
+Verdict: GROOMED') || M2641_ITER_PROSE=""
+assert_contains "mika#2641 (V10): une ITERATE citée en prose est relancée" \
+    "arch_calls=3" "$M2641_ITER_PROSE"
+assert_contains "mika#2641 (V10): et la relance converge" \
+    "rc=0" "$M2641_ITER_PROSE"
+
+# --- V3 (AC2) : deux illisibles d'affilée → ESCALATE à motif distinct -------
+
+M2641_DOUBLE=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" "$M2641_UNREADABLE") \
+    || M2641_DOUBLE=""
+
+assert_contains "mika#2641 (V3): l'enveloppe de relance est bornée à deux tentatives" \
+    "arch_calls=3" "$M2641_DOUBLE"
+assert_contains "mika#2641 (V3): un double illisible est une non-convergence" \
+    "rc=1" "$M2641_DOUBLE"
+assert_contains "mika#2641 (V3): le trail enregistre les deux tentatives" \
+    "trail_outcomes=READY,UNPARSED,UNPARSED-after-retry" "$M2641_DOUBLE"
+# D2 — `Outcome: ESCALATE` RESTE la ligne de disposition : `_measure_cycle_output`
+# P4 n'énumère que quatre valeurs, et un mot hors liste ferait tomber le cycle
+# en `empty`, c'est-à-dire un FAUX ROUGE sur un run qui a produit une décision.
+assert_contains "mika#2641 (V3): la ligne de disposition reste Outcome: ESCALATE" \
+    "outcome_escalate_lines=1" "$M2641_DOUBLE"
+assert_contains "mika#2641 (V3): le marqueur terminal est posé" \
+    "terminal_marker_lines=1" "$M2641_DOUBLE"
+# Le cœur d'AC2 : « un motif distinct, ET NON UN VERDICT ». La ligne
+# `Verdict: ESCALATE — human review required` affirmait un verdict que
+# l'architecte n'a jamais rendu.
+assert_contains "mika#2641 (V3): AUCUNE ligne Verdict: n'est affirmée" \
+    "verdict_lines=0" "$M2641_DOUBLE"
+assert_contains "mika#2641 (V3): le motif architect_unreadable est posé, ancré" \
+    "halt_cause_lines=1" "$M2641_DOUBLE"
+assert_contains "mika#2641 (V3): le motif est nommé dans le RESULT" \
+    "Groom-halt-cause: architect_unreadable" "$M2641_DOUBLE"
+# R-f — le motif voyage dans `tasks.result` et c'est TOUT ce que l'opérateur
+# voit (PR#2028). Dire « l'architecte a refusé » l'envoie lire une objection qui
+# n'existe pas : c'est la classe mika#1772 exactement.
+M2641_DOUBLE_REASON=$(printf '%s\n' "$M2641_DOUBLE" | grep '^reason=' || true)
+assert_contains "mika#2641 (V3): le motif nomme l'absence de ligne de verdict" \
+    "no parsable verdict line" "$M2641_DOUBLE_REASON"
+assert_contains "mika#2641 (V3): le motif dit que les deux tentatives ont manqué" \
+    "2 attempts" "$M2641_DOUBLE_REASON"
+assert_not_contains "mika#2641 (V3): le motif ne dit PAS que l'architecte a refusé" \
+    "refused" "$M2641_DOUBLE_REASON"
+
+# --- V6 : le MÊME traitement sur le site after-iterate ----------------------
+#
+# Deux `case` distincts, donc un seul corrigé se lit exactement comme deux.
+
+M2641_ITER=$(_groom_second_pass_probe_2641 iterate "$M2641_UNREADABLE" 'A1: « Ligne de corps 5 — rembourrage rembourrage rembourrage. »
+
+Verdict: GROOMED') || M2641_ITER=""
+
+assert_contains "mika#2641 (V6): le chemin after-iterate atteint lui aussi 3 appels" \
+    "arch_calls=3" "$M2641_ITER"
+assert_contains "mika#2641 (V6): le chemin after-iterate converge sur relance" \
+    "rc=0" "$M2641_ITER"
+assert_contains "mika#2641 (V6): le trail after-iterate porte la relance" \
+    "trail_outcomes=ITERATE,UNPARSED,GROOMED-after-retry" "$M2641_ITER"
+
+M2641_ITER_DOUBLE=$(_groom_second_pass_probe_2641 iterate "$M2641_UNREADABLE" "$M2641_UNREADABLE") \
+    || M2641_ITER_DOUBLE=""
+
+assert_contains "mika#2641 (V6): un double illisible after-iterate est borné" \
+    "arch_calls=3" "$M2641_ITER_DOUBLE"
+assert_contains "mika#2641 (V6): after-iterate pose le motif et pas de Verdict:" \
+    "halt_cause_lines=1" "$M2641_ITER_DOUBLE"
+assert_contains "mika#2641 (V6): after-iterate n'affirme aucun verdict" \
+    "verdict_lines=0" "$M2641_ITER_DOUBLE"
+assert_contains "mika#2641 (V6): le stage after-iterate est nommé dans le RESULT" \
+    "second-pass-after-iterate" "$M2641_ITER_DOUBLE"
+
+# --- V5 : contrôles NÉGATIFS — transport et `.content` vide ne sont PAS -----
+#         des unreadable (D5)
+#
+# « N'a pas répondu » et « a répondu sans disposition » restent deux
+# populations. Les deux replient vers le rejeu, mais par deux chemins
+# différents, et fondre le second dans le premier effacerait un diagnostic qui
+# a coûté trois tentatives et quatre tickets à établir (mika#2296).
+
+M2641_TRANSPORT=$(_groom_second_pass_probe_2641 ready 'inatteignable' 'inatteignable' transport2) \
+    || M2641_TRANSPORT=""
+
+assert_contains "mika#2641 (V5): un échec transport ne déclenche aucune relance d'illisible" \
+    "arch_calls=2" "$M2641_TRANSPORT"
+assert_contains "mika#2641 (V5): un échec transport reste une non-convergence" \
+    "rc=1" "$M2641_TRANSPORT"
+assert_contains "mika#2641 (V5): un échec transport ne pose AUCUN motif unreadable" \
+    "halt_cause_lines=0" "$M2641_TRANSPORT"
+assert_contains "mika#2641 (V5): un échec transport n'escalade pas" \
+    "outcome_escalate_lines=0" "$M2641_TRANSPORT"
+M2641_TRANSPORT_REASON=$(printf '%s\n' "$M2641_TRANSPORT" | grep '^reason=' || true)
+assert_contains "mika#2641 (V5): le motif transport est inchangé" \
+    "_arch_ask failed" "$M2641_TRANSPORT_REASON"
+
+M2641_EMPTY=$(_groom_second_pass_probe_2641 ready 'inatteignable' 'inatteignable' empty2) \
+    || M2641_EMPTY=""
+
+assert_contains "mika#2641 (V5): un .content vide ne déclenche aucune relance d'illisible" \
+    "arch_calls=2" "$M2641_EMPTY"
+assert_contains "mika#2641 (V5): un .content vide reste une non-convergence" \
+    "rc=1" "$M2641_EMPTY"
+assert_contains "mika#2641 (V5): un .content vide ne pose AUCUN motif unreadable" \
+    "halt_cause_lines=0" "$M2641_EMPTY"
+M2641_EMPTY_REASON=$(printf '%s\n' "$M2641_EMPTY" | grep '^reason=' || true)
+assert_contains "mika#2641 (V5): le motif budget (mika#2296) est inchangé" \
+    "EMPTY .content" "$M2641_EMPTY_REASON"
+
+# --- V5-bis : les deux chemins d'échec de la RELANCE elle-même --------------
+#
+# Le scan R5 de mika#2278 compte les six WARN d'échec DANS LA SOURCE ; sans ces
+# deux cas, rien n'assertait qu'ils FIRENT. Et `_pass_label2` a une valeur de
+# relance dont le second cas est le seul consommateur.
+
+M2641_RETRY_TRANSPORT=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" 'inatteignable' transport3) \
+    || M2641_RETRY_TRANSPORT=""
+
+assert_contains "mika#2641 (V5-bis): la relance est bien tentée avant d'échouer" \
+    "arch_calls=3" "$M2641_RETRY_TRANSPORT"
+assert_contains "mika#2641 (V5-bis): un transport mort sur la relance reste une non-convergence" \
+    "rc=1" "$M2641_RETRY_TRANSPORT"
+assert_contains "mika#2641 (V5-bis): et ne pose AUCUN motif unreadable (le transport n'en est pas un)" \
+    "halt_cause_lines=0" "$M2641_RETRY_TRANSPORT"
+M2641_RETRY_TRANSPORT_REASON=$(printf '%s\n' "$M2641_RETRY_TRANSPORT" | grep '^reason=' || true)
+assert_contains "mika#2641 (V5-bis): le WARN de la relance se nomme comme tel" \
+    "second-pass retry _arch_ask failed" "$M2641_RETRY_TRANSPORT_REASON"
+
+M2641_RETRY_EMPTY=$(_groom_second_pass_probe_2641 ready "$M2641_UNREADABLE" 'inatteignable' empty3) \
+    || M2641_RETRY_EMPTY=""
+
+assert_contains "mika#2641 (V5-bis): un .content vide sur la relance est tenté puis refusé" \
+    "arch_calls=3" "$M2641_RETRY_EMPTY"
+assert_contains "mika#2641 (V5-bis): et reste une non-convergence sans motif unreadable" \
+    "halt_cause_lines=0" "$M2641_RETRY_EMPTY"
+M2641_RETRY_EMPTY_REASON=$(printf '%s\n' "$M2641_RETRY_EMPTY" | grep '^reason=' || true)
+# Seul consommateur de la valeur de relance de `_pass_label2`.
+assert_contains "mika#2641 (V5-bis): le motif nomme la RELANCE, pas la 2e passe" \
+    "second-pass retry returned an EMPTY .content" "$M2641_RETRY_EMPTY_REASON"
+
+# --- V4 (R5/D7) : le prompt de relance est COURT, et le seuil est LU --------
+#
+# `mika-arch-second-review` déclare `review_anchor_min_brief_chars` : en dessous,
+# la garde d'ancrage mika#2037 ne s'arme pas. Un prompt de relance au-dessus
+# l'armerait — et l'architecte, qui n'a pas le brief sous les yeux dans un
+# re-prompt, ne peut produire aucune ancre ; le moteur retire alors la
+# disposition (tier 0) ou réécrit la réponse en escalade (tier 0b), et
+# `_parse_verdict` rend ESCALATE. Le correctif produirait exactement le terminal
+# qu'il existe pour empêcher.
+#
+# Le seuil est lu DEPUIS LE MANIFESTE, jamais recopié : un seuil durci dans le
+# `skill.toml` sans que le prompt rétrécisse doit faire rougir ce test.
+M2641_ANCHOR_MANIFEST="$SCRIPT_DIR/../mika-arch-second-review/skill.toml"
+M2641_ANCHOR_THRESHOLD=$(grep -E '^[[:space:]]*review_anchor_min_brief_chars[[:space:]]*=' \
+    "$M2641_ANCHOR_MANIFEST" 2>/dev/null | head -1 | sed 's/.*=[[:space:]]*//' | tr -d ' \r' || true)
+
+if [ -z "$M2641_ANCHOR_THRESHOLD" ]; then
+    echo "SKIP: mika#2641 (V4) — review_anchor_min_brief_chars absent de $M2641_ANCHOR_MANIFEST"
+    SKIPPED=$((SKIPPED + 1))
+else
+    M2641_RETRY_BYTES=$(printf '%s\n' "$M2641_RECOVERED" | grep '^retry_prompt_bytes=' \
+        | head -1 | cut -d= -f2 || true)
+    # Anti-vacuité : un prompt de 0 octet satisferait l'inégalité en ne
+    # mesurant rien (la sonde n'aurait pas tourné, ou le fichier aurait disparu).
+    if [ "${M2641_RETRY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
+        PASS=$((PASS + 1))
+        echo "  ✓ mika#2641 (V4): le prompt de relance a été mesuré (${M2641_RETRY_BYTES} octets)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ mika#2641 (V4): le prompt de relance n'a PAS été mesuré (vide ou sonde muette)"
+    fi
+    if [ "${M2641_RETRY_BYTES:-0}" -lt "$M2641_ANCHOR_THRESHOLD" ] 2>/dev/null; then
+        PASS=$((PASS + 1))
+        echo "  ✓ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) est sous le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD})"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  ✗ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) ATTEINT le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD}) — il armerait la garde mika#2037"
+    fi
+fi
+
+# --- S-c : scan de cardinalité des appels à `_escalate_groom` ---------------
+#
+# Chaque site doit passer une cause EXPLICITE. Un appel qui oublie l'argument
+# tomberait dans le défaut `verdict` et produirait un `RESULT` plausible — donc
+# aucun test comportemental ne peut voir cette classe.
+#
+# La cardinalité est ASSERTÉE, pas seulement la couverture : un scan qui
+# compterait sans borner passerait en ne regardant rien le jour où le nom de la
+# fonction change (classe mika#2205, même raison qui a fait asserter
+# `cardinality == 3` dans le scan de mika#2496).
+#
+# Il y a DEUX assertions de cardinalité à 5, et leur redondance est délibérée :
+# celle de la section ESCALATE lit le corps de `_iterate_groom_loop` par
+# `declare -f`, celle-ci lit le FICHIER ENTIER. Elles peuvent donc divergir — un
+# appel placé hors de la boucle rougit celle-ci et pas l'autre, un appel écrit
+# sans guillemets l'inverse — et c'est exactement pourquoi les deux restent.
+_m2641_escalate_call_sites() {
+    # Les APPELS, jamais la définition ni la prose : ligne dont le premier mot
+    # est `_escalate_groom` suivi d'un espace et d'un argument.
+    grep -nE '^[[:space:]]*_escalate_groom[[:space:]]+"' "$DISPATCH_LIB" || true
+}
+M2641_CALL_LINES=$(_m2641_escalate_call_sites)
+M2641_CALL_COUNT=$(printf '%s' "$M2641_CALL_LINES" | grep -c . || true)
+assert_eq "mika#2641 (S-c): exactement cinq sites appellent _escalate_groom" \
+    "5" "$M2641_CALL_COUNT"
+# Chaque site nomme sa cause PAR LA CONSTANTE, jamais par un littéral recopié.
+# C'est le prédicat plus fort des deux : il attrape à la fois le site qui omet
+# l'argument ET celui qui retape la valeur de fil à la main — or le format de
+# fil n'est exact que tant qu'il a un site de définition unique (D4).
+M2641_CAUSED_COUNT=$(printf '%s\n' "$M2641_CALL_LINES" \
+    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE)"[[:space:]]*$' || true)
+assert_eq "mika#2641 (S-c): les cinq sites passent une cause explicite, par la constante" \
+    "5" "$M2641_CAUSED_COUNT"
+
+# Le format de fil a un site de définition unique de chaque côté (D4). Côté
+# shell : une affectation, pas deux.
+M2641_WIRE_DEFS=$(grep -cE '^GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE=' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (D4): le motif de fil a une définition shell unique" \
+    "1" "$M2641_WIRE_DEFS"
+M2641_PREFIX_DEFS=$(grep -cE '^GROOM_HALT_CAUSE_LINE_PREFIX=' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (D4): le préfixe de ligne a une définition shell unique" \
+    "1" "$M2641_PREFIX_DEFS"
+
+# --- La prémisse qui rend la population de tier 0 VIDE, épinglée ------------
+#
+# `_parse_verdict` tier 0 (`Disposition-Withheld: REVIEW-ANCHOR-MISSING`) rend
+# RIEN, donc il atteindrait le chemin `architect_unreadable` et la relance
+# re-demanderait un verdict avec un prompt trop court pour armer la garde
+# d'ancrage mika#2037 — un contournement.
+#
+# Ce que ça ne peut pas faire aujourd'hui : son propre commentaire dit que
+# depuis mika#2338 tier 0 est le REPLI, et que tier 0b (qui rend ESCALATE, donc
+# ne passe PAS par la relance) tire dès que le skill déclare un `ESCALATE` de la
+# famille de la ligne retirée. Le manifeste livré le déclare, donc la population
+# de tier 0 sur la seconde passe est vide.
+#
+# C'est une PRÉMISSE, pas une garantie du prédicat : si quelqu'un retire cette
+# déclaration, le contournement s'ouvre. Cette assertion la rend fausse
+# BRUYAMMENT plutôt qu'en silence.
+M2641_SUFFIX_DECL=$(grep -cE '^[[:space:]]*required_suffix_lines[[:space:]]*=.*Verdict: ESCALATE' \
+    "$M2641_ANCHOR_MANIFEST" 2>/dev/null || true)
+assert_eq "mika#2641: le manifeste déclare Verdict: ESCALATE (tier 0b tire, tier 0 reste vide)" \
+    "1" "$M2641_SUFFIX_DECL"
+
+# R-b : une SEULE définition du prompt correctif de seconde passe. Deux copies
+# divergeraient, et c'est la leçon que `grooming_marker.rs` a dû engraver une
+# fois (mika#2158) : un prédicat recopié prend du retard sans que rien ne rougisse.
+M2641_HELPER_DEFS=$(grep -cE '^_second_pass_retry_prompt\(\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (R-b): le prompt correctif a une définition unique" \
+    "1" "$M2641_HELPER_DEFS"
+# Les appels, jamais la définition : `$(_second_pass_retry_prompt)` en
+# substitution de commande. La forme réelle est `local x; x=$(...)` sur une
+# ligne, donc le prédicat porte sur la substitution et non sur le début de ligne.
+M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent" \
+    "2" "$M2641_HELPER_CALLS"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0

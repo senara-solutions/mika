@@ -1129,6 +1129,13 @@ impl TaskDispatcher {
                 self.settings.effective_pilot_cost_alert_usd(),
             )
             .await;
+            // mika#2641 R-g: la moitié MOTEUR du couple. `dispatch-lib.sh`
+            // n'écrit aucune ligne d'audit (c'est du shell, sans accès à la
+            // base) et son stderr est jeté sur un dispatch de groom (classe
+            // mika#2050), donc le producteur pose un marqueur dans `RESULT` et
+            // ce lecteur l'y lit. Même placement et même discipline que le
+            // voisin ci-dessus : il n'arrête rien.
+            try_report_groom_architect_unreadable(&self.db, task).await;
             // mika#965: Write a human-readable callback summary to task_messages
             // so the dispatch session's next rebuild_context() includes it.
             try_write_callback_summary(&self.db, task).await;
@@ -4482,22 +4489,7 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
 
     let turns = pilot.get("turns").and_then(|v| v.as_u64());
 
-    // The ticket coordinates live on the PARENT's `reference_url` — the
-    // callback child carries a pgid and never a reference (the same two-row
-    // topology mika#2279 and mika#2335 had to name). Unresolvable coordinates
-    // downgrade the line, they never suppress it: a cost overrun on a dispatch
-    // whose parent cannot be read is still an overrun, and dropping it would
-    // silently shrink the population.
-    let mut repo = None;
-    let mut issue = None;
-    if let Some(parent_id) = &task.parent_task_id
-        && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
-        && let Some(url) = parent.reference_url.as_deref()
-        && let Some((r, n)) = parse_repo_issue_from_url(url)
-    {
-        repo = Some(r);
-        issue = Some(n);
-    }
+    let (repo, issue) = parent_issue_coordinates(db, task).await;
 
     warn!(
         event = "pilot_cost_overrun",
@@ -4519,10 +4511,7 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
         issue.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
         turns.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
     );
-    let session_id = task
-        .created_by_session
-        .clone()
-        .unwrap_or_else(|| format!("callback-{}", task.id));
+    let session_id = audit_session_id(task);
     if let Err(e) = db
         .log_audit_event(
             &session_id,
@@ -4541,6 +4530,207 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
             "engine: failed to write pilot_cost_overrun audit event"
         );
     }
+}
+
+/// Préfixe de la ligne de motif d'arrêt de groom, **synchronisé avec le shell**
+/// (mika#2641).
+///
+/// Jumeau de `GROOM_HALT_CAUSE_LINE_PREFIX` dans
+/// `skills/bundled/_shared/dispatch-lib.sh`. Les deux littéraux sont un **format
+/// de fil** à deux moitiés, et `canonical_tokens::tests::mika2641_*` refuse
+/// qu'elles divergent — un écrivain shell qui change le préfixe sans que ce
+/// lecteur suive rendrait la population **vide en silence**, c'est-à-dire
+/// indistinguable d'un champ sain (classe mika#2205).
+pub(crate) const GROOM_HALT_CAUSE_LINE_PREFIX: &str = "Groom-halt-cause:";
+
+/// La cause « l'architecte n'a émis aucune ligne de verdict lisible, deux fois ».
+///
+/// Jumeau de `GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE` côté shell. Le préfixe
+/// `architect_` est porteur : `executor.rs::GROOM_ESCALATE_VERDICT_UNREADABLE`
+/// porte déjà le mot `unreadable` nu, à un AUTRE sens (« la preuve en base n'a
+/// pas pu être lue »). Deux sens, deux couches ; les fondre couperait deux
+/// populations sous un même mot.
+pub(crate) const GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE: &str = "architect_unreadable";
+
+/// Audit `tool_name` sous lequel une seconde passe architecte illisible est
+/// enregistrée (mika#2641).
+///
+/// **SOLE WRITER.** Ce module est le seul site de production qui l'écrit, et
+/// `canonical_tokens::tests::mika2641_the_architect_unreadable_name_has_a_single_writer`
+/// refuse un second. La propriété est ce qui rend le `GROUP BY` de l'opérateur
+/// un compte exact de la population neuve — et ce compte est la **précondition
+/// explicite** du ticket de suivi sur le taux de coupure architecte, qui
+/// s'ouvrirait sinon sur une intuition.
+pub(crate) const GROOM_ARCHITECT_UNREADABLE_TOOL: &str = "groom_architect_unreadable";
+
+/// Les deux champs positionnels de la ligne de motif : `(cause, stage)`.
+///
+/// **Lue ANCRÉE en début de ligne, jamais par `contains`.** Le `result` d'un
+/// callback porte la prose du pilote, qui peut citer ce mécanisme même — c'est
+/// le faux positif que mika#2050 a mesuré sur le Signal S et que mika#2545 a dû
+/// éviter sur le sien. Aucun `trim_start` sur la ligne : `_escalate_groom`
+/// écrit en colonne 0, et ne pas tolérer d'indentation est la direction SÛRE
+/// (un faux négatif perd une ligne d'audit, un faux positif en fabrique une).
+///
+/// Résidu nommé, hérité de mika#2545 : une prose de pilote qui commencerait une
+/// ligne par ce littéral exact serait lue. Borné, et c'est le prix de l'ancrage
+/// plutôt que d'un parseur.
+fn groom_halt_cause(result: &str) -> Option<(&str, Option<&str>)> {
+    result.lines().find_map(|line| {
+        let rest = line.strip_prefix(GROOM_HALT_CAUSE_LINE_PREFIX)?;
+        let mut fields = rest.split_whitespace();
+        let cause = fields.next()?;
+        // Le second champ est FILTRÉ sur la forme d'une étape, et ce n'est pas
+        // de la minutie : il atterrit dans `audit_events.after_value`, qui est
+        // la dimension de `GROUP BY` de l'opérateur. Sans ce filtre, une ligne
+        // `Groom-halt-cause: <cause> — prose` (cause présente, étape absente,
+        // prose présente) ferait de l'em-dash une clé d'agrégation — « une
+        // mesure qui mentionne » exactement la classe que cette famille de
+        // lecteurs existe pour éviter. Inatteignable aujourd'hui (l'écrivain
+        // unique interpole toujours un `${stage}` non vide), et c'est pourquoi
+        // c'est un filtre et non un refus : une étape illisible DÉGRADE la
+        // ligne vers `unknown`, elle ne la supprime pas.
+        let stage = fields
+            .next()
+            .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        Some((cause, stage))
+    })
+}
+
+/// Rapporter — jamais empêcher — une seconde passe architecte qui n'a rendu
+/// aucune ligne de verdict lisible, deux fois (mika#2641 R-g / D8).
+///
+/// **La moitié moteur d'un couple à deux moitiés, et chacune tombe seule.** Le
+/// producteur est `dispatch-lib.sh`, qui pose la ligne `Groom-halt-cause:` dans
+/// `RESULT` ; elle suffit à elle seule pour la lecture SQL sur `tasks.result`.
+/// Ce lecteur l'y lit et écrit la ligne `audit_events` qu'AC2 demande. Livrée
+/// seule, la moitié shell donne une surface SQL ; livré seul, ce lecteur n'a
+/// rien à lire et reste muet. **Aucune des deux ne peut produire un faux
+/// positif en l'absence de l'autre.**
+///
+/// Pourquoi un lecteur moteur du tout : `grep -n "audit_event\|log_audit"` sur
+/// `dispatch-lib.sh` rend **zéro ligne** — c'est du shell, sans accès à la base.
+/// Et son stderr est structurellement jeté sur un dispatch de groom (la boucle
+/// est appelée **après** `_run_claude_pilot`, donc hors de la redirection
+/// `2>"$STDERR_FILE"`, et un groom sort toujours en 0 donc le `Stdio::piped()`
+/// est lâché sans être lu — classe mika#2050, Signaux M et Q). Toute
+/// instrumentation qui passerait par `echo … >&2` serait **inerte**.
+///
+/// Patron : `try_report_pilot_cost_overrun` juste au-dessus. **N'arrête rien**,
+/// best-effort, un échec d'audit avertit et rend la main — mesurer un arrêt ne
+/// doit pas pouvoir casser la livraison du callback qui le porte.
+async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) {
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let Some((cause, stage)) = groom_halt_cause(result) else {
+        return;
+    };
+    // Une cause AUTRE que celle-ci n'est pas la population de ce lecteur : le
+    // défaut `verdict` ne pose aucune ligne de motif, donc ce bras ne peut être
+    // atteint que par une cause future, et la traiter comme la nôtre polluerait
+    // un compte qui existe pour dimensionner un ticket de suivi.
+    if cause != GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE {
+        return;
+    }
+
+    // Une résolution impossible DÉGRADE la ligne, elle ne la supprime jamais :
+    // une seconde passe illisible dont le parent est illisible reste une
+    // seconde passe illisible, et la jeter rétrécirait la population en silence
+    // (motif `repo=unknown` de mika#2496). Le `await` n'est atteint qu'ICI,
+    // c'est-à-dire déjà DANS la population — le chemin nominal d'un callback
+    // sans ligne de motif n'y touche pas.
+    let (repo, issue) = parent_issue_coordinates(db, task).await;
+
+    warn!(
+        event = "groom_architect_unreadable",
+        repo = repo.as_deref().unwrap_or("unknown"),
+        issue = issue,
+        stage = stage.unwrap_or("unknown"),
+        task_id = %task.id,
+        "engine: a second architect pass produced no parsable verdict line twice — \
+         the groom halted on an ABSENCE OF SIGNAL, not on an objection to the plan \
+         (measured, not prevented)"
+    );
+
+    // `target_key` = le ticket, parce que c'est ce qu'un opérateur cherche ;
+    // `after_value` = l'étape, ce qui fait de « la population neuve, par étape »
+    // un `GROUP BY after_value`. Rectification assumée au § 10 du plan, dont le
+    // SQL groupait sur `target_key` en annonçant l'étape : les deux ne peuvent
+    // pas être vrais ensemble.
+    //
+    // Le repli est `task:<id>` et non `issue:unknown#?` : une clé dégradée doit
+    // rester DISCRIMINANTE, sans quoi tous les parents illisibles se
+    // confondraient dans une seule ligne du `GROUP BY`.
+    let target_key = match (repo.as_deref(), issue) {
+        (Some(r), Some(n)) => format!("issue:{r}#{n}"),
+        _ => format!("task:{}", task.id),
+    };
+    let session_id = audit_session_id(task);
+    if let Err(e) = db
+        .log_audit_event(
+            &session_id,
+            GROOM_ARCHITECT_UNREADABLE_TOOL,
+            &target_key,
+            None,
+            Some(stage.unwrap_or("unknown")),
+            Some(&format!("task:{} cause:{cause}", task.id)),
+            None,
+        )
+        .await
+    {
+        warn!(
+            task_id = %task.id,
+            error = %e,
+            "engine: failed to write groom_architect_unreadable audit event"
+        );
+    }
+}
+
+/// Les coordonnées du ticket d'un dispatch, résolues depuis son PARENT.
+///
+/// **La topologie est à deux lignes, et l'oublier est le défaut que mika#2279 et
+/// mika#2335 ont dû nommer tous les deux** : l'URL de l'issue vit sur le parent
+/// (`manual` / `action_type='none'`), le pgid sur l'enfant de callback, et
+/// **aucune ligne ne porte les deux**. Un lecteur qui conjoindrait les deux
+/// prédicats sur une seule ligne sélectionnerait l'ensemble vide.
+///
+/// Une résolution impossible rend `(None, None)` — les appelants **dégradent**
+/// leur ligne (`repo=unknown`) et ne la suppriment jamais : un fait mesuré sur un
+/// dispatch dont le parent est illisible reste un fait mesuré, et le jeter
+/// rétrécirait la population en silence (motif mika#2496).
+///
+/// Extrait parce que les deux lecteurs rétrospectifs de ce module
+/// (`try_report_pilot_cost_overrun`, `try_report_groom_architect_unreadable`) en
+/// portaient une copie **à l'octet près, commentaire compris**. Ce qui les
+/// distingue légitimement est ce qu'ils font du résultat — leur `warn!`, leur
+/// `target_key`, leur `reasoning` — pas la traversée.
+async fn parent_issue_coordinates(
+    db: &AsyncDatabase,
+    task: &Task,
+) -> (Option<String>, Option<u64>) {
+    if let Some(parent_id) = &task.parent_task_id
+        && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
+        && let Some(url) = parent.reference_url.as_deref()
+        && let Some((r, n)) = parse_repo_issue_from_url(url)
+    {
+        return (Some(r), Some(n));
+    }
+    (None, None)
+}
+
+/// La session sous laquelle un lecteur rétrospectif écrit sa ligne d'audit.
+///
+/// Le repli `callback-<id>` est porteur : `audit_events.session_id` n'est pas
+/// nullable, et une ligne écrite sous une session fabriquée reste **jointe à sa
+/// tâche** par son suffixe, donc retrouvable. Deuxième moitié de la duplication
+/// verbatim que portaient les deux lecteurs.
+fn audit_session_id(task: &Task) -> String {
+    task.created_by_session
+        .clone()
+        .unwrap_or_else(|| format!("callback-{}", task.id))
 }
 
 /// Parse `senara-solutions/<repo>/issues/<n>` from a reference URL.
@@ -5953,6 +6143,24 @@ mod tests {
     /// loaded callback task. Mirrors the two-row topology production writes:
     /// the issue URL lives on the PARENT, the dispatch on the child.
     async fn mika2496_dispatch_pair(db: &AsyncDatabase, result: &str) -> Task {
+        dispatch_pair_with_reference(
+            db,
+            result,
+            Some("https://github.com/senara-solutions/mika/issues/2484"),
+        )
+        .await
+    }
+
+    /// Même paire, avec le `reference_url` du parent en paramètre.
+    ///
+    /// mika#2641 a besoin du cas `None` pour exercer la DÉGRADATION de la clé
+    /// d'audit sur un parent dont les coordonnées sont illisibles — et un second
+    /// builder de cinquante lignes aurait été deux formes libres de diverger.
+    async fn dispatch_pair_with_reference(
+        db: &AsyncDatabase,
+        result: &str,
+        reference_url: Option<&str>,
+    ) -> Task {
         let parent = NewTask {
             agent_id: "mika".to_string(),
             team_run_id: None,
@@ -5971,7 +6179,7 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
-            reference_url: Some("https://github.com/senara-solutions/mika/issues/2484".to_string()),
+            reference_url: reference_url.map(|s| s.to_string()),
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: None,
@@ -6161,6 +6369,223 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    // ===== try_report_groom_architect_unreadable (mika#2641 R-g / V7) =====
+    //
+    // Le `RESULT` que `_escalate_groom` compose sur la cause
+    // `architect_unreadable`. Recopié depuis le producteur shell : la synchronie
+    // des deux littéraux est tenue par
+    // `canonical_tokens::tests::mika2641_the_halt_cause_wire_format_is_synchronised_shell_to_rust`,
+    // et cette fixture est ce qui exerce le LECTEUR.
+    const MIKA2641_UNREADABLE_RESULT: &str = "GROOM ESCALATED (terminal): mika-arch answered at second-pass-after-ready \
+         without a parsable verdict line.\n\
+         Groom-halt-cause: architect_unreadable second-pass-after-ready — no \
+         READY/ITERATE/GROOMED/ESCALATE line in two attempts (initial + corrective \
+         retry). This is an absence of signal, NOT an objection to the plan.\n\
+         Session: probe-2641\n\
+         Architect findings preserved at: /tmp/x/.iterate/escalate-second-pass-after-ready.md\n\
+         Outcome: ESCALATE — second-pass-after-ready";
+
+    /// Le `RESULT` d'un refus EXPLICITE — la cause `verdict`, inchangée par
+    /// mika#2641. Il ne porte AUCUNE ligne de motif.
+    const MIKA2641_EXPLICIT_ESCALATE_RESULT: &str = "GROOM ESCALATED (terminal): mika-arch escalated at second-pass-after-ready.\n\
+         Verdict: ESCALATE — human review required.\n\
+         Session: probe-2641\n\
+         Architect findings preserved at: /tmp/x/.iterate/escalate-second-pass-after-ready.md\n\
+         Outcome: ESCALATE — second-pass-after-ready";
+
+    #[tokio::test]
+    async fn mika2641_an_unreadable_second_pass_is_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2641_UNREADABLE_RESULT).await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "mika#2641 — la population neuve qu'AC2 demande doit être comptable"
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == GROOM_ARCHITECT_UNREADABLE_TOOL)
+            .expect("la ligne d'audit doit être lisible depuis la session du callback");
+        // `target_key` = le ticket, parce que c'est ce qu'un opérateur cherche.
+        assert_eq!(row.target_key, "issue:mika#2484");
+        // `after_value` = l'étape, ce qui fait de « la population neuve, par
+        // étape » un `GROUP BY after_value`.
+        assert_eq!(row.after_value.as_deref(), Some("second-pass-after-ready"));
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(
+            reasoning.contains("cause:architect_unreadable"),
+            "reasoning: {reasoning}"
+        );
+    }
+
+    /// **Contrôle négatif, et c'est AC3.** Sans lui, « le lecteur décide »
+    /// serait indistinguable de « le lecteur fire sur tout ESCALATE » — et une
+    /// ligne écrite sur chaque refus réel noierait la population que ce compte
+    /// existe pour dimensionner, en plus de faire lire une absence de signal
+    /// là où l'architecte a bel et bien objecté.
+    #[tokio::test]
+    async fn mika2641_an_explicit_escalate_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2641_EXPLICIT_ESCALATE_RESULT).await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2641 AC3 — un refus explicite n'entre pas dans la population \
+             des absences de signal"
+        );
+    }
+
+    /// **Contrôle négatif de l'ANCRAGE.** Le `result` d'un callback porte la
+    /// prose du pilote, qui peut citer ce mécanisme même — le faux positif que
+    /// mika#2050 a mesuré sur le Signal S et que mika#2545 a dû éviter sur le
+    /// sien. Une citation en milieu de ligne n'est pas une émission.
+    ///
+    /// **La fixture est la forme qui PIÈGE un prédicat non ancré**, et elle a
+    /// été corrigée par mutation : la première version citait le marqueur entre
+    /// backticks, donc un `contains` en extrayait `` architect_unreadable` `` —
+    /// jeton différent, retour anticipé, test vert POUR LA MAUVAISE RAISON. Ici les deux
+    /// champs positionnels suivent le marqueur nus, donc un prédicat non ancré
+    /// écrit la ligne et ce test rougit. Vu rouge sous cette mutation.
+    #[tokio::test]
+    async fn mika2641_prose_quoting_the_marker_mid_line_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "claude-pilot completed (status: done).\n\
+             I implemented the reader. Note that Groom-halt-cause: architect_unreadable \
+             second-pass-after-ready is only recognised when anchored at line start.\n\
+             PR: https://github.com/senara-solutions/mika/pull/2642",
+        )
+        .await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#2641 — la prose d'un pilote qui CITE le marqueur n'est pas une \
+             émission : le prédicat est ancré en début de ligne"
+        );
+    }
+
+    /// Une cause AUTRE que la nôtre n'entre pas dans la population. Le défaut
+    /// `verdict` ne pose aucune ligne de motif, donc ce bras ne peut être atteint
+    /// que par une cause future — et la compter comme la nôtre rendrait inexact
+    /// le compte dont le ticket de suivi dépend.
+    #[tokio::test]
+    async fn mika2641_another_halt_cause_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(
+            &db,
+            "GROOM ESCALATED (terminal): mika-arch halted at second-pass-after-ready.\n\
+             Groom-halt-cause: some_future_cause second-pass-after-ready — prose.\n\
+             Outcome: ESCALATE — second-pass-after-ready",
+        )
+        .await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Des coordonnées illisibles DÉGRADENT la clé, elles ne suppriment jamais
+    /// la ligne : une seconde passe illisible dont le parent est illisible reste
+    /// une seconde passe illisible (motif `repo=unknown` de mika#2496). Le repli
+    /// reste DISCRIMINANT — sans quoi tous les parents illisibles se
+    /// confondraient dans une seule ligne du `GROUP BY`.
+    #[tokio::test]
+    async fn mika2641_an_unresolvable_parent_degrades_the_key_and_keeps_the_row() {
+        let db = test_db();
+        let task = dispatch_pair_with_reference(&db, MIKA2641_UNREADABLE_RESULT, None).await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == GROOM_ARCHITECT_UNREADABLE_TOOL)
+            .expect("la ligne dégradée doit exister");
+        assert_eq!(row.target_key, format!("task:{}", task.id));
+    }
+
+    #[tokio::test]
+    async fn mika2641_an_absent_result_is_not_counted() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, "").await;
+
+        try_report_groom_architect_unreadable(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    // --- Le lecteur pur, aux bornes ----------------------------------------
+
+    #[test]
+    fn mika2641_the_cause_reader_is_anchored_at_line_start() {
+        assert_eq!(
+            groom_halt_cause(MIKA2641_UNREADABLE_RESULT),
+            Some(("architect_unreadable", Some("second-pass-after-ready")))
+        );
+        // Milieu de ligne : pas une émission.
+        assert_eq!(
+            groom_halt_cause("prose Groom-halt-cause: architect_unreadable stage — x"),
+            None
+        );
+        // Indenté : pas une émission non plus. `_escalate_groom` écrit en
+        // colonne 0, et ne pas tolérer d'indentation est la direction SÛRE — un
+        // faux négatif perd une ligne d'audit, un faux positif en fabrique une.
+        assert_eq!(
+            groom_halt_cause("  Groom-halt-cause: architect_unreadable stage — x"),
+            None
+        );
+        // Aucune ligne de motif du tout — le cas du refus explicite.
+        assert_eq!(groom_halt_cause(MIKA2641_EXPLICIT_ESCALATE_RESULT), None);
+        // Une ligne de motif sans étape reste lisible : la cause décide, l'étape
+        // enrichit. Dégrader plutôt que jeter.
+        assert_eq!(
+            groom_halt_cause("Groom-halt-cause: architect_unreadable"),
+            Some(("architect_unreadable", None))
+        );
+        // Un préfixe nu, sans cause : rien à rapporter.
+        assert_eq!(groom_halt_cause("Groom-halt-cause:"), None);
+        // Cause présente, étape ABSENTE, prose présente : l'em-dash ne devient
+        // pas une clé de `GROUP BY`. Inatteignable depuis l'écrivain unique, et
+        // épinglé quand même — c'est la dimension d'agrégation de l'opérateur.
+        assert_eq!(
+            groom_halt_cause("Groom-halt-cause: architect_unreadable — prose libre"),
+            Some(("architect_unreadable", None))
         );
     }
 
