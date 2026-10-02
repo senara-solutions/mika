@@ -11,8 +11,11 @@ motif rendez-vous), mika#571 (`ci_success_handler`), mika#2248 (qui merge)
 
 ## 1. Ce que la lecture du code déplace dans le ticket
 
-C'est le premier livrable. Neuf rectifications, chacune change ce qu'il faut
-écrire.
+C'est le premier livrable. Douze rectifications, chacune change ce qu'il faut
+écrire. R1–R9 datent de la première passe ; **R10–R12 sont les trois qu'une
+seconde lecture de l'arbre a trouvées, et les trois changent un livrable** —
+l'une ouvre une capacité que le plan supposait acquise, l'autre nomme un second
+lecteur, la troisième rend non livrables les tests tels qu'ils étaient décrits.
 
 ### R1 — `gh run rerun --job <id> --failed` n'est pas une commande valide
 
@@ -125,6 +128,68 @@ rougit sur le code actuel est **structurel** — l'argv construit ne porte plus
 `--required`. Le test comportemental est un **contrôle positif**, pas la preuve du
 correctif. Écrire l'inverse revendiquerait une couverture qu'on n'a pas.
 
+### R10 — AUCUNE lecture de commentaires de PR n'existe dans l'arbre, et AC5 en demande une
+
+Mesuré par recherche exhaustive sur `crates/mika-agent/src/` : zéro
+`--json comments`, zéro `gh api …/issues/{n}/comments`, zéro `gh pr view
+--comments`. Les seules occurrences du mot sont de la prose et un nom de skill
+(`address_pr_comments`). **AC5 n'est donc pas « un terme de plus sur des données
+qu'on a déjà » : c'est une capacité de lecture neuve**, et la première passe la
+supposait acquise — elle écrivait « la porte lit les commentaires » sans nommer la
+commande, le site d'appel, le délai ni le coût.
+
+**Le coût est la partie qui mord, et il est créé par le témoin de type.** `MergeClearance`
+force les **trois** sites de merge à produire un `MpcGateVerdict` ; sans
+court-circuit, chaque merge de `senara-solutions/mika` — la population écrasante —
+paierait un aller-retour réseau pour une liste de commentaires que personne ne lira.
+D'où l'ordre, qui est une propriété de `mpc_gate_verdict` et non une discipline
+d'appelant : **le terme de population se teste AVANT toute lecture**, et
+`MPC_GATE_REQUIRED_REPOS` ne contenant que `claude-pilot-py`, le chemin nominal
+reste à zéro appel.
+
+### R11 — le head SHA a déjà un lecteur, et sa disponibilité est ASYMÉTRIQUE par site
+
+`verdict_handler::fetch_pr_head_sha` (mika#1563, `gh pr view --json headRefOid
+--jq .headRefOid`, timeout 15 s) lit déjà ce fait. Ajouter `headRefOid` à
+`PrPreflight` en crée un second, sur une maison qui tient le lecteur unique
+(mika#2158, mika#2484, mika#2624). La coexistence est **nommée** plutôt que
+supprimée : les deux répondent à la même question à des **instants** différents et
+sur des chemins différents, et unifier demanderait de faire appeler le preflight
+par un site qui ne l'appelle pas — un appel de plus pour retirer une duplication,
+c'est-à-dire le mauvais sens.
+
+Et la disponibilité n'est pas uniforme, ce que la première passe n'avait pas relevé :
+
+| site | head SHA | appel réseau ajouté |
+|---|---|---|
+| `pr_merge_with_gate::execute` | **absent** — `PrPreflight` ne le porte pas | **zéro** : le preflight est déjà appelé, U3 ajoute un champ au `--json` existant |
+| `verdict_handler` | présent (`fetch_pr_head_sha`, et il appelle aussi le preflight l. 602) | zéro |
+| `merge_ready_handler` | **présent dans `signal.head_sha`** | **zéro** |
+
+**La bonne nouvelle est la troisième ligne, et elle porte AC5 en entier** :
+`merge_ready_handler` est le site qui merge une PR `claude-pilot-py` sans passer par
+le tool (R8), et le `MergeReadySignal` lui livre déjà le head SHA. Le terme le plus
+critique d'AC5 ne coûte donc **aucune** résolution de SHA, à aucun des trois sites.
+
+### R12 — `execute` n'a aucun seam d'injection, donc les treize cas de la première passe ne sont pas livrables tels quels
+
+`execute` appelle `run_gh_checks` et `run_gh_merge` **directement**, sur des
+fonctions libres, sans paramètre substituable. Le patron mika#2455 que la première
+passe invoquait ne substitue pas un `execute` : il définit deux outils de test, l'un
+délégant à `builtin_handlers::execute("run_gh", …)` verbatim pour observer le
+**câblage**, l'autre lançant la fonction de garde avec un **lecteur injecté** pour
+observer la **décision** — et son propre doc-comment dit pourquoi il faut les deux :
+*« Neither tool alone would be enough: the first would go green against a gate that
+decides nothing, the second against a gate nobody calls. »* Transposer ça à un tool
+qui n'est pas atteint par `run_gh` demanderait d'ouvrir un seam dans `execute`.
+
+Le remède est le motif maison plutôt qu'un seam : **extraire la décision en fonction
+pure** qui reçoit ce que le réseau a produit, et laisser `execute` être la plomberie
+— `decide_content_net` (mika#2270), `classify_wrapper_activity` (mika#2184),
+`screen_target_purges` / `apply_lock_probes` (mika#2619). Les treize cas portent alors
+sur la décision, et le câblage est tenu par le scan d'argv plus l'assertion de
+cardinalité. Voir § 4, réécrit en conséquence.
+
 ---
 
 ## 2. Requirements
@@ -188,8 +253,17 @@ correctif. Écrire l'inverse revendiquerait une couverture qu'on n'a pas.
   rétention de 90 jours). Motif mika#1869 / mika#2347, clé portant la tête, donc
   **un nouveau sha rouvre le budget de lui-même** — nouveau code, nouvelle chance.
 - `head_sha` : ajouter `headRefOid` au `--json` de `run_gh_pr_view` et le champ
-  `head_ref_oid` à `PrPreflight` (`#[serde(default)]`, vide = illisible).
-  `ci_success_handler` a déjà `pr.head_sha`.
+  `head_ref_oid` à `PrPreflight` (`#[serde(default)]`, vide = illisible — **jamais**
+  un `""` traité comme un SHA, qui ferait du ledger une clé partagée par toutes les
+  têtes illisibles). Aucun appel réseau ajouté à aucun site : voir le tableau de R11,
+  et noter que `merge_ready_handler` le reçoit déjà dans `signal.head_sha`. Le second
+  lecteur (`fetch_pr_head_sha`) est **conservé et nommé** par un commentaire daté, pas
+  retiré — R11.
+- **Clé de ledger, et le séparateur est porteur** : `rerun:{repo}#{pr}@{head_sha}:{run_id}`
+  est interrogée par **égalité exacte** (`count_recent_audit_events_for_target` compare
+  `target_key = ?3`), donc le piège `#234` ↔ `#2343` de mika#2347 ne s'ouvre pas ici. Le
+  `@` reste écrit pour qu'un futur lecteur de préfixe soit sûr par construction plutôt
+  que par chance.
 - **Fail-CLOSED sur le ledger** — l'inverse du reste de ce travail, et l'arbitrage
   est local : un faux « déjà relancé » coûte une relance perdue sur une PR qui
   attend de toute façon un humain ; un faux « jamais relancé » relance en boucle,
@@ -249,9 +323,29 @@ correctif. Écrire l'inverse revendiquerait une couverture qu'on n'a pas.
   `NotRequired` | `Attested` | `Missing` | `StaleSha { attested, head }`.
   Comparaison d'**égalité** sur le sha complet : tout push ultérieur invalide le
   marqueur de lui-même, ce qui est exactement la propriété qu'AC5 achète.
+- **La lecture des commentaires est une capacité NEUVE, et son coût est nul sur le
+  chemin nominal (R10).** `fetch_pr_comments(pr_number, repo, token) -> Result<Vec<String>, String>`
+  — `gh pr view <n> --repo <r> --json comments --jq '.comments[].body'`, une ligne par
+  commentaire, bornée par `tokio::time::timeout` 15 s (la valeur de
+  `fetch_pr_head_sha`, son voisin le plus proche, plutôt qu'un nombre neuf).
+  **L'ordre est une propriété de `mpc_gate_verdict`, jamais une discipline
+  d'appelant** : le terme de population (`MPC_GATE_REQUIRED_REPOS`) se teste
+  **avant** que le lecteur ne soit invoqué, donc un merge sur
+  `senara-solutions/mika` rend `NotRequired` sans aucun aller-retour. Écrit comme un
+  paramètre `comments: &[String]` dans la fonction pure et comme un **lecteur
+  paresseux** au site d'appel (une fermeture `async` que seul le bras « population
+  concernée » exécute) — sans quoi les trois sites paieraient l'appel pour le jeter.
 - **Fail-CLOSED** : commentaires illisibles, `gh` en échec, `head_sha` vide ⇒
   `Missing`. C'est une précondition **supplémentaire** sur une population petite ;
-  son illisibilité doit refuser, sinon la précondition n'en est pas une.
+  son illisibilité doit refuser, sinon la précondition n'en est pas une. Conséquence
+  nommée : une panne de l'API GitHub gèle le merge autonome de `claude-pilot-py`
+  seul — les autres dépôts ne consultent rien et ne peuvent donc pas être gelés par
+  ce terme.
+- **Le marqueur n'est jamais cherché dans un bloc de code.** `extract_mpc_gate_shas`
+  ignore les segments clôturés (```) du corps d'un commentaire, pour la raison que
+  mika#2050 a mesurée sur le Signal S : un commentaire **discutant** du format
+  (celui-ci, par exemple, ou le corps du ticket mika#2617) porte le littéral et
+  serait lu comme une attestation. Contrôle négatif épinglé au § 4.
 - **Témoin de type, et c'est ce qui rend AC5 non contournable.**
   `run_gh_merge` prend un `MergeClearance` dont le champ est privé et dont le seul
   constructeur est `MergeClearance::from_mpc_verdict(&MpcGateVerdict) -> Option<Self>`,
@@ -269,7 +363,8 @@ Détaillés aux § 4 et § 6.
 ## 3. Fire-Disposition
 
 Ce plan livre des détecteurs : trois scans de source / tests structurels (U4),
-un scan d'argv (U1), plus les tests de contrat. Disposition retenue :
+un scan d'argv (U1), deux scans d'exhaustivité de `match` (`RerunOutcome` en U3 et
+`MergeGateDecision` en R12/§ 4), plus les tests de contrat. Disposition retenue :
 
 **(a) exception nommée en allowlist — livrée VIDE, et épinglée vide.**
 
@@ -310,13 +405,38 @@ peut rougir sur l'arbre tel qu'il est après U1.
 | `mika2617_mpc_gate_verdict_*` | `NotRequired` hors population ; `Attested` sur égalité ; `StaleSha` sur divergence ; `Missing` sur absence et sur illisible |
 | `mika2617_merge_clearance_is_not_constructible_from_a_refusal` | le témoin de type ne se fabrique pas depuis `Missing`/`StaleSha` |
 | `mika2617_rerun_outcome_has_no_wildcard_arm` | scan de source : le `match` de l'appelant est exhaustif |
+| `mika2617_the_comment_reader_is_not_invoked_outside_the_population` | **R10, le test du coût** : sur `senara-solutions/mika`, le lecteur paresseux n'est **pas** exécuté (compteur d'invocations à zéro) et le verdict est `NotRequired`. Sans lui, un appel `gh` par merge s'ajoute sur la population écrasante sans qu'aucune assertion ne rougisse |
+| `mika2617_decide_merge_gate_has_no_wildcard_arm` | scan de source : le `match` d'`execute` sur `MergeGateDecision` est exhaustif (R12) |
 
-### Tests comportementaux (contrôles positifs, R9)
+### La décision est une fonction pure, et c'est ce que R12 impose
 
-`crates/mika-agent/tests/eval/test_merge_gate_all_checks_2617.rs`, patron
-mika#2455 : **le seam est le stdout brut du subprocess**, jamais les checks déjà
-parsés — un test qui injecterait des `GhCheck` laisserait `parse_gh_checks` et
-`classify_checks` hors du chemin de production et attesterait son propre parseur.
+`execute` n'offre aucun seam (R12), donc la décision est **extraite** plutôt que
+substituée :
+
+```
+decide_merge_gate(
+    preflight, checks, rerun_ledger_state, mpc_verdict
+) -> MergeGateDecision
+```
+
+Tout ce que le réseau a produit entre en paramètre ; `execute` devient la plomberie
+qui appelle, puis obéit. Motif maison : `decide_content_net` (mika#2270),
+`classify_wrapper_activity` (mika#2184), `screen_target_purges` (mika#2619). Deux
+propriétés que ça achète et qu'un seam n'aurait pas données : les treize cas tournent
+**sans tokio, sans base, sans fixture de subprocess**, et le `match` de `execute` sur
+`MergeGateDecision` est exhaustif **sans bras `_ =>`**, donc une issue ajoutée demain
+ne peut pas tomber dans un défaut silencieux.
+
+**Ce que ça ne couvre pas, et ce qui le couvre à la place :** que `execute` *appelle*
+cette fonction, et qu'il l'appelle avec les bons arguments. Aucun test comportemental
+ne peut le voir — un `execute` qui ignorerait la décision laisserait les treize cas
+verts. C'est le rôle du scan d'argv (U1), de l'assertion de cardinalité sur les sites
+de `run_gh_merge`, et du témoin de type `MergeClearance` (U5), qui rend le
+contournement **non compilable** plutôt que détectable.
+
+### Les treize cas (sur la décision, R9/R12)
+
+`crates/mika-agent/tests/eval/test_merge_gate_all_checks_2617.rs`
 
 | cas | attendu |
 |---|---|
@@ -375,7 +495,11 @@ boucle en entier avec toutes les autres assertions au vert.
 - [ ] **AC5.** Pour `senara-solutions/claude-pilot-py`, la porte exige en plus un
       commentaire portant `<!-- mpc-gate: ok sha=<SHA complet> -->` dont le `sha`
       **égale** la tête. Posée au chemin de merge et tenue par un **témoin de
-      type**, donc non contournable par les deux handlers (R8).
+      type**, donc non contournable par les deux handlers (R8). **Elle ajoute la
+      seule capacité de lecture neuve de ce travail** — aucune lecture de
+      commentaires n'existait dans l'arbre (R10) — et son coût est **nul hors de sa
+      population**, le terme de population précédant le lecteur. Le head SHA ne
+      coûte aucun appel à aucun des trois sites (R11).
 - [ ] **AC6 (ajoutée, R4).** La garde CI↔verdict de qa-review lit la même source.
       Gratuit par construction — attesté par un test, pas par du code neuf.
 
@@ -397,6 +521,13 @@ grep -c merge_gate_blocked "$MIKA_SPIRIT_LOG_FILE"
 
 # 4. Le gate MPC a-t-il refusé ? (régime attendu : VIDE hors claude-pilot-py)
 grep mpc_gate_refused "$MIKA_SPIRIT_LOG_FILE" | jq -c '{repo, pr, reason, attested, head}'
+
+# 4-bis. Les commentaires étaient-ils LISIBLES ? (régime attendu : VIDE)
+#        Nom distinct de `mpc_gate_refused` à dessein : « MPC n'a pas statué » et
+#        « nous n'avons pas pu lire » appellent deux remèdes opposés (poser le
+#        marqueur vs réparer l'accès API), et les fondre rendrait les deux
+#        populations incomptables — doctrine mika#2156 / mika#2277.
+grep mpc_gate_comments_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{repo, pr, error}'
 
 # 5. Un bucket inconnu est-il apparu ? (régime attendu : VIDE)
 grep merge_gate_unknown_check_bucket "$MIKA_SPIRIT_LOG_FILE" | jq -c '{name, bucket}'
@@ -421,6 +552,7 @@ SELECT count(*) FROM audit_events
 | `merge_gate_rerun_exhausted` | WARN | non vide, faible | deux échecs : ce n'est pas flaky, c'est cassé — le comportement voulu |
 | `merge_gate_unknown_check_bucket` | WARN | **vide** | `gh` a ajouté un bucket : il naît non bloquant (R6) |
 | `mpc_gate_refused` | WARN | **vide** hors `claude-pilot-py` | une occurrence sur un autre dépôt est une fuite de population |
+| `mpc_gate_comments_unreadable` | WARN | **vide** | le fail-closed mord sur un signal qu'on n'a pas su lire : le remède est l'accès API, **pas** le marqueur. Soutenu ⇒ le merge autonome de `claude-pilot-py` est gelé et il faut le dire plutôt que de basculer en fail-open |
 | `checks_pending` dans `tasks.result` | — | non vide | le nouveau refus de U2 ; son absence avec des PR qui attendent = halte 4 |
 
 `merge_gate_check_rerun` est **SOLE WRITER** de son nom dans le journal et dans
@@ -517,6 +649,18 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
   les requêtes du § 6, et **leur silence ne prouve rien tant que personne ne les
   exécute**.
 - **Il ne ferme pas le fail-open sur un bucket inconnu** (R6) : il le rend visible.
+- **Il n'atteste pas qu'`execute` obéit à la décision** (R12). La décision est une
+  fonction pure testée en treize cas ; que `execute` l'appelle, et l'appelle avec les
+  bons arguments, est tenu par le scan d'argv, la cardinalité des sites de merge et le
+  témoin de type — jamais par un test de bout en bout, qu'un `execute` ignorant la
+  décision laisserait vert. Ouvrir un seam dans `execute` est le remède alternatif, et
+  il est écarté : il déplacerait la confiance d'un type vérifié par le compilateur vers
+  une fixture de subprocess.
+- **Il ne borne pas le coût de lecture des commentaires au-delà de sa population**
+  (R10). `MPC_GATE_REQUIRED_REPOS` ne contient qu'un dépôt et le court-circuit précède
+  le lecteur, donc le chemin nominal est à zéro appel — mais **ajouter un dépôt à cette
+  liste ajoute un aller-retour `gh` à chacun de ses merges**, et rien ne le signalera.
+  C'est à savoir avant d'y toucher, pas à découvrir après.
 
 ---
 
@@ -552,8 +696,14 @@ exercée se lit exactement comme une garde qui marche* (mika#2205).
 - [ ] Le test d'argv (`mika2617_gh_checks_args_carries_no_required_flag`) a été
       **vu rouge** sur le code actuel avant correctif, et le fait est rapporté
       dans le corps de la PR (R9/AC4).
-- [ ] Les treize cas de `test_merge_gate_all_checks_2617.rs` passent, et chaque
-      terme a été **vu rouge par mutation individuelle**, rapporté dans le corps.
+- [ ] Les treize cas de `test_merge_gate_all_checks_2617.rs` passent **contre la
+      fonction pure de décision** (R12 — `execute` n'a pas de seam, et en ouvrir un
+      n'est pas le remède retenu), et chaque terme a été **vu rouge par mutation
+      individuelle**, rapporté dans le corps.
+- [ ] Le test du coût de R10 (`…_the_comment_reader_is_not_invoked_outside_the_population`)
+      passe, et le corps de la PR nomme la commande neuve
+      (`gh pr view --json comments`) comme la **seule** capacité de lecture ajoutée
+      par ce travail, avec son délai et sa population.
 - [ ] Les trois allowlists d'exemption sont livrées vides et le test frère qui les
       épingle vides passe (§ 3).
 - [ ] Les trois prompts `self-dev*` apprennent `checks_pending` dans leur taxonomie
