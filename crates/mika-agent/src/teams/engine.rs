@@ -3550,6 +3550,71 @@ mod tests {
         );
     }
 
+    /// Pilote `deliver_phase` avec un callback qui capture les `TeamEvent`, et
+    /// rend `(événement Deliverable, contenu de .meta/deliverable.md)`.
+    async fn drive_deliver_phase(
+        writer_responses: Vec<mika_common::llm::mock::MockResponse>,
+    ) -> (Option<String>, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = engine_with_mock(tmp.path(), writer_responses);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let sink = std::sync::Arc::clone(&seen);
+        engine.callback = Some(Arc::new(Box::new(move |event: TeamEvent| {
+            if let TeamEvent::Deliverable(text) = event {
+                *sink.lock().unwrap() = Some(text);
+            }
+        })));
+
+        engine.deliver_phase().await.unwrap();
+
+        let meta = std::fs::read_to_string(
+            tmp.path()
+                .join("workspace")
+                .join(".meta")
+                .join("deliverable.md"),
+        )
+        .unwrap();
+        let event = seen.lock().unwrap().clone();
+        (event, meta)
+    }
+
+    /// Constat de revue (testing, P2) — tous les tests de ce ticket appelaient
+    /// `commit_deliverable` directement : rien ne vérifiait que le site 1
+    /// transmet le texte ENGAGÉ à ses deux surfaces aval, l'événement
+    /// `TeamEvent::Deliverable` (que la TUI pousse dans le chat ET enregistre en
+    /// base) et `.meta/deliverable.md`. Un site qui appellerait le commit puis
+    /// transmettrait le texte produit garderait le scan de pose vert et tous les
+    /// tests au vert, en livrant la proposition — la classe même du ticket.
+    ///
+    /// Quatre réponses sales : deux pour le tour du rédacteur (5h re-prompte une
+    /// fois), deux pour la re-rédaction (idem).
+    #[tokio::test]
+    async fn mika2633_le_site_1_transmet_le_texte_engage_a_ses_surfaces() {
+        use mika_common::llm::mock::text_response;
+        let (event, meta) = drive_deliver_phase(vec![
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+            text_response(PROPOSAL),
+        ])
+        .await;
+
+        assert_eq!(event.as_deref(), Some(TEAM_DELIVERABLE_WITHHELD));
+        assert_eq!(meta, TEAM_DELIVERABLE_WITHHELD);
+    }
+
+    /// Le jumeau propre : sans refus, les deux surfaces portent le texte du
+    /// rédacteur. Sans lui, « transmet le texte engagé » serait indistinguable
+    /// de « transmet toujours la ligne neutre ».
+    #[tokio::test]
+    async fn mika2633_le_site_1_transmet_un_livrable_propre_tel_quel() {
+        let (event, meta) =
+            drive_deliver_phase(vec![mika_common::llm::mock::text_response("Le rapport.")]).await;
+
+        assert_eq!(event.as_deref(), Some("Le rapport."));
+        assert_eq!(meta, "Le rapport.");
+    }
+
     /// La ligne neutre est `Some(…)`, jamais `None` — sinon
     /// `teams::notification` rend « completed (no deliverable produced) », ce
     /// qui serait **faux** et rendrait un refus indistinguable d'un run sans
