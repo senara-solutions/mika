@@ -926,7 +926,13 @@ toute conclusion.
 - **Il n'ajoute aucune ligne `audit_events` et aucun compteur**, en cohérence
   explicite avec 5h et #2630 : la famille #953 est journal-only. Les seuls
   instruments sont les greps et la requête ci-dessus, et **leur silence ne prouve
-  rien tant que personne ne les exécute**.
+  rien tant que personne ne les exécute**. **Asymétrie avec #2627, à connaître :**
+  là, chaque refus laissait une ligne durable dans `tool_calls.output` (le refus
+  *était* un résultat d'outil) ; ici il n'y en a aucune. La requête SQL ne voit
+  que le **résidu** retenu — un refus dont la re-rédaction a abouti laisse en base
+  un texte propre, indiscernable d'un run qui n'a jamais rien proposé. Cette
+  population n'existe que dans `$MIKA_SPIRIT_LOG_FILE`, et elle est donc
+  invisible à un agent, qui ne lit pas ce journal.
 - **Il n'ajoute aucune variable d'environnement, et c'est une décision.**
   Précédent le plus proche : mika#2627, qui n'en a pas non plus, pour la raison
   qu'il écrit — *un désarmement par variable sur un chemin de doctrine serait un
