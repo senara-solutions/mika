@@ -1611,17 +1611,126 @@ en les neutralisant tous ensemble (leçon mika#2277).
 **Ce que ce travail ne fait PAS.** Il ne rattrape pas l'incident fondateur :
 mika#2589 a été sortie du brouillon deux fois et **rien ici ne réécrit une ligne
 d'audit datée d'un hold qu'on n'a pas observé** — la sonde est la **prochaine**
-occurrence. Il ne ferme pas le chemin `gh pr ready` d'un modèle sur une PR **hors
-signature `wip-rescue`** : mika#1682 le couvre déjà sur la population mesurée
-(#2589 porte le label), et l'élargir coûterait un appel timeline sur *chaque*
-`gh pr ready` pour une population dont aucune violation n'est mesurée — armer un
-détecteur sur du vide est ce que mika#2520 refuse (**suivi nommé**, précondition
-écrite). Il ne retire pas le palliatif à trois couches, et il ne touche pas le
-bypass admin de l'identité du pilote — les deux moitiés tombent séparément.
-Aucune valeur de réglage ne bouge, aucune migration, aucune variable neuve.
+occurrence. Il ne fermait pas le chemin `gh pr ready` d'un modèle sur une PR
+**hors signature `wip-rescue`** — suivi nommé, dont la précondition (une mesure)
+est tombée le 2026-10-01 et que mika#2624 ferme : § suivant. Il ne retire pas le
+palliatif à trois couches, et il ne touche pas le bypass admin de l'identité du
+pilote — les deux moitiés tombent séparément. Aucune valeur de réglage ne bouge,
+aucune migration, aucune variable neuve.
 
 Surfaces opérateur, régimes attendus, sondes et haltes : racine `CLAUDE.md`
 § Signal N.
+
+### Le même hold tient contre `run_gh pr ready` (mika#2624)
+
+**Le défaut, mesuré le 2026-10-01 (n=1).** samidarko remet PR #2621 en brouillon
+à 14:00:41Z pour qu'une revue ait lieu avant le merge ; à 14:46:03Z mika-dev
+appelle `run_gh ["pr","ready","2621"]` après avoir **lu** `isDraft=true`. Le hold
+saute ; une revue par spawn trouvait au même moment un P1 de perte de données.
+Le merge autonome n'a été évité que par calendrier. Même invariant que mika#2597,
+**second site d'écriture** : le garde mika#1682 de `run_gh` ne connaissait que la
+signature `wip-rescue`.
+
+**Sept rectifications que la lecture du code impose, et c'est le premier
+livrable.** (R1) le discriminant de mika#2597 est appelable, mais sa
+**classification** était inline dans `hold_verdict`, privée et couplée à
+`report_hold` : seule elle est extraite, en `classify_hold_verdict`, et le fetch
+comme le report restent où ils sont. (R2) `detect_ready_promote_pr` couvre **deux**
+formes, dont `pr edit <N> --title` qui ne touche pas l'état draft : le terme hold
+a son propre détecteur, `detect_pr_ready_undraft`, strictement plus étroit, et un
+renommage de titre d'une PR tenue n'est pas refusé. (R3) le handler stale-verdict
+n'émet aucun prompt — il n'y avait pas de prescription à corriger ; mais **quatre**
+prompts (`self-dev-webhook-{ci,qa,ready-label}`, `self-dev-callback`) interdisaient
+`pr ready` *par délimitation* de la signature `wip-rescue`, donc le **permettaient
+par contraste** — la lecture exacte du tour fautif. Ils deviennent topiques.
+(R4) `gh api` est déjà une allowlist fermée (`GH_API_ALLOW_MATRIX`) : ni `graphql`
+ni `/repos/*/pulls/*` n'y matchent, donc `markPullRequestReadyForReview` et
+`PATCH draft=false` sont **exclus par mesure**, pas par un second discriminant.
+(R5) `run_shell` refuse `gh` nommément et ses routes indirectes. (R6) le scan
+`mika2597_un_seul_site_dundraft_en_production` exige **un** site `"pr","ready"`
+en production : le terme hold compare des verbes à des variables et reste hors
+population **par sa forme** — aucune constante `&["pr","ready",…]` en moitié
+production. (R7) un pilote claude-pilot tape `gh` par Bash dans son bac à sable,
+jamais par `run_gh` : **exclu et non couvert**, population mesurée vide, suivi.
+
+**Un garde, deux termes, et l'ordre n'est pas arbitraire.** Les deux termes vivent
+dans `validate_pr_ready_undraft_scope` parce qu'ils répondent à la même question —
+*cette PR peut-elle sortir du brouillon ?* — et deux gardes au même site sont deux
+sites qu'un éditeur peut faire diverger. Terme 1, mika#1682, inchangé et
+**fail-open** sur sa lecture (`gh pr view`) ; terme 2, mika#2624, **fail-closed**
+sur la sienne (un appel GraphQL, sur la seule forme `pr ready`) : un refus du
+terme 1 économise l'appel du terme 2.
+
+**Fail-closed, et l'asymétrie est locale.** `NotHeld` autorise octet pour octet
+comme avant ; `Held` refuse sous `operator_hold` ; `Unreadable` refuse sous
+`hold_unreadable` ; `ctx.github_token` absent refuse sous `hold_no_token` (`gh`
+peut s'authentifier par `~/.config/gh/hosts.yml`, donc laisser passer garderait
+ouverte exactement la population que le moteur ne peut pas mesurer). Un faux refus
+coûte un `pr ready` visible et rattrapable ; un faux passage coûte le hold lui-même.
+C'est l'**inverse** du faucheur mika#2420, et l'arbitrage ne se transporte pas.
+Pas d'interrupteur d'environnement (précédent mika#2573) : le désarmement est un
+revert.
+
+**Résolution du dépôt, coût nommé.** Sans `repo` déclaré, repli sur
+`wip_rescue::DEFAULT_REPO`. Une PR d'un autre dépôt interroge alors la mauvaise
+timeline, l'extracteur rend `Err`, le refus tombe sous `hold_unreadable` — et son
+corps **nomme le paramètre `repo`**. Le corps du refus nomme le hold, `since` et
+`actor` quand GitHub les rend (jamais inventés, jamais `"null"`), dit que seul un
+humain le lève, et **ne nomme aucun contournement** (doctrine mika#2520).
+
+**Surfaces.** La ligne `tracing::info!(event = "pr_ready_undraft_blocked")` de
+mika#1682 garde son nom, gagne `hold_since` / `hold_actor`, et gagne une ligne
+`audit_events` sous le même nom — motif en `after_value`, **SOLE WRITER**
+`PR_READY_UNDRAFT_AUDIT_TOOL` — avec `pr_ready_undraft_audit_failed` (WARN) quand
+l'audit échoue. Un nom, quatre motifs (`operator_hold`, `hold_unreadable`,
+`hold_no_token`, `wip_rescue_contract`), format de fil épinglé par test : motif
+`ready_label_outcome` (mika#2323), pas deux noms, parce que les motifs
+appartiennent au même site et à la même population. **Coût daté :** mika#1682
+n'écrivait aucune ligne d'audit, donc un `count(*)` qui enjambe le déploiement
+compare un vide à une population ; la requête juste groupe par `after_value`.
+
+```sql
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pr_ready_undraft_blocked' GROUP BY 1 ORDER BY 2 DESC;
+```
+
+| motif | régime attendu | lecture |
+|---|---|---|
+| `operator_hold` | non vide, faible | un hold que le moteur n'a pas levé |
+| `hold_unreadable` | **vide** | lire d'abord si `repo` était passé, puis le jeton — **ne pas basculer en fail-open** |
+| `hold_no_token` | **vide** | `run_gh` tourne sans jeton résolu (mika#2205) |
+| `hold_unresolved_selector` | **vide** | `pr ready` sur une branche, `#N`, sans sélecteur, ou `repo` déclaré illisible : le terme ne peut pas adresser la timeline, il refuse (revue de PR #2628) |
+| `wip_rescue_contract` | inchangé en sens | la population mika#1682, comptable séparément |
+
+**Gardes structurelles**, allowlists livrées vides :
+`canonical_tokens::tests::mika2624_le_predicat_de_hold_a_un_lecteur_unique` (tout
+appel de production à `fetch_convert_to_draft_events` est l'argument immédiat de
+`classify_hold_verdict` ; anti-vacuité ≥ 2 appels) et
+`…::mika2624_le_nom_de_refus_a_un_ecrivain_unique`. Les deux lisent la production
+**jusqu'au module de test**, pas jusqu'au premier `#[cfg(test)]` :
+`builtin_handlers.rs` en porte un sur une constante, et l'énumérateur partagé les
+rendait verts par population vide — leurs anti-vacuités l'ont dit.
+
+**Sondes post-déploiement, et leurs haltes.** *S1* — sur une PR remise en
+brouillon à la main, un `run_gh pr ready` doit être refusé `operator_hold`, sans
+`ReadyForReviewEvent`. Halte : la PR sort du brouillon → lire d'abord
+`grep -c 'run_gh invocation'` (le garde tourne-t-il ?), puis **par quelle porte**
+l'appel est passé (`run_shell`, `gh api`, pilote — trois remèdes, seul le dernier
+est ouvert). *S2* (7 j) — `wip_rescue_success` continue de croître ; s'il se fige,
+la classification extraite a changé de sens : revert d'abord. *S3* (7 j) —
+`hold_unreadable` et `hold_no_token` restent vides. *S4* (7 j) — aucun refus
+`operator_hold` sur un `pr edit --title` (sinon le terme a été branché sur le
+détecteur à deux formes : réparer le détecteur). *S5* — `cargo test -p mika-agent
+mika2597_` reste vert ; s'il rougit sur la cardinalité, retirer le littéral, **ne
+pas allowlister**. Zéro refus **et** zéro `run_gh` ne prouve rien (mika#2205).
+
+**Ce que ça n'achète PAS.** L'incident de PR #2621 n'est pas rattrapé (rien ne
+rétro-écrit un refus non observé). Un pilote dispatché peut toujours taper
+`gh pr ready` (R7). Le modèle peut toujours *vouloir* sortir une PR du brouillon ;
+il ne peut plus le faire sur une PR tenue. Le `Passthrough` muet du réveil
+stale-verdict n'est pas enrichi (mika#1745 a tranché que ce chemin laisse le choix
+au modèle). Et rien n'est surveillé : le silence des requêtes ci-dessus ne prouve
+rien tant que personne ne les exécute.
 
 ### Unknown-Trigger Veto Lift (mika#2337)
 

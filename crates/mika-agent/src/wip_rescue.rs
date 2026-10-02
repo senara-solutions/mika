@@ -104,7 +104,11 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// The repository the wip-rescue scan targets. Matches `auto_pull::DEFAULT_REPO`.
-const DEFAULT_REPO: &str = "senara-solutions/mika";
+///
+/// `pub(crate)` since mika#2624: the `run_gh` hold term needs the same fallback
+/// when its caller declared no `repo`, and importing it is strictly better than
+/// writing the literal a third time in the tree.
+pub(crate) const DEFAULT_REPO: &str = "senara-solutions/mika";
 
 /// Label dispatch-lib applies to rescued draft PRs (mika#1631). The scan only
 /// ever touches drafts carrying this label.
@@ -209,7 +213,7 @@ fn hold_audit_key(pr_number: u64, motif: &str) -> String {
 }
 
 /// `(owner, repo)` of [`DEFAULT_REPO`], split once rather than at each call.
-fn default_repo_parts() -> (&'static str, &'static str) {
+pub(crate) fn default_repo_parts() -> (&'static str, &'static str) {
     DEFAULT_REPO
         .split_once('/')
         .expect("DEFAULT_REPO is `owner/repo`")
@@ -950,6 +954,42 @@ impl HoldVerdict {
     }
 }
 
+/// Classify a timeline read into a [`HoldVerdict`] — the **sole** site turning
+/// `ConvertToDraftEvent`s into a hold decision.
+///
+/// Extracted from [`hold_verdict`] by mika#2624 so a second un-draft surface
+/// (`run_gh pr ready`, `builtin_handlers.rs`) can reach the *same* discriminant
+/// by calling it rather than by transcribing it. The fetch stays with
+/// [`crate::github_graphql::fetch_convert_to_draft_events`] and the reporting
+/// stays with [`report_hold`]: `run_gh` has neither an `AsyncDatabase` shaped
+/// like this module's nor a `senara-solutions/mika`-hardcoded repo, so sharing
+/// the whole of `hold_verdict` was never available — only the classification is
+/// common, and only the classification moves.
+///
+/// Pure, synchronous, takes the `Result` rather than the `Vec` so the
+/// **fail-closed** half is a property of this function instead of a branch at
+/// each caller: an unreachable API, a 401/403/429, an unparseable payload or a
+/// shape the extractor does not recognise all land on `Unreadable`.
+/// `canonical_tokens::tests::mika2624_le_predicat_de_hold_a_un_lecteur_unique`
+/// refuses a second site.
+///
+/// The three states and the reasoning behind "mere presence suffices" live on
+/// [`HoldVerdict`]; this function only decides, it does not re-argue.
+pub(crate) fn classify_hold_verdict(
+    events: Result<Vec<crate::github_graphql::ConvertToDraftEvent>, String>,
+) -> HoldVerdict {
+    match events {
+        Ok(events) => match events.last() {
+            None => HoldVerdict::NotHeld,
+            Some(last) => HoldVerdict::Held {
+                since: last.created_at.clone(),
+                actor: last.actor_login.clone(),
+            },
+        },
+        Err(error) => HoldVerdict::Unreadable { error },
+    }
+}
+
 /// Read the hold state of a draft and **report** it (R4), in that order.
 ///
 /// This is the predicate production injects into [`select_eligible`]. Reading
@@ -958,12 +998,13 @@ impl HoldVerdict {
 /// property that makes the whole fix testable without a network.
 ///
 /// **Fail-closed towards "held".** An unreachable API, a 401/403/429, an
-/// unparseable payload, a shape we do not recognise: all exclude. The asymmetry
-/// is measured, not supposed — a false "held" leaves a rescue draft waiting for
-/// an operator gesture (visible, recoverable, and the pre-mika#1852 behaviour),
-/// while a false "not held" un-drafts a PR whose merge is forbidden. It is also
-/// this module's **uniform** policy: `has_bailed_marker`, `has_parked_marker`,
-/// `classify_route` and `fresh_pipeline_verified` are all four fail-closed.
+/// unparseable payload, a shape we do not recognise: all exclude — decided once
+/// in [`classify_hold_verdict`]. The asymmetry is measured, not supposed — a
+/// false "held" leaves a rescue draft waiting for an operator gesture (visible,
+/// recoverable, and the pre-mika#1852 behaviour), while a false "not held"
+/// un-drafts a PR whose merge is forbidden. It is also this module's **uniform**
+/// policy: `has_bailed_marker`, `has_parked_marker`, `classify_route` and
+/// `fresh_pipeline_verified` are all four fail-closed.
 ///
 /// **Named cost:** a durable GitHub API outage freezes `wip_rescue` entirely.
 /// That is why `Unreadable` carries its own event name — the inertia must be
@@ -976,19 +1017,9 @@ async fn hold_verdict(
     session_id: &str,
 ) -> HoldVerdict {
     let (owner, repo) = default_repo_parts();
-    let verdict =
-        match crate::github_graphql::fetch_convert_to_draft_events(token, owner, repo, pr_number)
-            .await
-        {
-            Ok(events) => match events.last() {
-                None => HoldVerdict::NotHeld,
-                Some(last) => HoldVerdict::Held {
-                    since: last.created_at.clone(),
-                    actor: last.actor_login.clone(),
-                },
-            },
-            Err(error) => HoldVerdict::Unreadable { error },
-        };
+    let verdict = classify_hold_verdict(
+        crate::github_graphql::fetch_convert_to_draft_events(token, owner, repo, pr_number).await,
+    );
     report_hold(db, session_id, pr_number, trace_id, &verdict).await;
     verdict
 }
@@ -3019,6 +3050,39 @@ mod tests {
         );
     }
 
+    /// mika#2624 — the extracted classifier, tested directly (review of PR
+    /// #2628, testing). Two production readers depend on it (`hold_verdict` and
+    /// `run_gh`'s hold term), so its three arms are pinned here rather than only
+    /// through one caller: no event → `NotHeld`; events → `Held` carrying the
+    /// **last** event's instant and actor; a read error → `Unreadable`, never
+    /// `NotHeld` (fail-closed is a property of this function).
+    #[test]
+    fn mika2624_classify_hold_verdict_a_trois_bras() {
+        use crate::github_graphql::ConvertToDraftEvent;
+        let event = |at: &str, by: &str| ConvertToDraftEvent {
+            created_at: Some(at.to_string()),
+            actor_login: Some(by.to_string()),
+        };
+
+        assert_eq!(classify_hold_verdict(Ok(vec![])), HoldVerdict::NotHeld);
+        assert_eq!(
+            classify_hold_verdict(Ok(vec![
+                event("2026-09-29T10:00:00Z", "first"),
+                event("2026-10-01T14:00:41Z", "samidarko"),
+            ])),
+            HoldVerdict::Held {
+                since: Some("2026-10-01T14:00:41Z".to_string()),
+                actor: Some("samidarko".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_hold_verdict(Err("GitHub API error 503".to_string())),
+            HoldVerdict::Unreadable {
+                error: "GitHub API error 503".to_string()
+            }
+        );
+    }
+
     /// V6 / AC3. Three states, **two** names — and `NotHeld` writes nothing.
     ///
     /// The two names must stay countable apart: one says the mechanism worked,
@@ -3149,12 +3213,12 @@ mod tests {
                 }
                 let content = std::fs::read_to_string(&path).expect("read of a source file");
                 scanned += 1;
-                // Production half only: a fixture argv in a `#[cfg(test)]` block
-                // is not a site that un-drafts anything.
-                let production = match content.find("#[cfg(test)]") {
-                    Some(i) => &content[..i],
-                    None => &content[..],
-                };
+                // Production half only: a fixture argv in the test module is not
+                // a site that un-drafts anything. Cut at the test MODULE, not at
+                // the first `#[cfg(test)]` — `builtin_handlers.rs` carries one on
+                // a constant at line ~674, and cutting there hid `run_gh` from
+                // this scan (review of PR #2628).
+                let production = crate::source_scan::production_half(&content);
                 let normalised: String = crate::source_scan::strip_comment_lines(production)
                     .split_whitespace()
                     .collect();

@@ -180,6 +180,25 @@ pub(crate) fn fn_bodies(src: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The production half of a source file: everything before its **test module**
+/// declaration (`#[cfg(test)]` immediately followed by `mod tests`), or the
+/// whole file when it declares none.
+///
+/// Cutting at the first `#[cfg(test)]` instead — the shape several scans were
+/// born with — drops every production line after a `#[cfg(test)]` /
+/// `#[cfg(not(test))]` pair on a constant: `skills/builtin_handlers.rs` carries
+/// one at line ~674, so `run_gh` and every guard after it were invisible to the
+/// mika#2597 single-un-draft-site scan (review of PR #2628). The anchor is the
+/// module declaration because that is what separates a `#[cfg(test)]` item
+/// that belongs to production from the test module, which does not.
+pub(crate) fn production_half(content: &str) -> &str {
+    const TEST_MODULE_ANCHOR: &str = "\n#[cfg(test)]\nmod tests";
+    match content.find(TEST_MODULE_ANCHOR) {
+        Some(i) => &content[..i],
+        None => content,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +206,31 @@ mod tests {
 
     fn src_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    #[test]
+    fn production_half_keeps_production_after_a_cfg_test_item() {
+        let src = "const A: u8 = 1;\n#[cfg(test)]\nconst B: u8 = 2;\n\
+                   fn prod() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+        let half = production_half(src);
+        assert!(
+            half.contains("fn prod()"),
+            "production after a cfg(test) item is kept"
+        );
+        assert!(!half.contains("fn t()"), "the test module is cut");
+        assert_eq!(production_half("fn only() {}\n"), "fn only() {}\n");
+    }
+
+    /// Positive control on the real tree: the file that motivated this helper
+    /// must keep `run_gh`'s guards in its production half, or every scan that
+    /// relies on it is blind exactly where mika#2624 writes (review of PR #2628).
+    #[test]
+    fn production_half_of_builtin_handlers_sees_run_gh() {
+        let content = std::fs::read_to_string(src_root().join("skills/builtin_handlers.rs"))
+            .expect("builtin_handlers.rs is readable");
+        let half = production_half(&content);
+        assert!(half.contains("async fn validate_pr_ready_undraft_scope("));
+        assert!(!half.contains("fn mika2624_un_hold_explicite_refuse_lundraft"));
     }
 
     #[test]

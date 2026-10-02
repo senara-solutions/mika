@@ -1799,6 +1799,238 @@ mod tests {
         );
     }
 
+    /// Les sources de production, tronquées au **module** de test et non au
+    /// premier `#[cfg(test)]` (mika#2624).
+    ///
+    /// [`production_sources`] coupe au premier `#[cfg(test)]` **où qu'il soit**,
+    /// et `builtin_handlers.rs` en porte un à la ligne 674 — une paire
+    /// `#[cfg(test)]` / `#[cfg(not(test))]` sur une constante de test. Les deux
+    /// scans de mika#2624 visent du code situé *après*, donc réutiliser cet
+    /// énumérateur les rendait **verts par population vide** : leurs deux
+    /// anti-vacuités l'ont dit, et c'est la seule raison pour laquelle on le sait.
+    /// Un garde de ce même fichier (`run_gh`'s argv scan) avait déjà dû écrire ce
+    /// contournement ; mika#2575 l'a écrit une seconde fois dans son module.
+    ///
+    /// La coupe est celle de [`crate::source_scan::production_half`] — ancrée
+    /// sur la **déclaration du module** de test, pas sur l'attribut seul — que
+    /// le scan mika#2597 emploie aussi : un découpage, deux lecteurs.
+    ///
+    /// Déliberément local : corriger [`production_sources`] élargirait la
+    /// population des cinq scans voisins (mika#2573, mika#2522, mika#2405, …),
+    /// ce qui est un changement de leur périmètre et non du nôtre.
+    fn production_sources_to_test_module() -> Vec<(String, String)> {
+        let crates_dir = repo_root().join("crates");
+        let mut out = Vec::new();
+        let mut stack = vec![crates_dir];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    if path.file_name().unwrap_or_default().to_string_lossy() == "target" {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(repo_root())
+                    .expect("chemin sous la racine")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if !rel.contains("/src/") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production = crate::source_scan::production_half(&content).to_string();
+                out.push((rel, production));
+            }
+        }
+
+        assert!(
+            !out.is_empty(),
+            "aucune source de production trouvée — un scan qui ne scanne rien est \
+             un laissez-passer vide, pas un scan propre (mika#2103)"
+        );
+        out
+    }
+
+    /// Sites de production autorisés à consommer un `ConvertToDraftEvent`
+    /// autrement qu'en le passant à `classify_hold_verdict` (mika#2624 D2).
+    ///
+    /// **Livrée vide et épinglée vide** — quand le scan ci-dessous tire, on
+    /// retire la seconde classification et on appelle le lecteur unique ; on
+    /// n'ajoute pas de ligne ici (doctrine mika#2201 ; une allowlist née vide est
+    /// un tiroir où déposer la prochaine infraction, mika#2323).
+    const HOLD_CLASSIFICATION_EXCEPTIONS: &[&str] = &[];
+
+    /// **Le prédicat de hold a un lecteur unique (mika#2624 D2).**
+    ///
+    /// AC1 exige que le discriminant de mika#2597 soit « factorisé ou appelé,
+    /// jamais recopié ». Ce scan le tient sur la **forme** plutôt que sur la
+    /// bonne volonté : tout appel de production à
+    /// `fetch_convert_to_draft_events` doit être **l'argument immédiat** de
+    /// `classify_hold_verdict`. Co-location sur la même expression — le motif que
+    /// le dépôt emploie déjà pour `_pilot_max_turns` et `_pilot_log_dir`.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Une seconde classification écrite demain ne rend **aucune** décision
+    /// fausse le jour où elle est écrite : les deux lecteurs répondraient d'abord
+    /// la même chose, toutes les assertions resteraient vertes, et ils
+    /// divergeraient des mois plus tard. C'est la classe exacte que mika#2158 a
+    /// mesurée — `is_groomed` et `check_grooming_markers` ont divergé pendant des
+    /// mois derrière un commentaire disant « mirrors ».
+    ///
+    /// # Pourquoi cette aiguille et pas le nom du type
+    ///
+    /// `ConvertToDraftEvent` apparaît légitimement dans la prose d'un corps de
+    /// refus et dans des doc-comments ; l'accuser ferait rougir du code sain, et
+    /// une garde qui rougit sur du sain est une garde qu'on désarme (leçon
+    /// mika#2517, mesurée aussi par le faux positif du Signal S, mika#2050). Et
+    /// `HoldVerdict::Held` ne discrimine pas non plus : un **motif** de `match`
+    /// s'écrit comme une **construction**, donc le scan accuserait les
+    /// consommateurs légitimes. Ce qui identifie une classification est de lire
+    /// la collection d'événements — et elle ne vient que du fetch.
+    ///
+    /// La **déclaration** du fetch est reconnue par sa forme (`fn` juste avant),
+    /// jamais par un nom de fichier : un périmètre par fichier serait une
+    /// allowlist déguisée.
+    #[test]
+    fn mika2624_le_predicat_de_hold_a_un_lecteur_unique() {
+        // Composés à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let fetch = format!("fetch_convert_to_draft{}(", "_events");
+        let classify = format!("classify_hold{}(", "_verdict");
+
+        let mut sites: Vec<(String, usize, usize)> = Vec::new();
+        let mut total_calls = 0usize;
+
+        for (rel, content) in production_sources_to_test_module() {
+            if HOLD_CLASSIFICATION_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            // Source normalisée en espaces : rustfmt coupe l'appel sur
+            // plusieurs lignes, donc un prédicat ancré sur la ligne raterait les
+            // deux sites réels.
+            let normalised: String = crate::source_scan::strip_comment_lines(&content)
+                .split_whitespace()
+                .collect();
+
+            let mut calls = 0usize;
+            let mut wrapped = 0usize;
+            for (idx, _) in normalised.match_indices(fetch.as_str()) {
+                // La déclaration elle-même n'est pas un appel.
+                if normalised[..idx].ends_with("fn") {
+                    continue;
+                }
+                calls += 1;
+                // L'appel doit être l'argument immédiat de la classification,
+                // avec ou sans son chemin de module.
+                let prefix = &normalised[..idx];
+                let immediate = prefix.ends_with(classify.as_str())
+                    || (prefix.ends_with("crate::github_graphql::")
+                        && prefix
+                            .trim_end_matches("crate::github_graphql::")
+                            .ends_with(classify.as_str()));
+                if immediate {
+                    wrapped += 1;
+                }
+            }
+            total_calls += calls;
+            if calls != wrapped {
+                sites.push((rel, calls, wrapped));
+            }
+        }
+
+        // Anti-vacuité : un scan qui vise une aiguille morte se lit exactement
+        // comme un arbre propre (mika#2205). Deux appels sont attendus —
+        // `wip_rescue` et le terme de hold de `run_gh`.
+        assert!(
+            total_calls >= 2,
+            "mika#2624 — {total_calls} appel(s) au fetch de timeline trouvé(s) : \
+             ce scan vise une aiguille morte, il ne vérifie rien"
+        );
+
+        assert!(
+            sites.is_empty(),
+            "mika#2624 — une seconde classification de `ConvertToDraftEvent` \
+             existe : {sites:?} (fichier, appels, appels enveloppés)\n\n\
+             RÉSOLUTION : passer le résultat du fetch à \
+             `wip_rescue::classify_hold_verdict` sur la même expression. Ne PAS \
+             l'ajouter à HOLD_CLASSIFICATION_EXCEPTIONS — le discriminant de \
+             mika#2597 n'a de valeur que tant qu'un seul site le décide."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2624_lallowlist_de_classification_est_livree_vide() {
+        assert!(
+            HOLD_CLASSIFICATION_EXCEPTIONS.is_empty(),
+            "HOLD_CLASSIFICATION_EXCEPTIONS est livrée vide et doit le rester : \
+             une seconde classification est un site à router vers le lecteur \
+             unique, jamais un site à exempter (mika#2201)."
+        );
+    }
+
+    /// **Le nom de refus a un écrivain unique (mika#2624).**
+    ///
+    /// `pr_ready_undraft_blocked` atterrit dans `audit_events.tool_name` et
+    /// l'opérateur en fait un `GROUP BY after_value` — exact seulement tant qu'un
+    /// seul site l'écrit. Un second écrivain ne rendrait aucune décision fausse ;
+    /// il rendrait ce compte inexact, ce qui est invisible à tout test
+    /// comportemental.
+    #[test]
+    fn mika2624_le_nom_de_refus_a_un_ecrivain_unique() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("pr_ready_undraft{}", "_blocked");
+        let owner = "crates/mika-agent/src/skills/builtin_handlers.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2624 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2624 — le nom de l'événement de refus a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : retirer le littéral et importer \
+             `skills::builtin_handlers::PR_READY_UNDRAFT_AUDIT_TOOL`."
+        );
+    }
+
     /// L'allowlist du scan d'exhaustivité est livrée vide, et le reste.
     ///
     /// Sans ce test, la doctrine « on déclare, on n'allowliste pas » ne vivrait

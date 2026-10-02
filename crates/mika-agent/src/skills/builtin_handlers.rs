@@ -2495,12 +2495,109 @@ fn detect_ready_promote_pr(args: &[String]) -> Option<&str> {
     extract_pr_number_positional(args)
 }
 
+/// Detect an **un-draft** `gh` call and extract its target PR number (mika#2624).
+///
+/// Strictly narrower than [`detect_ready_promote_pr`], which also returns
+/// `Some` for `pr edit <N> --title <T>`. That second shape belongs to mika#1682
+/// — the wip-rescue promotion has two gestures, un-drafting *and* renaming
+/// `wip(…)` → `fix(…)` — and it is deliberately **out** of the hold term's
+/// population: a hold forbids publishing a PR, it does not forbid correcting a
+/// title, and `pr edit --title` does not touch the draft state at all. Reusing
+/// the two-shape detector would refuse a rename on a held PR, which is outside
+/// mika#2624's AC1 and a false positive on a harmless gesture.
+///
+/// `--undo` converts **to** draft and is allowed, as in the sibling detector.
+///
+/// Returns `None` only when the call is not an un-draft. A `pr ready` whose
+/// selector is not a PR number — a branch name, `#N`, or no selector at all
+/// (the current-branch form) — is [`UndraftSelector::Unresolved`], **never**
+/// `None`: `gh` un-drafts through all of those shapes, and the hold term cannot
+/// read a timeline it cannot address. Reading them as "not an un-draft" was a
+/// fail-open inside a fail-closed term (review of PR #2628).
+///
+/// Deliberately written as a comparison against a variable rather than a
+/// literal argv slice: `wip_rescue::tests::mika2597_un_seul_site_dundraft_en_production`
+/// scans production source for the normalised `"pr","ready"` pattern and
+/// requires **exactly one** site, which is `wip_rescue`'s own un-draft. This
+/// term refuses and un-drafts nothing, so it stays out of that population **by
+/// shape, not by exemption** — and must keep that shape.
+fn detect_pr_ready_undraft(args: &[String]) -> Option<UndraftSelector<'_>> {
+    let subcommand = args.first().map(String::as_str)?;
+    if subcommand != "pr" {
+        return None;
+    }
+    let verb = args.get(1).map(String::as_str)?;
+    if verb != "ready" || args.iter().any(|a| a == "--undo") {
+        return None;
+    }
+
+    Some(match extract_pr_positional(args) {
+        Some(raw) => UndraftSelector::Number {
+            number: normalize_pr_identifier(raw),
+            url_repo: pr_url_repo(raw),
+        },
+        None => UndraftSelector::Unresolved,
+    })
+}
+
+/// The target of an un-draft call, as far as the hold term can address it
+/// (mika#2624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndraftSelector<'a> {
+    /// A PR number, bare or extracted from a PR URL — and, for a URL, the
+    /// `owner/repo` the URL itself names, which the number alone forgets.
+    Number {
+        number: &'a str,
+        url_repo: Option<&'a str>,
+    },
+    /// A selector the term cannot turn into a number: refused fail-closed.
+    Unresolved,
+}
+
+/// `owner/repo` named by a GitHub PR URL selector, or `None` for anything else
+/// (a bare number, a branch, a malformed URL).
+fn pr_url_repo(selector: &str) -> Option<&str> {
+    let after_host = &selector[selector.find("github.com/")? + "github.com/".len()..];
+    let repo = &after_host[..after_host.find("/pull/")?];
+    let (owner, name) = repo.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some(repo)
+}
+
+/// The repository whose timeline the hold term must read, or `None` when the
+/// call does not name one coherently (review of PR #2628).
+///
+/// A PR URL names its own repository, and `normalize_pr_identifier` keeps only
+/// the number: without this, `pr ready https://github.com/o/other/pull/12` with
+/// no `repo` parameter read PR #12 of the default repository — a different PR
+/// whose hold state says nothing about the one being un-drafted. A declared
+/// `repo` that disagrees with the URL's is ambiguous and refused, never
+/// arbitrated.
+fn resolve_hold_target_repo<'a>(
+    declared: Option<&'a str>,
+    url_repo: Option<&'a str>,
+) -> Option<&'a str> {
+    match (declared, url_repo) {
+        (Some(d), Some(u)) if !d.eq_ignore_ascii_case(u) => None,
+        (Some(d), _) => Some(d),
+        (None, Some(u)) => Some(u),
+        (None, None) => Some(crate::wip_rescue::DEFAULT_REPO),
+    }
+}
+
 /// Extract the first positional PR number from a `gh pr <verb> ...` argv.
 ///
 /// Scans args after the subcommand+verb (index 2+), skipping value-consuming flags
 /// and their values so a numeric `--title 123` is not mistaken for the PR number.
 /// Normalizes GitHub PR URLs to bare numbers via `normalize_pr_identifier`.
 fn extract_pr_number_positional(args: &[String]) -> Option<&str> {
+    extract_pr_positional(args).map(normalize_pr_identifier)
+}
+
+/// The raw positional argument [`extract_pr_number_positional`] reads its
+/// number from — kept whole so a PR URL's `owner/repo` is still readable
+/// (mika#2624, review of PR #2628). One scan, two readers: the two cannot
+/// disagree on which argument is the PR.
+fn extract_pr_positional(args: &[String]) -> Option<&str> {
     /// Flags on `gh pr ready`/`gh pr edit` that consume the next argument as a value.
     const VALUE_FLAGS: &[&str] = &[
         "--title",
@@ -2533,9 +2630,8 @@ fn extract_pr_number_positional(args: &[String]) -> Option<&str> {
             }
             continue;
         }
-        let normalized = normalize_pr_identifier(arg);
-        if normalized.parse::<u32>().is_ok() {
-            return Some(normalized);
+        if normalize_pr_identifier(arg).parse::<u32>().is_ok() {
+            return Some(arg.as_str());
         }
     }
     None
@@ -2576,6 +2672,257 @@ fn decide_pr_ready_undraft(pr_num: &str, view: Option<&PrWipRescueView>) -> Resu
         }
         _ => Ok(()),
     }
+}
+
+/// `reason` of a refusal caused by an actual operator hold (mika#2624).
+///
+/// **Expected regime: non-empty and low.** Each line is a hold the engine did
+/// not lift — the direct measure that the guard bites.
+const PR_READY_HOLD_MOTIF_OPERATOR_HOLD: &str = "operator_hold";
+
+/// `reason` of a refusal caused by a timeline that could not be read (AC2).
+///
+/// **Expected regime: empty.** Distinct from the motif above because the two
+/// call for opposite remedies: one is a hold being honoured, the other is the
+/// guard fail-closed on a signal it cannot read, and the cause is the token or
+/// the API — not the predicate. Merging them would make an outage read as a
+/// success (motif `phantom_aged_out` / `phantom_sweep_spared`, mika#2156).
+const PR_READY_HOLD_MOTIF_UNREADABLE: &str = "hold_unreadable";
+
+/// `reason` of a refusal caused by an absent engine GitHub token (AC2).
+///
+/// **Expected regime: empty.** Its own motif, so the population stays countable
+/// apart: `gh` can authenticate from `~/.config/gh/hosts.yml`, so a `pr ready`
+/// with no engine token **succeeds today** — letting it through would keep a
+/// door open for exactly the population the engine cannot measure.
+///
+/// The identifier says `NO_CREDENTIAL` while the wire value keeps
+/// `hold_no_token`: a `*_TOKEN` identifier reads as an env var to
+/// `scripts/check-substrate-leak.sh` rule 2, and the wire value is frozen
+/// (`mika2624_les_trois_motifs_sont_distincts`). The value reaches the audit
+/// row and the log line only — never the model: this refusal's body is the
+/// neutral fallback of [`pr_ready_hold_no_credential_fallback`] (mika#1783).
+const PR_READY_HOLD_MOTIF_NO_CREDENTIAL: &str = "hold_no_token";
+
+/// Operator half of the no-credential refusal (mika#2624, doctrine mika#1783).
+///
+/// Never reaches the model on family/champion tier — `dispatch_substrate_diagnostic`
+/// routes it to `audit_events` there; on operator tier it is folded back into the
+/// content, because the operator IS its reader. Also the log message of the
+/// refusal, so the two operator surfaces cannot spell the cause two ways.
+// substrate-diagnostic: the operator channel by construction (mika#2624) — naming
+// the missing engine credential and its host fallback is what makes the refusal
+// actionable. `dispatch_substrate_unavailable` routes it.
+const PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC: &str = "Operator detail (mika#2624): run_gh has no engine GitHub token in this context \
+     (ToolContext.github_token is None), so the ConvertToDraftEvent timeline of the PR could not be \
+     read and the un-draft was refused fail-closed under motif `hold_no_token`. `gh` could still \
+     authenticate from the host's hosts.yml, which is why letting it through would leave open the \
+     population the engine cannot measure (mika#2205).";
+
+/// `reason` of a refusal caused by a `pr ready` whose target the hold term
+/// cannot address: a branch name, `#N`, no selector at all, or a declared
+/// repository that does not name one (review of PR #2628).
+///
+/// **Expected regime: empty.** The bundled prompts forbid every `pr ready`, so
+/// any line here is a model reaching for a shape the guard cannot read. Its own
+/// motif because the remedy differs from `hold_unreadable`: the call is
+/// rewritable (a PR number plus `repo`), whereas an unreadable timeline is not.
+const PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR: &str = "hold_unresolved_selector";
+
+/// `reason` of the mika#1682 wip-rescue refusal, named so the two populations
+/// are separable from the first audit row rather than retroactively.
+const PR_READY_UNDRAFT_MOTIF_WIP_RESCUE: &str = "wip_rescue_contract";
+
+/// `audit_events.tool_name` of every un-draft refusal (mika#2624).
+///
+/// Same convention as [`crate::evidence::guards::DESTRUCTIVE_ACTION_AUDIT_TOOL`]:
+/// `audit_events` has no `event_type` column, `tool_name` is free-form TEXT, no
+/// migration. The name matches the pre-existing `tracing::info!` event of
+/// mika#1682, which until now wrote **no** row — so a bare `count(*)` spanning
+/// the deploy compares an empty set to a population, and the honest query is
+/// the one grouped by `after_value`.
+///
+/// **SOLE WRITER** — pinned by
+/// [`crate::canonical_tokens::tests::mika2624_le_nom_de_refus_a_un_ecrivain_unique`].
+/// That property is what makes the operator's `GROUP BY after_value` exact
+/// rather than a number two sites can disagree about.
+pub(crate) const PR_READY_UNDRAFT_AUDIT_TOOL: &str = "pr_ready_undraft_blocked";
+
+/// The motif a [`crate::wip_rescue::HoldVerdict`] refuses under, or `None` when
+/// it allows (mika#2624).
+///
+/// Exhaustive `match`, **no `_` arm**: a fourth state must decide. Mirrors
+/// `HoldVerdict::observability_tool` on the `wip_rescue` side, and is the single
+/// predicate [`decide_pr_ready_hold`] and the guard's log line both read — so
+/// "there is a refusal" and "there is a motif to report" cannot diverge.
+///
+/// **Fail-closed on `Unreadable`** (AC2): *a term one cannot read is never a
+/// satisfied term* (mika#2277), applied here to the term "this PR is **not**
+/// held". The asymmetry is measured, not supposed — a false refusal costs one
+/// `pr ready`, visible and recoverable at the next turn, and its remedy (a human
+/// un-drafts the PR) is the one the hold prescribes anyway; a false pass costs
+/// the operator hold itself, i.e. a PR out of draft, approved, green and
+/// mergeable by the engine. That is the founding incident, which nothing but the
+/// calendar prevented from merging.
+///
+/// Note the sense is the **inverse** of the mika#2420 reaper, where an unreadable
+/// signal *keeps*: there the action destroyed work, here the action **is** the
+/// lifting of a hold. **The arbitration is local and does not transport.**
+fn pr_ready_hold_motif(verdict: &crate::wip_rescue::HoldVerdict) -> Option<&'static str> {
+    use crate::wip_rescue::HoldVerdict;
+    match verdict {
+        HoldVerdict::NotHeld => None,
+        HoldVerdict::Held { .. } => Some(PR_READY_HOLD_MOTIF_OPERATOR_HOLD),
+        HoldVerdict::Unreadable { .. } => Some(PR_READY_HOLD_MOTIF_UNREADABLE),
+    }
+}
+
+/// `(since, actor)` of a hold, **when they are readable** (mika#2624).
+///
+/// Pure field extraction, never a decision: the two values decide **nothing**,
+/// exactly as on the `wip_rescue` side. They travel so that the day a machine
+/// puts a PR back into draft is visible. `None` yields an absent field, never
+/// the string `"null"` (mika#2331: *`null` is never `0`*).
+fn pr_ready_hold_attribution(
+    verdict: &crate::wip_rescue::HoldVerdict,
+) -> (Option<&str>, Option<&str>) {
+    use crate::wip_rescue::HoldVerdict;
+    match verdict {
+        HoldVerdict::Held { since, actor } => (since.as_deref(), actor.as_deref()),
+        HoldVerdict::NotHeld | HoldVerdict::Unreadable { .. } => (None, None),
+    }
+}
+
+/// Structured refusal body for an un-draft blocked by an explicit hold (mika#2624).
+///
+/// Shape of the neighbouring mika#2573 guard (`error` / `doctrine` / `reason` /
+/// `remedy`). The `remedy` says only a human lifts a hold and **names no
+/// alternative route**: a refusal that hands over the template is a leak with one
+/// more step (doctrine mika#2520).
+/// Takes `(since, actor)` already extracted rather than the verdict itself, so
+/// no caller has to **construct** a `HoldVerdict` just to describe a refusal —
+/// the unresolved-selector branch has no timeline read behind it and would
+/// otherwise have had to fabricate one, which is a second construction site for
+/// a type whose classification must have exactly one.
+///
+/// Not the no-credential refusal: its cause is substrate, so its body is the
+/// neutral [`pr_ready_hold_no_credential_fallback`] (doctrine mika#1783).
+fn pr_ready_hold_rejection_body(
+    pr_num: &str,
+    motif: &str,
+    repo: &str,
+    since: Option<&str>,
+    actor: Option<&str>,
+) -> String {
+    // Detail and remedy follow the motif. Only `operator_hold` establishes a
+    // hold; the unreadable motifs establish nothing, and telling the agent a
+    // hold exists — or sending it after a parameter that is not the cause —
+    // would misdirect the one gesture each refusal calls for.
+    let (reason, remedy) = if motif == PR_READY_HOLD_MOTIF_OPERATOR_HOLD {
+        (
+            format!(
+                "Pull request #{pr_num} on {repo} carries at least one \
+                 ConvertToDraftEvent: somebody put it back into draft after the \
+                 work was done. That draft state is a deliberate hold, not the \
+                 state a rescue PR is created in."
+            ),
+            "Leave this pull request in draft. A hold is lifted by a human and \
+             by nobody else — do not look for another route: this refusal is not \
+             lifted by retrying under a different shape. If you believe the hold \
+             should go, say so to the operator with `send_message` and stop.",
+        )
+    } else if motif == PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR {
+        (
+            format!(
+                "This `pr ready` call does not name a pull request the hold check \
+                 can address on {repo} (a branch name, `#N` or no selector at \
+                 all), so it cannot be established that the PR is not held."
+            ),
+            "Leave the pull request in draft. If you must ask for this check \
+             again, name the pull request by its number and pass the `repo` \
+             parameter; otherwise tell the operator with `send_message` and stop.",
+        )
+    } else {
+        (
+            format!(
+                "The draft-state history of pull request #{pr_num} on {repo} could \
+                 not be read, so it cannot be established that this PR is not \
+                 held. A term that cannot be read is not a satisfied term. If this \
+                 pull request does not live on {repo}, pass the `repo` parameter: \
+                 the history was looked up on the wrong repository."
+            ),
+            "Leave this pull request in draft. The only retry that can change \
+             this answer is the same call with the correct `repo`; otherwise tell \
+             the operator with `send_message` that the hold state could not be \
+             read, and stop.",
+        )
+    };
+
+    let mut payload = serde_json::json!({
+        "error": "pr_ready_undraft_refused",
+        "doctrine": "mika#2597 + mika#2624",
+        "pr": pr_num,
+        "repo": repo,
+        "reason": motif,
+        "detail": reason,
+        "remedy": remedy,
+    });
+
+    // `since` / `actor` ride along only when GitHub gave them, and are never
+    // invented: an absent field says "unknown", a fabricated one would send the
+    // reader after the wrong author.
+    if let Some(obj) = payload.as_object_mut() {
+        if let Some(since) = since {
+            obj.insert("hold_since".into(), serde_json::json!(since));
+        }
+        if let Some(actor) = actor {
+            obj.insert("hold_actor".into(), serde_json::json!(actor));
+        }
+    }
+    payload.to_string()
+}
+
+/// Model-visible half of the no-credential refusal (mika#2624, doctrine mika#1783).
+///
+/// Neutral by construction: no credential, no env var, no motif — the cause is
+/// the operator's and travels in [`PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC`]. What
+/// the model keeps is the conduct: the PR stays in draft, the refusal is not
+/// lifted by retrying, and the operator is told. Same shape as the other hold
+/// refusals minus `reason`, which would carry `hold_no_token` into the context.
+fn pr_ready_hold_no_credential_fallback(pr_num: &str, repo: &str) -> String {
+    serde_json::json!({
+        "error": "pr_ready_undraft_refused",
+        "doctrine": "mika#2597 + mika#2624",
+        "pr": pr_num,
+        "repo": repo,
+        "detail": format!(
+            "The draft-state history of pull request #{pr_num} on {repo} could \
+             not be checked in this context, so it cannot be established that \
+             this PR is not held."
+        ),
+        "remedy": "Leave this pull request in draft and tell the operator with \
+                   `send_message` that the hold state could not be checked; do \
+                   not retry under a different shape.",
+    })
+    .to_string()
+}
+
+/// Pure decision for the **explicit-hold** term of the un-draft guard (mika#2624).
+///
+/// Refuses iff [`pr_ready_hold_motif`] names a motif — one predicate, so the
+/// decision and the reported motif cannot drift apart.
+fn decide_pr_ready_hold(
+    pr_num: &str,
+    verdict: &crate::wip_rescue::HoldVerdict,
+    repo: &str,
+) -> Result<(), ToolOutput> {
+    let Some(motif) = pr_ready_hold_motif(verdict) else {
+        return Ok(());
+    };
+    let (since, actor) = pr_ready_hold_attribution(verdict);
+    Err(ToolOutput::error(pr_ready_hold_rejection_body(
+        pr_num, motif, repo, since, actor,
+    )))
 }
 
 /// Parse `gh pr view --json isDraft,labels,commits` JSON output into a
@@ -2801,32 +3148,271 @@ async fn validate_fallthrough_work_creation(
 /// so this structural guard is the load-bearing fix.
 ///
 /// Fail-open on `gh pr view` errors and on non-promote calls (pass-through).
+///
+/// # Two terms, one guard, and the order is not arbitrary (mika#2624)
+///
+/// Both terms answer the **same** question — *may this PR leave draft?* — by two
+/// discriminants, so they live in one guard: two guards at one site would split a
+/// decision into two places a future editor could make diverge, which this repo
+/// has already paid for once
+/// (`docs/solutions/.../two-predicates-for-one-concept-livelock-2026-09-03.md`).
+///
+/// | # | term | cost | disposition |
+/// |---|---|---|---|
+/// | 1 | wip-rescue signature (mika#1682) | one `gh pr view` subprocess | **fail-open** on the read |
+/// | 2 | explicit hold (mika#2624) | one GraphQL call | **fail-closed** on the read |
+///
+/// Term 1 first, unchanged: if it refuses, the GraphQL call is saved. Term 2 runs
+/// only on the `pr ready` shape ([`detect_pr_ready_undraft`]), so its cost is
+/// bounded to that population — a rare verb.
 async fn validate_pr_ready_undraft_scope(
     args: &[String],
     repo: Option<&str>,
     ctx: &ToolContext<'_>,
 ) -> Result<(), ToolOutput> {
-    let Some(pr_num) = detect_ready_promote_pr(args) else {
-        return Ok(());
-    };
-
-    let view = fetch_pr_wip_rescue_view(pr_num, repo, ctx).await;
-    let decision = decide_pr_ready_undraft(pr_num, view.as_ref());
-
-    if decision.is_err() {
-        // Audit event mirroring `gh_api_invocation` shape (mika#1682 AC3).
-        tracing::info!(
-            event = "pr_ready_undraft_blocked",
-            agent_id = %ctx.db.agent_id(),
-            session_id = %ctx.session_id,
-            pr_number = %pr_num,
-            reason = "wip_rescue_contract",
-            repo = %repo.unwrap_or("unknown"),
-            "blocked un-draft / rename of wip-rescue PR per mika#1613 contract"
-        );
+    // -- Term 1: wip-rescue signature (mika#1682), unchanged ----------------
+    if let Some(pr_num) = detect_ready_promote_pr(args) {
+        let view = fetch_pr_wip_rescue_view(pr_num, repo, ctx).await;
+        if let Err(output) = decide_pr_ready_undraft(pr_num, view.as_ref()) {
+            report_pr_ready_undraft_refusal(
+                ctx,
+                pr_num,
+                PR_READY_UNDRAFT_MOTIF_WIP_RESCUE,
+                repo,
+                None,
+                None,
+                "blocked un-draft / rename of wip-rescue PR per mika#1613 contract",
+            )
+            .await;
+            return Err(output);
+        }
     }
 
-    decision
+    // -- Term 2: explicit hold (mika#2624) ----------------------------------
+    //
+    // Narrower population than term 1: `pr edit --title` is deliberately out
+    // (see `detect_pr_ready_undraft`).
+    let Some(selector) = detect_pr_ready_undraft(args) else {
+        return Ok(());
+    };
+    let declared_repo = repo.unwrap_or(crate::wip_rescue::DEFAULT_REPO);
+
+    // A `pr ready` the term cannot address is refused before anything else:
+    // no token, no network call is needed to know the check cannot run.
+    let (pr_num, target_repo) = match selector {
+        UndraftSelector::Number { number, url_repo } => {
+            match resolve_hold_target_repo(repo, url_repo) {
+                Some(target_repo) => (number, target_repo),
+                None => {
+                    return Err(refuse_pr_ready_hold(
+                        ctx,
+                        number,
+                        PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                        declared_repo,
+                        (None, None),
+                        "refused un-draft: the PR URL names another repository than the declared one",
+                    )
+                    .await);
+                }
+            }
+        }
+        UndraftSelector::Unresolved => {
+            let target_repo = declared_repo;
+            return Err(refuse_pr_ready_hold(
+                ctx,
+                "unresolved",
+                PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                target_repo,
+                (None, None),
+                "refused un-draft: the pr ready selector is not a PR number",
+            )
+            .await);
+        }
+    };
+
+    // Fail-closed, under its own motif so the population stays countable apart:
+    // `gh` can authenticate from `~/.config/gh/hosts.yml`, so a token-less
+    // `pr ready` succeeds today, and that is exactly the population the engine
+    // cannot measure.
+    //
+    // The cause is substrate, so the two halves split (doctrine mika#1783): the
+    // motif goes to the audit row, the diagnostic to the operator channel, and
+    // the model receives the neutral fallback only.
+    let Some(token) = ctx.github_token else {
+        return Err(refuse_pr_ready_no_credential(ctx, pr_num, target_repo).await);
+    };
+
+    // `fetch_convert_to_draft_events` wants `(owner, repo)`. The tool's `repo`
+    // parameter is the declared one (`--repo` inside the argv is refused upstream
+    // by `validate_gh_input`); a PR URL selector names its own repository
+    // (`resolve_hold_target_repo`); with neither, we fall back on the default
+    // repo exactly as `wip_rescue::default_repo_parts` does.
+    //
+    // Named cost: a bare-number `pr ready` on a PR of another repository with
+    // no `repo` passed queries the wrong repository's timeline. GraphQL then answers
+    // `pullRequest: null`, the fail-closed extractor returns `Err`, and the
+    // refusal lands under `hold_unreadable`. That is a false positive whose
+    // remedy is **named in the refusal body**: pass `repo`. Acceptable because
+    // the error leans the safe way and the remedy is one argument away.
+    //
+    // A declared `repo` that does not split into `owner/name`, or a number that
+    // does not parse, leaves the term with nothing it can address: refused
+    // under the same motif as a non-numeric selector, never defaulted to
+    // another repository (the label would then name one repo while the
+    // timeline read was another's) and never waved through.
+    let (owner, repo_name, number) = match (
+        target_repo
+            .split_once('/')
+            .filter(|(o, r)| !o.is_empty() && !r.is_empty()),
+        pr_num.parse::<u64>(),
+    ) {
+        (Some((owner, repo_name)), Ok(number)) => (owner, repo_name, number),
+        _ => {
+            return Err(refuse_pr_ready_hold(
+                ctx,
+                pr_num,
+                PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+                target_repo,
+                (None, None),
+                "refused un-draft: the target repository or PR number cannot be addressed",
+            )
+            .await);
+        }
+    };
+
+    // The discriminant of mika#2597, **called** and never transcribed: the fetch
+    // from `github_graphql`, the classification from `wip_rescue`.
+    let verdict = crate::wip_rescue::classify_hold_verdict(
+        crate::github_graphql::fetch_convert_to_draft_events(token, owner, repo_name, number).await,
+    );
+
+    if let Err(output) = decide_pr_ready_hold(pr_num, &verdict, target_repo) {
+        let motif = pr_ready_hold_motif(&verdict).unwrap_or(PR_READY_HOLD_MOTIF_UNREADABLE);
+        let (since, actor) = pr_ready_hold_attribution(&verdict);
+        report_pr_ready_undraft_refusal(
+            ctx,
+            pr_num,
+            motif,
+            Some(target_repo),
+            since,
+            actor,
+            "refused un-draft of a pull request held in draft (mika#2624)",
+        )
+        .await;
+        return Err(output);
+    }
+
+    Ok(())
+}
+
+/// Report a hold-term refusal on both surfaces and build its body (mika#2624).
+///
+/// One site for the unresolved-selector refusals, which have no verdict behind
+/// them, so the reported motif and the body's motif cannot be spelled two ways.
+/// The no-credential refusal does not come through here: its body must stay
+/// neutral (doctrine mika#1783).
+async fn refuse_pr_ready_hold(
+    ctx: &ToolContext<'_>,
+    pr_num: &str,
+    motif: &'static str,
+    target_repo: &str,
+    (since, actor): (Option<&str>, Option<&str>),
+    message: &'static str,
+) -> ToolOutput {
+    report_pr_ready_undraft_refusal(ctx, pr_num, motif, Some(target_repo), since, actor, message)
+        .await;
+    ToolOutput::error(pr_ready_hold_rejection_body(
+        pr_num,
+        motif,
+        target_repo,
+        since,
+        actor,
+    ))
+}
+
+/// Fail-closed refusal of a `pr ready` the engine cannot check for want of a
+/// GitHub credential (mika#2624), split by doctrine mika#1783.
+///
+/// The motif lands in the audit row (`hold_no_token`, countable apart), the
+/// diagnostic in the operator channel, and the model receives the neutral
+/// fallback only — on family/champion tier, byte for byte.
+async fn refuse_pr_ready_no_credential(
+    ctx: &ToolContext<'_>,
+    pr_num: &str,
+    target_repo: &str,
+) -> ToolOutput {
+    report_pr_ready_undraft_refusal(
+        ctx,
+        pr_num,
+        PR_READY_HOLD_MOTIF_NO_CREDENTIAL,
+        Some(target_repo),
+        None,
+        None,
+        PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC,
+    )
+    .await;
+    crate::tools::dispatch_substrate_unavailable(
+        pr_ready_hold_no_credential_fallback(pr_num, target_repo),
+        PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC,
+        "run_gh",
+        ctx,
+    )
+    .await
+}
+
+/// Emit the two surfaces of an un-draft refusal — the log line and its audit row
+/// (mika#2624).
+///
+/// One site for both terms, so the pre-existing mika#1682 event keeps its name
+/// and gains its row at the same time, and the motif cannot be spelled two ways.
+/// Audit failures are warn-and-continue: losing the ledger row must never turn a
+/// refusal into an authorization.
+async fn report_pr_ready_undraft_refusal(
+    ctx: &ToolContext<'_>,
+    pr_num: &str,
+    motif: &str,
+    repo: Option<&str>,
+    hold_since: Option<&str>,
+    hold_actor: Option<&str>,
+    message: &'static str,
+) {
+    tracing::info!(
+        event = PR_READY_UNDRAFT_AUDIT_TOOL,
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        trace_id = %ctx.trace_id,
+        pr_number = %pr_num,
+        reason = %motif,
+        repo = %repo.unwrap_or("unknown"),
+        hold_since = hold_since.unwrap_or("—"),
+        hold_actor = hold_actor.unwrap_or("—"),
+        "{message}"
+    );
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            PR_READY_UNDRAFT_AUDIT_TOOL,
+            &format!("pr:{}#{}", repo.unwrap_or("unknown"), pr_num),
+            None,
+            Some(motif),
+            Some(&format!(
+                "since={} actor={}",
+                hold_since.unwrap_or("—"),
+                hold_actor.unwrap_or("—")
+            )),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(
+            event = "pr_ready_undraft_audit_failed",
+            error = %e,
+            reason = %motif,
+            "the INFO line landed but its audit row did not; the GROUP BY undercounts"
+        );
+    }
 }
 
 /// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` /
@@ -11804,6 +12390,469 @@ mod tests {
             labels: vec!["bug".to_string()],
             head_commit_headline: Some("fix(mika#1700): correct edge case".to_string()),
         }
+    }
+
+    // -- hold term of the un-draft guard (mika#2624) --
+    //
+    // AC3. The founding test is `..._un_hold_explicite_refuse_lundraft`: on the
+    // pre-fix tree `decide_pr_ready_hold` carries the current behaviour (allow)
+    // and this assertion is RED for the right reason — a behavioural failure,
+    // not a compile error. The two positive controls stay green on both sides of
+    // the fix; that is their job, telling "the predicate bites" from "the
+    // predicate refuses everything".
+
+    fn held_verdict() -> crate::wip_rescue::HoldVerdict {
+        crate::wip_rescue::HoldVerdict::Held {
+            since: Some("2026-10-01T14:00:41Z".to_string()),
+            actor: Some("samidarko".to_string()),
+        }
+    }
+
+    #[test]
+    fn mika2624_un_hold_explicite_refuse_lundraft() {
+        // The measured incident: PR #2621 held in draft by a human at 14:00:41Z,
+        // `run_gh ["pr","ready","2621"]` at 14:46:03Z. No wip-rescue signature on
+        // that PR, so the mika#1682 term allows — it is the hold term that must
+        // refuse.
+        let args = str_args(&["pr", "ready", "2621"]);
+        assert_eq!(
+            detect_pr_ready_undraft(&args),
+            Some(UndraftSelector::Number {
+                number: "2621",
+                url_repo: None
+            })
+        );
+
+        let view = normal_pr_view();
+        assert!(decide_pr_ready_undraft("2621", Some(&view)).is_ok());
+
+        let result = decide_pr_ready_hold("2621", &held_verdict(), "senara-solutions/mika");
+        assert!(
+            result.is_err(),
+            "a PR carrying a ConvertToDraftEvent is held; `pr ready` must be refused"
+        );
+        let err = result.unwrap_err();
+        assert!(err.content.contains("2621"), "the refusal names the PR");
+        assert!(
+            err.content.contains("mika#2624"),
+            "the refusal names its doctrine"
+        );
+    }
+
+    #[test]
+    fn mika2624_un_brouillon_ne_en_draft_reste_promouvable() {
+        // Positive control. A PR created `--draft` (every dispatch-lib rescue PR)
+        // carries no ConvertToDraftEvent, so `NotHeld` must allow — byte for byte
+        // the pre-mika#2624 behaviour.
+        let result = decide_pr_ready_hold(
+            "2600",
+            &crate::wip_rescue::HoldVerdict::NotHeld,
+            "senara-solutions/mika",
+        );
+        assert!(
+            result.is_ok(),
+            "a rescue draft is not a hold; wip_rescue must keep promoting it"
+        );
+    }
+
+    #[test]
+    fn mika2624_undo_reste_permis() {
+        // Positive control. `--undo` converts TO draft: it poses a hold, it does
+        // not lift one, so it never enters the population.
+        let args = str_args(&["pr", "ready", "2621", "--undo"]);
+        assert_eq!(detect_pr_ready_undraft(&args), None);
+    }
+
+    #[test]
+    fn mika2624_une_timeline_illisible_refuse() {
+        // AC2. Fail-closed: a term that cannot be read is never a satisfied term
+        // (mika#2277), applied to "this PR is NOT held".
+        let verdict = crate::wip_rescue::HoldVerdict::Unreadable {
+            error: "GitHub API error 503".to_string(),
+        };
+        let result = decide_pr_ready_hold("2621", &verdict, "senara-solutions/mika");
+        assert!(
+            result.is_err(),
+            "an unreadable timeline must refuse, not allow"
+        );
+        assert_eq!(
+            pr_ready_hold_motif(&verdict),
+            Some(PR_READY_HOLD_MOTIF_UNREADABLE),
+            "and it must do so under its own motif, not the operator-hold one"
+        );
+    }
+
+    #[test]
+    fn mika2624_les_trois_motifs_sont_distincts() {
+        // The three refusal motifs land in `audit_events.after_value` and the
+        // operator GROUP BYs them: two spellings of one motif would split a
+        // population without saying so, and one spelling for two causes would
+        // make an outage read as a hold being honoured (motif mika#2156).
+        let motifs = [
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            PR_READY_HOLD_MOTIF_UNREADABLE,
+            PR_READY_HOLD_MOTIF_NO_CREDENTIAL,
+            PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+            PR_READY_UNDRAFT_MOTIF_WIP_RESCUE,
+        ];
+        let unique: std::collections::HashSet<_> = motifs.iter().collect();
+        assert_eq!(unique.len(), motifs.len(), "motifs must stay distinct");
+        // Frozen as a wire format: a rename is a break to date in CLAUDE.md,
+        // never a silent test update.
+        assert_eq!(PR_READY_HOLD_MOTIF_OPERATOR_HOLD, "operator_hold");
+        assert_eq!(PR_READY_HOLD_MOTIF_UNREADABLE, "hold_unreadable");
+        assert_eq!(PR_READY_HOLD_MOTIF_NO_CREDENTIAL, "hold_no_token");
+        assert_eq!(
+            PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR,
+            "hold_unresolved_selector"
+        );
+        assert_eq!(PR_READY_UNDRAFT_MOTIF_WIP_RESCUE, "wip_rescue_contract");
+    }
+
+    #[test]
+    fn mika2624_le_refus_ne_nomme_aucun_contournement() {
+        // Doctrine mika#2520: a refusal that hands over the template is a leak
+        // with one more step. The body names the hold, says a human lifts it, and
+        // offers `send_message` — never the gesture that would bypass it.
+        let held = held_verdict();
+        let (since, actor) = pr_ready_hold_attribution(&held);
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            "senara-solutions/mika",
+            since,
+            actor,
+        );
+        assert!(body.contains("human"), "the refusal names who may lift it");
+        assert!(body.contains("send_message"), "and the correct exit");
+        for forbidden in ["--undo", "gh api", "graphql", "markPullRequestReady"] {
+            assert!(
+                !body.contains(forbidden),
+                "the refusal must not name `{forbidden}` as a route"
+            );
+        }
+    }
+
+    #[test]
+    fn mika2624_un_refus_illisible_nomme_le_parametre_repo() {
+        // Plan § Résolution du dépôt : sans `repo`, une PR d'un autre dépôt
+        // interroge la timeline du dépôt par défaut, GraphQL rend
+        // `pullRequest: null` et le refus tombe sous `hold_unreadable`. Ce faux
+        // positif n'est acceptable que parce que son remède est à un argument de
+        // distance — encore faut-il que le corps du refus le nomme.
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_UNREADABLE,
+            "senara-solutions/mika",
+            None,
+            None,
+        );
+        assert!(
+            body.contains("`repo`"),
+            "an unreadable-timeline refusal must name the `repo` parameter: {body}"
+        );
+        // …et le motif d'un hold réel ne le suggère pas : la timeline a été
+        // lue, le dépôt était le bon.
+        let held = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            "senara-solutions/mika",
+            None,
+            None,
+        );
+        assert!(!held.contains("`repo`"));
+    }
+
+    #[test]
+    fn mika2624_un_selecteur_non_numerique_reste_dans_la_population() {
+        // Revue mika#2628 (security, adversarial) : `gh pr ready` accepte une
+        // branche, `#N` ou aucun sélecteur (branche courante). Le terme hold ne
+        // sait pas lire la timeline de ces formes ; les laisser passer était un
+        // fail-open au cœur d'un terme fail-closed.
+        for argv in [
+            vec!["pr", "ready", "fix/2624/branche"],
+            vec!["pr", "ready", "#2621"],
+            vec!["pr", "ready"],
+        ] {
+            let args = str_args(&argv);
+            assert_eq!(
+                detect_pr_ready_undraft(&args),
+                Some(UndraftSelector::Unresolved),
+                "{argv:?} un-drafts a PR and must stay in the hold term's population"
+            );
+        }
+        // Contrôle négatif : `--undo` et un renommage de titre restent dehors.
+        assert!(detect_pr_ready_undraft(&str_args(&["pr", "ready", "x", "--undo"])).is_none());
+        assert!(detect_pr_ready_undraft(&str_args(&["pr", "edit", "x", "--title", "t"])).is_none());
+    }
+
+    #[test]
+    fn mika2624_une_url_de_pr_lit_la_timeline_de_son_propre_depot() {
+        // Revue mika#2628 (security, adversarial, reliability) : l'URL d'une PR
+        // d'un autre dépôt était réduite à son numéro, et le terme hold lisait
+        // la PR du même numéro sur le dépôt par défaut — une autre PR.
+        let args = str_args(&[
+            "pr",
+            "ready",
+            "https://github.com/senara-solutions/mika-cloud/pull/12",
+        ]);
+        let Some(UndraftSelector::Number { number, url_repo }) = detect_pr_ready_undraft(&args)
+        else {
+            panic!("a PR URL is an addressable un-draft");
+        };
+        assert_eq!(number, "12");
+        assert_eq!(url_repo, Some("senara-solutions/mika-cloud"));
+        assert_eq!(
+            resolve_hold_target_repo(None, url_repo),
+            Some("senara-solutions/mika-cloud"),
+            "with no declared repo, the URL's repository is the one read"
+        );
+        // Un repo déclaré qui contredit l'URL est ambigu : refusé, jamais
+        // arbitré.
+        assert_eq!(
+            resolve_hold_target_repo(Some("senara-solutions/mika"), url_repo),
+            None
+        );
+        // Contrôles positifs : déclaré et URL d'accord, numéro nu, rien du tout.
+        assert_eq!(
+            resolve_hold_target_repo(Some("Senara-Solutions/Mika-Cloud"), url_repo),
+            Some("Senara-Solutions/Mika-Cloud")
+        );
+        assert_eq!(resolve_hold_target_repo(Some("o/r"), None), Some("o/r"));
+        assert_eq!(
+            resolve_hold_target_repo(None, None),
+            Some(crate::wip_rescue::DEFAULT_REPO)
+        );
+        // Une URL malformée ne nomme aucun dépôt.
+        assert_eq!(pr_url_repo("https://github.com/only/pull/12"), None);
+        assert_eq!(pr_url_repo("2621"), None);
+    }
+
+    /// Bout en bout à travers `validate_pr_ready_undraft_scope`, sans réseau
+    /// (revue de PR #2628, testing) : un sélecteur non adressable sort du terme
+    /// mika#1682 (aucun numéro, donc pas de `gh pr view`) et le terme hold le
+    /// refuse avant tout appel. Assert sur les deux surfaces — le `ToolOutput`
+    /// et la ligne `audit_events` — parce qu'un refus qui ne s'écrit pas se lit
+    /// comme un refus qui n'a pas eu lieu.
+    #[tokio::test]
+    async fn mika2624_le_garde_refuse_et_ecrit_sa_ligne_daudit() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let args = str_args(&["pr", "ready", "fix/2624/branche"]);
+        let refused = validate_pr_ready_undraft_scope(&args, None, &ctx)
+            .await
+            .expect_err("an unaddressable pr ready is refused");
+        assert!(refused.is_error);
+        assert!(
+            refused
+                .content
+                .contains(PR_READY_HOLD_MOTIF_UNRESOLVED_SELECTOR),
+            "{}",
+            refused.content
+        );
+        assert_eq!(
+            harness
+                .db
+                .count_audit_events_by_tool_name(PR_READY_UNDRAFT_AUDIT_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "the refusal writes exactly one audit row"
+        );
+
+        // Contrôles négatifs, sans réseau eux aussi : `--undo` remet en draft et
+        // un renommage par branche ne touche pas l'état draft — ni refus, ni
+        // ligne. Sans eux, « le garde décide » serait indistinguable de « le
+        // garde refuse tout ».
+        for argv in [
+            vec!["pr", "ready", "fix/2624/branche", "--undo"],
+            vec!["pr", "edit", "fix/2624/branche", "--title", "t"],
+            vec!["pr", "view", "fix/2624/branche"],
+        ] {
+            assert!(
+                validate_pr_ready_undraft_scope(&str_args(&argv), None, &ctx)
+                    .await
+                    .is_ok(),
+                "{argv:?} is not an un-draft"
+            );
+        }
+        assert_eq!(
+            harness
+                .db
+                .count_audit_events_by_tool_name(PR_READY_UNDRAFT_AUDIT_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "the negative controls write no row"
+        );
+    }
+
+    /// Substrings that must never reach the model in the no-credential refusal
+    /// (doctrine mika#1783, lint `scripts/check-substrate-leak.sh` rule 2).
+    const NO_CREDENTIAL_LEAKS: &[&str] = &[
+        "token",
+        "Token",
+        "GitHub token",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "MIKA_",
+        "hosts.yml",
+        "hold_no_token",
+    ];
+
+    #[test]
+    fn mika2624_un_refus_sans_jeton_est_neutre_et_ne_blame_pas_le_depot() {
+        // Revue mika#2628 : le refus sans jeton partageait la prose de
+        // `hold_unreadable` et envoyait l'agent corriger un `repo` qui n'y est
+        // pour rien. Doctrine mika#1783 : sa cause est du substrat, donc le
+        // modèle ne reçoit qu'un texte neutre — ni jeton, ni variable, ni motif.
+        let body = pr_ready_hold_no_credential_fallback("2621", "senara-solutions/mika");
+        assert!(
+            !body.contains("`repo`"),
+            "a no-credential refusal must not blame the repo parameter: {body}"
+        );
+        for leak in NO_CREDENTIAL_LEAKS {
+            assert!(
+                !body.contains(leak),
+                "the model must not read `{leak}`: {body}"
+            );
+        }
+        // La conduite, elle, reste : brouillon, opérateur, pas de nouvel essai.
+        assert!(body.contains("pr_ready_undraft_refused"), "{body}");
+        assert!(body.contains("send_message"), "the correct exit: {body}");
+        assert!(body.contains("do not retry"), "{body}");
+        // …et aucun des deux refus « illisibles » n'affirme qu'un hold existe :
+        // le remède d'un hold n'est pas celui d'une lecture impossible.
+        let unreadable =
+            pr_ready_hold_rejection_body("2621", PR_READY_HOLD_MOTIF_UNREADABLE, "o/r", None, None);
+        for body in [&body, &unreadable] {
+            assert!(
+                !body.contains("A hold is lifted"),
+                "no hold was established, none may be claimed: {body}"
+            );
+        }
+        // Contrôle positif : le diagnostic opérateur, lui, nomme la cause.
+        assert!(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC.contains("GitHub token"));
+        assert!(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC.contains("hold_no_token"));
+    }
+
+    /// Les deux moitiés du refus sans jeton, sans réseau (mika#2624, doctrine
+    /// mika#1783) : sur tier famille le modèle lit le repli neutre octet pour
+    /// octet, le motif distinct reste dans l'audit, et le diagnostic part au
+    /// canal opérateur. Sur tier opérateur il est replié dans le contenu —
+    /// contrôle qui distingue « routé par tier » de « jamais émis ».
+    #[tokio::test]
+    async fn mika2624_un_refus_sans_jeton_garde_son_motif_dans_laudit() {
+        let harness = TestHarness::new();
+        let mut ctx = harness.ctx();
+        assert!(
+            ctx.github_token.is_none(),
+            "the path under test is token-less"
+        );
+        ctx.tier = mika_common::home::AgentTier::Family;
+
+        let refused = refuse_pr_ready_no_credential(&ctx, "2621", "senara-solutions/mika").await;
+        assert!(refused.is_error, "fail-closed");
+        assert_eq!(
+            refused.content,
+            pr_ready_hold_no_credential_fallback("2621", "senara-solutions/mika"),
+            "family tier reads the neutral fallback and nothing else"
+        );
+        for leak in NO_CREDENTIAL_LEAKS {
+            assert!(
+                !refused.content.contains(leak),
+                "the model must not read `{leak}`: {}",
+                refused.content
+            );
+        }
+
+        let events = harness.db.get_audit_events("test-session").await.unwrap();
+        let refusal: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == PR_READY_UNDRAFT_AUDIT_TOOL)
+            .collect();
+        assert_eq!(refusal.len(), 1, "one refusal row");
+        assert_eq!(
+            refusal[0].after_value.as_deref(),
+            Some(PR_READY_HOLD_MOTIF_NO_CREDENTIAL),
+            "the distinct motif stays in the audit"
+        );
+        assert!(
+            events.iter().any(|e| e.tool_name == "substrate_unavailable"
+                && e.after_value.as_deref() == Some(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC)),
+            "the diagnostic reaches the operator channel"
+        );
+
+        ctx.tier = mika_common::home::AgentTier::Default;
+        let operator = refuse_pr_ready_no_credential(&ctx, "2621", "senara-solutions/mika").await;
+        assert!(operator.is_error);
+        assert!(
+            operator
+                .content
+                .contains(PR_READY_HOLD_NO_CREDENTIAL_DIAGNOSTIC),
+            "operator tier: the diagnostic is folded back: {}",
+            operator.content
+        );
+    }
+
+    #[test]
+    fn mika2624_lattribution_nest_jamais_inventee() {
+        // mika#2331: `null` is never a value. An unreadable `since`/`actor`
+        // yields an ABSENT field, never the string "null" nor a placeholder that
+        // would send the reader after the wrong author.
+        let anonymous = crate::wip_rescue::HoldVerdict::Held {
+            since: None,
+            actor: None,
+        };
+        let (since, actor) = pr_ready_hold_attribution(&anonymous);
+        assert_eq!((since, actor), (None, None));
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            "senara-solutions/mika",
+            since,
+            actor,
+        );
+        assert!(!body.contains("hold_since"), "absent, not null");
+        assert!(!body.contains("hold_actor"), "absent, not null");
+
+        // …and present when GitHub gave them.
+        let held = held_verdict();
+        let (since, actor) = pr_ready_hold_attribution(&held);
+        let body = pr_ready_hold_rejection_body(
+            "2621",
+            PR_READY_HOLD_MOTIF_OPERATOR_HOLD,
+            "senara-solutions/mika",
+            since,
+            actor,
+        );
+        assert!(body.contains("2026-10-01T14:00:41Z"));
+        assert!(body.contains("samidarko"));
+    }
+
+    #[test]
+    fn mika2624_un_rename_de_titre_nentre_pas_dans_la_population_du_hold() {
+        // R2 shape boundary. `pr edit <N> --title` is mika#1682's second shape
+        // and is out of the hold term's reach: a hold forbids publishing, not
+        // correcting a title — and that argv does not touch the draft state.
+        let args = str_args(&[
+            "pr",
+            "edit",
+            "2621",
+            "--title",
+            "fix(mika#2624): refuse un hold explicite",
+        ]);
+        assert_eq!(
+            detect_ready_promote_pr(&args),
+            Some("2621"),
+            "the mika#1682 detector still covers the rename"
+        );
+        assert_eq!(
+            detect_pr_ready_undraft(&args),
+            None,
+            "the hold term must not see a title rename"
+        );
     }
 
     #[test]
