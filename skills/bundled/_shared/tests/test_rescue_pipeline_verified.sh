@@ -790,6 +790,10 @@ STATUS=success MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15K" \
     && { FAIL=$((FAIL + 1)); echo "  ✗ T15k-bis refuses a rescue-committed success"; }
 assert_eq "T15k-bis names the \`compound-traversal\` term" "compound-traversal" "$MEASURE_TERM"
 assert_contains "T15k-bis excerpt names the status that was read" "$MEASURE_EXCERPT" "success"
+# The second fact behind the refusal, and the reason a `success` is measured at
+# all. Without it the sentence would name a concluded session and stop there.
+assert_contains "T15k-bis excerpt names the auto-commit" "$MEASURE_EXCERPT" \
+    "dispatch-lib committed in the pilot's place"
 # The sentence must not contradict itself: this session DID conclude. Saying it
 # did not would trade a false marker for a false sentence — the very exchange
 # this ticket refuses to make at `_pilot_had_no_shipping_tail`.
@@ -801,6 +805,12 @@ assert_eq "T15k-bis term 0 short-circuits: no cargo, no verifier ran" "" "$(cat 
 B15K=$(_compose_rescue_pr_body "$R15K" "dirty-worktree" "Class fact." "2631" "no" "compound-traversal" "excerpt" "absent")
 assert_contains "T15k-bis body carries the traversal marker" "$B15K" "<!-- compound-traversal: absent -->"
 assert_contains "T15k-bis body stays unverified" "$B15K" "<!-- rescue-pipeline-verified: no -->"
+
+# Paired control: on a session cut short with no rescue commit, the suffix must
+# NOT appear — it names a fact, so it may only be said when the fact holds.
+STATUS=terminated RESCUED_DIRTY_WORKTREE=0 MIKA_RESCUE_REQUIRE_COMPOUND_TRAVERSAL=1 measure "$R15K" || true
+assert_not_contains "T15k-bis no auto-commit claim without the stamp" "$MEASURE_EXCERPT" \
+    "committed in the pilot's place"
 
 # ── T15l (AC2) — POSITIVE CONTROL, the half that keeps the remedy from being
 #                worse than the defect
@@ -898,6 +908,10 @@ for _line in $STATUS_SUCCESS_SITES; do
         /^[_a-zA-Z][_a-zA-Z0-9]*\(\) \{$/ { fn = $1; sub(/\(\)$/, "", fn) }
         /^    # mika#940 Unit 1: post-flight PR-existence check\.$/ { fn = "mika#940 Unit 1" }
         NR == n { print fn; exit }' "$DISPATCH_LIB")
+    # An empty owner would make the assertion below vacuous: every string
+    # contains the empty string.
+    assert_eq "T15o the reader at line $_line has an enclosing site" "1" \
+        "$( [ -n "$_owner" ] && echo 1 || echo 0 )"
     assert_contains "T15o the census names the reader at line $_line (\`$_owner\`)" \
         "$CENSUS_BLOCK" "$_owner"
 done
@@ -950,6 +964,57 @@ git -C "$R15Q" commit -q --allow-empty --no-verify \
     -m "wip(mika#1383): auto-PR-create rescue for mika#2631"
 assert_eq "T15q the marker commit does not make the class measure" "not-applicable" \
     "$(STATUS=success RESCUED_DIRTY_WORKTREE=0 traversal "$R15Q")"
+
+# ── T15r (AC1) — Phase A commits in the pilot's place too ───────────────────
+# Found in review: the mika#1383 Phase A rescue commits content the pilot wrote
+# and never committed, on the HEAD-ADVANCED side. The pilot committed part of its
+# work, left the rest dirty and handed the turn back — "in the pilot's place"
+# exactly as AC1 means it — and the class reads `commit-pushed-no-pr`. Driven
+# through the real `_post_flight_recovery` (patron `test_rescue_fmt_clean.sh`
+# T-b), so the case proves Phase A really writes the stamp, not that the
+# classifier reads a variable.
+echo "-- T15r: the trailing-content rescue makes a concluded session measure (AC1) --"
+# trailing_rescue <dir> — the HEAD-advanced shape: the pilot commits part of its
+# work (`add_work`), leaves a plan file dirty, concludes in `success`; then the
+# real `_post_flight_recovery` runs. `gh` is shadowed so the PR signal stays
+# offline.
+# shellcheck disable=SC2034  # globals read by the sourced dispatch-lib
+trailing_rescue() {
+    local repo="$1"
+    WORKTREE_DIR="$repo"; SKILL="dev-pilot"; REPO="mika"; ISSUE_NUM="2631"
+    BRANCH="fix/2631/dispatch-lib-compound-traversal-not"
+    PILOT_EXIT=0; STATUS="success"; PR_URL=""; LOG_ID="log-test"
+    RESULT="claude-pilot completed (status: success)."
+    RESCUED_DIRTY_WORKTREE=0; RESCUED_TRAILING_CONTENT=0
+    RESCUE_COMMITS=""; RESCUE_COMMITS_SIGNALLED=""
+    PRE_RUN_HEAD=$(git -C "$repo" rev-parse HEAD)
+    add_work "$repo"
+    POST_RUN_HEAD=$(git -C "$repo" rev-parse HEAD)
+    mkdir -p "$repo/docs/plans"
+    printf '%s' "$PLAN_DOC" > "$repo/docs/plans/2026-10-02-002-fix-2631-trailing-plan.md"
+    gh() { return 1; }
+    _post_flight_recovery >/dev/null 2>&1 || true
+    unset -f gh
+}
+R15R=$(make_repo t15r)
+trailing_rescue "$R15R"
+assert_eq "T15r Phase A committed the trailing content" "1" \
+    "$(git -C "$R15R" log --format=%s | grep -c 'trailing content after pilot end_turn')"
+assert_eq "T15r Phase A wrote its stamp" "1" "$RESCUED_TRAILING_CONTENT"
+assert_eq "T15r the dirty-worktree stamp stayed down (the class is not dirty-worktree)" \
+    "0" "$RESCUED_DIRTY_WORKTREE"
+assert_eq "T15r the classifier reads \`absent\`, not \`not-applicable\`" \
+    "absent" "$(STATUS=success traversal "$R15R")"
+# And the stamp's domain is exact, like its sibling's (T15n).
+for stamp in "0" "yes" " 1 "; do
+    assert_eq "T15r trailing stamp '$stamp' leaves the session exempt" "not-applicable" \
+        "$(STATUS=success RESCUED_DIRTY_WORKTREE=0 RESCUED_TRAILING_CONTENT="$stamp" traversal "$R15R")"
+done
+# Structural: the stamp is reset per dispatch, next to its sibling, so it cannot
+# leak from an earlier dispatch in the same process.
+assert_eq "T15r the trailing stamp is reset in \`_run_claude_pilot\`" "1" \
+    "$(sed -n '/^_run_claude_pilot() {$/,/^}$/p' "$DISPATCH_LIB" | grep -c '^    RESCUED_TRAILING_CONTENT=0$')"
+RESCUED_TRAILING_CONTENT=0
 
 echo ""
 echo "========================================"

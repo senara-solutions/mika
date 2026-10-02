@@ -3730,6 +3730,10 @@ _run_claude_pilot() {
 
     # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
     RESCUED_DIRTY_WORKTREE=0
+    # mika#2631: flag for the mika#1383 Phase A trailing-content rescue, read by
+    # `_rescue_committed_in_the_pilots_place`. Reset per dispatch, like its
+    # sibling above, so a stamp from an earlier dispatch cannot leak.
+    RESCUED_TRAILING_CONTENT=0
     # mika#2151: SHAs of rescue commits produced during THIS dispatch, and the
     # subset already reported on a PR. Reset here, per dispatch, deliberately:
     # the detector has no backlog — it never scans history, open PRs, or
@@ -5463,6 +5467,12 @@ ${RESULT}"
                     # mika#1685: bypass pre-commit hook — see rationale on the
                     # mika#1282 rescue commit above. Same salvage-not-gate principle.
                     if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" --no-verify 2>&9; then
+                        # mika#2631: dispatch-lib just committed content the
+                        # pilot wrote and never committed — the same fact as the
+                        # mika#1282 stamp, on the HEAD-advanced side. Set on the
+                        # commit, not on the push: the content is in the branch
+                        # either way.
+                        RESCUED_TRAILING_CONTENT=1
                         # mika#2151: this is the SECOND push site in dispatch-lib
                         # — it pushes inline, before _push_branch ever runs. A
                         # signal wired only into _push_branch would leave one
@@ -8639,10 +8649,17 @@ _rescue_touches_tracked_tree() {
 # reading the derivation rather than the fact adds a link that can diverge for no
 # gain.
 #
-# `commit-pushed-no-pr` is deliberately OUT, and AC1's parenthesis ("or any class
-# that auto-commits in the pilot's place") must not be read as sweeping it in. It
-# does create a commit — the empty `wip(mika#1383)` marker — but on that class the
-# pilot committed ITS OWN work; the marker exists only to arm guard 2 of
+# TWO PRODUCERS, ONE FACT. The HEAD-advanced side has its own auto-commit: the
+# mika#1383 Phase A trailing-content rescue. A pilot that commits part of its
+# work, leaves the rest dirty and hands the turn back gets that rest committed by
+# dispatch-lib — "in the pilot's place" exactly as AC1 means it — and the class
+# then reads `commit-pushed-no-pr`. Phase A stamps `RESCUED_TRAILING_CONTENT=1`
+# on its commit, and either stamp makes the traversal measure. Pinned by T15r,
+# which drives the real `_post_flight_recovery`.
+#
+# The EMPTY `wip(mika#1383)` marker stays OUT, and AC1's parenthesis must not be
+# read as sweeping it in. That commit carries no content: the pilot committed
+# all of ITS OWN work, the marker exists only to arm guard 2 of
 # `self-dev-webhook-qa`, and only `gh pr create` failed. Measuring the traversal
 # there would bite a pilot that finished correctly, i.e. part of the nominal
 # traffic under another name. Pinned by T15q.
@@ -8650,11 +8667,11 @@ _rescue_touches_tracked_tree() {
 # Exact, like the shipping-tail stamp test in `_pilot_had_no_shipping_tail`
 # (spelled differently here on purpose: T5 of `test-dispatch-lib.sh` counts that
 # stamp's readers): the scaffold-only path sets `0`, the two hook-failure paths
-# leave it unset, and dev-groom never sets it at all. Anything unreadable, empty or `0` leaves today's behaviour — which is
-# the fail-safe direction here, since not measuring is the prior state and never a
-# new permission.
+# leave it unset, and dev-groom never sets either stamp. Anything unreadable,
+# empty or `0` leaves today's behaviour — which is the fail-safe direction here,
+# since not measuring is the prior state and never a new permission.
 _rescue_committed_in_the_pilots_place() {
-    [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ]
+    [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ] || [ "${RESCUED_TRAILING_CONTENT:-}" = "1" ]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8734,13 +8751,13 @@ _rescue_committed_in_the_pilots_place() {
 # CALLED TWICE PER DISPATCH, and that is forced rather than sloppy: the callsite
 # invokes `_measure_pipeline_verified` inside `$(…)`, i.e. in a SUBSHELL, so a
 # global written there could not reach the body composer. Two calls of a pure
-# function of (`STATUS`, `RESCUED_DIRTY_WORKTREE`, worktree state) cannot diverge
-# — nothing between them mutates any of the three — and the alternative, a second
+# function of (`STATUS`, the two rescue stamps, worktree state) cannot diverge
+# — nothing between them mutates any of them — and the alternative, a second
 # classification written at the callsite, is the duplicated-predicate class this
-# file has had to undo before. The stamp joined that list in mika#2631, and the
-# argument extends verbatim: it is written far upstream (`_run_claude_pilot` →
-# `_post_flight_recovery` → `_rescue_dirty_worktree`), and the subshell of term 0
-# can write nothing at all.
+# file has had to undo before. The stamps joined that list in mika#2631, and the
+# argument extends verbatim: both are written far upstream (`_run_claude_pilot` →
+# `_post_flight_recovery`, in `_rescue_dirty_worktree` and in Phase A), and the
+# subshell of term 0 can write nothing at all.
 #
 # Args: $1 — worktree dir
 # Outputs: exactly one of the four values above, no trailing newline.
@@ -10266,7 +10283,8 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
                 _rescue_verify_term=$(head -1 <<<"$_rescue_verify_out")
                 _rescue_verify_excerpt=$(tail -n +2 <<<"$_rescue_verify_out")
             fi
-            # mika#2631 adds `rescue-committed=`, so the two reasons a traversal
+            # mika#2631 adds `rescue-committed=` and `trailing-committed=` (the
+            # two stamps), so the two reasons a traversal
             # reads `not-applicable` are distinguishable: the session concluded
             # AND committed its own work, versus the rescue having committed for
             # it (which now measures instead).
@@ -10282,7 +10300,7 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
             # naming the auto-commit. Same refusal, same words, as mika#2503's own
             # `echo` a few hundred lines above: a convenience, deliberately not
             # presented as a probe.
-            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} compound-traversal=${_rescue_compound} rescue-committed=${RESCUED_DIRTY_WORKTREE:-unset} (mika#2354, mika#2563, mika#2631)" >&2
+            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} compound-traversal=${_rescue_compound} rescue-committed=${RESCUED_DIRTY_WORKTREE:-unset} trailing-committed=${RESCUED_TRAILING_CONTENT:-unset} (mika#2354, mika#2563, mika#2631)" >&2
         else
             # The kill-switch leaves `$8` empty too, so the body stays
             # byte-identical to the pre-mika#2354 one — mika#2563 extends that
