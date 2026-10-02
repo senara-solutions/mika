@@ -804,9 +804,11 @@ une ligne neutre cherche dans le voisinage de 5h-bis.
 #### Surfaces opérateur
 
 ```bash
-# 1. Un livrable d'équipe a-t-il été arrêté ?
+# 1. Un livrable d'équipe a-t-il été arrêté ? Le grep est une SOUS-CHAÎNE et
+#    rend aussi le résidu `…_uncorrected` : le `select` sur `.event` est porteur.
 grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -c 'select(.channel == "team_deliverable")
+  | jq -c 'select(.event == "guard.testimony_access_proposal"
+                  and .channel == "team_deliverable")
            | {team_run_id, team_name, deliverable_source, writer_agent, matched_subject}'
 # `writer_agent` est ABSENT hors `deliverable_source = "writer"`. Pas d'`agent_id` sur
 # ce canal : la portée de la base d'équipe n'est pas l'agent qui agit.
@@ -835,7 +837,8 @@ SELECT r.id, t.name AS team_name, r.status, r.started_at
 | `_uncorrected`, `deliverable_source = "writer"` | WARN | **zéro** | la re-rédaction a échoué **après** que 5h a aussi échoué : lire le prompt servi au rédacteur **avant** de toucher au prédicat |
 | `team_deliverable_rewrite_skipped_no_budget` | WARN | **zéro** | la re-rédaction n'a pas été tentée faute de place avant le mur de 900 s du run : la ligne neutre est posée au lieu d'un run coupé en plein tour qui aurait persisté « no deliverable produced ». Couvre le mur du run, **pas** celui de l'outil `run_team` synchrone (300 s), que le moteur ne connaît pas — limite nommée |
 | `_uncorrected`, `workspace_fallback` \| `conversational_gate` \| `no_delegation` | WARN | **zéro** | nominal par conception : ces provenances n'ont pas de re-rédaction |
-| un même `team_run_id` portant plusieurs refus | WARN | **anomalie** | un seul retry est prévu, donc deux lignes signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
+| un même `team_run_id` portant une ligne nominale **et** son `_uncorrected` | WARN | **nominal** | c'est la forme attendue de tout refus servi en ligne neutre — **systématique** pour `workspace_fallback`, `conversational_gate` et `no_delegation`, qui n'ont pas de re-rédaction. Ne pas la lire comme une anomalie |
+| un même `team_run_id` portant **deux lignes sous le même nom d'événement** | WARN | **anomalie** | un seul retry est prévu, donc deux lignes nominales signifient un second site de pose — et `mika2633_les_quatre_sites_de_pose_passent_par_le_commit` aurait dû l'empêcher de compiler |
 | `channel != "team_deliverable"` | — | **non vide** | le contrôle positif : zéro partout ne prouve rien |
 
 **Coût daté, nommé plutôt que découvert :** les lignes antérieures au déploiement
