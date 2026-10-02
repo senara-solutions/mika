@@ -114,7 +114,7 @@ probe() {
 
         echo "sock_mode=$(stat -c %a "$_PILOT_EGRESS_SOCK" 2>/dev/null)"
         env_dump=$(tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null)
-        has() { printf "%s\n" "$env_dump" | grep -q "^$1=" && echo yes || echo no; }
+        has() { grep -q -- "^$1=" <<<"$env_dump" && echo yes || echo no; }
         echo "env_sentinel=$(has "$sname")"
         echo "env_path=$(has PATH)"
         echo "env_home=$(has HOME)"
