@@ -53,6 +53,6 @@ Never call `run_gh("pr merge ...")` or `run_gh("gh pr merge ...")` to merge a PR
 
 ---
 
-## Wip-rescue contract (mika#1613 / mika#1682)
+## Draft contract (mika#1613 / mika#1682 / mika#2624)
 
-Do NOT call `gh pr ready` or `gh pr edit --title` on any PR matching the wip-rescue signature: `wip-rescue` label OR head commit starts with `wip(`. The operator must un-draft these PRs manually after reviewing the rescued work. Engine-side guard mika#1682 will reject the tool call if attempted — this instruction is a prompt-level reinforcement to avoid hitting the guard.
+Do NOT call `gh pr ready` on any pull request. Taking a PR out of draft is never this turn's decision: a draft may be a hold somebody placed on purpose, and lifting it belongs to a human, whatever the PR's labels or commit titles say. Do NOT rename a `wip-rescue` PR with `gh pr edit --title` either. If you believe a draft should leave draft, say so to the operator with `send_message` and stop. Engine-side guards (mika#1682, mika#2624) reject these calls — this instruction states the intent, the guards hold it.

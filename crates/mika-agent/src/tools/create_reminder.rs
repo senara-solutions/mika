@@ -82,6 +82,34 @@ impl Tool for CreateReminderTool {
             )));
         }
 
+        // mika#2627 — a deferred `send_message` is still a `send_message`.
+        //
+        // The row created below carries `action_config = {"text": message}`, which
+        // `task_engine::dispatcher` later hands to the sender verbatim. So the
+        // proposal must be refused **at creation**, which is also the only site
+        // where a reason can be returned to the model: the dispatcher that fires a
+        // scheduled send has no model to answer, and would have to either delete
+        // silently (a reminder the person asked for vanishes without a word) or let
+        // it through.
+        //
+        // **The `action_type` discriminant is load-bearing, not decoration.** On
+        // `resume_agent` the `message` is an instruction to the agent, not a text
+        // to the person: « rappelle-moi de vérifier si j'ai ouvert l'accès à ma
+        // messagerie » is a note to self, not a proposal, and applying the
+        // predicate there would be a false positive on a legitimate population.
+        //
+        // Named consequence: rows created **before** this deploy are not covered.
+        // Bounded and measurable — see the operator query in the root `CLAUDE.md`.
+        if action_type_input == "send_message"
+            && let Some(refusal) = crate::tools::check_testimony_access_proposal(
+                ctx,
+                message,
+                crate::evidence::guards::TestimonyProposalChannel::CreateReminder,
+            )
+        {
+            return Ok(refusal);
+        }
+
         // Validate timezone if provided
         let validated_tz: Option<Tz> = if !timezone_input.is_empty() {
             match parse_timezone(timezone_input) {
@@ -882,6 +910,136 @@ mod tests {
 
         let reminders = harness.db.get_user_visible_tasks().await.unwrap();
         assert_eq!(reminders.len(), 1);
+    }
+
+    // --- mika#2627: a deferred `send_message` is still a `send_message` ---
+
+    /// A reminder whose message proposes to open testimony-grade access is
+    /// refused **at creation**, and no row is written.
+    ///
+    /// Creation rather than firing, because the dispatcher that fires a
+    /// scheduled send has no model to answer: it would have to delete silently
+    /// (a reminder the person asked for vanishing without a word) or let it
+    /// through. The remedy mika#2627 names is "the reason is returned to the
+    /// model", which exists only here.
+    #[tokio::test]
+    async fn mika2627_un_rappel_proposant_un_acces_est_refuse_a_la_creation() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateReminderTool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Je pourrais t'aider si tu me donnais accès à ta boîte Gmail.",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "the proposal must be refused");
+        assert!(
+            result
+                .content
+                .starts_with(crate::tools::TESTIMONY_ACCESS_REFUSAL_PREFIX),
+            "the refusal must carry the wire prefix: {}",
+            result.content
+        );
+        assert!(
+            harness
+                .db
+                .get_user_visible_tasks()
+                .await
+                .unwrap()
+                .is_empty(),
+            "no row may be created for a refused reminder"
+        );
+    }
+
+    /// The refusal says what did NOT happen on THIS channel: nothing was
+    /// scheduled, and the repair is to re-create the reminder — never to
+    /// "re-send the message".
+    ///
+    /// A model following a send-shaped repair line literally would call
+    /// `send_message` right away: the person gets the text now and the
+    /// reminder they asked for is never created. Seen red before the
+    /// channel-specific wording (the body said "NOTHING WAS SENT … Re-send
+    /// the message" on every channel).
+    #[tokio::test]
+    async fn mika2627_le_refus_dun_rappel_dit_que_rien_na_ete_planifie() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateReminderTool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    "message": "Je pourrais t'aider si tu me donnais accès à ta boîte Gmail.",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "the proposal must be refused");
+        assert!(
+            result.content.contains("NOTHING WAS SCHEDULED"),
+            "a scheduling refusal must say nothing was scheduled: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Re-send the message"),
+            "a scheduling refusal must not prescribe a send-shaped repair: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Re-create"),
+            "a scheduling refusal must name the right repair: {}",
+            result.content
+        );
+    }
+
+    /// V8's negative control, and the one that carries RK3: on `resume_agent`
+    /// the `message` is an **instruction to the agent**, not a text towards the
+    /// person.
+    ///
+    /// « rappelle-moi de vérifier si j'ai ouvert l'accès à ma messagerie » is a
+    /// note to self, not a proposal; refusing it would be a false positive on a
+    /// legitimate population. Without this control, "the discriminant decides"
+    /// would be indistinguishable from "the guard refuses every reminder naming
+    /// a mailbox".
+    #[tokio::test]
+    async fn mika2627_resume_agent_nest_pas_refuse() {
+        let harness = TestHarness::new();
+        let ctx = harness.ctx();
+
+        let result = CreateReminderTool
+            .execute(
+                serde_json::json!({
+                    "fire_at": "2099-12-31T23:59:59Z",
+                    // The same movement and the same subject as the refused case
+                    // above: only `action_type` differs, so the discriminant is
+                    // what this test measures.
+                    "message": "Je pourrais t'aider si tu me donnais accès à ta boîte Gmail.",
+                    "action_type": "resume_agent",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !result.is_error,
+            "a `resume_agent` reminder is an instruction to the agent, not a \
+             text to the person — it must not be refused: {}",
+            result.content
+        );
+        assert_eq!(
+            harness.db.get_user_visible_tasks().await.unwrap().len(),
+            1,
+            "the row must be created"
+        );
     }
 
     #[tokio::test]

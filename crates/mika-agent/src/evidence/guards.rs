@@ -1633,6 +1633,82 @@ fn enclosing_sentence(text: &str, start: usize, end: usize) -> (&str, Option<cha
 /// the shape of the agent's own text against a load-bearing product invariant.
 pub(crate) const TESTIMONY_ACCESS_PROPOSAL_LABEL: &str = "testimony_access_proposal";
 
+/// Which surface the testimony access-proposal guard caught a proposal on
+/// (mika#2627 AC4).
+///
+/// # The channel is a WIRE FORMAT, with a single definition site
+///
+/// [`Self::as_wire`] feeds the `channel` field of `guard.testimony_access_proposal`,
+/// which an operator groups by to size each population — so two spellings of one
+/// channel would split a population without saying so. Frozen by
+/// `mika2627_le_canal_est_un_format_de_fil` (motif
+/// `mika2498_les_valeurs_daudit_sont_un_format_de_fil`).
+///
+/// # The tool's name IS the channel, and that is a decision
+///
+/// mika#2627's AC4 names two values literally (`end_turn` | `send_message`); AC1
+/// extends the coverage to two scheduling tools, so the field carries **four**.
+/// The two the AC names are served verbatim and the two others follow the same
+/// rule, so adding a fifth site cannot change the vocabulary of the first four.
+///
+/// **Alternative declined:** `channel ∈ {end_turn, tool_input}` plus a second
+/// `tool` field. More regular in principle, but the ticket writes `send_message`
+/// as a channel *value*, and a `GROUP BY channel` then yields the per-site
+/// population directly. An "every tool channel" aggregate stays one `jq` away
+/// (`select(.channel != "end_turn")`).
+///
+/// The `match` below is exhaustive with **no wildcard arm** (motif
+/// `hosting_ground_truth_line`, mika#2290): the compiler, not a reviewer, forces
+/// a future channel to decide on its wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestimonyProposalChannel {
+    /// Guard 5h — the turn's final assistant text (mika#1960).
+    EndTurn,
+    /// The `send_message` tool's outgoing body — the sole user channel of a
+    /// silent turn, and the bypass mika#2627 closes.
+    SendMessage,
+    /// `create_reminder` with `action_type = "send_message"`.
+    CreateReminder,
+    /// `create_scheduled_task` with `action_type = "send_message"`.
+    ///
+    /// **Wired and inert in production, which is a correction to mika#2627's own
+    /// census (R2) rather than an oversight.** That census lists the tool as in
+    /// scope; the code says `CreateScheduledTaskTool` is constructed at exactly
+    /// one site in the tree — a test module of `complete_task.rs` — and is
+    /// registered in no production registry, its own doc-comment saying so
+    /// ("Removed from `default_tools()` … Retained for tests"). So the model
+    /// cannot reach this channel today, and no `channel = "create_scheduled_task"`
+    /// line can be emitted.
+    ///
+    /// The sentence above deliberately does **not** write the test-gate attribute
+    /// as a literal. `canonical_tokens::production_sources` truncates each file
+    /// at the first textual occurrence of it, comment or not, so a mention here
+    /// would hide everything below this point from every scan sharing that
+    /// enumerator — measured: it made the two mika#2573 anti-vacuity assertions
+    /// fail, because their needle sits 700 lines further down. A mention is not
+    /// an instruction (class mika#2050), and that blind spot is named and
+    /// inherited rather than widened by this ticket.
+    ///
+    /// The guard call stays, because it is correct and becomes live the day the
+    /// tool is re-registered — and leaving the surface uncovered would make its
+    /// return a silent re-opening. `#[allow(dead_code)]` carries that inertia
+    /// **named**: an inert coverage that reads as coverage is the mika#2205 class,
+    /// and the one thing this repository refuses is to let it go unsaid.
+    #[allow(dead_code)]
+    CreateScheduledTask,
+}
+
+impl TestimonyProposalChannel {
+    pub(crate) fn as_wire(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::SendMessage => "send_message",
+            Self::CreateReminder => "create_reminder",
+            Self::CreateScheduledTask => "create_scheduled_task",
+        }
+    }
+}
+
 /// Structured result of a testimony-grade access-proposal detection.
 ///
 /// Jumelle of [`FalseLocalHostingMatch`] and [`FrequencyPromiseMatch`]: the two
@@ -1863,14 +1939,34 @@ const TESTIMONY_REFUSAL_MARKERS: &[&str] = &[
 ///
 /// Phase 2 wires this at position 5h of `run_loop`'s EndTurn chain, so the five
 /// `#[allow(dead_code)]` of phase 1 are gone: the chain is reachable, and leaving
-/// one would be an annotation that lies. V4 now requires **exactly one**
-/// production wiring site — the 5h block of `run_loop` — which calls this
-/// function **twice by design**: once to fire, once to name the `_uncorrected`
-/// residue when the single-retry budget is spent (the 5d/5f/5g shape). So the
-/// `grep` of V4 returns two call expressions in `agent_loop/mod.rs`, both inside
-/// that block; a call anywhere else is the double wiring RK6 names. "Shipped
+/// one would be an annotation that lies. The 5h block calls this function
+/// **twice by design**: once to fire, once to name the `_uncorrected` residue
+/// when the single-retry budget is spent (the 5d/5f/5g shape). "Shipped
 /// disarmed" and "armed in passing" returned identical bytes before, and it is
 /// now "armed" and "wired twice" that must stay separable.
+///
+/// # mika#2627 inverted V4 a SECOND time: there are now TWO production readers
+///
+/// This paragraph used to say V4 required **exactly one** production wiring
+/// site, and that a call anywhere else was a double wiring. That is no longer
+/// true, and leaving it would have been worse than merely stale: it prescribed
+/// **deleting the second site as a duplicate**.
+///
+/// The two readers are the 5h block (the turn's final text) and
+/// [`crate::tools::check_testimony_access_proposal`] (an outgoing tool body) —
+/// the latter closing the `send_message` bypass 5h names in its own comment, on
+/// the only user channel a silent turn has. They read **different texts** at
+/// **different moments**, so they compose rather than duplicate, and the tool
+/// refusal deliberately does not touch `intent_guard_retries` (pinned by
+/// `mika2627_le_refus_doutil_ne_consomme_pas_le_budget_de_5h`).
+///
+/// V4's successor is no longer a `grep` but
+/// `canonical_tokens::tests::mika2627_le_predicat_na_que_deux_lecteurs_de_production`,
+/// which freezes the population at those two named sites — the by-`grep` form
+/// was never automated, so nothing turned red when the count changed. A **third**
+/// reader is a site redoing the refusal-plus-telemetry composition its own way:
+/// route it through the helper rather than adding an allowlist line
+/// (doctrine mika#2201).
 pub(crate) fn detect_testimony_access_proposal(text: &str) -> Option<TestimonyAccessProposalMatch> {
     // Every contraction the three layers and the refusal markers read is
     // written with the ASCII apostrophe; a model writes U+2019 as readily, and
@@ -7794,5 +7890,48 @@ mod tests {
                 "a Layer A subject must clear the fast path and reach the regex: {text}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2627 — the channel is a wire format
+    // -----------------------------------------------------------------------
+
+    /// V12 — the four channel values are frozen (motif
+    /// `mika2498_les_valeurs_daudit_sont_un_format_de_fil`).
+    ///
+    /// They feed the `channel` field of `guard.testimony_access_proposal`, which
+    /// an operator groups by to size each population. Two spellings of one
+    /// channel would split a population without saying so — so a rename here is
+    /// a break to **date in `CLAUDE.md`**, never a test to quietly update.
+    ///
+    /// The two values mika#2627's AC4 names literally are asserted as such; the
+    /// two others follow the same rule (the tool's name *is* the channel), so a
+    /// fifth site cannot change the vocabulary of the first four.
+    #[test]
+    fn mika2627_le_canal_est_un_format_de_fil() {
+        use super::TestimonyProposalChannel as C;
+
+        // The two AC4 names, verbatim.
+        assert_eq!(C::EndTurn.as_wire(), "end_turn");
+        assert_eq!(C::SendMessage.as_wire(), "send_message");
+        // The two AC1 extensions, under the same naming rule.
+        assert_eq!(C::CreateReminder.as_wire(), "create_reminder");
+        assert_eq!(C::CreateScheduledTask.as_wire(), "create_scheduled_task");
+
+        // No two channels share a wire value — which is what makes a
+        // `GROUP BY channel` a partition rather than a merge.
+        let all = [
+            C::EndTurn,
+            C::SendMessage,
+            C::CreateReminder,
+            C::CreateScheduledTask,
+        ];
+        let unique: std::collections::HashSet<&str> = all.iter().map(|c| c.as_wire()).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "two channels share one wire value: their populations would merge \
+             silently"
+        );
     }
 }

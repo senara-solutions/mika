@@ -438,7 +438,7 @@ After KG-related deploys, four signals tell you the fix is working. The second r
   **S4 — coût.** Un seul appel GraphQL par tick en régime nominal. *Halte 4 — le quota GitHub se dégrade :* le court-circuit par âge ne fonctionne pas. Réparer l'ordre de la boucle, **pas** mettre le prédicat en cache — un cache réintroduirait la fenêtre pendant laquelle un hold fraîchement posé n'est pas vu.
   **Halte transverse — les deux sondes muettes.** Zéro hold **et** zéro promotion ne prouve rien : il faut qu'un brouillon `wip-rescue` ait existé depuis le déploiement. *Une garde que personne n'a exercée se lit exactement comme une garde qui marche* (mika#2205).
 
-  **Ce que ça n'achète PAS.** L'incident fondateur n'est pas rattrapé — **rien ne rétro-écrit une ligne d'audit datée d'un hold qu'on n'a pas observé**, et la sonde est la prochaine occurrence. Le palliatif à trois couches n'est pas retiré : c'est le geste de l'opérateur, quand S1 est verte. Le chemin `gh pr ready` d'un modèle sur une PR **hors** signature `wip-rescue` reste ouvert — mika#1682 le couvre sur la population mesurée, et l'élargir est un **suivi nommé** dont la précondition est une mesure montrant qu'un `gh pr ready` de modèle a franchi un hold là. Et le bypass admin de l'identité du pilote n'est pas touché : les deux moitiés de la défense en profondeur tombent séparément.
+  **Ce que ça n'achète PAS.** L'incident fondateur n'est pas rattrapé — **rien ne rétro-écrit une ligne d'audit datée d'un hold qu'on n'a pas observé**, et la sonde est la prochaine occurrence. Le palliatif à trois couches n'est pas retiré : c'est le geste de l'opérateur, quand S1 est verte. Le chemin `gh pr ready` d'un modèle sur une PR **hors** signature `wip-rescue` restait ouvert ; sa précondition (une mesure) est tombée le 2026-10-01 sur PR #2621, et **mika#2624 le ferme** : `run_gh pr ready` consulte le même discriminant, fail-closed, sous le nom `pr_ready_undraft_blocked` (requête et haltes : `crates/mika-agent/CLAUDE.md` § *Le même hold tient contre `run_gh pr ready`*). Un pilote dispatché qui tape `gh` par Bash reste **non couvert**, population mesurée vide. Et le bypass admin de l'identité du pilote n'est pas touché : les deux moitiés de la défense en profondeur tombent séparément.
 - **Signal P — phantom sweep telemetry (mika#1712, mika#2156).** `grep phantom_sweep_complete $MIKA_SPIRIT_LOG_FILE | jq '{source, count, spared_count, lookup_error_count, agent_id}'` — one INFO line per sweep pass with `source` in `{"startup_sweep","watchdog_tick"}` (startup fires once per restart; watchdog fires on every 60-tick DB scan when at least one row was swept, spared, errored, or skipped). **Since mika#2156, `count: 0` with `spared_count > 0` is the healthy shape, not an anomaly** — it means the liveness guard withheld a transition because the row's dispatch is still running. A spared row is re-selected and re-spared on every pass (sparing writes no status change), so one dispatch running past the grace window emits one line pair per minute until it finishes; that is expected, not a leak. Steady state with no dispatch in flight: mostly silent, occasional non-zero `count` as genuine orphans age past the grace window then get swept. Anomaly signal: `grep phantom_sweep_large_backlog $MIKA_SPIRIT_LOG_FILE` should return zero lines after the first post-deploy startup — any hit means a single sweep pass transitioned > 100 rows, which feeds mika#1934's cause-racine investigation immediately. Audit-events SQL surface: `SELECT COUNT(*) FROM audit_events WHERE tool_name = 'phantom_aged_out'` (rows actually transitioned since deploy) and its mika#2156 sibling `... WHERE tool_name = 'phantom_sweep_spared'` (transitions the liveness guard withheld). The two names are deliberately distinct so the first keeps meaning "swept". Config surface: `MIKA_PHANTOM_SWEEP_AGE_SECONDS` (default `14400` since mika#2156) tunes the AC3 watchdog grace window; startup sweep (AC5) always runs at age=0 and is unaffected. Both paths spare a row whose dispatch child process is still alive — `grep phantom_sweep_spared $MIKA_SPIRIT_LOG_FILE | jq '{source, task_id, child_task_id, process_id}'` shows each withheld transition. Anomaly signal for the guard itself: a non-zero `unusable_child_count` means a dispatch child carried a PID but no readable `process_start_time`, so the guard could not rule out PID reuse and fell back to sweeping — that is the one path that silently returns the sweeper to its pre-mika#2156 behaviour, so a persistent non-zero count there deserves investigation. A non-zero `lookup_error_count` means rows were skipped because the child lookup failed; they are re-examined on the next pass.
 - **Signal Q — pilot secret-channel delivery (mika#2039, sink corrected by mika#2050).** `grep -l '^dispatch-lib: sandbox secret' "${PILOT_LOG_DIR:-/var/log/claude-pilot}"/*.stderr` — emitted by the sandbox entrypoint prologue when a secret file bound into the pilot sandbox is unreadable or empty. **The sink is the per-dispatch stderr file, never `$MIKA_SPIRIT_LOG_FILE`** — this entry named the latter until mika#2050 and the command returned nothing whatever the state. `$_PILOT_SECRET_PROLOGUE` is prepended to the `bwrap` invocation inside `_run_pilot_sandboxed`, which `_run_claude_pilot` launches under `2>"$STDERR_FILE"` and then persists to `$_PILOT_LOG_DIR/<task-id>.stderr`; Signal S below carries the full trajectory and the same two halts apply. Steady state: zero lines. Any hit names a secret the pilot started **without** — the diagnostic exists so that a late failure is traceable to the channel rather than misread as pilot drift. **Since mika#2056 the secret allowlist is empty, so this signal has no population in the shipped configuration:** `GH_TOKEN` no longer travels through this channel at all (the GitHub credential is injected host-side by the egress proxy, and the sandbox carries only the mika#2572 placeholder, see `GH_TOKEN` below). A secret that is added back travels as a `0600` file under `/run/mika-pilot-secrets/`, never through `bwrap --setenv` (that put it in the world-readable process argv). Two CI guards hold the invariant — `make test-sandbox-secret-argv` (no credential-shaped value reaches the argv or the `BASH_XTRACEFD` trace) and `make verify-no-secret-in-setenv` (deny-by-default over the `--setenv` allowlist) — and `scripts/canary-pilot-containment` PART 0 probes a live sandbox's argv on the host after a deploy.
   - **Since mika#2578 the canary no longer writes the host GitHub credential, and it ATTESTS so on exit.** Until then, every run overwrote `~/.mika/pilot-gh-token` — the host-side file the mika#2056 addon reads — with the canary's own decoy, because `_stage_pilot_gh_token` fires on each of its five `_run_pilot_sandboxed` calls. Measured 2026-09-28: 49 bytes at 20:33:03Z against 93 at 17:32, and `curl_github=401` in the same run, while the pilot of mika#2565 was in flight. **Every in-flight pilot sent the decoy to `api.github.com` and `github.com`, `git push` included, until the next real dispatch restaged.** The staging path is now redirected to a `mktemp` dir of the canary's own (`_PILOT_GH_TOKEN_FILE`, an internal name deliberately outside `SANDBOX_ENV_CORE_ALLOWLIST` and `PILOT_DISPATCH_ENV` — relaying it would hand the service environment a lever over where a **real** dispatch writes its GitHub credential), and the staging itself is **redirected, never neutralised**: the canary still traverses the real code it exists to exercise.
@@ -534,6 +534,203 @@ Optional (startup behavior):
   - **Effective scope of that particular section: mika-arch alone.** `[context.history]` is declared only by `build_mika_arch_identity`; the reconciler skips a path the spec does not define, so mika-dev, mika-qa and mika-test keep the defaults. mika-prime and mika-relay are not in `WELL_KNOWN_AGENTS` at all and have no spec to reconcile against. **Their absence of `[context.history]` after this change is the expected outcome, not a half-delivered fix** — giving a `session` window to a non-one-shot role is a product decision nobody has taken.
   - **The manual gesture is no longer the standard one** for well-known agents: the section lands at the next mika-spirit startup (the startup is what writes; an identity already written is re-read every turn). It remains the only route for agents with no spec.
   - **What this costs, named:** a hand edit inside a code-owned section is now overwritten at the next startup. `reconciled_paths` on `identity_reconcile.complete` names each overwritten path, so the loss is legible rather than silent. Operator grep: `identity_reconcile` in `$MIKA_SPIRIT_LOG_FILE` — `complete` on the first startup after deploy, `in_sync` afterwards.
+
+### La surface « propose » est fermée sur le canal des tours silencieux (mika#2627)
+
+**Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
+entrée est ici parce que l'opérateur qui voit un `send_message` refusé — ou qui
+cherche pourquoi un rappel n'a pas été créé — cherche dans le voisinage de la
+garde 5h.
+
+- **Le trou, que le code nommait déjà.** La garde 5h (mika#1960) refuse un tour
+  dont le **texte final** propose d'ouvrir un accès testimony-grade. Dans un tour
+  silencieux (heartbeat, callback, rappel) ce texte n'est montré à personne : ce
+  qui parvient à la personne passe par l'outil `send_message`, que 5h ne lit pas.
+  Le bloc 5h portait ce constat mot pour mot — *« named here rather than claimed
+  closed (closing it means reading the tool input pre-hoc, the mika#933 shape,
+  which is a distinct change) »*. **Ce ticket EST ce changement distinct**, nommé
+  par la phase 2 elle-même : il n'y avait rien à établir sur l'existence du trou.
+
+- **Un refus AVANT l'envoi, et avant la persistance.** Le même prédicat pur est
+  appliqué au corps sortant ; détecté, l'outil est refusé et la raison est rendue
+  au modèle. Ce n'est pas un re-prompt de fin de tour. Avant la persistance parce
+  qu'une proposition écrite dans `messages` est reservie au tour suivant par la
+  compaction — un refus qui persisterait quand même laisserait la doctrine violée
+  dans l'historique.
+
+- **Trois émetteurs, et le recensement EST le livrable (AC1).**
+
+  | # | outil | comment le texte atteint la personne | dans le périmètre ? |
+  |---|---|---|---|
+  | 1 | `send_message` | `ctx.message_sender.send(&cleaned)` — immédiat | **oui**, le vecteur du ticket |
+  | 2 | `create_reminder` + `action_type = "send_message"` | `action_config = {"text": …}`, tiré plus tard par le dispatcher | **oui** |
+  | 3 | `create_scheduled_task` + `action_type = "send_message"` | idem | **oui**, mais **inerte** — voir ci-dessous |
+  | 4 | `delegate_task` | passe le sender au délégué, n'envoie **rien** lui-même | non — couvert **transitivement** (le délégué appelle `send_message`) |
+  | 5 | `run_team` | notification de fin de run qui enveloppe `run.deliverable` — la **sortie LLM** de l'agent rédacteur (`TeamEngine::deliver`), ou le repli workspace | **non couvert — canal ouvert nommé.** Le recensement du plan le disait « texte du moteur » : c'est faux (revue de code). Bon site de garde : le livrable dans `TeamEngine::deliver` — suivi |
+  | 6 | le dispatcher du tir planifié | **consommateur** du différé | non — voir « au moment de la création » |
+
+  **Rectification au recensement du ticket, trouvée en lisant le code :** la
+  ligne 3 décrit un outil que le modèle **ne peut pas appeler en production** —
+  `CreateScheduledTaskTool` n'est construit qu'à un site `#[cfg(test)]` et n'est
+  enregistré dans aucun registre. La garde y est câblée et **inerte** : aucune
+  ligne `channel = "create_scheduled_task"` ne peut être émise aujourd'hui.
+  L'inertie est nommée sur la variante d'enum plutôt que laissée à découvrir —
+  une couverture inerte qui se lit comme une couverture est la classe mika#2205.
+
+- **Le refus est à la CRÉATION, jamais au tir, et c'est pourquoi les deux outils
+  de planification sont gardés ici.** Le dispatcher qui tire un `send_message`
+  planifié n'a **aucun modèle à qui rendre une raison** : il devrait soit
+  supprimer en silence (un rappel que la personne a demandé disparaît sans un
+  mot), soit laisser passer. **Conséquence nommée : les rows créées avant ce
+  déploiement ne sont pas couvertes.**
+
+- **Le discriminant `action_type` est porteur, pas décoratif.** Sur
+  `resume_agent`, le `message` est une **instruction à l'agent**, pas un texte
+  vers la personne : « rappelle-moi de vérifier si j'ai ouvert l'accès à ma
+  messagerie » est une note à soi-même, pas une proposition, et appliquer le
+  prédicat là serait un faux positif sur une population légitime. Contrôle
+  négatif épinglé aux deux sites.
+
+- **Le refus ne pose AUCUN `DeliveryVerdict`, et c'est le point le plus subtil.**
+  La garde 6f `unacknowledged_send_failure` lit ces verdicts et refuse un EndTurn
+  qui se clôt sur un envoi non réparé, en comptant `RefusedTooLong` comme une
+  non-livraison à réparer **par un découpage**. Un refus doctrinal n'est
+  réparable ni par un renvoi ni par un découpage : **découper un texte qui
+  propose un accès Gmail produit quatre messages qui le proposent.** Poser un
+  verdict ici ferait re-prompter le tour pour un envoi que la doctrine refuse, en
+  lui suggérant la réparation exactement inverse.
+
+- **Il précède aussi la garde de longueur (mika#2134)**, pour la même raison : un
+  texte à la fois trop long et porteur d'une proposition doit être refusé **par
+  la doctrine**, le remède de la garde de longueur étant un découpage.
+
+- **Les deux gardes composent et ne se dupliquent pas.** Sur un tour de
+  conversation le prédicat peut tourner deux fois — le corps de l'outil, puis le
+  texte final — et le refus d'outil ne touche **pas** `intent_guard_retries`,
+  donc 5h garde son budget d'un coup pour le texte final.
+
+### Surfaces opérateur
+
+```bash
+# 1. Une proposition a-t-elle été arrêtée, et par quel canal ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{channel, matched_subject, matched_movement, agent_id, session_id}'
+
+# 2. La population du canal outil, seule
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel != "end_turn") | {channel, matched_subject}'
+
+# 3. CONTRÔLE POSITIF — la garde 5h tourne-t-elle encore ?
+grep guard.testimony_access_proposal "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.channel == null or .channel == "end_turn")' | wc -l
+```
+
+```sql
+-- La population du refus, par outil (sans surface neuve : un `ToolOutput::error`
+-- atterrit dans `tool_calls.output`, persisté et scrubé)
+SELECT tool_name, count(*) FROM tool_calls
+ WHERE output LIKE 'REFUS (testimony-access, mika#2627)%' GROUP BY 1;
+
+-- Les rows planifiées AVANT le déploiement, hors périmètre
+SELECT id, label FROM tasks
+ WHERE action_type = 'send_message' AND status IN ('pending','recurring_active');
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `channel = "end_turn"` | WARN | **zéro** | inchangé par ce ticket |
+| `channel = "send_message"` | WARN | **zéro** | chaque ligne est une proposition arrêtée avant la personne, sur le canal des tours silencieux |
+| `channel = "create_reminder"` | WARN | **zéro** | une proposition différée arrêtée à la création |
+| `channel = "create_scheduled_task"` | WARN | **zéro par construction** | l'outil n'est enregistré nulle part en production : une occurrence signifie qu'il a été réenregistré |
+| une même session portant plusieurs refus | WARN | **anomalie** | le modèle insiste : lire le prompt servi **avant** de toucher au prédicat |
+
+**Le préfixe de refus est un format de fil lui aussi**, à constante unique
+(`tools::TESTIMONY_ACCESS_REFUSAL_PREFIX`, motif `REFUSED (cwd-guard,
+mika#2536)`), et la requête SQL ci-dessus est ce qui justifie de ne créer **ni
+table ni ligne `audit_events`** — en cohérence explicite avec 5h, qui a tranché
+que la famille #953 est journal-only.
+
+**Coût daté, nommé plutôt que découvert :** un
+`grep guard.testimony_access_proposal | jq 'select(.channel == "end_turn")'` qui
+enjambe le déploiement rend **vide** sur les lignes antérieures, où le champ
+n'existe pas. Les lignes historiques ne sont pas réécrites (motif mika#2361 : les
+réécrire rendrait faux ce qu'elles ont dit quand elles ont été écrites). La
+requête juste de part en part est
+`jq 'select(.channel == null or .channel == "end_turn")'`.
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+**Préalable.** Ces sondes décrivent le **binaire servi** : établir après
+`make deploy` que le `mika-spirit` qui tourne porte le correctif avant toute
+conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte — la
+base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas** (premier tour silencieux qui
+tente). Une ligne `channel = "send_message"`, et **aucun** message reçu par la
+personne.
+*Halte 1 — aucune ligne alors qu'une proposition est partie :* **ne pas élargir
+le prédicat par réflexe.** Établir d'abord le déploiement, puis lire le contrôle
+positif (sonde 3) : zéro ligne des deux côtés ne prouve rien du tout — *une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+**S2 — RK5, 30 jours.** Chercher une proposition étalée sur deux `send_message`
+consécutifs du même tour.
+*Halte 2 — une occurrence :* c'est le contournement **nommé**, pas un défaut du
+prédicat. Ouvrir le suivi **avec cette occurrence**, et surtout ne pas élargir le
+prédicat au-delà de la phrase — ce serait reprendre le faux positif que la
+segmentation par phrase existe pour éviter (même classe que mika#2237, qui a
+laissé son propre contournement ouvert avec sa raison : la garde ne peut pas
+arbitrer l'intention).
+
+**S3 — contrôle négatif de bruit, 7 jours.** Aucun refus sur un `send_message`
+ordinaire, et en particulier aucun sur un **refus que la doctrine prescrit**.
+*Halte 3 — une occurrence :* c'est un faux positif, et son coût change de nature
+par rapport à 5h — là c'était un re-prompt, ici c'est **un message qui ne part
+pas**. **Désarmer d'abord** (revert de l'appel au helper sur le site concerné),
+diagnostiquer ensuite : un message légitime refusé est un arbitrage de prédicat,
+pas un seuil à régler.
+
+**S4 — la population hors périmètre.** La requête SQL n°2, une fois, après
+déploiement.
+*Halte 4 — elle rend des lignes portant une proposition :* ce sont les rows
+pré-déploiement ; le remède est un geste d'opérateur (`mika tasks cancel`), pas un
+élargissement de la garde au tir.
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne rend pas la surface *propose* structurelle au sens des Layers 2/3/4.**
+  Le refus lit un texte sortant : il **rattrape** avant l'envoi, il ne rend pas
+  l'agent incapable de formuler la proposition. La doctrine maison est *construis
+  l'incapacité, ne promets pas la retenue* (mika#1991) ; elle n'est **pas
+  applicable ici** et il faut l'écrire plutôt que le contourner — il n'existe
+  aucune capacité à retirer, le livrable est du texte en langue naturelle.
+- **Il ne rattrape aucune proposition déjà partie.** Rien ne réécrit un message
+  envoyé, et **rien n'est rétro-estampillé** : la sonde est la **prochaine**
+  occurrence.
+- **Il ne couvre pas les rows planifiées avant le déploiement.**
+- **Il ne couvre pas le livrable d'équipe (`run_team`).** Le livrable est du
+  texte du modèle envoyé tel quel à la personne ; le recensement du plan l'avait
+  classé « texte du moteur » à tort. Le bon site de garde est
+  `TeamEngine::deliver` (un site couvre les chemins sync et async) — **suivi
+  nommé**, dont la précondition est de décider ce que devient un livrable refusé
+  (re-rédaction une fois, puis ligne neutre « livrable retenu »).
+- **Il ne ferme pas RK5** (la proposition étalée sur deux appels), nommé
+  ci-dessus avec sa précondition de suivi.
+- **Il n'ajoute aucune ligne `audit_events` et aucun compteur.** Les seuls
+  instruments sont le grep et la requête SQL ci-dessus, et **leur silence ne
+  prouve rien tant que personne ne les exécute**.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.** Le
+  précédent le plus proche, mika#1646 (garde d'action destructive), n'en a pas non
+  plus, pour la raison qu'il écrit : un désarmement par variable sur un chemin de
+  doctrine serait un désarmement par coquille. Le geste de désarmement est un
+  **revert**, et le coût d'un faux positif le supporte.
+- **Il ne touche ni la garde 5h, ni le prédicat, ni le re-prompt, ni le budget
+  d'un coup, ni la moitié désarmée de la phase 2** — la seule modification de 5h
+  est l'ajout du champ `channel = "end_turn"` sur sa ligne.
+
+Raisonnement complet, les trois gardes structurelles et leurs allowlists livrées
+vides : `crates/mika-agent/CLAUDE.md` § 5h-bis.
 
 ### La doctrine matérielle est un fait posé ; sa butée est topique (mika#2292)
 
