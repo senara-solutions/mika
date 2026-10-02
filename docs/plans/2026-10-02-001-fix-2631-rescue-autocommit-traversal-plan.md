@@ -101,6 +101,23 @@ autre nom. Le périmètre livré est donc : **`dirty-worktree` seule**, et ce ch
 épinglé par un test (T15o) pour qu'une relecture future de la parenthèse ne le défasse pas
 en silence.
 
+### R3-bis — amendement de revue (2026-10-02) : la Phase A de mika#1383 EST dans la population
+
+La revue de code (relecteurs correctness et adversarial, indépendants) a réfuté une
+prémisse de R3 : « sur cette classe le pilote a commité son propre travail, le commit
+est un marqueur vide ». C'est vrai du marqueur `wip(mika#1383)`, faux de la **Phase A**
+du même bloc : un pilote qui commite une partie de son travail, laisse le reste sale et
+rend la main voit dispatch-lib commiter ce reste (`trailing content after pilot
+end_turn`). C'est un auto-commit « à la place du pilote » au sens exact de l'AC1, et la
+classe se lit alors `commit-pushed-no-pr`.
+
+Correctif livré : un second stamp de producteur, `RESCUED_TRAILING_CONTENT`, remis à 0
+par dispatch dans `_run_claude_pilot` à côté de son frère et posé sur le commit de Phase
+A ; `_rescue_committed_in_the_pilots_place` lit les deux. Le **marqueur vide seul**
+reste exempté (T15q inchangé) : la décision de R3 tient pour lui, pas pour la Phase A.
+Épinglé par T15r, qui pilote le vrai `_post_flight_recovery`, et vu rouge des deux côtés
+(stamp non posé ; prédicat sans le second terme).
+
 ---
 
 ## Conception
@@ -445,7 +462,9 @@ d'allonger la liste : chaque entrée porte un verdict, et « non classé » n'en
   toute classe qui auto-commite à la place du pilote), `compound-traversal` ne vaut
   **jamais** `not-applicable`. On mesure alors `attested-solution`, `attested-trailer` ou
   `absent`, comme pour une session coupée. — *Tâches 1–2, T15i, T15i-bis, T15k. Périmètre
-  de la parenthèse : `dirty-worktree` seule, par R3, épinglé par T15o.*
+  de la parenthèse : `dirty-worktree` **et** la Phase A de mika#1383 (R3-bis, T15r) ; le
+  marqueur vide `commit-pushed-no-pr` reste dehors, épinglé par T15o. Les tests ont
+  atterri renumérotés T15k…T15r.*
 - **AC2.** `not-applicable` reste la valeur d'une session `success` qui a **elle-même**
   commité son travail (HEAD avancé, sans auto-commit du rescue) : c'est la route nominale
   `no-shipping-tail`. — *T15j, T15j-bis, T15e rendue explicite.*
