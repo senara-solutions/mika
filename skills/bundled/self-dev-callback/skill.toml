@@ -14,7 +14,24 @@ dependencies = ["self-dev"]
 # The historical rationale for this handler's branches lives in the root
 # `CLAUDE.md`, not here — a prompt is served on every callback turn, so the
 # *why* belongs to the reference surface and only the *gesture* belongs here.
-max_prompt_size = 20480
+#
+# mika#2634 — raised 20480 → 24576, and the measurement is the argument rather
+# than the comfort. The launcher-dead discriminator added ~1.9 KB, taking the
+# prompt from 17946 B (87.6 % of 20480) to 19833 B (**96.8 %**) — past the 95 %
+# warn gate, i.e. it consumed the whole margin mika#2545 had deliberately left.
+# At 24576 the file sits at 80.7 %, and the gate would warn again at 23347 B:
+# roughly two more discriminators of this size, which is the real growth law of
+# this prompt (one terminal class closed = one branch added, and that growth is
+# healthy — each branch is a retry loop removed).
+#
+# **24576 is not a capacity bound and must not be read as one.** The hard
+# ceiling `effective_prompt_limit` enforces is 80 KB; this number is a tuned
+# ALERT threshold whose only job is to make the 100 % cliff — where the skill is
+# silently DROPPED from the startup scan — unreachable by accident. Trimming the
+# existing prompt was the alternative and is refused here on scope: this is
+# loop substrate served on every callback turn, and shortening a branch that
+# routes a terminal verdict is a change to routing dressed up as housekeeping.
+max_prompt_size = 24576
 
 [triggers]
 keywords = [

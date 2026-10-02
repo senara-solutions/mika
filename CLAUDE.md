@@ -1640,6 +1640,282 @@ Optional (pilot turn budget, armed at the source — mika#2496):
 - **Out of scope, deliberately:** the missing dollar brake itself (`_sdk_guardrail_kwargs`'s `pass`) and the real-time per-boundary turn count, both follow-ups on `senara-solutions/claude-pilot` — this repo cannot create either; the V2 measurement, an operator gesture on the host that gates the default's value; and the revise path's stderr, whose line is persisted nowhere (inherited from Signal S).
 
 
+### Un lanceur `claude-pilot` mort est un fait estampillé, exit 79 (mika#2634, phase A)
+
+**Aucune variable d'environnement, aucune migration, aucune valeur de réglage
+déplacée.** Cette entrée est ici parce que l'opérateur qui lit un
+`Process Exit code: 1:` avec un `stderr_bytes: 0` et aucun journal pilote
+cherche dans ce voisinage.
+
+- **Le défaut, mesuré le 2026-10-02 (n=1, 2 h 45 de rail mort sans alarme).** À
+  01:26:20Z, `~/.local/bin/claude-pilot` a été réécrit avec le shebang
+  `#!/usr/bin/python3.14` — le Python **système** — au lieu de celui du venv
+  `uv tool`. Cause établie : l'`entry_points.txt` de claude-pilot déclare
+  `claude-pilot` en `[console_scripts]`, donc **tout `pip install -e` du dépôt
+  réécrit ce chemin** avec le shebang du Python qui lance pip. Deux
+  gestionnaires se disputent le même chemin et pip gagne en silence. Trois
+  dispatches sont morts sans démarrer (`04d02b33` 03:03Z, `a9fed84b` 03:05Z,
+  `7e7e881b` 04:00Z), chacun avec `long_running_handler_exit_nonzero`,
+  `stderr_bytes: 0`, et **aucun** `/var/log/claude-pilot/<id>.log`. La panne a
+  été trouvée à la main.
+
+- **Quatre rectifications que la lecture du code impose au ticket, et elles sont
+  le premier livrable.**
+
+  *(R1)* **La population mesurée est le PRÉ-FLIGHT, pas le lancement.** Un
+  shebang cassé ne fait **pas** échouer `command -v claude-pilot` — le fichier
+  existe et est exécutable. Il fait échouer `claude-pilot --help`, donc le smoke
+  test mika#1200, qui tournait **treize lignes avant** que
+  `trap '_dispatch_lib_exit_trap' EXIT` n'existe. D'où chaque octet mesuré :
+  aucun callback livré, tâche non terminale, `update_task_failed` rend
+  `Ok(true)`, et le moteur écrit `tasks.result = "Process Exit code: 1: "`. **Le
+  diagnostic mika#1200 a été écrit mot pour mot pour cette panne et n'a atteint
+  personne.**
+
+  *(R2)* **`stderr_bytes: 0` a une cause nommée DANS LE DÉPÔT, et une doc qui
+  affirmait l'inverse.** `exec 9>>"$TRACE_FILE" 2>/dev/null` est un `exec`
+  **sans commande** : ses redirections s'appliquent au shell courant **de façon
+  permanente**, donc fd 2 est `/dev/null` pour tout le reste du handler. Le
+  commentaire de `_halt_family` l'écrivait déjà (mika#903) ; ce qui manquait est
+  le lien avec « le pré-flight écrit son diagnostic dans le vide ». Le
+  `crates/mika-agent/CLAUDE.md` § mika#2532 affirmait le contraire — **rectifié
+  dans le même commit**.
+
+  *(R3)* **La cause Python était DÉJÀ capturée, mais pas atteignable par le
+  canal que le plan désignait.** Le smoke test redirigeait son stderr sur fd 9
+  (`2>&9`), donc le `ModuleNotFoundError` **était écrit sur disque** dans
+  `$TRACE_FILE`, et le trap EXIT append les 50 dernières lignes de ce fichier au
+  `RESULT` sur son bras crash — d'où la lecture du plan : *le remède d'AC3 est un
+  remède d'ORDRE, pas d'instrumentation.* **Mesuré à l'implémentation, c'est
+  insuffisant :** `set -x` est actif, donc cette fenêtre de cinquante lignes est
+  consommée par la trace du bloc lui-même (l'assignation du `RESULT` pèse ~30
+  lignes tracées) **plus** les commandes du trap avant qu'il ne lise le fichier
+  (`_release_issue_seat` seule en fait 12). Le traceback est écrit **avant** tout
+  cela : il tombe hors fenêtre, et la moitié « la cause est persistée » d'AC3
+  aurait été livrée cassée tout en ayant l'air livrée. La cause est donc
+  **capturée** dans un fichier que ce bloc possède et insérée dans le `RESULT`,
+  qui devient autonome ; la trace reçoit toujours un marqueur, en forensique
+  plutôt qu'en porteur.
+  **Et la forme de la capture n'est pas libre :** l'écriture naturelle
+  (`_VAR=$(timeout 15 claude-pilot --help 2>&1 >/dev/null)`) fait **disparaître**
+  ce site du scan de lancement mika#2496, dont le prédicat ancre `timeout` après
+  `^` ou `;` et compte le smoke test parmi ses quatre points d'étranglement —
+  mesuré, le compte est tombé de 4 à 3 et le scan l'a dit, ce qui est
+  exactement sa raison d'être (*« a renamed, reordered, or added launch point
+  turns red instead of evaporating »*). Une substitution de commande n'est aucun
+  des deux ancrages, donc aucune forme capturante ne garde le site visible —
+  d'où le fichier.
+
+  *(R4)* **Le discriminant « exit non nul + aucun journal » a quatre faux
+  positifs mesurables** : le refus de confinement (exit 78, mika#2049 — pas de
+  journal non plus, et sa propre prose nomme la cause), le refus
+  `already_groomed` (mika#2012) et le dry-run (tous deux exit 0, donc la
+  conjonction n'est sûre qu'en apparence), et le refus `cwd-guard` (mika#2536)
+  sur un skill voisin. Il introduirait aussi un **second lecteur** de
+  `<pilot_log_dir>/<task-id>.log`, dont le premier est
+  `task_engine::engine::probe_pilot_log_signal` (mika#2277) — la classe que
+  mika#2158 a dû refermer.
+
+- **Le fait est ESTAMPILLÉ par son producteur : exit 79.** Le pré-flight sort
+  avec `79` (`_EXIT_LAUNCHER_DEAD`) au lieu de `1`, et le moteur classe sur ce
+  code **sans rien inférer**. Doctrine maison écrite trois fois : *PR origin is
+  a fact stamped by its producer* (mika#2026), *the engine is told, never
+  derives* (mika#2249), *la cible PR est dite, jamais dérivée* (mika#2368, qui
+  condamne nommément la dérivation **tardive**). `79` est libre : 78 est pris par
+  le refus de confinement (même famille sémantique — « rien n'a été lancé »),
+  64-78 sont les `sysexits.h`, 126/127/128+ sont réservés par le shell.
+  **Coût nommé :** la valeur est écrite deux fois, en shell et en Rust — le
+  doublon inter-langage que mika#2520 a déjà dû assumer pour
+  `GIT_OPS_PROTECTED_BRANCHES` — et il est **gardé dans les deux sens** par un
+  scan Rust qui lit le littéral du shell.
+
+- **Le smoke test migre APRÈS le trap ; les trois `command -v` restent AVANT.**
+  Ce n'est pas un détail d'ordonnancement : le trap livre son callback par le
+  CLI `mika` et son corps emploie `jq`. Déplacer les `command -v` après
+  donnerait un trap qui échoue en silence sur un hôte où l'un des deux manque —
+  une panne muette échangée contre une autre. Le smoke test, lui, n'a aucune de
+  ces dépendances au moment où il tourne. **Conséquence : sur cette panne le
+  callback EST livré**, donc la tâche devient terminale, donc le moteur logue
+  `task_was_terminal: true` — et ce champ est la mesure directe que cette moitié
+  a pris.
+
+- **Le marqueur du callback est TERMINAL, et pas `HANDLER CRASH`.** Laisser le
+  trap produire son `HANDLER CRASH (exit code 79)` générique serait un piège
+  mesuré : il est dans la population que `self-dev-callback/system_prompt.md`
+  invite à rejouer, et que `_gate_non_empty_cycle` grepe à côté de
+  `PIPELINE FAILURE:`. Un lanceur cassé rejoué est exactement la boucle que
+  mika#2545 a dû refermer pour l'`ESCALATE` de groom. Le patron repris est le
+  sien, verbatim : un `Outcome: LAUNCHER_DEAD` **testé avant** les branches de
+  rejeu, terminal, qui **n'incrémente pas** `pipeline_retry_count`.
+
+- **Une seule compensation de classification sur deux, et c'est une
+  rectification.** Le plan en demandait deux (mika#2545 a payé les deux). La
+  première — faire reconnaître `^Outcome: LAUNCHER_DEAD` par
+  `_gate_non_empty_cycle` — est **déjà satisfaite par un terme plus fort** : son
+  court-circuit `PILOT_RAN != 1`, dont le commentaire nomme littéralement « a
+  crash before launch ». `PILOT_RAN=1` vit dans `_run_claude_pilot`, donc la
+  population est **vide par construction** et ajouter le motif serait une garde
+  dont le silence ne prouve rien (mika#2205). La moitié vérifiable est l'autre :
+  que le `RESULT` ne matche **aucun** des six motifs retryables — asserté plutôt
+  que lu. La seconde compensation est livrée : `self-dev-callback` gagne un
+  **Launcher-dead discriminator**, placé avant la routine `PIPELINE FAILURE:`
+  **et** avant le discriminateur `ESCALATE` (un groom mort au lancement n'a
+  produit aucun verdict, donc ne porte pas de ligne `Outcome: ESCALATE` à lire).
+
+- **L'« alarme vers le veilleur » est un WARN plus une ligne d'audit, et c'est
+  dit comme tel.** `spawn_long_running_exec` tourne dans un `tokio::spawn` qui
+  ne reçoit **aucun `message_sender`**, et `control-monitor` est hors de ce
+  workspace : il lit la base et les journaux (tout l'objet de mika#1990 et
+  mika#2267). Fabriquer ici un canal push serait une arbitration de canal
+  déguisée en observabilité. La lettre d'AC1 est satisfaite par le canal que le
+  veilleur lit, pas par un POST.
+
+### Surfaces opérateur
+
+```bash
+# 1. Un lanceur est-il mort au lancement ?
+grep pilot_launcher_dead "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "pilot_launcher_dead")
+           | {task_id, code_display, task_was_terminal, stderr_bytes, skill_dir}'
+
+# 2. CONTRÔLE NÉGATIF — la ligne d'audit est-elle passée ? (régime attendu : VIDE)
+grep pilot_launcher_dead_audit_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. CONTRÔLE POSITIF — des dispatches ont-ils seulement échoué ?
+grep -c long_running_handler_exit_nonzero "$MIKA_SPIRIT_LOG_FILE"
+```
+
+Le `select` sur `.event` est porteur : `grep pilot_launcher_dead` est une
+**sous-chaîne** et rend aussi le résidu `…_audit_failed`, plus tout texte qu'un
+pilote écrirait *au sujet* du signal (classe mika#2050, mesurée sur le Signal S).
+
+```sql
+-- La population, datée. `pilot_launcher_health` est SOLE WRITER, donc ce compte
+-- est exact plutôt qu'un nombre sur lequel deux sites peuvent diverger.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pilot_launcher_health' GROUP BY 1;
+
+-- Le détail, avec le répertoire de skill et le code
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'pilot_launcher_health' AND after_value = 'dead'
+ ORDER BY created_at DESC;
+
+-- Le callback réellement servi — il porte le remède ET le ModuleNotFoundError
+SELECT id, result FROM tasks WHERE result LIKE 'LAUNCHER DEAD (exit 79%';
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `pilot_launcher_dead` | WARN | **vide** | chaque ligne est un dispatch mort au lancement : le pilote n'a jamais démarré et l'hôte est à réparer |
+| `task_was_terminal: true` sur cette ligne | WARN | **c'est l'attendu** | le callback a été livré, donc le trap était armé — la mesure directe que le déplacement a pris. Un `false` signifie que le pré-flight sort **avant** le trap à nouveau |
+| `after_value = 'dead'` | audit | **vide** | la même population, datée et comptable |
+| `pilot_launcher_dead_audit_failed` | WARN | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` sous-compte à partir de là |
+| `long_running_handler_exit_nonzero` | WARN/INFO | non vide, faible | **conservée intacte** : un lanceur mort reste un exit non nul, et retirer la ligne générique casserait les requêtes publiées (celles de mika#2532 comprises) |
+
+### Sondes post-déploiement, et leurs quatre haltes
+
+> **Préalable.** `skills/bundled/` est une projection du **binaire**, pas du
+> checkout (mika#2340) : `cat ~/.mika/skills/.manifest-writer` doit porter le sha
+> qu'on vient de bâtir, **et** le `mika-spirit` servi doit porter le correctif.
+> Sans ces deux vérifications, chacune des sondes rend un résultat qui décrit le
+> binaire d'hier. Ce sont des **gestes d'opérateur** sur l'hôte : la base n'est
+> pas montée dans le bac à sable de dispatch.
+
+**S1 — le défaut fondateur ne se rejoue pas (prochain lanceur cassé).** Casser
+délibérément le lanceur sur un hôte de test, dispatcher. Attendu : une ligne
+`pilot_launcher_dead` portant `task_was_terminal: true`, une ligne d'audit
+`dead`, et le `tasks.result` du callback portant **le diagnostic prescriptif**
+(les deux causes et la commande qui les couvre) **plus** la queue de trace avec
+le `ModuleNotFoundError`.
+*Halte 1 — aucune ligne alors que le dispatch est mort :* **ne pas élargir le
+prédicat par réflexe.** Établir d'abord le déploiement (préalable ci-dessus),
+puis lire le **contrôle positif** (sonde 3). Zéro ligne des deux côtés ne prouve
+rien : *une garde que personne n'a exercée se lit exactement comme une garde qui
+marche* (mika#2205).
+
+**S2 — le callback porte la cause (même occurrence).** La requête SQL sur
+`tasks.result` doit rendre une ligne, et son contenu doit porter **les deux**
+moitiés d'AC3 : le bloc `What the launcher said` avec le `ModuleNotFoundError`,
+**et** le remède prescriptif avec ses deux causes.
+*Halte 2 — le `RESULT` porte le remède mais le bloc `What the launcher said`
+affiche `(the launcher wrote nothing on its stderr)` :* la capture a échoué, pas
+le prédicat. Le repli est là précisément pour que « le lanceur n'a rien dit » et
+« la capture a raté » ne se lisent pas pareil — vérifier que `${TMPDIR:-/tmp}`
+est inscriptible **avant** de toucher au bloc. Et si la cause manque alors que la
+capture a réussi, c'est le `tail -c 4000` qui l'a tronquée par la gauche :
+augmenter cette borne, **ne pas** revenir à la fenêtre de trace, qui est le canal
+que cette conception a mesuré insuffisant (R3).
+
+**S3 — contrôle négatif de faux positif (7 jours).** Aucun `pilot_launcher_dead`
+sur un dispatch nominal, et **en particulier aucun** sur un refus de confinement
+(exit 78), un `auto_skipped`, un dry-run ou un `PIPELINE_INCOMPLETE`.
+*Halte 3 — une occurrence :* c'est R4 qui se réalise, donc le classement ne lit
+pas le code dédié mais une inférence. **Désarmer d'abord** (revert du bloc de
+classification), réparer le prédicat ensuite.
+
+**S4 — le marqueur terminal ne rejoue pas (30 jours).** Aucun ticket
+re-dispatché en boucle à la suite d'un `Outcome: LAUNCHER_DEAD`.
+*Halte 4 — un rejeu :* la branche `self-dev-callback` n'est pas atteinte, ou elle
+est placée **après** la routine `PIPELINE FAILURE:`. C'est l'ordre du
+discriminateur qu'il faut lire, pas le prédicat — la leçon mika#2545 à la lettre.
+
+### Ce que ce travail n'achète PAS
+
+- **Il ne répare aucun lanceur.** Le shebang est un fait d'**hôte** ; la preflight
+  de `make deploy` et la sonde de surveillance (AC5 du ticket) sont traitées par
+  MPC dans le méta-dépôt, et le ticket les met hors périmètre en toutes lettres.
+- **Il ne borne pas encore le gaspillage (AC2).** Le frein — « à la deuxième
+  occurrence dans la fenêtre, cesser de dispatcher » — est la **phase B** de ce
+  ticket : `pilot_launcher_health.rs`, ses deux surfaces
+  (`validate_dispatch_readiness` et `auto_pull::classify_stuck_ready`, cette
+  seconde pour que le refus **ne consomme pas** le budget de re-drive mika#2020)
+  et ses trois variables. **Donc `after_value = 'recovered'`,
+  `pilot_launcher_brake_engaged` et `pilot_launcher_health_unreadable` n'existent
+  pas encore** : un grep dessus rend vide parce qu'aucun site ne les écrit,
+  jamais parce que la flotte va bien. Ce qui est livré ici est la **détection** :
+  la panne devient visible au premier lancement mort au lieu d'après 2 h 45.
+- **Il ne rattrape pas l'incident du 2026-10-02.** Les trois tâches mesurées
+  restent ce qu'elles sont et **rien ne rétro-écrit** une ligne d'audit datée
+  d'un fait qu'on n'a pas observé — ce serait l'inverse de ce que ce travail
+  défend. La sonde est la **prochaine** occurrence.
+- **Il ne couvre pas un lanceur qui PASSE le smoke test et meurt au lancement
+  réel.** Population nommée et **non couverte** : `claude-pilot --help` réussit,
+  puis le vrai lancement meurt sans journal (un drapeau refusé, la classe
+  mika#2043). Le canal y est différent — le trap est armé, le callback part, et
+  le signal devrait vivre dans le `RESULT`. **Ticket de suivi**, précondition :
+  une mesure montrant une occurrence.
+- **Il ne retire pas le `2>/dev/null` permanent** de l'ouverture de fd 9. Le
+  réflexe serait de le réparer pour que tout le stderr du handler remonte au
+  moteur ; **refusé ici, et la raison est un risque, pas une préférence :**
+  `spawn_long_running_exec` monte ce stderr sur un `Stdio::piped()` que
+  l'exécuteur ne lit **qu'après** `child.wait()`, et un pipe a une capacité
+  d'environ 64 Kio — un handler qui écrirait davantage sur fd 2 **bloquerait**
+  indéfiniment. Le `/dev/null` masquait peut-être ce risque par accident, et le
+  lever demande de décider où va ce stderr, alors que `TASK_ID` n'est pas connu
+  à la ligne qui ouvre fd 9. **Ticket de suivi**, avec cet arbitrage pour corps.
+- **Il n'ajoute aucun canal push vers le veilleur**, et aucune variable
+  d'environnement.
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les
+  greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
+  personne ne les exécute.**
+
+### Hors périmètre, délibérément
+
+- **La preflight `make deploy` et la sonde de shebang (AC5)** : attribuées à MPC
+  dans le méta-dépôt par le ticket lui-même.
+- **`probe_pilot_log_signal` et le faucheur mika#2249/#2277** : inchangés. Le
+  code de sortie dédié existe précisément pour ne pas créer un second lecteur de
+  ce chemin.
+- **Le refus de confinement exit 78** (mika#2141 / mika#2049) : inchangé, et
+  explicitement exclu de la population (R4, contrôle négatif épinglé par test).
+- **`MAX_OUTPUT_LEN` et la persistance mika#2532** : aucun octet touché. Le
+  mécanisme fonctionne ; ce qui change est qu'il aura désormais quelque chose à
+  persister sur ce chemin.
+- **Le budget de tours `PILOT_MAX_TURNS` et le seuil de coût** (mika#2496) :
+  aucune valeur déplacée.
+- **La garde anti-zombie mika#1742 et ses exemptions** : aucun contact.
+
+
 ### `MIKA_PLATFORM_DIR` traverse enfin, et un `cwd` incomposable est refusé en le nommant (mika#2536)
 
 - `MIKA_PLATFORM_DIR` — racine de la plateforme, posée par l'opérateur sur

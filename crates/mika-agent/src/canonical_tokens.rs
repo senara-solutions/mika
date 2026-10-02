@@ -1364,6 +1364,89 @@ mod tests {
         );
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2634 — le nom d'audit sous lequel vit la santé du LANCEUR a un
+    // seul écrivain.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est vérifiable : le nom
+    /// `pilot_launcher_health` est **neuf**. Il n'y a donc rien à excepter, ni
+    /// de case où déposer la prochaine infraction (mika#2323). Quand le scan
+    /// tire, **on retire le second site**, on ne l'allowliste pas (doctrine
+    /// mika#2201).
+    const LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// La propriété qui rend le `GROUP BY after_value` de l'opérateur exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, le moteur continuerait de classer, et chaque
+    /// assertion comportementale de `skills::executor::tests::mika2634`
+    /// resterait verte. Ce qui deviendrait faux est le **compte** — et c'est
+    /// lui que la phase B du ticket (le frein à deux occurrences) lira pour
+    /// décider d'arrêter la flotte. Un compte sur lequel deux sites peuvent
+    /// diverger est un frein qui mord au mauvais moment.
+    #[test]
+    fn mika2634_the_launcher_health_name_has_a_single_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("pilot_launcher{}", "_health");
+        let owner = "crates/mika-agent/src/skills/executor.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2634 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2634 — le nom d'audit de la santé du lanceur a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : retirer le second site. Ne PAS l'ajouter à \
+             LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS — le compte que le frein de \
+             la phase B lira n'est exact que tant qu'un seul site l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2634_the_sole_writer_allowlist_is_empty() {
+        assert!(
+            LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "LAUNCHER_HEALTH_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
     #[test]
     fn mika2496_the_sole_writer_allowlist_is_empty() {
