@@ -3730,6 +3730,10 @@ _run_claude_pilot() {
 
     # Unit 3 (mika#1282): flag for dirty-worktree rescue, checked by Unit 2.
     RESCUED_DIRTY_WORKTREE=0
+    # mika#2631: flag for the mika#1383 Phase A trailing-content rescue, read by
+    # `_rescue_committed_in_the_pilots_place`. Reset per dispatch, like its
+    # sibling above, so a stamp from an earlier dispatch cannot leak.
+    RESCUED_TRAILING_CONTENT=0
     # mika#2151: SHAs of rescue commits produced during THIS dispatch, and the
     # subset already reported on a PR. Reset here, per dispatch, deliberately:
     # the detector has no backlog — it never scans history, open PRs, or
@@ -5463,6 +5467,12 @@ ${RESULT}"
                     # mika#1685: bypass pre-commit hook — see rationale on the
                     # mika#1282 rescue commit above. Same salvage-not-gate principle.
                     if git -C "$WORKTREE_DIR" commit -m "wip(${REPO}#${ISSUE_NUM}): trailing content after pilot end_turn (mika#1383)" --no-verify 2>&9; then
+                        # mika#2631: dispatch-lib just committed content the
+                        # pilot wrote and never committed — the same fact as the
+                        # mika#1282 stamp, on the HEAD-advanced side. Set on the
+                        # commit, not on the push: the content is in the branch
+                        # either way.
+                        RESCUED_TRAILING_CONTENT=1
                         # mika#2151: this is the SECOND push site in dispatch-lib
                         # — it pushes inline, before _push_branch ever runs. A
                         # signal wired only into _push_branch would leave one
@@ -8554,6 +8564,117 @@ _rescue_touches_tracked_tree() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AC4 CENSUS — every reader of `STATUS = success` in this file (mika#2631)
+#
+# `STATUS = success` means "the pilot's session CONCLUDED". It does not mean "the
+# pilot DELIVERED": a pilot that hands its turn back before committing — the
+# cpp#267 shape, measured on pilot `bb9163e1`, 2026-10-01 — concludes in
+# `success` with its pipeline truncated. Exactly three sites read that literal,
+# and the question put to each is: does it carry the premise "concluded =
+# complete", and does that premise have a CONSEQUENCE?
+#
+# | site | reading | verdict |
+# |---|---|---|
+# | `_rescue_compound_traversal` | `success` ⇒ nothing was truncated | THE DEFECT — fixed below |
+# | `_pilot_had_no_shipping_tail` | `success` ⇒ the session concluded | named, deliberately NOT fixed |
+# | mika#940 Unit 1 | `success` ⇒ do not re-classify a failure | named, no defect |
+#
+# WHY #2 IS NOT FIXED — a measured refusal, not an oversight. It does carry the
+# premise: on the founding incident `dev-pilot` + shipping tail `absent` +
+# `success` reads TRUE while the work was truncated. Conjoining the same stamp
+# there would be a REGRESSION. It would change nothing in the class computation
+# (the stamp is tested FIRST there, so the class is already `dirty-worktree`),
+# and it would be ACTIVE on the mika#940 Unit 1 guard, whose term is written
+# `! _pilot_had_no_shipping_tail`: that term would flip to true and the guard
+# would write
+#
+#   "PIPELINE FAILURE: … Pipeline truncated before git push + gh pr create."
+#
+# — a FALSE sentence for a `dirty-worktree` rescue (dispatch-lib is opening the
+# PR at that very moment), plus a SECOND `PIPELINE FAILURE:` line on a RESULT
+# that already carries one. We would trade a false marker for a false sentence.
+#
+# What keeps #2 correct is therefore the ORDER OF INSTRUCTIONS, in two places:
+# the `RESCUED_DIRTY_WORKTREE` branch precedes the `_pilot_had_no_shipping_tail`
+# branch in the `RECOVERY_CLASS` computation, and the `PIPELINE FAILURE:` arm
+# precedes the `elif _pilot_had_no_shipping_tail` arm in the Unit 3
+# classification. An order is an EMERGENT property — inverting either would make
+# no decision wrong in any existing case and would reopen this ticket in silence
+# — so both are pinned structurally by T15p in
+# `tests/test_rescue_pipeline_verified.sh`.
+#
+# WHY #3 IS NOT A DEFECT. Its claim is conditioned on `PRE_RUN_HEAD !=
+# POST_RUN_HEAD` AND on `! _pilot_had_no_shipping_tail`, and on the
+# `dirty-worktree` class the rescue has already written its own `PIPELINE
+# FAILURE: … HEAD unchanged — dirty worktree detected and auto-committed` line.
+# The truncation is already named; this guard staying silent produces neither a
+# false green nor a false sentence.
+#
+# And `rescue-pipeline-verified`, which AC4 names explicitly, reads no `STATUS`
+# at all: its six terms reach it only through term 0, whose sole reader of
+# `STATUS` is `_rescue_compound_traversal`. Fixing the classifier fixes the
+# marker with no further change — which is what keeps this correction small.
+#
+# This table is the Fire-Disposition allowlist, and it is compared IN BOTH
+# DIRECTIONS by T15p's sibling T15o: a reader absent from it reddens the build,
+# and so does an entry whose site was renamed or removed. When it fires on a
+# FOURTH site, the resolution is to give that site a verdict, never to lengthen
+# the list — "unclassified" is not a verdict (mika#2201).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# _rescue_committed_in_the_pilots_place — did dispatch-lib commit FOR the pilot?
+#
+# mika#2631. True when the dirty-worktree rescue staged and committed content the
+# pilot wrote and never committed itself.
+#
+# THE FACT IS PAST, AND THAT DECIDES THE WHOLE DESIGN. The ticket names the
+# condition as "HEAD unchanged + dirty worktree", but by the time this is asked —
+# from `dispatch_claude_pilot`, after the rescue commit and after `_push_branch` —
+# both halves have DISAPPEARED from measurable state: the rescue advanced
+# `POST_RUN_HEAD` onto its own commit, so `PRE_RUN_HEAD != POST_RUN_HEAD` is now
+# TRUE, and it staged everything, so the tree is now CLEAN. A predicate that went
+# back to `git status` or compared the two SHAs would read the exact opposite of
+# the fact it is after. The only surviving trace is the stamp, written by its
+# PRODUCER at the two auto-commit sites in `_rescue_dirty_worktree` — the motif
+# this file already carries for `PILOT_SHIPPING_TAIL` (mika#2492), `origin:loop`
+# (mika#2026), `closing_pr_closed_unmerged` (mika#2242) and `qa_review_pr_target`
+# (mika#2368). T15k asserts those three facts on a real fixture rather than
+# trusting this paragraph.
+#
+# NOT `RECOVERY_CLASS`, which would be the tempting read. Two reasons: it is a
+# `local` of `dispatch_claude_pilot`, so reading it here would work only through
+# bash's DYNAMIC SCOPE — the fragility this file already refused once, when
+# mika#2496 chose to pass `"${LABELS:-}"` as an ARGUMENT to its three launch
+# sites "never by dynamic scope"; and it is DERIVED from this very stamp, so
+# reading the derivation rather than the fact adds a link that can diverge for no
+# gain.
+#
+# TWO PRODUCERS, ONE FACT. The HEAD-advanced side has its own auto-commit: the
+# mika#1383 Phase A trailing-content rescue. A pilot that commits part of its
+# work, leaves the rest dirty and hands the turn back gets that rest committed by
+# dispatch-lib — "in the pilot's place" exactly as AC1 means it — and the class
+# then reads `commit-pushed-no-pr`. Phase A stamps `RESCUED_TRAILING_CONTENT=1`
+# on its commit, and either stamp makes the traversal measure. Pinned by T15r,
+# which drives the real `_post_flight_recovery`.
+#
+# The EMPTY `wip(mika#1383)` marker stays OUT, and AC1's parenthesis must not be
+# read as sweeping it in. That commit carries no content: the pilot committed
+# all of ITS OWN work, the marker exists only to arm guard 2 of
+# `self-dev-webhook-qa`, and only `gh pr create` failed. Measuring the traversal
+# there would bite a pilot that finished correctly, i.e. part of the nominal
+# traffic under another name. Pinned by T15q.
+#
+# Exact, like the shipping-tail stamp test in `_pilot_had_no_shipping_tail`
+# (spelled differently here on purpose: T5 of `test-dispatch-lib.sh` counts that
+# stamp's readers): the scaffold-only path sets `0`, the two hook-failure paths
+# leave it unset, and dev-groom never sets either stamp. Anything unreadable,
+# empty or `0` leaves today's behaviour — which is the fail-safe direction here,
+# since not measuring is the prior state and never a new permission.
+_rescue_committed_in_the_pilots_place() {
+    [ "${RESCUED_DIRTY_WORKTREE:-}" = "1" ] || [ "${RESCUED_TRAILING_CONTENT:-}" = "1" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # _rescue_compound_traversal — was the compound decision traversed? (mika#2563)
 #
 # Classifies, and classifies ONLY. The disposition — whether an `absent` verdict
@@ -8586,16 +8707,29 @@ _rescue_touches_tracked_tree() {
 #   "Truncated work must not be presented as complete just because its
 #    perimeter had no shipping tail."
 #
+# That sentence has a SECOND application, and mika#2631 is it: the premise still
+# fails when the pilot DID conclude. CONCLUDING IS NOT DELIVERING. A pilot that
+# launches its reviewers, writes "waiting on them" and hands the turn back closes
+# in `success` with nothing committed; the rescue commits for it, and this term
+# used to call that complete. Truncated work must not be presented as complete
+# just because its SESSION reached an end either.
+#
 # Four values, and they are a WIRE FORMAT — they land in a PR-body marker
 # `<!-- compound-traversal: … -->` (mika#2201). One definition site; the set is
 # pinned by the T15 suite.
 #
-#   not-applicable    — `STATUS = success`: the session concluded. Nothing was
-#                       truncated, so there is nothing for this term to say.
-#                       This is the 71 % above, and D3: `no-shipping-tail` is
-#                       the NOMINAL route and carries `success` by construction
+#   not-applicable    — the session concluded AND committed its own work.
+#                       Nothing was truncated, so there is nothing for this term
+#                       to say. This is the 71 % above, and D3:
+#                       `no-shipping-tail` is the NOMINAL route and carries
+#                       `success` by construction
 #                       (`_pilot_had_no_shipping_tail` requires it), so it never
-#                       lands here.
+#                       lands here. mika#2631 added the second half of that
+#                       condition: a concluded session whose work was committed
+#                       BY THE RESCUE is measured like a truncated one — see
+#                       `_rescue_committed_in_the_pilots_place` above, and the
+#                       AC4 census next to it for why the premise "concluded =
+#                       complete" is false on exactly that population.
 #   attested-solution — the diff `origin/main...HEAD` carries a
 #                       `docs/solutions/**/*.md`: the decision "there is a
 #                       lesson" was taken AND executed.
@@ -8617,9 +8751,13 @@ _rescue_touches_tracked_tree() {
 # CALLED TWICE PER DISPATCH, and that is forced rather than sloppy: the callsite
 # invokes `_measure_pipeline_verified` inside `$(…)`, i.e. in a SUBSHELL, so a
 # global written there could not reach the body composer. Two calls of a pure
-# function of (`STATUS`, worktree state) cannot diverge — nothing between them
-# mutates either — and the alternative, a second classification written at the
-# callsite, is the duplicated-predicate class this file has had to undo before.
+# function of (`STATUS`, the two rescue stamps, worktree state) cannot diverge
+# — nothing between them mutates any of them — and the alternative, a second
+# classification written at the callsite, is the duplicated-predicate class this
+# file has had to undo before. The stamps joined that list in mika#2631, and the
+# argument extends verbatim: both are written far upstream (`_run_claude_pilot` →
+# `_post_flight_recovery`, in `_rescue_dirty_worktree` and in Phase A), and the
+# subshell of term 0 can write nothing at all.
 #
 # Args: $1 — worktree dir
 # Outputs: exactly one of the four values above, no trailing newline.
@@ -8630,7 +8768,18 @@ _rescue_compound_traversal() {
     # (`.status`). Read here, at the same place and by the same test
     # `_pilot_had_no_shipping_tail` reads it — a second reading of the same
     # field would be a second vocabulary for one fact.
-    [ "${STATUS:-}" = "success" ] && { printf 'not-applicable'; return 0; }
+    #
+    # mika#2631: a CONJUNCTION, and the second term is what closes the hole.
+    # Concluding is not delivering — a pilot that handed its turn back before
+    # committing concludes in `success` while dispatch-lib, thirty lines of its
+    # own code earlier, has just written that the pipeline was truncated. This
+    # REMOVES an early exit rather than adding one: once the exemption is
+    # refused, the flow falls into the two measurements below and the value is
+    # MEASURED, exactly as for a session that was cut short.
+    if [ "${STATUS:-}" = "success" ] && ! _rescue_committed_in_the_pilots_place; then
+        printf 'not-applicable'
+        return 0
+    fi
 
     # Same guard, same reason, as `_rescue_diff_carries_work`: `git -C ""`
     # silently operates on the dispatch process CWD — a live checkout — so an
@@ -8833,8 +8982,20 @@ _measure_pipeline_verified() {
     local _traversal
     _traversal=$(_rescue_compound_traversal "$wt_dir")
     if [ "$_traversal" = "absent" ] && _rescue_require_compound_traversal; then
-        printf 'compound-traversal\nthe pilot session did not conclude (status: %s) and nothing attests the compound decision was traversed.\nNo docs/solutions/**/*.md in `origin/main...HEAD`, and no `Compound: none — <reason>` trailer in `origin/main..HEAD`.\nLift it either way: write the learning, or state in a commit trailer that there is none.\n' \
-            "${STATUS:-<unreadable>}"
+        # mika#2631: the sentence must stay TRUE of both populations this term now
+        # has. It used to open on "the pilot session did not conclude", which was
+        # exact while `STATUS != success` was the only way in; on a rescue that
+        # committed in the pilot's place the status IS `success`, so that opening
+        # would read "did not conclude (status: success)" — a sentence refuting
+        # itself. The same exchange this ticket refuses to make at
+        # `_pilot_had_no_shipping_tail`: a false marker traded for a false
+        # sentence. So the refusal states what is MISSING (the attestation) and
+        # names the two facts behind it, each of which is independently readable.
+        local _why_measured=""
+        _rescue_committed_in_the_pilots_place \
+            && _why_measured=", and dispatch-lib committed in the pilot's place"
+        printf 'compound-traversal\nnothing attests the compound decision was traversed (pilot status: %s%s).\nNo docs/solutions/**/*.md in `origin/main...HEAD`, and no `Compound: none — <reason>` trailer in `origin/main..HEAD`.\nLift it either way: write the learning, or state in a commit trailer that there is none.\n' \
+            "${STATUS:-<unreadable>}" "$_why_measured"
         return 1
     fi
 
@@ -10122,7 +10283,24 @@ The pilot's implementation work is in the commit(s) below this one." 2>&9; then
                 _rescue_verify_term=$(head -1 <<<"$_rescue_verify_out")
                 _rescue_verify_excerpt=$(tail -n +2 <<<"$_rescue_verify_out")
             fi
-            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} compound-traversal=${_rescue_compound} (mika#2354, mika#2563)" >&2
+            # mika#2631 adds `rescue-committed=` and `trailing-committed=` (the
+            # two stamps), so the two reasons a traversal
+            # reads `not-applicable` are distinguishable: the session concluded
+            # AND committed its own work, versus the rescue having committed for
+            # it (which now measures instead).
+            #
+            # NOT A PROBE, and that is said rather than left to be discovered.
+            # This runs at `dispatch_claude_pilot` level, so its stderr is
+            # `spawn_long_running_exec`'s `Stdio::piped()` handle, which the
+            # executor reads ONLY inside `if !status.success()`. On a dispatch
+            # that succeeds the pipe is dropped unread — Signal M, the mika#2050
+            # class corrected three times over on Signal S. The durable surface is
+            # the PR body, which already carries BOTH halves of the attribution:
+            # the `<!-- compound-traversal: … -->` marker and the class sentence
+            # naming the auto-commit. Same refusal, same words, as mika#2503's own
+            # `echo` a few hundred lines above: a convenience, deliberately not
+            # presented as a probe.
+            echo "rescue_pipeline_verified: verified=${_rescue_verified} term=${_rescue_verify_term:-none} compound-traversal=${_rescue_compound} rescue-committed=${RESCUED_DIRTY_WORKTREE:-unset} trailing-committed=${RESCUED_TRAILING_CONTENT:-unset} (mika#2354, mika#2563, mika#2631)" >&2
         else
             # The kill-switch leaves `$8` empty too, so the body stays
             # byte-identical to the pre-mika#2354 one — mika#2563 extends that
