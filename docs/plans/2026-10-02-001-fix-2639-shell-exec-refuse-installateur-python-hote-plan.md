@@ -265,8 +265,20 @@ le troisième scan là où sont les deux premiers.* La surface SQL est **identiq
 celle de stdout** : sur un exit non nul, `execute_exec`
 (`executor.rs:1467-1479`) combine stdout et stderr et préfixe `Exit code: 1`,
 donc le jeton atterrit dans `tool_calls.output` de toute façon. mika#2449 a
-choisi stdout pour la même raison ; ici la cohérence de fichier tranche, et il
-n'y a rien à gagner à diverger.
+choisi stdout pour la même raison (l. 185, `printf` sans `>&2`) ; ici la
+cohérence de fichier tranche, et il n'y a rien à gagner à diverger.
+
+**Un piège à ne pas hériter, parce que le code le porte.** Le commentaire de
+`execute_exec` affirme *« run.sh merges them with 2>&1 »* — vrai de la commande
+**évaluée**, faux du refus : le `2>&1` de `run.sh` est porté par la ligne
+`eval "$COMMAND" 2>&1` (l. 199) **seule**, qu'un refus n'atteint jamais. Le
+stderr du bloc arrive donc comme vrai stderr de process, et c'est la combinaison
+de l'exécuteur — non une fusion côté shell — qui le fait atterrir dans
+`tool_calls.output`. La déduplication voisine (`stderr_trimmed != stdout.trim()`)
+ne peut pas l'écarter : sur un refus, stdout est vide. Conclure de ce
+commentaire que le stderr est déjà fusionné, et donc qu'il pourrait être
+dédupliqué, rendrait fausse la requête SQL du § *Surfaces opérateur* sur sa
+seule population.
 
 Format de fil, **site de définition unique** :
 
@@ -562,8 +574,12 @@ qui marche* (mika#2205).
 
 ## Definition of Done
 
-1. `run.sh` porte le quatrième bloc, borné et commenté, et refuse sur stdout avec
-   `exit 1` et le jeton de format de fil.
+1. `run.sh` porte le quatrième bloc, borné et commenté, et refuse sur **stderr**
+   (`>&2`) avec `exit 1` et le jeton de format de fil — le canal de ses deux
+   aînés du même fichier (l. 78 et l. 122), et non celui de mika#2449 (l. 185,
+   `printf` sur stdout). Le § *La surface de refus* porte l'arbitrage ; le jeton
+   atteint `tool_calls.output` dans les deux cas, donc rien n'est perdu à suivre
+   la cohérence de fichier.
 2. `qa-review/system_prompt.md` porte la recette Python, en butée **topique**,
    accrochée à la règle « Never compile inside the review turn ».
 3. `scripts/test-python-installer-guard.sh` existe, est câblé par
