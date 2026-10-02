@@ -4,6 +4,12 @@ description = "Iteration-pass plan review after a first-pass ITERATE verdict —
 version = "0.1.0"
 always_on = true
 timeout_secs = 120
+# mika#2636 — the ticket-size rule joined the existing Review-Anchor Attestation
+# Contract; the prompt is 17 387 bytes, 106 % of the 16 KiB default, so the
+# skill would be skipped at load (mika#852). Raised to 24 KiB like
+# mika-arch-groom-ticket: headroom for one more rule, well under the 80 KiB
+# ceiling. The declared size costs nothing — the real size is injected.
+max_prompt_size = 24576
 
 [triggers]
 keywords = [
